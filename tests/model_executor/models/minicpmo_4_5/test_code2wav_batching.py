@@ -2065,6 +2065,24 @@ def test_tf32_mode_reads_shipped_yaml_key(monkeypatch):
     assert _tf32_mode({}) == "tf32"
 
 
+def test_tf32_mode_null_means_unset_and_typos_raise(monkeypatch):
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import _tf32_mode
+
+    monkeypatch.delenv("MINICPMO_CODE2WAV_TF32", raising=False)
+    # An explicit null means "unset": fall through to the alias, then the default.
+    assert _tf32_mode({"token2wav_allow_tf32": None}) == "tf32"
+    assert _tf32_mode({"token2wav_allow_tf32": None, "code2wav_allow_tf32": False}) == "off"
+    assert _tf32_mode({"token2wav_allow_tf32": "off"}) == "off"
+    assert _tf32_mode({"token2wav_allow_tf32": "  TF32  "}) == "tf32"
+    with pytest.raises(ValueError, match="allow_tf32"):
+        _tf32_mode({"token2wav_allow_tf32": "maybe"})
+    with pytest.raises(ValueError, match="allow_tf32"):
+        _tf32_mode({"token2wav_allow_tf32": 2})
+    monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "maybe")
+    with pytest.raises(ValueError, match="allow_tf32"):
+        _tf32_mode({})
+
+
 def _encoder_dispatch_backend(eager, precaptured, dynamic):
     return SimpleNamespace(
         flow=SimpleNamespace(training=False),

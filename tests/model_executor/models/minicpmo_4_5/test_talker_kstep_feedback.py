@@ -70,6 +70,9 @@ def _make_talker(*, k_step_frames: int, scripted_samples: list[int]):
     model._request_audio_states = {}
     model._request_codec_history = {}
     model._request_generators = {}
+    # `__init__` is bypassed here: `_codec_sample_setup` still reads the
+    # fused-prelude switch, so set it explicitly (eager chain, no kernels).
+    model._codec_fused_prelude = False
     emb = nn.Embedding(_NUM_AUDIO_TOKENS, 4)
     with torch.no_grad():
         emb.weight.zero_()

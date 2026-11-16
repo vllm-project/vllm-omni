@@ -46,6 +46,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.ming_flash_omni_tts import MingFl
 from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import (
     MossTTSAdapter,
     MossTTSNanoAdapter,
+    _code_grid_cache_salt,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import (
     QWEN3_TTS_AUTO_BUDGET_KEY,
@@ -581,6 +582,51 @@ def test_moss_reference_transcript_mode(variant, ref_text, mode, mocker):
     assert prepared.tts_params["seed"] == [0]
     assert prepared.prompt["cache_salt"]
     assert request.input == "Target."
+
+
+def test_moss_code_grid_cache_salt():
+    import torch
+
+    pad = torch.full((1, 12), 1024)
+    reference = torch.arange(36).reshape(3, 12)
+
+    def grid(lead, tail, ref=reference):
+        return torch.cat([pad.expand(lead, -1), ref, pad.expand(tail, -1)])
+
+    salt = _code_grid_cache_salt(grid(12, 40))
+    # Trailing padding follows the text length.
+    assert _code_grid_cache_salt(grid(12, 7)) == salt
+    # The reference codes and their rows are Talker inputs.
+    assert _code_grid_cache_salt(grid(13, 40)) != salt
+    assert _code_grid_cache_salt(grid(12, 40, reference + 1)) != salt
+
+
+def test_moss_salt_shares_reference_across_texts(mocker):
+    import torch
+
+    def process(*, conversations, mode):
+        message = conversations[0][0]
+        tail = len(message["text"]) + len(message.get("language", ""))
+        codes = torch.cat([torch.full((2, 12), 1024), message["reference"][0], torch.full((tail, 12), 1024)])
+        return {"input_ids": [torch.cat([torch.zeros((len(codes), 1), dtype=torch.int64), codes], dim=1)]}
+
+    processor = mocker.Mock(side_effect=process)
+    processor.build_user_message.side_effect = lambda **kwargs: kwargs
+    adapter = MossTTSAdapter(SpeechServingContext(server=mocker.Mock()))
+    adapter._moss_variant = "local"
+    mocker.patch.object(adapter, "_get_moss_processor", return_value=processor)
+
+    def salt(reference, **fields):
+        mocker.patch.object(
+            adapter, "_encode_moss_references", new=mocker.AsyncMock(return_value=([reference], {0: "key"}))
+        )
+        request = OpenAICreateSpeechRequest(ref_audio="file:///reference.wav", **fields)
+        return asyncio.run(adapter.build(request, [], has_inline_ref_audio=True)).prompt["cache_salt"]
+
+    voice = torch.ones((3, 12), dtype=torch.int64)
+    hello = salt(voice, input="Hello.")
+    assert salt(voice, input="A longer target.", language="English") == hello
+    assert salt(voice + 1, input="Hello.") != hello
 
 
 def _moss_adapter_with_stage_configs(stage_configs, mocker):

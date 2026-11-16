@@ -331,15 +331,15 @@ class CausVidWanPipeline(nn.Module):
         if self.stage_parallel_size > 1 and history < 1:
             history = self.max_history_chunks
         schedule_name = str(extra.get("cell_schedule", "self_forcing")).strip().lower().replace("-", "_")
-        if schedule_name in ("", "self_forcing", "serial"):
+        if schedule_name in ("", "self_forcing"):
             ordering = Ordering.SELF_FORCING
-        elif schedule_name in ("latest_kv", "latest", "interleaved"):
+        elif schedule_name == "latest_kv":
             ordering = Ordering.LATEST_KV
+        elif schedule_name == "same_step":
+            ordering = Ordering.SAME_STEP
         else:
             raise ValueError(
-                "cell_schedule must be 'self_forcing' or 'latest_kv' "
-                "(aliases: serial, latest, interleaved), "
-                f"got {schedule_name!r}"
+                f"cell_schedule must be 'self_forcing', 'latest_kv', or 'same_step', got {schedule_name!r}"
             )
         stages = self.stage_parallel_size
         if stages not in (1, denoise + 1):

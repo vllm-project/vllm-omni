@@ -443,6 +443,9 @@ class BatchedToken2Wav(nn.Module):
         )
         self._timeline_cache: dict[tuple[torch.device, torch.dtype], tuple[torch.Tensor, list[float]]] = {}
         self.hift_graph_wrapper: HiFTGraphWrapper | None = None
+        # CFG-interleaved row order for the batched per-request cache split,
+        # cached per (batch_size, device); see ``_split_flow_cache``.
+        self._split_order_2n: dict[int, torch.Tensor] = {}
         graph_config = dict(hift_graph_config or {})
         if bool(graph_config.get("enabled", False)):
             if hift_parameter is None:
@@ -1593,6 +1596,33 @@ class BatchedToken2Wav(nn.Module):
         request (Whole-Euler). The streaming trim ``estimator_att_keep`` is
         applied while each request is copied out, so no trimmed copy of the
         whole batch is built first: at 16 requests that copy alone was ~7 GiB.
+
+        The conformer caches and ``estimator_cnn_cache`` are split with one
+        batched allocation per key instead of two ``clone`` calls and one
+        ``cat`` per row (3B small launches -> 3). The CFG-interleaved order
+        ``[cond0, uncond0, cond1, ...]`` reproduces the previous per-row
+        ``cat([row, batch + row], dim=2)`` row selection exactly, and the
+        fresh buffers keep the graph-output isolation the per-row ``clone``
+        provided.
+
+        Lifetime: each row's cache is a view into that chunk's B-row buffer,
+        so the buffer stays alive until every sibling row has been replaced by
+        a later chunk. When a chunk's rows advance together (the uniform case,
+        e.g. the 128x8 run), serving steps all of them in the same decode
+        call, so at most one extra chunk's buffers are pinned per generation.
+        A request that drops out of the next batch (its next token chunk is
+        not ready while its siblings advance) is not stepped with them, so it
+        keeps its whole B-row cnn/att/estimator_cnn buffers alive until it
+        steps again; scheduling changes that can strand rows across batches
+        must re-check this bound. The conformer_cnn rows are contiguous
+        (whole-tensor clone) and the
+        conformer_att/estimator_cnn rows stay strided views. Both consumers
+        accept the strided views without an extra copy: ``_stack_flow_cache``
+        concatenates them, and ``FlowEncoderGraphs.run`` copies rows into its
+        static views with ``torch.cat(..., out=...)``.
+        ``estimator_att_cache`` keeps its existing per-request copy/direct
+        path: it is coupled to ``keep_ranges``/``_copy_frame_segments`` and is
+        unchanged here.
         """
         estimator_att = cache["estimator_att_cache"]
         stacked_att = isinstance(estimator_att, torch.Tensor)
@@ -1602,6 +1632,18 @@ class BatchedToken2Wav(nn.Module):
             request_shape[2] = 2
             request_shape[4] = sum(length for _, length in keep_ranges)
             att_rows = estimator_att.unflatten(2, (2, batch_size))
+        dev = estimator_att.device if stacked_att else cache["conformer_cnn_cache"].device
+        order_2n = self._split_order_2n.get(batch_size)
+        if order_2n is None or order_2n.device != dev:
+            order_2n = torch.tensor(
+                [i for row in range(batch_size) for i in (row, batch_size + row)],
+                device=dev,
+                dtype=torch.long,
+            )
+            self._split_order_2n[batch_size] = order_2n
+        cnn_split = cache["conformer_cnn_cache"].detach().clone()
+        catt_split = cache["conformer_att_cache"].detach().clone()
+        ecnn_split = cache["estimator_cnn_cache"].index_select(2, order_2n).detach()
         result: list[dict[str, torch.Tensor]] = []
         for row in range(batch_size):
             if stacked_att:
@@ -1615,15 +1657,9 @@ class BatchedToken2Wav(nn.Module):
                 request_att = estimator_att[row]
             result.append(
                 {
-                    "conformer_cnn_cache": cache["conformer_cnn_cache"][row : row + 1].detach().clone(),
-                    "conformer_att_cache": cache["conformer_att_cache"][:, row : row + 1].detach().clone(),
-                    "estimator_cnn_cache": torch.cat(
-                        (
-                            cache["estimator_cnn_cache"][:, :, row : row + 1],
-                            cache["estimator_cnn_cache"][:, :, batch_size + row : batch_size + row + 1],
-                        ),
-                        dim=2,
-                    ).detach(),
+                    "conformer_cnn_cache": cnn_split[row : row + 1],
+                    "conformer_att_cache": catt_split[:, row : row + 1],
+                    "estimator_cnn_cache": ecnn_split[:, :, row * 2 : row * 2 + 2],
                     "estimator_att_cache": request_att,
                 }
             )

@@ -7,7 +7,9 @@ No torch. ``S ∈ {1, T+1}``. Schedule/KV unit is cell ``(chunk, step, block)``.
 * Weight split: PP layer-groups ``G``; each coarse ``(c,s)`` expands to local blocks.
 * ``S = 1``: layer PP. ``S = T+1``: one replica per denoise/clean step.
 * ``SELF_FORCING``: one chunk in flight (Self-Forcing / clean history);
-  ``LATEST_KV``: diagonal Latest-KV.
+  ``LATEST_KV``: diagonal Latest-KV (may P2P KV across stages);
+  ``SAME_STEP``: same diagonal topology, matching-step history only — always
+  local to the consumer rank, so no KV transfers.
 """
 
 from __future__ import annotations
@@ -23,9 +25,7 @@ Cell = tuple[int, int, int]
 class Ordering(str, Enum):
     SELF_FORCING = "self_forcing"
     LATEST_KV = "latest_kv"
-    # Accepted string aliases for request / deploy configs.
-    SERIAL = "self_forcing"
-    INTERLEAVED = "latest_kv"
+    SAME_STEP = "same_step"
 
 
 @dataclass(frozen=True)
@@ -206,12 +206,17 @@ def max_local_blocks(schedule: CellSchedule) -> int:
     )
 
 
+def _is_diagonal(ordering: Ordering) -> bool:
+    """Latest-KV and Same-Step share the diagonal (vertical) placement."""
+    return ordering in (Ordering.LATEST_KV, Ordering.SAME_STEP)
+
+
 def _s1_jobs(schedule: CellSchedule) -> list[tuple[int, int]]:
     steps = schedule.num_denoise_steps + (1 if schedule.kv_history_chunks > 0 else 0)
     chunks = schedule.chunks
     if schedule.ordering is Ordering.SELF_FORCING:
         return [(chunk, step) for chunk in range(chunks) for step in range(steps)]
-    if schedule.ordering is Ordering.LATEST_KV:
+    if _is_diagonal(schedule.ordering):
         world = schedule.layer_groups
         return [
             (chunk, step)
@@ -249,7 +254,7 @@ def _plan_s1_coarse(schedule: CellSchedule) -> tuple[tuple[tuple[int, int] | Non
 
 
 def _plan_vertical_coarse(schedule: CellSchedule) -> tuple[tuple[tuple[int, int] | None, ...], ...]:
-    """Diagonal Latest-KV at layer-group granularity (before block expand)."""
+    """Diagonal (vertical) placement at layer-group granularity (before block expand)."""
     n = schedule.chunks
     s = schedule.stages
     g = schedule.layer_groups
@@ -322,13 +327,34 @@ def _completions(slots: tuple[tuple[Cell | None, ...], ...]) -> dict[Cell, int]:
     return out
 
 
+def _history_step(
+    schedule: CellSchedule,
+    task: Cell,
+    prev: int,
+    completions: dict[Cell, int],
+    tick: int,
+) -> int | None:
+    """Pick history step for ``prev`` at ``task``'s block, or ``None`` if unread."""
+    _chunk, step, block = task
+    t_clean = schedule.num_denoise_steps
+    if schedule.ordering is Ordering.SAME_STEP:
+        # Matching step only; producer shares the consumer rank (no KV P2P).
+        if completions.get((prev, step, block), 10**9) < tick:
+            return step
+        return None
+    candidates = [s_prime for s_prime in range(t_clean + 1) if completions.get((prev, s_prime, block), 10**9) < tick]
+    if not candidates:
+        return None
+    # Latest-KV (and Self-Forcing serial, which only exposes clean by then).
+    return max(candidates)
+
+
 def _sources_and_transfers(
     slots: tuple[tuple[Cell | None, ...], ...],
     completions: dict[Cell, int],
     schedule: CellSchedule,
 ) -> tuple[dict[tuple[int, Cell], tuple[KVSource, ...]], dict[int, tuple[KVTransfer, ...]]]:
     h = schedule.kv_history_chunks
-    t_clean = schedule.num_denoise_steps
     sources: dict[tuple[int, Cell], tuple[KVSource, ...]] = {}
     transfer_acc: dict[int, list[KVTransfer]] = {}
     seen: set[tuple[Cell, int]] = set()
@@ -342,12 +368,9 @@ def _sources_and_transfers(
             chunk, _step, block = task
             found: list[KVSource] = []
             for prev in range(max(0, chunk - h), chunk):
-                candidates = [
-                    s_prime for s_prime in range(t_clean + 1) if completions.get((prev, s_prime, block), 10**9) < t
-                ]
-                if not candidates:
+                s_star = _history_step(schedule, task, prev, completions, t)
+                if s_star is None:
                     continue
-                s_star = max(candidates)
                 version = (prev, s_star, block)
                 owner = rank_of_block(s_star, block, schedule)
                 found.append(KVSource(version=version, owner=owner))
@@ -446,8 +469,10 @@ def build_cell_plan(schedule: CellSchedule) -> CellPlan:
         coarse = _plan_s1_coarse(schedule)
     elif schedule.ordering is Ordering.SELF_FORCING:
         coarse = _plan_vertical_serial_coarse(schedule)
-    else:
+    elif _is_diagonal(schedule.ordering):
         coarse = _plan_vertical_coarse(schedule)
+    else:
+        raise ValueError(f"unsupported ordering {schedule.ordering}")
     slots = _expand_to_cells(coarse, schedule)
     completions = _completions(slots)
     sources, transfers = _sources_and_transfers(slots, completions, schedule)

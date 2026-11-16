@@ -16,6 +16,11 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
+      # Talker codec prelude: one Triton kernel for the rep-penalty and
+      # temperature steps on NPU. Defaults to on; set false to force the eager
+      # chain for accuracy triage (e.g. after a CANN/torch_npu upgrade). It is
+      # a no-op off NPU or without Triton.
+      # talker_codec_fused_prelude: false
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300

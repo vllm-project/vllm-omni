@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CPU checks for cell-level chunk timetable and Latest-KV plan."""
+"""CPU checks for cell-level chunk timetable and Self-Forcing / Latest-KV / Same-Step plans."""
 
 from __future__ import annotations
 
@@ -53,9 +53,11 @@ def test_layer_groups_match_vllm_pp_indices():
 
 @pytest.mark.parametrize("world", [1, 2, 3, 4])
 @pytest.mark.parametrize("chunks", [1, 2, 3, 6])
-@pytest.mark.parametrize("schedule", ["self_forcing", "stepwise"])
-def test_s1_builds_without_idle_slot(world, chunks, schedule):
-    ordering = Ordering.SELF_FORCING if schedule == "self_forcing" else Ordering.LATEST_KV
+@pytest.mark.parametrize(
+    "ordering",
+    [Ordering.SELF_FORCING, Ordering.LATEST_KV, Ordering.SAME_STEP],
+)
+def test_s1_builds_without_idle_slot(world, chunks, ordering):
     plan = build_cell_plan(_s1(chunks, world, ordering))
     assert plan.num_slots >= chunks
     for t in range(plan.num_slots):
@@ -126,13 +128,46 @@ def test_vertical_diagonal_example():
     assert all(s.owner == 4 for s in clean_srcs)
 
 
+def test_vertical_same_step_matches_topology_not_latest_kv():
+    """Same-Step shares diagonal placement with Latest-KV but only reads matching local step."""
+    common = dict(chunks=4, num_denoise_steps=2, stages=3, layer_groups=2, kv_history_chunks=6)
+    latest = build_cell_plan(CellSchedule(**common, ordering=Ordering.LATEST_KV))
+    same = build_cell_plan(CellSchedule(**common, ordering=Ordering.SAME_STEP))
+    assert same.num_slots == latest.num_slots
+    for t in range(same.num_slots):
+        for rank in range(same.world):
+            assert same.task(t, rank) == latest.task(t, rank)
+    # Latest promotes chunk-0 to step 1; Same-Step stays on step 0.
+    latest_versions = {src.version for src in latest.sources((3, 0, 0), 0)}
+    same_versions = {src.version for src in same.sources((3, 0, 0), 0)}
+    assert (0, 1, 0) in latest_versions
+    assert same_versions == {(2, 0, 0), (1, 0, 0), (0, 0, 0)}
+    assert all(v[1] == 0 for v in same_versions)
+    # Clean stage still matches step (no Latest promotion across steps).
+    clean_srcs = same.sources((3, 2, 0), 4)
+    assert {s.version for s in clean_srcs} == {(2, 2, 0), (1, 2, 0), (0, 2, 0)}
+    # Same step × block is co-located → no KV P2P under Same-Step.
+    for t in range(same.num_slots):
+        assert same.transfers(t) == ()
+    for t in range(same.num_slots):
+        for rank in range(same.world):
+            task = same.task(t, rank)
+            if task is None:
+                continue
+            for src in same.sources(task, rank):
+                assert src.owner == rank
+                assert src.version[1] == task[1]
+                assert same.wait_ready(t, rank) == frozenset()
+
+
 def test_vertical_serial_same_topology_no_chunk_overlap():
     common = dict(chunks=3, num_denoise_steps=2, stages=3, layer_groups=1, kv_history_chunks=6)
     serial = build_cell_plan(CellSchedule(**common, ordering=Ordering.SELF_FORCING))
     latest = build_cell_plan(CellSchedule(**common, ordering=Ordering.LATEST_KV))
+    same = build_cell_plan(CellSchedule(**common, ordering=Ordering.SAME_STEP))
     world = 3
     assert serial.num_slots == 3 * world
-    assert latest.num_slots == 3 + world - 1
+    assert latest.num_slots == same.num_slots == 3 + world - 1
     for t in range(serial.num_slots):
         chunks = {task[0] for task in (serial.task(t, r) for r in range(world)) if task is not None}
         assert len(chunks) <= 1

@@ -2474,9 +2474,13 @@ def test_whole_euler_groups_are_acquired_again_after_a_flush() -> None:
 
 
 @pytest.mark.parametrize("fail", [False, True])
-def test_vocoder_restores_tf32_policy(fail):
+def test_vocoder_restores_tf32_policy(fail, monkeypatch):
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import MiniCPMO45Code2Wav
+    from vllm_omni.platforms import current_omni_platform
 
+    # The policy is a no-op off CUDA; pin it so the restore path stays covered
+    # on every CI platform.
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
     previous = torch.backends.cuda.matmul.allow_tf32
 
     def forward(*args, **kwargs):
@@ -2485,7 +2489,9 @@ def test_vocoder_restores_tf32_policy(fail):
             raise RuntimeError("injected")
         return "ok"
 
-    model = SimpleNamespace(_extra_config=lambda: {"token2wav_allow_tf32": True}, _forward_impl=forward)
+    # `_tf32_mode` is resolved in `__init__` now, so the stub model carries the
+    # resolved value instead of a config the policy would re-read per forward.
+    model = SimpleNamespace(_tf32_mode="tf32", _forward_impl=forward)
     if fail:
         with pytest.raises(RuntimeError, match="injected"):
             MiniCPMO45Code2Wav.forward(model)

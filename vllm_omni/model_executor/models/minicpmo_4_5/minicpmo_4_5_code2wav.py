@@ -33,6 +33,7 @@ from .batched_token2wav import (
     row_offset_signature,
     state_shape_signature,
 )
+from .config_flags import read_bool_flag
 from .cuda_graph_wrapper import ResidentAttCache, _format_memory_delta, _memory_snapshot
 
 if TYPE_CHECKING:
@@ -66,34 +67,55 @@ def _tf32_mode(extra: Mapping[str, Any]) -> str:
     dots. Not compensated TF32x3. ``token2wav_allow_tf32`` is the shipped YAML
     key; ``code2wav_allow_tf32`` and legacy env ``tf32x3`` / ``3xtf32`` alias it.
     Defaults to ``"tf32"`` unless explicitly disabled.
+
+    Like the other stage booleans, an explicit ``null`` means "unset" and falls
+    through to the alias and then to the default, and a value that is neither a
+    boolean nor a known token raises instead of silently disabling TF32.
     """
     raw = os.environ.get("MINICPMO_CODE2WAV_TF32")
-    value = raw if raw not in (None, "") else extra.get("token2wav_allow_tf32", extra.get("code2wav_allow_tf32", True))
+    value = raw if raw not in (None, "") else None
+    if value is None:
+        for key in ("token2wav_allow_tf32", "code2wav_allow_tf32"):
+            candidate = extra.get(key)
+            if candidate is not None:
+                value = candidate
+                break
+    if value is None:
+        return "tf32"
+    if isinstance(value, bool):
+        return "tf32" if value else "off"
+    if isinstance(value, int) and value in (0, 1):
+        return "tf32" if value else "off"
     if isinstance(value, str):
-        return {
-            "tf32": "tf32",
-            "tf32x3": "tf32",
-            "3xtf32": "tf32",
-            "flow": "tf32",
-            "1": "tf32",
-            "true": "tf32",
-            "yes": "tf32",
-        }.get(value.strip().lower(), "off")
-    return "tf32" if value else "off"
+        token = value.strip().lower()
+        if token in ("tf32", "tf32x3", "3xtf32", "flow", "1", "true", "yes"):
+            return "tf32"
+        if token in ("off", "0", "false", "no"):
+            return "off"
+    raise ValueError(f"token2wav_allow_tf32/MINICPMO_CODE2WAV_TF32 must be 'tf32'/'off' (or a boolean), got {value!r}")
 
 
 @contextmanager
-def _stage_matmul_policy(extra: Mapping[str, Any]) -> Iterator[None]:
+def _stage_matmul_policy(tf32_mode: str) -> Iterator[None]:
     """Apply this stage's TF32 matmul policy for the enclosed work.
 
     This stage owns the vocoder process. Restore its previous matmul
     policy after eager execution/capture; cuDNN's policy is independent.
     The idle prefetch runs the same preparation calls as chunk 0, so it
     runs under the same policy.
+
+    ``tf32_mode`` is resolved once in ``__init__`` and passed in, so this
+    never re-reads the stage config or the env var per forward, and it only
+    touches the CUDA matmul policy where that policy exists.
     """
+    from vllm_omni.platforms import current_omni_platform
+
+    if not current_omni_platform.is_cuda():
+        yield
+        return
     previous_tf32 = torch.backends.cuda.matmul.allow_tf32
     try:
-        if _tf32_mode(extra) != "off":
+        if tf32_mode != "off":
             torch.backends.cuda.matmul.allow_tf32 = True
         yield
     finally:
@@ -358,6 +380,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         from vllm_omni.platforms import current_omni_platform
 
         extra = self._extra_config()
+        # Resolved on every platform so an invalid value fails at startup
+        # instead of inside the first forward/prefetch (_stage_matmul_policy).
+        self._tf32_mode = _tf32_mode(extra)
         self._runtime_prompt_cache_size = int(extra.get("token2wav_runtime_prompt_cache_size", 4))
         if self._runtime_prompt_cache_size < 0:
             raise ValueError("MiniCPM-o Code2Wav runtime prompt cache capacity must be >= 0")
@@ -371,8 +396,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         # chunk 0 still runs setup_batch inline. ``token2wav_ref_prefetch_setup``
         # also warms the batch-1 setup (phase B), a ~100 ms CFM pass that
         # competes with the thinker's decode on a shared GPU.
-        self._ref_prefetch_enabled = bool(extra.get("token2wav_ref_prefetch", True))
-        self._ref_prefetch_setup = bool(extra.get("token2wav_ref_prefetch_setup", False))
+        self._ref_prefetch_enabled = read_bool_flag(extra, "token2wav_ref_prefetch", True)
+        self._ref_prefetch_setup = read_bool_flag(extra, "token2wav_ref_prefetch_setup", False)
         self._ref_prefetch_max_waiters = int(extra.get("token2wav_ref_prefetch_max_waiters", 1))
         if self._ref_prefetch_max_waiters < 1:
             raise ValueError("token2wav_ref_prefetch_max_waiters must be >= 1")
@@ -402,11 +427,11 @@ class MiniCPMO45Code2Wav(nn.Module):
         max_serial_batch = extra.get("max_serial_batch")
         max_serial_batch = 4 if max_serial_batch is None else int(max_serial_batch)
         self._hift_graph_config = {
-            "enabled": bool(extra.get("enable_hift_graph", False)),
+            "enabled": read_bool_flag(extra, "enable_hift_graph", False),
             "capture_batch_sizes": capture_batch_sizes,
             "max_serial_batch": max_serial_batch,
         }
-        enable_whole_euler = extra.get("enable_whole_euler")
+        enable_whole_euler = read_bool_flag(extra, "enable_whole_euler", True)
         max_graph_batch_raw = extra.get("max_graph_batch")
         max_graph_batch = int(max_graph_batch_raw) if max_graph_batch_raw is not None else None
         max_num_seqs = getattr(getattr(vllm_config, "scheduler_config", None), "max_num_seqs", None)
@@ -425,19 +450,19 @@ class MiniCPMO45Code2Wav(nn.Module):
         if not encoder_rows or any(row < 1 for row in encoder_rows):
             raise ValueError("MiniCPM-o code2wav_encoder_graph_rows must be positive")
         self._chunk_encoder_graph_config = {
-            "enabled": bool(extra.get("enable_code2wav_encoder_graph", False)),
+            "enabled": read_bool_flag(extra, "enable_code2wav_encoder_graph", False),
             "max_graphs": int(extra.get("code2wav_encoder_max_graphs", 8)),
             "capture_after": int(extra.get("code2wav_encoder_capture_after", 2)),
-            "capture_after_precapture": bool(extra.get("code2wav_encoder_capture_after_precapture", False)),
+            "capture_after_precapture": read_bool_flag(extra, "code2wav_encoder_capture_after_precapture", False),
             "rows": [row for row in encoder_rows if not max_num_seqs or row <= int(max_num_seqs)],
         }
         self._cfm_graph_config = {
-            "enabled": bool(extra.get("enable_cfm_graph", False)),
+            "enabled": read_bool_flag(extra, "enable_cfm_graph", False),
             "max_graphs": int(extra.get("cfm_max_graphs", 32)),
             "bucket_frames": int(extra.get("cfm_graph_bucket_frames", 0)),
             "capture_frames": extra.get("cfm_graph_capture_frames"),
             "offset_bucket_frames": int(extra.get("cfm_graph_offset_bucket_frames", 50)),
-            "enable_whole_euler": enable_whole_euler is None or bool(enable_whole_euler),
+            "enable_whole_euler": enable_whole_euler,
             "max_serial_batch": max_serial_batch,
             "max_graph_batch": max_graph_batch,
             "micro_batch_size": micro_batch_size,
@@ -446,14 +471,13 @@ class MiniCPMO45Code2Wav(nn.Module):
             # SM80+ and SDPA otherwise, so it respects the TF32 opt-out; NPU
             # uses packed QKV, in-place KV and ACLNN AddLayerNorm, independent
             # of TF32. An explicit ``cfm_fused_body`` overrides either default.
-            "fused_body": bool(
-                extra.get(
-                    "cfm_fused_body",
-                    (current_omni_platform.is_cuda() and _tf32_mode(extra) != "off") or current_omni_platform.is_npu(),
-                )
+            "fused_body": read_bool_flag(
+                extra,
+                "cfm_fused_body",
+                (current_omni_platform.is_cuda() and self._tf32_mode != "off") or current_omni_platform.is_npu(),
             ),
-            "slot_pool": bool(extra.get("cfm_slot_pool", False)),
-            "row_offset_merge": extra.get("cfm_row_offset_merge", False) is True,
+            "slot_pool": read_bool_flag(extra, "cfm_slot_pool", False),
+            "row_offset_merge": read_bool_flag(extra, "cfm_row_offset_merge", False),
         }
         # Exact-shape flow-encoder graphs (``FlowEncoderGraphs``, default off).
         # ``cfm_encoder_graph_rows`` is the largest row count or a list of counts.
@@ -462,7 +486,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         if any(r < 1 for r in rows):
             raise ValueError("MiniCPM-o cfm_encoder_graph_rows must be positive")
         self._encoder_graph_config = {
-            "enabled": extra.get("cfm_encoder_cuda_graph", False) is True,
+            "enabled": read_bool_flag(extra, "cfm_encoder_cuda_graph", False),
             "rows": [r for r in rows if not max_num_seqs or r <= int(max_num_seqs)],
             "token_widths": [int(w) for w in extra.get("cfm_encoder_graph_token_widths") or ()],
         }
@@ -480,10 +504,10 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._default_prompt_id = str(extra.get("prompt_cache_id", "HT_ref_audio"))
         self._prompt_wav_override = extra.get("prompt_wav")
         self._default_prompt_normalized: tuple[str, str] | None = None
-        self._onset_merge = bool(extra.get("cfm_onset_merge", False))
-        self._cross_turn_buckets = extra.get("cfm_cross_turn_buckets", False) is True
+        self._onset_merge = read_bool_flag(extra, "cfm_onset_merge", False)
+        self._cross_turn_buckets = read_bool_flag(extra, "cfm_cross_turn_buckets", False)
         self._row_offset_merge = self._cfm_graph_config["row_offset_merge"]
-        self._precapture_empty_cache = extra.get("cfm_precapture_empty_cache", False) is True
+        self._precapture_empty_cache = read_bool_flag(extra, "cfm_precapture_empty_cache", False)
 
     @property
     def _default_prompt_wav(self) -> str:
@@ -958,7 +982,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
-        with _stage_matmul_policy(self._extra_config()):
+        with _stage_matmul_policy(self._tf32_mode):
             return self._forward_impl(
                 input_ids,
                 positions,
@@ -1350,7 +1374,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         if len(self._prefetch_queue) > self._ref_prefetch_max_waiters:
             return False
         state_id, record = next(iter(self._prefetch_queue.items()))
-        with _stage_matmul_policy(self._extra_config()):
+        with _stage_matmul_policy(self._tf32_mode):
             return self._run_prefetch_phase(state_id, record)
 
     def _run_prefetch_phase(self, state_id: str, record: _RefPrefetch) -> bool:
@@ -1476,10 +1500,10 @@ class MiniCPMO45Code2Wav(nn.Module):
         # Token2wav runs in fp32, so without TF32 every flow-DiT GEMM runs on
         # SIMT cores. Ordinary TF32 uses SM80+ Tensor Cores for dense GEMMs and
         # Triton CFM attention dots. HiFT stays IEEE FP32.
-        tf32_mode = _tf32_mode(extra) if current_omni_platform.is_cuda() else "off"
+        tf32_mode = self._tf32_mode if current_omni_platform.is_cuda() else "off"
         if tf32_mode != "off":
             logger.info("MiniCPM-o Code2Wav: ordinary TF32 enabled for CFM DiT GEMMs")
-        use_float16 = bool(extra.get("token2wav_float16", False))
+        use_float16 = read_bool_flag(extra, "token2wav_float16", False)
         previous_dtype = torch.get_default_dtype()
         try:
             # vLLM constructs bf16 models under a bf16 default-dtype context.
@@ -1492,13 +1516,17 @@ class MiniCPMO45Code2Wav(nn.Module):
                 n_timesteps=int(extra.get("token2wav_n_timesteps", 10)),
                 # The batched backend builds its estimator caches itself and
                 # never runs the upstream chunk path that owns these buffers.
-                drop_upstream_chunk_att_buffers=extra.get("cfm_drop_upstream_att_buffer", False) is True,
+                drop_upstream_chunk_att_buffers=read_bool_flag(extra, "cfm_drop_upstream_att_buffer", False),
             )
         finally:
             torch.set_default_dtype(previous_dtype)
 
         trt_stepper = None
-        use_trt = bool(extra.get("token2wav_trt", False)) or os.environ.get("MINICPMO_TOKEN2WAV_TRT", "") == "1"
+        # Parsed before the platform branches: a typo in a shared stage config
+        # must fail at startup on every platform, not only where the toggle is
+        # consumed (CUDA for TensorRT, NPU for the device speaker embedding).
+        device_spk = read_bool_flag(extra, "token2wav_device_spk", True)
+        use_trt = read_bool_flag(extra, "token2wav_trt", False) or (os.environ.get("MINICPMO_TOKEN2WAV_TRT", "") == "1")
         # TensorRT is CUDA-only; other platforms ignore the toggle.
         if use_trt and current_omni_platform.is_cuda():
             from vllm_omni.model_executor.models.step_audio2.step_audio2_dit_trt import build_dit_trt_stepper
@@ -1522,8 +1550,16 @@ class MiniCPMO45Code2Wav(nn.Module):
             # CAM++ speaker embedding on device via torch (weights loaded from
             # the same campplus.onnx) — replaces the per-request CPU
             # onnxruntime run that blocks the host ~120-155ms per request.
-            token2wav.enable_device_spk_embedding()
-            logger.info("MiniCPM-o Code2Wav: campplus speaker embedding running on device (torch)")
+            # "token2wav_device_spk": false in the stage extra config falls
+            # back to the CPU onnxruntime path (accuracy triage).
+            if device_spk:
+                token2wav.enable_device_spk_embedding()
+                logger.info("MiniCPM-o Code2Wav: campplus speaker embedding running on device (torch)")
+            else:
+                logger.info(
+                    "MiniCPM-o Code2Wav: campplus speaker embedding falling back to CPU onnxruntime "
+                    "(token2wav_device_spk=false)"
+                )
         self.backend = BatchedToken2Wav(
             token2wav,
             trt_stepper=trt_stepper,
@@ -1531,13 +1567,13 @@ class MiniCPMO45Code2Wav(nn.Module):
             hift_graph_config=self._hift_graph_config,
             cfm_graph_config=self._cfm_graph_config,
             chunk_encoder_graph_config=self._chunk_encoder_graph_config,
-            bfloat16_attention_cache=bool(extra.get("code2wav_bfloat16_attention_cache", False)),
+            bfloat16_attention_cache=read_bool_flag(extra, "code2wav_bfloat16_attention_cache", False),
             setup_cache_size=self._setup_cache_size,
             cfm_tf32=tf32_mode != "off",
             encoder_graph_config=self._encoder_graph_config,
         )
         # Captured by the first forward (the warmup run): under vLLM's weight load a graph held GiBs.
-        self._precapture_pending = bool(extra.get("cfm_graph_precapture", True))
+        self._precapture_pending = read_bool_flag(extra, "cfm_graph_precapture", True)
 
     def _release_precapture_cache(self) -> None:
         """Return startup's unused cached allocator blocks to the driver (``cfm_precapture_empty_cache``).

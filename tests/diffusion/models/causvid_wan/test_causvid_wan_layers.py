@@ -153,6 +153,35 @@ def test_cell_schedule_rejects_unknown_values():
         pipeline._plan_for(req)
 
 
+@pytest.mark.parametrize("name", ["self_forcing", "latest_kv", "same_step"])
+def test_cell_schedule_accepts_known_values(name):
+    from vllm_omni.experimental.ar_diffusion.cell_schedule import Ordering
+
+    pipeline = _bare_pipeline(stages=4, history=6)
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id=f"sched-{name}",
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={"cell_schedule": name, "num_denoise_steps": 3, "num_chunks": 2}
+        ),
+    )
+    plan, _, _ = pipeline._plan_for(req)
+    assert plan.schedule.ordering is Ordering(name)
+    assert plan.schedule.ordering.value == name
+
+
+@pytest.mark.parametrize("name", ["serial", "latest", "interleaved", "vertical", "same_step_kv"])
+def test_cell_schedule_rejects_removed_aliases(name):
+    pipeline = _bare_pipeline()
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id=f"sched-alias-{name}",
+        sampling_params=OmniDiffusionSamplingParams(extra_args={"cell_schedule": name}),
+    )
+    with pytest.raises(ValueError, match="cell_schedule"):
+        pipeline._plan_for(req)
+
+
 @pytest.mark.parametrize("source", ["num_inference_steps", "num_denoise_steps", "sampling_params"])
 @pytest.mark.parametrize("steps", [0, -1])
 def test_cell_schedule_rejects_nonpositive_steps(source, steps):
