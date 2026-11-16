@@ -23,11 +23,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def test_minicpmo_kstep_is_on_by_default():
     """K-step multi-frame decode is the shipped CUDA decode path.
 
-    Five-tier sweep against the single-frame default in one window: c1 RTF
-    0.12 -> 0.09 and throughput +34%, c4 +5.8%, c8-c32 within noise. The K-step
-    knobs therefore live in ``minicpmo_4_5.yaml`` itself, with no separate
-    overlay. ``async_scheduling: false`` stays: async books the spec span a step
-    early, and the multi-frame loop refuses the resulting non-uniform steps.
+    Fifteen continuation drafts reserve sixteen codec positions per step in
+    ``minicpmo_4_5.yaml``, with no separate overlay. Synchronous scheduling
+    keeps the multi-frame spans uniform.
     """
     from pathlib import Path
 
@@ -36,7 +34,7 @@ def test_minicpmo_kstep_is_on_by_default():
     cuda = {s["stage_id"]: s for s in config["platforms"]["cuda"]["stages"]}
     extra = config["connectors"]["connector_of_shared_memory"]["extra"]
 
-    assert cuda[1]["speculative_config"]["num_speculative_tokens"] == 7
+    assert cuda[1]["speculative_config"]["num_speculative_tokens"] == 15
     assert cuda[1]["async_scheduling"] is False
     assert cuda[1]["default_sampling_params"]["stop_token_ids"] == [1]
     assert extra["cfm_cross_bucket_merge"] is True

@@ -26,7 +26,9 @@ from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.messages import CloseDuplexSessionMessage
 from vllm_omni.engine.duplex.plugin import duplex_history_digest, duplex_text_history
 from vllm_omni.engine.duplex.session import memory_runtime
-from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import VisualSummary
+from vllm_omni.engine.duplex.visual_memory import (
+    VisualSummary,
+)
 from vllm_omni.model_executor.stage_input_processors import joyai_vl_interaction as joyai_bridge
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]

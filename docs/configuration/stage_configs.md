@@ -105,7 +105,7 @@ The new deploy schema lives under `vllm_omni/deploy/` and is paired with a froze
 | `connectors` | dict | optional | `null` | Named connector specs (`{name, extra}`). Referenced by each stage's `input_connectors` / `output_connectors`. See [Connector schema](#connector-schema). |
 | `edges` | list | optional | `null` | Explicit edge list for the KV transfer graph. Auto-derived from stage inputs if omitted. |
 | `stages` | list | optional | `[]` | Per-stage runtime overrides matched by `stage_id`. Pipeline stages are still created from `PipelineConfig` when this list is empty. |
-| `platforms` | dict | optional | `null` | Keyed by `npu` / `rocm` / `xpu`, each contains a `stages:` list with per-platform overrides applied on top of the CUDA defaults. |
+| `platforms` | dict | optional | `null` | Keyed by platform (`cuda`, `npu`, `rocm`, `xpu`, etc.). Per-platform `stages:` and named `connectors:` overrides are applied on top of the shared defaults. |
 | `pipeline` | str | optional | `null` | Override the auto-detected pipeline registry key (used for structural variants like `qwen2_5_omni_thinker_only` / `qwen3_omni_moe_thinker_only`). |
 | `trust_remote_code` | bool \| null | optional | `null` | **Pipeline-wide.** Trust HF remote code on model load; applies to every stage when specified. |
 | `distributed_executor_backend` | str \| null | optional | `null` | **Pipeline-wide.** Distributed executor backend forwarded to vLLM (`"mp"`, `"ray"`, `"external_launcher"`). If omitted, vLLM auto-selects backend from runtime topology. |
@@ -415,6 +415,14 @@ stages:
     input_connectors:  {from_stage_0: shm}
 ```
 
+`platforms.<platform>.connectors` deep-merges named connector definitions,
+including `extra`, through each `base_config` inheritance level and then onto
+the shared connectors. A partial platform override retains the other inherited
+platform values. This applies both to deploy
+resolution and to the connector spec passed to workers. Unspecified keys retain
+their shared values; other platforms retain the shared connector. To override a
+platform-specific value in a user overlay, use the same platform block.
+
 ### CLI flags
 
 | Flag | Description |
@@ -606,27 +614,51 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/depl
 
 ## Qwen3-TTS with Model Runner V2
 
-Qwen3-TTS runs the native CUDA Model Runner V2 pipeline by default on vLLM
-0.29.0. MRV2 is an experimental feature for this model: the bundled default
-profile selects it on CUDA only, and its scheduler and delivery paths are
-still being qualified. Set `model_runner: v1` in a copy of the deploy config
-to opt out; the `platforms:` sections of `qwen3_tts.yaml` keep V1 on NPU, XPU,
-ROCm and MUSA. Select one of these deployment profiles:
+Qwen3-TTS selects Model Runner V2 by default on CUDA and NPU. MRV2 remains
+experimental for this model; its scheduler and delivery paths are still being
+qualified. Set `model_runner: v1` in a copy of the deploy config
+to opt out; the `platforms:` sections of `qwen3_tts.yaml` keep V1 on XPU,
+ROCm and MUSA. On NPU, the V2 Talker uses `FULL_AND_PIECEWISE`; Code2Wav
+retains `PIECEWISE`. If opting out to V1 on NPU, set both `model_runner: v1`
+and stage 0 to `PIECEWISE` in the NPU platform section of the copied
+configuration. The NPU Talker rejects
+V1 with full decode graphs before loading weights; use `PIECEWISE`, `NONE` or
+eager execution for V1. Select one of these
+deployment profiles:
 
 | Profile | Runner | Code2Wav graph batches | Intended use |
 | --- | --- | --- | --- |
-| `qwen3_tts.yaml` | V2 (default) | Existing defaults | Shipped default; experimental |
-| `qwen3_tts_mrv2.yaml` | V2 | B1 | Explicit MRV2 profile (same runner selection as the default) |
+| `qwen3_tts.yaml` | V2 on CUDA/NPU; V1 on XPU/ROCm/MUSA | B1 | Shipped default; experimental |
 | `qwen3_tts_high_concurrency_mrv2.yaml` | V2 | B1, B2 | Opt-in throughput tuning |
 | `qwen3_tts_high_concurrency_mrv2_b4.yaml` | V2 | B1, B2, B3, B4 | Experimental throughput / buffered playback |
 | `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` | V2 | B1–B8 | Experimental two-stage deployment on one GPU, with MPS |
 | `qwen3_tts_high_concurrency.yaml` | V1 | Existing defaults | V1 high-concurrency control |
 | `qwen3_tts_fused_single_gpu.yaml` | V2 | N/A (in-Talker decoder) | Opt-in single-stage CUDA pipeline on one GPU |
 
+The former `qwen3_tts_mrv2.yaml` profile has been removed. Use
+`qwen3_tts.yaml` instead: their resolved settings were identical on CUDA,
+XPU, ROCm and MUSA. On NPU, the former profile selected V1 with `PIECEWISE`
+Talker graphs, while the default selects V2 with `FULL_AND_PIECEWISE`.
+To retain that NPU V1 behavior, use a custom overlay:
+
+```yaml
+# qwen3_tts_npu_v1.yaml; replace base_config with your installed file's path.
+base_config: /absolute/path/to/vllm_omni/deploy/qwen3_tts.yaml
+platforms:
+  npu:
+    model_runner: v1
+    stages:
+      - stage_id: 0
+        compilation_config:
+          cudagraph_mode: PIECEWISE
+```
+
+Relative `base_config` paths resolve from the overlay's directory.
+
 ```bash
-# MRV2 is the default; pass a copy with `model_runner: v1` to force V1.
+# Use the overlay above to retain V1 on NPU.
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni \
-  --deploy-config /path/to/qwen3_tts_v1.yaml
+  --deploy-config /path/to/qwen3_tts_npu_v1.yaml
 ```
 
 The V2 profiles bound Talker prefill to 512 tokens per step and select the
@@ -634,7 +666,7 @@ Talker AR runner and the Code2Wav generation
 runner together. Native inter-stage delivery carries codec payloads directly;
 request-owned snapshots preserve buffers through asynchronous completion and
 CUDA graph reuse. Terminal completion waits for upstream stage metrics before
-releasing request state. Platform sections retain V1 on NPU, XPU, ROCm and MUSA;
+releasing request state. Platform sections retain V1 on XPU, ROCm and MUSA;
 this change does not qualify MRV2 on those backends or enable other model families.
 Selecting V2 for a stage without `supports_native_mrv2_data_plane` emits a warning
 when pipeline and deployment settings are merged. That stage retains the legacy
@@ -714,8 +746,8 @@ the shared worker does not select Qwen's context length or codebook layout.
 
 ### Qwen3-TTS first-frame delivery and rollback
 
-The standard `qwen3_tts.yaml`, `qwen3_tts_high_concurrency.yaml`,
-`qwen3_tts_mrv2.yaml` and `qwen3_tts_high_concurrency_mrv2.yaml` profiles
+The standard `qwen3_tts.yaml`, `qwen3_tts_high_concurrency.yaml`
+and `qwen3_tts_high_concurrency_mrv2.yaml` profiles
 enable the `talker_first_audio` connector option, as does the experimental
 two-stage `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` profile.
 This changes the default CUDA MRV2 streaming path:
