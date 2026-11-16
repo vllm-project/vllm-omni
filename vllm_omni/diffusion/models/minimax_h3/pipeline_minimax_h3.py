@@ -961,6 +961,11 @@ class MiniMaxH3Pipeline(
                 "would be rejected. Remove the default ranges or the latent_refine default."
             )
         self.device = get_local_device()
+        if file_backed:
+            if self.device.type != "cuda" or od_config.num_gpus != 1 or self.parallel_config.use_hsdp:
+                raise ValueError("MiniMax H3 file-backed offload requires a single CUDA GPU without HSDP")
+            if not od_config.enforce_eager or od_config.step_execution or od_config.streaming_output:
+                raise ValueError("MiniMax H3 file-backed offload requires eager, non-streaming full-request execution")
         self.load_text_encoder = od_config.model_loaded.get("text_encoder", True)
         self.load_vae_encoder = od_config.model_loaded.get("vae_encoder", True)
         self.load_vae_decoder = od_config.model_loaded.get("vae_decoder", True)
@@ -1004,6 +1009,14 @@ class MiniMaxH3Pipeline(
             str(od_config.model),
         )
         control_path = getattr(od_config, "controlnet_model_path", None)
+        if file_backed and (
+            modular
+            or self.partition != "fl2va"
+            or od_config.quantization_config is not None
+            or od_config.lora_path
+            or control_path
+        ):
+            raise ValueError("MiniMax H3 file-backed offload requires native BF16 FL2VA without LoRA or ControlNet")
         if control_path:
             if not Path(control_path).is_file() or Path(control_path).suffix != ".safetensors":
                 raise ValueError("--controlnet-model-path must be a local original .safetensors file")
@@ -1185,12 +1198,11 @@ class MiniMaxH3Pipeline(
                 spec.vsa_tile_size,
             )
         if ref2va_model_path is not None:
-            with torch.device("meta") if file_backed else nullcontext():
-                self.transformers_ref = MiniMaxH3DiTModel(
-                    od_config,
-                    quant_config=transformer_quant_config,
-                    diffusers_weights=modular,
-                )
+            self.transformers_ref = MiniMaxH3DiTModel(
+                od_config,
+                quant_config=transformer_quant_config,
+                diffusers_weights=modular,
+            )
 
         self._vdn = VDNCheckpoint.from_od_config(od_config, self.transformer)
         if self._vdn is not None:
@@ -1375,6 +1387,26 @@ class MiniMaxH3Pipeline(
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=(od_config.enable_diffusion_pipeline_profiler)
         )
+
+    def prepare_file_backed_offload(self) -> tuple[frozenset[str], set[str]]:
+        """Prepare adapters and report checkpoint sources covered by their manifests."""
+        from .dit_offload import MiniMaxH3DiTOffloader
+
+        prefixes: set[str] = set()
+        planned_weights: set[str] = set()
+        for source in self.weights_sources:
+            root = Path(source.model_or_path) / (source.subfolder or "")
+            if source.prefix == "transformer.":
+                offloader = MiniMaxH3DiTOffloader(self.transformer, root, self.device)
+                self.file_backed_offload_backend = offloader
+                entries = offloader.entries
+            elif source.prefix == "text_encoder.":
+                entries = self.text_encoder.enable_block_offload(root).entries
+            else:
+                continue
+            prefixes.add(source.prefix)
+            planned_weights.update(source.prefix + entry["runtime_name"] for entry in entries if not entry["buffer"])
+        return frozenset(prefixes), planned_weights
 
     def load_weights(
         self,
@@ -1984,6 +2016,14 @@ class MiniMaxH3Pipeline(
 
     @contextmanager
     def _resident_dit_layers_on_device(self, *, enabled: bool = True):
+        offloader = getattr(self, "file_backed_offload_backend", None)
+        if offloader is not None and enabled:
+            try:
+                offloader.activate()
+                yield
+            finally:
+                offloader.deactivate()
+            return
         controller = getattr(self, "_dlo_residency_controller", None)
         if controller is not None and enabled:
             controller.load_resident_layers()
