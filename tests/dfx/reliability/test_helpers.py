@@ -400,9 +400,21 @@ float16 = object()
     assert completed.stdout.rstrip().endswith("DONE")
 
 
-def test_sidecar_accepts_small_reported_residual_without_allocator_rejection(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("reporting_reserve_mib", "expected_returncode", "expected_status"),
+    [
+        (6, 0, "READY:"),
+        (9, 2, "ERROR:"),
+    ],
+)
+def test_sidecar_bounds_reported_residual_without_allocator_rejection(
+    tmp_path: Path,
+    reporting_reserve_mib: int,
+    expected_returncode: int,
+    expected_status: str,
+) -> None:
     (tmp_path / "torch.py").write_text(
-        """
+        f"""
 _MIB = 1024 * 1024
 
 
@@ -436,7 +448,7 @@ class _Cuda:
 
     @staticmethod
     def mem_get_info(device):
-        reporting_reserve = 2 * _MIB if _Cuda.allocated else 0
+        reporting_reserve = {reporting_reserve_mib} * _MIB if _Cuda.allocated else 0
         return _Cuda.initial_free - _Cuda.allocated + reporting_reserve, 1024 * _MIB
 
 
@@ -464,10 +476,100 @@ float16 = object()
         timeout=5,
     )
 
-    assert completed.returncode == 0, completed.stderr
-    assert "free_after=35651584" in completed.stdout
-    assert "READY:" in completed.stdout
-    assert completed.stdout.rstrip().endswith("DONE")
+    expected_free_after = (32 + reporting_reserve_mib) * 1024 * 1024
+    assert completed.returncode == expected_returncode, completed.stderr
+    assert f"free_after={expected_free_after}" in completed.stdout
+    assert expected_status in completed.stdout
+    assert completed.stdout.rstrip().endswith("DONE") is (expected_returncode == 0)
+
+
+@pytest.mark.parametrize(
+    ("target_ratio", "rejection_limit_mib", "expected_returncode", "expected_status"),
+    [
+        (0.95, 9728, 0, "READY:"),
+        (0.95, 9472, 2, "ERROR:"),
+        (0.0, 0, 2, "ERROR:"),
+    ],
+)
+def test_sidecar_requires_ratio_target_before_accepting_allocator_saturation(
+    tmp_path: Path,
+    target_ratio: float,
+    rejection_limit_mib: int,
+    expected_returncode: int,
+    expected_status: str,
+) -> None:
+    """A coarse allocation rejection is ready only after positive ratio pressure."""
+    (tmp_path / "torch.py").write_text(
+        f"""
+_MIB = 1024 * 1024
+
+
+class _DeviceProperties:
+    total_memory = 12 * 1024 * _MIB
+
+
+class _Chunk:
+    def __init__(self, elements):
+        self._elements = elements
+
+    def numel(self):
+        return self._elements
+
+
+class _Cuda:
+    initial_free = 10 * 1024 * _MIB
+    rejection_limit = {rejection_limit_mib} * _MIB
+    allocated = 0
+
+    @staticmethod
+    def init():
+        pass
+
+    @staticmethod
+    def set_device(device):
+        pass
+
+    @staticmethod
+    def get_device_properties(device):
+        return _DeviceProperties()
+
+    @staticmethod
+    def mem_get_info(device):
+        return _Cuda.initial_free - _Cuda.allocated, 12 * 1024 * _MIB
+
+
+def empty(shape, **kwargs):
+    requested = shape[0] * 2
+    if _Cuda.allocated + requested > _Cuda.rejection_limit:
+        raise RuntimeError("next coarse allocation rejected")
+    _Cuda.allocated += requested
+    return _Chunk(shape[0])
+
+
+cuda = _Cuda()
+float16 = object()
+""",
+        encoding="utf-8",
+    )
+    command = helpers._build_sidecar_cmd(0, target_ratio, 1, False, 32 * 1024 * 1024)
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(path for path in (str(tmp_path), env.get("PYTHONPATH", "")) if path)
+
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        check=False,
+        env=env,
+        text=True,
+        timeout=5,
+    )
+
+    assert completed.returncode == expected_returncode, completed.stderr
+    assert expected_status in completed.stdout
+    assert f"allocator_saturated={int(expected_returncode == 0)}" in completed.stdout
+    if expected_returncode == 0:
+        assert "free_after=536870912" in completed.stdout
+        assert completed.stdout.rstrip().endswith("DONE")
 
 
 def test_stage_config_device_spec_uses_inherited_platform_devices(tmp_path: Path) -> None:

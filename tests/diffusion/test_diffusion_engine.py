@@ -599,6 +599,54 @@ class TestRequestBatchCapability:
         warmup.assert_called_once_with()
 
 
+class _MixfusionCapablePipeline:
+    supports_mixfusion = True
+
+
+class TestMixFusionCapability:
+    pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+    @staticmethod
+    def _resolve(monkeypatch: pytest.MonkeyPatch, pipeline_cls: type, **config: object):
+        od_config = SimpleNamespace(
+            model_class_name="StubPipeline",
+            custom_pipeline_args=None,
+            streaming_output=False,
+            max_num_seqs=1,
+            **config,
+        )
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            lambda model_class_name: pipeline_cls,
+        )
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        return engine, od_config, engine._resolve_execution_mode(od_config)
+
+    def test_engine_rejects_server_level_mixfusion_on_unsupported_pipeline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with pytest.raises(ValueError, match="does not support MixFusion"):
+            self._resolve(monkeypatch, _SingleRequestPipeline, enable_mixfusion=True)
+
+    @pytest.mark.parametrize("step_execution", [False, True])
+    def test_server_level_mixfusion_runs_step_execution(
+        self, monkeypatch: pytest.MonkeyPatch, step_execution: bool
+    ) -> None:
+        # Request-mode batching keys on height/width, so MixFusion without step
+        # execution would silently never fuse.
+        engine, od_config, mode = self._resolve(
+            monkeypatch, _MixfusionCapablePipeline, enable_mixfusion=True, step_execution=step_execution
+        )
+        assert mode is DiffusionExecutionMode.STEP_BATCH
+        assert od_config.step_execution is True
+        assert engine.step_execution is True
+
+    def test_engine_ignores_mixfusion_check_when_flag_is_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _, _, mode = self._resolve(monkeypatch, _SingleRequestPipeline)
+        assert mode is DiffusionExecutionMode.REQUEST_BATCH
+
+
 class TestDiffusionCompileConfig:
     pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -979,8 +1027,8 @@ async def test_async_add_req_and_stream_response():
     engine.execution_mode = DiffusionExecutionMode.REQUEST_BATCH
 
     def _finalize(rid, out, err=None, **kwargs):
-        # Stream consumers stop on ``finished``; keep result_data for assertions.
-        return SimpleNamespace(result_data=out.result.result_data, finished=True, async_output_id=None)
+        # Use the real output contract consumed by the asynchronous stream.
+        return DiffusionOutput(custom_output={"result_data": out.result.result_data})
 
     engine._finalize_finished_request = _finalize
 
@@ -1022,7 +1070,7 @@ async def test_async_add_req_and_stream_response():
         engine.worker_thread.join(timeout=5)
     assert len(results) == 5
     for rid, res, elapsed in results:
-        assert rid in res.result_data
+        assert rid in res.custom_output["result_data"]
 
     eps = 0.5
     latencies = [r[2] for r in results]

@@ -33,7 +33,7 @@ async def _publish(engine: AsyncOmni, factors: list[tuple[str, torch.Tensor]]) -
         exporter.join(timeout=10)
 
 
-@pytest.mark.core_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.asyncio
