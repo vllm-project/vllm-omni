@@ -14,6 +14,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
+from string import ascii_uppercase
 
 
 @dataclass(frozen=True)
@@ -29,9 +30,14 @@ class VideoQuestion:
     annotation_sha256: str
 
     @property
+    def labels(self) -> str:
+        return ascii_uppercase[: len(self.options)]
+
+    @property
     def prompt(self) -> str:
         options = "\n".join(f"{chr(65 + i)}. {text}" for i, text in enumerate(self.options))
-        return f"{self.question}\n{options}\nAnswer with only the letter of the correct option (A, B, C, or D)."
+        labels = ", ".join(self.labels[:-1]) + f", or {self.labels[-1]}"
+        return f"{self.question}\n{options}\nAnswer with only the letter of the correct option ({labels})."
 
 
 def load_video_questions(
@@ -80,11 +86,11 @@ def load_video_questions(
                 raise ValueError(f"Duplicate question ID: {identity}")
             seen.add(identity)
             options = tuple(str(option) for option in question["options"])
-            if len(options) != 4:
-                raise ValueError(f"Expected four options for {identity}")
+            if not 2 <= len(options) <= len(ascii_uppercase):
+                raise ValueError(f"Expected 2 to 26 options for {identity}")
             if dataset == "ovo-bench":
                 index = question["gt"]
-                if type(index) is not int or not 0 <= index < 4:
+                if type(index) is not int or not 0 <= index < len(options):
                     raise ValueError(f"Invalid answer index for {identity}")
                 answer = chr(65 + index)
             else:
@@ -92,7 +98,7 @@ def load_video_questions(
                     text[3:] if text.startswith(f"{chr(65 + i)}. ") else text for i, text in enumerate(options)
                 )
                 answer = question["answer"]
-                if answer not in {"A", "B", "C", "D"}:
+                if answer not in tuple(ascii_uppercase[: len(options)]):
                     raise ValueError(f"Invalid answer for {identity}")
             if dataset == "videomme-streaming" and not video.is_file():
                 if video_index is None:

@@ -81,7 +81,22 @@ def test_cli_routes_real_annotations(tmp_path):
         get_samples(args, tokenizer=None)
 
 
-@pytest.mark.parametrize("change", [{"video": "../outside.mp4"}, {"realtime": float("nan")}, {"gt": 9}])
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"video": "../outside.mp4"},
+        {"realtime": float("nan")},
+        {"gt": 9},
+        {"gt": -1},
+        {"gt": True},
+        {"options": []},
+        {"options": ["one"]},
+        {"options": ["option"] * 27},
+        {"options": ["one", "two"], "gt": 2},
+        {"options": ["one", "two", "three"], "gt": 3},
+        {"options": ["option"] * 5, "gt": 5},
+    ],
+)
 def test_invalid_annotation_fails_before_inference(tmp_path, change):
     annotation, row = _annotation(tmp_path)
     annotation.write_text(json.dumps([{**row, **change}]))
@@ -124,7 +139,37 @@ def test_videomme_official_rows(tmp_path, folder):
 
 @pytest.mark.parametrize("text,expected", [("</response> C", "C"), ("Answer: (B).", "B"), ("A or B", None), ("", None)])
 def test_mcq_scoring(text, expected):
-    assert extract_choice(text) == expected
+    assert extract_choice(text, "ABCD") == expected
+
+
+@pytest.mark.parametrize("count", [2, 3, 4, 5])
+def test_variable_option_counts_load_prompt_and_score(tmp_path, count):
+    annotation, row = _annotation(tmp_path)
+    row.update(options=[f"choice {i}" for i in range(count)], gt=count - 1)
+    annotation.write_text(json.dumps([row]))
+    (case,) = load_video_questions(annotation, tmp_path, dataset="ovo-bench")
+    answer = chr(64 + count)
+    outside = chr(65 + count)
+    assert case.answer == answer
+    assert f"{answer}. choice {count - 1}" in case.prompt
+    assert f"or {answer})." in case.prompt
+    assert outside not in case.prompt.rsplit("(", 1)[1]
+    if count == 4:
+        assert case.prompt.endswith("Answer with only the letter of the correct option (A, B, C, or D).")
+
+    sample = LongVideoSampleRequest(prompt="", prompt_len=0, expected_output_len=0, case=case, output_dir=tmp_path)
+    report = finalize_long_video(
+        [sample] * 2,
+        [
+            MixRequestFuncOutput(success=True, generated_text=f"Answer: ({answer.lower()})."),
+            MixRequestFuncOutput(success=True, generated_text=outside),
+        ],
+    )
+    assert report["accuracy"] == 0.5
+    assert report["valid_answers"] == 1
+    assert report["completed"] == 2
+    assert json.loads((tmp_path / "ovo-bench/0000-37/result.json").read_text())["prediction"] == answer
+    assert json.loads((tmp_path / "ovo-bench/0001-37/result.json").read_text())["prediction"] is None
 
 
 def test_failed_and_invalid_answers_remain_in_denominator(tmp_path):

@@ -117,11 +117,11 @@ async def request_long_video(request, output, *, headers, pbar, total_timeout_s:
     return output
 
 
-def extract_choice(text: str) -> str | None:
+def extract_choice(text: str, labels: str) -> str | None:
     """Require an unambiguous MCQ answer; verbose/invalid replies count as wrong."""
     cleaned = text.replace("</response>", "").strip()
-    match = re.fullmatch(r"(?:Answer\s*:\s*)?\(?([ABCD])\)?[.!]?", cleaned, flags=re.IGNORECASE)
-    return match[1].upper() if match else None
+    match = re.fullmatch(r"(?:Answer\s*:\s*)?\(?([A-Z])\)?[.!]?", cleaned, flags=re.IGNORECASE)
+    return match[1].upper() if match and match[1].upper() in labels else None
 
 
 def finalize_long_video(samples, outputs) -> dict | None:
@@ -135,7 +135,7 @@ def finalize_long_video(samples, outputs) -> dict | None:
         root = sample.output_dir
         assert case is not None and root is not None
         result = getattr(output, "long_video_result", {})
-        prediction = extract_choice(output.generated_text) if output.success else None
+        prediction = extract_choice(output.generated_text, case.labels) if output.success else None
         rows.append(
             {
                 "id": case.id,
