@@ -21,9 +21,8 @@ disables audio output), `first_frame_decoder.py` (talker first-audio path),
 
 | YAML | Use |
 |------|-----|
-| `qwen3_omni_moe.yaml` | Default CUDA MRv2 with Thinker prefix caching on. 2×H100: thinker on GPU 0 (0.9), talker + code2wav on GPU 1 (0.6 / 0.1). `async_chunk: true`, shared-memory connector with `initial_codec_chunk_frames: 4`, `codec_chunk_frames: 25`, `codec_left_context_frames: 25` |
-| `qwen3_omni_moe_mrv2.yaml` | Specialized CUDA codec profile over the MRv2 default; disables Thinker prefix caching and adds `talker_first_audio`, `codec_chunk_ramp`, Code2Wav graph batch sizes, fused snake. Non-CUDA platforms fall back to v1 |
-| `qwen3_omni_moe_mrv2_h200.yaml` | MRv2 with all stages on one H200 (0.60 / 0.22 / 0.10) plus code-predictor KV and sampling optimizations |
+| `qwen3_omni_moe.yaml` | Default CUDA MRv2 with Thinker prefix caching on. 2×H100: thinker on GPU 0 (0.9), talker + code2wav on GPU 1 (0.6 / 0.1). `async_chunk: true`, shared-memory connector with `codec_chunk_frames: 25`, `codec_left_context_frames: 25`. CUDA adds `talker_first_audio`, `codec_chunk_ramp`, Code2Wav graph batch sizes and fused snake; other platforms keep `initial_codec_chunk_frames: 4` |
+| `qwen3_omni_moe_mrv2_h200.yaml` | MRv2 with all stages on one H200 (0.60 / 0.22 / 0.10), plus code-predictor KV and sampling optimizations |
 | `qwen3_omni_moe_thinking.yaml` | Thinker-only pipeline, TP=2, prefix caching on |
 | `qwen3_omni_duplex.yaml` | `session_mode: duplex` |
 | `qwen3_omni_moe_mori_intranode.yaml` | MI300X with Mori connector, one GPU per stage, all eager |
@@ -31,9 +30,8 @@ disables audio output), `first_frame_decoder.py` (talker first-audio path),
 ## Known quirks
 
 - Default CUDA deploy enables Thinker prefix caching on either runner; Talker
-  and Code2Wav keep it off. Non-CUDA platform sections and the specialized
-  `qwen3_omni_moe_mrv2.yaml` overlay disable Thinker caching (the H200 overlay
-  inherits that setting). Read the effective profile before tuning.
+  and Code2Wav keep it off. Non-CUDA platform sections and the H200 overlay
+  disable Thinker caching. Read the effective profile before tuning.
 - Talker first-frame and fused MTP fast paths require Talker prefix caching
   off, independently of Thinker caching. Eligibility lives in
   `vllm_omni/model_executor/models/common/talker_first_audio.py` and

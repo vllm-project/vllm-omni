@@ -4,9 +4,17 @@
 # Runner selection:
 #   Model Runner V2 is the default on CUDA and NPU. Set `model_runner: v1`
 #   in an overlay to opt out. XPU, ROCm and MUSA keep V1. The Thinker prefix
-#   cache is on for CUDA on both runners (stage 0). NPU, the other platforms
-#   and qwen3_omni_moe_mrv2.yaml keep it off.
-#   Duplex keeps V1 in qwen3_omni_duplex.yaml.
+#   cache is on for CUDA on both runners (stage 0); the other platforms keep
+#   it off.
+#
+# CUDA codec path:
+#   On MRv2 the Thinker hands each generated token's embedding to the Talker
+#   with the step that sampled it and replays decode in FULL CUDA graphs. The
+#   connector extras below add first-frame delivery, the codec chunk ramp,
+#   length-grouped Code2Wav graphs and fused decoder blocks. They apply on
+#   CUDA only; other platforms keep the 4-frame initial chunk. When the stages
+#   share one GPU, run them under NVIDIA MPS (see
+#   docs/configuration/stage_configs.md).
 #
 # Fields omitted from a stage fall back to StageDeployConfig defaults (see
 # vllm_omni/config/stage_config.py). Notable implicit defaults for this
@@ -29,6 +37,18 @@ connectors:
       initial_codec_chunk_frames: 4
       codec_chunk_frames: 25
       codec_left_context_frames: 25
+      # CUDA: the first Code2Wav chunk is the stream's first frame alone, then
+      # chunks double up to codec_chunk_frames (replaces the initial chunk).
+      # Code2Wav re-decodes up to codec_left_context_frames before each chunk,
+      # so windows are 1, 3, 7, 15, 31, then 50 frames. The one-frame first
+      # chunk lets the Talker deliver it itself; VLLM_OMNI_TALKER_FIRST_AUDIO=0
+      # disables that.
+      talker_first_audio: true
+      codec_chunk_ramp: [1, 2, 4, 8, 16, 25]
+      # CUDA: decode a streaming step as a few length groups on multi-row
+      # graphs instead of one eager call padded to its longest window.
+      codec_graph_batch_sizes: [2, 3, 4, 6, 8, 12, 16]
+      codec_fused_snake: true
 
 stages:
   - stage_id: 0

@@ -109,7 +109,7 @@ def _run_arm(model: str, directory: Path, cases: list[tuple[str, dict]], mooncak
     omni = Omni(
         model=model,
         revision=REVISION,
-        deploy_config="qwen3_omni_moe_mrv2.yaml",
+        deploy_config="qwen3_omni_moe.yaml",
         stage_overrides=overrides,
         trust_remote_code=True,
         stage_init_timeout=1800,

@@ -8,6 +8,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import Future
 from typing import Any, cast
 
 import torch
@@ -491,7 +492,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         """Per-request admission of a chunk; returns the task to queue, or None."""
         if request is None:
             raise ValueError("save_async requires a request")
-        is_finished = force_request_finished or (request.is_finished() and not request.resumable)
+        turn_continuation = getattr(request, "resume_from_full_prompt", False) is True
+        is_finished = (
+            force_request_finished
+            or (request.is_finished() and not request.resumable)
+            or (turn_continuation and is_segment_finished)
+        )
         if not hasattr(self, "_segment_generation"):
             self._segment_generation = defaultdict(int)
         external_req_id = request.external_req_id
@@ -517,6 +523,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if confirmed_num_computed_tokens is None:
             confirmed_num_computed_tokens = self._confirmed_num_computed_tokens(request)
         processor_request = self._snapshot_processor_request(request) if snapshot else request
+        if turn_continuation:
+            # The entry request remains resident, but each downstream speech
+            # pipeline receives a complete, independently terminating turn.
+            if processor_request is request:
+                processor_request = self._snapshot_processor_request(request)
+            processor_request.resumable = False
         task = {
             "multimodal_output": multimodal_output,
             "request": processor_request,
@@ -766,6 +778,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         return False
 
     def _send_single_request(self, task: dict):
+        if "turn_cleanup_done" in task:
+            task["turn_cleanup_done"].set_result(None)
+            return
         if "cleanup_shm" in task:
             assert isinstance(self.connector, SharedMemoryConnector)
             key_prefix, num_puts = task["cleanup_shm"]
@@ -773,7 +788,19 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 self.connector.cleanup(f"{key_prefix}_{chunk_id}")
             return
         if "release_shm" in task:
-            self._release_shm_prefix(task["release_shm"])
+            completion = task.get("completion")
+            try:
+                self._release_shm_prefix(task["release_shm"])
+            except Exception as exc:
+                if completion is None:
+                    raise
+                completion.set_exception(exc)
+            else:
+                if completion is not None:
+                    # Earlier puts can append abort cleanup behind this release.
+                    # Acknowledge only after those follow-up tasks have drained,
+                    # so no old cleanup can unlink a reinstalled turn's chunks.
+                    self._pending_save_reqs.append({"turn_cleanup_done": completion})
             return
         if "batch" in task:
             self._send_batch(task["batch"])
@@ -1212,7 +1239,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if cached_ic is not None:
             cached_ic.pop(external_req_id, None)
 
-    def release_shm_resources(self, request_id: str) -> None:
+    def release_shm_resources(self, request_id: str, *, wait: bool = False) -> Future[None] | None:
         """Queue reclaim of inter-stage segments this request left unconsumed.
 
         Safe only once every stage has finished with the request: the producer
@@ -1223,14 +1250,21 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         this (see ``Orchestrator._cleanup_request_ids``).
 
         Like abort cleanup, the unlink runs on the save thread, so the
-        scheduler never performs SHM I/O.
+        scheduler never performs SHM I/O. ``wait`` is used only by explicit
+        turn-retirement RPCs. It returns a future that completes after the
+        unlink and its follow-up cleanup, or fails with the cleanup error;
+        callers must not block the scheduler thread on it.
         """
         if not isinstance(self.connector, SharedMemoryConnector):
-            return
+            return None
         external_req_id = self.request_ids_mapping.get(request_id, request_id)
-        self._pending_save_reqs.append({"release_shm": f"{external_req_id}_{self.connector.stage_id}_"})
+        completion: Future[None] | None = Future() if wait else None
+        self._pending_save_reqs.append(
+            {"release_shm": f"{external_req_id}_{self.connector.stage_id}_", "completion": completion}
+        )
         with self._save_cond:
             self._save_cond.notify()
+        return completion
 
     def _release_shm_prefix(self, key_prefix: str) -> None:
         reclaimed = self.connector.cleanup_prefix(key_prefix)

@@ -155,7 +155,6 @@ x-qwen3-omni: &qwen3_omni
   - vllm_omni/model_executor/models/qwen3_tts/cuda_graph_decoder_wrapper.py
   - vllm_omni/model_executor/stage_input_processors/qwen3_omni.py
   - vllm_omni/deploy/qwen3_omni_moe.yaml
-  - vllm_omni/deploy/qwen3_omni_moe_mrv2.yaml
   - vllm_omni/deploy/qwen3_omni_moe_mrv2_h200.yaml
   - vllm_omni/deploy/qwen3_omni_moe_thinking.yaml
 
@@ -618,7 +617,6 @@ source_file_dependencies:
     - vllm_omni/model_executor/duplex_sampling.py
     - vllm_omni/outputs/duplex.py
     - vllm_omni/deploy/qwen3_omni_duplex.yaml
-    - vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml
     - vllm_omni/entrypoints/cli/benchmark/
     - vllm_omni/benchmarks/
     - tests/dfx/conftest.py

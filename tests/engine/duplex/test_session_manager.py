@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
-from dataclasses import FrozenInstanceError, dataclass, field
+from dataclasses import FrozenInstanceError, dataclass, field, replace
 from typing import Any
 
 import pytest
@@ -209,6 +209,7 @@ class FakePlugin(DuplexModelPlugin):
         # Resident Stage0 ids (MiniCPM-shaped); AURA opts out via supports_core_resumable_request=False.
         return DuplexCapabilities(
             supports_input_append=True,
+            supports_turn_commit_only=False,
             supports_core_resumable_request=True,
         )
 
@@ -500,6 +501,7 @@ async def test_open_answers_with_capabilities_and_emits_session_created() -> Non
         assert result.lease_generation == 0
         assert result.capabilities == DuplexCapabilities(
             supports_input_append=True,
+            supports_turn_commit_only=False,
             supports_core_resumable_request=True,
         )
         assert result.public_session is not None
@@ -572,6 +574,28 @@ async def test_ensure_stage_request_ignores_stages_beyond_the_pipeline() -> None
         assert context.request_id.endswith(".r.stage1")
         assert harness.manager.runner_for_request_id(context.request_id) is harness.manager.runners["sid-stages"]
         assert session.resource_request_ids() == [stage0_request_id("sid-stages"), context.request_id]
+
+
+@pytest.mark.parametrize("resumable,turn_commit_only", [(False, True), (True, True), (True, False)])
+@pytest.mark.parametrize("stage_id", [0, 1])
+async def test_stage_request_residency_follows_capability_and_turn_policy(resumable, turn_commit_only, stage_id):
+    async with Harness.create() as harness:
+        await harness.open("sid-residency")
+        session = harness.session("sid-residency")
+        session.capabilities = replace(
+            session.capabilities,
+            supports_core_resumable_request=resumable,
+            supports_turn_commit_only=turn_commit_only,
+        )
+        first = harness.manager.ensure_stage_request(session, stage_id=stage_id)
+        next_turn = replace(session.fence, turn_id=session.turn_id + 1)
+        second = harness.manager.ensure_stage_request(session, stage_id=stage_id, fence=next_turn)
+
+        assert first is not None and second is not None
+        resident = resumable and (stage_id == 0 or not turn_commit_only)
+        assert (first.request_id == second.request_id) is resident
+        if not resident:
+            assert second.request_id.endswith(f".r.stage{stage_id}-turn{next_turn.turn_id}")
 
 
 async def test_sampling_params_for_validates_the_plugin_policy() -> None:

@@ -155,7 +155,7 @@ def test_platform_dependencies_are_scoped(nightly, changed_file, platforms):
         ("vllm_omni/model_executor/duplex_sampling.py", {"duplex_perf"}),
         ("vllm_omni/outputs/duplex.py", {"duplex_perf"}),
         ("vllm_omni/core/sched/duplex_stage_work.py", {"duplex_perf"}),
-        ("vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml", {"duplex_perf"}),
+        ("vllm_omni/deploy/qwen3_omni_duplex.yaml", {"duplex_perf"}),
         (MINICPM, set()),
         ("vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py", set()),
         ("vllm_omni/platforms/npu/graph_tools.py", set()),
