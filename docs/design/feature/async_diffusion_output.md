@@ -159,7 +159,12 @@ Other models with `step_execution=False` are also supported but not yet verified
 
 ### Not Yet Supported (step-mode, `step_execution=True`)
 
-When `step_execution=True` (or `streaming_output=True`, which auto-enables step-mode), models use `execute_stepwise` instead of `execute_model`, which is not in the async Path 1 whitelist. Async output is not applicable.
+When `step_execution=True` (or `streaming_output=True` on pipelines without
+`supports_request_streaming_output`, which still auto-enables step-mode), models
+use `execute_stepwise` instead of `execute_model`, which is not in the async
+Path 1 whitelist. Async output is not applicable there. Pipelines that declare
+`supports_request_streaming_output` keep request-mode `execute_model` and emit
+in-order `CHUNK_READY` messages during the forward.
 
 **Verified**: Helios (`step_execution=True`, does not benefit from this feature).
 
