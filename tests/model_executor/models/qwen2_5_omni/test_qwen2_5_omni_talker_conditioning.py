@@ -9,16 +9,24 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import Qwen2_5OmniConfig
+from vllm.config import ModelConfig, VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.multimodal import MultiModalConfig
 from vllm.v1.worker.gpu import cudagraph_utils
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
+from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.qwen2_5_omni import qwen2_5_omni
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni import (
     Qwen2_5OmniForConditionalGeneration,
 )
 from vllm_omni.model_executor.stage_input_processors.qwen2_5_omni import (
     thinker2talker_full_payload,
 )
+from vllm_omni.worker_v2 import staged_writes
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -173,34 +181,65 @@ def test_length_capped_completion_appends_text_eos_and_pad() -> None:
     )
 
 
-@pytest.mark.parametrize("stage", ["thinker", "talker"])
-def test_ar_forward_supports_native_capture_and_replay(stage: str, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("stage", ["thinker", "talker", None, "code2wav"])
+def test_ar_forward_supports_native_capture_and_replay(stage: str | None, monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep native persistent output allocation/copy and replay view handling real.
 
     GPU capture is replaced with CPU calls, and fake replay updates the native
     buffer without re-entering Python forward, as a captured graph would.
     """
+    resolved_stage = stage or "thinker"
+    hf_config = Qwen2_5OmniConfig()
+    hf_config.thinker_config.text_config.vocab_size = 64
+    hf_config.thinker_config.text_config.hidden_size = 2
+    model_config = object.__new__(ModelConfig)
+    model_config.hf_config = hf_config
+    model_config.multimodal_config = MultiModalConfig()
+    if stage is not None:
+        model_config.model_stage = stage
+    config = object.__new__(VllmConfig)
+    config.model_config = model_config
 
     class HiddenModel(nn.Module):
         def __init__(self):
             super().__init__()
             self.calls = 0
+            self.make_empty_intermediate_tensors = lambda: None
+
+        def set_suppress_start_id(self, start_id):
+            self.suppress_start_id = start_id
 
         def forward(self, input_ids, **kwargs):
             self.calls += 1
             hidden = input_ids.float().reshape(-1, 1).expand(-1, 2).clone()
             # The thinker may also return its input embeddings.
-            return (torch.zeros_like(hidden), hidden) if stage == "thinker" else hidden
+            return (torch.zeros_like(hidden), hidden) if resolved_stage == "thinker" else hidden
 
         def compute_logits(self, hidden):
             return hidden + 1
 
     child = HiddenModel()
-    model = object.__new__(Qwen2_5OmniForConditionalGeneration)
-    nn.Module.__init__(model)
-    model.model_stage = stage
-    model.model = child
-    setattr(model, stage, child)
+    # Exercise the real stage declaration; replace only weight construction.
+    monkeypatch.setattr(qwen2_5_omni, "init_vllm_registered_model", lambda **kwargs: child)
+    monkeypatch.setattr(Qwen2_5OmniForConditionalGeneration, "_init_special_tokens_embeddings", lambda self: None)
+    model = Qwen2_5OmniForConditionalGeneration(vllm_config=config)
+    assert model.model_stage == resolved_stage
+    assert model.have_multimodal_outputs is True
+    runner = object.__new__(OmniGPUModelRunner)
+    runner._staged_writes = staged_writes.StagedWrites()
+    runner.model = model
+    runner._configure_cudagraph_output_contract()
+    if stage == "code2wav":
+        output = model(input_ids=torch.empty(0, dtype=torch.long), positions=torch.empty(3, 0, dtype=torch.long))
+        assert isinstance(output, OmniOutput)
+        assert output.text_hidden_states is None
+        assert output.multimodal_outputs["model_outputs"].numel() == 0
+        assert runner._model_has_structured_output is True
+        assert runner._exclude_full_graph is True
+        return
+    assert runner._model_has_structured_output is False
+    assert runner._exclude_full_graph is False
+    assert runner._full_graph_aux_outputs is False
     small, large = [cudagraph_utils.BatchExecutionDescriptor(CUDAGraphMode.FULL, n, n) for n in (2, 4)]
     manager = object.__new__(cudagraph_utils.ModelCudaGraphManager)
     manager.__dict__.update(
@@ -226,17 +265,26 @@ def test_ar_forward_supports_native_capture_and_replay(stage: str, monkeypatch: 
     monkeypatch.setattr(cudagraph_utils, "prepare_inputs_to_capture", lambda *args, **kwargs: (None, {}))
     monkeypatch.setattr(cudagraph_utils, "set_forward_context", lambda *args, **kwargs: nullcontext())
     monkeypatch.setattr(cudagraph_utils, "get_offloader", lambda: SimpleNamespace(sync_prev_onload=lambda: None))
-    manager.capture(
-        model,
-        SimpleNamespace(prepare_dummy_inputs=lambda nr, nt: {"positions": torch.arange(nt).expand(3, -1)}),
-        SimpleNamespace(
-            input_ids=torch.arange(4), positions=torch.arange(4), is_padding=torch.zeros(4, dtype=torch.bool)
-        ),
-        None,
-        None,
-        [],
-        None,
-    )
+
+    def capture_model(_self, *, profile_only=False):
+        manager.capture(
+            model,
+            SimpleNamespace(prepare_dummy_inputs=lambda nr, nt: {"positions": torch.arange(nt).expand(3, -1)}),
+            SimpleNamespace(
+                input_ids=torch.arange(4), positions=torch.arange(4), is_padding=torch.zeros(4, dtype=torch.bool)
+            ),
+            None,
+            None,
+            [],
+            None,
+        )
+        return 0
+
+    runner.cudagraph_manager = manager
+    runner.use_aux_hidden_state_outputs = False
+    monkeypatch.setattr(GPUModelRunner, "capture_model", capture_model)
+    assert runner.capture_model() == 0
+    assert manager._capture_descs == {CUDAGraphMode.FULL: [small, large]}
     # A smaller first capture must still allocate for the largest descriptor.
     assert manager.hidden_states.shape == (4, 2)
     torch.testing.assert_close(manager.hidden_states, torch.arange(4).float().reshape(-1, 1).expand(-1, 2))

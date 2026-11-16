@@ -115,6 +115,8 @@ class Qwen2_5OmniForConditionalGeneration(
         # else-branch below, so an unset stage would otherwise build no submodule
         # at all and fail later at self.thinker.
         self.model_stage = getattr(vllm_config.model_config, "model_stage", None) or "thinker"
+        # AR forwards return tensors; only Code2Wav returns OmniOutput.
+        self.mrv2_forward_returns_tensor = self.model_stage in ("thinker", "talker")
         if self.model_stage == "thinker":
             # Initialize thinker model (multimodal processing)
             self.thinker = init_vllm_registered_model(
