@@ -61,6 +61,12 @@ Reference isolation requires a fixed reference layout and rejects `keep_steps`
 reference-layout switching.
 
 This option defaults to off and does not use an environment-variable switch. **Isolation changes the learned model computation. It is not a lossless optimization.**
+#### MiniMax-H3 Tiny Decoder (TAEH3)
+
+[TAEH3](diffusion/tae_decoder.md) replaces the MiniMax-H3 video decoder with a
+tiny convolutional autoencoder for previews and low-memory hosts. It is an
+approximation with visibly softer detail. Enable it with
+`additional_config.tae_decoder_path`.
 
 #### Diffusion KV Prefix Caching
 
