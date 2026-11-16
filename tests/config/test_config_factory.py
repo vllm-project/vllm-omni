@@ -1970,8 +1970,8 @@ stages:
         The Nixl overlays inherit stage 0 through base_config and the decode
         pipeline reuses the encoder StagePipelineConfig via replace(), so the
         resolved engine args must match the base deploys: the encoder runs
-        model runner v2 with its native data plane, every later stage stays
-        on v1. Fails before the pipeline declaration, where the encoder
+        model runner v2 with its native data plane, while later stages use
+        their own diffusion runners. Fails before the pipeline declaration, where the encoder
         resolved v2 without the native data plane.
         """
         deploy = load_deploy_config(Path(get_deploy_config_path(deploy_name)))

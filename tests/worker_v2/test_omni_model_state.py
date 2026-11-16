@@ -36,6 +36,8 @@ def test_prepare_attn_forwards_release_model_specific_metadata():
 
 
 class _DummyInputBatch:
+    num_computed_prefill_tokens_np: np.ndarray
+    prefill_len_np: np.ndarray
     is_prefilling_np: np.ndarray
     req_ids: list[str]
 

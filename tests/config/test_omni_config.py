@@ -176,9 +176,11 @@ def test_minimax_h3_text_encoder_tp_targets_only_structured_stage_zero() -> None
     )
 
     assert config.stage_by_id(0).parallel_config.tensor_parallel_size == 4
+    assert config.stage_by_id(0).model_config.use_v2_model_runner is True
     diffusion = config.stage_by_id(1)
     assert diffusion.parallel_config.tensor_parallel_size == 1
     assert diffusion.parallel_config.text_encoder_tp_size == 1
+    assert diffusion.model_config.use_v2_model_runner is False
 
 
 def test_duplex_session_capacity_propagates_to_every_structured_stage() -> None:

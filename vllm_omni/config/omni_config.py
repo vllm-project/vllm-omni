@@ -2186,7 +2186,10 @@ def _build_model_config(
         kwargs["custom_voice_dir"] = _copy_value(deploy.custom_voice_dir)
     stage_runner = resolve_stage_model_runner(deploy, stage_deploy)
     validate_native_mrv2_session(deploy, topology, stage_runner)
-    kwargs.setdefault("use_v2_model_runner", stage_runner == "v2")
+    kwargs.setdefault(
+        "use_v2_model_runner",
+        stage_runner == "v2" and topology.execution_type is not StageExecutionType.DIFFUSION,
+    )
     kwargs.setdefault(
         "supports_native_mrv2_data_plane",
         topology.supports_native_mrv2_data_plane,

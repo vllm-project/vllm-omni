@@ -1449,9 +1449,10 @@ def _build_engine_args(
                 )
     stage_runner = resolve_stage_model_runner(deploy, ds)
     validate_native_mrv2_session(deploy, ps, stage_runner)
-    engine_args["use_v2_model_runner"] = stage_runner == "v2"
+    # This flag selects the LLM runner; diffusion stages own their runner.
+    engine_args["use_v2_model_runner"] = stage_runner == "v2" and ps.execution_type is not StageExecutionType.DIFFUSION
     engine_args["supports_native_mrv2_data_plane"] = bool(ps.supports_native_mrv2_data_plane)
-    if stage_runner == "v2" and not ps.supports_native_mrv2_data_plane:
+    if engine_args["use_v2_model_runner"] and not ps.supports_native_mrv2_data_plane:
         logger.warning(
             "Stage %s (%s) selects model_runner=v2 without declaring "
             "supports_native_mrv2_data_plane. It will use the legacy transport path; "
