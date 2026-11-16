@@ -349,11 +349,11 @@ _OMNI_MODELS = {
         "gepard_talker",
         "GepardTalkerForConditionalGeneration",
     ),
-    ## Kokoro-82M (hexgrad)
-    "KokoroForConditionalGeneration": (
-        "kokoro",
-        "modeling_kokoro",
-        "KokoroForConditionalGeneration",
+    ## Haru-4B (higurashi-ai) — full-duplex S2S, one AR stage with in-step audio hooks
+    "HaruForConditionalGeneration": (
+        "haru",
+        "haru",
+        "HaruForConditionalGeneration",
     ),
     ## audio8_tts (Audio8 TTS Preview 0.6B)
     "Audio8TTSSlowARForConditionalGeneration": (
