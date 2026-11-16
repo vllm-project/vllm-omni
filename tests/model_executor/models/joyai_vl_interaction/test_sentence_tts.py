@@ -52,12 +52,18 @@ def test_delegation_prefix_holds_then_releases():
     assert not incomplete_delegation_hold("Checking.</delega", finished=True)
     assert not spoken_text_ready("</response> Checking.</deleg", finished=False)
     assert spoken_text_ready("</response> Checking. </delegation> Why?", finished=False)
+    assert not spoken_text_ready("Checking. </delega", finished=False)
+    assert not spoken_text_ready("Checking. <delegatio", finished=False)
+    assert spoken_text_ready("Checking. </delegation> Why?", finished=False)
+    assert spoken_text_ready("Checking. </delega", finished=True)
 
 
 def test_spoken_payload_drops_markers_and_silence():
     assert spoken_payload("</response> The pot is smoking.", finished=False) == "The pot is smoking."
     assert spoken_payload("</silence>", finished=True) is None
     assert spoken_payload("</response> Checking.</deleg", finished=False) is None
+    assert spoken_payload("Checking. </delega", finished=False) is None
+    assert spoken_payload("Checking. </delegation> Why?", finished=False) == "Checking."
 
 
 def test_spoken_payload_strips_user_query_header_and_silence_tail():
@@ -178,6 +184,7 @@ class _FakeOutput:
     # None falls back to streaming.segments[].finished. MRv2 Talker parks set
     # this on the poll so a leftover True from the previous 2150 cannot hide it.
     is_segment_finished: bool | None = None
+    segment_generation: int | None = None
 
 
 def _stage0_output(text: str, *, finished: bool = False) -> _FakeOutput:
@@ -494,8 +501,9 @@ def test_talker_park_releases_without_generating_heartbeat():
 def test_talker_park_releases_repeated_stop_token_after_rebroadcast_window(monkeypatch):
     """MRv2 DELTA parks often report token_ids=[2150] for every sentence.
 
-    A leftover 2150 in the next poll must not dump the queue; the same stop
-    token one second later is the next utterance and must drain.
+    Without a generation stamp, a leftover 2150 in the next poll must not dump
+    the queue; the same stop token after the rebroadcast window is the next
+    utterance and must drain.
     """
     from vllm_omni.model_executor.models.joyai_vl_interaction.duplex import sentence_tts as sentence_tts_mod
 
@@ -528,6 +536,47 @@ def test_talker_park_releases_repeated_stop_token_after_rebroadcast_window(monke
     bridge["closed"] = True
     park_two = _stage0_output("park-2")
     park_two.is_segment_finished = True
+    park_two.outputs[0].token_ids = [2150]
+    assert plan_partial_stage_output(orchestrator, 1, 0, park_two, req_state, joyai_stage_id=0) is None
+    assert len(orchestrator.pending_talker_followups) == 2
+    assert "还在烧" in orchestrator.pending_talker_followups[1][0].text
+
+
+def test_talker_park_releases_same_stop_token_when_generation_advances():
+    """A short sentence can park again within the leftover window.
+
+    Both polls report ``[2150]``; the next utterance is a new segment
+    generation, not elapsed time.
+    """
+    orchestrator = _FakeOrchestrator()
+    req_state = _FakeReqState()
+    opened = plan_partial_stage_output(
+        orchestrator, 0, 0, _stage0_output("</response> 水开了。关"), req_state, joyai_stage_id=0
+    )
+    assert opened is not None
+    bridge = req_state.streaming.bridge_states["joyai_sentence_tts"]
+    bridge["queued"] = ["关火。", "还在烧。"]
+    bridge["talker_busy"] = True
+    req_state.streaming.enabled = True
+    req_state.streaming.segments[1] = _FakeSegment(finished=True)
+    park_one = _stage0_output("park-1")
+    park_one.is_segment_finished = True
+    park_one.segment_generation = 0
+    park_one.outputs[0].token_ids = [2150]
+    assert plan_partial_stage_output(orchestrator, 1, 0, park_one, req_state, joyai_stage_id=0) is None
+    assert len(orchestrator.pending_talker_followups) == 1
+
+    leftover = _stage0_output("leftover")
+    leftover.is_segment_finished = True
+    leftover.segment_generation = 0
+    leftover.outputs[0].token_ids = [2150]
+    assert plan_partial_stage_output(orchestrator, 1, 0, leftover, req_state, joyai_stage_id=0) is None
+    assert len(orchestrator.pending_talker_followups) == 1
+
+    bridge["closed"] = True
+    park_two = _stage0_output("park-2")
+    park_two.is_segment_finished = True
+    park_two.segment_generation = 1
     park_two.outputs[0].token_ids = [2150]
     assert plan_partial_stage_output(orchestrator, 1, 0, park_two, req_state, joyai_stage_id=0) is None
     assert len(orchestrator.pending_talker_followups) == 2

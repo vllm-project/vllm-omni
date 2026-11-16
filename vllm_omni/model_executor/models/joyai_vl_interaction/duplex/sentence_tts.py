@@ -16,7 +16,8 @@ resumable Talker update on the same request id. Only one sentence is in flight
 at a time: later sentences wait in ``queued`` until Talker parks on 2150, then
 the plugin submits the next one from the Talker-stage poll. MRv2 async_chunk
 Talker only emits those 2150 parks (no generating deltas), so a new park with
-different token ids must drain even while ``releasing`` is still set. The last
+a new segment generation (or different token ids) must drain even while
+``releasing`` is still set. The last
 sentence is a resumable unpark stamped ``joyai_finish_on_next_stop`` so that
 utterance's 2150 is Code2Wav's request terminal. A later parked close_only is
 too late: the vocoder already treated 2150 as a segment stop. Do not prefix
@@ -59,9 +60,9 @@ JOYAI_TTS_SEED = 0
 # and sentences. 0.4 is the Qwen3-Omni Talker recommendation: still sampled,
 # but stable enough that recitation does not change speaker mid-paragraph.
 JOYAI_TTS_TEMPERATURE = 0.4
-# V1 can rebroadcast the same 2150 in the following polls. MRv2 DELTA parks
-# often look like ``(2150,)`` every sentence, so same ids after this window
-# are the next utterance, not a leftover.
+# Fallback only when a poll has no segment generation: V1 leftovers share
+# token ids with the park we just drained. MRv2 DELTA often reports
+# ``(2150,)`` for every sentence; those later parks carry a new generation.
 _PARK_REBROADCAST_WINDOW_S = 0.2
 # JoyAI wraps the user turn with USER_QUERY_HEADER and may echo chunk-duration
 # tags plus a trailing </silence>. None of that is speech.
@@ -102,7 +103,10 @@ def spoken_text_ready(raw: str, *, finished: bool) -> bool:
     response_at = text.find(RESPONSE_TOKEN)
     if response_at == -1 and silence_at == -1:
         # No marker yet: either plain text (markers are optional) or a marker
-        # still arriving. Only the latter has to wait.
+        # still arriving. Only the latter has to wait. Bare text can still grow
+        # into a delegation tag, so hold the same way as a ``</response>`` note.
+        if incomplete_delegation_hold(text, finished=finished):
+            return False
         return finished or not incomplete_marker_prefix(text)
     if response_at == -1 or (silence_at != -1 and silence_at < response_at):
         # Silence is a decision, not speech.
@@ -441,6 +445,22 @@ def _talker_park_identity(output: object) -> tuple[int, ...]:
     return _talker_token_ids(output)
 
 
+def _talker_park_generation(output: object) -> int | None:
+    """Scheduler segment generation for this park, if the poll carried one.
+
+    ``bool`` is a subclass of ``int``, so reject it: a leftover ``True`` flag
+    is not a generation counter.
+    """
+    raw = getattr(output, "segment_generation", None)
+    if raw is None:
+        outputs = getattr(output, "outputs", None)
+        completion = outputs[0] if isinstance(outputs, (list, tuple)) and outputs else None
+        raw = getattr(completion, "segment_generation", None) if completion is not None else None
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None
+    return raw
+
+
 def _talker_output_has_progress(output: object, park_ids: object) -> bool:
     """True when this unparked delta is a new sentence, not a leftover rebroadcast.
 
@@ -458,13 +478,23 @@ def _talker_output_has_progress(output: object, park_ids: object) -> bool:
     return ids[: len(park_ids)] != park_ids
 
 
-def _is_same_park_rebroadcast(output: object, park_ids: object, *, released_at: object) -> bool:
+def _is_same_park_rebroadcast(
+    output: object,
+    park_ids: object,
+    *,
+    park_generation: object,
+    released_at: object,
+) -> bool:
     """True when this 2150 is the previous park replayed, not the next sentence.
 
-    V1 leftovers still carry the parked sentence's ids and arrive in the next
-    polls. MRv2 DELTA often reports ``(2150,)`` for every sentence; those later
-    parks must drain after ``_PARK_REBROADCAST_WINDOW_S``.
+    Segment generation is the identity across the Talker boundary: leftover
+    polls keep the generation we just drained, and the next sentence bumps it
+    even when MRv2 only reports ``(2150,)``. Elapsed time is only a fallback
+    when the poll carried no generation.
     """
+    generation = _talker_park_generation(output)
+    if generation is not None and isinstance(park_generation, int) and not isinstance(park_generation, bool):
+        return generation == park_generation
     if not isinstance(park_ids, tuple) or not park_ids:
         return False
     ids = _talker_park_identity(output)
@@ -496,9 +526,12 @@ def _plan_after_talker_park(
             bridge["releasing"] = False
         return None
     # MRv2 never sends the generating heartbeat that clears ``releasing``.
-    # A new 2150 (ids that are not the previous park replayed) must drain.
+    # A new 2150 (generation or ids that are not the previous park) must drain.
     if bridge.get("releasing") and _is_same_park_rebroadcast(
-        output, bridge.get("park_token_ids"), released_at=bridge.get("park_released_at")
+        output,
+        bridge.get("park_token_ids"),
+        park_generation=bridge.get("park_generation"),
+        released_at=bridge.get("park_released_at"),
     ):
         return None
     request_id = str(getattr(output, "request_id", getattr(req_state, "request_id", "")))
@@ -506,6 +539,7 @@ def _plan_after_talker_park(
     if chunk:
         bridge["releasing"] = True
         bridge["park_token_ids"] = _talker_park_identity(output)
+        bridge["park_generation"] = _talker_park_generation(output)
         bridge["park_released_at"] = time.monotonic()
         bridge["talker_busy"] = True
         enable_talker_streaming(req_state)

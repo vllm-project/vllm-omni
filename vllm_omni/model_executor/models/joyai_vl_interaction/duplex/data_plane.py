@@ -320,22 +320,37 @@ class JoyAIDataPlane(DuplexDataPlane):
                         else item
                         for item in observation.state.observations
                     ]
-                    if observation.query_reference is not None:
+                    if finished and observation.query_reference is not None:
+                        # Streaming deltas used to append this once per token.
+                        # The query window is 16 slots; copies of the current
+                        # answer would evict earlier replies and be rendered
+                        # repeatedly in ``_archived_qa_prefix``.
+                        item_id = f"item_{context.active_response_id}"
                         response = ResponseReference(
-                            f"item_{context.active_response_id}",
+                            item_id,
                             observation.response_time_s,
                             observation.response_frame_id,
                         )
-                        observation.state.queries = [
-                            replace(
-                                query,
-                                responses=(*query.responses, response)[-(RECENT_MESSAGES + SUMMARY_CHUNK_MESSAGES) :],
+                        queries: list[QueryReference] = []
+                        for query in observation.state.queries:
+                            if (query.item_id, query.text_digest) != (
+                                observation.query_reference.item_id,
+                                observation.query_reference.text_digest,
+                            ):
+                                queries.append(query)
+                                continue
+                            if any(item.item_id == item_id for item in query.responses):
+                                queries.append(query)
+                                continue
+                            queries.append(
+                                replace(
+                                    query,
+                                    responses=(*query.responses, response)[
+                                        -(RECENT_MESSAGES + SUMMARY_CHUNK_MESSAGES) :
+                                    ],
+                                )
                             )
-                            if (query.item_id, query.text_digest)
-                            == (observation.query_reference.item_id, observation.query_reference.text_digest)
-                            else query
-                            for query in observation.state.queries
-                        ]
+                        observation.state.queries = queries
                 event["text"] = delta
                 if finished:
                     event["model_context_text"] = spoken
