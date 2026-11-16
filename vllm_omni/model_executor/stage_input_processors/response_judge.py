@@ -24,8 +24,6 @@ from typing import Any
 
 from vllm.logger import init_logger
 
-from vllm_omni.model_executor.models.response_judge.config import laya_question_type
-
 logger = init_logger(__name__)
 
 RESPONSE_JUDGE_STAGE = "response_judge"
@@ -40,6 +38,22 @@ DEFAULT_CHAT_SYSTEM_PROMPT = (
     "或者用户在和身边的其他人说话。"
 )
 DEFAULT_CHAT_USER_TEMPLATE = "对话记录：\n（还没有对话）\n用户刚刚说：「{transcript}」"
+
+LAYA_QTYPES = {"choice": 0, "score": 1, "noul": 2}
+
+
+def laya_question_type(config: object) -> str:
+    model_qtype = getattr(config, "laya_question_type", None)
+    judge = getattr(config, "response_judge", None)
+    judge_qtype = judge.get("question_type") if isinstance(judge, Mapping) else None
+    for value in (model_qtype, judge_qtype):
+        if value is not None and (not isinstance(value, str) or value not in LAYA_QTYPES):
+            raise ValueError("LAYA question_type must be a name: choice, score or noul; integer IDs are not supported")
+    if model_qtype is not None and judge_qtype is not None and model_qtype != judge_qtype:
+        raise ValueError(
+            f"laya_question_type={model_qtype!r} does not match response_judge.question_type={judge_qtype!r}"
+        )
+    return model_qtype or judge_qtype or "choice"
 
 
 @dataclass(frozen=True, slots=True)
@@ -418,9 +432,11 @@ __all__ = [
     "DEFAULT_CHAT_SYSTEM_PROMPT",
     "RESPONSE_JUDGE_STAGE",
     "JudgeSpec",
+    "LAYA_QTYPES",
     "after_judge",
     "asr2judge",
     "default_transcript",
     "judge_input",
     "judge_rejects",
+    "laya_question_type",
 ]
