@@ -374,7 +374,8 @@ class ARDiffusionPagedForwardContext:
             _, pages, length, self.private_slots, self.superpage_fragment_tokens = previous
             return pages, length
 
-        pages, fragments = [], []
+        pages = []
+        fragments: list[int] = []
         sink_page_end = -(-self.sink_tokens // page) * page
         length = 0
         for block, first in sorted(first_position.items(), key=lambda item: item[1]):
@@ -879,7 +880,16 @@ def ar_diffusion_paged_attention(
             softmax_scale=float(softmax_scale),
             causal=causal,
         )
-    elif contiguous_kv_gather_enabled() and block_table.shape[0] == 1:
+    elif block_table.shape[0] == 1 and (
+        contiguous_kv_gather_enabled()
+        or not any(
+            key_cache.shape[1] == size if isinstance(size, int) else key_cache.shape[1] % size.base == 0
+            for size in supported_kernel_block_sizes()
+        )
+    ):
+        # Noisy logical blocks need not match the paged kernel's physical page
+        # alignment. Preserve their exact token layout via the existing gather
+        # view rather than padding between history versions.
         # Experimental (VLLM_OMNI_AR_DIFFUSION_KV_GATHER=1): FA3's paged-KV path with the
         # frame-sized block (1560 tokens, not a multiple of the FA3 K/V tile)
         # runs ~15-17% slower than the same kernel on contiguous K/V. Gather the

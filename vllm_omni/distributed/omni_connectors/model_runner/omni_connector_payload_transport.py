@@ -11,6 +11,7 @@ import os
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
+from copy import copy
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -758,7 +759,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
         self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
 
-    def flush_full_payload_outputs(self, finished_req_ids: set[str]) -> None:
+    def flush_full_payload_outputs(
+        self,
+        finished_req_ids: set[str],
+        *,
+        finished_req_output_token_ids: Mapping[str, list[int]] | None = None,
+    ) -> None:
         """Queue finished results, retaining those under temporary snapshot pressure."""
         # Finished IDs may only appear in one scheduler cycle. Remember them
         # until their result is queued, without sending unfinished accumulators.
@@ -766,9 +772,17 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         for req_id in list(self._pending_full_payload_send):
             if req_id not in self._full_payload_ready_req_ids:
                 continue
-            output = self._materialize_full_payload_entry(self._pending_full_payload_send[req_id])
+            output, request = self._materialize_full_payload_entry(self._pending_full_payload_send[req_id])
+            if finished_req_output_token_ids is not None and req_id in finished_req_output_token_ids:
+                # Give the processor authoritative terminal IDs without
+                # modifying the runner's live cached request or its lists.
+                request = copy(request)
+                request.output_token_ids = list(finished_req_output_token_ids[req_id])
+                request.all_token_ids = list(request.prompt_token_ids or []) + request.output_token_ids
+                # Terminal IDs may only be supplied in this scheduler cycle.
+                self._pending_full_payload_send[req_id] = (output, request)
             try:
-                self.send_full_payload_outputs(scheduler_output=None, outputs={req_id: output})
+                self.send_full_payload_outputs(scheduler_output=None, outputs={req_id: (output, request)})
             except PayloadCapacityError:
                 continue
             # Also consume intentional no-output / return-stage-payload cases.

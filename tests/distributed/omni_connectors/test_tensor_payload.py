@@ -284,6 +284,58 @@ def test_full_payload_retry_survives_request_cleanup(payload_transport, connecto
     assert not transport._ramp_chunk_count
 
 
+@pytest.mark.parametrize("final_ids", [[7, 8], []])
+def test_full_payload_retry_retains_final_token_ids(payload_transport, connector, final_ids):
+    transport = payload_transport
+    request = SimpleNamespace(
+        req_id="req",
+        external_req_id="external",
+        prompt_token_ids=[1, 2],
+        output_token_ids=[-1],
+        all_token_ids=[1, 2, -1],
+    )
+
+    def process(transfer_manager, pooling_output, request):
+        return {
+            **pooling_output,
+            "output_token_ids": request.output_token_ids,
+            "all_token_ids": request.all_token_ids,
+        }
+
+    transport._custom_process_func = process
+    held = connector.prepare_payload({"x": torch.ones(512)})
+    transport.accumulate_full_payload_output("req", {"x": torch.ones(512)}, request)
+    expected_ids = list(final_ids)
+    terminal_ids = {"req": list(final_ids)}
+    transport.flush_full_payload_outputs({"req"}, finished_req_output_token_ids=terminal_ids)
+    assert "req" in transport._pending_full_payload_send
+    assert not transport._pending_save_reqs
+    assert not transport._put_req_chunk
+    assert request.output_token_ids == [-1]
+    assert request.all_token_ids == [1, 2, -1]
+
+    # Neither the scheduler's lists nor the live request may back the retry.
+    terminal_ids["req"].append(99)
+    terminal_ids.clear()
+    request.output_token_ids.append(42)
+    request.all_token_ids.append(42)
+    del held
+    gc.collect()
+    transport.flush_full_payload_outputs(set())
+    task = transport._pending_save_reqs["req"][0]
+    assert task["put_key"] == "external_0_0"
+    assert transport._send_single_request(task)
+    stored = connector._local_buffers[task["put_key"] + "@0_1"][2]
+    result = decode_tensor_payload(stored.tensor)
+    assert result["output_token_ids"] == expected_ids
+    assert result["all_token_ids"] == [1, 2, *expected_ids]
+    assert not transport._pending_full_payload_send
+    assert not transport._full_payload_ready_req_ids
+    transport.flush_full_payload_outputs(set())
+    assert len(transport._pending_save_reqs["req"]) == 1
+    assert transport._put_req_chunk["req"] == 1
+
+
 def test_full_payload_oversized_frame_is_not_retryable(payload_transport):
     transport = payload_transport
     transport.accumulate_full_payload_output("large", {"x": torch.ones(4096)}, None)

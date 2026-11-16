@@ -155,6 +155,8 @@ by `memory_pool_size`. Temporary budget exhaustion raises `PayloadCapacityError`
 (a `MemoryError`) before reserving chunk IDs or delivery tickets. Full-payload
 flushes retain the completed result and retry on later scheduler cycles, even
 when its ID is no longer in `finished_req_ids`, without waiting for capacity.
+Scheduler-provided final token IDs are retained in a request copy for these
+retries, without modifying the runner's live request or the scheduler's lists.
 The retained inputs must remain unchanged until preparation succeeds. A single
 frame larger than the budget raises `MemoryError` and is not retried as temporary
 pressure. Other connectors retain identity preparation.
