@@ -16,6 +16,7 @@ to the attention kernel's accumulation order.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -36,6 +37,40 @@ class PagedKV:
     max_seqlen_k: int
 
 
+def _spec_decode_max_qlen() -> int:
+    raw = os.environ.get("VLLM_XPU_SPEC_DECODE_MAX_QLEN", "16")
+    try:
+        return int(raw)
+    except ValueError:
+        return 16
+
+
+def _xpu_paged_queries(
+    q: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    seqused_k: torch.Tensor,
+    block_table: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor, torch.Tensor]:
+    # Lengths in (1, cutoff] use an XPU spec-decode kernel that does not fall back.
+    batch = cu_seqlens.shape[0] - 1
+    q_len = max_seqlen
+    if batch <= 0 or q_len <= 1 or q_len > _spec_decode_max_qlen() or q.shape[0] != batch * q_len:
+        return q, cu_seqlens, max_seqlen, seqused_k, block_table
+    total = q.shape[0]
+    position = torch.arange(q_len, device=seqused_k.device)
+    seqused = ((seqused_k.reshape(batch, 1) - (q_len - 1 - position).reshape(1, q_len)).clamp_min(1).reshape(total)).to(
+        torch.int32
+    )
+    return (
+        q,
+        torch.arange(total + 1, device=q.device, dtype=torch.int32),
+        1,
+        seqused,
+        block_table.repeat_interleave(q_len, dim=0),
+    )
+
+
 class PackedQwen2:
     """Causal (sliding-window) Qwen2 forward over packed sequences."""
 
@@ -48,10 +83,12 @@ class PackedQwen2:
 
             flash_attn_varlen_func = xpu_ops.flash_attn_varlen_func
             fa_version = 2
+            self._xpu = True
         else:
             from vllm.vllm_flash_attn import flash_attn_varlen_func, is_fa_version_supported
 
             fa_version = 3 if is_fa_version_supported(3) else 2
+            self._xpu = False
 
         cfg = model.config
         self.model = model
@@ -141,15 +178,20 @@ class PackedQwen2:
                 ops.reshape_and_cache_flash(
                     k, v, key_cache, value_cache, kv.slot_mapping, "auto", self._unit_scale, self._unit_scale
                 )
+                query, cu_query, query_len, seqused_k, block_table = (
+                    _xpu_paged_queries(q, cu_seqlens, max_seqlen, kv.seqused_k, kv.block_table)
+                    if self._xpu
+                    else (q, cu_seqlens, max_seqlen, kv.seqused_k, kv.block_table)
+                )
                 attn = self._attn(
-                    q=q,
+                    q=query,
                     k=key_cache,
                     v=value_cache,
-                    max_seqlen_q=max_seqlen,
-                    cu_seqlens_q=cu_seqlens,
+                    max_seqlen_q=query_len,
+                    cu_seqlens_q=cu_query,
                     max_seqlen_k=kv.max_seqlen_k,
-                    seqused_k=kv.seqused_k,
-                    block_table=kv.block_table,
+                    seqused_k=seqused_k,
+                    block_table=block_table,
                     softmax_scale=scale,
                     causal=True,
                     window_size=self.windows[index],
