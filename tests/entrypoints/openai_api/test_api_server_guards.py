@@ -286,7 +286,13 @@ async def test_omni_worker_preserves_cli_cors_policy(
 
     listener = mocker.patch.object(api_server, "serve_http", side_effect=exercise_http)
     sock = _FakeSocket()
-    await api_server.omni_run_server_worker("127.0.0.1:8091", sock, args)
+    root_logger = logging.getLogger()
+    original_level = root_logger.level
+    try:
+        await api_server.omni_run_server_worker("127.0.0.1:8091", sock, args)
+    finally:
+        # Building the real app imports SageMaker standards, which changes root logging.
+        root_logger.setLevel(original_level)
     listener.assert_awaited_once()
     assert sock.closed
 
