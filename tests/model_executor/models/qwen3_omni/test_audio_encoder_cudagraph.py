@@ -23,7 +23,6 @@ from tests.model_executor.models.qwen3_omni.test_vision_encoder_cudagraph import
     _combined,
     _config,
     _images,
-    _runner_factory,
     _thinker,
 )
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
@@ -426,7 +425,7 @@ def test_stage_wrapper_forwards_the_audio_hooks(monkeypatch):
         "get_encoder_cudagraph_path_budgets",
     ):
         assert getattr_static(model, name).__self__ is model.thinker
-    manager = _runner_factory(model, cfg)
+    manager = SingleReplayEncoderCudaGraphManager(cfg, torch.device("cpu"), torch.float32, model)
     assert manager.supports_modality("audio")
     assert manager.path_token_budgets["audio"] == [0, 2, 8]
     assert manager.execute(_audio([5, 9])) is None
