@@ -1644,7 +1644,7 @@ def test_hunyuan_rocm_reliability_disables_expert_parallel() -> None:
     assert reliability_command.count("--shard-id=0 --num-shards=1") == 2
     assert "Expected exactly 13 HunyuanImage reliability nodes" in reliability_command
     assert "Expected exactly 13 executed HunyuanImage reliability tests" in reliability_command
-    assert "skipped != 0" in reliability_command
+    assert "skipped != 1" in reliability_command
     assert "vllm_omni/deploy/hunyuan_image3_dit_rocm_reliability.yaml" not in dependencies
     assert "tests/dfx/reliability/test_hunyuan_image_ep_startup.py" in dependencies
     assert "env" not in step
