@@ -3043,7 +3043,9 @@ class TestBaseConfigInheritance:
         [
             ("rocm", ["0", "1", "1"], 0.3),
             ("cuda", ["0", "1", "2"], 0.4),
-            ("xpu", ["0", "1", "2"], 0.5),
+            # XPU shares the talker card with Code2Wav, as ROCm does, so the CI
+            # deploy fits the two-card agents.
+            ("xpu", ["0", "1", "1"], 0.5),
         ],
     )
     def test_qwen2_5_omni_ci_placement(self, monkeypatch, platform, expected_devices, talker_memory):

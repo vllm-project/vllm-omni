@@ -110,7 +110,6 @@ tests/diffusion/models/hy_nomas/test_ar.py
 tests/diffusion/models/hy_nomas/test_hy_nomas.py
 tests/diffusion/models/hy_nomas/test_native_runtime.py
 tests/diffusion/models/hy_nomas/test_reference_history.py
-tests/diffusion/models/joy_image/test_joy_image.py
 tests/diffusion/models/lingbot_video/test_pipeline_lingbot_video.py
 tests/diffusion/models/lingbot_world/test_lingbot_leased_post_attention.py
 tests/diffusion/models/lingbot_world/test_lingbot_world_transformer.py

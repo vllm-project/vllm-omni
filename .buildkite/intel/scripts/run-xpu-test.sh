@@ -247,10 +247,13 @@ PY
         echo "--- :pytest: ${name}"
         ZE_AFFINITY_MASK="${cards}" timeout -k 30 "${budget}" \
             pytest -v -s --durations=25 "$@" || code=$?
-        # 5 = nothing collected for this marker set, which is not a failure.
-        if [ "${code}" = 0 ] || [ "${code}" = 5 ]; then
+        # Exit 5 means pytest collected nothing. Every stage here selects real
+        # tests, so an empty stage is coverage silently lost - for example a
+        # pinned path that upstream deleted - and it fails like any other.
+        if [ "${code}" = 0 ]; then
             echo "+++ PASS ${name} ($((SECONDS - t0))s)"
         else
+            [ "${code}" = 5 ] && echo "ERROR: stage ${name} collected no tests" >&2
             echo "FAIL ${name} ($((SECONDS - t0))s, rc=${code})"
             rc=1
         fi
@@ -264,7 +267,16 @@ PY
     # not apply to files named explicitly, which is why the exclusions live in
     # the list itself. See the header of both files for the measurements.
     if [ "${run_1card}" = 1 ]; then
-        mapfile -t xpu_path < <(grep -v "^#" .buildkite/intel/xpu-path-tests.txt | grep .)
+        # Upstream deletes test files; one stale path aborts the whole
+        # collection, so drop missing ones loudly instead of failing on them.
+        xpu_path=()
+        while read -r f; do
+            if [ -f "${f}" ]; then
+                xpu_path+=("${f}")
+            else
+                echo "WARNING: ${f} is in xpu-path-tests.txt but no longer exists" >&2
+            fi
+        done < <(grep -v "^#" .buildkite/intel/xpu-path-tests.txt | grep .)
         stage "xpu dispatch (no card)" 6m "${one_card}" -n "${XPU_CPU_WORKERS:-8}" \
             "${xpu_path[@]}" \
             -m "core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
