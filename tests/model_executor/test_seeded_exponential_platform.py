@@ -114,3 +114,24 @@ def test_direct_fill_fallback_preserves_ordered_draws(monkeypatch, rows) -> None
             assert torch.equal(actual_default, expected_default)
     finally:
         torch.cuda.set_rng_state(original_default)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("vocab", [6562, 300_000])
+def test_batched_steps_match_torch_noise_at_each_request_offset(vocab):
+    device = torch.device("cuda")
+    generators = tuple(torch.Generator(device=device).manual_seed(seed) for seed in (42, 42, 2**63 + 5))
+    offsets = (0, 12, 28)
+    for generator, offset in zip(generators, offsets, strict=True):
+        generator.set_offset(offset)
+    references = tuple(generator.clone_state() for generator in generators)
+    actual = torch.empty((3, len(generators), vocab), device=device, dtype=torch.float32)
+
+    increment = seeded_exponential.fill_exponential_steps(actual, generators)
+    assert tuple(generator.get_offset() for generator in generators) == offsets
+    expected = torch.empty_like(actual)
+    for frame in range(actual.shape[0]):
+        for row, reference in enumerate(references):
+            expected[frame, row].exponential_(generator=reference)
+            assert reference.get_offset() == offsets[row] + (frame + 1) * increment
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

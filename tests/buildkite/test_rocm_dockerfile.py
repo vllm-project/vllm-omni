@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -60,12 +62,119 @@ def test_amd_build_uses_registry_cache() -> None:
     template = AMD_TEMPLATE.read_text(encoding="utf-8")
     script_command = '"bash .buildkite/amd/scripts/build-ci-image.sh"'
     script = AMD_BUILD_SCRIPT.read_text(encoding="utf-8")
+    cache_export = script.index("--target deps")
+    image_push = script.index("--target test")
 
     assert template.count(script_command) == 1
     assert "docker buildx build --push" in script
+    assert 'docker buildx imagetools inspect "$CACHE_REF"' in script
     assert '--cache-from "type=registry,ref=${CACHE_REF}"' in script
-    assert '--cache-to "type=registry,ref=${CACHE_REF}' in script
+    assert script.count('--cache-to "type=registry,ref=${CACHE_REF}') == 1
     assert "mode=max" in script
+    assert cache_export < image_push
+    assert "--cache-to" in script[cache_export:image_push]
+    assert "--cache-to" not in script[image_push:]
+
+
+def test_amd_image_publisher_is_serialized_and_bounded() -> None:
+    template = AMD_TEMPLATE.read_text(encoding="utf-8")
+    script = AMD_BUILD_SCRIPT.read_text(encoding="utf-8")
+    build_step = template.split('label: "AMD: :docker: build image"', 1)[1].split("{% for step_group", 1)[0]
+
+    assert "concurrency: 1" in build_step
+    assert 'concurrency_group: "vllm-omni-amd-image-publish"' in build_step
+    assert 'IMAGE_PUSH_TIMEOUT="${AMD_IMAGE_PUSH_TIMEOUT:-15m}"' in script
+    assert 'IMAGE_PUSH_ATTEMPTS="${AMD_IMAGE_PUSH_ATTEMPTS:-2}"' in script
+    assert 'run_with_retry "ROCm CI image push"' in script
+
+
+def _write_executable(path: Path, source: str) -> None:
+    path.write_text(source, encoding="utf-8")
+    path.chmod(0o755)
+
+
+@pytest.mark.parametrize(
+    ("cache_exists", "fail_first_image_push", "expected_targets"),
+    [
+        (True, False, ["test"]),
+        (False, True, ["deps", "test", "test"]),
+    ],
+)
+def test_amd_image_build_cache_and_retry_flow(
+    tmp_path: Path,
+    cache_exists: bool,
+    fail_first_image_push: bool,
+    expected_targets: list[str],
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    docker_log = tmp_path / "docker.log"
+    image_attempts = tmp_path / "image-attempts"
+    _write_executable(
+        fake_bin / "timeout",
+        """#!/usr/bin/env bash
+set -euo pipefail
+while [[ $# -gt 0 && "$1" == --* ]]; do
+    shift
+done
+shift
+exec "$@"
+""",
+    )
+    _write_executable(fake_bin / "sleep", "#!/usr/bin/env bash\nexit 0\n")
+    _write_executable(
+        fake_bin / "docker",
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$FAKE_DOCKER_LOG"
+if [[ "$*" == "buildx imagetools inspect "* ]]; then
+    exit "$FAKE_CACHE_INSPECT_STATUS"
+fi
+if [[ "$*" == *"buildx build"* && "$*" == *"--target test"* ]]; then
+    attempts=0
+    if [[ -f "$FAKE_IMAGE_ATTEMPTS" ]]; then
+        attempts=$(<"$FAKE_IMAGE_ATTEMPTS")
+    fi
+    attempts=$((attempts + 1))
+    printf '%s\n' "$attempts" > "$FAKE_IMAGE_ATTEMPTS"
+    if [[ "$FAKE_FAIL_FIRST_IMAGE_PUSH" == "1" && "$attempts" == "1" ]]; then
+        exit 1
+    fi
+fi
+exit 0
+""",
+    )
+
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        "BUILDKITE_COMMIT": "0123456789abcdef0123456789abcdef01234567",
+        "ROCM_CI_IMAGE_REGISTRY": "example/vllm-omni",
+        "FAKE_DOCKER_LOG": str(docker_log),
+        "FAKE_IMAGE_ATTEMPTS": str(image_attempts),
+        "FAKE_CACHE_INSPECT_STATUS": "0" if cache_exists else "1",
+        "FAKE_FAIL_FIRST_IMAGE_PUSH": "1" if fail_first_image_push else "0",
+    }
+    result = subprocess.run(
+        ["bash", str(AMD_BUILD_SCRIPT)],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    build_calls = [line for line in docker_log.read_text(encoding="utf-8").splitlines() if "buildx build" in line]
+    targets = [line.split("--target ", 1)[1].split()[0] for line in build_calls]
+    assert targets == expected_targets
+    if cache_exists:
+        assert "dependency cache hit; skipping cache export" in result.stdout
+        assert all("--cache-to" not in call for call in build_calls)
+    else:
+        assert "dependency cache miss; exporting dependency layers" in result.stdout
+        assert "--cache-to" in build_calls[0]
+        assert "retrying in 5 seconds" in result.stderr
 
 
 def test_amd_cache_key_tracks_dependency_inputs_and_architecture() -> None:

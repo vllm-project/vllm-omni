@@ -16,7 +16,10 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     CreateAudio,
     OpenAICreateAudioGenerateRequest,
 )
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.entrypoints.openai.stage_params import (
+    get_default_sampling_params_list,
+    resolve_diffusion_sampling_params,
+)
 from vllm_omni.model_extras.registry import get_extra_body_params
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -74,7 +77,9 @@ class OmniOpenAIServingAudioGenerate(OpenAIServing, AudioMixin):
                 prompt["negative_prompt"] = request.negative_prompt
 
             # Build sampling params for diffusion
-            sampling_params_list = [OmniDiffusionSamplingParams(num_outputs_per_prompt=1)]
+            sampling_params_list = [
+                resolve_diffusion_sampling_params(get_default_sampling_params_list(self.engine_client))
+            ]
 
             # Create generator if seed provided
             if request.seed is not None:
@@ -116,7 +121,7 @@ class OmniOpenAIServingAudioGenerate(OpenAIServing, AudioMixin):
                     names = ", ".join(sorted(unsupported))
                     raise ValueError(f"Unsupported model-specific audio parameters: {names}")
                 audio_extra_args.update(request.extra_params)
-            sampling_params_list[0].extra_args = audio_extra_args
+            sampling_params_list[0].extra_args = {**sampling_params_list[0].extra_args, **audio_extra_args}
             if request.frame_rate is not None:
                 sampling_params_list[0].frame_rate = request.frame_rate
 

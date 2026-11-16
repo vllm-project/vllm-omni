@@ -38,9 +38,10 @@ class AudexAdapter(ARTTSAdapter):
     def _get_tokenizer(self):
         """Load and cache the tokenizer used only by the Audex TTS adapter."""
         if self._tokenizer is None:
-            from transformers import AutoTokenizer
-
-            from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
+            from vllm_omni.model_executor.models.audex.checkpoint import (
+                ensure_audex_snapshot,
+                load_audex_tokenizer,
+            )
 
             stage_config = self.ctx.server._tts_stage
             topology = getattr(stage_config, "stage_pipeline_config", None)
@@ -50,13 +51,15 @@ class AudexAdapter(ARTTSAdapter):
             profile, folder = (
                 ("full", "checkpoint_folder_full") if stage == "audex_omni" else ("tts", "checkpoint_folder_audiogen")
             )
-            model_path = os.path.normpath(self.ctx.engine_client.model_config.model)
+            engine_client = self.ctx.engine_client
+            assert engine_client is not None
+            model_path = os.path.normpath(engine_client.model_config.model)
             root = (
                 os.path.dirname(model_path)
                 if os.path.basename(model_path).startswith("checkpoint_folder")
                 else ensure_audex_snapshot(model_path, profile=profile)
             )
-            self._tokenizer = AutoTokenizer.from_pretrained(os.path.join(root, folder))
+            self._tokenizer = load_audex_tokenizer(os.path.join(root, folder))
         return self._tokenizer
 
     @classmethod

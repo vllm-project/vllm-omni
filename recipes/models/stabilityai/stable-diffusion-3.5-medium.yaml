@@ -111,17 +111,24 @@ guide: |
 
   ```python
   from vllm_omni.entrypoints.omni import Omni
+  from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
   omni = Omni(model="stabilityai/stable-diffusion-3.5-medium")
 
-  images = omni.generate(
-      prompt="a cat wearing sunglasses, cyberpunk style",
-      negative_prompt="blurry, low quality",
-      height=1024, width=1024,
-      num_inference_steps=28,
-      guidance_scale=7.5,
-      num_outputs_per_prompt=2,
+  outputs = omni.generate(
+      {
+          "prompt": "a cat wearing sunglasses, cyberpunk style",
+          "negative_prompt": "blurry, low quality",
+      },
+      OmniDiffusionSamplingParams(
+          height=1024,
+          width=1024,
+          num_inference_steps=28,
+          guidance_scale=7.5,
+          num_outputs_per_prompt=2,
+      ),
   )
+  images = outputs[0].images
   ```
 
   ## CLI Usage
