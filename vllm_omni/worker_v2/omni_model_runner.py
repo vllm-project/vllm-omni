@@ -112,6 +112,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     _kstep_frames: int = 0
     _last_aux_output: Any
     _last_multimodal_outputs: dict[str, Any] | None
+    _model_returns_tuple: bool
     _model_has_structured_output: bool
     # FULL-graph aux-output contract (see _configure_cudagraph_output_contract).
     _full_graph_aux_outputs = False
@@ -132,9 +133,9 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     def _aux_hidden_state_contract_conflicts(self) -> bool:
         """Whether a target-hidden-layer drafter conflicts with the model output.
 
-        ``_returns_tuple`` is the forward's tuple-output slot contract. A model
-        that only sets ``have_multimodal_outputs`` returns ``OmniOutput`` and
-        keeps its auxiliary state separately, so it is not a conflict.
+        ``_returns_tuple`` declares a model-owned auxiliary tuple. The
+        drafter-owned ``(hidden, aux layers)`` tuple is managed separately by
+        upstream MRv2 and must remain available to speculative decoding.
         """
         return bool(
             self.use_aux_hidden_state_outputs
