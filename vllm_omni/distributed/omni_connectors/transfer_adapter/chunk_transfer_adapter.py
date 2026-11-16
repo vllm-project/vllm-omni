@@ -140,6 +140,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     def __init__(self, vllm_config: Any):
         model_config = vllm_config.model_config
+        spec_config = getattr(vllm_config, "speculative_config", None)
+        self.uses_dflash = spec_config is not None and spec_config.use_dflash()
         # The base constructor starts the save thread, so sender-generation
         # state must exist before it can observe an enqueued task. The global
         # lock only protects this map and short state transitions. Slow payload

@@ -4758,33 +4758,55 @@ def test_diffusion_params_carry_the_sample_count(n: int, per_sample_kv: bool, co
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("resumable", "model_type", "method", "accepted"),
+    ("resumable", "model_type", "method", "final_stage_id", "async_chunk", "runner", "accepted"),
     [
-        (True, "qwen3_omni_moe", "dflash", False),
-        (False, "qwen3_omni_moe", "dflash", True),
-        (True, "qwen3_omni_moe", None, True),
-        (True, "qwen3_omni_moe", "mtp", True),
-        (True, "other_model", "dflash", True),
+        (True, "qwen3_omni_moe", "dflash", 1, False, "v1", False),
+        (True, "qwen3_omni_moe", "dflash", 1, True, "v1", True),
+        (True, "qwen3_omni_moe", "dflash", 1, True, "v2-scheduler", True),
+        (True, "qwen3_omni_moe", "dflash", 1, True, "v2-native", True),
+        (True, "qwen3_omni_moe", "dflash", 1, True, "v2-mixed", False),
+        (True, "qwen3_omni_moe", "dflash", 0, False, "v1", True),
+        (False, "qwen3_omni_moe", "dflash", 1, False, "v1", True),
+        (True, "qwen3_omni_moe", None, 1, False, "v1", True),
+        (True, "qwen3_omni_moe", "mtp", 1, False, "v1", True),
+        (True, "other_model", "dflash", 1, False, "v1", True),
     ],
 )
-async def test_add_request_rejects_qwen3_omni_dflash_resumable_input(
-    mocker, resumable: bool, model_type: str, method: str | None, accepted: bool
+async def test_qwen3_omni_dflash_resumable_admission(
+    mocker,
+    resumable: bool,
+    model_type: str,
+    method: str | None,
+    final_stage_id: int,
+    async_chunk: bool,
+    runner: str,
+    accepted: bool,
 ) -> None:
     pool = StagePool(
         0,
         FakeStageClient(),
         stage_vllm_config=SimpleNamespace(
-            model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type)),
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(model_type=model_type),
+                use_v2_model_runner=runner.startswith("v2"),
+                supports_native_mrv2_data_plane=runner in {"v2-native", "v2-mixed"},
+                async_chunk=async_chunk,
+            ),
             speculative_config=SimpleNamespace(use_dflash=lambda: method == "dflash") if method else None,
         ),
+    )
+    downstream_config = (
+        SimpleNamespace(model_config=pool.stage_vllm_config.model_config) if runner == "v2-native" else None
     )
     output_queue: asyncio.Queue = asyncio.Queue()
     orchestrator = Orchestrator(
         request_async_queue=asyncio.Queue(),
         output_async_queue=output_queue,
         rpc_async_queue=asyncio.Queue(),
-        stage_pools=[pool],
+        stage_pools=[pool, StagePool(1, FakeStageClient(), stage_vllm_config=downstream_config)],
+        async_chunk=async_chunk,
     )
+    mocker.patch.object(orchestrator, "_prewarm_async_chunk_stages", new_callable=mocker.AsyncMock)
     dispatch = mocker.patch.object(pool, "submit_initial", new_callable=mocker.AsyncMock, return_value=0)
     await orchestrator._handle_add_request(
         StageSubmissionMessage(
@@ -4793,16 +4815,16 @@ async def test_add_request_rejects_qwen3_omni_dflash_resumable_input(
             prompt=SimpleNamespace(sampling_params=SamplingParams(), resumable=resumable),
             original_prompt={},
             output_prompt_text=None,
-            sampling_params_list=[SamplingParams()],
-            final_stage_id=0,
+            sampling_params_list=[SamplingParams(), SamplingParams()],
+            final_stage_id=final_stage_id,
             preprocess_ms=0,
             request_timestamp=0,
             enqueue_ts=0,
         )
     )
     if accepted:
+        assert output_queue.empty(), output_queue.get_nowait()
         dispatch.assert_awaited_once()
-        assert output_queue.empty()
     else:
         dispatch.assert_not_awaited()
         error = output_queue.get_nowait()

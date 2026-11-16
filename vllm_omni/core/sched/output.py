@@ -131,6 +131,17 @@ class OmniRequestPrewarm:
 
 
 @dataclass
+class OmniChunkCommit:
+    """Scheduler decision for one worker-owned resumable output."""
+
+    request_id: str
+    token_ids: list[int]
+    segment_finished: bool = False
+    request_finished: bool = False
+    discard: bool = False
+
+
+@dataclass
 class OmniSchedulerOutput(SchedulerOutput):
     """Scheduler output with omni-specific transfer metadata."""
 
@@ -141,3 +152,5 @@ class OmniSchedulerOutput(SchedulerOutput):
     data_plane_terminal_req_ids: set[str] = field(default_factory=set)
     input_terminal_req_ids: set[str] = field(default_factory=set)
     pending_request_prewarms: list[OmniRequestPrewarm] = field(default_factory=list)
+    chunk_commits: list[OmniChunkCommit] = field(default_factory=list)
+    resume_chunk_receivers: set[str] = field(default_factory=set)

@@ -505,15 +505,15 @@ EAGLE3, `extract_hidden_states`, and missing DFlash layer IDs fail at model load
 DFlash also requires `pipeline_parallel_size=1` and rejects larger values
 before loading Thinker weights: upstream only configures its auxiliary captures
 on the last pipeline rank, so earlier ranks cannot supply the required tensors.
-DFlash speech support is limited to MRv1 with an eager Thinker and drafter;
-the service validation uses TP=2 and PP=1 on CUDA. CUDA Graph DFlash speech is outside
-the supported scope because the graph experiment has an unresolved speech
-ASR regression, even with custom all-reduce disabled. Default custom-all-reduce
-graph startup also failed in the pinned upstream runtime. See the
+DFlash speech uses an eager Thinker and drafter. The MRv1 service validation
+uses TP=2 and PP=1 on CUDA. The MRv2 integration smoke test uses TP=1 and PP=1.
+CUDA Graph DFlash speech is outside the supported scope because the graph
+experiment has an unresolved speech ASR regression, even with custom
+all-reduce disabled. Default custom-all-reduce graph startup also failed in
+the pinned upstream runtime. See the
 [user-facing configuration requirements](../../user_guide/examples/online_serving/qwen3_omni.md#experimental-dflash-thinker-decoding)
-and [validation evidence](../qwen3_omni_dflash_validation.md). Neither eager nor
-graph results establish strict greedy equivalence, MRv2 support, or support
-for other hardware backends.
+and [MRv1 validation evidence](../qwen3_omni_dflash_validation.md). These runs
+do not establish strict greedy equivalence or support for other hardware backends.
 
 When the output processor accumulates full payloads, `meta.decode_span`,
 `meta.consumed_input_span`, and `meta.committed_token_count` retain the latest
@@ -529,11 +529,17 @@ A marker at the first generated position releases any withheld prompt prefill
 without appending a generated embedding; connector terminal markers still
 follow the normal completion path.
 
-Qwen3-Omni with DFlash currently rejects resumable (streaming-input) requests
-at orchestrator admission with a request-local 400 error. Its multi-token
-payload spans do not yet support the Talker's resumable segment handling.
-Use non-resumable requests, or disable DFlash for streaming input. This
-restriction applies with either synchronous or asynchronous materialization.
+Thinker-only Qwen3-Omni requests can use DFlash with resumable
+(streaming-input) requests. The scheduler discards late drafts from the
+previous segment before admitting the next prompt. With the default
+Qwen3-Omni pipeline on MRv2, workers retain completed step payloads until the
+scheduler returns the accepted token IDs and segment decision. The native
+connector sends those payloads in order. A segment marker stops input polling
+until the receiver processes the segment, so the next Talker prompt and
+Code2Wav chunk cannot overwrite unconsumed data. Resumable DFlash speech uses
+`async_chunk: true`, synchronous AR scheduling, and disabled Thinker prefix
+caching. The optional `qwen3_omni_moe_resumable` pipeline uses scheduler-owned
+chunk transfer with MRv2 runners.
 
 An unsupported combination does not prevent serving; it only falls back to
 synchronous output construction for that stage. CUDA and ROCm are the validated

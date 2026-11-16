@@ -399,14 +399,24 @@ The gradio script supports the following arguments:
 
 ## Experimental DFlash Thinker decoding
 
-DFlash integration currently covers CUDA model runner v1 (MRv1), with an
-ordinary, non-speculative Talker and Code2Wav. The default deployment above
-uses MRv2 and is not the validated DFlash configuration. When configuring
-DFlash, explicitly select `model_runner: v1`, disable Thinker prefix caching
-(`enable_prefix_caching: false` on stage 0), and use non-resumable requests.
-Set stage 0 `pipeline_parallel_size: 1`: DFlash with pipeline parallelism is
-rejected before loading the Thinker weights because auxiliary captures are
-not configured on every pipeline rank. Tensor parallelism remains supported.
+DFlash runs on the Thinker. Talker and Code2Wav use their ordinary execution
+paths. For CUDA MRv2 resumable speech through the Python streaming-input API,
+use the standard Qwen3-Omni pipeline with these deploy settings:
+
+```yaml
+model_runner: v2
+async_chunk: true
+```
+
+Use `async_scheduling: false` on the AR stages, disable Thinker prefix
+caching with `enable_prefix_caching: false`, and set
+`pipeline_parallel_size: 1`. DFlash requires PP=1 because auxiliary captures
+are configured on the last pipeline rank. The native MRv2 resume smoke test
+uses TP=1. Its worker-owned connectors carry the payloads after the
+scheduler confirms committed tokens and segment boundaries.
+The `qwen3_omni_moe_resumable` pipeline is also available for deployments
+that use scheduler-managed chunk transfer with MRv2. For an MRv1 deployment,
+use the standard pipeline with `model_runner: v1`.
 
 For DFlash speech output, set stage 0 `enforce_eager: true` and
 `speculative_config.enforce_eager: true` so both the target Thinker and the
@@ -422,12 +432,11 @@ graph memory profiling before the service becomes ready. Eager execution
 of both target and drafter avoids that graph startup path. These settings
 are deployment requirements; the model does not enforce them at admission.
 
-Eager execution also does not establish strict greedy equivalence:
-baseline/DFlash token differences remain unexplained. Treat this integration
-as experimental, and do not infer speech quality or output equivalence from
-successful requests or throughput alone. See the
+In the controlled MRv1 Thinker tests, batch-shape-dependent target numerics
+accounted for the reproduced greedy token differences. Those checks covered
+text output. See the
 [validation results and limitations](../../../design/qwen3_omni_dflash_validation.md)
-for the tested configuration, accuracy evidence, and separate eager/graph
+for the tested configurations, accuracy evidence, and separate eager/graph
 performance results.
 
 ## Example materials

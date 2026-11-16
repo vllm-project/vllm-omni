@@ -262,3 +262,13 @@ def test_eager_output_is_token_major_with_invalid_rows():
     assert mm["codes"]["audio"].shape == (4, _Q)
     assert mm["meta"]["codec_frame_valid"].tolist() == [0, 0, 0, 0]
     assert out.text_hidden_states is hidden
+
+
+def test_v1_resumable_speculative_span_uses_pending_queue():
+    model = _talker()
+    model.vllm_config.model_config.use_v2_model_runner = False
+    payload = {
+        "embed": {"cached_decode": _rows(1, 2), "decode": _rows(3, 4)},
+        "meta": {"resumable": True, "decode_span": True, "num_processed_tokens": 20},
+    }
+    assert [_step(model, payload)[0].item() for _ in range(6)] == [1, 2, 3, 4, -1, -2]

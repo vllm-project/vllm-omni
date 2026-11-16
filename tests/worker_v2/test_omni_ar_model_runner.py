@@ -586,6 +586,62 @@ def test_build_async_chunk_outputs_slices_padded_axis_and_splits_channels() -> N
     assert client is None and torch.equal(inter_stage[0]["codes.audio"], req_codes[0])
 
 
+@pytest.mark.cpu
+def test_scheduler_dflash_payload_preserves_prefill_and_committed_decode_rows(monkeypatch):
+    from vllm_omni.model_executor.models.qwen3_omni.speculative_payload import (
+        apply_speculative_payload,
+        finalize_speculative_payload,
+        prepare_speculative_payload,
+    )
+
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    rows = torch.arange(5).reshape(5, 1)
+    batch = SimpleNamespace(
+        num_reqs=2,
+        query_start_loc_np=np.array([0, 2, 5]),
+        num_scheduled_tokens=np.array([2, 3]),
+        num_tokens_after_padding=5,
+    )
+    sampled = torch.tensor([[11, -1, -1], [23, 29, -1]])
+    staged = prepare_speculative_payload(
+        multimodal_outputs={"hidden_states": {"layers": {0: rows, 24: rows + 100}}},
+        req_ids=["prefill", "decode"],
+        speculative_request_ids=set(),
+        invalid_req_indices=(),
+        sampled_token_ids=sampled,
+        input_token_ids=torch.tensor([1, 2, 19, 23, 99]),
+        input_positions=torch.tensor([0, 1, 2, 3, 4]),
+        query_start_loc=batch.query_start_loc_np,
+        prompt_lens=[2, 2],
+        vocab_size=100,
+        consumed_input_span=False,
+        embed_input_ids=lambda ids: ids.unsqueeze(1),
+    )
+
+    def finalize(snapshot, _):
+        return finalize_speculative_payload(snapshot)
+
+    output = _async_output(
+        req_ids=("prefill", "decode"),
+        sampler_output=SamplerOutput(sampled, None, None, torch.tensor([1, 2]), torch.tensor([0, 1])),
+        num_sampled_tokens=torch.tensor([1, 2]),
+        num_rejected_tokens=torch.tensor([0, 1]),
+        input_batch=batch,
+        multimodal_outputs=staged,
+        async_chunk=True,
+        finalize_multimodal=finalize,
+        finalize_pooler_payload=apply_speculative_payload,
+    ).get_output()
+    prefill, decode = output.inter_stage_outputs
+    assert prefill["hidden_states.layer_0"].flatten().tolist() == [0, 1]
+    assert prefill["hidden_states.layer_24"].flatten().tolist() == [100, 101]
+    assert decode["hidden_states.layer_0"].flatten().tolist() == [19, 23, 29]
+    assert decode["ids.output"] == [19, 23, 29]
+    assert decode["meta.committed_token_count"] == 3
+    assert "hidden_states.layer_24" not in decode
+    assert "_thinker_speculative_payload" not in prefill and "_thinker_speculative_payload" not in decode
+
+
 @pytest.mark.parametrize("include_hidden", [False, True])
 @pytest.mark.parametrize("async_chunk", [False, True])
 @pytest.mark.parametrize(

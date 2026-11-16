@@ -1366,6 +1366,11 @@ class Qwen3OmniMoeForConditionalGeneration(
         except Exception:
             pass
         update_dict.setdefault("meta", {})["prefill_consumed_text_tokens"] = 1
+        if meta.get("resumable") and meta.get("decode_span") and start_index == 0:
+            # The first prefill step starts a fresh text queue for this segment.
+            embed = {**embed, "cached_decode": None}
+            update_dict.setdefault("embed", {})["cached_decode"] = None
+            update_dict.setdefault("meta", {})["eos_emitted"] = False
         self._talker_cache_thinker_decode_embeds(embed, update_dict)
 
         return req_input_ids[start_index:end_index], req_embeds[start_index:end_index], update_dict
@@ -1506,8 +1511,9 @@ class Qwen3OmniMoeForConditionalGeneration(
         use_v2_model_runner = getattr(self.vllm_config.model_config, "use_v2_model_runner", False)
         queue_started = meta.get("decode_span_queue_started", False)
         queued_decode = use_v2_model_runner or meta.get("decode_span", False) or queue_started
-        if queued_decode and not meta.get("resumable", False):
-            if not use_v2_model_runner and not queue_started:
+        resumable = meta.get("resumable", False)
+        if queued_decode and (not resumable or meta.get("decode_span", False)):
+            if not resumable and not use_v2_model_runner and not queue_started:
                 # MRv1's indexed cache retains consumed rows. Convert it to a
                 # pending-only queue once, when the first speculative span
                 # arrives; later chunks must not trim the pending rows again.

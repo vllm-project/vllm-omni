@@ -41,7 +41,10 @@ from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequest, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
-from vllm_omni.core.sched.omni_scheduling_coordinator import uses_native_mrv2_data_plane
+from vllm_omni.core.sched.omni_scheduling_coordinator import (
+    uses_native_mrv2_data_plane,
+    uses_native_qwen3_omni_resumable,
+)
 from vllm_omni.data_entry_keys import (
     ASYNC_CHUNK_PREWARM_NS,
     FIRST_AUDIO_KEY,
@@ -2288,6 +2291,16 @@ class OrchestratorBase:
                 ]
             )
 
+    def _diffusion_params_for_samples(self, req_state: OrchestratorRequestState, src_stage_id: int, params: Any) -> Any:
+        """Tell the diffusion stage how many per-sample KV caches to receive."""
+        params = _without_per_sample_kv_count(params)
+        n = getattr(req_state.sampling_params_list[src_stage_id], "n", 1) or 1
+        if n <= 1 or not self.stage_pools[src_stage_id].per_sample_kv:
+            return params
+        params = copy.copy(params)
+        params.extra_args = {**(params.extra_args or {}), PER_SAMPLE_KV_COUNT_KEY: n}
+        return params
+
     def _maybe_clone_diffusion_params_for_cfg(self, request_id: str, params: Any) -> Any:
         """Attach CFG companion ids to diffusion sampling params when needed."""
         companion_request_ids = self._cfg_tracker.get_companion_request_ids(request_id)
@@ -3964,16 +3977,6 @@ class Orchestrator(OrchestratorBase):
         max_num_seqs = getattr(scheduler_config, "max_num_seqs", None)
         return float("inf") if max_num_seqs is None else int(max_num_seqs)
 
-    def _diffusion_params_for_samples(self, req_state: OrchestratorRequestState, src_stage_id: int, params: Any) -> Any:
-        """Tell the diffusion stage how many per-sample KV caches to receive."""
-        params = _without_per_sample_kv_count(params)
-        n = getattr(req_state.sampling_params_list[src_stage_id], "n", 1) or 1
-        if n <= 1 or not self.stage_pools[src_stage_id].per_sample_kv:
-            return params
-        params = copy.copy(params)
-        params.extra_args = {**(params.extra_args or {}), PER_SAMPLE_KV_COUNT_KEY: n}
-        return params
-
     async def _handle_add_request(self, msg: StageSubmissionMessage) -> None:
         """Handle an add_request message from the main thread."""
         stage_id = msg.entry_stage_id
@@ -4003,27 +4006,56 @@ class Orchestrator(OrchestratorBase):
             return
 
         if getattr(prompt, "resumable", False):
-            for active_stage_id in range(stage_id, min(final_stage_id, len(self.stage_pools) - 1) + 1):
-                vllm_config = getattr(self.stage_pools[active_stage_id], "stage_vllm_config", None)
-                model_config = getattr(vllm_config, "model_config", None)
-                hf_config = getattr(model_config, "hf_config", None)
-                spec_config = getattr(vllm_config, "speculative_config", None)
-                if (
-                    getattr(hf_config, "model_type", None) == "qwen3_omni_moe"
-                    and spec_config is not None
-                    and spec_config.use_dflash()
-                ):
+            active_configs = [
+                getattr(self.stage_pools[index], "stage_vllm_config", None)
+                for index in range(stage_id, min(final_stage_id + 1, len(self.stage_pools)))
+            ]
+            entry_spec_config = getattr(active_configs[0], "speculative_config", None)
+            native_resume = (
+                entry_spec_config is not None
+                and entry_spec_config.use_dflash()
+                and all(
+                    uses_native_qwen3_omni_resumable(getattr(config, "model_config", None))
+                    and not getattr(getattr(config, "scheduler_config", None), "async_scheduling", False)
+                    for config in active_configs
+                )
+            )
+            # Thinker-only requests have no cross-stage speech spans.
+            if final_stage_id > stage_id:
+                for active_stage_id in range(stage_id, min(final_stage_id, len(self.stage_pools) - 1) + 1):
+                    vllm_config = getattr(self.stage_pools[active_stage_id], "stage_vllm_config", None)
+                    model_config = getattr(vllm_config, "model_config", None)
+                    hf_config = getattr(model_config, "hf_config", None)
+                    spec_config = getattr(vllm_config, "speculative_config", None)
+                    if getattr(hf_config, "model_type", None) != "qwen3_omni_moe":
+                        continue
+                    if spec_config is None or not spec_config.use_dflash():
+                        continue
+                    if (
+                        self.async_chunk
+                        and active_stage_id == stage_id
+                        and (
+                            native_resume
+                            or not uses_native_mrv2_data_plane(
+                                model_config,
+                                use_v2_model_runner=bool(getattr(model_config, "use_v2_model_runner", False)),
+                            )
+                        )
+                        and not getattr(getattr(vllm_config, "scheduler_config", None), "async_scheduling", False)
+                        and not getattr(getattr(vllm_config, "cache_config", None), "enable_prefix_caching", False)
+                        and self._stage_receives_async_chunks(stage_id + 1)
+                    ):
+                        continue
                     await self._fail_request_client_error(
                         request_id,
                         stage_id,
                         f"streaming (resumable) input is not supported with Qwen3-Omni DFlash on stage "
-                        f"{active_stage_id}; disable DFlash for streaming input or use a non-resumable request",
+                        f"{active_stage_id} in this configuration; speech requires async_chunk, "
+                        "synchronous Thinker scheduling and disabled Thinker prefix caching",
                     )
                     return
             mrv2_stage_id = self._native_mrv2_receiver_stage(final_stage_id)
-            if mrv2_stage_id is not None:
-                # Streaming-input sessions replace downstream prompts through
-                # the V1 chunk adapter, which MRv2's native data plane lacks.
+            if mrv2_stage_id is not None and not native_resume:
                 await self._fail_request_client_error(
                     request_id,
                     stage_id,

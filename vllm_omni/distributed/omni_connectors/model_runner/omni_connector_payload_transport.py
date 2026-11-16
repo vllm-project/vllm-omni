@@ -67,6 +67,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
     """Own payload caching, full/chunk transport, and connector I/O."""
 
     _full_payload_replace_keys_cached: frozenset[str]
+    _paused_chunk_receivers: set[str]
 
     # ------------------------------------------------------------------ #
     #  Local payload cache (RFC §2.4 – Model Runner ownership)
@@ -109,6 +110,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
     # ------------------------------------------------------------------ #
 
     _NON_CONSUMABLE_PAYLOAD_KEYS: set[tuple[str, str]] = {
+        ("meta", "is_segment_finished"),
+        ("meta", "replace_streaming_prompt"),
         ("meta", "finished"),
         ("meta", "override_keys"),
         ("meta", "next_stage_prompt_len"),
@@ -127,6 +130,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         if isinstance(value, (list, tuple, dict, set)):
             return len(value) > 0
         return True
+
+    @staticmethod
+    def _payload_segment_finished(payload: Any) -> bool:
+        meta = payload.get("meta") if isinstance(payload, dict) else None
+        flag = meta.get("is_segment_finished", False) if isinstance(meta, dict) else False
+        return bool(flag)
 
     @staticmethod
     def _payload_finished(payload: Any) -> bool:
@@ -909,7 +918,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             if request_id in self._stage_recv_req_ids:
                 return
             # Don't re-register if the finish sentinel was already received
-            if request_id in self._chunk_stream_completed:
+            if request_id in self._chunk_stream_completed or request_id in getattr(self, "_paused_chunk_receivers", ()):
                 return
             if isinstance(request.payload_sender_info, bytes):
                 # The payload came on the request: stage it as if fetched, on the rank that fetches.
@@ -1271,11 +1280,18 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
         if self._async_chunk:
             is_finished = self._payload_finished(payload_data)
+            segment_finished = getattr(self, "_native_resumable", False) and self._payload_segment_finished(
+                payload_data
+            )
             incoming_payload_consumable = self._payload_is_consumable(payload_data)
+            incoming_meta = payload_data.get("meta", {}) if isinstance(payload_data, dict) else {}
+            replace_prompt = bool(
+                getattr(self, "_native_resumable", False) and incoming_meta.get("replace_streaming_prompt")
+            )
 
             if self._model_mode != "ar":
                 new_ids = self._payload_audio_codes(payload_data)
-                if not self._payload_value_has_content(new_ids) and not is_finished:
+                if not self._payload_value_has_content(new_ids) and not (is_finished or segment_finished):
                     return False
                 payload_consumable = self._payload_is_consumable(payload_data)
 
@@ -1291,6 +1307,9 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     # before the recv thread publishes it to the local cache.
                     payload_data = self._accumulate_payload(external_req_id, payload_data)
                     payload_consumable = incoming_payload_consumable
+                if segment_finished:
+                    self._paused_chunk_receivers.add(req_id)
+                    self._pending_load_reqs.pop(req_id, None)
                 if is_finished:
                     self._chunk_finished_req_ids.add(req_id)
                     self._chunk_stream_completed.add(req_id)
@@ -1303,14 +1322,36 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 else:
                     self._local_stage_payload_cache[req_id] = payload_data
                 self._async_chunk_updated_req_ids.add(req_id)
-                update = self._extract_scheduling_metadata_update(self._local_stage_payload_cache[req_id])
+                metadata_payload = (
+                    payload_data
+                    if self._model_mode != "ar" or not getattr(self, "_native_resumable", False)
+                    else {"meta": incoming_meta}
+                )
+                update = self._extract_scheduling_metadata_update(metadata_payload)
+                if segment_finished or replace_prompt:
+                    update = replace(
+                        update or SchedulingMetadataUpdate(),
+                        segment_finished=segment_finished,
+                        replace_prompt=replace_prompt,
+                    )
+                if (
+                    getattr(self, "_native_resumable", False)
+                    and self._model_mode != "ar"
+                    and (is_finished or segment_finished)
+                    and not payload_consumable
+                ):
+                    # A boundary-only message must retire without decoding a dummy codec frame.
+                    update = replace(update or SchedulingMetadataUpdate(), prompt_token_ids=())
                 if update is not None:
+                    previous = self._local_request_metadata.get(req_id)
+                    if previous is not None and previous.replace_prompt:
+                        update = replace(update, replace_prompt=True, resize_prompt_to=previous.resize_prompt_to)
                     self._local_request_metadata[req_id] = update
                 # A finish-only sentinel still needs one terminal wake-up so
                 # the downstream stage can sync the merged local payload and
                 # flush/finish even when the last recv carries no new
                 # consumable chunk bytes.
-                if payload_consumable or is_finished:
+                if payload_consumable or is_finished or segment_finished:
                     self._finished_load_reqs.add(req_id)
                 if is_finished and not payload_consumable:
                     logger.debug(
@@ -1343,7 +1384,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 type(engine_inputs).__name__,
             )
 
-        if publish_ready and self._async_chunk and (payload_consumable or is_finished):
+        if publish_ready and self._async_chunk and (payload_consumable or is_finished or segment_finished):
             self.publish_omni_connector_output_to_sink()
         logger.debug("[Stage-%s] Received data for key %s", self._stage_id, connector_get_key)
         return True
@@ -1392,6 +1433,11 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 if propagate_errors:
                     raise
 
+        if request is not None and hasattr(request, "is_segment_finished"):
+            if supports_is_finished is not False:
+                kwargs["is_finished"] = kwargs.get("is_finished", False) or request.is_segment_finished
+            if "new_token_ids" in inspect.signature(self._custom_process_func).parameters:
+                kwargs["new_token_ids"] = request.sampled_token_ids
         try:
             return self._custom_process_func(**kwargs)
         except TypeError as exc:
@@ -1718,11 +1764,30 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         is_finished = getattr(request, "is_finished", None)
         return bool(is_finished()) if callable(is_finished) else False
 
+    def _annotate_resumable_chunk(self, request: Any, payload: Any) -> dict | None:
+        from vllm_omni.data_entry_keys import OmniPayloadStruct, to_dict
+
+        finished = self._request_is_finished(request)
+        segment_finished = request.is_segment_finished
+        if payload is None and not (finished or segment_finished):
+            return None
+        if isinstance(payload, OmniPayloadStruct):
+            payload = to_dict(payload)
+        payload = dict(payload or {})
+        payload["meta"] = {**payload.get("meta", {}), "finished": finished, "is_segment_finished": segment_finished}
+        return payload
+
     def _publish_chunk_cohort(self, entries: list[tuple[Any, Any]], *, wait_for_delivery: bool) -> int:
         # A request's last chunk must carry its finish marker even when the
         # processor has nothing left to send (e.g. its frames ended exactly on
         # a chunk boundary), as the V1 chunk adapter guarantees; otherwise the
         # receiver waits for input until its deadline.
+        entries = [
+            (request, self._annotate_resumable_chunk(request, payload))
+            if hasattr(request, "is_segment_finished")
+            else (request, payload)
+            for request, payload in entries
+        ]
         entries = [
             (request, payload if payload is not None else self._finish_marker_payload())
             for request, payload in entries

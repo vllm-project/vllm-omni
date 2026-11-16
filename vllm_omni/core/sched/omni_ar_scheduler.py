@@ -27,6 +27,7 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer, set_request_perf_chunk
 from vllm_omni.core.sched.fast_allocate import install_decode_allocate_fast_path
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.core.sched.output import OmniChunkCommit
 from vllm_omni.core.sched.utils import (
     free_kv_blocks_in_physical_order,
 )
@@ -43,6 +44,7 @@ class _ChunkSaveKwargs(TypedDict, total=False):
     confirmed_num_computed_tokens: int | None
     duplex_perf_chunk: tuple[int, int]
     segment_generation: int | None
+    force_request_finished: bool
 
 
 def _should_emit_engine_output(
@@ -535,7 +537,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.num_spec_tokens,
         ).tolist()
 
-    def update_draft_token_ids(self, draft_token_ids) -> None:
+    def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
         """Align the per-request draft buffers before the next schedule().
 
         Upstream writes each request's drafts independently, so a request
@@ -557,6 +559,21 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 draft_token_ids.req_ids,
                 [self._propose_scheduler_ngram(req_id) for req_id in draft_token_ids.req_ids],
             )
+        for req_id, drafts in zip(draft_token_ids.req_ids, draft_token_ids.draft_token_ids):
+            request = self.requests.get(req_id)
+            if (
+                drafts
+                and request is not None
+                and request.resumable
+                and (
+                    request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+                    or request.num_computed_tokens < request.num_prompt_tokens
+                )
+            ):
+                # post_step can return drafts after update_from_output already
+                # ended this segment and installed the next prompt. Never
+                # let those drafts become lookahead for the new segment.
+                drafts.clear()
         super().update_draft_token_ids(draft_token_ids)
         if not self._talker_kstep_armed():
             return
@@ -950,6 +967,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             or spec_decode_tokens
             or getattr(self, "kv_transfer_criteria", None)
             or self.chunk_transfer_adapter is not None
+            or getattr(self, "_native_resumable", False)
             or getattr(self, "is_mm_encoder_only", False)
             or num_nans_in_logits is not None
             or prompt_logprobs_dict
@@ -1028,7 +1046,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # domains must consume the old frame before new output passes.
                 request.async_tokens_to_discard = max(0, stale_async_tokens - len(generated_token_ids))
 
+            native_resumable_output = getattr(self, "_native_resumable", False) and getattr(
+                request, "_omni_native_resumable_sender", request.resumable
+            )
+            if native_resumable_output:
+                request._omni_native_resumable_sender = True
             if async_output_is_stale or (output_is_stale and request.drop_stale_output):
+                if native_resumable_output:
+                    self._pending_chunk_commits.append(OmniChunkCommit(req_id, [], discard=True))
                 # Output of a step scheduled before the request's in-flight
                 # tokens were discarded (segment stop / session replacement).
                 # num_computed_tokens was rolled back at the discard site, so
@@ -1273,7 +1298,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 omits_chunk_transfer = self._request_omits_chunk_transfer_to_next_stage(request)
             # Capture before resumable stop handling can clear token history.
             num_generation_tokens = _num_generation_tokens(request)
+            processor_request = request
             if stopped:
+                if (
+                    request.resumable
+                    and self.chunk_transfer_adapter is not None
+                    and getattr(self.chunk_transfer_adapter, "uses_dflash", False) is True
+                ):
+                    processor_request = self.chunk_transfer_adapter._snapshot_processor_request(request)
                 if self.chunk_transfer_adapter is not None:
                     confirmed_num_computed_tokens = self.chunk_transfer_adapter._confirmed_num_computed_tokens(request)
                 if (
@@ -1412,6 +1444,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 assert not prompt_logprobs_tensors
                 assert prompt_token_id_logprobs is None
 
+            if native_resumable_output:
+                self._pending_chunk_commits.append(
+                    OmniChunkCommit(
+                        req_id,
+                        list(new_token_ids),
+                        segment_finished=is_segment_finished,
+                        request_finished=finished,
+                        discard=sampling_validation_failed,
+                    )
+                )
+
             if omits_chunk_transfer and inter_stage_output is not None:
                 logger.warning(
                     "Skipping inter-stage chunk for request %s: "
@@ -1449,9 +1492,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         }
                     )
                 else:
+                    if processor_request is not request and finished:
+                        save_kwargs["force_request_finished"] = True
                     self.chunk_transfer_adapter.save_async(
                         inter_stage_output,
-                        request,
+                        processor_request,
                         is_segment_finished,
                         **save_kwargs,
                     )
@@ -2046,6 +2091,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         exists to keep alive. The same holds for a session whose overflow was
         recorded before this call and that upstream still reports as resumed.
         """
+        if self._resume_native_chunk_receiver(request):
+            return False
         finished = super()._handle_stopped_request(request)
         if finished:
             return True

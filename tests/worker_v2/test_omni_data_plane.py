@@ -53,6 +53,11 @@ def _bare_plane(*, delivery_timeout_s=1.0, shutdown_timeout_s=1.0):
         _native_output_closed=False,
         _native_outputs_in_flight=defaultdict(int),
         _native_terminal_pending=set(),
+        _native_resumable=False,
+        _uncommitted_payloads={},
+        _paused_chunk_receivers=set(),
+        _chunk_receiver_handles={},
+        _pending_streaming_prefills={},
         _deferred_shm_releases=set(),
         _async_chunk=True,
         _can_send=True,
@@ -233,6 +238,39 @@ def test_resumable_output_keeps_scheduler_owned_segment_boundary(plane):
         _complete(plane, [{"codes.audio": torch.tensor([[token]])}], token=token)
     assert plane._native_requests["internal"].output_token_ids == [21, 2150, 22]
     assert len(plane.record.batches) == 3
+
+
+def test_native_resumable_publishes_only_scheduler_commits(plane):
+    from vllm_omni.core.sched.output import OmniChunkCommit
+
+    plane._native_resumable = True
+    plane._code_prompt_token_ids = {"external": [torch.tensor([[10]])]}
+    plane._ramp_chunk_count["external"] = 1
+    plane.register_request(_new_request())
+
+    for sampled in (21, 22):
+        plane.reserve_outputs(["internal"])
+        output = OmniModelRunnerOutput(
+            req_ids=["internal"],
+            req_id_to_index={"internal": 0},
+            sampled_token_ids=[[sampled, 99]],
+            prompt_logprobs_dict={},
+            inter_stage_outputs=[{"codes.audio": torch.tensor([[sampled]])}],
+        )
+        plane.publish_output(output)
+        assert output.inter_stage_outputs is None
+    assert plane.record.batches == []
+
+    plane.commit_resumable_outputs(
+        [OmniChunkCommit("internal", [21], segment_finished=True), OmniChunkCommit("internal", [], discard=True)]
+    )
+    [(request, payload)] = plane.record.batches[0]
+    assert request.sampled_token_ids == [21] and request.is_segment_finished
+    assert payload["codes"]["audio"].tolist() == [[21]]
+    assert "external" not in plane._code_prompt_token_ids
+    assert "external" not in plane._ramp_chunk_count
+    assert "internal" not in plane._native_outputs_in_flight
+    assert len(plane.record.batches) == 1
 
 
 def test_full_payload_qwen_builder_receives_complete_codec(raw_plane, monkeypatch):

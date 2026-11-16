@@ -363,7 +363,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self.chunk_transfer_adapter is not None:
             return self.chunk_transfer_adapter.is_done_receiving_chunks(request_id)
         coordinator = self.input_coordinator
-        return bool(self._native_data_plane and coordinator is not None and request_id in coordinator.finished_requests)
+        return bool(
+            self._native_data_plane
+            and coordinator is not None
+            and (request_id in coordinator.finished_requests or request_id in coordinator.segment_finished_req_ids)
+        )
 
     def _input_execution_is_terminal(
         self,
@@ -397,6 +401,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         )
 
     def _handle_stopped_request(self, request: Request) -> bool:
+        if self._resume_native_chunk_receiver(request):
+            return False
         if (
             request.resumable
             and not request.streaming_queue

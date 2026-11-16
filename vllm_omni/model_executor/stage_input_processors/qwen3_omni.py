@@ -504,6 +504,85 @@ def _get_streaming_codec_delta_len(
 # =========================
 
 
+def _resumable_dflash_talker_chunk(
+    manager: Any,
+    request: OmniEngineCoreRequest,
+    embed: Mapping[str, Any],
+    rows: torch.Tensor,
+    hidden: torch.Tensor | None,
+    *,
+    decode_span: bool,
+    committed_ids: list[int],
+    new_token_ids: Iterable[int] | None,
+    is_finished: bool,
+) -> OmniPayloadStruct | None:
+    """Translate inline verifier rows using the active segment's prompt boundary."""
+    req_id = request.external_req_id
+    pending = manager._pending_streaming_prefills
+    if not decode_span:
+        assert hidden is not None
+        saved = pending.get(req_id)
+        if saved is None:
+            _clear_tool_speech_cut(manager, req_id)
+            saved = OmniPayloadStruct(
+                embed=EmbeddingsStruct(
+                    prefill=rows.detach().cpu(),
+                    tts_bos=_as_tensor_or_none(embed.get("tts_bos")),
+                    tts_eos=_as_tensor_or_none(embed.get("tts_eos")),
+                    tts_pad=_as_tensor_or_none(embed.get("tts_pad")),
+                ),
+                hidden_states=HiddenStatesStruct(output=hidden.detach().cpu()),
+                speaker=extract_speaker_from_request(request),
+                language=extract_language_from_request(request),
+            )
+            pending[req_id] = saved
+        else:
+            saved.embed.prefill = torch.cat((saved.embed.prefill, rows.detach().cpu()))
+            saved.hidden_states.output = torch.cat((saved.hidden_states.output, hidden.detach().cpu()))
+        if is_finished:
+            # No decode step follows a segment that ends on its prefill sample.
+            pending.pop(req_id, None)
+        return None
+
+    if rows.shape[0] != len(committed_ids):
+        raise RuntimeError(f"Committed token/embedding mismatch for request {req_id}")
+    saved = pending.pop(req_id, None)
+    if _tool_speech_is_cut(manager, req_id):
+        return None
+    kept = len(_token_id_list(new_token_ids)) + (saved is not None)
+    if is_finished:
+        # The segment's final sampled token is dropped at resume.
+        kept = max(0, kept - 1)
+    ids = committed_ids[:kept]
+    end = spoken_span_end(ids, 0, len(ids))
+    if end < len(ids):
+        _mark_tool_speech_cut(manager, req_id)
+    ids = ids[:end]
+    rows = rows[:end].detach().cpu()
+    if not ids:
+        return None
+    if saved is not None:
+        prompt = list(request.prompt_token_ids[-saved.embed.prefill.shape[0] :])
+        saved.embed.prefill = torch.cat((saved.embed.prefill, rows[:1]))
+        saved.embed.decode = rows[1:]
+        saved.ids = IdsStruct(prompt=prompt, all=prompt + ids[:1])
+        saved.meta = MetaStruct(
+            resumable=True,
+            replace_streaming_prompt=True,
+            num_processed_tokens=0,
+            decode_flag=False,
+            decode_span=True,
+            committed_token_count=len(ids),
+            next_stage_prompt_len=_compute_talker_prompt_ids_length(cast(OmniPayload, to_dict(saved)), device="cpu"),
+        )
+        return saved
+    return OmniPayloadStruct(
+        meta=MetaStruct(resumable=True, decode_span=True, committed_token_count=len(ids)),
+        embed=EmbeddingsStruct(decode=rows),
+        ids=IdsStruct(output=ids),
+    )
+
+
 def thinker2talker_async_chunk(
     transfer_manager: Any,
     multimodal_output: OmniPayload | dict[str, Any],
@@ -573,6 +652,19 @@ def thinker2talker_async_chunk(
             thinker_hid is not None,
         )
         return None
+    if getattr(transfer_manager, "uses_dflash", False) is True and request.resumable:
+        return _resumable_dflash_talker_chunk(
+            transfer_manager,
+            request,
+            thinker_embed,
+            thinker_emb,
+            thinker_hid,
+            decode_span=decode_span,
+            committed_ids=committed_ids,
+            new_token_ids=new_token_ids,
+            is_finished=is_finished,
+        )
+
     speaker = extract_speaker_from_request(request)
     language = extract_language_from_request(request)
 
@@ -597,13 +689,17 @@ def thinker2talker_async_chunk(
             committed_ids = expected
             thinker_emb = thinker_emb[: len(expected)]
         else:
-            # The scheduler may cut a verifier result at EOS or the length limit.
+            # The scheduler or native worker ledger can end a verifier span
+            # early. Native snapshots omit the full history after the first put.
+            if new_token_ids is None:
+                new_token_ids = getattr(request, "sampled_token_ids", None)
             if new_token_ids is not None:
                 scheduled_count = len(_token_id_list(new_token_ids)) + (chunk_id == 0)
                 committed_ids = committed_ids[:scheduled_count]
                 thinker_emb = thinker_emb[:scheduled_count]
-            token_start = max(0, len(output_ids) - len(committed_ids)) if output_ids else 0
-            if is_finished and not getattr(request, "resumable", False):
+            output_count = int(getattr(request, "output_token_count", len(output_ids)))
+            token_start = max(0, output_count - len(committed_ids))
+            if (is_finished or getattr(request, "output_stopped", False)) and not request.resumable:
                 committed_ids = committed_ids[:-1]
                 thinker_emb = thinker_emb[:-1]
         spoken_end = spoken_span_end(committed_ids, 0, len(committed_ids))
@@ -636,6 +732,8 @@ def thinker2talker_async_chunk(
                     embed=EmbeddingsStruct(
                         prefill=torch.cat((saved_prefill, thinker_emb[:1].detach().cpu()), dim=0),
                         decode=thinker_emb[1:].detach().cpu(),
+                        decode_token_start=token_start + 1,
+                        decode_token_end=token_end,
                         tts_bos=saved["embed"].get("tts_bos"),
                         tts_eos=saved["embed"].get("tts_eos"),
                         tts_pad=saved["embed"].get("tts_pad"),
@@ -668,6 +766,7 @@ def thinker2talker_async_chunk(
         )
 
     if chunk_id == 0:
+        assert thinker_hid is not None
         all_token_ids = _ensure_list(request.all_token_ids)
         prompt_token_ids = _ensure_list(request.prompt_token_ids)
         payload = OmniPayloadStruct(
@@ -1068,8 +1167,12 @@ def talker2code2wav_async_chunk(
             ),
         )
 
+    # Codec history and the ramp cursor both restart at each input segment.
+    # The transport chunk ID stays monotonic for the lifetime of the request.
+    segment_counts = getattr(transfer_manager, "ramp_chunk_count", None)
+    segment_chunk_id = chunk_id if segment_counts is None else segment_counts.get(request_id, 0)
     if configured_initial_chunk_size > 0:
-        if chunk_id == 0:
+        if segment_chunk_id == 0:
             chunk_size_config = configured_initial_chunk_size
         else:
             length -= configured_initial_chunk_size
@@ -1083,7 +1186,7 @@ def talker2code2wav_async_chunk(
 
     context_length = chunk_length if chunk_length != 0 else chunk_size_config
     # ensure left context does not exceed available length
-    if configured_initial_chunk_size > 0 and chunk_id == 1:
+    if configured_initial_chunk_size > 0 and segment_chunk_id == 1:
         left_context_size = configured_initial_chunk_size
         end_index = length + configured_initial_chunk_size
     else:

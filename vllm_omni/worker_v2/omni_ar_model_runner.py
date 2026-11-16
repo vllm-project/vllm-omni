@@ -33,6 +33,7 @@ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import get_drafter_hidden_states
 from vllm.v1.worker.workspace import use_workspace_lane
 
+from vllm_omni.core.sched.omni_scheduling_coordinator import uses_native_qwen3_omni_resumable
 from vllm_omni.data_entry_keys import OmniPayload, flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVTransferManager,
@@ -277,7 +278,13 @@ class OmniARModelRunner(OmniGPUModelRunner):
             self.model_state.run_postprocess(text_hidden, input_batch, multimodal_outputs)
         prefix_cache_rewrite = self._prefix_cache_save_mrv2(input_batch, text_hidden, multimodal_outputs)
         mooncake_rewrite = snapshot_mooncake_output(self, input_batch)
-        if bool(getattr(self.model_config, "async_chunk", False)) and multimodal_outputs:
+
+        uses_scheduler_speculative_payload = self._uses_scheduler_speculative_payload()
+        if (
+            not uses_scheduler_speculative_payload
+            and bool(getattr(self.model_config, "async_chunk", False))
+            and multimodal_outputs
+        ):
             multimodal_outputs = self._retain_multimodal_outputs(multimodal_outputs)
             snapshot_slot = self._last_multimodal_snapshot_slot
             self._last_multimodal_snapshot_slot = None
@@ -303,6 +310,36 @@ class OmniARModelRunner(OmniGPUModelRunner):
         num_sampled, num_rejected = sampling_output.num_sampled, sampling_output.num_rejected
         if sampling_output.multimodal_outputs is not None:
             multimodal_outputs = sampling_output.multimodal_outputs
+        finalize_pooler_payload = None
+        finalize_multimodal = sampling_output.finalize_multimodal
+        if uses_scheduler_speculative_payload and multimodal_outputs:
+            # MRv2 rejection sampling reports valid widths separately from the
+            # padded token buffer. Mask unused columns before the model lookup.
+            sampled = sampler_output.sampled_token_ids
+            valid = torch.arange(sampled.shape[1], device=sampled.device) < num_sampled[:, None]
+            multimodal_outputs = self.model.prepare_speculative_multimodal_outputs(
+                multimodal_outputs=multimodal_outputs,
+                req_ids=input_batch.req_ids,
+                speculative_request_ids=set(),
+                invalid_req_indices=(),
+                sampled_token_ids=sampled.masked_fill(~valid, -1),
+                input_token_ids=input_batch.input_ids,
+                input_positions=input_batch.positions,
+                query_start_loc=input_batch.query_start_loc_np,
+                prompt_lens=self.req_states.prompt_len.np[input_batch.idx_mapping_np],
+                vocab_size=int(self.model_config.get_vocab_size()),
+                consumed_input_span=False,
+            )
+            finalize_snapshot = self.model.finalize_multimodal_outputs_from_cpu_snapshot
+
+            def finalize_multimodal(snapshot, _):
+                return finalize_snapshot(snapshot)
+
+            finalize_pooler_payload = self.model.finalize_pooler_payload
+            assert multimodal_outputs is not None
+            multimodal_outputs = self._retain_multimodal_outputs(multimodal_outputs)
+            snapshot_slot = self._last_multimodal_snapshot_slot
+            self._last_multimodal_snapshot_slot = None
         post_sample = getattr(self.model_state, "post_sample", None)
         if post_sample is not None:
             post_sample(
@@ -384,10 +421,10 @@ class OmniARModelRunner(OmniGPUModelRunner):
         finalize_output = self._prefix_cache_output_finalizer(
             prefix_cache_rewrite,
             None if materialize_native else self._finalize_native_data_plane_output,
-            mergeable=sampling_output.finalize_multimodal is None and streaming_audio is None,
+            mergeable=finalize_multimodal is None and streaming_audio is None,
         )
         if mooncake_rewrite is not None:
-            if sampling_output.finalize_multimodal is not None or streaming_audio is not None:
+            if finalize_multimodal is not None or streaming_audio is not None:
                 raise ValueError("Mooncake Thinker captures cannot use model-owned output materialization")
             finalize_output = mooncake_rewrite.finalize(finalize_output)
         async_output = OmniAsyncOutput(
@@ -406,7 +443,8 @@ class OmniARModelRunner(OmniGPUModelRunner):
             # through pooling_output for llm2tts.
             partition_async_payload=async_chunk and stage_sends_async_output(self.model_config),
             finalize_output=finalize_output,
-            finalize_multimodal=sampling_output.finalize_multimodal,
+            finalize_multimodal=finalize_multimodal,
+            finalize_pooler_payload=finalize_pooler_payload,
             check_ep_fault=self.check_ep_fault,
             pending_aux_output=pending_aux_output,
             streaming_audio=streaming_audio,
@@ -445,6 +483,14 @@ class OmniARModelRunner(OmniGPUModelRunner):
         if materialize_native:
             return self._materialize_native_output(async_output)
         return async_output
+
+    def _uses_scheduler_speculative_payload(self) -> bool:
+        return (
+            bool(getattr(self.model_config, "async_chunk", False))
+            and self._shares_drafter_aux_output()
+            and self.speculative_config.use_dflash()
+            and (self._omni_data_plane is None or uses_native_qwen3_omni_resumable(self.model_config))
+        )
 
     def _propose_draft_tokens(
         self,
@@ -630,6 +676,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         padded_total_tokens: int | None = None,
         req_ids: list[str] | None = None,
         engine_output_type: str = "audio",
+        finalize_pooler_payload: Any | None = None,
     ) -> tuple[list[dict[str, Any] | None] | None, list[dict[str, Any] | None] | None]:
         """Build async-chunk payloads without materializing hidden on CPU."""
         if not mm_outputs:
@@ -664,7 +711,10 @@ class OmniARModelRunner(OmniGPUModelRunner):
                 )
                 for key, value in payload_mm.items()
             }
-            inter_stage, client_mm = partition_flat_payload(flatten_payload(payload))
+            flat = flatten_payload(payload)
+            if finalize_pooler_payload is not None:
+                flat = flatten_payload(finalize_pooler_payload(flat, multimodal_outputs=mm_outputs, idx=i))
+            inter_stage, client_mm = partition_flat_payload(flat)
             inter_stage_list.append(inter_stage or None)
             client_mm_list.append(client_mm or None)
 
@@ -954,6 +1004,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         partition_async_payload: bool | None = None,
         finalize_output: Any | None = None,
         finalize_multimodal: Any | None = None,
+        finalize_pooler_payload: Any | None = None,
         check_ep_fault: bool = False,
         pending_aux_output: Any | None = None,
         streaming_audio: StreamingAudioSnapshot | None = None,
@@ -975,6 +1026,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         )
         self._finalize_output = finalize_output
         self._finalize_multimodal = finalize_multimodal
+        self._finalize_pooler_payload = finalize_pooler_payload
         self._has_fault: torch.Tensor | None = None
 
         # Snapshot input_batch metadata needed for pooler_output slicing
@@ -1202,6 +1254,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                     self._padded_total_tokens,
                     self._req_ids,
                     self._engine_output_type,
+                    self._finalize_pooler_payload,
                 )
             if self._streaming_audio is not None:
                 pooler_inter, pooler_client = None, self._streaming_audio.get_output()

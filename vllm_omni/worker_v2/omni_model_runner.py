@@ -123,6 +123,19 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             self.model, "_last_captured_layers"
         )
 
+    def _shares_drafter_aux_output(self) -> bool:
+        return (
+            self.use_aux_hidden_state_outputs
+            and getattr(self.model, "supports_speculative_payload", False) is True
+            and callable(getattr(self.model, "extract_aux_hidden_states", None))
+        )
+
+    def _shared_drafter_aux(self, hidden_states, payload):
+        _, layers = self.model.extract_aux_hidden_states(
+            OmniOutput(text_hidden_states=hidden_states, multimodal_outputs=payload)
+        )
+        return layers
+
     def _split_fullgraph_output(self, replayed: Any) -> tuple[Any, Any]:
         """FULL replay output -> ``(hidden_states, aux pytree or None)``."""
         if self._full_graph_aux_outputs and isinstance(replayed, tuple):
@@ -299,6 +312,12 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         plane = getattr(self, "_omni_data_plane", None)
         if plane is None:
             return
+        commits = getattr(scheduler_output, "chunk_commits", ())
+        if commits:
+            plane.commit_resumable_outputs(commits)
+        receivers = getattr(scheduler_output, "resume_chunk_receivers", ())
+        if receivers:
+            plane.resume_chunk_receivers(receivers)
         for request_data in getattr(scheduler_output, "scheduled_new_reqs", []):
             if is_warmup_request(request_data.req_id):
                 continue
@@ -408,8 +427,10 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         self._last_aux_output = None
         self._last_multimodal_outputs = None
         self._configure_cudagraph_output_contract()
-        if self.use_aux_hidden_state_outputs and (
-            self._model_has_structured_output or hasattr(self.model, "_last_captured_layers")
+        if (
+            self.use_aux_hidden_state_outputs
+            and (self._model_has_structured_output or hasattr(self.model, "_last_captured_layers"))
+            and not self._shares_drafter_aux_output()
         ):
             # Both would use the forward's tuple output slot.
             raise NotImplementedError(
@@ -1065,9 +1086,12 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                     self._last_multimodal_outputs = cast(dict[str, Any], stepped.multimodal_outputs)
             else:
                 replayed = self.cudagraph_manager.run_fullgraph(batch_desc)
-                if self.use_aux_hidden_state_outputs:
+                shared_aux = self._shares_drafter_aux_output()
+                if self.use_aux_hidden_state_outputs and not shared_aux:
                     replayed, draft_aux_hidden_states = replayed
                 hidden_states, self._last_aux_output = self._split_fullgraph_output(replayed)
+                if shared_aux:
+                    draft_aux_hidden_states = self._shared_drafter_aux(hidden_states, self._last_aux_output)
                 if hasattr(self.model, "_last_captured_layers"):
                     self.model._last_captured_layers = self._last_aux_output
         else:
@@ -1116,7 +1140,8 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             # Extract hidden_states from model output.
             self._last_aux_output = None
             self._last_multimodal_outputs = None
-            if self.use_aux_hidden_state_outputs:
+            shared_aux = self._shares_drafter_aux_output()
+            if self.use_aux_hidden_state_outputs and not shared_aux:
                 model_output, draft_aux_hidden_states = model_output
             if isinstance(model_output, OmniOutput):
                 hidden_states = model_output.text_hidden_states
@@ -1128,6 +1153,9 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                     self.model._last_captured_layers = self._last_aux_output
             else:
                 hidden_states = model_output
+            if shared_aux:
+                payload = self._last_multimodal_outputs or self._last_aux_output
+                draft_aux_hidden_states = self._shared_drafter_aux(hidden_states, payload)
         if kstep_extra and kstep_frames == 0 and isinstance(hidden_states, torch.Tensor):
             kstep_extra["request_sample_eligible"] = [
                 int(input_batch.num_computed_prefill_tokens_np[i]) + int(input_batch.num_scheduled_tokens[i])
