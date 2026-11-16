@@ -795,6 +795,16 @@ def _encode_gate_vae(monkeypatch: pytest.MonkeyPatch, *, mode: str, parallel_siz
     # Bypass nn.Module.__setattr__: the gate tests skip Module.__init__.
     object.__setattr__(vae, "encoder", tiny.encoder)
     object.__setattr__(vae, "quant_conv", tiny.quant_conv)
+    # The gate also checks Diffusers' encode-cache protocol and cross-checks the downsample count
+    # against the config, so carry both over from the real VAE. ConfigMixin.config is a read-only
+    # view of _internal_dict; tests that need other values overwrite it after calling this.
+    object.__setattr__(vae, "clear_cache", tiny.clear_cache)
+    object.__setattr__(vae, "_cached_conv_counts", tiny._cached_conv_counts)
+    object.__setattr__(
+        vae,
+        "_internal_dict",
+        SimpleNamespace(patch_size=tiny.config.patch_size, scale_factor_spatial=tiny.config.scale_factor_spatial),
+    )
     return vae
 
 
@@ -803,7 +813,7 @@ def _encode_gate_vae(monkeypatch: pytest.MonkeyPatch, *, mode: str, parallel_siz
 def test_encode_dispatches_to_spatial_shard_without_tiling(monkeypatch: pytest.MonkeyPatch):
     vae = _encode_gate_vae(monkeypatch, mode="spatial_shard_width")
     # ConfigMixin.config is a read-only view of _internal_dict.
-    object.__setattr__(vae, "_internal_dict", SimpleNamespace(patch_size=None))
+    object.__setattr__(vae, "_internal_dict", SimpleNamespace(patch_size=None, scale_factor_spatial=8))
     vae.use_tiling = False
     calls = []
 
@@ -848,10 +858,49 @@ def test_can_spatial_shard_encode_requires_a_pointwise_quant_conv():
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+@pytest.mark.parametrize("kind", ["wan2.1", "wan2.2"])
+def test_can_spatial_shard_encode_cross_checks_the_downsample_count(kind):
+    """The counted stride must agree with the config; encode has no trim backstop if it is wrong."""
+    vae = _tiny_wan_vae(kind)
+    x = torch.zeros((1, 3, 5, 48, 128))
+    if vae.config.patch_size is not None:
+        from diffusers.models.autoencoders.autoencoder_kl_wan import patchify
+
+        x = patchify(x, patch_size=vae.config.patch_size)
+    assert wan_spatial_shard.can_spatial_shard_encode(vae, x, split_dim="width", world_size=2) is True
+    assert wan_spatial_shard._encoder_shard_stride(vae, vae.encoder) == 8
+
+    # A config that implies a different spatial compression than the modules say must decline.
+    vae.register_to_config(scale_factor_spatial=32)
+    assert wan_spatial_shard._encoder_shard_stride(vae, vae.encoder) is None
+    assert wan_spatial_shard.can_spatial_shard_encode(vae, x, split_dim="width", world_size=2) is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_can_spatial_shard_encode_requires_the_diffusers_cache_contract():
+    """A changed Diffusers encode-cache protocol must decline at the gate, not IndexError mid-loop."""
+    vae = _tiny_wan_vae("wan2.1")
+    x = torch.zeros((1, 3, 5, 48, 128))
+    assert wan_spatial_shard.can_spatial_shard_encode(vae, x, split_dim="width", world_size=2) is True
+
+    # clear_cache() sizes _enc_feat_map from this count, and every halo conv consumes one slot.
+    counts = dict(vae._cached_conv_counts)
+    vae._cached_conv_counts = {**counts, "encoder": counts["encoder"] + 1}
+    assert wan_spatial_shard.can_spatial_shard_encode(vae, x, split_dim="width", world_size=2) is False
+
+    vae._cached_conv_counts = counts
+    assert wan_spatial_shard.can_spatial_shard_encode(vae, x, split_dim="width", world_size=2) is True
+    del vae._cached_conv_counts
+    assert wan_spatial_shard.can_spatial_shard_encode(vae, x, split_dim="width", world_size=2) is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_encode_keeps_the_regular_path_for_a_4d_input(monkeypatch: pytest.MonkeyPatch):
     """A 4D input must not reach ``patchify``, which assumes the 5D video layout."""
     vae = _encode_gate_vae(monkeypatch, mode="spatial_shard_width")
-    object.__setattr__(vae, "_internal_dict", SimpleNamespace(patch_size=2))
+    object.__setattr__(vae, "_internal_dict", SimpleNamespace(patch_size=2, scale_factor_spatial=16))
     vae.use_tiling = False
     monkeypatch.setattr(
         "vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan.patchify",
@@ -1138,6 +1187,10 @@ def test_registry_auto_enables_vae_tiling_only_for_tile_mode(monkeypatch, mocker
     vae.distributed_executor.set_parallel_size.assert_called_once_with(2, mode=mode)
 
 
+# Sharded encode is exact by construction, so it is held far tighter than the decode tolerance:
+# measured max_abs_diff is ~3.2e-6 (fp32, real weights) against the untiled reference, and the fp64
+# CPU tests assert < 1e-10. 3e-2 would not catch a seam or boundary regression here.
+_SPATIAL_SHARD_ENCODE_TOLERANCE = 1e-4
 _SPATIAL_SHARD_ENCODE_FRAMES = 17
 _SPATIAL_SHARD_ENCODE_HEIGHT = 480
 _SPATIAL_SHARD_ENCODE_WIDTH = 832
@@ -1219,7 +1272,7 @@ def test_spatial_shard_encode_matches_untiled_reference(split_dim: str):
             f"spatial_shard_{split_dim} encode rank {rank}: max_abs_diff={max_abs_diff:.6e} "
             f"mean_abs_diff={return_dict[f'mean_abs_diff_rank{rank}']:.6e}"
         )
-        assert max_abs_diff <= _SPATIAL_SHARD_TOLERANCE, (
+        assert max_abs_diff <= _SPATIAL_SHARD_ENCODE_TOLERANCE, (
             f"rank {rank}: spatial_shard_{split_dim} encode max_abs_diff {max_abs_diff} exceeds "
-            f"{_SPATIAL_SHARD_TOLERANCE}"
+            f"{_SPATIAL_SHARD_ENCODE_TOLERANCE}"
         )

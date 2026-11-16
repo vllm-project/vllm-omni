@@ -1120,6 +1120,68 @@ def _quant_conv_is_pointwise(vae: Any) -> bool:
     return tuple(kernel_size)[-2:] == (1, 1)
 
 
+def _encoder_shard_stride(vae: Any, encoder: nn.Module) -> int | None:
+    """The shard-extent multiple that keeps every stride-2 downsample exact, or ``None`` if unsure.
+
+    Counted from the encoder's downsampling ``WanResample`` modules and cross-checked against the
+    config's spatial compression (the input is already patchified, so divide that out). The check
+    matters because the one-pixel halo per layer is only enough while each shard stays even through
+    every downsample, and encode has no ``_zero_invalid_extent`` backstop the way decode does: an
+    undercount would let an odd extent through the gate and produce wrong latents instead of
+    falling back.
+    """
+    counted = 2 ** _encoder_downsample_count(encoder)
+    # No config to cross-check against means no guarantee, so decline rather than trust the count.
+    scale_factor_spatial = getattr(getattr(vae, "config", None), "scale_factor_spatial", None)
+    if scale_factor_spatial is None:
+        return None
+    patch_size = getattr(vae.config, "patch_size", None) or 1
+    expected, remainder = divmod(int(scale_factor_spatial), patch_size)
+    if remainder or counted != expected:
+        logger.warning(
+            "Wan VAE spatial sharded encode counted %s downsampling stages (stride %s) but the "
+            "config implies stride %s (scale_factor_spatial=%s, patch_size=%s); falling back to the "
+            "unsharded encode path.",
+            _encoder_downsample_count(encoder),
+            counted,
+            scale_factor_spatial if remainder else expected,
+            scale_factor_spatial,
+            patch_size,
+        )
+        return None
+    return counted
+
+
+def _encode_cache_contract_holds(vae: Any, encoder: nn.Module) -> bool:
+    """Whether Diffusers' private encode feature-cache protocol is still the one we drive.
+
+    ``spatial_shard_encode`` runs Diffusers' untiled loop by hand: ``clear_cache`` sizes
+    ``_enc_feat_map`` from ``_cached_conv_counts["encoder"]`` and each halo conv of the copy
+    consumes exactly one slot. If a Diffusers release changes how that cache is sized or counted,
+    decline here instead of failing with an ``IndexError`` midway through the temporal loop.
+    """
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
+
+    counts = getattr(vae, "_cached_conv_counts", None)
+    if not callable(getattr(vae, "clear_cache", None)) or not isinstance(counts, dict):
+        logger.warning(
+            "Wan VAE spatial sharded encode needs Diffusers' clear_cache/_cached_conv_counts "
+            "protocol; falling back to the unsharded encode path."
+        )
+        return False
+    # Counted the way clear_cache() sizes _enc_feat_map, so a rename or a layout change shows up here.
+    found = sum(1 for module in encoder.modules() if isinstance(module, WanCausalConv3d))
+    if found == 0 or counts.get("encoder") != found:
+        logger.warning(
+            "Wan VAE spatial sharded encode expected %s cached encoder convs but the encoder has "
+            "%s; falling back to the unsharded encode path.",
+            counts.get("encoder"),
+            found,
+        )
+        return False
+    return True
+
+
 def can_spatial_shard_encode(vae: Any, x: torch.Tensor, *, split_dim: str, world_size: int) -> bool:
     """Whether ``x`` (already patchified) splits into exact, stride-aligned encoder shards."""
     encoder = getattr(vae, "encoder", None)
@@ -1127,8 +1189,12 @@ def can_spatial_shard_encode(vae: Any, x: torch.Tensor, *, split_dim: str, world
         return False
     if not _quant_conv_is_pointwise(vae):
         return False
-    divisor = world_size * 2 ** _encoder_downsample_count(encoder)
-    return x.shape[_spatial_dim(split_dim)] % divisor == 0
+    if not _encode_cache_contract_holds(vae, encoder):
+        return False
+    stride = _encoder_shard_stride(vae, encoder)
+    if stride is None:
+        return False
+    return x.shape[_spatial_dim(split_dim)] % (world_size * stride) == 0
 
 
 def install_wan_spatial_shard_encode(vae: Any, group: dist.ProcessGroup, split_dim: str = "height") -> nn.Module:
@@ -1163,6 +1229,17 @@ def install_wan_spatial_shard_encode(vae: Any, group: dist.ProcessGroup, split_d
             source = encoder.get_submodule(name)
             module.weight = source.weight
             module.bias = source.bias
+
+    # Each halo conv of the copy consumes one _enc_feat_map slot, so a 1:1 replacement is what
+    # makes driving Diffusers' cache by hand safe. can_spatial_shard_encode already checked the
+    # original against _cached_conv_counts; this catches a copy that lost or gained one.
+    cached = (getattr(vae, "_cached_conv_counts", None) or {}).get("encoder")
+    halo_convs = sum(1 for module in sharded.modules() if isinstance(module, WanDistCausalConv3d))
+    if cached is not None and halo_convs != cached:
+        raise RuntimeError(
+            "Wan spatial-shard VAE encoder copy has "
+            f"{halo_convs} halo causal convs but Diffusers caches {cached} encoder conv slots."
+        )
 
     vae.__dict__["_vllm_omni_wan_spatial_shard_encoder"] = sharded
     vae.__dict__["_vllm_omni_wan_spatial_shard_encode_split_dim"] = split_dim

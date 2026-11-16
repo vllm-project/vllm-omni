@@ -739,12 +739,14 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
         world_size = dist.get_world_size(group=self.distributed_executor.group)
         requested_size = int(self.distributed_executor.parallel_size)
         if requested_size != world_size:
+            # Decode falls back to the tile-parallel path; encode falls back to super()._encode(),
+            # which in spatial_shard mode (tiling off) encodes the whole frame on every rank.
             logger.warning(
                 "Wan VAE spatial sharded %s currently requires vae_patch_parallel_size "
-                "to match the DIT group size; falling back to tiled %s. "
+                "to match the DIT group size; falling back to %s. "
                 "requested=%s dit_group=%s split_dim=%s",
                 stage,
-                stage,
+                "tiled decode" if stage == "decode" else "unsharded encode",
                 requested_size,
                 world_size,
                 split_dim,
