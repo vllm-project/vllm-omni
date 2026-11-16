@@ -104,6 +104,33 @@ from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.mark.parametrize(
+    "model_cls, fields, message",
+    [
+        pytest.param(SpeechBatchItem, {"input": ""}, "input cannot be empty", id="batch_item_empty_input"),
+        pytest.param(SpeechBatchItem, {"input": "   "}, "input cannot be empty", id="batch_item_blank_input"),
+        pytest.param(
+            SpeechBatchItem, {"input": "hello", "voice": ""}, "voice cannot be empty", id="batch_item_empty_voice"
+        ),
+        pytest.param(
+            BatchSpeechRequest,
+            {"items": [{"input": "hello"}], "voice": ""},
+            "voice cannot be empty",
+            id="batch_empty_voice",
+        ),
+        pytest.param(
+            OpenAICreateSpeechRequest,
+            {"input": "hello", "voice": ""},
+            "voice cannot be empty",
+            id="speech_empty_voice",
+        ),
+    ],
+)
+def test_speech_request_rejects_empty_fields(model_cls, fields, message):
+    with pytest.raises(ValidationError, match=message):
+        model_cls(**fields)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model", [None, "test-model", "alias", "missing-model"])
 async def test_diffusion_speech_checks_all_served_model_names(mocker, monkeypatch, tmp_path, model):

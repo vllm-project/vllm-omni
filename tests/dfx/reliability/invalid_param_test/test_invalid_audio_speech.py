@@ -135,8 +135,8 @@ def test_speech_missing_required_fields(omni_server: OmniServer, online_client: 
 @pytest.mark.parametrize(
     "overrides, err_message",
     [
-        pytest.param({"input": ""}, ("input", "empty"), id="input_empty"),
-        pytest.param({"input": "   "}, ("input", "empty"), id="input_whitespace_only"),
+        pytest.param({"input": ""}, ("input", "cannot be empty"), id="input_empty"),
+        pytest.param({"input": "   "}, ("input", "cannot be empty"), id="input_whitespace_only"),
         pytest.param({"voice": ""}, "Invalid voice", id="voice_empty"),
         pytest.param(
             {"instructions": 123}, ("instructions", "string_type", "valid string"), id="instructions_wrong_type"
@@ -272,8 +272,10 @@ def test_speech_invalid_field_values(
 @pytest.mark.parametrize(
     "extra_json, err_message",
     [
-        pytest.param({"input": "", "response_format": "wav"}, ("input", "empty"), id="input_empty"),
-        pytest.param({"input": "   ", "response_format": "wav"}, ("input", "empty"), id="input_whitespace_only"),
+        pytest.param({"input": "", "response_format": "wav"}, ("input", "cannot be empty"), id="input_empty"),
+        pytest.param(
+            {"input": "   ", "response_format": "wav"}, ("input", "cannot be empty"), id="input_whitespace_only"
+        ),
         pytest.param(
             {"input": "Hello world.", "max_new_tokens": 0},
             ("max_new_tokens", "greater_than_equal"),
@@ -402,11 +404,11 @@ def test_speech_batch_missing_items(omni_server: OmniServer, online_client: Onli
 @pytest.mark.parametrize(
     "loc, overrides, err_message",
     [
-        pytest.param("item", {"input": ""}, ("input", "empty"), id="item_input_empty"),
+        pytest.param("item", {"input": ""}, ("input", "cannot be empty"), id="item_input_empty"),
         pytest.param(
             "item",
             {"input": "   "},
-            ("input", "empty"),
+            ("input", "cannot be empty"),
             id="item_input_whitespace_only",
         ),
         pytest.param("batch", {"voice": ""}, "Invalid voice", id="batch_voice_empty"),
