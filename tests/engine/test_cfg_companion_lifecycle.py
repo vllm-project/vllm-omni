@@ -379,3 +379,36 @@ async def test_parent_abort_still_expands_to_companions():
     assert not orch._cfg_tracker.is_companion("p__neg")
     aborted = {rid for pool in orch.stage_pools for batch in pool.aborted for rid in batch}
     assert {"p", "p__neg"} <= aborted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_id", ["p", "p__neg"])
+async def test_required_cfg_receive_error_aborts_parent_and_companion(failed_id):
+    from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.distributed.omni_connectors.kv_transfer_manager import KVCacheReceiveError
+
+    orch = _make_orchestrator()
+    orch._cfg_tracker.register_companion("p", "cfg_text", "p__neg")
+    orch.request_states["p"] = _req_state()
+    orch.request_states["p__neg"] = _req_state()
+    # Worker error conversion, followed by the stage error routing boundary.
+    output = DiffusionOutput.from_exception(KVCacheReceiveError("Missing required CFG KV: cfg_text"))
+    stage_output = SimpleNamespace(
+        request_id=failed_id,
+        error=output.error,
+        error_type=output.error_type,
+        error_status_code=output.error_status_code,
+    )
+    await orch._handle_processed_outputs(1, 0, [stage_output])
+    # A late duplicate from another rank must not emit a second error.
+    await orch._handle_processed_outputs(1, 0, [stage_output])
+    message = orch.output_async_queue.get_nowait()
+    assert isinstance(message, ErrorMessage)
+    assert message.request_id == "p"
+    assert "cfg_text" in message.error
+    assert orch.output_async_queue.empty()
+    assert not orch.request_states
+    assert not orch._cfg_tracker.is_companion("p__neg")
+    for pool in orch.stage_pools:
+        assert len(pool.aborted) == 1
+        assert set(pool.aborted[0]) == {"p", "p__neg"}

@@ -48,3 +48,24 @@ normal completion, cancellation, failure, and shutdown.
 
 Test setup, transfer, synchronization, timeout, cancellation, failure, and
 cleanup across every affected backend.
+
+## Required companion KV receive failures
+
+For legacy AR-to-diffusion KV reception, a successful primary receive does not
+make a request usable when a role explicitly declared in `cfg_kv_request_ids`
+is absent. An explicitly received empty KV object remains valid. Validate the
+receiving rank's full payload before CFG scatter reduces it to rank-local roles.
+
+Synchronous reception and prefetch consumption share a terminal receive verdict.
+TP-active participants exchange errors in TP, CFG, then SP order; pure TP
+includes errors in its existing KV-state consensus. This happens before any
+rank clears its request-side KV references and raises `KVCacheReceiveError`.
+The non-TP route retains the existing world-only distribution assumption: every
+world member participates in the same request. This is not a new guarantee for
+independent DP or PP requests on that route.
+
+A consumed prefetch payload is never synchronously fetched again after a
+terminal processing error. Primary misses without a terminal error retain the
+existing fallback. This does not enable prefetch for models whose CFG collector
+currently disables it. Process crashes, broken control collectives, and errors
+during subsequent payload distribution are outside this receive verdict.

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Pure-TP KV receive consensus (#5627) — CPU-testable mechanism.
 
 In pure TP (LOCAL role) each rank fetches its own KV shard independently and
@@ -32,8 +35,8 @@ class _FakeGroup:
     def __init__(self, rank_in_group, world_size, peer_signatures=None, verdict=None):
         self.rank_in_group = rank_in_group
         self.world_size = world_size
-        self._peer_signatures = list(peer_signatures or [])
-        self._verdict = verdict
+        self._peer_signatures = [(signature, ()) for signature in (peer_signatures or [])]
+        self._verdict = (verdict, ())
         self.sent = []
         self.broadcasts = []
 
@@ -148,7 +151,7 @@ def test_rank0_drops_kv_when_peer_missed_primary():
     mgr = _manager(_topo(tp_group=group))
 
     assert mgr._tp_local_receive_consensus(req, True) is False
-    assert group.broadcasts == [False]  # peers were told to fall back too
+    assert group.broadcasts == [(False, ())]  # peers were told to fall back too
     assert req.past_key_values is None
     assert req.kv_metadata is None
     assert req.sampling_params.past_key_values is None
@@ -161,7 +164,7 @@ def test_rank0_keeps_kv_when_all_ranks_match():
     mgr = _manager(_topo(tp_group=group))
 
     assert mgr._tp_local_receive_consensus(req, True) is True
-    assert group.broadcasts == [True]
+    assert group.broadcasts == [(True, ())]
     assert req.past_key_values is not None
     assert req.sampling_params.past_key_values is not None
 
@@ -175,7 +178,7 @@ def test_rank0_drops_kv_on_companion_role_divergence():
     mgr = _manager(_topo(tp_group=group))
 
     assert mgr._tp_local_receive_consensus(req, True) is False
-    assert group.broadcasts == [False]
+    assert group.broadcasts == [(False, ())]
     assert req.past_key_values is None
     assert req.sampling_params.cfg_text_past_key_values is None
 
@@ -196,7 +199,7 @@ def test_rank0_own_miss_fails_verdict_even_if_peers_received():
     group = _FakeGroup(0, 3, peer_signatures=[(True, ("past_key_values",)), (True, ("past_key_values",))])
     mgr = _manager(_topo(tp_group=group))
     assert mgr._tp_local_receive_consensus(req, False) is False
-    assert group.broadcasts == [False]
+    assert group.broadcasts == [(False, ())]
 
 
 # --------------------------------------------------------------------------- #
@@ -211,7 +214,7 @@ def test_follower_rank_drops_kv_on_negative_verdict():
     mgr = _manager(_topo(tp_group=group))
 
     assert mgr._tp_local_receive_consensus(req, True) is False
-    assert group.sent == [(sig_before_clear, 0)]
+    assert group.sent == [((sig_before_clear, ()), 0)]
     assert req.past_key_values is None
     assert req.sampling_params.past_key_values is None
 
@@ -222,7 +225,7 @@ def test_follower_rank_keeps_kv_on_positive_verdict():
     mgr = _manager(_topo(tp_group=group))
 
     assert mgr._tp_local_receive_consensus(req, True) is True
-    assert group.sent == [(_signature_of(req), 0)]
+    assert group.sent == [((_signature_of(req), ()), 0)]
     assert req.past_key_values is not None
 
 
@@ -232,9 +235,9 @@ def test_follower_rank_keeps_kv_on_positive_verdict():
 
 
 def _wired_manager(monkeypatch, consensus_calls):
-    mgr = _manager(_topo(tp_group=_FakeGroup(0, 2)))
+    mgr = _manager(_topo(tp_group=_FakeGroup(0, 2, peer_signatures=[()])))
 
-    def fake_consensus(req, received):
+    def fake_consensus(req, received, errors=()):
         consensus_calls.append(received)
         return False
 

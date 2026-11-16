@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unified OmniConnector and KV cache transfer management."""
 
 import enum
@@ -49,6 +49,10 @@ LayerKV = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
 
 class KVPrefetchConsumeError(RuntimeError):
     """Payload consumed from connector but post-get processing failed — sync retry impossible."""
+
+
+class KVCacheReceiveError(RuntimeError):
+    """A request cannot continue with incomplete or unusable received KV."""
 
 
 class ReceiveRole(enum.Enum):
@@ -1864,7 +1868,7 @@ class OmniKVTransferManager:
         combined = combined.to(device)
         return self._unpack_kv_payload(combined)
 
-    def _tp_local_receive_consensus(self, req: Any, received: bool) -> bool:
+    def _tp_local_receive_consensus(self, req: Any, received: bool, errors: tuple[str, ...] = ()) -> bool:
         """Identical-KV-state verdict across pure-TP ranks (LOCAL role).
 
         In pure TP every rank fetches its own KV shard with an independent
@@ -1878,7 +1882,8 @@ class OmniKVTransferManager:
         the signatures differ, every rank drops its KV so all take the same
         fallback path together; identical-but-partial state is kept, since
         symmetric absence is consistent (e.g. Bagel's empty unconditional
-        branch).
+        branch). Terminal receive errors travel in the same exchange and take
+        precedence over fallback, including symmetrically missing required CFG.
 
         The exchange runs over the stage's tensor-parallel group only: those
         are the ranks executing this request in lockstep. ``world`` would
@@ -1901,13 +1906,21 @@ class OmniKVTransferManager:
 
         signature = (bool(received), tuple(sorted(self._collect_request_kv_payload(req))))
         if group.rank_in_group == 0:
-            signatures = [signature]
-            signatures.extend(group.recv_object(src=src) for src in range(1, pt.tp_size))
-            consistent = all(sig == signature for sig in signatures)
-            group.broadcast_object(consistent, src=0)
+            merged = set(errors)
+            consistent = True
+            for src in range(1, pt.tp_size):
+                peer_signature, peer_errors = group.recv_object(src=src)
+                consistent &= peer_signature == signature
+                merged.update(peer_errors)
+            errors = tuple(sorted(merged))
+            group.broadcast_object((consistent, errors), src=0)
         else:
-            group.send_object(signature, dst=0)
-            consistent = bool(group.broadcast_object(None, src=0))
+            group.send_object((signature, errors), dst=0)
+            consistent, errors = group.broadcast_object(None, src=0)
+
+        if errors:
+            self._clear_request_kv_payload(req)
+            raise KVCacheReceiveError(f"KV receive failed for {request_id}: {'; '.join(errors)}")
 
         if not consistent:
             logger.warning(
@@ -1922,50 +1935,102 @@ class OmniKVTransferManager:
             return False
         return received
 
+    @staticmethod
+    def _merge_receive_errors(group: Any, errors: tuple[str, ...]) -> tuple[str, ...]:
+        """Union small error records, with every group member taking part."""
+        if group is None or group.world_size <= 1:
+            return errors
+        if group.rank_in_group == 0:
+            merged = set(errors)
+            for src in range(1, group.world_size):
+                merged.update(group.recv_object(src=src))
+            return tuple(group.broadcast_object(tuple(sorted(merged)), src=0))
+        group.send_object(errors, dst=0)
+        return tuple(group.broadcast_object(None, src=0))
+
+    def _finish_kv_receive(
+        self, req: Any, received: bool, target_device: torch.device | None, error: str | None = None
+    ) -> bool:
+        """Agree on terminal receive failures before entering KV distribution.
+
+        Validate the complete receiving-side payload before CFG scatter makes
+        rank-local subsets. Never raise on just the fetching rank: followers
+        must participate in the status exchange even when they fetched nothing.
+        """
+        pt = self.topo_config
+        errors = (error,) if error is not None else ()
+        request_id = self._resolve_request_id(req)
+        if (
+            self.config.need_recv_cache
+            and request_id is not None
+            and not OmniDiffusionRequest.is_dummy_run_request_id(request_id)
+        ):
+            if received and not pt.is_follower:
+                params = getattr(req, "sampling_params", None)
+                required = getattr(params, "cfg_kv_request_ids", None) or {}
+                branch_map = getattr(params, "cfg_branch_past_key_values", None) or {}
+                missing = sorted(
+                    role
+                    for role in required
+                    if getattr(params, f"{role}_past_key_values", None) is None and branch_map.get(role) is None
+                )
+                if missing:
+                    errors += (f"Missing required CFG KV: {', '.join(missing)}",)
+            if pt.is_local and pt.tp_active and pt.tp_group is not None and pt.tp_size > 1:
+                received = self._tp_local_receive_consensus(req, received, errors)
+                # The TP verdict already raised any terminal error.
+                errors = ()
+            elif not pt.is_local:
+                # Cartesian groups spread errors without unrelated DP/PP ranks.
+                # Non-TP retains the existing world-only distribution topology.
+                groups = (pt.tp_group, pt.cfg_group, pt.sp_group) if pt.tp_active else (pt.world,)
+                for group in groups:
+                    errors = self._merge_receive_errors(group, errors)
+        if errors:
+            self._clear_request_kv_payload(req)
+            raise KVCacheReceiveError(f"KV receive failed for {request_id}: {'; '.join(sorted(set(errors)))}")
+
+        kv_payload = self.distribute_kv_cache(req, target_device, received=received)
+        if kv_payload is not None:
+            self._apply_request_kv_payload(req, kv_payload, target_device)
+        return received or kv_payload is not None
+
     def receive_multi_kv_cache_distributed(
         self,
         req: Any,
         cfg_kv_collect_func: Callable | None = None,
         target_device: torch.device | None = None,
     ) -> bool:
-        """Synchronous receive: fetch → distribute → apply (FOLLOWER skips fetch)."""
+        """Fetch, agree on errors, then distribute (FOLLOWER skips fetch)."""
         received = False
+        error = None
         if not self.topo_config.is_follower:
-            received = self.receive_multi_kv_cache(req, cfg_kv_collect_func, target_device)
-        received = self._tp_local_receive_consensus(req, received)
-        kv_payload = self.distribute_kv_cache(req, target_device, received=received)
-        if kv_payload is not None:
-            self._apply_request_kv_payload(req, kv_payload, target_device)
-        return received or kv_payload is not None
+            try:
+                received = self.receive_multi_kv_cache(req, cfg_kv_collect_func, target_device)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+        return self._finish_kv_receive(req, received, target_device, error)
 
     def consume_and_distribute_kv_cache(self, req: Any, target_device: torch.device | None = None) -> bool:
-        """Consume prefetched KV → apply → distribute; sync-receive on miss (no retry on consume-error)."""
+        """Use prefetch or sync receive, then share the same terminal verdict."""
         received = False
-        payload_consumed = False
-        if self._async_prefetch and not self.topo_config.is_follower:
+        error = None
+        if not self.topo_config.is_follower:
             try:
-                data, _ = self.consume_prefetched_kv(req)
-                if data is not None:
-                    self._record_stream_for_prefetched(data)
-                    self.apply_kv_cache_to_request(req, data)
-                    received = True
-            except KVPrefetchConsumeError:
-                logger.error(
-                    "KV prefetch consumed payload for %s but post-get failed; request cannot recover",
-                    self._resolve_request_id(req),
-                )
-                payload_consumed = True
-        # Only fall back to sync receive on miss, not when payload was
-        # already consumed from the connector (sync receive would block
-        # until timeout as the data is gone).
-        if not received and not self.topo_config.is_follower and not payload_consumed:
-            logger.debug("KV prefetch miss for %s; falling back to sync receive", self._resolve_request_id(req))
-            received = self.receive_multi_kv_cache(req, None, target_device)
-        received = self._tp_local_receive_consensus(req, received)
-        kv_payload = self.distribute_kv_cache(req, target_device, received=received)
-        if kv_payload is not None:
-            self._apply_request_kv_payload(req, kv_payload, target_device)
-        return received or kv_payload is not None
+                if self._async_prefetch:
+                    data, _ = self.consume_prefetched_kv(req)
+                    if data is not None:
+                        self._record_stream_for_prefetched(data)
+                        self.apply_kv_cache_to_request(req, data)
+                        received = True
+                if not received:
+                    logger.debug("KV prefetch miss for %s; falling back to sync receive", self._resolve_request_id(req))
+                    received = self.receive_multi_kv_cache(req, None, target_device)
+            except Exception as exc:
+                # In particular, a consumed payload must not be fetched again.
+                # Peers still need the verdict before any rank can raise.
+                error = f"{type(exc).__name__}: {exc}"
+        return self._finish_kv_receive(req, received, target_device, error)
 
     def _cfg_scatter(
         self,
