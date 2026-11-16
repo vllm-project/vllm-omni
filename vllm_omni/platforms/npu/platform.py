@@ -166,6 +166,25 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         _install_ascend_mamba_prefill_end_compat()
 
     @classmethod
+    def init_ar_worker_runtime(
+        cls,
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ) -> None:
+        super().init_ar_worker_runtime(vllm_config, device)
+
+        # Register the MOSS-TTS depth whole-loop adapter here, not in __init__
+        # (the patch imports the model module, which resolves the platform and
+        # would re-enter construction) and not in set_device (MOSS stage 0 runs
+        # on NPUARWorker, which never reaches it). This hook runs after device
+        # setup and before model loading.
+        from vllm_omni.platforms.npu.models.moss_tts_local_depth import (
+            apply_moss_tts_local_depth_patch,
+        )
+
+        apply_moss_tts_local_depth_patch()
+
+    @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
         return "vllm_omni.platforms.npu.worker.npu_ar_worker.NPUARWorker"
 
