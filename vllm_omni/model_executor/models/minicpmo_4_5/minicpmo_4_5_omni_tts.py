@@ -1895,6 +1895,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 "min_tokens": min_tokens,
                 "turn_end_drain": drain_kind,
             }
+            if native_duplex:
+                state["host_condition_seq"] = condition_seq
             if isinstance(retained_codes, torch.Tensor) or retained_codes:
                 state["recent_codes"] = retained_codes
             request_states = getattr(self, "_request_audio_states", None)
@@ -1916,6 +1918,18 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 codec_inputs = getattr(self, "_request_codec_device_inputs", None)
                 if isinstance(codec_inputs, dict):
                     codec_inputs.pop(request_id, None)
+                host_states = getattr(self, "_request_host_codec_states", None)
+                host_state = host_states.get(request_id) if isinstance(host_states, dict) else None
+                if (
+                    host_state is not None
+                    and isinstance(condition_seq, int)
+                    and not isinstance(condition_seq, bool)
+                    and host_state.get("condition_seq") != condition_seq
+                ):
+                    # Finishing one segment must not stop the next; retries of
+                    # the same segment must preserve its finished state.
+                    host_state["finished"] = False
+                    host_state["condition_seq"] = condition_seq
             empty_codes = torch.empty(0, dtype=torch.long, device="cpu")
             return (
                 input_ids,
@@ -2982,14 +2996,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             old_codes = state.get("codes")
             if not isinstance(old_codes, torch.Tensor):
                 old_codes = hidden.new_empty((0,), dtype=torch.long)
-            elif old_codes.device != delta.device:
-                # The prefill handoff seeds ``codes`` on the host, while the
-                # fused CUDA graph emits ``delta`` on the device. Align them
-                # before concatenating (build 19180 Stage-1 fatal error).
-                old_codes = old_codes.to(delta.device)
             # Full-width mirror; only the host-side ``_request_codec_history``
             # (flushed one step later) is exact, and it is the one readers use.
-            old_codes = old_codes.reshape(-1)[-HISTORY_WINDOW:].to(delta.device)
+            # Prefill seeds ``codes`` on the host. Trim before transferring
+            # the retained window to the device that emits ``delta``.
+            old_codes = old_codes.reshape(-1)[-HISTORY_WINDOW:].to(delta.device, non_blocking=True)
             state["codes"] = torch.cat((old_codes, delta.reshape(-1)))[-HISTORY_WINDOW:]
             # ``last_tokens`` keeps the pre-step id when nothing emits, so the
             # unconditional snapshot matches the host loop's ``if emitted``
@@ -3837,6 +3848,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 "finished": False,
                 "bins": bins,
                 "generator": generator,
+                "condition_seq": request_state.get("host_condition_seq"),
             }
             states[request_id] = hstate
         # Resolve knobs once per request, same sources as the device
