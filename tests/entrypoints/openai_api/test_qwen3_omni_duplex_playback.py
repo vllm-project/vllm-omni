@@ -601,12 +601,13 @@ class TestQwen3OmniDuplexPlayback:
         _assert_auto_committed_turns(turns)
 
     @pytest.mark.advanced_model
+    def test_full_history_rejects_audio_overflow(self, qwen_duplex_server, tmp_path: Path):
+        """The unconfigured default preserves sources and rejects a fifth audio input."""
+        asyncio.run(_run_duplex_history(qwen_duplex_server, tmp_path / "events.json", reject_overflow=True))
+
+    # Keep this fixture parameter last to group the default-policy cases on one server.
+    @pytest.mark.advanced_model
     @pytest.mark.parametrize("qwen_duplex_server", ["recent"], indirect=True)
     def test_mixed_image_audio_history_pruning(self, qwen_duplex_server, tmp_path: Path):
         """Explicit recent history evicts old audio and its paired image/answer."""
         asyncio.run(_run_duplex_history(qwen_duplex_server, tmp_path / "events.json"))
-
-    @pytest.mark.advanced_model
-    def test_full_history_rejects_audio_overflow(self, qwen_duplex_server, tmp_path: Path):
-        """The unconfigured default preserves sources and rejects a fifth audio input."""
-        asyncio.run(_run_duplex_history(qwen_duplex_server, tmp_path / "events.json", reject_overflow=True))

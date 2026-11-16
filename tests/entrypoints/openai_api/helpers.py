@@ -347,9 +347,9 @@ async def _duplex_receive_until(
             event = json.loads(raw)
             events.append(event)
             if event.get("type") == "error":
-                assert expected_error_code is not None and event.get("error", {}).get("code") == expected_error_code, (
-                    event
-                )
+                error = event.get("error")
+                assert isinstance(error, dict), event
+                assert expected_error_code is not None and error.get("code") == expected_error_code, event
 
     await asyncio.wait_for(receive(), timeout=timeout_s)
 
