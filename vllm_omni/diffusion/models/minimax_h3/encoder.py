@@ -33,6 +33,7 @@ from __future__ import annotations
 import itertools
 import re
 from collections.abc import Iterable
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,7 @@ from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMetho
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.layers.norm import RMSNorm as DiffusionRMSNorm
+from vllm_omni.diffusion.models.minimax_h3.qwen3vl_offload import Qwen3VLBlockOffloader
 from vllm_omni.diffusion.offloader.module_residency import (
     BoundedAllocatorCache,
     PinnedModuleStager,
@@ -521,7 +523,8 @@ class MiniMaxH3Qwen3VLVisionRotaryEmbedding(nn.Module):
         self.theta = theta
         # Plain attribute (not a registered buffer): the reference keeps this
         # table in float32 and module-wide dtype casts must not touch it.
-        self._inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
+        freq_device = "cpu" if torch.get_default_device().type == "meta" else None
+        self._inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float, device=freq_device) / dim))
 
     def forward(self, seqlen: int) -> torch.Tensor:
         inv_freq = self._inv_freq.to(device=self._inv_freq.device)
@@ -968,6 +971,7 @@ class MiniMaxH3Qwen3VLTextModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.hidden_size = config.hidden_size
         self.num_layers = min(int(getattr(config, "num_hidden_layers", 0)), selected_layer)
+        self.block_offloader: Qwen3VLBlockOffloader | None = None
         self.embed_tokens = MiniMaxH3Qwen3VLVocabParallelEmbedding(
             group, num_embeddings=config.vocab_size, embedding_dim=config.hidden_size, dtype=dtype
         )
@@ -1008,14 +1012,17 @@ class MiniMaxH3Qwen3VLTextModel(nn.Module):
     ) -> torch.Tensor:
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, positions, inv_freq=rotary_inv_freq)
-        for layer_idx, decoder_layer in enumerate(self.layers):
-            hidden_states = decoder_layer(hidden_states, position_embeddings=position_embeddings)
-            if deepstack_visual_embeds is not None and layer_idx in range(len(deepstack_visual_embeds)):
-                hidden_states = self._deepstack_process(
-                    hidden_states,
-                    visual_pos_masks,
-                    deepstack_visual_embeds[layer_idx],
-                )
+        offloader = self.block_offloader
+        with offloader.run() if offloader is not None else nullcontext():
+            for layer_idx, decoder_layer in enumerate(self.layers):
+                with offloader.layer(layer_idx) if offloader is not None else nullcontext(decoder_layer) as layer:
+                    hidden_states = layer(hidden_states, position_embeddings=position_embeddings)
+                if deepstack_visual_embeds is not None and layer_idx in range(len(deepstack_visual_embeds)):
+                    hidden_states = self._deepstack_process(
+                        hidden_states,
+                        visual_pos_masks,
+                        deepstack_visual_embeds[layer_idx],
+                    )
         return hidden_states
 
 
@@ -1284,8 +1291,16 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             raise RuntimeError(f"MiniMax H3 text encoder weights not loaded: {len(missing)} params: {missing}")
         return loaded
 
+    def enable_block_offload(self, root: str | Path, *, num_slots: int = 6) -> Qwen3VLBlockOffloader:
+        offloader = Qwen3VLBlockOffloader(self, root, num_slots=num_slots)
+        self.text_model.block_offloader = offloader
+        return offloader
+
     def load_to_device(self) -> None:
         if not self.is_loaded:
+            return
+        if self.text_model.block_offloader is not None:
+            self.text_model.block_offloader.activate()
             return
         if getattr(self, "_omni_layerwise_enabled", False):
             stager = getattr(self, "_omni_non_block_stager", None)
@@ -1306,6 +1321,9 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
 
     def offload_to_cpu(self) -> None:
         if not self.is_loaded:
+            return
+        if self.text_model.block_offloader is not None:
+            self.text_model.block_offloader.deactivate()
             return
         if getattr(self, "_omni_layerwise_enabled", False):
             for hook in self._omni_layerwise_hooks:

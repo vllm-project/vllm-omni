@@ -943,6 +943,7 @@ class MiniMaxH3Pipeline(
         super().__init__()
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
+        file_backed = resolve_offload_strategy(od_config) is OffloadStrategy.FILE_BACKED
         if int(self.parallel_config.cfg_parallel_size) != 1:
             raise ValueError("MiniMax-H3 is CFG-distilled and has no negative branch; cfg_parallel_size must be 1")
         # A request that omits attention_schedule and latent_refine inherits both defaults, a pair
@@ -1160,11 +1161,12 @@ class MiniMaxH3Pipeline(
                 ),
             )
         transformer_cls = type(self)._transformer_cls or MiniMaxH3DiTModel
-        self.transformer = transformer_cls(
-            od_config,
-            quant_config=transformer_quant_config,
-            diffusers_weights=modular,
-        )
+        with torch.device("meta") if file_backed else nullcontext():
+            self.transformer = transformer_cls(
+                od_config,
+                quant_config=transformer_quant_config,
+                diffusers_weights=modular,
+            )
         if self._fasth3_checkpoint is not None:
             spec = self._fasth3_checkpoint
             if isinstance(spec, FastH3OmniCheckpointSpec) and self.transformer.arch.pdd_steps != 32:
@@ -1183,11 +1185,12 @@ class MiniMaxH3Pipeline(
                 spec.vsa_tile_size,
             )
         if ref2va_model_path is not None:
-            self.transformers_ref = MiniMaxH3DiTModel(
-                od_config,
-                quant_config=transformer_quant_config,
-                diffusers_weights=modular,
-            )
+            with torch.device("meta") if file_backed else nullcontext():
+                self.transformers_ref = MiniMaxH3DiTModel(
+                    od_config,
+                    quant_config=transformer_quant_config,
+                    diffusers_weights=modular,
+                )
 
         self._vdn = VDNCheckpoint.from_od_config(od_config, self.transformer)
         if self._vdn is not None:
@@ -1271,13 +1274,14 @@ class MiniMaxH3Pipeline(
                 )
             self.text_encoder_tp_size = text_encoder_tp_size
             self.text_encoder_group = self._build_text_encoder_group(text_encoder_tp_size)
-            self.text_encoder = MiniMaxH3Qwen3VLEncoder(
-                os.path.join(encoder_model_path, "text_encoder"),
-                device=self.device,
-                load_model=rank < text_encoder_tp_size,
-                encoder_group=self.text_encoder_group,
-                quant_config=_resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config),
-            )
+            with torch.device("meta") if file_backed else nullcontext():
+                self.text_encoder = MiniMaxH3Qwen3VLEncoder(
+                    os.path.join(encoder_model_path, "text_encoder"),
+                    device=self.device,
+                    load_model=rank < text_encoder_tp_size,
+                    encoder_group=self.text_encoder_group,
+                    quant_config=_resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config),
+                )
             if rank < text_encoder_tp_size:
                 self.weights_sources.append(
                     DiffusersPipelineLoader.ComponentSource(
