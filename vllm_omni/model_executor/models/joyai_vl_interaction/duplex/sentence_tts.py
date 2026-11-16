@@ -14,7 +14,8 @@ is still open may not be the note after all.
 Sentence TTS follows AURA's orchestrator contract: each confirmed sentence is a
 resumable Talker update on the same request id. Only one sentence is in flight
 at a time: later sentences wait in ``queued`` until Talker parks on 2150, then
-the plugin submits the next one from the Talker-stage poll. MRv2 async_chunk
+the Talker-stage poll returns a plan whose ``source_stage_id`` is JoyAI so the
+orchestrator submits the next sentence onto Talker. MRv2 async_chunk
 Talker only emits those 2150 parks (no generating deltas), so a new park with
 a new segment generation (or different token ids) must drain even while
 ``releasing`` is still set. The last
@@ -28,13 +29,13 @@ flags written here; do not duplicate the key strings elsewhere.
 
 from __future__ import annotations
 
-import asyncio
 import time
 
 import regex as re
 
 from vllm_omni.data_entry_keys import JOYAI_FINISH_ON_NEXT_STOP_KEY
 from vllm_omni.engine.duplex.plugin import PartialStageForward
+from vllm_omni.engine.duplex.sentence_tts import SentenceTtsOutput
 from vllm_omni.entrypoints.openai.speech_text_splitter import SpeechTextSplitter
 from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import (
     DELEGATION_TAG,
@@ -243,18 +244,6 @@ def enable_talker_streaming(req_state: object) -> None:
         streaming.enabled = True
 
 
-class SentenceTtsOutput:
-    """JoyAI view that exposes only the sentence Talker should speak."""
-
-    def __init__(self, request_id: str, text: str) -> None:
-        self.request_id = request_id
-        self.finished = False
-        self.text = text
-        self.cumulative_text = text
-        self.outputs = [self]
-        self.token_ids: list[int] = []
-
-
 def _stage_pool(orchestrator: object, stage_id: int) -> object | None:
     """The orchestrator stores pools in a list; tests may use a dict."""
     pools = getattr(orchestrator, "stage_pools", None)
@@ -328,72 +317,38 @@ def _pop_queued_sentence(bridge: dict[str, object]) -> str:
     return ""
 
 
-def _skip_legacy_plan(request_id: str) -> PartialStageForward:
-    """Keep Stage0's full action off Talker while a sentence is already speaking."""
-    return PartialStageForward(
-        output=SentenceTtsOutput(request_id, ""),
-        is_final_update=False,
-        close_only=False,
-        queue_close_after=False,
-    )
-
-
-def _schedule_talker_followup_sequence(
-    orchestrator: object,
+def _talker_forward_plan(
+    request_id: str,
+    text: str,
     joyai_stage_id: int,
-    req_state: object,
-    steps: list[tuple[SentenceTtsOutput, bool, bool, bool]],
-) -> None:
-    """Submit Talker updates from JoyAI's stage, not from Talker→Code2Wav.
-
-    ``DuplexOrchestrator._route_output`` always forwards ``stage_id + 1``. A
-    Talker-stage plan would therefore hit Code2Wav. Scheduling from
-    ``joyai_stage_id`` keeps ``joyai_action_to_tts`` on the Talker path.
-    """
-    if not steps:
-        return
-    pending = getattr(orchestrator, "pending_talker_followups", None)
-    if isinstance(pending, list):
-        pending.extend((view, is_final_update) for view, is_final_update, _close_only, _finish in steps)
-    last = steps[-1]
-    mark_talker_prompt_flags(req_state, close_only=last[2], finish_on_next_stop=last[3])
-    forward = getattr(orchestrator, "_forward_to_next_stage", None)
-    if not callable(forward):
-        return
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return
-
-    async def _run() -> None:
-        for view, is_final_update, close_only, finish_on_next_stop in steps:
-            mark_talker_prompt_flags(req_state, close_only=close_only, finish_on_next_stop=finish_on_next_stop)
-            await forward(
-                str(view.request_id),
-                joyai_stage_id,
-                view,
-                req_state,
-                is_streaming_session=True,
-                is_final_update=is_final_update,
-            )
-
-    loop.create_task(_run())
-
-
-def _schedule_talker_followup(
-    orchestrator: object,
-    joyai_stage_id: int,
-    view: SentenceTtsOutput,
-    req_state: object,
     *,
     is_final_update: bool,
     close_only: bool = False,
-) -> None:
-    _schedule_talker_followup_sequence(
-        orchestrator,
+    queue_close_after: bool = False,
+) -> PartialStageForward:
+    """A Talker update the orchestrator must submit from the JoyAI stage.
+
+    ``source_stage_id`` is JoyAI even when this plan is returned from a Talker
+    park poll. Forwarding from Talker would hit Code2Wav.
+    """
+    return PartialStageForward(
+        output=SentenceTtsOutput(request_id, text),
+        is_final_update=is_final_update,
+        close_only=close_only,
+        queue_close_after=queue_close_after,
+        source_stage_id=joyai_stage_id,
+    )
+
+
+def _skip_legacy_plan(request_id: str, joyai_stage_id: int) -> PartialStageForward:
+    """Keep Stage0's full action off Talker while a sentence is already speaking."""
+    return _talker_forward_plan(
+        request_id,
+        "",
         joyai_stage_id,
-        req_state,
-        [(view, is_final_update, close_only, False)],
+        is_final_update=False,
+        close_only=False,
+        queue_close_after=False,
     )
 
 
@@ -515,6 +470,7 @@ def _plan_after_talker_park(
     joyai_stage_id: int,
 ) -> PartialStageForward | None:
     """Release the next queued sentence, or close, once Talker parks on 2150."""
+    del orchestrator
     bridge = _sentence_tts_bridge(req_state)
     if bridge is None:
         return None
@@ -549,15 +505,17 @@ def _plan_after_talker_park(
         # finish-on-next-stop so that utterance's 2150 is Code2Wav's request
         # terminal. A later parked close_only is too late: the vocoder already
         # treated 2150 as a segment stop and never sees ``finished``.
+        mark_talker_prompt_flags(req_state, close_only=False, finish_on_next_stop=close_after)
         if close_after:
             mark_close_sent(req_state)
-        _schedule_talker_followup_sequence(
-            orchestrator,
+        return _talker_forward_plan(
+            request_id,
+            chunk,
             joyai_stage_id,
-            req_state,
-            [(SentenceTtsOutput(request_id, chunk), False, False, close_after)],
+            is_final_update=False,
+            close_only=False,
+            queue_close_after=False,
         )
-        return None
     bridge["talker_busy"] = False
     if not bridge.get("closed") or bridge.get("close_sent"):
         # ``close_sent``: the idle-at-finish path already handed the sentinel to
@@ -567,15 +525,15 @@ def _plan_after_talker_park(
     bridge["releasing"] = True
     mark_close_sent(req_state)
     enable_talker_streaming(req_state)
-    _schedule_talker_followup(
-        orchestrator,
+    mark_talker_prompt_flags(req_state, close_only=True, finish_on_next_stop=False)
+    return _talker_forward_plan(
+        request_id,
+        "",
         joyai_stage_id,
-        SentenceTtsOutput(request_id, ""),
-        req_state,
         is_final_update=True,
         close_only=True,
+        queue_close_after=False,
     )
-    return None
 
 
 def plan_partial_stage_output(
@@ -648,7 +606,7 @@ def plan_partial_stage_output(
             return None
         mark_talker_prompt_flags(req_state, close_only=False)
         enable_talker_streaming(req_state)
-        return _skip_legacy_plan(request_id)
+        return _skip_legacy_plan(request_id, joyai_stage_id)
 
     if chunk:
         bridge["talker_busy"] = True
@@ -669,8 +627,10 @@ def plan_partial_stage_output(
             # finishes on the coming 2150; either way a later park-close must
             # not send a second terminal.
             mark_close_sent(req_state)
-        return PartialStageForward(
-            output=SentenceTtsOutput(request_id, chunk),
+        return _talker_forward_plan(
+            request_id,
+            chunk,
+            joyai_stage_id,
             is_final_update=is_final_update,
             close_only=False,
             queue_close_after=queue_close_after,
@@ -680,8 +640,10 @@ def plan_partial_stage_output(
         mark_talker_prompt_flags(req_state, close_only=True)
         enable_talker_streaming(req_state)
         mark_close_sent(req_state)
-        return PartialStageForward(
-            output=SentenceTtsOutput(request_id, ""),
+        return _talker_forward_plan(
+            request_id,
+            "",
+            joyai_stage_id,
             is_final_update=True,
             close_only=True,
             queue_close_after=False,

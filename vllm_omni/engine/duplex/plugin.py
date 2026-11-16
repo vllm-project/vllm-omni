@@ -355,12 +355,18 @@ class PartialStageForward:
     finished and an earlier sentence is already in flight. The text must be
     submitted resumable. A non-resumable submit is an end sentinel
     (``StreamingUpdate.from_request`` returns None) and aborts that sentence.
+
+    ``source_stage_id`` is the stage the orchestrator forwards *from*
+    (``_forward_to_next_stage`` always goes to source + 1). ``None`` means
+    the producing stage that just emitted ``output``. A Talker-park follow-up
+    must name the thinker stage; forwarding from Talker would hit Code2Wav.
     """
 
     output: object
     is_final_update: bool
     close_only: bool = False
     queue_close_after: bool = False
+    source_stage_id: int | None = None
 
 
 def duplex_text_history(conversation: Iterable[Mapping[str, object]]) -> tuple[tuple[str, str], ...]:
@@ -662,7 +668,8 @@ class DuplexModelPlugin(ABC):
         """Return a Talker update the orchestrator should submit, or None.
 
         Default models do not split Stage1 text. The orchestrator owns the
-        actual ``_forward_to_next_stage`` call.
+        actual ``_forward_to_next_stage`` call, including follow-ups whose
+        ``source_stage_id`` is not the producing stage.
         """
         del orchestrator, stage_id, replica_id, output, req_state
         return None

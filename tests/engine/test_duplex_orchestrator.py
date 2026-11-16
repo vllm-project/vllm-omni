@@ -1176,6 +1176,47 @@ async def test_sentence_partial_does_not_legacy_forward_the_full_stage_output() 
 
 
 @pytest.mark.asyncio
+async def test_cross_stage_partial_keeps_legacy_and_forwards_from_source() -> None:
+    from vllm_omni.engine.duplex.plugin import PartialStageForward
+
+    orchestrator, *_ = _build(stages=4)
+    forwarded: list[tuple[int, object]] = []
+
+    async def record_forward(req_id, stage_id, output, req_state, **kwargs):
+        del req_id, req_state, kwargs
+        forwarded.append((stage_id, output))
+
+    async def no_intercept(*args, **kwargs):
+        del args, kwargs
+        return False
+
+    orchestrator._forward_to_next_stage = record_forward  # type: ignore[method-assign]
+    orchestrator._intercept_stage_output = no_intercept  # type: ignore[method-assign]
+    orchestrator.async_chunk = True
+    orchestrator._stage_receives_async_chunks = lambda stage_id: False  # type: ignore[method-assign]
+
+    full = SimpleNamespace(request_id="r", finished=True, text="CODEC")
+    chunk = SimpleNamespace(request_id="r", finished=False, text="关火。")
+    req_state = DuplexOrchestratorRequestState(
+        request_id="r",
+        final_stage_id=3,
+        session_owned=True,
+        sampling_params_list=[SimpleNamespace() for _ in range(4)],
+    )
+    orchestrator.plugin.plan_partial_stage_output = lambda *args, **kwargs: PartialStageForward(  # type: ignore[method-assign]
+        output=chunk,
+        is_final_update=False,
+        source_stage_id=0,
+    )
+    orchestrator.plugin.partial_stage_followup = lambda *args, **kwargs: None  # type: ignore[method-assign]
+
+    await orchestrator._route_output(1, 0, full, req_state, None)
+
+    assert forwarded == [(1, full), (0, chunk)]
+    assert req_state.skip_legacy_stage_forward is False
+
+
+@pytest.mark.asyncio
 async def test_stage_work_reaches_the_ledger_before_any_session_output() -> None:
     orchestrator, _, rpc_q, _ = _build(stages=2, runtime_config=DuplexSessionRuntimeConfig(collect_stats=True))
     try:

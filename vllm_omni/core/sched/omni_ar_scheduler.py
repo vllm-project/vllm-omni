@@ -33,6 +33,9 @@ from vllm_omni.core.sched.omni_scheduler_mixin import (
 from vllm_omni.core.sched.utils import (
     free_kv_blocks_in_physical_order,
 )
+from vllm_omni.core.sched.utils import (
+    streaming_update_replaces_prompt as _streaming_update_replaces_prompt,
+)
 from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import CONTINUE_TOKEN_ID
@@ -47,6 +50,42 @@ class _ChunkSaveKwargs(TypedDict, total=False):
     duplex_perf_chunk: tuple[int, int]
     segment_generation: int | None
     force_request_finished: bool
+
+
+def _enqueue_last_sentence_chunk(
+    scheduler: OmniSchedulerMixin,
+    request: Request,
+    inter_stage_output: object,
+    scheduler_output: SchedulerOutput,
+    req_id: str,
+    *,
+    is_segment_finished: bool,
+    new_token_ids: list[int],
+    confirmed_num_computed_tokens: int | None,
+) -> None:
+    """Enqueue the last-sentence vocoder chunk before ``_free_request``.
+
+    Saving after free drops that chunk; Code2Wav then parks on the last
+    segment until the client times out. Immediate ``save_async``, not
+    ``batch_saves``: the batch flush runs after the caller loop.
+    """
+    adapter = scheduler.chunk_transfer_adapter
+    if adapter is None:
+        return
+    save_kwargs: _ChunkSaveKwargs = {
+        "new_token_ids": new_token_ids,
+        "confirmed_num_computed_tokens": confirmed_num_computed_tokens,
+        "force_request_finished": True,
+    }
+    perf_chunk = OmniSchedulerMixin._duplex_step_chunk(scheduler, scheduler_output, req_id)
+    if isinstance(perf_chunk, tuple):
+        save_kwargs["duplex_perf_chunk"] = perf_chunk
+    adapter.save_async(
+        inter_stage_output,
+        request,
+        is_segment_finished,
+        **save_kwargs,
+    )
 
 
 def _should_emit_engine_output(
@@ -82,32 +121,6 @@ def _holds_payloadless_outputs(model_config: object) -> bool:
     return bool(getattr(model_config, "final_output", False)) and (
         getattr(model_config, "engine_output_type", None) == "audio"
     )
-
-
-def _streaming_update_replaces_prompt(update_infos: tuple[object, ...]) -> bool:
-    """Whether this streaming update is a new utterance, not a prompt extension.
-
-    MiniCPM sets a nested dict ``meta.replace_streaming_prompt``. Sentence TTS
-    serializes the same flag through ``serialize_payload``, so it arrives as
-    an ``AdditionalInformationPayload`` entry ``meta.replace_streaming_prompt``.
-    The dict-only check missed that wire shape and appended the next sentence
-    onto leftover Talker codec KV.
-    """
-    for info in update_infos:
-        if isinstance(info, dict):
-            meta = info.get("meta")
-            if isinstance(meta, dict) and meta.get("replace_streaming_prompt") is True:
-                return True
-            if info.get("meta.replace_streaming_prompt") is True:
-                return True
-            continue
-        entries = getattr(info, "entries", None)
-        if not isinstance(entries, dict):
-            continue
-        entry = entries.get("meta.replace_streaming_prompt")
-        if entry is not None and getattr(entry, "scalar_data", None) is True:
-            return True
-    return False
 
 
 class SampledLogprobContractError(RuntimeError):
@@ -1383,19 +1396,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     # client times out. Immediate ``save_async``, not
                     # ``batch_saves``: the batch flush runs after this loop.
                     if finish_on_next_stop and self.chunk_transfer_adapter is not None and not omits_chunk_transfer:
-                        save_kwargs: _ChunkSaveKwargs = {
-                            "new_token_ids": new_token_ids,
-                            "confirmed_num_computed_tokens": confirmed_num_computed_tokens,
-                            "force_request_finished": True,
-                        }
-                        perf_chunk = OmniSchedulerMixin._duplex_step_chunk(self, scheduler_output, req_id)
-                        if isinstance(perf_chunk, tuple):
-                            save_kwargs["duplex_perf_chunk"] = perf_chunk
-                        self.chunk_transfer_adapter.save_async(
-                            inter_stage_output,
+                        _enqueue_last_sentence_chunk(
+                            self,
                             request,
-                            is_segment_finished,
-                            **save_kwargs,
+                            inter_stage_output,
+                            scheduler_output,
+                            req_id,
+                            is_segment_finished=is_segment_finished,
+                            new_token_ids=new_token_ids,
+                            confirmed_num_computed_tokens=confirmed_num_computed_tokens,
                         )
                         enqueued_finish_on_next_stop = True
                     kv_transfer_params, ec_transfer_params = self._free_request(request)

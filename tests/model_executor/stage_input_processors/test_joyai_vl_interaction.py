@@ -320,7 +320,7 @@ def test_joyai_action_to_tts_partial_keeps_the_sentence_view(monkeypatch: pytest
     assert talker_input["additional_information"]["embed"]["prefill"] == []
     assert talker_input["additional_information"]["hidden_states"]["trailing_text"] == []
     assert talker_input["model_intermediate_buffer"] == talker_input["additional_information"]
-    from vllm_omni.core.sched.omni_ar_scheduler import _streaming_update_replaces_prompt
+    from vllm_omni.core.sched.utils import streaming_update_replaces_prompt as _streaming_update_replaces_prompt
     from vllm_omni.data_entry_keys import serialize_payload
 
     payload = serialize_payload(talker_input["additional_information"])

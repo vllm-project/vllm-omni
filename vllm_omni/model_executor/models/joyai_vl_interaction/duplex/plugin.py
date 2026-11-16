@@ -1506,7 +1506,9 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         """Hand confirmed spoken sentences to Talker while JoyAI still generates.
 
         Only one Talker sentence is in flight. Later sentences wait for a 2150
-        park, which this plugin sees because Talker uses DELTA output.
+        park, which this plugin sees because Talker uses DELTA output. The park
+        returns a plan whose ``source_stage_id`` is JoyAI; the orchestrator
+        submits it onto Talker after this poll's Code2Wav routing.
 
         Requires the streaming profile: with ``async_chunk: false`` the Talker is
         one-shot, its segment stops are not visible, and Code2Wav is not

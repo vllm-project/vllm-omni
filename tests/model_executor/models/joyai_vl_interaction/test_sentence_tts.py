@@ -21,6 +21,18 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts im
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_sentence_tts_output_is_shared_with_aura():
+    from vllm_omni.engine.duplex.sentence_tts import SentenceTtsOutput as Shared
+    from vllm_omni.model_executor.models.aura_omni.duplex.sentence_tts import (
+        SentenceTtsOutput as Aura,
+    )
+    from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts import (
+        SentenceTtsOutput as JoyAI,
+    )
+
+    assert Shared is Aura is JoyAI
+
+
 @pytest.mark.parametrize("raw", ["", "</res", "</respon", "</sile", "</sil"])
 def test_marker_prefix_is_held(raw):
     """A marker still arriving must not be rendered as speech."""
@@ -131,7 +143,6 @@ class _FakeOrchestrator:
     # Match production: Orchestrator.stage_pools is a list indexed by stage id.
     stage_pools: list[_FakePool] | dict[int, _FakePool] = field(default_factory=lambda: [_FakePool(), _FakePool()])
     chunk_fed: bool = False
-    pending_talker_followups: list[tuple[object, bool]] = field(default_factory=list)
 
     def _stage_receives_async_chunks(self, stage_id: int) -> bool:
         del stage_id
@@ -400,17 +411,16 @@ def test_talker_park_releases_the_next_queued_sentence():
     parked = _stage0_output("codec")
     parked.outputs[0].token_ids = [100, 101, 2150]
     park = plan_partial_stage_output(orchestrator, 1, 0, parked, req_state, joyai_stage_id=0)
-    assert park is None
+    assert park is not None
     # Last queued sentence stays resumable; its 2150 is the request terminal.
-    assert len(orchestrator.pending_talker_followups) == 1
-    view, is_final_update = orchestrator.pending_talker_followups[0]
-    assert is_final_update is False
-    assert "关火" in view.text
-    assert not view.text.startswith("。")
+    # The orchestrator forwards this from JoyAI, not from Talker→Code2Wav.
+    assert park.source_stage_id == 0
+    assert park.is_final_update is False
+    assert "关火" in park.output.text
+    assert not park.output.text.startswith("。")
     leftover = _stage0_output("codec-again")
     leftover.outputs[0].token_ids = [100, 101, 2150]
     assert plan_partial_stage_output(orchestrator, 1, 0, leftover, req_state, joyai_stage_id=0) is None
-    assert len(orchestrator.pending_talker_followups) == 1
     info = req_state.prompt["additional_information"]
     assert info[JOYAI_TTS_PARTIAL_KEY] is True
     assert info[JOYAI_TTS_CLOSE_ONLY_KEY] is False
@@ -426,7 +436,6 @@ def test_talker_park_releases_the_next_queued_sentence():
     assert (
         plan_partial_stage_output(orchestrator, 1, 0, _stage0_output("park-close"), req_state, joyai_stage_id=0) is None
     )
-    assert len(orchestrator.pending_talker_followups) == 1
     assert info[JOYAI_TTS_CLOSE_ONLY_KEY] is False
 
 
@@ -440,7 +449,7 @@ def test_talker_park_closes_after_the_queue_drains():
     assert opened is not None
     # The action ends without another spoken unit, while sentence 1 is in flight:
     # the finish is a skip-legacy marker, not the close.
-    plan_partial_stage_output(
+    skip = plan_partial_stage_output(
         orchestrator,
         0,
         0,
@@ -448,14 +457,17 @@ def test_talker_park_closes_after_the_queue_drains():
         req_state,
         joyai_stage_id=0,
     )
-    assert orchestrator.pending_talker_followups == []
+    assert skip is not None
+    assert skip.output.text == ""
+    assert skip.is_final_update is False
+    assert skip.close_only is False
     req_state.streaming.segments[1] = _FakeSegment(finished=True)
     park = plan_partial_stage_output(orchestrator, 1, 0, _stage0_output("codec"), req_state, joyai_stage_id=0)
-    assert park is None
-    assert len(orchestrator.pending_talker_followups) == 1
-    view, is_final_update = orchestrator.pending_talker_followups[0]
-    assert is_final_update is True
-    assert view.text == ""
+    assert park is not None
+    assert park.source_stage_id == 0
+    assert park.is_final_update is True
+    assert park.close_only is True
+    assert park.output.text == ""
     info = req_state.prompt["additional_information"]
     assert info[JOYAI_TTS_CLOSE_ONLY_KEY] is True
 
@@ -481,9 +493,10 @@ def test_talker_park_releases_without_generating_heartbeat():
     park_one = _stage0_output("park-1")
     park_one.is_segment_finished = True
     park_one.outputs[0].token_ids = [100, 101, 2150]
-    assert plan_partial_stage_output(orchestrator, 1, 0, park_one, req_state, joyai_stage_id=0) is None
-    assert len(orchestrator.pending_talker_followups) == 1
-    assert "关火" in orchestrator.pending_talker_followups[0][0].text
+    first = plan_partial_stage_output(orchestrator, 1, 0, park_one, req_state, joyai_stage_id=0)
+    assert first is not None
+    assert first.source_stage_id == 0
+    assert "关火" in first.output.text
     # Stage0 finished while sentence 2 was in flight (skip-legacy). The last
     # queued sentence's 2150 must still be Code2Wav's request terminal.
     bridge["closed"] = True
@@ -491,9 +504,10 @@ def test_talker_park_releases_without_generating_heartbeat():
     park_two = _stage0_output("park-2")
     park_two.is_segment_finished = True
     park_two.outputs[0].token_ids = [200, 201, 2150]
-    assert plan_partial_stage_output(orchestrator, 1, 0, park_two, req_state, joyai_stage_id=0) is None
-    assert len(orchestrator.pending_talker_followups) == 2
-    assert "还在烧" in orchestrator.pending_talker_followups[1][0].text
+    second = plan_partial_stage_output(orchestrator, 1, 0, park_two, req_state, joyai_stage_id=0)
+    assert second is not None
+    assert second.source_stage_id == 0
+    assert "还在烧" in second.output.text
     info = req_state.prompt["additional_information"]
     assert info[JOYAI_TTS_FINISH_ON_NEXT_STOP_KEY] is True
 
@@ -523,23 +537,24 @@ def test_talker_park_releases_repeated_stop_token_after_rebroadcast_window(monke
     park_one = _stage0_output("park-1")
     park_one.is_segment_finished = True
     park_one.outputs[0].token_ids = [2150]
-    assert plan_partial_stage_output(orchestrator, 1, 0, park_one, req_state, joyai_stage_id=0) is None
-    assert len(orchestrator.pending_talker_followups) == 1
+    first = plan_partial_stage_output(orchestrator, 1, 0, park_one, req_state, joyai_stage_id=0)
+    assert first is not None
+    assert first.source_stage_id == 0
+    assert "关火" in first.output.text
 
     leftover = _stage0_output("leftover")
     leftover.is_segment_finished = True
     leftover.outputs[0].token_ids = [2150]
     assert plan_partial_stage_output(orchestrator, 1, 0, leftover, req_state, joyai_stage_id=0) is None
-    assert len(orchestrator.pending_talker_followups) == 1
 
     clock["now"] += 1.0
     bridge["closed"] = True
     park_two = _stage0_output("park-2")
     park_two.is_segment_finished = True
     park_two.outputs[0].token_ids = [2150]
-    assert plan_partial_stage_output(orchestrator, 1, 0, park_two, req_state, joyai_stage_id=0) is None
-    assert len(orchestrator.pending_talker_followups) == 2
-    assert "还在烧" in orchestrator.pending_talker_followups[1][0].text
+    second = plan_partial_stage_output(orchestrator, 1, 0, park_two, req_state, joyai_stage_id=0)
+    assert second is not None
+    assert "还在烧" in second.output.text
 
 
 def test_talker_park_releases_same_stop_token_when_generation_advances():
@@ -563,24 +578,25 @@ def test_talker_park_releases_same_stop_token_when_generation_advances():
     park_one.is_segment_finished = True
     park_one.segment_generation = 0
     park_one.outputs[0].token_ids = [2150]
-    assert plan_partial_stage_output(orchestrator, 1, 0, park_one, req_state, joyai_stage_id=0) is None
-    assert len(orchestrator.pending_talker_followups) == 1
+    first = plan_partial_stage_output(orchestrator, 1, 0, park_one, req_state, joyai_stage_id=0)
+    assert first is not None
+    assert first.source_stage_id == 0
+    assert "关火" in first.output.text
 
     leftover = _stage0_output("leftover")
     leftover.is_segment_finished = True
     leftover.segment_generation = 0
     leftover.outputs[0].token_ids = [2150]
     assert plan_partial_stage_output(orchestrator, 1, 0, leftover, req_state, joyai_stage_id=0) is None
-    assert len(orchestrator.pending_talker_followups) == 1
 
     bridge["closed"] = True
     park_two = _stage0_output("park-2")
     park_two.is_segment_finished = True
     park_two.segment_generation = 1
     park_two.outputs[0].token_ids = [2150]
-    assert plan_partial_stage_output(orchestrator, 1, 0, park_two, req_state, joyai_stage_id=0) is None
-    assert len(orchestrator.pending_talker_followups) == 2
-    assert "还在烧" in orchestrator.pending_talker_followups[1][0].text
+    second = plan_partial_stage_output(orchestrator, 1, 0, park_two, req_state, joyai_stage_id=0)
+    assert second is not None
+    assert "还在烧" in second.output.text
 
 
 def test_talker_empty_unpark_does_not_dump_the_queued_sentence():
@@ -599,8 +615,10 @@ def test_talker_empty_unpark_does_not_dump_the_queued_sentence():
     park_tokens = [100, 101, 2150]
     parked = _stage0_output("park-1")
     parked.outputs[0].token_ids = list(park_tokens)
-    assert plan_partial_stage_output(orchestrator, 1, 0, parked, req_state, joyai_stage_id=0) is None
-    assert len(orchestrator.pending_talker_followups) == 1
+    first = plan_partial_stage_output(orchestrator, 1, 0, parked, req_state, joyai_stage_id=0)
+    assert first is not None
+    assert first.source_stage_id == 0
+    assert "关火" in first.output.text
     req_state.streaming.segments[1] = _FakeSegment(finished=False)
     leftover = _stage0_output("leftover")
     leftover.outputs[0].token_ids = list(park_tokens)
@@ -609,15 +627,14 @@ def test_talker_empty_unpark_does_not_dump_the_queued_sentence():
     park_again = _stage0_output("park-2")
     park_again.outputs[0].token_ids = list(park_tokens)
     assert plan_partial_stage_output(orchestrator, 1, 0, park_again, req_state, joyai_stage_id=0) is None
-    assert len(orchestrator.pending_talker_followups) == 1
     req_state.streaming.segments[1] = _FakeSegment(finished=False)
     generating = _stage0_output("codec")
     generating.outputs[0].token_ids = [7]
     assert plan_partial_stage_output(orchestrator, 1, 0, generating, req_state, joyai_stage_id=0) is None
     req_state.streaming.segments[1] = _FakeSegment(finished=True)
-    assert plan_partial_stage_output(orchestrator, 1, 0, _stage0_output("park-3"), req_state, joyai_stage_id=0) is None
-    assert len(orchestrator.pending_talker_followups) == 2
-    assert "还在烧" in orchestrator.pending_talker_followups[1][0].text
+    third = plan_partial_stage_output(orchestrator, 1, 0, _stage0_output("park-3"), req_state, joyai_stage_id=0)
+    assert third is not None
+    assert "还在烧" in third.output.text
 
 
 def test_talker_park_is_ignored_until_the_segment_stops():
@@ -633,7 +650,6 @@ def test_talker_park_is_ignored_until_the_segment_stops():
     assert opened is not None
     req_state.streaming.segments[1] = _FakeSegment(finished=False)
     assert plan_partial_stage_output(orchestrator, 1, 0, _stage0_output("codec"), req_state, joyai_stage_id=0) is None
-    assert orchestrator.pending_talker_followups == []
 
 
 def test_plan_partial_still_indexes_a_dict_of_pools():
@@ -674,6 +690,7 @@ def test_single_sentence_finish_is_a_final_talker_submit():
     assert plan.is_final_update is True
     assert plan.close_only is False
     assert plan.queue_close_after is False
+    assert plan.source_stage_id == 0
     assert isinstance(plan, PartialStageForward)
 
 
@@ -708,6 +725,7 @@ def test_last_sentence_after_a_parked_talker_stays_resumable():
     assert last.is_final_update is False
     assert last.close_only is False
     assert last.queue_close_after is True
+    assert last.source_stage_id == 0
     info = req_state.prompt["additional_information"]
     assert info[JOYAI_TTS_CLOSE_ONLY_KEY] is False
     assert info[JOYAI_TTS_FINISH_ON_NEXT_STOP_KEY] is True
@@ -745,4 +763,3 @@ def test_close_sentinel_is_sent_at_most_once():
     # The park poll that follows must not schedule a second terminal.
     req_state.streaming.segments[1] = _FakeSegment(finished=True)
     assert plan_partial_stage_output(orchestrator, 1, 0, _stage0_output("codec"), req_state, joyai_stage_id=0) is None
-    assert orchestrator.pending_talker_followups == []

@@ -32,8 +32,8 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_ar_scheduler import (
     OmniARAsyncScheduler,
     OmniARScheduler,
-    _streaming_update_replaces_prompt,
 )
+from vllm_omni.core.sched.utils import streaming_update_replaces_prompt as _streaming_update_replaces_prompt
 from vllm_omni.data_entry_keys import serialize_payload
 from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
 from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2code2wav_async_chunk

@@ -40,7 +40,12 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_is_auxiliary_request,
 )
 from vllm_omni.engine.duplex.messages import DuplexSessionError
-from vllm_omni.engine.duplex.plugin import DuplexInputCapacityError, DuplexModelPlugin, validate_duplex_replica_policy
+from vllm_omni.engine.duplex.plugin import (
+    DuplexInputCapacityError,
+    DuplexModelPlugin,
+    PartialStageForward,
+    validate_duplex_replica_policy,
+)
 from vllm_omni.engine.duplex.replica_placement import DuplexReplicaPlacement
 from vllm_omni.engine.duplex.session.engine_session import DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
@@ -813,6 +818,48 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             replica_id=replica_id,
         )
 
+    @staticmethod
+    def _partial_forward_source_stage(plan: PartialStageForward, stage_id: int) -> int:
+        """Stage to forward from. ``None`` means the producing stage."""
+        source = plan.source_stage_id
+        return stage_id if source is None else source
+
+    async def _submit_partial_stage_forward(
+        self,
+        plan: PartialStageForward,
+        *,
+        source_stage_id: int,
+        replica_id: int,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        """Submit ``plan`` (and an optional close follow-up) from ``source_stage_id``.
+
+        The orchestrator owns this await so abort cancels the submit with the
+        poll, and a failed submit surfaces instead of a fire-and-forget task.
+        """
+        await self._forward_to_next_stage(
+            req_state.request_id,
+            source_stage_id,
+            plan.output,
+            req_state,
+            src_replica_id=replica_id,
+            is_streaming_session=True,
+            is_final_update=plan.is_final_update and not plan.queue_close_after,
+        )
+        followup = self.plugin.partial_stage_followup(plan, req_state)
+        if followup is None:
+            return
+        followup_source = self._partial_forward_source_stage(followup, source_stage_id)
+        await self._forward_to_next_stage(
+            req_state.request_id,
+            followup_source,
+            followup.output,
+            req_state,
+            src_replica_id=replica_id,
+            is_streaming_session=True,
+            is_final_update=followup.is_final_update,
+        )
+
     async def _route_output(
         self,
         stage_id: int,
@@ -822,38 +869,38 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         stage_metrics: Any,
     ) -> None:
         plan = self.plugin.plan_partial_stage_output(self, stage_id, replica_id, output, req_state)
+        deferred: PartialStageForward | None = None
         if plan is not None:
-            # A text-bearing final is not itself the end sentinel. Submit the
-            # sentence resumable first; the follow-up, if any, closes the stream.
-            await self._forward_to_next_stage(
-                req_state.request_id,
-                stage_id,
-                plan.output,
-                req_state,
-                src_replica_id=replica_id,
-                is_streaming_session=True,
-                is_final_update=plan.is_final_update and not plan.queue_close_after,
-            )
-            followup = self.plugin.partial_stage_followup(plan, req_state)
-            if followup is not None:
-                await self._forward_to_next_stage(
-                    req_state.request_id,
-                    stage_id,
-                    followup.output,
-                    req_state,
-                    src_replica_id=replica_id,
-                    is_streaming_session=True,
-                    is_final_update=followup.is_final_update,
+            source_stage_id = self._partial_forward_source_stage(plan, stage_id)
+            if source_stage_id == stage_id:
+                # This stage's output is the sentence itself. Submit it now
+                # and skip the legacy full-text forward.
+                await self._submit_partial_stage_forward(
+                    plan,
+                    source_stage_id=source_stage_id,
+                    replica_id=replica_id,
+                    req_state=req_state,
                 )
-            # Sentence TTS already handed this Stage1 result to Talker. The
-            # legacy path below would run aura2tts on the original full text
-            # again when the next stage is not connector-fed (AURA Talker is
-            # a sender: Stage1→2 is orchestrator-fed).
-            req_state.skip_legacy_stage_forward = True
+                # Sentence TTS already handed this Stage1 result to Talker. The
+                # legacy path below would run aura2tts on the original full text
+                # again when the next stage is not connector-fed (AURA Talker is
+                # a sender: Stage1→2 is orchestrator-fed).
+                req_state.skip_legacy_stage_forward = True
+            else:
+                # Talker-park follow-up: keep routing this poll to Code2Wav,
+                # then submit the next sentence from the thinker stage.
+                deferred = plan
         try:
             await super()._route_output(stage_id, replica_id, output, req_state, stage_metrics)
         finally:
             req_state.skip_legacy_stage_forward = False
+        if deferred is not None:
+            await self._submit_partial_stage_forward(
+                deferred,
+                source_stage_id=self._partial_forward_source_stage(deferred, stage_id),
+                replica_id=replica_id,
+                req_state=req_state,
+            )
 
     async def cleanup(self, request_ids: list[str], *, abort: bool = False) -> None:
         await self._cleanup_request_ids(request_ids, abort=abort)
