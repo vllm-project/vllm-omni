@@ -53,7 +53,6 @@ def _make_pipeline(recorder: dict) -> StableDiffusionXLPipeline:
     pipeline.od_config = SimpleNamespace(dtype=torch.float32)
     pipeline.vae_scale_factor = VAE_SCALE
     pipeline.default_sample_size = HEIGHT // VAE_SCALE
-    pipeline.default_guidance_scale = 5.0
     pipeline.tokenizer_max_length = 77
     pipeline.output_type = "pt"
     pipeline.unet = SimpleNamespace(in_channels=LATENT_CHANNELS)

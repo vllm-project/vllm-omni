@@ -50,6 +50,9 @@ class StableDiffusionXLPipeline(
     # Both CFG branches share latents and timestep and have fixed 77-token prompts.
     supports_cfg_batching = True
     supports_request_batch = True
+    # diffusers' StableDiffusionXLPipeline defaults guidance_scale to 5.0, so an
+    # omitted guidance_scale must resolve to the same value here.
+    default_guidance_scale: float = 5.0
 
     def __init__(
         self,
@@ -124,9 +127,6 @@ class StableDiffusionXLPipeline(
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
         self.tokenizer_max_length = 77
         self.default_sample_size = 128  # 1024 / 8
-        # diffusers' StableDiffusionXLPipeline defaults guidance_scale to 5.0,
-        # so an omitted guidance_scale must resolve to the same value here.
-        self.default_guidance_scale = 5.0
         self.output_type = self.od_config.output_type
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
