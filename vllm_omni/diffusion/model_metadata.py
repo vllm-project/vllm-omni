@@ -59,6 +59,7 @@ FLUX3_MAX_INPUT_IMAGES = 10
 
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
+    "Praxis1Pipeline": DiffusionModelMetadata(final_output_type="actions"),
     "HyNomasPipeline": DiffusionModelMetadata(final_output_type="video"),
     "HyNomasModularPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SeedVR2Pipeline": DiffusionModelMetadata(supports_multimodal_inputs=True, final_output_type="video"),
@@ -127,6 +128,15 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         final_output_type="video",
         attention_mask_free=True,
     ),
+    # MiniMax-H3-Image: t2i without references, edit with ordered references
+    # ("Picture i"); it shares H3's packed layout and padding document.
+    "MiniMaxH3ImagePipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        # MINIMAX_H3_IMAGE_MAX_REFERENCES in pipeline_minimax_h3_image.py.
+        max_multimodal_image_inputs=16,
+        final_output_type="image",
+        attention_mask_free=True,
+    ),
     # TaoMate-H3 is a text-prompted streaming model on the MiniMax-H3 packed
     # layout; alignment padding is a second packed document, as for H3.
     "TaoMateH3Pipeline": DiffusionModelMetadata(
@@ -168,6 +178,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         attention_mask_free=True,
         final_output_type="video",
     ),
+    "CausVidWanPipeline": DiffusionModelMetadata(final_output_type="video"),
     "WanT2VDMD2Pipeline": DiffusionModelMetadata(final_output_type="video"),
     "WanI2VDMD2Pipeline": DiffusionModelMetadata(final_output_type="video"),
     "LTX2Pipeline": DiffusionModelMetadata(final_output_type="video"),
@@ -178,6 +189,12 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "HeliosPyramidPipeline": DiffusionModelMetadata(final_output_type="video"),
     "HunyuanVideo15Pipeline": DiffusionModelMetadata(final_output_type="video"),
     "HunyuanVideo15ImageToVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
+    # One pipeline serves text-to-video and, with a first frame, image-to-video.
+    "PAN2ModularPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        final_output_type="video",
+    ),
     "LingBotVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
     "LongCatVideoAvatarPipeline": DiffusionModelMetadata(final_output_type="video"),
     "MagiHumanPipeline": DiffusionModelMetadata(final_output_type="video"),

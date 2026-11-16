@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 This example shows how to use vLLM-Omni for running offline inference
 with Step-Audio2 model for audio understanding and generation.
@@ -61,9 +61,7 @@ def get_audio_to_text_query(
     if question is None:
         question = "请记录下你所听到的语音内容。"
 
-    prompt = (
-        f"<|im_start|>system\n{question}<|im_end|>\n<|im_start|>user\n<audio_patch><|im_end|>\n<|im_start|>assistant\n"
-    )
+    prompt = f"<|BOT|>system\n{question}<|EOT|><|BOT|>human\n<audio_patch><|EOT|><|BOT|>assistant\n"
 
     # Load audio
     if audio_path:

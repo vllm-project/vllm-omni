@@ -109,6 +109,7 @@ class VoxtralTTSForConditionalGeneration(
         self.have_multimodal_outputs = True
         self.has_preprocess = False
         self.has_postprocess = False
+        self.postprocess_requires_multimodal_outputs = False
         self.config = config
         self.repo_id = vllm_config.model_config.model
         self.is_hf_model = not Path(self.repo_id).is_dir()
@@ -116,6 +117,9 @@ class VoxtralTTSForConditionalGeneration(
         if self.model_stage == "audio_generation":
             self.has_preprocess = True
             self.has_postprocess = True
+            # compute_mm_logits() creates the feedback frame in
+            # make_omni_output(), after the raw forward returns.
+            self.postprocess_requires_multimodal_outputs = True
             self.requires_raw_input_tokens = True
             self.set_custom_preprocess(self.tts_preprocess)
             self.set_custom_postprocess(self.tts_postprocess)
@@ -253,11 +257,16 @@ class VoxtralTTSForConditionalGeneration(
             codes = multimodal_outputs.get("codes")
             if isinstance(codes, Mapping) and "audio" in codes:
                 audio_frames = codes["audio"]
-                assert self.post_process_idx < len(audio_frames), (
-                    f"Expect {self.post_process_idx=} < {len(audio_frames)=}"
-                )
-                update_dict["codes"] = {"audio": audio_frames[self.post_process_idx]}
-                self.post_process_idx += 1
+                batch_row = info_dict.get("_omni_batch_row")
+                if isinstance(batch_row, int):
+                    frame_index = batch_row
+                else:
+                    # V1 calls postprocess in request order and does not expose
+                    # its row index, so retain the existing counter fallback.
+                    frame_index = self.post_process_idx
+                    self.post_process_idx += 1
+                assert frame_index < len(audio_frames), f"Expect {frame_index=} < {len(audio_frames)=}"
+                update_dict["codes"] = {"audio": audio_frames[frame_index]}
         return update_dict
 
     def embed_input_ids(
@@ -348,7 +357,10 @@ class VoxtralTTSForConditionalGeneration(
         )
 
     def make_omni_output(
-        self, model_outputs: torch.Tensor | OmniOutput | tuple, logits_index: int | None = None, **kwargs
+        self,
+        model_outputs: torch.Tensor | OmniOutput | tuple,
+        logits_index: torch.Tensor | int | None = None,
+        **kwargs,
     ) -> OmniOutput:
         if isinstance(model_outputs, torch.Tensor):
             if self.model_stage == "audio_generation":

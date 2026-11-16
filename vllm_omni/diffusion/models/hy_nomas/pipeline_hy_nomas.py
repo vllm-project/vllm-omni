@@ -19,6 +19,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -37,7 +38,9 @@ from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import (
     REQUIRED_FILES,
     HyNomasARConfig,
 )
+from vllm_omni.diffusion.models.hy_nomas.decoder import PixelUMMDecoder
 from vllm_omni.diffusion.models.hy_nomas.history import HyNomasHistoryFrame, action_tails, recent_history
+from vllm_omni.diffusion.models.hy_nomas.history_archive import HyNomasHistoryArchive
 from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import (
     build_transformer,
     load_component_weights,
@@ -45,8 +48,6 @@ from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import (
     validate_sequence_parallelism,
 )
 from vllm_omni.diffusion.models.hy_nomas.interaction import HyNomasInteractionSession, validate_camera_payload
-from vllm_omni.diffusion.models.hy_nomas.pixelumm import PixelUMMDCAELatentDecoder
-from vllm_omni.diffusion.models.hy_nomas.pixelumm_model import DCAEVPixelUMMDecoder, GenExpertArch
 from vllm_omni.diffusion.models.hy_nomas.processing_hy_nomas import (
     action_conditioning,
     normalize_request,
@@ -110,29 +111,23 @@ def read_component_config(root: Path, component: str, filename: str, class_name:
 
 
 def build_decoder(config: dict[str, Any], device: torch.device) -> nn.Module:
-    arch = GenExpertArch(**{name: config[name] for name in GenExpertArch.__dataclass_fields__})
-    local_pixels = config["local_attention_tile_pixels"]
-    if type(local_pixels) is not int or local_pixels < 0 or local_pixels % 16:
-        raise ValueError("Hy-Nomas local_attention_tile_pixels must be a nonnegative multiple of 16.")
+    """Construct the native PixelUMM decoder in BF16, excluding checkpoint metadata."""
+    kwargs = {name: value for name, value in config.items() if not name.startswith("_")}
     with set_default_torch_dtype(torch.bfloat16), torch.device(device):
-        decoder = DCAEVPixelUMMDecoder(arch, local_attention_tile=local_pixels // 16)
-    vae = PixelUMMDCAELatentDecoder(
-        decoder,
-        **{
-            name: config[name]
-            for name in (
-                "denoising_step_list",
-                "num_steps",
-                "seed",
-                "temporal_window_latents",
-                "temporal_overlap_latents",
-                "decoder_tile_pixels",
-                "decoder_tile_overlap_pixels",
-                "tail_hold_latents",
-            )
-        },
-    )
-    return vae.to(device=device, dtype=torch.bfloat16).eval().requires_grad_(False)
+        vae = PixelUMMDecoder(**kwargs)
+    return vae.eval().requires_grad_(False)
+
+
+def _validate_compile(config: object) -> bool:
+    if getattr(config, "enforce_eager", False):
+        return False
+    if (g := getattr(config, "diffusion_compile_granularity", "regional")) != "regional":
+        err = (
+            "Hy-Nomas does not support full transformer compilation; "
+            "use diffusion_compile_granularity='regional' or enforce_eager=True."
+        )
+        raise ValueError(err if g == "full" else f"Unsupported Hy-Nomas diffusion_compile_granularity: {g!r}")
+    return True
 
 
 def validate_config(config: OmniDiffusionConfig) -> None:
@@ -160,8 +155,7 @@ def validate_config(config: OmniDiffusionConfig) -> None:
         raise ValueError("Hy-Nomas currently supports the unquantized distilled checkpoint without LoRA.")
     if config.flow_shift not in (None, 5.0):
         raise ValueError("Hy-Nomas requires flow_shift=5.")
-    if not config.enforce_eager and config.diffusion_compile_granularity == "full":
-        raise ValueError("Hy-Nomas does not support full transformer compilation; use enforce_eager=True.")
+    _validate_compile(config)
     if resolve_offload_strategy(config) not in (OffloadStrategy.NONE, OffloadStrategy.MODEL_LEVEL):
         raise ValueError("Hy-Nomas supports module CPU offload; layer offload is not supported.")
     custom = config.custom_pipeline_args or {}
@@ -179,6 +173,13 @@ def validate_config(config: OmniDiffusionConfig) -> None:
     text_encoder = custom.get("text_encoder")
     if "text_encoder" in custom and (not isinstance(text_encoder, str) or not text_encoder.strip()):
         raise ValueError("Hy-Nomas text_encoder must be a nonempty model ID or local path.")
+
+
+def _as_versioned_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if not tensor.is_inference():
+        return tensor
+    with torch.inference_mode(False), torch.no_grad():
+        return torch.empty_like(tensor).copy_(tensor)
 
 
 @dataclass
@@ -199,6 +200,7 @@ class HyNomasSession:
     offline_cache: list[dict[str, torch.Tensor]] | None = None
     noise_generator: torch.Generator | None = None
     history_frames: list[HyNomasHistoryFrame] = field(default_factory=list)
+    history_archive: HyNomasHistoryArchive | None = None
 
 
 class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
@@ -214,6 +216,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         super().__init__()
         del prefix
         validate_config(od_config)
+        self.od_config = od_config
         self.device = get_local_device()
         if self.device.type != "cuda":
             raise ValueError("Hy-Nomas requires CUDA.")
@@ -221,6 +224,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         self.sp_size = od_config.parallel_config.ulysses_degree
         self.target_dtype = torch.bfloat16
         self._cpu_offload = False
+        self._vae_offloaded = False
         root = Path(od_config.model)
         text_encoder_override = (od_config.custom_pipeline_args or {}).get("text_encoder")
         if not root.is_dir():
@@ -303,8 +307,15 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             if component in components:
                 raise ValueError(f"Duplicate Hy-Nomas component weight stream: {component}")
             components.add(component)
-            loader = load_transformer_weights if component == "transformer" else load_component_weights
-            names = loader(getattr(self, component), ((name.partition(".")[2], value) for name, value in entries))
+            module = getattr(self, component)
+            stream = ((name.partition(".")[2], value) for name, value in entries)
+            if component == "transformer":
+                names = load_transformer_weights(module, stream)
+            elif hasattr(module, "load_weights"):
+                # The native decoder stacks the checkpoint's q/k/v and gate/up projections.
+                names = module.load_weights(stream)
+            else:
+                names = load_component_weights(module, stream)
             loaded.update(f"{component}.{name}" for name in names)
         if components != {"transformer", "vae"}:
             raise ValueError(
@@ -314,7 +325,10 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         return loaded
 
     def setup_compile(self) -> None:
-        raise NotImplementedError("Hy-Nomas uses forward_with_cache; set enforce_eager=True.")
+        if _validate_compile(od_config := getattr(self, "od_config", None)):
+            dynamic = True if od_config is None else getattr(od_config, "diffusion_compile_dynamic", True)
+            opts = {"triton.cudagraphs": False, "triton.cudagraph_trees": False}
+            regionally_compile(self.transformer, dynamic=dynamic, options=opts)
 
     @contextmanager
     def _component_context(self, module: nn.Module):
@@ -373,11 +387,24 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             offload_encoder_modules=selected,
         )
         self._cpu_offload = True
+        # Only the all-components profile stages the VAE; naming dit/text_encoder
+        # leaves it resident even though the pipeline as a whole is "offloaded".
+        self._vae_offloaded = offload_components is None
 
     def disable_omni_model_cpu_offload(self) -> None:
         if self._cpu_offload:
             remove_sequential_offload([self.transformer, self.text_encoder, self.vae])
             self._cpu_offload = False
+            self._vae_offloaded = False
+
+    def _streaming_decode_to_cpu(self) -> bool:
+        """Send decoded windows to the host only when the VAE is staged.
+
+        ``create_streaming_decode_session(to_cpu=True)`` copies every decoded
+        window to the host, so the quantize and the pinned staging can only run
+        on the device when the VAE keeps its rolling buffers resident.
+        """
+        return self._vae_offloaded
 
     def _encode_prompt(self, prompt: str) -> dict[str, torch.Tensor | None]:
         with self._component_context(self.text_encoder):
@@ -467,7 +494,9 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             self._ar_state = None
 
     def reset_ar_diffusion_session(self, session_id: str) -> None:
-        self._ar_sessions.pop(session_id, None)
+        session = self._ar_sessions.pop(session_id, None)
+        if session is not None and session.history_archive is not None:
+            session.history_archive.clear()
 
     def close_ar_diffusion_session(self, session_id: str) -> None:
         self.reset_ar_diffusion_session(session_id)
@@ -538,12 +567,22 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                 request.seed,
                 noise,
                 generator,
-                self.vae.create_streaming_decode_session() if bound is not None else None,
-                torch.empty((1, 0), dtype=torch.bool, device=self.device),
+                # A staged VAE has no resident budget for the decoder's rolling
+                # buffers; a resident VAE keeps the decode on the device so the
+                # quantize and the transfer stay uint8.
+                self.vae.create_streaming_decode_session(to_cpu=self._streaming_decode_to_cpu())
+                if bound is not None
+                else None,
+                _as_versioned_tensor(torch.empty((1, 0), dtype=torch.bool, device=self.device)),
             )
             if recent:
                 session.noise_generator = torch.Generator(device="cpu").manual_seed(request.seed)
                 session.generator = torch.Generator(device="cpu").manual_seed(request.seed ^ 0x4E4F4D4153)
+                if config.history_archive_max_bytes:
+                    session.history_archive = HyNomasHistoryArchive(
+                        max_bytes=config.history_archive_max_bytes,
+                        max_frames=config.history_archive_max_frames,
+                    )
             if bound is not None:
                 self._ar_sessions[bound.session_id] = session
             else:
@@ -607,7 +646,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             # The reference owns padding and action-token coordinates. The
             # generic batcher must not trim that conditioning to mask.sum().
             state.prompt_embeds_mask = None
-            state.extra["hy_nomas_text_mask"] = encoded["text_mask"]
+            state.extra["hy_nomas_text_mask"] = _as_versioned_tensor(encoded["text_mask"])
             state.txt_seq_lens = [int(state.prompt_embeds.shape[1])]
             if state.txt_seq_lens[0] > int(self.args.text_len):
                 raise OmniClientError("Hy-Nomas prompt exceeds the deployed text token limit.")
@@ -686,6 +725,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         state.extra["hy_nomas_camera_mask"] = (
             torch.zeros(1, dtype=torch.bool, device=self.device) if camera_off else None
         )
+        state.extra["hy_nomas_chunk_masks"] = None
 
     def _forward_chunk(
         self, state: StepRequestState, latents: torch.Tensor, timestep: torch.Tensor, *, commit: bool
@@ -715,12 +755,25 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                 {name: tensor[:, : history + current_tokens] for name, tensor in layer.items()}
                 for layer in session.offline_cache
             ]
-        mask = torch.cat(
-            (session.history_mask, torch.zeros((1, current_tokens), device=self.device, dtype=torch.bool)), 1
-        )
-        for segment, start, end in session.action_tails:
-            if segment != state.extra["hy_nomas_segment_id"]:
-                mask[:, start:end] = False
+        mask, mask_list = state.extra.get("hy_nomas_chunk_masks") or (None, None)
+        if (
+            mask is None
+            or mask_list is None
+            or mask.shape != (1, history + current_tokens)
+            or mask.device != self.device
+            or len(mask_list) != self.num_double_blocks
+            or any(item is not mask for item in mask_list)
+        ):
+            mask = _as_versioned_tensor(
+                torch.cat(
+                    (session.history_mask, torch.zeros((1, current_tokens), device=self.device, dtype=torch.bool)), 1
+                )
+            )
+            for segment, start, end in session.action_tails:
+                if segment != state.extra["hy_nomas_segment_id"]:
+                    mask[:, start:end] = False
+            mask_list = [mask] * self.num_double_blocks
+            state.extra["hy_nomas_chunk_masks"] = (mask, mask_list)
         if latents.shape[1] < self.in_channels:
             latents = torch.cat(
                 (
@@ -746,6 +799,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             try:
                 self._check_sp_error(error, "KV allocation")
             except BaseException:
+                state.extra["hy_nomas_chunk_masks"] = None
                 cache.rollback()
                 raise
         try:
@@ -766,7 +820,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                     global_frame_counter=session.latent_frames,
                     guidance=None,
                     cache_txt=first,
-                    cache_mask_list=[mask] * self.num_double_blocks,
+                    cache_mask_list=mask_list,
                     camera_embedding=state.extra["hy_nomas_camera"],
                     camera_has_mask=state.extra["hy_nomas_camera_mask"],
                     intra_seg_txt_offsets=state.extra["hy_nomas_intra_offsets"],
@@ -804,18 +858,35 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                         for layer in range(self.num_double_blocks):
                             cache.stage(layer)
                         cache.validate_commit(retain=retained)
+                        if session.history_archive is not None:
+                            session.history_archive.stage(
+                                cache.pending_layer_views(),
+                                mask[:, history:],
+                                frame_start=session.latent_frames,
+                                frame_count=latents.shape[2],
+                                tokens_per_frame=image_tokens // latents.shape[2],
+                                segment=state.extra["hy_nomas_segment_id"],
+                                text_tokens=state.prompt_embeds.shape[1] if first else 0,
+                                action_start=state.extra["hy_nomas_action_start"] if first else -1,
+                            )
                     except Exception as exc:
                         error = exc
                     self._check_sp_error(error, "KV staging")
                     cache.commit(retain=retained)
+                    if session.history_archive is not None:
+                        session.history_archive.publish()
                     if recent:
                         session.history_frames = frames
-                        session.history_mask = torch.cat((session.history_mask, mask[:, history:]), 1)[:, cut:].clone()
+                        session.history_mask = _as_versioned_tensor(
+                            torch.cat((session.history_mask, mask[:, history:]), 1)[:, cut:].clone()
+                        )
                         session.action_tails = action_tails(frames)
                 elif written != current_tokens:
                     raise RuntimeError("Hy-Nomas clean forward wrote an unexpected KV token count.")
                 if not recent:
-                    session.history_mask = torch.cat((session.history_mask, mask[:, history:].clone()), 1)
+                    session.history_mask = _as_versioned_tensor(
+                        torch.cat((session.history_mask, mask[:, history:].clone()), 1)
+                    )
                 action_start = state.extra["hy_nomas_action_start"]
                 if (
                     not recent
@@ -830,10 +901,15 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                             history + current_tokens,
                         )
                     )
+                state.extra["hy_nomas_chunk_masks"] = None
             return prediction
         except BaseException:
-            if commit and cache is not None:
-                cache.rollback()
+            if commit:
+                state.extra["hy_nomas_chunk_masks"] = None
+                if cache is not None:
+                    cache.rollback()
+                    if session.history_archive is not None:
+                        session.history_archive.rollback()
             raise
 
     def _check_sp_error(self, error: Exception | None, operation: str) -> None:
@@ -872,6 +948,24 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         state.step_in_chunk += 1
         state.step_index += 1
 
+    @staticmethod
+    def _to_host(frames: torch.Tensor) -> np.ndarray:
+        """Return one quantized chunk as HWC uint8, staged through pinned memory.
+
+        A blocking ``.cpu()`` into pageable memory runs at roughly 2 GB/s.
+        Copying into a freshly allocated pinned buffer with a recorded event
+        reaches PCIe speed, and allocating per chunk leaves the returned array
+        the sole owner, so no lease or reuse protocol is needed.
+        """
+        if frames.device.type != "cuda":
+            return frames.cpu().numpy()
+        host = torch.empty(frames.shape, dtype=frames.dtype, pin_memory=True)
+        host.copy_(frames, non_blocking=True)
+        done = torch.cuda.Event()
+        done.record()
+        done.synchronize()
+        return host.numpy()
+
     def _decode_chunk(
         self, session: HyNomasSession, latents: torch.Tensor, *, pixel_frames: int, finish: bool
     ) -> np.ndarray:
@@ -887,7 +981,8 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                         pixels = torch.cat((pixels, tail), 2) if pixels.numel() else tail
             if pixels.numel():
                 pixels = (pixels * 0.5 + 0.5).clamp(0, 1)
-                video = pixels[0].permute(1, 2, 3, 0).float().mul(255).round().to(torch.uint8).cpu().numpy()
+                frames = pixels[0].permute(1, 2, 3, 0).float().mul(255).round().to(torch.uint8).contiguous()
+                video = self._to_host(frames)
             else:
                 video = np.empty((0, session.height, session.width, 3), dtype=np.uint8)
         except Exception as exc:
@@ -969,6 +1064,10 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                         "segments": session.segments,
                         "history_tokens": session.history_mask.shape[1],
                         "history_mode": self.ar_config.history_mode,
+                        "archive_payload_bytes": session.history_archive.payload_bytes
+                        if session.history_archive
+                        else 0,
+                        "archive_latent_frames": session.history_archive.frames if session.history_archive else 0,
                         "sampling_version": "incremental_v1" if session.noise_generator is not None else "legacy_v1",
                     },
                 },
