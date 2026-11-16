@@ -25,7 +25,7 @@ from vllm_omni.engine.duplex.messages import (
     ResumeDuplexSessionMessage,
     TouchDuplexSessionMessage,
 )
-from vllm_omni.engine.duplex.plugin import validate_duplex_replica_policy
+from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, validate_duplex_replica_policy
 from vllm_omni.engine.duplex_omni_engine import DuplexOmniEngine
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -89,6 +89,27 @@ async def test_open_session_runs_the_correlated_rpc_with_the_typed_config() -> N
     # A momentarily full request queue is backpressure, not a failed open: the
     # control RPC blocks rather than raising an untyped queue.Full at the caller.
     assert engine.rpc_client.block_on_submit_flags == [True]
+
+
+@pytest.mark.asyncio
+async def test_open_uses_the_cold_start_budget_and_controls_keep_the_short_one() -> None:
+    # #9072: the first open on a cold engine also initializes per-session runner
+    # state, which can exceed the 10 s control budget. Only open gets the longer
+    # budget; control ops on a live session keep the short one.
+    from vllm_omni.engine.duplex_omni_engine import _DEFAULT_CONTROL_TIMEOUT_S, _DEFAULT_OPEN_TIMEOUT_S
+
+    assert _DEFAULT_OPEN_TIMEOUT_S > _DEFAULT_CONTROL_TIMEOUT_S
+    output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+
+    open_engine = _engine(
+        _ok("open", capabilities=DuplexCapabilities(), public_session={"id": "sid"}, lease_generation=0)
+    )
+    await open_engine.open_session_async("sid", DuplexSessionConfig(), output_buffer=output_buffer)
+    assert open_engine.rpc_client.calls[-1][2] == _DEFAULT_OPEN_TIMEOUT_S
+
+    control_engine = _engine(_ok("close"))
+    await control_engine.close_session_async("sid")
+    assert control_engine.rpc_client.calls[-1][2] == _DEFAULT_CONTROL_TIMEOUT_S
 
 
 @pytest.mark.asyncio
@@ -265,6 +286,7 @@ def test_duplex_runtime_uses_tokenizer_owner_model_config(monkeypatch):
 )
 def test_validate_deployment_checks_replica_policy_before_starting_workers(
     monkeypatch,
+    mocker,
     replica_policy: str,
     replica_cap: int | None,
     single_stage_mode: bool,
@@ -292,7 +314,7 @@ def test_validate_deployment_checks_replica_policy_before_starting_workers(
         capability_calls.append(max_sessions)
         return DuplexCapabilities(supports_multi_session_same_replica=supports_sharing)
 
-    plugin = SimpleNamespace(capabilities=capabilities, configure_pipeline=configure_pipeline)
+    plugin = mocker.Mock(spec=DuplexModelPlugin, capabilities=capabilities, configure_pipeline=configure_pipeline)
 
     def load_plugin(path: str, audio_encoder):
         assert path == "fake.Plugin"
@@ -307,6 +329,7 @@ def test_validate_deployment_checks_replica_policy_before_starting_workers(
         assert candidate_config is runtime_config
         assert len(configure_pipeline_calls) == 1
         assert configure_pipeline_calls[0] is engine.pipeline_config
+        plugin.configure_server.assert_called_once_with(runtime_config)
         validation_calls.append(distributed)
         validate_duplex_replica_policy(candidate_plugin, candidate_config, distributed=distributed)
 

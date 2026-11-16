@@ -10,7 +10,9 @@ import time
 from pathlib import Path
 
 import pytest
+from vllm.benchmarks import serve as vllm_benchmark_serve
 
+import vllm_omni.benchmarks.patch.patch  # noqa: F401
 from vllm_omni.entrypoints.cli.benchmark.cli_args import (
     add_omni_args,
     extend_omni_choices,
@@ -129,6 +131,7 @@ def test_extend_omni_choices_updates_tracking_parser_shadow(dataset_name: str) -
     ("argv", "dest", "expected"),
     [
         (["--print-stage"], "print_stage", True),
+        (["--omni-fail-fast-on-timeout"], "omni_fail_fast_on_timeout", True),
         (["--daily-omni-input-mode", "audio"], "daily_omni_input_mode", "audio"),
         (["--omniinteract-subsets", "1qna"], "omniinteract_subsets", ["1qna"]),
         (["--seed-tts-locale", "zh"], "seed_tts_locale", "zh"),
@@ -156,6 +159,7 @@ def test_add_omni_args_preserves_implicit_defaults() -> None:
 
     args = parser.parse_args([])
     assert args.print_stage is False
+    assert args.omni_fail_fast_on_timeout is False
     assert args.daily_omni_input_mode == "all"
     assert args.omniinteract_subsets == ["1q1a", "1q1a_math", "1qna"]
     assert args.seed_tts_locale == "en"
@@ -166,6 +170,7 @@ def test_update_omni_help_updates_upstream_actions() -> None:
     parser = TrackingArgumentParser()
     parser.add_argument("--num-prompts", default=1000, help="Number of prompts.")
     parser.add_argument("--percentile-metrics", help="Upstream percentile help.")
+    parser.add_argument("--goodput", help="Upstream goodput help.")
     parser.add_argument("--random-mm-limit-mm-per-prompt", help="Upstream limit help.")
     parser.add_argument("--random-mm-bucket-config", help="Upstream bucket help.")
 
@@ -174,8 +179,25 @@ def test_update_omni_help_updates_upstream_actions() -> None:
     actions = {action.dest: action for action in parser._actions}
     assert "OmniInteract uses 3" in actions["num_prompts"].help
     assert all(metric in actions["percentile_metrics"].help for metric in ("ttfc", "tpop", "audio_rtf"))
+    assert "audio_ttfp" in actions["goodput"].help
     assert "probabilities are renormalized" in actions["random_mm_limit_mm_per_prompt"].help
     assert "Currently allows for 3 modalities" in actions["random_mm_bucket_config"].help
+
+
+def test_goodput_accepts_audio_ttfp_and_combines_slos() -> None:
+    args = argparse.Namespace(goodput=["ttft:500", "audio_ttfp:1000"])
+
+    assert vllm_benchmark_serve.check_goodput_args(args) == {
+        "ttft": 500.0,
+        "audio_ttfp": 1000.0,
+    }
+
+
+def test_goodput_rejects_unsupported_metric() -> None:
+    args = argparse.Namespace(goodput=["audio_ttft:500"])
+
+    with pytest.raises(ValueError, match="Invalid metric name"):
+        vllm_benchmark_serve.check_goodput_args(args)
 
 
 @pytest.mark.parametrize(
@@ -533,6 +555,68 @@ def test_omni_request_timeout_s_flag_defaults_and_parses() -> None:
 
     args = parser.parse_args(["--omni-request-timeout-s", "3600"])
     assert args.omni_request_timeout_s == 3600.0
+
+    args = parser.parse_args(["--omni-fail-fast-on-timeout"])
+    assert args.omni_fail_fast_on_timeout is True
+
+
+@pytest.mark.parametrize(
+    ("backend", "request_rate", "self_timed"),
+    [
+        ("openai-image-edits-omni", float("inf"), False),
+        ("openai-chat-omni", 1.0, False),
+        ("openai-chat-omni", float("inf"), True),
+    ],
+)
+def test_fail_fast_on_timeout_rejects_unsupported_dispatch_modes(
+    backend: str,
+    request_rate: float,
+    self_timed: bool,
+) -> None:
+    from vllm_omni.benchmarks.serve import _validate_fail_fast_on_timeout
+
+    args = argparse.Namespace(
+        omni_fail_fast_on_timeout=True,
+        backend=backend,
+        request_rate=request_rate,
+        self_timed=self_timed,
+    )
+
+    with pytest.raises(ValueError, match="requires --backend openai-chat-omni"):
+        _validate_fail_fast_on_timeout(args)
+
+
+def test_fail_fast_on_timeout_accepts_immediate_chat_omni_dispatch() -> None:
+    from vllm_omni.benchmarks.serve import _validate_fail_fast_on_timeout
+
+    args = argparse.Namespace(
+        omni_fail_fast_on_timeout=True,
+        backend="openai-chat-omni",
+        request_rate=float("inf"),
+        self_timed=False,
+    )
+
+    _validate_fail_fast_on_timeout(args)
+
+
+def test_fail_fast_on_timeout_rejects_finite_rate_before_dispatch(mocker) -> None:
+    from vllm_omni.benchmarks import serve
+
+    run_benchmark = mocker.patch.object(serve, "main_async")
+    enable_fail_fast = mocker.patch.object(serve, "set_fail_fast_on_timeout")
+    args = argparse.Namespace(
+        omni_fail_fast_on_timeout=True,
+        backend="openai-chat-omni",
+        endpoint="/v1/chat/completions",
+        request_rate=1.0,
+        self_timed=False,
+    )
+
+    with pytest.raises(ValueError, match="requires --backend openai-chat-omni"):
+        serve.main(args)
+
+    run_benchmark.assert_not_called()
+    enable_fail_fast.assert_not_called()
 
 
 def test_realtime_chat_choice_is_available_without_importing_runtime() -> None:

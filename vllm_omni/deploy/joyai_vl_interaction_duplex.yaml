@@ -1,8 +1,11 @@
 # Text/video observations with the existing JoyAI -> Qwen3-TTS -> Code2Wav stages.
 base_config: joyai_vl_interaction.yaml
 session_mode: duplex
+# Stream Talker codec frames into Code2Wav so audio reaches the client per chunk.
+# JoyAI -> Talker stays orchestrator-fed through joyai_action_to_tts.
+async_chunk: true
 duplex_session:
   max_sessions: 1
-  # All-sync Code2Wav emits the whole waveform in one event. Allow the
-  # 4096-frame TTS budget (~22 MiB of base64 PCM16 at normal playback speed).
+  # A full 4096-frame TTS response is ~22 MiB of base64 PCM16 at normal
+  # playback speed; allow it to queue behind a slow client.
   max_pending_output_bytes_per_session: 33554432

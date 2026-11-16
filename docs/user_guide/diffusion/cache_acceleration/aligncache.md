@@ -38,7 +38,8 @@ reference-KV caching/offload (`kv_offload_config`), compile/decode graphs, step
 execution, disaggregated stages, and paged KV. Also
 rejected are Qwen image editing and extra transformer conditions, H3 reference
 media, editing, locked audio, refine/upscale, continuation, FastH3 and VDNH3,
-Wan2.1 I2V/FLF2V checkpoints with CLIP image embeddings, and Wan2.2 S2V,
+H3 ControlNet inputs, cached-clip continuation, and request-level Cache-DiT
+(`quality="high"`), Wan2.1 I2V/FLF2V checkpoints with CLIP image embeddings, and Wan2.2 S2V,
 Animate and VACE.
 
 ## Configuration

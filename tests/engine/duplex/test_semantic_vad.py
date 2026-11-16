@@ -249,6 +249,72 @@ def test_a_complete_turn_commits_at_the_first_pause() -> None:
     assert committed.as_payload()["turn_complete_probability"] == pytest.approx(0.9)
 
 
+def test_process_aggregates_one_chunk_for_the_turn_based_realtime_caller() -> None:
+    turn = _ScriptedTurn(0.9)
+    detector = _detector(turn, eagerness="high")
+    speech = np.full(1024 * RATE // 1000, SPEECH, dtype=np.float32)
+    silence = np.zeros(1024 * RATE // 1000, dtype=np.float32)
+
+    result = detector.process(
+        _b64(np.concatenate((speech, silence))),
+        fmt="pcm_f32le",
+        sample_rate_hz=RATE,
+    )
+
+    assert result.speech_started
+    assert result.speech_stopped
+    assert result.should_commit
+    assert result.semantic_decision == "smart_turn_complete"
+    assert result.commit_reason == "semantic_complete"
+    assert result.turn_complete_probability == pytest.approx(0.9)
+    assert len(turn.windows) == 1
+
+
+def test_process_preserves_the_first_onset_across_append_boundaries() -> None:
+    speech_a = np.full(1024 * RATE // 1000, 0.2, dtype=np.float32)
+    speech_b = np.full(1024 * RATE // 1000, 0.4, dtype=np.float32)
+    pause = np.zeros(512 * RATE // 1000, dtype=np.float32)
+    chunks = [speech_a, pause, speech_b, pause]
+
+    aggregate_turn = _ScriptedTurn(0.1, 0.1)
+    aggregate_detector = _detector(aggregate_turn, eagerness="high")
+    aggregate_result = aggregate_detector.process(
+        _b64(np.concatenate(chunks[:3])), fmt="pcm_f32le", sample_rate_hz=RATE
+    )
+    aggregate_detector.process(_b64(chunks[3]), fmt="pcm_f32le", sample_rate_hz=RATE)
+
+    split_turn = _ScriptedTurn(0.1, 0.1)
+    split_detector = _detector(split_turn, eagerness="high")
+    split_result = split_detector.process(_b64(chunks[0]), fmt="pcm_f32le", sample_rate_hz=RATE)
+    for chunk in chunks[1:]:
+        split_detector.process(_b64(chunk), fmt="pcm_f32le", sample_rate_hz=RATE)
+
+    assert aggregate_result.audio_start_ms == split_result.audio_start_ms == 0
+    assert len(aggregate_turn.windows) == len(split_turn.windows) == 2
+    assert np.array_equal(aggregate_turn.windows[-1], split_turn.windows[-1])
+    assert np.any(aggregate_turn.windows[-1] == 0.2)
+    assert np.any(aggregate_turn.windows[-1] == 0.4)
+
+
+def test_process_coalesces_a_completed_turn_and_restarted_speech() -> None:
+    turn = _ScriptedTurn(0.9)
+    detector = _detector(turn, eagerness="high")
+    speech = np.full(1024 * RATE // 1000, SPEECH, dtype=np.float32)
+    silence = np.zeros(512 * RATE // 1000, dtype=np.float32)
+
+    result = detector.process(
+        _b64(np.concatenate((speech, silence, speech))),
+        fmt="pcm_f32le",
+        sample_rate_hz=RATE,
+    )
+
+    assert result.speech_started
+    assert result.speech_stopped
+    assert result.speech_active
+    assert not result.should_commit
+    assert len(turn.windows) == 1
+
+
 def test_default_waits_through_a_short_clause_pause_before_scoring() -> None:
     # Even a confidently complete model answer must not split a 900 ms
     # hesitation: the default only calls it after the 1200 ms candidate pause.

@@ -3,7 +3,9 @@
 
 import json
 import math
+from datetime import datetime
 from functools import partial
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image
@@ -14,18 +16,90 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.parametrize(
-    ("device_name", "profile"),
-    [("NVIDIA H100 80GB HBM3", "H100"), ("NVIDIA B200", "default"), ("Ascend A3", "default")],
+    ("device_name", "device_architecture", "profile"),
+    [
+        ("NVIDIA H100 80GB HBM3", None, "H100"),
+        ("NVIDIA B200", None, "default"),
+        ("Ascend A3", None, "default"),
+        ("AMD Instinct MI300X", "gfx942", "gfx942"),
+    ],
 )
-def test_similarity_thresholds_device_and_default(device_name, profile):
+def test_similarity_thresholds_device_and_default(device_name, device_architecture, profile):
     table = {
         "H100": helpers.SimilarityThresholds(ssim=0.98, psnr=35.0),
+        "gfx942": helpers.SimilarityThresholds(ssim=0.95, psnr=27.0),
         "default": helpers.SimilarityThresholds(ssim=0.99, psnr=40.0),
     }
-    resolved_profile = helpers.resolve_device_profile(device_name, profiles=table)
+    resolved_profile = helpers.resolve_device_profile(
+        device_name,
+        device_architecture=device_architecture,
+        profiles=table,
+    )
     assert resolved_profile == profile
     assert helpers.resolve_similarity_thresholds(table, resolved_profile) == table[profile]
-    assert helpers.resolve_similarity_thresholds(table, device_name=device_name) == table[profile]
+    assert (
+        helpers.resolve_similarity_thresholds(
+            table,
+            device_name=device_name,
+            device_architecture=device_architecture,
+        )
+        == table[profile]
+    )
+
+
+@pytest.mark.parametrize("device_name", ["Ascend910", "Ascend910_9382", "Ascend910_93"])
+def test_ascend910_device_name_aliases_to_a3_profile(device_name):
+    a3 = helpers.SimilarityThresholds(ssim=0.95, psnr=26.0)
+    cuda = helpers.SimilarityThresholds(ssim=0.98, psnr=34.6)
+    table = {"H100": cuda, "A3": a3, "default": cuda}
+    assert helpers.resolve_device_profile(device_name, profiles=table) == "A3"
+    assert helpers.resolve_similarity_thresholds(table, device_name=device_name) == a3
+
+
+@pytest.mark.parametrize("device_name", ["Ascend910B1", "Ascend910B4", "Ascend910B2"])
+def test_ascend910b_device_name_does_not_use_a3_alias(device_name):
+    a3 = helpers.SimilarityThresholds(ssim=0.95, psnr=26.0)
+    cuda = helpers.SimilarityThresholds(ssim=0.98, psnr=34.6)
+    table = {"H100": cuda, "A3": a3, "default": cuda}
+    assert helpers.resolve_device_profile(device_name, profiles=table) == "default"
+    assert helpers.resolve_similarity_thresholds(table, device_name=device_name) == cuda
+
+
+def test_explicit_profile_key_precedes_ascend910_alias():
+    a2 = helpers.SimilarityThresholds(ssim=0.96, psnr=28.0)
+    a3 = helpers.SimilarityThresholds(ssim=0.95, psnr=26.0)
+    table = {"Ascend910B": a2, "A3": a3, "default": a3}
+    assert helpers.resolve_device_profile("Ascend910B1", profiles=table) == "Ascend910B"
+    assert helpers.resolve_similarity_thresholds(table, device_name="Ascend910B1") == a2
+
+
+def test_npu_name_outside_ascend910_does_not_use_a3_profile():
+    table = {
+        "A3": helpers.SimilarityThresholds(ssim=0.95, psnr=26.0),
+        "default": helpers.SimilarityThresholds(ssim=0.98, psnr=34.6),
+    }
+    assert helpers.resolve_device_profile("Ascend310P3", profiles=table) == "default"
+
+
+def test_similarity_thresholds_use_runtime_rocm_architecture(monkeypatch):
+    import vllm_omni.platforms as platforms
+
+    runtime_platform = SimpleNamespace(
+        get_device_name=lambda: "AMD Instinct MI300X",
+        get_torch_device=lambda: "cuda",
+    )
+    device_module = SimpleNamespace(
+        get_device_properties=lambda _device_id: SimpleNamespace(gcnArchName="gfx942:sramecc+:xnack-")
+    )
+    monkeypatch.setattr(platforms, "current_omni_platform", runtime_platform)
+    monkeypatch.setattr(helpers.torch, "get_device_module", lambda _device: device_module)
+
+    rocm = helpers.SimilarityThresholds(ssim=0.95, psnr=27.0)
+    default = helpers.SimilarityThresholds(ssim=0.98, psnr=34.6)
+    table = {"gfx942": rocm, "default": default}
+
+    assert helpers.resolve_device_profile(profiles=table) == "gfx942"
+    assert helpers.resolve_similarity_thresholds(table) == rocm
 
 
 def test_similarity_thresholds_require_default():
@@ -55,7 +129,11 @@ def test_write_json_artifact_rejects_nonfinite_without_overwriting(tmp_path, non
 @pytest.mark.parametrize("psnr", [40.0, float("inf")])
 def test_similarity_metrics_accept_inclusive_bounds_and_identical_psnr(psnr):
     helpers.assert_similarity_metrics(
-        model_name="example (RGBA)", ssim_score=0.99, psnr_score=psnr, ssim_threshold=0.99, psnr_threshold=40.0
+        model_name="example (RGBA)",
+        ssim_score=0.99,
+        psnr_score=psnr,
+        ssim_threshold=0.99,
+        psnr_threshold=40.0,
     )
 
 
@@ -71,8 +149,107 @@ def test_similarity_metrics_accept_inclusive_bounds_and_identical_psnr(psnr):
 def test_similarity_metrics_reject_below_bounds_and_nan(ssim, psnr, failed_metric):
     with pytest.raises(AssertionError, match=rf"{failed_metric} below threshold for example \(RGBA\)"):
         helpers.assert_similarity_metrics(
-            model_name="example (RGBA)", ssim_score=ssim, psnr_score=psnr, ssim_threshold=0.99, psnr_threshold=40.0
+            model_name="example (RGBA)",
+            ssim_score=ssim,
+            psnr_score=psnr,
+            ssim_threshold=0.99,
+            psnr_threshold=40.0,
         )
+
+
+def test_write_accuracy_result_persists_scores_and_metadata(tmp_path, monkeypatch):
+    import tests.helpers.hardware as hardware
+
+    monkeypatch.setattr(hardware, "get_runtime_resource_label", lambda: "H100")
+    monkeypatch.setenv("BUILDKITE_BRANCH", "fix/diffusion-accuracy-write-results")
+    when = datetime(2026, 11, 2, 9, 30, 0)
+    path = helpers.write_accuracy_result(
+        model_id="Qwen/Qwen-Image",
+        dataset="image_similarity",
+        metrics={"ssim": 0.991, "psnr": float("inf"), "seed_tts_content_error_mean": 0.12},
+        baseline={
+            "H100": {"ssim": 0.99, "psnr": 40.0, "max_seed_tts_mean_wer": 0.2},
+            "A3": {"ssim": 0.95, "psnr": 35.0, "max_seed_tts_mean_wer": 0.25},
+        },
+        result_dir=tmp_path,
+        when=when,
+        extra={"label": "qwen_image"},
+    )
+
+    assert path.name == "result_acc_Qwen-Image_image_similarity_20261102_093000.json"
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["model_id"] == "Qwen/Qwen-Image"
+    assert saved["dataset"] == "image_similarity"
+    assert saved["ssim"] == 0.991
+    assert saved["psnr"] == "inf"
+    assert saved["seed_tts_content_error_mean"] == 0.12
+    assert saved["baseline"] == {
+        "H100": {"ssim": 0.99, "psnr": 40.0, "max_seed_tts_mean_wer": 0.2},
+        "A3": {"ssim": 0.95, "psnr": 35.0, "max_seed_tts_mean_wer": 0.25},
+    }
+    assert saved["Hardware"] == "H100"
+    assert saved["branch"] == "fix/diffusion-accuracy-write-results"
+    assert saved["label"] == "qwen_image"
+
+
+def test_write_accuracy_result_rejects_unsanitized_nan_in_raw_payload(tmp_path, monkeypatch):
+    """Defense-in-depth: allow_nan=False if a caller somehow skips sanitization."""
+    import tests.helpers.hardware as hardware
+
+    monkeypatch.setattr(hardware, "get_runtime_resource_label", lambda: "H100")
+    monkeypatch.setattr(helpers, "_json_safe_metric_value", lambda value: value)
+    with pytest.raises(ValueError, match="Out of range float values"):
+        helpers.write_accuracy_result(
+            model_id="Qwen-Image",
+            dataset="image_similarity",
+            metrics={"ssim": float("nan")},
+            baseline={"ssim": 0.99},
+            result_dir=tmp_path,
+            when=datetime(2026, 11, 2, 10, 15, 0),
+        )
+
+
+def test_write_accuracy_result_wraps_flat_baseline_under_hardware(tmp_path, monkeypatch):
+    import tests.helpers.hardware as hardware
+
+    monkeypatch.setattr(hardware, "get_runtime_resource_label", lambda: "L4")
+    monkeypatch.delenv("BUILDKITE_BRANCH", raising=False)
+    helpers.write_accuracy_result(
+        model_id="Qwen-Image",
+        dataset="image_similarity",
+        metrics={"ssim": 0.5, "psnr": 20.0},
+        baseline={"ssim": 0.99, "psnr": 40.0},
+        result_dir=tmp_path,
+        when=datetime(2026, 11, 2, 10, 0, 0),
+    )
+    with pytest.raises(AssertionError, match="SSIM below threshold"):
+        helpers.assert_similarity_metrics(
+            model_name="Qwen-Image",
+            ssim_score=0.5,
+            psnr_score=20.0,
+            ssim_threshold=0.99,
+            psnr_threshold=40.0,
+        )
+
+    paths = list(tmp_path.glob("result_acc_Qwen-Image_image_similarity_*.json"))
+    assert len(paths) == 1
+    saved = json.loads(paths[0].read_text(encoding="utf-8"))
+    assert saved["ssim"] == 0.5
+    assert saved["psnr"] == 20.0
+    assert saved["baseline"] == {"L4": {"ssim": 0.99, "psnr": 40.0}}
+    assert saved["Hardware"] == "L4"
+    assert saved["branch"] == ""
+
+
+def test_baseline_from_similarity_thresholds_keeps_all_profiles():
+    table = {
+        "B200": helpers.SimilarityThresholds(ssim=0.93, psnr=28.0),
+        "default": helpers.SimilarityThresholds(ssim=0.94, psnr=28.0),
+    }
+    assert helpers.baseline_from_similarity_thresholds(table) == {
+        "B200": {"ssim": 0.93, "psnr": 28.0},
+        "default": {"ssim": 0.94, "psnr": 28.0},
+    }
 
 
 @pytest.mark.parametrize("ssim", [0.99, 0.98])

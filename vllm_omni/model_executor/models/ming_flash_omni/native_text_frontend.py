@@ -14,7 +14,7 @@ from .front_toolkit import (
     PROTECTED_LEXEME,
     WebMarkupScrubber,
     add_period,
-    preprosess_text,
+    strip_markdown_code,
     tokenize_mixed_text_iterator,
 )
 from .native_text_segment_cut import cut_text_by_semantic_length
@@ -148,14 +148,14 @@ class NativeMingTextFrontend:
                 self.buffer.append(ele)
                 continue
             if should_process:
-                buffered_text = preprosess_text("".join(self.buffer))
+                buffered_text = strip_markdown_code("".join(self.buffer))
                 text_list = cut_text_by_semantic_length(buffered_text, self.max_length)
                 self.count += len(text_list)
                 output.extend(text_list)
                 self.buffer = []
         if final:
             if self.buffer and any(char.isalnum() for token in self.buffer for char in token):
-                text = preprosess_text("".join(self.buffer))
+                text = strip_markdown_code("".join(self.buffer))
                 # A bare numeric answer is already a complete utterance. An
                 # invented sentence dot can change the model's pronunciation.
                 if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d+)?|\.\d+)[。！？.!?，,；;：:、]*", text.strip()):

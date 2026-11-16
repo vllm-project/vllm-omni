@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from vllm.config import ModelConfig, SpeechToTextConfig, VllmConfig
 from vllm.config.speech_to_text import SpeechToTextParams
 from vllm.inputs import PromptType, TokensPrompt
+from vllm.logger import init_logger
 from vllm.model_executor.models.bailing_moe_v3 import BailingMoeV3ForCausalLM
 from vllm.model_executor.models.interfaces import (
     HasInnerState,
@@ -45,6 +46,7 @@ from vllm_omni.transformers_utils.configs.ming3_audio import (
     BailingMoeV3AudioConfig,
 )
 
+from .audio_encoder_graphs import Ming3AudioEncoderGraphs
 from .processing import (
     ASR_PROMPT,
     Ming3AudioDummyInputsBuilder,
@@ -52,6 +54,8 @@ from .processing import (
     Ming3AudioProcessingInfo,
     get_ming3_audio_placeholder,
 )
+
+logger = init_logger(__name__)
 
 _SAMPLE_RATE = 16000
 _WHISPER_ENCODER_BATCH_SIZE = 32
@@ -151,6 +155,7 @@ class BailingMoeV3AudioForConditionalGeneration(
                 prefix=maybe_prefix(prefix, "language_model"),
             )
         self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
+        self._audio_graphs: Ming3AudioEncoderGraphs | None = None
 
     def _encode_audio_item(
         self,
@@ -158,6 +163,11 @@ class BailingMoeV3AudioForConditionalGeneration(
         feature_length: int,
     ) -> torch.Tensor:
         features = features.reshape(-1, features.shape[-1])[:feature_length]
+        graphs = getattr(self, "_audio_graphs", None)
+        if graphs is not None and feature_length <= self.config.audio_config.whisper_chunk_size:
+            embeddings = graphs.encode(features)
+            if embeddings is not None:
+                return embeddings
         chunk_lengths = iter_chunk_lengths(feature_length, self.config.audio_config.whisper_chunk_size)
         chunks = list(features.split(chunk_lengths))
         padded_length = max(chunk_lengths)
@@ -269,14 +279,32 @@ class BailingMoeV3AudioForConditionalGeneration(
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
+    def capture_auxiliary_graphs(self) -> None:
+        """Capture after loading and eval; the worker accounts for the pool."""
+        param = self.audio_encoder.conv1.weight
+        if self._audio_graphs is not None or param.device.type != "cuda" or self.vllm_config.model_config.enforce_eager:
+            return
+        if self.training:
+            raise RuntimeError("Ming audio encoder graphs require eval mode")
+        graphs = Ming3AudioEncoderGraphs(
+            self.audio_encoder,
+            self.audio_projector,
+            max_frames=self.config.audio_config.whisper_chunk_size,
+            normalize=bool(self.config.norm_query_embeds),
+        )
+        graphs.capture()
+        self._audio_graphs = graphs
+        logger.info("Captured Ming-3 audio encoder graphs for mel frames %s", graphs.buckets)
+
+    def release_auxiliary_graphs(self) -> None:
+        """Release the worker's temporary memory-profiling captures."""
+        self._audio_graphs = None
+
     def get_mm_mapping(self) -> MultiModelKeys:
         return MultiModelKeys.from_string_field(
             language_model="language_model",
             tower_model=["audio_encoder.", "audio_projector."],
         )
-
-    def get_num_mm_encoder_tokens(self, num_audio_tokens: int) -> int:
-        return num_audio_tokens
 
     @classmethod
     def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig) -> tuple[tuple[int, int], tuple[int, int, int]]:

@@ -3,7 +3,6 @@
 # Adopted from https://github.com/inclusionAI/Ming-omni-tts/blob/main/modeling_bailingmm.py
 from __future__ import annotations
 
-import os
 import time
 from collections.abc import Iterable
 from typing import Any
@@ -119,10 +118,7 @@ class MingLLMModel(nn.Module):
         self._pending_postprocess_updates: dict[str, dict[str, Any]] = {}
         self._last_ming_next_token_ids: list[int] | None = None
         self._last_text_mode = False
-        # CUDAGraph for the flow-matching (CFM) diffusion head — the TTFP/latency
-        # hot spot. The legacy MING_CFM_CUDAGRAPH switch controls this
-        # independently of the backbone's eager/graph configuration.
-        self._init_cfm_graph_state("MING_CFM_CUDAGRAPH")
+        self._init_cfm_graph_state()
 
     def embed_input_ids(
         self, input_ids: torch.Tensor, inputs_embeds: torch.Tensor | None = None, **_: Any
@@ -383,15 +379,11 @@ class MingLLMModel(nn.Module):
             logprobs_tensors=None,
         )
 
-    def _init_cfm_graph_state(self, env_var: str | None = None) -> None:
+    def _init_cfm_graph_state(self) -> None:
         compilation_config = self.vllm_config.compilation_config
-        if env_var is not None:
-            self._cfm_graph_enabled = os.environ.get(env_var, "1") == "1"
-        else:
-            self._cfm_graph_enabled = (
-                not self.vllm_config.model_config.enforce_eager
-                and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-            )
+        self._cfm_graph_enabled = (
+            not self.vllm_config.model_config.enforce_eager and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        )
         self._cfm_graphs: dict[int, CFMGraphExecutor] = {}
         self._cfm_graph_failed_batch_sizes: set[int] = set()
         self._cfm_graph_warmed_up = False
@@ -574,9 +566,15 @@ class MingLLMModel(nn.Module):
         generators: list[torch.Generator | None],
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        shape = (1, self.ming_config.patch_size, self.ming_config.latent_dim)
+        if all(generator is None for generator in generators):
+            # Unseeded rows share the global RNG, so one draw serves them all.
+            count = len(generators)
+            initial = torch.randn((count, *shape[1:]), device=device, dtype=torch.float32)
+            solver = torch.randn((DEFAULT_CFM_STEPS, count, *shape[1:]), device=device, dtype=torch.float32)
+            return initial, solver
         initial_noise = []
         solver_noise = []
-        shape = (1, self.ming_config.patch_size, self.ming_config.latent_dim)
         for generator in generators:
             initial_noise.append(
                 torch.randn(
@@ -627,6 +625,13 @@ class MingLLMModel(nn.Module):
             dit_model = self.flowloss.cfm.model
             if not getattr(dit_model, "_ming_compiled", False):
                 try:
+                    # Static shapes compile once per graph bucket (plus once
+                    # for the lazily fused QKV weights); past dynamo's
+                    # recompile limit the remaining buckets would run eager.
+                    dynamo_config = torch._dynamo.config
+                    dynamo_config.recompile_limit = max(
+                        dynamo_config.recompile_limit, 2 * len(self._cfm_graph_batch_sizes)
+                    )
                     dit_model.forward = torch.compile(
                         dit_model.forward,
                         fullgraph=False,
@@ -674,6 +679,7 @@ class MingLLMModel(nn.Module):
         generator: torch.Generator | None = None,
         initial_noise: torch.Tensor | None = None,
         solver_noise: torch.Tensor | None = None,
+        check_finite: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if hidden_states.dim() != 2:
             raise RuntimeError(f"Expected decode hidden_states rank-2 [B,H], got {tuple(hidden_states.shape)}")
@@ -687,7 +693,7 @@ class MingLLMModel(nn.Module):
             )
         # [Batch, Hidden] -> [Batch, Time, Hidden] = [B, 1, H] for FlowLoss conditioning.
         z_diff_cond = hidden_states.to(dtype=self.fm_dtype).unsqueeze(1)
-        if not torch.isfinite(z_diff_cond).all():
+        if check_finite and not torch.isfinite(z_diff_cond).all():
             raise RuntimeError("Non-finite z_diff_cond before FlowLoss.sample().")
 
         # Fast path: CUDAGraph-captured flow head (CFM sampling + Aggregator +
@@ -745,11 +751,11 @@ class MingLLMModel(nn.Module):
                 f"FlowLoss output shape mismatch: got {tuple(sampled_token_latent.shape)}, expected {expected_shape}"
             )
         new_history = torch.cat([latent_history[:, self.ming_config.patch_size :, :], sampled_token_latent], dim=1)
-        if not torch.isfinite(sampled_token_latent).all():
+        if check_finite and not torch.isfinite(sampled_token_latent).all():
             raise RuntimeError("Non-finite sampled_token_latent in Ming decode step.")
-        if not torch.isfinite(next_embeds).all():
+        if check_finite and not torch.isfinite(next_embeds).all():
             raise RuntimeError("Non-finite next_embeds in Ming decode step.")
-        if not torch.isfinite(stop_probs).all():
+        if check_finite and not torch.isfinite(stop_probs).all():
             raise RuntimeError("Non-finite stop_probs in Ming decode step.")
         return sampled_token_latent, next_embeds, new_history, stop_probs
 

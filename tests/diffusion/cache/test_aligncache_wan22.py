@@ -22,7 +22,7 @@ def make_pipeline(two_experts=True, out_channels=None):
         transformer_2=object() if two_experts else None,
         expand_timesteps=False,
         is_dmd=False,
-        record_denoise_step=lambda *a: None,
+        record_denoise_step=lambda *a, **kw: None,
         _sample_solver="unipc",
         scheduler=SimpleNamespace(timesteps=timesteps, num_inference_steps=40, config={}),
     )
@@ -182,7 +182,11 @@ def test_actual_wan22_loop_preserves_native_routing(mode):
     cls = definitions(
         "vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py",
         {"Wan22Pipeline"},
-        {"set_forward_context_denoise_step_idx": lambda i: None},
+        {
+            "begin_scheduled_denoise": lambda n: None,
+            "clear_scheduled_denoise_step_on_exit": lambda n: nullcontext(),
+            "is_forward_context_available": lambda: False,
+        },
         {"diffuse"},
     )["Wan22Pipeline"]
     pipeline.diffuse = MethodType(cls.diffuse, pipeline)
@@ -213,7 +217,11 @@ def test_actual_wan_loop_runs_wan21_with_one_component(failure):
     cls = definitions(
         "vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py",
         {"Wan22Pipeline"},
-        {"set_forward_context_denoise_step_idx": lambda i: None},
+        {
+            "begin_scheduled_denoise": lambda n: None,
+            "clear_scheduled_denoise_step_on_exit": lambda n: nullcontext(),
+            "is_forward_context_available": lambda: False,
+        },
         {"diffuse"},
     )["Wan22Pipeline"]
 
@@ -355,7 +363,15 @@ def build_image_loop(profile, mode, failure=None):
         else ("vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py", "Wan22Pipeline")
     )
     cls = definitions(
-        path, {name}, {"torch": torch, "set_forward_context_denoise_step_idx": lambda i: None}, {"diffuse"}
+        path,
+        {name},
+        {
+            "torch": torch,
+            "begin_scheduled_denoise": lambda n: None,
+            "clear_scheduled_denoise_step_on_exit": lambda n: nullcontext(),
+            "is_forward_context_available": lambda: False,
+        },
+        {"diffuse"},
     )[name]
     pipeline = make_pipeline(two_experts=i2v, out_channels=16 if i2v else None)
     pipeline.expand_timesteps = not i2v

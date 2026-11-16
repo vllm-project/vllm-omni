@@ -125,7 +125,12 @@ def test_native_qwen_loop_prefill_scheduler_and_release(cfg, mode):
     env = definitions(
         "vllm_omni/diffusion/models/qwen_image_21/cfg_parallel.py",
         {"QwenImage21CFGParallelMixin"},
-        {"torch": torch, "QwenImage21KVCache": list},
+        {
+            "torch": torch,
+            "QwenImage21KVCache": list,
+            "is_forward_context_available": lambda: False,
+            "set_forward_context_denoise_step_idx": lambda i: None,
+        },
         {"diffuse"},
     )
     pipeline = env["QwenImage21CFGParallelMixin"]()
@@ -196,11 +201,12 @@ def test_native_qwen_loop_prefill_scheduler_and_release(cfg, mode):
 
 @pytest.mark.parametrize("mode", [None, "force_exact", "trace", "accelerate"])
 @pytest.mark.parametrize("failure", [None, "model", "solver", "cancel", "callback"])
-def test_native_h3_loop_preserves_av_solver_steps_and_cleanup(mode, failure):
+def test_native_h3_loop_preserves_av_solver_steps_and_cleanup(mode, failure, monkeypatch):
     from contextlib import nullcontext
     from types import SimpleNamespace
 
-    from tests.diffusion.cache.aligncache_helpers import definitions
+    from vllm_omni.diffusion import sampler as sampler_module
+    from vllm_omni.diffusion.models.minimax_h3 import denoise_loop, sampling
 
     steps, progress, kv_events = [], [], []
 
@@ -218,40 +224,26 @@ def test_native_h3_loop_preserves_av_solver_steps_and_cleanup(mode, failure):
         if failure == "cancel":
             raise RuntimeError("injected cancel")
 
-    def callback(*args):
+    def callback(step, *args):
+        steps.append(step)
         if failure == "callback":
             raise RuntimeError("injected callback")
 
-    class Solver:
-        def __init__(self, sigmas):
-            self.sigmas = sigmas
-
-        def step(self, x, x0, i):
-            if failure == "solver":
-                raise RuntimeError("injected solver")
-            steps.append(i)
-            return x + (x0 - x) * 0.01
-
     def prepare(**kw):
-        return kw["initial_video_rows"].clone(), kw["initial_audio_rows"].clone(), None, None
+        return kw["initial_video_rows"].clone(), kw["initial_audio_rows"].clone()
 
-    env = definitions(
-        "vllm_omni/diffusion/models/minimax_h3/denoise_loop.py",
-        {"minimax_h3_denoise_loop"},
-        {
-            "torch": torch,
-            "nullcontext": nullcontext,
-            "MINIMAX_H3_IMGVID_COND_TIMESTEP": 0.999,
-            "MINIMAX_H3_AUDIO_REF_COND_TIMESTEP": 1.0,
-            "current_omni_platform": SimpleNamespace(is_npu=lambda: False),
-            "minimax_h3_prepare_denoise_rows": prepare,
-            "create_h3_sample_solver": lambda sampler, s: Solver(s),
-            "check_request_cancellation": cancel,
-            "minimax_h3_publish_denoise_progress": lambda *a: progress.append(a),
-            "minimax_h3_prepare_edit_rows": lambda rows, *a, **kw: (rows, None),
-            "minimax_h3_rf_v_to_x0": lambda x, v, t: x - (1 - t) * v,
-        },
-    )
+    native_step = sampler_module.euler_eta0_step
+
+    def step(*args, **kwargs):
+        if failure == "solver":
+            raise RuntimeError("injected solver")
+        return native_step(*args, **kwargs)
+
+    monkeypatch.setattr(sampler_module, "euler_eta0_step", step)
+    monkeypatch.setattr(denoise_loop, "minimax_h3_prepare_denoise_rows", prepare)
+    monkeypatch.setattr(denoise_loop, "check_request_cancellation", cancel)
+    monkeypatch.setattr(sampling, "check_request_cancellation", cancel)
+    monkeypatch.setattr(denoise_loop, "minimax_h3_publish_denoise_progress", lambda *a: progress.append(a))
     branch = SimpleNamespace(
         update_mask_dev=torch.ones(8, dtype=torch.bool),
         audio_update_mask_dev=torch.ones(8, dtype=torch.bool),
@@ -259,7 +251,7 @@ def test_native_h3_loop_preserves_av_solver_steps_and_cleanup(mode, failure):
         update_mask=torch.ones(8, dtype=torch.bool),
         static_kwargs={"preserved": True},
     )
-    branch.forward_kwargs = lambda **kw: kw
+    branch.forward_kwargs = lambda **kw: {**kw, **branch.static_kwargs}
     calls = []
 
     def model(**kw):
@@ -271,19 +263,18 @@ def test_native_h3_loop_preserves_av_solver_steps_and_cleanup(mode, failure):
     model.create_reference_kv_state = lambda **kwargs: ReferenceKVState() if mode is None else None
     runtime = FlowRuntime(config("minimax_h3_reference_v1", mode)) if mode is not None else None
     outcome = pytest.raises(RuntimeError, match=f"injected {failure}") if failure else nullcontext()
+    arguments = dict(
+        model=model,
+        positive=branch,
+        initial_video_rows=torch.ones(8, 96),
+        initial_audio_rows=torch.ones(8, 32),
+        keyframe_cond_rows=None,
+        sigmas_video=torch.linspace(1, 0, 31).tolist(),
+        sigmas_audio=torch.linspace(1, 0, 31).tolist(),
+        device=torch.device("cpu"),
+    )
     with outcome, runtime.request_context() if runtime else nullcontext():
-        env["minimax_h3_denoise_loop"](
-            model=model,
-            positive=branch,
-            initial_video_rows=torch.ones(8, 96),
-            initial_audio_rows=torch.ones(8, 32),
-            keyframe_cond_rows=None,
-            sigmas_video=torch.linspace(1, 0, 31).tolist(),
-            sigmas_audio=torch.linspace(1, 0, 31).tolist(),
-            device=torch.device("cpu"),
-            aligncache_runtime=runtime,
-            on_step=callback,
-        )
+        output = denoise_loop.minimax_h3_denoise_loop(**arguments, aligncache_runtime=runtime, update_progress=callback)
     assert progress[-1] == (None, None, None)
     assert branch.static_kwargs == {"preserved": True}
     if runtime is not None:
@@ -295,10 +286,14 @@ def test_native_h3_loop_preserves_av_solver_steps_and_cleanup(mode, failure):
             assert [event for event, _ in kv_events].count("begin") == 30
             assert [event for event, _ in kv_events].count("end") == 30
     if failure is None:
-        assert steps == [i for i in range(30) for _ in range(2)]
+        assert steps == list(range(30))
         assert len(calls) < 30 if mode == "accelerate" else len(calls) == 30
         if runtime is not None:
             assert runtime.last_summary["model_forward_calls"] == len(calls)
+        if mode in ("force_exact", "trace"):
+            reference = denoise_loop.minimax_h3_denoise_loop(**arguments)
+            for actual, expected in zip(output, reference, strict=True):
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
@@ -321,6 +316,8 @@ def test_flow_rejects_unsupported_wan_knobs(overrides):
         ("latent_refine", {}),
         ("latent_upscale", (512, 512)),
         ("continuation", (10, 2)),
+        ("latent_continuation", object()),
+        ("control_rows", torch.ones(1)),
         ("num_outputs", 2),
     ],
 )

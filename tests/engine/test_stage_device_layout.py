@@ -35,6 +35,7 @@ def _stage(stage_id, devices, num_replicas=1, engine_args=None):
     return types.SimpleNamespace(
         stage_id=stage_id,
         stage_type="llm",
+        final_output_type=None,
         engine_args=engine_args or {},
         runtime=types.SimpleNamespace(devices=devices, num_replicas=num_replicas),
     )

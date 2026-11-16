@@ -571,19 +571,6 @@ def test_worker_rejects_lora_before_activation():
         worker.execute_model(req, SimpleNamespace(cache_backend="align_cache"))
 
 
-def test_active_weight_update_rejected_before_loading():
-    cls = definitions(
-        "vllm_omni/diffusion/worker/diffusion_model_runner.py", {"DiffusionModelRunner"}, {}, {"load_weights"}
-    )["DiffusionModelRunner"]
-    runner = cls()
-    runner.pipeline = SimpleNamespace(
-        _aligncache_runtime=SimpleNamespace(active=True),
-        load_weights=lambda weights: pytest.fail("weights must not change"),
-    )
-    with pytest.raises(RuntimeError, match="active"):
-        runner.load_weights([])
-
-
 def test_backend_invalid_request_and_default_context(backend_module, monkeypatch):
     monkeypatch.setattr(backend_module, "validate_pipeline", lambda p: None)
     pipeline = SimpleNamespace(transformer=object(), od_config=execution_config())

@@ -22,10 +22,10 @@
 # MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
 # --------------------------------------------------------
 import logging
+from collections.abc import Callable
 from contextlib import nullcontext
 from functools import cached_property
 from queue import Queue
-from threading import Lock
 
 import torch
 import torch.nn as nn
@@ -162,6 +162,10 @@ class CFM(nn.Module):
         t: torch.Tensor,
         sde_args: torch.Tensor,
         sde_rnd: torch.Tensor,
+        forward_with_cfg: Callable[
+            [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None], torch.Tensor
+        ]
+        | None = None,
     ):
         """Sample audio latent via ODE/SDE integration with CFG.
 
@@ -172,10 +176,13 @@ class CFM(nn.Module):
             t: timesteps from get_epss_timesteps
             sde_args: [cfg_strength, sigma, temperature]
             sde_rnd: random noise for SDE steps (steps, B, patch_size, latent_dim)
+            forward_with_cfg: replacement for ``self.model.forward_with_cfg``,
+                such as a compiled one
         """
+        forward_with_cfg = forward_with_cfg or self.model.forward_with_cfg
 
         def fn(fn_t, x):
-            pred_cfg = self.model.forward_with_cfg(x, fn_t, llm_cond, lat_cond, None)
+            pred_cfg = forward_with_cfg(x, fn_t, llm_cond, lat_cond, None)
             pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
             return pred + (pred - null_pred) * sde_args[0]
 
@@ -284,13 +291,7 @@ class CFMGraphExecutorPool:
     """Thread-safe pool of CFMGraphExecutors for concurrent inference."""
 
     def __init__(self, config, cfm, aggregator, stop_head: nn.Linear, pool_size: int = 1):
-        self.config = config
-        self.cfm = cfm
-        self.aggregator = aggregator
-        self.stop_head = stop_head
-        self.pool_size = pool_size
         self.pool = Queue(maxsize=pool_size)
-        self.lock = Lock()
 
         for _ in range(pool_size):
             executor = CFMGraphExecutor(config, cfm, aggregator, stop_head)
@@ -541,7 +542,8 @@ def build_tts_input(
     if spk_emb is not None:
         spk_token_id = tokenizer.encode("<|vision_start|>")
         assert len(spk_token_id) == 1, "<|vision_start|> must tokenize to a single id"
-        spk_indices = torch.where(input_ids[0] == spk_token_id[0])[0]
+        # Positions from the host token list: no device round trip.
+        spk_indices = [i for i, token in enumerate(input_part) if token == spk_token_id[0]]
         assert len(spk_indices) > 0, "expected at least one <|vision_start|> slot"
         for i, se in enumerate(spk_emb):
             inputs_embeds[0, spk_indices[i] + 1] = se
@@ -550,7 +552,7 @@ def build_tts_input(
     if prompt_wav_emb is not None and prompt_text is not None:
         audio_token_id = tokenizer.encode("<audio>")
         assert len(audio_token_id) == 1, "<audio> must tokenize to a single id"
-        audio_indices = torch.where(input_ids[0] == audio_token_id[0])[0]
+        audio_indices = [i for i, token in enumerate(input_part) if token == audio_token_id[0]]
         assert len(audio_indices) > 0, "expected at least one <audio> slot"
         start = audio_indices[0] + 1
         inputs_embeds[0, start : start + prompt_wav_emb.size(1), :] = prompt_wav_emb[0]

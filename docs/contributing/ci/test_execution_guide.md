@@ -15,12 +15,23 @@ vLLM-Omni is built based on vLLM. You can follow [install guide](../../getting_s
 
 ### Test Case Dependencies
 
-When running test cases, you may need to install the following dependencies:
+After installing the matching platform runtime, run from the repository root.
+The `[dev]` extra includes VoxCPM 2.0.3 and its Gradio dependency; use the
+[temporary source backport](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
+in the same dependency install. These setup commands do not establish CI or
+native model acceptance.
 
 ```bash
-uv pip install ".[dev]"
+python tools/build_gradio_pillow13.py --output-dir /tmp/gradio-pillow13
+uv pip install ".[dev]" \
+  /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl
+uv pip check
 apt-get install -y espeak-ng jq
 ```
+
+The CUDA CI image verifies the vLLM 0.33 runtime and imports the rebuilt
+`lmcache.cuda_ops` before model tests. See the installation guide for the
+base-image dependency repairs; metadata checks alone do not verify native ABI.
 
 ## Running Tests
 
@@ -96,12 +107,8 @@ Failed jobs: 1/2
     **Recommended:** run CI-aligned jobs from the repo root via [`tools/run_merge_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/run_merge_jobs.sh). The script reads [`.buildkite/cuda/test-merge.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-merge.yml), generates per-step bash wrappers, runs pytest, and tees logs under `logs/merge_jobs/` (see [CI job runners](#ci-job-runners-l2l4-logs-timing-and-timeouts)). Requires `bash`, `python3`, and PyYAML (`pip install pyyaml`).
 
     ```bash
-    # All L3 and L1 jobs (default: every pytest step in test-merge.yml)
+    # All L3 jobs (default: every pytest step in test-merge.yml)
     bash tools/run_merge_jobs.sh
-
-    # Skip L1-style "Simple Test" steps in test-merge.yml (group or "Simple ·" labels)
-    bash tools/run_merge_jobs.sh --skip-simple
-    bash tools/run_merge_jobs.sh --skip-simple --model-type omni
 
     # Preview extracted commands without running
     bash tools/run_merge_jobs.sh --dry-run
@@ -141,12 +148,12 @@ Failed jobs: 1/2
     bash tools/nightly/run_nightly_jobs.sh --test-type function --model-type omni
     bash tools/nightly/run_nightly_jobs.sh --test-type perf --model-type diffusion
 
-    # Stability scripts (tests/dfx/stability/scripts/) and local marker tests
+    # Stability scripts (tests/dfx/stability/scripts/run_stability_benchmark.py) and local marker tests
     bash tools/nightly/run_nightly_jobs.sh --test-type stability --model-type omni
     bash tools/nightly/run_nightly_jobs.sh --test-type local --model-type tts
     ```
 
-    Perf steps (label contains ``Perf Test``) run before other jobs; Excel output is written under ``logs/``. Diffusion nightly steps may also appear in [test-nightly-diffusion.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly-diffusion.yml) on CI.
+    Perf steps (label contains ``Perf Test``) run before other jobs; Excel output is written under ``logs/``. Diffusion nightly steps may also appear in [test-nightly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml) on CI. **Simple · CPU Coverage Test** in [test-nightly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml) runs when ``NIGHTLY=1`` (``pytest -m 'core_model and cpu'`` plus a Cobertura XML artifact).
 
     **Ad hoc:** run a single test file or marker expression manually:
 
@@ -167,7 +174,7 @@ Failed jobs: 1/2
     pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_tts.json
     pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_cosmos3_vllm_omni.json
     ```
-    Nightly **Perf Test** jobs in [``test-nightly.yml``](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml) use ``--test-config-file`` only (no ``-m``). Weekly **Perf Test** in [``test-weekly.yml``](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-weekly.yml) runs ``test_qwen3_omni_vllm_text.json`` and ``test_qwen3_omni_multi_replicas.json`` (JSON ``mark`` includes ``slow``). E2e L4 function tests use ``full_model`` + ``--run-level full_model``. Example:
+    Nightly **Perf Test** jobs in [``test-nightly.yml``](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml) use ``--test-config-file`` only (no ``-m``). E2e L4 function tests use ``full_model`` + ``--run-level full_model``. Example:
 
 === "L5 level"
 
@@ -177,10 +184,10 @@ Failed jobs: 1/2
     cd tests
 
     # Stability: Qwen3-Omni
-    pytest -s -v dfx/stability/scripts/run_stability_qwen3_omni.py -m slow
+    pytest -s -v dfx/stability/scripts/run_stability_benchmark.py --test-config-file dfx/stability/tests/test_qwen3_omni.json -m slow
 
     # Stability: Wan2.2 (v1/videos diffusion benchmark loop)
-    pytest -s -v dfx/stability/scripts/run_stability_wan22.py -m slow
+    pytest -s -v dfx/stability/scripts/run_stability_benchmark.py --test-config-file dfx/stability/tests/test_wan22.json -m slow
 
     # Reliability: Qwen3-Omni (H100 × 2)
     pytest -s -v dfx/reliability/test_qwen3_omni.py -m "slow and cards_2"
@@ -198,7 +205,7 @@ Failed jobs: 1/2
 
     The latest L5 CI jobs are in [test-weekly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-weekly.yml):
 
-    - **Reliability** (+ invalid-parameter), **Perf Test** (Omni vLLM Text / Multi-Replica), and **Simple · CPU Coverage Test** → `WEEKLY=1` (or PR label `weekly-test` for Reliability/Perf). Scheduled upload of those env-gated steps still requires `main`.
+    - **Reliability** (+ invalid-parameter) and **Perf Test** (Omni vLLM Text / Multi-Replica) → `WEEKLY=1` (or PR label `weekly-test`). Scheduled upload of those env-gated steps still requires `main`.
     - **E2E Tests** (slow Omni / TTS / Diffusion sweeps) → `NON_CRITICAL=1` (pipeline upload also accepts `WEEKLY=1` / `weekly-test`; the group `if` still needs `NON_CRITICAL`)
 
 You can find more information about markers in [Test Writing Guide — Markers for Tests](./test_writing_guide.md#markers-for-tests).

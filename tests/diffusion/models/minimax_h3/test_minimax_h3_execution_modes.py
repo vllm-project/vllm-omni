@@ -296,3 +296,16 @@ def test_mixed_reference_conditioning_matches_stage_zero_handoff(pipeline, monke
         call.args[0].shape[-1] == round(107 / 24 * 32000)
         for call in pipeline.audio_vae.encode_waveform.call_args_list[1::2]
     )
+
+
+def test_aligncache_rejects_request_cache_dit_before_installation(pipeline):
+    pipeline._aligncache_runtime = object()
+    pipeline._quality_policy.resolve.return_value = SimpleNamespace(cache_dit=object())
+    request = _request("t2va")
+    request.sampling_params.quality = "high"
+
+    with pytest.raises(OmniClientError, match="request-level Cache-DiT"):
+        pipeline.forward(request)
+
+    pipeline._cache_dit_runtime.prepare.assert_not_called()
+    pipeline.diffuse.assert_not_called()

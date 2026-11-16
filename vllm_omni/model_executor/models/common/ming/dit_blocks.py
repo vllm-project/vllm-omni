@@ -41,9 +41,37 @@ class FeedForward(nn.Module):
         activation = nn.GELU(approximate=approximate)
         project_in = nn.Sequential(nn.Linear(dim, inner_dim), activation)
         self.ff = nn.Sequential(project_in, nn.Dropout(dropout), nn.Linear(inner_dim, dim_out))
+        # Opt-in (the batched Ming talker sets it): a tanh GELU runs as the
+        # input projection's cuBLASLt epilogue instead of as its own kernel.
+        # Only CUDA's epilogue is the tanh approximation.
+        self.fused_gelu = False
 
     def forward(self, x):
+        proj, activation = self.ff[0]
+        if (
+            self.fused_gelu
+            and x.is_cuda
+            and not self.training
+            and activation.approximate == "tanh"
+            and proj.bias is not None
+        ):
+            hidden = torch._addmm_activation(proj.bias, x.reshape(-1, x.shape[-1]), proj.weight.t(), use_gelu=True)
+            return self.ff[2](hidden.view(*x.shape[:-1], -1))
         return self.ff(x)
+
+
+# Flow-head sequences are a few tokens (condition, history, patch); for them a
+# broadcast-and-reduce, which torch.compile fuses, replaces one SDPA launch per
+# layer and ODE step.
+SHORT_ATTENTION_MAX_TOKENS = 8
+
+
+def _short_attention(query, key, value):
+    """Unmasked attention for tiny sequences, accumulated in fp32."""
+    scale = query.shape[-1] ** -0.5
+    scores = (query.float().unsqueeze(3) * key.float().unsqueeze(2)).sum(-1) * scale
+    probs = scores.softmax(dim=-1)
+    return (probs.unsqueeze(-1) * value.float().unsqueeze(2)).sum(3).to(query.dtype)
 
 
 class Attention(nn.Module):
@@ -81,6 +109,8 @@ class Attention(nn.Module):
         self.pe_attn_head = pe_attn_head
         self.attn_mask_enabled = attn_mask_enabled
         self.native_attention = native_attention
+        # Opt-in (the batched Ming talker sets it before compiling its flow head).
+        self.short_attention = False
         # cos/sin cache keyed by seq_len (freqs are deterministic in seq_len).
         self._rope_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         # TODO: materialize fused weights eagerly outside any torch.compile
@@ -154,7 +184,10 @@ class Attention(nn.Module):
         else:
             attn_mask = None
 
-        x = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
+        if self.short_attention and attn_mask is None and key.shape[-2] <= SHORT_ATTENTION_MAX_TOKENS:
+            x = _short_attention(query, key, value)
+        else:
+            x = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
         if self.attn_mask_enabled and mask is not None:
             final_output[valid_sample_indices] = x
             x = final_output
