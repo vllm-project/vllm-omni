@@ -151,7 +151,7 @@ def _graphable_estimator_step(
     # while the buffers kept across steps split K/V on a leading axis: pack on
     # the way in and unpack the result back into ``att_out``, so the graph's
     # output placeholder stays on the split layout the next step expects.
-    from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import (
         _pack_att_cache,
         _packed_att_buffer,
         _unpack_att_cache,
@@ -446,7 +446,7 @@ def apply_minicpmo_4_5_code2wav_patch() -> None:
     if _PATCHED:
         return
 
-    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import (
         BatchedToken2Wav,
     )
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (

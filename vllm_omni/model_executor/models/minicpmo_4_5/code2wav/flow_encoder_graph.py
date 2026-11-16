@@ -29,8 +29,8 @@ from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 
 from vllm_omni.utils.cuda_stream import create_cuda_stream
 
-from .cuda_graph_wrapper import _graph_api, _graph_execution_context
-from .encoder_graph import NPUEncoderGraphRunners
+from ..encoder_graph import NPUEncoderGraphRunners
+from .graphs import _graph_api, _graph_execution_context
 
 logger = init_logger(__name__)
 
@@ -555,40 +555,6 @@ class FlowEncoderGraphs:
                 self.stats["evictions"],
                 len(self.exact_graphs) + len(self._npu_pe),
             )
-
-    def capture_now(self, tokens, *, last_chunk, cnn_cache, att_cache, position_tables=()):
-        """Capture this exact CUDA shape immediately, skipping admission.
-
-        Returns whether a new graph was installed. A full cache or a batch at
-        ``eager_min_batch`` or above is left eager. Failures latch the wrapper shut, just like request-time capture.
-        """
-        if self._failed:
-            raise RuntimeError("Code2Wav encoder graph capture failed; restart the stage before retrying")
-        if tokens.device.type != "cuda" or torch.version.hip is not None:
-            return False
-        shape = getattr(tokens, "shape", None)
-        if (
-            self.eager_min_batch is not None
-            and shape is not None
-            and len(shape) >= 2
-            and int(shape[0]) >= self.eager_min_batch
-        ):
-            return False
-        if len(self.exact_graphs) >= self.max_graphs:
-            return False
-        inputs = (tokens, cnn_cache, att_cache)
-        amp = torch.is_autocast_enabled("cuda")
-        dtype = torch.get_autocast_dtype("cuda")
-        key = self._exact_key(inputs, last_chunk, amp, dtype, position_tables)
-        if key in self.exact_graphs:
-            return False
-        try:
-            self._install_capture(key, inputs, last_chunk, amp, dtype, position_tables)
-        except Exception:
-            self._failed = True
-            logger.exception("Code2Wav encoder CUDA precapture failed; stage restart required")
-            raise
-        return True
 
     @staticmethod
     def _exact_key(inputs, last_chunk, amp, dtype, position_tables):

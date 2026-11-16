@@ -45,7 +45,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
     MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
     MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
 )
-from vllm_omni.model_executor.models.minicpmo_4_5.config_flags import (
+from vllm_omni.model_executor.models.minicpmo_4_5.config import (
     parse_bool_flag as _bool_flag,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.handoff import unpack_handoff_tensor
@@ -274,17 +274,6 @@ def blank_scheduler_prompt_for_penalties(
     them would tax unrelated codec tokens.
     """
     return torch.full_like(prompt_token_ids, int(vocab_size))
-
-
-def kstep_frame_rows(spans: list[tuple[int, int]], device: torch.device) -> torch.Tensor:
-    """Rows a K-frame step samples for each request: the last row of its span.
-
-    The loop reads ``hidden[end - 1 : end]`` for a request, so that is the row
-    whose codec logits matter. For a one-row span (what the per-frame loop
-    passes) this is ``start``; for a wider span it is the span's tail -- which
-    is exactly where vLLM put this frame's scheduled position.
-    """
-    return torch.tensor([int(end) - 1 for _, end in spans], device=device, dtype=torch.long)
 
 
 def _native_duplex_row_meta(info_dict: Mapping[str, Any]) -> tuple[bool, int, int, str, bool]:

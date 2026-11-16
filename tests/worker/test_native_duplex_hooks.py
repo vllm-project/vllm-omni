@@ -1862,7 +1862,7 @@ def test_minicpmo_stage0_runtime_uses_loaded_vllm_embed_tokens_when_get_input_em
 
 
 def test_minicpmo_remote_config_patch_handles_nested_and_dict_configs():
-    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.compat import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.config import (
         patch_minicpmo_remote_config,
     )
 

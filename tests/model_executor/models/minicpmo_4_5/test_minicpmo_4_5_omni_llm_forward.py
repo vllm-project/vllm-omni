@@ -28,7 +28,7 @@ def test_multimodal_runner_preserves_forwarded_token_identities(monkeypatch):
         lambda **kwargs: stage_model,
     )
     monkeypatch.setattr(
-        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.compat.patch_minicpmo_remote_config",
+        "vllm_omni.model_executor.models.minicpmo_4_5.config.patch_minicpmo_remote_config",
         lambda config: None,
     )
     config = SimpleNamespace(

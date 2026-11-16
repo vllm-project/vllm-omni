@@ -10,9 +10,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import vllm_omni.model_executor.models.minicpmo_4_5.flow_encoder_graph as graph_module
+import vllm_omni.model_executor.models.minicpmo_4_5.code2wav.flow_encoder_graph as graph_module
 from tests.helpers.mark import hardware_test
-from vllm_omni.model_executor.models.minicpmo_4_5.flow_encoder_graph import (
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.flow_encoder_graph import (
     FlowEncoderGraphs,
     reachable_conformer_cache_frames,
 )
@@ -198,7 +198,7 @@ def test_explicit_shared_batches_bypass_opportunistic_capture_cutoff(fake_captur
 def test_startup_precapture_admission_policy(fake_capture, mock_nvidia_platform, runtime_capture):
     from contextlib import nullcontext
 
-    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import BatchedToken2Wav
 
     weight = torch.randn(_HIDDEN, _HIDDEN)
     graphs = FlowEncoderGraphs(
@@ -235,7 +235,7 @@ def test_startup_precapture_admission_policy(fake_capture, mock_nvidia_platform,
 
 @pytest.mark.cpu
 def test_legacy_graph_options_share_one_owner():
-    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import BatchedToken2Wav
 
     graph = FlowEncoderGraphs(lambda *args, **kwargs: args, max_graphs=16)
     encoder = SimpleNamespace(embed=SimpleNamespace(pos_enc=SimpleNamespace(pe=torch.zeros(1))), up_layer=object())
@@ -256,7 +256,7 @@ def test_legacy_graph_options_share_one_owner():
 @pytest.mark.nvidia_only
 @_requires_nvidia_capture
 @torch.inference_mode()
-def test_exact_precapture_failure_blocks_retry(monkeypatch):
+def test_exact_capture_failure_blocks_retry(monkeypatch):
     graph = FlowEncoderGraphs(lambda x, **kwargs: (x, x, x))
 
     def fail(*args):
@@ -264,10 +264,9 @@ def test_exact_precapture_failure_blocks_retry(monkeypatch):
 
     monkeypatch.setattr(graph, "_capture", fail)
     tokens = torch.zeros(1, 6, device="cuda")
+    graph(tokens, last_chunk=False, cnn_cache=None, att_cache=None)
     with pytest.raises(RuntimeError, match="capture failed"):
-        graph.capture_now(tokens, last_chunk=False, cnn_cache=None, att_cache=None)
-    with pytest.raises(RuntimeError, match="restart"):
-        graph.capture_now(tokens, last_chunk=False, cnn_cache=None, att_cache=None)
+        graph(tokens, last_chunk=False, cnn_cache=None, att_cache=None)
     with pytest.raises(RuntimeError, match="restart"):
         graph(tokens, last_chunk=False, cnn_cache=None, att_cache=None)
 
@@ -279,7 +278,10 @@ def test_exact_precapture_failure_blocks_retry(monkeypatch):
 def test_shared_real_conformer_preserves_mixed_cache_dtypes(amp):
     from cosyvoice2.transformer.upsample_encoder_v2 import UpsampleConformerEncoderV2
 
-    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav, _undecorate_dynamo
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import (
+        BatchedToken2Wav,
+        _undecorate_dynamo,
+    )
 
     backend = BatchedToken2Wav.__new__(BatchedToken2Wav)
     torch.nn.Module.__init__(backend)
@@ -349,7 +351,7 @@ def test_cpu_fallback_and_capacity():
 @pytest.mark.cpu
 @torch.inference_mode()
 def test_rocm_cuda_devices_fall_back_before_nvidia_stream_creation(monkeypatch):
-    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import BatchedToken2Wav
 
     def forbidden(*args, **kwargs):
         pytest.fail("ROCm fallback must not create or capture NVIDIA streams")
@@ -371,7 +373,7 @@ def test_rocm_cuda_devices_fall_back_before_nvidia_stream_creation(monkeypatch):
 @pytest.mark.skipif(torch.version.hip is None or not torch.cuda.is_available(), reason="ROCm GPU required")
 @torch.inference_mode()
 def test_rocm_eager_chunks_preserve_outputs_and_cache(monkeypatch):
-    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import BatchedToken2Wav
 
     def forbidden(*args, **kwargs):
         pytest.fail("ROCm eager chunks must not enter NVIDIA capture")
@@ -606,7 +608,10 @@ def test_configurable_admission_avoids_short_lived_shape_capture():
 def test_real_conformer_chunks_replay_and_preserve_state(amp):
     from cosyvoice2.transformer.upsample_encoder_v2 import UpsampleConformerEncoderV2
 
-    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav, _undecorate_dynamo
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import (
+        BatchedToken2Wav,
+        _undecorate_dynamo,
+    )
 
     encoder = (
         UpsampleConformerEncoderV2(

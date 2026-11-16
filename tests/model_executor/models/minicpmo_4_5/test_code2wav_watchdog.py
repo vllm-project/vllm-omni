@@ -7,7 +7,7 @@ import threading
 
 import pytest
 
-from vllm_omni.model_executor.models.minicpmo_4_5.code2wav_watchdog import (
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.watchdog import (
     CODE2WAV_WATCHDOG_TIMEOUT_ENV,
     Code2WavWatchdog,
     Code2WavWatchdogReport,
