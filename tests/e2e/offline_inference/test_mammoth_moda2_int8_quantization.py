@@ -399,8 +399,7 @@ def _build_t2i_request(prompt: str, height: int, width: int, gen_cfg: dict) -> d
         expected = int(gen_cfg[key])
         actual = additional_information[key]
         assert actual == [expected], (
-            f"{_T2I_GEN_CONFIG_FILE} declares {key}={expected}, "
-            f"but the production prompt builder hardcodes {actual}"
+            f"{_T2I_GEN_CONFIG_FILE} declares {key}={expected}, but the production prompt builder hardcodes {actual}"
         )
     additional_information.update(
         {
