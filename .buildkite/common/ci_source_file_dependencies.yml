@@ -37,7 +37,6 @@ x-qwen3-tts: &qwen3_tts
   - vllm_omni/engine/cuda_mps.py
   - vllm_omni/engine/stage_runtime.py
   - vllm_omni/engine/stage_init_utils.py
-  - vllm_omni/deploy/qwen3_tts_mrv2.yaml
   - vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2.yaml
   - vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2_b4.yaml
 
