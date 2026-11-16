@@ -17,6 +17,7 @@ import os
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 import pytest
+import torch
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
@@ -87,6 +88,7 @@ def test_text_to_text(omni_runner, offline_client) -> None:
     # Test single completion
     response = offline_client.send_omni_request(request_config)
     assert response.text_content is not None
+    assert response.text_content != ""
 
 
 @pytest.mark.advanced_model
@@ -100,6 +102,7 @@ def test_text_to_audio(omni_runner, offline_client) -> None:
     # Test single completion
     response = offline_client.send_omni_request(request_config)
     assert response.audio_content is not None
+    assert not torch.all(response.audio_content == 0), "Audio is silence"
 
 
 @pytest.mark.advanced_model
@@ -115,6 +118,7 @@ def test_image_to_text(omni_runner, offline_client) -> None:
     # Test single completion
     response = offline_client.send_omni_request(request_config)
     assert response.text_content is not None
+    assert response.text_content != ""
 
 
 @pytest.mark.advanced_model
@@ -130,6 +134,7 @@ def test_image_to_audio(omni_runner, offline_client) -> None:
     # Test single completion
     response = offline_client.send_omni_request(request_config)
     assert response.audio_content is not None
+    assert not torch.all(response.audio_content == 0), "Audio is silence"
 
 
 @pytest.mark.advanced_model
@@ -145,6 +150,7 @@ def test_video_to_text(omni_runner, offline_client) -> None:
     # Test single completion
     response = offline_client.send_omni_request(request_config)
     assert response.text_content is not None
+    assert response.text_content != ""
 
 
 @pytest.mark.advanced_model
@@ -160,6 +166,7 @@ def test_video_to_audio(omni_runner, offline_client) -> None:
     # Test single completion
     response = offline_client.send_omni_request(request_config)
     assert response.audio_content is not None
+    assert not torch.all(response.audio_content == 0), "Audio is silence"
 
 
 @pytest.mark.advanced_model
@@ -177,6 +184,7 @@ def test_audio_to_text(omni_runner, offline_client) -> None:
     # Test single completion
     response = offline_client.send_omni_request(request_config)
     assert response.text_content is not None
+    assert response.text_content != ""
 
 
 @pytest.mark.advanced_model
@@ -194,6 +202,7 @@ def test_audio_to_audio(omni_runner, offline_client) -> None:
     # Test single completion
     response = offline_client.send_omni_request(request_config)
     assert response.audio_content is not None
+    assert not torch.all(response.audio_content == 0), "Audio is silence"
 
 
 @pytest.mark.advanced_model
@@ -207,3 +216,4 @@ def test_thinker_only_model_request(omni_runner, offline_client) -> None:
     # Test single completion
     response = offline_client.send_omni_request(request_config)
     assert response.text_content is not None
+    assert response.text_content != ""
