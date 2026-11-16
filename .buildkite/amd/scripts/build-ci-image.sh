@@ -11,7 +11,7 @@ set -euo pipefail
 
 REGISTRY="${ROCM_CI_IMAGE_REGISTRY:-rocm/vllm-omni}"
 DOCKERFILE="docker/Dockerfile.rocm"
-BUILDER_NAME="vllm-omni-rocm-builder"
+BUILDER_NAME="vllm-omni-rocm-${BUILDKITE_JOB_ID:-$$-$RANDOM}"
 ROCM_ARCH="${PYTORCH_ROCM_ARCH:-gfx942}"
 CACHE_PROBE_TIMEOUT="${AMD_CACHE_PROBE_TIMEOUT:-1m}"
 CACHE_EXPORT_TIMEOUT="${AMD_CACHE_EXPORT_TIMEOUT:-60m}"
@@ -63,13 +63,20 @@ IMAGE_REF="${REGISTRY}:${BUILDKITE_COMMIT}"
 echo "ROCm dependency cache: ${CACHE_REF}"
 echo "ROCm CI image: ${IMAGE_REF}"
 
-# The docker-container driver supports exporting the full cache to a registry;
-# the default docker driver on CI does not.
-if ! docker buildx inspect "$BUILDER_NAME" >/dev/null 2>&1; then
-    docker buildx create --name "$BUILDER_NAME" --driver docker-container
-fi
-docker buildx use "$BUILDER_NAME"
-docker buildx inspect --bootstrap
+# Own a builder per invocation. Never change Buildx's selected builder: another
+# job can share the Docker daemon or client configuration. Registry cache
+# publication still needs the pipeline's separate concurrency protection.
+docker buildx create --name "$BUILDER_NAME" --driver docker-container
+cleanup_builder() {
+    if ! timeout --signal=TERM --kill-after=10s 1m \
+        docker buildx rm --force "$BUILDER_NAME"; then
+        echo "WARNING: could not remove job builder ${BUILDER_NAME}" >&2
+    fi
+}
+# Install cleanup only after creation succeeds; never remove an existing builder
+# when creation failed. Cleanup warnings must not hide the build's exit status.
+trap cleanup_builder EXIT
+docker buildx inspect "$BUILDER_NAME" --bootstrap
 
 run_with_retry() {
     local description=$1
@@ -108,6 +115,7 @@ else
     echo "ROCm dependency cache miss; exporting dependency layers"
     if timeout --signal=TERM --kill-after=1m "$CACHE_EXPORT_TIMEOUT" \
         docker buildx build --pull --progress=plain \
+            --builder "$BUILDER_NAME" \
             --target deps \
             --build-arg "ARG_PYTORCH_ROCM_ARCH=${ROCM_ARCH}" \
             --cache-from "type=registry,ref=${CACHE_REF}" \
@@ -123,6 +131,7 @@ fi
 
 image_build=(
     docker buildx build --push --pull --progress=plain
+    --builder "$BUILDER_NAME"
     --target test
     --build-arg "ARG_PYTORCH_ROCM_ARCH=${ROCM_ARCH}"
     --cache-from "type=registry,ref=${CACHE_REF}"
