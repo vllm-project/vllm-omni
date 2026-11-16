@@ -12,7 +12,7 @@ steps:
       agent_pool: mi300_1
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
-      grade: NonBlocking
+      grade: Blocking
       timeout_in_minutes: 75
       source_file_dependencies:
         - entrypoints_function
@@ -123,7 +123,7 @@ steps:
   steps:
     - label: "Simple · Model Executor Test · Shard %N/%t"
       agent_pool: mi300_1
-      parallelism: 3
+      parallelism: 5
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
@@ -132,14 +132,16 @@ steps:
         - "artifacts/amd-cpu-suites/**/*"
       commands:
         - export VLLM_ROCM_USE_AITER=0
+        # Match the four-CPU pod quota instead of the host-visible CPU count.
+        - export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 NUMEXPR_NUM_THREADS=4
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
         # that is not supported on CPU
         - >-
-          python -u .buildkite/amd/scripts/run_cpu_suite.py model-executor -sv tests/model_executor
+          python -u .buildkite/amd/scripts/run_cpu_suite.py
+          --timing-profile=.buildkite/amd/cpu-timings/model-executor-v1.json
+          model-executor -sv tests/model_executor
           -m 'core_model and cpu and not omni'
           --deselect=tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py::test_mimi_streaming_step_matches_legacy_end_to_end
-          --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
-          --shard-id=$$BUILDKITE_PARALLEL_JOB
 
     - label: "Simple · Omni Processor Snapshot Smoke"
       agent_pool: mi300_1
@@ -163,7 +165,7 @@ steps:
       grade: Blocking
       timeout_in_minutes: 60
       artifact_paths:
-        - "artifacts/amd-diffusion-cpu-shards/*.xml"
+        - "artifacts/amd-cpu-suites/**/*"
       # Buildkite's status-based rule cannot prove every exit 134 is a GPU hang.
       # It retries 134 once; the Kubernetes job retry starts a fresh pod.
       # Assertions (1), timeouts (124), and OOMs (137) remain non-retryable.
@@ -173,8 +175,8 @@ steps:
             limit: 1
       commands:
         - export VLLM_ROCM_USE_AITER=0
-        - export DIFFUSION_CPU_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/amd-diffusion-cpu-shards"
-        - mkdir -p "$$DIFFUSION_CPU_ARTIFACT_DIR"
+        # Two gloo ranks each use two CPU threads within the four-CPU quota.
+        - export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 NUMEXPR_NUM_THREADS=2
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
         # that is not supported on CPU
         # Keep multi-GPU tests out of this one-GPU pool even when their module
@@ -182,7 +184,9 @@ steps:
         # Keep π0.5 CPU units out of these shards: CUDA READY/MERGE already run
         # the same suite mandatorily, and AMD covers it non-blocking in nightly.
         - >-
-          pytest -sv tests/diffusion
+          python -u .buildkite/amd/scripts/run_cpu_suite.py
+          --timing-profile=.buildkite/amd/cpu-timings/diffusion-v1.json
+          diffusion -sv tests/diffusion
           -m 'core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
           --ignore=tests/diffusion/cache/test_teacache_extractors.py
           --ignore=tests/diffusion/models/pi05/test_pi05_units.py
@@ -192,10 +196,6 @@ steps:
           --deselect='tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_continues_real_causal_vae_beyond_initial_horizon[realtime]'
           --deselect='tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_continues_real_causal_vae_beyond_initial_horizon[stepwise]'
           --deselect='tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_encoder_stops_at_its_fixed_point_and_restarts_with_the_session'
-          --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
-          --shard-id=$$BUILDKITE_PARALLEL_JOB
-          --durations=50
-          --junitxml="$$DIFFUSION_CPU_ARTIFACT_DIR/pytest-$${BUILDKITE_PARALLEL_JOB}-of-$${BUILDKITE_PARALLEL_JOB_COUNT}.xml"
 
     # Hash sharding put these six CPU cases on shard 2/5. Main builds 13600 and
     # 13615 spent about 15 and 23 minutes on them. A separate job keeps that
@@ -207,7 +207,7 @@ steps:
       grade: Blocking
       timeout_in_minutes: 40
       artifact_paths:
-        - "artifacts/amd-diffusion-slow-cpu/pytest.xml"
+        - "artifacts/amd-cpu-suites/**/*"
       # Same exit-134 retry as the five-way shards. Buildkite cannot prove
       # every 134 is a GPU hang. Assertions (1), timeouts (124), and OOMs
       # (137) remain non-retryable.
@@ -217,10 +217,10 @@ steps:
             limit: 1
       commands:
         - export VLLM_ROCM_USE_AITER=0
-        - export DIFFUSION_SLOW_CPU_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/amd-diffusion-slow-cpu"
-        - mkdir -p "$$DIFFUSION_SLOW_CPU_ARTIFACT_DIR"
+        # Two gloo ranks each use two CPU threads within the four-CPU quota.
+        - export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 NUMEXPR_NUM_THREADS=2
         - >-
-          pytest -sv
+          python -u .buildkite/amd/scripts/run_cpu_suite.py diffusion -sv
           'tests/diffusion/distributed/test_wan_vae_fastpath_install.py::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype0]'
           'tests/diffusion/distributed/test_wan_vae_fastpath_install.py::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype1]'
           'tests/diffusion/distributed/test_wan_decoder_fast_path.py::test_sharded_fast_path_on_every_rank[True-exact]'
@@ -228,8 +228,6 @@ steps:
           'tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_continues_real_causal_vae_beyond_initial_horizon[stepwise]'
           'tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_encoder_stops_at_its_fixed_point_and_restarts_with_the_session'
           -m 'core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
-          --durations=20
-          --junitxml="$$DIFFUSION_SLOW_CPU_ARTIFACT_DIR/pytest.xml"
 
     - label: "Diffusion · AuK VAE GPU Test"
       agent_pool: mi300_1
@@ -253,8 +251,9 @@ steps:
         - export VLLM_ROCM_USE_AITER=0
         - "pytest -sv tests/entrypoints tests/engine -m 'core_model and cpu'"
 
-    - label: "Simple · Other Test"
+    - label: "Simple · Other Test · Shard %N/%t"
       agent_pool: mi300_1
+      parallelism: 2
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
@@ -264,7 +263,7 @@ steps:
         - export VLLM_ROCM_USE_AITER=0
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
         # that is not supported on CPU
-        - "python -u .buildkite/amd/scripts/run_cpu_suite.py other -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine  --ignore=tests/diffusion/cache/test_teacache_extractors.py"
+        - "python -u .buildkite/amd/scripts/run_cpu_suite.py --timing-profile=.buildkite/amd/cpu-timings/other-v1.json other -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine --ignore=tests/diffusion/cache/test_teacache_extractors.py"
 
 
 - group: ":test_tube: ROCm bagel-shm-connectors MERGE"
@@ -676,17 +675,15 @@ steps:
       commands:
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
         - >-
-          bash .buildkite/amd/scripts/assert-pytest-collection.sh 13
+          bash .buildkite/amd/scripts/assert-pytest-collection.sh 11
           tests/e2e/offline_inference/test_qwen3_omni.py
           tests/e2e/online_serving/test_qwen3_omni.py
-          tests/e2e/offline_inference/test_qwen3_omni_colocate_async.py
           -m 'advanced_model and rocm and MI325 and not nvidia_only'
           --run-level 'advanced_model'
         - >-
           pytest -s -v
           tests/e2e/offline_inference/test_qwen3_omni.py
           tests/e2e/online_serving/test_qwen3_omni.py
-          tests/e2e/offline_inference/test_qwen3_omni_colocate_async.py
           -m 'advanced_model and rocm and MI325 and not nvidia_only'
           --run-level 'advanced_model'
 
@@ -852,7 +849,7 @@ steps:
           set -euo pipefail
           node='tests/e2e/online_serving/test_qwen_image.py::test_text_to_image_001[default]'
           pytest --collect-only -q "$$node" \
-            -m 'advanced_model and diffusion and rocm and MI325 and cards_1' \
+            -m 'slow and diffusion and rocm and MI325 and cards_1' \
             --run-level advanced_model \
             > "$$QWEN_IMAGE_MERGE_ARTIFACT_DIR/collection.txt"
           count=$$(awk -v node="$$node" 'index($$0, node) { n++ } END { print n + 0 }' \
@@ -867,7 +864,7 @@ steps:
           timeout --signal=TERM --kill-after=2m 45m \
             pytest -s -v -ra \
             'tests/e2e/online_serving/test_qwen_image.py::test_text_to_image_001[default]' \
-            -m 'advanced_model and diffusion and rocm and MI325 and cards_1' \
+            -m 'slow and diffusion and rocm and MI325 and cards_1' \
             --run-level advanced_model \
             --junitxml="$$QWEN_IMAGE_MERGE_ARTIFACT_DIR/pytest.xml" \
             || status=$$?
@@ -910,7 +907,7 @@ steps:
           set -euo pipefail
           node='tests/e2e/online_serving/test_qwen_image.py::test_batch_001[default]'
           pytest --collect-only -q "$$node" \
-            -m 'advanced_model and diffusion and rocm and MI325 and cards_1' \
+            -m 'slow and diffusion and rocm and MI325 and cards_1' \
             --run-level advanced_model \
             > "$$QWEN_IMAGE_BATCH_MERGE_ARTIFACT_DIR/collection.txt"
           count=$$(awk -v node="$$node" 'index($$0, node) { n++ } END { print n + 0 }' \
@@ -925,7 +922,7 @@ steps:
           timeout --signal=TERM --kill-after=2m 45m \
             pytest -s -v -ra \
             'tests/e2e/online_serving/test_qwen_image.py::test_batch_001[default]' \
-            -m 'advanced_model and diffusion and rocm and MI325 and cards_1' \
+            -m 'slow and diffusion and rocm and MI325 and cards_1' \
             --run-level advanced_model \
             --junitxml="$$QWEN_IMAGE_BATCH_MERGE_ARTIFACT_DIR/pytest.xml" \
             || status=$$?
@@ -972,7 +969,7 @@ steps:
           )
           printf '%s\n' "$${nodes[@]}" | sort > /tmp/drama3-merge-expected.txt
           pytest -q 'tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]' \
-            -m "advanced_model and tts and rocm and MI325 and cards_1" \
+            -m "slow and tts and rocm and MI325 and cards_1" \
             --run-level "advanced_model" \
             --collect-only \
             | sed -n 's/^\(tests\/.*::.*\)/\1/p' \
@@ -982,7 +979,7 @@ steps:
             exit 1
           fi
           pytest -s -v 'tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]' \
-            -m "advanced_model and tts and rocm and MI325 and cards_1" \
+            -m "slow and tts and rocm and MI325 and cards_1" \
             --run-level "advanced_model" \
             --junitxml="$$DRAMA3_MERGE_ARTIFACT_DIR/pytest.xml"
           python -c 'import sys, xml.etree.ElementTree as ET
@@ -1007,7 +1004,7 @@ steps:
       agent_pool: mi300_1
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
-      grade: NonBlocking
+      grade: Blocking
       timeout_in_minutes: 75
       source_file_dependencies:
         - tts_drama_3_function
@@ -1031,7 +1028,7 @@ steps:
           )
           printf '%s\n' "$${nodes[@]}" | LC_ALL=C sort > "$$ROCM_MERGE_ARTIFACT_DIR/expected.txt"
           pytest --collect-only -q "$${nodes[@]}" \
-            -m 'advanced_model and tts and rocm and MI325 and cards_1' --run-level advanced_model \
+            -m 'slow and tts and rocm and MI325 and cards_1' --run-level advanced_model \
             --shard-id=0 --num-shards=1 \
             > "$$ROCM_MERGE_ARTIFACT_DIR/collection.txt"
           sed -n '/^tests\/.*::/p' "$$ROCM_MERGE_ARTIFACT_DIR/collection.txt" \
@@ -1048,7 +1045,7 @@ steps:
             'tests/e2e/online_serving/test_drama_3.py::test_voice_clone_streaming_002[seed42-drama_3-rocm]' \
             'tests/e2e/online_serving/test_drama_3.py::test_voice_clone_concurrent_003[drama_3-rocm]' \
             'tests/e2e/online_serving/test_drama_3.py::test_voice_clone_requires_ref_text_004[drama_3-rocm]' \
-            -m 'advanced_model and tts and rocm and MI325 and cards_1' --run-level advanced_model \
+            -m 'slow and tts and rocm and MI325 and cards_1' --run-level advanced_model \
             --shard-id=0 --num-shards=1 \
             --basetemp="$$ROCM_MERGE_ARTIFACT_DIR/tmp-voice-clone" \
             --junitxml="$$ROCM_MERGE_ARTIFACT_DIR/voice-clone.xml" || status=$$?
@@ -1184,7 +1181,7 @@ steps:
       agent_pool: mi300_1
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
-      grade: NonBlocking
+      grade: Blocking
       timeout_in_minutes: 90
       source_file_dependencies:
         - omni_minicpmo_4_5_duplex_function

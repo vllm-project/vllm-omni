@@ -280,6 +280,8 @@ def test_pipeline_router_dtype_depends_on_sharing_not_meta(monkeypatch, shared, 
             "DiffusersPipelineLoader": Mock(),
             "HunyuanImage3Model": backbone,
             "get_local_device": lambda: torch.device("cpu"),
+            # The attention schedule startup note is outside this contract.
+            "_log_step0_profile_reuse": lambda _: None,
         },
         base_class=PipelineBase,
     )
