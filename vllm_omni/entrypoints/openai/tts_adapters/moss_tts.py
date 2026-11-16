@@ -8,6 +8,7 @@ handles each); they are registered under distinct model-type names.
 
 import asyncio
 import hashlib
+import os
 import threading
 from typing import TYPE_CHECKING, Any, cast
 
@@ -26,12 +27,17 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     apply_max_new_tokens,
     conditioning_cache_salt,
 )
+from vllm_omni.model_executor.models.moss_tts.processor_loading import load_moss_processor
 from vllm_omni.model_executor.models.moss_tts.realtime_prompt import build_realtime_prompt
 
 if TYPE_CHECKING:
+    import torch
+
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 
 logger = init_logger(__name__)
+
+_MOSS_REALTIME_REF_ENCODER_DEVICE_ENV = "VLLM_OMNI_MOSS_REALTIME_REF_ENCODER_DEVICE"
 
 
 def _local_continuation_prompt(proc: Any, user_kwargs: dict[str, Any], reference: Any) -> tuple[list[int], Any] | None:
@@ -303,7 +309,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         devices = getattr(anchor, "devices", None)
         return str(devices) if devices is not None and str(devices).strip() else None
 
-    def _resolve_ref_encoder_device(self):
+    def _resolve_ref_encoder_device(self) -> "torch.device":
         """Pick the device of the API-process reference-audio encoder.
 
         The encoder follows the code2wav stage onto its first accelerator: the stage
@@ -339,6 +345,17 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             return torch.device("cpu")
         return platform.get_torch_device(index)
 
+    def _resolve_realtime_ref_encoder_device(self) -> "torch.device":
+        """Resolve the Realtime codec device, allowing only the CI CPU fallback."""
+        override = os.getenv(_MOSS_REALTIME_REF_ENCODER_DEVICE_ENV, "").strip().lower()
+        if not override:
+            return self._resolve_ref_encoder_device()
+        if override != "cpu":
+            raise ValueError(f"{_MOSS_REALTIME_REF_ENCODER_DEVICE_ENV} only supports 'cpu'; got {override!r}")
+        import torch
+
+        return torch.device("cpu")
+
     def _get_moss_processor(self):
         """Lazily load the upstream MOSS-TTS processor once per server.
 
@@ -353,17 +370,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         cached = getattr(self, "_moss_processor_cache", None)
         if cached is not None:
             return cached
-        from transformers import AutoProcessor
-
-        model_id = self.engine_client.model_config.model
-        if self._moss_variant == "local":
-            # AutoProcessor injects loader-only kwargs (e.g. revision) that
-            # Local's custom from_pretrained forwards to ProcessorMixin.__init__.
-            # Invoke the checkpoint's loader directly, as for Realtime below.
-            processor_cls = get_class_from_dynamic_module("processing_moss_tts.MossTTSLocalProcessor", model_id)
-            proc = processor_cls.from_pretrained(model_id, trust_remote_code=True)
-        else:
-            proc = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+        proc = load_moss_processor(self.engine_client.model_config.model)
         if hasattr(proc, "audio_tokenizer"):
             device = self._resolve_ref_encoder_device()
             proc._vllm_omni_ref_encoder_device = device
@@ -388,6 +395,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             if cached is not None:
                 return cached
 
+            device = self._resolve_realtime_ref_encoder_device()
             model_id = self.engine_client.model_config.model
             processor_cls = get_class_from_dynamic_module(
                 "processing_mossttsrealtime.MossTTSRealtimeProcessor",
@@ -411,9 +419,10 @@ class _MossTTSAdapterBase(ARTTSAdapter):
                 codec_path,
                 trust_remote_code=True,
             )
-            # Reference encoding runs in the API process; follow the codec
-            # (code2wav) stage's GPU like the processor path above.
-            codec = codec.to(self._resolve_ref_encoder_device()).eval()
+            # Production follows the codec stage accelerator. Memory-constrained
+            # qualification lanes can opt into CPU without weakening the
+            # default cold-reference latency for user deployments.
+            codec = codec.to(device).eval()
             cached = (tokenizer, processor, codec)
             self._moss_realtime_components = cached
             return cached

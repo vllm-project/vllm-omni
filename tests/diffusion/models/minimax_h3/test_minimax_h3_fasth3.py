@@ -325,7 +325,7 @@ def _pipeline_stub(fusion=None):
 
 
 def _sampling(steps=FASTH3_DENOISE_STEPS, **kwargs) -> SimpleNamespace:
-    fields = {"num_inference_steps": steps, "extra_args": {}, "lora_request": None}
+    fields = {"num_inference_steps": steps, "extra_args": {}, "lora_request": None, "lora_scale": 1.0}
     return SimpleNamespace(**{**fields, **kwargs})
 
 

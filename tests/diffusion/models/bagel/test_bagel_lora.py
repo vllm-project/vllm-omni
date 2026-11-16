@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for BAGEL LoRA support across Stage 0 (Thinker) and Stage 1 (DiT)."""
 
 from __future__ import annotations
@@ -251,3 +251,90 @@ class TestBagelLoRARoundTrip:
         assert torch.all(lora_a == 1.0), f"lora_a should be all ones, got {lora_a}"
         # B weights should be 2.0 * scale(0.5) = 1.0
         assert torch.allclose(lora_b, torch.ones_like(lora_b)), f"lora_b should be 2.0 * 0.5 = 1.0, got {lora_b}"
+
+    def test_mot_qkv_full_path_adapter_binds_and_routes_to_text_tokens(self, tmp_path, monkeypatch):
+        """The production BAGEL MoT QKV path must bind without adapting VAE tokens."""
+        from vllm.config import VllmConfig, set_current_vllm_config
+        from vllm.model_executor import parameter
+        from vllm.model_executor.layers import linear
+
+        from vllm_omni.diffusion.models.bagel.mot.mot_qkv_parallel_linear import (
+            MoTQKVParallelLinear,
+            MoTQKVParallelLinearWithLoRA,
+        )
+
+        for module in (linear, parameter):
+            monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
+            monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+        monkeypatch.setattr(
+            linear,
+            "dispatch_unquantized_gemm",
+            lambda *_args, **_kwargs: lambda _layer, x, weight, bias=None: torch.nn.functional.linear(x, weight, bias),
+        )
+        # This regression intentionally drives CPU tensors even on accelerator
+        # runners. Keep the base MoT layer on its portable gather/scatter path
+        # instead of dispatching those tensors to the CUDA Triton kernel.
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.models.bagel.mot.mot_qkv_parallel_linear.current_platform.is_cuda",
+            lambda: False,
+        )
+
+        module_name = "bagel.language_model.model.layers.0.self_attn.qkv_proj"
+        with set_current_vllm_config(VllmConfig()):
+            qkv_proj = MoTQKVParallelLinear(
+                hidden_size=4,
+                head_size=2,
+                total_num_heads=2,
+                total_num_kv_heads=1,
+                bias=False,
+                vae_bias=False,
+                params_dtype=torch.float32,
+                disable_tp=True,
+                prefix=module_name,
+            )
+            with torch.no_grad():
+                qkv_proj.weight.zero_()
+                qkv_proj.gen_exp.weight.zero_()
+
+            pipeline = torch.nn.Module()
+            pipeline._lora_components = ["bagel"]
+            pipeline.bagel = torch.nn.Module()
+            pipeline.bagel.language_model = torch.nn.Module()
+            pipeline.bagel.language_model.model = torch.nn.Module()
+            layer = torch.nn.Module()
+            layer.self_attn = torch.nn.Module()
+            layer.self_attn.qkv_proj = qkv_proj
+            pipeline.bagel.language_model.model.layers = torch.nn.ModuleList([layer])
+
+            manager = DiffusionLoRAManager(
+                pipeline=pipeline,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+                max_cached_adapters=1,
+            )
+            lora_dir = _write_synthetic_lora(
+                tmp_path / "mot_qkv_lora",
+                module_name,
+                rank=1,
+                in_dim=4,
+                out_dim=8,
+            )
+            manager.set_active_adapter(
+                LoRARequest(
+                    lora_name="mot_qkv",
+                    lora_int_id=43,
+                    lora_path=lora_dir,
+                ),
+                lora_scale=0.5,
+            )
+
+            wrapped = pipeline.bagel.language_model.model.layers[0].self_attn.qkv_proj
+            assert isinstance(wrapped, MoTQKVParallelLinearWithLoRA)
+
+            inputs = torch.ones((2, 4), dtype=torch.float32)
+            text_indices = torch.tensor([0], dtype=torch.long)
+            vae_indices = torch.tensor([1], dtype=torch.long)
+            output, _ = wrapped(inputs, text_indices, vae_indices)
+
+        assert torch.count_nonzero(output[0]) == output.shape[1]
+        assert torch.count_nonzero(output[1]) == 0

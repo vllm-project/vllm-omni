@@ -3,6 +3,17 @@
 This example uses the custom WebSocket endpoint `WS /v1/realtime/video` to receive a video byte stream as chunks are produced.
 It covers text-to-video, and image-conditioned models through `--image-reference`.
 
+The Python client disables WebSocket compression because MP4 chunks are already
+compressed. Recompressing them can delay delivery and return of playback credit
+while saving little bandwidth. Browser clients negotiate compression separately;
+this Python client setting does not change the server or browser defaults.
+
+For browser video streaming, add `--disable-websocket-compression` to the server
+command, for example `vllm serve MODEL --omni --disable-websocket-compression`.
+This opts out of per-message deflate on **all WebSocket routes** served by that
+process, including every frontend with `--api-server-count`; it preserves the
+video codec compression. Without the flag, existing negotiation defaults apply.
+
 ## Start The Server
 
 Start a diffusion video model with streaming output enabled:
