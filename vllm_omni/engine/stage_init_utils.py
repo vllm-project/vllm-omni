@@ -581,6 +581,9 @@ class StageMetadata:
     prompt_expand_func: Callable | None = None
     cfg_kv_collect_func: Callable | None = None
     async_chunk_prewarm_payload_func: Callable | None = None
+    # Sampling keys that the stage's MRV2 sampler cannot honor. The frontend
+    # uses this declaration to reject active values before queue admission.
+    mrv2_unsupported_sampling_params: tuple[str, ...] = ()
     # Multi-replica: replica_id distinguishes replicas of the same stage.
     # For single-replica stages this defaults to 0.
     replica_id: int = 0
@@ -673,6 +676,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         async_chunk_prewarm_payload_func = getattr(importlib.import_module(_mod), _fn)
 
     model_stage = engine_args.get("model_stage")
+    mrv2_unsupported_sampling_params = tuple(_get_attr_or_item(stage_config, "mrv2_unsupported_sampling_params", ()))
 
     if stage_type == "diffusion":
         return StageMetadata(
@@ -690,6 +694,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
             runtime_cfg=runtime_cfg,
             prompt_transform_func=prompt_transform_func,
             cfg_kv_collect_func=cfg_kv_collect_func,
+            mrv2_unsupported_sampling_params=mrv2_unsupported_sampling_params,
         )
 
     engine_output_type = engine_args.get("engine_output_type")
@@ -712,6 +717,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         prompt_transform_func=prompt_transform_func,
         prompt_expand_func=prompt_expand_func,
         async_chunk_prewarm_payload_func=async_chunk_prewarm_payload_func,
+        mrv2_unsupported_sampling_params=mrv2_unsupported_sampling_params,
     )
 
 
@@ -758,6 +764,7 @@ def extract_stage_metadata_from_omni_stage_config(
             runtime_cfg=stage_config.runtime_config,
             prompt_transform_func=_resolve_omni_metadata_hook(stage_config.prompt_transform_func),
             cfg_kv_collect_func=_resolve_omni_metadata_hook(stage_config.cfg_kv_collect_func),
+            mrv2_unsupported_sampling_params=tuple(stage_config.stage_pipeline_config.mrv2_unsupported_sampling_params),
         )
 
     return StageMetadata(
@@ -776,6 +783,7 @@ def extract_stage_metadata_from_omni_stage_config(
         prompt_transform_func=_resolve_omni_metadata_hook(stage_config.prompt_transform_func),
         prompt_expand_func=_resolve_omni_metadata_hook(stage_config.prompt_expand_func),
         async_chunk_prewarm_payload_func=_resolve_omni_metadata_hook(stage_config.async_chunk_prewarm_payload_func),
+        mrv2_unsupported_sampling_params=tuple(stage_config.stage_pipeline_config.mrv2_unsupported_sampling_params),
     )
 
 

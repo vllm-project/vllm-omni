@@ -92,6 +92,7 @@ class StageRuntimeInfo:
     final_output_type: FinalOutputModalityType | None
     stage_type: str
     model_stage: str | None = None
+    mrv2_unsupported_sampling_params: tuple[str, ...] = ()
 
 
 @dataclass
