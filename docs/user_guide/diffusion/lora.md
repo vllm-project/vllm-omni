@@ -263,6 +263,44 @@ checkpoint second to `--lora-path`.
 !!! note "Server-side Path Requirement"
     The LoRA adapter path (`local_path`) must be readable on the **server** machine. If your client and server are on different machines, ensure the LoRA adapter is accessible via a shared mount or copied to the server.
 
+## Runtime LoRA with online FP8 quantization
+
+Runtime PEFT LoRA works with [online FP8](../quantization/fp8.md) on Z-Image-Turbo.
+The base layers run the FP8 GEMM.
+The adapter delta is computed in the pipeline dtype and added to the FP8 output.
+The adapter weights are not quantized.
+
+```python
+from vllm_omni import Omni
+
+omni = Omni(
+    model="Tongyi-MAI/Z-Image-Turbo",
+    dtype="bfloat16",
+    quantization="fp8",
+    lora_backend="peft",
+    lora_application="runtime",
+    max_cpu_loras=2,
+)
+```
+
+The integration test uses a rank-8 adapter on the fused QKV projection.
+It also uses a rank-16 adapter with the Diffusers per-projection names (`to_q`, `to_k`, `to_v`, `to_out.0`, `w1`, `w2`, `w3`) and the unquantized `adaLN_modulation.0`.
+This is the module layout of common Z-Image-Turbo adapters.
+The test checks A-to-B-to-A switching, zero scale, and return to the base model.
+Both adapters must change the image.
+Each repeated state must reproduce its first image pixel for pixel.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 pytest -sv \
+  tests/diffusion/lora/test_diffusion_lora_fp8.py \
+  -m 'advanced_model and cuda' --run-level advanced_model
+```
+
+On a 16 GB GPU, startup with the BF16 text encoder can run out of memory while the transformer is quantized.
+Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to reduce fragmentation.
+
+This coverage does not include other models, other quantization methods, the distill LoRA backend, the global merged LoRA policy, compilation, or multi-GPU configurations.
+
 ## Wan2.2 LightX2V Offline Assembly
 
 This workflow is LoRA-adjacent: it uses external LightX2V conversion plus
