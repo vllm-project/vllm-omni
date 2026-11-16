@@ -2546,6 +2546,13 @@ class Cosmos3VFMTransformer(nn.Module):
             if prep.freqs_gen is None:
                 raise RuntimeError("Cosmos3 GEN inputs must go through _shard_gen_prep before the stack.")
             return self._gen_graph(
+                # The precision schedule changes Python dispatch inside the
+                # linears. Replay needs a separate graph for each active mode.
+                variant=(
+                    self.mixed_precision_runtime.use_high_precision("generation")
+                    if self.mixed_precision_runtime is not None
+                    else None
+                ),
                 hidden=prep.hidden_gen,
                 kv=self.cached_kv,
                 freqs=prep.freqs_gen,

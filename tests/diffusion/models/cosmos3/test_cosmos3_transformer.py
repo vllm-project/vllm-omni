@@ -1854,6 +1854,66 @@ def test_gen_graph_uses_supplied_kv_instead_of_mutable_cache(monkeypatch: pytest
     assert model.cached_kv[0][0] is stale
 
 
+@torch.no_grad()
+def test_gen_graph_replay_preserves_precision_schedule_across_requests(accelerator_device: torch.device) -> None:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
+    from vllm_omni.diffusion.models.cosmos3.mixed_precision import (
+        Cosmos3MixedPrecisionConfig,
+        Cosmos3MixedPrecisionRuntime,
+    )
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer, _GenPrepared
+
+    runtime = Cosmos3MixedPrecisionRuntime(Cosmos3MixedPrecisionConfig(first_steps=1, last_steps=1))
+
+    def scheduled_forward(*, hidden, **kwargs):
+        # A Python branch is fixed at capture time, as in the quantized linears.
+        return hidden + (1 if runtime.use_high_precision("generation") else -1)
+
+    graph = current_omni_platform.get_graphed_forward_cls()(scheduled_forward, device=accelerator_device)
+    if not graph.enabled:
+        pytest.skip("Device graph capture required")
+    model = Cosmos3VFMTransformer(
+        OmniDiffusionConfig(tf_model_config=TransformerConfig.from_dict(_tiny_cosmos3_config()), dtype=torch.float32)
+    )
+    model._gen_graph = graph
+    model.mixed_precision_runtime = runtime
+    model.cached_kv = []
+    hidden = torch.ones(2, 4, device=accelerator_device)
+    prep = _GenPrepared(
+        hidden_gen=hidden,
+        time_embed=hidden,
+        t=1,
+        h=1,
+        w=1,
+        s_video=1,
+        s_control=0,
+        s_action=0,
+        s_sound=0,
+        has_control=False,
+        has_action=False,
+        has_sound=False,
+        action_domain_ids=None,
+        ulysses_size=1,
+        freqs_gen=(hidden, hidden),
+        multi_control_token_sizes=None,
+        multi_control_weights=None,
+        use_multi_control_attention=False,
+        defer_gen_gather=False,
+    )
+    # Include an all-A16 short request between requests that switch modes.
+    for steps in (5, 2, 5):
+        for step in range(steps):
+            runtime.set_step(step, steps)
+            hidden.add_(1)
+            expected = scheduled_forward(hidden=hidden)
+            actual = model._run_gen_stack(prep)
+            assert torch.equal(actual, expected)
+        runtime.reset()
+    assert graph.captures == 2
+    assert graph.replays == 12
+    assert graph.eager_calls == 0
+
+
 @pytest.mark.parametrize("mode", ["action", "sound", "control", "multi_control", "conditioned_video"])
 @torch.no_grad()
 def test_graph_regions_preserve_packed_modalities(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:

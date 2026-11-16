@@ -3890,3 +3890,35 @@ def test_graph_option_rejects_unsupported_config_before_loading(monkeypatch, ove
     config = OmniDiffusionConfig(additional_config={"cosmos3_manual_cuda_graphs": True}, **override)
     with pytest.raises(ValueError, match="Cosmos3 manual CUDA graphs require"):
         pipeline_cosmos3.Cosmos3OmniDiffusersPipeline(od_config=config)
+
+
+@pytest.mark.parametrize(
+    ("quant_method", "serialized", "supported"),
+    [("modelopt", True, True), ("modelopt", False, False), ("modelopt_fp4", True, False)],
+)
+def test_graph_option_accepts_only_serialized_modelopt_fp8(monkeypatch, quant_method, serialized, supported) -> None:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+    from vllm_omni.quantization import build_quant_config
+
+    monkeypatch.setattr(pipeline_cosmos3, "get_local_device", lambda: torch.device("cuda"))
+
+    def reached_checkpoint_loading(*args, **kwargs):
+        raise RuntimeError("reached checkpoint loading")
+
+    monkeypatch.setattr(pipeline_cosmos3.FlowUniPCMultistepScheduler, "load_config", reached_checkpoint_loading)
+    config = OmniDiffusionConfig(additional_config={"cosmos3_manual_cuda_graphs": True})
+    config.model = "unused-checkpoint"
+
+    config.quantization_config = build_quant_config(
+        {"quant_method": quant_method, "quant_algo": "FP8" if quant_method == "modelopt" else "NVFP4"}
+    )
+    if quant_method == "modelopt":
+        config.quantization_config.is_checkpoint_fp8_serialized = serialized
+    error, message = (
+        (RuntimeError, "reached checkpoint loading")
+        if supported
+        else (ValueError, "Cosmos3 manual CUDA graphs require")
+    )
+    with pytest.raises(error, match=message):
+        pipeline_cosmos3.Cosmos3OmniDiffusersPipeline(od_config=config)

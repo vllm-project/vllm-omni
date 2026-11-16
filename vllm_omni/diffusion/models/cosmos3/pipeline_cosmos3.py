@@ -1100,7 +1100,13 @@ class Cosmos3OmniDiffusersPipeline(
             or od_config.parallel_config.use_hsdp
             or resolved_offload.strategy is not OffloadStrategy.NONE
             or od_config.cache_backend not in (None, "none", "sea_cache")
-            or od_config.quantization_config is not None
+            or (
+                od_config.quantization_config is not None
+                and (
+                    od_config.quantization_config.get_name() != "modelopt"
+                    or not getattr(od_config.quantization_config, "is_checkpoint_fp8_serialized", False)
+                )
+            )
             or od_config.lora_path is not None
             or od_config.enable_sleep_mode
             or (not od_config.enforce_eager and od_config.diffusion_compile_granularity != "regional")
@@ -1109,7 +1115,8 @@ class Cosmos3OmniDiffusersPipeline(
             raise ValueError(
                 "Cosmos3 manual CUDA graphs require a single resident CUDA GPU with eager execution "
                 "or regional compilation, "
-                "with no cache or SeaCache, without offload, quantization, LoRA, sleep or attention schedules."
+                "with no cache or SeaCache and unquantized or serialized ModelOpt FP8 weights, "
+                "without offload, LoRA, sleep or attention schedules."
             )
 
         model_path = od_config.model
@@ -1172,8 +1179,6 @@ class Cosmos3OmniDiffusersPipeline(
         )
         self.is_edge_model = transformer_cls is Cosmos3EdgeVFMTransformer
         if use_manual_cuda_graphs:
-            if self.transformer.mixed_precision_runtime is not None:
-                raise ValueError("cosmos3_manual_cuda_graphs requires a checkpoint without mixed precision")
             self.transformer.enable_cuda_graphs(self.device)
 
         # Opt-in: route the per-CFG-branch UND text K/V through the shared
