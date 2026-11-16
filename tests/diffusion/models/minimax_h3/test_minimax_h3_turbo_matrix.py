@@ -64,10 +64,32 @@ def test_all_eight_artifacts_are_covered() -> None:
         # the supported one; the loader refuses them by name.
         "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
         "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors",
+        "minimax_h3_fl2v_turbo_4step_v0.1_768p_sla_comfyui_bf16.safetensors",
+        # The segments have one published order.
+        "minimax_h3_fl2v_turbo_4step_v0.1_sla_768p_bf16.safetensors",
+        "minimax_h3_fl2v_turbo_4step_v0.1_768p_bf16_sla.safetensors",
     ],
 )
 def test_unrelated_names_are_rejected(filename: str) -> None:
     assert parse_turbo_filename(filename) is None
+
+
+def test_turbo_sla_artifact_is_recognised_with_its_training_sparsity() -> None:
+    """lightx2v/Minimax-h3-Turbo-SLA: a 4-step 768p Turbo LoRA distilled under sparse attention."""
+    spec = parse_turbo_filename("minimax_h3_fl2v_turbo_4step_v0.1_768p_sla_bf16.safetensors")
+    assert spec is not None
+    assert spec.task_family == "fl2v"
+    assert spec.denoise_steps == 4
+    assert spec.video_shift == _TURBO_VIDEO_SHIFT_768P
+    assert spec.audio_shift == _TURBO_AUDIO_SHIFT
+    assert spec.attention_sparsity == 0.85
+
+
+@pytest.mark.parametrize(("filename", "task", "steps", "video_shift"), PUBLISHED)
+def test_dense_artifacts_declare_no_attention_sparsity(
+    filename: str, task: str, steps: int, video_shift: float
+) -> None:
+    assert parse_turbo_filename(filename).attention_sparsity is None
 
 
 def _spec(filename: str) -> TurboSpec:

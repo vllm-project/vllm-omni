@@ -1502,6 +1502,15 @@ rejected.
 `audio_flow_shift` is `3.0` across the family. Each row is the complete
 published filename; use it verbatim as `TURBO_FILE` below.
 
+[Turbo-SLA](https://huggingface.co/lightx2v/Minimax-h3-Turbo-SLA)
+(`minimax_h3_fl2v_turbo_4step_v0.1_768p_sla_bf16.safetensors`, T2VA / FL2VA,
+4 forwards, `flow_shift` 6, declared `alpha` 128) loads the same way. It was
+distilled with LightX2V's dynamic sparse attention at 85% sparsity. Loading it
+does not turn sparse attention on: the server uses whichever attention backend
+is configured, and logs the adapter's training sparsity at load. Its output
+under dense attention, or under one of the block-sparse backends, has not been
+compared with LightX2V's reference.
+
 Alpha needs no manual compensation: the server reads it from the artifact's
 metadata, falling back to 8 with a warning for
 `minimax_h3_fl2v_turbo_4step_v0.1`, the one artifact that declares none. The

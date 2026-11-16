@@ -863,3 +863,43 @@ def test_h3_turbo_binds_the_adaln_projections_only_for_artifacts_that_carry_them
     assert adaln == (expected if with_adaln else set())
     assert "transformer.blocks.0.attn.out_proj" in manager._lora_modules
     assert "transformer.blocks.49.mlp.fc2" in manager._lora_modules
+
+
+def test_h3_turbo_loads_the_sla_artifact_as_a_turbo_adapter(tmp_path, caplog):
+    """Turbo-SLA has the ordinary 624-tensor layout; only its name is new."""
+    path = tmp_path / "minimax_h3_fl2v_turbo_4step_v0.1_768p_sla_bf16.safetensors"
+    _write_tiny_turbo(path)
+
+    with caplog.at_level("INFO", logger=lora_module.logger.name):
+        loaded = load_minimax_h3_turbo_lora(
+            partition="fl2va",
+            lora_request=_request(path),
+            lora_path=path,
+            dtype=torch.float32,
+        )
+
+    assert loaded is not None
+    lora_model, peft_helper, spec = loaded
+    assert len(lora_model.loras) == 312
+    assert peft_helper.lora_alpha == 128
+    assert (spec.denoise_steps, spec.video_shift, spec.attention_sparsity) == (4, 6.0, 0.85)
+    assert spec.supported_tasks == frozenset({"t2va", "fl2va"})
+    assert "85% block-sparse attention" in caplog.text
+
+
+def test_h3_turbo_sla_requests_follow_the_four_step_768p_contract():
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    spec = _spec("minimax_h3_fl2v_turbo_4step_v0.1_768p_sla_bf16.safetensors")
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    pipeline.default_video_shift = 12.0
+    pipeline.default_audio_shift = 3.0
+    pipeline._validate_turbo_sampling(
+        SimpleNamespace(num_inference_steps=4, extra_args={"flow_shift": 6.0, "audio_flow_shift": 3.0}),
+        spec,
+    )
+    with pytest.raises(OmniClientError, match="requires flow_shift=6"):
+        pipeline._validate_turbo_sampling(
+            SimpleNamespace(num_inference_steps=4, extra_args={"flow_shift": 12.0, "audio_flow_shift": 3.0}),
+            spec,
+        )

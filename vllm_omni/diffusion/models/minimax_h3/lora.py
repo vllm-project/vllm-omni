@@ -30,11 +30,11 @@ _TURBO_HIDDEN_SIZE = 5376
 _TURBO_ATTENTION_INNER_SIZE = 7168
 _TURBO_FFN_HIDDEN_SIZE = 14336
 _TURBO_TIME_EMBED_DIM = 2688
-# ``minimax_h3_<task>_turbo_<n>step_v<major.minor>[_768p][_bf16]``. The name is
-# the only place the sampler contract is recorded.
+# ``minimax_h3_<task>_turbo_<n>step_v<major.minor>[_768p][_sla][_bf16]``. The
+# name is the only place the sampler contract is recorded.
 _TURBO_NAME_RE = re.compile(
     r"^minimax_h3_(?P<task>fl2v|ref2v)_turbo_(?P<steps>\d+)step"
-    r"_v\d+\.\d+(?P<res>_768p)?(?:_bf16)?\.safetensors$"
+    r"_v\d+\.\d+(?P<res>_768p)?(?P<sla>_sla)?(?:_bf16)?\.safetensors$"
 )
 # The 768p retrains moved to a shorter video flow shift; the 544p artifacts keep
 # the base model's.
@@ -49,6 +49,12 @@ _TURBO_VIDEO_SHIFT_BY_NAME = {
     _TURBO_V1_2_8STEP_FILENAME: 12.0,
 }
 _TURBO_AUDIO_SHIFT = 3.0
+# Turbo-SLA (lightx2v/Minimax-h3-Turbo-SLA) was distilled with LightX2V's
+# dynamic sparse attention, which keeps the top-scoring 15% of key blocks for
+# each query block. The file itself is an ordinary Turbo LoRA and records the
+# ratio nowhere; this is the value on its model card and in LightX2V's
+# reference config.
+_TURBO_SLA_ATTENTION_SPARSITY = 0.85
 # Only ``4step_v0.1`` declares no alpha. LightX2V's reference script never reads
 # the metadata: it applies ``scale * alpha / rank`` with ``--lora-alpha``
 # defaulting to 8, and its documented v0.1 command does not override that. So an
@@ -68,6 +74,10 @@ class TurboSpec:
     audio_shift: float
     rank: int
     alpha: float
+    attention_sparsity: float | None = None
+    """Fraction of key blocks the adapter was distilled to do without, for an
+    artifact trained under block-sparse attention; ``None`` for a dense one.
+    Informational: loading the adapter does not select an attention backend."""
 
     @property
     def sigma_points(self) -> int:
@@ -104,6 +114,7 @@ def parse_turbo_filename(name: str) -> TurboSpec | None:
         audio_shift=_TURBO_AUDIO_SHIFT,
         rank=_TURBO_RANK,
         alpha=_TURBO_DEFAULT_ALPHA,
+        attention_sparsity=_TURBO_SLA_ATTENTION_SPARSITY if match.group("sla") else None,
     )
 
 
@@ -439,6 +450,13 @@ def load_minimax_h3_turbo_lora(
         spec.video_shift,
         spec.audio_shift,
     )
+    if spec.attention_sparsity is not None:
+        logger.info(
+            "MiniMax-H3 Turbo adapter %s was distilled under %g%% block-sparse attention. "
+            "Loading it does not change the attention backend; the configured one is used.",
+            spec.filename,
+            100 * spec.attention_sparsity,
+        )
     return lora_model, peft_helper, spec
 
 
