@@ -7,9 +7,10 @@ import pytest
 import torch
 from torch import nn
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.voxcpm2.incremental_vae import incremental_vae_decode
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model]
 
 
 def _vae():
@@ -24,12 +25,13 @@ def _vae():
     return SimpleNamespace(decoder=decoder, decode=lambda x, **_: decoder(x))
 
 
+@pytest.mark.cpu
 def test_incremental_matches_full_decode_with_short_patches_and_reordering():
     vae = _vae()
-    caches = {}
+    caches: dict[str, torch.Tensor] = {}
     prompts = torch.randn(2, 2, 8)
     expected = vae.decode(prompts)
-    actual = [[], []]
+    actual: list[list[torch.Tensor]] = [[], []]
     with torch.no_grad():
         for step in range(4):
             order = [0, 1] if step % 2 == 0 else [1, 0]
@@ -44,9 +46,10 @@ def test_incremental_matches_full_decode_with_short_patches_and_reordering():
     assert caches["0"].shape == (3, 2, 6)
 
 
+@pytest.mark.cpu
 def test_incremental_inactive_slots_and_resume_into_different_slot():
     vae = _vae()
-    caches = {}
+    caches: dict[str, torch.Tensor] = {}
     audio = torch.randn(1, 2, 8)
     with torch.no_grad():
         first = incremental_vae_decode(vae, audio[..., :4], caches, torch.tensor([0]), torch.tensor([True]), 3, None)
@@ -60,6 +63,7 @@ def test_incremental_inactive_slots_and_resume_into_different_slot():
     torch.testing.assert_close(torch.cat([first, second], -1), vae.decode(audio))
 
 
+@pytest.mark.cpu
 def test_incremental_restores_native_decode_after_error():
     vae = _vae()
     original = [module.forward for module in vae.decoder]
@@ -68,6 +72,7 @@ def test_incremental_restores_native_decode_after_error():
     assert [module.forward for module in vae.decoder] == original
 
 
+@pytest.mark.cpu
 def test_incremental_native_decoder_matches_full_history():
     native = pytest.importorskip("voxcpm.modules.audiovae.audio_vae_v2")
     torch.manual_seed(7)
@@ -75,7 +80,7 @@ def test_incremental_native_decoder_matches_full_history():
     vae = SimpleNamespace(decoder=decoder, decode=lambda x, sr_cond: decoder(x, sr_cond))
     audio = torch.randn(2, 2, 32)
     sr = torch.tensor([48000], dtype=torch.int32)
-    cache = {}
+    cache: dict[str, torch.Tensor] = {}
     with torch.no_grad():
         expected = vae.decode(audio, sr)
         chunks = [
@@ -86,11 +91,11 @@ def test_incremental_native_decoder_matches_full_history():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_incremental_cuda_graph_replay_preserves_slot_caches():
     vae = _vae()
     vae.decoder.cuda()
-    cache = {}
+    cache: dict[str, torch.Tensor] = {}
     patch = torch.zeros(2, 2, 2, device="cuda")
     slots = torch.tensor([0, 1], device="cuda")
     valid = torch.zeros(2, device="cuda", dtype=torch.bool)
@@ -104,7 +109,7 @@ def test_incremental_cuda_graph_replay_preserves_slot_caches():
             output = incremental_vae_decode(vae, patch, cache, slots, valid, 3, None)
     torch.cuda.current_stream().wait_stream(stream)
     audio = torch.randn(2, 2, 4, device="cuda")
-    actual = []
+    actual: list[torch.Tensor] = []
     with torch.no_grad():
         valid.fill_(True)
         for step in range(2):

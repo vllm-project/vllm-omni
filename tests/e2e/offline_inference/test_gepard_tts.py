@@ -229,7 +229,7 @@ def _transcribe_for(wav: torch.Tensor, tmp_dir: str, name: str, accepts) -> str:
     return _transcribe(wav, tmp_dir, name, model_size=_ASR_ESCALATION_MODEL)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize(
     ("text", "keyword"),
     [
@@ -275,7 +275,7 @@ def test_gepard_offline_zero_shot(omni_runner, run_level: str, text: str, keywor
 
 
 @pytest.mark.slow
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_gepard_offline_long_text_skips_repetition(omni_runner, run_level: str) -> None:
     """The other branch of the prompt layout, end to end.
 
@@ -300,7 +300,7 @@ def test_gepard_offline_long_text_skips_repetition(omni_runner, run_level: str) 
 
 
 @pytest.mark.slow
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_gepard_offline_concurrent_requests_stay_isolated(omni_runner, run_level: str) -> None:
     """Four requests in one batch, each holding its own generation state.
 

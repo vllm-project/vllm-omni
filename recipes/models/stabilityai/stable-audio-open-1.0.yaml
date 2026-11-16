@@ -29,8 +29,8 @@ omni:
     - t2a
 
 dependencies:
-  - note: "vLLM 0.22.0 or newer"
-    command: "uv pip install 'vllm>=0.22.0'"
+  - note: "Final vLLM 0.33.0 for this source checkout"
+    command: "uv pip install --torch-backend=cu130 vllm==0.33.0"
   - note: "vllm-omni provides the audio generation backend"
     command: "uv pip install git+https://github.com/vllm-project/vllm-omni.git"
   - note: "soundfile (recommended) or scipy for WAV output"
@@ -85,20 +85,23 @@ guide: |
   import torch
   import soundfile as sf
   from vllm_omni.entrypoints.omni import Omni
+  from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
   omni = Omni(model="stabilityai/stable-audio-open-1.0")
   generator = torch.Generator(device="cuda").manual_seed(42)
 
-  audio = omni.generate(
-      "The sound of a dog barking",
-      negative_prompt="Low quality.",
-      generator=generator,
-      guidance_scale=7.0,
-      num_inference_steps=100,
-      extra={"audio_start_in_s": 0.0, "audio_end_in_s": 10.0},
+  outputs = omni.generate(
+      {"prompt": "The sound of a dog barking", "negative_prompt": "Low quality."},
+      OmniDiffusionSamplingParams(
+          generator=generator,
+          guidance_scale=7.0,
+          num_inference_steps=100,
+          extra_args={"audio_start_in_s": 0.0, "audio_end_in_s": 10.0},
+      ),
   )
 
-  audio_data = audio[0].cpu().float().numpy().T  # [samples, channels]
+  audio = outputs[0].multimodal_output["audio"]  # numpy.ndarray, [batch, channels, samples]
+  audio_data = audio[0].T  # [samples, channels]
   sf.write("output.wav", audio_data, 44100)
   ```
 

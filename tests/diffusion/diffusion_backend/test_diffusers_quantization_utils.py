@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Focused tests for Diffusers backend quantization conversion helpers."""
 
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -70,7 +71,7 @@ def _quant_config(method: str, **kwargs):
 )
 def test_apply_injects_converted_quantization_config(method, expected_type):
     od_config = SimpleNamespace(quantization_config=_quant_config(method))
-    load_kwargs = {}
+    load_kwargs: dict[str, Any] = {}
 
     injected = quantization_utils.apply_diffusers_quantization_config(
         od_config,
@@ -85,7 +86,7 @@ def test_apply_injects_converted_quantization_config(method, expected_type):
 
 def test_apply_injects_converted_quantization_config_for_transformer_2():
     od_config = SimpleNamespace(quantization_config=_quant_config("int8"))
-    load_kwargs = {}
+    load_kwargs: dict[str, Any] = {}
 
     quantization_utils.apply_diffusers_quantization_config(
         od_config,
@@ -111,6 +112,7 @@ def test_unsupported_methods_fail_explicitly(method):
         _quant_config("fp8", activation_scheme="static"),
         _quant_config("int8", is_checkpoint_int8_serialized=True),
         _quant_config("fp8", weight_block_size=[128, 128]),
+        _quant_config("fp8", online_block_size=64),
         _quant_config("int8", ignored_layers=["transformer.proj_out"]),
     ],
 )

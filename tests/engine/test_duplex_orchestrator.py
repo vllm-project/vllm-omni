@@ -803,8 +803,10 @@ async def test_terminal_stage_error_preserves_plugin_cleanup_policy(mocker, plug
     )
     cleanup = mocker.patch.object(orchestrator, "_cleanup_request_ids", new_callable=mocker.AsyncMock)
     try:
-        await orchestrator._report_duplex_session_request_error(0, 0, output, request_state)
-        cleanup.assert_awaited_once_with([request_state.request_id], abort=True, release_owners=close_session)
+        assert await orchestrator._report_duplex_session_request_error(0, 0, output, request_state) is True
+        cleanup.assert_awaited_once_with(
+            [request_state.request_id], abort=True, release_owners=close_session, trace_error="RuntimeError"
+        )
     finally:
         await orchestrator.session_manager.shutdown()
 
@@ -1167,6 +1169,55 @@ async def test_sentence_partial_does_not_legacy_forward_the_full_stage_output() 
     await orchestrator._route_output(1, 0, full, req_state, None)
 
     assert forwarded == [full]
+
+
+@pytest.mark.asyncio
+async def test_stage_work_reaches_the_ledger_before_any_session_output() -> None:
+    orchestrator, _, rpc_q, _ = _build(stages=2, runtime_config=DuplexSessionRuntimeConfig(collect_stats=True))
+    try:
+        assert (await _open(orchestrator, rpc_q)).ok
+        ledger = orchestrator.session_manager.get(SESSION_ID).perf
+        assert ledger is not None
+        ledger.open_chunk(epoch=0, seq=1, turn_id=0, turn_seq=1, submitted_ns=ledger.opened_at_ns)
+        state = orchestrator.request_states[_stage0_request_id()]
+        start = ledger.opened_at_ns + 5
+        # A step that produces no session output (e.g. a forwarded Talker step).
+        orchestrator._collect_duplex_stage_work(1, SimpleNamespace(stage_work=[[0, 1, start, 10]]), state)
+        (turn,) = ledger.snapshot()["turns"]
+        assert turn["chunks"][0]["stage_work"] == [{"stage_id": 1, "spans": [[5, 10]]}]
+        # The next session output of that stage still marks the chunk handled.
+        assert orchestrator._take_perf_chunks(state, 1) == {(0, 1)}
+        assert orchestrator._take_perf_chunks(state, 0) == frozenset()
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("buffer", [None, {"payload": [1]}, {"duplex": {"epoch": 0, "seq": 1}}])
+async def test_stage_work_chunk_reaches_forwarded_prompts_without_a_duplex_envelope(buffer) -> None:
+    from copy import deepcopy
+
+    from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer
+
+    orchestrator, _, rpc_q, _ = _build(stages=2, runtime_config=DuplexSessionRuntimeConfig(collect_stats=True))
+    try:
+        assert (await _open(orchestrator, rpc_q)).ok
+        state = orchestrator.request_states[_stage0_request_id()]
+        state.stage_output_chunks[0] = (0, 1)
+        original: dict[str, Any] = {"prompt_token_ids": [1]}
+        if buffer is not None:
+            original["model_intermediate_buffer"] = deepcopy(buffer)
+        inputs = [deepcopy(original)]
+        orchestrator._annotate_next_stage_inputs(0, state, inputs)
+        assert perf_chunk_from_buffer(inputs[0].get("model_intermediate_buffer")) == (0, 1)
+        if buffer is not None:
+            for key, value in buffer.items():
+                if key == "duplex":
+                    assert inputs[0]["model_intermediate_buffer"][key].items() >= value.items()
+                else:
+                    assert inputs[0]["model_intermediate_buffer"][key] == value
+    finally:
+        await orchestrator.session_manager.shutdown()
 
 
 def test_default_plugin_declares_no_draining_stages() -> None:

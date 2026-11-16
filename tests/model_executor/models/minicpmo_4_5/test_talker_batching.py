@@ -35,6 +35,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     MiniCPMO45OmniTTSForConditionalGeneration,
     _apply_batched_repetition_penalty,
     _native_duplex_chunk_budget,
+    _native_duplex_row_meta,
     _restore_weight_norm_weight,
     _trailing_code_runs,
     _turn_end_boundary_eos_masked,
@@ -782,6 +783,21 @@ def test_make_omni_output_reads_history_from_runner_cpu_buffer(device, default_d
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.parametrize("as_tensor", [False, True], ids=["transport-list", "tensor"])
+@pytest.mark.parametrize(
+    "condition_ids,turn_end",
+    [([99, 41], False), ([99, 41, 99], True), ([99], True), ([], False)],
+)
+def test_talker_turn_end_follows_last_condition_token(condition_ids, turn_end, as_tensor) -> None:
+    info = {
+        "native_duplex": True,
+        "duplex": {"epoch": 0, "turn_id": 10},
+        "ids": {"tts": torch.tensor(condition_ids, dtype=torch.long) if as_tensor else condition_ids},
+        "meta": {"turn_eos_token_id": 99},
+    }
+    assert _native_duplex_row_meta(info)[-1] is turn_end
+
+
 def test_talker_projects_request_aligned_duplex_metadata() -> None:
     talker = _make_talker()
     infos = [
@@ -789,7 +805,7 @@ def test_talker_projects_request_aligned_duplex_metadata() -> None:
             "request_id": "req-a",
             "native_duplex": True,
             "duplex": {"epoch": 3, "turn_id": 7},
-            "ids": {"tts": [41]},
+            "ids": {"tts": [99, 41]},
             "meta": {
                 "native_duplex_segment_text": "first",
                 "turn_eos_token_id": 99,
@@ -899,7 +915,8 @@ def test_cpu_codec_transport_preserves_embedding_and_owns_delta(device, dtype, c
 
 
 @pytest.mark.parametrize("use_snapshot", [False, True])
-def test_cpu_codec_transport_routes_owned_payloads_with_hidden(monkeypatch, use_snapshot) -> None:
+@pytest.mark.parametrize("include_hidden", [False, True])
+def test_cpu_codec_transport_routes_owned_payloads(monkeypatch, use_snapshot, include_hidden) -> None:
     from types import SimpleNamespace
 
     from tests.worker.test_gpu_ar_model_runner import _make_async_output_runner
@@ -927,9 +944,10 @@ def test_cpu_codec_transport_routes_owned_payloads_with_hidden(monkeypatch, use_
     assert [value.device.type for value in mm["codes"]["audio"]] == ["cpu"] * 3
     assert [value.shape for value in mm["codes"]["audio"]] == [(1, 1), (0, 1), (1, 1)]
     if use_snapshot:
-        snapshot = _snapshot_tensor_payload_to_cpu_async(
-            {"hidden_states": hidden, "multimodal_outputs": mm}, copy_stream=None, pin_memory=False
-        )
+        payload = {"multimodal_outputs": mm}
+        if include_hidden:
+            payload["hidden_states"] = hidden
+        snapshot = _snapshot_tensor_payload_to_cpu_async(payload, copy_stream=None, pin_memory=False)
         assert snapshot._ready_event is None
         snapshot.wait()
         mm = snapshot.payload["multimodal_outputs"]
@@ -937,7 +955,7 @@ def test_cpu_codec_transport_routes_owned_payloads_with_hidden(monkeypatch, use_
         assert mm["codes"]["audio"][0].tolist() == [[0]]
 
     runner = _make_async_output_runner(engine_output_type="latent")
-    assert runner._pooler_payload_include_hidden_flag is True
+    runner._pooler_payload_include_hidden_flag = include_hidden
     runner.requests = {rid: object() for rid in req_ids}
     monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, ids: ("latent", ids))
     monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
@@ -945,7 +963,7 @@ def test_cpu_codec_transport_routes_owned_payloads_with_hidden(monkeypatch, use_
     monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
     output = runner._build_omni_model_runner_output_from_snapshot(
         scheduler_output=SimpleNamespace(total_num_scheduled_tokens=3, num_scheduled_tokens=dict.fromkeys(req_ids, 1)),
-        hidden_states=hidden,
+        hidden_states=hidden if include_hidden else hidden[:0],
         staged_hidden_states_cpu=None,
         multimodal_outputs=mm,
         req_ids_output_copy=req_ids,
@@ -975,7 +993,10 @@ def test_cpu_codec_transport_routes_owned_payloads_with_hidden(monkeypatch, use_
     assert [payload["meta.finished"].item() for payload in output.inter_stage_outputs] == [False, True, False]
     assert all(payload["codes.audio"].device.type == "cpu" for payload in output.inter_stage_outputs)
     for index, payload in enumerate(output.inter_stage_outputs):
-        torch.testing.assert_close(payload["hidden"], hidden[index : index + 1])
+        if include_hidden:
+            torch.testing.assert_close(payload["hidden"], hidden[index : index + 1])
+        else:
+            assert "hidden" not in payload
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -1592,3 +1613,64 @@ def test_mrv2_overlapping_native_conditions_use_distinct_request_ids(mocker, leg
     condition("session-a", 12)
     assert talker._request_condition_states["new-session"]["condition_seq"] == 0
     assert talker._request_condition_states["session-a"]["condition_seq"] == 12
+
+
+def test_host_sampler_resumes_only_for_a_new_duplex_condition(mocker):
+    talker = _make_talker()
+    talker._codec_seed = 0
+    talker.emb_text = nn.Embedding(1, 2)
+    mocker.patch.object(talker, "_build_condition_embeddings", return_value=torch.ones(2, 2))
+
+    def prefill(request_id, seq):
+        return talker.preprocess(
+            torch.zeros(2, dtype=torch.long),
+            None,
+            req_id=request_id,
+            native_duplex=True,
+            _omni_is_prefill=True,
+            _omni_prompt_len=2,
+            tts_token_ids=torch.tensor([1]),
+            tts_hidden_states=torch.ones(1, 2),
+            **({"meta": {"streaming_condition_seq": seq, "turn_start": seq == 0}} if seq is not None else {}),
+        )[2]["audio_state"]
+
+    def sample(request_id, state, max_tokens):
+        return talker._sample_audio_code_host(
+            hidden_state=torch.zeros(1, 2),
+            history=torch.empty(0, dtype=torch.long),
+            request_id=request_id,
+            request_state=state,
+            step=0,
+            min_tokens=0,
+            max_tokens=max_tokens,
+            eos_window_masked=False,
+            lg_dev=torch.zeros(8),
+        )
+
+    first = prefill("a", 0)
+    other = prefill("b", 0)
+    assert sample("a", first, 1)[1:] == (True, False)
+    assert sample("b", other, 1)[1:] == (True, False)
+    host_state = talker._request_host_codec_states["a"]
+    generator = host_state["generator"]
+    host_state["history"] = [3, 4]
+    host_state["bins"] = {3: 2}
+
+    # Repeating a prefill for the same condition must not reopen the segment.
+    retry = prefill("a", 0)
+    assert sample("a", retry, 3)[1:] == (True, False)
+
+    next_condition = prefill("a", 1)
+    assert host_state["generator"] is generator
+    assert host_state["history"] == [3, 4]
+    assert host_state["bins"] == {3: 2}
+    assert sample("a", next_condition, 3)[1:] == (False, True)
+    assert talker._request_host_codec_states["b"]["finished"] is True
+
+    # An unnumbered prefill retains the other request's finished state.
+    prefill("b", None)
+    assert talker._request_host_codec_states["b"]["finished"] is True
+
+    talker.on_requests_finished({"a"})
+    talker._flush_deferred_cleanup()
+    assert "a" not in talker._request_host_codec_states

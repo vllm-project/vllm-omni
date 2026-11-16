@@ -59,8 +59,8 @@ def _setup_comfyui_test_environment():
         def get_frame_rate(self):
             return Fraction(24)
 
-        def save_to(self, file: str | BinaryIO, *, format: str = "auto"):
-            """Save video data to file or file-like object."""
+        def save_to(self, file: str | BinaryIO, **kwargs):
+            """Save video data to file or file-like object; ``format`` and other options are ignored."""
             if isinstance(file, str):
                 print("Called VideoInput.save_to with file path. Saving to a path is no-op in tests.")
             else:
@@ -99,6 +99,8 @@ def _setup_comfyui_test_environment():
         processing_interrupted=lambda: False,
         throw_exception_if_processing_interrupted=lambda: None,
     )
+
+    sys.modules["folder_paths"] = ModuleType("folder_paths")
 
     # Install mock modules BEFORE importing any comfyui_vllm_omni code
     sys.modules["comfy_api"] = mock_comfy_api

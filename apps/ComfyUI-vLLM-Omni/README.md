@@ -52,6 +52,7 @@ This extension offers the following nodes based on the output modalities (at **C
 - **Restore Video (SeedVR2)** for remote VIDEO restoration with source FPS and audio;
   see the [standalone and H3 chaining guide](docs/seedvr2-restoration.md).
 - **Latent Mask Editing** for MiniMax-H3 latent-mask editing (source media plus video/audio noise masks)
+- **MiniMax H3 Add Guide** for anchoring images, clips, and audio at chosen frames of a MiniMax-H3 video (timeline guides)
 - **FastH3 Deployment** for routing text-to-video requests to a MiniMax-H3 server with FastH3 fused at startup
 - **Multimodality Understanding** for multimodality-to-text and multimodality-to-audio tasks
 - **TTS** and **TTS Voice Clone** for TTS tasks
@@ -180,6 +181,9 @@ drop the server's audio while decoding the response.
    Keep the references connected to **Generate Video** and leave `frame` disconnected.
 4. Match prompt tags such as `<Picture 1>`, `<Video 1>`, and `<Audio 1>` to the
    connected references, counting each media type separately and skipping empty slots.
+   To drive the clip with a soundtrack instead, connect exactly one audio and set
+   **MiniMax-H3 Video Params → audio_mode** to `lock_source`; that audio is not
+   counted as an `<Audio N>` reference.
 5. Run the workflow. **Save Video** writes an MP4 under `output/video/` and preserves
    the generated audio when the audio-output prerequisite is installed.
 
@@ -221,6 +225,26 @@ Record the server commit, model/adapter, input assets, prompt, settings, and out
 alongside the result. Local schema or mocked-server checks do not establish H3
 generation quality or replace this real-model validation.
 
+#### MiniMax H3 Character Replacement
+
+Download [Character Swap V1.5](https://huggingface.co/akatz-ai/MiniMax-H3-Character-Swap-LoRA) on the machine running vLLM-Omni:
+
+```bash
+hf download akatz-ai/MiniMax-H3-Character-Swap-LoRA h3_character_swap_v1.5.safetensors --local-dir /models
+```
+
+In **LoRA(Character Swap)**, set `local_path` to `/models/h3_character_swap_v1.5.safetensors`, enable the adapter and start with `scale=1.0`. Leave `int_id=0` for automatic identification. Start the service with `--lora-backend peft`; for Swap + Turbo composition, use `--max-cpu-loras 3`. The target image supplies appearance, the video supplies motion and scene structure, and the prompt identifies which person to replace. FastH3-Omni + Swap requires a server that supports request-level LoRA for that checkpoint.
+
+Load [MiniMax-H3 Character Replacement](example_workflows/vLLM-Omni%20MiniMax-H3%20Character%20Replacement.json),
+select your own target image and motion video, and replace both `/models/...`
+adapter paths with server-local files. This template uses reference conditioning,
+not pixel-locked editing, and saves generated audio. Supply the complete reference
+video and target duration. Enable long_video and select continuation for the existing
+latent-tail continuation mode. Adjust continuation_window_frames and
+continuation_overlap_frames to set the window length and overlap. Reference video
+and audio are reused across windows, rather than sliced to each source interval.
+Inspect continuity and source action timing; output may include frame-alignment padding.
+
 ### MiniMax H3 Text to Video
 
 Import [the H3 text-to-video template](example_workflows/MiniMax_H3_Text_to_Video.json)
@@ -229,6 +253,14 @@ optional Turbo sampling, H3 parameters, and Remote LoRA nodes. See the
 [workflow guide](docs/minimax-h3-t2v.md) for server setup, artifact-specific Turbo
 settings, and saved-video/audio validation. Set Remote LoRA’s `local_path` to
 the downloaded Turbo artifact on your server before enabling Turbo.
+
+#### H3 all-in-one (H3-06)
+
+The **vLLM-Omni MiniMax-H3 All-in-One** template puts T2VA, first/last-frame FL2VA, and mixed-reference Ref2VA in one graph. The server URL, served model name, duration, sampling, and flow shifts are set once and shared by all modes; enable the group for the mode you want to run. It does not include a prompt LLM. See [workflow setup](docs/h3-06-all-in-one.md).
+
+#### H3 music video from a supplied track (H3-03)
+
+The **vLLM-Omni MiniMax-H3 Music Video** template cuts a supplied music track into 124-frame slices, generates one Ref2VA shot per slice with a shared character/style image, and joins the shots with the original track as the soundtrack. Each shot sets **MiniMax-H3 Video Params → audio_mode** to `lock_source`, so its slice drives generation instead of acting as a short reference. Requires ComfyUI v0.36.0+ for Concatenate Video. See [workflow setup](docs/h3-03-music-video.md).
 
 #### H3 video upscale (WF-07)
 
@@ -279,6 +311,84 @@ Connect a **Latent Mask Editing** node to **Generate Video → latent_edit** to 
 - `audio_mask` — a scalar in `[0, 1]`; `0` keeps the source audio, `1` regenerates it, fractional values blend.
 
 The node requires at least one mask; the server then enforces the cross-field rules (a source requires a matching mask, and a non-trivial mask requires its source). This node only forwards inputs to the server; the served model must declare latent-mask editing support (MiniMax-H3).
+
+#### Timeline guides (MiniMax-H3)
+
+Timeline guides pin a still image or a clip, optionally with audio, to a chosen
+frame of the generated video. Chain **MiniMax H3 Add Guide** nodes
+(`VLLMOmniMiniMaxH3Guide`) and connect the last one to
+**Generate Video → timeline_guides**:
+
+```text
+Load Image ─────image──► Add Guide (frame_index=36) ─┐
+Load Image ─────image──► Add Guide (frame_index=72) ◄┘ ─┐
+Load Video ─────video──► Add Guide (frame_index=-22) ◄──┘ ──timeline_guides──► Generate Video ──► Save Video
+Load Audio ─────audio──┘
+```
+
+The [MiniMax-H3 Timeline Guides](example_workflows/vLLM-Omni%20MiniMax-H3%20Timeline%20Guides.json)
+template (**Templates → ComfyUI-vLLM-Omni**) wires this chain, guiding the closing
+clip with its own soundtrack through **Get Video Components → audio**. Its loader
+filenames are placeholders; select your own files.
+
+| Socket | Type | Notes |
+| --- | --- | --- |
+| `frame_index` (widget) | `INT` | Output frame where the guide starts, on the 24 FPS timeline. Negative values count from the end: `-1` is the last frame, `-22` starts a clip that ends on it. |
+| `image` | `IMAGE` | One frame. A batch of several images is rejected; turn it into a clip with **Create Video** at 24 FPS and connect `video` instead. |
+| `video` | `VIDEO` | A clip, decoded by the server at 24 FPS whatever its own frame rate. Its soundtrack is **not** used; connect **Get Video Components → audio** to `audio` to guide with it. |
+| `audio` | `AUDIO` | One mono or stereo clip, starting at the same frame. Audio-only guides are allowed. |
+| `timeline_guides` (input/output) | `H3_TIMELINE_GUIDES` | The chain. Each node appends one guide to a copy, so branching a chain never changes the other branch. |
+
+Every node adds exactly one guide that carries media: `image`, `video`, `audio`,
+`image` + `audio`, or `video` + `audio`. `image` and `video` cannot be combined.
+Guides keep chain order; they are not sorted, deduplicated, or checked for
+overlap, so a repeated image is sent as its own guide.
+
+The request carries the guides as a `timeline_guides` JSON manifest plus one
+repeated `guide_files` upload per medium (PNG; MP4, with MKV/WebM sources
+converted; FLAC), numbered in chain order with the visual input before the audio,
+as described in the [Videos API](../../docs/serving/videos_api.md#minimax-h3-timeline-guides).
+Limits are 8 guides, 16 uploads, and 30 MiB per image, 50 MiB per clip, 15 MiB
+per audio after encoding; larger inputs fail before anything is uploaded.
+
+The server, not the node, fits guides to the video. The output length is
+aligned up to `17k+5` frames, a negative index resolves to `frames + index`,
+and a clip is shortened to `17k+5` frames (or 1) and must fit between its start
+and the end of the video. Errors such as an index that does not fit are shown
+in ComfyUI as returned by the server.
+
+A guided request:
+
+- sets **fps** to 24 (other values are rejected rather than changed) and sends
+  `quality=lossless`; requests without guides are sent exactly as before;
+- keeps the usual routing: guides alone are T2VA, with `first_frame` /
+  `last_frame` FL2VA, with **Video References** Ref2VA. References keep their
+  `<Picture N>` / `<Video N>` / `<Audio N>` numbering;
+- requires base H3 weights and rejects FastH3 (Preview and Omni) or active request-level LoRA before upload; set every LoRA scale to zero or disconnect it. Server-side restrictions remain authoritative.
+
+Use a vLLM-Omni server that includes timeline guides
+([#8838](https://github.com/vllm-project/vllm-omni/pull/8838)). Older servers
+may silently ignore the unknown form fields, and `/v1/models` does not report
+guide support, so the node cannot detect this for you.
+
+The served model name must match the H3 model spec (for example, start the
+server with `--served-model-name MiniMaxAI/MiniMax-H3`); otherwise the node
+refuses to send guides, for example to a server named only by its model path.
+
+The [Agentic Continuation](example_workflows/vLLM-Omni%20MiniMax-H3%20Character%20Replacement%20Continuation%20(Agentic).json) example uses two boundary images at frames 0 and 21, ordinary Generate Video requests, and native crop/concatenation nodes. **Reverse Image Batch** reverses the frame order of any `IMAGE` batch; it has no model, VAE, request, or queue logic. The supplied segment lengths reproduce a 27-second example; another source needs matching contexts, prompts, and cut values. Loader filenames are placeholders. Guided segments require base H3 weights with all request-level LoRAs disabled; FastH3 + Swap + guides is unsupported.
+
+Validate the node and the request contract locally with:
+
+```bash
+python -m pytest -q tests/e2e/features/comfyui/test_timeline_guides.py
+python -m pytest -q tests/e2e/features/comfyui/test_comfyui_integration.py -k timeline_guides
+```
+
+The second command runs the real `/v1/videos` multipart parser against a mocked
+model. Neither replaces a real-model run: generate against H3, save with
+**Save Video**, then check the file with
+`ffprobe -v error -count_frames -show_streams -show_format -of json "$OUTPUT"`
+and `ffmpeg -v error -i "$OUTPUT" -f null -`, and watch and listen to it.
 
 ### TTS (e.g., Qwen TTS series)
 

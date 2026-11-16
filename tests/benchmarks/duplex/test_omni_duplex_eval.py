@@ -443,6 +443,13 @@ def test_protocol_prompt_wording_is_pinned():
     ]
 
 
+def test_content_frame_times_keep_one_frame_every_three_seconds():
+    times = eval_module._content_frame_times(120)
+    assert len(times) == 40
+    assert times[0] == 0.0
+    assert times[-1] == 117.0
+
+
 def test_frame_sample_content_passes_frames(tmp_path, monkeypatch):
     response = tmp_path / "response.json"
     response.write_text(json.dumps([{"sentence": "A person moves.", "start": 1, "end": 2}]), encoding="utf-8")
@@ -490,7 +497,7 @@ def _write_rtd_response(tmp_path):
 def test_content_prompt_falls_back_to_frame_sample_on_judge_context_overflow(tmp_path, monkeypatch):
     # #9089: in video_url mode a long clip can exceed the judge model's context
     # window and the judge answers HTTP 400. The content call must degrade to
-    # the bounded frame-sample path (and record the fallback) instead of failing
+    # the frame-sample path (and record the fallback) instead of failing
     # the whole evaluation run.
     import requests
 
@@ -506,10 +513,13 @@ def test_content_prompt_falls_back_to_frame_sample_on_judge_context_overflow(tmp
         def content(self, prompt, video, frames=None, *, mode="video_url"):
             modes.append(mode)
             if mode == "video_url":
+                overflow = requests.Response()
+                overflow.status_code = 400
+                overflow._content = b"Input length (83158) exceeds context length"
                 raise requests.HTTPError(
                     '400 response from judge: {"error":{"message":"Input length (83158) exceeds '
                     "model's maximum context length (65536).\"}}",
-                    response=SimpleNamespace(status_code=400, text="Input length (83158) exceeds context length"),
+                    response=overflow,
                 )
             assert frames == [b"\xff\xd8jpeg", b"\xff\xd8jpeg"]
             return '{"content_score": 3}'
@@ -535,11 +545,57 @@ def test_content_prompt_falls_back_to_frame_sample_on_judge_context_overflow(tmp
     assert score["content"]["content_score"] == 3
 
 
+def test_uncapped_frame_sample_fallback_propagates_a_second_overflow(tmp_path, monkeypatch):
+    # Frame sampling is one frame every three seconds with no cap, so the
+    # video_url fallback can overflow the judge again. That second error fails
+    # the sample instead of being retried.
+    import requests
+
+    monkeypatch.setattr(eval_module, "extract_jpeg", lambda *args, **kwargs: b"\xff\xd8jpeg")
+    response, video = _write_rtd_response(tmp_path)
+    observed = []
+
+    def overflow():
+        rejected = requests.Response()
+        rejected.status_code = 400
+        rejected._content = b"Input length exceeds the maximum context length"
+        return requests.HTTPError("400 response from judge", response=rejected)
+
+    class Judge:
+        def temporal(self, *args, **kwargs):
+            return '{"temporal_score": 3, "is_relevant": 1}'
+
+        def content(self, prompt, video, frames=None, *, mode="video_url"):
+            observed.append((mode, None if frames is None else len(frames)))
+            raise overflow()
+
+    sample = DuplexSample(
+        id="rtd",
+        split="RTD_counting",
+        family="rtd",
+        task_type=None,
+        video=video,
+        video_duration=120,
+    )
+    with pytest.raises(requests.HTTPError):
+        eval_module.evaluate_sample(
+            sample,
+            response,
+            tmp_path / "score.json",
+            Judge(),
+            judge_video_mode="video_url",
+        )
+    assert observed == [("video_url", None), ("frame-sample", 40)]
+
+
 def test_judge_context_length_error_detection():
     import requests
 
     def error(status_code, text):
-        return requests.HTTPError("judge error", response=SimpleNamespace(status_code=status_code, text=text))
+        response = requests.Response()
+        response.status_code = status_code
+        response._content = text.encode()
+        return requests.HTTPError("judge error", response=response)
 
     # vLLM's exact wording from the CI run.
     assert eval_module._is_judge_context_length_error(
@@ -570,10 +626,10 @@ def test_content_prompt_context_overflow_without_decodable_frames_reraises(tmp_p
 
         def content(self, prompt, video, frames=None, *, mode="video_url"):
             calls.append(mode)
-            raise requests.HTTPError(
-                "400 response from judge",
-                response=SimpleNamespace(status_code=400, text="Input length exceeds the maximum context length"),
-            )
+            overflow = requests.Response()
+            overflow.status_code = 400
+            overflow._content = b"Input length exceeds the maximum context length"
+            raise requests.HTTPError("400 response from judge", response=overflow)
 
     sample = DuplexSample(
         id="rtd",
@@ -607,10 +663,10 @@ def test_content_prompt_judge_errors_other_than_context_overflow_propagate(tmp_p
             return '{"temporal_score": 3, "is_relevant": 1}'
 
         def content(self, prompt, video, frames=None, *, mode="video_url"):
-            raise requests.HTTPError(
-                "400 response from judge: bad request",
-                response=SimpleNamespace(status_code=400, text="invalid request body"),
-            )
+            rejected = requests.Response()
+            rejected.status_code = 400
+            rejected._content = b"invalid request body"
+            raise requests.HTTPError("400 response from judge: bad request", response=rejected)
 
     sample = DuplexSample(
         id="rtd",

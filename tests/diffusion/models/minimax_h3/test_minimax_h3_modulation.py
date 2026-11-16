@@ -152,7 +152,7 @@ def test_modulation_wrappers_match_reference_above_grid_limit(device):
         torch.testing.assert_close(actual.cpu(), expected, atol=2e-2, rtol=2e-2)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_fused_modulation_preserves_bf16_residual_boundary() -> None:
