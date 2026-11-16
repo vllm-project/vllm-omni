@@ -630,3 +630,35 @@ def test_remote_owner_cancel_retires_worker_if_receive_cannot_drain(monkeypatch)
         for work in transport.pending[0]:
             work.done.set()
         assert released.wait(timeout=2.0)
+
+
+@pytest.mark.parametrize("failed_chunk", [1, 2])
+def test_remote_decode_error_remains_recoverable_after_cancel(monkeypatch, failed_chunk):
+    transport = _Transport()
+    monkeypatch.setattr(asd_mod.torch, "empty", _unpinned_empty)
+    monkeypatch.setattr(asd_mod.dist, "irecv", transport.irecv)
+    monkeypatch.setattr(asd_mod.dist, "isend", transport.isend)
+    original_decode = _FakeDecoder.decode_chunk
+
+    def decode(self, latent, state):
+        if self.chunks + 1 == failed_chunk:
+            raise ValueError("decode failed")
+        return original_decode(self, latent, state)
+
+    monkeypatch.setattr(_FakeDecoder, "decode_chunk", decode)
+    shape = (1, 4, 1, 2, 2)
+    owner, source = transport.start_jobs(0, shape)
+    try:
+        for chunk in range(2):
+            transport.emit(source, 0, chunk, 0.1, shape)
+        source.join()
+        with pytest.raises(ValueError, match="decode failed"):
+            owner.join()
+        owner.cancel()
+        owner.cancel()  # Cleanup is idempotent after draining.
+        assert not transport.pending[0]
+        with pytest.raises(ValueError, match="decode failed"):
+            owner.join()
+    finally:
+        source.cancel()
+        owner.cancel()

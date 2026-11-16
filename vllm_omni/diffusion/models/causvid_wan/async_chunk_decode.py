@@ -226,6 +226,7 @@ def start_async_chunk_decode(
         error: list[BaseException] = []
         emitted = [0]
         cancelled = threading.Event()
+        received = [0]
 
         def _consumer() -> None:
             assert decoder is not None and vae is not None
@@ -235,10 +236,9 @@ def start_async_chunk_decode(
                     # Always wait: posted irecvs must complete or the next
                     # request's isend can match a stale receive and hang.
                     work.wait()
+                    received[0] = chunk_index + 1
                     if cancelled.is_set():
-                        for leftover in recv_works[chunk_index + 1 :]:
-                            leftover.wait()
-                        break
+                        continue
                     scaled = _rescale_latents(vae, buf)
                     pixels = decoder.decode_chunk(scaled, state).clamp(-1, 1)
                     if cancelled.is_set():
@@ -273,10 +273,11 @@ def start_async_chunk_decode(
             # Producer cancel fills remaining isends; wait for the consumer to
             # drain every posted irecv so the stream group is reusable.
             _join_on_cancel(thread, timeout=_CANCEL_DRAIN_TIMEOUT_S, session_id=session_id)
-            if error:
-                raise SystemExit(
-                    f"async_chunk_decode cancel: remote decoder failed; retiring Worker ({session_id!r})"
-                ) from error[0]
+            # Decode failure may leave receives after the failed chunk. Once
+            # drained, join() owns the original error; cleanup is recoverable.
+            for work in recv_works[received[0] :]:
+                _drain_on_cancel(work, session_id=session_id)
+            received[0] = len(recv_works)
 
         return AsyncStreamDecodeJob(
             on_finished=None,
