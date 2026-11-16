@@ -2108,6 +2108,25 @@ class TestMmapValidation:
         assert result.plan is None
         assert result.fallback_reason == "TP=2 requires the ordinary loader"
 
+    def test_load_time_fusion_falls_back_before_checkpoint_discovery(self):
+        class FusedPipeline(nn.Module):
+            @property
+            def lora_is_fused(self) -> bool:
+                return True
+
+        result = build_checkpoint_mmap_plan(
+            FusedPipeline(),
+            dit_modules=(),
+            sources=(),
+            model_path="unused",
+            tensor_parallel_size=1,
+            use_hsdp=False,
+            online_quantization=False,
+        )
+
+        assert result.plan is None
+        assert result.fallback_reason == "load-time weight fusion requires the ordinary loader"
+
     @pytest.mark.parametrize(
         ("use_hsdp", "online_quantization", "expected_reason"),
         [

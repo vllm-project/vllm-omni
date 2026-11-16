@@ -7,6 +7,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, OmniDiffusionConfig
 from vllm_omni.diffusion.models.minimax_h3 import vdnh3
 from vllm_omni.diffusion.models.minimax_h3.vdnh3 import (
     VDN_CHECKPOINT,
@@ -189,6 +190,18 @@ def test_vdn_checkpoint_validation(tmp_path):
             OmniDiffusionSamplingParams(num_inference_steps=8, extra_args={"sampler": "res_multistep"}), "t2va"
         )
     ckpt.check_request(OmniDiffusionSamplingParams(num_inference_steps=8, extra_args={"sampler": "euler"}), "t2va")
+
+
+def test_vdn_checkpoint_allows_dlo_with_the_fused_loader(tmp_path):
+    _write_artifact(tmp_path)
+    ckpt = VDNCheckpoint.from_path(tmp_path, head_dim=4)
+    od_config = OmniDiffusionConfig(
+        diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="VDNH3_ATTN")),
+        enable_distributed_layerwise_offload=True,
+        dlo_use_allgather=False,
+    )
+
+    ckpt.check_serving_contract(partition="fl2va", od_config=od_config)
 
 
 def test_vdn_checkpoint_detection(tmp_path):
