@@ -130,11 +130,21 @@ def test_wrapper_shutdown_releases_worker_once():
 
 
 def _make_executor(fake_ray, actors, group=None, owns_group=True):
+    from collections import OrderedDict
+
     executor = object.__new__(ray_module.RayDiffusionExecutor)
     executor._closed = False
     executor._is_failed = False
     executor._state_lock = threading.Lock()
     executor._failure_callbacks = []
+    executor._chunk_ready_handler = None
+    executor._futures_lock = threading.RLock()
+    executor._output_futures = {}
+    executor._completed_outputs = {}
+    executor._dropped_output_ids = OrderedDict()
+    executor._chunk_queue = None
+    executor._chunk_pump_stop = threading.Event()
+    executor._chunk_pump_thread = None
     executor.workers = [ray_module._RayWorkerMetadata(actor, rank=rank) for rank, actor in enumerate(actors)]
     executor._resources = ray_module._RayExecutorResources(executor.workers, group, owns_group)
     executor._finalizer = executor._resources
@@ -472,15 +482,27 @@ def test_health_failure_releases_actors_and_notifies(monkeypatch, probe_result):
 
 
 def _make_request_executor(monkeypatch, prompts, component="text_encoder", allgather=True):
+    from collections import OrderedDict
+
     executor = object.__new__(ray_module.RayDiffusionExecutor)
     executor._closed = False
     executor._is_failed = False
     executor._state_lock = threading.Lock()
     executor._failure_callbacks = []
+    executor._chunk_ready_handler = None
+    executor._futures_lock = threading.RLock()
+    executor._output_futures = {}
+    executor._completed_outputs = {}
+    executor._dropped_output_ids = OrderedDict()
+    executor._chunk_queue = None
+    executor._chunk_pump_stop = threading.Event()
+    executor._chunk_pump_thread = None
     executor._finalizer = Mock()
     executor.od_config = SimpleNamespace(
         parallel_config=SimpleNamespace(data_parallel_size=len(prompts)),
         diffusion_attention_schedule=None,
+        streaming_output=False,
+        step_execution=False,
         diffusion_offload_config={
             "mode": "layer",
             "components": [component],
@@ -608,3 +630,94 @@ def test_move_to_cpu_handles_typed_video_media(wrapper):
     torch.testing.assert_close(moved.video.tensor, tensor.detach())
     assert media.video.tensor is tensor
     assert tensor.requires_grad
+
+
+def test_ray_wrapper_emits_chunk_ready_onto_queue_before_rpc_returns():
+    from vllm_omni.diffusion.data import AsyncOutputKind
+    from vllm_omni.diffusion.request_streaming import get_emit_chunk, request_chunk_emitter
+
+    actor = ray_module.RayDiffusionWorkerWrapper(0)
+    actor.worker = Mock()
+    actor.worker.od_config = SimpleNamespace(streaming_output=True, step_execution=False)
+    chunks = []
+
+    class _Queue:
+        def put(self, message):
+            chunks.append(message)
+
+    actor.set_chunk_queue(_Queue())
+
+    def execute_method(method, *args, **kwargs):
+        del method, args, kwargs
+        with request_chunk_emitter([SimpleNamespace(request_id="req")], enabled=True):
+            emit = get_emit_chunk()
+            assert emit is not None
+            emit(DiffusionOutput(finished=False, chunk_index=0, output=torch.zeros(2)))
+            assert len(chunks) == 1
+        return DiffusionOutput(finished=True, output=torch.ones(2))
+
+    actor.worker.execute_method.side_effect = execute_method
+    result = actor.execute_rpc("execute_model", output_rank=0, exec_all_ranks=True)
+    assert result["replied"] is True
+    assert chunks[0].kind is AsyncOutputKind.CHUNK_READY
+    assert chunks[0].request_id == "req"
+    assert chunks[0].async_output_id
+    assert chunks[0].output is not None
+    torch.testing.assert_close(chunks[0].output.output, torch.zeros(2))
+    assert result["result"].finished is True
+
+
+def test_ray_wrapper_non_reply_rank_does_not_emit_chunks():
+    from vllm_omni.diffusion.request_streaming import get_emit_chunk, request_chunk_emitter
+
+    actor = ray_module.RayDiffusionWorkerWrapper(1)
+    actor.worker = Mock()
+    actor.worker.od_config = SimpleNamespace(streaming_output=True, step_execution=False)
+    actor.set_chunk_queue(Mock())
+    seen = []
+
+    def execute_method(method, *args, **kwargs):
+        del method, args, kwargs
+        with request_chunk_emitter([SimpleNamespace(request_id="req")], enabled=True):
+            seen.append(get_emit_chunk())
+        return DiffusionOutput(finished=True)
+
+    actor.worker.execute_method.side_effect = execute_method
+    result = actor.execute_rpc("execute_model", output_rank=0, exec_all_ranks=True)
+    assert result["replied"] is False
+    assert result["result"] is None
+    assert seen == [None]
+
+
+def test_ray_executor_chunk_pump_caches_for_wait_output_ready():
+    from collections import OrderedDict
+
+    from vllm_omni.diffusion.data import AsyncDiffusionOutput, AsyncOutputKind
+
+    executor = object.__new__(ray_module.RayDiffusionExecutor)
+    executor._closed = False
+    executor._chunk_ready_handler = None
+    executor._futures_lock = threading.RLock()
+    executor._output_futures = {}
+    executor._completed_outputs = {}
+    executor._dropped_output_ids = OrderedDict()
+    delivered = []
+
+    def handler(request_id, chunk_index, output, error):
+        delivered.append((request_id, chunk_index, output, error))
+
+    executor.register_chunk_ready_handler(handler)
+    payload = DiffusionOutput(finished=False, chunk_index=0, output=torch.zeros(3), async_output_id="ray-chunk")
+    executor._deliver_chunk_ready(
+        AsyncDiffusionOutput(
+            kind=AsyncOutputKind.CHUNK_READY,
+            async_output_id="ray-chunk",
+            output=payload,
+            request_id="req",
+            chunk_index=0,
+        )
+    )
+    assert delivered == [("req", 0, payload, None)]
+    media = executor.wait_output_ready("ray-chunk").result(timeout=1)
+    assert media.async_output_id == "ray-chunk"
+    torch.testing.assert_close(media.output, torch.zeros(3))
