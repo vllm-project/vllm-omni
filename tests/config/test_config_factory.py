@@ -1627,15 +1627,14 @@ class TestDeployConfigLoading:
             assert stages[0].yaml_engine_args.get("enable_prefix_caching") is not True
             assert stages[1].yaml_engine_args["speculative_config"] == {
                 "method": "ngram",
-                "num_speculative_tokens": 7,
+                "num_speculative_tokens": 15,
                 "prompt_lookup_min": 1,
                 "prompt_lookup_max": 1,
             }
             # K-step books its span with the synchronous runner contract.
             assert stages[1].yaml_engine_args["async_scheduling"] is False
-            # Base concurrency stays 16; only the NPU overlay lowers it to 8,
-            # so a CUDA deployment keeps the pipeline default.
-            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [16, 16, 16]
+            # CUDA Code2Wav uses two replicas with eight slots each.
+            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [16, 16, 8]
 
     @pytest.mark.parametrize(
         ("filename", "stage0_devices", "stage1_devices", "stage2_devices", "stage1_replicas"),
@@ -2113,18 +2112,8 @@ stages:
             ("qwen3_omni_moe_mrv2.yaml", "cuda", False),
             ("qwen3_omni_duplex.yaml", "cuda", False),
             ("qwen3_omni_duplex_mrv2.yaml", "cuda", False),
-            ("minicpmo_4_5_turn.yaml", "cuda", True),
-            *(
-                (yaml_name, platform, False)
-                for yaml_name in (
-                    "minicpmo_4_5_turn.yaml",
-                    "minicpmo_4_5_turn_mrv2.yaml",
-                    "minicpmo_4_5_turn_mrv2_h200.yaml",
-                )
-                for platform in ("npu", "rocm", "xpu", "musa")
-            ),
-            ("minicpmo_4_5_turn_mrv2.yaml", "cuda", True),
-            ("minicpmo_4_5_turn_mrv2_h200.yaml", "cuda", True),
+            ("minicpmo_4_5_turn.yaml", "cuda", False),
+            *(("minicpmo_4_5_turn.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
             ("minicpmo_4_5.yaml", "cuda", False),
             ("minicpmo_4_5_duplex_h200.yaml", "cuda", False),
         ],
@@ -2155,8 +2144,8 @@ stages:
 
     @pytest.mark.parametrize("runner", ["v1", "v2"])
     @pytest.mark.parametrize("disable_prefix_cache", [False, True])
-    def test_minicpmo_turn_cuda_prefix_cache_can_be_disabled(self, monkeypatch, tmp_path, runner, disable_prefix_cache):
-        """Both runners inherit the enabled cache; an explicit overlay can opt out."""
+    def test_minicpmo_turn_cuda_prefix_cache_stays_disabled(self, monkeypatch, tmp_path, runner, disable_prefix_cache):
+        """Both runners keep prefix caching off for inherited ngram speculation."""
         from vllm_omni import platforms
 
         monkeypatch.setattr(platforms.current_omni_platform, "device_name", "cuda")
@@ -2171,13 +2160,8 @@ stages:
         )
         deploy = _apply_platform_overrides(load_deploy_config(overlay), platform="cuda")
         stages = merge_pipeline_deploy(resolve_pipeline_config(deploy.pipeline), deploy)
-        # The inherited CUDA Talker entry keeps V1 for multi-frame decode.
-        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [
-            runner == "v2",
-            False,
-            runner == "v2",
-        ]
-        assert stages[0].yaml_engine_args["enable_prefix_caching"] is (not disable_prefix_cache)
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [runner == "v2"] * 3
+        assert stages[0].yaml_engine_args["enable_prefix_caching"] is False
 
     def test_step_audio2_online_ci_deploy_is_single_thinker(self):
         deploy = load_deploy_config(Path(get_deploy_config_path("step_audio2_ci.yaml")))
@@ -3291,11 +3275,9 @@ class TestPlatformOverrides:
         [
             ("qwen3_tts_mrv2.yaml", "qwen3_tts", "v2", ()),
             ("moss_tts_local.yaml", "moss_tts_local", "v2", ()),
-            # The CUDA Talker keeps V1 for multi-frame decode.
-            ("minicpmo_4_5.yaml", "minicpmo_4_5", "v2", (1,)),
-            ("minicpmo_4_5_turn.yaml", "minicpmo_4_5", "v2", (1,)),
-            ("minicpmo_4_5_duplex_h200.yaml", "minicpmo_4_5", "v1", (0, 1, 2)),
-            ("minicpmo_4_5_turn_mrv2.yaml", "minicpmo_4_5", "v2", ()),
+            ("minicpmo_4_5.yaml", "minicpmo_4_5", "v2", ()),
+            ("minicpmo_4_5_turn.yaml", "minicpmo_4_5", "v2", ()),
+            ("minicpmo_4_5_duplex_h200.yaml", "minicpmo_4_5", "v2", ()),
         ],
     )
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])

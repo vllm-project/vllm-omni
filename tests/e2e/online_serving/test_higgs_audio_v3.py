@@ -324,7 +324,7 @@ class TestHiggsAudioV3OnlineVoiceClone:
 
 @pytest.mark.slow
 @pytest.mark.tts
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize(
     "omni_server",
     [

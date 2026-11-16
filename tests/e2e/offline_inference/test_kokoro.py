@@ -54,7 +54,7 @@ def _info(text: str, voice: str, seed: int) -> dict:
 
 @pytest.mark.core_model
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_kokoro_offline_concurrent_voices(omni_runner: OmniRunner, run_level: str) -> None:
     """Three concurrent requests in three languages each return 24 kHz audio."""
     request_config = {
@@ -71,7 +71,7 @@ def test_kokoro_offline_concurrent_voices(omni_runner: OmniRunner, run_level: st
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_kokoro_offline_long_text_spans_chunks(omni_runner: OmniRunner) -> None:
     request_config = {
         "input": _LONG_TEXT,
