@@ -199,6 +199,7 @@ def test_streaming_session_update_invalidates_omits_kv_transfer_cache():
         request_id="req",
         additional_information=tagged.additional_information,
         status=RequestStatus.WAITING,
+        max_tokens=8,
     )
     assert scheduler._request_omits_chunk_transfer_to_next_stage(session)
     assert "req" in scheduler._omits_kv_transfer_cache
@@ -207,11 +208,13 @@ def test_streaming_session_update_invalidates_omits_kv_transfer_cache():
         model_intermediate_buffer=None,
         arrival_time=0.0,
         sampling_params=None,
+        max_tokens=32,
     )
 
     OmniSchedulerMixin._finish_streaming_session_update(scheduler, session, update)
 
     assert scheduler._omits_kv_transfer_cache == {}
+    assert session.max_tokens == update.max_tokens
     assert session.additional_information == {"omni_final_stage_id": 1}
     assert not scheduler._request_omits_chunk_transfer_to_next_stage(session)
     assert not scheduler._request_omits_kv_transfer_to_next_stage(session)
