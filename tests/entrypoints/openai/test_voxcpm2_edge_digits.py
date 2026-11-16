@@ -72,6 +72,12 @@ def test_leading_digit_bound_to_unit_or_date_keeps_no_comma():
     assert shape_voxcpm2_edge_digits("2万元已到账") == "2万元已到账"
     assert shape_voxcpm2_edge_digits("5个苹果") == "5个苹果"
     assert shape_voxcpm2_edge_digits("3斤苹果") == "3斤苹果"
+    # [important regression, linyueqian 11-16]: compound units bind too - the
+    # first character of 小时/公里/千元/公斤 must mark the digit as used up.
+    assert shape_voxcpm2_edge_digits("1小时后再来") == "1小时后再来"
+    assert shape_voxcpm2_edge_digits("3公里后右转") == "3公里后右转"
+    assert shape_voxcpm2_edge_digits("2千元已到账") == "2千元已到账"
+    assert shape_voxcpm2_edge_digits("8公斤重") == "8公斤重"
 
 
 def test_leading_standalone_digit_run_still_gets_comma():
@@ -87,7 +93,7 @@ def test_lone_trailing_zero_is_sentinel_held():
     assert out.endswith("\uee00。")
 
 
-def test_lone_trailing_zero_before_final_newline_keeps_the_zero():
+def test_lone_trailing_zero_before_final_newline_keeps_the_zero(monkeypatch: pytest.MonkeyPatch):
     # "$" also matches before a final newline: the matched "0。" here is NOT
     # the last two characters ("。\n" is), so a text[:-2] slice dropped the
     # wrong span and re-appended the stop -> "今天00。" with TN off.
@@ -96,11 +102,8 @@ def test_lone_trailing_zero_before_final_newline_keeps_the_zero():
     # and the restore path (TN off) puts back exactly one 0
     from vllm_omni.entrypoints.openai.tts_adapters.voxcpm2_digits import normalize_voxcpm2_text
 
-    monkey_text = out
-    import os
-
-    os.environ["VLLM_OMNI_SPEECH_TEXT_NORMALIZE"] = "0"
-    assert normalize_voxcpm2_text(monkey_text, None) == "今天天气真好，一起去吃饭。0。\n"
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_TEXT_NORMALIZE", "0")
+    assert normalize_voxcpm2_text(out, None) == "今天天气真好，一起去吃饭。0。\n"
 
 
 def test_zero_inside_multi_digit_run_is_not_sentinel_split():

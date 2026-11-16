@@ -42,15 +42,32 @@ from typing import Any
 import regex as re
 
 _VOXCPM2_ZERO_SENTINEL = "\uee00"
-# Characters that bind a preceding digit into a normal numeric expression
-# (dates 月日年号, clock times 点分秒, magnitudes 万亿 + currencies 元角,
-# measure words 个只条根张片本件台位名次遍趟层楼岁 and units 斤两米尺寸
-# 升斗吨磅周). The comma lead-in skips digit-runs directly followed by
-# one of these - measured: the inserted comma never helps and sometimes
-# garbles those readings (n=3..5 per shape), while standalone edge
-# numbers ("10今天...") need it.
+# Characters that bind a preceding digit into a normal numeric expression,
+# so the comma lead-in skips digit-runs directly followed by one of them.
+# Grouped by role; deliberately generous (conservative = prefer MISSING a
+# comma over inserting one inside a normal amount - a comma inside
+# "1小时"/"3公里" garbles the reading, while a missed comma on a true edge
+# number only keeps the baseline pronunciation):
+# - dates & clock: 月日年号点分秒
+# - magnitudes & currency: 万亿两千百亿万元角块毛
+# - metric & market units: 公里米寸尺升斗吨磅克毫厘斤两亩顷度
+# - ratio: 倍折成
+# - measure words: 个只条根张片本件台位名次遍趟层楼岁回场轮局关课题章
+#   节页行字词句声步道幅座栋间堵扇门
+# - containers & objects: 瓶杯碗碟盘桶罐盒箱包袋辆架艘套双对副把支枝
+#   棵株颗粒滴朵头匹服剂味股
+# Measured: the inserted comma never helps and sometimes garbles those
+# readings (n=3..5 per shape), while standalone edge numbers
+# ("10今天...") need it.
 _VOXCPM2_BOUND_FOLLOW_RE = re.compile(
-    r"[月日年号点分秒万亿两元角块个只条根张片本件台位名次遍趟层楼岁斤米尺寸升斗吨磅周]"
+    "["
+    "月日年号点分秒时周"
+    "万亿两千百亿元角块毛"
+    "小公里米寸尺升斗吨磅克毫厘斤两亩顷度"
+    "倍折成"
+    "个只条根张片本件台位名次遍趟层楼岁回场轮局关课题章节页行字词句声步道幅座栋间堵扇门"
+    "瓶杯碗碟盘桶罐盒箱包袋辆架艘套双对副把支枝棵株颗粒滴朵头匹服剂味股"
+    "]"
 )
 _VOXCPM2_LEAD_TEN_RE = re.compile(r"^10(?=[\u4e00-\u9fff])")
 _VOXCPM2_LEADING_DIGIT_RUN_RE = re.compile(r"^(\d{1,2})(?=[\u4e00-\u9fff])")
