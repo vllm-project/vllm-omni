@@ -8,6 +8,7 @@ import torch
 
 # isort: off
 import vllm_omni  # noqa: F401 - import for side effects (patch vLLM)
+from vllm.outputs import RequestError
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine import FinishReason
 from vllm.v1.metrics.stats import IterationStats, LoRARequestStates, RequestStateStats
@@ -164,7 +165,12 @@ def test_external_termination_flushes_pending_tokens_after_request_removal(
 
         sched._handle_failed_kv_load_outputs = finish_kv_failure
     elif termination == "grammar_error":
-        sched.grammar_compile_error_reqs = {request.request_id}
+        sched.grammar_compile_error_reqs = {
+            request.request_id: RequestError(
+                code="validation_error",
+                message="Invalid structured outputs: fixture",
+            )
+        }
     elif termination == "input_timeout":
         OmniSchedulerMixin._finish_input_timeout_requests(sched, {request.request_id})
     elif termination == "context_overflow":

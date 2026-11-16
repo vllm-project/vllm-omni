@@ -3,6 +3,7 @@
 """CPU contracts for the benchmark, independent of GPU availability."""
 
 import os
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -55,7 +56,7 @@ def test_routed_reference_sort_is_inside_every_timed_call(monkeypatch):
         assert kwargs == {"deterministic": True}
         events.append("reference")
 
-    def candidate(*args):
+    def candidate(*args, **kwargs):
         assert args == (data[0], data[1], data[2], "packed-w13", data[5], "route-buffers")
         events.append("candidate")
 
@@ -81,9 +82,13 @@ def test_routed_reference_sort_is_inside_every_timed_call(monkeypatch):
         global_sort_routes=sort,
         triton_mh_moe_forward=legacy,
         _bf16_fused_moe_forward=candidate,
+        _BF16_MOE_CONFIG={"BLOCK_SIZE_K": 32},
+    )
+    moe_helpers = SimpleNamespace(
         _pack_bf16_w13=pack_w13,
         _allocate_bf16_route_buffers=allocate_route_buffers,
     )
+    monkeypatch.setitem(sys.modules, "vllm_omni.diffusion.models.magi2.layers.cuda.mh_moe", moe_helpers)
     result = bench.benchmark(None, moe, None, 2, bench.parse_args(["--mode", "routed"]))
     assert events == ["sort", "reference", "candidate"] * 2
     assert result["mode"] == "routed"

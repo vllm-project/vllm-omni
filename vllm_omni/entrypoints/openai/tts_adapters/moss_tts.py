@@ -8,6 +8,7 @@ handles each); they are registered under distinct model-type names.
 
 import asyncio
 import hashlib
+import os
 import threading
 from typing import TYPE_CHECKING, Any, cast
 
@@ -26,12 +27,17 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     apply_max_new_tokens,
     conditioning_cache_salt,
 )
+from vllm_omni.model_executor.models.moss_tts.processor_loading import load_moss_processor
 from vllm_omni.model_executor.models.moss_tts.realtime_prompt import build_realtime_prompt
 
 if TYPE_CHECKING:
+    import torch
+
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 
 logger = init_logger(__name__)
+
+_MOSS_REALTIME_REF_ENCODER_DEVICE_ENV = "VLLM_OMNI_MOSS_REALTIME_REF_ENCODER_DEVICE"
 
 
 def _local_continuation_prompt(proc: Any, user_kwargs: dict[str, Any], reference: Any) -> tuple[list[int], Any] | None:
@@ -303,44 +309,52 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         devices = getattr(anchor, "devices", None)
         return str(devices) if devices is not None and str(devices).strip() else None
 
-    def _resolve_ref_encoder_device(self):
+    def _resolve_ref_encoder_device(self) -> "torch.device":
         """Pick the device of the API-process reference-audio encoder.
 
-        The encoder follows the code2wav stage onto its first GPU: the stage
-        worker remaps its ``devices`` entry through ``CUDA_VISIBLE_DEVICES``
+        The encoder follows the code2wav stage onto its first accelerator: the stage
+        worker remaps its ``devices`` entry through the platform's visibility variable
         and sees it as logical index 0, while replica launch restores the
-        parent environment, so the same index names the same physical GPU in
+        parent environment, so the same index names the same physical device in
         this process. When the stage pins no devices the stage worker and the
-        encoder both default to the first visible GPU. Falls back to CPU when
-        CUDA is unavailable or the stage device is not parseable.
+        encoder both default to the first visible device. Device enumeration
+        and construction use the platform interface for every variant.
+        Unavailable or unparsable stage devices fall back to CPU.
         """
         import torch  # local to avoid pulling torch at module import time
 
-        if not torch.cuda.is_available():
-            return torch.device("cpu")
+        from vllm_omni.platforms import current_omni_platform
+
+        platform = current_omni_platform
         devices_str = self._codec_stage_devices()
-        if devices_str is None:
-            # No explicit pinning: the stage worker lands on the first visible
-            # GPU (vLLM picks cuda:0 of the un-remapped environment).
-            return torch.device("cuda", 0)
-        first = devices_str.split(",")[0].strip()
-        if not first:
-            return torch.device("cuda", 0)
+        first = devices_str.split(",")[0].strip() if devices_str is not None else ""
         if first == "cpu":
             return torch.device("cpu")
-        if not first.isdigit():
+        if first and not first.isdigit():
             logger.warning("MOSS ref encoder: codec stage devices %r not parseable; keeping CPU", devices_str)
             return torch.device("cpu")
-        index = int(first)
-        device_count = torch.accelerator.device_count()
+        index = int(first) if first else 0
+        device_count = platform.get_device_count()
         if index >= device_count:
             logger.warning(
-                "MOSS ref encoder: codec stage device cuda:%d out of range (%d visible); keeping CPU",
+                "MOSS ref encoder: codec stage device %s:%d out of range (%d visible); keeping CPU",
+                platform.device_type,
                 index,
                 device_count,
             )
             return torch.device("cpu")
-        return torch.device("cuda", index)
+        return platform.get_torch_device(index)
+
+    def _resolve_realtime_ref_encoder_device(self) -> "torch.device":
+        """Resolve the Realtime codec device, allowing only the CI CPU fallback."""
+        override = os.getenv(_MOSS_REALTIME_REF_ENCODER_DEVICE_ENV, "").strip().lower()
+        if not override:
+            return self._resolve_ref_encoder_device()
+        if override != "cpu":
+            raise ValueError(f"{_MOSS_REALTIME_REF_ENCODER_DEVICE_ENV} only supports 'cpu'; got {override!r}")
+        import torch
+
+        return torch.device("cpu")
 
     def _get_moss_processor(self):
         """Lazily load the upstream MOSS-TTS processor once per server.
@@ -356,10 +370,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         cached = getattr(self, "_moss_processor_cache", None)
         if cached is not None:
             return cached
-        from transformers import AutoProcessor
-
-        model_id = self.engine_client.model_config.model
-        proc = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+        proc = load_moss_processor(self.engine_client.model_config.model)
         if hasattr(proc, "audio_tokenizer"):
             device = self._resolve_ref_encoder_device()
             proc._vllm_omni_ref_encoder_device = device
@@ -384,6 +395,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             if cached is not None:
                 return cached
 
+            device = self._resolve_realtime_ref_encoder_device()
             model_id = self.engine_client.model_config.model
             processor_cls = get_class_from_dynamic_module(
                 "processing_mossttsrealtime.MossTTSRealtimeProcessor",
@@ -407,9 +419,10 @@ class _MossTTSAdapterBase(ARTTSAdapter):
                 codec_path,
                 trust_remote_code=True,
             )
-            # Reference encoding runs in the API process; follow the codec
-            # (code2wav) stage's GPU like the processor path above.
-            codec = codec.to(self._resolve_ref_encoder_device()).eval()
+            # Production follows the codec stage accelerator. Memory-constrained
+            # qualification lanes can opt into CPU without weakening the
+            # default cold-reference latency for user deployments.
+            codec = codec.to(device).eval()
             cached = (tokenizer, processor, codec)
             self._moss_realtime_components = cached
             return cached
@@ -482,6 +495,8 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         proc = self._get_moss_processor()
 
         user_kwargs: dict[str, Any] = {"text": request.input or ""}
+        if v == "local" and request.token_count is not None:
+            user_kwargs["tokens"] = request.token_count
         resolve_keys: dict[int, str] = {}
         if v in ("tts", "local", "ttsd"):
             user_kwargs["reference"], resolve_keys = await self._encode_moss_references(
@@ -513,6 +528,8 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         if v == "local" and request.ref_text and request.ref_text.strip():
             reference = user_kwargs.pop("reference")
             user_kwargs["text"] = request.ref_text.strip() + " " + (request.input or "")
+            if request.token_count is not None:
+                user_kwargs["tokens"] = request.token_count + int(reference[0].shape[0])
             fast = _local_continuation_prompt(proc, user_kwargs, reference)
             if fast is None:
                 user_msg = proc.build_user_message(**user_kwargs)
@@ -532,6 +549,10 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             "prompt_token_ids": text_ids,
             "codes": {"ref": audio_codes},
         }
+        if v == "local" and request.ref_text and request.ref_text.strip():
+            # Only continuation has an assistant audio prefix. Generation's
+            # user-side reference conditions the talker, not the decoder.
+            params["meta"] = {"ref_code_len": int(reference[0].shape[0])}
         if request.max_new_tokens is not None:
             params["max_new_frames"] = [request.max_new_tokens]
         if 0 in resolve_keys:

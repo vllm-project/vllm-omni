@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import math
 import warnings
 from collections import defaultdict
 from collections.abc import Sequence
@@ -19,6 +20,23 @@ _PERCENTILE_ROWS_TYPE = list[tuple[float, float]] | None
 _STAGE_DURATION_MAP_TYPE = dict[str, float] | None
 _FLOAT_LIST_TYPE = list[float]
 _INT_LIST_TYPE = list[int]
+VALID_GOODPUT_METRICS = ("ttft", "tpot", "e2el", defs.AUDIO_TTFP)
+
+
+def validate_goodput_config(goodput_config_dict: dict[str, float]) -> None:
+    """Validate request-level goodput SLO names and values."""
+    for slo_name, slo_val in goodput_config_dict.items():
+        if slo_name not in VALID_GOODPUT_METRICS:
+            raise ValueError(
+                f"Invalid metric name found, {slo_name}: {slo_val}. "
+                "The service level objective name should be one of "
+                f"{list(VALID_GOODPUT_METRICS)}. "
+            )
+        if slo_val < 0:
+            raise ValueError(
+                f"Invalid value found, {slo_name}: {slo_val}. The service level objective value should be non-negative."
+            )
+
 
 _MULTIMODAL_BENCHMARK_FIELDS = [
     ("num_ttft_samples", int, field(default=0)),
@@ -882,6 +900,7 @@ def calculate_metrics(
     request_rate,
     benchmark_duration,
     print_stage: bool = False,
+    duplex_metric_aggregation: str = "session",
 ) -> tuple[MultiModalsBenchmarkMetrics, list[int]]:
     """Calculate the metrics for the benchmark.
 
@@ -896,6 +915,8 @@ def calculate_metrics(
     Returns:
         A tuple of the benchmark metrics and the actual output lengths.
     """
+    validate_goodput_config(goodput_config_dict)
+
     actual_output_lens: list[int] = []
     total_input = 0
     completed = 0
@@ -981,17 +1002,52 @@ def calculate_metrics(
             itls += outputs[i].itl
             session_metrics = getattr(outputs[i], "duplex_session_metrics", None)
             ttft_measured = not isinstance(session_metrics, dict) or session_metrics.get("ttft_ms") is not None
-            audio_ttfp_measured = not isinstance(session_metrics, dict) or session_metrics.get("ttfp_ms") is not None
-            audio_rtf_measured = not isinstance(session_metrics, dict) or session_metrics.get("rtf") is not None
-            if ttft_measured:
-                ttfts.append(outputs[i].ttft)
-            if audio_ttfp_measured:
-                audio_ttfps.append(getattr(outputs[i], defs.AUDIO_TTFP, 0.0))
-            if audio_rtf_measured:
-                audio_rtfs.append(getattr(outputs[i], defs.AUDIO_RTF, 0.0))
+            audio_ttfp_value = float(getattr(outputs[i], defs.AUDIO_TTFP, 0.0) or 0.0)
+            # Duplex records an explicit ttfp_ms presence bit. Other backends reuse
+            # audio_ttfp == 0.0 as "first packet not observed"; that sentinel must
+            # not satisfy an audio_ttfp SLO.
+            if isinstance(session_metrics, dict):
+                audio_ttfp_measured = session_metrics.get("ttfp_ms") is not None
+            else:
+                audio_ttfp_measured = audio_ttfp_value > 0
+            audio_duration_value = float(getattr(outputs[i], defs.AUDIO_DURATION, 0.0) or 0.0)
+            if isinstance(session_metrics, dict):
+                audio_rtf_measured = session_metrics.get("rtf") is not None
+            else:
+                # A request that produced no audio has no RTF sample. Counting the
+                # 0.0 placeholder pulls the mean and percentiles down in mixed
+                # text+audio runs, where text requests would otherwise all read
+                # as perfectly real-time synthesis.
+                audio_rtf_measured = audio_duration_value > 0
+            if duplex_metric_aggregation == "response" and isinstance(session_metrics, dict):
+                # Pool responses rather than giving short and long sessions equal weight.
+                # Goodput below remains request/session based.
+                # Duplex rows use None for missing timings; a measured zero is
+                # valid here, unlike the legacy audio_ttfp == 0.0 sentinel.
+                for row in getattr(outputs[i], "duplex_request_metrics", None) or []:
+                    for field, samples, scale in (
+                        ("ttft_ms", ttfts, 0.001),
+                        ("ttfp_ms", audio_ttfps, 0.001),
+                        ("rtf", audio_rtfs, 1.0),
+                    ):
+                        value = row.get(field)
+                        if (
+                            isinstance(value, (int, float))
+                            and not isinstance(value, bool)
+                            and math.isfinite(value)
+                            and value >= 0
+                        ):
+                            samples.append(value * scale)
+            else:
+                if ttft_measured:
+                    ttfts.append(outputs[i].ttft)
+                if audio_ttfp_measured:
+                    audio_ttfps.append(audio_ttfp_value)
+                if audio_rtf_measured:
+                    audio_rtfs.append(getattr(outputs[i], defs.AUDIO_RTF, 0.0))
             goodput_ttfts.append(outputs[i].ttft if ttft_measured else None)
-            goodput_audio_ttfps.append(getattr(outputs[i], defs.AUDIO_TTFP, 0.0) if audio_ttfp_measured else None)
-            audio_duration.append(getattr(outputs[i], defs.AUDIO_DURATION, 0.0))
+            goodput_audio_ttfps.append(audio_ttfp_value if audio_ttfp_measured else None)
+            audio_duration.append(audio_duration_value)
             audio_frames.append(getattr(outputs[i], defs.AUDIO_FRAMES, 0))
             image_count = int(getattr(outputs[i], defs.IMAGE_COUNT, 0) or 0)
             total_images += image_count
@@ -1030,9 +1086,9 @@ def calculate_metrics(
         if "ttft" in goodput_config_dict:
             valid_metrics.append(goodput_ttfts)
             slo_values.append(goodput_config_dict["ttft"] / MILLISECONDS_TO_SECONDS_CONVERSION)
-        if "audio_ttft" in goodput_config_dict:
+        if defs.AUDIO_TTFP in goodput_config_dict:
             valid_metrics.append(goodput_audio_ttfps)
-            slo_values.append(goodput_config_dict["audio_ttft"] / MILLISECONDS_TO_SECONDS_CONVERSION)
+            slo_values.append(goodput_config_dict[defs.AUDIO_TTFP] / MILLISECONDS_TO_SECONDS_CONVERSION)
         if "tpot" in goodput_config_dict:
             valid_metrics.append(all_tpots)
             slo_values.append(goodput_config_dict["tpot"] / MILLISECONDS_TO_SECONDS_CONVERSION)

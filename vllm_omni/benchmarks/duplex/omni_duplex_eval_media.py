@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import io
 import logging
+import math
 import os
 import tempfile
 import wave
 from collections.abc import Iterator
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -133,9 +135,11 @@ def extract_jpeg(path: str | Path, *, timestamp: float, quality: int = 3) -> byt
     ``quality`` follows the ffmpeg ``-q:v`` convention (lower = better, 1..31)
     and is mapped to the PIL JPEG quality scale (higher = better).
 
-    After ``seek`` the function continues decoding until a frame with PTS >=
-    target_pts is found, matching the ``ffmpeg -ss`` semantic of returning the
-    first decodable frame *at or after* the requested timestamp.
+    ``timestamp`` is seconds after the video stream's first presentation time,
+    the same origin ``read_soundtrack_pcm16`` uses. After ``seek`` the function
+    continues decoding until a frame with PTS >= target_pts is found, matching
+    the ``ffmpeg -ss`` semantic of returning the first decodable frame *at or
+    after* the requested timestamp.
 
     Raises:
         ValueError: If the file contains no video stream or no frame could be decoded.
@@ -149,8 +153,11 @@ def extract_jpeg(path: str | Path, *, timestamp: float, quality: int = 3) -> byt
         stream.thread_type = _video_thread_type(stream)
         time_base = stream.time_base
         if time_base is None:
-            time_base = 1 / 90000
-        target_pts = int(max(0.0, timestamp) / time_base)
+            time_base = Fraction(1, 90000)
+        # Session time 0 is the first presented frame, not absolute PTS 0.
+        # Audio placement uses this same origin.
+        origin = _presentation_origin(container)
+        target_pts = int((origin + Fraction(max(0.0, timestamp))) / Fraction(time_base))
         container.seek(target_pts, any_frame=False, backward=True, stream=stream)
         closest_frame = None
         for frame in container.decode(stream):
@@ -169,7 +176,9 @@ def iter_jpegs(
     path: str | Path, *, fps: float = 1.0, duration: float | None = None, quality: int = 3
 ) -> Iterator[tuple[float, bytes]]:
     end = duration if duration is not None else video_duration(path)
-    step = 1.0 / fps
+    if not math.isfinite(fps) or fps <= 0 or not math.isfinite(end) or end < 0:
+        raise ValueError("fps must be finite and positive; video duration must be finite and nonnegative")
+    index = 0
     timestamp = 0.0
     while timestamp < end:
         try:
@@ -179,7 +188,10 @@ def iter_jpegs(
             break
         if frame:
             yield timestamp, frame
-        timestamp += step
+        # Repeated addition can turn the excluded endpoint into an extra frame
+        # (e.g. 4 seconds at 1.5 fps ends at 3.9999999999999996).
+        index += 1
+        timestamp = index / fps
 
 
 def read_audio_pcm16(path: str | Path) -> bytes:
@@ -218,19 +230,134 @@ def read_audio_pcm16(path: str | Path) -> bytes:
         raise
 
 
+def _presentation_origin(container: Any) -> Fraction:
+    """Return the timeline zero used by frame extraction, in seconds.
+
+    Frame requests are seconds after the video stream's first presentation
+    time, not absolute PTS. Audio has to use that same origin: a container
+    whose audio and video both start late is not silence, while audio that
+    starts later than the video is.
+    """
+    if container.streams.video:
+        stream = container.streams.video[0]
+        if stream.start_time is not None and stream.time_base is not None:
+            return Fraction(int(stream.start_time)) * Fraction(stream.time_base)
+    start = getattr(container, "start_time", None)
+    if start:
+        import av
+
+        return Fraction(int(start), int(av.time_base))
+    return Fraction(0)
+
+
+def _pcm_sample_index(frame: Any, origin: Fraction) -> int | None:
+    """Map a decoded frame onto the 16 kHz timeline, or None when it has no PTS."""
+    if frame.pts is None or frame.time_base is None:
+        return None
+    delta = Fraction(int(frame.pts)) * Fraction(frame.time_base) - origin
+    return int(round(delta * PCM16_SAMPLE_RATE))
+
+
+def read_soundtrack_pcm16(path: str | Path) -> bytes:
+    """Decode a clip's own audio track to 16 kHz mono PCM16.
+
+    The returned buffer starts at the video timeline's zero. A track with no
+    audio stream is empty. A track whose presentation time is later than the
+    video start is left-padded with silence; one that leads the video is trimmed.
+    Sample placement follows each decoded frame's PTS, so a leading offset or an
+    edit list that shifts the start stays aligned with the question audio and the
+    extracted frames.
+    """
+    import av
+    import numpy as np
+
+    try:
+        with av.open(str(path)) as container:
+            if not container.streams.audio:
+                return b""
+            origin = _presentation_origin(container)
+            resampler = av.AudioResampler(format="s16", layout="mono", rate=PCM16_SAMPLE_RATE)
+            pieces: list[tuple[int, Any]] = []
+            cursor = 0
+
+            def _take(frame: Any) -> None:
+                nonlocal cursor
+                samples = np.asarray(frame.to_ndarray(), dtype=np.int16).reshape(-1).copy()
+                if samples.size == 0:
+                    return
+                index = _pcm_sample_index(frame, origin)
+                if index is None:
+                    index = cursor
+                if index < 0:
+                    samples = samples[-index:]
+                    index = 0
+                if samples.size == 0:
+                    return
+                pieces.append((index, samples))
+                cursor = index + int(samples.size)
+
+            for frame in container.decode(audio=0):
+                for resampled in resampler.resample(frame):
+                    _take(resampled)
+            for resampled in resampler.resample(None):
+                _take(resampled)
+    except (OSError, ValueError) as exc:
+        logger.warning("Failed to read the audio track from %s: %s", path, exc)
+        raise
+    if not pieces:
+        return b""
+    end = max((index + int(samples.size) for index, samples in pieces))
+    mixed = np.zeros(end, dtype=np.int16)
+    for index, samples in pieces:
+        mixed[index : index + int(samples.size)] = samples
+    return mixed.tobytes()
+
+
+def mix_pcm16(*tracks: bytes) -> bytes:
+    """Sum PCM16 tracks sample by sample, padding to the longest and clipping to int16."""
+    import numpy as np
+
+    arrays = [np.frombuffer(track[: len(track) // 2 * 2], dtype=np.int16) for track in tracks if track]
+    if not arrays:
+        return b""
+    mixed = np.zeros(max(len(array) for array in arrays), dtype=np.int32)
+    for array in arrays:
+        mixed[: len(array)] += array
+    return np.clip(mixed, -32768, 32767).astype(np.int16).tobytes()
+
+
 def iter_av_units(
     audio_pcm16: bytes, frames: Iterator[tuple[float, bytes]], *, unit_ms: int = 1000
-) -> Iterator[tuple[bytes, bytes | None]]:
+) -> Iterator[tuple[bytes, bytes | list[bytes] | None]]:
+    """Attach every frame in each audio interval [start, end), including the tail.
+
+    Audio must cover the video timeline. Frames that cannot fit the interval or
+    the wire's two-image limit fail explicitly instead of being lost or delayed.
+    """
+    if unit_ms <= 0 or len(audio_pcm16) % PCM16_BYTES_PER_SAMPLE:
+        raise ValueError("unit_ms must be positive and PCM16 must contain whole samples")
     unit_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * unit_ms // 1000
+    bytes_per_second = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE
     frame_iter = iter(frames)
     next_frame = next(frame_iter, None)
+    previous_timestamp = -1.0
     for offset in range(0, len(audio_pcm16), unit_bytes):
-        timestamp = offset / (PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE)
-        frame = None
-        if next_frame is not None and next_frame[0] <= timestamp + unit_ms / 1000:
-            frame = next_frame[1]
+        end = min(offset + unit_bytes, len(audio_pcm16))
+        selected: list[bytes] = []
+        while next_frame is not None:
+            timestamp, frame = next_frame
+            if not math.isfinite(timestamp) or timestamp < 0 or timestamp < previous_timestamp:
+                raise ValueError("frame timestamps must be finite, nonnegative and ordered")
+            if timestamp >= end / bytes_per_second:
+                break
+            selected.append(frame)
+            if len(selected) > 2:
+                raise ValueError("Realtime permits at most two frames per audio unit; reduce fps or unit_ms")
+            previous_timestamp = timestamp
             next_frame = next(frame_iter, None)
-        yield audio_pcm16[offset : offset + unit_bytes], frame
+        yield audio_pcm16[offset:end], selected[0] if len(selected) == 1 else selected or None
+    if next_frame is not None:
+        raise ValueError("frame timestamp is outside the audio timeline")
 
 
 def _ffmpeg_q_to_pil_quality(quality: int) -> int:
