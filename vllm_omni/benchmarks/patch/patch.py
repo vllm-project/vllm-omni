@@ -2840,6 +2840,10 @@ _BENCH_AUDIO_SAVE_INDEX = itertools.count(1)
 # the first save of a process truncates it, saves within the run append.
 _BENCH_AUDIO_MANIFEST_OPENED: set[str] = set()
 _BENCH_AUDIO_MANIFEST_LOCK = threading.Lock()
+# Scheduled-but-not-yet-finished WAV dumps. The request function schedules
+# them fire-and-forget so disk I/O never holds a concurrency slot or extends
+# the timed window; the timed run flushes this set right after the gather.
+_BENCH_AUDIO_SAVE_TASKS: set[asyncio.Task[None]] = set()
 
 
 def _save_streamed_pcm_as_wav(
@@ -2912,6 +2916,33 @@ def _save_streamed_pcm_as_wav(
                 + "\n"
             )
     return path
+
+
+def _schedule_streamed_pcm_save(save_dir: str, pcm: bytes, **kwargs) -> None:
+    """Queue one WAV dump as a background task instead of awaiting it inline.
+
+    The request's latency/RTF are already recorded when this is called, so
+    saving never perturbs the metrics it documents; scheduling (instead of
+    awaiting) also means disk I/O holds no benchmark concurrency slot and
+    does not extend the timed window. The timed run flushes the queue right
+    after the request gather, so dumps always complete before the run ends.
+    """
+    task = asyncio.get_running_loop().create_task(asyncio.to_thread(_save_streamed_pcm_as_wav, save_dir, pcm, **kwargs))
+    _BENCH_AUDIO_SAVE_TASKS.add(task)
+    task.add_done_callback(_bench_audio_save_done)
+
+
+def _bench_audio_save_done(task: asyncio.Task[None]) -> None:
+    _BENCH_AUDIO_SAVE_TASKS.discard(task)
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("Streamed PCM dump failed: %s", exc)
+
+
+async def _await_pending_audio_saves() -> None:
+    """Wait for every scheduled WAV dump to land before the run is reported."""
+    if _BENCH_AUDIO_SAVE_TASKS:
+        await asyncio.gather(*list(_BENCH_AUDIO_SAVE_TASKS), return_exceptions=True)
 
 
 async def async_request_openai_audio_speech(
@@ -3031,8 +3062,7 @@ async def async_request_openai_audio_speech(
                         api_url,
                     )
                 if audio_dump is not None:
-                    await asyncio.to_thread(
-                        _save_streamed_pcm_as_wav,
+                    _schedule_streamed_pcm_save(
                         audio_save_dir,
                         bytes(audio_dump),
                         sample_rate=sample_rate,
@@ -4084,6 +4114,8 @@ async def benchmark(
             request_task = asyncio.create_task(warmup_limited_request_func(warmup_input))
             warmup_tasks.append(request_task)
         _ = await asyncio.gather(*warmup_tasks)
+        # Warmup dumps must not bleed into the timed run that follows.
+        await _await_pending_audio_saves()
 
         if warmup_pbar is not None:
             warmup_pbar.close()
@@ -4228,6 +4260,9 @@ async def benchmark(
     else:
         outputs = await asyncio.gather(*tasks)
     fail_fast_triggered = any(getattr(output, "timed_out", False) for output in outputs)
+    # The timed window ends at the gather: flush queued WAV dumps here, after
+    # it, so disk I/O never extends benchmark_duration.
+    await _await_pending_audio_saves()
 
     if probe_task is not None:
         probe_stop.set()

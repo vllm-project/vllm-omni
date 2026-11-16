@@ -797,6 +797,9 @@ async def test_audio_speech_stream_saves_wav_and_manifest(
     output = await async_request_openai_audio_speech(request_input, mock_session)
 
     assert output.success is True
+    # The dump is scheduled fire-and-forget: it lands only after the flush.
+    assert not list(tmp_path.glob("bench_*.wav"))
+    await patch._await_pending_audio_saves()
     wavs = list(tmp_path.glob("bench_*.wav"))
     assert len(wavs) == 1
     with wave.open(str(wavs[0]), "rb") as wav_file:
@@ -843,7 +846,50 @@ async def test_audio_speech_stream_without_save_dir_writes_nothing(
     output = await async_request_openai_audio_speech(request_input, mock_session)
 
     assert output.success is True
+    await patch._await_pending_audio_saves()
     assert save_spy.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_audio_speech_stream_saves_off_the_request_slot(
+    mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    # [linzeshi]: awaiting the dump inline holds a concurrency slot (visible
+    # at --max-concurrency 1) and extends the timed window. The request
+    # function must return while the dump is still running; the timed run
+    # flushes the queue after the gather.
+    import itertools
+
+    from vllm_omni.benchmarks.patch import patch
+
+    monkeypatch.setenv("VLLM_OMNI_BENCH_SAVE_AUDIO_DIR", str(tmp_path))
+    patch._BENCH_AUDIO_SAVE_INDEX = itertools.count(1)
+    real_save = patch._save_streamed_pcm_as_wav
+
+    def slow_save(*args, **kwargs):
+        time.sleep(0.3)
+        return real_save(*args, **kwargs)
+
+    mocker.patch.object(patch, "_save_streamed_pcm_as_wav", side_effect=slow_save)
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="slot check",
+        api_url="http://test.com/v1/audio/speech",
+        prompt_len=10,
+        output_len=20,
+    )
+    mock_response = MockResponse(200, [_pcm_s16le_sine(0.01, 0.5)])
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_audio_speech(request_input, mock_session)
+
+    assert output.success is True
+    # Returned before the (deliberately slow) dump landed: no slot was held.
+    assert not list(tmp_path.glob("bench_*.wav"))
+    await patch._await_pending_audio_saves()
+    assert len(list(tmp_path.glob("bench_*.wav"))) == 1
 
 
 def test_save_streamed_pcm_loud_clip_passes_through(tmp_path):

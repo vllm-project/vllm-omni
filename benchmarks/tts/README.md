@@ -132,8 +132,9 @@ sample rate, frames, duration, TTFP and RTF. Each benchmark run regenerates the
 rewrites the manifest: it always describes exactly the wav set on disk, never
 stale entries from earlier runs. Saved copies are loudness
 normalized (gain-up only, 0.95 peak clip) so a mixed set auditions
-consistently; saving runs off the event loop after the metrics are measured,
-so it never perturbs the numbers it documents.
+consistently; saving is scheduled off the request path (it holds no benchmark
+concurrency slot) and the timed run flushes pending dumps right after the
+request gather, outside the measured window.
 
 #### Add WER / SIM / UTMOS to any of the above
 
