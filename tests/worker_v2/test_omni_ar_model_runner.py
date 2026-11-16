@@ -173,7 +173,9 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
     runner.is_last_pp_rank, runner.pp_handler, runner.check_ep_fault = True, None, False
     runner.aux_output_connector = None
     runner.model_config = SimpleNamespace(async_chunk=False)
-    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(engine_output_type=engine_output_type))
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(engine_output_type=engine_output_type), kv_transfer_config=None
+    )
     text_hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     multimodal_outputs = {"codes": {"audio": torch.ones(3, 1)}}
     runner.model_state = SimpleNamespace(
@@ -273,7 +275,9 @@ def test_sample_tokens_drafts_from_target_layers_after_postprocess(monkeypatch, 
     runner.is_last_pp_rank, runner.pp_handler, runner.check_ep_fault = True, None, False
     runner.aux_output_connector = None
     runner.model_config = SimpleNamespace(async_chunk=False)
-    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(engine_output_type="text"))
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(engine_output_type="text"), kv_transfer_config=None
+    )
     runner.model = SimpleNamespace(compute_logits=lambda h: h)
     runner.model_state = SimpleNamespace(
         postprocess_model_output=MagicMock(return_value=(hidden, None)), supports_mm_inputs=False

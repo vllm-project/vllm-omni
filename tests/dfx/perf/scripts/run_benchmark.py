@@ -590,6 +590,7 @@ def _maybe_write_omniinteract_aggregate_accuracy_result(
     subsets = params.get(_OMNIINTERACT_AGGREGATE_SUBSETS)
     max_concurrency = result.get("max_concurrency")
     min_ia_qtf1 = params.get(_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1)
+    max_concurrency = result.get("max_concurrency")
     passed = not _is_finite_number(min_ia_qtf1) or pooled.ia_qtf1 >= float(min_ia_qtf1)
     write_dfx_accuracy_result(
         accuracy_path,
@@ -852,6 +853,7 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
         "duplex_eval_score_floor_hardware",
         "duplex_performance_only",
         "required_duplex_metrics",
+        "require_speculative_stage",
         "name",
         "enable_negative_prompt",
         "random_request_config",
@@ -955,6 +957,19 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
                 )
             finally:
                 _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)
+        if (stage_id := params.get("require_speculative_stage")) is not None:
+            import httpx
+            from prometheus_client.parser import text_string_to_metric_families
+
+            response = httpx.get(f"http://{host}:{port}/metrics", timeout=10)
+            response.raise_for_status()
+            assert any(
+                sample.name == "vllm:spec_decode_num_accepted_tokens_total"
+                and sample.labels.get("stage") == str(stage_id)
+                and sample.value > 0
+                for family in text_string_to_metric_families(response.text)
+                for sample in family.samples
+            ), f"Stage {stage_id} accepted no speculative tokens"
     finally:
         if artifact_root is not None:
             artifact_root.cleanup()
