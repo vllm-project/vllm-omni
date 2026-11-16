@@ -573,8 +573,10 @@ for queue updates and the final validity check before delivery.
   `duplex_session.collect_stats`. `ModelChannel` stamps each Stage-0 append's
   envelope with `duplex.perf_chunk = [epoch, seq]` (a seq retried after a failed
   submit gets a fresh id, so the aborted submit's late spans are ignored); the orchestrator copies the
-  producing step's chunk into forwarded updates and the chunk transfer adapter
-  into connector payloads. Stage schedulers (`DuplexStageWorkRecorder`) time
+  producing step's chunk into forwarded updates. Both the scheduler chunk
+  transfer adapter and the MRv2 runner's connector sender carry that identity
+  as `meta.duplex_perf_chunk` in connector payloads, so downstream stages can
+  attribute their work to the same chunk. Stage schedulers (`DuplexStageWorkRecorder`) time
   every step of a request that carries a chunk and return the spans on
   `OmniEngineCoreOutput.stage_work`, which the orchestrator hands to the
   session as it collects them. `DuplexEngineSession.perf`

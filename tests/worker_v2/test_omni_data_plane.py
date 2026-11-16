@@ -314,6 +314,52 @@ def _stop_save_thread(plane):
     assert not plane._save_thread.is_alive()
 
 
+@pytest.mark.parametrize("structured", [False, True])
+@pytest.mark.parametrize("measured", [False, True])
+@pytest.mark.parametrize("batched", [False, True])
+def test_native_chunks_preserve_duplex_perf_identity(raw_plane, structured, measured, batched):
+    from vllm_omni.data_entry_keys import OmniPayloadStruct, to_dict, to_struct
+    from vllm_omni.worker.scheduling_metadata_adapter import DefaultSchedulingMetadataAdapter
+
+    sent = []
+
+    class Connector:
+        def put(self, *, data, **_kwargs):
+            sent.append(to_dict(data) if isinstance(data, OmniPayloadStruct) else data)
+            return True, 0, None
+
+    _start_save_thread(raw_plane, Connector())
+    request = _new_request()
+    if measured:
+        request.model_intermediate_buffer = {"duplex": {"perf_chunk": [2, 7]}}
+    payload = {"codes": {"audio": torch.tensor([21])}, "meta": {"next_stage_prompt_len": 1}}
+    if structured:
+        payload = to_struct(payload)
+
+    def build_payloads(*, transfer_manager, pooling_outputs, requests, is_finished):
+        return [payload for _ in requests]
+
+    def build_payload(*, transfer_manager, pooling_output, request, is_finished):
+        return payload
+
+    raw_plane._custom_process_batch_func = build_payloads if batched else None
+    raw_plane._custom_process_func = build_payload
+    try:
+        raw_plane.register_request(request)
+        assert _complete(raw_plane, [{"codes.audio": torch.tensor([21])}]) == 1
+        (received,) = sent
+        metadata = DefaultSchedulingMetadataAdapter().extract(received, model_mode="generation")
+        assert metadata is not None
+        assert metadata.duplex_perf_chunk == ((2, 7) if measured else None)
+        assert metadata.prompt_token_ids == (21,)
+        # Stamping transport metadata must not alter the builder's payload.
+        original = to_dict(payload) if structured else payload
+        assert "duplex_perf_chunk" not in original["meta"]
+        assert received["codes"]["audio"] is original["codes"]["audio"]
+    finally:
+        _stop_save_thread(raw_plane)
+
+
 class _Output:
     copy_event = None
 

@@ -18,7 +18,8 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 from vllm.distributed.parallel_state import get_tp_group
 
-from vllm_omni.data_entry_keys import OmniPayload, returns_stage_payload
+from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer
+from vllm_omni.data_entry_keys import OmniPayload, OmniPayloadStruct, returns_stage_payload, to_dict
 from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime import (
     _OmniConnectorRuntimeMixin,
     logger,
@@ -1645,6 +1646,17 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         wait_for_delivery: bool = False,
     ) -> tuple[bool, Any | None]:
         """Enqueue an already-built payload under its per-request chunk key."""
+        # Native MRv2 sends bypass the scheduler's chunk transfer adapter.
+        # Carry the measured request's identity so downstream work reaches
+        # the same session turn. Copy metadata only; builder tensors stay shared.
+        perf_chunk = perf_chunk_from_buffer(getattr(request, "model_intermediate_buffer", None))
+        if perf_chunk is not None:
+            if isinstance(payload_data, OmniPayloadStruct):
+                payload_data = to_dict(payload_data)
+            payload_data = {
+                **payload_data,
+                "meta": {**(payload_data.get("meta") or {}), "duplex_perf_chunk": list(perf_chunk)},
+            }
         raw_req_id = getattr(request, "request_id", None) or getattr(request, "req_id", None)
         request_id = self._resolve_external_req_id(request, raw_req_id)
         if raw_req_id and raw_req_id != request_id:
