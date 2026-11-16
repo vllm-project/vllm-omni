@@ -65,6 +65,10 @@ OMNI_PROCESSOR_TEST = "tests/model_executor/models/test_omni_processing.py"
 OMNI_PROCESSOR_TIMING_ENV = "VLLM_OMNI_AMD_PROCESSOR_TIMING"
 QWEN_IMAGE_SMOKE_LABEL = "Qwen-Image Official-Weight Smoke"
 QWEN_IMAGE_SMOKE_NODE = "tests/e2e/online_serving/test_qwen_image.py::test_text_to_image_001[default]"
+NIGHTLY_CROSS_PIPELINE_PARITY_OWNER_LABELS = (
+    "Wan2.2 Diffusers Backend Similarity",
+    "Qwen-Image Diffusers Accuracy",
+)
 TINY_DIFFUSION_PATH = "tests/model_tests/diffusion/test_common_offline.py"
 TINY_DIFFUSION_JOBS = (
     (
@@ -164,6 +168,19 @@ def _steps_selecting_node(pipeline_path: Path, node: str) -> list[dict]:
         for step in _walk_steps(pipeline["steps"])
         if any(node in split(command) for command in step.get("commands", []))
     ]
+
+
+@pytest.mark.parametrize("label", NIGHTLY_CROSS_PIPELINE_PARITY_OWNER_LABELS)
+def test_cross_pipeline_parity_nightly_owner_is_blocking(label: str) -> None:
+    pipeline = yaml.safe_load(AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8"))
+    matches = [step for step in _walk_steps(pipeline["steps"]) if step.get("label") == label]
+
+    assert len(matches) == 1
+    step = matches[0]
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "Blocking"
+    assert "retry" not in step
 
 
 def test_qwen_image_has_one_amd_official_weight_nightly_owner() -> None:
@@ -2848,9 +2865,9 @@ def test_amd_runner_preserves_piped_failures_and_empty_collection() -> None:
     assert template.count("soft_fail: true") == 2
 
 
-def test_qwen_image_diffusers_accuracy_is_one_nonblocking_nightly_job() -> None:
+def test_qwen_image_diffusers_accuracy_is_one_blocking_nightly_job() -> None:
     step = _find_step("Qwen-Image Diffusers Accuracy", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
