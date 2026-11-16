@@ -36,7 +36,7 @@ from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniServer
 from tests.helpers.stage_config import get_deploy_config_path
 
-pytestmark = [pytest.mark.advanced_model, pytest.mark.omni, *hardware_marks(res={"cuda": "H100"}, num_cards=2)]
+pytestmark = [pytest.mark.full_model, pytest.mark.omni, *hardware_marks(res={"cuda": "H100"}, num_cards=2)]
 
 MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 REVISION = "26291f793822fb6be9555850f06dfe95f2d7e695"
