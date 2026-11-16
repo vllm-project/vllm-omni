@@ -120,7 +120,6 @@ def test_npu_rmsnorm_unsupported_layouts_use_native(mocker, npu_runtime, shape, 
 @pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires NPU")
 @pytest.mark.parametrize("angle_ndim", [2, 3])
 def test_real_npu_rope_fp32_partial_rotation_matches_native(mocker, npu_runtime, angle_ndim):
-    pytest.importorskip("mindiesd")
     generator = torch.Generator().manual_seed(17)
     # MAGI-2 normalizes Q/K to FP32 and casts to checkpoint dtype after RoPE.
     x = torch.randn(1, 11, 3, 128, generator=generator)
@@ -131,8 +130,7 @@ def test_real_npu_rope_fp32_partial_rotation_matches_native(mocker, npu_runtime,
     expected = native_apply_rotary_emb(x, cos, sin)
     device_x = x.to("npu").transpose(1, 2).contiguous().transpose(1, 2)
     assert not device_x.is_contiguous()
-    assert npu_rope._HAS_MINDIESD
-    provider = mocker.spy(npu_rope, "apply_rotary_emb_mindiesd")
+    provider = mocker.spy(npu_rope, "apply_rotary_emb_torch_npu")
     fallback = mocker.spy(npu_rope, "native_apply_rotary_emb")
 
     with torch.inference_mode():
@@ -153,24 +151,20 @@ def test_real_npu_rope_fp32_partial_rotation_matches_native(mocker, npu_runtime,
 @hardware_test(res={"npu": "A5"}, num_cards=1)
 @pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires NPU")
 @pytest.mark.parametrize(
-    "batch,shared_angles,interleaved,has_mindiesd",
+    "batch,shared_angles,interleaved",
     [
-        pytest.param(2, False, False, True, id="batch-specific-angles"),
-        pytest.param(1, True, True, True, id="interleaved"),
-        pytest.param(1, True, False, False, id="without-mindiesd"),
+        pytest.param(2, False, False, id="batch-specific-angles"),
+        pytest.param(1, True, True, id="interleaved"),
     ],
 )
-def test_npu_rope_unsupported_contracts_use_native(
-    mocker, monkeypatch, npu_runtime, batch, shared_angles, interleaved, has_mindiesd
-):
+def test_npu_rope_unsupported_contracts_use_native(mocker, npu_runtime, batch, shared_angles, interleaved):
     generator = torch.Generator().manual_seed(23)
     x = torch.randn(batch, 11, 3, 128, generator=generator)
     angle_shape = (11, 48) if shared_angles else (batch, 11, 48)
     angles = torch.randn(angle_shape, generator=generator)
     cos, sin = angles.cos(), angles.sin()
     expected = native_apply_rotary_emb(x, cos, sin, interleaved=interleaved)
-    monkeypatch.setattr(npu_rope, "_HAS_MINDIESD", has_mindiesd)
-    provider = mocker.spy(npu_rope, "apply_rotary_emb_mindiesd")
+    provider = mocker.spy(npu_rope, "apply_rotary_emb_torch_npu")
     fallback = mocker.spy(npu_rope, "native_apply_rotary_emb")
 
     with torch.inference_mode():
@@ -184,14 +178,13 @@ def test_npu_rope_unsupported_contracts_use_native(
 
 @pytest.mark.cpu
 @pytest.mark.parametrize("interleaved", [False, True])
-def test_npu_rope_cpu_inputs_use_native(mocker, monkeypatch, interleaved):
+def test_npu_rope_cpu_inputs_use_native(mocker, interleaved):
     generator = torch.Generator().manual_seed(29)
     x = torch.randn(1, 7, 2, 64, generator=generator)
     angles = torch.randn(7, 24, generator=generator)
     cos, sin = angles.cos(), angles.sin()
     expected = native_apply_rotary_emb(x, cos, sin, interleaved=interleaved)
-    monkeypatch.setattr(npu_rope, "_HAS_MINDIESD", True)
-    provider = mocker.spy(npu_rope, "apply_rotary_emb_mindiesd")
+    provider = mocker.spy(npu_rope, "apply_rotary_emb_torch_npu")
     fallback = mocker.spy(npu_rope, "native_apply_rotary_emb")
 
     actual = npu_rope.apply_rotary_emb(x, cos, sin, interleaved=interleaved)
