@@ -33,7 +33,7 @@ steps:
         agent_pool: mi300_1
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 120
         source_file_dependencies: diffusion_wan22_accuracy
         env:
@@ -818,7 +818,7 @@ steps:
       - label: "Qwen-Image Diffusers Accuracy"
         agent_pool: mi300_1
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: diffusion_qwen_image_accuracy
         env:
