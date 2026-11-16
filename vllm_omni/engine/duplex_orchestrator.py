@@ -656,6 +656,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         state = self.request_states.get(request_id) if isinstance(request_id, str) else None
         prompt = kwargs.get("prompt")
         complete_turn = None
+        prepare_prompt = None
         prefix = None
         capabilities = self.plugin.capabilities(max_sessions=self.duplex_session_config.max_sessions)
         if (
@@ -685,44 +686,27 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 prompt_tokenizer = state.turn_prompt_tokenizer
                 complete_turn = prompt_tokenizer.complete_turn
 
-                def tokenize() -> tuple[dict, list[int] | None]:
-                    # Tokenizer instances can be shared by stage processors.
-                    # Use the same worker-thread lock as upstream preprocessing.
-                    with self._prompt_processing_lock:
-                        prepared, prefix = prompt_tokenizer.prepare_turn(prompt)
-                        prepared = dict(prepared)
-                        text = prepared.pop("prompt")
-                        if defaults is not None:
-                            # Preserve upstream's character-length validation
-                            # and pre-truncation before replacing text with IDs.
-                            text = defaults.apply_pre_tokenization(tokenizer, {"prompt": text})["prompt"]
-                        prepared["prompt_token_ids"] = prompt_tokenizer.tokenize(text)
-                        return prepared, prefix
+                def tokenize() -> dict:
+                    # The base worker owns the shared tokenizer lock and joins
+                    # both tokenization and multimodal processing on cancellation.
+                    nonlocal prefix
+                    prefix = prompt_tokenizer.prepare_turn(prompt)
+                    prepared = dict(prompt)
+                    text = prepared.pop("prompt")
+                    if defaults is not None:
+                        # Preserve upstream's character-length validation
+                        # and pre-truncation before replacing text with IDs.
+                        text = defaults.apply_pre_tokenization(tokenizer, {"prompt": text})["prompt"]
+                    prepared["prompt_token_ids"] = prompt_tokenizer.tokenize(text)
+                    return prepared
 
-                task = asyncio.create_task(asyncio.to_thread(tokenize))
-                try:
-                    prepared, prefix = await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    # Finish updating this request-owned cache before another
-                    # append can acquire the stage's input submission guard.
-                    while not task.done():
-                        try:
-                            await asyncio.shield(task)
-                        except asyncio.CancelledError:
-                            continue
-                        except Exception:
-                            break
-                    if not task.cancelled():
-                        task.exception()
-                    raise
-                kwargs["prompt"] = prepared
-        request = await super()._process_stage_inputs(stage_id, **kwargs)
+                prepare_prompt = tokenize
+        request = await super()._process_stage_inputs(stage_id, prepare_prompt=prepare_prompt, **kwargs)
         if stage_id == 0 and isinstance(state, DuplexOrchestratorRequestState):
             self._validate_turn_history(state, state.input_history_revision)
         if complete_turn is not None:
-            assert isinstance(prompt, dict)
             request = OmniEngineCoreRequest.from_request(request)
-            complete_turn(prompt, request, prefix)
+            complete_turn(request, prefix)
         return request
 
     async def _build_next_stage_request(self, req_id, next_stage_id, next_input, params, **kwargs):
@@ -743,13 +727,21 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         return await super()._build_next_stage_request(req_id, next_stage_id, next_input, params, **kwargs)
 
     def _process_stage_inputs_in_worker(
-        self, stage_id: int, *, validate_input_tokens: Callable[[int], None] | None = None, **kwargs: Any
+        self,
+        stage_id: int,
+        *,
+        prepare_prompt: Callable[[], dict] | None = None,
+        validate_input_tokens: Callable[[int], None] | None = None,
+        **kwargs: Any,
     ) -> EngineCoreRequest:
         """Own duplex renderer adaptation inside the shared, joined worker.
 
-        Render once before backend length admission, preserving exact recoverable
-        capacity errors and reusing the engine input's multimodal features.
+        Run optional turn tokenization under the same lock as preprocessing.
+        Capacity-checked snapshots render once before backend length admission,
+        preserving recoverable errors and reusing the input's multimodal features.
         """
+        if prepare_prompt is not None:
+            kwargs["prompt"] = prepare_prompt()
         if validate_input_tokens is None:
             return super()._process_stage_inputs_in_worker(stage_id, **kwargs)
         processor = self._get_stage_input_processor(stage_id)

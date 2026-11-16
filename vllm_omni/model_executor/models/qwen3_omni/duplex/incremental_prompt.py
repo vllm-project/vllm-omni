@@ -38,15 +38,15 @@ class QwenIncrementalPrompt:
             and self.tokenizer.decode(self._output_ids[:-1], skip_special_tokens=False) == assistant_text
         )
 
-    def prepare_turn(self, prompt: dict) -> tuple[dict, list[int] | None]:
-        """Use the session-authorized delta, or process a replacement snapshot."""
+    def prepare_turn(self, prompt: dict) -> list[int] | None:
+        """Return accepted prefix tokens for a delta, or None for a snapshot."""
         if prompt.get(DUPLEX_TURN_DELTA_KEY):
             if not self._finished or not self._output_ids or not self._append_safe:
                 raise ValueError("Turn delta has no completed resident token ledger")
-            return prompt, self._prompt_ids + self._output_ids[:-1]
-        return prompt, None
+            return self._prompt_ids + self._output_ids[:-1]
+        return None
 
-    def complete_turn(self, prompt: dict, request: OmniEngineCoreRequest, prefix: list[int] | None) -> None:
+    def complete_turn(self, request: OmniEngineCoreRequest, prefix: list[int] | None) -> None:
         if prefix is not None:
             request.append_prefix_length = len(prefix)
             request.prompt_token_ids = prefix + (request.prompt_token_ids or [])

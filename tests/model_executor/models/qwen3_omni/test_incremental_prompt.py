@@ -80,7 +80,7 @@ def test_turn_delta_keeps_sampled_tokens_and_only_new_media(tokenizer, change):
         data_parallel_rank=None,
     )
     cache.tokenize(first["prompt"])
-    cache.complete_turn(first, request, None)
+    cache.complete_turn(request, None)
     generated = tokenizer.encode("hello", add_special_tokens=False)
     cache.record_output(generated, False)
     cache.record_output([tokenizer.convert_tokens_to_ids("<|im_end|>")], change != "unfinished")
@@ -89,7 +89,7 @@ def test_turn_delta_keeps_sampled_tokens_and_only_new_media(tokenizer, change):
         change not in {"assistant", "unfinished"}
     )
     if change in {"assistant", "unfinished"}:
-        assert cache.prepare_turn(first) == (first, None)
+        assert cache.prepare_turn(first) is None
         return
     delta = {
         DUPLEX_TURN_DELTA_KEY: True,
@@ -97,11 +97,10 @@ def test_turn_delta_keeps_sampled_tokens_and_only_new_media(tokenizer, change):
         "multi_modal_data": {"audio": ["new audio"]},
         "multi_modal_uuids": {"audio": ["rep0:new"]},
     }
-    prepared, prefix = cache.prepare_turn(delta)
-    assert prepared is delta
+    prefix = cache.prepare_turn(delta)
     assert prefix == [11, 12, 13] + generated
     request.prompt_token_ids = [21, 22]
-    cache.complete_turn(delta, request, prefix)
+    cache.complete_turn(request, prefix)
     assert request.prompt_token_ids == prefix + [21, 22]
     assert request.for_engine_submission().prompt_token_ids == [21, 22]
     assert request.prompt_token_ids == prefix + [21, 22]

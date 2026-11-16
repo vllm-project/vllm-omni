@@ -182,6 +182,32 @@ def test_direct_turn_delta_reuses_resident_blocks_without_snapshot_hashes():
     assert list(request.output_token_ids) == [888]
 
 
+@pytest.mark.parametrize("delta", [False, True])
+@pytest.mark.parametrize("prompt_length", [127, 128])
+def test_turn_continuation_context_limit_includes_resident_prefix(delta, prompt_length):
+    scheduler = _scheduler()
+    request = _request(list(range(33)))
+    lookahead = _stop_with_in_flight_decode(scheduler, request)
+    assert not scheduler.update_from_output(lookahead, _output(request, 777))
+    prefix = list(range(34))
+    tokens = prefix + [999] * (prompt_length - len(prefix))
+    update = _request(tokens[len(prefix) :] if delta else tokens)
+    if delta:
+        update.append_prefix_length = len(prefix)
+        update.append_prefix_digest = token_prefix_digest(prefix)
+    scheduler.add_request(update)
+    if prompt_length == scheduler.max_model_len:
+        assert request.status == RequestStatus.FINISHED_ERROR
+        assert request.request_id not in scheduler.requests
+        assert "128 tokens" in scheduler._streaming_context_overflow[request.request_id][1]
+        assert not scheduler.kv_cache_manager.get_block_ids(request.request_id)[0]
+    else:
+        assert request.status == RequestStatus.WAITING
+        assert request.prompt_token_ids == tokens
+        assert request.num_computed_tokens == (32 if delta else 0)
+    assert scheduler.num_waiting_for_streaming_input == 0
+
+
 @pytest.mark.parametrize("stale", ["length", "content", "missing"])
 def test_stale_turn_delta_fails_only_its_request(stale):
     scheduler = _scheduler()

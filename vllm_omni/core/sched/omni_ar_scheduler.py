@@ -1628,7 +1628,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self._resume_from_turn_delta(session, update)
             return
         if getattr(update, "resume_from_full_prompt", False):
-            self._resume_from_full_prompt(session, update)
+            self._resume_turn(session, update)
             return
         self._new_prompt_len_snapshot[req_id] = len(update.prompt_token_ids)
         outstanding_async_tokens = getattr(session, "num_output_placeholders", 0)
@@ -1849,12 +1849,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Retain only complete blocks that still have physical KV. Replay the
         # partial block for the stage-output cache; after reclamation, ordinary
         # scheduling and APC recover the entire logical prefix instead.
-        snapshot = replace(
+        continuation = replace(
             update,
-            prompt_token_ids=session._all_token_ids[:prefix_length] + (update.prompt_token_ids or []),
+            prompt_token_ids=session._all_token_ids[retained:prefix_length] + (update.prompt_token_ids or []),
             mm_features=features,
         )
-        self._resume_from_full_prompt(session, snapshot, retained_prefix=retained)
+        self._resume_turn(session, continuation, retained_prefix=retained)
         logger.debug(
             "Resident turn delta request=%s prefix=%d appended=%d retained=%d",
             session.request_id,
@@ -1863,35 +1863,32 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             retained,
         )
 
-    def _resume_from_full_prompt(
-        self, session: Request, update: StreamingUpdate, *, retained_prefix: int | None = None
-    ) -> None:
-        """Continue a validated turn delta on resident KV, or rebuild a snapshot.
+    def _resume_turn(self, session: Request, update: StreamingUpdate, *, retained_prefix: int | None = None) -> None:
+        """Install a turn suffix after retained KV, or rebuild a full snapshot.
 
-        A full snapshot releases the resident allocation and restarts from no
-        computed tokens, so upstream prefix caching re-matches every unchanged
-        block, including multimodal identities and cache salt.
+        Tokens start at retained_prefix; media descriptors have absolute offsets.
+        None means a full snapshot: release KV and let upstream prefix caching
+        re-match unchanged blocks, including multimodal identities and salt.
         """
-        if self._streaming_update_overflows(session, update, projected_len=len(update.prompt_token_ids)):
+        retained = retained_prefix or 0
+        if self._streaming_update_overflows(session, update, projected_len=retained + len(update.prompt_token_ids)):
             return
         if retained_prefix is None:
             self._release_replaced_streaming_prompt_cache(session)
-            retained = 0
         else:
-            retained = retained_prefix
             # Encoder-cache entries are indexed by feature within the request.
             # The delta re-indexes features after the retained KV; do not let
             # those indices reuse the previous turn's encoder state.
             self.encoder_cache_manager.free(session)
         self._reset_streaming_session_replacement_state(session)
 
-        # Adapt the full snapshot to upstream's streaming-input contract: a
+        # Adapt the turn to upstream's streaming-input contract: a
         # computed prefix, one uncomputed token to discard, and an input delta.
         # Keeping that lookahead also satisfies upstream versions which trim
         # at num_tokens - 1 instead of num_computed_tokens. No synthetic token
         # reaches the worker: upstream discards it before installing the delta.
-        session._all_token_ids[:] = session._all_token_ids[: retained + 1]
-        session.prompt_token_ids = list(session._all_token_ids[:retained])
+        del session._all_token_ids[retained + 1 :]
+        session.prompt_token_ids = session._all_token_ids[:retained]
         session.num_prompt_tokens = retained
         session.num_computed_tokens = retained
         del session.block_hashes[retained // self.hash_block_size :]
@@ -1905,13 +1902,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 session.mm_features.append(feature)
             else:
                 # Upstream rebases delta features in place; clone descriptors
-                # so the caller's full snapshot keeps its absolute positions.
+                # so the caller's input keeps its absolute positions.
                 delta_features.append(
                     replace(
                         feature, mm_position=replace(feature.mm_position, offset=feature.mm_position.offset - retained)
                     )
                 )
-        delta = replace(update, prompt_token_ids=update.prompt_token_ids[retained:], mm_features=delta_features)
+        delta = replace(update, mm_features=delta_features)
         super()._update_request_as_session(session, delta)
 
         # Omni transport and queue ownership remain separate from upstream's

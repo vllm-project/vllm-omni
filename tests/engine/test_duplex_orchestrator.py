@@ -1314,29 +1314,43 @@ async def test_a_dead_replica_closes_the_sessions_it_was_serving() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("worker_error", [False, True])
-async def test_incremental_tokenization_cancellation_joins_worker(monkeypatch, worker_error):
+@pytest.mark.parametrize("phase", ["tokenization", "multimodal"])
+async def test_incremental_tokenization_cancellation_joins_worker(mocker, worker_error, phase):
     started = threading.Event()
     release = threading.Event()
     finished = threading.Event()
 
     from vllm_omni.model_executor.models.qwen3_omni.duplex.incremental_prompt import QwenIncrementalPrompt
 
+    def pause_worker(at):
+        if at != phase:
+            return
+        started.set()
+        try:
+            assert release.wait(timeout=5)
+            if worker_error:
+                raise ValueError("input processing failed after cancellation")
+        finally:
+            finished.set()
+
     class BlockingTokenizer(QwenIncrementalPrompt):
         def tokenize(self, text: str) -> list[int]:
-            started.set()
-            try:
-                assert release.wait(timeout=5)
-                if worker_error:
-                    raise ValueError("tokenization failed after cancellation")
-                return [1, 2]
-            finally:
-                finished.set()
+            pause_worker("tokenization")
+            return [1, 2]
+
+    def process_inputs(**kwargs):
+        pause_worker("multimodal")
+        return None  # Cancellation discards the worker result before ledger commit.
 
     orchestrator, _, _, _ = _build(plugin=Qwen3OmniDuplexPlugin(_encode_audio), async_chunk=True)
-    orchestrator.request_states["r"] = DuplexOrchestratorRequestState(
-        request_id="r", turn_prompt_tokenizer=BlockingTokenizer(None)
+    ledger = BlockingTokenizer(None)
+    commit = mocker.spy(ledger, "complete_turn")
+    orchestrator.request_states["r"] = DuplexOrchestratorRequestState(request_id="r", turn_prompt_tokenizer=ledger)
+    mocker.patch.object(
+        orchestrator,
+        "_get_stage_input_processor",
+        return_value=mocker.Mock(spec=InputProcessor, process_inputs=process_inputs),
     )
-    monkeypatch.setattr(orchestrator, "_get_stage_input_processor", lambda stage_id: None)
     task = asyncio.create_task(orchestrator._process_stage_inputs(0, request_id="r", prompt={"prompt": "hello"}))
     try:
         assert await asyncio.to_thread(started.wait, 5)
@@ -1351,6 +1365,7 @@ async def test_incremental_tokenization_cancellation_joins_worker(monkeypatch, w
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=5)
     assert finished.is_set()
+    commit.assert_not_called()
 
 
 @pytest.mark.asyncio
