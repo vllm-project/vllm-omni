@@ -78,8 +78,8 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`fishaudio/Drama-3.md`](./fishaudio/Drama-3.md) | Online serving for TTS | 1x H200 141GB / 2x Ascend 910B 64GB |
 | [`fishaudio/Fish-Speech-S2-Pro.md`](./fishaudio/Fish-Speech-S2-Pro.md) | Online serving for TTS | 1x A800 80GB |
 | [`Helios/Helios.md`](./Helios/Helios.md) | Text-to-video, image-to-video, and video-to-video generation | 1x NVIDIA H20 |
-| [`hexgrad/Kokoro-82M-A6000.md`](./hexgrad/Kokoro-82M-A6000.md) | Online + offline TTS with 54 built-in voices (streaming PCM/WAV, SSE) | 1x RTX A6000 48GB |
 | [`HiDream-ai/HiDream-O1-Image.md`](./HiDream-ai/HiDream-O1-Image.md) | Text-to-image with shared offline example | 1x or 2x H100 80GB |
+| [`higurashi-ai/Haru-4B-H200.md`](./higurashi-ai/Haru-4B-H200.md) | Live full-duplex spoken dialogue over `/v1/realtime?duplex=1` (character card + voice reference) | 1x NVIDIA H200 141GB |
 | [`inclusionAI/Ming-3.0-audio-flash.md`](./inclusionAI/Ming-3.0-audio-flash.md) | Online multilingual ASR and speech QA with optional 44.1 kHz speech output | 4x 80GB GPU / 2x H200 141GB |
 | [`inclusionAI/Ming-flash-omni-2.0.md`](./inclusionAI/Ming-flash-omni-2.0.md) | Online serving for multimodal chat + standalone TTS | 4x H100 / 1x H100 80GB |
 | [`inclusionAI/Ming-omni-tts.md`](./inclusionAI/Ming-omni-tts.md) | Offline + online dense Ming TTS/audio generation | 1x H100 80GB / 1x AMD MI300X (ROCm 7.2) |
@@ -106,7 +106,6 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`Kandinsky/Kandinsky6-TI2VA.md`](./Kandinsky/Kandinsky6-TI2VA.md) | Text/image-to-video-and-audio, offline and `/v1/videos` | 1x H100 80GB with CPU offload; 2x H100 for parallel modes |
 | [`LTX/LTX-2.md`](./LTX/LTX-2.md) | LTX-2/LTX-2.3 text-to-video and image-to-video with synchronized audio | H200 141GB / 96GB-class GPU / 1x Intel Arc Pro B70 32GB |
 | [`LTX/LTX-2.5.md`](./LTX/LTX-2.5.md) | LTX-2.5-Diffusers: Full/SFT one-stage and distilled two-stage T2V/I2V with synchronized audio | NVIDIA B300; cuDNN-qualified / 1x Intel Arc Pro B70 32GB |
-| [`JD/JoyAI-Image-Edit.md`](./JD/JoyAI-Image-Edit.md) | Text-guided single-image editing | 1x H800 PCIe 80GB |
 | [`m-a-p/SheetSage2-H200.md`](./m-a-p/SheetSage2-H200.md) | Official audio-to-score preprocessing and YuE2 request export | 1x H200 141GB |
 | [`m-a-p/YuE2-3B.md`](./m-a-p/YuE2-3B.md) | Offline and online text-to-music with optional ABC score | 1x RTX 4090 24GB |
 | [`MammothModa2/MammothModa2.md`](./MammothModa2/MammothModa2.md) | Preview and Dev text-to-image (AR → DiT); Dev text/image understanding | Preview: 1x L40S 48GB / 1x ≥40GB GPU; Dev: 1x NVIDIA GPU with sufficient cache headroom |
