@@ -1724,7 +1724,7 @@ stages:
             load_deploy_config(Path(get_deploy_config_path("qwen3_omni_moe.yaml"))),
             platform=platform,
         )
-        expect_v2 = platform in {"cuda", "npu"}
+        expect_v2 = platform in {"cuda", "npu", "xpu"}
         if not expect_v2:
             with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
                 merge_pipeline_deploy(pipeline, deploy)
@@ -3363,9 +3363,11 @@ class TestPlatformOverrides:
             "minicpmo_4_5_turn.yaml",
             "minicpmo_4_5_duplex_h200.yaml",
         )
+        # XPU has no V1 fallback: vLLM 0.34 removed Model Runner V1.
+        xpu_full_mrv2 = platform == "xpu" and filename in ("qwen3_tts.yaml", "moss_tts_nano.yaml")
         if platform == "cuda":
             expected_runner = cuda_default_runner
-        elif npu_full_mrv2:
+        elif npu_full_mrv2 or xpu_full_mrv2:
             expected_runner = "v2"
         else:
             expected_runner = "v1"
@@ -3381,7 +3383,7 @@ class TestPlatformOverrides:
         stages = merge_pipeline_deploy(pipeline, deploy)
         if platform == "cuda":
             expected = [stage.stage_id not in cuda_v1_stages for stage in stages]
-        elif npu_full_mrv2:
+        elif npu_full_mrv2 or xpu_full_mrv2:
             expected = [True for _ in stages]
         else:
             expected = [False for _ in stages]

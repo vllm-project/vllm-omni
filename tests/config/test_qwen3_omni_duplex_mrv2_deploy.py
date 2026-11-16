@@ -36,7 +36,16 @@ def test_duplex_mrv2_cuda_profile(monkeypatch) -> None:
     assert connector["talker_first_audio"] is True
 
 
-@pytest.mark.parametrize("platform", ["npu", "xpu", "rocm", "musa"])
+def test_duplex_mrv2_profile_runs_v2_on_xpu(monkeypatch) -> None:
+    # XPU has no V1 fallback: vLLM 0.34 removed Model Runner V1.
+    monkeypatch.setattr(current_omni_platform, "device_name", "xpu")
+    config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform="xpu")
+    assert config.model_runner == "v2"
+    stages = merge_pipeline_deploy(QWEN3_OMNI_PIPELINE, config)
+    assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [True, True, True]
+
+
+@pytest.mark.parametrize("platform", ["npu", "rocm", "musa"])
 def test_duplex_mrv2_profile_keeps_non_cuda_on_v1(monkeypatch, platform) -> None:
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
     config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform=platform)

@@ -691,53 +691,41 @@ def test_xpu_workers_reuse_omni_gpu_worker_base(module_name, class_name):
         ("vllm_omni.platforms.xpu.worker.xpu_generation_worker", "XPUGenerationWorker", "XPUOmniGenerationModelRunner"),
     ],
 )
-@pytest.mark.parametrize("use_v2", [False, True])
-def test_xpu_workers_build_only_the_selected_runner(monkeypatch, module_name, class_name, v2_runner, use_v2):
+def test_xpu_workers_always_build_the_v2_runner(monkeypatch, module_name, class_name, v2_runner):
+    # vLLM 0.34 removed Model Runner V1: the XPU workers have no runner choice.
     module = pytest.importorskip(module_name)
     worker_cls = getattr(module, class_name)
+    v2_module = pytest.importorskip("vllm_omni.platforms.xpu.worker.xpu_omni_v2_model_runner")
+    assert worker_cls.model_runner_cls is getattr(v2_module, v2_runner)
+    assert worker_cls.use_v2_model_runner is True
+
     built = []
 
-    def fake_runner(name):
-        def build(vllm_config, device):
-            built.append((name, vllm_config, device))
-            return name
+    def fake_runner(vllm_config, device):
+        built.append((vllm_config, device))
+        return "v2"
 
-        return build
-
-    monkeypatch.setattr(worker_cls, "model_runner_cls", staticmethod(fake_runner("v1")))
-    v2_module = pytest.importorskip("vllm_omni.platforms.xpu.worker.xpu_omni_v2_model_runner")
-    monkeypatch.setattr(v2_module, v2_runner, fake_runner("v2"))
+    monkeypatch.setattr(worker_cls, "model_runner_cls", staticmethod(fake_runner))
     worker = worker_cls.__new__(worker_cls)
-    worker.use_v2_model_runner = use_v2
     worker.vllm_config, worker.device = object(), "xpu:0"
 
-    assert worker._make_model_runner() == ("v2" if use_v2 else "v1")
-    assert built == [("v2" if use_v2 else "v1", worker.vllm_config, worker.device)]
+    assert worker._make_model_runner() == "v2"
+    assert built == [(worker.vllm_config, worker.device)]
 
 
-@pytest.mark.parametrize("use_v2", [False, True])
-def test_xpu_generation_worker_v2_warmup_skips_kv_cache_and_sampler_warmup(monkeypatch, use_v2):
-    # Mirrors GPUGenerationWorker: a v2 generation stage has no KV cache or
+def test_xpu_generation_worker_warmup_skips_kv_cache_and_sampler_warmup(monkeypatch):
+    # Mirrors GPUGenerationWorker: a V2 generation stage has no KV cache or
     # sampler, so it only profiles and captures the auxiliary graphs.
     module = pytest.importorskip("vllm_omni.platforms.xpu.worker.xpu_generation_worker")
     worker_cls = module.XPUGenerationWorker
     calls = []
     parent = next(cls for cls in worker_cls.__mro__[1:] if "compile_or_warm_up_model" in vars(cls))
-
-    def parent_warmup(_self):
-        calls.append("super")
-        return "v1-times"
-
-    monkeypatch.setattr(parent, "compile_or_warm_up_model", parent_warmup)
+    monkeypatch.setattr(parent, "compile_or_warm_up_model", lambda _self: calls.append("super"))
     worker = worker_cls.__new__(worker_cls)
-    worker.use_v2_model_runner = use_v2
     worker.model_runner = SimpleNamespace(profile_run=lambda: calls.append("profile_run"))
     worker._capture_auxiliary_graphs = lambda: calls.append("capture_auxiliary_graphs")
 
     times = worker.compile_or_warm_up_model()
 
-    if use_v2:
-        assert calls == ["profile_run", "capture_auxiliary_graphs"]
-        assert times.encoder == 0.0 and times.language_model >= 0.0
-    else:
-        assert calls == ["super"] and times == "v1-times"
+    assert calls == ["profile_run", "capture_auxiliary_graphs"]
+    assert times.encoder == 0.0 and times.language_model >= 0.0

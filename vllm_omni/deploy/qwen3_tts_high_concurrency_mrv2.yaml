@@ -5,8 +5,6 @@ model_runner: v2
 platforms:
   npu:
     model_runner: v1
-  xpu:
-    model_runner: v1
   rocm:
     model_runner: v1
   musa:

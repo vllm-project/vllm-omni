@@ -148,7 +148,6 @@ platforms:
         enforce_eager: true
 
   xpu:
-    model_runner: v1
     stages:
       - stage_id: 0
         enable_prefix_caching: false
