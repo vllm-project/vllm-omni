@@ -92,7 +92,26 @@ Another 425.574 MiB allocated was unassigned: opaque graph pools, temporary
 CFM/VAE workspaces, unselected tensors and allocator rounding are not split.
 Current allocated / reserved was 7,336.837 / 7,834 MiB. A separate mixed-load
 interval peaked at 7.434 / 8.008 GiB allocated / reserved. Reserved includes
-allocated; full-startup allocator peaks remain unmeasured.
+allocated; the original n=30 study did not capture startup allocator peaks.
+
+### Targeted memory follow-up
+
+A separate run on 2026-11-16 measured startup and request-window memory with the
+same pinned runtime and model. It used one fresh service per KV profile, n=8
+English requests at c1 and c4 after shape prewarm, and the same VAE, cadence,
+admission, and unified-graph settings as the profiles above. This is a bounded
+memory check, not a rerun of the 540-request KV matrix.
+
+| KV | Startup device peak (MiB) | Startup Stage 0 allocated / reserved (GiB) | c4 device peak (MiB) | c4 Stage 0 allocated / reserved (GiB) | c1 / c4 requests |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 6 GiB | 12,130.0 | 11.198 / 11.598 | 12,178.1 | 11.168 / 11.619 | 8 / 8 |
+| 2 GiB | 9,478.0 | 8.712 / 9.193 | 8,082.1 | 7.168 / 7.619 | 8 / 8 |
+
+The startup values cover the health-boundary allocator epoch; the request
+values cover the post-prewarm c4 window. NVML device samples and allocator
+peaks are different measurements, and the sampled peak can miss a short spike.
+The two configs differed only in KV budget. The follow-up does not qualify
+8/12GB cards, other GPUs, or a cold-cache startup.
 
 ## Admission and unified-graph comparison
 
@@ -117,7 +136,7 @@ The [unrounded records](https://github.com/RongHuang14/vllm-omni/releases/downlo
 also contain c1/2 cells, inputs, transcripts, artifact pins and source hashes.
 Fixtures and full commands are in the package. B→C lowered admission and the
 graph capture ceiling together from 8 to 4; current allocated fell by ~1.2 MiB.
-All profiles peaked at 9,478 MiB whole-device; the optional YAML keeps admission 8 and unified graphs on.
+In this admission/graph comparison, all three profiles peaked at 9,478 MiB whole-device; the optional YAML keeps admission 8 and unified graphs on.
 Clients never exceeded 4, so this does not characterize admission queuing.
 Fresh cached processes reached health in 66.1–69.1 s; first external audio
 was 2.255–2.362 s. Health includes built-in speech warmup. The first diagnostic
@@ -146,6 +165,9 @@ issues reported. This non-blind check does not cover changed new-cohort PCM.
 - Earlier legacy-VAE concurrent speech omitted/repeated words despite HTTP
   success. Those timings are excluded; the existing configuration workaround
   above is used, without another engine fix.
-- No saturated 4,096-token context, eight-client, 8/12GB, WSL2, other-GPU or
-  production-duration qualification. See the [shared recipe](VoxCPM2.md) for
-  the model contract beyond this measured hardware profile.
+- The original matrix did not capture full-startup allocator peaks; the targeted
+  follow-up above measured a separate startup epoch without a controlled cold
+  cache. No saturated 4,096-token context, eight-client, 8/12GB, WSL2,
+  other-GPU or production-duration qualification was performed. See the
+  [shared recipe](VoxCPM2.md) for the model contract beyond this measured
+  hardware profile.
