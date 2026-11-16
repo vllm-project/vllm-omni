@@ -125,7 +125,7 @@ model-specific guide says otherwise.
 | ------------ | ---------------------------------------- | -------------------- | ------------------------------------------------------------------------------- |
 | BAGEL        | Stage-specific transformer or DiT module | Not validated        | Route FP8 to the intended stage before enabling                                 |
 | GLM-Image    | Stage-specific transformer or DiT module | Not validated        | Validate quality against BF16 baseline                                          |
-| MammothModa2 | DiT stage (`stage_id: 1`) only           | Validated online FP8 | Set `quantization: fp8` on stage 1 in the deploy YAML; keep the AR stage in BF16 |
+| MammothModa2 | AR stage (`stage_id: 0`) or DiT stage (`stage_id: 1`) | Stage-specific online FP8 | Set `quantization: fp8` on the target stage; AR-stage A/B validation covers Dev and Preview with DiT in BF16 |
 
 ## Configuration
 

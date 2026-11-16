@@ -31,6 +31,7 @@ from upload_pipeline import (  # noqa: E402
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+
 CUDA_BOOTSTRAP_STEPS = Path(".buildkite/cuda/bootstrap-upload-steps.yml")
 AMD_MERGE_YAML = Path(".buildkite/amd/test-amd-merge.yml")
 NIGHTLY_YAML = Path(".buildkite/cuda/test-nightly.yml")
@@ -406,7 +407,11 @@ def test_nightly_yaml_infers_h100_l4_and_b200(monkeypatch: pytest.MonkeyPatch) -
     """Nightly inferred jobs share card counts across H100/L4 and B200 mirrors."""
     src = yaml.safe_load(NIGHTLY_YAML.read_text(encoding="utf-8"))
     pytest_leaves = [step for step in _leaf_steps(src["steps"]) if "pytest" in str(step.get("commands"))]
-    inferred_leaves = [step for step in pytest_leaves if "mirror_hardwares" not in step]
+    inferred_leaves = [
+        step
+        for step in pytest_leaves
+        if "mirror_hardwares" not in step and step.get("agents", {}).get("queue") != "medium_cpu_queue_premerge"
+    ]
     pinned_leaves = [step for step in pytest_leaves if "mirror_hardwares" in step]
     assert inferred_leaves
 
@@ -1088,3 +1093,29 @@ def test_qwen_image_21_accuracy_model_dependencies(
     assert any("test_qwen_image_21.py" in command for command in step["commands"])
     assert any(selector in command for command in step["commands"])
     assert "tests/e2e/accuracy/artifacts/qwen_image_21/**/*" in step["artifact_paths"]
+
+@pytest.mark.parametrize(
+    "changed_path,expected_group",
+    [
+        ("vllm_omni/outputs/omni_request_output.py", "omni_mammoth_moda2_image_contract"),
+        ("vllm_omni/diffusion/utils/image_output.py", "omni_mammoth_moda2_image_contract"),
+        ("vllm_omni/model_extras/registry.py", "omni_mammoth_moda2_fp8"),
+        ("vllm_omni/model_executor/models/mammoth_moda2/model.py", "omni_mammoth_moda2_fp8"),
+    ],
+)
+def test_mammoth_fp8_routes_shared_image_changes_to_cpu(
+    monkeypatch: pytest.MonkeyPatch, changed_path: str, expected_group: str
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    doc = yaml.safe_load(NIGHTLY_YAML.read_text(encoding="utf-8"))
+    labels = {
+        step["label"]: step["source_file_dependencies"]
+        for step in _iter_steps(doc)
+        if step.get("source_file_dependencies") in (
+            "omni_mammoth_moda2_image_contract",
+            "omni_mammoth_moda2_fp8",
+        )
+    }
+    rendered = _render_test_pipeline(doc, [changed_path], pipeline_path=NIGHTLY_YAML)
+    selected = {labels[step["label"]] for step in _iter_steps(rendered) if step.get("label") in labels}
+    assert selected == {expected_group}

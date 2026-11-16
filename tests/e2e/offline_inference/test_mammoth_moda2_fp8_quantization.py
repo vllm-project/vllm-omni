@@ -5,7 +5,6 @@
 These tests load the real ``MammothModa2-Preview`` and ``MammothModa2-Dev``
 checkpoints and compare BF16 vs FP8 generation, scoped to the AR stage:
 
-* ``test_ar_generation_smoke`` — each format loads and produces tokens.
 * ``test_bf16_vs_fp8_generation_consistency`` — AR-only understanding: the
   base head / understanding expert under FP8 (reported token agreement and
   MAE; shared-prefix logprob similarity gate).
@@ -45,12 +44,6 @@ MODEL_CASES = [
         id="dev",
     ),
 ]
-
-# Quantization cases for the A/B gate. ``None`` is the BF16 baseline (the
-# ``quantization`` stage key is removed). FP8 is vLLM's runtime W8A8
-# (weight + activation) quantization, computed directly from the BF16
-# checkpoint — no pre-quantized weights required.
-QUANTIZATION_CASES = [None, "fp8"]
 
 # Hardware gate: any CUDA GPU (H100/B200 datacenter or RTX PRO 6000
 # workstation). ``@hardware_test`` supplies the CI SKU/cards marks (H100,
@@ -170,16 +163,6 @@ def _mean_abs_diff(a: list[float], b: list[float]) -> float:
 @_CUDA_ONLY
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"})
-@pytest.mark.parametrize("quantization", QUANTIZATION_CASES, ids=["bf16", "fp8"])
-def test_ar_generation_smoke(model_path: str, quantization: str | None):
-    """Each supported format loads and produces a non-empty greedy sequence."""
-    token_ids, _ = _generate(model_path, quantization)
-    assert token_ids, f"no tokens generated for quantization={quantization!r}"
-
-
-@_CUDA_ONLY
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100"})
 def test_bf16_vs_fp8_generation_consistency(model_path: str):
     """Gate shared-prefix logprob cosine; report token agreement and MAE."""
     bf16_ids, bf16_lp = _generate(model_path, None)
@@ -233,7 +216,6 @@ def test_bf16_vs_fp8_generation_consistency(model_path: str):
 # stage to emit visual tokens, exercising the generation experts and the extra
 # vocabulary/head under FP8 end to end.
 
-_AR_PATCH_SIZE = 16
 _T2I_IMAGE_SIZE = (256, 256)  # PIL (width, height)
 _T2I_IMAGE_COUNT = 1
 
@@ -245,28 +227,23 @@ _VISION_END_TOKEN_ID = 151653
 
 
 def _load_t2i_gen_config(model: str) -> dict:
-    """Load ``t2i_generation_config.json`` from a local dir or hub id."""
+    """Load the required config from a local dir or hub id.
+
+    Unlike the optional expansion smoke test, this A/B validation must fail
+    when its checkpoint lacks the config rather than silently skip coverage.
+    """
     import json
     from pathlib import Path
 
     local = Path(model) / "t2i_generation_config.json"
-    if local.exists():
+    if Path(model).is_dir():
         return json.loads(local.read_text(encoding="utf-8"))
 
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
-    weights_dir = Path(snapshot_download(model))
+    weights_dir = Path(hf_api().snapshot_download(model))
     cfg_path = weights_dir / "t2i_generation_config.json"
     return json.loads(cfg_path.read_text(encoding="utf-8"))
-
-
-def _format_t2i_prompt(user_prompt: str, ar_width: int, ar_height: int) -> str:
-    return (
-        "<|im_start|>system\nYou are a helpful image generator.<|im_end|>\n"
-        f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
-        "<|im_start|>assistant\n"
-        f"<|image start|>{ar_width}*{ar_height}<|image token|>"
-    )
 
 
 def _t2i_stage_config(quantization: str | None) -> str:
@@ -288,6 +265,7 @@ def _generate_t2i_image(model: str, quantization: str | None) -> torch.Tensor:
     from vllm.sampling_params import SamplingParams
 
     from tests.helpers.runtime import OmniRunner
+    from vllm_omni.model_extras import build_text_to_image_prompt
 
     gen_cfg = _load_t2i_gen_config(model)
     eol_token_id = int(gen_cfg["eol_token_id"])
@@ -295,11 +273,26 @@ def _generate_t2i_image(model: str, quantization: str | None) -> torch.Tensor:
     visual_end = int(gen_cfg["visual_token_end_id"])
 
     width, height = _T2I_IMAGE_SIZE  # small for CI speed
-    ar_height, ar_width = height // _AR_PATCH_SIZE, width // _AR_PATCH_SIZE
-    expected_grid_tokens = ar_height * (ar_width + 1)
+    prompt_dict = build_text_to_image_prompt(
+        "MammothModa2DiTPipeline",
+        {"prompt": "A cat sitting on a laptop keyboard"},
+        height=height,
+        width=width,
+    )
+    prompt_dict["additional_information"].update(
+        {
+            "eol_token_id": [eol_token_id],
+            "visual_token_start_id": [visual_start],
+            "visual_token_end_id": [visual_end],
+            "num_inference_steps": [2],
+            "text_guidance_scale": [1.0],
+            "cfg_range": [0.0, 1.0],
+            "visual_ids": [_IMAGE_TOKEN_ID, _VIDEO_TOKEN_ID, _VISION_START_TOKEN_ID, _VISION_END_TOKEN_ID],
+        }
+    )
 
-    formatted_prompt = _format_t2i_prompt("A cat sitting on a laptop keyboard", ar_width, ar_height)
-
+    info = prompt_dict["additional_information"]
+    expected_grid_tokens = info["ar_height"][0] * (info["ar_width"][0] + 1)
     ar_sampling = SamplingParams(
         temperature=0.0,
         top_k=1,
@@ -314,30 +307,7 @@ def _generate_t2i_image(model: str, quantization: str | None) -> torch.Tensor:
     with OmniRunner(model, seed=_SEED, deploy_config=_t2i_stage_config(quantization)) as runner:
         outputs = list(
             runner.omni.generate(
-                [
-                    {
-                        "prompt": formatted_prompt,
-                        "additional_information": {
-                            "omni_task": ["t2i"],
-                            "ar_width": [ar_width],
-                            "ar_height": [ar_height],
-                            "eol_token_id": [eol_token_id],
-                            "visual_token_start_id": [visual_start],
-                            "visual_token_end_id": [visual_end],
-                            "image_height": [height],
-                            "image_width": [width],
-                            "num_inference_steps": [2],
-                            "text_guidance_scale": [1.0],
-                            "cfg_range": [0.0, 1.0],
-                            "visual_ids": [
-                                _IMAGE_TOKEN_ID,
-                                _VIDEO_TOKEN_ID,
-                                _VISION_START_TOKEN_ID,
-                                _VISION_END_TOKEN_ID,
-                            ],
-                        },
-                    }
-                ],
+                [prompt_dict],
                 [ar_sampling, dit_sampling],
             )
         )
@@ -542,7 +512,7 @@ def test_bf16_vs_fp8_t2i_image_consistency(model_path: str):
     for name in ("psnr_db", "mae", "max_abs", "cosine", "rel_l2", "pixel_match"):
         print(f"  {name:12s} = {metrics[name]:.6f}")
 
-    # Same seed + greedy AR + deterministic DiT: a correctly quantized
-    # gen_mlp/gen_head must reproduce the same visual tokens, hence the image.
+    # FP8 can flip greedy visual tokens even with fixed seeds; these decoded-
+    # image gates are sensitive to those flips and do not require token identity.
     assert metrics["cosine"] >= 0.99, f"BF16/FP8 t2i images diverge too much: cosine={metrics['cosine']:.6f} < 0.99"
     assert metrics["rel_l2"] < 0.05, f"BF16/FP8 t2i images diverge too much: rel_l2={metrics['rel_l2']:.6f} >= 0.05"

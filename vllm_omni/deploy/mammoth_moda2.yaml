@@ -22,8 +22,8 @@ stages:
     step_execution: false
     trust_remote_code: true
     enable_prefix_caching: false
-    # Optional online FP8 quantization for the DiT stage only; uncomment to
-    # enable. Keep the stage-0 AR model in BF16.
+    # Optional online FP8 for this DiT stage; uncomment to enable.
+    # AR-stage FP8 is configured separately on stage 0; its A/B tests keep DiT in BF16.
     # quantization: fp8
     # Optional Cache-DiT acceleration for the DiT stage (~2x faster denoise,
     # training-free). Request mode only; uncomment to enable.
