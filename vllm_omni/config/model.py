@@ -346,11 +346,12 @@ class OmniModelConfig(ModelConfig):
         return omni_cfg
 
     def _validate_response_judge_config(self) -> None:
-        from vllm_omni.model_executor.stage_input_processors.response_judge import RESPONSE_JUDGE_STAGE, JudgeSpec
+        if self.model_stage != "response_judge":
+            return
+        # Reject a bad judge configuration at startup, not on the first turn.
+        from vllm_omni.model_executor.stage_input_processors.response_judge import JudgeSpec
 
-        if self.model_stage == RESPONSE_JUDGE_STAGE:
-            # Reject a bad judge configuration at startup, not on the first turn.
-            JudgeSpec.for_model_config(self)
+        JudgeSpec.for_model_config(self)
 
     @classmethod
     def _validate_omni_fields(cls, **omni_kwargs):
