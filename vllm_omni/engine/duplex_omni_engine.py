@@ -13,7 +13,9 @@ correlated RPC, session commands one-way) and which orchestrator to build
 from __future__ import annotations
 
 import asyncio
+import math
 import queue
+import time
 import uuid
 from typing import TYPE_CHECKING, Any
 
@@ -24,6 +26,7 @@ from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig, apply_session_stats_capability
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
+    DrainDuplexAudioMessage,
     DuplexControlResultMessage,
     DuplexSessionCommandMessage,
     DuplexSessionError,
@@ -105,9 +108,11 @@ class DuplexOmniEngine(AsyncOmniEngine):
         from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator
 
         assert self.plugin is not None, "_validate_deployment() must run before the orchestrator is created"
+        pipeline_config = self.pipeline_config
+        assert pipeline_config is not None, "_validate_deployment() must run before the orchestrator is created"
         # Match the frontend's comprehension-stage selection. An optional ASR
         # stage does not own the served model's tokenizer or prompt policy.
-        model_stage_id = next((stage.stage_id for stage in self.pipeline_config.stages if stage.owns_tokenizer), 0)
+        model_stage_id = next((stage.stage_id for stage in pipeline_config.stages if stage.owns_tokenizer), 0)
         stage_vllm_config = self.stage_pools[model_stage_id].stage_vllm_config if self.stage_pools else None
         model_config = getattr(stage_vllm_config, "model_config", None)
         client_config = self._client_config or {}
@@ -145,6 +150,7 @@ class DuplexOmniEngine(AsyncOmniEngine):
         operation: str,
         session_id: str,
         timeout: float | None,
+        block_on_submit: bool = True,
     ) -> DuplexControlResultMessage:
         try:
             result = self.rpc_client.execute(
@@ -152,16 +158,26 @@ class DuplexOmniEngine(AsyncOmniEngine):
                 message,
                 timeout=timeout,
                 timeout_message=f"duplex {operation} timed out for session {session_id}",
-                # Block rather than surface a raw queue.Full: the handlers below
-                # promise a typed DuplexSessionError, and a momentarily full
-                # request queue is backpressure, not a failed control op.
-                block_on_submit=True,
+                # Existing lifecycle controls retain blocking admission. Drain
+                # opts out so saturation cannot bypass its bounded wait; both
+                # modes report typed session errors, never a raw queue.Full.
+                block_on_submit=block_on_submit,
             )
+        except queue.Full as exc:
+            raise DuplexSessionError(
+                "engine request queue is full", code="engine_backpressure", retryable=True, session_id=session_id
+            ) from exc
         except TimeoutError as exc:
             raise DuplexSessionError(str(exc), code="timeout", retryable=True, session_id=session_id) from exc
         except RuntimeError as exc:
             # The RPC router is closed or the orchestrator reported a terminal error.
             raise DuplexSessionError(str(exc), code="engine_error", session_id=session_id) from exc
+        return self._validate_control_result(result, operation=operation, session_id=session_id)
+
+    @staticmethod
+    def _validate_control_result(
+        result: EngineQueueMessage, *, operation: str, session_id: str
+    ) -> DuplexControlResultMessage:
         if not isinstance(result, DuplexControlResultMessage):
             raise DuplexSessionError(
                 f"unexpected duplex control result: {type(result).__name__}",
@@ -333,6 +349,43 @@ class DuplexOmniEngine(AsyncOmniEngine):
                 timeout=timeout,
             ),
         )
+
+    async def drain_audio_async(
+        self, session_id: str, *, timeout: float = _DEFAULT_CONTROL_TIMEOUT_S
+    ) -> DuplexControlResultMessage:
+        """Drain an acoustic prefix within one admission/result timeout budget.
+
+        A consumer must keep sending output. Expiry raises a retryable session
+        error; cancellation cannot retract a control already sent to the engine.
+        """
+        if isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("audio drain requires a finite positive timeout")
+        control_id = uuid.uuid4().hex
+        deadline = time.monotonic() + timeout
+        timeout_message = f"duplex drain_audio timed out for session {session_id}"
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(timeout_message)
+            message = DrainDuplexAudioMessage(control_id=control_id, session_id=session_id, timeout_s=remaining)
+            # Waiting in the default executor can starve the send-completion
+            # command needed by this drain. The router owns an async waiter;
+            # legacy lifecycle controls and command backpressure stay unchanged.
+            result = await self.rpc_client.execute_async(
+                ("duplex", control_id),
+                message,
+                timeout=remaining,
+                timeout_message=timeout_message,
+            )
+        except queue.Full as exc:
+            raise DuplexSessionError(
+                "engine request queue is full", code="engine_backpressure", retryable=True, session_id=session_id
+            ) from exc
+        except TimeoutError as exc:
+            raise DuplexSessionError(timeout_message, code="timeout", retryable=True, session_id=session_id) from exc
+        except RuntimeError as exc:
+            raise DuplexSessionError(str(exc), code="engine_error", session_id=session_id) from exc
+        return self._validate_control_result(result, operation="drain_audio", session_id=session_id)
 
     def _submit_command(self, session_id: str, command: DuplexCommand) -> None:
         """One-way: enqueue a session command in caller order (blocks only on queue backpressure)."""

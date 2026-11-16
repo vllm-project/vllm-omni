@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
+import asyncio
 import queue
 import threading
+import time
+from concurrent.futures import Future, InvalidStateError
 from typing import TypeAlias
 
 from vllm.logger import init_logger
@@ -18,6 +21,8 @@ logger = init_logger(__name__)
 
 RpcCorrelationKey: TypeAlias = tuple[str, str]
 RpcWaiter: TypeAlias = queue.Queue[EngineQueueMessage]
+RpcAsyncWaiter: TypeAlias = Future[EngineQueueMessage]
+_RpcWaiter: TypeAlias = RpcWaiter | RpcAsyncWaiter
 
 
 class RpcResultRouter:
@@ -25,7 +30,7 @@ class RpcResultRouter:
 
     def __init__(self, source_queue) -> None:
         self._source_queue = source_queue
-        self._pending: dict[RpcCorrelationKey, RpcWaiter] = {}
+        self._pending: dict[RpcCorrelationKey, _RpcWaiter] = {}
         self._lock = threading.Lock()
         self._stopped = threading.Event()
         self._terminal_error: ErrorMessage | None = None
@@ -38,6 +43,15 @@ class RpcResultRouter:
 
     def register(self, key: RpcCorrelationKey) -> RpcWaiter:
         waiter: RpcWaiter = queue.Queue(maxsize=1)
+        self._register_waiter(key, waiter)
+        return waiter
+
+    def register_async(self, key: RpcCorrelationKey) -> RpcAsyncWaiter:
+        waiter: RpcAsyncWaiter = Future()
+        self._register_waiter(key, waiter)
+        return waiter
+
+    def _register_waiter(self, key: RpcCorrelationKey, waiter: _RpcWaiter) -> None:
         with self._lock:
             if self._stopped.is_set():
                 raise RuntimeError("RPC result router is closed")
@@ -46,9 +60,8 @@ class RpcResultRouter:
             if key in self._pending:
                 raise RuntimeError(f"duplicate pending RPC correlation key: {key!r}")
             self._pending[key] = waiter
-        return waiter
 
-    def unregister(self, key: RpcCorrelationKey, waiter: RpcWaiter) -> None:
+    def unregister(self, key: RpcCorrelationKey, waiter: _RpcWaiter) -> None:
         with self._lock:
             if self._pending.get(key) is waiter:
                 self._pending.pop(key, None)
@@ -95,6 +108,20 @@ class RpcResultRouter:
             if waiter is None:
                 logger.warning("Dropping late or unknown RPC result correlation_key=%s", key)
                 continue
+            self._deliver(waiter, message)
+
+    @staticmethod
+    def _deliver(waiter: _RpcWaiter, message: EngineQueueMessage) -> None:
+        if isinstance(waiter, Future):
+            try:
+                waiter.set_result(message)
+            except InvalidStateError:
+                # Cancellation may race with routing after the waiter was
+                # removed under the router lock. A cancelled caller must not
+                # stop this shared consumer or receive a late reply.
+                if not waiter.cancelled():
+                    raise
+        else:
             waiter.put_nowait(message)
 
     def _broadcast_error(self, message: ErrorMessage) -> None:
@@ -105,7 +132,7 @@ class RpcResultRouter:
             self._pending.clear()
         for waiter in waiters:
             try:
-                waiter.put_nowait(message)
+                self._deliver(waiter, message)
             except queue.Full:
                 pass
 
@@ -149,12 +176,49 @@ class CorrelatedRpcClient:
         finally:
             self._router.unregister(key, waiter)
 
+    async def execute_async(
+        self,
+        key: RpcCorrelationKey,
+        message: EngineQueueMessage,
+        *,
+        timeout: float | None,
+        timeout_message: str,
+    ) -> EngineQueueMessage:
+        """Submit without blocking and await a thread-safe correlated future.
+
+        Use the queue's sync face: its async face belongs to the orchestrator
+        loop, not necessarily the caller's loop. No executor worker is held
+        while awaiting the reply, leaving it available for one-way commands.
+        Cancellation only retires the waiter; it cannot retract an admitted
+        request. Admission and reply waiting share one timeout budget.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        waiter = self._router.register_async(key)
+        try:
+            if deadline is not None and deadline <= time.monotonic():
+                raise TimeoutError(timeout_message)
+            self._request_queue.put_nowait(message)
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError(timeout_message)
+            try:
+                result = await asyncio.wait_for(asyncio.wrap_future(waiter), timeout=remaining)
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(timeout_message) from exc
+            if isinstance(result, ErrorMessage):
+                raise RuntimeError(result.error)
+            return result
+        finally:
+            self._router.unregister(key, waiter)
+            waiter.cancel()
+
     def close(self) -> None:
         self._router.close()
 
 
 __all__ = [
     "CorrelatedRpcClient",
+    "RpcAsyncWaiter",
     "RpcCorrelationKey",
     "RpcResultRouter",
     "RpcWaiter",
