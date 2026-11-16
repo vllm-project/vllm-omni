@@ -482,6 +482,101 @@ def test_model_binding_commit_and_batch_compaction():
     assert [flag.item() for flag in output.multimodal_outputs["meta"]["finished"]] == [True, False]
 
 
+def _binding_model():
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        _request_audio_states={},
+        _request_codec_history={},
+        _request_generators={},
+        _codec_min_tokens=0,
+        _codec_max_tokens=10,
+        _codec_temperature=0,
+        _codec_repetition_penalty=1,
+        _codec_top_k=0,
+        _codec_top_p=1,
+        _codec_seed=7,
+        _codec_eos_id=VOCAB_SIZE - 1,
+        _codec_fused_prelude=True,
+        _codec_fused_tail=True,
+        _merge_request_codec_params=lambda *args, **kwargs: None,
+    )
+
+
+def _duplex_info(request_id, *, epoch, turn_id, condition_seq, text):
+    return {
+        "request_id": request_id,
+        "native_duplex": True,
+        "duplex": {"epoch": epoch, "turn_id": turn_id},
+        "meta": {"streaming_condition_seq": condition_seq, "native_duplex_segment_text": text},
+    }
+
+
+def test_model_binding_fuses_native_duplex_rows_with_step_metadata():
+    """Native duplex decode rows take the fused K-step and still report their duplex fence.
+
+    The fused commit returns one output per step, so the per-request duplex
+    metadata the eager frame loop reports (and merge_frame_outputs keeps from
+    the last frame) has to come from the commit itself.
+    """
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        MiniCPMO45OmniTTSForConditionalGeneration,
+        _native_duplex_meta_outputs,
+    )
+
+    model = _binding_model()
+    hidden = torch.zeros(2, 4)
+    infos = [
+        _duplex_info("a", epoch=1, turn_id=3, condition_seq=5, text="hi"),
+        _duplex_info("b", epoch=0, turn_id=0, condition_seq=2, text="\u4f60\u597d"),
+    ]
+    kwargs = {"model_intermediate_buffer": infos, "request_token_spans": [(0, 1), (1, 2)]}
+    state = MiniCPMO45OmniTTSForConditionalGeneration.prepare_cuda_kstep(model, hidden, 2, **kwargs)
+    assert state is not None
+    state.sample(logits([3, 4]), 0, VOCAB_SIZE - 1)
+    state.sample(logits([5, 6]), 1, VOCAB_SIZE - 1)
+    output = MiniCPMO45OmniTTSForConditionalGeneration.commit_cuda_kstep(model, hidden)
+
+    meta = output.multimodal_outputs["meta"]
+    expected = _native_duplex_meta_outputs(infos)
+    for key, values in expected.items():
+        assert [v.tolist() for v in meta[key]] == [v.tolist() for v in values], key
+    assert [v.item() for v in meta["duplex_epoch"]] == [1, 0]
+    assert [v.item() for v in meta["streaming_condition_seq"]] == [5, 2]
+    assert bytes(meta["llm_output_text_utf8"][1].tolist()).decode("utf-8") == "\u4f60\u597d"
+    assert [d.flatten().tolist() for d in output.multimodal_outputs["codes"]["audio"]] == [[3, 5], [4, 6]]
+
+
+def test_model_binding_turn_mode_commit_carries_no_duplex_metadata():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        MiniCPMO45OmniTTSForConditionalGeneration,
+    )
+
+    model = _binding_model()
+    hidden = torch.zeros(1, 4)
+    kwargs = {"model_intermediate_buffer": [{"request_id": "a"}], "request_token_spans": [(0, 1)]}
+    state = MiniCPMO45OmniTTSForConditionalGeneration.prepare_cuda_kstep(model, hidden, 1, **kwargs)
+    state.sample(logits([3]), 0, VOCAB_SIZE - 1)
+    output = MiniCPMO45OmniTTSForConditionalGeneration.commit_cuda_kstep(model, hidden)
+    assert set(output.multimodal_outputs["meta"]) == {"finished", "codec_frame_valid"}
+
+
+def test_model_binding_keeps_duplex_turn_end_drain_on_the_frame_loop():
+    """A duplex turn-end condition drains with per-frame host checks, so it stays eager."""
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        MiniCPMO45OmniTTSForConditionalGeneration,
+    )
+
+    model = _binding_model()
+    model._request_audio_states["a"] = {"step": 3, "turn_end_drain": 1}
+    infos = [_duplex_info("a", epoch=0, turn_id=1, condition_seq=4, text="")]
+    result = MiniCPMO45OmniTTSForConditionalGeneration.prepare_cuda_kstep(
+        model, torch.zeros(1, 4), 2, model_intermediate_buffer=infos, request_token_spans=[(0, 1)]
+    )
+    assert result is None
+    assert not hasattr(model, "_cuda_kstep_workspaces")
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 @pytest.mark.parametrize("eos_frame", [0, 1, 2])
 @pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])

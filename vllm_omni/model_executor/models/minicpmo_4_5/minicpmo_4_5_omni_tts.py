@@ -326,6 +326,38 @@ def _native_duplex_row_meta(info_dict: Mapping[str, Any]) -> tuple[bool, int, in
     )
 
 
+def _native_duplex_meta_outputs(infos: list[Any]) -> dict[str, list[torch.Tensor]] | None:
+    """Per-request native-duplex step metadata, or None when no row is native duplex.
+
+    The eager frame loop reports these lists on every frame; they are constant
+    across a step's frames, so a fused step reports them once.
+    """
+    if not any(isinstance(info, dict) and info.get("native_duplex") is True for info in infos):
+        return None
+    outputs: dict[str, list[torch.Tensor]] = {
+        "native_duplex": [],
+        "duplex_epoch": [],
+        "duplex_turn_id": [],
+        "streaming_condition_seq": [],
+        "llm_output_text_utf8": [],
+        "turn_end": [],
+    }
+    for info in infos:
+        info_dict = info if isinstance(info, dict) else {}
+        native_duplex, epoch, turn_id, segment_text, turn_end = _native_duplex_row_meta(info_dict)
+        meta_info = info_dict.get("meta") if isinstance(info_dict.get("meta"), Mapping) else {}
+        condition_seq = meta_info.get("streaming_condition_seq")
+        outputs["native_duplex"].append(torch.tensor(native_duplex, dtype=torch.bool))
+        outputs["duplex_epoch"].append(torch.tensor(epoch, dtype=torch.long))
+        outputs["duplex_turn_id"].append(torch.tensor(turn_id, dtype=torch.long))
+        outputs["streaming_condition_seq"].append(
+            torch.tensor(condition_seq if isinstance(condition_seq, int) else -1, dtype=torch.long)
+        )
+        outputs["llm_output_text_utf8"].append(torch.tensor(list(segment_text.encode("utf-8")), dtype=torch.uint8))
+        outputs["turn_end"].append(torch.tensor(turn_end, dtype=torch.bool))
+    return outputs
+
+
 def _restore_weight_norm_weight(weight_g: torch.Tensor, weight_v: torch.Tensor) -> torch.Tensor:
     """Materialize ``weight_norm(..., dim=0)`` checkpoint parameters."""
     return torch._weight_norm(weight_v, weight_g, dim=0)
@@ -2753,7 +2785,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         eligible = kwargs.get("request_sample_eligible", [True] * len(infos))
         if not infos or len(spans) != len(infos) or not all(eligible):
             return None
-        if any(not isinstance(info, dict) or info.get("native_duplex") for info in infos):
+        if any(not isinstance(info, dict) for info in infos):
             return None
         if any(int(end) - int(start) != 1 for start, end in spans):
             return None
@@ -3017,11 +3049,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # compute_logits expects request-major [B*K, 2] control rows.
         stop = workspace.stops.transpose(0, 1).reshape(-1, 1).long()
         self.batch_stop_logits = hidden.new_full((stop.shape[0], 2), float("-inf")).scatter_(1, stop, 0.0)
+        meta_outputs: dict[str, Any] = {"finished": finished_flags, "codec_frame_valid": valids}
+        duplex_meta = _native_duplex_meta_outputs(infos)
+        if duplex_meta is not None:
+            meta_outputs.update(duplex_meta)
         return OmniOutput(
             text_hidden_states=hidden,
             multimodal_outputs={
                 "codes": {"audio": deltas},
-                "meta": {"finished": finished_flags, "codec_frame_valid": valids},
+                "meta": meta_outputs,
             },
         )
 
@@ -3071,7 +3107,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 f"MiniCPM-o continuous Talker received {len(request_max_tokens_remaining)} "
                 f"remaining-token budgets for {len(infos)} requests"
             )
-        emit_duplex_metadata = any(isinstance(info, dict) and info.get("native_duplex") is True for info in infos)
 
         # Hoisted out of the per-request loop: this is the same dict for every
         # row of the frame, and the loop runs rows x frames times per step.
@@ -3082,12 +3117,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         stop_rows: list[torch.Tensor] = []
         codec_deltas: list[torch.Tensor] = []
         terminal_flags: list[torch.Tensor] = []
-        native_duplex_flags: list[torch.Tensor] = []
-        duplex_epochs: list[torch.Tensor] = []
-        duplex_turn_ids: list[torch.Tensor] = []
-        condition_seqs: list[torch.Tensor] = []
-        segment_texts_utf8: list[torch.Tensor] = []
-        turn_end_flags: list[torch.Tensor] = []
         row_continue, row_stop, flag_false, flag_true, empty_delta = self._step_constants(hidden)
         # Keep one batched projection, but omit rows that exit without sampling.
         projection_rows: list[int] = []
@@ -3128,20 +3157,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 frame_rows = torch.tensor(projection_rows, device=hidden.device, dtype=torch.long)
                 head_logits_all = self.head_code[0](hidden.index_select(0, frame_rows)).float()
         for index, info in enumerate(infos):
-            info_dict = info if isinstance(info, dict) else {}
-            if emit_duplex_metadata:
-                native_duplex, epoch, turn_id, segment_text, turn_end = _native_duplex_row_meta(info_dict)
-                native_duplex_flags.append(torch.tensor(native_duplex, dtype=torch.bool))
-                duplex_epochs.append(torch.tensor(epoch, dtype=torch.long))
-                duplex_turn_ids.append(torch.tensor(turn_id, dtype=torch.long))
-                meta_info = info_dict.get("meta") if isinstance(info_dict.get("meta"), Mapping) else {}
-                condition_seq = meta_info.get("streaming_condition_seq")
-                condition_seqs.append(
-                    torch.tensor(condition_seq if isinstance(condition_seq, int) else -1, dtype=torch.long)
-                )
-                segment_texts_utf8.append(torch.tensor(list(segment_text.encode("utf-8")), dtype=torch.uint8))
-                turn_end_flags.append(torch.tensor(turn_end, dtype=torch.bool))
-
             if not isinstance(info, dict):
                 stop_rows.append(row_continue)
                 codec_deltas.append(empty_delta)
@@ -3382,17 +3397,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 torch.ones(delta.shape[0], dtype=torch.bool, device=delta.device) for delta in codec_deltas
             ],
         }
-        if emit_duplex_metadata:
-            meta_outputs.update(
-                {
-                    "native_duplex": native_duplex_flags,
-                    "duplex_epoch": duplex_epochs,
-                    "duplex_turn_id": duplex_turn_ids,
-                    "streaming_condition_seq": condition_seqs,
-                    "llm_output_text_utf8": segment_texts_utf8,
-                    "turn_end": turn_end_flags,
-                }
-            )
+        duplex_meta = _native_duplex_meta_outputs(infos)
+        if duplex_meta is not None:
+            meta_outputs.update(duplex_meta)
         multimodal_outputs: dict[str, Any] = {
             "codes": {"audio": codec_deltas},
             "meta": meta_outputs,
@@ -4277,13 +4284,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         budget reached) or mask EOS on (min_tokens, duplex turn-end drain
         window).
         """
-        emit_duplex_metadata = any(isinstance(info, dict) and info.get("native_duplex") is True for info in infos)
-        native_duplex_flags: list[torch.Tensor] = []
-        duplex_epochs: list[torch.Tensor] = []
-        duplex_turn_ids: list[torch.Tensor] = []
-        condition_seqs: list[torch.Tensor] = []
-        segment_texts_utf8: list[torch.Tensor] = []
-        turn_end_flags: list[torch.Tensor] = []
         empty_delta = torch.empty((0, 1), dtype=torch.long, device="cpu")
         codec_deltas: list[Any] | torch.Tensor = [empty_delta for _ in infos]
         terminal_flags: list[Any] | torch.Tensor = [None] * len(infos)
@@ -4298,25 +4298,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         batch_codec_output = False
         frame_valid: list[Any] | torch.Tensor = [None] * len(infos)
         for index, info in enumerate(infos):
-            info_dict = info if isinstance(info, dict) else {}
-            if emit_duplex_metadata:
-                native_duplex, epoch, turn_id, segment_text, turn_end = _native_duplex_row_meta(info_dict)
-                native_duplex_flags.append(torch.tensor(native_duplex, dtype=torch.bool))
-                duplex_epochs.append(torch.tensor(epoch if isinstance(epoch, int) else -1, dtype=torch.long))
-                duplex_turn_ids.append(torch.tensor(turn_id if isinstance(turn_id, int) else -1, dtype=torch.long))
-                meta_info = info_dict.get("meta") if isinstance(info_dict.get("meta"), Mapping) else {}
-                condition_seq = meta_info.get("streaming_condition_seq")
-                condition_seqs.append(
-                    torch.tensor(condition_seq if isinstance(condition_seq, int) else -1, dtype=torch.long)
-                )
-                segment_texts_utf8.append(
-                    torch.tensor(
-                        list(segment_text.encode("utf-8")),
-                        dtype=torch.uint8,
-                    )
-                )
-                turn_end_flags.append(torch.tensor(turn_end, dtype=torch.bool))
-
             if not isinstance(info, dict):
                 continue
             request_id = _request_key(info, index)
@@ -4492,17 +4473,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         meta_outputs: dict[str, Any] = {"finished": terminal_flags}
         if gpu_rows:
             meta_outputs["codec_frame_valid"] = frame_valid
-        if emit_duplex_metadata:
-            meta_outputs.update(
-                {
-                    "native_duplex": native_duplex_flags,
-                    "duplex_epoch": duplex_epochs,
-                    "duplex_turn_id": duplex_turn_ids,
-                    "streaming_condition_seq": condition_seqs,
-                    "llm_output_text_utf8": segment_texts_utf8,
-                    "turn_end": turn_end_flags,
-                }
-            )
+        duplex_meta = _native_duplex_meta_outputs(infos)
+        if duplex_meta is not None:
+            meta_outputs.update(duplex_meta)
         return OmniOutput(
             text_hidden_states=hidden,
             multimodal_outputs={
