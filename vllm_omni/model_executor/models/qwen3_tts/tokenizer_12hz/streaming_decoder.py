@@ -161,6 +161,28 @@ def _im2col_kernel(
         )
 
 
+def _igemm_configs():
+    tiles = (
+        (64, 64, 64, 4, 4), (64, 64, 32, 4, 3), (64, 128, 128, 8, 3), (128, 64, 64, 8, 4), (64, 128, 64, 4, 3),
+        (128, 128, 64, 8, 3), (128, 128, 32, 8, 3), (128, 64, 32, 4, 3), (128, 32, 32, 4, 3), (64, 32, 32, 4, 3),
+        (256, 32, 32, 8, 3), (128, 128, 32, 4, 3),
+    )  # fmt: skip
+    return [triton.Config({"BM": bm, "BN": bn, "BC": bc}, num_warps=w, num_stages=st) for bm, bn, bc, w, st in tiles]
+
+
+def _igemm_prune(configs, named_args, **kwargs):
+    args = {**named_args, **kwargs}
+    c, n = args["C"], args["N"]
+    kept = [cfg for cfg in configs if c % cfg.kwargs["BC"] == 0 and cfg.kwargs["BN"] <= max(32, n)]
+    return kept or configs[:1]
+
+
+@triton.autotune(
+    configs=_igemm_configs(),
+    key=["C", "N", "D", "RB"],
+    prune_configs_by={"early_config_prune": _igemm_prune},
+    cache_results=True,
+)
 @triton.jit
 def _dilated_conv_snake_kernel(
     ext_ptr,  # [B, H + T, C] transformed rows: history then this call's
@@ -171,6 +193,7 @@ def _dilated_conv_snake_kernel(
     ibeta_ptr,
     T,
     rows,
+    RB,  # power-of-two bucket of rows (min 1024); only an autotune key
     C: tl.constexpr,
     N: tl.constexpr,
     K: tl.constexpr,
@@ -384,48 +407,6 @@ def _bias_gelu_kernel(x_ptr, b_ptr, N: tl.constexpr, BN: tl.constexpr):
 
 
 @triton.jit
-def _col2im_kernel(
-    z_ptr,  # [B * T, 2 * R, C] transposed-conv GEMM rows
-    bias_ptr,  # [C]
-    prev_ptr,  # [2, S, R, C] previous call's last GEMM row, second half
-    slots_ptr,
-    pos_ptr,
-    par_ptr,
-    out_ptr,  # [B * T * R, C]
-    T,
-    S,
-    ROWS,
-    R: tl.constexpr,
-    C: tl.constexpr,
-    BR: tl.constexpr,
-    BC: tl.constexpr,
-):
-    row = tl.program_id(0) * BR + tl.arange(0, BR)  # b * T + t
-    j = tl.program_id(1)  # 0 .. R - 1
-    c = tl.program_id(2) * BC + tl.arange(0, BC)
-    rm = row < ROWS
-    cm = c < C
-    m = rm[:, None] & cm[None, :]
-    b = row // T
-    t = row % T
-    slot = tl.load(slots_ptr + b, mask=rm, other=0).to(tl.int64)
-    live = tl.load(pos_ptr + b, mask=rm, other=0) != 0
-    par = tl.load(par_ptr + slot, mask=rm, other=0).to(tl.int64)
-    zr = z_ptr + row.to(tl.int64)[:, None] * 2 * R * C + c[None, :]
-    cur = tl.load(zr + j * C, mask=m).to(tl.float32)
-    prev_in = tl.load(zr - 2 * R * C + (R + j) * C, mask=m & (t > 0)[:, None], other=0.0).to(tl.float32)
-    st = ((par * S + slot) * R + j)[:, None] * C + c[None, :]
-    prev_st = tl.load(prev_ptr + st, mask=m & ((t == 0) & live)[:, None], other=0.0).to(tl.float32)
-    y = cur + tl.where((t > 0)[:, None], prev_in, prev_st) + tl.load(bias_ptr + c, mask=cm).to(tl.float32)[None, :]
-    dt = out_ptr.dtype.element_ty
-    tl.store(out_ptr + (row.to(tl.int64) * R + j)[:, None] * C + c[None, :], y.to(dt), mask=m)
-    lm = m & (t == T - 1)[:, None]
-    last = tl.load(zr + (R + j) * C, mask=lm)
-    nst = (((1 - par) * S + slot) * R + j)[:, None] * C + c[None, :]
-    tl.store(prev_ptr + nst, last, mask=lm)
-
-
-@triton.jit
 def _conv_out_kernel(
     ext_ptr,  # [B, H + T, C] transformed rows: history then this call's
     w_ptr,  # [K, C]
@@ -508,10 +489,10 @@ def _snake_params(module) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.exp(alpha).contiguous(), (1.0 / (torch.exp(beta) + 1e-9)).contiguous()
 
 
-# Dilated unit convs of these widths run as one implicit GEMM (BM, BN, BC, warps)
-# instead of a K-times patch matrix plus cuBLAS: the patch traffic dominates for
-# the long, narrow late blocks. The widest block is faster as patch + GEMM.
-_DILATED_IGEMM = {384: (128, 128, 64, 8), 192: (128, 64, 64, 4), 96: (128, 128, 32, 4)}
+# Dilated unit convs of these widths run as one implicit GEMM instead of a
+# K-times patch matrix plus cuBLAS: the patch traffic dominates for the long,
+# narrow late blocks. Tile configs are autotuned per (C, N, D, row bucket).
+_DILATED_IGEMM = (768, 384, 192, 96)
 
 
 class StreamingCodecDecoder(nn.Module):
@@ -635,15 +616,22 @@ class StreamingCodecDecoder(nn.Module):
             c_out = trans.conv.out_channels
             rate = trans.conv.stride[0]
             tw = f32(trans.conv.weight)  # [C_in, C_out, 2 * rate]
+            # kernel = 2 * stride: output frame t's `rate` samples depend on input
+            # frames t - 1 and t only, so the transposed conv is a 2-tap conv
+            # (one im2col + one GEMM, history of one frame) with the second half
+            # of the kernel applied to the previous frame.
+            w = tw.permute(0, 2, 1).reshape(c_in, 2 * rate * c_out)
+            half = rate * c_out
+            trans_spec = _ConvSpec(cast(torch.cat([w[:, half:], w[:, :half]], 0)), c_in, 2, 1, hist(1, c_in))
             entry = dict(
                 pb=cast(pending),
                 snake=_snake_params(snake),
                 rate=rate,
                 c_in=c_in,
                 c_out=c_out,
-                w=cast(tw.permute(0, 2, 1).reshape(c_in, 2 * rate * c_out)),
-                b=cast(f32(trans.conv.bias)),
-                prev=torch.zeros(2, S, rate, c_out, device=dev, dtype=dtype),
+                trans=trans_spec,
+                b=cast(f32(trans.conv.bias).repeat(rate)),
+                prev=trans_spec.hist,
                 units=[],
             )
             pending = torch.zeros(c_out, device=dev, dtype=torch.float32)
@@ -753,12 +741,13 @@ class StreamingCodecDecoder(nn.Module):
         spec = u["conv1"]
         ext = self._im2col(x, spec, T, slots, pos, bias=u["pb"], snake=u["act1"], ext=True)
         rows, c = x.shape
-        bm, bn, bc, warps = _DILATED_IGEMM[c]
-        out = torch.empty(rows, spec.weight.shape[1], device=x.device, dtype=self.dtype)
+        n = spec.weight.shape[1]
+        out = torch.empty(rows, n, device=x.device, dtype=self.dtype)
         alpha, ibeta = u["act2"]
-        _dilated_conv_snake_kernel[(triton.cdiv(rows, bm), triton.cdiv(out.shape[1], bn))](
-            ext, spec.weight, out, u["b1"], alpha, ibeta, T, rows,
-            C=c, N=out.shape[1], K=spec.k, D=spec.d, BM=bm, BN=bn, BC=bc, num_warps=warps, num_stages=3,
+        grid = lambda meta: (triton.cdiv(rows, meta["BM"]), triton.cdiv(n, meta["BN"]))  # noqa: E731
+        _dilated_conv_snake_kernel[grid](
+            ext, spec.weight, out, u["b1"], alpha, ibeta, T, rows, 1 << max((rows - 1).bit_length(), 10),
+            C=c, N=n, K=spec.k, D=spec.d,
         )  # fmt: skip
         return out
 
@@ -843,23 +832,16 @@ class StreamingCodecDecoder(nn.Module):
 
         x = torch.mm(self._im2col(y, self.conv_in, t_rows, slots, pos, bias=self.conv_in_pb), self.conv_in.weight)
         for blk in self.blocks:
-            s = self._snake(x, blk["snake"], blk["pb"])
-            zt = torch.mm(s, blk["w"])  # [rows, 2 * rate * c_out]
             r, c_out = blk["rate"], blk["c_out"]
-            x = torch.empty(rows * r, c_out, device=dev, dtype=dt)
-            bc = min(128, triton.next_power_of_2(c_out))
-            br = max(1, 2048 // bc)
-            _col2im_kernel[(triton.cdiv(rows, br), r, triton.cdiv(c_out, bc))](
-                zt, blk["b"], blk["prev"], slots, pos, self.parity, x, t_rows, self.num_slots, rows,
-                R=r, C=c_out, BR=br, BC=bc,
-            )  # fmt: skip
+            col = self._im2col(x, blk["trans"], t_rows, slots, pos, bias=blk["pb"], snake=blk["snake"])
+            x = torch.addmm(blk["b"], col, blk["trans"].weight).view(rows * r, c_out)
             rows, t_rows = rows * r, t_rows * r
             for u in blk["units"]:
-                if u.get("conv1_w4") is not None:
-                    s2 = self._snake(self._conv_cudnn(x, u, t_rows, slots, pos), u["act2"], u["b1"])
                 # Below ~16 frames per call the implicit GEMM has too few row tiles to win.
-                elif self.dilated_igemm and c_out in _DILATED_IGEMM and B * T >= 16:
+                if self.dilated_igemm and c_out in _DILATED_IGEMM and B * T >= 16:
                     s2 = self._dilated_conv_snake(x, u, t_rows, slots, pos)
+                elif u.get("conv1_w4") is not None:
+                    s2 = self._snake(self._conv_cudnn(x, u, t_rows, slots, pos), u["act2"], u["b1"])
                 else:
                     col = self._im2col(x, u["conv1"], t_rows, slots, pos, bias=u["pb"], snake=u["act1"])
                     s2 = self._snake(torch.mm(col, u["conv1"].weight), u["act2"], u["b1"])
