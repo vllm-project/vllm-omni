@@ -2348,10 +2348,7 @@ class WorkerProc:
         if sharing_registry is not None and not sharing_registry.register(rank):
             return  # Parent sealed the sharing group before this worker started.
 
-        # Arm parent-death protection before logging/plugins/WorkerProc init.
-        # A later registration leaves a window where serve-root can die while
-        # this worker is still unprotected and then continue as an orphan
-        # (see #10398). Hard SIGKILL: no manager remains to escalate cleanup.
+        # Arm before initialization; no parent remains to escalate cleanup.
         set_death_signal(signal.SIGKILL)
 
         from vllm_omni.plugins import load_omni_general_plugins

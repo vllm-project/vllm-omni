@@ -352,18 +352,10 @@ def terminate_alive_proc(proc, timeout=5):
 
 
 def set_death_signal(sig: int) -> None:
-    """Arm Linux ``PR_SET_PDEATHSIG`` so this process dies if its parent exits.
+    """Arm Linux parent-death signaling; self-signal if the parent is gone.
 
-    ``prctl`` only delivers *future* parent deaths. If the parent already
-    exited (or exits in the window between the liveness check and ``prctl``),
-    registration cannot retroactively deliver that death, so this process
-    would otherwise become an orphan under ``init``. Detect that race and
-    self-signal with ``sig`` instead of silently continuing unprotected.
-
-    An initial parent PID of 1 is treated as orphaned. Reparenting to a
-    non-init subreaper before the first PID check cannot be detected here.
-    Non-Linux platforms are a no-op. ``prctl`` failures are logged; if the
-    parent is already gone when arming fails, this process still self-signals.
+    Reparenting to a subreaper before the first PID check is not detected.
+    Non-Linux is a no-op; registration failures are logged.
     """
     try:
         import ctypes
@@ -372,16 +364,13 @@ def set_death_signal(sig: int) -> None:
         if platform.system() != "Linux":
             return
 
-        # PR_SET_PDEATHSIG == 1. Capture the current parent before arming so a
-        # mid-call death still looks like a parent change afterward.
         parent = os.getppid()
         if parent <= 1:
-            # Already reparented (typically to init): arming cannot recover.
             os.kill(os.getpid(), sig)
             return
 
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        rc = libc.prctl(1, sig)
+        rc = libc.prctl(1, sig)  # PR_SET_PDEATHSIG
         if rc != 0:
             logger.warning(
                 "prctl(PR_SET_PDEATHSIG, %s) failed: rc=%s errno=%s",
@@ -393,7 +382,7 @@ def set_death_signal(sig: int) -> None:
                 os.kill(os.getpid(), sig)
             return
 
-        # Parent may have died between the initial check and prctl return.
+        # Catch parent death during registration.
         if os.getppid() != parent:
             os.kill(os.getpid(), sig)
     except Exception:
