@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import json
 import struct
 
@@ -606,3 +609,99 @@ def test_manager_extraction_no_connector(kv_config, common_constants):
     )
 
     assert req_id in processed
+
+
+def test_failed_publication_is_not_acknowledged_and_can_retry(kv_config, monkeypatch):
+    from unittest.mock import Mock
+
+    manager = OmniKVTransferManager(kv_config)
+    connector = Mock()
+    connector.put.return_value = (False, 0, None)
+    manager._connector = connector
+    monkeypatch.setattr(kv_transfer_manager_module.time, "sleep", lambda _: None)
+    data = KVCacheTransferData(request_id="retry", layer_blocks={}, block_ids=[0], metadata={})
+    monkeypatch.setattr(manager, "_extract_kv_cache", lambda *a: data)
+    monkeypatch.setattr(manager, "_serialize_transfer_payload", lambda data: b"payload")
+    finished = {"retry": {"seq_len": 1, "block_ids": [0]}}
+    assert manager.handle_finished_requests_kv_transfer(finished, [], 1, "float32") == []
+    assert connector.put.call_count == 3
+    connector.cleanup.assert_called_once()
+    connector.put.return_value = (True, 7, None)
+    assert manager.handle_finished_requests_kv_transfer(finished, [], 1, "float32") == ["retry"]
+
+
+def test_partial_publication_is_rolled_back(kv_config, monkeypatch):
+    from unittest.mock import Mock
+
+    manager = OmniKVTransferManager(kv_config)
+    manager._connector = Mock()
+    monkeypatch.setattr(kv_transfer_manager_module, "build_rank_aware_send_keys", lambda *a, **k: ["a", "b"])
+    monkeypatch.setattr(manager, "_serialize_transfer_payload", lambda data: b"payload")
+    replies = iter([(True, 7, None), (False, 0, None)])
+    monkeypatch.setattr(manager, "_transfer_with_retry", lambda *a: next(replies))
+    data = KVCacheTransferData(request_id="partial", layer_blocks={}, block_ids=[0], metadata={})
+    monkeypatch.setattr(manager, "_extract_kv_cache", lambda *a: data)
+    assert (
+        manager.handle_finished_requests_kv_transfer({"partial": {"block_ids": [0], "seq_len": 1}}, [], 1, "float32")
+        == []
+    )
+    assert [c.args[0] for c in manager.connector.cleanup.call_args_list] == ["a", "b"]
+
+
+def test_real_shm_capacity_rejection_remains_retryable(kv_config, monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
+    from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime import _OmniConnectorRuntimeMixin
+
+    manager = OmniKVTransferManager(kv_config)
+    connector = SharedMemoryConnector({})
+    manager._connector = connector
+    runtime = SimpleNamespace(_kv_transfer_manager=manager, _kv_sent_req_ids=[])
+    data = KVCacheTransferData(request_id="capacity-retry", layer_blocks={}, block_ids=[0], metadata={})
+    monkeypatch.setattr(manager, "_extract_kv_cache", lambda *a: data)
+    clock = iter(range(10000))
+    monkeypatch.setattr(kv_transfer_manager_module.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(kv_transfer_manager_module.time, "sleep", lambda _: None)
+    free = connector._shm_free_bytes
+    monkeypatch.setattr(connector, "_shm_free_bytes", lambda: 0)
+    finished = {"capacity-retry": {"seq_len": 1, "block_ids": [0]}}
+    try:
+        assert _OmniConnectorRuntimeMixin.send_kv_cache(runtime, finished, [], 1, "float32") == []
+        assert runtime._kv_sent_req_ids == []
+        assert not connector._pending_keys
+        monkeypatch.setattr(connector, "_shm_free_bytes", free)
+        assert _OmniConnectorRuntimeMixin.send_kv_cache(runtime, finished, [], 1, "float32") == ["capacity-retry"]
+        assert runtime._kv_sent_req_ids == ["capacity-retry"]
+        assert connector._pending_keys
+    finally:
+        connector.close()
+
+
+def test_sender_rank_does_not_ack_when_peer_failed(kv_config, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from vllm_omni.distributed.omni_connectors.utils.kv_utils import KVTPTopology
+
+    manager = OmniKVTransferManager(kv_config)
+    manager._connector = Mock()
+    manager._tp_topo = KVTPTopology(2, 2, 0)
+    data = KVCacheTransferData(request_id="peer-failed", layer_blocks={}, block_ids=[0], metadata={})
+    monkeypatch.setattr(manager, "_extract_kv_cache", lambda *a: data)
+    monkeypatch.setattr(manager, "_transfer_kv_cache", lambda *a: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    group = object()
+    monkeypatch.setattr("vllm.distributed.get_tp_group", lambda: SimpleNamespace(cpu_group=group))
+    calls = []
+
+    def failed_peer(verdict, op, group):
+        calls.append((op, group))
+        assert verdict.item() == 1  # local publication succeeded
+        verdict.fill_(0)  # another sender rejected publication
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", failed_peer)
+    finished = {"peer-failed": {"block_ids": [0], "seq_len": 1}}
+    assert manager.handle_finished_requests_kv_transfer(finished, [], 1, "float32") == []
+    assert calls == [(torch.distributed.ReduceOp.MIN, group)]
+    manager.connector.cleanup.assert_called_once()

@@ -961,6 +961,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 )
             )
 
+        OmniARScheduler._retry_unacknowledged_kv_transfers(self, scheduler_output, model_runner_output)
+
         # Pre-process KV extraction acks so that the per-request loop below
         # can see up-to-date active_kv_transfers state and emit kv_ready
         # signals while requests are still alive (before any deferred stop).
@@ -2369,6 +2371,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     def has_unfinished_requests(self) -> bool:
         """Check if there are any unfinished requests (including those needing KV transfer)."""
         return self._has_pending_kv_work() or super().has_unfinished_requests()
+
+    def _retry_unacknowledged_kv_transfers(
+        self, scheduler_output: SchedulerOutput, model_runner_output: ModelRunnerOutput
+    ) -> None:
+        # An unacknowledged publication retains its pinned KV blocks and is
+        # resubmitted next step. Never resurrect a concurrently aborted request.
+        transfer_batch = getattr(scheduler_output, "finished_requests_needing_kv_transfer", {})
+        transfer_acks = set(getattr(model_runner_output, "kv_extracted_req_ids", None) or ())
+        for req_id, transfer_data in transfer_batch.items():
+            if req_id not in transfer_acks and req_id in self.requests:
+                self.requests_needing_kv_transfer[req_id] = transfer_data
 
     def get_finished_requests_needing_kv_transfer(self) -> dict[str, dict]:
         """Get and clear the list of requests needing KV cache transfer.

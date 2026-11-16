@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unified OmniConnector and KV cache transfer management."""
 
 import enum
@@ -995,7 +995,7 @@ class OmniKVTransferManager:
             request_id_resolver: Optional function to resolve global request ID
 
         Returns:
-            List of request IDs that were processed
+            List of request IDs whose KV was successfully published
         """
         if not finished_reqs:
             return []
@@ -1011,31 +1011,32 @@ class OmniKVTransferManager:
 
         extracted_ids = []
         for req_id, data in finished_reqs.items():
+            success = False
+            transfer_req_id = req_id
             try:
+                transfer_req_id = request_id_resolver(req_id) if request_id_resolver else req_id
                 seq_len = data.get("seq_len", 0)
                 block_ids = data.get("block_ids", [])
-                if not block_ids:
-                    logger.warning(f"Request {req_id} has no block IDs, skipping")
-                    continue
-
-                custom_metadata = data.get("custom_metadata")
-
-                # Extract KV cache from GPU blocks and keep it on-device when
-                # possible so raw-data connectors can use the fast path.
-                kv_data = self._extract_kv_cache(
-                    req_id, block_ids, seq_len, kv_caches, block_size, cache_dtype, custom_metadata
-                )
-                if kv_data:
-                    # Resolve global request ID if available
-                    transfer_req_id = request_id_resolver(req_id) if request_id_resolver else req_id
-
-                    # Transfer to downstream stage via connector
-                    self._transfer_kv_cache(kv_data, transfer_req_id)
-
+                if block_ids:
+                    kv_data = self._extract_kv_cache(
+                        req_id, block_ids, seq_len, kv_caches, block_size, cache_dtype, data.get("custom_metadata")
+                    )
+                    if kv_data:
+                        success = self._transfer_kv_cache(kv_data, transfer_req_id)
             except Exception as e:
                 logger.error(f"Failed KV transfer for {req_id}: {e}")
-            finally:
+
+            # Even extraction/serialization failures must reach this exchange,
+            # otherwise healthy TP peers could block waiting for the failed rank.
+            if self._send_success_consensus(success):
                 extracted_ids.append(req_id)
+            else:
+                from_stage, to_stage = self.send_stages
+                if from_stage and to_stage:
+                    for key in build_rank_aware_send_keys(
+                        transfer_req_id, from_stage, to_stage, self._tp_topo, hook=self.kv_send_key_builder
+                    ):
+                        self.connector.cleanup(key)
 
         return extracted_ids
 
@@ -1117,7 +1118,7 @@ class OmniKVTransferManager:
             },
         )
 
-    def _transfer_kv_cache(self, kv_data: KVCacheTransferData, transfer_req_id: str) -> None:
+    def _transfer_kv_cache(self, kv_data: KVCacheTransferData, transfer_req_id: str) -> bool:
         """Transfer KV cache data to downstream stage via OmniConnector.
 
         Args:
@@ -1183,6 +1184,17 @@ class OmniKVTransferManager:
             )
         else:
             logger.error(f"KV transfer FAILED: {transfer_req_id}")
+        return all_succeeded
+
+    def _send_success_consensus(self, succeeded: bool) -> bool:
+        """Acknowledge only after every source TP rank published its shard."""
+        if self._tp_topo.source_tp_size > 1 and torch.distributed.is_initialized():
+            from vllm.distributed import get_tp_group
+
+            verdict = torch.tensor(int(succeeded), dtype=torch.int32)
+            torch.distributed.all_reduce(verdict, op=torch.distributed.ReduceOp.MIN, group=get_tp_group().cpu_group)
+            return bool(verdict.item())
+        return succeeded
 
     def _transfer_with_retry(
         self,

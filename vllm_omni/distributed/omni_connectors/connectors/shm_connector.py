@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import errno
 import fcntl
 import glob
 import hashlib
@@ -69,7 +70,7 @@ class SharedMemoryConnector(OmniConnectorBase):
 
     def _write_bytes(self, payload: bytes | bytearray | memoryview, name: str) -> dict[str, Any]:
         """Publish payload bytes while the caller holds the segment lock."""
-        return shm_write_bytes(payload, name=name)
+        return shm_write_bytes(payload, name=name, reserve=True)
 
     def _read_bytes(self, metadata: dict[str, Any]) -> bytes:
         """Read logical payload bytes and unlink under the segment lock."""
@@ -116,11 +117,6 @@ class SharedMemoryConnector(OmniConnectorBase):
             return 0
         return min(_DEFAULT_SHM_CAPACITY_RESERVE_BYTES, mount // 8)
 
-    def _capacity_lock_path(self) -> str:
-        # Serialize capacity check + segment create across TP ranks / processes
-        # so concurrent puts cannot race past a free-space check (#10296).
-        return f"{self.shm_directory}/omni_shm_cap_{os.getuid()}.lock"
-
     def _ensure_shm_capacity(self, nbytes: int, *, attempts: int = 80) -> bool:
         """Wait for enough free SHM, reaping consumed keys between polls.
 
@@ -138,11 +134,12 @@ class SharedMemoryConnector(OmniConnectorBase):
             # Receivers unlink in another process; sweep our pending bookkeeping
             # so we notice freed keys quickly.
             self.reap_consumed(max_keys=256)
-            time.sleep(min(0.5, 0.02 * (1 + attempt // 4)))
+            if attempt + 1 < max(1, attempts):
+                time.sleep(min(0.5, 0.02 * (1 + attempt // 4)))
         free = self._shm_free_bytes()
         if free >= need:
             return True
-        logger.error(
+        logger.debug(
             "SharedMemoryConnector: /dev/shm low (%s MiB free, need %s MiB); giving up on put",
             free // (1 << 20),
             need // (1 << 20),
@@ -323,16 +320,23 @@ class SharedMemoryConnector(OmniConnectorBase):
 
             name = self._shm_name(put_key)
             lock_file = self._lock_file(name)
-            # Hold the uid-scoped capacity lock across the free-space check and
-            # segment create so TP ranks cannot collectively overrun /dev/shm.
-            with open(self._capacity_lock_path(), "wb+") as capf:
-                fcntl.flock(capf, fcntl.LOCK_EX)
-                if not self._ensure_shm_capacity(size):
+            # fallocate reserves backing storage across users atomically.
+            # Poll without a global lock; per-key contention shares the deadline.
+            deadline = time.monotonic() + 16.8
+            while True:
+                if self._ensure_shm_capacity(size, attempts=1):
+                    try:
+                        with open(lock_file, "wb+") as lockf:
+                            fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            meta = self._write_bytes(payload, name)
+                        break
+                    except OSError as exc:
+                        if exc.errno not in (errno.ENOSPC, errno.EAGAIN):
+                            raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     return False, 0, None
-                with open(lock_file, "wb+") as lockf:
-                    fcntl.flock(lockf, fcntl.LOCK_EX)
-                    meta = self._write_bytes(payload, name)
-                    fcntl.flock(lockf, fcntl.LOCK_UN)
+                time.sleep(min(0.1, remaining))
 
             # meta contains {'name': ..., 'size': ...}
             metadata = {"shm": meta, "size": size}

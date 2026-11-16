@@ -229,3 +229,18 @@ def test_omits_cache_misses_when_payload_object_is_replaced():
     request.additional_information = {"omni_final_stage_id": 1}
 
     assert not scheduler._request_omits_chunk_transfer_to_next_stage(request)
+
+
+def test_failed_kv_publication_requeues_without_releasing_blocks():
+    sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched.requests = {"retry": object(), "done": object()}
+    sched.requests_needing_kv_transfer = {}
+    sched.active_kv_transfers = {"retry", "done"}
+    data = {"block_ids": [4], "seq_len": 8}
+    step = SimpleNamespace(finished_requests_needing_kv_transfer={"retry": data, "done": data, "aborted": data})
+    output = SimpleNamespace(kv_extracted_req_ids=["done"])
+    sched._retry_unacknowledged_kv_transfers(step, output)
+    assert sched.requests_needing_kv_transfer == {"retry": data}
+    assert "retry" in sched.active_kv_transfers
+    assert sched.get_finished_requests_needing_kv_transfer() == {"retry": data}
+    assert sched.requests_needing_kv_transfer == {}

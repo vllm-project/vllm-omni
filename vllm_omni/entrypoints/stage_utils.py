@@ -190,10 +190,13 @@ def serialize_obj(obj: Any) -> bytes:
     return OmniSerializer.serialize(obj)
 
 
-def shm_write_bytes(payload: bytes | bytearray | memoryview, name: str | None = None) -> dict[str, Any]:
+def shm_write_bytes(
+    payload: bytes | bytearray | memoryview, name: str | None = None, *, reserve: bool = False
+) -> dict[str, Any]:
     """Write bytes into SharedMemory and return meta dict {name,size}.
 
-    Caller should close the segment; the receiver should unlink.
+    The writer closes the segment; the receiver should unlink.
+    ``reserve=True`` preallocates Linux POSIX SHM backing storage before copying.
     """
     try:
         shm = _shm.SharedMemory(create=True, size=len(payload), name=name)
@@ -209,15 +212,22 @@ def shm_write_bytes(payload: bytes | bytearray | memoryview, name: str | None = 
         else:
             raise
 
-    mv = memoryview(shm.buf)
-    mv[: len(payload)] = payload
-    del mv
-    meta = {"name": shm.name, "size": len(payload)}
     try:
+        if reserve:
+            # ftruncate does not reserve tmpfs pages. Reserve before touching
+            # the mmap so competing writers get ENOSPC instead of SIGBUS.
+            fd = os.open(f"/dev/shm/{shm.name}", os.O_RDWR | os.O_NOFOLLOW)
+            try:
+                os.posix_fallocate(fd, 0, len(payload))
+            finally:
+                os.close(fd)
+        shm.buf[: len(payload)] = payload
+        return {"name": shm.name, "size": len(payload)}
+    except BaseException:
+        shm.unlink()
+        raise
+    finally:
         shm.close()
-    except Exception as e:
-        logger.debug("Failed to close shared memory: %s", e)
-    return meta
 
 
 def shm_read_bytes(meta: dict[str, Any]) -> bytes:

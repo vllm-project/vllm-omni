@@ -675,6 +675,8 @@ def test_reaping_keeps_consumed_records_bounded_behind_unread_keys(connector):
 
 
 def test_put_waits_then_fails_when_shm_capacity_exhausted(connector, monkeypatch, mocker):
+    clock = iter(range(1000))
+    monkeypatch.setattr(time, "monotonic", lambda: next(clock))
     """Persistent /dev/shm exhaustion fails the put and does not publish (#10296)."""
     from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
 
@@ -780,3 +782,107 @@ def test_put_accepts_payload_that_fits_on_small_shm_mount(connector, monkeypatch
     got = connector.get("s0", "s1", key, metadata=meta)
     assert got is not None
     assert got[0] == {"x": 1}
+
+
+def test_preallocation_failure_unlinks_segment_before_copy(connector, monkeypatch):
+    import errno
+    from multiprocessing import shared_memory
+
+    key = "reserve_failure_" + uuid.uuid4().hex
+    calls = []
+
+    def reject(fd, offset, size):
+        calls.append((offset, size))
+        assert os.pread(fd, size, 0) == bytes(size)
+        raise OSError(errno.ENOSPC, "injected capacity rejection")
+
+    monkeypatch.setattr(os, "posix_fallocate", reject)
+    with pytest.raises(OSError, match="injected capacity rejection"):
+        connector._write_bytes(b"payload", key)
+    assert calls == [(0, 7)]
+    with pytest.raises(FileNotFoundError):
+        shared_memory.SharedMemory(name=key)
+
+
+def test_capacity_wait_does_not_block_small_put(connector, monkeypatch):
+    import threading
+
+    waiting = threading.Event()
+    release = threading.Event()
+    original = connector._ensure_shm_capacity
+
+    def capacity(size, *, attempts=80):
+        if size > 1000:
+            waiting.set()
+            assert release.wait(5)
+            return False
+        return original(size, attempts=attempts)
+
+    monkeypatch.setattr(connector, "_ensure_shm_capacity", capacity)
+    large_key = "large_" + uuid.uuid4().hex
+    small_key = "small_" + uuid.uuid4().hex
+    large = threading.Thread(target=lambda: connector.put("0", "1", large_key, b"x" * 2000))
+    large.start()
+    try:
+        assert waiting.wait(5)
+        assert connector.put("0", "1", small_key, "small")[0]
+        assert connector.get("0", "1", small_key)[0] == "small"
+    finally:
+        release.set()
+        large.join(20)
+        connector.cleanup(large_key)
+    assert not large.is_alive()
+
+
+def test_put_key_lock_wait_is_bounded(connector, monkeypatch):
+    key = "contended_" + uuid.uuid4().hex
+    clock = iter(range(1000))
+    monkeypatch.setattr(time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    with open(connector._lock_file(key), "wb+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        assert connector.put("0", "1", key, "value") == (False, 0, None)
+    connector.cleanup(key)
+
+
+def test_competing_writers_reserve_before_copy(connector, monkeypatch):
+    import errno
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from multiprocessing import shared_memory
+
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    reserved = 0
+    original = os.posix_fallocate
+
+    def reserve(fd, offset, size):
+        nonlocal reserved
+        # Both writers reached allocation despite the advisory space check.
+        barrier.wait(timeout=5)
+        with lock:
+            assert os.pread(fd, size, 0) == bytes(size)
+            if reserved + size > 8:
+                raise OSError(errno.ENOSPC, "competing writer reserved the remaining capacity")
+            original(fd, offset, size)
+            reserved += size
+
+    monkeypatch.setattr(os, "posix_fallocate", reserve)
+    keys = ["compete_" + uuid.uuid4().hex for _ in range(2)]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(connector._write_bytes, b"12345678", key) for key in keys]
+        successes, failures = [], []
+        for key, future in zip(keys, futures):
+            try:
+                successes.append((key, future.result(timeout=5)))
+            except OSError as exc:
+                assert exc.errno == errno.ENOSPC
+                failures.append(key)
+    try:
+        assert len(successes) == len(failures) == 1
+        assert connector._read_bytes(successes[0][1]) == b"12345678"
+        with pytest.raises(FileNotFoundError):
+            shared_memory.SharedMemory(name=failures[0])
+    finally:
+        for key in keys:
+            connector.cleanup(key)

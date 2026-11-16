@@ -48,3 +48,19 @@ normal completion, cancellation, failure, and shutdown.
 
 Test setup, transfer, synchronization, timeout, cancellation, failure, and
 cleanup across every affected backend.
+
+### Shared-memory capacity failures
+
+`SharedMemoryConnector` checks available space as an advisory admission hint,
+then reserves backing storage with `posix_fallocate` before copying into the
+mapping. Allocation failure unlinks the unpublished segment. Capacity polling
+holds no UID-wide lock; per-key lock contention uses a nonblocking lock and the
+same bounded wait as capacity polling.
+
+A failed KV publication is not an extraction acknowledgement. All sender TP
+ranks must agree on success; otherwise published local shards are cleaned up.
+The AR scheduler retains the request's KV blocks and resubmits the transfer on
+its next step. Cancellation removes the request rather than resurrecting it
+for a retry. Restoring capacity permits publication and block release without
+requiring a new model computation. Persistent rejection remains pending until
+capacity returns or the request is cancelled; it is not reported as success.
