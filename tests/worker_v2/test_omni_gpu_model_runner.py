@@ -536,6 +536,20 @@ def test_minicpmo_capture_contract(stage, use_mrv2, returns_aux, exclude_full):
     assert runner._exclude_full_graph is exclude_full
 
 
+def test_minimax_music3_capture_contract_preserves_full_graph():
+    from vllm_omni.model_executor.models.minimax_music3.talker import MiniMaxMusic3TalkerForConditionalGeneration
+
+    model = MiniMaxMusic3TalkerForConditionalGeneration.__new__(MiniMaxMusic3TalkerForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    runner = _make_runner()
+    runner.model = model
+
+    runner._configure_cudagraph_output_contract()
+
+    assert not runner._model_has_structured_output
+    assert not runner._exclude_full_graph
+
+
 def _aux_output(num_tokens):
     hidden = torch.arange(num_tokens * 2, dtype=torch.float32).reshape(num_tokens, 2)
     return hidden, {"hidden_states": {"layers": {0: hidden + 1, 24: hidden + 2}}}
