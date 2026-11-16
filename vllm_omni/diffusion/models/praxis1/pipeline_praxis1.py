@@ -37,6 +37,7 @@ from vllm_omni.diffusion.models.praxis1.configuration_praxis1 import load_config
 from vllm_omni.diffusion.models.praxis1.layers import ATTENTION_IMPLS
 from vllm_omni.diffusion.models.praxis1.praxis1_transformer import Praxis1Transformer
 from vllm_omni.diffusion.models.praxis1.processing import NormStats
+from vllm_omni.diffusion.models.praxis1.processing_yam import YamServeSession
 from vllm_omni.diffusion.models.utils import create_transformers_model_with_vllm_linears
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -181,7 +182,8 @@ class Session:
         self.seed = int(seed)
         self.last_used = time.monotonic()
         config = pipeline.transformer.config
-        self.state = single_arm.ServeSession(
+        session_type = YamServeSession if config.get("embodiment") == "bimanual" else single_arm.ServeSession
+        self.state = session_type(
             encode=pipeline.vae.encode,
             stats=pipeline.stats,
             device=pipeline.device,
@@ -320,12 +322,16 @@ class Praxis1Pipeline(nn.Module):
             raise ValueError("Deployment exec_horizon must be an integer in [1, 24]")
         native_config = load_config(checkpoint)
         self.embodiment = native_config["embodiment"]
+        if self.embodiment == "bimanual" and self.sampler.control_mode != "none":
+            raise ValueError("YAM requires control_mode=none; use the Praxis-1 YAM deployment")
         video_config = native_config["video"]
         # The OpenPI/Positronic handshake must advertise what this worker does.
         # Deployment settings may be omitted; checkpoint geometry and session
         # flags are required once a handshake is declared.
         required = {
-            "image_resolution": list(single_arm.fit_resize_size(video_config["tile_width"])),
+            "image_resolution": [416, 416]
+            if self.embodiment == "bimanual"
+            else list(single_arm.fit_resize_size(video_config["tile_width"])),
             "tile_size": [video_config["tile_height"], video_config["tile_width"]],
             "fps": native_config["chunking"]["grid_hz"],
             "video_antialias": True,
@@ -412,21 +418,30 @@ class Praxis1Pipeline(nn.Module):
         """Expose the existing rollout cleanup hook without invoking the model."""
         self.reset(session_id)
 
+    @property
+    def _arm_suffixes(self) -> tuple[str, ...]:
+        return (".left", ".right") if self.embodiment == "bimanual" else ("",)
+
     def _empty_actions(self) -> np.ndarray:
-        return np.empty((0, 13), dtype=np.float32)
+        return np.empty((0, 13 * len(self._arm_suffixes)), dtype=np.float32)
 
     def _warmup(self) -> DiffusionOutput:
         """Compile the configured context depths before the server is ready."""
         if self.startup_warmup:
             video = self.transformer.config["video"]
             h, w = video["tile_height"], video["tile_width"]
+            bimanual = self.embodiment == "bimanual"
+            h = 260 if bimanual else h
+            views = ("exterior", "wrist_left", "wrist_right") if bimanual else ("exterior", "wrist")
+            sides = (".left", ".right") if bimanual else ("",)
             obs = {
-                **{f"image.{v}": np.zeros((25, h, w, 3), dtype=np.uint8) for v in ("exterior", "wrist")},
-                "robot_state.ee_pose": np.tile([0.4, 0, 0.3, 1, 0, 0, 0], (25, 1)),
-                "grip": np.full((25, 1), 0.5, dtype=np.float32),
+                **{f"image.{v}": np.zeros((25, h, w, 3), dtype=np.uint8) for v in views},
+                **{f"robot_state{side}.ee_pose": np.tile([0.4, 0, 0.3, 1, 0, 0, 0], (25, 1)) for side in sides},
+                **{f"grip{side}": np.full((25, 1), 0.5, dtype=np.float32) for side in sides},
                 "task": "Move the gripper forward.",
-                "descriptor": "praxis.sim",
             }
+            if not bimanual:
+                obs["descriptor"] = "praxis.sim"
             session = Session(
                 self, max_context_chunks=self.sampler.max_context_chunks, control_mode=self.sampler.control_mode
             )
@@ -521,11 +536,17 @@ class Praxis1Pipeline(nn.Module):
             result = session.step(observation)
             session.last_used = time.monotonic()
             commands = result.commands
+            suffixes = self._arm_suffixes
             actions = np.asarray(
-                [np.concatenate((cmd["robot_command"]["pose"], [cmd["target_grip"]])) for cmd in commands],
+                [
+                    np.concatenate(
+                        [np.concatenate((cmd[f"robot_command{s}"]["pose"], [cmd[f"target_grip{s}"]])) for s in suffixes]
+                    )
+                    for cmd in commands
+                ],
                 dtype=np.float32,
             )
-            if actions.ndim != 2 or actions.shape[1] != 13 or not np.isfinite(actions).all():
+            if actions.ndim != 2 or actions.shape[1] != 13 * len(suffixes) or not np.isfinite(actions).all():
                 raise ValueError("Praxis-1 returned invalid Cartesian pose/gripper actions.")
             payload: DiffusionPayload = {"actions": actions}
             trajectory: DiffusionPayload = {}

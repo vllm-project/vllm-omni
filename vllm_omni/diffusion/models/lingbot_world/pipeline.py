@@ -11,6 +11,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
+from functools import partial
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
@@ -71,6 +72,7 @@ from vllm_omni.diffusion.offloader.config import (
     OffloadStrategy,
     resolve_offload_strategy,
 )
+from vllm_omni.diffusion.offloader.sequential_backend import sequential_offload_component
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -401,146 +403,168 @@ def _decode_source_image_file(path: str | os.PathLike[str]) -> PIL.Image.Image:
         source_image.close()
 
 
+def _preprocess_lingbot_request(
+    request: OmniDiffusionRequest,
+    *,
+    configured_action_root: str | None,
+    stepwise: bool,
+) -> OmniDiffusionRequest:
+    """Materialize request-local files once before dispatching GPU workers."""
+    prompt = request.prompt
+    if not isinstance(prompt, dict):
+        raise ValueError("LingBot World requires a prompt mapping containing multi_modal_data.image.")
+    multi_modal_data = prompt.get("multi_modal_data") or {}
+    additional_information = prompt.get("additional_information") or {}
+    if not isinstance(multi_modal_data, dict):
+        raise ValueError("prompt.multi_modal_data must be a mapping containing image.")
+    if not isinstance(additional_information, dict):
+        raise ValueError("prompt.additional_information must be a mapping.")
+    if "action_path" in additional_information:
+        raise ValueError(
+            "prompt.additional_information.action_path is not supported; use sampling_params.extra_args.action_path."
+        )
+
+    image = multi_modal_data.get("image")
+    if isinstance(image, list):
+        raise ValueError("LingBot World requires one image and does not accept an image list.")
+    if image is None:
+        raise ValueError("LingBot World requires exactly one image in multi_modal_data.image.")
+    if isinstance(image, (str, os.PathLike)):
+        image = _load_source_image(image)
+    elif isinstance(image, PIL.Image.Image):
+        image = _decode_source_image(image)
+    elif not isinstance(image, torch.Tensor):
+        raise ValueError("multi_modal_data.image must be a PIL image, tensor, or file path.")
+
+    extra_args = getattr(request.sampling_params, "extra_args", None) or {}
+    if not isinstance(extra_args, dict):
+        raise ValueError("sampling_params.extra_args must be a mapping.")
+    tick = ARDiffusionTickRequest.from_extra_args(extra_args)
+    if tick is not None:
+        camera_controls = [control for control in tick.controls if control.track == "camera"]
+        if len(camera_controls) != 1:
+            raise ValueError("LingBot realtime ticks require exactly one camera control.")
+        camera_control = camera_controls[0]
+        if camera_control.schema == LINGBOT_CAMERA_TRAJECTORY_SCHEMA:
+            camera_data = camera_control.data
+            try:
+                poses = torch.as_tensor(camera_data["poses"], dtype=torch.float32)
+                intrinsics = torch.as_tensor(
+                    camera_data["intrinsics"],
+                    dtype=torch.float32,
+                )
+            except (KeyError, TypeError, ValueError):
+                raise ValueError("lingbot.camera_trajectory.v1 requires numeric poses and intrinsics fields.") from None
+            if poses.ndim != 3 or poses.shape[1:] != (4, 4):
+                raise ValueError("camera control poses must have shape [frames, 4, 4].")
+            if intrinsics.ndim != 2 or intrinsics.shape[1:] != (4,):
+                raise ValueError("camera control intrinsics must have shape [frames, 4].")
+            if poses.shape[0] != intrinsics.shape[0] or poses.shape[0] == 0:
+                raise ValueError("camera control poses and intrinsics must contain the same positive number of frames.")
+            if not torch.isfinite(poses).all() or not torch.isfinite(intrinsics).all():
+                raise ValueError("camera control values must all be finite.")
+            trajectory = CameraTrajectory(
+                poses=poses,
+                intrinsics=intrinsics,
+            )
+            camera_actions = None
+        elif camera_control.schema == LINGBOT_CAMERA_ACTION_SCHEMA:
+            trajectory = None
+            camera_actions = parse_lingbot_camera_action_frames(
+                camera_control.data,
+                expected_frames=3,
+            )
+        else:
+            raise ValueError(
+                "LingBot realtime camera controls require schema "
+                "'lingbot.camera_trajectory.v1' or 'lingbot.camera_actions.v1'."
+            )
+        camera_action_script = None
+    elif extra_args.get("camera_action_script") is not None:
+        if extra_args.get("action_path"):
+            raise ValueError("camera_action_script cannot be combined with action_path.")
+        camera_action_script = parse_lingbot_camera_action_script(
+            extra_args.get("camera_action_script"),
+            frames_per_chunk=3,
+        )
+        trajectory = None
+        camera_actions = None
+    else:
+        action_path = extra_args.get("action_path")
+        if action_path is None or action_path == "":
+            # Stepwise / streaming sessions may omit a request-scoped camera
+            # script and instead drive motion via mid-generation camera
+            # interaction (idle hold until the first camera event).
+            if stepwise:
+                trajectory = None
+                camera_actions = None
+                camera_action_script = None
+            else:
+                raise ValueError("action_path is required in sampling_params.extra_args.action_path.")
+        else:
+            if not isinstance(action_path, (str, os.PathLike)) or not str(action_path):
+                raise ValueError("action_path is required in sampling_params.extra_args.action_path.")
+            if not configured_action_root:
+                raise ValueError(
+                    "sampling_params.extra_args.action_path requires a trusted action root configured by "
+                    f"model_config.lingbot_action_root or {_ACTION_ROOT_ENV}."
+                )
+            action_directory = resolve_trusted_action_directory(
+                action_path,
+                configured_action_root,
+            )
+            try:
+                trajectory = load_camera_trajectory(action_directory)
+            except OSError:
+                raise ValueError(
+                    "Unable to load camera trajectory from action_path; expected poses.npy and intrinsics.npy."
+                ) from None
+            camera_actions = None
+            camera_action_script = None
+
+    updated_prompt = dict(prompt)
+    updated_multi_modal_data = dict(multi_modal_data)
+    updated_multi_modal_data["image"] = image
+    updated_prompt["multi_modal_data"] = updated_multi_modal_data
+    request.prompt = updated_prompt
+    request.sampling_params.extra_args = {
+        **extra_args,
+        _PREPROCESSED_CAMERA_KEY: trajectory,
+        _PREPROCESSED_CAMERA_ACTIONS_KEY: camera_actions,
+        _PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY: camera_action_script,
+    }
+    return request
+
+
 def get_lingbot_world_pre_process_func(
     od_config: OmniDiffusionConfig,
 ) -> Callable[[OmniDiffusionRequest], OmniDiffusionRequest]:
-    """Materialize request-local files once before dispatching GPU workers."""
-
+    """Resolve the trusted action root once, then bind the request helper."""
     model_config = getattr(od_config, "model_config", None) or {}
     configured_action_root = model_config.get("lingbot_action_root") or os.environ.get(_ACTION_ROOT_ENV)
+    stepwise = bool(getattr(od_config, "step_execution", False) or getattr(od_config, "streaming_output", False))
+    return partial(
+        _preprocess_lingbot_request,
+        configured_action_root=configured_action_root,
+        stepwise=stepwise,
+    )
 
-    def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
-        prompt = request.prompt
-        if not isinstance(prompt, dict):
-            raise ValueError("LingBot World requires a prompt mapping containing multi_modal_data.image.")
-        multi_modal_data = prompt.get("multi_modal_data") or {}
-        additional_information = prompt.get("additional_information") or {}
-        if not isinstance(multi_modal_data, dict):
-            raise ValueError("prompt.multi_modal_data must be a mapping containing image.")
-        if not isinstance(additional_information, dict):
-            raise ValueError("prompt.additional_information must be a mapping.")
-        if "action_path" in additional_information:
-            raise ValueError(
-                "prompt.additional_information.action_path is not supported; use "
-                "sampling_params.extra_args.action_path."
-            )
 
-        image = multi_modal_data.get("image")
-        if isinstance(image, list):
-            raise ValueError("LingBot World requires one image and does not accept an image list.")
-        if image is None:
-            raise ValueError("LingBot World requires exactly one image in multi_modal_data.image.")
-        if isinstance(image, (str, os.PathLike)):
-            image = _load_source_image(image)
-        elif isinstance(image, PIL.Image.Image):
-            image = _decode_source_image(image)
-        elif not isinstance(image, torch.Tensor):
-            raise ValueError("multi_modal_data.image must be a PIL image, tensor, or file path.")
+def _project_text_layer_kv(
+    blocks: Iterable[Any],
+    projected_text: torch.Tensor,
+) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    """Yield per-block cross-attention K/V for one projected prompt.
 
-        extra_args = getattr(request.sampling_params, "extra_args", None) or {}
-        if not isinstance(extra_args, dict):
-            raise ValueError("sampling_params.extra_args must be a mapping.")
-        tick = ARDiffusionTickRequest.from_extra_args(extra_args)
-        if tick is not None:
-            camera_controls = [control for control in tick.controls if control.track == "camera"]
-            if len(camera_controls) != 1:
-                raise ValueError("LingBot realtime ticks require exactly one camera control.")
-            camera_control = camera_controls[0]
-            if camera_control.schema == LINGBOT_CAMERA_TRAJECTORY_SCHEMA:
-                camera_data = camera_control.data
-                try:
-                    poses = torch.as_tensor(camera_data["poses"], dtype=torch.float32)
-                    intrinsics = torch.as_tensor(
-                        camera_data["intrinsics"],
-                        dtype=torch.float32,
-                    )
-                except (KeyError, TypeError, ValueError):
-                    raise ValueError(
-                        "lingbot.camera_trajectory.v1 requires numeric poses and intrinsics fields."
-                    ) from None
-                if poses.ndim != 3 or poses.shape[1:] != (4, 4):
-                    raise ValueError("camera control poses must have shape [frames, 4, 4].")
-                if intrinsics.ndim != 2 or intrinsics.shape[1:] != (4,):
-                    raise ValueError("camera control intrinsics must have shape [frames, 4].")
-                if poses.shape[0] != intrinsics.shape[0] or poses.shape[0] == 0:
-                    raise ValueError(
-                        "camera control poses and intrinsics must contain the same positive number of frames."
-                    )
-                if not torch.isfinite(poses).all() or not torch.isfinite(intrinsics).all():
-                    raise ValueError("camera control values must all be finite.")
-                trajectory = CameraTrajectory(
-                    poses=poses,
-                    intrinsics=intrinsics,
-                )
-                camera_actions = None
-            elif camera_control.schema == LINGBOT_CAMERA_ACTION_SCHEMA:
-                trajectory = None
-                camera_actions = parse_lingbot_camera_action_frames(
-                    camera_control.data,
-                    expected_frames=3,
-                )
-            else:
-                raise ValueError(
-                    "LingBot realtime camera controls require schema "
-                    "'lingbot.camera_trajectory.v1' or 'lingbot.camera_actions.v1'."
-                )
-            camera_action_script = None
-        elif extra_args.get("camera_action_script") is not None:
-            if extra_args.get("action_path"):
-                raise ValueError("camera_action_script cannot be combined with action_path.")
-            camera_action_script = parse_lingbot_camera_action_script(
-                extra_args.get("camera_action_script"),
-                frames_per_chunk=3,
-            )
-            trajectory = None
-            camera_actions = None
-        else:
-            action_path = extra_args.get("action_path")
-            if action_path is None or action_path == "":
-                # Stepwise / streaming sessions may omit a request-scoped camera
-                # script and instead drive motion via mid-generation camera
-                # interaction (idle hold until the first camera event).
-                if getattr(od_config, "step_execution", False) or getattr(od_config, "streaming_output", False):
-                    trajectory = None
-                    camera_actions = None
-                    camera_action_script = None
-                else:
-                    raise ValueError("action_path is required in sampling_params.extra_args.action_path.")
-            else:
-                if not isinstance(action_path, (str, os.PathLike)) or not str(action_path):
-                    raise ValueError("action_path is required in sampling_params.extra_args.action_path.")
-                if not configured_action_root:
-                    raise ValueError(
-                        "sampling_params.extra_args.action_path requires a trusted action root configured by "
-                        f"model_config.lingbot_action_root or {_ACTION_ROOT_ENV}."
-                    )
-                action_directory = resolve_trusted_action_directory(
-                    action_path,
-                    configured_action_root,
-                )
-                try:
-                    trajectory = load_camera_trajectory(action_directory)
-                except OSError:
-                    raise ValueError(
-                        "Unable to load camera trajectory from action_path; expected poses.npy and intrinsics.npy."
-                    ) from None
-                camera_actions = None
-                camera_action_script = None
-
-        updated_prompt = dict(prompt)
-        updated_multi_modal_data = dict(multi_modal_data)
-        updated_multi_modal_data["image"] = image
-        updated_prompt["multi_modal_data"] = updated_multi_modal_data
-        request.prompt = updated_prompt
-        request.sampling_params.extra_args = {
-            **extra_args,
-            _PREPROCESSED_CAMERA_KEY: trajectory,
-            _PREPROCESSED_CAMERA_ACTIONS_KEY: camera_actions,
-            _PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY: camera_action_script,
-        }
-        return request
-
-    return pre_process_func
+    A generator on purpose: publishing one layer at a time keeps the text-cache
+    build from materializing every layer's K/V at once.
+    """
+    for block in blocks:
+        cross_attention = block.cross_attn
+        shape = (cross_attention.num_local_heads, cross_attention.head_dim)
+        key = cross_attention.norm_k(cross_attention.k(projected_text)).unflatten(2, shape)
+        value = cross_attention.v(projected_text).unflatten(2, shape)
+        yield key, value
 
 
 def _fold_camera_embedding(
@@ -552,29 +576,32 @@ def _fold_camera_embedding(
     return folded.permute(1, 0, 2, 3).unsqueeze(0).contiguous()
 
 
+def _postprocess_lingbot_video(
+    video: torch.Tensor,
+    output_type: str = "np",
+    sampling_params: Any | None = None,
+    *,
+    video_processor: Any,
+) -> Any:
+    """Wrap the decoded video in the pipeline payload envelope."""
+    if isinstance(video, dict) and isinstance(video.get("payload"), dict):
+        return video
+    if sampling_params is not None:
+        output_type = getattr(sampling_params, "output_type", None) or output_type
+    if output_type == "latent":
+        return video
+    return {
+        "payload": {"video": video_processor.postprocess_video(video, output_type=output_type)},
+        "metadata": {},
+    }
+
+
 def get_lingbot_world_post_process_func(od_config: OmniDiffusionConfig) -> Callable[..., Any]:
     del od_config
     from diffusers.video_processor import VideoProcessor
 
     video_processor = VideoProcessor(vae_scale_factor=8)
-
-    def post_process_func(
-        video: torch.Tensor,
-        output_type: str = "np",
-        sampling_params: Any | None = None,
-    ) -> Any:
-        if isinstance(video, dict) and isinstance(video.get("payload"), dict):
-            return video
-        if sampling_params is not None:
-            output_type = getattr(sampling_params, "output_type", None) or output_type
-        if output_type == "latent":
-            return video
-        return {
-            "payload": {"video": video_processor.postprocess_video(video, output_type=output_type)},
-            "metadata": {},
-        }
-
-    return post_process_func
+    return partial(_postprocess_lingbot_video, video_processor=video_processor)
 
 
 class LingBotWorldCausalDMDPipeline(
@@ -631,6 +658,18 @@ class LingBotWorldCausalDMDPipeline(
         if isinstance(first_block_limit, bool) or not isinstance(first_block_limit, int) or first_block_limit <= 0:
             raise ValueError("model_config.lingbot_first_block_kv_cpu_limit_bytes must be a positive integer.")
         self._first_block_kv_cpu_limit_bytes = first_block_limit if share_first_block else 0
+        worldkv_value = model_config.get("worldkv")
+        if worldkv_value is not None:
+            if not od_config.enforce_eager or reuse_last_step_kv or share_first_block:
+                raise ValueError("worldkv requires eager clean commits without first-block sharing")
+            # _validate_parallel_config already rejects pipeline, ring, CFG and VAE parallelism.
+            tensor_parallel_size = getattr(parallel_config, "tensor_parallel_size", 1)
+            ulysses_degree = getattr(parallel_config, "ulysses_degree", 1)
+            if tensor_parallel_size != 1 or ulysses_degree != 1:
+                raise ValueError(
+                    "worldkv currently requires single-rank attention, got "
+                    f"tensor_parallel_size={tensor_parallel_size}, ulysses_degree={ulysses_degree}."
+                )
         self.device = get_local_device()
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         model = od_config.model
@@ -687,6 +726,19 @@ class LingBotWorldCausalDMDPipeline(
             quant_config=getattr(od_config, "quantization_config", None),
             prefix="transformer",
         )
+
+        from vllm_omni.experimental.ar_diffusion.worldkv import WorldKVConfig
+
+        native = self.transformer.config
+        self._worldkv_config = WorldKVConfig.parse(
+            worldkv_value,
+            window_frames=(
+                int(native.local_attn_size) if native.local_attn_size != -1 else int(native.sliding_window_num_frames)
+            ),
+            sink_frames=int(native.sink_size),
+            chunk_frames=int(native.num_frames_per_block),
+        )
+        self.transformer.worldkv_config = self._worldkv_config
 
         scheduler_config = _load_json(model, "scheduler/scheduler_config.json", local_files_only)
         _validate_scheduler_config(scheduler_config)
@@ -800,6 +852,20 @@ class LingBotWorldCausalDMDPipeline(
             * int(self.transformer.config.attention_head_dim)
             * element_size
         )
+        memory_config = getattr(self, "_worldkv_config", None)
+        memory_bytes = 0
+        if memory_config is not None:
+            memory_bytes = memory_config.reservation_bytes(
+                int(self.transformer.config.num_layers),
+                tokens_per_frame,
+                int(self.transformer.blocks[0].self_attn.num_sp_heads),
+                int(self.transformer.config.attention_head_dim),
+                element_size,
+                chunk_frames=condition_latent_frames,
+            )
+            # Policy memory owns history; the legacy pool retains only its
+            # minimum geometry and never receives duplicate self-KV writes.
+            sink_frames, recent_window_frames = 0, 1
         return ARDiffusionKVCacheSpec(
             num_layers=int(self.transformer.config.num_layers),
             num_kv_heads=int(self.transformer.blocks[0].self_attn.num_sp_heads),
@@ -820,7 +886,8 @@ class LingBotWorldCausalDMDPipeline(
                 ),
             ),
             model_owned_state_bytes_per_session=(
-                condition_bytes_per_session
+                memory_bytes
+                + condition_bytes_per_session
                 + camera_bytes_per_session
                 + 2 * self._condition_encoder_cache_bytes()  # Committed and in-flight histories.
                 + self._streaming_decode_bytes_per_session()
@@ -1406,17 +1473,17 @@ class LingBotWorldCausalDMDPipeline(
         layers = scope.lookup(identity)
         if layers is None:
             ticket = scope.begin_build(identity)
-            projected_text = self.transformer.text_embedding(prompt_embeds)
+            # These projections bypass transformer.forward and its offload
+            # hook. Keep weights resident until the lazy K/V iterator finishes.
+            component = (
+                sequential_offload_component(self.transformer)
+                if resolve_offload_strategy(self.od_config) is OffloadStrategy.MODEL_LEVEL
+                else nullcontext()
+            )
+            with component:
+                projected_text = self.transformer.text_embedding(prompt_embeds)
 
-            def layer_kv() -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
-                for block in self.transformer.blocks:
-                    cross_attention = block.cross_attn
-                    shape = (cross_attention.num_local_heads, cross_attention.head_dim)
-                    key = cross_attention.norm_k(cross_attention.k(projected_text)).unflatten(2, shape)
-                    value = cross_attention.v(projected_text).unflatten(2, shape)
-                    yield key, value
-
-            scope.publish(ticket, layer_kv())
+                scope.publish(ticket, _project_text_layer_kv(self.transformer.blocks, projected_text))
             layers = scope.lookup(identity)
             assert layers is not None
         return [
@@ -1477,6 +1544,7 @@ class LingBotWorldCausalDMDPipeline(
         schedule: tuple[tuple[float, float], ...],
         generator: torch.Generator,
         progress_bar: TqdmProgressBar[Any],
+        camera_pose: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self._dmd_blocks.generate_block(
             condition=condition,
@@ -1488,6 +1556,7 @@ class LingBotWorldCausalDMDPipeline(
             schedule=schedule,
             generator=generator,
             progress_bar=progress_bar,
+            camera_pose=camera_pose,
         )
 
     def _session_text_caches(
@@ -1682,6 +1751,16 @@ class LingBotWorldCausalDMDPipeline(
                 max_sequence_length=inputs.max_sequence_length,
                 session_state=session_state,
             )
+        retrieval_poses = None
+        memory_config = getattr(self, "_worldkv_config", None)
+        if memory_config is not None and memory_config.retrieval_frames:
+            trajectory = inputs.camera_trajectory
+            if inputs.camera_actions is None:
+                trajectory = CameraTrajectory(
+                    poses=trajectory.poses[: inputs.num_frames], intrinsics=trajectory.intrinsics[: inputs.num_frames]
+                )
+                trajectory = interpolate_camera_trajectory(trajectory, inputs.num_latent_frames)
+            retrieval_poses = trajectory.poses
         generated_blocks: list[torch.Tensor] = []
         total_steps = (inputs.num_latent_frames // block_frames) * len(LINGBOT_DMD_TIMESTEPS)
         first_start_frame = tick.chunk_index * block_frames if tick is not None else 0
@@ -1707,6 +1786,11 @@ class LingBotWorldCausalDMDPipeline(
                         schedule=schedule,
                         generator=inputs.generator,
                         progress_bar=progress_bar,
+                        **(
+                            {"camera_pose": retrieval_poses[local_start_frame + block_frames // 2]}
+                            if retrieval_poses is not None
+                            else {}
+                        ),
                     )
                 )
         generated_latents = torch.cat(generated_blocks, dim=2)
@@ -2074,6 +2158,7 @@ class LingBotWorldCausalDMDPipeline(
                 initial_pitch=float(extra.get("camera_pitch", 0.0)),
             )
             extra["camera_pitch"] = camera_pitch
+            retrieval_pose = action_trajectory.poses[block_frames // 2]
             media_frames = self._chunk_media_frame_count(state, block_frames=block_frames)
             chunk_inputs = replace(
                 inputs,
@@ -2095,6 +2180,7 @@ class LingBotWorldCausalDMDPipeline(
             ):
                 raise ValueError("Cannot use mid-generation camera interaction together with camera_embedding_cache; ")
             trajectory = extra["camera_trajectory_cache"]
+            retrieval_pose = trajectory.poses[start_frame + block_frames // 2]
             camera = extra["camera_embedding_cache"][:, :, start_frame:stop_frame]
             camera_tail = CameraTrajectory(
                 poses=trajectory.poses[stop_frame - 1 : stop_frame].clone(),
@@ -2117,6 +2203,7 @@ class LingBotWorldCausalDMDPipeline(
                     "camera interaction must produce exactly one pose per latent frame; "
                     f"got {int(absolute_poses.shape[0])}, expected {num_latent_frames}."
                 )
+            retrieval_pose = absolute_poses[block_frames // 2]
             action_trajectory = camera_trajectory_from_absolute_pose(
                 absolute_poses,
                 width=inputs.width,
@@ -2147,6 +2234,7 @@ class LingBotWorldCausalDMDPipeline(
             raise ValueError("LingBot World requires the runner-provided torch.Generator.")
         extra["condition"] = condition
         extra["camera"] = camera
+        extra["retrieval_pose"] = retrieval_pose
         # One camera-modulation cache per block: the four probes and the
         # commit below are separate scheduler steps, so the block runner
         # cannot open the reuse window around them the way generate_block
@@ -2188,11 +2276,17 @@ class LingBotWorldCausalDMDPipeline(
         states: Sequence[StepRequestState] | None = None,
         **kwargs: Any,
     ) -> torch.Tensor | None:
-        del input_batch, kwargs
+        del kwargs
         if states is None or len(states) != 1:
             raise ValueError("LingBot step execution supports a single request, not a batched request.")
         self._require_bound_ar_state()
         state = states[0]
+        members = getattr(input_batch, "execution_batch", None)
+        if members is not None:
+            if members.request_ids != (state.request_id,):
+                raise ValueError("LingBot compute members do not match the scheduled request")
+            if members.kv_views != (self._ar_diffusion_kv_state,):
+                raise ValueError("LingBot compute member is bound to a different KV backend")
         extra = state.extra
         latents = state.latents
         if latents is None:
@@ -2202,17 +2296,19 @@ class LingBotWorldCausalDMDPipeline(
             raise RuntimeError("LingBot step execution requires a current timestep before denoise_step.")
         schedule = extra["schedule"]
         step_in_chunk = state.step_in_chunk
+        ar_context = self._ar_block_context(extra["ar_cross_attention"])
         return self._dmd_blocks.probe_step(
             current_latents=latents,
             condition=extra["condition"],
             camera=extra["camera"],
             prompt_embeds=cast(torch.Tensor, state.prompt_embeds),
             cache=None,
-            ar=self._ar_block_context(extra["ar_cross_attention"]),
+            ar=ar_context,
             start_frame=int(extra["start_frame"]),
             timestep_value=float(schedule[step_in_chunk][0]),
             step_index=step_in_chunk,
             camera_cache=extra["camera_cache"],
+            camera_pose=extra.get("retrieval_pose"),
         )
 
     def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
@@ -2256,6 +2352,7 @@ class LingBotWorldCausalDMDPipeline(
             ar=self._ar_block_context(extra["ar_cross_attention"]),
             start_frame=int(extra["start_frame"]),
             camera_cache=extra.pop("camera_cache"),
+            camera_pose=extra.get("retrieval_pose"),
         )
         completed_chunk_index = state.chunk_index
         inputs: _LingBotRequestInputs = extra["inputs"]
