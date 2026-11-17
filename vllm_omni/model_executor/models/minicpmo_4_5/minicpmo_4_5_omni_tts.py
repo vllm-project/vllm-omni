@@ -1907,9 +1907,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             if native_duplex:
                 max_tokens, min_tokens = _native_duplex_chunk_budget(meta if isinstance(meta, Mapping) else None)
             elif turn_chunk and meta.get("turn_chunk_close") is not True:
-                # generate_with_buffer's per-block ceiling.
+                # generate_with_buffer's per-block ceiling, lowered to the cap
+                # the bridge counted against the Talker context for this block.
                 remaining = int(self._tts_config.max_position_embeddings) - target_len
-                max_tokens = max(min(_TURN_CHUNK_CODEC_MAX_NEW_TOKENS, remaining), 1)
+                block_cap = meta.get("turn_chunk_max_codes")
+                if not isinstance(block_cap, int) or isinstance(block_cap, bool) or block_cap <= 0:
+                    block_cap = _TURN_CHUNK_CODEC_MAX_NEW_TOKENS
+                max_tokens = max(min(block_cap, _TURN_CHUNK_CODEC_MAX_NEW_TOKENS, remaining), 1)
                 min_tokens = None
             else:
                 # MiniCPMTTS.generate()'s max_new_token, clamped to what the

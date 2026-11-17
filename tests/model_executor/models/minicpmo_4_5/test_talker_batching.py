@@ -1199,6 +1199,22 @@ def test_turn_chunk_next_block_resumes_with_the_confirmed_penalty_window() -> No
     assert talker._request_host_codec_states["req-chunk"] == {"finished": False, "condition_seq": 1}
 
 
+def test_turn_chunk_open_block_stops_at_the_code_cap_the_bridge_counted() -> None:
+    talker = _condition_talker()
+    meta = {"turn_chunk": True, "turn_chunk_close": False, "streaming_condition_seq": 0, "turn_chunk_max_codes": 200}
+    _, _, updates = talker.preprocess(
+        torch.zeros(3, dtype=torch.long),
+        None,
+        _omni_is_prefill=True,
+        _omni_prompt_len=3,
+        request_id="req-cap",
+        meta=meta,
+        tts_token_ids=torch.tensor([2, 3]),
+        tts_hidden_states=torch.ones(2, 2),
+    )
+    assert updates["audio_state"]["max_tokens"] == 200
+
+
 def test_ordinary_turn_condition_keeps_the_whole_reply_ceiling() -> None:
     talker = _condition_talker()
     _, _, updates = talker.preprocess(

@@ -2426,6 +2426,8 @@ class OrchestratorBase:
                 # The next stage takes this stage's output as it grows: its
                 # request stays resumable, and the finish sends the last
                 # input followed by the terminal (resumable=False) update.
+                # Each forward rewrites stage_submit_ts[stage_id + 1], so the
+                # next stage's metrics start at the last input's submit time.
                 await self._forward_to_next_stage(
                     req_id, stage_id, output, req_state, src_replica_id=replica_id, is_streaming_session=True
                 )

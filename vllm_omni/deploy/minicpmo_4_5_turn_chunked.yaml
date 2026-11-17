@@ -4,7 +4,8 @@
 # streaming_generate: the Talker keeps one resumable request, stops at each
 # block's EOS and finishes after the last block. Audio differs from
 # minicpmo_4_5_turn.yaml, which conditions on the whole reply at once.
-# Non-streaming requests still hand over the whole reply when it finishes.
+# Non-streaming requests still hand over the whole reply when it finishes,
+# but take the stage-1 min_tokens below too.
 base_config: minicpmo_4_5_turn.yaml
 pipeline: minicpmo_4_5_turn_chunked
 
@@ -12,5 +13,5 @@ stages:
   - stage_id: 1
     default_sampling_params:
       # generate_with_buffer sets no per-block floor; a block may end on its
-      # first codec.
+      # first codec. This applies to every request on the profile.
       min_tokens: 0

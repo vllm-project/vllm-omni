@@ -101,6 +101,14 @@ caching, and passes the completed Thinker payload to the Talker. The Talker
 streams codec chunks to Code2Wav. To select V1 on CUDA, set
 `platforms.cuda.model_runner: v1` in a custom deployment overlay.
 
+For streaming chat with audio output, the opt-in
+[`minicpmo_4_5_turn_chunked.yaml`](../../vllm_omni/deploy/minicpmo_4_5_turn_chunked.yaml)
+starts the Talker on the first 10 reply tokens instead of the completed reply,
+so first audio no longer grows with the reply length. It also drops the
+Talker's 50-code floor for every request, non-streaming ones included, so short
+replies sound different from `minicpmo_4_5_turn.yaml`. See
+[the chunked handoff](../../docs/design/minicpm_o45_mrv2_performance.md#turn-mode-chunked-talker-handoff).
+
 Stage-0 speculative decoding (including n-gram) cannot be combined with the
 stage-output prefix cache. Existing CUDA turn overlays that enable speculation
 must also set stage 0 `enable_prefix_caching: false` under `platforms.cuda`;

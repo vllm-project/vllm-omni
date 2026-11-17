@@ -242,6 +242,94 @@ def test_native_duplex_output_is_rejected() -> None:
         llm2tts_chunked([output], None, False, _context())
 
 
+def _talker(max_model_len: int = 4096):
+    return SimpleNamespace(max_model_len=max_model_len, hf_config_name=None)
+
+
+def _talker_stage_bridge(max_model_len: int):
+    """Call the bridge the way the Talker's stage client does, with the Talker's model config."""
+    from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
+
+    client = object.__new__(StageEngineCoreClient)
+    client.custom_process_input_func = llm2tts_chunked
+    client.requires_multimodal_data = False
+    client._stage_hf_config = None
+    client.vllm_config = SimpleNamespace(model_config=_talker(max_model_len))
+    return lambda outputs, context: client._call_custom_process_input(outputs, None, context)
+
+
+@pytest.mark.parametrize("max_model_len", [4096, 768])
+def test_long_reply_keeps_the_resumable_talker_within_its_context(max_model_len) -> None:
+    """Blocks stop once the Talker context bound is full; the closing block takes what still fits.
+
+    Without the bound every 10 tokens add a block, and the resumable Talker
+    outgrows max_model_len, which fails the whole request.
+    """
+    thinker = _Thinker([5, TTS_BOS])
+    context = _context()
+    bridge = _talker_stage_bridge(max_model_len)
+    reply = [100 + index % 50 for index in range(900)]
+    emitted = []
+    for token_id in reply:
+        emitted.extend(bridge([thinker.step([token_id])], context))
+    final = thinker.step([TTS_EOS], finished=True)
+    emitted.extend(bridge([final], context))
+
+    blocks = [_handoff(tts_input) for tts_input in emitted]
+    *opened, (closing_ids, _, closing_meta) = blocks
+    assert closing_meta["turn_chunk_close"] is True
+    assert all(not meta["turn_chunk_close"] for _, _, meta in opened)
+    # Worst case per open block: its condition, its code cap (the Talker's
+    # default ceiling without one) and the step that samples its EOS; then
+    # the closing condition and one CUDA K-step of samples on top.
+    worst = sum(meta["next_stage_prompt_len"] + meta.get("turn_chunk_max_codes", 500) + 16 for _, _, meta in opened)
+    worst += closing_meta["next_stage_prompt_len"] + 16
+    assert worst <= max_model_len
+    spoken = [token_id for ids, _, _ in blocks for token_id in ids]
+    assert spoken == reply[: len(spoken)]
+    assert 0 < len(closing_ids) and len(spoken) < len(reply)
+
+
+def test_reply_that_fits_is_spoken_whole_under_the_context_bound() -> None:
+    thinker = _Thinker([5, TTS_BOS])
+    context = _context()
+    bridge = _talker_stage_bridge(4096)
+    reply = list(range(100, 267))
+    emitted = []
+    for token_id in reply:
+        emitted.extend(bridge([thinker.step([token_id])], context))
+    final = thinker.step([TTS_EOS], finished=True)
+    emitted.extend(bridge([final], context))
+
+    blocks = [_handoff(tts_input) for tts_input in emitted]
+    assert [token_id for ids, _, _ in blocks for token_id in ids] == reply
+    assert all(meta["turn_chunk_max_codes"] == 200 for _, _, meta in blocks[:-1])
+    assert "turn_chunk_max_codes" not in blocks[-1][2]
+
+
+def test_blocks_concatenate_only_the_steps_that_forwarded_their_rows(monkeypatch) -> None:
+    from vllm_omni.model_executor.stage_input_processors import minicpmo_4_5_omni
+
+    prompt = [5] * 300 + [TTS_BOS]
+    thinker = _Thinker(prompt)
+    context = _context()
+    seen: list[int] = []
+    original = minicpmo_4_5_omni._row_tensor
+
+    def record(item):
+        seen.append(item.shape[0])
+        return original(item)
+
+    monkeypatch.setattr(minicpmo_4_5_omni, "_row_tensor", record)
+    emitted, _ = _speak(thinker, context, list(range(100, 125)))
+
+    assert len(emitted) == 3
+    # The 301 prompt rows are never concatenated; each block reads its own steps.
+    assert len(prompt) not in seen
+    assert sum(seen) == 25
+    assert _handoff(emitted[1])[1][:, 0].tolist() == list(range(len(prompt) + 10, len(prompt) + 20))
+
+
 def test_only_the_chunked_bridge_takes_partial_outputs() -> None:
     assert llm2tts_chunked.accepts_partial_source_outputs is True
     assert not getattr(llm2tts, "accepts_partial_source_outputs", False)

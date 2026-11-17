@@ -455,3 +455,104 @@ async def test_unfinished_output_is_not_forwarded_without_the_opt_in() -> None:
     await orchestrator._route_output(0, 0, SimpleNamespace(request_id="req-partial", finished=True), req_state, None)
     orchestrator._forward_to_next_stage.assert_awaited_once()
     assert orchestrator._forward_to_next_stage.await_args.kwargs["is_streaming_session"] is False
+
+
+def _chunk_bridge(*_args, **_kwargs):
+    return []
+
+
+_chunk_bridge.accepts_partial_source_outputs = True
+
+
+class ScriptedBridgeStageClient(FakeStageClient):
+    """Stage-1 client double whose opted-in bridge returns one scripted input list per call."""
+
+    def __init__(self, script: list[list[dict[str, Any]]]) -> None:
+        super().__init__()
+        self.custom_process_input_func = _chunk_bridge
+        self.script = list(script)
+
+    def process_engine_inputs(self, _source_outputs, prompt=None, streaming_context=None):
+        return self.script.pop(0)
+
+
+def _real_partial_orchestrator(script, monkeypatch):
+    stage0 = FakeStageClient()
+    stage1 = ScriptedBridgeStageClient(script)
+    stage_pools = [
+        StagePool(
+            stage_id,
+            [client],
+            output_processor=FakeOutputProcessor(),
+            stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+        )
+        for stage_id, client in enumerate((stage0, stage1))
+    ]
+    orchestrator = Orchestrator(
+        request_async_queue=janus.Queue().async_q,
+        output_async_queue=janus.Queue().async_q,
+        rpc_async_queue=janus.Queue().async_q,
+        stage_pools=stage_pools,
+        async_chunk=False,
+    )
+    req_state = OrchestratorRequestState(
+        request_id="req-chunked",
+        prompt={"prompt_token_ids": [1, 2]},
+        sampling_params_list=[SamplingParams(max_tokens=8), SamplingParams(max_tokens=8)],
+        final_stage_id=1,
+    )
+    orchestrator.request_states[req_state.request_id] = req_state
+    submits: list[tuple[str, bool]] = []
+    pool = stage_pools[1]
+    for name in ("submit_initial", "submit_update"):
+        original = getattr(pool, name)
+
+        async def spy(request_id, state, request, *args, _original=original, _name=name, **kwargs):
+            submits.append((_name, bool(request.resumable)))
+            return await _original(request_id, state, request, *args, **kwargs)
+
+        monkeypatch.setattr(pool, name, spy)
+    return orchestrator, req_state, stage1, submits
+
+
+def _block(length: int) -> dict[str, Any]:
+    return {"prompt_token_ids": [0] * length}
+
+
+@pytest.mark.asyncio
+async def test_partial_handoff_submits_a_resumable_request_and_ends_it_on_finish(monkeypatch) -> None:
+    closing = _block(4)
+    orchestrator, req_state, stage1, submits = _real_partial_orchestrator(
+        [[], [_block(11)], [_block(11)], [closing], [closing]], monkeypatch
+    )
+    output = SimpleNamespace(request_id="req-chunked", finished=False)
+
+    # The bridge has no block yet: nothing is submitted and no submit time is recorded.
+    await orchestrator._route_output(0, 0, output, req_state, None)
+    assert submits == []
+    assert 1 not in req_state.stage_submit_ts
+
+    await orchestrator._route_output(0, 0, output, req_state, None)
+    await orchestrator._route_output(0, 0, output, req_state, None)
+    await orchestrator._route_output(0, 0, SimpleNamespace(request_id="req-chunked", finished=True), req_state, None)
+
+    assert submits == [
+        ("submit_initial", True),
+        ("submit_update", True),
+        ("submit_update", True),
+        ("submit_update", False),
+    ]
+    assert stage1.script == []
+    assert [call[0].prompt_token_ids for call in stage1.add_request_calls] == [[0] * 11, [0] * 11, [0] * 4, [0] * 4]
+
+
+@pytest.mark.asyncio
+async def test_partial_handoff_short_reply_whose_first_forward_is_the_finish(monkeypatch) -> None:
+    closing = _block(5)
+    orchestrator, req_state, _stage1, submits = _real_partial_orchestrator([[closing], [closing]], monkeypatch)
+
+    await orchestrator._route_output(0, 0, SimpleNamespace(request_id="req-chunked", finished=True), req_state, None)
+
+    # Admitted resumable, then the terminal update ends the Talker request.
+    assert submits == [("submit_initial", True), ("submit_update", False)]
+    assert 1 in req_state.stage_submit_ts

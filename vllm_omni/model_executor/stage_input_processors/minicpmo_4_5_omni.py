@@ -1330,7 +1330,23 @@ def llm2tts(
 #: Reply tokens per Talker condition in turn-chunked serving, as HF
 #: ``streaming_generate`` (``generate_chunk_size``).
 MINICPMO45_TURN_CHUNK_TOKENS = 10
+#: Codes an open block may take per reply token: 0.8 s of speech at 25 Hz,
+#: about 2.7x the rate measured on MiniCPM-o 4.5 replies. The Talker stops an
+#: open block there, so the bridge holds an upper bound on the Talker context.
+MINICPMO45_TURN_CHUNK_CODES_PER_TOKEN = 20
+#: Talker positions kept free on top of the prompt for one step's samples
+#: (a CUDA K-step samples 16), with margin.
+_TURN_CHUNK_SAMPLE_RESERVE = 32
+#: Positions a block may take past its condition and codes: the step that
+#: samples its EOS.
+_TURN_CHUNK_BLOCK_SLACK = 16
+#: Room kept for the closing block: two blocks of text and their codes.
+_TURN_CHUNK_CLOSE_RESERVE = 2 * MINICPMO45_TURN_CHUNK_TOKENS * (1 + MINICPMO45_TURN_CHUNK_CODES_PER_TOKEN) + 2
 _TURN_CHUNK_STATE = "minicpmo45_turn_chunks"
+
+
+def _row_tensor(item: torch.Tensor) -> torch.Tensor:
+    return item.squeeze(0) if item.ndim == 3 and item.shape[0] == 1 else item.reshape(-1, *item.shape[1:])
 
 
 def _stacked_rows(value: Any) -> torch.Tensor | None:
@@ -1338,16 +1354,70 @@ def _stacked_rows(value: Any) -> torch.Tensor | None:
     if isinstance(value, torch.Tensor):
         return value
     if isinstance(value, (list, tuple)) and value and all(isinstance(item, torch.Tensor) for item in value):
-        parts = [
-            item.squeeze(0) if item.ndim == 3 and item.shape[0] == 1 else item.reshape(-1, *item.shape[1:])
-            for item in value
-        ]
-        return torch.cat(parts, dim=0)
+        return torch.cat([_row_tensor(item) for item in value], dim=0)
     return None
 
 
-def _next_turn_chunk(llm_output, prompt, requires_multimodal_data: bool, state: dict[str, Any]):
-    """Build the next Talker condition for one turn request, or None while a block is incomplete."""
+def _turn_chunk_rows(
+    state: dict[str, Any],
+    mm_output: Mapping[str, Any],
+    output: Any,
+    full_token_ids: Sequence[int],
+    start: int,
+    end: int,
+    request_id: str,
+) -> torch.Tensor | None:
+    """Thinker rows for ``full_token_ids[start:end]``, or None without a latent.
+
+    A DELTA payload holds one tensor per step. Only steps that forwarded a
+    position at or past ``start`` can hold the block's rows, so the prompt's
+    rows and earlier blocks' rows are not concatenated again for every block.
+    """
+    steps = [mm_output.get(key) for key in ("latent", "latent_input_ids", "latent_positions")]
+    if all(isinstance(value, (list, tuple)) and value for value in steps) and len({len(value) for value in steps}) == 1:
+        latent, row_ids, row_positions = steps
+        if all(isinstance(item, torch.Tensor) for value in steps for item in value):
+            maxima = state.setdefault("step_max_position", [])
+            if len(maxima) > len(row_positions):
+                maxima.clear()
+            maxima.extend(int(item.max()) if item.numel() else -1 for item in row_positions[len(maxima) :])
+            used = [index for index, maximum in enumerate(maxima) if maximum >= start]
+            if not used:
+                return torch.empty(0, 0)
+            ledger = {
+                "latent_input_ids": torch.cat([row_ids[index].reshape(-1) for index in used]),
+                "latent_positions": torch.cat([row_positions[index].reshape(-1) for index in used]),
+            }
+            rows = torch.cat([_row_tensor(latent[index]) for index in used], dim=0)
+            return _turn_hidden_rows(ledger, rows.detach(), full_token_ids, start, end, request_id)
+    latent = _stacked_rows(mm_output.get("latent"))
+    if latent is None:
+        latent = getattr(output, "hidden_states", None)
+    if latent is None:
+        return None
+    if latent.ndim == 3 and latent.shape[0] == 1:
+        latent = latent.squeeze(0)
+    ledger = {key: _stacked_rows(mm_output.get(key)) for key in ("latent_input_ids", "latent_positions")}
+    return _turn_hidden_rows(ledger, latent.detach(), full_token_ids, start, end, request_id)
+
+
+def _next_turn_chunk(
+    llm_output,
+    prompt,
+    requires_multimodal_data: bool,
+    state: dict[str, Any],
+    talker_context: int | None,
+):
+    """Build the next Talker condition for one turn request, or None while a block is incomplete.
+
+    ``state["context"]`` bounds the Talker context the blocks sent so far can
+    take: each open block's condition, its code cap and the step that samples
+    its EOS. An open block goes out only while the bound leaves room for it and
+    a closing block; past that the rest of the reply waits for the closing
+    block, whose text is cut to what fits. Without the bound a long reply
+    would extend the resumable Talker past ``max_model_len`` and fail the
+    request, where a whole-reply condition only truncates the audio.
+    """
     request_id = str(llm_output.request_id)
     finished = bool(getattr(llm_output, "finished", False))
     output = llm_output.outputs[0]
@@ -1394,29 +1464,40 @@ def _next_turn_chunk(llm_output, prompt, requires_multimodal_data: bool, state: 
                 break
     block_start = (start or 0) + int(state["sent"])
 
+    context = int(state.setdefault("context", 0))
+    open_codes = MINICPMO45_TURN_CHUNK_TOKENS * MINICPMO45_TURN_CHUNK_CODES_PER_TOKEN
+    open_cost = MINICPMO45_TURN_CHUNK_TOKENS + 1 + open_codes + _TURN_CHUNK_BLOCK_SLACK
     if not finished:
         # Wait for a full block of tokens with Thinker rows. The newest sampled
         # token has no row yet, and holding it back keeps the closing block
         # non-empty.
         if start is None or end - block_start <= MINICPMO45_TURN_CHUNK_TOKENS:
             return None
+        if talker_context is not None and (
+            context + open_cost + _TURN_CHUNK_CLOSE_RESERVE + _TURN_CHUNK_SAMPLE_RESERVE > talker_context
+        ):
+            return None
         block_end = block_start + MINICPMO45_TURN_CHUNK_TOKENS
     else:
         block_end = end
-    latent = _stacked_rows(mm_output.get("latent"))
-    if latent is None:
-        latent = getattr(output, "hidden_states", None)
+        if talker_context is not None:
+            # The closing condition must fit; its codes take whatever the
+            # Talker context still holds, as with a whole-reply condition.
+            room = talker_context - context - _TURN_CHUNK_SAMPLE_RESERVE - 2
+            if block_end - block_start > max(room, 0):
+                logger.warning_once(
+                    "MiniCPM-o turn-chunked handoff: the reply outgrew the Talker context; "
+                    "the text past it is not spoken"
+                )
+                block_end = block_start + max(room, 0)
     if start is None or block_end <= block_start:
         rows = torch.empty(0, 0)
-    elif latent is None:
-        if not finished:
-            return None
-        raise ValueError("No latent or hidden_states found in thinker output")
     else:
-        if latent.ndim == 3 and latent.shape[0] == 1:
-            latent = latent.squeeze(0)
-        ledger = {key: _stacked_rows(mm_output.get(key)) for key in ("latent_input_ids", "latent_positions")}
-        rows = _turn_hidden_rows(ledger, latent.detach(), full_token_ids, block_start, block_end, request_id)
+        rows = _turn_chunk_rows(state, mm_output, output, full_token_ids, block_start, block_end, request_id)
+        if rows is None:
+            if not finished:
+                return None
+            raise ValueError("No latent or hidden_states found in thinker output")
         if not finished and rows.shape[0] < MINICPMO45_TURN_CHUNK_TOKENS:
             return None
     block_ids = full_token_ids[block_start : block_start + rows.shape[0]]
@@ -1443,6 +1524,8 @@ def _next_turn_chunk(llm_output, prompt, requires_multimodal_data: bool, state: 
     meta["turn_chunk"] = True
     meta["turn_chunk_close"] = finished
     meta["streaming_condition_seq"] = condition_seq
+    if not finished:
+        meta["turn_chunk_max_codes"] = open_codes
     if condition_seq == 0:
         meta["replace_streaming_prompt"] = True
     multi_modal_data = None
@@ -1459,6 +1542,7 @@ def _next_turn_chunk(llm_output, prompt, requires_multimodal_data: bool, state: 
     )
     state["sent"] = int(state["sent"]) + len(block_ids)
     state["condition_seq"] = condition_seq + 1
+    state["context"] = context + (condition_length if finished else open_cost)
     if finished:
         state["closed"] = tts_input
     return tts_input
@@ -1469,6 +1553,8 @@ def llm2tts_chunked(
     prompt: OmniTokensPrompt | TextPrompt = None,
     requires_multimodal_data: bool = False,
     _streaming_context=None,
+    *,
+    target_model_config: Any = None,
 ):
     """Hand the Talker the reply one block of tokens at a time (opt-in turn profile).
 
@@ -1478,7 +1564,8 @@ def llm2tts_chunked(
     ending in <audio_bos>; once Stage 0 finishes, the rest of the reply becomes
     the last condition, closed with <text_eos><audio_bos>, as in HF
     ``streaming_generate``. The Talker keeps one resumable request: it stops at
-    each block's EOS and continues from its KV cache on the next block.
+    each block's EOS and continues from its KV cache on the next block. The
+    Talker's ``target_model_config`` sizes the blocks to its context.
     """
     if not source_outputs:
         raise ValueError("source_outputs cannot be empty")
@@ -1489,6 +1576,13 @@ def llm2tts_chunked(
             return llm2tts(source_outputs, prompt, requires_multimodal_data, _streaming_context)
         return []
     chunk_states = bridge_states.setdefault(_TURN_CHUNK_STATE, {})
+    talker_context = None
+    if target_model_config is not None:
+        from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
+            _resolve_talker_streaming_prompt_config,
+        )
+
+        talker_context = _resolve_talker_streaming_prompt_config(target_model_config)[0] or None
     prompts = prompt if isinstance(prompt, list) else [prompt] * len(source_outputs)
     tts_inputs = []
     for llm_output, prompt_item in zip(source_outputs, prompts):
@@ -1498,7 +1592,7 @@ def llm2tts_chunked(
             # Talker request; vLLM ignores its prompt.
             tts_inputs.append(state["closed"])
             continue
-        tts_input = _next_turn_chunk(llm_output, prompt_item, requires_multimodal_data, state)
+        tts_input = _next_turn_chunk(llm_output, prompt_item, requires_multimodal_data, state, talker_context)
         if tts_input is not None:
             tts_inputs.append(tts_input)
     return tts_inputs
