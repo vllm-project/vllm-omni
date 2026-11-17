@@ -3517,6 +3517,13 @@ class MiniMaxH3Pipeline(
             num_inference_steps=num_steps,
             extra_args=extra,
         )
+        if (
+            quality_plan.cache_dit is not None
+            and resolve_offload_strategy(self.od_config) is OffloadStrategy.FILE_BACKED
+        ):
+            raise OmniClientError(
+                "MiniMax H3 Cache-DiT cannot be combined with file-backed offload; use quality=lossless."
+            )
         if sampler == "heun" and quality_plan.cache_dit is not None:
             raise OmniClientError("Heun requires uncached model runs; set quality=lossless")
         if continuation is not None and quality_plan.cache_dit is not None:
