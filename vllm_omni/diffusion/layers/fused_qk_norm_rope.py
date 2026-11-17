@@ -26,7 +26,9 @@ or rotary-product intermediates. The interleaved mode supports any even
 two); the half-split mode keeps the pre-existing kernel and its MiniMax-H3
 geometry contract (``head_dim == 128``, ``rotary_dim == 96``). Ascend
 composes its RMSNorm and rotary fused primitives on the MiniMax-H3 geometry;
-unsupported inputs use the eager reference.
+unsupported inputs use the eager reference. On Ascend, the separate
+``try_fused_qkv_norm_rope`` entry point takes one BSND stream and uses
+MindIE-SD for full-head rotation with either pairing.
 
 ``cuda_rms_norm=True`` (single-stream and joint ops) reproduces the vLLM CUDA
 RMSNorm reduction order and keeps the rotation free of FMA contraction, so for
@@ -72,7 +74,13 @@ def _load_norm_rope_concat() -> Callable[..., tuple[torch.Tensor, ...]] | None:
     import mindiesd
 
     op = getattr(mindiesd, "norm_rope_concat", None)
-    if not callable(op) or not {"input_layout", "output_layout"} <= signature(op).parameters.keys():
+    if not callable(op):
+        return None
+    try:
+        parameters = signature(op).parameters
+    except (TypeError, ValueError):
+        return None
+    if not {"input_layout", "output_layout"} <= parameters.keys():
         return None
     return op
 
@@ -171,8 +179,8 @@ def try_fused_qkv_norm_rope(
         norm_key_weight=k_weight,
         rope_cos=cos,
         rope_sin=sin,
-        norm_type=4,
-        rope_type=1 if interleaved else 2,
+        norm_type=4,  # Affine RMSNorm.
+        rope_type=1 if interleaved else 2,  # Adjacent pairs or half-split pairs.
         eps=eps,
     )
     return outputs[0], outputs[1], outputs[2]
@@ -1383,5 +1391,8 @@ __all__ = [
     "fused_qk_norm_rope",
     "fused_qk_norm_rope_available",
     "fused_qk_norm_rope_min_tokens",
+    "norm_rope_concat_available",
     "pack_qk_norm_rope_table",
+    "prepare_norm_rope_concat_tables",
+    "try_fused_qkv_norm_rope",
 ]

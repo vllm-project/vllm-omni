@@ -341,6 +341,7 @@ x-cosmos3: &cosmos3
   - vllm_omni/model_extras/cosmos3.py
 
 x-qwen-image: &qwen_image
+  - vllm_omni/diffusion/layers/fused_qk_norm_rope.py
   - vllm_omni/diffusion/models/qwen_image/
   - vllm_omni/diffusion/models/dmd2/
   - vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage.py
@@ -381,16 +382,19 @@ x-hunyuan-image3: &hunyuan_image3
   - vllm_omni/diffusion/lora/
 
 x-minimax-h3: &minimax_h3
+  - vllm_omni/diffusion/layers/fused_qk_norm_rope.py
   - vllm_omni/diffusion/models/minimax_h3/
   - vllm_omni/diffusion/layers/indexed_modulation.py
 
 x-flux3: &flux3
+  - vllm_omni/diffusion/layers/fused_qk_norm_rope.py
   - vllm_omni/diffusion/models/flux3/
   - vllm_omni/diffusion/model_metadata.py
   - vllm_omni/diffusion/registry.py
   - vllm_omni/model_extras/registry.py
 
 x-hunyuan-video: &hunyuan_video
+  - vllm_omni/diffusion/layers/fused_qk_norm_rope.py
   - vllm_omni/diffusion/models/hunyuan_video/
   - vllm_omni/model_executor/models/hunyuan_video/
 
@@ -403,6 +407,7 @@ x-sana-video: &sana_video
   - vllm_omni/model_extras/sana_video.py
 
 x-z-image: &z_image
+  - vllm_omni/diffusion/layers/fused_qk_norm_rope.py
   - vllm_omni/diffusion/models/z_image/
 
 x-stable-audio: &stable_audio
@@ -1422,6 +1427,7 @@ source_file_dependencies:
   diffusion_qwen_image_21_function:
     - *qwen_image_21
     - tests/e2e/offline_inference/test_qwen_image_21.py
+    - tests/assets/qwen_image_edit/
     - tests/helpers/
     - tests/conftest.py
 
@@ -1464,6 +1470,7 @@ source_file_dependencies:
     - tests/examples/online_serving/test_text_to_image.py
     - vllm_omni/diffusion/models/nextstep_1_1/
     - vllm_omni/diffusion/models/longcat_image/
+    - vllm_omni/diffusion/layers/fused_qk_norm_rope.py
     - vllm_omni/diffusion/models/ovis_image/
     - vllm_omni/diffusion/models/omnigen2/
     - vllm_omni/diffusion/models/sd3/

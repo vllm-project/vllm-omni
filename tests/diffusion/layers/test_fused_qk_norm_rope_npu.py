@@ -18,13 +18,15 @@ _EPS = 1e-5
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("api", ["absent", "legacy", "public"])
+@pytest.mark.parametrize("api", ["absent", "legacy", "uninspectable", "public"])
 def test_single_stream_optional_public_api(monkeypatch, api):
     from vllm_omni.diffusion.layers import fused_qk_norm_rope as fused
 
     module = types.ModuleType("mindiesd")
     if api == "legacy":
         monkeypatch.setattr(module, "norm_rope_concat", lambda q, k, v: None, raising=False)
+    elif api == "uninspectable":
+        monkeypatch.setattr(module, "norm_rope_concat", iter, raising=False)
     elif api == "public":
         monkeypatch.setattr(
             module,
