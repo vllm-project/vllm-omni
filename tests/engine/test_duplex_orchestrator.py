@@ -27,6 +27,7 @@ from tests.engine.test_orchestrator import (
     _build_stage_pools,
 )
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.distributed.omni_coordinator import ReplicaStatus, RoundRobinBalancer
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexSessionConfig, DuplexSessionState
@@ -42,11 +43,18 @@ from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
     DuplexControlResultMessage,
     DuplexSessionCommandMessage,
+    DuplexSessionEventMessage,
     OpenDuplexSessionMessage,
 )
 from vllm_omni.engine.duplex.plugin import DuplexInputCapacityError
 from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator, DuplexOrchestratorRequestState
-from vllm_omni.engine.messages import AbortRequestMessage, AddCompanionRequestMessage, ShutdownRequestMessage
+from vllm_omni.engine.membership_controller import MembershipController
+from vllm_omni.engine.messages import (
+    AbortRequestMessage,
+    AddCompanionRequestMessage,
+    ErrorMessage,
+    ShutdownRequestMessage,
+)
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState, build_engine_core_request_from_tokens
 from vllm_omni.engine.stage_pool import StageUnavailableError
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
@@ -164,18 +172,20 @@ def _append_audio(samples: int = 16000) -> commands.AppendAudio:
     )
 
 
-async def _submit(orchestrator: DuplexOrchestrator, command: commands.DuplexCommand) -> None:
-    assert await orchestrator._dispatch_message(DuplexSessionCommandMessage(session_id=SESSION_ID, command=command))
-    await _settle(orchestrator)
+async def _submit(
+    orchestrator: DuplexOrchestrator, command: commands.DuplexCommand, *, session_id: str = SESSION_ID
+) -> None:
+    assert await orchestrator._dispatch_message(DuplexSessionCommandMessage(session_id=session_id, command=command))
+    await _settle(orchestrator, session_id=session_id)
 
 
-async def _settle(orchestrator: DuplexOrchestrator, *, timeout_s: float = 3.0) -> None:
+async def _settle(orchestrator: DuplexOrchestrator, *, timeout_s: float = 3.0, session_id: str = SESSION_ID) -> None:
     """Let the session runner drain its mailbox and append tasks."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
     quiet = 0
     while loop.time() < deadline:
-        runner = orchestrator.session_manager.runners.get(SESSION_ID)
+        runner = orchestrator.session_manager.runners.get(session_id)
         busy = runner is not None and (
             not runner._mailbox.empty()
             or any(not task.done() for task in runner.tasks.append_tasks)
@@ -1565,24 +1575,79 @@ async def test_replica_failure_closes_active_and_idle_owners_only() -> None:
 
 
 @pytest.mark.asyncio
-async def test_membership_detach_fails_the_sessions_reserved_on_the_replica() -> None:
-    """A hub-reported detach reaches the same policy as an in-process engine death."""
-    orchestrator, _, rpc_q, _ = _build(stages=2, replicas=2, runtime_config=_placement_config())
+async def test_membership_detach_closes_active_and_idle_sessions_and_preserves_healthy_routing(monkeypatch) -> None:
+    orchestrator, _, rpc_q, output_q = _build(
+        replicas=2, runtime_config=_placement_config(replica_groups=[{0: 0}, {0: 1}])
+    )
+    pool = orchestrator.stage_pools[0]
+    addresses = ("tcp://replica-0", "tcp://replica-1")
+    replicas = [SimpleNamespace(input_addr=address, status=ReplicaStatus.UP) for address in addresses]
+    for replica_id, address in enumerate(addresses):
+        pool.add_client(address, pool.clients[replica_id], replica_id=replica_id)
+
+    hub = SimpleNamespace(
+        get_replicas_for_stage=lambda _stage_id: SimpleNamespace(replicas=replicas),
+        close=lambda: None,
+    )
+    monkeypatch.setattr("vllm_omni.engine.membership_controller.OmniCoordClientForHub", lambda _address: hub)
+    controller = MembershipController(
+        stage_pools=[pool],
+        coordinator_pub_address="tcp://127.0.0.1:12345",
+        load_balancer_factory=RoundRobinBalancer,
+        remote_replica_factory=lambda _stage_id, _replica_id: FakeStageClient(),
+    )
+
+    async def cleanup(request_ids: list[str]) -> None:
+        await orchestrator._cleanup_request_ids(request_ids, abort=True, trace_error="replica_removed")
+
+    controller.install_membership_handlers(
+        output_queue=output_q,
+        cleanup_callback=cleanup,
+        replica_removed_callback=orchestrator._handle_replica_removed,
+    )
     buffers = {}
     try:
         for session_id in (SESSION_ID, "healthy", "idle"):
             buffers[session_id] = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
             assert (await _open(orchestrator, rpc_q, session_id=session_id, output_buffer=buffers[session_id])).ok
+        placement = orchestrator.replica_placement
+        assert placement.snapshot()["sessions"] == {SESSION_ID: 0, "healthy": 1, "idle": 0}
+
         await _submit(orchestrator, _append_audio())
-        await orchestrator._on_replica_removed(1, 0)
+        request_id = _stage0_request_id()
+        assert pool.get_bound_replica_id(request_id) == 0
+        replicas[0].status = ReplicaStatus.DOWN
+        await controller.handle_unregister(0, addresses[0])
         await _settle(orchestrator)
+
         manager = orchestrator.session_manager
         await asyncio.wait_for(asyncio.gather(*tuple(manager._dispatched_control_tasks)), timeout=1)
         await asyncio.wait_for(manager.reap_expired(), timeout=1)
-        assert orchestrator.replica_placement.snapshot()["sessions"] == {"healthy": 3}
+        assert placement.snapshot()["sessions"] == {"healthy": 1}
+        assert placement.snapshot()["reserved"] == {(0, 0): 0, (0, 1): 1}
         assert set(manager.runners) == {"healthy"}
-        assert not orchestrator.stage_pools[1].is_replica_available(0)
+        assert pool.get_bound_replica_id(request_id) is None
+        assert request_id not in orchestrator.request_states
+        assert not pool.is_replica_available(0)
+
+        messages = [output_q.get_nowait() for _ in range(output_q.qsize())]
+        assert any(isinstance(message, ErrorMessage) and message.request_id == request_id for message in messages)
+        for session_id in (SESSION_ID, "idle"):
+            events = [await buffers[session_id].get() for _ in range(buffers[session_id].pending_events)]
+            events.extend(
+                message.event
+                for message in messages
+                if isinstance(message, DuplexSessionEventMessage) and message.event.session_id == session_id
+            )
+            assert any(event.type == "error" and event.code == "replica_unavailable" for event in events)
+            assert events[-1].type == "session.expired"
+
+        await _submit(orchestrator, _append_audio(), session_id="healthy")
+        healthy_request_id = duplex_resource_request_id(DuplexFence("healthy", epoch=0), "stage0")
+        assert pool.get_bound_replica_id(healthy_request_id) == 1
+        assert pool.clients[1].add_request_calls
     finally:
+        controller.shutdown()
         await orchestrator.session_manager.shutdown()
 
 
