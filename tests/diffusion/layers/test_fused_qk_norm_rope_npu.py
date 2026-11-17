@@ -169,10 +169,15 @@ def test_single_stream_npu_against_fp32_reference(npu_family, batch, heads, dim,
         packed = torch.randn(batch, 17, 3 * heads * dim, device="npu", dtype=torch.bfloat16)
         q, k, v = [t.unflatten(-1, (heads, dim)) for t in packed.chunk(3, -1)]
         weight = torch.randn(dim, device="npu", dtype=q.dtype)
-        theta = torch.randn(17, dim // 2, device="npu")
-        cos, sin = fused.prepare_norm_rope_concat_tables(
-            theta.cos(), theta.sin(), interleaved=interleaved, dtype=q.dtype
-        )
+        theta = torch.randn(17, dim // 2, device="npu", dtype=torch.float32)
+        cos_half, sin_half = theta.cos(), theta.sin()
+        cos, sin = fused.prepare_norm_rope_concat_tables(cos_half, sin_half, interleaved=interleaved, dtype=q.dtype)
+        # Expand the original FP32 coefficients independently of the operator tables.
+        if interleaved:
+            cos_fp32 = torch.stack((cos_half, cos_half), dim=-1).flatten(-2)
+            sin_fp32 = torch.stack((sin_half, sin_half), dim=-1).flatten(-2)
+        else:
+            cos_fp32, sin_fp32 = cos_half.repeat(1, 2), sin_half.repeat(1, 2)
         result = fused.try_fused_qkv_norm_rope(
             q, k, v, weight, weight, (cos, sin), _EPS, head_dim=dim, rotary_dim=dim, interleaved=interleaved
         )
@@ -188,6 +193,8 @@ def test_single_stream_npu_against_fp32_reference(npu_family, batch, heads, dim,
                 rotated = torch.cat((-second, first), -1)
             expected = (normalized * cos.float()[None, :, None] + rotated * sin.float()[None, :, None]).to(q.dtype)
             torch.testing.assert_close(actual, expected, atol=0.0625, rtol=0.02)
+            expected_fp32 = normalized * cos_fp32[None, :, None] + rotated * sin_fp32[None, :, None]
+            torch.testing.assert_close(actual.float(), expected_fp32, atol=0.0625, rtol=0.02)
         torch.testing.assert_close(result[2], v, atol=0, rtol=0)
         compiled = torch.compile(fused.try_fused_qkv_norm_rope, backend="eager", fullgraph=True)(
             q,

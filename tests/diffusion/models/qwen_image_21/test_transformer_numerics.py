@@ -2,14 +2,96 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 from tests.helpers.mark import hardware_marks, hardware_test
+from vllm_omni.diffusion.layers import fused_qk_norm_rope as fused
 from vllm_omni.diffusion.models.qwen_image_21 import qwen_image_21_transformer as transformer
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("enforce_eager", [False, True])
+def test_qkv_forward_prepares_one_table_for_all_blocks(monkeypatch, enforce_eager):
+    head_dim = 8
+    model = transformer.QwenImage21Transformer2DModel.__new__(transformer.QwenImage21Transformer2DModel)
+    torch.nn.Module.__init__(model)
+    model.parallel_config = None
+    model.causal_condition = model.causal_block = False
+    model._enforce_eager = enforce_eager
+    model._nz_runs_eager = True
+    model.txt_in = torch.nn.Identity()
+    model.sequence_prepare = transformer.QwenImage21SequencePrepare(
+        torch.nn.Identity(), transformer.QwenImage21Rope(theta=10000, axes_dim=[2, 2, 4])
+    )
+    model.time_text_embed = lambda timestep, hidden_states: hidden_states[:, 0]
+    model.modulation = torch.nn.Linear(head_dim, 4 * head_dim)
+    model.norm_out = lambda hidden_states, temb, mask: hidden_states
+    model.proj_out = torch.nn.Identity()
+    model.transformer_blocks = torch.nn.ModuleList()
+    received = []
+
+    def record_block_input(block, args, kwargs):
+        received.append((block, kwargs.get("norm_rope_concat_tables")))
+
+    for _ in range(2):
+        block = transformer.QwenImage21TransformerBlock.__new__(transformer.QwenImage21TransformerBlock)
+        torch.nn.Module.__init__(block)
+        block.img_norm1 = torch.nn.Identity()
+        block.img_norm2 = torch.nn.Identity()
+        block.img_mlp = torch.nn.Identity()
+        attention = transformer.QwenImage21Attention.__new__(transformer.QwenImage21Attention)
+        torch.nn.Module.__init__(attention)
+        attention.head_dim = head_dim
+        attention.num_heads = attention.num_kv_heads = 1
+        attention.to_qkv = lambda x: (torch.cat((x, x, x), dim=-1), None)
+        attention.norm_q = torch.nn.RMSNorm(head_dim, eps=1e-5)
+        attention.norm_k = torch.nn.RMSNorm(head_dim, eps=1e-5)
+        attention.norm_q.bias = attention.norm_k.bias = None
+        attention.attn = lambda q, k, v, metadata: q
+        attention.to_out = torch.nn.Identity()
+        block.attn = attention
+        block.register_forward_pre_hook(record_block_input, with_kwargs=True)
+        model.transformer_blocks.append(block)
+
+    prepared = []
+    prepare_tables = transformer.prepare_norm_rope_concat_tables
+
+    def record_tables(*args, **kwargs):
+        tables = prepare_tables(*args, **kwargs)
+        prepared.append(tables)
+        return tables
+
+    op = Mock(side_effect=lambda q, k, v, **kwargs: (q, k, v))
+    monkeypatch.setattr(transformer, "prepare_norm_rope_concat_tables", record_tables)
+    monkeypatch.setattr(transformer, "norm_rope_concat_available", lambda device: True)
+    monkeypatch.setattr(fused, "norm_rope_concat_available", lambda device: True)
+    monkeypatch.setattr(fused, "_load_norm_rope_concat", lambda: op)
+    monkeypatch.setattr(transformer, "qk_rotary", lambda *args: None)
+
+    with torch.inference_mode():
+        model(
+            hidden_states=torch.randn(1, 4, head_dim),
+            encoder_hidden_states=torch.randn(1, 1, head_dim),
+            timestep=torch.tensor([0.5]),
+            img_shapes=[[(1, 2, 2)]],
+            img_mask=torch.tensor([[False, True]]),
+            return_dict=False,
+        )
+
+    assert [block for block, _ in received] == list(model.transformer_blocks)
+    if enforce_eager:
+        assert len(prepared) == 1
+        assert all(tables is prepared[0] for _, tables in received)
+        assert op.call_count == len(model.transformer_blocks)
+    else:
+        assert prepared == []
+        assert all(tables is None for _, tables in received)
+        op.assert_not_called()
 
 
 @pytest.mark.cpu
