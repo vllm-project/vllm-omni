@@ -102,12 +102,81 @@ def test_valid_audio_requires_decodable_duration_and_measurable_latency():
 
 def test_seed_requires_all_scores_not_only_high_means():
     case = nightly.NightlyCase("async-prefix", "seed-tts", 64, 1088)
-    data = {"seed_tts_content_evaluated": 1088, "seed_tts_sim_evaluated": 1087, "seed_tts_utmos_evaluated": 1088}
+    data = {**_full_quality_result("seed-tts"), "seed_tts_sim_evaluated": 1087}
     assert nightly.accuracy_coverage_errors(data, case, "cuda") == ["seed_tts_sim_evaluated=1087, expected 1088"]
     data["seed_tts_sim_evaluated"] = 1088
     data.pop("seed_tts_utmos_evaluated")
     assert nightly.accuracy_coverage_errors(data, case, "npu") == []
     assert nightly.accuracy_coverage_errors(data, case, "cuda")
+
+
+def _full_quality_result(dataset):
+    if dataset == "daily-omni":
+        return {"daily_omni_evaluated_ok": 1197, "daily_omni_accuracy": 0.75}
+    return {
+        "seed_tts_content_evaluated": 1088,
+        "seed_tts_content_error_mean": 0.02,
+        "seed_tts_sim_evaluated": 1088,
+        "seed_tts_sim_mean": 0.85,
+        "seed_tts_utmos_evaluated": 1088,
+        "seed_tts_utmos_mean": 3.4,
+    }
+
+
+@pytest.mark.parametrize(
+    "dataset,failure_key",
+    [
+        ("daily-omni", "daily_omni_request_failed"),
+        ("daily-omni", "daily_omni_no_gold"),
+        ("daily-omni", "timed_out_requests"),
+        ("daily-omni", "cancelled_after_timeout_requests"),
+        ("seed-tts", "seed_tts_request_failed"),
+        ("seed-tts", "seed_tts_no_pcm"),
+        ("seed-tts", "seed_tts_asr_failed"),
+        ("seed-tts", "seed_tts_empty_audio"),
+        ("seed-tts", "seed_tts_sim_failed"),
+        ("seed-tts", "seed_tts_sim_skipped_no_ref"),
+        ("seed-tts", "seed_tts_utmos_failed"),
+    ],
+)
+def test_nightly_rejects_reported_failures_even_with_complete_score_counts(dataset, failure_key):
+    case = nightly.NightlyCase("default", dataset, 64, nightly.DATASETS[dataset]["count"])
+    result = {**_full_quality_result(dataset), failure_key: 1}
+    errors = nightly.accuracy_coverage_errors(result, case, "cuda")
+    assert any(failure_key in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    "dataset,metric",
+    [
+        ("daily-omni", "daily_omni_accuracy"),
+        ("seed-tts", "seed_tts_content_error_mean"),
+        ("seed-tts", "seed_tts_sim_mean"),
+        ("seed-tts", "seed_tts_utmos_mean"),
+    ],
+)
+def test_nightly_requires_finite_scores(dataset, metric):
+    case = nightly.NightlyCase("default", dataset, 64, nightly.DATASETS[dataset]["count"])
+    result = {**_full_quality_result(dataset), metric: float("nan")}
+    assert any(metric in error for error in nightly.accuracy_coverage_errors(result, case, "cuda"))
+
+
+def test_npu_accepts_zero_wer_without_disabled_utmos_scores():
+    case = nightly.NightlyCase("default", "seed-tts", 64, 1088)
+    result = {**_full_quality_result("seed-tts"), "seed_tts_content_error_mean": 0.0}
+    result.pop("seed_tts_utmos_evaluated")
+    result.pop("seed_tts_utmos_mean")
+    assert nightly.accuracy_coverage_errors(result, case, "npu") == []
+
+
+def test_source_checkout_version_metadata_remains_available(monkeypatch):
+    def version(package):
+        if package == "vllm-omni":
+            raise nightly.PackageNotFoundError(package)
+        return {"vllm": "0.33.0", "torch": "2.10.0"}[package]
+
+    monkeypatch.setattr(nightly, "version", version, raising=False)
+    assert nightly.software_versions() == {"vllm": "0.33.0", "vllm-omni": "not-installed", "torch": "2.10.0"}
 
 
 def _reference(case):
@@ -134,16 +203,34 @@ def _valid_performance(case, value=10.0):
     }
 
 
+@pytest.mark.parametrize("mode", ["collect", "enforce"])
+def test_performance_gate_returns_metadata_without_mutating_input(mode):
+    case = nightly.NightlyCase("default", "seed-tts", 64, 1088)
+    result = _valid_performance(case)
+    original = dict(result)
+    outcome = nightly.performance_gate(result, case, "H100", _reference(case), mode)
+    assert result == original
+    errors, annotated = outcome
+    assert errors == []
+    assert annotated == {
+        **original,
+        "performance_baseline_status": "collecting" if mode == "collect" else "enforced",
+        "performance_baseline": _reference(case)["references"]["H100"][case.id],
+    }
+
+
 def test_enforced_regression_uses_its_own_hardware_and_workload():
     case = nightly.NightlyCase("async-prefix", "daily-omni", 16, 256)
     reference = _reference(case)
     result = _valid_performance(case, 10.5)
-    assert nightly.performance_gate(result, case, "H100", reference, "enforce") == []
+    assert nightly.performance_gate(result, case, "H100", reference, "enforce")[0] == []
     result["mean_ttft_ms"] = 11.1
-    assert any("mean_ttft_ms" in e for e in nightly.performance_gate(result, case, "H100", reference, "enforce"))
-    assert nightly.performance_gate(result, case, "B200", reference, "enforce")
+    errors, _ = nightly.performance_gate(result, case, "H100", reference, "enforce")
+    assert any("mean_ttft_ms" in e for e in errors)
+    assert nightly.performance_gate(result, case, "B200", reference, "enforce")[0]
     reference["references"]["H100"][case.id]["num_prompts"] = 32
-    assert any("workload" in e for e in nightly.performance_gate(result, case, "H100", reference, "enforce"))
+    errors, _ = nightly.performance_gate(result, case, "H100", reference, "enforce")
+    assert any("workload" in e for e in errors)
 
 
 @pytest.mark.parametrize("bad", [None, 0, float("nan"), float("inf"), True])
@@ -151,23 +238,24 @@ def test_collection_mode_still_rejects_unmeasured_metrics(bad):
     case = nightly.NightlyCase("default", "seed-tts", 64, 1088)
     result = _valid_performance(case)
     result["mean_audio_rtf"] = bad
-    assert nightly.performance_gate(result, case, "H100", _reference(case), "collect")
-    assert result["performance_baseline_status"] == "collecting"
+    errors, annotated = nightly.performance_gate(result, case, "H100", _reference(case), "collect")
+    assert errors
+    assert annotated["performance_baseline_status"] == "collecting"
 
 
 def test_missing_reference_cannot_silently_pass_enforce():
     case = nightly.NightlyCase("default", "daily-omni", 64, 1197)
     result = _valid_performance(case)
     manifest = {"schema_version": 1, "references": {}}
-    assert nightly.performance_gate(result, case, "H100", manifest, "collect") == []
-    assert nightly.performance_gate(result, case, "H100", manifest, "enforce")
+    assert nightly.performance_gate(result, case, "H100", manifest, "collect")[0] == []
+    assert nightly.performance_gate(result, case, "H100", manifest, "enforce")[0]
 
 
 def test_fast_mean_cannot_hide_missing_latency_samples():
     case = nightly.NightlyCase("default", "daily-omni", 64, 1197)
     result = _valid_performance(case)
     result["num_ttft_samples"] = 1000
-    errors = nightly.performance_gate(result, case, "H100", _reference(case), "collect")
+    errors, _ = nightly.performance_gate(result, case, "H100", _reference(case), "collect")
     assert any("num_ttft_samples" in e for e in errors)
 
 
@@ -192,19 +280,28 @@ def test_seed_subset_is_trimmed_before_loader_can_skip_rows(tmp_path, monkeypatc
     assert (work / "en/prompt_wavs/first.wav").read_bytes() == b"wav"
 
 
-def test_nightly_wiring_reuses_c64_and_preserves_other_pipelines():
-    for platform, name in (("cuda", "test-nightly.yml"), ("npu", "test-npu-nightly.yml")):
-        pipeline = yaml.safe_load((ROOT / ".buildkite" / platform / name).read_text())
-        steps = [step for group in pipeline["steps"] if "steps" in group for step in group["steps"]]
-        combined = [s for s in steps if "Qwen3-Omni Accuracy + Perf" in s.get("label", "")]
-        assert len(combined) == 2
-        commands = "\n".join(command for s in steps for command in s.get("commands", []))
-        assert "test_qwen3_omni_no_async_chunk.json" not in commands
-        assert "test_qwen3_omni_async_chunk.json" not in commands
-        assert "test_qwen3_omni.py -m" not in commands
-        assert all("test_qwen3_omni_nightly.py" in "\n".join(s["commands"]) for s in combined)
+def test_cuda_nightly_reuses_c64_and_preserves_verbatim_regression():
+    pipeline = yaml.safe_load((ROOT / ".buildkite/cuda/test-nightly.yml").read_text())
+    steps = [step for group in pipeline["steps"] if "steps" in group for step in group["steps"]]
+    combined = [s for s in steps if "Qwen3-Omni Accuracy + Perf" in s.get("label", "")]
+    assert len(combined) == 2
+    commands = "\n".join(command for s in steps for command in s.get("commands", []))
+    assert "test_qwen3_omni_no_async_chunk.json" not in commands
+    assert "test_qwen3_omni_async_chunk.json" not in commands
+    assert "test_qwen3_omni.py -m" not in commands
+    assert all("test_qwen3_omni_nightly.py" in "\n".join(s["commands"]) for s in combined)
     cuda = (ROOT / ".buildkite/cuda/test-nightly.yml").read_text()
     assert "test_qwen3_omni_seed_tts_reads_questions_verbatim" in cuda
+
+
+def test_a3_keeps_existing_jobs_until_full_matrix_qualification():
+    pipeline = yaml.safe_load((ROOT / ".buildkite/npu/test-npu-nightly.yml").read_text())
+    steps = [step for group in pipeline["steps"] if "steps" in group for step in group["steps"]]
+    commands = "\n".join(command for step in steps for command in step.get("commands", []))
+    assert "test_qwen3_omni_nightly.py" not in commands
+    assert "test_qwen3_omni.py -m" in commands
+    assert "test_qwen3_omni_no_async_chunk.json" in commands
+    assert "test_qwen3_omni_async_chunk.json" in commands
 
 
 def test_combined_artifact_enters_performance_report(tmp_path):

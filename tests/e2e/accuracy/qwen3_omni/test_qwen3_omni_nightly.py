@@ -9,7 +9,6 @@ import math
 import os
 import subprocess
 from datetime import datetime, timezone
-from importlib.metadata import version
 from pathlib import Path
 
 import pytest
@@ -27,6 +26,7 @@ from tests.e2e.accuracy.qwen3_omni.nightly import (
     performance_gate,
     quality_baseline,
     resolve_dataset,
+    software_versions,
 )
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
@@ -109,7 +109,8 @@ def _run_case(server, case: NightlyCase, platform: str, sources: dict[str, Path]
             )
     manifest = json.loads(MANIFEST.read_text())
     mode = os.environ.get("QWEN3_OMNI_BASELINE_MODE", manifest["mode"])
-    errors += performance_gate(result, case, hardware, manifest, mode)
+    perf_errors, result = performance_gate(result, case, hardware, manifest, mode)
+    errors += perf_errors
     perf = result.get("performance_baseline") or {}
     perf_limits = {
         key: spec["value"] * (1 + spec["relative_tolerance"])
@@ -142,7 +143,7 @@ def _run_case(server, case: NightlyCase, platform: str, sources: dict[str, Path]
             "branch": os.environ.get("BUILDKITE_BRANCH", ""),
             "date": datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"),
             "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-            "software_versions": {package: version(package) for package in ("vllm", "vllm-omni", "torch")},
+            "software_versions": software_versions(),
             "baseline": {hardware: {**limits, **perf_limits}},
             "validation_errors": errors,
         }

@@ -1,9 +1,14 @@
 # Qwen3-Omni non-duplex nightly
 
-The CUDA and Ascend nightly suites use Daily-Omni and English Seed-TTS to
-measure accuracy and serving performance. A concurrency-64 run supplies both
-sets of metrics from the same inference requests. ASR, speaker similarity,
-UTMOS and answer scoring run after the benchmark measurement window.
+The combined nightly suite uses Daily-Omni and English Seed-TTS to measure
+accuracy and serving performance. A concurrency-64 run supplies both sets of
+metrics from the same inference requests. ASR, speaker similarity, UTMOS and
+answer scoring run after the benchmark measurement window.
+
+CUDA nightly schedules the combined suite. The Ascend A3 profile is available
+for explicit qualification; scheduled A3 nightly retains its existing accuracy
+and synthetic performance executions until both candidate deployments pass on
+A3, including Thinker prefix caching in the async-prefix deployment.
 
 ## Workloads
 
@@ -20,7 +25,7 @@ Both inherit the production runner and hardware placement.
 
 Each row applies to both datasets. There are ten benchmark runs per hardware
 profile, four of which also evaluate accuracy. The CUDA jobs use two H100 or
-two B200 devices. The A3 job reserves four devices: Thinker uses devices 0–1,
+two B200 devices. A3 qualification reserves four devices: Thinker uses devices 0–1,
 audio stages use device 2, and the accuracy evaluators use device 3.
 
 Daily-Omni uses all 1197 questions at revision
@@ -46,6 +51,10 @@ return decodable audio with positive duration, TTFP and RTF for every request.
 The full runs also require all expected questions or utterances to participate
 in scoring. High mean scores cannot conceal failed HTTP requests, missing
 audio, missing source rows or partial evaluator coverage.
+
+These completeness checks belong to the combined suite. Existing shared
+accuracy helpers and their AMD and legacy A3 callers retain their validation
+behavior and scoring denominators.
 
 The existing quality thresholds remain: Daily accuracy at least 0.69, Seed-TTS
 WER at most 0.05 and SIM at least 0.75. CUDA also requires UTMOS at least 3.10.
@@ -101,7 +110,9 @@ request counts, invalid metrics, and regressions fail the test.
 
 The unified `result_acc_*.json` artifacts include `nightly_suite`, configuration,
 hardware, concurrency, source revision, quality and performance metrics, and
-validation errors. The repository's HTML and Excel performance readers accept
+validation errors. Package-version metadata records `not-installed` when a
+source-only checkout lacks distribution metadata, preserving the result and
+its Git revision. The repository's HTML and Excel performance readers accept
 these combined artifacts. There is no second inference pass or duplicated
 performance result. External dashboard consumers may need to adopt the same
 suite discriminator. The smaller performance-only runs use `result_test_*.json`
@@ -132,7 +143,7 @@ gpu run --gpus 2 --nonblock --timeout 6h --note 'Qwen3 nightly qualification' --
 
 For A3, set `SEED_TTS_EVAL_DEVICE=npu:3` and select
 `-m 'full_model and npu and A3 and cards_4'`. Use `-k default` or
-`-k async-prefix` to match the two CI jobs. These commands do not run against
+`-k async-prefix` to qualify each deployment separately. These commands do not run against
 AMD. The CPU contract tests require pytest, PyYAML and the report dependencies:
 
 ```bash
@@ -140,8 +151,9 @@ uv run --no-sync pytest --noconftest -o addopts='' \
   tests/benchmarks/test_qwen3_nightly_contract.py
 ```
 
-Before enabling the new nightly configuration, qualify both deployments on
-CUDA and A3, including the newly enabled A3 Thinker prefix cache. Verify the
+Before replacing the scheduled A3 nightly executions, qualify both deployments
+on A3, including the newly enabled Thinker prefix cache. A2 supporting results
+do not qualify A3. Verify the
 full dataset counts, quality floors, usable audio metrics and saved artifacts.
 Only then retire the old nightly performance executions. Performance references
 remain in collection mode until the repeated target-hardware measurements are

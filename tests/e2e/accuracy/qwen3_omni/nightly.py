@@ -9,6 +9,7 @@ import json
 import math
 import os
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import TypedDict
 
@@ -164,12 +165,26 @@ def quality_baseline(case: NightlyCase, platform: str) -> dict[str, float]:
     return limits
 
 
-def performance_gate(result: dict, case: NightlyCase, hardware: str, manifest: dict, mode: str) -> list[str]:
-    """Collect until calibrated; enforce rejects missing or incompatible references."""
+def software_versions() -> dict[str, str]:
+    """Record package metadata without losing diagnostics for source-only installs."""
+    versions = {}
+    for package in ("vllm", "vllm-omni", "torch"):
+        try:
+            versions[package] = version(package)
+        except PackageNotFoundError:
+            versions[package] = "not-installed"
+    return versions
+
+
+def performance_gate(
+    result: dict, case: NightlyCase, hardware: str, manifest: dict, mode: str
+) -> tuple[list[str], dict]:
+    """Return validation errors and an annotated copy, preserving the input artifact."""
     if mode not in ("collect", "enforce"):
         raise ValueError(f"Unknown baseline mode: {mode}")
     if manifest.get("schema_version") != 1:
         raise ValueError("Unsupported nightly baseline schema")
+    annotated = dict(result)
     errors = []
     sample_counts = {
         "mean_ttft_ms": "num_ttft_samples",
@@ -184,17 +199,17 @@ def performance_gate(result: dict, case: NightlyCase, hardware: str, manifest: d
         if result.get(count_key) != case.count:
             errors.append(f"{count_key}={result.get(count_key)!r}, expected {case.count}")
     entry = manifest.get("references", {}).get(hardware, {}).get(case.id)
-    result["performance_baseline_status"] = "collecting" if mode == "collect" else "enforced"
-    result["performance_baseline"] = entry
+    annotated["performance_baseline_status"] = "collecting" if mode == "collect" else "enforced"
+    annotated["performance_baseline"] = entry
     if mode == "collect":
-        return errors
+        return errors, annotated
     if not isinstance(entry, dict) or not entry:
-        return errors + [f"No calibrated baseline for {hardware}/{case.id}"]
+        return errors + [f"No calibrated baseline for {hardware}/{case.id}"], annotated
     if entry.get("dataset_revision") != DATASETS[case.dataset]["revision"] or entry.get("num_prompts") != case.count:
-        return errors + ["Performance baseline workload does not match the pinned dataset/count"]
+        return errors + ["Performance baseline workload does not match the pinned dataset/count"], annotated
     repetitions = entry.get("repetitions")
     if not entry.get("reference_commit") or not isinstance(repetitions, int) or repetitions < 2:
-        return errors + ["Baseline must identify its reference commit and repeated measurements"]
+        return errors + ["Baseline must identify its reference commit and repeated measurements"], annotated
     for metric in case.metrics:
         spec = entry.get("metrics", {}).get(metric, {})
         if not isinstance(spec, dict):
@@ -216,10 +231,11 @@ def performance_gate(result: dict, case: NightlyCase, hardware: str, manifest: d
         value = result.get(metric)
         if isinstance(value, (int, float)) and value > reference * (1 + tolerance):
             errors.append(f"{metric}={value} exceeds {reference} * (1 + {tolerance})")
-    return errors
+    return errors, annotated
 
 
 def accuracy_coverage_errors(result: dict, case: NightlyCase, platform: str) -> list[str]:
+    """Apply full-dataset completeness only to the combined nightly matrix."""
     if not case.accuracy:
         return []
     counts = (
@@ -232,4 +248,27 @@ def accuracy_coverage_errors(result: dict, case: NightlyCase, platform: str) -> 
     )
     if case.dataset == "seed-tts" and platform == "cuda":
         counts.append("seed_tts_utmos_evaluated")
-    return [f"{key}={result.get(key)!r}, expected {case.count}" for key in counts if result.get(key) != case.count]
+    errors = [f"{key}={result.get(key)!r}, expected {case.count}" for key in counts if result.get(key) != case.count]
+    failure_keys = ["timed_out_requests", "cancelled_after_timeout_requests"]
+    if case.dataset == "daily-omni":
+        failure_keys += ["daily_omni_request_failed", "daily_omni_no_gold"]
+        score_keys = ["daily_omni_accuracy"]
+    else:
+        failure_keys += [
+            "seed_tts_request_failed",
+            "seed_tts_no_pcm",
+            "seed_tts_asr_failed",
+            "seed_tts_empty_audio",
+            "seed_tts_sim_failed",
+            "seed_tts_sim_skipped_no_ref",
+        ]
+        score_keys = ["seed_tts_content_error_mean", "seed_tts_sim_mean"]
+        if platform == "cuda":
+            failure_keys.append("seed_tts_utmos_failed")
+            score_keys.append("seed_tts_utmos_mean")
+    errors += [f"{key}={result[key]}; nightly coverage is incomplete" for key in failure_keys if result.get(key, 0)]
+    for key in score_keys:
+        value = result.get(key)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+            errors.append(f"{key} must be a finite score: {value!r}")
+    return errors

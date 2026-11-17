@@ -577,21 +577,21 @@ def _iter_steps(doc: dict):
     ],
 )
 @pytest.mark.parametrize(
-    "changed_file,select_perf",
+    "changed_file,select_cuda,select_npu",
     [
-        ("vllm_omni/benchmarks/realtime_seed_tts.py", False),
-        ("vllm_omni/benchmarks/patch/patch.py", True),
-        ("vllm_omni/benchmarks/data_modules/seed_tts_dataset.py", True),
-        ("vllm_omni/benchmarks/data_modules/daily_omni_dataset.py", True),
-        ("vllm_omni/benchmarks/validation.py", True),
-        ("tests/e2e/accuracy/qwen3_omni/nightly.py", True),
-        ("vllm_omni/clients/duplex.py", False),
-        ("vllm_omni/deploy/qwen3_omni_duplex.yaml", False),
-        ("tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json", True),
-        ("tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json", True),
-        ("vllm_omni/model_executor/models/qwen3_omni/qwen3_omni.py", True),
-        ("vllm_omni/model_executor/models/common/qwen3_code_predictor.py", True),
-        ("tests/dfx/perf/scripts/run_benchmark.py", True),
+        ("vllm_omni/benchmarks/realtime_seed_tts.py", False, False),
+        ("vllm_omni/benchmarks/patch/patch.py", True, True),
+        ("vllm_omni/benchmarks/data_modules/seed_tts_dataset.py", True, False),
+        ("vllm_omni/benchmarks/data_modules/daily_omni_dataset.py", True, False),
+        ("vllm_omni/benchmarks/validation.py", True, True),
+        ("tests/e2e/accuracy/qwen3_omni/nightly.py", True, True),
+        ("vllm_omni/clients/duplex.py", False, False),
+        ("vllm_omni/deploy/qwen3_omni_duplex.yaml", False, False),
+        ("tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json", True, True),
+        ("tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json", True, True),
+        ("vllm_omni/model_executor/models/qwen3_omni/qwen3_omni.py", True, True),
+        ("vllm_omni/model_executor/models/common/qwen3_code_predictor.py", True, True),
+        ("tests/dfx/perf/scripts/run_benchmark.py", True, True),
     ],
 )
 def test_qwen3_perf_pipeline_selection(
@@ -599,9 +599,10 @@ def test_qwen3_perf_pipeline_selection(
     pipeline_path: Path,
     perf_keys: set[str],
     changed_file: str,
-    select_perf: bool,
+    select_cuda: bool,
+    select_npu: bool,
 ) -> None:
-    """Select combined dataset jobs while excluding realtime-only inputs."""
+    """Select combined CUDA and retained A3 jobs according to their own workloads."""
     monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
     _load_source_file_dependencies.cache_clear()
     doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
@@ -609,7 +610,8 @@ def test_qwen3_perf_pipeline_selection(
     surviving_keys = {step["key"] for step in _iter_steps(rendered) if isinstance(step.get("key"), str)}
 
     # Compare the dependency-filtered Qwen perf jobs.
-    expected_keys = set(perf_keys) if select_perf else set()
+    selected = select_cuda if pipeline_path.parent.name == "cuda" else select_npu
+    expected_keys = set(perf_keys) if selected else set()
     assert surviving_keys & perf_keys == expected_keys
 
 
