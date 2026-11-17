@@ -61,7 +61,15 @@ class _FakePool:
     def live_replica_ids(self) -> list[int]:
         return [0]
 
-    async def submit_initial(self, request_id, _req_state, request, prompt_text=None, expected_replica_id=None):
+    async def submit_initial(
+        self,
+        request_id,
+        _req_state,
+        request,
+        prompt_text=None,
+        expected_replica_id=None,
+        requested_replica_id=None,
+    ):
         self.submitted.append(request)
         return 0
 
@@ -73,6 +81,9 @@ class _FakePool:
 
     def get_bound_client(self, request_id):
         return self.stage_client
+
+    def get_payload_sender_info(self, request_id):
+        return None
 
 
 def _orchestrator(payload_func: Any = None, cls: type[Orchestrator] = Orchestrator) -> Orchestrator:

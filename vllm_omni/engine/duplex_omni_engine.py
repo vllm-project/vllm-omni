@@ -21,7 +21,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
-from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
+from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig, apply_session_stats_capability
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
     DuplexControlResultMessage,
@@ -39,6 +39,7 @@ from vllm_omni.engine.duplex.plugin import (
 )
 from vllm_omni.engine.messages import EngineQueueMessage
 from vllm_omni.engine.orchestrator import OrchestratorBase
+from vllm_omni.tracing import capture_trace_headers
 
 if TYPE_CHECKING:
     from vllm_omni.engine.duplex.commands import DuplexCommand
@@ -97,6 +98,7 @@ class DuplexOmniEngine(AsyncOmniEngine):
         self.duplex_session_config = deploy_config.duplex_session
         self.plugin = load_duplex_plugin(plugin_path, self._audio_encoder)
         self.plugin.configure_pipeline(pipeline_config)
+        self.plugin.configure_server(self.duplex_session_config)
         validate_duplex_replica_policy(self.plugin, self.duplex_session_config, distributed=self.single_stage_mode)
 
     # Any: signature of the ``OmniEngineBase._create_orchestrator`` seam it overrides.
@@ -104,6 +106,7 @@ class DuplexOmniEngine(AsyncOmniEngine):
         from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator
 
         assert self.plugin is not None, "_validate_deployment() must run before the orchestrator is created"
+        assert self.pipeline_config is not None, "Duplex deployment must resolve a model pipeline"
         # Match the frontend's comprehension-stage selection. An optional ASR
         # stage does not own the served model's tokenizer or prompt policy.
         model_stage_id = next((stage.stage_id for stage in self.pipeline_config.stages if stage.owns_tokenizer), 0)
@@ -129,7 +132,10 @@ class DuplexOmniEngine(AsyncOmniEngine):
     def duplex_capabilities(self) -> DuplexCapabilities:
         if self.plugin is None:
             raise RuntimeError("duplex plugin is not loaded")
-        return self.plugin.capabilities(max_sessions=self.duplex_session_config.max_sessions)
+        return apply_session_stats_capability(
+            self.plugin.capabilities(max_sessions=self.duplex_session_config.max_sessions),
+            bool(getattr(self.duplex_session_config, "collect_stats", False)),
+        )
 
     # ---- session message surface ----
 
@@ -180,6 +186,7 @@ class DuplexOmniEngine(AsyncOmniEngine):
         *,
         output_buffer: DuplexOutputBuffer,
         timeout: float | None = _DEFAULT_OPEN_TIMEOUT_S,
+        trace_headers: dict[str, str] | None = None,
     ) -> DuplexControlResultMessage:
         control_id = uuid.uuid4().hex
         return self._execute_control(
@@ -188,6 +195,7 @@ class DuplexOmniEngine(AsyncOmniEngine):
                 session_id=session_id,
                 session_config=session_config,
                 output_buffer=output_buffer,
+                trace_headers=capture_trace_headers(trace_headers),
             ),
             control_id=control_id,
             operation="open",
@@ -204,9 +212,12 @@ class DuplexOmniEngine(AsyncOmniEngine):
         timeout: float | None = _DEFAULT_OPEN_TIMEOUT_S,
     ) -> DuplexControlResultMessage:
         loop = asyncio.get_running_loop()
+        trace_headers = capture_trace_headers()
         return await loop.run_in_executor(
             None,
-            lambda: self._open_session(session_id, session_config, output_buffer=output_buffer, timeout=timeout),
+            lambda: self._open_session(
+                session_id, session_config, output_buffer=output_buffer, timeout=timeout, trace_headers=trace_headers
+            ),
         )
 
     def _close_session(

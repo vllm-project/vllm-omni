@@ -5,8 +5,9 @@ import asyncio
 import copy
 import re
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
+from threading import Barrier, Event, get_ident
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
@@ -498,24 +499,20 @@ def test_omni_async_gpu_model_runner_output_builds_lazily_once():
 
 def test_omni_async_gpu_model_runner_output_reraises_background_exception():
     async_output = object.__new__(OmniAsyncGPUModelRunnerOutput)
-    joined = []
-
-    class FakeThread:
-        def join(self):
-            joined.append("join")
-
-    async_output._background_thread = FakeThread()
-    async_output._background_exception = RuntimeError("background failed")
+    async_output._background_future = Future()
+    async_output._background_future.set_exception(RuntimeError("background failed"))
 
     with pytest.raises(RuntimeError, match="background failed"):
         async_output.get_output()
 
-    assert joined == ["join"]
-    assert async_output._background_thread is None
+    with pytest.raises(RuntimeError, match="background failed"):
+        async_output.get_output()
 
 
 def _make_async_output_runner(engine_output_type: str = "audio"):
     runner = object.__new__(GPUARModelRunner)
+    runner._omni_output_executor = None
+    runner.speculative_config = None
     runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=True)
     runner._pooler_payload_include_hidden_flag = True
     model_config = SimpleNamespace(
@@ -706,6 +703,27 @@ def test_async_omni_output_guard_requires_safe_conditions():
 
     runner.model.eager_omni_postprocess_before_async_output = True
     assert GPUARModelRunner._should_use_async_omni_output(runner)
+
+
+@pytest.mark.parametrize(
+    "has_config,is_dflash,model_support,expected",
+    [
+        (False, False, True, False),
+        (True, False, True, False),
+        (True, True, False, False),
+        (True, True, True, True),
+    ],
+)
+def test_async_speculative_payload_requires_method_and_model_support(has_config, is_dflash, model_support, expected):
+    runner = _make_async_output_runner()
+    runner.speculative_config = SimpleNamespace(use_dflash=lambda: is_dflash) if has_config else None
+    runner.model.supports_speculative_payload = model_support
+    runner.model.use_async_omni_output = True
+    runner.use_async_scheduling = True
+    runner._should_accumulate_full_payload_output = lambda: False
+    assert runner._supports_speculative_payload() is expected
+    if has_config:
+        assert runner._should_use_async_omni_output() is expected
 
 
 @pytest.mark.parametrize("ming3", [False, True])
@@ -1965,6 +1983,13 @@ class TestPreferModelSamplerNoneFallback:
             def emit(self, record):
                 records.append(record)
 
+        import vllm.logger as vllm_logger
+
+        # warning_once is cached for the whole worker process. Another test on
+        # the same xdist worker can consume this message before we attach a handler.
+        vllm_logger._print_warning_once.cache_clear()
+        previous_level = ar_module.logger.level
+        ar_module.logger.setLevel(logging.INFO)
         handler = _Capture(level=logging.WARNING)
         ar_module.logger.addHandler(handler)
         try:
@@ -1973,6 +1998,8 @@ class TestPreferModelSamplerNoneFallback:
                 assert out is sentinel
         finally:
             ar_module.logger.removeHandler(handler)
+            ar_module.logger.setLevel(previous_level)
+            vllm_logger._print_warning_once.cache_clear()
 
         fallback_records = [r for r in records if "falling back to the default sampler" in r.getMessage()]
         assert len(fallback_records) == 1
@@ -2185,13 +2212,52 @@ def test_query_metadata_lifetime_matches_materialization_mode(snapshot):
         assert offsets.tolist() == [0, 9, 3]
 
 
-def test_background_output_survives_step_metadata_reuse(monkeypatch, mocker):
+@pytest.mark.parametrize(
+    "dflash,materialization,partial_prefill",
+    [
+        (False, "deferred", False),
+        (True, "deferred", False),
+        (True, "full", False),
+        (True, "prefix_cache", False),
+        (True, "deferred", True),
+    ],
+)
+def test_output_survives_step_metadata_reuse(monkeypatch, mocker, dflash, materialization, partial_prefill):
     """Delay the real builder until offsets, batch IDs and counts are reused."""
 
     runner = _make_async_output_runner()
     runner.use_async_scheduling = True
     runner.speculative_config = None
     runner.model.use_async_omni_output = True
+    if dflash:
+        runner.speculative_config = SimpleNamespace(
+            use_dflash=lambda: True,
+            use_eagle=lambda: False,
+            uses_draft_model=lambda: False,
+            uses_extract_hidden_states=lambda: False,
+        )
+        mocker.patch.object(runner, "_input_fits_in_drafter", return_value=False)
+        mocker.patch.object(runner, "finalize_kv_connector")
+        runner.model.supports_speculative_payload = True
+        runner.model.embed_input_ids = lambda input_ids: input_ids.float().unsqueeze(-1)
+        mocker.patch.object(runner, "_should_accumulate_full_payload_output", return_value=False)
+        mocker.patch.object(runner, "_get_or_create_omni_payload_copy_stream", return_value=None)
+    if dflash:
+        from vllm_omni.model_executor.models.qwen3_omni.speculative_payload import (
+            apply_speculative_payload,
+            finalize_speculative_payload,
+            prepare_speculative_payload,
+        )
+
+        runner.model.prepare_speculative_multimodal_outputs = lambda **kwargs: prepare_speculative_payload(
+            **kwargs, embed_input_ids=runner.model.embed_input_ids
+        )
+        runner.model.finalize_multimodal_outputs_from_cpu_snapshot = finalize_speculative_payload
+        runner.model.finalize_pooler_payload = apply_speculative_payload
+    if materialization == "full":
+        runner._async_chunk = runner.model_config.async_chunk = False
+    if materialization == "prefix_cache":
+        runner.omni_prefix_cache = object()
     runner.broadcast_pp_output = False
     runner.kv_connector_output = None
     runner.device = torch.device("cpu")
@@ -2199,17 +2265,40 @@ def test_background_output_survives_step_metadata_reuse(monkeypatch, mocker):
     runner.input_batch = mocker.Mock(
         spec=InputBatch, req_ids=["r1", "r2"], req_id_to_index={"r1": 0, "r2": 1}, vocab_size=10
     )
+    runner.input_batch.num_reqs = 2
+    runner.discard_request_mask = SimpleNamespace(np=np.array([partial_prefill, False]))
+    runner.positions = torch.tensor([2, 2, 3])
+    runner.requests = {rid: SimpleNamespace(prompt_token_ids=[1]) for rid in ["r1", "r2"]}
     runner.query_start_loc = object.__new__(CpuGpuBuffer)
     runner.query_start_loc.cpu = torch.tensor([0, 1, 3], dtype=torch.int32)
     runner._omni_num_scheduled_tokens_np = np.array([1, 2], dtype=np.int32)
     scheduler = SchedulerOutput.make_empty()
     scheduler.num_scheduled_tokens = {"r1": 1, "r2": 2}
     scheduler.total_num_scheduled_tokens = 3
+    if dflash:
+        scheduler.scheduled_spec_decode_tokens = {"r1": [1], "r2": [2]}
+    if partial_prefill:
+        scheduler.scheduled_spec_decode_tokens.pop("r1")
+        runner.requests["r1"].prompt_token_ids = [1, 2, 3, 4]
     hidden = torch.tensor([[1.0], [2.0], [3.0]])
+    runner.input_ids = SimpleNamespace(gpu=torch.tensor([6, 7, 8]))
+    captured = torch.tensor([[60.0], [70.0], [80.0]])
     runner.execute_model_state = ExecuteModelState(
-        scheduler, None, None, None, hidden, None, None, None, None, None, {}, None
+        scheduler,
+        None,
+        None,
+        None,
+        hidden,
+        None,
+        None,
+        None,
+        None,
+        None,
+        {"hidden_states": {"layers": {0: captured}}},
+        None,
     )
-    sampler = SamplerOutput(sampled_token_ids=torch.tensor([[7], [8]]), logprobs_tensors=None)
+    sampled_ids = torch.tensor([[7, -1], [8, 9]]) if dflash else torch.tensor([[7], [8]])
+    sampler = SamplerOutput(sampled_token_ids=sampled_ids, logprobs_tensors=None)
     mocker.patch.object(runner, "_sample", return_value=sampler)
     mocker.patch.object(runner, "_update_states_after_model_execute")
     # Match upstream bookkeeping's ownership contract: these are already copies.
@@ -2224,28 +2313,27 @@ def test_background_output_survives_step_metadata_reuse(monkeypatch, mocker):
             {},
             runner.input_batch.req_ids.copy(),
             runner.input_batch.req_id_to_index.copy(),
-            [],
+            [0] if partial_prefill else [],
         ),
     )
-    mocker.patch.object(runner, "_run_post_sample_talker_mtp", return_value={})
+    mocker.patch.object(runner, "_run_post_sample_talker_mtp", side_effect=lambda **kw: kw["multimodal_outputs"])
     mocker.patch.object(runner, "eplb_step")
     mocker.patch.object(runner, "get_omni_connector_output", return_value=None)
     monkeypatch.setattr(gpu_ar_model_runner, "get_pp_group", lambda: mocker.Mock(world_size=1))
     mocker.patch.object(runner, "_resolve_pooler_payload_req_ids", side_effect=lambda ids: ("audio", ids))
     # Device copying is covered separately; this test isolates metadata lifetime.
-    mocker.patch.object(
-        runner,
-        "_snapshot_omni_output_tensors_for_async_output",
-        return_value=gpu_ar_model_runner._OmniOutputTensorSnapshot(
-            hidden_states=hidden, staged_hidden_states_cpu=None, multimodal_outputs={}
-        ),
-    )
+    mocker.patch.object(runner, "_get_or_create_omni_payload_copy_stream", return_value=None)
     async_output = mocker.Mock(
         spec=OmniAsyncGPUModelRunnerOutput,
         sampled_token_ids_cpu=sampler.sampled_token_ids,
         async_copy_ready_event=object(),
     )
-    constructor = mocker.patch.object(gpu_ar_model_runner, "OmniAsyncGPUModelRunnerOutput", return_value=async_output)
+    constructor = mocker.patch.object(
+        gpu_ar_model_runner,
+        "OmniAsyncGPUModelRunnerOutput" if materialization == "deferred" else "AsyncGPUModelRunnerOutput",
+        return_value=async_output,
+    )
+    runner._omni_output_executor = None
 
     assert runner.sample_tokens(None) is async_output
     runner.query_start_loc.cpu.fill_(99)
@@ -2253,12 +2341,38 @@ def test_background_output_survives_step_metadata_reuse(monkeypatch, mocker):
     scheduler.num_scheduled_tokens.clear()
     runner.input_batch.req_ids[:] = ["next-step"]
     runner.input_batch.req_id_to_index.clear()
-    output = constructor.call_args.kwargs["model_runner_output_builder"]()
+    if dflash:
+        sampler.sampled_token_ids.fill_(99)
+        runner.input_ids.gpu.fill_(99)
+        captured.fill_(99)
+        runner.requests.clear()
+        # Both request state and routing may change while the output waits.
+        runner._resolve_pooler_payload_req_ids.side_effect = AssertionError("read live routing")
+    output = (
+        constructor.call_args.kwargs["model_runner_output_builder"]()
+        if materialization == "deferred"
+        else constructor.call_args.kwargs["model_runner_output"]
+    )
 
     assert output.req_ids == ["r1", "r2"]
     assert output.req_id_to_index == {"r1": 0, "r2": 1}
-    torch.testing.assert_close(output.inter_stage_outputs[0]["hidden"], hidden[:1])
-    torch.testing.assert_close(output.inter_stage_outputs[1]["hidden"], hidden[1:])
+    if dflash and materialization == "deferred":
+        if partial_prefill:
+            assert "ids.output" not in output.inter_stage_outputs[0]
+            torch.testing.assert_close(output.inter_stage_outputs[0]["hidden"], hidden[:1])
+        else:
+            assert output.inter_stage_outputs[0]["ids.output"].tolist() == [6]
+        assert output.inter_stage_outputs[1]["ids.output"].tolist() == [7, 8]
+        assert output.inter_stage_outputs[0]["hidden_states.layer_0"].flatten().tolist() == [60.0]
+        assert output.inter_stage_outputs[1]["hidden_states.layer_0"].flatten().tolist() == [70.0, 80.0]
+    elif dflash:
+        assert output.inter_stage_outputs[0]["ids.output"].tolist() == [7]
+        assert output.inter_stage_outputs[1]["ids.output"].tolist() == [8, 9]
+        assert output.inter_stage_outputs[0]["hidden_states.layer_0"].flatten().tolist() == [7.0]
+        assert output.inter_stage_outputs[1]["hidden_states.layer_0"].flatten().tolist() == [8.0, 9.0]
+    else:
+        torch.testing.assert_close(output.inter_stage_outputs[0]["hidden"], hidden[:1])
+        torch.testing.assert_close(output.inter_stage_outputs[1]["hidden"], hidden[1:])
 
 
 def test_shutdown_drops_cached_sampled_token_override(mocker):
@@ -2273,3 +2387,112 @@ def test_shutdown_drops_cached_sampled_token_override(mocker):
 
     assert runner._sampled_token_ids_cpu_override is None
     upstream.assert_called_once()
+
+
+def test_async_output_reuses_worker_and_survives_builder_failure(mocker):
+    mocker.patch.object(torch.cuda, "current_stream", return_value=Mock())
+    mocker.patch.object(torch.cuda, "stream", side_effect=lambda stream: nullcontext())
+    mocker.patch.object(torch, "Event", side_effect=Mock)
+    device = mocker.patch.object(torch.cuda, "set_device")
+    order = []
+    threads = []
+    started, release = Event(), Event()
+
+    def builder(index):
+        threads.append(get_ident())
+        order.append(index)
+        if index == 0:
+            started.set()
+            assert release.wait(5)
+        if index == 1:
+            raise RuntimeError("failed step")
+        return OmniModelRunnerOutput(req_ids=[str(index)], req_id_to_index={str(index): 0})
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        outputs = []
+        try:
+            for index in range(3):
+                outputs.append(
+                    OmniAsyncGPUModelRunnerOutput(
+                        model_runner_output_builder=lambda index=index: builder(index),
+                        output_executor=executor,
+                        cuda_device="cuda:0",
+                        sampled_token_ids=torch.tensor([[7]]),
+                        logprobs_tensors=None,
+                        invalid_req_indices=[],
+                        async_output_copy_stream=Mock(),
+                        vocab_size=10,
+                    )
+                )
+            assert started.wait(5)
+            assert order == [0]
+        finally:
+            release.set()
+        assert outputs[0].get_output().sampled_token_ids == [[7]]
+        with pytest.raises(RuntimeError, match="failed step"):
+            outputs[1].get_output()
+        assert outputs[2].get_output().req_ids == ["2"]
+        with pytest.raises(RuntimeError, match="failed step"):
+            outputs[1].get_output()
+    assert order == [0, 1, 2]
+    assert len(set(threads)) == 1
+    assert threads[0] != get_ident()
+    assert device.call_count == 3
+
+
+def test_shutdown_drains_output_builder_before_releasing_runner_state(mocker):
+    runner = object.__new__(GPUARModelRunner)
+    runner.omni_prefix_cache = None
+    runner._omni_output_executor = ThreadPoolExecutor(max_workers=1)
+    started, release = Event(), Event()
+    order = []
+
+    def build():
+        started.set()
+        assert release.wait(5)
+        order.append("built")
+
+    runner._omni_output_executor.submit(build)
+    draining = Event()
+    shutdown_executor = runner._omni_output_executor.shutdown
+
+    def drain(**kwargs):
+        draining.set()
+        shutdown_executor(**kwargs)
+
+    mocker.patch.object(runner._omni_output_executor, "shutdown", side_effect=drain)
+    mocker.patch.object(runner, "_clear_duplex_sampling", side_effect=lambda: order.append("clear"))
+    mocker.patch.object(
+        gpu_ar_model_runner.OmniGPUModelRunner, "shutdown", side_effect=lambda: order.append("shutdown")
+    )
+    with ThreadPoolExecutor(max_workers=1) as closer:
+        try:
+            assert started.wait(5)
+            stopped = closer.submit(runner.shutdown)
+            assert draining.wait(5)
+            assert not stopped.done()
+            assert order == []
+        finally:
+            release.set()
+        stopped.result(timeout=5)
+    assert order == ["built", "clear", "shutdown"]
+    assert runner._omni_output_executor is None
+
+
+@pytest.mark.parametrize("shape", [(), (1, 1), (2, 3), (0, 1)])
+@pytest.mark.parametrize("is_tuple", [False, True])
+def test_unpack_equal_shape_snapshot_preserves_rows_and_container(shape, is_tuple):
+    count = 16
+    size = torch.Size(shape)
+    flat = torch.arange(count * size.numel())
+    packed = gpu_ar_model_runner._PackedTensorPayload(flat, [size] * count, is_tuple)
+    rows = gpu_ar_model_runner._copy_tensor_payload_to_cpu(packed, pin_memory=False)
+    assert type(rows) is (tuple if is_tuple else list)
+    assert len(rows) == count
+    for index, row in enumerate(rows):
+        expected = torch.arange(index * size.numel(), (index + 1) * size.numel()).reshape(shape)
+        torch.testing.assert_close(row, expected)
+    if flat.numel():
+        # Unpacking preserves views of the owned snapshot, without row copies.
+        flat.fill_(-1)
+        assert all(torch.all(row == -1) for row in rows)

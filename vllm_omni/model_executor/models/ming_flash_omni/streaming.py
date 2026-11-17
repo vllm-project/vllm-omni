@@ -6,8 +6,12 @@ from collections import deque
 from queue import Empty, Full, Queue
 from threading import Event, Thread
 from time import monotonic
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from .talker_batch import BatchedVAEState
 
 
 class _CancelledError(Exception):
@@ -153,17 +157,18 @@ class MingStreamingJob:
 class MingBatchedStreamJob:
     """Consumer half of a request decoded by the shared talker batch engine.
 
-    The engine thread publishes completed latents; ``next_audio`` runs on the
-    model runner thread and VAE-decodes everything that has arrived. Waiting
-    happens once per runner step for all requests (see ``urgent``), not per
-    request. A request that is not streamed collects every latent and is
-    decoded by ``decode_full`` when its final latent arrives.
+    The engine thread publishes completed latents; on the model runner thread
+    ``take`` drains everything that has arrived for a shared batched VAE
+    decode (``mark_decoded`` records its result), or ``next_audio`` decodes
+    it with this job's own VAE state. Waiting happens once per runner step for
+    all requests (see ``urgent``), not per request. A request that is not
+    streamed collects every latent and is decoded by ``decode_full`` when its
+    final latent arrives.
     """
 
-    def __init__(self, vae, device, *, low_latency_streaming=False, decode_full=None):
+    def __init__(self, vae, device, *, decode_full=None):
         self.vae = vae
         self.device = device
-        self.low_latency_streaming = low_latency_streaming
         self.decode_full = decode_full
         self.request = None
         self.latents = deque()
@@ -172,6 +177,8 @@ class MingBatchedStreamJob:
         self.final_published = False
         self.past_key_values = None
         self.stream_state = (None, None, None)
+        # Stream position and buffers owned by a BatchedAudioVAEDecoder.
+        self.vae_state: BatchedVAEState = {}
         self.finished = False
         self._has_audio_output = False
 
@@ -196,7 +203,7 @@ class MingBatchedStreamJob:
         # First audio as early as possible, the final flush immediately.
         return not self._has_audio_output or self.final_published
 
-    def next_audio(self):
+    def _drain(self):
         if self.error is not None:
             raise self.error
         parts = []
@@ -209,30 +216,47 @@ class MingBatchedStreamJob:
             parts.append(latent)
         # A request with no speakable segment is final without any latent.
         last = last or (self.final_published and not parts and not self.latents and not self.finished)
+        return parts, last
+
+    def take(self):
+        """Return ``(latents or None, last)`` for a streamed job's next decode."""
+        parts, last = self._drain()
+        if not parts:
+            self.finished = last
+            return None, last
+        return torch.cat(parts, dim=1), last
+
+    def mark_decoded(self, audio, last):
+        self.finished = last
+        if audio.numel():
+            self._has_audio_output = True
+
+    def next_audio(self):
         if self.decode_full is not None:
+            parts, last = self._drain()
             self.collected.extend(parts)
             if not last:
                 return torch.empty(1, 1, 0, device=self.device), False
             self.finished = True
             return self.decode_full(self.collected), True
-        if not parts:
-            self.finished = last
+        latents, last = self.take()
+        if latents is None:
             return torch.empty(1, 1, 0, device=self.device), last
         audio, self.stream_state, self.past_key_values = self.vae.decode(
-            torch.cat(parts, dim=1),
+            latents,
             past_key_values=self.past_key_values,
             stream_state=self.stream_state,
             use_cache=True,
             last_chunk=last,
         )
-        self.finished = last
-        if audio.numel():
-            self._has_audio_output = True
+        self.mark_decoded(audio, last)
         return audio, last
 
-    def close(self, engine=None):
+    def close(self, engine=None, vae_decoder=None):
         if engine is not None and self.request is not None and not self.finished:
             engine.cancel(self.request)
+        if vae_decoder is not None:
+            vae_decoder.release(self.vae_state)
         self.latents.clear()
         self.collected = []
         self.past_key_values = None

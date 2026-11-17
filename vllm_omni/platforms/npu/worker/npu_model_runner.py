@@ -20,7 +20,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import using_paged_attention
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable
-from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
+from vllm_ascend.worker.v1.model_runner import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 
 from vllm_omni.core.prefix_cache import stage_prefix_cache_config
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -33,9 +33,9 @@ logger = init_logger(__name__)
 
 
 if is_310p():
-    from vllm_ascend._310p.model_runner_310p import NPUModelRunner310 as NPUModelRunner
+    from vllm_ascend.worker.v1._310p.model_runner_310p import NPUModelRunner310 as NPUModelRunner
 else:
-    from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+    from vllm_ascend.worker.v1.model_runner import NPUModelRunner
 
 
 class OmniNPUModelRunner(NPUAuxOutputMixin, OmniGPUModelRunner, NPUModelRunner):
@@ -512,7 +512,8 @@ class OmniNPUModelRunner(NPUAuxOutputMixin, OmniGPUModelRunner, NPUModelRunner):
         # the buffer the graph reads; the wide path refreshes the per-frame
         # inputs instead. Everything else (prefill, a mixed step, another stage)
         # falls through to the ordinary single-forward path below.
-        from vllm_omni.platforms.npu.worker import talker_multiframe
+        from vllm_omni.platforms.npu.worker import talker_narrow_replay
+        from vllm_omni.worker import talker_multiframe
 
         frames = talker_multiframe.applies(self.model, model_kwargs_extra)
         if frames <= 1 and talker_multiframe.is_multi_token_decode(self.model, model_kwargs_extra):
@@ -527,7 +528,7 @@ class OmniNPUModelRunner(NPUAuxOutputMixin, OmniGPUModelRunner, NPUModelRunner):
             )
         if frames > 1:
             spans = [(int(start), int(end)) for start, end in model_kwargs_extra["request_token_spans"]]
-            narrow = talker_multiframe.begin_narrow_step(
+            narrow = talker_narrow_replay.begin_narrow_step(
                 runner=self,
                 forward_context=forward_context,
                 frames=frames,
@@ -549,7 +550,7 @@ class OmniNPUModelRunner(NPUAuxOutputMixin, OmniGPUModelRunner, NPUModelRunner):
                     narrow=narrow,
                 )
             finally:
-                talker_multiframe.end_narrow_step(forward_context, narrow)
+                talker_narrow_replay.end_narrow_step(forward_context, narrow)
             # The vocab gate the multi-frame path needs, applied here because
             # this is the wrapper the K-step runs through. The Talker's
             # vLLM-level head is the two-wide continue/stop row, but input_batch

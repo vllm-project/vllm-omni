@@ -359,7 +359,6 @@ class Qwen2_5OmniForConditionalGeneration(
             # mock data for profile
             if input_ids is None:
                 input_ids = torch.zeros(inputs_embeds.shape[0], dtype=torch.long, device=inputs_embeds.device)
-                self.thinker_reply_part = torch.zeros_like(inputs_embeds)
 
             # For MRoPE, positions shape is [3, num_tokens] (T/H/W), don't slice it
             if positions.ndim == 2 and positions.shape[0] == 3:
@@ -740,29 +739,52 @@ class Qwen2_5OmniForConditionalGeneration(
         input_embeds: torch.Tensor,
         **info_dict: object,
     ):
-        # Mixed-mode support: In a single step, both Prefill*n and Decode*n are supported.
-        # Rules:
-        # - Prefill segments are wrapped with special tokens: [BOS][PAD...][EOS]
-        # - Decode segments consist of a single non-special token.
-        # - If additional_information is provided (can be a list split by request or a
-        #   concatenated tensor plus a list of shapes), then for each request, reconstruct
-        #   the thinker→talker input embeddings for the Prefill segments;
-        # - For Decode segments, if per-request auxiliary decode embeddings are provided (optional),
-        #   add them; otherwise, keep the original embedding.
-
+        # The runner reports, for every scheduled span, the request's prompt length
+        # and the absolute position of the span's first token (#3662). The span is
+        # assembled from these positions, never from its length: a chunked-prefill
+        # chunk, a speculative-decoding verify step and a preemption replay all
+        # schedule spans whose length does not identify their phase.
+        # - Prompt positions take rows of the reconstructed Talker prompt.
+        # - Generated positions add the request's ``thinker_reply`` row for their
+        #   generation offset, repeating its final text-PAD row after text ends.
         payload: OmniPayload = info_dict
+        try:
+            start = int(payload["_omni_num_computed_tokens"])
+            prompt_len = int(payload["_omni_prompt_len"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "Qwen2.5-Omni talker preprocessing requires the runner metadata "
+                "_omni_num_computed_tokens and _omni_prompt_len."
+            ) from exc
+
+        if start >= prompt_len:
+            thinker_reply = payload.get("embed", {}).get("thinker_reply")
+            return self.thinker_to_talker_decode(input_ids, input_embeds, thinker_reply, start - prompt_len)
 
         # Ensure we have base embeddings when only ids are provided
         if input_embeds is None and input_ids is not None:
             input_embeds = self.talker.embed_input_ids(input_ids)
-
-        span_len = input_ids.shape[0]
-        if span_len > 1:
-            # prefill
-            return self.thinker_to_talker_process(input_ids, input_embeds, payload)
-        else:
-            # decode
-            return self.thinker_to_talker_decode_one_step(input_ids, input_embeds, payload)
+        req_input_ids, req_embeds, update_dict = self.thinker_to_talker_process(input_ids, input_embeds, payload)
+        if req_embeds.shape[0] != prompt_len:
+            raise ValueError(
+                f"Reconstructed Talker prompt has {req_embeds.shape[0]} rows, but the "
+                f"scheduled prompt has {prompt_len} tokens."
+            )
+        num_prompt = min(int(input_ids.shape[0]), prompt_len - start)
+        out_ids = req_input_ids[start : start + num_prompt]
+        out_embeds = req_embeds[start : start + num_prompt]
+        if num_prompt < input_ids.shape[0]:
+            # After preemption the scheduler resets num_computed_tokens to 0 while
+            # keeping the generated tokens, and may schedule the prompt and those
+            # tokens in one span. The generated suffix uses the thinker_reply
+            # reconstructed above, so it matches the original decode steps.
+            thinker_reply = update_dict.get("embed", {}).get("thinker_reply")
+            suffix_ids, suffix_embeds, _ = self.thinker_to_talker_decode(
+                input_ids[num_prompt:], input_embeds[num_prompt:], thinker_reply, 0
+            )
+            out_ids = torch.cat([out_ids, suffix_ids.to(device=out_ids.device, dtype=out_ids.dtype)])
+            out_embeds = torch.cat([out_embeds, suffix_embeds.to(device=out_embeds.device, dtype=out_embeds.dtype)])
+        return out_ids, out_embeds, update_dict
 
     def thinker_to_talker_process(
         self,
@@ -872,49 +894,34 @@ class Qwen2_5OmniForConditionalGeneration(
             )
         return prompt_token_ids_processed, prompt_embeds
 
-    def thinker_to_talker_decode_one_step(self, input_ids, input_embeds, payload: OmniPayload):
-        embed = payload.get("embed", {})
+    def thinker_to_talker_decode(self, input_ids, input_embeds, thinker_reply, offset: int):
+        """Assemble embeddings for generated positions starting at generation ``offset``.
 
-        update_dict = {}
-        # choose step vector in priority order
-        step_vec = None
-        q = embed.get("thinker_reply", None)
-        if isinstance(q, torch.Tensor) and q.numel() > 0:
-            step_vec = q[0:1]
-            new_q = q[1:].detach().to("cpu").contiguous()
-            update_dict.setdefault("embed", {})["thinker_reply"] = new_q
-        else:
-            # B) per-request provided decode vector (optional)
-            dv = embed.get("decode")
-            if isinstance(dv, torch.Tensor) and dv.numel() > 0:
-                step_vec = dv[0:1] if dv.ndim == 2 else dv.view(1, -1)
-            elif (
-                hasattr(self, "thinker_reply_part")
-                and isinstance(self.thinker_reply_part, torch.Tensor)
-                and self.thinker_reply_part.numel() > 0
-            ):
-                # C) fallback shared pool
-                step_vec = self.thinker_reply_part[0:1]
-                self.thinker_reply_part = self.thinker_reply_part[1:]
+        Each position needs ``thinker_reply[offset + i] + codec_embedding``. The
+        rows are selected by position and ``thinker_reply`` is never consumed, so
+        a single decode step, a speculative-decoding verify span and a
+        preemption replay of the same positions all receive the same rows.
+        Prefill appends text EOS and PAD; the final PAD conditions every
+        remaining audio position, matching the reference decoder.
+        """
+        span_len = int(input_ids.shape[0])
+        # Build the span embeddings from the codec ids rather than trusting the
+        # incoming buffer: in a mixed batch the runner hands decode requests a
+        # slice of a ``torch.empty`` scratch tensor (uninitialized memory).
+        out_dtype = input_embeds.dtype if input_embeds is not None else None
+        input_embeds = self.talker.embed_input_ids(input_ids)
+        if out_dtype is not None and input_embeds.dtype != out_dtype:
+            input_embeds = input_embeds.to(out_dtype)
 
-        if isinstance(step_vec, torch.Tensor) and step_vec.numel() > 0:
-            one_id = input_ids[0:1]
-            _, one_embed = self._thinker_to_talker_decode_one_step(
-                output_prompt_embeds=step_vec.to(input_embeds.dtype).to(self._module_device(self.model)),
-                output_token_ids=one_id,
-            )
-            input_embeds[0] = one_embed[0]
-        return input_ids[0:1], input_embeds[0:1], update_dict
-
-    def _thinker_to_talker_decode_one_step(
-        self,
-        output_prompt_embeds,
-        output_token_ids,
-    ):
-        processed_output_token_embeds = output_prompt_embeds + self.talker.embed_input_ids(
-            output_token_ids
-        )  # for decode
-        return output_token_ids, processed_output_token_embeds
+        if isinstance(thinker_reply, torch.Tensor) and thinker_reply.numel() > 0:
+            rows = thinker_reply[offset : offset + span_len]
+            n = int(rows.shape[0])
+            if n > 0:
+                input_embeds[:n] = input_embeds[:n] + rows.to(dtype=input_embeds.dtype, device=input_embeds.device)
+            if n < span_len:
+                pad = thinker_reply[-1:].to(dtype=input_embeds.dtype, device=input_embeds.device)
+                input_embeds[n:] = input_embeds[n:] + pad
+        return input_ids, input_embeds, {}
 
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, **kwargs: object) -> torch.Tensor | None:
         # Handle OmniOutput type
