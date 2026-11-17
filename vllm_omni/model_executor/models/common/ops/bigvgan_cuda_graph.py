@@ -24,8 +24,7 @@ Modeled on ``CUDAGraphBigVGANWrapper``
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import torch
 from vllm.logger import init_logger
@@ -78,12 +77,7 @@ class BigVGANCUDAGraphWrapper:
     def warmup(self, device: torch.device, dtype: torch.dtype) -> None:
         """Capture every bucket; idempotent. A failing bucket logs one
         warning and is skipped, the rest still replay."""
-        if (
-            not self.enabled
-            or self._warmed_up
-            or device.type != "cuda"
-            or torch.cuda.is_current_stream_capturing()
-        ):
+        if not self.enabled or self._warmed_up or device.type != "cuda" or torch.cuda.is_current_stream_capturing():
             return
         if device.index is None:
             # Normalize so later mel.device comparisons (always indexed)

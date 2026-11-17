@@ -80,9 +80,7 @@ def test_amplitude_to_db_min_level_cached():
     assert torch.equal(a1, a2)
     assert len(model._min_level_cache) == 1
 
-    fresh = 20 * torch.log10(
-        torch.clamp(x, min=torch.exp(torch.tensor(-115 / 20.0 * np.log(10))))
-    )
+    fresh = 20 * torch.log10(torch.clamp(x, min=torch.exp(torch.tensor(-115 / 20.0 * np.log(10)))))
     torch.testing.assert_close(a1, fresh, rtol=0.0, atol=0.0)
 
     # A different level (or dtype/device) gets its own entry.

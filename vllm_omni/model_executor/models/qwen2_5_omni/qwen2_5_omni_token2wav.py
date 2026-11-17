@@ -964,9 +964,7 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
 _DEFAULT_VOCODER_GRAPH_LADDER = [128, 256, 512, 1024, 2048]
 
 
-def _vocoder_graph_capture_sizes(
-    chunk_size: int, future_size: int, ladder: list[int]
-) -> list[int]:
+def _vocoder_graph_capture_sizes(chunk_size: int, future_size: int, ladder: list[int]) -> list[int]:
     """Bucket sizes for the vocoder graph: the ladder plus the recurring
     streaming mel widths as exact-shape hits.
 
@@ -997,9 +995,7 @@ def _maybe_enable_vocoder_cuda_graph(model: "Qwen2_5OmniToken2WavModel") -> None
         capture_fn=vocoder.vocode,
         num_mels=vocoder.config.mel_dim,
         upsample_factor=model.vocoder_hop,
-        capture_sizes=_vocoder_graph_capture_sizes(
-            model.chunk_size, model.future_size, ladder
-        ),
+        capture_sizes=_vocoder_graph_capture_sizes(model.chunk_size, model.future_size, ladder),
     )
     logger.info(
         "Qwen2.5-Omni vocoder CUDA graph enabled (capture sizes: %s)",

@@ -121,9 +121,7 @@ def test_padded_replay_trims_and_bounds_tail_leakage():
     with torch.no_grad():
         eager = model.vocode(mel)
     clean_frames = t - 32  # well beyond the tiny model's receptive field
-    torch.testing.assert_close(
-        out[..., : clean_frames * HOP], eager[..., : clean_frames * HOP], rtol=0.0, atol=1e-4
-    )
+    torch.testing.assert_close(out[..., : clean_frames * HOP], eager[..., : clean_frames * HOP], rtol=0.0, atol=1e-4)
     assert (out - eager).abs().max() < 0.25
 
 
@@ -225,9 +223,7 @@ def test_streaming_widths_are_exact_hits():
         _vocoder_graph_capture_sizes,
     )
 
-    sizes = _vocoder_graph_capture_sizes(
-        chunk_size=72, future_size=20, ladder=[128, 256]
-    )
+    sizes = _vocoder_graph_capture_sizes(chunk_size=72, future_size=20, ladder=[128, 256])
     assert sizes == [72, 112, 128, 256]
 
     model = _make_tiny_vocoder()
