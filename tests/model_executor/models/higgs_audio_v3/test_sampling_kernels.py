@@ -6,10 +6,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
+from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE, NVIDIA_CUDA_OR_XPU
 from tests.helpers.mark import hardware_test
 
-pytestmark = [pytest.mark.core_model, pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="requires CUDA")]
+pytestmark = [pytest.mark.core_model, pytest.mark.skipif(not NVIDIA_CUDA_OR_XPU, reason="requires NVIDIA CUDA or XPU")]
 
 
 @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)

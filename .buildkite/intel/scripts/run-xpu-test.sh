@@ -103,8 +103,9 @@ mkdir -p "${HF_CACHE}"
 HF_MOUNT="/root/.cache/huggingface"
 
 # Test budget inside the container; the pipeline gives the broad scope more.
-# Each stage also has its own cap, summing to 59m in the pr scope and 94m in the
-# broad scope, so one runaway stage cannot eat the whole budget. Measured end to
+# Each stage also has its own cap - 6+13+28+2+10 = 59m in the pr scope, plus
+# 20+15 = 94m in the broad scope - so one runaway stage cannot eat the whole
+# budget, and the stages that run last still get their full cap. Measured end to
 # end in the pr scope on two cards: 3m40s dispatch + 10m05s omni + 23m01s core
 # 1-card + 23s mxfp8 + 1m41s core 2-card = 39m31s including the reaps.
 # timeout_in_minutes on the step has to cover the budget plus the image build
@@ -136,6 +137,8 @@ time timeout -k 30 "${XPU_TEST_BUDGET}" docker run \
     -e HF_TOKEN \
     -e HF_HUB_OFFLINE \
     -e XPU_TEST_SCOPE \
+    -e XPU_TEST_CARDS \
+    -e XPU_REQUIRE_CARDS \
     -e XPU_CPU_WORKERS \
     -e ZE_AFFINITY_MASK \
     --name "${container_name}" \
@@ -239,7 +242,9 @@ PY
 
     rc=0
     # stage <name> <budget> <cards> <pytest args...>; cards is the
-    # ZE_AFFINITY_MASK the stage runs under, or "" for the no-card stage.
+    # ZE_AFFINITY_MASK the stage runs under. Always pass a mask, also for the
+    # no-card stage: an empty ZE_AFFINITY_MASK makes every card on the host
+    # visible, including the ones other agents own.
     stage() {
         local name="$1" budget="$2" cards="$3"
         shift 3
@@ -284,7 +289,7 @@ PY
         # The omni models go first and in their own process. They want the most
         # device memory of anything here - Qwen2.5-Omni colocates three stages
         # on one card at utils 0.45/0.25/0.15 - so they run on a clean card.
-        stage "omni · 1 card" 15m "${one_card}" "${paths[@]}" "${ignore[@]}" \
+        stage "omni · 1 card" 13m "${one_card}" "${paths[@]}" "${ignore[@]}" \
             -m "omni and xpu and B60 and cards_1" --run-level core_model
 
         # core_model excludes omni: the async-omni tests carry both markers and
@@ -294,11 +299,13 @@ PY
         stage "mxfp8 config" 2m "${one_card}" tests/diffusion/quantization/test_mxfp8_config.py
 
         # advanced_model loads the larger checkpoints (Qwen3-TTS, Z-Image,
-        # Wan2.1, Voxtral), so it waits for the nightly or a manual build.
-        # full_model stays out of both until the cache is seeded.
+        # Wan2.1, Voxtral) with real weights - --run-level advanced_model, not
+        # core_model, which swaps in tiny checkpoints and dummy weights - so it
+        # waits for the nightly or a manual build. full_model stays out of both
+        # until the cache is seeded.
         if [ "${XPU_TEST_SCOPE:-pr}" = "broad" ]; then
-            stage "advanced_model · 1 card" 15m "${one_card}" "${paths[@]}" "${ignore[@]}" \
-                -m "advanced_model and not full_model and xpu and B60 and cards_1" --run-level core_model
+            stage "advanced_model · 1 card" 20m "${one_card}" "${paths[@]}" "${ignore[@]}" \
+                -m "advanced_model and not full_model and xpu and B60 and cards_1" --run-level advanced_model
         fi
     fi
 
@@ -310,7 +317,7 @@ PY
         # "or omni" picks up the Qwen2.5-Omni expansion, which carries the omni
         # marker and no level; "not advanced_model" keeps the sleep/wake cases
         # (omni + advanced_model, and BAGEL-7B-MoT) in the broad stage below.
-        stage "core_model · 2 cards" 20m "${two_cards}" "${paths[@]}" "${ignore[@]}" \
+        stage "core_model · 2 cards" 10m "${two_cards}" "${paths[@]}" "${ignore[@]}" \
             -m "(core_model or omni) and not advanced_model and not full_model and xpu and (B60 or B70) and cards_2" \
             --run-level core_model
 
@@ -318,7 +325,7 @@ PY
             # Z-Image-Turbo on two cards and tensor parallel TP=2.
             stage "advanced_model · 2 cards" 15m "${two_cards}" "${paths[@]}" "${ignore[@]}" \
                 --ignore tests/entrypoints/test_omni_sleep_mode_xpu.py \
-                -m "advanced_model and not full_model and xpu and (B60 or B70) and cards_2" --run-level core_model
+                -m "advanced_model and not full_model and xpu and (B60 or B70) and cards_2" --run-level advanced_model
             # tests/entrypoints/test_omni_sleep_mode_xpu.py stays out: BAGEL-7B-MoT
             # loads 27.37 GiB of LLM weights, and at the util 0.9 the suite sets on a
             # 30.3 GiB card that leaves 0.0 GiB of KV cache, so every case fails

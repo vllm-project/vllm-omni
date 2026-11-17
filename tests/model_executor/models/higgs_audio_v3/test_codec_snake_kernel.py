@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from tests.helpers.cudnn import deterministic_cudnn
-from tests.helpers.device import DEVICE_GRAPH, DEVICE_MODULE, DEVICE_TYPE
+from tests.helpers.device import DEVICE_GRAPH, DEVICE_MODULE, DEVICE_TYPE, NVIDIA_CUDA_OR_XPU
 from tests.helpers.mark import hardware_test
 from vllm_omni.platforms import current_omni_platform
 
@@ -22,7 +22,8 @@ def with_deterministic_cudnn():
         yield
 
 
-requires_cuda = pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="requires CUDA")
+requires_cuda = pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="requires CUDA")
+requires_cuda_or_xpu = pytest.mark.skipif(not NVIDIA_CUDA_OR_XPU, reason="requires NVIDIA CUDA or XPU")
 
 _DAC_CONFIG = {
     "codebook_dim": 8,
@@ -151,7 +152,7 @@ def test_fused_decoder_graph_replays_changed_inputs(dtype, with_deterministic_cu
         assert torch.equal(output, reference(x))
 
 
-@requires_cuda
+@requires_cuda_or_xpu
 @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @torch.inference_mode()
 def test_fused_snake_uses_eager_on_non_nvidia_platform(monkeypatch):

@@ -4,15 +4,12 @@
 import pytest
 import torch
 
-from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
 from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE, AudioVAEConfig
 from vllm_omni.model_executor.models.ming3_tts.batched_vae_decoder import BatchedStreamingVAEDecoder
 
 pytestmark = [pytest.mark.core_model, pytest.mark.tts]
-cuda = pytest.mark.skipif(
-    not DEVICE_MODULE.is_available() or torch.version.hip is not None, reason="NVIDIA CUDA required"
-)
+cuda = pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None, reason="NVIDIA CUDA required")
 
 # Chunk schedules cross the sliding window at different steps per request.
 _SCHEDULES = [[4, 8, 16, 5], [1, 2, 4, 8, 3], [6], [3, 3, 3, 3, 3, 3]]
@@ -119,9 +116,9 @@ def test_batched_decode_matches_per_request_streams(device):
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("graphs", [False, True])
 def test_packed_decode_matches_per_request_streams(graphs):
-    vae = _vae(packed=True).to(DEVICE_TYPE)
+    vae = _vae(packed=True).cuda()
     torch.manual_seed(1)
-    latents = [torch.randn(sum(sizes), 1, 8, device=DEVICE_TYPE) for sizes in _SCHEDULES]
+    latents = [torch.randn(sum(sizes), 1, 8, device="cuda") for sizes in _SCHEDULES]
     with torch.inference_mode():
         reference = [_per_request(vae, latent, sizes) for latent, sizes in zip(latents, _SCHEDULES)]
         vae.to(torch.bfloat16)
@@ -153,14 +150,14 @@ def test_short_flow_attention_matches_sdpa(tokens):
 
 
 @cuda
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("shape", [(5, 3, 16), (7, 16)])
 def test_feed_forward_gelu_epilogue_matches_modules(shape):
     from vllm_omni.model_executor.models.common.ming.dit_blocks import FeedForward
 
     torch.manual_seed(0)
-    ff = FeedForward(16, mult=4, approximate="tanh").eval().to(DEVICE_TYPE)
+    ff = FeedForward(16, mult=4, approximate="tanh").eval().cuda()
     ff.fused_gelu = True
-    x = torch.randn(*shape, device=DEVICE_TYPE)
+    x = torch.randn(*shape, device="cuda")
     with torch.inference_mode():
         torch.testing.assert_close(ff(x), ff.ff(x), rtol=1e-4, atol=1e-5)

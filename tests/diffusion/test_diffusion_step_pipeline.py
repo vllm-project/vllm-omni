@@ -14,10 +14,10 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 from pytest_mock import MockerFixture
-from vllm.utils.network_utils import get_open_port
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import get_open_port
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.diffusion.attention import schedule as schedule_module
 from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, AttentionSigmaWindow

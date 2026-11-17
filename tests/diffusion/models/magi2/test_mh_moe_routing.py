@@ -29,6 +29,7 @@ from vllm_omni.diffusion.models.magi2.layers.native.mh_moe import (
     _reference_topk_probs_and_indices,
     torch_mh_moe_forward,
 )
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
@@ -75,7 +76,7 @@ ROUTE_WEIGHT_ATOL = 1e-6
 # These cases assert the fused kernel's lowest-expert tie break. Off NVIDIA
 # CUDA the router falls back to ``torch.topk``, which leaves that order open.
 _requires_fused_cuda_tie_break = pytest.mark.skipif(
-    not DEVICE_MODULE.is_available(),
+    not current_omni_platform.is_cuda(),
     reason="MAGI-2 fused routing tie-break is NVIDIA CUDA only",
 )
 
@@ -161,7 +162,7 @@ def test_selection_bias_does_not_reach_the_route_weight() -> None:
 
 
 @_requires_fused_cuda_tie_break
-@hardware_test(res={"cuda": ["B200", "H100", "L4"], "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": ["B200", "H100", "L4"]}, num_cards=1)
 def test_fused_routing_ties_break_towards_the_lowest_expert() -> None:
     """Exact ties are undefined for torch.topk; the fused kernel is explicit."""
 
@@ -222,7 +223,7 @@ def test_narrow_dtype_expert_bias_matches_reference(bias_dtype: torch.dtype) -> 
 
 
 @_requires_fused_cuda_tie_break
-@hardware_test(res={"cuda": ["B200", "H100", "L4"], "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": ["B200", "H100", "L4"]}, num_cards=1)
 def test_exhausted_selection_scores_still_pick_distinct_experts() -> None:
     """Selecting an expert must retire it even when every candidate left is -inf.
 
@@ -242,7 +243,7 @@ def test_exhausted_selection_scores_still_pick_distinct_experts() -> None:
 
 
 @_requires_fused_cuda_tie_break
-@hardware_test(res={"cuda": ["B200", "H100", "L4"], "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": ["B200", "H100", "L4"]}, num_cards=1)
 @pytest.mark.parametrize("route_norm", [True, False])
 def test_nan_router_logits_rank_first_and_stay_in_range(route_norm: bool) -> None:
     """NaN selection scores rank first, as in torch.topk, and never leak ids.
@@ -477,7 +478,7 @@ def _median_microseconds(operation, *, warmup: int = 10, iterations: int = 30) -
 # entry, so it selects CI jobs without keeping the test off other platforms.
 # The floor is NVIDIA-only, hence the explicit platform guard.
 @pytest.mark.skipif(
-    not DEVICE_MODULE.is_available(),
+    not current_omni_platform.is_cuda(),
     reason="Routing speedup floor is calibrated on NVIDIA CUDA only",
 )
 @pytest.mark.benchmark

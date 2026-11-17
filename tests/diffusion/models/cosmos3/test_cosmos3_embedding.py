@@ -5,7 +5,7 @@ import pytest
 import torch
 from torch import nn
 
-from tests.helpers.device import DEVICE_MODULE
+from tests.helpers.device import NVIDIA_CUDA_OR_XPU
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
     Cosmos3LanguageModel,
@@ -74,8 +74,8 @@ def test_embedding_preserves_unstaged_forward_and_checkpoint_keys():
 @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("raise_in_forward", [False, True])
 def test_staged_embedding_reuses_checkpoint_and_recovers_after_forward(monkeypatch, raise_in_forward):
-    if not DEVICE_MODULE.is_available() or current_omni_platform.get_device_count() == 0:
-        pytest.skip("CUDA required")
+    if not NVIDIA_CUDA_OR_XPU or current_omni_platform.get_device_count() == 0:
+        pytest.skip("NVIDIA CUDA or XPU required")
     device = current_omni_platform.get_torch_device(0)
     embedding = _Cosmos3StagedEmbedding(16, 8).to(dtype=torch.bfloat16)
     checkpoint = torch.arange(128, dtype=torch.bfloat16).reshape(16, 8)

@@ -20,7 +20,7 @@ from vllm.model_executor.layers.fused_moe import fused_moe as fused_moe_module
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.utils.torch_utils import set_default_torch_dtype
 
-from tests.helpers.device import DEVICE_GRAPH, DEVICE_MODULE, DEVICE_TYPE
+from tests.helpers.device import DEVICE_GRAPH, DEVICE_MODULE, DEVICE_TYPE, NVIDIA_CUDA_OR_XPU
 from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.model_executor.models.qwen3_omni.hf_numerics import (
     HFNumericsDecoderLayer,
@@ -32,11 +32,14 @@ from vllm_omni.model_executor.models.qwen3_omni.hf_numerics import (
     hf_mrope,
     hf_rms_norm,
 )
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model]
 
 _DTYPES = [torch.float32, torch.bfloat16]
-_requires_cuda = pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="needs CUDA")
+_requires_cuda = pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="needs CUDA")
+# The MoE cases run vLLM's Triton fused_experts, which XPU launches as well.
+_requires_cuda_or_xpu = pytest.mark.skipif(not NVIDIA_CUDA_OR_XPU, reason="needs NVIDIA CUDA or XPU")
 _DEVICES = [
     pytest.param("cpu", marks=pytest.mark.cpu),
     pytest.param("cuda", marks=[*hardware_marks(res={"cuda": "L4"}, num_cards=1), _requires_cuda]),
@@ -224,7 +227,7 @@ def _hf_router_then_fused_experts(block, x: torch.Tensor) -> torch.Tensor:
 
 
 @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
-@_requires_cuda
+@_requires_cuda_or_xpu
 def test_moe_matches_hf_router_with_fused_experts():
     # bf16 only: the default fused_experts config for fp32 needs more shared memory than an L4 has.
     dtype = torch.bfloat16
@@ -237,7 +240,7 @@ def test_moe_matches_hf_router_with_fused_experts():
 
 
 @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
-@_requires_cuda
+@_requires_cuda_or_xpu
 def test_moe_rows_do_not_depend_on_the_batch(monkeypatch):
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     fused_moe_module.get_moe_configs.cache_clear()
@@ -301,7 +304,7 @@ def _load_hf_experts(layer: HFNumericsDecoderLayer, hf_block) -> None:
 
 
 @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
-@_requires_cuda
+@_requires_cuda_or_xpu
 def test_triton_loaded_moe_matches_hf_router_with_fused_experts(_dist, tmp_path):
     torch.manual_seed(0)
     layer = _build_layer(tmp_path, enforce_eager=True)
@@ -312,7 +315,7 @@ def test_triton_loaded_moe_matches_hf_router_with_fused_experts(_dist, tmp_path)
 
 
 @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
-@_requires_cuda
+@_requires_cuda_or_xpu
 def test_flashinfer_cutlass_moe_backend_is_rejected(_dist, tmp_path, monkeypatch):
     from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
     from vllm.model_executor.layers.fused_moe.oracle.unquantized import UnquantizedMoeBackend
@@ -327,7 +330,7 @@ def test_flashinfer_cutlass_moe_backend_is_rejected(_dist, tmp_path, monkeypatch
 
 
 @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
-@_requires_cuda
+@_requires_cuda_or_xpu
 def test_moe_capture_replay_matches_eager(_dist, tmp_path):
     torch.manual_seed(0)
     layer = _build_layer(tmp_path)

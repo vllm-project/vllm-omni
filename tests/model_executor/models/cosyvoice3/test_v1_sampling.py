@@ -5,11 +5,11 @@
 import pytest
 import torch
 
-from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
+from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE, NVIDIA_CUDA_OR_XPU
 from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.cosyvoice3.v1_sampling import categorical_sample, nucleus_sample
 
-pytestmark = [pytest.mark.core_model, pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="requires CUDA")]
+pytestmark = [pytest.mark.core_model, pytest.mark.skipif(not NVIDIA_CUDA_OR_XPU, reason="requires NVIDIA CUDA or XPU")]
 
 
 def _torch_sample(probs, generators):

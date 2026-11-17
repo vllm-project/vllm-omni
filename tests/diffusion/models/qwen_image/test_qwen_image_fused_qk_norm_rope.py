@@ -116,7 +116,7 @@ MIN_TOKENS_ENV = "VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS"
 
 def _nvidia_cuda_available() -> bool:
     """True only where the fused QK-norm RoPE CUDA kernel can run."""
-    return bool(DEVICE_MODULE.is_available() and torch.version.hip is None and DEVICE_MODULE.is_available())
+    return bool(torch.cuda.is_available() and torch.version.hip is None and current_platform.is_cuda())
 
 
 def _rocm_available() -> bool:
@@ -176,7 +176,7 @@ def test_qwen_image_qk_norm_rope_cuda_fp16_fallback_matches_reference():
     torch.testing.assert_close(actual_k, expected_k, atol=1e-3, rtol=1e-3)
 
 
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @_REQUIRES_NVIDIA_CUDA
 @pytest.mark.parametrize("seq_len", [1, 7, 257, 1024])
 @pytest.mark.parametrize("packed_qkv_view", [False, True])
@@ -199,7 +199,7 @@ def test_qwen_image_fused_qk_norm_rope_cuda_matches_fp32_rope_reference(
     torch.testing.assert_close(actual_k, expected_k, atol=0.0625, rtol=0.02)
 
 
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @_REQUIRES_NVIDIA_CUDA
 def test_qwen_image_fused_qk_norm_rope_torch_compile_fullgraph_capture(force_always_fuse):
     data = _make_input(
@@ -233,7 +233,7 @@ def test_qwen_image_fused_qk_norm_rope_torch_compile_fullgraph_capture(force_alw
     torch.testing.assert_close(actual_k, expected_k, atol=0.0625, rtol=0.02)
 
 
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @_REQUIRES_NVIDIA_CUDA
 def test_qwen_image_short_seq_default_gate_uses_eager_path(monkeypatch):
     """Below _FUSED_MIN_TOKENS the helper must stay on the eager chain (#7780)."""
@@ -254,7 +254,7 @@ def test_qwen_image_short_seq_default_gate_uses_eager_path(monkeypatch):
     torch.testing.assert_close(actual_k, expected_k, atol=0, rtol=0)
 
 
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @_REQUIRES_NVIDIA_CUDA
 def test_qwen_image_above_gate_uses_fused_path(monkeypatch):
     monkeypatch.delenv(MIN_TOKENS_ENV, raising=False)

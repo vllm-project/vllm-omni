@@ -5,7 +5,7 @@ import pytest
 import torch
 from vllm.triton_utils import HAS_TRITON
 
-from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
+from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE, NVIDIA_CUDA_OR_XPU
 from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion.layers.indexed_modulation import (
     _MAX_1D_GRID_SIZE,
@@ -194,7 +194,7 @@ def test_fused_modulation_preserves_bf16_residual_boundary() -> None:
 
 
 @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
-@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not NVIDIA_CUDA_OR_XPU, reason="NVIDIA CUDA or XPU required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 @pytest.mark.parametrize("fused_gate", [False, True])
 def test_fused_modulation_keeps_fp32_affine_intermediates(fused_gate: bool) -> None:

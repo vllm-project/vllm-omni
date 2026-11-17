@@ -7,7 +7,7 @@ import pytest
 import torch
 from torch import nn
 
-from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
+from tests.helpers.device import DEVICE_TYPE, NVIDIA_CUDA_OR_XPU
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.cache.teacache.extractors import extract_sensenova_u1_context
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -215,7 +215,7 @@ def test_denoise_loop_preserves_cfg_boundaries_and_request_isolation(
         assert not torch.equal(pipe.steps[0][1], pipe.steps[1][1])
 
 
-@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not NVIDIA_CUDA_OR_XPU, reason="NVIDIA CUDA or XPU required")
 @hardware_test(res={"cuda": "L4", "xpu": "B60"})
 @torch.inference_mode()
 def test_cached_vision_grid_has_no_device_scalar_reads():

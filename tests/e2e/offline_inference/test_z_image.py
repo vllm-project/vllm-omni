@@ -14,6 +14,8 @@ _REPEAT_MAX_MEAN_ABSOLUTE_ERROR = 0.015
 
 
 @pytest.mark.slow
+# advanced_model only lets the XPU broad 2-card stage select this case; the
+# CUDA and AMD lanes pick this file by path, so they are unaffected.
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards={"cuda": 1, "rocm": 1, "xpu": 2})
@@ -37,6 +39,7 @@ def test_zimage(offline_client: OfflineOmniClient):
 
 
 @pytest.mark.slow
+# advanced_model: XPU broad 2-card stage only, as above.
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards={"cuda": 1, "xpu": 2})

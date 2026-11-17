@@ -44,3 +44,10 @@ DEVICE_GRAPH: Any = getattr(DEVICE_MODULE, "CUDAGraph", None) or getattr(DEVICE_
 
 #: Collective backend that matches the device (``nccl`` / ``xccl`` / ``gloo``).
 DIST_BACKEND: str = {"cuda": "nccl", "rocm": "nccl", "xpu": "xccl"}.get(DEVICE_TYPE, "gloo")
+
+#: NVIDIA CUDA or XPU. Not a GPU-presence check: ``DEVICE_MODULE.is_available()``
+#: is also true on ROCm. Use it where a test used to require
+#: ``current_omni_platform.is_cuda()`` and its subject (plain PyTorch, or a
+#: Triton kernel the code launches without a platform gate) runs the same path
+#: on XPU. Tests that assert a CUDA-only fused kernel keep ``is_cuda()``.
+NVIDIA_CUDA_OR_XPU: bool = current_omni_platform.is_cuda() or current_omni_platform.is_xpu()

@@ -8,10 +8,14 @@ import numpy as np
 import pytest
 import torch
 
-from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
+from tests.helpers.device import DEVICE_TYPE, NVIDIA_CUDA_OR_XPU
 from tests.helpers.mark import hardware_test
+from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="requires CUDA")]
+pytestmark = [pytest.mark.core_model, pytest.mark.skipif(not NVIDIA_CUDA_OR_XPU, reason="requires NVIDIA CUDA or XPU")]
+# The RAS sampler cases below compare the fused Triton sampler, which runs on
+# NVIDIA CUDA only; elsewhere both arms take the Torch path.
+_requires_nvidia_cuda = pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="requires NVIDIA CUDA")
 
 
 class _Uva:
@@ -108,6 +112,7 @@ def _sample(sampler, logits, pos, fused):
     return sampled
 
 
+@_requires_nvidia_cuda
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("fused", [True, False])
 def test_ras_mrv2_sample_rejects_recent_repeats_on_device(fused):
@@ -137,6 +142,7 @@ def test_ras_mrv2_sample_rejects_recent_repeats_on_device(fused):
     assert sampled[1:] == [7, 7, 7]
 
 
+@_requires_nvidia_cuda
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("fused", [True, False])
 def test_ras_mrv2_sample_draws_from_top_p_capped_by_top_k(fused):
@@ -164,6 +170,7 @@ def test_ras_mrv2_sample_draws_from_top_p_capped_by_top_k(fused):
     assert abs((high == 0).float().mean().item() - 4 / 9) < 0.04
 
 
+@_requires_nvidia_cuda
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_fused_ras_replacement_follows_the_remaining_distribution():
     dev, vocab, rows = "cuda", 16, 8192
