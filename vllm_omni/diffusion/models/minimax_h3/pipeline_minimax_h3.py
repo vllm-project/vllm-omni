@@ -1433,8 +1433,17 @@ class MiniMaxH3Pipeline(
             planned_weights.update(source.prefix + entry["runtime_name"] for entry in entries if not entry["buffer"])
         return frozenset(prefixes), planned_weights
 
+    @staticmethod
+    def _media_requires_audio_encoder(media: MiniMaxH3EncoderMediaInput | None) -> bool:
+        return media is not None and (
+            bool(media.audios)
+            or any(audio is not None for audio in media.video_audios)
+            or media.audio_edit is not None
+            or any(guide.audio is not None for guide in media.timeline_guides)
+        )
+
     @contextmanager
-    def _file_backed_vaes(self, *, encode_only: bool = False):
+    def _file_backed_vaes(self, *, encode_only: bool = False, encode_audio: bool = False):
         """Load and release native VAEs per stage only for file-backed offload."""
         factories = getattr(self, "_file_backed_vae_factories", None)
         if factories is None:
@@ -1450,6 +1459,8 @@ class MiniMaxH3Pipeline(
                     lightvae_decoder_path=None,
                     pin_memory=False,
                 )
+                if encode_audio:
+                    self.audio_vae = audio_factory(encode_only=True, decode_only=False, pin_memory=False)
             else:
                 # Reuse full native loading, including the unused video encoder.
                 self.video_vae = video_factory(decode_only=False, pin_memory=False)
@@ -3201,7 +3212,10 @@ class MiniMaxH3Pipeline(
                     logger.info("MiniMax H3 encoding continuation prompt %d/%d", index, len(prompts))
                     window_text.append(self.encode_prompt(replace(prepared, prompt=prompt) if rank == 0 else None))
             media_input = prepared.media if prepared is not None else None
-            with self._file_backed_vaes(encode_only=True):
+            with self._file_backed_vaes(
+                encode_only=True,
+                encode_audio=self._media_requires_audio_encoder(media_input),
+            ):
                 media = self._encode_local_media(media_input)
             if initial_noise is not None:
                 assert request_context is not None
