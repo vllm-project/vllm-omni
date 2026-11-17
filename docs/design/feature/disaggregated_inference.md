@@ -16,7 +16,13 @@ Backend-specific setup lives in separate docs:
 ## Overview
 
 Connectors enable data transfer between pipeline stages (e.g., Thinker -> Talker).
-Current connectors operate in D2H2D (device to host to device) mode.
+The default object-serialization path stages device tensors through the host.
+Mooncake Transfer Engine can instead pack supported nested tensor payloads into
+its device pool when `tensor_payload: true` is enabled on both peers. Producers
+must keep their tensors on device and prepare an owned snapshot before queueing;
+see the [tensor payload contract](omni_connectors/mooncake_transfer_engine_connector.md).
+This option does not install a model runtime or remove host copies in unrelated
+producer paths.
 
 ## Connector Choices
 

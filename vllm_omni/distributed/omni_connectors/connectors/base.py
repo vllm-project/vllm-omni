@@ -9,6 +9,10 @@ from ..utils.logging import get_connector_logger
 logger = get_connector_logger(__name__)
 
 
+class PayloadCapacityError(MemoryError):
+    """Payload preparation can be retried after queued snapshots are released."""
+
+
 class OmniConnectorBase(ABC):
     """Base class for all OmniConnectors."""
 
@@ -16,6 +20,18 @@ class OmniConnectorBase(ABC):
     # without going through OmniSerializer.  Connectors that copy raw
     # payloads directly (e.g. RDMA) should override this to True.
     supports_raw_data: bool = False
+
+    def prepare_payload(self, data: Any) -> Any:
+        """Capture producer-owned data before asynchronous sender handoff.
+
+        The default preserves existing connector behavior. A device-aware
+        connector may return an owned snapshot with producer readiness attached.
+        Call on the stream that produced the payload, before reusing its buffers.
+
+        PayloadCapacityError denotes temporary pressure. The caller must retain
+        the inputs unchanged until a later preparation succeeds.
+        """
+        return data
 
     @abstractmethod
     def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:

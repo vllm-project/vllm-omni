@@ -53,6 +53,9 @@ class MockConnector:
         self.stage_id = stage_id
         self._store: dict[str, Any] = {}
 
+    def prepare_payload(self, data):
+        return data
+
     def put(self, from_stage, to_stage, put_key, data):
         key = f"{from_stage}_{to_stage}_{put_key}"
         self._store[key] = data
@@ -1951,6 +1954,9 @@ class _FailingConnector:
         self._fail_count = fail_count
         self._raise_on_fail = raise_on_fail
         self.attempt = 0
+
+    def prepare_payload(self, data):
+        return data
 
     def put(self, from_stage, to_stage, put_key, data):
         self.attempt += 1

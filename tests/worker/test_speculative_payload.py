@@ -581,6 +581,7 @@ def test_full_payload_flush_honors_scheduler_stop_boundary(
 
     runner = object.__new__(GPUARModelRunner)
     runner._pending_full_payload_send = {}
+    runner._full_payload_ready_req_ids = set()
     runner._full_payload_replace_keys_cached = frozenset()
     runner._stage_id = 0
     # Upstream async bookkeeping stores placeholders, while sync bookkeeping

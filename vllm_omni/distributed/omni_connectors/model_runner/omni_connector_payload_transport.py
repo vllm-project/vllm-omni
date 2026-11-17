@@ -19,6 +19,7 @@ import torch
 from vllm.distributed.parallel_state import get_tp_group
 
 from vllm_omni.data_entry_keys import OmniPayload, returns_stage_payload
+from vllm_omni.distributed.omni_connectors.connectors.base import PayloadCapacityError
 from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime import (
     _OmniConnectorRuntimeMixin,
     logger,
@@ -764,32 +765,29 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         *,
         finished_req_output_token_ids: Mapping[str, list[int]] | None = None,
     ) -> None:
-        """Send accumulated full_payload outputs for requests that just finished."""
-        pending_req_ids = set(self._pending_full_payload_send.keys())
-        if not (finished_req_ids & pending_req_ids):
-            return
-
-        logger.debug(
-            "[Stage-%s] flush_full_payload_outputs: finished_req_ids=%s, pending=%s",
-            self._stage_id,
-            finished_req_ids,
-            list(self._pending_full_payload_send.keys()),
-        )
-        to_send: dict[str, tuple[Any, Any]] = {}
-        for req_id in finished_req_ids:
-            entry = self._pending_full_payload_send.pop(req_id, None)
-            if entry is not None:
-                output, request = self._materialize_full_payload_entry(entry)
-                if finished_req_output_token_ids is not None and req_id in finished_req_output_token_ids:
-                    # Give the processor authoritative terminal IDs without
-                    # modifying the runner's live cached request or its lists.
-                    request = copy(request)
-                    request.output_token_ids = list(finished_req_output_token_ids[req_id])
-                    request.all_token_ids = list(request.prompt_token_ids or []) + request.output_token_ids
-                to_send[req_id] = (output, request)
-        logger.debug("[Stage-%s] flush_full_payload_outputs: to_send=%s", self._stage_id, list(to_send.keys()))
-        if to_send:
-            self.send_full_payload_outputs(scheduler_output=None, outputs=to_send)
+        """Queue finished results, retaining those under temporary snapshot pressure."""
+        # Finished IDs may only appear in one scheduler cycle. Remember them
+        # until their result is queued, without sending unfinished accumulators.
+        self._full_payload_ready_req_ids.update(finished_req_ids & self._pending_full_payload_send.keys())
+        for req_id in list(self._pending_full_payload_send):
+            if req_id not in self._full_payload_ready_req_ids:
+                continue
+            output, request = self._materialize_full_payload_entry(self._pending_full_payload_send[req_id])
+            if finished_req_output_token_ids is not None and req_id in finished_req_output_token_ids:
+                # Give the processor authoritative terminal IDs without
+                # modifying the runner's live cached request or its lists.
+                request = copy(request)
+                request.output_token_ids = list(finished_req_output_token_ids[req_id])
+                request.all_token_ids = list(request.prompt_token_ids or []) + request.output_token_ids
+                # Terminal IDs may only be supplied in this scheduler cycle.
+                self._pending_full_payload_send[req_id] = (output, request)
+            try:
+                self.send_full_payload_outputs(scheduler_output=None, outputs={req_id: (output, request)})
+            except PayloadCapacityError:
+                continue
+            # Also consume intentional no-output / return-stage-payload cases.
+            self._pending_full_payload_send.pop(req_id)
+            self._full_payload_ready_req_ids.discard(req_id)
 
     def send_full_payload_outputs(
         self,
@@ -858,6 +856,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     meta.get("left_context_size"),
                 )
 
+            prepared_payload = self._omni_connector.prepare_payload(payload)
             external_req_id = self._resolve_external_req_id(request, req_id)
             chunk_id = self._put_req_chunk[req_id]
             self._put_req_chunk[req_id] += 1
@@ -875,7 +874,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 "stage_id": self._stage_id,
                 "next_stage_id": next_stage_id,
                 "put_key": connector_put_key,
-                "data": payload,
+                "data": prepared_payload,
                 "request_id": req_id,
             }
             with self._lock:
@@ -1645,6 +1644,9 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         wait_for_delivery: bool = False,
     ) -> tuple[bool, Any | None]:
         """Enqueue an already-built payload under its per-request chunk key."""
+        # Preparation can fail (for example on a bounded snapshot budget).
+        # Do it before reserving chunk ids or a delivery completion ticket.
+        prepared_payload = self._omni_connector.prepare_payload(payload_data)
         raw_req_id = getattr(request, "request_id", None) or getattr(request, "req_id", None)
         request_id = self._resolve_external_req_id(request, raw_req_id)
         if raw_req_id and raw_req_id != request_id:
@@ -1675,7 +1677,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             "stage_id": self._stage_id,
             "next_stage_id": next_stage_id,
             "put_key": connector_put_key,
-            "data": payload_data,
+            "data": prepared_payload,
             "request_id": request_id,
             "completion": completion,
         }
