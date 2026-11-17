@@ -1,8 +1,18 @@
-# Phonon 31M EN
+# Phonon 31M EN — RTX 3090
 
 Single-stage MRV2 integration for `gradium/phonon-31m-en`.
 The default deployment uses one request, TP=1, BF16 AR/Flow and FP32 Mimi.
 The default pretrained voice produces 24 kHz mono audio in 1920-sample frames.
+
+## Validated configuration
+
+- Model: `gradium/phonon-31m-en`.
+- Hardware: one NVIDIA RTX 3090, 24 GB.
+- Runtime: vLLM 0.33.0 with this Phonon integration.
+- Scope: English default-voice streaming TTS, B=1 and TP=1.
+- Latest reported steady-state mean RTF: 0.029022; mean TTFP: 14.228 ms.
+  These are means of rounds 2–4, with 256 requests and 16 warmups per round.
+  The original Transformers comparison used a different request selection.
 
 ## Serve
 
@@ -76,6 +86,25 @@ python benchmarks/tts/bench_tts.py \
   --output-dir ./results/phonon
 ```
 
-If the server was started with `--served-model-name phonon`, also pass
-`--served-model-name phonon` to the benchmark. The registry sends `voice=default`
-and English conditioning.
+The registry sends `voice=default` and English conditioning.
+
+Request-level `max_new_tokens` overrides the deployment generation budget.
+The accepted range is 1–4096 latent steps, at 12.5 steps per second. EOS can
+finish generation earlier; the default deployment budget is 1500 steps.
+
+## Validation
+
+Validated on one RTX 3090 (24576 MiB), driver 595.71.05, Python 3.12.3,
+PyTorch 2.14.0+cu130 and vLLM 0.33.0.
+
+Using `vllm_omni/deploy/phonon.yaml` with BF16 AR/Flow, FP32 Mimi, B=1,
+TP=1 and a 256 MiB KV cache, the **single model-stage worker reached
+840 MiB** of GPU memory. The API process separately reached 256 MiB.
+The device-wide observed peak was 1119 MiB, with a 9 MiB baseline before
+service startup. The deployment has one model stage and separate API and worker
+processes.
+
+These footprints were sampled with `nvidia-smi` approximately every 0.5
+seconds, including command overhead, across server startup and one online
+synthesis request. They include CUDA contexts, caches and graph allocations.
+Shorter peaks between samples may be missed.

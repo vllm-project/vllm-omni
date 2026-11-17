@@ -92,3 +92,57 @@ def test_flow_postprocess_graph_restores_capture_state_and_reuses_slots():
                 assert snapshot.item()
                 assert not actual[0].item()
         assert snapshot.item()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compiled_mimi_replay_slot_reuse_and_pcm_ownership():
+    import copy
+
+    from vllm_omni.model_executor.models.phonon.cuda_graph_wrapper import MimiDecodeRunner
+    from vllm_omni.model_executor.models.phonon.mimi_decoder import MimiStreamingDecoder
+
+    config = dict(
+        dimension=8,
+        quantizer_dimension=4,
+        quantizer_output_dimension=8,
+        transformer_d_model=8,
+        transformer_num_heads=2,
+        transformer_num_layers=1,
+        transformer_context=3,
+        transformer_max_period=10000.0,
+        transformer_dim_feedforward=16,
+        transformer_layer_scale=0.01,
+        ratios=[2],
+        sample_rate=8,
+        frame_rate=2,
+        n_filters=4,
+        kernel_size=3,
+        last_kernel_size=3,
+        channels=1,
+        n_residual_layers=1,
+        residual_kernel_size=3,
+        dilation_base=2,
+        compress=2,
+    )
+    torch.manual_seed(42)
+    eager = MimiStreamingDecoder(config, 2).cuda().eval()
+    captured = copy.deepcopy(eager)
+    runner = MimiDecodeRunner(captured)
+    slot = torch.tensor([1], device="cuda")
+    saved = []
+    with torch.inference_mode():
+        for step in range(6):
+            if step == 4:
+                for decoder in (eager, captured):
+                    for name, buffer in decoder.named_buffers():
+                        if name.endswith(("history", "key_pool", "value_pool")):
+                            buffer.fill_(float("nan"))
+            position = torch.tensor([((step if step < 4 else step - 4) * eager.upsample_ratio)], device="cuda")
+            latent = torch.randn(1, 4, 1, device="cuda")
+            expected = eager(latent, slot, position)
+            actual, event = runner.decode(latent, slot, position)
+            torch.cuda.current_stream().wait_event(event)
+            torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-4)
+            for returned, snapshot in saved:
+                torch.testing.assert_close(returned, snapshot, atol=0, rtol=0)
+            saved.append((actual, actual.clone()))

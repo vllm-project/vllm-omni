@@ -1831,3 +1831,39 @@ def test_ming3_tts_defaults_to_ip_voice_without_reference():
     assert info["prompt_audio_mode"] == "none"
     assert info["speaker_conditioning"] == "mute"
     assert "reference_audio" not in info
+
+
+@pytest.mark.parametrize("budget", [None, 1, 2000, 4096])
+def test_phonon_forwards_request_budget(mocker, budget):
+    from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+    from vllm_omni.entrypoints.openai.tts_adapters.phonon import PhononAdapter
+
+    mocker.patch.object(PhononAdapter, "_load_assets", return_value=(SimpleNamespace(encode=lambda text: [1, 2]), 3))
+    defaults = [SamplingParams(max_tokens=1500)]
+    server = mocker.Mock()
+    server.engine_client = SimpleNamespace(
+        errored=False, default_sampling_params_list=defaults, generate=mocker.Mock(return_value=object())
+    )
+    server.model_config = SimpleNamespace(async_chunk=True)
+    server._tts_model_type = "phonon"
+    server._validate_speech_sample_rate.return_value = None
+    server.request_logger = None
+    server._speech_output_policies = {}
+    adapter = PhononAdapter(SpeechServingContext(server=server, engine_client=server.engine_client))
+    server._get_tts_adapter.return_value = adapter
+    request = OpenAICreateSpeechRequest(input="Hello", voice="default", max_new_tokens=budget)
+    asyncio.run(OmniOpenAIServingSpeech._prepare_speech_generation(server, request, request_id="test"))
+    forwarded = server.engine_client.generate.call_args.kwargs["sampling_params_list"]
+    assert forwarded[0].max_tokens == (1500 if budget is None else budget)
+    assert defaults[0].max_tokens == 1500
+
+
+@pytest.mark.parametrize("budget", [0, 4097])
+def test_phonon_rejects_invalid_request_budget(budget):
+    from vllm_omni.entrypoints.openai.tts_adapters.phonon import PhononAdapter
+
+    adapter = PhononAdapter.__new__(PhononAdapter)
+    request = SimpleNamespace(
+        input="Hello", voice="default", ref_audio=None, speaker_embedding=None, max_new_tokens=budget
+    )
+    assert "max_new_tokens" in adapter.validate(request)

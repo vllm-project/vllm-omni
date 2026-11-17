@@ -10,6 +10,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     ARTTSAdapter,
     OutputPolicy,
     PreparedRequest,
+    apply_max_new_tokens,
     conditioning_cache_salt,
 )
 
@@ -40,7 +41,10 @@ class PhononAdapter(ARTTSAdapter):
             return "Phonon initial release supports the default pretrained voice"
         if request.ref_audio is not None or request.speaker_embedding is not None:
             return "Phonon initial release supports precomputed speaker conditioning"
-        return None
+        return self._validate_max_new_tokens(request)
+
+    def apply_sampling_overrides(self, sampling_params_list, request, prompt=None, request_id=None):
+        return apply_max_new_tokens(sampling_params_list, request)
 
     async def build(
         self,
