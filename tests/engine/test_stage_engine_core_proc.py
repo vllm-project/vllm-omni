@@ -1,6 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import multiprocessing
+import os
+import queue
+import signal
+import sys
+import threading
+import time
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -102,6 +109,50 @@ def test_first_audio_sink_preserves_first_decoder_and_opts_in_stream_decoder(
     runner._omni_data_plane = None
     assert _bind_first_audio_sink(executor, mocker.Mock(), mocker.Mock()) is expected
     assert runner.model_state.set_first_audio_sink.call_count == int(expected)
+
+
+def _idle_stage_with_sigterm_on_worker(ready):
+    from vllm_omni.engine.stage_engine_core_proc import _SignalQueueWakeup
+
+    input_queue: queue.Queue[object] = queue.Queue()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    wakeup = _SignalQueueWakeup(input_queue)
+    signal_now = threading.Event()
+
+    def send_sigterm():
+        signal_now.wait()
+        time.sleep(0.05)
+        signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
+
+    threading.Thread(target=send_sigterm, daemon=True).start()
+    ready.send(True)
+    ready.close()
+    signal_now.set()
+    try:
+        while True:
+            input_queue.get()
+    finally:
+        wakeup.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX thread-directed signals")
+def test_idle_stage_wakes_when_sigterm_reaches_another_thread():
+    """A stage idle in Queue.get must process SIGTERM sent to a worker thread."""
+    ctx = multiprocessing.get_context("spawn")
+    parent, child = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=_idle_stage_with_sigterm_on_worker, args=(child,))
+    proc.start()
+    child.close()
+    try:
+        assert parent.poll(60), "child did not reach the idle wait"
+        assert parent.recv() is True
+        proc.join(timeout=5)
+        assert proc.exitcode == 0, "idle stage did not process SIGTERM"
+    finally:
+        if proc.is_alive():
+            proc.kill()
+        proc.join(timeout=5)
+        parent.close()
 
 
 def test_preprocess_add_request_preserves_omni_fields():

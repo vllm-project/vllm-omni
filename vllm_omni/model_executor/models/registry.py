@@ -13,6 +13,8 @@ _OMNI_MODELS = {
     "Lfm3OmniForConditionalGeneration": ("lfm3_omni", "model", "Lfm3OmniForConditionalGeneration"),
     "Lfm3OmniCode2Wav": ("lfm3_omni", "code2wav", "Lfm3OmniCode2Wav"),
     "Lfm3AudioForConditionalGeneration": ("lfm3_audio", "model", "Lfm3AudioForConditionalGeneration"),
+    "SparkQwen2ForCausalLM": ("spark_tts", "llm", "SparkQwen2ForCausalLM"),
+    "SparkBiCodecDecoder": ("spark_tts", "bicodec", "SparkBiCodecDecoder"),
     "BreezeForConditionalGeneration": ("breeze_tts_2", "modeling_breeze", "BreezeForConditionalGeneration"),
     "BreezeCode2Wav": ("breeze_tts_2", "code2wav", "BreezeCode2Wav"),
     "Qwen2_5OmniForConditionalGeneration": (
