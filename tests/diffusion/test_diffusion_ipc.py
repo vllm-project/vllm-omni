@@ -640,6 +640,10 @@ def _drive_d2h(monkeypatch: pytest.MonkeyPatch, *, pin_error: Exception | None =
     monkeypatch.setattr(torch.accelerator, "current_stream", lambda *a, **k: None)
     monkeypatch.setattr(torch.accelerator, "set_stream", lambda *a, **k: None)
     monkeypatch.setattr(torch, "empty", fake_empty)
+    # Drive the fallback contract (pinned attempt, then pageable) regardless
+    # of how the host resolves PIN_MEMORY. raising=False keeps this file
+    # runnable against a pre-PIN_MEMORY ipc.py for base comparisons.
+    monkeypatch.setattr(diffusion_ipc, "PIN_MEMORY", True, raising=False)
     return attempts, FakeStream()
 
 
