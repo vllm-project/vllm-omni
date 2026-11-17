@@ -42,6 +42,7 @@ from vllm_omni.diffusion.models.utils import create_transformers_model
 from vllm_omni.diffusion.models.z_image.z_image_transformer import (
     ZImageTransformer2DModel,
 )
+from vllm_omni.diffusion.offloader import OffloadPlan
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -168,6 +169,12 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
+    # The Qwen3 text encoder is a Transformers causal LM; streaming its decoder
+    # layers lets layerwise offload select it explicitly (low-VRAM preset).
+    _offload_plan = OffloadPlan(
+        encoder_component_types={"text_encoder": "text_encoder"},
+        encoder_block_attrs={"text_encoder": ("model.layers",)},
+    )
 
     def __init__(
         self,

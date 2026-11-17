@@ -1591,6 +1591,14 @@ class DistStageRuntime(StageRuntime):
             if runtime_cfg is None:
                 continue
             if stage_id == target_stage_id:
+                # Config validation saw num_replicas before this process-local
+                # override, so the single-GPU preset is re-checked here.
+                diffusion_cfg = getattr(stage_cfg, "diffusion_config", None)
+                if self._omni_dp_size_local != 1 and getattr(diffusion_cfg, "low_vram_preset", None) is not None:
+                    raise ValueError(
+                        "low_vram_preset requires a single GPU with all parallel degrees set to 1; "
+                        f"got --omni-dp-size-local={self._omni_dp_size_local} for stage {stage_id}"
+                    )
                 try:
                     runtime_cfg.num_replicas = self._omni_dp_size_local
                 except (AttributeError, TypeError):

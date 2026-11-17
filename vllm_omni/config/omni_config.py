@@ -380,6 +380,7 @@ def _stage_cli_overrides(
     *,
     execution_type: StageExecutionType | None = None,
     stage_scoped_lora: bool = False,
+    stage_deploy: StageDeployConfig | None = None,
 ) -> dict[str, Any]:
     if execution_type == StageExecutionType.DIFFUSION:
         stage_override_pattern = re.compile(r"^stage_\d+_")
@@ -387,6 +388,18 @@ def _stage_cli_overrides(
             name: _copy_value(value) for name, value in cli_overrides.items() if stage_override_pattern.match(name)
         }
         global_inputs = {name: _copy_value(value) for name, value in cli_overrides.items() if name not in stage_scoped}
+        # Ingress normalization drops malformed cache JSON with a warning, so
+        # check it first against the preset, which may come from deploy.
+        from vllm_omni.diffusion.low_vram import reject_malformed_cache_config
+
+        reject_malformed_cache_config(
+            _first_defined(
+                stage_scoped.get(f"stage_{stage_id}_low_vram_preset"),
+                global_inputs.get("low_vram_preset"),
+                getattr(stage_deploy, "low_vram_preset", None),
+            ),
+            _first_defined(stage_scoped.get(f"stage_{stage_id}_cache_config"), global_inputs.get("cache_config")),
+        )
         cli_overrides = {
             **normalize_and_validate_diffusion_engine_ingress_kwargs(
                 global_inputs,
@@ -917,6 +930,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     lora_application: Literal["runtime", "merged"] = "runtime"
     max_cpu_loras: int | None = None
     output_type: str = "pil"
+    low_vram_preset: str | None = None
     diffusion_offload_config: dict[str, Any] | None = None
     kv_offload_config: dict[str, Any] | None = None
     # Compatibility aliases for existing callers and model-specific stage
@@ -1028,11 +1042,15 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
             normalize_omni_diffusion_kwargs,
             validate_omni_diffusion_kwargs,
         )
+        from vllm_omni.diffusion.low_vram import expand_low_vram_preset
         from vllm_omni.diffusion.offloader.config import parse_diffusion_offload_config
 
         valid_fields = frozenset(f.name for f in fields(cast(Any, cls)))
         normalized = normalize_omni_diffusion_kwargs(kwargs)
         validate_omni_diffusion_kwargs(normalized, valid_fields)
+        # Built from merged deploy/CLI stage values, so preset defaults fill
+        # only settings that no source provided.
+        normalized = expand_low_vram_preset(normalized)
         # Validate before stage construction while retaining the raw mapping
         # needed by dataclass/config serialization across process boundaries.
         parse_diffusion_offload_config(normalized.get("diffusion_offload_config"))
@@ -1580,6 +1598,7 @@ def extract_diffusion_stage_config_kwargs(
         normalize_omni_diffusion_kwargs,
         validate_omni_diffusion_kwargs,
     )
+    from vllm_omni.diffusion.low_vram import expand_low_vram_preset
 
     shared_only_fields = sorted(_DIFFUSION_SHARED_ONLY_ENGINE_FIELDS.intersection(kwargs))
     if shared_only_fields:
@@ -1603,19 +1622,22 @@ def extract_diffusion_stage_config_kwargs(
     # the compatibility adapter without treating it as a deprecated alias.
     mixed_kwargs = {name: _copy_value(value) for name, value in kwargs.items()}
     engine_quantization = mixed_kwargs.pop("quantization", None)
-    normalized = normalize_omni_diffusion_kwargs(mixed_kwargs)
     if engine_quantization is not None:
-        if normalized.get("quantization_config") is not None:
+        if mixed_kwargs.get("quantization_config") is not None:
             raise ValueError(
                 "Diffusion config fields 'quantization' and 'quantization_config' cannot both be provided."
             )
-        normalized["quantization_config"] = engine_quantization
+        mixed_kwargs["quantization_config"] = engine_quantization
+    normalized = normalize_omni_diffusion_kwargs(mixed_kwargs)
 
     validate_omni_diffusion_kwargs(
         normalized,
         diffusion_fields | fields_owned_elsewhere,
         stage_id=stage_id,
     )
+    # Input here is the merged stage payload; expanding earlier (on a single
+    # source) would turn preset defaults into overrides of other sources.
+    normalized = expand_low_vram_preset(normalized)
     return {name: _copy_value(value) for name, value in normalized.items() if name in diffusion_fields}
 
 
@@ -1935,6 +1957,24 @@ class VllmOmniDiffusionStageConfig(BaseVllmOmniStageConfig):
     parallel_config: OmniStageDiffusionParallelConfig = field(default_factory=OmniStageDiffusionParallelConfig)
     diffusion_config: _DiffusionConfigProjection = field(default_factory=_DiffusionConfigProjection)
 
+    @model_validator(mode="after")
+    def _validate_low_vram_preset(self) -> Self:
+        if self.diffusion_config.low_vram_preset is not None:
+            parallel = self.parallel_config
+            if (
+                parallel.world_size != 1
+                or parallel.sequence_parallel_size != 1
+                or parallel.cfg_parallel_size != 1
+                or parallel.vae_patch_parallel_size != 1
+                or parallel.text_encoder_tp_size != 1
+                or parallel.use_hsdp
+                or self.runtime_config.num_replicas != 1
+            ):
+                raise ValueError("low_vram_preset requires a single GPU with all parallel degrees set to 1")
+            if self.model_config.enable_sleep_mode:
+                raise ValueError("low_vram_preset with sleep mode is not qualified; disable sleep mode")
+        return self
+
 
 StageConfigType: TypeAlias = VllmOmniARStageConfig | VllmOmniGenerationStageConfig | VllmOmniDiffusionStageConfig
 
@@ -2097,6 +2137,8 @@ def _build_diffusion_stage_config(
         quantization_config=common_kwargs["quantization_config"],
         enable_prefix_caching=bool(common_kwargs["cache_config"].enable_prefix_caching),
     )
+    if common_kwargs["diffusion_config"].low_vram_preset is not None:
+        common_kwargs["quantization_config"] = common_kwargs["diffusion_config"].quantization_config
     return cast(
         VllmOmniDiffusionStageConfig,
         _with_resolved_processors(
@@ -2562,6 +2604,7 @@ class VllmOmniConfig:
                         cli_overrides,
                         execution_type=topology.execution_type,
                         stage_scoped_lora=len(pipeline_cfg.stages) > 1,
+                        stage_deploy=deploy_by_id.get(topology.stage_id),
                     ),
                 ),
                 model=model,

@@ -1014,6 +1014,15 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
 
+        omni_config_group.add_argument(
+            "--low-vram-preset",
+            choices=("fp8",),
+            default=None,
+            help="Opt-in single-GPU diffusion preset: FP8, layer offload of DiT and text encoder, "
+            "VAE tiling, and no approximate cache by default. Supports the native Z-Image pipeline only. "
+            "Does not guarantee an 8 GB fit; see the low-VRAM configuration guide.",
+        )
+
         # VAE memory optimization parameters
         omni_config_group.add_argument(
             "--vae-use-slicing",

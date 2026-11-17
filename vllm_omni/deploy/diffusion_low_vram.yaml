@@ -1,0 +1,8 @@
+# Experimental single-GPU memory composition; not an 8/12/16 GB qualification.
+# Native Z-Image only. See docs/configuration/low_vram.md.
+stages:
+  - stage_id: 0
+    devices: "0"
+    low_vram_preset: fp8
+    max_num_seqs: 1
+    enforce_eager: true

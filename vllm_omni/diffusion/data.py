@@ -129,7 +129,9 @@ def normalize_omni_diffusion_kwargs(
 
     # Check environment variable as fallback for cache_backend.
     # Support both old DIFFUSION_CACHE_ADAPTER and new DIFFUSION_CACHE_BACKEND.
-    if "cache_backend" not in config_kwargs and apply_defaults:
+    # The low-VRAM preset owns this default (cache off, even when the
+    # environment selects a backend); it is filled after sources merge.
+    if "cache_backend" not in config_kwargs and apply_defaults and config_kwargs.get("low_vram_preset") is None:
         cache_backend = os.environ.get("DIFFUSION_CACHE_BACKEND") or os.environ.get("DIFFUSION_CACHE_ADAPTER")
         config_kwargs["cache_backend"] = cache_backend.lower() if cache_backend else "none"
     elif "cache_backend" in config_kwargs and config_kwargs["cache_backend"] is None and apply_defaults:
@@ -143,8 +145,10 @@ def normalize_omni_diffusion_kwargs(
         try:
             config_kwargs["cache_config"] = json.loads(cache_config)
         except json.JSONDecodeError:
-            logger.warning("Invalid cache_config JSON, using backend defaults.")
-            config_kwargs.pop("cache_config", None)
+            # Under low_vram_preset the strict preset check rejects it instead.
+            if config_kwargs.get("low_vram_preset") is None:
+                logger.warning("Invalid cache_config JSON, using backend defaults.")
+                config_kwargs.pop("cache_config", None)
 
     if config_kwargs.get("streaming_output") is None and config_kwargs.get("diffusion_streaming_output") is not None:
         config_kwargs["streaming_output"] = config_kwargs["diffusion_streaming_output"]
@@ -983,6 +987,7 @@ class OmniDiffusionConfig:
     # CPU offload parameters. Keep the public mapping raw so stage configs can
     # serialize it across processes; __post_init__ validates it once and caches
     # the internal typed resolution used at runtime.
+    low_vram_preset: str | None = None
     diffusion_offload_config: dict[str, Any] | None = None
     kv_offload_config: dict[str, Any] | None = None
     # Compatibility aliases. Some model-specific legacy stage lifecycles are
@@ -1017,7 +1022,8 @@ class OmniDiffusionConfig:
 
     # VAE memory optimization parameters
     vae_use_slicing: bool = False
-    vae_use_tiling: bool = False
+    # ``None`` means unset: False normally, True under ``low_vram_preset``.
+    vae_use_tiling: bool | None = None
     # Wan VAE decoder fast path. ``"lossless"`` installs the bit-exact fused
     # kernels on every diffusers Wan VAE, ``"channels_last"`` additionally
     # converts decoder convolution weights to channels-last memory format and
@@ -1443,6 +1449,24 @@ class OmniDiffusionConfig:
                 self.num_gpus = 1
 
         self.parallel_config.resolve_data_parallel_size(self.num_gpus)
+        if self.low_vram_preset is not None:
+            from vllm_omni.diffusion.low_vram import expand_low_vram_preset
+
+            current = {f.name: getattr(self, f.name) for f in fields(self) if f.init}
+            # Retain every value the preset filled or normalized, not a subset.
+            for name, value in expand_low_vram_preset(current).items():
+                if value is not current.get(name):
+                    setattr(self, name, value)
+            if (
+                self.num_gpus != 1
+                or self.parallel_config.world_size != 1
+                or self.parallel_config.vae_patch_parallel_size != 1
+                or self.parallel_config.text_encoder_tp_size != 1
+                or self.parallel_config.use_hsdp
+            ):
+                raise ValueError("low_vram_preset requires a single GPU with all parallel degrees set to 1")
+        elif self.vae_use_tiling is None:
+            self.vae_use_tiling = False
         # Resolve offload only after DP/SP normalization so cached policy
         # validation observes the actual execution topology.
         offload_strategy = materialize_legacy_offload_flags(self)
@@ -1667,6 +1691,10 @@ class OmniDiffusionConfig:
         propagate_skip_softmax_calibration(specs, self.model, tf_config)
 
     def update_multimodal_support(self) -> None:
+        if self.low_vram_preset is not None:
+            from vllm_omni.diffusion.low_vram import validate_low_vram_pipeline
+
+            validate_low_vram_pipeline(self.model_class_name)
         # Resolve serving-visible multimodal behavior from shared metadata
         # instead of importing concrete pipeline modules into the config layer.
         metadata = get_diffusion_model_metadata(self.model_class_name)
