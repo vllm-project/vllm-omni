@@ -99,10 +99,17 @@ def talker2code2wav_async_chunk(
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
-    """CosyVoice3 async_chunk processor: talker token stream -> code2wav chunks."""
+    """Build cumulative Flow prefixes from V1 history or MRv2 token deltas.
+
+    ``left_context_size`` counts already consumed tokens. Code2Wav trims
+    those mel frames and emits only new PCM, including the HiFT tail at EOF.
+    """
     with nullcontext():
         request_id = request.external_req_id
         finished = bool(is_finished or request.is_finished())
+        if getattr(request, "aborted", False):
+            # A cancelled utterance must not flush buffered speech.
+            return OmniPayloadStruct(meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)))
 
         connector = getattr(transfer_manager, "connector", None)
         raw_cfg = getattr(connector, "config", {}) or {}
@@ -123,7 +130,9 @@ def talker2code2wav_async_chunk(
         request_state = transfer_manager.request_payload.get(request_id)
         if not isinstance(request_state, dict) or "_cosyvoice3_async_state" not in request_state:
             with nullcontext():
-                info = deserialize_additional_information(getattr(request, "additional_information", None))
+                info = getattr(request, "model_intermediate_buffer", None)
+                if not isinstance(info, Mapping):
+                    info = deserialize_additional_information(getattr(request, "additional_information", None))
                 info_embed = info.get("embed", {}) if isinstance(info, dict) else {}
                 prompt_payload = {}
                 cond_keys = ("speech_token", "speech_feat", "embedding", "speech_token_len")
@@ -188,8 +197,20 @@ def talker2code2wav_async_chunk(
         with nullcontext():
             output_token_ids = _ensure_list(getattr(request, "output_token_ids", []))
             seen_len = int(state.get("seen_len", 0))
-            new_tokens = output_token_ids[seen_len:] if seen_len < len(output_token_ids) else []
-            state["seen_len"] = len(output_token_ids)
+            output_count = int(getattr(request, "output_token_count", len(output_token_ids)))
+            if output_count < seen_len:
+                raise ValueError(f"CosyVoice3 token history regressed for request {request_id}")
+            if len(output_token_ids) == output_count:
+                new_tokens = output_token_ids[seen_len:]
+            else:
+                # Native MRv2 omits cumulative history after chunk 0. Its
+                # count includes control tokens, so advance before filtering.
+                delta_count = output_count - seen_len
+                sampled = _ensure_list(getattr(request, "sampled_token_ids", []))
+                if delta_count > len(sampled):
+                    raise ValueError(f"CosyVoice3 missing codec token delta for request {request_id}")
+                new_tokens = sampled[-delta_count:] if delta_count else []
+            state["seen_len"] = output_count
 
         if not hasattr(transfer_manager, "code_prompt_token_ids"):
             transfer_manager.code_prompt_token_ids = defaultdict(list)
@@ -210,23 +231,16 @@ def talker2code2wav_async_chunk(
             state["terminal_sent"] = True
             return OmniPayloadStruct(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
-                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+                meta=MetaStruct(
+                    finished=torch.tensor(True, dtype=torch.bool),
+                    stream_finished=torch.tensor(True, dtype=torch.bool),
+                    req_id=[request_id],
+                    left_context_size=0,
+                ),
                 embed=embed_struct,
             )
 
         emitted_token_len = int(state.get("emitted_token_len", 0))
-        if finished and length <= emitted_token_len:
-            embed_struct = None
-            if not state.get("sent_prompt", False):
-                embed_struct = _build_prompt_embed_struct(state.get("prompt_payload", {}))
-                state["sent_prompt"] = True
-            state["terminal_sent"] = True
-            return OmniPayloadStruct(
-                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
-                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
-                embed=embed_struct,
-            )
-
         with nullcontext():
             token_hop_len = max(1, int(state.get("token_hop_len", chunk_size)))
             prompt_token_pad = max(0, int(state.get("prompt_token_pad", 0)))
@@ -241,8 +255,8 @@ def talker2code2wav_async_chunk(
                 prefix_len = emitted_token_len + required
                 token_offset = emitted_token_len
             else:
-                if available <= 0:
-                    return None
+                # Even an exact-boundary EOF must run the decoder: no new
+                # mel remains, but HiFT still owns withheld waveform samples.
                 prefix_len = length
                 token_offset = emitted_token_len
 

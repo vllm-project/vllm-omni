@@ -16,11 +16,26 @@ from dataclasses import dataclass
 import torch
 import torch._dynamo as dynamo
 import torch.nn.functional as F
-from vllm.vllm_flash_attn import flash_attn_varlen_func
+from vllm.logger import init_logger
+from vllm.platforms import current_platform
 
+from ..runtime import cosyvoice3_flow_graph_max
 from .packed_conv import pack_conv_weight, packed_causal_conv_mish
 
+logger = init_logger(__name__)
+
 FA3_PAGE_SIZE = 1
+
+
+def to_device_async(host: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Copy host metadata to ``device`` without waiting for its queued kernels.
+
+    A pageable host-to-device copy blocks the host until every kernel already
+    queued on the stream has run; staging through pinned memory does not.
+    """
+    if torch.device(device).type != "cuda":
+        return host.to(device)
+    return host.pin_memory().to(device, non_blocking=True)
 
 
 class RaggedRowAttention:
@@ -52,10 +67,10 @@ class RaggedRowAttention:
                 segment_rows.append(row)
                 segment_ends.append(end)
                 offsets.append(offsets[-1] + end - start)
-        self.cache_seqlens = torch.tensor(segment_ends, dtype=torch.int32, device=device)
-        self.cu_seqlens_q = torch.tensor(offsets, dtype=torch.int32, device=device)
+        self.cache_seqlens = to_device_async(torch.tensor(segment_ends, dtype=torch.int32), device)
+        self.cu_seqlens_q = to_device_async(torch.tensor(offsets, dtype=torch.int32), device)
         self.max_seqlen_q = max(b - a for a, b in zip(offsets, offsets[1:]))
-        starts = rows.starts_host[segment_rows].to(device)
+        starts = to_device_async(rows.starts_host[segment_rows], device)
         page = torch.arange(width or max(segment_ends), dtype=torch.int32, device=device)
         self.page_table = torch.where(page[None] < self.cache_seqlens[:, None], starts[:, None] + page[None], 0)
 
@@ -192,6 +207,8 @@ def packed_fa3(
     max_seqlen_q: int,
 ) -> torch.Tensor:
     """Alias-free FA3 boundary for the compiled PackedDiT path."""
+    from vllm.vllm_flash_attn import flash_attn_varlen_func
+
     return flash_attn_varlen_func(
         q,
         k_cache,
@@ -295,11 +312,11 @@ class PackedRows:
 def pack_rows(lengths: Sequence[int], device: torch.device) -> PackedRows:
     lengths = tuple(int(length) for length in lengths)
     starts_host = F.pad(torch.tensor(lengths, dtype=torch.int64).cumsum(0), (1, 0))
-    starts = starts_host.to(device)
+    starts = to_device_async(starts_host, device)
     total = int(starts_host[-1])
     row_ids = torch.repeat_interleave(
         torch.arange(len(lengths), device=device),
-        torch.tensor(lengths, dtype=torch.int64, device=device),
+        to_device_async(torch.tensor(lengths, dtype=torch.int64), device),
         output_size=total,
     )
     positions = torch.arange(total, device=device) - starts[row_ids]
@@ -539,10 +556,12 @@ def solve_flow_euler_packed(
     cfg_rate: float,
     streaming: bool,
     modulation_key: tuple | None = None,
+    graphs: bool = True,
 ) -> torch.Tensor:
     """Euler steps over a packed sequence with classifier free guidance: the
-    conditional rows and their unconditional twins share one DiT call."""
-    if estimator.graph_runner is not None and modulation_key is not None:
+    conditional rows and their unconditional twins share one DiT call.
+    ``graphs=False`` keeps the solve off the CUDA graph runner."""
+    if graphs and estimator.graph_runner is not None and modulation_key is not None:
         solved = estimator.graph_runner.run(
             noise, time_span, mu, spks, cond, rows, cfg_rate=cfg_rate, streaming=streaming, key=modulation_key
         )
@@ -639,8 +658,8 @@ def pad_to_graph_bucket(rows, noise, mu, spks, cond):
     )
 
 
-_FLOW_GRAPH_SLOTS = (1, 2, 4, 8)
-_FLOW_GRAPH_MAX_TOTAL = int(__import__("os").environ.get("COSYVOICE3_FLOW_GRAPH_MAX_TOTAL", "16384"))
+FLOW_GRAPH_SLOTS = (1, 2, 4, 8)
+FLOW_GRAPH_MAX_TOTAL = int(__import__("os").environ.get("COSYVOICE3_FLOW_GRAPH_MAX_TOTAL", "16384"))
 _FLOW_GRAPH_SEGMENT_STEP = 16
 
 
@@ -648,6 +667,14 @@ def flow_graph_total(total: int) -> int:
     """Packed-length bucket: at most ~12% padding, few recurring layouts."""
     step = 128 if total <= 1024 else (256 if total <= 4096 else 512)
     return -(-total // step) * step
+
+
+def flow_graph_totals(limit: int) -> list[int]:
+    """Every packed-length bucket up to the one holding ``limit`` frames."""
+    totals = [flow_graph_total(1)]
+    while totals[-1] < limit:
+        totals.append(flow_graph_total(totals[-1] + 1))
+    return totals
 
 
 @dataclass
@@ -667,6 +694,21 @@ class _FlowGraph:
     output: torch.Tensor | None = None
 
 
+def retire_graph_generation(graphs: dict) -> None:
+    """Retire every graph of one cache at once.
+
+    Flow graphs record into the process-wide graph pool, so a graph retired
+    alone would return blocks that its live peers still address in their
+    recorded kernels. Retiring the whole generation never leaves a live graph
+    behind a freed one, as MiniCPM-o 4.5's CFMGraphWrapper does. The sync keeps
+    a replay from being in flight; the pool itself stays with the process.
+    """
+    torch.accelerator.synchronize()
+    for state in graphs.values():
+        state.graph.reset()
+    graphs.clear()
+
+
 class FlowGraphRunner:
     """Replay the whole CFG Euler solve as one CUDA graph per padded layout.
 
@@ -677,21 +719,28 @@ class FlowGraphRunner:
     like the bucketed layouts above: padding rows are isolated by attention
     and by the positional masks of the packed convolution, so real frames only
     see their own row. Metadata lives in static buffers that are rewritten
-    before each replay.
+    before each replay. A layout missing from a full cache retires the whole
+    generation before it records.
     """
 
     def __init__(self, estimator: PackedDiT) -> None:
         self.estimator = estimator
         self.graphs: dict[tuple, _FlowGraph] = {}
-        self.pool = None
+        self.max_graphs = cosyvoice3_flow_graph_max()
+        self.flushes = 0
         attn = estimator.dit.transformer_blocks[0].attn
         self.heads, self.head_dim = attn.heads, attn.inner_dim // attn.heads
 
+    def flush(self) -> None:
+        retire_graph_generation(self.graphs)
+        self.flushes += 1
+        logger.info("CosyVoice3 Flow graphs retired: flush %d at %d graphs", self.flushes, self.max_graphs)
+
     def _layout(self, lengths: tuple[int, ...], streaming: bool):
         n, total = len(lengths), sum(lengths)
-        slots = next((b for b in _FLOW_GRAPH_SLOTS if b >= n), None)
+        slots = next((b for b in FLOW_GRAPH_SLOTS if b >= n), None)
         padded_total = flow_graph_total(total)
-        if slots is None or padded_total > _FLOW_GRAPH_MAX_TOTAL:
+        if slots is None or padded_total > FLOW_GRAPH_MAX_TOTAL:
             return None
         twin = (tuple(lengths) + (0,) * (slots - n) + (padded_total - total,)) * 2
         chunk = self.estimator.dit.static_chunk_size if streaming else None
@@ -794,6 +843,25 @@ class FlowGraphRunner:
             cfg_rate,
         )
 
+    def capture(
+        self,
+        slots: int,
+        total: int,
+        like: torch.Tensor,
+        speaker_dim: int,
+        time_span: torch.Tensor,
+        *,
+        cfg_rate: float,
+        key: tuple,
+    ) -> None:
+        """Record the full-context solve of ``slots`` row slots and ``total``
+        packed frames (a bucket) before serving, from one zero batch in it."""
+        lengths = (total - slots + 1,) + (1,) * (slots - 1)
+        zeros = like.new_zeros((1, total, like.shape[-1]))
+        speakers = like.new_zeros((slots, speaker_dim))
+        rows = pack_rows(lengths, like.device)
+        self.run(zeros, time_span, zeros, speakers, zeros, rows, cfg_rate=cfg_rate, streaming=False, key=key)
+
     def run(
         self,
         noise: torch.Tensor,
@@ -815,20 +883,20 @@ class FlowGraphRunner:
         state = self.graphs.get(graph_key)
         fresh = state is None
         if fresh:
+            if len(self.graphs) >= self.max_graphs:
+                self.flush()
             state = self._allocate(graph_key, noise, spks, time_span)
         self._load(state, twin, seg_rows, seg_ends, offsets, noise, mu, cond, spks, time_span)
         if fresh:
             # Warm up (and compile new dynamic shapes) off the capture, then
-            # record the solve into the shared pool.
+            # record the solve into the process-wide graph pool.
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
                 self._solve(state, cfg_rate, graph_key)
             torch.cuda.current_stream().wait_stream(stream)
-            with torch.cuda.graph(state.graph, pool=self.pool):
+            with torch.cuda.graph(state.graph, pool=current_platform.get_global_graph_pool()):
                 state.output = self._solve(state, cfg_rate, graph_key)
-            if self.pool is None:
-                self.pool = state.graph.pool()
             self.graphs[graph_key] = state
         state.graph.replay()
         return state.output[:, : noise.shape[1]].float()

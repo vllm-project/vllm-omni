@@ -10,13 +10,16 @@ This module contains the code2wav (token-to-waveform) stage which uses:
 """
 
 import os
+import time
 from collections import Counter
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any, Literal, TypedDict, cast, overload
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from omegaconf import DictConfig
 from vllm.logger import init_logger
 
@@ -27,16 +30,42 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import (
     CausalConditionalCFM,
     CausalMaskedDiffWithDiT,
 )
+from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.flow_prefix_cache import (
+    PAGE_FRAMES,
+    FlowPrefixCache,
+    FlowPrefixState,
+    PrefixQuery,
+)
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     CausalConvRNNF0Predictor,
     CausalHiFTGenerator,
 )
+from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hift_stream_batch import (
+    MAX_BATCH_ROWS,
+    HiftWindow,
+    StreamingHiFTBatcher,
+)
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreLookaheadLayer
+from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import (
+    FLOW_GRAPH_MAX_TOTAL,
+    FLOW_GRAPH_SLOTS,
+    PackedDiT,
+    bucketed_width,
+    flow_graph_totals,
+    gather_rows,
+    pack_rows,
+    scatter_rows,
+    solve_flow_euler_packed,
+    to_device_async,
+)
 from vllm_omni.model_executor.models.cosyvoice3.runtime import (
     compile_cosyvoice3_padded_dit,
     cosyvoice3_batch_flow_debug,
     cosyvoice3_batch_flow_profile,
+    cosyvoice3_flow_prefix_cache_bytes,
     cosyvoice3_full_response_enabled,
+    cosyvoice3_hift_batch_enabled,
+    cosyvoice3_hift_stream_enabled,
     cosyvoice3_packed_inference_enabled,
     cosyvoice3_packed_streaming_enabled,
     cosyvoice3_stage1_npu_graph_enabled,
@@ -44,6 +73,9 @@ from vllm_omni.model_executor.models.cosyvoice3.runtime import (
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 
 logger = init_logger(__name__)
+
+# Most rows one packed Flow solve takes: the widest row slot its graphs record.
+_FLOW_GROUP_ROWS = FLOW_GRAPH_SLOTS[-1]
 
 
 def _build_dit_estimator(estimator_config: Mapping[str, Any]) -> DiT:
@@ -69,6 +101,9 @@ class StreamingHiFTState(TypedDict, total=False):
     mel: torch.Tensor
     mel_offset: int
     phase_acc: torch.Tensor | None
+    flow_prefix: FlowPrefixState
+    # Prompt tokens, prompt mel and speaker embedding, copied to the device once.
+    conditioning: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 
 class StreamingFlowItem(TypedDict, total=False):
@@ -84,6 +119,28 @@ class StreamingFlowItem(TypedDict, total=False):
     cache_state: StreamingHiFTState | None
     token_offset_tokens: int
     finalize: bool
+
+
+@dataclass
+class _HiftStepInput:
+    """The mel one streaming HiFT step reads: cached history joined to the new frames."""
+
+    mel: torch.Tensor  # F0 input: F0 margin, then the decoded window (overlap and new frames)
+    f0_margin: int  # leading frames only the F0 predictor reads
+    window_offset: int  # absolute mel frame where the decoded window starts
+    new_frames: int
+    phase_acc: torch.Tensor | None  # harmonic phase carried from the previous step
+
+
+@dataclass
+class _HiftJob:
+    """Mels of one Flow group of a packed streaming step, awaiting HiFT."""
+
+    indices: list[int]  # the group's positions in the step's items
+    mels: list[torch.Tensor]
+    flow_states: list[FlowPrefixState | None]
+    finalize: bool
+    flow_queued: torch.cuda.Event | None  # set when HiFT runs on its own stream
 
 
 class CosyVoice3Code2Wav(nn.Module):
@@ -274,6 +331,33 @@ class CosyVoice3Code2Wav(nn.Module):
 
         return feat
 
+    def _hift_step_input(self, feat: torch.Tensor, cache_state: StreamingHiFTState | None) -> _HiftStepInput:
+        """Join a request's cached mel history to this step's new frames.
+
+        The decoded window re-reads up to ``_hift_window_len`` plus the F0
+        look-ahead of history; the F0 predictor also reads up to its left
+        context before that. The per-request and the batched HiFT steps both
+        start from this.
+        """
+        hift_weight = self.hift.m_source.l_linear.weight
+        chunk_mel = feat.to(device=hift_weight.device, dtype=hift_weight.dtype)
+        overlap_frames = self._hift_window_len + int(self.hift.f0_predictor.condnet[0].causal_padding)
+        mel = chunk_mel
+        f0_margin = 0
+        window_offset = 0
+        cached_mel = None if not cache_state else cache_state.get("mel")
+        if isinstance(cached_mel, torch.Tensor) and cached_mel.numel() > 0:
+            cached_mel = cached_mel.to(device=chunk_mel.device, dtype=chunk_mel.dtype)
+            history = cached_mel.shape[-1]
+            overlap = min(overlap_frames, history)
+            f0_margin = min(int(self.hift.f0_predictor.left_context_frames), history - overlap)
+            window_offset = int(cache_state.get("mel_offset", 0)) + history - overlap
+            mel = torch.cat([cached_mel[..., history - overlap - f0_margin :], chunk_mel], dim=-1)
+        phase_acc = None if not cache_state else cache_state.get("phase_acc")
+        if phase_acc is not None:
+            phase_acc = phase_acc.to(device=chunk_mel.device, dtype=chunk_mel.dtype)
+        return _HiftStepInput(mel, f0_margin, window_offset, chunk_mel.shape[-1], phase_acc)
+
     def _stream_hift_from_feat(
         self,
         feat: torch.Tensor,
@@ -281,46 +365,26 @@ class CosyVoice3Code2Wav(nn.Module):
         cache_state: StreamingHiFTState | None = None,
         finalize: bool = False,
     ) -> tuple[torch.Tensor, StreamingHiFTState | None]:
-        hift_weight = self.hift.m_source.l_linear.weight
-        chunk_mel = feat.to(device=hift_weight.device, dtype=hift_weight.dtype)
+        """One request's streaming HiFT step: the new speech and its next state."""
+        step = self._hift_step_input(feat, cache_state)
+        f0_input_mel, f0_margin, window_offset = step.mel, step.f0_margin, step.window_offset
+        phase_acc = step.phase_acc
+        if not finalize and step.new_frames == 0:
+            # A non-final empty hop must not advance vocoder state. Final hops
+            # still decode the overlap to release withheld waveform samples.
+            return f0_input_mel.new_empty((f0_input_mel.shape[0], 1, 0)), cache_state
 
-        cached_mel = None if not cache_state else cache_state.get("mel")
-        cached_offset = 0 if not cache_state else int(cache_state.get("mel_offset", 0))
         window_len = self._hift_window_len
         samples_per_mel = int(np.prod(self.hift.upsample_rates) * self.hift.istft_params["hop_len"])
         trim = int(self.hift.f0_predictor.condnet[0].causal_padding)
-        f0_margin_frames = int(self.hift.f0_predictor.left_context_frames)
-        f0_margin = 0
-        if isinstance(cached_mel, torch.Tensor) and cached_mel.numel() > 0:
-            cached_mel = cached_mel.to(device=chunk_mel.device, dtype=chunk_mel.dtype)
-            total_hist = cached_mel.shape[-1]
-            overlap = min(window_len + trim, total_hist)
-            window_mel = torch.cat([cached_mel[..., -overlap:], chunk_mel], dim=-1)
-            window_offset = cached_offset + total_hist - overlap
-            uv_offset = window_offset * samples_per_mel
-            f0_margin = min(f0_margin_frames, total_hist - overlap)
-            f0_input_mel = (
-                torch.cat(
-                    [cached_mel[..., total_hist - overlap - f0_margin : total_hist - overlap], window_mel], dim=-1
-                )
-                if f0_margin > 0
-                else window_mel
-            )
-        else:
-            window_mel = chunk_mel
-            f0_input_mel = chunk_mel
-            window_offset = 0
-            uv_offset = 0
+        window_frames = f0_input_mel.shape[-1] - f0_margin
+        uv_offset = window_offset * samples_per_mel
 
-        phase_acc = None if not cache_state else cache_state.get("phase_acc")
-        if phase_acc is not None:
-            phase_acc = phase_acc.to(device=chunk_mel.device, dtype=chunk_mel.dtype)
-
-        if window_mel.shape[-1] == 0:
-            tts_speech = torch.zeros((chunk_mel.shape[0], 1, 0), device=chunk_mel.device, dtype=chunk_mel.dtype)
+        if window_frames == 0:
+            tts_speech = f0_input_mel.new_zeros((f0_input_mel.shape[0], 1, 0))
             new_phase_acc = phase_acc
         else:
-            next_overlap = min(window_len + trim, window_mel.shape[-1])
+            next_overlap = min(window_len + trim, window_frames)
             # On finalize the F0 predictor consumes the whole window (it does not
             # hold back `trim` frames), so trim must not inflate the phase-carry
             # index -- it would point past the end of a short window.
@@ -336,7 +400,7 @@ class CosyVoice3Code2Wav(nn.Module):
             )
 
         tts_speech = tts_speech.reshape(tts_speech.shape[0], -1)
-        new_samples = chunk_mel.shape[-1] * samples_per_mel
+        new_samples = step.new_frames * samples_per_mel
         if finalize:
             frames_withheld_per_chunk = trim + self.hift.conv_pre_look_right + 1
             released = frames_withheld_per_chunk * samples_per_mel
@@ -382,14 +446,7 @@ class CosyVoice3Code2Wav(nn.Module):
         group and passed to the flow as per-row token lengths.
         """
         if items and cosyvoice3_packed_streaming_enabled():
-            results = [None] * len(items)
-            for finalize in (False, True):
-                group = [(i, x) for i, x in enumerate(items) if bool(x.get("finalize", False)) == finalize]
-                if group:
-                    values = self.forward_batch([x for _, x in group], n_timesteps=n_timesteps, stream_items=True)
-                    for (i, _), value in zip(group, values):
-                        results[i] = value
-            return results
+            return self._forward_packed_streaming(items, n_timesteps)
         if (
             items
             and cosyvoice3_packed_inference_enabled()
@@ -555,6 +612,407 @@ class CosyVoice3Code2Wav(nn.Module):
         self._position_noise = torch.cat(blocks, dim=-1) if len(blocks) > 1 else blocks[0]
         return self._position_noise[..., :width]
 
+    def _get_packed_estimator(self, dtype: torch.dtype) -> PackedDiT:
+        """The packed Flow estimator, built and compiled for ``dtype`` on first use."""
+        if not hasattr(self, "_packed_estimator"):
+            self._packed_estimator = PackedDiT(self.flow_model.decoder.estimator)
+            self._packed_estimator.compile(dtype)
+        return self._packed_estimator
+
+    def _get_flow_prefix_cache(self, n_timesteps: int) -> FlowPrefixCache | None:
+        """The request-owned Flow prefix cache, built on first use; None when disabled."""
+        cache = getattr(self, "_flow_prefix_cache", None)
+        if cache is None:
+            capacity = cosyvoice3_flow_prefix_cache_bytes()
+            if capacity <= 0:
+                return None
+            weight = next(self.flow_model.parameters())
+            estimator = self._get_packed_estimator(weight.dtype)
+            cache = FlowPrefixCache(
+                estimator,
+                steps=n_timesteps,
+                capacity_bytes=capacity,
+                compiled=weight.is_cuda,
+                graphs=estimator.graph_runner is not None,
+            )
+            if cache.chunk % self.token_mel_ratio != 0:
+                raise ValueError("Flow prefix cache needs attention chunks aligned to codec tokens")
+            logger.info(
+                "CosyVoice3 Flow prefix cache: %d pages of %d frames (%.3f GiB allocated, %.3f GiB budget)",
+                cache.num_pages,
+                PAGE_FRAMES,
+                cache.allocated_bytes / 2**30,
+                capacity / 2**30,
+            )
+            self._flow_prefix_cache = cache
+        if cache.steps != n_timesteps:
+            raise ValueError(f"Flow prefix cache was built for {cache.steps} Euler steps, got {n_timesteps}")
+        return cache
+
+    def _flow_schedule(self, n_timesteps: int) -> tuple[torch.Tensor, float, tuple]:
+        """Euler time span, CFG rate and modulation key of every packed Flow
+        solve; the key also names the solve's CUDA graphs."""
+        flow = self.flow_model
+        weight = next(flow.parameters())
+        time_span = torch.linspace(0, 1, n_timesteps + 1, device=weight.device, dtype=weight.dtype)
+        if flow.decoder.t_scheduler == "cosine":
+            time_span = 1 - torch.cos(time_span * 0.5 * torch.pi)
+        key = (n_timesteps, flow.decoder.t_scheduler, weight.dtype, weight.device)
+        return time_span, flow.decoder.inference_cfg_rate, key
+
+    @torch.inference_mode()
+    def capture_graphs(self, n_timesteps: int = 10, row_frames: int = 512, hift_frames: int = 320) -> None:
+        """Record packed streaming's CUDA graphs before the stage serves.
+
+        On demand, a layout records on the step that first meets it and stalls
+        that step for ~200 ms. Recorded here: prefix-cache hops and final hops
+        for every Flow row slot up to ``row_frames`` frames a row (a short
+        sentence's prompt and speech) and, with HiFT batching and decode graphs
+        on, every padded HiFT batch up to ``hift_frames`` wide (F0 margin,
+        overlap and a 100-token hop). Longer Flow layouts still record on demand,
+        up to ``COSYVOICE3_FLOW_GRAPH_MAX`` graphs per cache before the cache
+        retires them all; hops that miss a full prefix pool run without graphs.
+        HiFT's cuFFT plans are created here too, for every width up to
+        ``hift_frames``, whether or not decode graphs are on.
+        """
+        flow = self.flow_model
+        weight = next(flow.parameters())
+        if not weight.is_cuda or not cosyvoice3_packed_streaming_enabled():
+            return
+        estimator = self._get_packed_estimator(weight.dtype)
+        prefix = self._get_flow_prefix_cache(n_timesteps)
+        start = time.perf_counter()
+        free_before = torch.accelerator.get_memory_info()[0]
+        time_span, cfg_rate, key = self._flow_schedule(n_timesteps)
+        like = weight.new_zeros((1, 0, self.output_size))
+        speaker_dim = flow.spk_embed_affine_layer.out_features
+        flow_graphs = 0
+        if estimator.graph_runner is not None:
+            with torch.autocast("cuda", dtype=weight.dtype):
+                for slots in FLOW_GRAPH_SLOTS:
+                    for total in flow_graph_totals(min(slots * row_frames, FLOW_GRAPH_MAX_TOTAL)):
+                        estimator.graph_runner.capture(
+                            slots, total, like, speaker_dim, time_span, cfg_rate=cfg_rate, key=key
+                        )
+                        flow_graphs += 1
+                        if prefix is not None:
+                            prefix.capture(
+                                slots, total, like, speaker_dim, time_span, cfg_rate=cfg_rate, modulation_key=key
+                            )
+                            flow_graphs += 1
+        hift_graphs = 0
+        if cosyvoice3_hift_batch_enabled():
+            hift_graphs = self._get_hift_batcher().capture_decode_graphs(hift_frames)
+        fft_widths = self._get_hift_batcher().warm_fft_plans(hift_frames)
+        torch.accelerator.synchronize()
+        logger.info(
+            "CosyVoice3 code2wav: recorded %d Flow and %d HiFT CUDA graphs and warmed %d HiFT FFT sizes "
+            "in %.1f s using %.2f GiB",
+            flow_graphs,
+            hift_graphs,
+            fft_widths,
+            time.perf_counter() - start,
+            (free_before - torch.accelerator.get_memory_info()[0]) / 2**30,
+        )
+
+    def release_flow_prefix(self, cache_state: StreamingHiFTState | None) -> None:
+        """Return the Flow prefix pages held by a request's streaming state."""
+        cache = getattr(self, "_flow_prefix_cache", None)
+        if cache is not None and cache_state:
+            cache.release(cache_state.get("flow_prefix"))
+
+    @torch.inference_mode()
+    def _forward_packed_streaming(
+        self, items: list[StreamingFlowItem], n_timesteps: int
+    ) -> list[tuple[torch.Tensor, StreamingHiFTState | None]]:
+        """One packed streaming step.
+
+        Every Flow group is queued first: prefix-cache hops, hops the pool could
+        not hold, then final hops, which attend over full context and so cannot
+        use the chunk-causal prefix cache. HiFT then runs per group, batched
+        across requests when enabled, and on its own stream when enabled, so a
+        group's HiFT overlaps the later groups' Flow.
+        """
+        device = next(self.flow_model.parameters()).device
+        conditioning = [self._device_conditioning(item, device) for item in items]
+        items = [
+            cast(StreamingFlowItem, dict(item, prompt_token=prompt_token, prompt_feat=prompt_feat, embedding=embedding))
+            for item, (prompt_token, prompt_feat, embedding) in zip(items, conditioning)
+        ]
+        hift_stream = self._get_hift_stream(device)
+        final = [index for index, item in enumerate(items) if item.get("finalize", False)]
+        hops = [index for index, item in enumerate(items) if not item.get("finalize", False)]
+        for index in final:
+            self.release_flow_prefix(items[index].get("cache_state"))
+        jobs: list[_HiftJob] = []
+
+        if hops:
+            # One HiFT batch for every non-final hop, after both of their Flow paths.
+            served = self._stream_prefix_mels([items[index] for index in hops], n_timesteps)
+            mels = [None if value is None else value[0] for value in served]
+            flow_states = [None if value is None else value[1] for value in served]
+            misses = [position for position, value in enumerate(served) if value is None]
+            if misses:
+                # With a prefix pool, misses mean it is full: up to eight whole
+                # rows per solve keep the GPU busy without graphs, and their
+                # layouts were never recorded at startup, so recording them now
+                # would stall every request in the step.
+                missed = self._stream_flow_mels(
+                    [items[hops[position]] for position in misses],
+                    n_timesteps,
+                    graphs=getattr(self, "_flow_prefix_cache", None) is None,
+                )
+                for position, mel in zip(misses, missed):
+                    mels[position] = mel
+            jobs.append(_HiftJob(hops, mels, flow_states, False, self._flow_queued_event(hift_stream)))
+        if final:
+            mels = self._stream_flow_mels([items[index] for index in final], n_timesteps)
+            jobs.append(_HiftJob(final, mels, [None] * len(final), True, self._flow_queued_event(hift_stream)))
+
+        results: list[tuple[torch.Tensor, StreamingHiFTState | None] | None] = [None] * len(items)
+        for job in jobs:
+            cache_states = [items[index].get("cache_state") for index in job.indices]
+            if hift_stream is None:
+                values = self._stream_hift(job.mels, cache_states, finalize=job.finalize)
+            else:
+                with torch.cuda.stream(hift_stream):
+                    hift_stream.wait_event(job.flow_queued)
+                    for mel in job.mels:
+                        mel.record_stream(hift_stream)
+                    values = self._stream_hift(job.mels, cache_states, finalize=job.finalize)
+            for index, flow_state, (speech, state) in zip(job.indices, job.flow_states, values):
+                if state is not None:
+                    state["conditioning"] = conditioning[index]
+                    if flow_state is not None:
+                        state["flow_prefix"] = flow_state
+                results[index] = (speech, state)
+        if hift_stream is not None:
+            current = torch.cuda.current_stream(device)
+            current.wait_stream(hift_stream)
+            for speech, _ in results:
+                speech.record_stream(current)
+        return cast(list[tuple[torch.Tensor, StreamingHiFTState | None]], results)
+
+    @staticmethod
+    def _flow_queued_event(hift_stream: torch.cuda.Stream | None) -> torch.cuda.Event | None:
+        """Mark the Flow work queued so far on the current stream, for the HiFT
+        stream to wait on; None when HiFT shares that stream."""
+        if hift_stream is None:
+            return None
+        event = torch.cuda.Event()
+        event.record()
+        return event
+
+    @staticmethod
+    def _device_conditioning(
+        item: StreamingFlowItem, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """A request's prompt tokens, prompt mel and speaker embedding on device.
+
+        They stay fixed for the whole request, so the first hop copies them
+        without waiting for queued kernels and later hops reuse that copy.
+        """
+        cache_state = item.get("cache_state")
+        cached = cache_state.get("conditioning") if cache_state else None
+        if cached is not None:
+            return cached
+        tensors = []
+        for key in ("prompt_token", "prompt_feat", "embedding"):
+            tensor = item[key]
+            if tensor.device != device:
+                tensor = to_device_async(tensor, device) if tensor.device.type == "cpu" else tensor.to(device)
+            tensors.append(tensor)
+        return tensors[0], tensors[1], tensors[2]
+
+    def _get_hift_stream(self, device: torch.device) -> torch.cuda.Stream | None:
+        """The CUDA stream HiFT runs on, created on first use; None when HiFT
+        shares the Flow stream."""
+        if device.type != "cuda" or not cosyvoice3_hift_stream_enabled():
+            return None
+        stream = getattr(self, "_hift_stream", None)
+        if stream is None:
+            stream = self._hift_stream = torch.cuda.Stream(device=device)
+        return stream
+
+    def _stream_flow_mels(
+        self, items: list[StreamingFlowItem], n_timesteps: int, *, graphs: bool = True
+    ) -> list[torch.Tensor]:
+        """Full-recompute packed Flow for streaming items, in groups of at most
+        eight by length as forward_batch runs them; each item's new mel frames.
+        ``graphs=False`` solves them without the Flow graph runner."""
+        if len(items) <= _FLOW_GROUP_ROWS:
+            groups = [list(range(len(items)))]
+        else:
+            ordered = sorted(
+                range(len(items)),
+                key=lambda index: items[index]["token"].shape[1] + items[index]["prompt_token"].shape[1],
+            )
+            groups = [ordered[start : start + _FLOW_GROUP_ROWS] for start in range(0, len(ordered), _FLOW_GROUP_ROWS)]
+        mels: list[torch.Tensor | None] = [None] * len(items)
+        for group in groups:
+            feat, lengths, prompt_lengths = self._flow_feat(
+                [items[index] for index in group], n_timesteps, stream_items=True, graphs=graphs
+            )
+            for row, index in enumerate(group):
+                offset = max(0, int(items[index].get("token_offset_tokens", 0))) * self.token_mel_ratio
+                mels[index] = feat[row : row + 1, :, prompt_lengths[row] + offset : lengths[row]].float()
+        return cast(list[torch.Tensor], mels)
+
+    def _stream_hift(
+        self, feats: list[torch.Tensor], cache_states: list[StreamingHiFTState | None], *, finalize: bool
+    ) -> list[tuple[torch.Tensor, StreamingHiFTState | None]]:
+        """HiFT for a group of streaming items, batched across them when enabled.
+
+        Settled windows, final or not, batch right aligned; early non-final
+        windows batch left aligned; an early final window runs alone at exact
+        width. Windows the batched step does not cover take the per-request path.
+        """
+        if not cosyvoice3_hift_batch_enabled():
+            return [
+                self._stream_hift_from_feat(feat, cache_state=cache_state, finalize=finalize)
+                for feat, cache_state in zip(feats, cache_states)
+            ]
+        batcher = self._get_hift_batcher()
+        results: list[tuple[torch.Tensor, StreamingHiFTState | None] | None] = [None] * len(feats)
+        pending = []
+        for index, (feat, cache_state) in enumerate(zip(feats, cache_states)):
+            prepared = self._hift_stream_window(feat, cache_state, finalize=finalize)
+            if prepared is None:
+                results[index] = self._stream_hift_from_feat(feat, cache_state=cache_state, finalize=finalize)
+            else:
+                pending.append((index, *prepared))
+        layouts: dict[str, list] = {}
+        for entry in pending:
+            layouts.setdefault(batcher.layout(entry[1]), []).append(entry)
+        for layout, entries in layouts.items():
+            if layout == "exact":
+                group_size = 1
+            else:
+                group_size = MAX_BATCH_ROWS
+            for start in range(0, len(entries), group_size):
+                group = entries[start : start + group_size]
+                speeches, carries = batcher.run([window for _, window, _ in group], layout=layout)
+                for (index, window, mel_offset), speech, carry in zip(group, speeches, carries):
+                    state: StreamingHiFTState | None = None
+                    if not finalize:
+                        # A first window's mel can slice this step's batched Flow
+                        # output, which the next graph replay overwrites. Copy
+                        # the request's state so it outlives the step.
+                        state = {
+                            "mel": window.mel.detach().clone(),
+                            "mel_offset": mel_offset,
+                            "phase_acc": None if carry is None else carry.detach().clone(),
+                        }
+                    results[index] = (speech, state)
+        return cast(list[tuple[torch.Tensor, StreamingHiFTState | None]], results)
+
+    def _get_hift_batcher(self) -> StreamingHiFTBatcher:
+        """The batched streaming HiFT runner, built on first use."""
+        batcher = getattr(self, "_hift_batcher", None)
+        if batcher is None:
+            batcher = self._hift_batcher = StreamingHiFTBatcher(self.hift)
+        return batcher
+
+    def _hift_stream_window(
+        self, feat: torch.Tensor, cache_state: StreamingHiFTState | None, *, finalize: bool
+    ) -> tuple[HiftWindow, int] | None:
+        """One request's window for the batched HiFT step.
+
+        Returns the window and the mel offset of its state, or None for the
+        empty and too-short windows that ``_stream_hift_from_feat`` handles.
+        """
+        batcher = self._get_hift_batcher()
+        step = self._hift_step_input(feat, cache_state)
+        decoded = step.mel.shape[-1] - step.f0_margin
+        if step.new_frames == 0 or decoded - batcher.held_back <= 0:
+            return None
+        overlap_frames = self._hift_window_len + batcher.trim
+        emit_start, emit_end = batcher.emit_range(decoded, step.new_frames, finalize=finalize)
+        # Settled: a carried phase, the full overlap (reaching past the decoder's
+        # receptive field) and the F0 predictor's full left context.
+        full_overlap = decoded - step.new_frames == overlap_frames
+        covers_decoder = overlap_frames >= batcher.settled_overlap
+        full_f0_margin = step.f0_margin == int(self.hift.f0_predictor.left_context_frames)
+        settled = step.phase_acc is not None and full_overlap and covers_decoder and full_f0_margin
+        window = HiftWindow(
+            mel=step.mel,
+            margin=step.f0_margin,
+            phase_acc=step.phase_acc,
+            noise_offset=step.window_offset * batcher.scale,
+            next_overlap=min(overlap_frames, decoded),
+            emit_start=emit_start,
+            emit_end=emit_end,
+            final=finalize,
+            settled=settled,
+        )
+        return window, step.window_offset - step.f0_margin
+
+    @torch.inference_mode()
+    def _stream_prefix_mels(
+        self, items: list[StreamingFlowItem], n_timesteps: int
+    ) -> list[tuple[torch.Tensor, FlowPrefixState] | None]:
+        """Non-final hops through the prefix cache: Flow runs only the frames past
+        the cached prefix and returns each item's new mel frames with its cache
+        rows. Items it cannot serve (pool full) come back as None for the
+        full-recompute path.
+        """
+        results: list[tuple[torch.Tensor, FlowPrefixState] | None] = [None] * len(items)
+        cache = self._get_flow_prefix_cache(n_timesteps)
+        if cache is None:
+            return results
+        flow = self.flow_model
+        weight = next(flow.parameters())
+        ratio = self.token_mel_ratio
+        lookahead = int(flow.pre_lookahead_len)
+        # conv2 of the lookahead layer is causal: new tokens need its left taps.
+        token_context = flow.pre_lookahead_layer.conv2.kernel_size[0] - 1
+        queries, served = [], []
+        for index, item in enumerate(items):
+            cache_state = item.get("cache_state")
+            state = cache_state.get("flow_prefix") if cache_state else None
+            if state is None:
+                state = FlowPrefixState()
+            tokens = torch.cat(
+                tuple(item[key].to(device=weight.device, dtype=torch.long) for key in ("prompt_token", "token")), dim=1
+            )
+            end = (tokens.shape[1] - lookahead) * ratio
+            emit = item["prompt_feat"].shape[1] + max(0, int(item.get("token_offset_tokens", 0))) * ratio
+            start = min(state.committed, emit // cache.chunk * cache.chunk)
+            if end <= start:
+                # An empty non-final hop does not abandon the request's prefix.
+                # FP32 matches FlowPrefixCache.solve, which returns float() mels.
+                results[index] = (weight.new_empty((1, self.output_size, 0), dtype=torch.float32), state)
+                continue
+            if not cache.reserve(state, end):
+                cache.release(state)
+                continue
+            # mu of tokens [first, end / ratio): their lookahead tokens are all
+            # known, so the values match the full-sequence computation.
+            first = start // ratio
+            left = min(first, token_context)
+            embedded = flow.input_embedding(tokens[:, first - left :].clamp(min=0))
+            if lookahead > 0:
+                hidden = flow.pre_lookahead_layer(embedded[:, :-lookahead], context=embedded[:, -lookahead:])
+            else:
+                hidden = flow.pre_lookahead_layer(embedded)
+            mu = hidden[0, left:].repeat_interleave(ratio, dim=0)
+            cond = torch.zeros_like(mu)
+            prompt = item["prompt_feat"][0, start:end].to(cond)
+            cond[: prompt.shape[0]] = prompt
+            noise = self._stream_position_noise(end, mu)[0, :, start:end].transpose(0, 1)
+            speaker = F.normalize(item["embedding"].to(weight), dim=1)
+            queries.append(PrefixQuery(state, start, end, noise, mu, cond, flow.spk_embed_affine_layer(speaker)))
+            served.append((index, emit))
+        if not queries:
+            return results
+        time_span, cfg_rate, modulation_key = self._flow_schedule(n_timesteps)
+        with torch.autocast("cuda", dtype=weight.dtype, enabled=weight.is_cuda):
+            solved = cache.solve(queries, time_span, cfg_rate=cfg_rate, modulation_key=modulation_key)
+        for (index, emit), query, frames in zip(served, queries, solved):
+            query.state.committed = query.end // cache.chunk * cache.chunk
+            results[index] = (frames[emit - query.start :].transpose(0, 1).unsqueeze(0), query.state)
+        return results
+
     @overload
     def forward_batch(
         self, items: list[StreamingFlowItem], *, n_timesteps: int = 10, stream_items: Literal[False] = False
@@ -583,19 +1041,63 @@ class CosyVoice3Code2Wav(nn.Module):
                 raise ValueError("Packed streaming requires COSYVOICE3_PACKED_STREAMING on Hopper")
             if any(bool(item.get("finalize", False)) != bool(items[0].get("finalize", False)) for item in items):
                 raise ValueError("Use forward_streaming_batch to group mixed finalization states")
-        if len(items) > 8:
+        if len(items) > _FLOW_GROUP_ROWS:
             ordered = sorted(
                 enumerate(items), key=lambda pair: pair[1]["token"].shape[1] + pair[1]["prompt_token"].shape[1]
             )
             outputs: list[torch.Tensor | tuple[torch.Tensor, StreamingHiFTState | None] | None] = [None] * len(items)
-            for start in range(0, len(ordered), 8):
-                group = ordered[start : start + 8]
+            for start in range(0, len(ordered), _FLOW_GROUP_ROWS):
+                group = ordered[start : start + _FLOW_GROUP_ROWS]
                 for (index, _), speech in zip(
                     group,
                     self.forward_batch([item for _, item in group], n_timesteps=n_timesteps, stream_items=stream_items),
                 ):
                     outputs[index] = speech
             return cast(list[torch.Tensor] | list[tuple[torch.Tensor, StreamingHiFTState | None]], outputs)
+        feat, lengths, prompt_lengths = self._flow_feat(items, n_timesteps, stream_items=stream_items)
+        if stream_items:
+            results = []
+            for row, item in enumerate(items):
+                start = prompt_lengths[row] + max(0, int(item.get("token_offset_tokens", 0))) * self.token_mel_ratio
+                mel = feat[row : row + 1, :, start : lengths[row]].float()
+                results.append(
+                    self._stream_hift_from_feat(
+                        mel, cache_state=item.get("cache_state"), finalize=bool(item.get("finalize", False))
+                    )
+                )
+            return results
+        hift_weight = self.hift.m_source.l_linear.weight
+        if cosyvoice3_full_response_enabled():
+            mels = []
+            for row, item in enumerate(items):
+                start = prompt_lengths[row] + max(0, int(item.get("token_offset_tokens", 0))) * self.token_mel_ratio
+                mels.append(feat[row : row + 1, :, start : lengths[row]].float().to(hift_weight))
+            width = max(mel.shape[-1] for mel in mels)
+            if width == 0:
+                return [mel.new_zeros((1, 1, 0)) for mel in mels]
+            # Recurring shapes let cuDNN/cuFFT reuse plans; rows are already
+            # right padded to the batch maximum and trimmed below.
+            width = bucketed_width(width)
+            padded = torch.cat([torch.nn.functional.pad(mel, (0, width - mel.shape[-1])) for mel in mels])
+            speech, _, _ = self.hift.inference(speech_feat=padded, finalize=True)
+            stride = int(np.prod(self.hift.upsample_rates) * self.hift.istft_params["hop_len"])
+            return [speech[row : row + 1, ..., : mel.shape[-1] * stride] for row, mel in enumerate(mels)]
+        results = []
+        for row, item in enumerate(items):
+            start = prompt_lengths[row] + max(0, int(item.get("token_offset_tokens", 0))) * self.token_mel_ratio
+            mel = feat[row : row + 1, :, start : lengths[row]].float().to(hift_weight)
+            if mel.shape[-1] == 0:
+                speech = mel.new_zeros((1, 1, 0))
+            else:
+                speech, _, _ = self.hift.inference(speech_feat=mel, finalize=True)
+            results.append(speech)
+        return results
+
+    def _flow_feat(
+        self, items: list[StreamingFlowItem], n_timesteps: int, *, stream_items: bool, graphs: bool = True
+    ) -> tuple[torch.Tensor, list[int], list[int]]:
+        """Flow over each item's prompt and continuation, right padded to the
+        widest; returns the mel batch with each row's total and prompt length."""
         flow = self.flow_model
         weight = next(flow.parameters())
         mus, conds, speakers, lengths, prompt_lengths = [], [], [], [], []
@@ -622,31 +1124,14 @@ class CosyVoice3Code2Wav(nn.Module):
         width = max(lengths)
         mu = torch.cat([torch.nn.functional.pad(x, (0, width - x.shape[-1])) for x in mus])
         cond = torch.cat([torch.nn.functional.pad(x, (0, width - x.shape[-1])) for x in conds])
-        mask = (
-            (torch.arange(width, device=weight.device)[None, :] < torch.tensor(lengths, device=weight.device)[:, None])
-            .unsqueeze(1)
-            .to(mu)
-        )
         if cosyvoice3_packed_inference_enabled():
-            from .code2wav_core.packed_dit import (
-                PackedDiT,
-                gather_rows,
-                pack_rows,
-                scatter_rows,
-                solve_flow_euler_packed,
-            )
-
-            if not hasattr(self, "_packed_estimator"):
-                self._packed_estimator = PackedDiT(flow.decoder.estimator)
-                self._packed_estimator.compile(mu.dtype)
+            self._get_packed_estimator(mu.dtype)
             rows = pack_rows(lengths, mu.device)
             if stream_items:
                 noise = self._stream_position_noise(width, mu).expand(len(items), -1, -1)
             else:
                 noise = torch.randn(mu.shape, device=mu.device, dtype=mu.dtype)
-            time_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
-            if flow.decoder.t_scheduler == "cosine":
-                time_span = 1 - torch.cos(time_span * 0.5 * torch.pi)
+            time_span, cfg_rate, modulation_key = self._flow_schedule(n_timesteps)
             with torch.autocast("cuda", dtype=mu.dtype):
                 packed = solve_flow_euler_packed(
                     self._packed_estimator,
@@ -656,55 +1141,26 @@ class CosyVoice3Code2Wav(nn.Module):
                     torch.cat(speakers),
                     gather_rows(cond.transpose(1, 2), rows),
                     rows,
-                    cfg_rate=flow.decoder.inference_cfg_rate,
+                    cfg_rate=cfg_rate,
                     streaming=stream_items and not items[0].get("finalize", False),
-                    modulation_key=(n_timesteps, flow.decoder.t_scheduler, mu.dtype, mu.device),
+                    modulation_key=modulation_key,
+                    graphs=graphs,
                 )
             feat = scatter_rows(packed, rows, width).transpose(1, 2)
 
         else:
+            mask = (
+                (
+                    torch.arange(width, device=weight.device)[None, :]
+                    < torch.tensor(lengths, device=weight.device)[:, None]
+                )
+                .unsqueeze(1)
+                .to(mu)
+            )
             feat, _ = flow.decoder(
                 mu=mu, mask=mask, spks=torch.cat(speakers), cond=cond, n_timesteps=n_timesteps, streaming=False
             )
-        if stream_items:
-            results = []
-            for row, item in enumerate(items):
-                start = prompt_lengths[row] + max(0, int(item.get("token_offset_tokens", 0))) * self.token_mel_ratio
-                mel = feat[row : row + 1, :, start : lengths[row]].float()
-                results.append(
-                    self._stream_hift_from_feat(
-                        mel, cache_state=item.get("cache_state"), finalize=bool(item.get("finalize", False))
-                    )
-                )
-            return results
-        hift_weight = self.hift.m_source.l_linear.weight
-        if cosyvoice3_full_response_enabled():
-            mels = []
-            for row, item in enumerate(items):
-                start = prompt_lengths[row] + max(0, int(item.get("token_offset_tokens", 0))) * self.token_mel_ratio
-                mels.append(feat[row : row + 1, :, start : lengths[row]].float().to(hift_weight))
-            width = max(mel.shape[-1] for mel in mels)
-            if width == 0:
-                return [mel.new_zeros((1, 1, 0)) for mel in mels]
-            from .code2wav_core.packed_dit import bucketed_width
-
-            # Recurring shapes let cuDNN/cuFFT reuse plans; rows are already
-            # right padded to the batch maximum and trimmed below.
-            width = bucketed_width(width)
-            padded = torch.cat([torch.nn.functional.pad(mel, (0, width - mel.shape[-1])) for mel in mels])
-            speech, _, _ = self.hift.inference(speech_feat=padded, finalize=True)
-            stride = int(np.prod(self.hift.upsample_rates) * self.hift.istft_params["hop_len"])
-            return [speech[row : row + 1, ..., : mel.shape[-1] * stride] for row, mel in enumerate(mels)]
-        results = []
-        for row, item in enumerate(items):
-            start = prompt_lengths[row] + max(0, int(item.get("token_offset_tokens", 0))) * self.token_mel_ratio
-            mel = feat[row : row + 1, :, start : lengths[row]].float().to(hift_weight)
-            if mel.shape[-1] == 0:
-                speech = mel.new_zeros((1, 1, 0))
-            else:
-                speech, _, _ = self.hift.inference(speech_feat=mel, finalize=True)
-            results.append(speech)
-        return results
+        return feat, lengths, prompt_lengths
 
     @torch.inference_mode()
     def forward(

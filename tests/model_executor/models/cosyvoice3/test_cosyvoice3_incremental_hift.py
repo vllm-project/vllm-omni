@@ -316,6 +316,29 @@ def test_finalize_matches_single_pass_length_exactly(config):
 
 
 @pytest.mark.parametrize("config", CONFIGS)
+def test_empty_final_chunk_releases_tail_without_replaying_audio(config):
+    """An EOF with no new mel must flush exactly the samples HiFT withheld."""
+    chunks = _chunks(total_mel=96, chunk_len=24)
+    reference_hift = _make_hift(config)
+    torch.manual_seed(0)
+    reference, _, _ = reference_hift.inference(speech_feat=torch.cat(chunks, dim=-1), finalize=True)
+
+    model = _make_model(_make_hift(config), window_len=64)
+    torch.manual_seed(0)
+    cache = None
+    emitted = []
+    for chunk in chunks:
+        speech, cache = model._stream_hift_from_feat(chunk, cache_state=cache, finalize=False)
+        emitted.append(speech.reshape(1, -1))
+    tail, cache = model._stream_hift_from_feat(chunks[-1][:, :, :0], cache_state=cache, finalize=True)
+    assert cache is None
+    assert tail.shape[-1] > 0
+    emitted.append(tail.reshape(1, -1))
+    streamed = torch.cat(emitted, dim=-1)
+    torch.testing.assert_close(streamed, reference.reshape(1, -1), atol=ATOL, rtol=RTOL)
+
+
+@pytest.mark.parametrize("config", CONFIGS)
 def test_incremental_hift_matches_reference_for_voiced_f0(config):
     """Forces F0 above nsf_voiced_threshold (untrained weights never trigger voiced,
     so no other test here does) and checks windowed output against the full-

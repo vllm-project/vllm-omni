@@ -1,6 +1,11 @@
 # Opt-in single-Hopper streaming profile: AR64 / codec16, Flow10.
 # Request stream=true to measure first audible audio; non-stream latency is not TTFP.
 # Keeps each request's HiFT mel/phase state on GPU and uses mainline GPU FP32 F0.
+# Non-final Flow hops reuse paged DiT prefixes; pool misses fully recompute.
+# The prefix pool and CUDA graphs allocate outside gpu_memory_utilization.
+# Flow graphs capture short layouts at startup and longer ones on first use.
+# Cached ISTFT avoids per-row host syncs; HiFT decode graphs remain opt-in.
+# Batched non-final HiFT windows overlap later Flow groups on a separate stream.
 # Shared serving settings come from the full-response profile; only chunk
 # boundaries, codec admission capacity, and stage environment differ.
 base_config: cosyvoice3_full_response.yaml
@@ -15,4 +20,9 @@ stages:
       COSYVOICE3_BATCH_FLOW: "1"
       COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS: "0"
       COSYVOICE3_PACKED_STREAMING: "1"
+      COSYVOICE3_FLOW_GRAPH: "1"
+      COSYVOICE3_FLOW_PREFIX_CACHE_GIB: "8"
+      COSYVOICE3_CACHED_ISTFT: "1"
+      COSYVOICE3_HIFT_BATCH: "1"
+      COSYVOICE3_HIFT_STREAM: "1"
     max_num_seqs: 16
