@@ -42,6 +42,7 @@ def _publish_memory_snapshots(connection):
     logger = OmniPrometheusStatLogger.__new__(OmniPrometheusStatLogger)
     logger._omni_per_engine_labelvalues = {index: ["m", "1", str(index)] for index in (0, 1)}
     logger._init_stage_post_warmup_memory_families()
+    connection.send("ready")
     while (command := connection.recv()) is not None:
         engine_idx, allocated, reserved, timestamp = command
         with patch("prometheus_client.metrics.time.time", return_value=timestamp):
@@ -66,6 +67,8 @@ def test_memory_snapshots_aggregate_shared_frontends(monkeypatch, tmp_path):
         process.start()
         child.close()
         frontends.append((process, parent))
+        assert parent.poll(180), f"Snapshot writer did not initialize (exitcode={process.exitcode})"
+        assert parent.recv() == "ready"
         return process, parent
 
     def publish(frontend, replica, allocated, reserved, timestamp):
