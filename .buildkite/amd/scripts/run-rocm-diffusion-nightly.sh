@@ -114,10 +114,20 @@ import sys
 import xml.etree.ElementTree as ET
 
 root = ET.parse(sys.argv[1]).getroot()
+if root.tag not in {"testsuite", "testsuites"}:
+    raise SystemExit(5)
 suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
 counts = {key: sum(int(s.attrib.get(key, 0)) for s in suites) for key in ("tests", "failures", "errors", "skipped")}
-print(counts)
-if counts["tests"] != int(sys.argv[2]) or any(counts[key] for key in ("failures", "errors", "skipped")):
+# pytest 9 includes subtests in the suite total. Collection counts top-level
+# cases, so compare testcase elements while retaining every failure/skip gate.
+cases = [case for suite in suites for case in suite.findall("testcase")]
+print({**counts, "testcases": len(cases)})
+if (
+    len(cases) != int(sys.argv[2])
+    or counts["tests"] < len(cases)
+    or any(counts[key] for key in ("failures", "errors", "skipped"))
+    or any(element.tag in {"failure", "error", "skipped"} for case in cases for element in case.iter())
+):
     raise SystemExit(5)
 PY
 junit_status=$?

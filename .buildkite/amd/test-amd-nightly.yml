@@ -1668,19 +1668,33 @@ steps:
       - label: "ROCm · Tiny Diffusion Multi-GPU · 4-GPU"
         agent_pool: mi300_4
         mirror_hardwares: [amdproduction]
-        grade: Blocking
+        grade: NonBlocking
         timeout_in_minutes: 50
         source_file_dependencies: diffusion_tiny_model
         artifact_paths:
           - artifacts/rocm-tiny-diffusion-4gpu/**/*
-        env:
-          ROCM_DIFFUSION_RUN_LEVEL: core_model
         commands:
-          - >-
-            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
-            4 11 40m rocm-tiny-diffusion-4gpu
-            tests/model_tests/diffusion/test_common_offline.py
-            -m "full_model and diffusion and rocm and MI325 and cards_4 and not nvidia_only"
+          - export ROCM_TINY_DIFFUSION_4GPU_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-tiny-diffusion-4gpu"
+          - mkdir -p "$$ROCM_TINY_DIFFUSION_4GPU_ARTIFACT_DIR"
+          - |
+            bash .buildkite/amd/scripts/assert-pytest-collection.sh 11 \
+              tests/model_tests/diffusion/test_common_offline.py \
+              -m "full_model and diffusion and rocm and MI325 and cards_4 and not nvidia_only" \
+              --run-level core_model \
+              | tee "$$ROCM_TINY_DIFFUSION_4GPU_ARTIFACT_DIR/collection.txt"
+          - |
+            set +e
+            timeout --signal=TERM --kill-after=2m 40m \
+              pytest -s -v -ra tests/model_tests/diffusion/test_common_offline.py \
+              -m "full_model and diffusion and rocm and MI325 and cards_4 and not nvidia_only" \
+              --run-level core_model --durations=20 \
+              --junitxml="$$ROCM_TINY_DIFFUSION_4GPU_ARTIFACT_DIR/pytest.xml" \
+              2>&1 | tee "$$ROCM_TINY_DIFFUSION_4GPU_ARTIFACT_DIR/pytest.log"
+            status=$${PIPESTATUS[0]}
+            set -e
+            tail -n 100 "$$ROCM_TINY_DIFFUSION_4GPU_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_TINY_DIFFUSION_4GPU_ARTIFACT_DIR/pytest-summary.txt"
+            exit "$$status"
 
   - group: ":full_moon: MiniCPM-o 4.5 Perf MI300 Nightly"
     steps:

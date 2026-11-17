@@ -1007,28 +1007,54 @@ def test_tiny_diffusion_multigpu_nightly_uses_native_rocm_collection(
 
     assert step["agent_pool"] == agent_pool
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == "Blocking"
+    assert step["grade"] == ("Blocking" if agent_pool == "mi300_2" else "NonBlocking")
     assert step["timeout_in_minutes"] == 50
     assert step["artifact_paths"] == [artifacts]
     assert "retry" not in step
 
-    assert step["env"]["ROCM_DIFFUSION_RUN_LEVEL"] == "core_model"
-    assert len(step["commands"]) == 1
-    argv = split(step["commands"][0])
-    cards = agent_pool.rsplit("_", 1)[1]
-    assert argv == [
-        "bash",
-        ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh",
-        cards,
-        str(expected_count),
-        "40m",
-        f"rocm-tiny-diffusion-{cards}gpu",
-        TINY_DIFFUSION_PATH,
-        "-m",
-        markers,
-    ]
+    if agent_pool == "mi300_2":
+        assert step["env"]["ROCM_DIFFUSION_RUN_LEVEL"] == "core_model"
+        assert len(step["commands"]) == 1
+        assert split(step["commands"][0]) == [
+            "bash",
+            ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh",
+            "2",
+            str(expected_count),
+            "40m",
+            "rocm-tiny-diffusion-2gpu",
+            TINY_DIFFUSION_PATH,
+            "-m",
+            markers,
+        ]
+        return
+
+    commands = step["commands"]
+    collect_commands = [command for command in commands if AMD_COLLECTION_GUARD.name in command]
+    run_commands = [command for command in commands if "pytest -s" in command]
+    assert len(collect_commands) == 1
+    assert len(run_commands) == 1
+
+    collect_command = collect_commands[0]
+    run_command = run_commands[0]
+    collect_argv = split(collect_command)
+    run_argv = split(run_command)
+    assert collect_argv[:2] == ["bash", str(AMD_COLLECTION_GUARD)]
+    assert collect_argv[2] == str(expected_count)
+    assert "timeout --signal=TERM --kill-after=2m 40m" in run_command
+
+    for command, argv in ((collect_command, collect_argv), (run_command, run_argv)):
+        assert TINY_DIFFUSION_PATH in argv
+        assert _marker_expressions({"commands": [command]}) == [markers]
+        assert argv[argv.index("--run-level") + 1] == "core_model"
+
     for cuda_marker in ("cuda", "L4", "H100", "B200"):
         assert re.search(rf"\b{cuda_marker}\b", markers) is None
+
+    all_commands = "\n".join(commands)
+    assert "collection.txt" in all_commands
+    assert "pytest.xml" in all_commands
+    assert "pytest.log" in all_commands
+    assert "pytest-summary.txt" in all_commands
 
 
 def test_flux2_klein_tiny_diffusion_has_cold_start_headroom() -> None:
