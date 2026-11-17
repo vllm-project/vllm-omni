@@ -7,6 +7,7 @@
 #   publish-release-images.sh            # release mode (default)
 #   publish-release-images.sh release
 #   publish-release-images.sh nightly
+#   publish-release-images.sh {release|nightly} xpu   # vllm/vllm-omni-xpu, x86_64 only
 #
 # Release tags: latest, v<version>
 # Nightly tags: nightly, nightly-<commit>
@@ -14,8 +15,9 @@
 set -euo pipefail
 
 MODE="${1:-release}"
+VARIANT="${2:-}"
 
-DOCKERHUB_REPO="vllm/vllm-omni"
+DOCKERHUB_REPO="vllm/vllm-omni${VARIANT:+-$VARIANT}"
 ECR_REPO="public.ecr.aws/q9t5s3a7/vllm-omni-release-repo"
 COMMIT="$BUILDKITE_COMMIT"
 PRIMARY_TAGS=()
@@ -52,6 +54,18 @@ echo "========================================"
 
 aws ecr-public get-login-password --region us-east-1 | \
   docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7
+
+# A variant image has one architecture, so it gets plain tags, no manifest.
+if [ -n "${VARIANT}" ]; then
+  SRC="${ECR_REPO}:${COMMIT}-${VARIANT}"
+  docker pull "${SRC}"
+  for tag in "${PRIMARY_TAGS[@]}" ${EXTRA_MANIFEST_TAGS[@]+"${EXTRA_MANIFEST_TAGS[@]}"}; do
+    docker tag "${SRC}" "${DOCKERHUB_REPO}:${tag}"
+    docker push "${DOCKERHUB_REPO}:${tag}"
+  done
+  echo "Successfully published ${MODE} ${VARIANT} images"
+  exit 0
+fi
 
 SRC_X86="${ECR_REPO}:${COMMIT}-x86_64"
 SRC_ARM="${ECR_REPO}:${COMMIT}-aarch64"

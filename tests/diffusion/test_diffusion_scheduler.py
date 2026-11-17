@@ -14,7 +14,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCache
 from vllm.v1.outputs import KVConnectorOutput
 
 from tests.helpers.kv_layout import build_kv_cache_tensor
-from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, InvalidAttentionScheduleError
 from vllm_omni.diffusion.data import (
     AttentionConfig,
     AttentionScheduleConfig,
@@ -36,6 +36,7 @@ from vllm_omni.diffusion.sched import (
 )
 from vllm_omni.diffusion.sched.interface import CachedRequestData, NewRequestData, SchedulerRequestState
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import PER_SAMPLE_KV_COUNT_KEY
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -189,6 +190,7 @@ async def test_single_native_kv_failure_reaches_output_stream(mocker, scheduler_
             side_effect=KVTransferRegistrationError("registration failed"),
         )
     engine = object.__new__(DiffusionEngine)
+    engine._request_chunk_states = {}
     engine.scheduler = scheduler
     engine.od_config = SimpleNamespace(diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER)
     engine.execution_mode = (
@@ -393,6 +395,57 @@ class TestGetStepBatchSamplingParamsKey:
         b.batch_compatibility_key = ("bagel_cfg", 4.0)
 
         assert scheduler._build_sampling_params_key(a) != scheduler._build_sampling_params_key(b)
+
+    @staticmethod
+    def _make_stacked(
+        lora_int_ids: list[int],
+        lora_scales: list[float],
+    ) -> OmniDiffusionRequest:
+        from vllm_omni.lora.request import LoRARequest
+
+        sp = OmniDiffusionSamplingParams(num_inference_steps=2)
+        sp.lora_request = [
+            LoRARequest(
+                lora_name=f"adapter-{lora_int_id}",
+                lora_int_id=lora_int_id,
+                lora_path=f"/tmp/lora-{lora_int_id}",
+            )
+            for lora_int_id in lora_int_ids
+        ]
+        sp.lora_scale = lora_scales
+        return OmniDiffusionRequest(
+            prompt="prompt",
+            sampling_params=sp,
+            request_id=f"req-stacked-{'-'.join(map(str, lora_int_ids))}",
+        )
+
+    def test_stacked_lora_list_order_invariant(self) -> None:
+        """The same adapter combination in different list order batches together."""
+        scheduler = _ConcreteScheduler()
+        a = scheduler._build_sampling_params_key(self._make_stacked([1, 2], [0.5, 1.0]))
+        b = scheduler._build_sampling_params_key(self._make_stacked([2, 1], [1.0, 0.5]))
+        assert a == b
+
+    def test_stacked_lora_matches_equivalent_single(self) -> None:
+        """A single-element LoRA list batches together with the scalar form."""
+        scheduler = _ConcreteScheduler()
+        a = scheduler._build_sampling_params_key(self._make(lora_int_id=1, lora_scale=0.5))
+        b = scheduler._build_sampling_params_key(self._make_stacked([1], [0.5]))
+        assert a == b
+
+    def test_stacked_lora_distinguishes_combination_and_scale(self) -> None:
+        scheduler = _ConcreteScheduler()
+        base = scheduler._build_sampling_params_key(self._make_stacked([1, 2], [0.5, 1.0]))
+        assert base != scheduler._build_sampling_params_key(self._make_stacked([1, 3], [0.5, 1.0]))
+        assert base != scheduler._build_sampling_params_key(self._make_stacked([1, 2], [0.6, 1.0]))
+        assert base != scheduler._build_sampling_params_key(self._make(lora_int_id=1, lora_scale=0.5))
+
+    def test_stacked_lora_scale_rounding(self) -> None:
+        """Scales are rounded to 4 decimals before grouping."""
+        scheduler = _ConcreteScheduler()
+        a = scheduler._build_sampling_params_key(self._make_stacked([1], [0.50001]))
+        b = scheduler._build_sampling_params_key(self._make_stacked([1], [0.50002]))
+        assert a == b
 
     @pytest.mark.parametrize(("first", "second", "same_batch"), _ATTENTION_SCHEDULE_KEY_CASES)
     def test_attention_schedule_identity(self, first, second, same_batch) -> None:
@@ -747,8 +800,9 @@ class TestRequestScheduler:
         mocker.patch.object(
             self.scheduler,
             "_can_schedule_waiting",
-            side_effect=lambda state: can_schedule(state)
-            and not (state.request_id == "deferred" and manager.has_request("deferred")),
+            side_effect=lambda state: (
+                can_schedule(state) and not (state.request_id == "deferred" and manager.has_request("deferred"))
+            ),
         )
         for request_id in ("admitted", "deferred"):
             request = _make_request(request_id)
@@ -1065,6 +1119,7 @@ class TestRequestScheduler:
             self.scheduler.add_request(req)
         scheduled = self.scheduler.schedule()
         engine = object.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         engine.scheduler = self.scheduler
         engine.od_config = SimpleNamespace(diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER)
         engine.abort_queue = queue.Queue()
@@ -1585,6 +1640,7 @@ class TestRequestScheduler:
 class TestDiffusionEngine:
     def test_add_req_and_wait_for_response_single_path(self, mocker: MockerFixture) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         engine.od_config = SimpleNamespace(streaming_output=False)
         engine.scheduler = RequestScheduler()
         engine.scheduler.initialize(SimpleNamespace())
@@ -1616,6 +1672,7 @@ class TestDiffusionEngine:
         scheduler = _StubScheduler(request, runner_output)
 
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         engine.od_config = SimpleNamespace(streaming_output=False)
         engine.scheduler = scheduler
         engine._rpc_lock = threading.RLock()
@@ -1709,6 +1766,7 @@ class TestDiffusionEngine:
     @pytest.mark.asyncio
     async def test_step_streaming_raises_aborted_error(self, mocker: MockerFixture) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         engine._check_and_start_background_loop = mocker.AsyncMock()
         request = _make_request("req-abort")
         prepared_layout = object()
@@ -1735,6 +1793,7 @@ class TestDiffusionEngine:
 
     def test_abort_queue_marks_request_finished_aborted(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         engine._rpc_lock = threading.RLock()
         engine._cv = threading.Condition(engine._rpc_lock)
         engine._closed = False
@@ -1750,6 +1809,7 @@ class TestDiffusionEngine:
 
     def test_finalize_finished_request_returns_aborted_output(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         engine._cv = threading.Condition()
         engine.scheduler = StepScheduler()
         engine.scheduler.initialize(SimpleNamespace())
@@ -1764,6 +1824,7 @@ class TestDiffusionEngine:
 
     def test_finalize_finished_request_returns_scheduler_admission_error(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         engine._cv = threading.Condition()
         engine.scheduler = StepScheduler()
         engine.scheduler.initialize(SimpleNamespace())
@@ -1781,6 +1842,7 @@ class TestDiffusionEngine:
     @pytest.mark.asyncio
     async def test_streaming_runner_output_notifies_each_chunk(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         engine.scheduler = StepScheduler()
         engine.scheduler.initialize(SimpleNamespace())
         engine._rpc_lock = threading.RLock()
@@ -1829,6 +1891,7 @@ class TestDiffusionEngine:
     @pytest.mark.asyncio
     async def test_finished_streaming_request_without_runner_output_notifies_waiter(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         engine.execution_mode = DiffusionExecutionMode.REQUEST_BATCH
         engine.scheduler = RequestScheduler()
         engine.scheduler.initialize(SimpleNamespace())
@@ -1880,6 +1943,7 @@ class TestDiffusionEngine:
 
     def test_dummy_run_raises_on_output_error(self, mocker: MockerFixture) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         engine.od_config = SimpleNamespace(model_class_name="mock_model", diffusion_load_format="default")
         engine.pre_process_func = None
         engine.add_req_and_wait_for_response = mocker.Mock(return_value=DiffusionOutput(error="boom"))
@@ -1889,6 +1953,7 @@ class TestDiffusionEngine:
 
     def test_dummy_run_delegates_preprocessing_to_sync_admission(self, mocker: MockerFixture) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         engine.od_config = SimpleNamespace(model_class_name="mock_model", diffusion_load_format="default")
         engine.pre_process_func = mocker.Mock()
         engine.add_req_and_wait_for_response = mocker.Mock(return_value=DiffusionOutput(output=None))
@@ -2375,6 +2440,33 @@ class TestStepScheduler:
         assert req_without not in admitted
         assert sched_output.num_waiting_reqs == 1
 
+    def test_step_batch_co_schedules_requests_sharing_lora_stack(self) -> None:
+        """Requests with the same stacked LoRA combination co-batch, regardless of list order."""
+        from vllm_omni.lora.request import LoRARequest
+
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=3))
+
+        lora_a = LoRARequest(lora_name="adapter-A", lora_int_id=1, lora_path="/tmp/lora-a")
+        lora_b = LoRARequest(lora_name="adapter-B", lora_int_id=2, lora_path="/tmp/lora-b")
+
+        def _with_loras(req_id: str, loras: list, scales: list[float]) -> OmniDiffusionRequest:
+            sp = OmniDiffusionSamplingParams(num_inference_steps=4)
+            sp.lora_request = loras
+            sp.lora_scale = scales
+            return _make_step_request(req_id, sampling_params=sp)
+
+        req_ab = scheduler.add_request(_with_loras("ab", [lora_a, lora_b], [0.5, 1.0]))
+        req_ba = scheduler.add_request(_with_loras("ba", [lora_b, lora_a], [1.0, 0.5]))
+        req_a = scheduler.add_request(_with_loras("a-only", [lora_a], [0.5]))
+
+        sched_output = scheduler.schedule()
+
+        admitted = _new_ids(sched_output)
+        assert admitted == [req_ab, req_ba]
+        assert req_a not in admitted
+        assert sched_output.num_waiting_reqs == 1
+
     def test_preempt_request_preserves_step_index(self) -> None:
         request = _make_step_request("preempt", num_inference_steps=3)
         req_id = self.scheduler.add_request(request)
@@ -2492,11 +2584,113 @@ def test_decode_only_stage_drops_the_request_schedule_copied_to_it(model_class_n
         ),
         request_id="req",
     )
+    sigma_request = OmniDiffusionRequest(
+        prompt="prompt",
+        sampling_params=OmniDiffusionSamplingParams(
+            num_inference_steps=1,
+            extra_args={"attention_sigma_schedule": [{"low": 0.0, "high": 1.0, "profile": "sparse"}]},
+        ),
+        request_id="sigma-req",
+    )
 
     if admitted:
         scheduler.add_request(request)
         assert request.sampling_params.attention_schedule is None
         assert "attention_schedule" not in request.sampling_params.extra_args
+        scheduler.add_request(sigma_request)
+        assert sigma_request.sampling_params.attention_sigma_schedule is None
+        assert "attention_sigma_schedule" not in sigma_request.sampling_params.extra_args
     else:
         with pytest.raises(ValueError, match="unknown profile"):
             scheduler.add_request(request)
+        with pytest.raises(ValueError, match="unknown profile"):
+            scheduler.add_request(sigma_request)
+
+
+# (stage_role, model_stage) of the Wan2.2 topology stages, plus deploy configs that set only the
+# legacy model_stage. All of them use the WanPipeline class.
+_WAN_STAGES_WITHOUT_DENOISING = [
+    pytest.param("encode", "text_encode", id="eg-egd-encode"),
+    pytest.param("decode", "decode", id="egd-decode"),
+    pytest.param(None, "text_encode", id="legacy-text-encode"),
+    pytest.param(None, "vae_decode", id="legacy-vae-decode"),
+]
+_WAN_DENOISING_STAGES = [
+    pytest.param("denoise", "denoise", id="egd-denoise"),
+    pytest.param("denoise_decode", "dit", id="eg-denoise-decode"),
+    pytest.param("full", "diffusion", id="single-stage"),
+    pytest.param(None, None, id="unset"),
+]
+
+
+def _wan_stage_scheduler(stage_role, model_stage, service) -> RequestScheduler:
+    scheduler = RequestScheduler()
+    scheduler.initialize(
+        OmniDiffusionConfig(
+            model_class_name="WanPipeline",
+            stage_role=stage_role,
+            model_stage=model_stage,
+            diffusion_attention_schedule=service,
+        )
+    )
+    return scheduler
+
+
+@pytest.mark.parametrize(("stage_role", "model_stage"), _WAN_STAGES_WITHOUT_DENOISING)
+def test_wan_stage_without_denoising_drops_the_request_schedule_copied_to_it(stage_role, model_stage) -> None:
+    """Video and chat endpoints copy the request's diffusion params to every Wan2.2 EG/EGD stage.
+
+    The request names a profile that only the denoising stage configures. The schedule is written into
+    extra_args after construction, which the inline stage client delivers unabsorbed.
+    """
+    scheduler = _wan_stage_scheduler(stage_role, model_stage, service=None)
+    sampling_params = OmniDiffusionSamplingParams(num_inference_steps=1)
+    sampling_params.extra_args["attention_schedule"] = [{"start": 0, "end": None, "profile": "sparse"}]
+    request = OmniDiffusionRequest(prompt="prompt", sampling_params=sampling_params, request_id="req")
+
+    scheduler.add_request(request)
+
+    assert request.sampling_params.attention_schedule is None
+    assert "attention_schedule" not in request.sampling_params.extra_args
+
+
+@pytest.mark.parametrize(("stage_role", "model_stage"), _WAN_DENOISING_STAGES)
+def test_denoising_wan_stage_keeps_and_validates_the_request_schedule(stage_role, model_stage) -> None:
+    scheduler = _wan_stage_scheduler(stage_role, model_stage, service=_attention_schedule_service())
+    known = OmniDiffusionRequest(
+        prompt="prompt",
+        sampling_params=OmniDiffusionSamplingParams(
+            num_inference_steps=1, attention_schedule=[{"start": 0, "end": None, "profile": "sparse"}]
+        ),
+        request_id="known",
+    )
+    unknown = OmniDiffusionRequest(
+        prompt="prompt",
+        sampling_params=OmniDiffusionSamplingParams(
+            num_inference_steps=1, attention_schedule=[{"start": 0, "end": None, "profile": "missing"}]
+        ),
+        request_id="unknown",
+    )
+
+    scheduler.add_request(known)
+    assert known.sampling_params.attention_schedule == (AttentionScheduleRange(start=0, end=None, profile="sparse"),)
+    with pytest.raises(InvalidAttentionScheduleError, match="unknown profile"):
+        scheduler.add_request(unknown)
+
+
+@pytest.mark.parametrize(("count", "prefetched"), [(1, True), (3, False)])
+def test_per_sample_kv_request_is_not_prefetched(count: int, prefetched: bool) -> None:
+    scheduler = RequestScheduler()
+    scheduler.initialize(
+        SimpleNamespace(request_batch_max_wait_ms=0.0, omni_kv_config={"enable_kv_async_prefetch": True})
+    )
+    for req_id in ("first", "next"):
+        request = _make_request(req_id)
+        request.kv_sender_info = {0: {"host": "127.0.0.1"}}
+        request.sampling_params.extra_args = {PER_SAMPLE_KV_COUNT_KEY: count}
+        scheduler.add_request(request)
+
+    job = scheduler.schedule().kv_prefetch_job
+
+    # Per-sample KV is received in the forward, one transfer per sample.
+    assert (job is not None and job["request_id"] == "next") is prefetched
