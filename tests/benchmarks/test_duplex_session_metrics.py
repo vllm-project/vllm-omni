@@ -329,14 +329,14 @@ def _stats_turn(turn_id, chunks, *, final=True, status="done"):
     return {"epoch": 0, "turn_id": turn_id, "status": status, "final": final, "chunks": chunks, "audio": []}
 
 
-def test_chunk_metrics_time_each_final_chunk_against_the_next_input() -> None:
+def test_chunk_metrics_time_each_final_chunk_against_the_input_period() -> None:
     stats = {
         "turns": [
-            # Done long before the next input at 1000: no overrun.
+            # 300 ms in the engine against a 1000 ms period: on time.
             _stats_turn(0, [_stats_chunk(1, 0, 300, {0: [(20, 200)]})], status="listen"),
-            # Still in the engine at 2300 when the next input arrived at 2000.
+            # 1300 ms in the engine: the next unit had to wait.
             _stats_turn(1, [_stats_chunk(2, 1000, 2300, {0: [(1100, 900)], 1: [(1900, 400)]})]),
-            # An open turn: no row of its own, but its input still marks chunk 2's deadline.
+            # An open turn: no row of its own, but its submission still counts for the period.
             _stats_turn(2, [_stats_chunk(3, 2000, None, {})], final=False, status="open"),
         ]
     }
@@ -346,19 +346,36 @@ def test_chunk_metrics_time_each_final_chunk_against_the_next_input() -> None:
     assert [(row["turn_id"], row["seq"]) for row in rows] == [(0, 1), (1, 2)]
     assert [row["in_engine_ms"] for row in rows] == [300.0, 1300.0]
     assert [row["queue_ms"] for row in rows] == [20.0, 100.0]
+    assert [row["input_period_ms"] for row in rows] == [1000.0, 1000.0]
     assert [row["overrun"] for row in rows] == [False, True]
 
 
-def test_chunk_metrics_leave_the_last_chunk_and_spanless_chunks_unjudged() -> None:
+def test_an_extra_append_right_behind_a_unit_is_not_an_overrun() -> None:
+    # Units every second; a camera frame appended on its own 3 ms after the
+    # second one. The unit at 1000 is done long before the next second.
+    chunks = [
+        _stats_chunk(1, 0, 100, {0: [(0, 100)]}),
+        _stats_chunk(2, 1000, 1400, {0: [(1000, 400)]}),
+        _stats_chunk(3, 1003, 1100, {0: [(1003, 97)]}),
+        _stats_chunk(4, 2000, 2100, {0: [(2000, 100)]}),
+        _stats_chunk(5, 3000, 3100, {0: [(3000, 100)]}),
+    ]
+
+    rows = session_stats_chunk_metrics({"turns": [_stats_turn(0, chunks)]})
+
+    assert rows[1]["input_period_ms"] == 998.5
+    assert [row["overrun"] for row in rows] == [False] * 5
+
+
+def test_chunk_metrics_leave_spanless_chunks_and_lone_chunks_unjudged() -> None:
     stats = {
         "turns": [
             _stats_turn(
                 0,
                 [
                     _stats_chunk(1, 0, 40, {0: [(10, 30)]}),
-                    # No stage span: no engine time, even with a next submission.
+                    # No stage span: no engine time.
                     _stats_chunk(2, 1000, 1000, {}),
-                    # The session's last chunk has nothing to be late for.
                     _stats_chunk(3, 2000, 2050, {0: [(2000, 50)]}),
                 ],
             )
@@ -367,16 +384,16 @@ def test_chunk_metrics_leave_the_last_chunk_and_spanless_chunks_unjudged() -> No
 
     rows = session_stats_chunk_metrics(stats)
 
-    assert [row["overrun"] for row in rows] == [False, None, None]
+    assert [row["overrun"] for row in rows] == [False, None, False]
     assert (rows[1]["in_engine_ms"], rows[1]["queue_ms"]) == (None, None)
     assert rows[2]["in_engine_ms"] == 50.0
     # An audio turn without the vocoder's spans would time its chunks short, as busy RTF would read low.
     speaking = {**_stats_turn(1, [_stats_chunk(4, 3000, 3100, {0: [(3010, 90)]})]), "audio": [_audio(500.0)]}
     staged = {"stages": [{"stage_id": 0}, {"stage_id": 2}], "turns": [*stats["turns"], speaking]}
-    staged_rows = session_stats_chunk_metrics(staged)
-    assert [row["seq"] for row in staged_rows] == [1, 2, 3]
-    # Its input still arrived: chunk 3 now has a next submission.
-    assert staged_rows[2]["overrun"] is False
+    assert [row["seq"] for row in session_stats_chunk_metrics(staged)] == [1, 2, 3]
+    # One chunk gives no period to judge against.
+    (lone,) = session_stats_chunk_metrics({"turns": [_stats_turn(0, [_stats_chunk(1, 0, 40, {0: [(0, 40)]})])]})
+    assert (lone["in_engine_ms"], lone["input_period_ms"], lone["overrun"]) == (40.0, None, None)
     assert session_stats_chunk_metrics(None) == []
     assert session_stats_chunk_metrics({"turns": None}) == []
 

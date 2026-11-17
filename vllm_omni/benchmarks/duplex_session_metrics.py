@@ -11,9 +11,9 @@ per-session ``stream_*`` values into a run-level report.
 
 from __future__ import annotations
 
-import bisect
 import json
 import math
+import statistics
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -235,18 +235,18 @@ def session_stats_chunk_metrics(session_stats: Mapping[str, object] | None) -> l
     """One row per chunk of the snapshot's final turns, in submission order.
 
     ``in_engine_ms`` is the chunk's ``[submitted_ns, done_ns]`` interval and
-    ``queue_ms`` the wait from submission to its first stage span. ``overrun``
-    says whether the chunk was still in the engine when the session's next chunk
-    was submitted. ``submitted_ns`` is when the server took the append off the
-    session queue, so a later unit's wait in that queue is not counted and an
-    overrun can only be missed, not invented. For model-native duplex, where a
-    chunk is one fixed-period input unit, an overrun is a unit the engine had
-    not finished when the next one was accepted; for turn-commit plugins a
-    chunk is a whole turn. The session's last chunk has no successor, and a
-    chunk with no stage span has no engine time: their fields are ``None``.
-    Chunks of turns that get no numbers from :func:`session_stats_turn_metrics`
-    (not final, or an audio turn missing a stage's spans) are left out, but
-    still mark when input arrived.
+    ``queue_ms`` the wait from submission to its first stage span.
+    ``input_period_ms`` is the session's median gap between chunk submissions:
+    with real-time input that is the unit period (about 1 s for MiniCPM-o on
+    Omni-DuplexEval), and an occasional extra append right behind a unit, such as
+    a camera frame sent on its own, does not move it. ``overrun`` is whether the
+    chunk spent longer than one period in the engine, so the units behind it had
+    to wait. For turn-commit plugins a chunk is a whole turn and the period is
+    the gap between turns. A chunk with no stage span has no engine time, and a
+    session with one chunk has no period: those fields are ``None``. Chunks of
+    turns that get no numbers from :func:`session_stats_turn_metrics` (not final,
+    or an audio turn missing a stage's spans) are left out, but their
+    submissions still count for the period.
     """
     turns = session_stats.get("turns") if session_stats is not None else None
     if not isinstance(turns, list):
@@ -267,26 +267,27 @@ def session_stats_chunk_metrics(session_stats: Mapping[str, object] | None) -> l
                 if final:
                     final_chunks.append((turn, chunk))
     submitted.sort()
+    gaps = [later - earlier for earlier, later in zip(submitted, submitted[1:])]
+    period_ns = statistics.median(gaps) if gaps else None
     rows: list[dict[str, object]] = []
     for turn, chunk in sorted(final_chunks, key=lambda item: item[1]["submitted_ns"]):
         submitted_ns = int(chunk["submitted_ns"])
-        done_ns = int(chunk["done_ns"])
+        in_engine_ns = int(chunk["done_ns"]) - submitted_ns
         starts = [
             int(span[0])
             for work in chunk.get("stage_work") or ()
             if isinstance(work, Mapping)
             for span in work.get("spans") or ()
         ]
-        later = bisect.bisect_right(submitted, submitted_ns)
-        next_ns = submitted[later] if later < len(submitted) else None
         rows.append(
             {
                 "epoch": turn.get("epoch"),
                 "turn_id": turn.get("turn_id"),
                 "seq": chunk.get("seq"),
-                "in_engine_ms": round((done_ns - submitted_ns) / 1e6, 3) if starts else None,
+                "in_engine_ms": round(in_engine_ns / 1e6, 3) if starts else None,
                 "queue_ms": round(max(0, min(starts) - submitted_ns) / 1e6, 3) if starts else None,
-                "overrun": done_ns > next_ns if starts and next_ns is not None else None,
+                "input_period_ms": round(period_ns / 1e6, 3) if period_ns else None,
+                "overrun": in_engine_ns > period_ns if starts and period_ns else None,
             }
         )
     return rows
