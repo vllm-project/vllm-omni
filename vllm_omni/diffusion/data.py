@@ -864,10 +864,23 @@ class DiffusionBatchingConfig:
 
     The ``compute_budget`` policy (DRR admission) is coupled to MixFusion:
     it requires ``enable_mixfusion=True`` and engine startup fails fast
-    otherwise. MixFusion can still run with the default ``fixed`` policy.
+    otherwise. The default ``auto`` policy enables DRR whenever MixFusion is
+    on, and falls back to ``fixed`` when it is off. Set ``policy="fixed"``
+    explicitly to keep MixFusion but disable DRR.
+
+    How the DRR budget is chosen:
+    - Explicit ``max_num_seqs > 1``: the user already stated how many
+      reference requests to run, so ``budget = max_num_seqs *
+      reference_compute_units`` (one 512x512 image by default) and neither
+      ``compute_unit_budget`` nor warmup calibration is used.
+    - ``max_num_seqs <= 1`` (the default "unset" sentinel): the policy uses
+      ``compute_unit_budget`` (optionally warmup-calibrated) and the
+      budget-derived request cap replaces the literal ``max_num_seqs``.
     """
 
-    policy: str = "fixed"
+    # "auto" enables DRR (compute_budget) whenever MixFusion is on and keeps
+    # the fixed FIFO policy otherwise. "fixed" disables DRR explicitly.
+    policy: str = "auto"
     compute_unit_budget: int = 10240
 
     # Qwen-Image packs VAE latents into 2x2 patches. The effective sequence
@@ -921,6 +934,12 @@ class DiffusionBatchingConfig:
         known_params = {k: v for k, v in data.items() if k in field_names}
         return cls(**known_params)
 
+    def resolve_policy(self, *, enable_mixfusion: bool) -> str:
+        """Resolve the default ``auto`` policy against the MixFusion flag."""
+        if self.policy == "auto":
+            return "compute_budget" if enable_mixfusion else "fixed"
+        return self.policy
+
     @property
     def uses_compute_budget(self) -> bool:
         return self.policy == "compute_budget"
@@ -959,6 +978,18 @@ class DiffusionBatchingConfig:
 
     def effective_compute_unit_budget(self) -> int:
         return max(1, int(self.compute_unit_budget))
+
+    def reference_compute_units(self) -> int:
+        """Compute units of one reference request (512x512 by default).
+
+        An explicit ``max_num_seqs > 1`` defines the DRR admission budget as
+        ``max_num_seqs * reference_compute_units``, i.e. each admitted slot is
+        worth one 512x512 image.
+        """
+        return max(
+            1,
+            self.spatial_compute_units(self.warmup_reference_height, self.warmup_reference_width),
+        )
 
     @staticmethod
     def _uses_true_cfg(sampling_params: Any, prompts: list[Any]) -> bool:

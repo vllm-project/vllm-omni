@@ -971,14 +971,23 @@ class OmniServeCommand(CLISubcommand):
             "--diffusion-batching-config",
             type=json.loads,
             default=None,
-            help=("JSON config for diffusion continuous-batching policy. Example: '{\"compute_unit_budget\":10240}'."),
+            help=(
+                "JSON config for diffusion continuous-batching policy. Example: "
+                "'{\"compute_unit_budget\":10240}'. With policy='compute_budget', an explicit "
+                "max_num_seqs > 1 sets the budget to max_num_seqs * 1024 compute units (one "
+                "512x512 image); otherwise compute_unit_budget is used and its derived request "
+                "cap replaces the default max_num_seqs=1."
+            ),
         )
         omni_config_group.add_argument(
             "--diffusion-batching-policy",
-            choices=["fixed", "compute_budget", "profile"],
+            choices=["auto", "fixed", "compute_budget", "profile"],
             default=None,
             help=(
-                "Diffusion batching policy. 'compute_budget' uses a profiled compute-unit budget; "
+                "Diffusion batching policy. 'auto' (default) enables DRR admission "
+                "(compute_budget) whenever MixFusion is on and uses fixed FIFO otherwise; "
+                "'compute_budget' (DRR admission, requires MixFusion) admits waiting requests "
+                "under a compute-unit budget; 'fixed' disables DRR even with MixFusion; "
                 "'profile' ramps batch size and logs data for profiling."
             ),
         )
