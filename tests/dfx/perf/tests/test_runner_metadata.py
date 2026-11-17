@@ -630,6 +630,22 @@ def test_resolve_baseline_value_errors():
         resolve_baseline_value({"1": 0.4}, sweep_index=0)
 
 
+def test_diffusion_benchmark_module_is_preloaded_by_name():
+    """Leave ``run_diffusion_benchmark`` bound on its parent package.
+
+    ``test_baseline_gate.py`` imports the submodule by name first, which also
+    sets the attribute on ``tests.dfx.perf.scripts``. The next test pops the
+    submodule from ``sys.modules`` and imports it again; that fresh import must
+    not reuse this stale package attribute. Definition order is what exercises
+    the regression, so keep this test directly above it.
+    """
+    import sys
+
+    from tests.dfx.perf.scripts import run_diffusion_benchmark
+
+    assert run_diffusion_benchmark is sys.modules["tests.dfx.perf.scripts.run_diffusion_benchmark"]
+
+
 def test_diffusion_build_run_params_resolves_baseline_per_sweep(tmp_path, monkeypatch):
     """``_build_run_params`` / ``_iter_sweep_runs`` narrow list baselines per concurrency."""
     import importlib
@@ -656,9 +672,11 @@ def test_diffusion_build_run_params_resolves_baseline_per_sweep(tmp_path, monkey
     )
     monkeypatch.setattr(sys, "argv", ["pytest", "--test-config-file", str(cfg)])
     sys.modules.pop("tests.dfx.perf.scripts.run_diffusion_benchmark", None)
-    from tests.dfx.perf.scripts import run_diffusion_benchmark as rdb
-
-    importlib.reload(rdb)
+    # Import the module object instead of the attribute bound on the parent
+    # package: a prior ``from ... import run_diffusion_benchmark`` leaves that
+    # attribute pointing at the module we just popped, and reloading it then
+    # fails with "module ... not in sys.modules".
+    rdb = importlib.import_module("tests.dfx.perf.scripts.run_diffusion_benchmark")
 
     params = {
         "name": "c_sweep",
