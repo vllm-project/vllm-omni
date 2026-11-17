@@ -1,4 +1,6 @@
-# Online FP8 Block Scaling on ROCm
+# Online FP8 on ROCm
+
+## Online block scaling
 
 ROCm can opt into finer online FP8 groups when per-tensor or fixed 128-block
 scaling loses too much diffusion quality. Set `online_block_size` to `32`,
@@ -43,3 +45,46 @@ supported with the Diffusers backend, DLO AllGather, or HSDP.
 
 See [FP8 quantization](fp8.md) for component scope, ignored-layer guidance,
 and serialized-checkpoint configuration.
+
+## Experimental MiniMax-H3-Image MLP FP8 with Hadamard64
+
+MiniMax-H3-Image can opt into online FP8 for its 100 MLP linears while keeping
+attention projections, text encoding, the image VAE and protected FP32 heads
+in their existing precision. The optional
+`minimax_h3_mlp_fp8_hadamard` boolean in `additional_config` adds a signed,
+normalized 64-point Hadamard rotation to the 50 MLP `fc2` input/weight pairs.
+Its default is `false`; enabling it also requires the explicit MLP-only
+quantization configuration below.
+
+Add these options to a working single-GPU MiniMax-H3-Image launch:
+
+```bash
+vllm serve <model-path> --omni \
+  --num-gpus 1 --usp 1 --ring 1 --text-encoder-tp-size 1 \
+  --additional-config '{"minimax_h3_mlp_fp8_hadamard":true}' \
+  --diffusion-quantization-config \
+  '{"default":null,"text_encoder":null,"vae":null,"transformer":{"method":"online","targets":{"re:blocks\\.[0-9]+\\.mlp\\.(fc1|fc2)":"fp8_per_channel"}}}'
+```
+
+The supported path uses a BF16 checkpoint, ROCm `gfx950`, TP1/SP1 and vLLM's
+online per-channel-weight/per-token-activation FP8 method with the row-wise
+Torch FP8 scaled-matrix-multiplication kernel. Keep weights resident; CPU
+offload, sleep mode, LoRA adapters and runtime weight updates are unsupported.
+Other quantization recipes,
+backends or feature combinations are rejected when the rotation is enabled.
+Keep `online_block_size` unset for this recipe. The value 64 specifies the
+rotation's channel-group size; the FP8 scaling remains per channel for weights
+and per token for activations.
+
+Weights rotate in FP32 during loading before FP8 conversion. At runtime one
+Triton kernel fuses activation rotation and FP8 quantization, retaining the
+native main FP8 GEMM without an extra GEMM or a materialized rotated activation.
+The matching input/weight rotations preserve the ideal matrix product; FP8
+rounding still changes model outputs.
+
+This is an experimental performance option, not a claim of BF16-equivalent
+accuracy. Controlled tests showed better mean SSIM/PSNR than ordinary MLP FP8,
+but some cases regressed and substantial BF16 differences remained. Validate
+the prompts, geometry and sampling settings required by your application.
+For a BF16 baseline, omit both the quantization configuration and the Hadamard
+option. Independent single-GPU replicas can each use this same configuration.

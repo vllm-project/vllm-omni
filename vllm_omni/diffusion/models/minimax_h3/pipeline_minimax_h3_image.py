@@ -33,7 +33,7 @@ from dataclasses import replace
 from itertools import groupby
 from math import sqrt
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
@@ -76,6 +76,9 @@ from .packed_tokens import minimax_h3_patchify_video_latent, minimax_h3_unpatchi
 from .pipeline_minimax_h3 import MiniMaxH3Pipeline, _broadcast_tensor, _dit_rank_world
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm_omni.lora.request import LoRARequest
 
 MINIMAX_H3_IMAGE_PIXEL_GRID = 32
 MINIMAX_H3_IMAGE_DEFAULT_MIN_GENERATION_AREA = 2048 * 2048
@@ -373,6 +376,9 @@ class MiniMaxH3ImagePipeline(
         )
         self.num_steps = len(self.pdd_sigmas) - 1
         additional = od_config.additional_config or {}
+        self._mlp_fp8_hadamard = additional.get("minimax_h3_mlp_fp8_hadamard", False)
+        if type(self._mlp_fp8_hadamard) is not bool:
+            raise ValueError("minimax_h3_mlp_fp8_hadamard must be a bool")
         self.min_generation_area: int | None = additional.get(
             "min_generation_area", MINIMAX_H3_IMAGE_DEFAULT_MIN_GENERATION_AREA
         )
@@ -394,6 +400,10 @@ class MiniMaxH3ImagePipeline(
 
         transformer_quant_config = resolve_component_quant_config(od_config.quantization_config, "transformer")
         self.transformer = MiniMaxH3DiTModel(od_config, quant_config=transformer_quant_config)
+        if self._mlp_fp8_hadamard:
+            from .hadamard_fp8 import install_fc2_hadamard_fp8
+
+            install_fc2_hadamard_fp8(self.transformer, od_config=od_config, device=self.device)
         if self.transformer.arch.audio_enabled:
             raise ValueError("MiniMax-H3-Image requires an audio-free DiT (audio_enabled: false)")
 
@@ -472,6 +482,15 @@ class MiniMaxH3ImagePipeline(
         logger.info("MiniMax-H3-Image: DiT stays eager; VAE tile decode uses CUDA graphs: %s", self._vae_cuda_graph)
 
     # -- checkpoint resolution ----------------------------------------------
+
+    def _load_diffusion_lora_adapter(
+        self, *, lora_request: LoRARequest, lora_path: str | Path, dtype: torch.dtype
+    ) -> None:
+        # Dynamic adapters arrive after construction. Their unrotated fc2
+        # factors cannot be combined with the rotated FP8 operand layout.
+        if self._mlp_fp8_hadamard:
+            raise ValueError("MiniMax-H3-Image Hadamard64 FP8 does not support LoRA adapters")
+        return None  # Retain the manager's ordinary adapter-loading path.
 
     @staticmethod
     def _resolve_model_root(model: str, revision: str | None) -> Path:

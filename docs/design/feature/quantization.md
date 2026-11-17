@@ -171,6 +171,15 @@ resolved through `quantization_config`; runtime attention/KV-cache quantization
 is configured by the diffusion attention configuration and must be validated
 independently.
 
+MiniMax-H3-Image's optional `minimax_h3_mlp_fp8_hadamard` transform is disabled
+by default and operates only on an explicitly selected online MLP-only FP8
+recipe. It does not select or override `quantization_config`. Its model-level
+integration validates the actual quantized-layer inventory and rejects
+unsupported platform, parallelism or loading combinations before installing
+matching activation/weight rotations. See the
+[ROCm FP8 guide](../../user_guide/quantization/rocm_online_fp8.md) for the supported
+recipe and numerical-quality limits.
+
 ## Platform and parallelism boundaries
 
 Platform checks belong in the method implementation rather than in the common
