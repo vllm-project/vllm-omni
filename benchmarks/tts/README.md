@@ -124,7 +124,7 @@ still hear gaps - common at high concurrency on streaming TTS pipelines.
 
 #### Add WER / SIM / UTMOS to any of the above
 
-Append `--seed-tts-wer-eval` (and optionally `SEED_TTS_EVAL_DEVICE=cuda:0`
+Append `--wer-eval` (and optionally `SEED_TTS_EVAL_DEVICE=cuda:0`
 in the env, per PR #2558). This triggers the seed-tts-eval protocol:
 Whisper-large-v3 ASR → WER, WavLM embeddings → SIM, balacoon/utmos → UTMOS.
 

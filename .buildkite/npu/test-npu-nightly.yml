@@ -89,7 +89,7 @@ steps:
           # in this process; the worker hides every card except that physical NPU
           # and rewrites cuda:0 onto npu:0 there. There is no numeric MOS floor
           # until an A3 run measures one.
-          - export SEED_TTS_WER_EVAL=1
+          - export WER_EVAL=1
           - export SEED_TTS_SIM_EVAL=1
           - export SEED_TTS_UTMOS_EVAL=1
           - export SEED_TTS_EVAL_DEVICE=npu:1
@@ -115,7 +115,7 @@ steps:
           # auto-picks npu:0, which the omni server under test already fills with its
           # KV cache (thinker TP=2 on npu:0-1, talker/code2wav on npu:2), so Whisper
           # OOMs on `.to(device)` and every clip reports "ASR / WER failed".
-          - export SEED_TTS_WER_EVAL=1
+          - export WER_EVAL=1
           - export SEED_TTS_SIM_EVAL=1
           - export SEED_TTS_EVAL_DEVICE=npu:3
           # UTMOS is intentionally off on A3: balacoon/utmos is not in the offline

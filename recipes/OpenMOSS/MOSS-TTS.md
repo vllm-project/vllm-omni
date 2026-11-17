@@ -451,7 +451,7 @@ entries. Run the native benchmark after the server is ready:
 ```bash
 export VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=48000
 export VLLM_OMNI_BENCH_AUDIO_CHANNELS=2
-export SEED_TTS_WER_EVAL=0
+export WER_EVAL=0
 
 for concurrency in 128; do
   for phase in warm r1 r2; do

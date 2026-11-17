@@ -69,7 +69,7 @@ for any streaming-quality claim.
 
 | Eval | How | Result keys |
 |------|-----|-------------|
-| Seed-TTS WER | `--dataset-name seed-tts --seed-tts-wer-eval` (needs `vllm-omni[dev]`) | `seed_tts_content_error_*` |
+| Seed-TTS WER | `--dataset-name seed-tts --wer-eval` (needs `vllm-omni[dev]`) | `seed_tts_content_error_*` |
 | Daily-Omni | `--dataset-name daily-omni` with `--daily-omni-qa-json`, `--daily-omni-video-dir`; `--daily-omni-pack-mode qwen\|minicpm-interleave` | `daily_omni_accuracy*` |
 | Video-MME | `--dataset-name videomme` | `videomme_accuracy*` |
 | OmniInteract (duplex) | `--backend openai-realtime-duplex --dataset-name omniinteract --endpoint /v1/realtime --omniinteract-evaluate` | IA-QTF1 etc. |

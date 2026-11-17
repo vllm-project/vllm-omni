@@ -121,7 +121,7 @@ steps:
           - artifacts/rocm-qwen3-omni-accuracy/**/*
           - tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json
         commands:
-          - export SEED_TTS_WER_EVAL=1
+          - export WER_EVAL=1
           # PyTorch ROCm uses the torch.cuda device namespace.
           - export SEED_TTS_EVAL_DEVICE=cuda:1
           - |
@@ -925,7 +925,7 @@ steps:
         timeout_in_minutes: 180
         source_file_dependencies: omni_minicpmo_4_5_accuracy
         env:
-          SEED_TTS_WER_EVAL: "1"
+          WER_EVAL: "1"
           SEED_TTS_SIM_EVAL: "1"
           VLLM_OMNI_CODE2WAV_WATCHDOG_TIMEOUT_S: "60"
         artifact_paths:

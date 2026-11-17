@@ -3257,7 +3257,7 @@ def test_minicpmo_accuracy_is_two_nonblocking_nightly_jobs() -> None:
             "ROCM_MINICPMO_SEED_ACCURACY_ARTIFACT_DIR",
             "Expected exactly one MiniCPM-o 4.5 Seed-TTS accuracy node",
             {
-                "SEED_TTS_WER_EVAL": "1",
+                "WER_EVAL": "1",
                 "SEED_TTS_SIM_EVAL": "1",
                 "VLLM_OMNI_CODE2WAV_WATCHDOG_TIMEOUT_S": "60",
             },
