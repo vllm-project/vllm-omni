@@ -2404,12 +2404,17 @@ class OrchestratorBase:
         if await self._intercept_stage_output(stage_id, replica_id, output, req_state, stage_metrics, submit_ts):
             return
 
+        partial_handoff = self._forwards_partial_outputs(stage_id, req_state)
         if (
-            (finished or segment_finished)
+            (finished or segment_finished or partial_handoff)
             and stage_id < req_state.final_stage_id
             and not req_state.skip_legacy_stage_forward
             and (not self.async_chunk or not self._stage_receives_async_chunks(stage_id + 1))
-            and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
+            and (
+                not self._next_stage_already_submitted(stage_id, req_state)
+                or req_state.streaming.enabled
+                or partial_handoff
+            )
         ):
             if (
                 finished
@@ -2417,6 +2422,23 @@ class OrchestratorBase:
                 and not self._cfg_tracker.all_companions_done(req_id)
             ):
                 self._cfg_tracker.defer_parent(req_id, output, stage_id)
+            elif partial_handoff:
+                # The next stage takes this stage's output as it grows: its
+                # request stays resumable, and the finish sends the last
+                # input followed by the terminal (resumable=False) update.
+                await self._forward_to_next_stage(
+                    req_id, stage_id, output, req_state, src_replica_id=replica_id, is_streaming_session=True
+                )
+                if finished and self.request_states.get(req_id) is req_state:
+                    await self._forward_to_next_stage(
+                        req_id,
+                        stage_id,
+                        output,
+                        req_state,
+                        src_replica_id=replica_id,
+                        is_streaming_session=True,
+                        is_final_update=True,
+                    )
             else:
                 stage_params = req_state.sampling_params_list[stage_id]
                 final_only_finished = (
@@ -2463,6 +2485,23 @@ class OrchestratorBase:
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
+
+    def _forwards_partial_outputs(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
+        """Whether the next stage's input processor takes this stage's unfinished outputs.
+
+        Opt-in per processor (``accepts_partial_source_outputs``), for plain
+        requests whose stage reports unfinished outputs at all: FINAL_ONLY
+        requests take the ordinary whole-output handoff, and streaming-input
+        and session-owned requests keep their own segment forwarding.
+        """
+        if req_state.streaming.enabled or req_state.session_owned or stage_id + 1 >= len(self.stage_pools):
+            return False
+        params = req_state.sampling_params_list[stage_id] if stage_id < len(req_state.sampling_params_list) else None
+        if getattr(params, "output_kind", None) == RequestOutputKind.FINAL_ONLY:
+            return False
+        next_client = self.stage_pools[stage_id + 1].stage_client
+        processor = getattr(next_client, "custom_process_input_func", None)
+        return bool(getattr(processor, "accepts_partial_source_outputs", False))
 
     def _stage_receives_async_chunks(self, stage_id: int) -> bool:
         """Whether a stage's connector supplies its runtime inputs."""
