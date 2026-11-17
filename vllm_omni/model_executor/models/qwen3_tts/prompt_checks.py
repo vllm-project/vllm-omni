@@ -35,10 +35,13 @@ _MISSING_TRANSCRIPT = (
     "Base task requires non-empty 'ref_text' (transcript of the reference audio) unless 'x_vector_only_mode' is enabled"
 )
 _NOT_TRANSPORTABLE = (
-    "Qwen3-TTS additional_information[{key!r}] holds a NumPy array or a tensor nested in a list or dict, which "
-    "does not reach the engine intact; pass plain Python lists (e.g. 'ref_audio': [[waveform.tolist(), sr]]) "
-    "or a file path/URL"
+    "Qwen3-TTS additional_information[{key!r}] holds a NumPy array or a tensor inside a list or dict, which does "
+    "not reach the engine intact; pass {fix}"
 )
+_TRANSPORTABLE_FORMS = {
+    "ref_audio": "a path/URL or the waveform as plain lists, e.g. ['ref.wav'] or [[waveform.tolist(), sr]]",
+    "voice_clone_prompt": "its values as plain Python lists",
+}
 
 
 def _is_text(value: object) -> bool:
@@ -49,8 +52,11 @@ def _has_array(value: object) -> bool:
     if isinstance(value, (torch.Tensor, np.ndarray)):
         return True
     if isinstance(value, dict):
-        value = list(value.values())
-    return isinstance(value, (list, tuple)) and any(_has_array(v) for v in value)
+        return any(_has_array(v) for v in value.values())
+    # A list starting with a plain number is taken as all numbers (e.g. a waveform) rather than walked.
+    if isinstance(value, (list, tuple)) and not (value and isinstance(value[0], (int, float))):
+        return any(_has_array(v) for v in value)
+    return False
 
 
 def _reaches_engine(value: object) -> bool:
@@ -71,7 +77,8 @@ def validate_voice_clone_request(info: Mapping[str, Any]) -> None:
         return
     for key in ("ref_audio", "voice_clone_prompt", "ref_ids", PRECOMPUTED_REF_IDS_KEY):
         if not _reaches_engine(info.get(key)):
-            raise ValueError(_NOT_TRANSPORTABLE.format(key=key))
+            fix = _TRANSPORTABLE_FORMS.get(key, "a top-level tensor or plain Python lists")
+            raise ValueError(_NOT_TRANSPORTABLE.format(key=key, fix=fix))
     ref_audio = info.get("ref_audio")
     has_ref_audio = isinstance(ref_audio, list) and bool(ref_audio) and ref_audio[0] is not None
     if has_ref_audio and isinstance(ref_audio[0], str):

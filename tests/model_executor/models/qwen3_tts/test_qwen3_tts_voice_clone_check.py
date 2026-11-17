@@ -16,7 +16,10 @@ from vllm_omni.engine.serialization import deserialize_additional_information, s
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import _ref_audio_wire_waveform
 from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_FUSED_PIPELINE, QWEN3_TTS_PIPELINE
 from vllm_omni.model_executor.models.qwen3_tts.prompt_checks import check_voice_clone_prompt
-from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import PRECOMPUTED_REF_IDS_KEY
+from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+    PRECOMPUTED_REF_IDS_KEY,
+    Qwen3TTSPromptEmbedsBuilder,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -27,6 +30,7 @@ AUDIO = ["ref.wav"]
 TEXT = ["Reference words."]
 SPK = [0.1] * 8
 CODE = torch.zeros(4, 16, dtype=torch.long)
+WAV = [0.0] * 1024  # The Talker's shortest usable reference waveform.
 IDS = torch.arange(100, 112).reshape(1, 12)
 
 
@@ -127,10 +131,10 @@ _USABLE_BASE = [
     pytest.param(_base(ref_audio=AUDIO, voice_clone_prompt=[{"ref_ids": IDS.tolist()}]), id="vcp-ref-ids"),
     # Intentionally passed to the Talker: it resolves a stored voice from a cache this check cannot see.
     pytest.param(_base(speaker=["stored"]), id="stored-speaker-no-ref-left-to-talker"),
+    pytest.param(_base(ref_audio=[[WAV, 24000]], ref_text=TEXT), id="plain-list-audio"),
     # Shapes the speech API's _build_tts_params sends.
-    pytest.param(_base(ref_audio=[[[0.0, 0.1], 24000]], ref_text=TEXT), id="api-inline-audio"),
     pytest.param(
-        _base(ref_audio=[[_ref_audio_wire_waveform(np.zeros(4, dtype=np.float32)), 24000]], ref_text=TEXT),
+        _base(ref_audio=[[_ref_audio_wire_waveform(np.asarray(WAV, dtype=np.float32)), 24000]], ref_text=TEXT),
         id="api-wire-audio",
     ),
     pytest.param(_base(voice_clone_prompt=[{"ref_spk_embedding": SPK}], x_vector_only_mode=[True]), id="api-embedding"),
@@ -186,6 +190,10 @@ def test_accepted_base_prompts_reach_the_engine_intact(prompt):
     for key, value in info.items():
         assert torch.equal(received[key], value) if isinstance(value, torch.Tensor) else received[key] == value, key
     check_voice_clone_prompt({**prompt, "additional_information": received}, [])
+    ref_audio = received.get("ref_audio")
+    if ref_audio is not None and not isinstance(ref_audio[0], str):
+        # The Talker decodes an inline waveform without loading anything.
+        object.__new__(Qwen3TTSPromptEmbedsBuilder).normalize_ref_audio(ref_audio[0])
 
 
 @pytest.mark.parametrize("pipeline", [QWEN3_TTS_PIPELINE, QWEN3_TTS_FUSED_PIPELINE], ids=lambda p: p.model_type)
