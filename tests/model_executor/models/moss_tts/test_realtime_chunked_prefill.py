@@ -275,3 +275,57 @@ def test_moss_realtime_local_transformer_incremental_kv_forwards_generators() ->
     assert torch.equal(actual, expected)
     for b_gen, s_gen in zip(batched_gens, solo_gens, strict=True):
         torch.testing.assert_close(b_gen.get_state(), s_gen.get_state())
+
+
+def test_moss_realtime_local_transformer_fp16_uses_reprefill_fallback() -> None:
+    import torch.nn as nn
+    from vllm.config import VllmConfig, set_current_vllm_config
+
+    from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import (
+        MossTTSLocalTransformerConfig,
+    )
+    from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local import (
+        MossTTSRealtimeLocalTransformer,
+    )
+
+    cfg = MossTTSLocalTransformerConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        vocab_size=128,
+        audio_vocab_size=32,
+        rvq=4,
+    )
+    with set_current_vllm_config(VllmConfig()):
+        local_tf = MossTTSRealtimeLocalTransformer(cfg).to(dtype=torch.float16).eval()
+        lm_heads = nn.ModuleList([nn.Linear(64, 32, bias=False).to(dtype=torch.float16) for _ in range(4)])
+
+    hidden = torch.randn((2, 64), dtype=torch.float16)
+    codes = local_tf.generate_frame(hidden, lm_heads, do_sample=False)
+    assert codes.shape == (2, 4)
+    assert local_tf._kv_buf is None
+
+
+def test_moss_realtime_talker_mrv2_enables_full_cuda_graph_capture() -> None:
+    import torch.nn as nn
+
+    from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import (
+        MossTTSRealtimeTalkerForGeneration,
+    )
+    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+    model = object.__new__(MossTTSRealtimeTalkerForGeneration)
+    nn.Module.__init__(model)
+    assert model.have_multimodal_outputs is True
+    assert model.mrv2_forward_returns_tensor is True
+
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = model
+    runner._configure_cudagraph_output_contract()
+
+    assert runner._model_has_structured_output is False
+    assert runner._full_graph_aux_outputs is False
+    assert runner._exclude_full_graph is False

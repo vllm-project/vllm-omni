@@ -784,6 +784,8 @@ class MossTTSCodecDecoder(nn.Module):
                 },
             )
 
+        # MRv2 OmniModelState.prepare_dummy_inputs and empty dummy slots pass {}
+        # without _is_dummy; real scheduled requests always carry req_id / meta.
         if self._async_chunk and all(not info or info.get("_is_dummy") for info in info_list):
             return OmniOutput(
                 text_hidden_states=None,

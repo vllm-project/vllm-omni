@@ -152,6 +152,8 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
 
         codec_embeds = self.model.codec_embedding
         codes = backbone_last_hidden.new_zeros((B, rvq), dtype=torch.long)
+        # CodePredictorBaseModel upcasts float16 inputs to float32 under autocast,
+        # whereas a float16 KV buffer truncates cached K/V; keep re-prefill there.
         use_kv_cache = hasattr(self.model, "forward_cached") and backbone_last_hidden.dtype != torch.float16
 
         if use_kv_cache:
