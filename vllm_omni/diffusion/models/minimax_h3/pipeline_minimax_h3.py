@@ -1428,7 +1428,11 @@ class MiniMaxH3Pipeline(
         try:
             if encode_only:
                 self.video_vae = video_factory(
-                    encode_only=True, decode_only=False, decoder_source=None, lightvae_decoder_path=None, pin_memory=False
+                    encode_only=True,
+                    decode_only=False,
+                    decoder_source=None,
+                    lightvae_decoder_path=None,
+                    pin_memory=False,
                 )
             else:
                 # Reuse full native loading, including the unused video encoder.

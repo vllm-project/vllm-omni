@@ -70,6 +70,7 @@ def test_encoder_non_block_children_use_one_shared_snapshot_stager(monkeypatch, 
     class TextStack(torch.nn.Module):
         def __init__(self):
             super().__init__()
+            self.block_offloader = None
             self.embed_tokens = torch.nn.Embedding(4, 2)
             self.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)])
 

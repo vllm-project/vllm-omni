@@ -167,6 +167,7 @@ def test_forward_releases_video_after_quantization_and_before_next_seed(monkeypa
         _offload_model_cpu_stage_output=_recording_release(events, releases),
         _release_stage_cache=lambda: None,
     )
+    pipeline._file_backed_vaes = MiniMaxH3Pipeline._file_backed_vaes.__get__(pipeline)
     request = SimpleNamespace(prompts=["a prompt"], sampling_params=SimpleNamespace())
 
     output = MiniMaxH3Pipeline.forward(pipeline, request)
@@ -218,6 +219,7 @@ def test_forward_drops_the_decoded_video_before_the_next_seed_diffuses(monkeypat
         _offload_model_cpu_stage_output=lambda value: value.clone(),
         _release_stage_cache=lambda: None,
     )
+    pipeline._file_backed_vaes = MiniMaxH3Pipeline._file_backed_vaes.__get__(pipeline)
     request = SimpleNamespace(prompts=["a prompt"], sampling_params=SimpleNamespace())
 
     MiniMaxH3Pipeline.forward(pipeline, request)
