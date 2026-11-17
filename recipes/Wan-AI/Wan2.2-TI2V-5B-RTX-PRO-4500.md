@@ -147,13 +147,16 @@ nb_read_frames=121
 ```
 
 The synchronous response headers and an independent 200 ms `nvidia-smi`
-sampler produced these results on the first T2V and I2V requests after
-server startup:
+sampler produced these results after one 2-step warmup request per task
+(same resolution and frame count):
 
 | Task | HTTP | `X-Inference-Time-S` | Server peak | Observed device peak | MP4 size |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| T2V | 200 | 529.817 s | 25,478 MB | 26,135 MiB | 6,680,214 bytes |
-| I2V | 200 | 563.678 s | 29,370 MB | 29,766 MiB | 9,887,628 bytes |
+| T2V | 200 | 523.954 s | 27,430 MB | 28,087 MiB | 6,680,214 bytes |
+| I2V | 200 | 559.184 s | 29,460 MB | 29,856 MiB | 9,887,628 bytes |
+
+First requests without warmup were within about 1% of these times
+(529.817 s T2V, 563.678 s I2V).
 
 Both outputs were decoded in full and visually inspected. The T2V output
 contained the prompted boxing cats. The I2V first frame preserved the uploaded
@@ -162,11 +165,12 @@ cherry-blossom scene, and later frames showed motion.
 ## Notes
 
 - Memory: model loading used 21.2239 GiB. The measured I2V device peak was
-  29,766 MiB, leaving about 2.8 GiB free on this 32 GB card. Native 720p runs
+  29,856 MiB, leaving about 2.7 GiB free on this 32 GB card. Native 720p runs
   without CPU or layerwise offload, but with little headroom; concurrent
   requests and higher resolutions are not qualified on this profile.
-- Speed: per-clip inference time was about 1.85x the A100 80GB profile
-  (529.8 s vs 288.3 s for T2V, 563.7 s vs 299.4 s for I2V) at identical settings.
+- Speed: post-warmup inference time was about 1.82x (T2V) and 1.87x (I2V)
+  the A100 80GB profile at identical settings (523.95 s vs 288.27 s,
+  559.18 s vs 299.44 s).
 - Attention backend: vLLM-Omni selects `CUDNN_ATTN` by default on Blackwell
   sm_120 (cuDNN 9.25.1, head_dim 128). The A100 profile used FlashAttention.
 - Startup: model loading took 349.2 s (241.9 s reading weights from a
@@ -180,6 +184,7 @@ cherry-blossom scene, and later frames showed motion.
   separately warming and measuring compiled mode.
 - `flow_shift=5.0` is the 720p setting. The shared 480p examples use 12.0.
 - The generated MP4 contains video only; this checkpoint does not generate audio.
+- Repeated runs with seed 42 produced byte-identical MP4 outputs
 
 ## Supported features
 
@@ -189,5 +194,5 @@ cherry-blossom scene, and later frames showed motion.
 | VAE tiling | Enabled and qualified on one RTX PRO 4500 | [VAE parallelism and tiling](../../docs/user_guide/diffusion/parallelism/vae_parallelism.md) |
 | Cache-DiT / TaylorSeer | Available but not enabled in the measurements above | [Cache-DiT](../../docs/user_guide/diffusion/cache_acceleration/cache_dit.md) |
 | TeaCache | Available but not qualified in this recipe | [TeaCache](../../docs/user_guide/diffusion/cache_acceleration/teacache.md) |
-| CPU or layerwise offload | Not needed; the I2V peak leaves about 2.8 GiB free on 32 GB | [CPU offload](../../docs/user_guide/diffusion/cpu_offload.md) |
+| CPU or layerwise offload | Not needed; the I2V peak leaves about 2.7 GiB free on 32 GB | [CPU offload](../../docs/user_guide/diffusion/cpu_offload.md) |
 | TP / SP / CFG parallelism | Not applicable to this single-GPU profile | [Parallelism overview](../../docs/user_guide/diffusion/parallelism/overview.md) |
