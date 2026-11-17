@@ -248,31 +248,32 @@ def session_stats_chunk_metrics(session_stats: Mapping[str, object] | None) -> l
     or an audio turn missing a stage's spans) are left out, but their
     submissions still count for the period.
     """
-    turns = session_stats.get("turns") if session_stats is not None else None
-    if not isinstance(turns, list):
+    if session_stats is None or not isinstance(turns := session_stats.get("turns"), list):
         return []
     stages = session_stats.get("stages")
     stage_ids = (
         [stage["stage_id"] for stage in stages if isinstance(stage, Mapping)] if isinstance(stages, list) else None
     )
     submitted: list[int] = []
-    final_chunks: list[tuple[Mapping[str, object], Mapping[str, object]]] = []
+    final_chunks: list[tuple[int, Mapping[str, object], Mapping[str, object]]] = []
     for turn in turns:
-        if not isinstance(turn, Mapping) or not isinstance(turn.get("chunks"), list):
+        if not isinstance(turn, Mapping) or not isinstance(chunks := turn.get("chunks"), list):
             continue
         final = session_stats_turn_metrics(turn, stage_ids=stage_ids)["final"] is True
-        for chunk in turn["chunks"]:
-            if isinstance(chunk, Mapping) and isinstance(chunk.get("submitted_ns"), int):
-                submitted.append(chunk["submitted_ns"])
+        for chunk in chunks:
+            if isinstance(chunk, Mapping) and isinstance(submitted_ns := chunk.get("submitted_ns"), int):
+                submitted.append(submitted_ns)
                 if final:
-                    final_chunks.append((turn, chunk))
+                    final_chunks.append((submitted_ns, turn, chunk))
     submitted.sort()
     gaps = [later - earlier for earlier, later in zip(submitted, submitted[1:])]
     period_ns = statistics.median(gaps) if gaps else None
     rows: list[dict[str, object]] = []
-    for turn, chunk in sorted(final_chunks, key=lambda item: item[1]["submitted_ns"]):
-        submitted_ns = int(chunk["submitted_ns"])
-        in_engine_ns = int(chunk["done_ns"]) - submitted_ns
+    for submitted_ns, turn, chunk in sorted(final_chunks, key=lambda item: item[0]):
+        done_ns = chunk.get("done_ns")
+        if not isinstance(done_ns, int):  # a final turn's chunks all have one
+            continue
+        in_engine_ns = done_ns - submitted_ns
         starts = [
             int(span[0])
             for work in chunk.get("stage_work") or ()
