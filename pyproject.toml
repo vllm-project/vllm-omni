@@ -68,7 +68,7 @@ dev = [
     "psutil==7.2.2",
     "soundfile==0.14.0",
     "imageio[ffmpeg]==2.37.4",
-    "opencv-python==5.0.0.93",
+    "opencv-python-headless==5.0.0.93",
     # 0.3.12 includes acknowledged TCP writes (Mooncake #2850): completion
     # must mean the receive buffer is ready before zero-copy consumers read it.
     "mooncake-transfer-engine-cuda13==0.3.12.post1",
@@ -100,7 +100,7 @@ dev = [
 
 demo = [
     "gradio>=6.7.0",
-    "opencv-python>=4.12.0.88",  # cli/stream_client frame reading
+    "opencv-python-headless>=4.12.0.88",  # cli/stream_client frame reading
     "requests>=2.28.0",  # cli/stream_client HTTP
     "cn2an>=0.5.22",  # Chinese number normalization for TTS (e.g. "1次" -> "一次")
 ]
