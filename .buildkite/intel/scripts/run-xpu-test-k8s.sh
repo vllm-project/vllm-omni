@@ -7,7 +7,7 @@ set -euo pipefail
 test_suite="${1:-all}"
 test_paths=(tests/diffusion tests/dfx tests/e2e tests/platforms)
 
-cd /workspace/vllm-omni
+cd /vllm-omni
 pip install tblib==3.1.0
 
 case "${test_suite}" in

@@ -163,7 +163,7 @@ time timeout -k 30 "${XPU_TEST_BUDGET}" docker run \
     bash -c '
     set -uo pipefail
     pip install tblib==3.1.0 || exit 1
-    cd /workspace/vllm-omni || exit 1
+    cd /vllm-omni || exit 1
 
     # Card budget. The agent sets ZE_AFFINITY_MASK; take its first entry for the
     # cards_1 stages and its first two for the cards_2 ones, so a test can never
