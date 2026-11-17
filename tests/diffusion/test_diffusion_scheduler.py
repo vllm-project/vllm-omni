@@ -190,6 +190,7 @@ async def test_single_native_kv_failure_reaches_output_stream(mocker, scheduler_
             side_effect=KVTransferRegistrationError("registration failed"),
         )
     engine = object.__new__(DiffusionEngine)
+    engine._request_chunk_states = {}
     engine.scheduler = scheduler
     engine.od_config = SimpleNamespace(diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER)
     engine.execution_mode = (
@@ -799,8 +800,9 @@ class TestRequestScheduler:
         mocker.patch.object(
             self.scheduler,
             "_can_schedule_waiting",
-            side_effect=lambda state: can_schedule(state)
-            and not (state.request_id == "deferred" and manager.has_request("deferred")),
+            side_effect=lambda state: (
+                can_schedule(state) and not (state.request_id == "deferred" and manager.has_request("deferred"))
+            ),
         )
         for request_id in ("admitted", "deferred"):
             request = _make_request(request_id)
@@ -1117,6 +1119,7 @@ class TestRequestScheduler:
             self.scheduler.add_request(req)
         scheduled = self.scheduler.schedule()
         engine = object.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         engine.scheduler = self.scheduler
         engine.od_config = SimpleNamespace(diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER)
         engine.abort_queue = queue.Queue()
@@ -1637,6 +1640,7 @@ class TestRequestScheduler:
 class TestDiffusionEngine:
     def test_add_req_and_wait_for_response_single_path(self, mocker: MockerFixture) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         engine.od_config = SimpleNamespace(streaming_output=False)
         engine.scheduler = RequestScheduler()
         engine.scheduler.initialize(SimpleNamespace())
@@ -1668,6 +1672,7 @@ class TestDiffusionEngine:
         scheduler = _StubScheduler(request, runner_output)
 
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         engine.od_config = SimpleNamespace(streaming_output=False)
         engine.scheduler = scheduler
         engine._rpc_lock = threading.RLock()
@@ -1761,6 +1766,7 @@ class TestDiffusionEngine:
     @pytest.mark.asyncio
     async def test_step_streaming_raises_aborted_error(self, mocker: MockerFixture) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         engine._check_and_start_background_loop = mocker.AsyncMock()
         request = _make_request("req-abort")
         prepared_layout = object()
@@ -1787,6 +1793,7 @@ class TestDiffusionEngine:
 
     def test_abort_queue_marks_request_finished_aborted(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         engine._rpc_lock = threading.RLock()
         engine._cv = threading.Condition(engine._rpc_lock)
         engine._closed = False
@@ -1802,6 +1809,7 @@ class TestDiffusionEngine:
 
     def test_finalize_finished_request_returns_aborted_output(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         engine._cv = threading.Condition()
         engine.scheduler = StepScheduler()
         engine.scheduler.initialize(SimpleNamespace())
@@ -1816,6 +1824,7 @@ class TestDiffusionEngine:
 
     def test_finalize_finished_request_returns_scheduler_admission_error(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         engine._cv = threading.Condition()
         engine.scheduler = StepScheduler()
         engine.scheduler.initialize(SimpleNamespace())
@@ -1833,6 +1842,7 @@ class TestDiffusionEngine:
     @pytest.mark.asyncio
     async def test_streaming_runner_output_notifies_each_chunk(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         engine.scheduler = StepScheduler()
         engine.scheduler.initialize(SimpleNamespace())
         engine._rpc_lock = threading.RLock()
@@ -1881,6 +1891,7 @@ class TestDiffusionEngine:
     @pytest.mark.asyncio
     async def test_finished_streaming_request_without_runner_output_notifies_waiter(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         engine.execution_mode = DiffusionExecutionMode.REQUEST_BATCH
         engine.scheduler = RequestScheduler()
         engine.scheduler.initialize(SimpleNamespace())
@@ -1932,6 +1943,7 @@ class TestDiffusionEngine:
 
     def test_dummy_run_raises_on_output_error(self, mocker: MockerFixture) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         engine.od_config = SimpleNamespace(model_class_name="mock_model", diffusion_load_format="default")
         engine.pre_process_func = None
         engine.add_req_and_wait_for_response = mocker.Mock(return_value=DiffusionOutput(error="boom"))
@@ -1941,6 +1953,7 @@ class TestDiffusionEngine:
 
     def test_dummy_run_delegates_preprocessing_to_sync_admission(self, mocker: MockerFixture) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         engine.od_config = SimpleNamespace(model_class_name="mock_model", diffusion_load_format="default")
         engine.pre_process_func = mocker.Mock()
         engine.add_req_and_wait_for_response = mocker.Mock(return_value=DiffusionOutput(output=None))
