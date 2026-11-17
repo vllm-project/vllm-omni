@@ -105,13 +105,13 @@ _MAX_COMMITMENT_UTTERANCE_CHARS = 128 * 1024
 _MAX_COMMITMENT_PENDING_CHARS = 4096
 _MAX_COMMITMENT_QUEUE_SIZE = 8
 _MAX_INCREMENTAL_UTTERANCE_SECONDS = 300.0
-_INCREMENTAL_SEND_TIMEOUT_SECONDS = 10.0
+_SEND_TIMEOUT_SECONDS = 10.0
 
 _UTTERANCE_EOF = object()
 
 
 class _SerializedWebSocket:
-    """Serialize ASGI writes made by the receiver and synthesis worker."""
+    """Serialize ASGI writes with bounded waits for the send lock and transport."""
 
     def __init__(self, websocket: WebSocket) -> None:
         self._websocket = websocket
@@ -121,16 +121,19 @@ class _SerializedWebSocket:
         return await self._websocket.receive_text()
 
     async def send_json(self, data: object) -> None:
-        async with self._send_lock:
-            await self._websocket.send_json(data)
+        with anyio.fail_after(_SEND_TIMEOUT_SECONDS):
+            async with self._send_lock:
+                await self._websocket.send_json(data)
 
     async def send_bytes(self, data: bytes) -> None:
-        async with self._send_lock:
-            await self._websocket.send_bytes(data)
+        with anyio.fail_after(_SEND_TIMEOUT_SECONDS):
+            async with self._send_lock:
+                await self._websocket.send_bytes(data)
 
     async def close(self) -> None:
-        async with self._send_lock:
-            await self._websocket.close()
+        with anyio.fail_after(_SEND_TIMEOUT_SECONDS):
+            async with self._send_lock:
+                await self._websocket.close()
 
 
 @dataclass
@@ -523,14 +526,13 @@ class OmniStreamingSpeechHandler:
         fields = config.model_dump(exclude={"text_input_mode", "model_input_mode", "split_granularity", "stream_audio"})
         return OpenAICreateSpeechRequest(**{**fields, "input": text, "stream": True})
 
-    async def _fail_incremental_input(
-        self, websocket: WebSocket, state: _IncrementalUtterance, error: Exception
-    ) -> None:
+    @staticmethod
+    def _record_incremental_failure(state: _IncrementalUtterance, error: Exception) -> None:
+        """Record the first failure without waiting for client I/O."""
         if state.failure.done():
             return
         state.failure.set_result(error)
         state.text = ""
-        await self._send_error(websocket, str(error), partial_audio=state.total_bytes > 0)
 
     async def _feed_incremental_text(
         self, websocket: WebSocket, state: _IncrementalUtterance, text: str, *, final: bool = False
@@ -555,11 +557,11 @@ class OmniStreamingSpeechHandler:
                 elif text:
                     state.inputs.put_nowait(text)
             except ValueError as exc:
-                await self._fail_incremental_input(websocket, state, exc)
+                self._record_incremental_failure(state, exc)
         if final:
             state.closed.set_result(None)
         if state.worker is None:
-            if state.text.strip() or final:
+            if state.text.strip() or final or state.failure.done():
                 initial_text = state.text
                 state.text = ""
                 state.worker = asyncio.create_task(self._incremental_worker(websocket, state, initial_text, final))
@@ -599,17 +601,14 @@ class OmniStreamingSpeechHandler:
     ) -> None:
         if state.start_sent:
             return
-        await asyncio.wait_for(
-            websocket.send_json(
-                {
-                    "type": "audio.start",
-                    "utterance_index": state.index,
-                    "sentence_index": 0,
-                    "format": "pcm",
-                    **(audio_format or {}),
-                }
-            ),
-            timeout=_INCREMENTAL_SEND_TIMEOUT_SECONDS,
+        await websocket.send_json(
+            {
+                "type": "audio.start",
+                "utterance_index": state.index,
+                "sentence_index": 0,
+                "format": "pcm",
+                **(audio_format or {}),
+            }
         )
         state.start_sent = True
 
@@ -631,7 +630,7 @@ class OmniStreamingSpeechHandler:
             async for chunk in chunks:
                 if chunk:
                     await self._send_incremental_start(websocket, state, audio_format)
-                    await asyncio.wait_for(websocket.send_bytes(chunk), timeout=_INCREMENTAL_SEND_TIMEOUT_SECONDS)
+                    await websocket.send_bytes(chunk)
                     state.total_bytes += len(chunk)
         return usage_acc.stage0_finish_reason
 
@@ -695,59 +694,61 @@ class OmniStreamingSpeechHandler:
     async def _incremental_worker(
         self, websocket: WebSocket, state: _IncrementalUtterance, initial_text: str, final: bool
     ) -> None:
-        ready = asyncio.get_running_loop().create_future()
-        operation = asyncio.create_task(self._run_incremental_utterance(websocket, state, initial_text, final, ready))
-        try:
-            done, _ = await asyncio.wait(
-                (operation, state.failure, ready),
-                return_when=asyncio.FIRST_COMPLETED,
+        if not state.failure.done():
+            ready = asyncio.get_running_loop().create_future()
+            operation = asyncio.create_task(
+                self._run_incremental_utterance(websocket, state, initial_text, final, ready)
             )
-            if ready in done:
+            try:
                 done, _ = await asyncio.wait(
-                    (operation, state.failure),
-                    timeout=_MAX_INCREMENTAL_UTTERANCE_SECONDS,
+                    (operation, state.failure, ready),
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-            if state.failure in done:
-                raise state.failure.result()
-            if not done:
-                raise asyncio.TimeoutError(
-                    f"Incremental utterance exceeded {_MAX_INCREMENTAL_UTTERANCE_SECONDS:g} seconds"
-                )
-            await operation
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            message = str(exc) or "Incremental streaming operation timed out"
-            await self._fail_incremental_input(
-                websocket, state, RuntimeError(f"Incremental generation failed: {message}")
-            )
-        finally:
-            if not ready.done():
-                ready.cancel()
-            if not operation.done():
-                operation.cancel()
-            await asyncio.gather(operation, return_exceptions=True)
+                if ready in done:
+                    done, _ = await asyncio.wait(
+                        (operation, state.failure),
+                        timeout=_MAX_INCREMENTAL_UTTERANCE_SECONDS,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                if state.failure in done:
+                    raise state.failure.result()
+                if not done:
+                    raise asyncio.TimeoutError(
+                        f"Incremental utterance exceeded {_MAX_INCREMENTAL_UTTERANCE_SECONDS:g} seconds"
+                    )
+                await operation
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                message = str(exc) or "Incremental streaming operation timed out"
+                self._record_incremental_failure(state, RuntimeError(f"Incremental generation failed: {message}"))
+            finally:
+                if not ready.done():
+                    ready.cancel()
+                if not operation.done():
+                    operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
         if state.request_id is not None:
             await self._send_incremental_start(websocket, state)
-            await asyncio.wait_for(
-                websocket.send_json(
-                    {
-                        "type": "audio.done",
-                        "utterance_index": state.index,
-                        "sentence_index": 0,
-                        "total_bytes": state.total_bytes,
-                        "error": state.failure.done(),
-                    }
-                ),
-                timeout=_INCREMENTAL_SEND_TIMEOUT_SECONDS,
+        if state.failure.done():
+            await self._send_error(
+                websocket,
+                str(state.failure.result()),
+                partial_audio=state.total_bytes > 0,
+            )
+        if state.request_id is not None:
+            await websocket.send_json(
+                {
+                    "type": "audio.done",
+                    "utterance_index": state.index,
+                    "sentence_index": 0,
+                    "total_bytes": state.total_bytes,
+                    "error": state.failure.done(),
+                }
             )
         await asyncio.shield(state.closed)
-        await asyncio.wait_for(
-            websocket.send_json(
-                {"type": "session.done", "utterance_index": state.index, "total_sentences": int(state.start_sent)}
-            ),
-            timeout=_INCREMENTAL_SEND_TIMEOUT_SECONDS,
+        await websocket.send_json(
+            {"type": "session.done", "utterance_index": state.index, "total_sentences": int(state.start_sent)}
         )
 
     @staticmethod

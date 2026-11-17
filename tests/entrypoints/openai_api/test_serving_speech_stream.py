@@ -685,12 +685,68 @@ class TestStreamingSpeechWebSocket:
             async def send_bytes(self, _data):
                 await self._write()
 
+            async def close(self):
+                await self._write()
+
         probe = ProbeWebSocket()
         websocket = streaming_speech_module._SerializedWebSocket(probe)
 
-        await asyncio.gather(websocket.send_json({"type": "error"}), websocket.send_bytes(b"audio"))
+        await asyncio.gather(websocket.send_json({"type": "error"}), websocket.send_bytes(b"audio"), websocket.close())
 
         assert probe.max_active_writes == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "operation, args",
+        [("send_json", ({"type": "probe"},)), ("send_bytes", (b"audio",)), ("close", ())],
+    )
+    @pytest.mark.parametrize("blocked_on", ["transport", "send_lock"])
+    @pytest.mark.parametrize("cancel", [False, True], ids=["timeout", "cancel"])
+    async def test_websocket_writes_are_bounded_and_release_lock(
+        self, mocker, monkeypatch, operation, args, blocked_on, cancel
+    ):
+        monkeypatch.setattr(streaming_speech_module, "_SEND_TIMEOUT_SECONDS", 0.03)
+        write_started = asyncio.Event()
+        write_stopped = asyncio.Event()
+
+        async def blocked_write(*_args):
+            write_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                write_stopped.set()
+
+        raw_websocket = mocker.Mock(spec=WebSocket)
+        raw_websocket.send_json = mocker.AsyncMock()
+        write = mocker.AsyncMock(side_effect=blocked_write)
+        setattr(raw_websocket, operation, write)
+        websocket = streaming_speech_module._SerializedWebSocket(raw_websocket)
+        is_lock_held = blocked_on == "send_lock"
+        if is_lock_held:
+            await websocket._send_lock.acquire()
+        send = asyncio.create_task(getattr(websocket, operation)(*args))
+        try:
+            if not is_lock_held:
+                await asyncio.wait_for(write_started.wait(), timeout=3)
+            if cancel:
+                await asyncio.sleep(0)
+                send.cancel()
+            done, _ = await asyncio.wait({send}, timeout=1)
+            assert send in done
+            with pytest.raises(asyncio.CancelledError if cancel else TimeoutError):
+                await send
+            if is_lock_held:
+                write.assert_not_awaited()
+            else:
+                write.assert_awaited_once_with(*args)
+                assert write_stopped.is_set()
+        finally:
+            send.cancel()
+            await asyncio.gather(send, return_exceptions=True)
+            if is_lock_held:
+                websocket._send_lock.release()
+        raw_websocket.send_json.side_effect = None
+        await asyncio.wait_for(websocket.send_json({"type": "probe"}), timeout=3)
 
     @pytest.mark.parametrize("language", (None, "Auto", "French"))
     def test_commitment_mode_requires_chinese_or_english(self, language, mocker: MockerFixture):

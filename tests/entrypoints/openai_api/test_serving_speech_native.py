@@ -434,20 +434,28 @@ def test_native_generation_ending_before_eof_reports_error_and_rejects_more_text
     assert native_app.engine.appends == [(native_app.engine.submissions[1]["request_id"], [], True)]
 
 
-def test_native_utterance_limit_is_enforced_before_submission(native_app, monkeypatch):
+@pytest.mark.parametrize("has_request", [False, True])
+def test_native_utterance_limit_is_enforced_before_submission(native_app, monkeypatch, has_request):
     monkeypatch.setattr(stream_module, "_MAX_COMMITMENT_UTTERANCE_CHARS", 16)
     native_app.engine.submission_gate = asyncio.Event()
     with TestClient(native_app.app) as client, client.websocket_connect("/v1/audio/speech/stream") as ws:
         ws.send_json(_NATIVE_CONFIG)
-        ws.send_json({"type": "input.text", "text": "Hello "})
-        assert native_app.engine.submitting.wait(3)
+        if has_request:
+            ws.send_json({"type": "input.text", "text": "Hello "})
+            assert native_app.engine.submitting.wait(3)
         ws.send_json({"type": "input.text", "text": "x" * 17})
+        if has_request:
+            assert ws.receive_json()["type"] == "audio.start"
         assert "utterance exceeds 16 characters" in ws.receive_json()["message"]
-        assert ws.receive_json()["type"] == "audio.start"
-        assert ws.receive_json()["error"]
+        if has_request:
+            assert ws.receive_json()["error"]
         ws.send_json({"type": "input.done"})
-        assert ws.receive_json()["type"] == "session.done"
-    assert len(native_app.engine.cancelled) == 1
+        assert ws.receive_json() == {
+            "type": "session.done",
+            "utterance_index": 0,
+            "total_sentences": int(has_request),
+        }
+    assert len(native_app.engine.submissions) == len(native_app.engine.cancelled) == int(has_request)
     assert not native_app.engine.active
 
 
@@ -499,7 +507,7 @@ def test_native_completed_utterance_idle_uses_normal_session_timeout(native_app,
     engine = native_app.engine
     engine.drain_gate = asyncio.Event()
     native_app.handler._idle_timeout = 0.05
-    failure = mocker.spy(native_app.handler, "_fail_incremental_input")
+    failure = mocker.spy(native_app.handler, "_record_incremental_failure")
     with TestClient(native_app.app) as client, client.websocket_connect("/v1/audio/speech/stream") as ws:
         ws.send_json(_NATIVE_CONFIG)
         ws.send_json({"type": "input.text", "text": "Hello "})
@@ -511,7 +519,7 @@ def test_native_completed_utterance_idle_uses_normal_session_timeout(native_app,
         events, _ = _finish_utterance(ws)
         assert not events[-2]["error"]
         assert ws.receive_json() == {"type": "error", "message": "Idle timeout: no message received"}
-    failure.assert_not_awaited()
+    failure.assert_not_called()
     assert len(engine.submissions) == 1
     assert not engine.active and not engine.cancelled
 
@@ -540,12 +548,187 @@ def test_native_total_deadline_cancels_the_request(native_app, monkeypatch, inpu
     assert not native_app.engine.active
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("input_closed", [False, True])
+@pytest.mark.parametrize("disconnect", [False, True])
+async def test_native_deadline_cleans_generation_before_error_delivery(
+    native_app, mocker, monkeypatch, input_closed, disconnect
+):
+    monkeypatch.setattr(stream_module, "_MAX_INCREMENTAL_UTTERANCE_SECONDS", 0.05)
+    monkeypatch.setattr(stream_module, "_SEND_TIMEOUT_SECONDS", 1)
+    engine = native_app.engine
+    if input_closed:
+        engine.drain_gate = asyncio.Event()
+    error_started = asyncio.Event()
+    error_cancelled = asyncio.Event()
+    release_error = asyncio.Event()
+    events = []
+
+    async def send_json(payload):
+        events.append(payload)
+        if payload["type"] == "error":
+            error_started.set()
+            try:
+                await release_error.wait()
+            except asyncio.CancelledError:
+                error_cancelled.set()
+                raise
+
+    raw_websocket = mocker.Mock(spec=WebSocket)
+    raw_websocket.send_json = mocker.AsyncMock(side_effect=send_json)
+    raw_websocket.send_bytes = mocker.AsyncMock()
+    websocket = stream_module._SerializedWebSocket(raw_websocket)
+    config = StreamingSpeechSessionConfig(**_NATIVE_CONFIG)
+    state = stream_module._IncrementalUtterance(
+        index=0, config=config, frontend=native_app.handler._create_commitment_frontend(config)
+    )
+    if input_closed:
+        state.closed.set_result(None)
+    original_tasks = asyncio.all_tasks()
+    state.worker = asyncio.create_task(native_app.handler._incremental_worker(websocket, state, "Hello ", input_closed))
+    try:
+        await asyncio.wait_for(error_started.wait(), timeout=3)
+        assert state.failure.done()
+        assert "exceeded 0.05 seconds" in events[-1]["message"]
+        assert events[-1]["partial_audio"] and events[-1]["action"] == "discard"
+        assert not engine.active and not engine.streams
+        assert len(engine.cancelled) == 1
+        assert not state.worker.done()
+        if disconnect:
+            await native_app.handler._cleanup_incremental_utterance(state)
+            assert state.worker.cancelled() and error_cancelled.is_set()
+            assert [event["type"] for event in events] == ["audio.start", "error"]
+        else:
+            if not input_closed:
+                state.closed.set_result(None)
+            release_error.set()
+            await asyncio.wait_for(state.worker, timeout=3)
+            assert [event["type"] for event in events] == ["audio.start", "error", "audio.done", "session.done"]
+            assert events[-2]["error"]
+    finally:
+        release_error.set()
+        await native_app.handler._cleanup_incremental_utterance(state)
+    engine.abort.assert_not_awaited()
+    assert not asyncio.all_tasks() - original_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("input_closed", [False, True])
+async def test_native_failed_input_skips_generation(native_app, mocker, input_closed):
+    run = mocker.patch.object(native_app.handler, "_run_incremental_utterance", new_callable=mocker.AsyncMock)
+    error_sent = asyncio.Event()
+    events = []
+
+    async def send_json(payload):
+        events.append(payload)
+        if payload["type"] == "error":
+            error_sent.set()
+
+    raw_websocket = mocker.Mock(spec=WebSocket)
+    raw_websocket.send_json = mocker.AsyncMock(side_effect=send_json)
+    websocket = stream_module._SerializedWebSocket(raw_websocket)
+    config = StreamingSpeechSessionConfig(**_NATIVE_CONFIG)
+    state = stream_module._IncrementalUtterance(
+        index=0, config=config, frontend=native_app.handler._create_commitment_frontend(config)
+    )
+    state.failure.set_result(ValueError("input rejected"))
+    if input_closed:
+        state.closed.set_result(None)
+    state.worker = asyncio.create_task(native_app.handler._incremental_worker(websocket, state, "Hello ", input_closed))
+    try:
+        await asyncio.wait_for(error_sent.wait(), timeout=3)
+        run.assert_not_called()
+        if not input_closed:
+            assert not state.worker.done()
+            state.closed.set_result(None)
+        await asyncio.wait_for(state.worker, timeout=3)
+        assert events == [
+            {"type": "error", "message": "input rejected"},
+            {"type": "session.done", "utterance_index": 0, "total_sentences": 0},
+        ]
+        assert not native_app.engine.submissions
+    finally:
+        await native_app.handler._cleanup_incremental_utterance(state)
+
+
+@pytest.mark.asyncio
+async def test_native_failed_start_send_propagates_after_generation_cleanup(native_app, mocker, monkeypatch):
+    monkeypatch.setattr(stream_module, "_MAX_INCREMENTAL_UTTERANCE_SECONDS", 0.03)
+    native_app.engine.submission_gate = asyncio.Event()
+    attempts = []
+
+    async def send_json(payload):
+        attempts.append(payload)
+        if payload["type"] == "audio.start":
+            assert len(native_app.engine.cancelled) == 1
+            assert not native_app.engine.active and not native_app.engine.streams
+            raise TimeoutError("start write blocked")
+
+    raw_websocket = mocker.Mock(spec=WebSocket)
+    raw_websocket.send_json = mocker.AsyncMock(side_effect=send_json)
+    raw_websocket.send_bytes = mocker.AsyncMock()
+    websocket = stream_module._SerializedWebSocket(raw_websocket)
+    config = StreamingSpeechSessionConfig(**_NATIVE_CONFIG)
+    state = stream_module._IncrementalUtterance(
+        index=0, config=config, frontend=native_app.handler._create_commitment_frontend(config)
+    )
+    state.closed.set_result(None)
+    state.worker = asyncio.create_task(native_app.handler._incremental_worker(websocket, state, "Hello ", True))
+    try:
+        with pytest.raises(TimeoutError, match="start write blocked"):
+            await asyncio.wait_for(state.worker, timeout=3)
+        assert [attempt["type"] for attempt in attempts] == ["audio.start"]
+        assert "exceeded 0.03 seconds" in str(state.failure.result())
+        assert not state.start_sent
+        raw_websocket.send_bytes.assert_not_awaited()
+        assert len(native_app.engine.cancelled) == 1
+        assert not native_app.engine.active
+    finally:
+        await native_app.handler._cleanup_incremental_utterance(state)
+
+
+@pytest.mark.asyncio
+async def test_native_deadline_bounds_all_json_writes_after_eof(native_app, mocker, monkeypatch):
+    monkeypatch.setattr(stream_module, "_MAX_INCREMENTAL_UTTERANCE_SECONDS", 0.05)
+    monkeypatch.setattr(stream_module, "_SEND_TIMEOUT_SECONDS", 0.03)
+    native_app.engine.drain_gate = asyncio.Event()
+    events = []
+
+    async def send_json(payload):
+        events.append(payload)
+        if payload["type"] != "audio.start":
+            await asyncio.Event().wait()
+
+    raw_websocket = mocker.Mock(spec=WebSocket)
+    raw_websocket.send_json = mocker.AsyncMock(side_effect=send_json)
+    raw_websocket.send_bytes = mocker.AsyncMock()
+    websocket = stream_module._SerializedWebSocket(raw_websocket)
+    config = StreamingSpeechSessionConfig(**_NATIVE_CONFIG)
+    state = stream_module._IncrementalUtterance(
+        index=0, config=config, frontend=native_app.handler._create_commitment_frontend(config)
+    )
+    state.closed.set_result(None)
+    original_tasks = asyncio.all_tasks()
+    state.worker = asyncio.create_task(native_app.handler._incremental_worker(websocket, state, "Hello ", True))
+    try:
+        done, _ = await asyncio.wait({state.worker}, timeout=3)
+        assert state.worker in done
+        with pytest.raises(asyncio.TimeoutError):
+            await state.worker
+        assert [event["type"] for event in events] == ["audio.start", "error", "audio.done"]
+        assert len(native_app.engine.cancelled) == 1
+        assert not native_app.engine.active and not native_app.engine.streams
+    finally:
+        await native_app.handler._cleanup_incremental_utterance(state)
+    assert not asyncio.all_tasks() - original_tasks
+
+
 def test_native_slow_audio_client_is_bounded(native_app, monkeypatch):
     async def blocked_send(self, data):
         await asyncio.Event().wait()
 
-    monkeypatch.setattr(stream_module._SerializedWebSocket, "send_bytes", blocked_send)
-    monkeypatch.setattr(stream_module, "_INCREMENTAL_SEND_TIMEOUT_SECONDS", 0.03)
+    monkeypatch.setattr(WebSocket, "send_bytes", blocked_send)
+    monkeypatch.setattr(stream_module, "_SEND_TIMEOUT_SECONDS", 0.03)
     with TestClient(native_app.app) as client, client.websocket_connect("/v1/audio/speech/stream") as ws:
         ws.send_json(_NATIVE_CONFIG)
         ws.send_json({"type": "input.text", "text": "Hello "})
@@ -637,9 +820,10 @@ def test_native_admission_capacity_error_does_not_leave_the_input_pump_waiting(n
     with TestClient(native_app.app) as client, client.websocket_connect("/v1/audio/speech/stream") as ws:
         ws.send_json(_NATIVE_CONFIG)
         ws.send_json({"type": "input.text", "text": "Hello "})
-        assert "token capacity" in ws.receive_json()["message"]
         assert ws.receive_json()["type"] == "audio.start"
-        assert ws.receive_json()["error"]
+        assert "token capacity" in ws.receive_json()["message"]
+        done = ws.receive_json()
+        assert done["type"] == "audio.done" and done["error"]
         ws.send_json({"type": "input.done"})
         assert ws.receive_json()["type"] == "session.done"
     assert not native_app.engine.active
@@ -677,9 +861,10 @@ def test_native_empty_audio_is_not_a_success(native_app):
         ws.send_json(_NATIVE_CONFIG)
         ws.send_json({"type": "input.text", "text": "Hello"})
         ws.send_json({"type": "input.done"})
-        assert "no audio" in ws.receive_json()["message"]
         assert ws.receive_json()["type"] == "audio.start"
-        assert ws.receive_json()["error"]
+        assert "no audio" in ws.receive_json()["message"]
+        done = ws.receive_json()
+        assert done["type"] == "audio.done" and done["error"]
         assert ws.receive_json()["type"] == "session.done"
 
 
