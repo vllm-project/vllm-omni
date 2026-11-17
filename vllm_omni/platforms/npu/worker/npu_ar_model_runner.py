@@ -14,7 +14,7 @@ from typing import Any, NamedTuple
 import numpy as np
 import torch
 from vllm.compilation.cuda_graph import CUDAGraphStat
-from vllm.config import CUDAGraphMode
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
@@ -122,13 +122,19 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     # capture path would raise AttributeError without a default here.
     enable_hamming_sparse: bool = False
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, vllm_config: VllmConfig, device: torch.device):
         from vllm_omni.platforms.npu.attention import static_shape_decode
 
         # Before parent init: vLLM's selector uses current_platform
         # (vllm-ascend), not NPUOmniPlatform.get_attn_backend_cls.
-        static_shape_decode.install_into_ascend_backend()
-        super().__init__(*args, **kwargs)
+        self._omni_static_decode_enabled = (
+            vllm_config.model_config.hf_config.model_type != "hunyuan_image_3_moe"
+        )
+        # Keep Hunyuan AR on the standard attention path. Its validated graph
+        # configuration is PIECEWISE, with attention outside the captured regions.
+        if self._omni_static_decode_enabled:
+            static_shape_decode.install_into_ascend_backend()
+        super().__init__(vllm_config, device)
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         # each model stage has their own hidden size
         self.hidden_size = self.model_config.hf_text_config.hidden_size
@@ -194,6 +200,9 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         from vllm.config import CUDAGraphMode
 
         from vllm_omni.platforms.npu.attention import static_shape_decode
+
+        if not self._omni_static_decode_enabled:
+            return super()._capture_cudagraphs(*args, **kwargs)
 
         runtime_mode = kwargs.get("cudagraph_runtime_mode")
         if runtime_mode is None and len(args) >= 2:

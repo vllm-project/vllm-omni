@@ -102,3 +102,12 @@ AdaLN host staging defaults on only for the NPU H3 image pipeline when its
 projection cache is enabled, weights are unquantized and DiT offload/HSDP is
 absent. Explicit `minimax_h3_adaln_offload=false` keeps weights resident;
 existing CUDA SM120 defaults and other pipeline defaults are unchanged.
+
+## HunyuanImage3 AR NPU graphs
+
+Hunyuan AR selects the standard Ascend attention backend and capture entrypoint
+rather than installing the fixed-capacity decode override. Its opt-in validated
+configuration uses PIECEWISE regions with attention outside the graph; generic
+deploy defaults remain eager. FULL graph capture is not an output-correctness
+guarantee. See the [Hunyuan recipe](../../../recipes/Tencent/HunyuanImage-3.0-Instruct.md#ascend-npu-ar-only-piecewise-graphs-with-modelslim-mxfp8)
+for the checkpoint, capture sizes, workload, and validation limits.

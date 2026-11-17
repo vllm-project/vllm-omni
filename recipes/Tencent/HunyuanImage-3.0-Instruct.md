@@ -139,7 +139,7 @@ the same checkpoint, parallelism, and image settings.
 Start the DiT-only server with one of the following CLI-only configurations.
 These commands use explicit CLI flags for all parallelism and runtime settings.
 
-**TP=4 + FP8**
+##### TP=4 + FP8
 
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \
@@ -152,7 +152,7 @@ vllm serve tencent/HunyuanImage-3.0-Instruct \
   --enable-diffusion-pipeline-profiler
 ```
 
-**TP=2 + FP8 + SP=2**
+##### TP=2 + FP8 + SP=2
 
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \
@@ -166,7 +166,7 @@ vllm serve tencent/HunyuanImage-3.0-Instruct \
   --enable-diffusion-pipeline-profiler
 ```
 
-**TP=2 + FP8 + CFG=2**
+##### TP=2 + FP8 + CFG=2
 
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \
@@ -470,3 +470,119 @@ thresholds are `SSIM >= 0.20` and `PSNR >= 10.0`.
 - `--force-cutlass-fp8` keeps the FP8 dense layers on the CUTLASS FP8 path.
 - The benchmark table is an online HTTP concurrency-16 result; do not compare
   it directly with loaded-once request-level benchmarks.
+
+## Ascend NPU: AR-only PIECEWISE graphs with ModelSlim MXFP8
+
+This opt-in configuration serves the AR text stage. It does not start DiT or
+produce images. The generic deploy YAML keeps its eager defaults.
+
+### Checkpoint and graph boundaries
+
+Use a ModelSlim HunyuanImage3 checkpoint with `quant_model_description.json`
+and `W8A8_MXFP8` entries. The AR loader aliases fused `gate_and_up_proj`
+metadata to runtime `gate_up_proj` names, preserves the checkpoint up/gate
+ordering during weight and scale loading, and enables quantized routers when
+using the Ascend quantizer. Other router quantization backends retain their
+previous behavior. QKV scale reshaping preserves the scale tensor's compressed
+input dimension.
+
+Hunyuan AR bypasses the fixed-capacity decode attention override. In the
+validated PIECEWISE mode, attention runs outside captured regions while
+supported surrounding computation is captured. FULL and FULL_AND_PIECEWISE
+produced incorrect text in the tested environment and are not validated by this
+recipe. Successful capture or a 128-token usage count alone is insufficient:
+compare the generated text with eager output as well.
+
+### Start the service
+
+Run from the repository root. Prepare the model directory and eight available
+Ascend NPUs, then start:
+
+```bash
+export MODEL=/path/to/HunyuanImage-3.0-Instruct-Distil-W8A8F8-MXFP
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export NO_PROXY=localhost,127.0.0.1,::1
+
+vllm serve "$MODEL" \
+  --omni \
+  --deploy-config vllm_omni/deploy/hunyuan_image3_ar.yaml \
+  --quantization ascend \
+  --dtype bfloat16 \
+  --trust-remote-code \
+  --served-model-name hunyuanimage3-ar-mxfp8 \
+  --host 0.0.0.0 --port 8010 \
+  --max-model-len 8192 \
+  --chat-template examples/chat_templates/hunyuan_image3_t2t.jinja \
+  --stage-overrides '{"0":{"enforce_eager":false,"compilation_config":{"cudagraph_mode":"PIECEWISE","cudagraph_capture_sizes":[1,2,4,8,1280]}}}'
+```
+
+The supplied chat template supports one text-only user message and contains the
+Hunyuan unified system prompt. It does not implement multi-turn or image chat.
+The 1280-token graph size covers the 1259-token benchmark prompt; choose capture
+sizes for other workloads separately. Prefix caching remains disabled and
+`max_num_seqs` remains 1, so multiple concurrent requests queue rather than form
+a multi-request execution batch.
+
+To compare against eager, restart with the same command and replace the stage
+override with `'{"0":{"enforce_eager":true}}'`.
+
+### Fixed text request
+
+After `/health` returns HTTP 200, send the same request to either configuration:
+
+```bash
+curl --noproxy '*' -N http://127.0.0.1:8010/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "hunyuanimage3-ar-mxfp8",
+    "messages": [{"role":"user","content":"请用中文详细描述一幅未来城市的画面，包括建筑、交通、天空和街道上的人们。请直接描述画面，不要列出提纲。"}],
+    "modalities": ["text"],
+    "stream": true,
+    "stream_options": {"include_usage":true},
+    "sampling_params_list": [{
+      "temperature":0.0,
+      "max_tokens":128,
+      "min_tokens":128,
+      "ignore_eos":true,
+      "seed":42,
+      "detokenize":true,
+      "extra_args":{"ar_task_mode":"comprehension"}
+    }]
+  }'
+```
+
+Explicit stage sampling parameters avoid relying on comprehension-stage discovery
+for this AR-only topology. The fixed-length request is a performance workload;
+normal application requests should retain appropriate stopping behavior.
+
+### Recorded hardware results
+
+Measured on eight Ascend950DT NPUs, TP=8, with the same pre-quantized checkpoint
+in both modes: driver 25.6.1.b023, CANN 9.2.1, PyTorch 2.10.0,
+torch-npu 2.10.0.post7, vLLM 0.33.0, and Transformers 5.19.0. The original
+measurement used vLLM-Omni `a72de0985bdc15c2b4fd9690fc895f0bb46ce2c7` plus the
+ModelSlim/runner adaptations in this change. These results have not been
+remeasured on the current upstream base.
+
+Each case used two sequential warmups and eight measured requests. The input
+was 1259 tokens including the system prompt; every output was 128 tokens.
+The client reused one HTTP connection pool and disabled environment proxies.
+TTFT ends at the first non-empty streamed text delta; E2E ends after the stream;
+TPOT uses first-to-last text-delta time divided by 127.
+
+| Metric | Eager | PIECEWISE |
+| --- | ---: | ---: |
+| C=1 mean TTFT | 70.71 ms | 41.80 ms |
+| C=1 mean TPOT | 59.90 ms/token | 13.18 ms/token |
+| C=1 mean E2E | 7.678 s | 1.717 s |
+| C=1 QPS | 0.1302 | 0.5825 |
+| C=4 mean TTFT | 17.165 s | 3.849 s |
+| C=4 mean E2E | 24.720 s | 5.510 s |
+| C=4 QPS | 0.1312 | 0.5893 |
+
+All 16 measured PIECEWISE texts exactly matched the corresponding eager texts,
+and logs confirmed ACL graph replay. This is a small, single-prompt performance
+and text-parity check, not a general accuracy evaluation, BF16-versus-MXFP8
+comparison, or validation of image input, DiT, FULL graphs, or other hardware.
+The table compares configurations with the same weight-loading adaptations;
+it does not attribute speedup to the metadata or router changes individually.
