@@ -75,6 +75,21 @@ def _make_runner():
     return runner
 
 
+def test_native_output_freezes_each_requests_current_perf_chunk():
+    runner = _make_runner()
+    runner._omni_data_plane = SimpleNamespace(reserve_outputs=MagicMock())
+    first, second = {"duplex": {"perf_chunk": [3, 7]}}, {"duplex": {"perf_chunk": [8, 2]}}
+    runner.model_state = SimpleNamespace(intermediate_buffer=SimpleNamespace(buffers=[first, second]))
+    output = SimpleNamespace(req_ids=["r2", "r1"])
+
+    runner._reserve_native_data_plane_outputs(output)
+    first["duplex"]["perf_chunk"][:] = [3, 8]
+    second["duplex"]["perf_chunk"] = [9, 0]
+
+    assert output._duplex_perf_chunks == {"r1": (3, 7), "r2": (8, 2)}
+    runner._omni_data_plane.reserve_outputs.assert_called_once_with(["r2", "r1"])
+
+
 @pytest.mark.parametrize("backbone_mode", [CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE, CUDAGraphMode.NONE])
 @pytest.mark.parametrize("num_reqs,bucket", [(1, 1), (3, 4), (4, 4)])
 def test_mtp_graph_replay_is_independent_of_backbone_mode(mocker, backbone_mode, num_reqs, bucket):
