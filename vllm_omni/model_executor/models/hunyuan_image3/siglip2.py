@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Licensed under the TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -103,7 +106,9 @@ class Siglip2VisionEmbeddings(nn.Module):
         target_dtype = self.patch_embedding.weight.dtype
         patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))
 
-        # Resize position embeddings per image and concatenate (packed)
+        return patch_embeds + self.interpolate_pos_encoding(spatial_shapes)
+
+    def interpolate_pos_encoding(self, spatial_shapes: torch.Tensor) -> torch.Tensor:
         positional_embeddings = self.position_embedding.weight.reshape(
             self.position_embedding_size, self.position_embedding_size, -1
         )
@@ -125,10 +130,9 @@ class Siglip2VisionEmbeddings(nn.Module):
             )
             # (1, embed_dim, h, w) → (h*w, embed_dim)
             resized = resized.reshape(self.embed_dim, height * width).transpose(0, 1)
-            position_embs.append(resized.to(target_dtype))
+            position_embs.append(resized.to(self.patch_embedding.weight.dtype))
 
-        packed_position_embs = torch.cat(position_embs, dim=0)
-        return patch_embeds + packed_position_embs
+        return torch.cat(position_embs, dim=0)
 
 
 class Siglip2Attention(nn.Module):
@@ -177,6 +181,7 @@ class Siglip2Attention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        max_seqlen: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -192,7 +197,8 @@ class Siglip2Attention(nn.Module):
         k = k.view(seq_length, self.num_heads_per_partition, self.head_dim)
         v = v.view(seq_length, self.num_heads_per_partition, self.head_dim)
 
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+        if max_seqlen is None:
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
         attn_output = self.attn(
             query=q.unsqueeze(0),
             key=k.unsqueeze(0),
@@ -264,6 +270,7 @@ class Siglip2EncoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        max_seqlen: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -272,7 +279,7 @@ class Siglip2EncoderLayer(nn.Module):
         """
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
-        hidden_states = self.self_attn(hidden_states, cu_seqlens=cu_seqlens)
+        hidden_states = self.self_attn(hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -307,6 +314,7 @@ class Siglip2Encoder(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        max_seqlen: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -314,7 +322,7 @@ class Siglip2Encoder(nn.Module):
             cu_seqlens: Cumulative sequence lengths (B+1,)
         """
         for layer in self.layers:
-            hidden_states = layer(hidden_states, cu_seqlens)
+            hidden_states = layer(hidden_states, cu_seqlens, max_seqlen)
         return hidden_states
 
 
@@ -385,6 +393,17 @@ class Siglip2VisionTransformer(nn.Module):
         output[mask_bool] = hidden_states
 
         return output
+
+    def forward_packed(
+        self,
+        pixel_values: torch.Tensor,
+        position_embeddings: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden_states = self.embeddings.patch_embedding(pixel_values) + position_embeddings
+        hidden_states = self.encoder(hidden_states, cu_seqlens, max_seqlen)
+        return self.post_layernorm(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
