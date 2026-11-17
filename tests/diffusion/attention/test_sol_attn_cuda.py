@@ -21,7 +21,7 @@ if not torch.cuda.is_available():
 pytest.importorskip("sol_attn")
 
 
-@hardware_test(res={"cuda": ["L4", "H100", "RTX5090"]}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "H100", "B200", "RTX5090"]}, num_cards=1)
 @pytest.mark.parametrize("used,sink_tokens", [(63, 5), (64, 5), (257, 5), (4097, 951)])
 @pytest.mark.parametrize("compiled", [False, True])
 def test_real_sol_kernel_padding_and_sink(used, sink_tokens, compiled):
@@ -54,7 +54,7 @@ def test_real_sol_kernel_padding_and_sink(used, sink_tokens, compiled):
     torch.compiler.reset()
 
 
-@hardware_test(res={"cuda": ["L4", "H100", "RTX5090"]}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "H100", "B200", "RTX5090"]}, num_cards=1)
 def test_real_sol_production_attention_entry():
     config = OmniDiffusionConfig(
         diffusion_attention_config={
@@ -127,14 +127,14 @@ def _ulysses_worker(rank, init_method):
         destroy_distributed_env()
 
 
-@hardware_test(res={"cuda": ["L4", "H100", "RTX5090"]}, num_cards=2)
+@hardware_test(res={"cuda": ["L4", "H100", "B200", "RTX5090"]}, num_cards=2)
 def test_real_sol_ulysses_matches_local(tmp_path):
     if torch.accelerator.device_count() < 2:
         pytest.skip("Requires two CUDA GPUs")
     torch.multiprocessing.spawn(_ulysses_worker, args=(f"file://{tmp_path / 'rendezvous'}",), nprocs=2)
 
 
-@hardware_test(res={"cuda": ["L4", "H100", "RTX5090"]}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "H100", "B200", "RTX5090"]}, num_cards=1)
 def test_real_sol_wan_transformer_forward(tmp_path, monkeypatch):
     import vllm_omni.diffusion.attention.backends.sol_attn as sol_module
     from vllm_omni.diffusion.distributed.parallel_state import (

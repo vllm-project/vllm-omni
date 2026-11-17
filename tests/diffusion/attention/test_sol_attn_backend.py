@@ -159,9 +159,22 @@ def test_partial_sequence_parallelism_fails_at_construction(monkeypatch, attribu
         make_impl()
 
 
-def test_split_kv_is_rejected_outside_hopper():
+@pytest.mark.parametrize("capability", [DeviceCapability(8, 0), DeviceCapability(10, 0), DeviceCapability(12, 0)])
+@pytest.mark.parametrize("kv_splits", [2, 4])
+def test_split_kv_is_rejected_outside_hopper(monkeypatch, capability, kv_splits):
+    monkeypatch.setattr(sol_module.current_omni_platform, "get_device_capability", lambda: capability)
     with pytest.raises(ValueError, match="SM90"):
-        make_impl(kv_splits=2)
+        make_impl(kv_splits=kv_splits)
+
+
+@pytest.mark.parametrize("capability", [DeviceCapability(9, 0), DeviceCapability(10, 0), DeviceCapability(12, 0)])
+@pytest.mark.parametrize("kv_splits", ["auto", 1])
+def test_hopper_and_blackwell_single_split_configuration(monkeypatch, capability, kv_splits):
+    monkeypatch.setattr(sol_module.current_omni_platform, "get_device_capability", lambda: capability)
+    impl = make_impl(kv_splits=kv_splits)
+    assert impl.kv_splits == 1
+    expected_dense = sol_module.CuDNNAttentionImpl if capability.major == 12 else sol_module.SDPAImpl
+    assert isinstance(impl.dense_attention, expected_dense)
 
 
 def test_sparse_forward_trims_padding_and_keeps_sink_queries_dense(kernel):
@@ -322,8 +335,11 @@ def test_cuda_selection_rejects_unsupported_geometry(monkeypatch, capability, he
 
 
 @pytest.mark.parametrize("head_size", [-1, 128])
-def test_cuda_selection_accepts_probe_and_real_head_size(kernel, monkeypatch, head_size):
-    monkeypatch.setattr(CudaOmniPlatform, "get_device_capability", lambda: DeviceCapability(8, 0))
+@pytest.mark.parametrize(
+    "capability", [DeviceCapability(8, 0), DeviceCapability(9, 0), DeviceCapability(10, 0), DeviceCapability(12, 0)]
+)
+def test_cuda_selection_accepts_probe_and_real_head_size(kernel, monkeypatch, head_size, capability):
+    monkeypatch.setattr(CudaOmniPlatform, "get_device_capability", lambda: capability)
     assert (
         CudaOmniPlatform.get_diffusion_attn_backend_cls("SOL_ATTN", head_size)
         == DiffusionAttentionBackendEnum.SOL_ATTN.get_path()

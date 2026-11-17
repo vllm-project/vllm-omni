@@ -23,6 +23,13 @@ Requirements:
 - No arbitrary masks, GQA/MQA, paged KV, quantized KV, or compact reference-KV
   attention with unequal Q/KV lengths.
 
+Architecture dispatch is delegated to upstream `sol_attn`, which provides
+CuTe DSL kernels for Hopper SM90 and Blackwell SM100/SM120. Install the
+[upstream runtime dependencies](https://github.com/NVlabs/Sana/blob/sol-engine/techniques/sparse_backends/README.md#requirements)
+for these specialized kernels; upstream falls back to Triton when the optional
+CuTe runtime is unavailable. The default `kv_splits="auto"` uses one split on
+all architectures; explicit splits of 2 or 4 require the Hopper CuTe path.
+
 The external kernel is wrapped in a PyTorch custom op with a fake implementation
 for compilation. Dense guard steps and sink queries use PyTorch SDPA, pinned to
 cuDNN on SM120/SM121. On other CUDA architectures SDPA selects its dense kernel.
