@@ -3,6 +3,7 @@
 """ConvRot rotated W8A8 / W4A4 diffusion quantization."""
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -10,6 +11,7 @@ from pytest_mock import MockerFixture
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
 import vllm_omni.quantization.convrot_config as convrot_config
+from tests.helpers.mark import hardware_test
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization import build_quant_config
 from vllm_omni.quantization.convrot_config import (
@@ -154,6 +156,20 @@ def test_mxfp_from_config_rejects_int8_layers(config_cls):
         config_cls.from_config({"int8_layers": ["to_out"]})
 
 
+@pytest.mark.parametrize("config_cls", [DiffusionConvRotMxfp4Config, DiffusionConvRotMxfp8Config])
+def test_mxfp_configs_require_ampere_or_newer(config_cls):
+    assert config_cls.get_min_capability() == 80
+
+
+def test_kernel_bias_prefers_prepared_layer_bias_only_when_layer_has_bias():
+    layer_with_bias = SimpleNamespace(has_bias=True, bias="prepared")
+    assert convrot_config._resolve_kernel_bias(layer_with_bias, "caller") == "prepared"
+    assert convrot_config._resolve_kernel_bias(layer_with_bias, None) is None
+
+    layer_without_bias = SimpleNamespace(has_bias=False)
+    assert convrot_config._resolve_kernel_bias(layer_without_bias, "caller") == "caller"
+
+
 def test_missing_mxfp_support_only_disables_mxfp_methods(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
     mocker.patch.object(convrot_config, "_MXFP_AVAILABLE", False)
@@ -278,11 +294,7 @@ class TestCudaConvRot:
         assert layer.weight.dtype == torch.int8 and error < 0.02
 
 
-@mxfp_available
-@accelerator_available
-class TestGpuConvRotMxfp4:
-    """Real MXFP4 kernels selected by vLLM for the current accelerator."""
-
+class _GpuConvRotMxfpTestBase:
     @staticmethod
     def _layer(weight, bias=None):
         layer = torch.nn.Module()
@@ -318,6 +330,14 @@ class TestGpuConvRotMxfp4:
         out = method.apply(layer, x, bias)
         assert out.shape == (*x.shape[:-1], weight.shape[0]) and out.dtype == torch.bfloat16
         return layer, self._error(out, torch.nn.functional.linear(x, weight, bias))
+
+
+@mxfp_available
+@accelerator_available
+@hardware_test(res={"cuda": ["H100", "H200", "B200"], "xpu": "B60"}, num_cards=1)
+@pytest.mark.full_model
+class TestGpuConvRotMxfp4(_GpuConvRotMxfpTestBase):
+    """Real MXFP4 kernels selected by vLLM for the current accelerator."""
 
     def test_selects_a_vllm_mxfp4_kernel(self):
         x, weight, bias = self._inputs()
@@ -343,44 +363,10 @@ class TestGpuConvRotMxfp4:
 
 @mxfp_available
 @accelerator_available
-class TestGpuConvRotMxfp8:
+@hardware_test(res={"cuda": ["H100", "H200", "B200"], "xpu": "B60"}, num_cards=1)
+@pytest.mark.full_model
+class TestGpuConvRotMxfp8(_GpuConvRotMxfpTestBase):
     """Real MXFP8 kernels selected by vLLM for the current accelerator."""
-
-    @staticmethod
-    def _layer(weight, bias=None):
-        layer = torch.nn.Module()
-        layer.weight = torch.nn.Parameter(weight.clone(), requires_grad=False)
-        layer.logical_widths = [weight.shape[0]]
-        layer.input_size_per_partition = weight.shape[1]
-        layer.output_size_per_partition = weight.shape[0]
-        layer.output_partition_sizes = [weight.shape[0]]
-        layer.orig_dtype = weight.dtype
-        layer.params_dtype = weight.dtype
-        layer.has_bias = bias is not None
-        if bias is not None:
-            layer.bias = torch.nn.Parameter(bias.clone(), requires_grad=False)
-        return layer
-
-    @staticmethod
-    def _inputs():
-        torch.manual_seed(0)
-        x = torch.randn(4, 64, 1024, dtype=torch.bfloat16, device=accelerator_device())
-        x[..., [3, 500, 777]] *= 80.0
-        weight = torch.randn(768, 1024, dtype=torch.bfloat16, device=accelerator_device()) / 32
-        weight[:, 11] *= 30.0
-        bias = torch.randn(768, dtype=torch.bfloat16, device=accelerator_device())
-        return x, weight, bias
-
-    @staticmethod
-    def _error(out, ref):
-        return ((out.float() - ref.float()).norm() / ref.float().norm()).item()
-
-    def _quantized_error(self, method, weight, x, bias):
-        layer = self._layer(weight, bias)
-        method.process_weights_after_loading(layer)
-        out = method.apply(layer, x, bias)
-        assert out.shape == (*x.shape[:-1], weight.shape[0]) and out.dtype == torch.bfloat16
-        return layer, self._error(out, torch.nn.functional.linear(x, weight, bias))
 
     def test_gemm_matches_the_dequantized_payload(self):
         from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (

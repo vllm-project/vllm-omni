@@ -183,6 +183,20 @@ def _rotated_weight(layer: Module, requested_group: int) -> torch.Tensor:
     return weight if hadamard is None else rotate(weight, hadamard)
 
 
+def _resolve_kernel_bias(layer: torch.nn.Module, bias: torch.Tensor | None) -> torch.Tensor | None:
+    """Select the bias the selected kernel should apply.
+
+    Kernels may replace or pad ``layer.bias`` while preparing weights. Use that
+    prepared tensor only when the layer owns a bias; otherwise preserve the
+    caller-provided bias (or ``None`` for ``skip_bias_add``).
+    """
+    if bias is None:
+        return None
+    if getattr(layer, "has_bias", False):
+        return layer.bias
+    return bias
+
+
 class DiffusionConvRotConfig(QuantizationConfig):
     """Online ConvRot quantization of every non-ignored diffusion linear layer."""
 
@@ -309,7 +323,7 @@ class DiffusionConvRotMxfp4Config(DiffusionConvRotConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 75
+        return 80
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
         super().apply_vllm_mapper(hf_to_vllm_mapper)
@@ -367,7 +381,7 @@ class DiffusionConvRotMxfp8Config(DiffusionConvRotConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 75
+        return 80
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> DiffusionConvRotMxfp8Config:
@@ -473,7 +487,7 @@ class ConvRotMxfp4OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):
         if layer.convrot_hadamard is not None:
             x = rotate(x, layer.convrot_hadamard)
         rows = x.reshape(-1, x.shape[-1]).contiguous()
-        kernel_bias = None if bias is None else getattr(layer, "bias", bias)
+        kernel_bias = _resolve_kernel_bias(layer, bias)
         out = kernel.apply_weights(layer, rows, kernel_bias)
         return out.reshape(*x.shape[:-1], out.shape[-1])
 
@@ -512,6 +526,6 @@ class ConvRotMxfp8OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):
         if layer.convrot_hadamard is not None:
             x = rotate(x, layer.convrot_hadamard)
         rows = x.reshape(-1, x.shape[-1]).contiguous()
-        kernel_bias = None if bias is None else getattr(layer, "bias", bias)
+        kernel_bias = _resolve_kernel_bias(layer, bias)
         out = kernel.apply_weights(layer, rows, kernel_bias)
         return out.reshape(*x.shape[:-1], out.shape[-1])
