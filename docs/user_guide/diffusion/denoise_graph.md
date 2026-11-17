@@ -61,9 +61,11 @@ value. In these cases the runner is not built, a warning starting with
 - `--enforce-eager`.
 - A paged diffusion KV mode (`diffusion_kv_mode` other than `dense_legacy`).
 - `diffusion_kv_cache_skip_steps` together with a quantized
-  `diffusion_kv_cache_dtype`: KV quantization is switched on and off by step
-  index. Skip steps without a quantized KV dtype have no effect and do not
-  block graphs.
+  `diffusion_kv_cache_dtype` or an explicit `quant.precision` in
+  `diffusion_attention_config.default` or `per_role`: attention quantization
+  is switched on and off by step index. Skip steps without either precision
+  selection have no effect and do not block graphs. Execution options such as
+  `fp8_fa_mode` alone do not select a quantized precision.
 - `TRTLLM_ATTN` with `skip_softmax.disabled_until_timestep > 0`: attention
   changes with the timestep.
 - `diffusion_attention_schedule` profiles, even with an empty default schedule:

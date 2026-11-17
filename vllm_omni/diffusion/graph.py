@@ -109,9 +109,8 @@ def _step_dependent_attention(od_config: Any) -> str | None:
     off the step's arguments, so a replay would keep the capture step's choice.
     """
     kv_cache_dtype = getattr(od_config, "diffusion_kv_cache_dtype", None)
-    if kv_cache_dtype not in (None, "auto", "float") and getattr(
-        od_config, "diffusion_kv_cache_skip_step_indices", None
-    ):
+    skip_steps = getattr(od_config, "diffusion_kv_cache_skip_step_indices", None)
+    if kv_cache_dtype not in (None, "auto", "float") and skip_steps:
         return "diffusion_kv_cache_skip_steps makes KV quantization depend on the step index"
     # Checked even with an empty default: requests can bring their own ranges.
     if getattr(od_config, "diffusion_attention_schedule", None) is not None:
@@ -120,6 +119,9 @@ def _step_dependent_attention(od_config: Any) -> str | None:
     if attention_config is not None:
         specs = [attention_config.default, *attention_config.per_role.values()]
         for spec in specs:
+            quant = getattr(spec, "quant", None)
+            if quant is not None and quant.precision is not None and skip_steps:
+                return "diffusion_kv_cache_skip_steps makes quant.precision depend on the step index"
             skip_softmax = getattr(spec, "skip_softmax", None)
             if skip_softmax is not None and skip_softmax.disabled_until_timestep > 0:
                 return "TRTLLM_ATTN skip_softmax.disabled_until_timestep makes attention depend on the timestep"

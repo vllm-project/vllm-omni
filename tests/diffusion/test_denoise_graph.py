@@ -21,7 +21,13 @@ import vllm_omni.diffusion.cuda_graph as cuda_graph_mod
 import vllm_omni.diffusion.distributed.utils as dist_utils
 import vllm_omni.diffusion.graph as graph_mod
 from vllm_omni.diffusion.cuda_graph import GraphedForward, copy_into
-from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, AttentionSpec, SkipSoftmaxSpec
+from vllm_omni.diffusion.data import (
+    AttentionConfig,
+    AttentionScheduleConfig,
+    AttentionSpec,
+    AttnQuantSpec,
+    SkipSoftmaxSpec,
+)
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.graph import (
     DENOISE_GRAPH_MAX_ENTRIES,
@@ -232,6 +238,36 @@ def test_build_runner_stays_eager_when_unsafe(platform, overrides, refusal):
 )
 def test_build_runner_allows_step_independent_attention(platform, overrides):
     assert build_denoise_graph_runner(_od_config(**overrides), _affine, "T") is not None
+
+
+@pytest.mark.parametrize("scope", ["default", "per_role"])
+@pytest.mark.parametrize("precision", ["fp8", "mxfp8", "mxfp4"])
+@pytest.mark.parametrize("global_dtype", [None, "auto", "float"])
+@pytest.mark.parametrize("skip_steps", [(), (1,)])
+def test_build_runner_respects_spec_quant_skip_steps(platform, scope, precision, global_dtype, skip_steps):
+    spec = AttentionSpec(backend="FLASH_ATTN", quant=AttnQuantSpec(precision=precision))
+    attention_config = AttentionConfig(**{scope: spec if scope == "default" else {"self": spec}})
+    config = _od_config(
+        diffusion_attention_config=attention_config,
+        diffusion_kv_cache_dtype=global_dtype,
+        diffusion_kv_cache_skip_step_indices=skip_steps,
+    )
+
+    runner = build_denoise_graph_runner(config, _affine, "T")
+
+    assert (runner is None) == bool(skip_steps)
+
+
+@pytest.mark.parametrize("scope", ["default", "per_role"])
+def test_build_runner_allows_quant_options_without_precision(platform, scope):
+    spec = AttentionSpec(backend="FLASH_ATTN", quant=AttnQuantSpec(fp8_fa_mode="C8V16_TILING512"))
+    attention_config = AttentionConfig(**{scope: spec if scope == "default" else {"self": spec}})
+    config = _od_config(
+        diffusion_attention_config=attention_config,
+        diffusion_kv_cache_skip_step_indices=(1,),
+    )
+
+    assert build_denoise_graph_runner(config, _affine, "T") is not None
 
 
 @pytest.mark.parametrize(
