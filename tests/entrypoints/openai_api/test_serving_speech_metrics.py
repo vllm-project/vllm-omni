@@ -22,6 +22,7 @@ class _MetricsStub:
         self.ttfp_calls: list[tuple[str, str, float]] = []
         self.underrun_calls: list[tuple[str, str, float]] = []
         self.continuity_calls: list[tuple[str, str, int]] = []
+        self.stall_details: list[dict] = []
         self.abort_calls: list[str] = []
         self.completed = 0
 
@@ -36,6 +37,9 @@ class _MetricsStub:
 
     def observe_audio_underrun(self, stage: str, replica: str, seconds: float) -> None:
         self.underrun_calls.append((stage, replica, seconds))
+
+    def observe_audio_stall_details(self, stage: str, replica: str, **details) -> None:
+        self.stall_details.append({"stage": stage, "replica": replica, **details})
 
     def inc_audio_continuity_ok(self, stage: str, replica: str, threshold_ms: int) -> None:
         self.continuity_calls.append((stage, replica, threshold_ms))
@@ -434,6 +438,12 @@ async def test_resampled_speech_records_flush_with_audio_producer(monkeypatch, f
     assert finalized[0]["chunk_bytes"] == [4800] * len(expected_arrivals)
     assert finalized[0]["chunk_arrival_times_s"] == expected_arrivals
     assert metrics.underrun_calls == [("1", "2", pytest.approx(0.0 if flush_only else 0.15))]
+    assert len(metrics.stall_details) == 1
+    details = metrics.stall_details[0]
+    assert details["total_underrun_s"] == pytest.approx(0 if flush_only else 0.15)
+    assert details["event_count"] == (0 if flush_only else 1)
+    assert details["underrun_ratio"] == pytest.approx(0 if flush_only else 0.15 / 0.35)
+    assert details["events_per_minute"] == (0 if flush_only else 300)
     assert metrics.continuity_calls == ([("1", "2", 100)] if flush_only else [])
 
 
@@ -466,3 +476,4 @@ async def test_resampled_speech_without_pcm_does_not_emit_metrics(monkeypatch, e
     assert metrics.ttfp_calls == []
     assert metrics.underrun_calls == []
     assert metrics.continuity_calls == []
+    assert metrics.stall_details == []

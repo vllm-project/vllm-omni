@@ -37,7 +37,7 @@ Defined in `vllm_omni/metrics/prometheus.py`. Track request lifecycle across the
 
 ## Audio Modality Metrics (`vllm_omni:`)
 
-Emitted at request finalize, except for `audio_ttfp_s` (the first audio packet/frame from streaming Chat or Speech APIs) and `audio_underrun_s` / `audio_continuity_ok_total` (Chat or Speech streaming finalize, after the chunk stream is exhausted). Non-streaming Speech latency is represented by `e2e_request_latency_s`, not TTFP. All audio metrics carry `{model_name, stage, replica}` plus the listed extra label.
+Emitted at request finalize, except for `audio_ttfp_s` (the first audio packet/frame from streaming Chat or Speech APIs) and the stall metrics / `audio_continuity_ok_total` (Chat or Speech streaming finalize, after the chunk stream is exhausted). Non-streaming Speech latency is represented by `e2e_request_latency_s`, not TTFP. All audio metrics carry `{model_name, stage, replica}` plus the listed extra label.
 
 | Metric | Type | Extra label | Description |
 | -------- | ------ | ------------- | ------------- |
@@ -45,19 +45,24 @@ Emitted at request finalize, except for `audio_ttfp_s` (the first audio packet/f
 | `vllm_omni:audio_duration_s` | Histogram | — | Audio content duration (`audio_frames / sample_rate`) |
 | `vllm_omni:audio_rtf` | Histogram | — | Real-time factor (`stage_gen_time_s / audio_duration_s`); streaming TTS SLO red line `< 1`; uses `RTF_BUCKETS` |
 | `vllm_omni:audio_frames_total` | Counter | — | Cumulative audio frame count; throughput via `rate()` |
-| `vllm_omni:audio_underrun_s` | Histogram | — | Per-request worst-case player deficit; `> 0` indicates listener heard silent gaps |
-| `vllm_omni:audio_continuity_ok_total` | Counter | `threshold_ms` | Incremented when the request's worst underrun stayed below `threshold_ms` |
+| `vllm_omni:audio_underrun_s` | Histogram | — | Legacy maximum cumulative playback deficit; equals total stalls |
+| `vllm_omni:audio_max_single_underrun_s` | Histogram | — | Largest individual playback stall per response, in seconds |
+| `vllm_omni:total_underrun_s` | Histogram | — | Sum of playback stalls per response, excluding first-packet wait |
+| `vllm_omni:audio_underrun_event_count` | Histogram | — | Actual new stalls per response; `_sum` gives total event count |
+| `vllm_omni:audio_underrun_ratio` | Histogram | — | Total stalls / (audio content duration + total stalls), per response |
+| `vllm_omni:audio_underrun_events_per_minute` | Histogram | — | Stall count / (audio content seconds / 60), per response |
+| `vllm_omni:audio_continuity_ok_total` | Counter | `threshold_ms` | Incremented when total response stalls stay within the threshold |
 | `vllm_omni:audio_skipped_requests_total` | Counter | `reason` | Silent-loss counter — code2wav rejected malformed codec input and returned `200 OK` with empty audio |
 
 The continuity math comes from `vllm_omni/benchmarks/audio_continuity.py::compute_continuity_stats` so the server-side observation aligns with the bench-side definition.
 For Speech, continuity applies to raw audio, SSE, and WebSocket streaming. WAV headers and empty chunks are excluded; non-streaming Speech requests do not emit continuity samples.
 
-Continuity rate for the default 100 ms threshold can be derived from the successful-continuity counter and the underrun Histogram's request count:
+Continuity rate for the default 100 ms threshold can be derived from the successful-continuity counter and the total-underrun Histogram's response count:
 
 ```promql
 sum by (model_name, stage, replica) (rate(vllm_omni:audio_continuity_ok_total{threshold_ms="100"}[5m]))
 /
-sum by (model_name, stage, replica) (rate(vllm_omni:audio_underrun_s_count[5m]))
+sum by (model_name, stage, replica) (rate(vllm_omni:total_underrun_s_count[5m]))
 ```
 
 ## Diffusion Metrics (`vllm_omni:`)
