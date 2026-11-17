@@ -79,11 +79,6 @@ self-attention and leave cross-attention dense:
 }'
 ```
 
-The CUDA regression suite exercises this configuration through a small Wan
-transformer with synthetic weights, checking both dense guards and actual
-sparse-kernel dispatch. This is forward-path compatibility coverage, not
-pretrained-model quality or end-to-end speed evidence.
-
 Do not apply SOL globally to models that also use cross-attention, masks,
 GQA, or incompatible head dimensions. Models must publish denoising-step
 metadata and parseable layer prefixes for the default guards to permit sparse
@@ -116,13 +111,8 @@ Short distilled schedules can remain entirely dense with `dense_steps=10`;
 change this only after validating quality.
 
 Warm up both dense and sparse branches using a complete request before timing.
-Report repeated latency, variation, peak GPU memory, video metrics, and audio
-quality on the tested revision. The
-[original-H3 E2E report](../../../../benchmarks/diffusion/sol_attn_h3_e2e_results.md)
-records a matched dense/SOL comparison and its outstanding perceptual checks.
-The old
-[SM120 sweep](../../../../benchmarks/diffusion/sol_attn_sm120_results.md)
-predates the current sink and metadata handling and is historical evidence only.
+Measure repeated latency, variation, peak GPU memory, video metrics, and audio
+quality on the deployed revision.
 
 CPU contract regressions:
 

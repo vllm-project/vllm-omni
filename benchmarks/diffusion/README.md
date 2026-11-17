@@ -5,14 +5,6 @@ This folder contains an online-serving benchmark script for diffusion models.
 It sends requests to a vLLM OpenAI-compatible endpoint and reports throughput,
 latency percentiles, and optional SLO attainment.
 
-For a matched original MiniMax-H3 dense/SOL generation comparison, see the
-[2026-11-17 E2E report](./sol_attn_h3_e2e_results.md). It measures offline
-generation, not HTTP-serving latency, and records outstanding quality checks.
-
-For historical MiniMax-H3 Sol-Attn measurements on RTX PRO 5000 SM120,
-see the [speed/quality sweep](./sol_attn_sm120_results.md). These results
-predate the current backend and are not validation of its speed or quality.
-
 The main entrypoint is:
 
 - `benchmarks/diffusion/diffusion_benchmark_serving.py`
