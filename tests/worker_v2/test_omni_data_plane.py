@@ -1100,7 +1100,6 @@ def test_native_perf_tags_survive_deferred_cohort_wire_and_shared_payload(raw_pl
     runner.model_state = SimpleNamespace(intermediate_buffer=SimpleNamespace(buffers=[first, second, {}]))
     output = OmniModelRunnerOutput(
         req_ids=req_ids,
-        req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
         sampled_token_ids=[[21], [22], [23]],
         prompt_logprobs_dict={},
         inter_stage_outputs=[shared] * 3,
