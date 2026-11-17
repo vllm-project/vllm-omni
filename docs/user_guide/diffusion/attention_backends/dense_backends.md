@@ -106,8 +106,8 @@ DIFFUSION_ATTENTION_BACKEND=FLASHINFER_ATTN \
 option on CUDA platforms and an automatic Blackwell fallback when FlashInfer
 is installed but cuDNN is too old for `CUDNN_ATTN`.
 
-On Blackwell, `auto` resolves to FlashInfer cute-dsl, which cannot run a
-nontrivial custom mask. Automatic selection may fall back to SDPA for those
+On SM 10.x/11.x Blackwell, `auto` resolves to FlashInfer cute-dsl, which cannot
+run a nontrivial custom mask; SM 12.x resolves to `fa2`, Hopper to `fa3`. Automatic selection may fall back to SDPA for those
 masks. An explicit `FLASHINFER_ATTN` selection does not: sequence-parallel
 auto-padding that would create a padding mask is rejected at capability
 preflight. Use `TORCH_SDPA`, pin `quant.flashinfer_backend` to `fa2`/`fa3`

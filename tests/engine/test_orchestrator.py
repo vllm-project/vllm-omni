@@ -2459,6 +2459,64 @@ async def test_stage_pool_requested_replica_down_race_does_not_fallback() -> Non
     assert all(not client.add_request_calls for client in clients)
 
 
+def test_stage_pool_pinned_binding_accepts_a_replica_the_hub_reports_up() -> None:
+    pool, clients, _ = _distributed_routing_pool()
+
+    assert pool.bind_request_to_replica("pinned", 1) == 1
+    assert pool.get_bound_replica_id("pinned") == 1
+    assert all(not client.add_request_calls for client in clients)
+
+
+def test_stage_pool_pinned_binding_rejects_a_replica_the_hub_reports_down() -> None:
+    pool, _, _ = _distributed_routing_pool((ReplicaStatus.UP, ReplicaStatus.DOWN))
+
+    with pytest.raises(StageUnavailableError, match="pinned replica 1 is unavailable"):
+        pool.bind_request_to_replica("pinned", 1)
+
+    assert pool.get_bound_replica_id("pinned") is None
+
+
+@pytest.mark.asyncio
+async def test_distributed_pin_down_after_binding_does_not_fallback() -> None:
+    pool, clients, hub = _distributed_routing_pool()
+    assert pool.bind_request_to_replica("pinned", 1) == 1
+    hub.replicas[1].status = ReplicaStatus.DOWN
+    pool.invalidate_addr("tcp://replica-1")
+
+    with pytest.raises(OmniClientError, match="replica_id 1 does not exist or is not available"):
+        pool.preselect_replica_id("pinned")
+
+    state = OrchestratorRequestState(request_id="pinned", sampling_params_list=[_sampling_params()], final_stage_id=0)
+    request = FakePromptRequest(request_id="pinned", prompt_token_ids=[1])
+    with pytest.raises(StageUnavailableError, match="pinned replica 1 is unavailable"):
+        await pool.submit_initial("pinned", state, request, pinned_replica_id=1)
+
+    assert all(not client.add_request_calls for client in clients)
+
+
+def test_invalidate_addr_returns_pinned_requests_too() -> None:
+    pool, _, _ = _distributed_routing_pool()
+    assert pool.bind_request_to_replica("pinned", 1) == 1
+
+    # Pins share the distributed affinity ledger with explicit routes.
+    assert pool.invalidate_addr("tcp://replica-1") == ["pinned"]
+
+    assert pool.get_bound_replica_id("pinned") is None
+    pool.release_binding("pinned")
+    assert pool.get_bound_replica_id("pinned") is None
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_pinned_submit_in_distributed_mode_uses_that_replica() -> None:
+    pool, clients, _ = _distributed_routing_pool()
+    state = OrchestratorRequestState(request_id="pinned", sampling_params_list=[_sampling_params()], final_stage_id=0)
+    request = FakePromptRequest(request_id="pinned", prompt_token_ids=[1])
+
+    assert await pool.submit_initial("pinned", state, request, pinned_replica_id=1) == 1
+    assert len(clients[1].add_request_calls) == 1
+    assert not clients[0].add_request_calls
+
+
 @pytest.mark.asyncio
 async def test_explicit_run_request_detached_before_admission_returns_client_error() -> None:
     pool, clients, hub = _distributed_routing_pool()
@@ -2795,17 +2853,6 @@ async def test_stage_pool_pinned_submit_rejects_mismatched_cache_replica(monkeyp
     assert pool.get_bound_replica_id("pinned") is None
     assert not processor.add_request_calls
     assert all(not client.add_request_calls for client in clients)
-
-
-@pytest.mark.parametrize("distributed_hook", ["_hub", "_lb"])
-def test_stage_pool_pinned_binding_rejects_distributed_mode(distributed_hook: str) -> None:
-    pool = StagePool(0, [FakeStageClient(), FakeStageClient()])
-    setattr(pool, distributed_hook, object())
-
-    with pytest.raises(StageUnavailableError, match="only supported for local stage pools"):
-        pool.bind_request_to_replica("pinned", 1)
-
-    assert pool.get_bound_replica_id("pinned") is None
 
 
 @pytest.mark.asyncio
