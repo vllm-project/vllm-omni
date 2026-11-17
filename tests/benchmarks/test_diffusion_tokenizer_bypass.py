@@ -19,8 +19,8 @@ from vllm_omni.benchmarks.serve import (
 
 pytestmark = [
     pytest.mark.core_model,
-    pytest.mark.diffusion,
     pytest.mark.cpu,
+    pytest.mark.benchmark,
 ]
 
 
@@ -43,6 +43,12 @@ def test_diffusion_endpoints_detected_without_leading_slash(endpoint):
 @pytest.mark.parametrize("backend", sorted(_DIFFUSION_BACKENDS))
 def test_diffusion_backends_detected(backend):
     assert is_diffusion_benchmark(Namespace(endpoint="", backend=backend))
+
+
+@pytest.mark.parametrize("endpoint", sorted(_DIFFUSION_ENDPOINTS))
+def test_diffusion_endpoints_detected_as_backend_spelling(endpoint):
+    """Endpoint paths are also valid --backend spellings (registered adapters)."""
+    assert is_diffusion_benchmark(Namespace(endpoint="", backend=endpoint))
 
 
 @pytest.mark.parametrize(
@@ -82,6 +88,7 @@ def _make_bench_args(**overrides):
         print_stage=False,
         extra_body=None,
         dataset_name=None,
+        dataset_path=None,
         tokenizer=None,
         tokenizer_mode="auto",
         trust_remote_code=False,
@@ -131,6 +138,16 @@ def test_main_slashless_endpoint_skips_tokenizer():
     mock_tokenizer.assert_not_called()
 
 
+def test_main_backend_spelling_skips_tokenizer():
+    """--backend /v1/videos (endpoint path as backend) must also bypass tokenizer init."""
+    args = _make_bench_args(endpoint="/v1/completions", backend="/v1/videos")
+    with patch("vllm.benchmarks.serve.get_tokenizer") as mock_tokenizer:
+        mock_tokenizer.side_effect = AssertionError("get_tokenizer should not be called")
+        with pytest.raises(ValueError, match="dataset-name"):
+            main(args)
+    mock_tokenizer.assert_not_called()
+
+
 def test_main_image_edit_keeps_tokenizer_init():
     """Image edits with random-mm and no explicit --tokenizer must not skip
     tokenizer init: the retained dataset path samples via tokenizer.vocab_size."""
@@ -153,3 +170,87 @@ def test_main_image_edit_backend_keeps_tokenizer_init():
             main(args)
     mock_tokenizer.assert_called_once()
     assert not args.skip_tokenizer_init
+
+
+def test_main_image_edit_endpoint_as_backend_keeps_tokenizer_init():
+    """--backend /v1/images/edits must keep tokenizer init like the endpoint spelling."""
+    args = _make_bench_args(backend="/v1/images/edits", dataset_name="random-mm")
+    with patch("vllm.benchmarks.serve.get_tokenizer", return_value=MagicMock()) as mock_tokenizer:
+        with pytest.raises(Exception):
+            main(args)
+    mock_tokenizer.assert_called_once()
+    assert not args.skip_tokenizer_init
+
+
+class _ReachedBenchmarkError(Exception):
+    """Sentinel raised by the mocked benchmark() to stop main_async."""
+
+
+def test_main_tokenizer_less_diffusion_run_reaches_sampling(tmp_path):
+    """A tokenizer-less diffusion run must get past tokenizer init, dataset
+    validation, and sampling, and reach the benchmark loop with tokenizer=None.
+
+    This exercises the full region of upstream main_async between
+    ``skip_tokenizer_init`` and ``benchmark()`` — the previously untested
+    stretch behind the ``--dataset-name`` stop point of the other tests.
+    """
+    dataset_path = tmp_path / "prompts.jsonl"
+    dataset_path.write_text(
+        '{"prompt": "a cat sitting on a mat"}\n{"prompt": "a red barn in a field"}\n',
+        encoding="utf-8",
+    )
+    args = _make_bench_args(
+        dataset_name="custom",
+        dataset_path=str(dataset_path),
+        num_prompts=2,
+        custom_output_len=8,
+        skip_chat_template=True,
+        disable_shuffle=True,
+        no_oversample=True,
+        # Post-dataset fields read by upstream main_async before benchmark()
+        input_len=None,
+        output_len=None,
+        self_timed=None,
+        goodput=None,
+        top_p=None,
+        top_k=None,
+        min_p=None,
+        temperature=None,
+        frequency_penalty=None,
+        presence_penalty=None,
+        repetition_penalty=None,
+        percentile_metrics=None,
+        metric_percentiles="99",
+        logprobs=None,
+        request_rate=1.0,
+        burstiness=1.0,
+        disable_tqdm=True,
+        num_warmups=0,
+        profile=False,
+        ignore_eos=False,
+        lora_modules=None,
+        lora_assignment=None,
+        ramp_up_start_rps=None,
+        ramp_up_end_rps=None,
+        ready_check_timeout_sec=None,
+        probe_request_rate=None,
+    )
+
+    captured: dict = {}
+
+    async def _fake_benchmark(**kwargs):
+        captured.update(kwargs)
+        raise _ReachedBenchmarkError
+
+    with patch("vllm.benchmarks.serve.get_tokenizer") as mock_tokenizer:
+        mock_tokenizer.side_effect = AssertionError("get_tokenizer should not be called")
+        with patch("vllm.benchmarks.serve.benchmark", side_effect=_fake_benchmark):
+            with pytest.raises(_ReachedBenchmarkError):
+                main(args)
+
+    mock_tokenizer.assert_not_called()
+    assert args.skip_tokenizer_init is True
+    # The run reached the benchmark loop with a tokenizer-less config and
+    # sampled requests from the dataset on the way.
+    assert captured["tokenizer"] is None
+    assert len(captured["input_requests"]) == 2

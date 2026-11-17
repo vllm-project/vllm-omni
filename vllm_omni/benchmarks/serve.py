@@ -87,12 +87,21 @@ _DIFFUSION_BACKENDS = frozenset(
     }
 )
 
+_IMAGE_EDIT_BACKENDS = frozenset(
+    {
+        "/v1/images/edits",
+        "openai-image-edits-omni",
+    }
+)
+
 
 def is_diffusion_benchmark(args) -> bool:
     """Return True when the benchmark targets a diffusion/image/video endpoint."""
     endpoint = _normalize_endpoint(getattr(args, "endpoint", None)) or ""
     backend = getattr(args, "backend", None) or ""
-    return endpoint in _DIFFUSION_ENDPOINTS or backend in _DIFFUSION_BACKENDS
+    # Endpoint paths double as backend spellings (they are registered as
+    # request adapters in ASYNC_REQUEST_FUNCS), so match both.
+    return endpoint in _DIFFUSION_ENDPOINTS or backend in _DIFFUSION_ENDPOINTS or backend in _DIFFUSION_BACKENDS
 
 
 def _is_image_edit_benchmark(args) -> bool:
@@ -103,7 +112,7 @@ def _is_image_edit_benchmark(args) -> bool:
     """
     endpoint = _normalize_endpoint(getattr(args, "endpoint", None)) or ""
     backend = getattr(args, "backend", None) or ""
-    return endpoint == "/v1/images/edits" or backend == "openai-image-edits-omni"
+    return endpoint == "/v1/images/edits" or backend in _IMAGE_EDIT_BACKENDS
 
 
 def _prepare_diffusion_args(args: argparse.Namespace) -> None:
