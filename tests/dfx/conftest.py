@@ -988,6 +988,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help=("Path to benchmark config JSON. Example: --test-config-file tests/dfx/perf/tests/test_tts.json"),
     )
     parser.addoption(
+        "--require-duplex-eval-score-floors",
+        action="store_true",
+        default=False,
+        help="Fail Omni-DuplexEval accuracy cases without score floors for the runtime hardware (default: off).",
+    )
+    parser.addoption(
         "--assert-baseline",
         action="store_true",
         default=False,
