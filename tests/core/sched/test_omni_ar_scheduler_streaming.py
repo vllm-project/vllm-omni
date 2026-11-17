@@ -635,26 +635,43 @@ def test_stage0_plain_streaming_update_keeps_the_first_chunk_text() -> None:
     assert has_tts_text_conditioning(info, allow_blank_text=False)
 
 
-def test_stage0_replace_flag_in_additional_information_extends_the_prompt() -> None:
-    # The scheduler receives additional_information serialized and reads the
-    # replace flag from model_intermediate_buffer only; Qwen3-TTS's update
-    # check treats an additional_information flag as a plain extension too.
+@pytest.mark.parametrize(
+    "replace_flag",
+    [{"meta": {"replace_streaming_prompt": True}}, {"meta.replace_streaming_prompt": True}],
+    ids=["nested", "wire-key"],
+)
+@pytest.mark.parametrize("text", [["Next sentence."], [""]], ids=["text", "blank-text"])
+def test_stage0_replace_flag_in_additional_information_replaces_the_prompt(replace_flag, text) -> None:
+    # The scheduler reads the replace flag from additional_information too, so
+    # such an update installs its own text. Qwen3-TTS's update check must then
+    # accept exactly the updates whose text the Talker can still use.
     sched = _make_scheduler(stage_id=0)
     session = _make_request()
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
-    first_chunk_info = serialize_additional_information({"task_type": ["CustomVoice"], "text": ["Hello there."]})
-    session.additional_information = first_chunk_info
-    update = _make_update([10, 20])
-    update.additional_information = serialize_additional_information(
-        {"text": [""], "meta": {"replace_streaming_prompt": True}}
+    session.additional_information = serialize_additional_information(
+        {"task_type": ["CustomVoice"], "text": ["Hello there."]}
     )
+    update_prompt = {
+        "prompt_token_ids": [10, 20],
+        "additional_information": {"task_type": ["CustomVoice"], "text": text, **replace_flag},
+    }
+    try:
+        check_text_update(update_prompt, [])
+        accepted = True
+    except ValueError:
+        accepted = False
+    update = _make_update([10, 20])
+    update.additional_information = serialize_additional_information(update_prompt["additional_information"])
     update.model_intermediate_buffer = None
 
     sched._update_request_as_session(session, update)
 
-    assert session.additional_information is first_chunk_info
-    assert list(session.prompt_token_ids[:3]) == [1, 2, 3]
-    assert list(session.prompt_token_ids[-2:]) == [10, 20]
+    assert session.additional_information is update.additional_information
+    assert list(session.prompt_token_ids) == [10, 20]
+    readmitted = OmniNewRequestData.from_request(session, block_ids=([],))
+    info = deserialize_additional_information(readmitted.additional_information)
+    assert info["text"] == text
+    assert accepted == has_tts_text_conditioning(info, allow_blank_text=False)
 
 
 _QWEN3_TTS_FIRST_CHUNKS = {

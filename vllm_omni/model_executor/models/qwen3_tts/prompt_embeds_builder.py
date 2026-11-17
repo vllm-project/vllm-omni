@@ -42,6 +42,7 @@ from vllm.logger import init_logger
 from vllm.multimodal.audio import AudioResampler
 
 from vllm_omni.config.stage_config import on_streaming_updates
+from vllm_omni.core.sched.utils import streaming_update_replaces_prompt
 from vllm_omni.utils.audio import mel_filter_bank
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 
@@ -163,21 +164,19 @@ def check_text_update(prompt: Any, sampling_params_list: Sequence[Any]) -> Any:
 
     A plain stage-0 update keeps the first chunk's ``additional_information``
     but installs its own ``model_intermediate_buffer``, which Model Runner V2
-    lays over it when it re-admits the request. An update whose buffer sets
-    ``meta.replace_streaming_prompt`` replaces both payloads, so it gets the
-    first-submission check. The scheduler reads that flag from the buffer only:
-    it receives ``additional_information`` serialized, so a flag there leaves a
-    plain extension. ``AsyncOmni`` closes every stream with a text-less
-    ``TokensPrompt([0])`` update, which passes.
+    lays over it when it re-admits the request. An update that sets
+    ``meta.replace_streaming_prompt`` in either payload replaces both, so it
+    gets the first-submission check; the scheduler decides this with the same
+    ``streaming_update_replaces_prompt``. ``AsyncOmni`` closes every stream with
+    a text-less ``TokensPrompt([0])`` update, which passes.
     """
     for item in prompt if isinstance(prompt, list) else (prompt,):
-        buffer = item.get("model_intermediate_buffer") if isinstance(item, dict) else None
-        if not isinstance(buffer, dict):
+        if not isinstance(item, dict):
             continue
-        meta = buffer.get("meta")
-        if isinstance(meta, dict) and meta.get("replace_streaming_prompt") is True:
+        buffer = item.get("model_intermediate_buffer")
+        if streaming_update_replaces_prompt((buffer, item.get("additional_information"))):
             check_text_prompt(item, sampling_params_list)
-        elif "text" in buffer or PRECOMPUTED_TEXT_IDS_KEY in buffer:
+        elif isinstance(buffer, dict) and ("text" in buffer or PRECOMPUTED_TEXT_IDS_KEY in buffer):
             if not has_tts_text_conditioning(buffer, allow_blank_text=False):
                 raise ValueError(_TEXT_ERROR)
     return prompt
@@ -197,7 +196,8 @@ def check_text_prompt(prompt: Any, sampling_params_list: Sequence[Any]) -> Any:
     ``additional_information`` must carry the text itself: a plain streaming
     update replaces the first chunk's ``model_intermediate_buffer`` with its
     own, often none, and Model Runner V2 then re-admits the request from the
-    first chunk's ``additional_information`` and that buffer. Laying the buffer over it, as Model Runner V2 does
+    first chunk's ``additional_information`` and that buffer. Laying the
+    buffer over it, as Model Runner V2 does
     (``OmniIntermediateBuffer.add_request``), must keep the text too; the V1
     runner applies ``additional_information`` last. A client ``trailing_text``
     hidden state does not count, since the Talker writes its own at first

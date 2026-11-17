@@ -106,6 +106,9 @@ _REJECTED_UPDATES = {
     "replace-blank-text": _update({"text": ["  "]}, buffer=_REPLACE),
     "replace-buffer-only-text": _update(buffer={"text": ["Hello."], **_REPLACE}),
     "replace-buffer-blanks-text": _update({"text": ["Hello."]}, buffer={"text": [""], **_REPLACE}),
+    # The scheduler also reads the flag from additional_information, nested or as its wire key.
+    "info-replace-flag-blank-text": _update({"text": [""], **_REPLACE}),
+    "info-wire-replace-flag-blank-text": _update({"text": [""], "meta.replace_streaming_prompt": True}),
 }
 _ACCEPTED_UPDATES = {
     # AsyncOmni closes every stream with TokensPrompt([0]); the engine stamps the request id.
@@ -115,9 +118,7 @@ _ACCEPTED_UPDATES = {
     "plain-blank-text": _update({"text": ["  "]}),
     "buffer-text": _update(buffer={"text": ["Hello."]}),
     "replace-text": _update({"text": ["Hello."]}, buffer=_REPLACE),
-    # The scheduler receives additional_information serialized and reads the
-    # replace flag from the buffer only, so this update is a plain extension.
-    "info-replace-flag-blank-text": _update({"text": [""], **_REPLACE}),
+    "info-replace-flag-text": _update({"text": ["Hello."], **_REPLACE}),
 }
 
 
