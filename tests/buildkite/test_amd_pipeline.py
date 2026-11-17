@@ -2236,6 +2236,36 @@ _COSMOS3_WEEKLY_NODES = (
 )
 _COSMOS3_T2I_NODE = "tests/e2e/online_serving/test_cosmos3.py::test_text_to_image_001"
 
+_WAN21_VACE_WEEKLY_JOBS = (
+    (
+        "Wan2.1 VACE probe · 1-GPU",
+        "mi300_1",
+        "1",
+        "2",
+        "105m",
+        120,
+        "rocm-wan-vace-weekly-1gpu",
+        (
+            "tests/e2e/online_serving/test_wan_2_1_vace_expansion.py::test_wan_2_1_vace[single_card_cpu_offload]",
+            "tests/e2e/online_serving/test_wan_2_1_vace_expansion.py::test_wan_2_1_vace[single_card_001]",
+        ),
+    ),
+    (
+        "Wan2.1 VACE probe · 2-GPU",
+        "mi300_2",
+        "2",
+        "5",
+        "165m",
+        180,
+        "rocm-wan-vace-weekly-2gpu",
+        tuple(
+            f"tests/e2e/online_serving/test_wan_2_1_vace_expansion.py::test_wan_2_1_vace[parallel_{index:03d}]"
+            for index in range(1, 6)
+        ),
+    ),
+)
+_WAN21_VACE_WEEKLY_LABELS = {job[0] for job in _WAN21_VACE_WEEKLY_JOBS}
+
 
 def test_cosmos3_weekly_is_blocking_and_replaces_narrow_nightly_owner() -> None:
     def flatten_paths(items: list) -> set[str]:
@@ -2305,6 +2335,82 @@ def test_cosmos3_weekly_is_blocking_and_replaces_narrow_nightly_owner() -> None:
     assert "Cosmos3 T2I Function" not in nightly_source
     assert ":full_moon: Cosmos3 MI300 Nightly" not in nightly_source
     assert _steps_selecting_node(AMD_NIGHTLY_PIPELINE, _COSMOS3_T2I_NODE) == []
+
+
+def test_wan21_vace_weekly_has_two_exact_nonblocking_rocm_probes() -> None:
+    def flatten_paths(items: list) -> set[str]:
+        paths: set[str] = set()
+        for item in items:
+            if isinstance(item, list):
+                paths.update(flatten_paths(item))
+            else:
+                paths.add(item)
+        return paths
+
+    group = _find_group("Diffusion E2E Weekly", AMD_WEEKLY_PIPELINE)
+    probe_steps = [step for step in group["steps"] if step["label"] in _WAN21_VACE_WEEKLY_LABELS]
+    assert len(probe_steps) == 2
+
+    runner = ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh"
+    for (
+        label,
+        agent_pool,
+        expected_gpus,
+        expected_tests,
+        run_timeout,
+        step_timeout,
+        artifact_name,
+        nodes,
+    ) in _WAN21_VACE_WEEKLY_JOBS:
+        step = _find_step(label, AMD_WEEKLY_PIPELINE)
+        assert step["grade"] == "NonBlocking"
+        assert step["agent_pool"] == agent_pool
+        assert step["depends_on"] == "amd-build"
+        assert step["mirror_hardwares"] == ["amdproduction"]
+        assert step["timeout_in_minutes"] == step_timeout
+        assert step["source_file_dependencies"] == "diffusion_wan2_1_vace_weekly"
+        assert step["artifact_paths"] == [f"artifacts/{artifact_name}/**/*"]
+        assert "retry" not in step
+
+        assert len(step["commands"]) == 1
+        command = step["commands"][0]
+        assert "MI325" not in command
+        assert "-m rocm" not in command
+        tokens = split(command)
+        runner_index = tokens.index(runner)
+        assert tokens[runner_index + 1 :] == [
+            expected_gpus,
+            expected_tests,
+            run_timeout,
+            artifact_name,
+            *nodes,
+        ]
+
+        for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
+            assert label not in pipeline_path.read_text(encoding="utf-8")
+
+    dependencies = yaml.safe_load(AMD_SOURCE_DEPENDENCIES.read_text(encoding="utf-8"))["source_file_dependencies"]
+    dependency_paths = flatten_paths(dependencies["diffusion_wan2_1_vace_weekly"])
+    assert {
+        "tests/e2e/online_serving/test_wan_2_1_vace_expansion.py",
+        ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh",
+        ".buildkite/amd/scripts/assert-pytest-collection.sh",
+        "tests/conftest.py",
+        "tests/helpers/mark.py",
+        "tests/helpers/runtime.py",
+        "tests/helpers/fixtures/",
+        "vllm_omni/diffusion/models/wan2_2/",
+        "vllm_omni/diffusion/cache/cachedit/",
+        "vllm_omni/diffusion/distributed/",
+        "vllm_omni/diffusion/offloader/",
+        "vllm_omni/model_extras/vace.py",
+        "vllm_omni/model_extras/registry.py",
+    } <= dependency_paths
+
+    source = Path("tests/e2e/online_serving/test_wan_2_1_vace_expansion.py").read_text(encoding="utf-8")
+    assert 'SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})' in source
+    assert 'PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)' in source
+    assert '"rocm": "MI325"' not in source
 
 
 @pytest.mark.parametrize(
@@ -5810,9 +5916,10 @@ def test_minicpmo_ready_grades_render_blocking() -> None:
         assert rendered["env"]["VLLM_ROCM_USE_AITER"] == "0"
 
 
-def test_weekly_all_jobs_are_blocking() -> None:
+def test_weekly_keeps_only_wan21_vace_burn_in_nonblocking() -> None:
     weekly = yaml.safe_load(AMD_WEEKLY_PIPELINE.read_text(encoding="utf-8"))
     steps = [step for group in weekly["steps"] for step in group["steps"]]
 
-    assert len(steps) == 34
-    assert all(step["grade"] == "Blocking" for step in steps)
+    assert len(steps) == 36
+    assert sum(step["grade"] == "Blocking" for step in steps) == 34
+    assert {step["label"] for step in steps if step["grade"] == "NonBlocking"} == _WAN21_VACE_WEEKLY_LABELS
