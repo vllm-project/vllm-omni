@@ -172,15 +172,23 @@ class TestDeployTopology:
         assert stages[2].attention_backend is None
 
     @pytest.mark.parametrize(("filename", "devices"), _DEPLOY_LAYOUTS.items())
-    def test_deploy_resolves_three_stage_pipeline(self, filename: str, devices: list[str]) -> None:
+    @pytest.mark.parametrize("platform", ["cuda", "npu", "cpu"])
+    def test_deploy_resolves_three_stage_pipeline(
+        self, filename: str, devices: list[str], platform: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(current_omni_platform, "device_name", platform)
         deploy = load_deploy_config(_DEPLOY_DIR / filename)
         pipeline = OMNI_PIPELINES[deploy.pipeline]
         stages = merge_pipeline_deploy(pipeline, deploy)
 
+        # The NPU two-card profile also inherits the base CUDA overrides
+        # when the configuration is resolved for CUDA.
+        cuda_replicas = platform == "cuda" and filename in {"minicpmo_4_5.yaml", "minicpmo_4_5_npu_2card.yaml"}
+        expected_devices = ["0", "0", "0,0"] if cuda_replicas else devices
         assert deploy.pipeline == _PIPELINE_KEY
         assert deploy.async_chunk is True
         assert [stage.stage_id for stage in stages] == [0, 1, 2]
-        assert [stage.yaml_runtime["devices"] for stage in stages] == devices
+        assert [stage.yaml_runtime["devices"] for stage in stages] == expected_devices
         assert "additional_config" not in stages[1].yaml_engine_args
         assert "skip_mm_profiling" not in stages[0].yaml_engine_args
         assert stages[1].yaml_engine_args["skip_mm_profiling"] is True
@@ -201,15 +209,17 @@ class TestDeployTopology:
         assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(expected_processor)
         assert "hf_overrides" not in stages[1].yaml_engine_args
         if filename == "minicpmo_4_5.yaml":
-            # The NPU overlay caps all three stages at 8 so the top tier is not
-            # gated by a single stage; every other platform keeps the base 16.
-            is_npu = (current_omni_platform.device_name or "").lower() == "npu"
-            expected_seqs = 8 if is_npu else 16
-            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [expected_seqs] * 3
+            # CUDA uses two Code2Wav replicas with eight sequences each;
+            # NPU caps all stages at eight and CPU retains the base layout.
+            expected_seqs = {"cuda": [16, 16, 8], "npu": [8, 8, 8], "cpu": [16, 16, 16]}[platform]
+            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == expected_seqs
+            assert stages[2].yaml_runtime["num_replicas"] == (2 if platform == "cuda" else 1)
             memory_utilizations = [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages]
-            # The NPU overlay also retunes the per-stage memory budget for the
-            # 910B single-card layout; every other platform keeps the base one.
-            expected_utils = [0.55, 0.10, 0.22] if is_npu else [0.55, 0.15, 0.18]
+            expected_utils = {
+                "cuda": [0.55, 0.15, 0.15],
+                "npu": [0.55, 0.10, 0.22],
+                "cpu": [0.55, 0.15, 0.18],
+            }[platform]
             assert memory_utilizations == expected_utils
             assert sum(memory_utilizations) <= 0.9 + 1e-6
             # Keep the default Daily-Omni budget; Video-MME overrides stage 0 explicitly.
