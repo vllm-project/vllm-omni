@@ -218,7 +218,7 @@ def finalize_duplex_eval(samples: list[SampleRequest], outputs: list[RequestFunc
             try:
                 write_failed_sample_diagnostics(result)
                 failed_diagnostics += 1
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 message = f"Cannot publish failed-session diagnostics for {result.output}: {exc}"
                 errors.append(message)
                 logger.exception(message)
@@ -230,7 +230,7 @@ def finalize_duplex_eval(samples: list[SampleRequest], outputs: list[RequestFunc
             published.append(sample)
             if result.metadata.get("unfinished_response_ids"):
                 published_with_unfinished_responses += 1
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             message = f"Cannot publish {result.output}: {exc}"
             errors.append(message)
             logger.exception(message)

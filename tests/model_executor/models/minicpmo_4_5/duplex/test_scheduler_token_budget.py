@@ -374,6 +374,28 @@ def test_no_model_config_means_no_tile() -> None:
     assert _model_vision_tile_pixels(_ModelConfig()) is None
 
 
+def test_session_sampling_overrides_reach_stage_zero() -> None:
+    runtime_config: dict[str, object] = {}
+
+    _apply_default_scheduler_policy(
+        runtime_config,
+        config=DuplexSessionConfig(
+            temperature=0.6,
+            extra_body={"top_p": 0.75, "top_k": 12, "repetition_penalty": 1.1},
+        ),
+        tokenizer=None,
+    )
+
+    stage_sampling = runtime_config["duplex_stage_sampling_params"]
+    assert isinstance(stage_sampling, dict)
+    assert stage_sampling["0"] == {
+        "temperature": 0.6,
+        "top_p": 0.75,
+        "top_k": 12,
+        "repetition_penalty": 1.1,
+    }
+
+
 def test_the_tile_reaches_the_budget_through_the_runtime_config(tmp_path: Path) -> None:
     """``_apply_default_scheduler_policy`` writes it; ``build_duplex_data_plane_prompt`` reads it back."""
     runtime_config: dict[str, object] = {}

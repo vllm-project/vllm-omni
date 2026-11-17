@@ -89,6 +89,35 @@ def test_window_internal_configuration_is_server_owned():
         _plugin().validate_client_extra_body({"duplex_window_config": {}})
 
 
+def test_temperature_update_preserves_merged_session_sampling():
+    config = DuplexSessionConfig(
+        temperature=0.6,
+        extra_body={"top_p": 0.75, "top_k": 12, "repetition_penalty": 1.1},
+    )
+    current = {
+        "duplex_stage_sampling_params": {
+            "0": {
+                "temperature": 0.6,
+                "top_p": 0.75,
+                "top_k": 12,
+                "repetition_penalty": 1.1,
+                "stop_token_ids": [1],
+            }
+        }
+    }
+
+    config.apply_realtime_update({"temperature": 0.5})
+    updated = _plugin().runtime_config_for_update(config, current)
+
+    assert updated["duplex_stage_sampling_params"]["0"] == {
+        "temperature": 0.5,
+        "top_p": 0.75,
+        "top_k": 12,
+        "repetition_penalty": 1.1,
+        "stop_token_ids": [1],
+    }
+
+
 @pytest.mark.asyncio
 async def test_audio_session_uses_the_model_bundled_reference_audio(monkeypatch, tmp_path: Path):
     model_dir = tmp_path / "model"

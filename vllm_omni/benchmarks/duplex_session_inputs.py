@@ -15,7 +15,8 @@ session. Two properties of that session decide how the clip has to be sent:
   append (``video_frames``). Models that refuse that field but accept
   ``input_image`` conversation items get the frames as items, inside the
   server's bounded image context (8 images / 4 MiB, see
-  ``vllm_omni/engine/duplex/session/control.py``).
+  ``vllm_omni/engine/duplex/session/control.py``). The SGLang replay adapter
+  uses its timestamped ``sglang.input_image.append`` event instead.
 
 This module imports no client or server runtime code, so both benchmarks can
 use it without crossing the duplex import boundary.
@@ -35,6 +36,7 @@ TURN_DETECTION_MODES = (TURN_DETECTION_NONE, TURN_DETECTION_SERVER_VAD)
 
 FRAME_TRANSPORT_APPEND = "append"
 FRAME_TRANSPORT_IMAGE_ITEMS = "image_items"
+FRAME_TRANSPORT_SGLANG_IMAGE = "sglang_input_image"
 
 #: Mirrors the server's image context bound on ``conversation.item.create``.
 MAX_IMAGE_ITEMS = 8

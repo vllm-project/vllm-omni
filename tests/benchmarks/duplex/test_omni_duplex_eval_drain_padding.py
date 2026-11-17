@@ -13,6 +13,8 @@ stop when the drain ends.
 
 import asyncio
 import base64
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -195,7 +197,100 @@ async def test_sample_pads_only_after_its_commit(monkeypatch, tmp_path) -> None:
     assert calls[0] == ("commit", None)
     # The padding period comes from the session's negotiated chunk period,
     # not from the test: only its shape is pinned here.
-    assert calls[1:] and all(call[0] == "append_silence" and call[1] > 0 for call in calls[1:])
+    assert calls[1:] and all(
+        name == "append_silence" and period is not None and period > 0 for name, period in calls[1:]
+    )
+
+
+async def test_sample_replay_accepts_a_session_without_native_commit(tmp_path) -> None:
+    calls: list[str] = []
+    pcm = bytes(32_000)
+    output_audio = bytes(4_800)
+
+    class ReplaySession:
+        frame_transport = "append"
+        supports_session_stats = False
+
+        def __init__(self) -> None:
+            self.events = RealtimeEventCollector()
+
+        async def configure(
+            self,
+            model: str,
+            *,
+            ref_audio: str | None,
+            instructions: str | None,
+            extra_body: dict[str, object] | None,
+            turn_detection: str,
+        ) -> None:
+            assert model == "test-model"
+            calls.append("configure")
+
+        def prepare_input(self, audio: bytes, frames: tuple[tuple[float, bytes], ...]) -> bytes:
+            assert audio == pcm
+            return audio
+
+        async def stream_input(
+            self,
+            audio: bytes,
+            frames: tuple[tuple[float, bytes], ...],
+            *,
+            sample_id: str,
+            unit_ms: int,
+            realtime: bool,
+        ) -> None:
+            assert audio == pcm
+            assert frames == ()
+            assert sample_id == "s1"
+            assert realtime
+            calls.append("stream")
+
+        async def finish_input(self, *, timeout_s: float) -> runner.ReplayDrainResult:
+            calls.append("finish")
+            self.events.add({"type": "response.created", "response": {"id": "r1"}})
+            self.events.add(
+                {
+                    "type": "response.output_audio.delta",
+                    "response_id": "r1",
+                    "delta": base64.b64encode(output_audio).decode("ascii"),
+                }
+            )
+            self.events.add({"type": "response.done", "response": {"id": "r1", "status": "completed"}})
+            return runner.ReplayDrainResult(response_done=True)
+
+        async def acknowledge_playback(self) -> None:
+            pass
+
+        async def get_session_stats(self, *, timeout_s: float, event_id: str) -> dict[str, object]:
+            raise AssertionError("The runner requested stats from a session without that capability")
+
+        async def close(self, *, timeout_s: float) -> None:
+            calls.append("close")
+
+    @asynccontextmanager
+    async def open_session(
+        url: str, model: str, headers: dict[str, str] | None
+    ) -> AsyncIterator[runner.DuplexReplaySession]:
+        assert (url, model, headers) == ("ws://localhost:8000/v1/realtime", "test-model", {"X-Test": "replay"})
+        yield ReplaySession()
+
+    result = await runner.generate_sample(
+        _sample(),
+        url="ws://localhost:8000/v1/realtime",
+        model="test-model",
+        ref_audio=None,
+        output_root=tmp_path,
+        prepared=PreparedSample(pcm=pcm, frames=(), duration=1.0, ref_audio=None, ref_audio_sha256=None),
+        additional_headers={"X-Test": "replay"},
+        session_factory=open_session,
+    )
+
+    assert calls == ["configure", "stream", "finish", "close"]
+    assert result.error == ""
+    assert result.metadata["response_done"] is True
+    assert result.metadata["input_committed"] is False
+    assert result.audio_bytes == len(output_audio)
+    assert result.request_metrics[0]["audio_continuity"]["audio_chunk_count"] == 1
 
 
 async def test_padding_stops_when_the_drain_finishes() -> None:

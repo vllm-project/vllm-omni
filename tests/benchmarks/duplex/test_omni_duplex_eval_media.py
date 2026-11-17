@@ -18,6 +18,7 @@ from vllm_omni.benchmarks.duplex.omni_duplex_eval_media import (
     extract_jpeg,
     iter_av_units,
     iter_jpegs,
+    iter_timed_av_units,
     materialize_media,
     mix_pcm16,
     read_audio_pcm16,
@@ -42,6 +43,19 @@ def test_av_units_keep_all_frames_in_their_capture_interval(unit_ms):
 def test_av_units_put_boundary_frame_in_the_following_unit():
     units = list(iter_av_units(bytes(2 * 32000), iter([(1.0, b"boundary")])))
     assert [frame for _, frame in units] == [None, b"boundary"]
+
+
+def test_timed_av_units_preserve_frame_timestamps():
+    units = list(
+        iter_timed_av_units(
+            bytes(2 * 32000),
+            iter([(0.25, b"first"), (1.0, b"boundary")]),
+        )
+    )
+    assert [frames for _, frames in units] == [
+        ((0.25, b"first"),),
+        ((1.0, b"boundary"),),
+    ]
 
 
 @pytest.mark.parametrize("samples", [0, 5, 16000, 20005])
