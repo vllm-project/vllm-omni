@@ -126,7 +126,7 @@ The following fields belong under `duplex_session` and apply when
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `max_sessions` | int | `1` | Global session limit, including sessions being opened or closed. |
-| `replica_policy` | `legacy` \| `least_sessions` | `legacy` | `legacy` preserves existing request routing and worker capacities. `least_sessions` reserves a replica group once when a session opens. |
+| `replica_policy` | `legacy` \| `least_sessions` | `legacy` | `legacy` preserves existing request routing and worker capacities; its stickiness is per request, so each turn of a duplex session may land on a different replica. `least_sessions` reserves a replica group once when a session opens and keeps every turn of that session on it. |
 | `max_sessions_per_replica` | int \| null | `null` | Required and at least `1` for `least_sessions`. Bounds reserved sessions and model-owned session resources on each replica of every stage. |
 | `replica_groups` | list of stage-to-replica maps \| null | `null` | Explicit groups such as `[{0: 0, 1: 0}, {0: 1, 1: 0}]`. Stage and replica IDs must be nonnegative integers. |
 
@@ -162,8 +162,41 @@ hold their slots, and closing sessions release them after cleanup completes.
 When no group has capacity, opening a session fails with the retryable
 `resource_exhausted` error containing `replica_capacity_exhausted`.
 
-`least_sessions` supports local single-host deployments only; coordinator or
-distributed routing is rejected at startup. A per-replica cap above `1` also
+`least_sessions` supports a local single-host deployment, and a distributed one
+(coordinator, hub or load-balancer routing) when `replica_groups` declares the
+stage replica topology; a distributed deployment without `replica_groups` is
+rejected at startup. The reason is placement, not counting: locally the stage's
+replica ids come from the deploy config, but in a distributed deployment the
+coordinator assigns ids as replicas register, so the engine cannot tell which
+numeric ids share a host. The operator cannot choose those ids either; declaring
+`replica_groups` records the mapping they observed, and a config-only check
+cannot prove that the ids still correspond to those hosts.
+
+A declared group is a routing map, not a host-compatibility guarantee. Each
+stage-to-stage edge must use a connector that can run on the hosts in the
+group. `SharedMemoryConnector` is local-only; the MiniCPM-o 4.5 stage 1 -> 2
+edge uses it, so each stage-1 replica must run on the same host as the stage-2
+replica in its group. The supported distributed layout keeps stage 0 on the
+head and stages 1/2 co-located on the worker. Splitting a stage-1 replica from
+stage 2 is not supported by that deployment.
+
+The coordinator fills unfilled startup slots in registration order and allocates
+ids past the startup count once those slots are filled. It does not restore a
+previously used startup slot when a replica restarts. Each replica registers with
+an input address, exposed as `ReplicaInfo.input_addr`. The startup attach line is
+`[DistStageRuntime] Remote LLM replica attached stage=<id> replica=<id>`; a
+replica attached later logs `[MembershipController] attached remote replica
+stage=<id> replica=<id> addr=<host:port>`. Use the stage/replica ids together
+with the host launch plan to write `replica_groups`. There is no dedicated
+endpoint for dumping the mapping.
+
+A replica that leaves the declared topology is not re-added to its group: the
+group stays unavailable, its sessions are failed, and recovery requires
+restarting the head. A replacement replica gets a new id outside
+`replica_groups`, logs a warning, and can serve ordinary requests but not duplex
+sessions. Dynamic regrouping is out of scope.
+
+A per-replica cap above `1` also
 requires the model plugin to support concurrent sessions on one replica; use
 `1` for plugins without that capability, including VoiceChat. A failed replica
 closes all sessions assigned to it, including idle sessions. Those sessions

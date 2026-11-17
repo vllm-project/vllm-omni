@@ -242,18 +242,23 @@ def test_validate_duplex_plugin_sampling_rejects_non_tuple_results() -> None:
 
 
 @pytest.mark.parametrize(
-    ("policy", "cap", "distributed", "sharing", "error"),
+    ("policy", "cap", "distributed", "sharing", "groups", "error"),
     [
-        ("legacy", None, True, False, None),
-        ("legacy", 2, False, False, None),
-        ("least_sessions", 1, False, False, None),
-        ("least_sessions", 2, False, True, None),
-        ("least_sessions", 2, False, False, "set max_sessions_per_replica to 1"),
-        ("least_sessions", 1, True, False, "does not support distributed hub/LB mode"),
-        ("least_sessions", 2, True, False, "does not support distributed hub/LB mode"),
+        ("legacy", None, True, False, None, None),
+        ("legacy", 2, False, False, None, None),
+        ("least_sessions", 1, False, False, None, None),
+        ("least_sessions", 2, False, True, None, None),
+        ("least_sessions", 2, False, False, None, "set max_sessions_per_replica to 1"),
+        # A distributed pool cannot derive its topology from a startup snapshot,
+        # so it must declare the replica groups explicitly.
+        ("least_sessions", 1, True, False, None, "requires duplex_session.replica_groups"),
+        ("least_sessions", 2, True, False, None, "requires duplex_session.replica_groups"),
+        # With a declared topology the distributed case is accepted.
+        ("least_sessions", 1, True, False, [{0: 0}], None),
+        ("least_sessions", 2, True, True, [{0: 0}], None),
     ],
 )
-def test_validate_duplex_replica_policy(policy, cap, distributed, sharing, error) -> None:
+def test_validate_duplex_replica_policy(policy, cap, distributed, sharing, groups, error) -> None:
     capability_calls: list[int] = []
 
     class CapabilityPlugin(FakePlugin):
@@ -262,15 +267,23 @@ def test_validate_duplex_replica_policy(policy, cap, distributed, sharing, error
             return DuplexCapabilities(supports_multi_session_same_replica=sharing)
 
     plugin = CapabilityPlugin(_encode_audio)
-    config = DuplexSessionRuntimeConfig(max_sessions=11, replica_policy=policy, max_sessions_per_replica=cap)
+    config = DuplexSessionRuntimeConfig(
+        max_sessions=11,
+        replica_policy=policy,
+        max_sessions_per_replica=cap,
+        replica_groups=groups,
+    )
     if error is not None:
         with pytest.raises(ValueError, match=error):
             validate_duplex_replica_policy(plugin, config, distributed=distributed)
     else:
         validate_duplex_replica_policy(plugin, config, distributed=distributed)
-    # Distributed rejection precedes plugin access. Legacy and one-session
-    # replicas do not need a capability that permits sharing.
-    expected = [cap] if policy == "least_sessions" and not distributed and cap > 1 else []
+    # Legacy returns before the plugin is consulted, and a missing topology is
+    # rejected before it too. Otherwise the sharing capability is only needed
+    # for more than one session per replica.
+    expected = [] if error == "requires duplex_session.replica_groups" else [cap]
+    if policy != "least_sessions" or cap is None or cap <= 1:
+        expected = []
     assert capability_calls == expected
 
 
