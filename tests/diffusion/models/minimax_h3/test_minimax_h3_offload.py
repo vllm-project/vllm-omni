@@ -10,7 +10,10 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.minimax_h3.conditioning import MiniMaxH3EncoderMediaInput
+from vllm_omni.model_executor.models.minimax_h3.conditioning import (
+    MiniMaxH3EncoderMediaInput,
+    MiniMaxH3TimelineGuide,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -19,6 +22,64 @@ def _media(**kwargs):
     return MiniMaxH3EncoderMediaInput(
         task="ref2va", height=768, width=1344, num_frames=124, latent_t=37, audio_t=207, **kwargs
     )
+
+
+@pytest.mark.parametrize(
+    ("media", "expected"),
+    [
+        (_media(), False),
+        (_media(audios=((torch.ones(32), 16_000),)), True),
+        (_media(video_audios=((torch.ones(32), 16_000),)), True),
+        (_media(audio_edit=(torch.ones(32), 16_000)), True),
+        (
+            _media(timeline_guides=(MiniMaxH3TimelineGuide(start=0, audio=(torch.ones(32), 16_000)),)),
+            True,
+        ),
+    ],
+)
+def test_file_backed_media_requires_audio_encoder(media, expected):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    assert MiniMaxH3Pipeline._media_requires_audio_encoder(media) is expected
+
+
+@pytest.mark.parametrize("encode_audio", [False, True])
+def test_file_backed_encode_only_vae_stages_audio_on_demand(encode_audio):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    video_vae = Mock()
+    audio_vae = Mock()
+    video_factory = Mock(return_value=video_vae)
+    audio_factory = Mock(return_value=audio_vae)
+    pipeline = SimpleNamespace(
+        video_vae=None,
+        audio_vae=None,
+        vae=None,
+        _file_backed_vae_factories=(video_factory, audio_factory),
+        _release_stage_cache=Mock(),
+    )
+    pipeline._file_backed_vaes = MiniMaxH3Pipeline._file_backed_vaes.__get__(pipeline)
+
+    with pipeline._file_backed_vaes(encode_only=True, encode_audio=encode_audio):
+        assert pipeline.video_vae is video_vae
+        if encode_audio:
+            assert pipeline.audio_vae is audio_vae
+        else:
+            assert pipeline.audio_vae is None
+
+    video_factory.assert_called_once_with(
+        encode_only=True,
+        decode_only=False,
+        decoder_source=None,
+        lightvae_decoder_path=None,
+        pin_memory=False,
+    )
+    if encode_audio:
+        audio_factory.assert_called_once_with(encode_only=True, decode_only=False, pin_memory=False)
+    else:
+        audio_factory.assert_not_called()
+    assert pipeline.video_vae is pipeline.audio_vae is pipeline.vae is None
+    pipeline._release_stage_cache.assert_called_once_with()
 
 
 def test_h3_full_pipeline_profiler_includes_local_encoding():
