@@ -270,7 +270,7 @@ def load_vae_scale_factor(
     Returns *default* when ``block_out_channels`` is missing or empty.
     Raises ``FileNotFoundError`` when the config file is missing and
     ``ValueError`` when it cannot be parsed, so a partially-downloaded
-    snapshot fails loudly instead of silently producing mis-sized images.
+    snapshot fails loudly instead of silently producing incorrectly sized images.
 
     Callers that need more values from the same file can pass the already
     loaded mapping via *vae_config* to avoid reading it twice.
