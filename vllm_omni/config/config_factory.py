@@ -672,11 +672,7 @@ class StageConfigFactory:
         kwargs = normalize_and_validate_diffusion_engine_ingress_kwargs(kwargs, stage_id=0)
         raw_sampling_params = kwargs.get("default_sampling_params")
         if isinstance(raw_sampling_params, str):
-            try:
-                raw_sampling_params = json.loads(raw_sampling_params)
-            except json.JSONDecodeError:
-                logger.warning("Invalid default_sampling_params JSON, ignoring stage defaults.")
-                raw_sampling_params = None
+            raw_sampling_params = json.loads(raw_sampling_params)
         if not isinstance(raw_sampling_params, Mapping):
             raw_sampling_params = None
         default_sampling_params = dict(raw_sampling_params.get("0", {})) if raw_sampling_params else {}
@@ -807,16 +803,15 @@ class StageConfigFactory:
                 stage_overrides[f"stage_0_{name}"] = kwargs[name]
         # Caller defaults belong to deployment, not immutable pipeline constraints:
         # explicit request sampling parameters must still be able to override them.
-        if default_sampling_params:
-            stage_deploy.default_sampling_params = {
-                **(stage_deploy.default_sampling_params or {}),
-                **default_sampling_params,
-            }
         return VllmOmniConfig.from_pipeline_config(
             pipeline,
             user_deploy_config=deploy,
             deploy_config_path=deploy_config_path,
-            cli_overrides={"model": model, **stage_overrides},
+            cli_overrides={
+                "model": model,
+                **stage_overrides,
+                "default_sampling_params": {"0": default_sampling_params},
+            },
         )
 
     @classmethod

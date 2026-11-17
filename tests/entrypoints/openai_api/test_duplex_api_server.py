@@ -368,6 +368,23 @@ def test_minicpmo_serving_profiles(monkeypatch, deploy_name, expected):
     assert api_server._should_serve_duplex("openbmb/MiniCPM-o-4_5", {}) is True
 
 
+@pytest.mark.parametrize("asr", [False, True])
+@pytest.mark.parametrize("duplex", [False, True])
+def test_joyai_serving_profiles(monkeypatch, asr, duplex):
+    from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
+        JOYAI_VL_INTERACTION_ASR_PIPELINE,
+        JOYAI_VL_INTERACTION_PIPELINE,
+    )
+
+    pipeline = JOYAI_VL_INTERACTION_ASR_PIPELINE if asr else JOYAI_VL_INTERACTION_PIPELINE
+    monkeypatch.setattr(StageConfigFactory, "get_pipeline_config", lambda **_: pipeline)
+    name = "joyai_vl_interaction" + ("_asr" if asr else "") + ("_duplex" if duplex else "") + ".yaml"
+    assert (
+        api_server._should_serve_duplex("jdopensource/JoyAI-VL-Interaction-Preview", {"deploy_config": name}) is duplex
+    )
+    assert not api_server._should_serve_duplex("jdopensource/JoyAI-VL-Interaction-Preview", {})
+
+
 # --------------------------------------------------------------------------- #
 # app.state of a duplex-only server                                           #
 # --------------------------------------------------------------------------- #
