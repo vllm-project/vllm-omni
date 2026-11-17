@@ -57,7 +57,7 @@ class TestLatentChannelsFromVae:
         assert latent_channels_from_vae(vae) == 24
 
     def test_hunyuan_default_32(self):
-        vae = _FakeVAE(_FakeConfig(latent_channels=32))
+        vae = _FakeVAE(_FakeConfig())
         assert latent_channels_from_vae(vae, default=32) == 32
 
     def test_qwen_z_dim_with_none_vae(self):

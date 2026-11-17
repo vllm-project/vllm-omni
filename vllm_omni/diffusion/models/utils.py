@@ -252,7 +252,9 @@ def latent_channels_from_vae(
     """Read the number of latent channels from a VAE's config.
 
     Handles both attribute-based and dict-like configs, with a consistent
-    fallback when the VAE is ``None`` or has no config.
+    fallback when the VAE is ``None`` or has no config.  Unlike
+    ``vae_scale_factor_from_vae``, only ``vae.config`` is consulted; a
+    config-less custom VAE falls back to *default*.
     """
     if vae is None:
         return default

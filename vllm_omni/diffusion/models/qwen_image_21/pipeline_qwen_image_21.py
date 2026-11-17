@@ -47,7 +47,7 @@ from vllm_omni.diffusion.models.qwen_image_21.qwen_image_21_transformer import (
     QwenImage21KVCache,
     QwenImage21Transformer2DModel,
 )
-from vllm_omni.diffusion.models.utils import create_transformers_model
+from vllm_omni.diffusion.models.utils import create_transformers_model, latent_channels_from_vae
 from vllm_omni.diffusion.offloader.config import offload_enabled
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -429,7 +429,7 @@ class QwenImage21Pipeline(
         # The VAE compresses 16x spatially and the transformer consumes latents
         # unpatched, so one token covers a 16x16 pixel tile.
         self.vae_scale_factor = 16
-        self.latent_channels = self.vae.config.z_dim if getattr(self, "vae", None) else 64
+        self.latent_channels = latent_channels_from_vae(getattr(self, "vae", None), config_key="z_dim", default=64)
 
         self.sys_prompt = "Comprehend and analyze the provided prompt."
         # The prompt is built as a raw template string and passed straight to
