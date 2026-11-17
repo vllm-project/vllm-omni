@@ -1110,6 +1110,12 @@ class OmniServeCommand(CLISubcommand):
             "New integrations should use mode=layer and configure weight transfer per component.",
         )
         omni_config_group.add_argument(
+            "--enable-file-backed-offload",
+            action="store_true",
+            help="Enable file-backed on-demand weight offloading for supported diffusion models "
+            "(currently MiniMax H3 FL2VA).",
+        )
+        omni_config_group.add_argument(
             "--dlo-use-allgather",
             dest="dlo_use_allgather",
             action="store_true",

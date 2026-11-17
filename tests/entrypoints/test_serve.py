@@ -196,6 +196,13 @@ def _parse_serve_args(argv: list[str]) -> TrackingNamespace:
     return parser.parse_args(argv)
 
 
+def test_serve_parser_accepts_file_backed_offload_flag() -> None:
+    args = _parse_serve_args(["serve", "fake-model", "--omni", "--enable-file-backed-offload"])
+
+    assert args.enable_file_backed_offload is True
+    assert args.get_explicit_kwargs_dict()["enable_file_backed_offload"] is True
+
+
 def test_video_output_warmup_cli_options() -> None:
     argv = ["serve", "fake-model", "--omni"]
     args = _parse_serve_args(argv)
