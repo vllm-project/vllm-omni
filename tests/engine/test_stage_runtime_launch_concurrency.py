@@ -12,7 +12,7 @@ from typing import NoReturn
 
 import pytest
 from pytest_mock import MockerFixture
-from vllm.config import VllmConfig
+from vllm.config import DeviceConfig, VllmConfig
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.utils import CoreEngineProcManager, EngineZmqAddresses
 
@@ -75,7 +75,10 @@ def _plan(stage_id: int, device: str) -> LogicalStageInitPlan:
         metadata=metadata,
         stage_connector_spec={},
         omni_kv_connector=(None, None, None),
-        stage_vllm_config=VllmConfig(),
+        # Pin the device so the config does not have to infer one: this test
+        # exercises the per-device locking/scheduling only and never touches an
+        # accelerator, so it must also run on a CPU-only host.
+        stage_vllm_config=VllmConfig(device_config=DeviceConfig(device="cpu")),
         executor_class=object,
         engine_args_dict={},
     )
