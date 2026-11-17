@@ -14,7 +14,11 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_aligned_groups_balance_sessions_and_keep_routes_stable() -> None:
-    placement = DuplexReplicaPlacement(stage_replica_counts=[3, 3], max_sessions_per_replica=2)
+    placement = DuplexReplicaPlacement(
+        stage_replica_counts=[3, 3],
+        max_sessions_per_replica=2,
+        replica_groups=[{0: 0, 1: 0}, {0: 1, 1: 1}, {0: 2, 1: 2}],
+    )
     reservations = [placement.reserve(f"s{index}") for index in range(6)]
     assert [reservation.group_id for reservation in reservations] == [0, 1, 2, 0, 1, 2]
     assert placement.snapshot()["groups"] == [{0: 0, 1: 0}, {0: 1, 1: 1}, {0: 2, 1: 2}]
@@ -28,6 +32,36 @@ def test_aligned_groups_balance_sessions_and_keep_routes_stable() -> None:
     assert exc.value.code == "resource_exhausted"
     assert exc.value.retryable is True
     assert exc.value.session_id == "overflow"
+
+
+@pytest.mark.parametrize(
+    ("counts", "paths"),
+    [
+        ([1, 3, 1], [(0, 0, 0), (0, 1, 0), (0, 2, 0)]),
+        ([2, 2], [(0, 0), (0, 1), (1, 0), (1, 1)]),
+        ([1, 1, 1], [(0, 0, 0)]),
+        ([2], [(0,), (1,)]),
+    ],
+)
+def test_omitted_groups_join_all_stage_replicas(counts, paths) -> None:
+    placement = DuplexReplicaPlacement(stage_replica_counts=counts, max_sessions_per_replica=2)
+    assert placement.snapshot()["groups"] == [dict(enumerate(path)) for path in paths]
+
+
+def test_join_can_route_across_indexes_when_aligned_paths_are_unavailable() -> None:
+    placement = DuplexReplicaPlacement(stage_replica_counts=[2, 2], max_sessions_per_replica=1)
+    placement.mark_unavailable(0, 0)
+    placement.mark_unavailable(1, 1)
+    reservation = placement.reserve("session")
+    assert dict(reservation.replicas) == {0: 1, 1: 0}
+    assert placement.reserve("session") is reservation
+    assert placement.route("session", 0) == 1
+    assert placement.route("session", 1) == 0
+    with pytest.raises(DuplexSessionError, match="replica_capacity_exhausted"):
+        placement.reserve("overflow")
+    placement.release("session")
+    assert not any(placement.snapshot()["reserved"].values())
+    assert dict(placement.reserve("replacement").replicas) == {0: 1, 1: 0}
 
 
 def test_round_robin_ties_advance_even_when_sessions_release_immediately() -> None:
@@ -54,7 +88,6 @@ def test_shared_replica_capacity_is_not_duplicated_by_groups() -> None:
     placement = DuplexReplicaPlacement(
         stage_replica_counts=[1, 2],
         max_sessions_per_replica=2,
-        replica_groups=[{0: 0, 1: 0}, {0: 0, 1: 1}],
     )
     assert placement.reserve("a").group_id == 0
     assert placement.reserve("b").group_id == 1
@@ -77,7 +110,7 @@ def test_failure_finds_all_owners_and_rejects_routes_through_other_stages() -> N
         placement.route("a", 0)
     assert exc.value.code == "replica_unavailable"
     assert placement.route("b", 0) == 1
-    assert placement.reserve("d").group_id == 1
+    assert dict(placement.reserve("d").replicas) == {0: 1, 1: 1}
     placement.release("a")
     placement.release("c")
     assert placement.mark_unavailable(1, 0) == set()
@@ -115,7 +148,6 @@ def test_reservations_and_snapshots_do_not_expose_mutable_placement_state() -> N
         ([True], 1, None, "positive replica count"),
         ([1], 0, None, "positive integer"),
         ([1], True, None, "positive integer"),
-        ([1, 2], 1, None, "unequal stage replica counts"),
         ([1], 1, [], "at least one group"),
         ([1, 1], 1, [{0: 0}], "cover every stage"),
         ([1], 1, [{0: 0, 1: 0}], "cover every stage"),
@@ -144,6 +176,7 @@ def test_frontend_ownership_partitions_all_replicas(replicas: int, frontends: in
         placement = DuplexReplicaPlacement(
             stage_replica_counts=[replicas, replicas],
             max_sessions_per_replica=2,
+            replica_groups=[{0: replica, 1: replica} for replica in range(replicas)],
             frontend_count=frontends,
             frontend_index=frontend,
         )
@@ -235,13 +268,14 @@ def test_invalid_frontend_topology_is_rejected(frontends, index, message) -> Non
         )
 
 
-def test_shared_replica_cannot_belong_to_different_frontends() -> None:
+@pytest.mark.parametrize("groups", [None, [{0: 0, 1: 0}, {0: 0, 1: 1}]])
+def test_shared_replica_cannot_belong_to_different_frontends(groups) -> None:
     for index in range(2):
         with pytest.raises(ValueError, match="sharing stage 0 replica 0 must belong to the same frontend"):
             DuplexReplicaPlacement(
                 stage_replica_counts=[1, 2],
                 max_sessions_per_replica=2,
-                replica_groups=[{0: 0, 1: 0}, {0: 0, 1: 1}],
+                replica_groups=groups,
                 frontend_count=2,
                 frontend_index=index,
             )

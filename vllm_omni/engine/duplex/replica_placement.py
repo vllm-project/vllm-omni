@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from itertools import product
 from types import MappingProxyType
 from typing import TypedDict
 
@@ -56,11 +57,7 @@ class DuplexReplicaPlacement:
         if type(frontend_index) is not int or not 0 <= frontend_index < frontend_count:
             raise ValueError("frontend_index must be in [0, frontend_count)")
         if replica_groups is None:
-            if len(set(counts)) != 1:
-                raise ValueError("unequal stage replica counts require explicit duplex_session.replica_groups")
-            replica_groups = [
-                {stage_id: replica_id for stage_id in range(len(counts))} for replica_id in range(counts[0])
-            ]
+            replica_groups = [dict(enumerate(replicas)) for replicas in product(*(range(count) for count in counts))]
         if not replica_groups:
             raise ValueError("replica_groups must contain at least one group")
 

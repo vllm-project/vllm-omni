@@ -1515,7 +1515,7 @@ async def test_failed_initial_submit_evicts_session_replica_after_binding_rollba
         await asyncio.wait_for(asyncio.gather(*tuple(manager._dispatched_control_tasks)), timeout=1)
         await asyncio.wait_for(manager.reap_expired(), timeout=1)
         assert not manager._closing
-        assert orchestrator.replica_placement.snapshot()["sessions"] == {"healthy": 1}
+        assert orchestrator.replica_placement.snapshot()["sessions"] == {"healthy": 3}
         assert set(orchestrator.session_manager.runners) == {"healthy"}
         assert not orchestrator.stage_pools[failing_stage].is_replica_available(0)
         assert (failing_stage, 0) in orchestrator.replica_placement.snapshot()["unavailable"]
@@ -1539,7 +1539,7 @@ async def test_replica_failure_closes_active_and_idle_owners_only() -> None:
         await asyncio.wait_for(asyncio.gather(*tuple(manager._dispatched_control_tasks)), timeout=1)
         await asyncio.wait_for(manager.reap_expired(), timeout=1)
         assert not manager._closing
-        assert orchestrator.replica_placement.snapshot()["sessions"] == {"healthy": 1}
+        assert orchestrator.replica_placement.snapshot()["sessions"] == {"healthy": 3}
         assert set(orchestrator.session_manager.runners) == {"healthy"}
         terminal_events = [output_q.get_nowait().event for _ in range(output_q.qsize())]
         for session_id in (SESSION_ID, "idle"):
@@ -1579,7 +1579,7 @@ async def test_membership_detach_fails_the_sessions_reserved_on_the_replica() ->
         manager = orchestrator.session_manager
         await asyncio.wait_for(asyncio.gather(*tuple(manager._dispatched_control_tasks)), timeout=1)
         await asyncio.wait_for(manager.reap_expired(), timeout=1)
-        assert orchestrator.replica_placement.snapshot()["sessions"] == {"healthy": 1}
+        assert orchestrator.replica_placement.snapshot()["sessions"] == {"healthy": 3}
         assert set(manager.runners) == {"healthy"}
         assert not orchestrator.stage_pools[1].is_replica_available(0)
     finally:
@@ -1680,7 +1680,12 @@ def test_orchestrator_validates_groups_against_actual_stage_pools() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("frontend_index", range(4))
 async def test_frontend_reserves_only_owned_groups_with_local_admission_budget(frontend_index) -> None:
-    config = DuplexSessionRuntimeConfig(replica_policy="least_sessions", max_sessions=11, max_sessions_per_replica=2)
+    config = DuplexSessionRuntimeConfig(
+        replica_policy="least_sessions",
+        max_sessions=11,
+        max_sessions_per_replica=2,
+        replica_groups=[{0: replica, 1: replica} for replica in range(8)],
+    )
     orchestrator, _, rpc_q, _ = _build(
         stages=2, replicas=8, runtime_config=config, frontend_count=4, frontend_index=frontend_index
     )
@@ -1708,7 +1713,11 @@ async def test_frontend_reserves_only_owned_groups_with_local_admission_budget(f
 @pytest.mark.asyncio
 async def test_multi_frontend_initial_update_and_prewarm_use_owned_replica(monkeypatch) -> None:
     orchestrator, _, rpc_q, _ = _build(
-        stages=2, replicas=4, runtime_config=_placement_config(), frontend_count=2, frontend_index=1
+        stages=2,
+        replicas=4,
+        runtime_config=_placement_config(replica_groups=[{0: replica, 1: replica} for replica in range(4)]),
+        frontend_count=2,
+        frontend_index=1,
     )
     orchestrator.async_chunk = True
     monkeypatch.setattr(orchestrator, "_stage_receives_async_chunks", lambda stage: True)
@@ -1734,7 +1743,13 @@ async def test_frontends_emit_reserved_metrics_only_for_owned_replicas() -> None
         writes.append((stage, replica))
 
     frontends = [
-        _build(stages=2, replicas=2, runtime_config=_placement_config(), frontend_count=2, frontend_index=index)
+        _build(
+            stages=2,
+            replicas=2,
+            runtime_config=_placement_config(replica_groups=[{0: 0, 1: 0}, {0: 1, 1: 1}]),
+            frontend_count=2,
+            frontend_index=index,
+        )
         for index in range(2)
     ]
     try:
@@ -1925,7 +1940,7 @@ async def test_repeated_replica_failure_reports_session_error_and_close_once(
         assert dead_client.shutdown_calls == 1
         assert orchestrator.stage_pools[failing_stage].clients[0] is None
         assert not manager._closing
-        assert placement.snapshot()["sessions"] == {"healthy": 1}
+        assert placement.snapshot()["sessions"] == {"healthy": 3}
         assert set(placement.snapshot()["reserved"].values()) == {0, 1}
         messages = [output_q.get_nowait() for _ in range(output_q.qsize())]
         terminal_events = [message.event for message in messages if hasattr(message, "event")]

@@ -1124,9 +1124,14 @@ total `3`, local `2`, TP `1`, and `devices: "0,1"` assign GPUs 0/1 to the two
 local replicas; the third registration slot has no local device assignment.
 
 `DuplexReplicaPlacement` owns the startup group map and session reservations.
-Equal stage counts can derive groups by replica index; unequal counts require
-explicit groups. The example above needs three groups `{0: 0, 1: i, 2: 0}` for
-`i = 0, 1, 2`. Stage 0 and stage 2 each need a per-replica session cap of at
+Omitting `replica_groups` generates the Cartesian product of the stage replica
+slots, equivalent to a SQL `CROSS JOIN`, for both equal and unequal stage counts.
+The example above automatically gets three groups `{0: 0, 1: i, 2: 0}` for
+`i = 0, 1, 2`; `[2, 2]` gets all four pairs. The last stage's replica index
+changes fastest when assigning group IDs. Explicit groups restrict the paths
+instead of adding to the generated product. Each session reserves one path;
+replicas shared across paths retain one capacity counter. Stage 0 and stage 2
+each need a per-replica session cap of at
 least three to admit three sessions concurrently. Registration-assigned replica
 IDs identify replica slots, not durable host identities; explicit groups do
 not establish host affinity.
@@ -1170,7 +1175,11 @@ no central per-frame session dispatcher.
 Placement, rather than engine attachment, enforces exclusive ownership. Group
 `g` belongs to frontend `g % K`, and only that frontend may reserve its replicas
 or submit its session requests. Groups sharing a physical stage replica must
-have the same owner, and `K` must not exceed the group count. The global session
+have the same owner, and `K` must not exceed the group count. This validation
+also applies to automatically joined groups. Multi-stage joins usually share
+replicas across frontend owners, so those deployments must supply explicit
+groups with disjoint ownership, such as `[{0: 0, 1: 0}, {0: 1, 1: 1}]` for
+two stages with two replicas and two frontends. The global session
 budget is divided by floor/remainder across frontends and bounded by each
 frontend's owned replica capacity; budgets do not move between frontends.
 The reservation lifetime, strict stage pins and worker caps apply within each
