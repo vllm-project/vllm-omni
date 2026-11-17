@@ -17,7 +17,7 @@ from pytest_mock import MockerFixture
 from vllm.v1.engine.utils import EngineZmqAddresses
 
 from vllm_omni.config.config_factory import StageConfigFactory
-from vllm_omni.config.omni_config import VllmOmniARStageConfig, VllmOmniDiffusionStageConfig
+from vllm_omni.config.omni_config import OmniStageParallelConfig, VllmOmniARStageConfig, VllmOmniDiffusionStageConfig
 from vllm_omni.config.stage_config import (
     DeployConfig,
     DuplexSessionRuntimeConfig,
@@ -719,6 +719,56 @@ class TestSingleStageInitialization:
             monkeypatch.undo()
 
         assert [plan.replicas[0].launch_mode for plan in stage_plans] == ["local", "remote"]
+
+    @pytest.mark.parametrize(
+        ("devices", "tp_size", "expected_devices"),
+        [("0,1", 1, ["0", "1", None]), ("0,1,2,3", 2, ["0,1", "2,3", None]), ("0", 1, ["0", "1", None])],
+    )
+    def test_prepare_stage_plans_splits_only_local_device_pool(
+        self, mocker: MockerFixture, devices, tp_size, expected_devices
+    ):
+        import vllm_omni.engine.stage_runtime as runtime_mod
+
+        stage_cfgs = [
+            VllmOmniARStageConfig(
+                stage_pipeline_config=StagePipelineConfig(stage_id=i, model_stage="thinker"),
+                parallel_config=OmniStageParallelConfig(tensor_parallel_size=tp_size if i == 0 else 1),
+            )
+            for i in range(2)
+        ]
+        stage_cfgs[0].runtime_config.num_replicas = 3
+        stage_cfgs[0].runtime_config.devices = devices
+        stage_cfgs[1].runtime_config.num_replicas = 3
+        stage_cfgs[1].runtime_config.devices = "4,5,6"
+        runtime = DistStageRuntime(
+            stage_configs=stage_cfgs,
+            model="fake-model",
+            config_path="/fake/stages.yaml",
+            stage_init_timeout=60,
+            async_chunk=False,
+            single_stage_id_filter=0,
+            omni_master_address="127.0.0.1",
+            omni_master_port=26000,
+            omni_dp_size_local=2,
+        )
+        mocker.patch.object(runtime_mod, "prepare_engine_environment")
+        mocker.patch.object(runtime_mod, "load_omni_transfer_config_for_model", return_value=None)
+        mocker.patch.object(runtime_mod, "get_stage_connector_spec", return_value={})
+        mocker.patch.object(runtime_mod, "resolve_omni_kv_config_for_stage", return_value=(None, None, None))
+        vllm_config = mocker.Mock()
+        vllm_config.quant_config = None
+        mocker.patch("vllm_omni.engine.stage_init_utils.OmniEngineArgs.create_engine_config", return_value=vllm_config)
+        mocker.patch("vllm_omni.engine.stage_init_utils.Executor.get_class", return_value=object)
+
+        plans = runtime._prepare_stage_plans()
+
+        assert [len(plan.replicas) for plan in plans] == [3, 3]
+        assert [replica.launch_mode for replica in plans[0].replicas] == ["local", "local", "remote"]
+        assert [replica.stage_cfg.runtime_config.devices for replica in plans[0].replicas] == expected_devices
+        assert all(replica.launch_mode == "remote" for replica in plans[1].replicas)
+        assert all(replica.metadata.runtime_cfg is None for replica in plans[1].replicas)
+        assert stage_cfgs[0].runtime_config.devices == devices
+        assert [cfg.runtime_config.num_replicas for cfg in stage_cfgs] == [3, 3]
 
     def test_build_logical_stage_init_plans_keeps_total_and_launches_only_local_share(self, mocker: MockerFixture):
         import vllm_omni.engine.stage_runtime as runtime_mod

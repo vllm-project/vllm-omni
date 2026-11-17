@@ -1119,6 +1119,10 @@ Other stages attach remotely in their entirety. The existing unfiltered
 `single_stage_mode=True` path keeps all configured replicas local.
 The existing frontend-only head keeps all stage replicas remote.
 
+Device pools are split against the runtime's local replica count. For example,
+total `3`, local `2`, TP `1`, and `devices: "0,1"` assign GPUs 0/1 to the two
+local replicas; the third registration slot has no local device assignment.
+
 `DuplexReplicaPlacement` owns the startup group map and session reservations.
 Equal stage counts can derive groups by replica index; unequal counts require
 explicit groups. The example above needs three groups `{0: 0, 1: i, 2: 0}` for

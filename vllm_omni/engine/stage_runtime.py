@@ -728,7 +728,9 @@ class StageRuntime:
 
     def _prepare_stage_plans(self) -> list[LogicalStageInitPlan]:
         """Build logical stage plans and cache prompt expansion metadata."""
-        replicas_per_stage, replica_devices_map = compute_replica_layout(self._stage_configs)
+        replicas_per_stage, replica_devices_map = compute_replica_layout(
+            self._stage_configs, local_replica_counts=self._get_local_replica_counts()
+        )
         prepare_engine_environment()
         omni_transfer_config = load_omni_transfer_config_for_model(self._model, self._config_path)
         stage_plans = self._build_logical_stage_init_plans(
@@ -739,6 +741,10 @@ class StageRuntime:
         self._validate_mps_topology(stage_plans)
         self._validate_native_kv_topology(stage_plans)
         return stage_plans
+
+    def _get_local_replica_counts(self) -> Mapping[int, int] | None:
+        """Use all configured replicas for local device placement by default."""
+        return None
 
     def _finalize_initialized_stages(
         self,
@@ -894,6 +900,7 @@ class StageRuntime:
     ) -> list[LogicalStageInitPlan]:
         """Build startup plans for every logical stage and replica."""
         stage_plans: list[LogicalStageInitPlan] = []
+        local_replica_counts = self._get_local_replica_counts()
 
         for stage_idx, stage_cfg in enumerate(self._stage_configs):
             base_metadata = (
@@ -956,6 +963,9 @@ class StageRuntime:
                     api_process_count=self._client_count,
                     api_process_rank=self._api_process_rank,
                     watermark_config=self._watermark_config,
+                    local_replica_count=(
+                        local_replica_counts.get(stage_idx, num_replicas) if local_replica_counts is not None else None
+                    ),
                 )
 
             for replica_id in range(num_replicas):
@@ -1579,6 +1589,16 @@ class DistStageRuntime(StageRuntime):
             load_balancer_factory=_build_load_balancer_factory(self._omni_lb_policy),
             remote_replica_factory=self._build_remote_replica,
         )
+
+    def _get_local_replica_counts(self) -> Mapping[int, int] | None:
+        if self._single_stage_id_filter is None:
+            return None
+        return {
+            idx: self._omni_dp_size_local
+            if int(getattr(stage_cfg, "stage_id", idx)) == self._single_stage_id_filter
+            else 0
+            for idx, stage_cfg in enumerate(self._stage_configs)
+        }
 
     def _prepare_stage_plans(self) -> list[LogicalStageInitPlan]:
         self._validate_single_stage_mode_replica_constraints()
