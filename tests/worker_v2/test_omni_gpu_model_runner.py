@@ -502,6 +502,24 @@ def test_finish_requests_notifies_model_and_cleans_only_known_slots(monkeypatch)
     assert sorted(c.args[0] for c in runner.model_state.remove_request.call_args_list) == [0]
 
 
+def test_aux_hidden_state_contract_uses_tuple_slot_not_structured_output():
+    runner = _make_runner()
+    runner.model = SimpleNamespace(have_multimodal_outputs=True)
+    runner.use_aux_hidden_state_outputs = True
+
+    runner._configure_cudagraph_output_contract()
+
+    assert runner._model_has_structured_output is True
+    assert runner._model_returns_tuple is False
+    assert runner._aux_hidden_state_contract_conflicts() is False
+
+    runner.model = SimpleNamespace(_returns_tuple=True)
+    runner._configure_cudagraph_output_contract()
+
+    assert runner._model_returns_tuple is True
+    assert runner._aux_hidden_state_contract_conflicts() is True
+
+
 @pytest.mark.parametrize("stage,declared", [("thinker", False), ("custom_ar", True)])
 def test_capture_contract_uses_model_declaration(stage, declared):
     runner = _make_runner()
@@ -510,6 +528,30 @@ def test_capture_contract_uses_model_declaration(stage, declared):
     assert runner._model_has_structured_output is declared
     assert runner._exclude_full_graph is declared
     assert runner._full_graph_aux_outputs is False
+
+
+@pytest.mark.parametrize(
+    ("stage", "use_mrv2", "returns_aux", "exclude_full"),
+    [("llm", True, False, False), ("tts", True, False, False), ("llm", True, True, True), ("llm", False, False, True)],
+)
+def test_minicpmo_capture_contract(stage, use_mrv2, returns_aux, exclude_full):
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.model_stage = stage
+    model._use_v2_model_runner = use_mrv2
+    model._returns_aux_hidden_states = returns_aux
+    model.have_multimodal_outputs = True
+
+    runner = _make_runner()
+    runner.model = model
+    runner._configure_cudagraph_output_contract()
+
+    assert runner._model_has_structured_output is exclude_full
+    assert runner._exclude_full_graph is exclude_full
 
 
 def _aux_output(num_tokens):

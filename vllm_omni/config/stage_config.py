@@ -47,6 +47,18 @@ _TOPOLOGY_OWNED_ENGINE_FIELDS = frozenset(
     }
 )
 
+SKIP_STREAMING_UPDATES_ATTR = "_omni_skip_streaming_updates"
+
+
+def skip_on_streaming_updates(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Mark a ``prompt_transform_func`` to run only when a request is first submitted.
+
+    The engine then does not call it on streaming-input updates, which carry
+    the later chunks of a request that already passed the transform.
+    """
+    setattr(func, SKIP_STREAMING_UPDATES_ATTR, True)
+    return func
+
 
 def _normalize_stage_backend_fields(stage: StageDeployConfig) -> None:
     """Normalize promoted backends and enforce their precedence over extras."""
@@ -395,7 +407,8 @@ class StagePipelineConfig:
     supports_duplex_mrv2: bool = False
     # Rewrites the Stage-0 view of a raw prompt before vLLM input processing.
     # The callable receives ``(prompt, sampling_params_list)``; downstream
-    # stages continue to receive the original prompt.
+    # stages continue to receive the original prompt. It also runs on
+    # streaming-input updates unless marked with ``skip_on_streaming_updates``.
     prompt_transform_func: str | None = None
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
@@ -746,6 +759,9 @@ class DuplexSessionRuntimeConfig:
     history_ms_per_token: float | None = None
     history_calibration_timeout_ms: int = 1000
     history_audio_max_bytes_per_session: int = 8 * 1024 * 1024
+    # Server-only model configuration. Models validate their own options;
+    # client session.update cannot select code or change these limits.
+    model_custom_options: dict[str, object] = field(default_factory=dict)
     # Startup warmup, before real ``/v1/realtime`` clients are admitted.
     # Audio-primary models run this many silent frames; 0 disables that path.
     # Video-required models (AURA) still run one short non-silent audio chunk
@@ -763,6 +779,8 @@ class DuplexSessionRuntimeConfig:
     collect_stats: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.model_custom_options, dict):
+            raise ValueError("duplex_session.model_custom_options must be a mapping")
         if not isinstance(self.collect_stats, bool):
             raise ValueError("duplex_session.collect_stats must be a boolean")
         if self.replica_policy not in ("legacy", "least_sessions"):
