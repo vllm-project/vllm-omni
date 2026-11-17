@@ -397,6 +397,7 @@ def test_minicpmo_non_duplex_sample_skips_duplex_row_scan():
 
     calls = []
     runner = GPUARModelRunner.__new__(GPUARModelRunner)
+    runner.requests = {}
     runner.input_batch = SimpleNamespace(
         sampling_metadata=SimpleNamespace(output_token_ids=[]),
         update_async_output_token_ids=lambda: None,
@@ -424,6 +425,7 @@ def test_minicpmo_duplex_sample_clears_stale_rows_once_without_scanning():
 
     calls = []
     runner = GPUARModelRunner.__new__(GPUARModelRunner)
+    runner.requests = {}
     runner.input_batch = SimpleNamespace(
         sampling_metadata=SimpleNamespace(output_token_ids=[]),
         update_async_output_token_ids=lambda: None,
@@ -1535,6 +1537,71 @@ def test_minicpmo_stage0_streaming_processor_is_isolated_per_session():
     assert observed == [1, 1, 2, 2]
     assert processor_a is not processor_b
     assert runtime.processor._streaming_mel_processor.counter == 0
+
+
+def test_minicpmo_stage0_feature_extractor_is_isolated_per_session():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    class _FeatureExtractor:
+        # Like MiniCPMAAudioProcessor: the log-mel floor mode lives on the extractor.
+        def __init__(self):
+            self.dynamic_log_norm = True
+            self.dynamic_range_db = 8.0
+            self.log_floor_db = -10.0
+
+        def set_spac_log_norm(self, dynamic_range_db=None, log_floor_db=None):
+            if dynamic_range_db is not None:
+                self.dynamic_log_norm, self.dynamic_range_db = True, dynamic_range_db
+            if log_floor_db is not None:
+                self.dynamic_log_norm, self.log_floor_db = False, log_floor_db
+
+    class _Mel:
+        # Like StreamingMelProcessorExact._extract_full below 5 s of buffer.
+        def __init__(self, feature_extractor: _FeatureExtractor):
+            self.feature_extractor = feature_extractor
+
+        def process(self) -> bool:
+            self.feature_extractor.set_spac_log_norm(log_floor_db=-10)
+            return self.feature_extractor.dynamic_log_norm
+
+    class _Processor:
+        # Like the remote MiniCPMOProcessor: set_streaming_mode() rebuilds the streaming
+        # mel processor on self.audio_processor, and process_audio() (the reference
+        # voice) reads whatever floor mode that extractor is in.
+        def __init__(self):
+            self.audio_processor = _FeatureExtractor()
+            self._streaming_mel_processor = _Mel(self.audio_processor)
+
+        def set_streaming_mode(self, **_kwargs):
+            self._streaming_mel_processor = _Mel(self.audio_processor)
+
+        def reset_streaming(self):
+            return None
+
+        def process_audio_streaming(self, _audio, **_kwargs):
+            return self._streaming_mel_processor.process()
+
+        def process_audio(self, _audios):
+            return self.audio_processor.dynamic_log_norm
+
+    runtime = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
+    runtime.processor = _Processor()
+    runtime.stage_model = SimpleNamespace()
+    runtime.thinker = runtime.stage_model
+    processor_a = runtime._configure_streaming_processor(_MiniCPMO45Stage0SessionState(session_id="a"))
+    processor_b = runtime._configure_streaming_processor(_MiniCPMO45Stage0SessionState(session_id="b"))
+
+    assert runtime._process_streaming_audio([], 0, processor=processor_a) is False
+
+    # Session a's stream changed neither the processor that encodes reference voices
+    # nor session b.
+    assert runtime.processor.process_audio([]) is True
+    assert processor_b.audio_processor.dynamic_log_norm is True
+    assert processor_a._streaming_mel_processor.feature_extractor is processor_a.audio_processor
+    assert processor_a.audio_processor is not processor_b.audio_processor
 
 
 def test_minicpmo_stage0_data_plane_next_append_reinjects_previous_listen():
@@ -3182,3 +3249,84 @@ def test_minicpmo_stage0_stop_tokens_exclude_turn_eos():
     stop_ids = _stage0_stop_token_ids(_NativeDuplexTokenizer())
 
     assert stop_ids == [151718, 151721, 151705]
+
+
+@pytest.mark.parametrize("is_speech", [False, True])
+def test_minicpmo_camera_frames_preserve_audio_speech_gate(is_speech):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="silent-camera")
+    result = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(4, dtype=np.float32),
+        video_frames=["frame"],
+        is_speech=is_speech,
+        epoch=0,
+        seq=1,
+    )
+    assert result["success"]
+    assert state.pending_speech_context is is_speech
+
+
+def test_minicpmo_vision_only_units_skip_audio_encoder_and_keep_boundaries():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="vision-only")
+
+    def unexpected_audio(*args, **kwargs):
+        raise AssertionError("VISION must not encode synthetic audio")
+
+    runtime._process_streaming_audio = unexpected_audio
+    for seq in (1, 2):
+        result = runtime._stage_prefill_embeddings_only(
+            state,
+            None,
+            encoded_frames=[[torch.zeros(2, 2)]],
+            epoch=0,
+            seq=seq,
+        )
+        assert result["success"]
+        assert state.audio_chunk_idx == seq
+        assert state.audio_buffer.size == 0
+        assert state.pending_speech_context
+        ids = result["input_token_ids"]
+        assert ids.count(runtime.unit_token_id) == 1
+        assert ids.count(runtime.unit_end_token_id) == (seq - 1)
+
+
+def test_minicpmo_audio_after_vision_unit_starts_audio_encoder_at_first_chunk():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    # 4 Hz keeps the 1250 ms first window at 5 samples against a 4-sample chunk.
+    runtime.stage_model.first_chunk_ms = 1250
+    runtime.processor._streaming_mel_processor = SimpleNamespace(
+        sample_rate=4, get_config=lambda: {"effective_first_chunk_ms": 1250}
+    )
+    original_process = runtime._process_streaming_audio
+    encoded = []
+
+    def process(chunk, chunk_idx, *, processor=None):
+        encoded.append((chunk.copy(), chunk_idx))
+        return original_process(chunk, chunk_idx, processor=processor)
+
+    runtime._process_streaming_audio = process
+    state = _MiniCPMO45Stage0SessionState(session_id="vision-then-audio")
+    vision = runtime._stage_prefill_embeddings_only(state, None, encoded_frames=[[torch.zeros(2, 2)]], epoch=0, seq=1)
+    assert vision["success"]
+    assert state.audio_chunk_idx == 1
+    assert state.audio_encoder_chunk_idx == 0
+
+    audio = runtime._stage_prefill_embeddings_only(state, np.ones(4, dtype=np.float32), epoch=0, seq=2)
+
+    assert audio["success"]
+    [(chunk, chunk_idx)] = encoded
+    assert chunk_idx == 0
+    # The mel processor's first window is front-padded, as for an audio-first session.
+    assert chunk.tolist() == [0.0, 1.0, 1.0, 1.0]
+    assert state.audio_buffer.size == 0
+    assert state.audio_encoder_chunk_idx == 1
+    assert state.audio_chunk_idx == 2
+    assert audio["input_token_ids"][:2] == [runtime.unit_end_token_id, runtime.unit_token_id]

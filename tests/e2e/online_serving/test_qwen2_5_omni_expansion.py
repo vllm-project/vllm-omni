@@ -151,3 +151,30 @@ def test_text_to_text_001(omni_server, online_client) -> None:
     }
 
     online_client.send_omni_request(request_config, request_num=get_max_batch_size())
+
+
+@pytest.mark.slow
+@pytest.mark.omni
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.parametrize("speaker", ["Chelsie", "ETHAN"])
+def test_speaker_001(omni_server, online_client, speaker: str) -> None:
+    """
+    Test per-request speaker selection for audio output via OpenAI API.
+    Deploy Setting: default yaml
+    Input Modal: text
+    Output Modal: text + audio using a case-insensitive preset speaker name
+    Datasets: single request
+    """
+    messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": False,
+        "speaker": speaker,
+        "key_words": {"text": ["beijing"]},
+    }
+
+    # core_model loads dummy weights; the preset voice is checked only at
+    # advanced_model / full_model, which load the real checkpoint.
+    online_client.send_omni_request(request_config)

@@ -126,6 +126,7 @@ def test_resumable_generation_stop_marks_segment_boundary() -> None:
     sched.chunk_transfer_adapter = SimpleNamespace(
         is_done_receiving_chunks=lambda _request_id: True,
         segment_finished_requests={session.request_id},
+        mark_chunk_consumed=lambda _request_id: None,
     )
 
     def rearm_resumable_request(request: Request) -> bool:
@@ -196,6 +197,7 @@ def test_rejected_grammar_finishes_and_frees_generation_request(prompt_complete:
     sched.chunk_transfer_adapter = SimpleNamespace(
         is_done_receiving_chunks=lambda _request_id: True,
         segment_finished_requests={session.request_id},
+        mark_chunk_consumed=lambda _request_id: None,
     )
 
     sched._async_chunk_transport_enabled.return_value = False

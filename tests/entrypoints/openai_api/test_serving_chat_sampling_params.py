@@ -14,6 +14,7 @@ from typing import Any, cast
 import pytest
 from pytest_mock import MockerFixture
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import SamplingParams
 
 from tests.helpers.serving_chat import build_serving_chat
@@ -274,7 +275,9 @@ def test_mixed_consumer_keeps_root_common_args_with_nested_extras(mock_engine_cl
     ]
     mock_engine_client.output_modalities = ["image"]
     mock_engine_client.errored = False
-    mock_engine_client.renderer = SimpleNamespace(get_tokenizer=lambda: object())
+    # Upstream's OpenAIServingChat.__init__ reads renderer.tokenizer when
+    # composing the tool/reasoning parser; None is its skip-validation value.
+    mock_engine_client.renderer = SimpleNamespace(get_tokenizer=lambda: object(), tokenizer=None)
 
     captured: dict[str, object] = {}
 
@@ -342,7 +345,9 @@ def test_text_only_request_reaches_engine_with_comprehension_task_mode(mock_engi
     ]
     mock_engine_client.output_modalities = ["text", "image"]
     mock_engine_client.errored = False
-    mock_engine_client.renderer = SimpleNamespace(get_tokenizer=lambda: object())
+    # Upstream's OpenAIServingChat.__init__ reads renderer.tokenizer when
+    # composing the tool/reasoning parser; None is its skip-validation value.
+    mock_engine_client.renderer = SimpleNamespace(get_tokenizer=lambda: object(), tokenizer=None)
     captured: dict[str, object] = {}
 
     async def results():
@@ -976,3 +981,166 @@ def test_existing_extra_args_are_merged_not_replaced():
     ar = SamplingParams(extra_args={"custom": 1})
     _apply_tag([ar], None)
     assert ar.extra_args == {"custom": 1, "ar_task_mode": "comprehension"}
+
+
+@pytest.mark.parametrize("token_field", ["max_tokens", "max_completion_tokens"])
+def test_partial_stage_params_inherit_request_and_deploy_defaults(mock_engine_client, token_field):
+    instance = build_serving_chat(engine_client=mock_engine_client)
+    defaults = mock_engine_client.default_sampling_params_list
+    defaults[0].extra_args = {"deploy_option": True}
+    request = ChatCompletionRequest(model="test", messages=[], temperature=0, **{token_field: 256})
+
+    result = instance._to_sampling_params_list([{"extra_args": {"no_repeat_ngram_size": 10}}], request=request)
+
+    assert result[0].max_tokens == 256
+    assert result[0].temperature == 0
+    assert result[0].repetition_penalty == defaults[0].repetition_penalty
+    assert result[0].extra_args == {"deploy_option": True, "no_repeat_ngram_size": 10}
+    assert result[1].max_tokens == defaults[1].max_tokens
+    assert defaults[0].max_tokens == 4353
+    assert defaults[0].extra_args == {"deploy_option": True}
+
+
+def test_explicit_stage_params_override_top_level_request(mock_engine_client):
+    instance = build_serving_chat(engine_client=mock_engine_client)
+    request = ChatCompletionRequest(model="test", messages=[], max_tokens=256, temperature=0)
+    result = instance._to_sampling_params_list([{"max_tokens": 64, "temperature": 0.7}], request=request)
+    assert result[0].max_tokens == 64
+    assert result[0].temperature == 0.7
+
+
+def test_partial_stage_params_validate_max_tokens(mock_engine_client):
+    instance = build_serving_chat(engine_client=mock_engine_client)
+    with pytest.raises(VLLMValidationError):
+        instance._to_sampling_params_list([{"max_tokens": 0}])
+
+
+def test_partial_stage_params_without_request_preserve_yaml_defaults(mock_engine_client):
+    instance = build_serving_chat(engine_client=mock_engine_client)
+    result = instance._to_sampling_params_list([{"extra_args": {"no_repeat_ngram_size": 10}}])
+    assert result[0].max_tokens == 4353
+    assert result[0].temperature == 0.4
+
+
+def test_max_completion_tokens_takes_precedence(mock_engine_client):
+    instance = build_serving_chat(engine_client=mock_engine_client)
+    request = ChatCompletionRequest(model="test", messages=[], max_tokens=256, max_completion_tokens=512)
+    assert instance._build_sampling_params_list_from_request(request)[0].max_tokens == 512
+
+
+def _set_raw_sampling_defaults(engine, values, layout="typed"):
+    stage: Any = SimpleNamespace(stage_type="llm", is_comprehension=True)
+    if layout == "typed":
+        stage.model_config = SimpleNamespace(default_sampling_params=values)
+    elif layout == "legacy":
+        stage.default_sampling_params = values
+    else:
+        stage = {"stage_type": "llm", "is_comprehension": True, "default_sampling_params": values}
+    engine.stage_configs[0] = stage
+    engine.default_sampling_params_list[0] = SamplingParams(**values)
+
+
+@pytest.mark.parametrize("layout", ["typed", "legacy", "mapping"])
+@pytest.mark.parametrize("prompt_logprobs", [None, 0, 1])
+def test_partial_stage_params_recompute_prompt_logprobs_cache_policy(mock_engine_client, layout, prompt_logprobs):
+    defaults = {"prompt_logprobs": 1 if prompt_logprobs is None else None}
+    _set_raw_sampling_defaults(mock_engine_client, defaults, layout)
+    instance = build_serving_chat(engine_client=mock_engine_client)
+    result = instance._to_sampling_params_list([{"prompt_logprobs": prompt_logprobs}])
+    assert result[0].skip_reading_prefix_cache is (prompt_logprobs is not None)
+    assert mock_engine_client.default_sampling_params_list[0].prompt_logprobs == defaults["prompt_logprobs"]
+
+
+@pytest.mark.parametrize(
+    "deploy_policy,stage_overrides,expected",
+    [
+        (False, {"prompt_logprobs": 1}, False),
+        (True, {"prompt_logprobs": None}, True),
+        (False, {"prompt_logprobs": 1, "skip_reading_prefix_cache": None}, True),
+        (True, {"prompt_logprobs": 1, "skip_reading_prefix_cache": False}, False),
+    ],
+)
+def test_partial_stage_params_preserve_explicit_cache_policy(
+    mock_engine_client, deploy_policy, stage_overrides, expected
+):
+    defaults = {"skip_reading_prefix_cache": deploy_policy, "extra_args": {"deploy": True}}
+    _set_raw_sampling_defaults(mock_engine_client, defaults)
+    instance = build_serving_chat(engine_client=mock_engine_client)
+    result = instance._to_sampling_params_list([stage_overrides])
+    assert result[0].skip_reading_prefix_cache is expected
+    result[0].extra_args["request_only"] = True
+    assert defaults == {"skip_reading_prefix_cache": deploy_policy, "extra_args": {"deploy": True}}
+    assert mock_engine_client.default_sampling_params_list[0].extra_args == {"deploy": True}
+
+
+@pytest.mark.parametrize("partial", [[], [{}]])
+def test_empty_stage_params_inherit_explicit_request(mock_engine_client, partial):
+    instance = build_serving_chat(engine_client=mock_engine_client)
+    request = ChatCompletionRequest(model="test", messages=[], max_tokens=256, temperature=0)
+    result = instance._to_sampling_params_list(partial, request=request)
+    assert result[0].max_tokens == 256
+    assert result[0].temperature == 0
+    assert result[1].max_tokens == 4096
+
+
+def test_omitted_comprehension_stage_inherits_explicit_request(mock_engine_client):
+    mock_engine_client.stage_configs.reverse()
+    mock_engine_client.default_sampling_params_list.reverse()
+    instance = build_serving_chat(engine_client=mock_engine_client)
+    request = ChatCompletionRequest(model="test", messages=[], max_tokens=256)
+    result = instance._to_sampling_params_list([{}], request=request)
+    assert result[0].max_tokens == 4096
+    assert result[1].max_tokens == 256
+
+
+@pytest.mark.parametrize("with_stage_params", [False, True])
+def test_request_sampling_preserves_raw_deploy_filters(mock_engine_client, with_stage_params):
+    _set_raw_sampling_defaults(mock_engine_client, {"temperature": 0, "top_p": 0.8, "top_k": 20})
+    instance = build_serving_chat(engine_client=mock_engine_client)
+    request = ChatCompletionRequest(model="test", messages=[], temperature=0.7)
+    result = (
+        instance._to_sampling_params_list([{}], request=request)
+        if with_stage_params
+        else instance._build_sampling_params_list_from_request(request)
+    )
+    assert result[0].temperature == 0.7
+    assert result[0].top_p == 0.8
+    assert result[0].top_k == 20
+
+
+def test_stage_sampling_preserves_diffusion_and_constructed_params(mock_engine_client):
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    mock_engine_client.stage_configs[1] = SimpleNamespace(stage_type="diffusion", is_comprehension=False)
+    default = OmniDiffusionSamplingParams(height=1024, width=1024, num_inference_steps=9)
+    mock_engine_client.default_sampling_params_list[1] = default
+    instance = build_serving_chat(engine_client=mock_engine_client)
+    explicit = SamplingParams(max_tokens=64)
+    request = ChatCompletionRequest(model="test", messages=[], max_tokens=256, seed=99)
+    result = instance._to_sampling_params_list([explicit, {"height": 512}], request=request)
+    assert result[0] is explicit
+    assert result[0].max_tokens == 64
+    assert result[1].height == 512
+    assert result[1].width == OmniDiffusionSamplingParams().width
+    assert result[1].seed == OmniDiffusionSamplingParams().seed
+    omitted = instance._to_sampling_params_list([explicit], request=request)
+    assert omitted[1] is not default
+    assert omitted[1].height == 1024
+    assert omitted[1].num_inference_steps == 9
+
+
+def test_omitted_pooling_stage_keeps_parameter_type(mock_engine_client):
+    from vllm.pooling_params import PoolingParams
+
+    default = PoolingParams(task="token_classify", requires_token_ids=True)
+    mock_engine_client.stage_configs[1] = SimpleNamespace(
+        stage_type="llm", is_comprehension=False, model_config=SimpleNamespace(default_sampling_params=None)
+    )
+    mock_engine_client.default_sampling_params_list[1] = default
+    instance = build_serving_chat(engine_client=mock_engine_client)
+    request = ChatCompletionRequest(model="test", messages=[], max_tokens=256)
+    result = instance._to_sampling_params_list([{}], request=request)
+    assert isinstance(result[1], PoolingParams)
+    assert result[1] is not default
+    assert result[1].task == "token_classify"
+    assert result[1].requires_token_ids is True

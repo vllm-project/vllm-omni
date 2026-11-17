@@ -119,13 +119,7 @@ class CosyVoice3Adapter(ARTTSAdapter):
         if not request.ref_text or not request.ref_text.strip():
             return "CosyVoice3 requires 'ref_text' (transcript of the reference audio)"
 
-        if request.max_new_tokens is not None:
-            if request.max_new_tokens < self.max_new_tokens_min:
-                return f"max_new_tokens must be at least {self.max_new_tokens_min}"
-            if request.max_new_tokens > self.max_new_tokens_max:
-                return f"max_new_tokens cannot exceed {self.max_new_tokens_max}"
-
-        return None
+        return self._validate_max_new_tokens(request)
 
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool

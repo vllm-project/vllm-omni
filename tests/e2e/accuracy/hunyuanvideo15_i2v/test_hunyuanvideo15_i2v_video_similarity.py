@@ -9,7 +9,6 @@ import sys
 from pathlib import Path
 
 import pytest
-import torch
 
 from tests.e2e.accuracy.helpers import (
     assert_video_metadata,
@@ -24,11 +23,12 @@ from tests.e2e.accuracy.helpers import (
 )
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
+from vllm_omni.platforms import current_omni_platform
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 MODEL_NAME = "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v"
-IMAGE_URL = "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/wan_i2v_input.JPG"
 PROMPT = (
     "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. "
     "The fluffy-furred feline gazes directly at the camera with a relaxed expression. "
@@ -53,6 +53,11 @@ WORKSPACE_ROOT = REPO_ROOT.parent
 RUNNER_PATH = REPO_ROOT / "examples" / "offline_inference" / "image_to_video" / "image_to_video.py"
 RESULT_ROOT = Path(__file__).parent / "result"
 VIDEO_TIMEOUT_SECONDS = 60 * 60
+# A cold MI325 load can spend more than ten minutes reading the seven DiT
+# shards (AMD Buildkite #14270). Bound real hangs without failing that path.
+ENGINE_INIT_TIMEOUT_SECONDS = 30 * 60
+# Tile VAE decoding on NPU to reduce peak memory usage.
+VAE_TILING_ARGS = ["--vae-use-tiling"] if current_omni_platform.is_npu() else []
 SERVER_CASES = [
     pytest.param(
         OmniServerParams(
@@ -61,11 +66,14 @@ SERVER_CASES = [
                 "--flow-shift",
                 str(FLOW_SHIFT),
                 "--enforce-eager",
+                *VAE_TILING_ARGS,
             ],
             env_dict={"VLLM_OMNI_STORAGE_PATH": str(RESULT_ROOT / "storage")},
             use_omni=True,
+            init_timeout=ENGINE_INIT_TIMEOUT_SECONDS,
+            stage_init_timeout=ENGINE_INIT_TIMEOUT_SECONDS,
         ),
-        id="hunyuanvideo15_i2v_default",
+        id="hunyuanvideo15_i2v_vae_tiling" if VAE_TILING_ARGS else "hunyuanvideo15_i2v_default",
     )
 ]
 
@@ -90,7 +98,11 @@ def _resolve_image_source(configured: str | None) -> str:
         if candidate.exists():
             return str(candidate.resolve())
         return configured
-    return IMAGE_URL
+    return hf_api().hf_hub_download(
+        repo_id="YiYiXu/testing-images",
+        filename="wan_i2v_input.JPG",
+        repo_type="dataset",
+    )
 
 
 def _artifact_paths(image_source: str) -> tuple[Path, Path]:
@@ -126,11 +138,16 @@ def _build_offline_command(*, image_source: str, output_path: Path) -> list[str]
         str(GUIDANCE_SCALE),
         "--flow-shift",
         str(FLOW_SHIFT),
+        "--init-timeout",
+        str(ENGINE_INIT_TIMEOUT_SECONDS),
+        "--stage-init-timeout",
+        str(ENGINE_INIT_TIMEOUT_SECONDS),
         "--fps",
         str(FPS),
         "--seed",
         str(SEED),
         "--enforce-eager",
+        *VAE_TILING_ARGS,
         "--output",
         str(output_path),
     ]
@@ -183,13 +200,10 @@ def _generate_online_video(
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325", "npu": "A3"}, num_cards=1)
 def test_hunyuanvideo15_i2v_diffusers_offline_generates_video(
     hunyuanvideo15_i2v_image_source: str | None,
 ) -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("HunyuanVideo-1.5 I2V offline accuracy test requires CUDA.")
-
     probe_binary("ffprobe")
     if not RUNNER_PATH.exists():
         raise AssertionError(f"Offline runner does not exist: {RUNNER_PATH}")
@@ -203,7 +217,7 @@ def test_hunyuanvideo15_i2v_diffusers_offline_generates_video(
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_CASES, indirect=True)
 def test_hunyuanvideo15_i2v_online_serving_generates_video(
     omni_server,
@@ -211,9 +225,6 @@ def test_hunyuanvideo15_i2v_online_serving_generates_video(
     hunyuanvideo15_i2v_image_source: str | None,
     hunyuanvideo15_online_timeout_seconds: int,
 ) -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("HunyuanVideo-1.5 I2V online accuracy test requires CUDA.")
-
     probe_binary("ffprobe")
     image_source = _resolve_image_source(hunyuanvideo15_i2v_image_source)
     validate_image_source(image_source)
@@ -229,13 +240,10 @@ def test_hunyuanvideo15_i2v_online_serving_generates_video(
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325", "npu": "A3"}, num_cards=1)
 def test_hunyuanvideo15_i2v_serving_matches_offline_video_similarity(
     hunyuanvideo15_i2v_image_source: str | None,
 ) -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("HunyuanVideo-1.5 I2V video similarity test requires CUDA.")
-
     probe_binary("ffmpeg")
     probe_binary("ffprobe")
     image_source = _resolve_image_source(hunyuanvideo15_i2v_image_source)

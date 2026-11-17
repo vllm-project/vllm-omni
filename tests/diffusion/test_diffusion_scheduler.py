@@ -1675,6 +1675,7 @@ class TestDiffusionEngine:
 
     def test_finalize_finished_request_returns_aborted_output(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._cv = threading.Condition()
         engine.scheduler = StepScheduler()
         engine.scheduler.initialize(SimpleNamespace())
 
@@ -1688,6 +1689,7 @@ class TestDiffusionEngine:
 
     def test_finalize_finished_request_returns_scheduler_admission_error(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._cv = threading.Condition()
         engine.scheduler = StepScheduler()
         engine.scheduler.initialize(SimpleNamespace())
 
@@ -1724,7 +1726,9 @@ class TestDiffusionEngine:
             result=DiffusionOutput(output="chunk-0", finished=False, chunk_index=0, total_chunks=2),
         )
         finished_req_ids = engine.scheduler.update_from_output(sched_output, chunk)
-        engine._emit_outputs(finished_req_ids, sched_output.scheduled_request_ids, chunk)
+        engine._emit_outputs(
+            finished_req_ids, sched_output.scheduled_request_ids, chunk, worker_execution_completed=True
+        )
 
         notified_chunk = await asyncio.wait_for(queue.get(), timeout=1)
         assert notified_chunk.output == "chunk-0"
@@ -1738,7 +1742,9 @@ class TestDiffusionEngine:
             result=DiffusionOutput(output="chunk-1", finished=True, chunk_index=1, total_chunks=2),
         )
         finished_req_ids = engine.scheduler.update_from_output(sched_output, final_chunk)
-        engine._emit_outputs(finished_req_ids, sched_output.scheduled_request_ids, final_chunk)
+        engine._emit_outputs(
+            finished_req_ids, sched_output.scheduled_request_ids, final_chunk, worker_execution_completed=True
+        )
 
         notified_final = await asyncio.wait_for(queue.get(), timeout=1)
         assert notified_final.output == "chunk-1"
@@ -1748,6 +1754,7 @@ class TestDiffusionEngine:
     @pytest.mark.asyncio
     async def test_finished_streaming_request_without_runner_output_notifies_waiter(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.execution_mode = DiffusionExecutionMode.REQUEST_BATCH
         engine.scheduler = RequestScheduler()
         engine.scheduler.initialize(SimpleNamespace())
         engine._rpc_lock = threading.RLock()
@@ -1979,6 +1986,25 @@ class TestStepScheduler:
         )
         assert finished == {req_id}
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_ABORTED
+
+    def test_reused_request_id_does_not_finish_on_old_worker_cleanup(self) -> None:
+        request_id = self.scheduler.add_request(_make_step_request("reused", num_inference_steps=2))
+        first = self.scheduler.schedule()
+        self.scheduler.update_from_output(first, _make_step_output(request_id, step_index=2, finished=True))
+        self.scheduler.pop_request_state(request_id)
+
+        self.scheduler.add_request(_make_step_request(request_id, num_inference_steps=2))
+        second = self.scheduler.schedule()
+        # The old lifecycle still needs Worker cleanup before the new one starts.
+        assert second.finished_req_ids == {request_id}
+        assert _new_ids(second) == [request_id]
+        assert self.scheduler.update_from_output(second, _make_step_output(request_id, step_index=1)) == set()
+        assert self.scheduler.get_request_state(request_id).status == DiffusionRequestStatus.RUNNING
+
+        final = self.scheduler.schedule()
+        assert self.scheduler.update_from_output(final, _make_step_output(request_id, step_index=2, finished=True)) == {
+            request_id
+        }
 
     def test_batches_compatible_step_requests(self) -> None:
         scheduler = StepScheduler()
@@ -2318,6 +2344,8 @@ class TestPendingFinishedRequestIds:
         assert sched.pending_finished_request_ids() == {"a"}
 
         sched.pop_request_state("a")
+        assert sched.pending_finished_request_ids() == set()
+        sched.add_request(_make_request("a"))
         assert sched.pending_finished_request_ids() == set()
         # The next wave still ships the id to the worker for its own cleanup.
         assert sched.schedule().finished_req_ids == {"a"}

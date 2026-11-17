@@ -62,6 +62,18 @@ DIFFUSION_TEST_SETTINGS = {
             [DiffusionAccs.SEQUENCE_PARALLEL, DiffusionAccs.CACHE_DIT, DiffusionAccs.LAYERWISE_OFFLOAD],
             [DiffusionAccs.CFG_PARALLEL, DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.CPU_OFFLOAD],
         ],
+        # The LTX2 audio vocoder currently has no usable MIOpen conv1d
+        # algorithm on MI325. Keep these groups on CUDA until that runtime
+        # path is qualified separately.
+        rocm_multigpu=False,
+    ),
+    "LTX2TextToAudioPipeline": DiffusionModelTestOpts(
+        model="Lightricks/LTX-2",
+        builder=diff_model_builders.tiny_ltx2_audio_builder,
+        supported_tasks=[DiffusionTasks.TEXT_TO_AUDIO],
+        model_type_marker=ModelTypeMarker.DIFFUSION,
+        check_multi_output=False,
+        check_determinism=False,
     ),
     "SanaVideoPipeline": DiffusionModelTestOpts(
         model="Efficient-Large-Model/SANA-Video_2B_480p_diffusers",
@@ -180,5 +192,12 @@ DIFFUSION_TEST_SETTINGS = {
         builder=diff_model_builders.tiny_krea2_builder,
         supported_tasks=[DiffusionTasks.TEXT_TO_IMAGE],
         model_type_marker=ModelTypeMarker.DIFFUSION,
+    ),
+    "StableDiffusionXLPipeline": DiffusionModelTestOpts(
+        model="stabilityai/stable-diffusion-xl-base-1.0",
+        builder=diff_model_builders.tiny_sdxl_builder,
+        supported_tasks=[DiffusionTasks.TEXT_TO_IMAGE],
+        model_type_marker=ModelTypeMarker.DIFFUSION,
+        extra_test_groups=[[DiffusionAccs.CPU_OFFLOAD]],
     ),
 }

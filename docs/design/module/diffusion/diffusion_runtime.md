@@ -400,9 +400,13 @@ closes scheduler state and worker resources before returning the error.
 
 `abort()` places request IDs on an abort queue. The busy loop marks those
 requests `FINISHED_ABORTED`; finalization removes scheduler state and emits an
-aborted output when a consumer still exists. The runner removes cached
-step-mode state when it receives a scheduler output that reports the finished
-request ID.
+aborted output when a consumer still exists, including when no requests remain
+to schedule. After an in-flight execution call returns, the engine explicitly
+retires cancelled step-mode state on the workers; cleanup does not depend on
+a future scheduler wave. The runner also retires completed state and invalidates
+any cached input batch containing a terminated request, so the batch cannot
+retain that request's model-private tensors. Outputs keep their own tensor
+references through transport and consumption.
 
 On the multiproc request-mode async path, abort or consumer drop while output
 is still materializing should release the associated async-output bookkeeping
@@ -502,6 +506,8 @@ Test the smallest affected slice, then cover its neighboring boundary:
 Always exercise success, cancellation, per-request failure, fatal worker
 failure, repeated shutdown, one request, and multiple compatible requests.
 For step-mode changes, also test partial progress and cleanup of runner state.
+`test_step_request_lifecycle.py` checks state and private-tensor weak references
+at idle through the engine, executor, worker, and runner using two CPU regressions.
 
 ## Related documents
 

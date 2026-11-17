@@ -113,7 +113,7 @@ def test_invalid_batch_fails_before_advancing_any_generator(invalid: str) -> Non
     assert not sampler._graphs
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @torch.inference_mode()
 def test_cuda_replay_preserves_tokens_rng_and_owned_outputs(monkeypatch) -> None:
     sampler = BreezeFirstCodeSampler()
@@ -198,7 +198,7 @@ def test_cuda_replay_preserves_tokens_rng_and_owned_outputs(monkeypatch) -> None
     torch.testing.assert_close(torch.cuda.get_rng_state(), global_state, atol=0, rtol=0)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @torch.inference_mode()
 def test_cuda_parameters_vocab_and_missing_graph_api(monkeypatch) -> None:
     sampler = BreezeFirstCodeSampler()
@@ -249,7 +249,7 @@ def test_cuda_parameters_vocab_and_missing_graph_api(monkeypatch) -> None:
     _assert_states(mixed_generators, [expected_generators[0], cpu_reference, expected_generators[2]])
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @torch.inference_mode()
 def test_cuda_shared_generator_uses_sequential_eager_fallback(monkeypatch) -> None:
     sampler = BreezeFirstCodeSampler()
@@ -280,7 +280,7 @@ def test_cuda_shared_generator_uses_sequential_eager_fallback(monkeypatch) -> No
         assert all(sampler._graphs[key] is value for key, value in cached.items())
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @torch.inference_mode()
 def test_cuda_cache_limit_falls_back_without_evicting_warmed_graphs(monkeypatch) -> None:
     sampler = BreezeFirstCodeSampler()

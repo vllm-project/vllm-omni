@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from vllm.logger import init_logger
 from vllm.v1.worker.xpu_worker import XPUWorker
 
 from vllm_omni.platforms.xpu.worker.xpu_generation_model_runner import XPUGenerationModelRunner
+from vllm_omni.worker.base import OmniGPUWorkerBase
 from vllm_omni.worker.mixins import OmniWorkerMixin
 
 logger = init_logger(__name__)
 
 
-class XPUGenerationWorker(OmniWorkerMixin, XPUWorker):
+class XPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase, XPUWorker):
     """XPU generation worker for the code2wav (non-AR waveform generation) stage in the Omni model."""
 
     model_runner_cls = XPUGenerationModelRunner

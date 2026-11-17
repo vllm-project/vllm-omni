@@ -671,6 +671,30 @@ class HiFTGenerator(nn.Module):
         """Opt into CUDA ISTFT with a cached overlap envelope."""
         self._use_cached_istft = True
 
+    def enable_npu_graph_stft(self) -> None:
+        """Use a real-valued DFT projection in the captured HiFT body.
+
+        Ascend's complex STFT path currently offloads to CPU. The small HiFT
+        FFT (16 samples) is equivalent to these fixed, windowed filters.
+        Prepare both transforms before capture; the eager ISTFT finalizer
+        then stays on NPU instead of round-tripping every chunk through CPU.
+        """
+        n_fft = self.istft_params["n_fft"]
+        basis = torch.fft.rfft(torch.eye(n_fft, dtype=torch.float32, device="cpu"), dim=-1).T
+        basis = torch.cat((basis.real, basis.imag), dim=0) * self.stft_window.float().cpu()
+        parameter = next(self.parameters())
+        self.register_buffer("_npu_stft_basis", basis.T.contiguous().to(parameter.device), persistent=False)
+        # irfft restores the omitted negative frequencies. DC and (for an
+        # even FFT) Nyquist occur only once; every other bin occurs twice.
+        scale = torch.full((n_fft // 2 + 1,), 2.0 / n_fft, device="cpu")
+        scale[0] = 1.0 / n_fft
+        if n_fft % 2 == 0:
+            scale[-1] = 1.0 / n_fft
+        inverse = basis * scale.repeat(2).unsqueeze(1)
+        self.register_buffer("_npu_istft_basis", inverse.to(parameter.device), persistent=False)
+        self._npu_istft_window = self.stft_window.detach().float().cpu().clone()
+        self._npu_istft_envelopes: dict[tuple, torch.Tensor] = {}
+
     def remove_weight_norm(self) -> int:
         """Fold the generator's frozen weight norms into plain weights.
 
@@ -692,6 +716,15 @@ class HiFTGenerator(nn.Module):
 
     def _stft(self, x):
         if x.device.type == "npu":
+            basis = getattr(self, "_npu_stft_basis", None)
+            if basis is not None:
+                n_fft = self.istft_params["n_fft"]
+                # Match the CPU FFT's FP32 accumulation even inside FP16 decode.
+                with torch.autocast("npu", enabled=False):
+                    padded = F.pad(x.float().unsqueeze(1), (n_fft // 2, n_fft // 2), mode="reflect").squeeze(1)
+                    frames = padded.unfold(-1, n_fft, self.istft_params["hop_len"])
+                    spec = (frames @ basis).transpose(1, 2).to(x.dtype)
+                return spec.split(n_fft // 2 + 1, dim=1)
             return self._stft_on_cpu(x)
 
         spec = torch.stft(
@@ -721,6 +754,8 @@ class HiFTGenerator(nn.Module):
 
     def _istft(self, magnitude, phase):
         if magnitude.device.type == "npu":
+            if getattr(self, "_npu_istft_basis", None) is not None:
+                return self._istft_on_npu(magnitude, phase)
             return self._istft_on_cpu(magnitude, phase)
 
         magnitude = torch.clip(magnitude, max=1e2)
@@ -749,6 +784,30 @@ class HiFTGenerator(nn.Module):
             window,
             envelopes,
         )
+
+    def _istft_on_npu(self, magnitude, phase):
+        """Small real inverse DFT and overlap-add, without per-chunk host copies."""
+        n_fft, hop = self.istft_params["n_fft"], self.istft_params["hop_len"]
+        batch, _, n_frames = magnitude.shape
+        expected_len = n_fft + hop * (n_frames - 1)
+        key = (n_frames, magnitude.device)
+        envelope = self._npu_istft_envelopes.get(key)
+        if envelope is None:
+            # Validate NOLA once on CPU. Window-only data is independent of
+            # the queued forward and is primed during HiFT graph warmup.
+            envelope = _istft_envelope(self._npu_istft_window, n_fft, hop, n_frames).to(magnitude.device)
+            # The finalizer is eager and its returned waveform owns storage;
+            # no graph retains these envelopes. Bound arbitrary tail lengths.
+            if len(self._npu_istft_envelopes) >= 64:
+                self._npu_istft_envelopes.pop(next(iter(self._npu_istft_envelopes)))
+            self._npu_istft_envelopes[key] = envelope
+        magnitude = magnitude.clamp(max=1e2)
+        real, imag = magnitude * phase.cos(), magnitude * phase.sin()
+        with torch.autocast("npu", enabled=False):
+            frames = torch.cat((real, imag), dim=1).float().transpose(1, 2) @ self._npu_istft_basis
+            signal = torch.ops.aten.unfold_backward(frames, [batch, expected_len], 1, n_fft, hop)
+            waveform = signal[:, n_fft // 2 : expected_len - n_fft // 2] / envelope
+        return waveform.to(magnitude.dtype)
 
     def _istft_on_cpu(self, magnitude, phase):
         target_device = magnitude.device

@@ -180,10 +180,19 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # State specific to Chunk management
         self.custom_process_next_stage_input_func: Callable[..., OmniPayloadStruct | None] | None = None
         custom_process_next_stage_input_func = getattr(model_config, "custom_process_next_stage_input_func", None)
+        # Optional ``<func>_batch(transfer_manager, multimodal_outputs, requests,
+        # is_finished)``: one call per scheduler step, one payload (or None)
+        # per request, in order. See ``save_async_batch``. Opt-in: the batch
+        # form must set ``per_step_batch = True``, since per-step saves skip
+        # the request snapshot (other ``_batch`` forms serve other callers).
+        self.custom_process_next_stage_input_batch_func: Callable[..., list[OmniPayloadStruct | None]] | None = None
         if custom_process_next_stage_input_func:
             module_path, func_name = custom_process_next_stage_input_func.rsplit(".", 1)
             module = importlib.import_module(module_path)
             self.custom_process_next_stage_input_func = getattr(module, func_name)
+            batch_func = getattr(module, f"{func_name}_batch", None)
+            if getattr(batch_func, "per_step_batch", False) is True:
+                self.custom_process_next_stage_input_batch_func = batch_func
         self._processor_accepts_step_tokens: dict[Callable[..., Any], bool] = {}
         # mapping for request id and chunk id
         self.put_req_chunk: dict[str, int] = defaultdict(int)
@@ -269,7 +278,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             "prompt_token_ids",
         ):
             if hasattr(request, name):
-                setattr(snapshot, name, snapshot_container(getattr(request, name)))
+                value = getattr(request, name)
+                if name == "prompt_token_ids" and value is not None:
+                    # Token IDs are immutable integers. Copy the sequence without
+                    # walking every prompt token in Python for each chunk.
+                    value = value.copy() if isinstance(value, list) else list(value)
+                else:
+                    value = snapshot_container(value)
+                setattr(snapshot, name, value)
 
         for private_name, public_name in (
             ("_all_token_ids", "all_token_ids"),
@@ -410,6 +426,51 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 because ``finish_requests`` skips requests that already report
                 ``is_finished()``. See ``_finish_parked_streaming_session``.
         """
+        task = self._admit_save(
+            multimodal_output,
+            request,
+            is_segment_finished,
+            new_token_ids,
+            confirmed_num_computed_tokens,
+            segment_generation,
+            force_request_finished,
+            snapshot=self.custom_process_next_stage_input_func is not None,
+        )
+        if task is not None:
+            self._pending_save_reqs.append(task)
+            with self._save_cond:
+                self._save_cond.notify()
+
+    def save_async_batch(self, entries: list[dict[str, Any]]) -> None:
+        """``save_async`` for one scheduler step's requests, through the batch processor.
+
+        Each entry holds ``save_async``'s keyword arguments. Admission (stale
+        generations, preemption, sender fences) is per request as in
+        ``save_async``, but requests are not snapshotted, and the step is one
+        queued task: the save loop runs the processor once over it and puts
+        only the payloads it returns. Only a batch form that sets
+        ``per_step_batch = True`` gets here; by doing so it reads nothing of a
+        request but its ids, and takes finishing from the flags it is given.
+        """
+        tasks = [task for task in (self._admit_save(**entry, snapshot=False) for entry in entries) if task is not None]
+        if tasks:
+            self._pending_save_reqs.append({"batch": tasks})
+            with self._save_cond:
+                self._save_cond.notify()
+
+    def _admit_save(
+        self,
+        multimodal_output: dict[str, Any] | None = None,
+        request: Request | None = None,
+        is_segment_finished: bool = False,
+        new_token_ids: Iterable[int] | None = None,
+        confirmed_num_computed_tokens: int | None = None,
+        segment_generation: int | None = None,
+        force_request_finished: bool = False,
+        *,
+        snapshot: bool,
+    ) -> dict[str, Any] | None:
+        """Per-request admission of a chunk; returns the task to queue, or None."""
         is_finished = force_request_finished or (request.is_finished() and not request.resumable)
         if not hasattr(self, "_segment_generation"):
             self._segment_generation = defaultdict(int)
@@ -430,14 +491,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 generation,
                 expected_generation,
             )
-            return
+            return None
         self._segment_generation[external_req_id] = generation
 
         if confirmed_num_computed_tokens is None:
             confirmed_num_computed_tokens = self._confirmed_num_computed_tokens(request)
-        processor_request = (
-            self._snapshot_processor_request(request) if self.custom_process_next_stage_input_func else request
-        )
+        processor_request = self._snapshot_processor_request(request) if snapshot else request
         task = {
             "multimodal_output": multimodal_output,
             "request": processor_request,
@@ -462,7 +521,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     f"request.num_output_placeholders={getattr(request, 'num_output_placeholders', 0)}, "
                     f"previous_chunks_sent={self.requests_num_chunks_sent.get(external_req_id, 0)}"
                 )
-                return
+                return None
 
             else:
                 self.requests_num_chunks_sent[external_req_id] = confirmed_num_computed_tokens
@@ -470,7 +529,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     sender_token = _SenderGeneration()
                     self._sender_tokens[external_req_id] = sender_token
                 task["sender_token"] = sender_token
-                self._pending_save_reqs.append(task)
                 if is_finished:
                     # Fence this generation against cleanup until the terminal
                     # chunk has been handed to the connector (#6670).
@@ -491,9 +549,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if reject_reason is not None:
             logger.error("Cannot enqueue %s: %s", external_req_id, reject_reason)
             self.record_send_failure(request.request_id, reject_reason)
-            return
-        with self._save_cond:
-            self._save_cond.notify()
+            return None
+        return task
 
     def _poll_single_request(self, entry: _LoadEntry):
         request = entry.request
@@ -695,6 +752,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if "release_shm" in task:
             self._release_shm_prefix(task["release_shm"])
             return
+        if "batch" in task:
+            self._send_batch(task["batch"])
+            return
         request = task["request"]
         external_req_id = request.external_req_id
         sender_token = task.get("sender_token")
@@ -734,6 +794,76 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                         self._queue_shm_cleanup_locked(external_req_id, sender_token)
                         self._sender_tokens.pop(external_req_id, None)
                         self._clear_sender_state_locked(external_req_id)
+
+    def _send_batch(self, tasks: list[dict]) -> None:
+        """Run the batch processor once over a step's live tasks, then send each like a single task.
+
+        The processor reads and writes per-request sender state
+        (``request_payload``), so every live generation is marked in flight
+        while it runs, as ``_send_single_request`` does around its processor:
+        ``cleanup_sender`` then defers to this thread instead of clearing state
+        the processor would recreate.
+        """
+        live = []
+        marked: list[tuple[str, _SenderGeneration]] = []
+        with self._sender_state_lock:
+            for task in tasks:
+                token = task.get("sender_token")
+                external_req_id = task["request"].external_req_id
+                current = token is None or (
+                    self._sender_tokens.get(external_req_id) is token and (task["is_finished"] or not token.cancelled)
+                )
+                if current:
+                    live.append(task)
+                    if token is not None and not token.in_flight:
+                        token.in_flight = True
+                        marked.append((external_req_id, token))
+        payloads: list[OmniPayloadStruct | None] = [None] * len(live)
+        processor = self.custom_process_next_stage_input_batch_func
+        try:
+            if live and processor is not None:
+                try:
+                    outputs = [
+                        unflatten_payload(t["multimodal_output"])
+                        if isinstance(t["multimodal_output"], Mapping)
+                        else t["multimodal_output"]
+                        for t in live
+                    ]
+                    payloads = list(
+                        processor(
+                            self,
+                            outputs,
+                            [t["request"] for t in live],
+                            [bool(t["is_segment_finished"] or t["is_finished"]) for t in live],
+                        )
+                    )
+                except Exception as e:
+                    # The batch form may have advanced some requests' state
+                    # already, so the scalar form is not re-run: these
+                    # requests lose this step's chunk.
+                    logger.error(
+                        "Batch next-stage input processor failed; requests %s lose this step's chunk: %s",
+                        [t["request"].external_req_id for t in live],
+                        e,
+                    )
+        finally:
+            with self._sender_state_lock:
+                for external_req_id, token in marked:
+                    if self._sender_tokens.get(external_req_id) is not token:
+                        continue
+                    token.in_flight = False
+                    # A cancel that arrived while the processor ran deferred
+                    # its cleanup to here (a queued terminal chunk keeps the fence).
+                    if token.cancelled and not token.terminal_pending:
+                        self._queue_shm_cleanup_locked(external_req_id, token)
+                        self._sender_tokens.pop(external_req_id, None)
+                        self._clear_sender_state_locked(external_req_id)
+        for task, payload in zip(live, payloads, strict=True):
+            task["payload"] = payload
+        # Stale tasks still pass through to release their terminal fences.
+        for task in tasks:
+            task.setdefault("payload", None)
+            self._send_single_request(task)
 
     def _release_terminal_fence(self, external_req_id: str, sender_token: _SenderGeneration) -> None:
         """Drop the terminal fence and run the cleanup it deferred.
@@ -785,7 +915,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
         # Process payload in save_loop thread
         payload_data: OmniPayloadStruct | None = None
-        if self.custom_process_next_stage_input_func:
+        if "payload" in task:
+            # Precomputed by the batch processor (_send_batch).
+            payload_data = task["payload"]
+        elif self.custom_process_next_stage_input_func:
             try:
                 processor = self.custom_process_next_stage_input_func
                 processor_kwargs = {
@@ -1038,6 +1171,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         """Clear sender state while ``_sender_state_lock`` is held."""
         self.put_req_chunk.pop(external_req_id, None)
         self.request_payload.pop(external_req_id, None)
+        getattr(self, "_ming3_chunk_state", {}).pop(external_req_id, None)
         self.code_prompt_token_ids.pop(external_req_id, None)
         getattr(self, "_qwen3_tts_emitted_frames", {}).pop(external_req_id, None)
         self.requests_num_chunks_sent.pop(external_req_id, None)
@@ -1528,6 +1662,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self,
         scheduler_output: Any,
         requests: dict[str, Request] | None = None,
+        *,
+        consume_chunks: bool = True,
     ) -> None:
         """
         Add additional info for cached requests and
@@ -1542,7 +1678,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if requests is not None:
             self.attach_cached_additional_information(scheduler_output, requests)
-        self._clear_chunk_ready(scheduler_output)
+        if consume_chunks:
+            self._clear_chunk_ready(scheduler_output)
+
+    def mark_chunk_consumed(self, request_id: str) -> None:
+        """Release an input only after its generation output is complete."""
+        self.requests_with_ready_chunks.discard(request_id)
 
     @staticmethod
     def attach_cached_additional_information(scheduler_output: Any, requests: dict[str, Request]) -> None:

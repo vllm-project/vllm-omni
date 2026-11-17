@@ -741,30 +741,6 @@ class MiMoAudioForConditionalGeneration(
 
             loaded_weights.update(token2wav_loaded)
 
-    @staticmethod
-    def insert_between(input_ids: torch.Tensor, group_size: int, value: int = -100):
-        if group_size < 0:
-            raise ValueError("group_size must be non-negative")
-
-        if not isinstance(input_ids, torch.Tensor):
-            input_ids = torch.tensor(input_ids)
-        if input_ids.dim() != 1:
-            raise ValueError("input_ids must be 1-D tensor or list")
-
-        L = input_ids.numel()
-        if group_size == 0 or L == 0:
-            return input_ids.clone()
-
-        new_len = L * (group_size + 1)
-        # Create output tensor filled with value, dtype & device consistent with input_ids
-        out = input_ids.new_full((new_len,), value)
-
-        # Place original elements at the first position of each block: 0, group_size+1, 2*(group_size+1), ...
-        positions = torch.arange(L, dtype=torch.long, device=input_ids.device) * (group_size + 1)
-        out[positions] = input_ids
-
-        return out
-
     def forward(
         self,
         input_ids: torch.Tensor,

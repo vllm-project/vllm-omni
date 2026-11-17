@@ -80,18 +80,39 @@ class TestKeyBasedReadWrite:
         result = connector.get("s0", "s1", "no_such_key_xyz", metadata=None)
         assert result is None
 
-    def test_get_empty_shm_race_returns_none(self, connector, monkeypatch):
-        def raise_empty_file(*args, **kwargs):
-            raise ValueError("cannot mmap an empty file")
+    def test_get_does_not_open_shm_before_writer_sizes_it(self, connector, tmp_path, monkeypatch, mocker):
+        import threading
 
-        monkeypatch.setattr(
-            "vllm_omni.distributed.omni_connectors.connectors.shm_connector.shm_pkg.SharedMemory",
-            raise_empty_file,
-        )
+        from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
 
-        result = connector.get("s0", "s1", "not_ready_yet", metadata=None)
+        # Isolate the publication lock from the host's coordination directory.
+        monkeypatch.setattr(module, "open", lambda path, mode: (tmp_path / "writer.lock").open(mode), raising=False)
+        entered, release = threading.Event(), threading.Event()
+        original = os.ftruncate
+        opens = mocker.spy(module.shm_pkg, "SharedMemory")
 
-        assert result is None
+        def pause_size(fd, size):
+            entered.set()
+            assert release.wait(timeout=5)
+            return original(fd, size)
+
+        key = "sizing_" + uuid.uuid4().hex[:16]
+        result = []
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "ftruncate", pause_size)
+            writer = threading.Thread(target=lambda: result.append(connector.put("0", "1", key, {"ready": True})))
+            writer.start()
+            try:
+                assert entered.wait(timeout=5)
+                before_read = opens.call_count
+                assert connector.get("0", "1", key) is None
+                assert opens.call_count == before_read
+            finally:
+                release.set()
+                writer.join(timeout=5)
+        assert not writer.is_alive()
+        assert result[0][0]
+        assert connector.get("0", "1", key, metadata=result[0][2])[0] == {"ready": True}
 
     def test_rank_aware_keys_independent(self, connector):
         """Each TP rank writes/reads its own key — simulates homogeneous TP."""
@@ -589,3 +610,45 @@ def test_receive_poll_interval_validation(monkeypatch, value, expected):
 
     monkeypatch.setenv("VLLM_OMNI_CONNECTOR_RECV_POLL_MS", value)
     assert _recv_poll_seconds() == expected
+
+
+def test_put_limits_reaping_work_with_unread_backlog(connector, monkeypatch):
+    """A backlog must not turn every data send into a large filesystem sweep."""
+    prefix = f"reap_budget_{uuid.uuid4().hex}"
+    for index in range(128):
+        assert connector.put("0", "1", f"{prefix}_{index}", index)[0]
+
+    checked_paths = []
+    exists = os.path.exists
+
+    def track_exists(path):
+        if str(path).startswith(f"/dev/shm/{prefix}"):
+            checked_paths.append(path)
+        return exists(path)
+
+    monkeypatch.setattr(os.path, "exists", track_exists)
+    assert connector.put("0", "1", f"{prefix}_next", "next")[0]
+    # Keep per-send housekeeping small, independently of the backlog length.
+    assert len(checked_paths) <= 8
+
+
+def test_reaping_keeps_consumed_records_bounded_behind_unread_keys(connector):
+    """Small send-time sweeps must still catch up with ongoing consumption."""
+    receiver = SharedMemoryConnector({})
+    prefix = f"reap_mixed_{uuid.uuid4().hex}"
+    unread_count = 128
+    try:
+        for index in range(unread_count):
+            assert connector.put("0", "1", f"{prefix}_held_{index}", index)[0]
+        for index in range(2048):
+            key = f"{prefix}_consumed_{index}"
+            assert connector.put("0", "1", key, index)[0]
+            assert receiver.get("0", "1", key)[0] == index
+            assert len(connector._pending_keys) <= 2 * unread_count
+        for index in range(unread_count):
+            assert receiver.get("0", "1", f"{prefix}_held_{index}")[0] == index
+        for _ in range(4):
+            connector.reap_consumed()
+        assert not connector._pending_keys
+    finally:
+        receiver.close()

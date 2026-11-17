@@ -1,14 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for INC/AutoRound quantization via the unified framework."""
 
 import pytest
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
-def test_build_quant_config_autoround():
-    """build_quant_config("auto-round", ...) should produce an INCConfig."""
+@pytest.mark.parametrize(
+    ("data_type", "group_size", "packing_format"),
+    [
+        ("int", 128, "auto_round:auto_gptq"),
+        ("mx_fp", 32, "auto_round:llm_compressor"),
+        ("nv_fp", 16, "auto_round:llm_compressor"),
+    ],
+    ids=["int4", "mxfp4", "nvfp4"],
+)
+def test_build_quant_config_autoround(data_type, group_size, packing_format):
+    """Build INC configs for AutoRound INT4, MXFP4, and NVFP4 checkpoints."""
     from vllm.model_executor.layers.quantization.inc import INCConfig
 
     from vllm_omni.quantization import build_quant_config
@@ -16,14 +25,64 @@ def test_build_quant_config_autoround():
     config = build_quant_config(
         "auto-round",
         bits=4,
-        group_size=128,
+        group_size=group_size,
         sym=True,
-        packing_format="auto_round:auto_gptq",
+        data_type=data_type,
+        packing_format=packing_format,
     )
     assert config is not None
     assert isinstance(config, INCConfig)
     assert config.weight_bits == 4
-    assert config.group_size == 128
+    assert config.group_size == group_size
+    assert config.data_type == data_type
+    assert config.packing_format == packing_format
+
+
+@pytest.mark.parametrize(
+    ("data_type", "group_size", "scheme_name"),
+    [("mx_fp", 32, "INCMxfp4LinearMethod"), ("nv_fp", 16, "CompressedTensorsW4A4Fp4")],
+    ids=["mxfp4", "nvfp4"],
+)
+@pytest.mark.parametrize("excluded", [False, True])
+def test_inc_fp4_linear_method(mocker, data_type, group_size, scheme_name, excluded):
+    from torch.nn import LayerNorm
+    from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsLinearMethod,
+    )
+    from vllm.model_executor.layers.quantization.inc.inc_linear import INCLinearMethod
+
+    from vllm_omni.quantization import build_quant_config
+
+    # Keep config parsing and method selection real; avoid device kernel initialization.
+    mxfp4_kernel = mocker.patch(
+        "vllm.model_executor.layers.quantization.inc.schemes.inc_mxfp4_linear.init_mxfp4_linear_kernel"
+    )
+    nvfp4_kernel = mocker.patch(
+        "vllm.model_executor.layers.quantization.compressed_tensors.schemes."
+        "compressed_tensors_w4a4_nvfp4.init_nvfp4_linear_kernel"
+    )
+    config = build_quant_config(
+        "auto-round",
+        bits=4,
+        group_size=group_size,
+        data_type=data_type,
+        packing_format="auto_round:llm_compressor",
+        extra_config={"proj": {"bits": 16}} if excluded else None,
+    )
+    layer = mocker.Mock(spec=LinearBase)
+    method = config.get_quant_method(layer, "proj")
+    if excluded:
+        assert isinstance(method, UnquantizedLinearMethod)
+        mxfp4_kernel.assert_not_called()
+        nvfp4_kernel.assert_not_called()
+    elif data_type == "nv_fp":
+        assert isinstance(method, CompressedTensorsLinearMethod)
+        assert type(layer.scheme).__name__ == scheme_name
+    else:
+        assert isinstance(method, INCLinearMethod)
+        assert type(method.scheme).__name__ == scheme_name
+    assert config.get_quant_method(LayerNorm(64), "norm") is None
 
 
 def test_build_quant_config_inc():

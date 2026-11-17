@@ -12,7 +12,6 @@ from typing import Any, ClassVar
 import numpy as np
 import torch
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
-from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from torch import nn
 from transformers import AutoConfig, ByT5Tokenizer, Qwen2_5_VLTextModel, Qwen2Tokenizer
@@ -30,6 +29,7 @@ from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer impor
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
+from vllm_omni.diffusion.models.utils import latent_channels_from_vae
 from vllm_omni.diffusion.models.utils import prepare_latents as _prepare_latents
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
@@ -181,7 +181,7 @@ class HunyuanVideo15Pipeline(
         self.vae_scale_factor_spatial = (
             self.vae.spatial_compression_ratio if hasattr(self.vae, "spatial_compression_ratio") else 16
         )
-        self.num_channels_latents = self.vae.config.latent_channels if hasattr(self.vae, "config") else 32
+        self.num_channels_latents = latent_channels_from_vae(self.vae, default=32)
 
         # fmt: off
         # NOTE: whitespace must match the diffusers reference exactly because

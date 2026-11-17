@@ -1,9 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Protocol
 
 import msgspec
 from vllm.inputs import PromptType
+from vllm.lora.request import LoRARequest
 from vllm.v1.engine import EngineCoreRequest
 
 from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
@@ -13,6 +17,14 @@ from vllm_omni.outputs import OmniRequestOutput
 
 class EngineQueueMessage(msgspec.Struct, forbid_unknown_fields=True):
     pass
+
+
+class OutputQueueWriter(Protocol):
+    """Where the orchestrator thread puts messages for the serving frontend."""
+
+    async def put(self, item: EngineQueueMessage) -> None: ...
+
+    def put_nowait(self, item: EngineQueueMessage) -> None: ...
 
 
 class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
@@ -28,6 +40,8 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     enqueue_ts: float
     final_output_stage_ids: list[int] | None = None
     request_artifact_dirs: list[str] | None = None
+    entry_stage_id: int = 0
+    lora_request: LoRARequest | None = None
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):
@@ -85,6 +99,7 @@ class ErrorMessage(EngineQueueMessage, kw_only=True):
     error: str
     status_code: int | None = None
     error_type: str | None = None
+    mm_cache_miss_hashes: list[str] | None = None
     fatal: bool = False
     request_id: str | None = None
     stage_id: int | None = None

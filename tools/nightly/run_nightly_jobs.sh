@@ -607,6 +607,8 @@ STABILITY_CASES: list[tuple[str, str, tuple[str, ...]]] = [
     ("stability_hunyuan_image", "tests/dfx/stability/scripts/run_stability_hunyuan_image.py", ("diffusion",)),
     ("stability_minimax_h3", "tests/dfx/stability/scripts/run_stability_minimax_h3.py", ("diffusion",)),
     ("stability_hunyuanvideo15", "tests/dfx/stability/scripts/run_stability_hunyuanvideo15.py", ("diffusion",)),
+    ("stability_cosmos3", "tests/dfx/stability/scripts/run_stability_cosmos3.py", ("diffusion",)),
+    ("stability_lingbot_video", "tests/dfx/stability/scripts/run_stability_lingbot_video.py", ("diffusion",)),
 ]
 
 

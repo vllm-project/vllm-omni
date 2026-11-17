@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The vLLM-Omni team.
 # Copyright (c) Ant Group. All rights reserved.
 # Adapted from:
@@ -6,6 +7,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from functools import cached_property
@@ -55,6 +57,81 @@ class VoicePresetRegistry:
         self._patch_size = patch_size
 
         self.registered: dict[str, dict[str, Any]] = {}
+        self._reference_cache: dict[tuple, dict[str, Any]] = {}
+
+    @torch.no_grad()
+    def resolve_reference(
+        self,
+        prompt_wav_path: str | list[str] | None,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        need_speaker: bool,
+        need_latents: bool,
+        reference_audio: list[dict] | None = None,
+    ) -> dict[str, Any]:
+        """Resolve reference audio, extracting only the requested features."""
+        from torchaudio.functional import resample as resample_reference
+
+        cache_key = None
+        waveforms = None
+        if prompt_wav_path:
+            paths = self._normalize_paths("request", prompt_wav_path)
+            cache_key = (tuple((p, os.stat(p).st_mtime_ns) for p in paths), need_speaker, need_latents)
+            if cache_key in self._reference_cache:
+                return self._reference_cache[cache_key]
+            reference_audio = []
+            for path in paths:
+                data, sr = sf.read(path, dtype="float32")
+                if data.ndim == 2:
+                    data = data.mean(axis=1)
+                reference_audio.append({"samples": data, "sample_rate": sr})
+        elif reference_audio:
+            # Inline and registered-name voices arrive as samples with every
+            # text segment. Feature extraction is deterministic (CAMPPlus and
+            # a fixed-seed VAE posterior), so key the cache by content.
+            waveforms = [
+                torch.as_tensor(item["samples"], dtype=torch.float32).reshape(1, -1) for item in reference_audio
+            ]
+            digest = hashlib.blake2b(digest_size=16)
+            for item, waveform in zip(reference_audio, waveforms, strict=True):
+                digest.update(str(int(item["sample_rate"])).encode())
+                digest.update(waveform.numpy().tobytes())
+            cache_key = (("samples", digest.hexdigest()), need_speaker, need_latents)
+            if cache_key in self._reference_cache:
+                return self._reference_cache[cache_key]
+        if not reference_audio:
+            raise ValueError("Reference audio is missing")
+        speech = []
+        embeddings = []
+        for index, item in enumerate(reference_audio):
+            waveform = (
+                waveforms[index]
+                if waveforms is not None
+                else torch.as_tensor(item["samples"], dtype=torch.float32).reshape(1, -1)
+            )
+            sr = int(item["sample_rate"])
+            if sr <= 0 or waveform.numel() == 0 or not torch.isfinite(waveform).all():
+                raise ValueError("Reference audio must be finite, nonempty, and have a positive sample rate")
+            if need_speaker:
+                raw = self._spkemb_extractor(resample_reference(waveform, sr, 16000))
+                if raw is None:
+                    raise ValueError("CAMPPlus did not produce a reference speaker embedding")
+                embeddings.append(self._spk_head(raw.to(device=device, dtype=dtype)))
+            if need_latents:
+                if self._audio_vae is None:
+                    raise RuntimeError("Reference continuation requires AudioVAE")
+                speech.append(resample_reference(waveform, sr, int(self._audio_vae.config.sample_rate)))
+        latents, projected = None, None
+        if need_latents:
+            latents, projected = self._build_wav_embeddings("request", torch.cat(speech, dim=-1), device=device)
+        resolved = {"spk_emb": embeddings, "prompt_wav_lat": latents, "prompt_wav_emb": projected}
+        if cache_key is not None:
+            # Bound retained GPU reference features for long evaluation jobs.
+            if len(self._reference_cache) >= 16:
+                self._reference_cache.pop(next(iter(self._reference_cache)))
+            self._reference_cache[cache_key] = resolved
+        return resolved
 
     def __contains__(self, voice_name: str) -> bool:
         return voice_name in self.registered
@@ -62,6 +139,7 @@ class VoicePresetRegistry:
     def get(self, voice_name: str) -> dict[str, Any] | None:
         return self.registered.get(voice_name)
 
+    @torch.no_grad()
     def register(
         self,
         voice_name: str,
@@ -256,6 +334,7 @@ class VoicePresetRegistry:
         prompt_wav_lat, _ = self._audio_vae.encode_latent(
             speech.to(dtype=torch.bfloat16, device=device),
             torch.tensor([speech.size(1)], dtype=torch.long, device=device),
+            generator=torch.Generator(device=device).manual_seed(1234),
         )
         assert prompt_wav_lat.shape[1] % self._patch_size == 0, (
             f"AudioVAE latent length is incompatible with patch_size for voice preset '{voice_name}'"

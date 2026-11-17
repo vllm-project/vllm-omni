@@ -84,8 +84,10 @@ duplex (`is_enabled()` is unconditionally true). Turn-based models
 
 ## Hardware Support
 
-Verified on GPU (Hopper-class). The serving path is plain PyTorch eager plus the
-native modules, so other CUDA GPUs with enough memory are expected to work.
+Verified on GPU (Hopper-class). The shipped deploy config runs the Stage 0
+talker with CUDA graphs and replays the streaming Mimi encode (Stage 0) and
+decode (Stage 1) frame steps from model-local CUDA graphs, bitwise equal to
+eager. Other CUDA GPUs with enough memory are expected to work.
 
 ## GPU
 
@@ -137,9 +139,11 @@ python tests/e2e/online_serving/personaplex_realtime_duplex.py \
 
 #### Notes
 
-- Realtime budget is 80 ms/frame. Verified eager per-tick latency at four
-  concurrent sessions is ~70-74 ms on this hardware class, i.e. all four
-  conversations stay realtime; single-session has comfortable headroom.
+- Realtime budget is 80 ms/frame. The shipped config admits two sessions; on a
+  141 GB card, 64 concurrent 30 s sessions stayed realtime after raising
+  `duplex_session.max_sessions` and both stages' `max_num_seqs` (see the
+  sizing notes in `vllm_omni/deploy/personaplex.yaml`). Longer sessions cost
+  more per step as their context fills.
 - Decoding is greedy only (temperature/top-k knobs are intentionally not
   exposed): greedy is what the parity gates pin against the reference
   implementation, and sampling amplifies sub-bit numeric drift into divergence.

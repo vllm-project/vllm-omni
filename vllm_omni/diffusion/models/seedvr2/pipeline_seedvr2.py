@@ -233,12 +233,22 @@ _XYZ_TO_SRGB = (
 
 
 def _binomial_lowpass(image: Tensor, radius: int) -> Tensor:
-    """One a-trous low-pass step with the separable 1-2-1 binomial kernel."""
-    channels = image.shape[1]
-    weights = image.new_tensor([1.0, 2.0, 1.0]) / 4.0
-    kernel = torch.outer(weights, weights).expand(channels, 1, 3, 3)
+    """One a-trous low-pass step with the separable 1-2-1 binomial kernel.
+
+    The dilated taps run as shifted weighted sums rather than a dilated
+    conv2d. On NPU workers the dilated conv2d routes through lazy TBE
+    compilation, whose helper ``multiprocessing.Manager`` cannot start inside
+    a spawned worker and aborts the process; the shift-add form is exactly
+    equivalent for the fixed 1-2-1 kernel and compiles everywhere.
+    """
+    height, width = image.shape[-2:]
     padded = F.pad(image, (radius,) * 4, mode="replicate")
-    return F.conv2d(padded, kernel, groups=channels, dilation=radius)
+
+    def axis_lowpass(x: Tensor, size: int, dim: int) -> Tensor:
+        low, mid, high = (x.narrow(dim, offset, size) for offset in (0, radius, 2 * radius))
+        return (low + 2 * mid + high) / 4.0
+
+    return axis_lowpass(axis_lowpass(padded, height, -2), width, -1)
 
 
 def _lowest_band(image: Tensor, levels: int = WAVELET_LEVELS) -> Tensor:

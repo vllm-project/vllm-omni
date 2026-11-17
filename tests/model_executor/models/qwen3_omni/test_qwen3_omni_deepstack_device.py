@@ -67,6 +67,7 @@ def test_deepstack_buffers_use_execution_device(mocker, vision_limit, num_tokens
     model.start_layer = 0
     model.end_layer = 2
     model.norm = _Norm()
+    model.hf_numerics = False
     mocker.patch.object(thinker_module, "get_pp_group", return_value=mocker.Mock(is_first_rank=True, is_last_rank=True))
     inputs = torch.ones(num_tokens, 8)
     # Before the fix, audio-only construction reaches this actual forward

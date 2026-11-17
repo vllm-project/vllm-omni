@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 import json
@@ -27,7 +27,12 @@ logger = init_logger(__name__)
 _PROMPT_ENCODER_LOAD_LOCK = threading.Lock()
 
 
-def _resolve_prompt_latents(wrapper: Any, info_dict: dict[str, Any]) -> dict[str, torch.Tensor] | None:
+def _resolve_prompt_latents(
+    wrapper: Any,
+    info_dict: dict[str, Any],
+    *,
+    generator: torch.Generator | None = None,
+) -> dict[str, torch.Tensor] | None:
     raw_latents = info_dict.get(KEY_PROMPT_LATENTS, info_dict.get("prompt_latents"))
     raw_waveform = info_dict.get("prompt_waveform", info_dict.get("prompt_waveforms"))
     if raw_latents is not None and raw_waveform is not None:
@@ -54,6 +59,7 @@ def _resolve_prompt_latents(wrapper: Any, info_dict: dict[str, Any]) -> dict[str
             wrapper,
             raw_waveform,
             info_dict.get("prompt_waveform_length"),
+            generator=generator,
         )
     return _coerce_prompt_latents(
         latents,
@@ -72,7 +78,7 @@ def _load_prompt_encoder(wrapper: Any) -> AudioVAE:
             raise RuntimeError("Ming Stage-0 requires audio_tokenizer_config to encode prompt audio.")
 
         load_start = time.perf_counter()
-        encoder = AudioVAE(wrapper.ming_config.audio_tokenizer_config).eval()
+        encoder = AudioVAE(wrapper.ming_config.audio_tokenizer_config, build_decoder=False).eval()
         state_dict = encoder.state_dict()
         loaded = 0
         loaded_encoder_params = set()
@@ -103,8 +109,6 @@ def _load_prompt_encoder(wrapper: Any) -> AudioVAE:
 
         dev = next(wrapper.parameters()).device
         try:
-            del encoder.decoder
-            encoder.decoder = None
             if dev.type != "cpu":
                 encoder.encoder.to(dev, dtype=getattr(wrapper.model, "fm_dtype", torch.bfloat16))
             else:
@@ -117,7 +121,13 @@ def _load_prompt_encoder(wrapper: Any) -> AudioVAE:
 
 
 @torch.inference_mode()
-def _encode_prompt_waveform_to_latents(wrapper: Any, waveform: Any, waveform_length: Any = None) -> torch.Tensor:
+def _encode_prompt_waveform_to_latents(
+    wrapper: Any,
+    waveform: Any,
+    waveform_length: Any = None,
+    *,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
     encoder = _load_prompt_encoder(wrapper)
     waveform = _normalize_prompt_waveform(waveform, target_sr=wrapper.ming_config.sample_rate)
     waveform = pad_prompt_waveform(
@@ -134,7 +144,11 @@ def _encode_prompt_waveform_to_latents(wrapper: Any, waveform: Any, waveform_len
     else:
         waveform_length = waveform_length.to(device=dev, dtype=torch.int32)
 
-    latents, _ = encoder.encode_latent(waveform, waveform_length)
+    latents, _ = encoder.encode_latent(
+        waveform,
+        waveform_length,
+        generator=generator,
+    )
     if latents.ndim == 3 and latents.shape[0] == 1:
         latents = latents.squeeze(0)
     count_prompt_latent_patches(

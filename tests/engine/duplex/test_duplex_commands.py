@@ -105,6 +105,17 @@ def test_pre_realtime_client_event_aliases_map_to_their_canonical_command(
     assert type(command_from_realtime({"type": alias, **body})) is expected_cls
 
 
+@pytest.mark.parametrize("event_type", ["playback.ack", "audio.playback_ack"])
+@pytest.mark.parametrize("truncate", [None, False, True])
+def test_playback_ack_preserves_hard_stop_through_command_translation(event_type, truncate):
+    event = {"type": event_type, "played_ms": 200}
+    if truncate is not None:
+        event["truncate"] = truncate
+    command = command_from_realtime(event)
+    assert isinstance(command, AckPlayback)
+    assert command.payload().get("truncate", False) is (truncate is True)
+
+
 def test_append_audio_decodes_and_converts_pcm16_to_16k_float32():
     command = command_from_realtime(
         {"type": "input_audio_buffer.append", "audio": _LOUD_PCM16, "format": "pcm16", "sample_rate_hz": 16000}
@@ -247,7 +258,7 @@ def test_malformed_append_raises_command_error_with_code(body: dict[str, object]
         ({"type": "conversation.item.truncate", "item_id": "item_1"}, "bad_event"),
         ({"type": "session.update", "session": {"output_audio_format": "opus"}}, "unsupported_audio_format"),
         (
-            {"type": "session.update", "session": {"turn_detection": {"type": "semantic_vad"}}},
+            {"type": "session.update", "session": {"turn_detection": {"type": "foo_vad"}}},
             "unsupported_turn_detection",
         ),
         ({"type": "response.create", "response": {"output_audio_format": "opus"}}, "unsupported_audio_format"),
@@ -382,6 +393,7 @@ def test_playback_ack_close_and_text_append_payloads():
         "played_ms": 1200,
         "committed_ms": 1000,
         "response_id": "resp_1",
+        "truncate": False,
     }
 
     assert command_from_realtime({"type": "session.close"}) == CloseSession(reason="client_close")

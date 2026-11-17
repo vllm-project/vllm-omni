@@ -31,6 +31,23 @@ last_reviewed: 2026-07-16
 The AR runtime extends vLLM scheduling and worker execution for omni-stage
 inputs and outputs while preserving vLLM scheduling and cache semantics.
 
+## Full-payload input scheduling
+
+For a downstream, non-async stage with `requires_full_payload_input`,
+`OmniSchedulingCoordinator` parks requests until the Model Runner receives the
+complete upstream payload. `OmniConnectorModelRunnerMixin` keeps that payload
+in its local cache and uses `SchedulingMetadataAdapter` to translate
+model-specific fields into `SchedulingMetadataUpdate`. The Scheduler consumes
+only the typed update and readiness signal; it does not inspect payload fields.
+
+The receive flow is
+`process_pending_full_payload_inputs()` -> `register_chunk_recv()` ->
+`recv_full_payload_inputs()` -> `SchedulingMetadataAdapter.extract()` ->
+`OmniConnectorOutput` -> `update_request_metadata()`. Native MRV2 async
+receive also uses this coordinator and typed updates, with the built-in
+metadata adapter. Other async-chunk paths retain `OmniChunkTransferAdapter`
+ownership of chunk transfer and request updates.
+
 ## Candidate invariants
 
 ### AR-INV-001: vLLM owns base scheduling semantics

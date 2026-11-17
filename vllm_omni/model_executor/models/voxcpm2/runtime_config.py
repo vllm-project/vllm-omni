@@ -12,6 +12,29 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def reject_outer_full_cudagraph(vllm_config: Any) -> None:
+    """Refuse vLLM's outer full CUDA graph capture on the MRV1 runner.
+
+    The talker walks its pending requests and keeps its own CUDA graphs. A full
+    outer graph replays the model over a padded batch, which breaks that
+    per-request bookkeeping, so the engine dies on the first request. The
+    shipped eager default and PIECEWISE are unaffected. The check covers only
+    the default MRV1 runner, where the failure was reported.
+    """
+    if getattr(vllm_config.model_config, "use_v2_model_runner", False):
+        return
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    mode = getattr(compilation_config, "cudagraph_mode", None)
+    if mode is None or not mode.has_full_cudagraphs():
+        return
+    raise ValueError(
+        f"VoxCPM2 does not support cudagraph_mode={mode.name}. The talker owns its own CUDA graphs "
+        "and cannot also run inside vLLM's outer full-graph capture. Use "
+        '--compilation-config \'{"cudagraph_mode": "PIECEWISE"}\', or drop --no-enforce-eager to use '
+        "the shipped default, which is the fastest configuration for this model."
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class _VoxCPM2RuntimeConfig:
     startup_lora_path: str | None = None
@@ -30,6 +53,9 @@ class _VoxCPM2RuntimeConfig:
     cfg_cutoff_ratio: float = 1.0
     decode_graph_capture_policy: str = "all"
     enable_vae_cuda_graph: bool = False
+    enable_incremental_vae: bool = False
+    enable_exact_patch_batch: bool = False
+    mixed_graph_cache_limit: int = 0  # Zero means unlimited cached mixed graph buckets.
     enable_cfm_cuda_graph: bool = False
     enable_cfm_prealloc_output: bool = False
     enable_batched_cfm: bool = True
@@ -41,30 +67,32 @@ class _VoxCPM2RuntimeConfig:
     delayed_audio_copy_use_events: bool = False
     coalesce_audio_d2h: bool = True
     enable_batched_vae_decode: bool = True
-    enable_batched_fsq_fusion: bool = False
+    enable_batched_fsq_fusion: bool = True
     batched_fsq_fusion_max_batch: int = 32
-    enable_batched_prefill_tail: bool = False
+    enable_batched_prefill_tail: bool = True
     enable_unified_decode_graph: bool = True
     unified_decode_graph_max_batch_size: int = 64
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> _VoxCPM2RuntimeConfig:
         model_config = vllm_config.model_config
+        values: dict[str, Any] = {}
+        if getattr(model_config, "use_v2_model_runner", False):
+            values.update(enable_incremental_vae=True, vae_decode_every=1, audio_emit_every=3)
         raw = getattr(model_config, "voxcpm2_runtime_config", None)
         if raw is None:
             raw = getattr(getattr(model_config, "hf_config", None), "voxcpm2_runtime_config", None)
         if raw is None:
-            return cls()
+            return cls(**values)._normalized()
         if hasattr(raw, "to_dict"):
             raw = raw.to_dict()
         elif not isinstance(raw, dict) and hasattr(raw, "__dict__"):
             raw = vars(raw)
         if not isinstance(raw, dict):
             logger.warning("Ignoring invalid voxcpm2_runtime_config=%r; expected a dict.", raw)
-            return cls()
+            return cls(**values)._normalized()
 
         fields = {field.name: field for field in dataclasses.fields(cls)}
-        values: dict[str, Any] = {}
         for key, value in raw.items():
             if key not in fields:
                 logger.warning("Ignoring unknown VoxCPM2 runtime config key: %s", key)
@@ -75,6 +103,10 @@ class _VoxCPM2RuntimeConfig:
 
     def _normalized(self) -> _VoxCPM2RuntimeConfig:
         cfg = self
+        if cfg.enable_exact_patch_batch and (
+            not cfg.enable_incremental_vae or cfg.vae_decode_every != 1 or not cfg.enable_unified_decode_graph
+        ):
+            raise ValueError("Exact patch batches require incremental per-patch unified graphs")
         if cfg.enable_batched_cfm and cfg.enable_cfm_cuda_graph:
             logger.warning(
                 "VoxCPM2 batched CFM and CFM CUDA Graph are mutually exclusive; "
@@ -87,6 +119,10 @@ class _VoxCPM2RuntimeConfig:
         if cfg.delayed_audio_copy_use_events and not cfg.enable_delayed_audio_copy:
             logger.warning("VoxCPM2 delayed audio copy events require delayed audio copy; disabling event polling.")
             cfg = dataclasses.replace(cfg, delayed_audio_copy_use_events=False)
+        if cfg.enable_incremental_vae and cfg.enable_batched_vae_decode:
+            # Incremental unified graphs batch VAE themselves; this flag only
+            # controls the legacy latent-cohort collection path.
+            cfg = dataclasses.replace(cfg, enable_batched_vae_decode=False)
         if cfg.enable_batched_vae_decode and (
             cfg.enable_delayed_audio_copy or cfg.audio_emit_every > 1 or cfg.enable_vae_cuda_graph
         ):
@@ -119,6 +155,8 @@ class _VoxCPM2RuntimeConfig:
             return bool(value)
         if isinstance(default, int) and not isinstance(default, bool):
             value = int(value)
+            if key == "mixed_graph_cache_limit" and value < 0:
+                raise ValueError("VoxCPM2 mixed_graph_cache_limit must be non-negative")
             if key == "inference_timesteps":
                 return max(2, value)
             if key in {"audio_emit_every", "vae_decode_every", "batched_fsq_fusion_max_batch"}:

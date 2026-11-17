@@ -1,0 +1,191 @@
+meta:
+  title: "Cosmos3-Nano"
+  slug: "cosmos3-nano"
+  provider: "NVIDIA"
+  description: "Compact 16B omnimodal world model (Mixture-of-Transformers) for multimodal understanding, world simulation, future prediction, action reasoning, and Physical AI"
+  date_added: 2026-06-02
+  date_updated: 2026-06-02
+  tasks:
+    - omni
+  performance_headline: "16B omnimodal world model — single-GPU H200 video/audio generation"
+  related_recipes:
+    - nvidia/Cosmos3-Super
+    - nvidia/Cosmos3-Super-Text2Image
+    - nvidia/Cosmos3-Super-Image2Video
+  hardware:
+    h200: verified
+    h100: verified
+
+model:
+  model_id: "nvidia/Cosmos3-Nano"
+  min_vllm_version: "0.21.0"
+  docker_image: "vllm/vllm-omni:cosmos3"
+  install:
+    docker:
+      note: "Release-tested vLLM-Omni image bundling the Cosmos3 omni handlers."
+    pip:
+  architecture: dense
+  parameter_count: "16B"
+  active_parameters: "16B"
+  context_length: 262144
+  base_args:
+    - "--host"
+    - "0.0.0.0"
+    - "--port"
+    - "8000"
+    - "--init-timeout"
+    - "1800"
+  base_env: {}
+
+omni:
+  # Cosmos3-Nano runs on a single H200 in omni mode. Both video tasks hit the
+  # same /v1/videos/sync endpoint; audio is generated jointly and muxed into
+  # the output MP4 (no separate audio endpoint). Prompts should be JSON-upsampled
+  # for best quality — see the guide.
+  tasks:
+    - id: t2v
+      description: "Text → video (audio muxed into the MP4)"
+      curl: |
+        curl -X POST http://localhost:8000/v1/videos/sync \
+          -H "Accept: video/mp4" \
+          -F "prompt=$(cat assets/example_t2v_prompt.json)" \
+          -F "negative_prompt=$(cat assets/negative_prompt.json)" \
+          -F "size=1280x720" \
+          -F "num_frames=189" \
+          -F "fps=24" \
+          -F "num_inference_steps=35" \
+          -F "guidance_scale=6.0" \
+          -F "max_sequence_length=4096" \
+          -F "flow_shift=10.0" \
+          -F "seed=123" \
+          --output output.mp4
+    - id: i2v
+      description: "Image → video (temporally coherent, audio muxed in)"
+      curl: |
+        curl -X POST http://localhost:8000/v1/videos/sync \
+          -H "Accept: video/mp4" \
+          -F "input_reference=@assets/example_i2v_input.jpg" \
+          -F "prompt=$(cat assets/example_i2v_prompt.json)" \
+          -F "negative_prompt=$(cat assets/negative_prompt.json)" \
+          -F "size=1280x720" \
+          -F "num_frames=189" \
+          -F "fps=24" \
+          -F "num_inference_steps=35" \
+          -F "guidance_scale=6.0" \
+          -F "max_sequence_length=4096" \
+          -F "flow_shift=10.0" \
+          -F "seed=1111" \
+          --output output.mp4
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 39
+    description: "BF16 weights — single-GPU H200 omni generation"
+
+compatible_strategies: []
+
+hardware_overrides: {}
+
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  **Cosmos3-Nano** is the compact (16B) member of NVIDIA's Cosmos3 family of
+  **omnimodal world models**. Built on a Mixture-of-Transformers (MoT)
+  architecture — an autoregressive tower for discrete-token generation paired
+  with a diffusion tower for continuous modalities — it generates coherent text,
+  images, video, audio, and action commands from combinations of text, image,
+  video, and action-trajectory inputs. It targets Physical AI: world
+  understanding, world simulation, future prediction, and action reasoning.
+
+  This recipe covers the **vLLM-Omni** serving path (video + muxed-audio
+  generation). The same checkpoint also serves a text/multimodal **Reasoner**
+  endpoint via standard vLLM — see [Reasoner mode](#reasoner-mode-multimodal-understanding)
+  below.
+
+  ## Prerequisites
+
+  - 1× H200 (or H100 / A100) for the documented single-GPU profile
+  - The release-tested `vllm/vllm-omni:cosmos3` container, or vLLM-Omni installed
+    on top of `vllm==0.21.0`
+  - Prompts should be JSON-upsampled for best quality (see
+    [cosmos-framework prompt upsampling](https://github.com/NVIDIA/cosmos-framework/blob/main/docs/prompt_upsampling.md))
+
+  ## Launch command (vLLM-Omni)
+
+  ```bash
+  docker pull vllm/vllm-omni:cosmos3
+
+  vllm serve nvidia/Cosmos3-Nano \
+    --omni \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --init-timeout 1800
+  ```
+
+  To speed up inference with additional GPUs, enable context parallelism with
+  `--ulysses-degree` or switch to tensor parallelism with
+  `--tensor-parallel-size`. On memory-constrained GPUs, `--enable-layerwise-offload`
+  reduces VRAM usage at a performance cost.
+
+  ### Example: text-to-video
+
+  ```bash
+  curl -X POST http://localhost:8000/v1/videos/sync \
+    -H "Accept: video/mp4" \
+    -F "prompt=$(cat assets/example_t2v_prompt.json)" \
+    -F "negative_prompt=$(cat assets/negative_prompt.json)" \
+    -F "size=1280x720" \
+    -F "num_frames=189" \
+    -F "fps=24" \
+    -F "num_inference_steps=35" \
+    -F "guidance_scale=6.0" \
+    -F "max_sequence_length=4096" \
+    -F "flow_shift=10.0" \
+    -F "seed=123" \
+    --output output.mp4
+  ```
+
+  Image-to-video uses the same endpoint with an `input_reference` file part.
+  Audio is generated jointly and muxed into the output MP4 (48 kHz stereo AAC) —
+  there is no separate audio endpoint.
+
+  ## Reasoner mode (multimodal understanding)
+
+  The same checkpoint serves a text/multimodal **Reasoner** for world
+  understanding, future prediction, and action reasoning via the standard `vllm`
+  package (not vLLM-Omni):
+
+  ```bash
+  # CUDA 13 drivers:
+  uv pip install --torch-backend=cu130 "vllm==0.21.0" \
+    "vllm-cosmos3 @ git+https://github.com/NVIDIA/cosmos-framework.git#subdirectory=packages/vllm-cosmos3" \
+    openai
+  # CUDA 12.8 drivers: use --torch-backend=cu128 "vllm==0.19.1"
+
+  CUDA_VISIBLE_DEVICES=0 \
+  vllm serve nvidia/Cosmos3-Nano \
+    --hf-overrides '{"architectures": ["Cosmos3ReasonerForConditionalGeneration"]}' \
+    --tensor-parallel-size 1 \
+    --mm-encoder-tp-mode data \
+    --async-scheduling \
+    --allowed-local-media-path / \
+    --media-io-kwargs '{"video": {"num_frames": -1}}' \
+    --port 8000
+  ```
+
+  Then query the OpenAI-compatible `/v1/chat/completions` endpoint with text +
+  image/video content.
+
+  ## References
+
+  - [Model card](https://huggingface.co/nvidia/Cosmos3-Nano)
+  - [vLLM-Omni](https://github.com/vllm-project/vllm-omni)
+  - [cosmos-framework](https://github.com/NVIDIA/cosmos-framework)
+  - [Cosmos](https://github.com/nvidia/cosmos)

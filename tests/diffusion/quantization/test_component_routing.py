@@ -234,6 +234,36 @@ class TestOmniINCConfigUpgrade:
         assert upgraded.weight_bits == 4
         assert upgraded.group_size == 128
 
+    def test_upgraded_config_resolves_remapped_blocks(self):
+        """Layer resolution sees blocks remapped after the upgrade (#5652).
+
+        The upgraded instance must not keep a config_parser bound to the
+        vanilla INCConfig, otherwise the stage-prefix remap done by
+        apply_vllm_mapper is not seen when thinker layers are resolved.
+        """
+        from vllm.model_executor.layers.quantization.inc import INCConfig
+
+        vanilla = INCConfig(
+            weight_bits=4,
+            group_size=128,
+            sym=True,
+            block_name_to_quantize="thinker.model.layers",
+        )
+        upgraded = OmniINCConfig.maybe_upgrade(vanilla)
+        upgraded.apply_vllm_mapper(THINKER_MAPPER)
+
+        layer = torch.nn.Linear(8, 8)
+        # Remapped thinker block -> quantized with the checkpoint settings.
+        assert upgraded.get_layer_config(layer, "thinker.language_model.model.layers.0.mlp.down_proj") == (
+            4,
+            128,
+            True,
+        )
+        # Outside the quantized blocks -> left unquantized.
+        assert upgraded.get_layer_config(layer, "thinker.visual.blocks.0.attn.proj") == (16, -1, True)
+        # The original config is not remapped by the upgrade.
+        assert vanilla.block_name_to_quantize == ["thinker.model.layers"]
+
 
 # ===================================================================
 # 2. Three-branch thinker routing (simulated)

@@ -32,6 +32,8 @@ class SiluAndMul(CustomOp):
         return out
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device.type != "npu":
+            return self.forward_native(x)
         import torch_npu
 
         return torch_npu.npu_swiglu(x, dim=-1)

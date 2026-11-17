@@ -13,12 +13,12 @@ from tests.helpers.runtime import OmniServer, OpenAIClientHandler
 from ._common import assert_h3_video, dlo_params, run_dlo_wave, run_fl2va
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
-H100_TWO_CARD_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+TWO_CARD_MARKS = hardware_marks(res={"cuda": "H100", "npu": "A3"}, num_cards=2)
 
 
 @pytest.mark.parametrize(
     "omni_server",
-    [pytest.param(dlo_params("fl2va"), id="minimax_h3_dlo_dp2_fl2va", marks=H100_TWO_CARD_MARKS)],
+    [pytest.param(dlo_params("fl2va"), id="minimax_h3_dlo_dp2_fl2va", marks=TWO_CARD_MARKS)],
     indirect=True,
 )
 def test_minimax_h3_dlo_dp2_fl2va(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:

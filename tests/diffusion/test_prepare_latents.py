@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import pytest
 import torch
 
 from vllm_omni.diffusion.models.utils import prepare_latents
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class TestPrepareLatents:
@@ -24,13 +27,8 @@ class TestPrepareLatents:
         assert out.shape == (1, 4, 32, 32)
 
     def test_generator_list_length_mismatch_raises(self):
-        try:
-            prepare_latents(
-                (2, 4, 64, 64), dtype=torch.float32, device="cpu", generator=[torch.Generator()]
-            )
-            assert False, "Should have raised ValueError"
-        except ValueError as e:
-            assert "does not match batch size" in str(e)
+        with pytest.raises(ValueError, match="does not match batch size"):
+            prepare_latents((2, 4, 64, 64), dtype=torch.float32, device="cpu", generator=[torch.Generator()])
 
     def test_valid_generator_list(self):
         gens = [torch.Generator(), torch.Generator()]
@@ -41,3 +39,13 @@ class TestPrepareLatents:
         gen = torch.Generator().manual_seed(42)
         latents = prepare_latents((1, 4, 32, 32), dtype=torch.float32, device="cpu", generator=gen)
         assert latents.shape == (1, 4, 32, 32)
+
+    def test_same_seed_reproduces_latents(self):
+        """The generator must be wired through to randn_tensor."""
+        first = prepare_latents(
+            (2, 4, 16, 16), dtype=torch.float32, device="cpu", generator=torch.Generator().manual_seed(7)
+        )
+        second = prepare_latents(
+            (2, 4, 16, 16), dtype=torch.float32, device="cpu", generator=torch.Generator().manual_seed(7)
+        )
+        assert torch.equal(first, second)

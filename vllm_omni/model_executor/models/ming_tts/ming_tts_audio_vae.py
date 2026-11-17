@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adopted from https://github.com/inclusionAI/Ming-omni-tts/blob/main/audio_tokenizer/modeling_audio_vae.py
 from __future__ import annotations
 
@@ -19,8 +19,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
-from .config_ming_tts import KEY_CHUNK_ID, KEY_REQUEST_ID, MingTTSConfig
-from .patch_emission import MING_STOP_REASON_KEY
+from .config_ming_tts import KEY_CHUNK_ID, KEY_REQUEST_ID, KEY_STOP_REASON, MingTTSConfig
 
 logger = init_logger(__name__)
 
@@ -41,7 +40,7 @@ class MingAudioVAEModel(nn.Module):
             raise ValueError("MingAudioVAEModel requires audio_tokenizer_config")
         self.ming_config.validate()
 
-        self.audio = AudioVAE(self.ming_config.audio_tokenizer_config)
+        self.audio = AudioVAE(self.ming_config.audio_tokenizer_config, build_encoder=False)
         self.have_multimodal_outputs = True
         self.has_preprocess = False
         self.has_postprocess = False
@@ -219,8 +218,8 @@ class MingAudioVAEModel(nn.Module):
                             "request_id": request_id,
                             "chunk_id": chunk_id,
                             "stop_reason": _first_present(
-                                info.get(MING_STOP_REASON_KEY),
-                                kv_meta.get(MING_STOP_REASON_KEY),
+                                info.get(KEY_STOP_REASON),
+                                kv_meta.get(KEY_STOP_REASON),
                             ),
                             "final_decode_step": _coerce_optional_int(
                                 _first_present(

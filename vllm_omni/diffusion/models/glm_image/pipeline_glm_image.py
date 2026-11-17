@@ -12,7 +12,6 @@ This pipeline implements GLM-Image text-to-image generation with:
 from __future__ import annotations
 
 import inspect
-import json
 import logging
 import os
 import re
@@ -27,7 +26,6 @@ from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
-from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import (
     ByT5Tokenizer,
@@ -47,6 +45,7 @@ from vllm_omni.diffusion.models.glm_image.glm_image_transformer import (
     GlmImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.utils import load_vae_scale_factor, vae_scale_factor_from_vae
 from vllm_omni.diffusion.models.utils import prepare_latents as _prepare_latents
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -71,11 +70,7 @@ def get_glm_image_pre_process_func(od_config: OmniDiffusionConfig):
     else:
         model_path = download_weights_from_hf_specific(model_name, None, ["*"])
 
-    vae_config_path = os.path.join(model_path, "vae/config.json")
-    with open(vae_config_path) as f:
-        vae_config = json.load(f)
-        block_out_channels = vae_config.get("block_out_channels", [128, 256, 512, 512])
-        vae_scale_factor = 2 ** (len(block_out_channels) - 1)
+    vae_scale_factor = load_vae_scale_factor(model_path)
 
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor)
     # GLM-Image uses patch_size=2 for transformer
@@ -145,11 +140,7 @@ def get_glm_image_post_process_func(od_config: OmniDiffusionConfig):
     else:
         model_path = download_weights_from_hf_specific(model_name, None, ["*"])
 
-    vae_config_path = os.path.join(model_path, "vae/config.json")
-    with open(vae_config_path) as f:
-        vae_config = json.load(f)
-        block_out_channels = vae_config.get("block_out_channels", [128, 256, 512, 512])
-        vae_scale_factor = 2 ** (len(block_out_channels) - 1)
+    vae_scale_factor = load_vae_scale_factor(model_path)
 
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor)
 
@@ -322,7 +313,7 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
         ]
 
         # Configure scale factors
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.vae_scale_factor = vae_scale_factor_from_vae(self.vae)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
         self.default_sample_size = 128
 

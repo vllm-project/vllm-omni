@@ -870,7 +870,9 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         local_embeds: torch.FloatTensor,  # [1, 1, hidden_size]
         tokens_dtype: torch.dtype = torch.int64,
         tokens_device: torch.device = torch.device(
-            f"cuda:{torch.accelerator.current_device_index()}" if torch.cuda.is_available() else "cpu"
+            f"{torch.accelerator.current_accelerator().type}:{torch.accelerator.current_device_index()}"
+            if torch.accelerator.is_available()
+            else "cpu"
         ),
         local_sampler: MiMoSampler | MiMoLocalSamplerTensor | None = None,
     ):
@@ -924,7 +926,9 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         local_embeds: torch.FloatTensor,  # [1, 1, hidden_size]
         tokens_dtype: torch.dtype = torch.int64,
         tokens_device: torch.device = torch.device(
-            f"cuda:{torch.accelerator.current_device_index()}" if torch.cuda.is_available() else "cpu"
+            f"{torch.accelerator.current_accelerator().type}:{torch.accelerator.current_device_index()}"
+            if torch.accelerator.is_available()
+            else "cpu"
         ),
         local_sampler: MiMoSampler | None = None,
     ):
@@ -1518,34 +1522,3 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             cursor = end
 
         return segments
-
-    def _get_past_len(self, past_key_values: DynamicCache | None) -> int:
-        if past_key_values is None:
-            return 0
-
-        if hasattr(past_key_values, "get_seq_length"):
-            try:
-                pl = past_key_values.get_seq_length()
-                if pl is not None:
-                    return int(pl)
-            except Exception as e:
-                logger.error(f"error happened: {e}")
-
-        if hasattr(past_key_values, "seen_tokens"):
-            try:
-                return int(past_key_values.seen_tokens)
-            except Exception as e:
-                logger.error(f"error happened: {e}")
-
-        try:
-            if hasattr(past_key_values, "layers") and len(past_key_values.layers) > 0:
-                k = past_key_values.layers[0].keys
-                return int(k.shape[-2])
-
-            if hasattr(past_key_values, "key_cache") and len(past_key_values.key_cache) > 0:
-                k = past_key_values.key_cache[0]
-                return int(k.shape[-2])
-        except Exception as e:
-            logger.error(f"error happened: {e}")
-
-        return 0

@@ -12,7 +12,6 @@ import numpy as np
 import PIL.Image
 import torch
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
-from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from torch import nn
 from transformers import (
@@ -43,6 +42,7 @@ from vllm_omni.diffusion.models.hunyuan_video.pipeline_hunyuan_video_1_5 import 
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
+from vllm_omni.diffusion.models.utils import latent_channels_from_vae
 from vllm_omni.diffusion.models.utils import prepare_latents as _prepare_latents
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -226,7 +226,7 @@ class HunyuanVideo15I2VPipeline(
         self.vae_scale_factor_spatial = (
             self.vae.spatial_compression_ratio if hasattr(self.vae, "spatial_compression_ratio") else 16
         )
-        self.num_channels_latents = self.vae.config.latent_channels if hasattr(self.vae, "config") else 32
+        self.num_channels_latents = latent_channels_from_vae(self.vae, default=32)
 
         # fmt: off
         # NOTE: whitespace must match the diffusers reference exactly because

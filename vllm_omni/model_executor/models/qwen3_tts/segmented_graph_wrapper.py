@@ -67,6 +67,7 @@ class CUDAGraphDecoderWrapper:
         self.enabled = enabled
         self.async_chunk = bool(async_chunk)
         self._warmed_up = False
+        self.post_warmup_memory_stats: tuple[int, int] | None = None
 
         self.combined_states: dict[tuple[str, int, int], dict] = {}
         self.icl_prefix_states: dict[int, dict] = {}
@@ -407,6 +408,7 @@ class CUDAGraphDecoderWrapper:
                         exc_info=True,
                     )
             self._warmed_up = bool(self.stateless_states)
+            self._record_post_warmup_memory(device)
             return
 
         if not self.icl_capture_sizes:
@@ -471,6 +473,20 @@ class CUDAGraphDecoderWrapper:
                     )
 
         self._warmed_up = bool(self.icl_prefix_states) or bool(self.xvec_prefix_states) or bool(self.combined_states)
+        self._record_post_warmup_memory(device)
+
+    def _record_post_warmup_memory(self, device: torch.device) -> None:
+        if not self._warmed_up:
+            return
+        # These are process allocator totals at decoder warmup, before later
+        # engine initialization. RPCs read this snapshot without resampling.
+        try:
+            self.post_warmup_memory_stats = (
+                int(torch.accelerator.memory_allocated(device)),
+                int(torch.accelerator.memory_reserved(device)),
+            )
+        except RuntimeError:
+            logger.warning("Unable to collect post-warmup decoder memory stats", exc_info=True)
 
     def _capture_stateless(
         self,

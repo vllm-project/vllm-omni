@@ -1201,3 +1201,14 @@ def test_dualscale_without_fallback_keeps_original_a4_path(online, monkeypatch):
     method.apply(layer, torch.ones(2, 512, dtype=torch.bfloat16))
     assert len(calls) == 1 + int(online)
     torch.testing.assert_close(calls[-1], layer.mul_scale)
+
+
+def test_xpu_online_method_keeps_vllm_weight_lifecycle():
+    """XPU online MXFP4 must not replace vLLM's create_weights (meta-device weight,
+    layer-by-layer quantization); only the 3-D activation reshape is added."""
+    from vllm.model_executor.layers.quantization.online.mxfp4 import Mxfp4OnlineLinearMethod
+
+    from vllm_omni.quantization.mxfp4_config import VllmMxfp4OnlineLinearMethod
+
+    for name in ("create_weights", "process_weights_after_loading"):
+        assert getattr(VllmMxfp4OnlineLinearMethod, name) is getattr(Mxfp4OnlineLinearMethod, name)

@@ -26,7 +26,6 @@ import numpy as np
 import PIL.Image
 import torch
 from diffusers.schedulers import DPMSolverMultistepScheduler
-from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from torch import nn
 from transformers import AutoModel, Gemma2PreTrainedModel, GemmaTokenizer, GemmaTokenizerFast
@@ -47,7 +46,8 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
-from vllm_omni.diffusion.models.utils import _load_json, prepare_latents as _prepare_latents
+from vllm_omni.diffusion.models.utils import _load_json
+from vllm_omni.diffusion.models.utils import prepare_latents as _prepare_latents
 from vllm_omni.diffusion.offloader.config import (
     OffloadStrategy,
     offload_enabled,

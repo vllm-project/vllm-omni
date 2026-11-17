@@ -11,10 +11,15 @@
 # enforce_eager policy across the three deploy YAMLs:
 #   * code2wav / generation stages:  always true (cudagraph incompatible with
 #     the custom generation loop — set explicitly everywhere).
-#   * AR stages (thinker, talker):   model-dependent. Qwen2.5-Omni runs eager
-#     on CUDA (thinker uses custom ops that don't trace cleanly); NPU / XPU
-#     overrides are documented below. Qwen3-Omni / Qwen3-TTS AR stages use the
-#     default (false = cudagraph on).
+#   * AR stages (thinker, talker):   model-dependent. Qwen2.5-Omni runs the
+#     talker with CUDA graphs (false) because it emits 1.5-2k codec tokens per
+#     request and its decode loop is launch-bound. The thinker stays eager:
+#     compiling its decode changes image-conditioned greedy text (the compiled
+#     kernels pick a different argmax mid-answer) and is slower for that
+#     prefill shape, while it only saves ~8% end-to-end on text/audio.
+#     ROCm keeps both eager because capturing there is not validated yet; NPU
+#     keeps the talker eager for the same reason. XPU overrides are documented
+#     below.
 async_chunk: false
 
 stages:
@@ -39,7 +44,7 @@ stages:
     max_num_batched_tokens: 32768
     max_num_seqs: 1
     gpu_memory_utilization: 0.8
-    enforce_eager: true
+    enforce_eager: false
     trust_remote_code: true
     enable_prefix_caching: false
     devices: "1"
@@ -70,12 +75,22 @@ stages:
       repetition_penalty: 1.1
 
 platforms:
+  rocm:
+    stages:
+      # Capturing the Qwen2.5 AR decode steps is not validated on ROCm; keep
+      # both stages eager there so only the tested CUDA path changes.
+      - stage_id: 0
+        enforce_eager: true
+      - stage_id: 1
+        enforce_eager: true
   npu:
     stages:
-      # NPU has cudagraph support for the thinker, unlike GPU which still
-      # only runs eager.
+      # NPU has cudagraph support for the thinker but the talker graph is not
+      # qualified there yet, so pin the talker back to eager.
       - stage_id: 0
         enforce_eager: false
+      - stage_id: 1
+        enforce_eager: true
       - stage_id: 2
         # 3-NPU layout: stage 2 lives on its own card.
         devices: "2"

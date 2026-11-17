@@ -12,7 +12,9 @@ import pytest
 
 from vllm_omni.benchmarks.duplex import omni_duplex_eval_eval as eval_module
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_clock import (
+    extract_timed_chunks,
     extract_timed_sentences,
+    normalize_response_chunks,
     normalize_response_items,
     split_text,
     validate_clock,
@@ -249,6 +251,168 @@ def test_response_aliases_and_clock_guard():
         extract_timed_sentences([], clock="wall")
 
 
+def test_timed_sentences_keep_whitespace_only_deltas_between_tokens():
+    deltas = [" ", "There", " are", " exactly", " ", "1", "2", " dumplings", "."]
+    events = [{"type": "response.output_text.delta", "delta": delta, "_media_clock_ms": 1000} for delta in deltas]
+    timed = extract_timed_sentences(events)
+    assert [item.sentence for item in timed] == ["There are exactly 12 dumplings."]
+
+
+def test_timed_chunks_group_deltas_by_media_time():
+    stamped = [("Look", 13000), (",", 13000), (" ", None), ("the", 14000), (" man", 14000), (" is back.", 18000)]
+    events = [
+        {"type": "response.output_text.delta", "delta": delta} | ({} if stamp is None else {"_media_clock_ms": stamp})
+        for delta, stamp in stamped
+    ]
+    assert [chunk.as_dict() for chunk in extract_timed_chunks(events)] == [
+        {"text": "Look, ", "current_time": 13.0},
+        {"text": "the man", "current_time": 14.0},
+        {"text": " is back.", "current_time": 18.0},
+    ]
+    # The same deltas form one sentence that starts before an 18 s window.
+    assert [item.as_dict() for item in extract_timed_sentences(events)] == [
+        {"sentence": "Look, the man is back.", "start": 13.0, "end": 18.0}
+    ]
+    with pytest.raises(ValueError, match="only clock=media"):
+        extract_timed_chunks([], clock="wall")
+
+
+def test_response_chunks_prefer_chunks_and_fall_back_to_sentences():
+    sentences = [{"sentence": "Look, the man is back.", "start": 13.0, "end": 18.0}]
+    chunks = [{"text": "is back.", "current_time": 18.0}]
+    published = {"sentences": sentences, "chunks": chunks}
+    assert normalize_response_chunks(published) == [{"text": "is back.", "current_time": 18.0}]
+    assert normalize_response_items(published) == [{"sentence": "Look, the man is back.", "start": 13.0, "end": 18.0}]
+    assert normalize_response_chunks(sentences) == [{"text": "Look, the man is back.", "current_time": 13.0}]
+    assert normalize_response_chunks({"sentences": sentences}) == normalize_response_chunks(sentences)
+    with pytest.raises(ValueError, match="chunks/sentences"):
+        normalize_response_chunks({"text": "x"})
+
+
+@pytest.mark.parametrize(
+    "response,expected_segment",
+    [
+        (
+            {
+                "sentences": [{"sentence": "Look, the man is back.", "start": 13.0, "end": 18.0}],
+                "chunks": [
+                    {"text": "Look,", "current_time": 13.0},
+                    {"text": "the man", "current_time": 14.0},
+                    {"text": "is back.", "current_time": 18.0},
+                ],
+            },
+            "is back.",
+        ),
+        ([{"sentence": "Look, the man is back.", "start": 13.0, "end": 18.0}], ""),
+    ],
+    ids=["chunks", "legacy-sentences"],
+)
+def test_reminder_window_selects_chunks_by_output_time(tmp_path, response, expected_segment):
+    response_path = tmp_path / "265.json"
+    response_path.write_text(json.dumps(response), encoding="utf-8")
+    response_path.with_name("265.meta.json").write_text(json.dumps({"clock": "media"}), encoding="utf-8")
+    judged = []
+
+    class Judge:
+        def chat(self, prompt):
+            judged.append(prompt)
+            return '{"success_score": 1, "reasoning": "reminded"}'
+
+    sample = DuplexSample(
+        id="265",
+        split="PR_post_event_reminder",
+        family="pr",
+        task_type="post_event_reminder",
+        video=None,
+        question_text="Remind me when the man comes back.",
+        reminder1="18.0",
+    )
+    score = eval_module.evaluate_sample(sample, response_path, tmp_path / "score.json", Judge())
+    (event,) = score["pr"]["events"]
+    assert event["start_time"] == 18.0
+    assert event["response_segment"] == expected_segment
+    assert len(judged) == (1 if expected_segment else 0)
+    assert score["pr"]["all_success"] is bool(expected_segment)
+
+
+@pytest.mark.parametrize(
+    "task_type,chunks,expected",
+    [
+        (
+            "post_event_reminder",
+            [{"text": "dump", "current_time": 13.0}, {"text": "lings", "current_time": 13.08}],
+            "dumplings",
+        ),
+        (
+            "post_event_reminder",
+            [{"text": "你", "current_time": 13.0}, {"text": "好", "current_time": 13.08}],
+            "你好",
+        ),
+        (
+            "correction",
+            [{"text": "hello ", "current_time": 1.0}, {"text": "world", "current_time": 1.2}],
+            "hello world",
+        ),
+    ],
+    ids=["split-word", "cjk", "inter-word-space"],
+)
+def test_reminder_text_joins_chunks_without_inserting_spaces(tmp_path, task_type, chunks, expected):
+    response_path = tmp_path / "sample.json"
+    response_path.write_text(json.dumps({"sentences": [], "chunks": chunks}), encoding="utf-8")
+    response_path.with_name("sample.meta.json").write_text(json.dumps({"clock": "media"}), encoding="utf-8")
+    seen = []
+
+    class Judge:
+        def chat(self, prompt):
+            seen.append(prompt)
+            return '{"success_score": 1, "reasoning": "ok"}'
+
+    sample = DuplexSample(
+        id="sample",
+        split="PR_correction" if task_type == "correction" else "PR_post_event_reminder",
+        family="pr",
+        task_type=task_type,
+        video=None,
+        question_text="Watch this.",
+        reminder1=None if task_type == "correction" else "13.0",
+        answer1="right",
+    )
+    eval_module.evaluate_sample(sample, response_path, tmp_path / "score.json", Judge())
+    assert expected in seen[0]
+    assert "dump lings" not in seen[0]
+    assert "你 好" not in seen[0]
+
+
+@pytest.mark.parametrize("task_type", ["post_event_reminder", "correction"])
+def test_legacy_sentence_responses_keep_space_between_sentences(tmp_path, task_type):
+    response_path = tmp_path / "sample.json"
+    sentences = [
+        {"sentence": "Got it.", "start": 13.0, "end": 13.5},
+        {"sentence": "Let me check.", "start": 14.0, "end": 14.5},
+    ]
+    response_path.write_text(json.dumps(sentences), encoding="utf-8")
+    response_path.with_name("sample.meta.json").write_text(json.dumps({"clock": "media"}), encoding="utf-8")
+    seen = []
+
+    class Judge:
+        def chat(self, prompt):
+            seen.append(prompt)
+            return '{"success_score": 1, "reasoning": "ok"}'
+
+    sample = DuplexSample(
+        id="sample",
+        split="PR_correction" if task_type == "correction" else "PR_post_event_reminder",
+        family="pr",
+        task_type=task_type,
+        video=None,
+        question_text="Watch this.",
+        reminder1=None if task_type == "correction" else "13.0",
+        answer1="right",
+    )
+    score = eval_module.evaluate_sample(sample, response_path, tmp_path / "score.json", Judge())
+    assert score["pr"]["events"][0]["response_segment"] == "Got it. Let me check."
+
+
 def test_protocol_windows_and_parsing():
     assert PROTOCOL_PIN == "ca3c122b4d4bf67afd6b18ea5e724b4561bdde48"
     assert temporal_window(4, 5, 10) == (2.0, 3.0)
@@ -312,6 +476,158 @@ def test_frame_sample_content_passes_frames(tmp_path, monkeypatch):
         judge_video_mode="frame-sample",
     )
     assert score["content"]["frame_count"] == 2
+
+
+def _write_rtd_response(tmp_path):
+    response = tmp_path / "response.json"
+    response.write_text(json.dumps([{"sentence": "A person moves.", "start": 1, "end": 2}]), encoding="utf-8")
+    response.with_name("response.meta.json").write_text(json.dumps({"clock": "media"}), encoding="utf-8")
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+    return response, video
+
+
+def test_content_prompt_falls_back_to_frame_sample_on_judge_context_overflow(tmp_path, monkeypatch):
+    # #9089: in video_url mode a long clip can exceed the judge model's context
+    # window and the judge answers HTTP 400. The content call must degrade to
+    # the bounded frame-sample path (and record the fallback) instead of failing
+    # the whole evaluation run.
+    import requests
+
+    monkeypatch.setattr(eval_module, "extract_jpeg", lambda *args, **kwargs: b"\xff\xd8jpeg")
+    response, video = _write_rtd_response(tmp_path)
+
+    modes = []
+
+    class Judge:
+        def temporal(self, *args, **kwargs):
+            return '{"temporal_score": 3, "is_relevant": 1}'
+
+        def content(self, prompt, video, frames=None, *, mode="video_url"):
+            modes.append(mode)
+            if mode == "video_url":
+                raise requests.HTTPError(
+                    '400 response from judge: {"error":{"message":"Input length (83158) exceeds '
+                    "model's maximum context length (65536).\"}}",
+                    response=SimpleNamespace(status_code=400, text="Input length (83158) exceeds context length"),
+                )
+            assert frames == [b"\xff\xd8jpeg", b"\xff\xd8jpeg"]
+            return '{"content_score": 3}'
+
+    sample = DuplexSample(
+        id="rtd",
+        split="RTD_counting",
+        family="rtd",
+        task_type=None,
+        video=video,
+        video_duration=4,
+    )
+    score = eval_module.evaluate_sample(
+        sample,
+        response,
+        tmp_path / "score.json",
+        Judge(),
+        judge_video_mode="video_url",
+    )
+    assert modes == ["video_url", "frame-sample"]
+    assert score["content"]["judge_input_fallback"] == "frame-sample"
+    assert score["content"]["frame_count"] == 2
+    assert score["content"]["content_score"] == 3
+
+
+def test_judge_context_length_error_detection():
+    import requests
+
+    def error(status_code, text):
+        return requests.HTTPError("judge error", response=SimpleNamespace(status_code=status_code, text=text))
+
+    # vLLM's exact wording from the CI run.
+    assert eval_module._is_judge_context_length_error(
+        error(400, "Input length (83158) exceeds model's maximum context length (65536).")
+    )
+    assert eval_module._is_judge_context_length_error(error(400, "Input length exceeds the limit"))
+    # Unrelated 400s and non-HTTP errors must not trigger the fallback.
+    assert not eval_module._is_judge_context_length_error(error(400, "input length must be positive"))
+    assert not eval_module._is_judge_context_length_error(error(500, "maximum context length"))
+    assert not eval_module._is_judge_context_length_error(RuntimeError("maximum context length"))
+
+
+def test_content_prompt_context_overflow_without_decodable_frames_reraises(tmp_path, monkeypatch):
+    # If no frame can be decoded there is nothing to fall back to; the original
+    # judge error must surface so the sample stays failed.
+    import requests
+
+    def no_frames(*args, **kwargs):
+        raise OSError("undecodable clip")
+
+    monkeypatch.setattr(eval_module, "extract_jpeg", no_frames)
+    response, video = _write_rtd_response(tmp_path)
+    calls = []
+
+    class Judge:
+        def temporal(self, *args, **kwargs):
+            return '{"temporal_score": 3, "is_relevant": 1}'
+
+        def content(self, prompt, video, frames=None, *, mode="video_url"):
+            calls.append(mode)
+            raise requests.HTTPError(
+                "400 response from judge",
+                response=SimpleNamespace(status_code=400, text="Input length exceeds the maximum context length"),
+            )
+
+    sample = DuplexSample(
+        id="rtd",
+        split="RTD_counting",
+        family="rtd",
+        task_type=None,
+        video=video,
+        video_duration=4,
+    )
+    with pytest.raises(requests.HTTPError):
+        eval_module.evaluate_sample(
+            sample,
+            response,
+            tmp_path / "score.json",
+            Judge(),
+            judge_video_mode="video_url",
+        )
+    assert calls == ["video_url"]
+
+
+def test_content_prompt_judge_errors_other_than_context_overflow_propagate(tmp_path, monkeypatch):
+    # A 400 that is not a context-length overflow (or any other HTTP error)
+    # must keep failing the sample so the run stays "partial" and CI stays loud.
+    import requests
+
+    monkeypatch.setattr(eval_module, "extract_jpeg", lambda *args, **kwargs: b"\xff\xd8jpeg")
+    response, video = _write_rtd_response(tmp_path)
+
+    class Judge:
+        def temporal(self, *args, **kwargs):
+            return '{"temporal_score": 3, "is_relevant": 1}'
+
+        def content(self, prompt, video, frames=None, *, mode="video_url"):
+            raise requests.HTTPError(
+                "400 response from judge: bad request",
+                response=SimpleNamespace(status_code=400, text="invalid request body"),
+            )
+
+    sample = DuplexSample(
+        id="rtd",
+        split="RTD_counting",
+        family="rtd",
+        task_type=None,
+        video=video,
+        video_duration=4,
+    )
+    with pytest.raises(requests.HTTPError):
+        eval_module.evaluate_sample(
+            sample,
+            response,
+            tmp_path / "score.json",
+            Judge(),
+            judge_video_mode="video_url",
+        )
 
 
 def test_local_directory_collapsed_train_with_row_identity_and_split_filter(tmp_path):

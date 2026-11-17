@@ -1,5 +1,4 @@
 import inspect
-import json
 import logging
 import os
 from collections.abc import Iterable
@@ -10,7 +9,6 @@ from diffusers.image_processor import VaeImageProcessor
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
-from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import CLIPTextModelWithProjection, CLIPTokenizer, T5EncoderModel, T5Tokenizer
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -22,10 +20,11 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
-from vllm_omni.diffusion.models.utils import prepare_latents as _prepare_latents
 from vllm_omni.diffusion.models.sd3.sd3_transformer import (
     SD3Transformer2DModel,
 )
+from vllm_omni.diffusion.models.utils import load_vae_scale_factor, vae_scale_factor_from_vae
+from vllm_omni.diffusion.models.utils import prepare_latents as _prepare_latents
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -45,10 +44,7 @@ def get_sd3_image_post_process_func(
         model_path = model_name
     else:
         model_path = download_weights_from_hf_specific(model_name, None, ["*"])
-    vae_config_path = os.path.join(model_path, "vae/config.json")
-    with open(vae_config_path) as f:
-        vae_config = json.load(f)
-        vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
+    vae_scale_factor = load_vae_scale_factor(model_path)
 
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor)
 
@@ -247,7 +243,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
             torch_dtype=dtype,
         ).to(self.device)
 
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
+        self.vae_scale_factor = vae_scale_factor_from_vae(getattr(self, "vae", None))
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
 
         self.tokenizer_max_length = (
@@ -511,7 +507,11 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
             int(width) // self.vae_scale_factor,
         )
         return _prepare_latents(
-            shape, dtype=self.od_config.dtype, device=self.device, generator=generator, latents=latents,
+            shape,
+            dtype=self.od_config.dtype,
+            device=self.device,
+            generator=generator,
+            latents=latents,
         )
 
     def prepare_timesteps(self, num_inference_steps, sigmas, image_seq_len):

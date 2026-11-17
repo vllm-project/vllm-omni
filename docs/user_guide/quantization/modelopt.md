@@ -219,19 +219,29 @@ The native and A16 paths share one quantized weight representation. The A16
 path dequantizes the live backend weight and calls `F.linear`; it does not keep
 a second checkpoint-weight snapshot. Scheduled FP8 currently requires
 serialized tensorwise scales and a backend that retains canonical FP8 weights.
-Scheduled NVFP4 requires a supported CUTLASS-compatible native or FlashInfer
-layout. SmoothQuant, Marlin-repacked FP8, and per-channel/per-token FP8
+Scheduled NVFP4 requires canonical packed weights with a CUTLASS, FlashInfer
+CUTLASS, or FlashInfer CuTe-DSL kernel, or with the emulation kernel. On GPUs
+without native FP4, set `linear_backend: emulation`
+(`--linear-backend emulation`) to run emulated W4A4; it is slower than native
+FP4. SmoothQuant, Marlin-repacked FP8 or NVFP4, and per-channel/per-token FP8
 schedules fail closed.
 
 The reasoner uses dense A16 execution by default when its weights are FP8 or
 NVFP4. Set the nested `reasoner` field to `native` to retain the checkpoint-native
 W8A8/W4A4 path. A BF16 reasoner remains BF16 in either mode. The schedule
-currently requires tensor parallel size 1 and one active request per worker,
-does not support HSDP, and does not support block-scaled FP8. Its live-weight
-design is compatible with model-level and standard layer-wise offload, but
-those paths still require GPU end-to-end validation. Distributed layer-wise
-offload is rejected because its direct loader bypasses ModelOpt post-load
-transformations.
+requires one active request per worker and does not support block-scaled FP8.
+
+The schedule supports tensor parallelism and HSDP. Regression tests cover FP8
+and native or emulated NVFP4 with TP 2 and 4, Ulysses SP 2 and 4, CFG 2, and
+the pairwise TP/SP/CFG combinations, and with HSDP alone, with Ulysses SP or
+CFG, and with `hsdp_replicate_size=2`. HSDP cannot be combined with CPU offload.
+Under HSDP, NVFP4 packed weights stay replicated, so their memory does not
+shrink with the shard count.
+
+Without HSDP, the live-weight design is compatible with model-level and
+standard layer-wise offload, but those paths still require GPU end-to-end
+validation. Distributed layer-wise offload is rejected because its direct
+loader bypasses ModelOpt post-load transformations.
 
 A checkpoint can opt in by adding a versioned policy to its authoritative
 `transformer/config.json`. The same policy schema is used for FP8 and NVFP4:
@@ -286,8 +296,9 @@ override; an empty object uses the defaults shown above.
 The schedule uses vLLM's selected native backend and fails during loading if
 its live weight layout cannot support A16 dequantization.
 The runtime selects FP8 or NVFP4 from the checkpoint's ModelOpt configuration.
-BF16 linears are untouched. Mixed FP8/NVFP4 checkpoints are not supported by
-this schedule.
+BF16 linears are untouched. A `modelopt_mixed` checkpoint is accepted when all
+of its quantized layers use the same format (all FP8 or all NVFP4); checkpoints
+that mix FP8 and NVFP4 layers are not supported by this schedule.
 
 ## Validation and Notes
 

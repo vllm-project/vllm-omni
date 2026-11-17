@@ -179,7 +179,8 @@ def test_fish_kvcache_attn_guard_rejects_unsupported_block_size(monkeypatch):
     )
 
 
-def test_fish_kvcache_backend_wraps_only_model_instance(monkeypatch):
+@pytest.mark.parametrize("release_metadata", [False, True])
+def test_fish_kvcache_backend_wraps_only_model_instance(monkeypatch, release_metadata):
     fish_kvcache_backend.reset_fish_kvcache_attn_stats()
     monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
     monkeypatch.setattr(fish_kvcache_backend, "is_available", lambda: True)
@@ -203,6 +204,19 @@ def test_fish_kvcache_backend_wraps_only_model_instance(monkeypatch):
     assert not hasattr(other_impl, "_fish_kvcache_attn_installed")
 
     metadata = _metadata()
+    if release_metadata:
+        from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
+
+        metadata = FlashAttentionMetadata(
+            num_actual_tokens=metadata.num_actual_tokens,
+            max_query_len=metadata.max_query_len,
+            query_start_loc=torch.arange(3, dtype=torch.int32),
+            max_seq_len=metadata.max_seq_len,
+            seq_lens=metadata.seq_lens,
+            block_table=metadata.block_table,
+            slot_mapping=torch.arange(2, dtype=torch.int64),
+        )
+        metadata.seq_lens_cpu_upper_bound = metadata.seq_lens
     query = torch.zeros((2, 32, 128), dtype=torch.float16)
     output = torch.zeros_like(query)
     kv_cache = _decode_kv_cache()

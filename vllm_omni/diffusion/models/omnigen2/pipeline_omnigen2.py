@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import inspect
-import json
 import logging
 import os
 import warnings
@@ -24,7 +23,6 @@ from diffusers.image_processor import (
 from diffusers.models.autoencoders import AutoencoderKL
 from diffusers.schedulers.scheduling_utils import SchedulerMixin
 from diffusers.utils import BaseOutput
-from diffusers.utils.torch_utils import randn_tensor
 from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2_5_VLProcessor
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -34,11 +32,12 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
-from vllm_omni.diffusion.models.utils import prepare_latents as _prepare_latents
 from vllm_omni.diffusion.models.omnigen2.omnigen2_transformer import (
     OmniGen2RotaryPosEmbed,
     OmniGen2Transformer2DModel,
 )
+from vllm_omni.diffusion.models.utils import _load_json, load_vae_scale_factor
+from vllm_omni.diffusion.models.utils import prepare_latents as _prepare_latents
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -248,10 +247,13 @@ def get_omnigen2_pre_process_func(
         model_path = model_name
     else:
         model_path = download_weights_from_hf_specific(model_name, None, ["*"])
-    vae_config_path = os.path.join(model_path, "vae/config.json")
-    with open(vae_config_path) as f:
-        vae_config = json.load(f)
-        vae_scale_factor = 2 ** len(vae_config["temporal_downsample"]) if "temporal_downsample" in vae_config else 8
+    vae_config = _load_json(model_path, "vae/config.json")
+    vae_scale_factor = load_vae_scale_factor(
+        model_path,
+        vae_config=vae_config,
+        config_key="temporal_downsample",
+        exponent_offset=0,
+    )
 
     image_processor = OmniGen2ImageProcessor(vae_scale_factor=vae_scale_factor * 2, do_resize=True)
     latent_channels = vae_config.get("z_dim", 16)
@@ -309,10 +311,7 @@ def get_omnigen2_post_process_func(
         model_path = model_name
     else:
         model_path = download_weights_from_hf_specific(model_name, None, ["*"])
-    vae_config_path = os.path.join(model_path, "vae/config.json")
-    with open(vae_config_path) as f:
-        vae_config = json.load(f)
-        vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
+    vae_scale_factor = load_vae_scale_factor(model_path)
 
     image_processor = OmniGen2ImageProcessor(vae_scale_factor=vae_scale_factor * 2, do_resize=True)
 

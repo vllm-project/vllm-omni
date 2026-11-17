@@ -187,6 +187,8 @@ def _stream_metadata_from_diffusion_output(diffusion_output: DiffusionOutput) ->
         or bool(diffusion_output.started_event_ids)
         or bool(diffusion_output.active_event_ids)
         or bool(diffusion_output.completed_event_ids)
+        or bool(diffusion_output.coalesced_event_ids)
+        or bool(diffusion_output.streaming_metrics)
     )
     if not has_stream_data:
         return None
@@ -194,9 +196,19 @@ def _stream_metadata_from_diffusion_output(diffusion_output: DiffusionOutput) ->
         DiffusionMetadata,
         {
             "generation_chunk_index": diffusion_output.chunk_index,
+            **(
+                {"output_chunk_index": diffusion_output.chunk_index, "pacing": diffusion_output.streaming_metrics}
+                if diffusion_output.streaming_metrics
+                else {}
+            ),
             "started_event_ids": diffusion_output.started_event_ids,
             "active_event_ids": diffusion_output.active_event_ids,
             "completed_event_ids": diffusion_output.completed_event_ids,
+            **(
+                {"coalesced_event_ids": diffusion_output.coalesced_event_ids}
+                if diffusion_output.coalesced_event_ids
+                else {}
+            ),
         },
     )
 

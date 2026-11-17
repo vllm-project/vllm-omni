@@ -22,6 +22,12 @@ def pcm_payload(samples: int, *, speech: bool = True) -> dict[str, object]:
     }
 
 
+def _b64_audio(payload: dict[str, object]) -> bytes:
+    audio = payload["audio"]
+    assert isinstance(audio, str)
+    return base64.b64decode(audio)
+
+
 def test_commit_does_not_add_silence_after_incremental_audio_was_drained():
     buffer = MiniCPMO45PcmAppendBuffer()
 
@@ -127,7 +133,7 @@ def test_pcm_append_reservation_rollback_restores_emitted_audio():
 
     retried = buffer.flush(chunk_period_ms=1_000)
     assert retried is not None
-    assert base64.b64decode(retried["audio"]) == base64.b64decode(original["audio"])
+    assert _b64_audio(retried) == _b64_audio(original)
 
 
 def test_pcm_commit_keeps_prior_append_reservation_active():
@@ -176,7 +182,7 @@ def test_pcm_commit_reservation_rollback_restores_residual_audio():
         chunk_period_ms=1_000,
     )
     assert retried.payload is not None
-    assert base64.b64decode(retried.payload["audio"]) == (base64.b64decode(original["audio"]) + b"\x00" * (8_000 * 4))
+    assert _b64_audio(retried.payload) == (_b64_audio(original) + b"\x00" * (8_000 * 4))
 
 
 def _frame_payload(samples: int, frames: list[str]) -> dict[str, object]:
@@ -282,3 +288,148 @@ def test_rollback_restores_frame_groups_in_wire_order():
     assert retried is not None
     assert retried["video_frames"] == ["base-0", "stack-0"]
     assert buffer._frame_queue == [["base-1", "stack-1"]]
+
+
+def test_queued_vision_units_count_toward_pending_bytes_until_rollback_or_commit():
+    buffer = MiniCPMO45PcmAppendBuffer()
+    first = "frame-a" + ("x" * 40)
+    second = "frame-b" + ("y" * 40)
+
+    held = buffer.prepare_append(
+        dict(pcm_payload(0, speech=False), video_frames=[first]),
+        operation_id="first",
+        chunk_period_ms=1000,
+        allow_emit=False,
+    )
+    assert held is not None and held.payload is None
+    assert buffer.pending_byte_count == len(first)
+    held.commit()
+    assert buffer.pending_byte_count == len(first)
+
+    rejected = buffer.prepare_append(
+        dict(pcm_payload(0, speech=False), video_frames=[second]),
+        operation_id="second",
+        chunk_period_ms=1000,
+        allow_emit=False,
+    )
+    assert buffer.pending_byte_count == len(first) + len(second)
+    assert rejected is not None
+    rejected.rollback()
+    assert buffer.pending_byte_count == len(first)
+    assert [item["video_frames"] for item in buffer._vision_queue] == [[first]]
+
+    emitted = buffer.flush(chunk_period_ms=1000)
+    assert emitted is not None and emitted["video_frames"] == [first]
+    assert emitted["audio"] == ""
+    assert buffer.pending_byte_count == 0
+    assert not buffer.has_pending()
+
+
+def test_first_audio_after_vision_keeps_the_first_mel_window_across_rollback():
+    buffer = MiniCPMO45PcmAppendBuffer()
+    vision = buffer.prepare_append(
+        dict(pcm_payload(0, speech=False), video_frames=["frame"]),
+        operation_id="vision",
+        chunk_period_ms=1000,
+    )
+    assert vision is not None and vision.payload is not None
+    assert vision.payload.get("first_audio_window") is not True
+    vision.commit()
+
+    speech = buffer.prepare_append(pcm_payload(32_000), operation_id="two-seconds", chunk_period_ms=1000)
+    assert speech is not None and speech.payload is not None
+    assert speech.payload["first_audio_window"] is True
+    speech.rollback()
+
+    retried = buffer.flush(chunk_period_ms=1000)
+    assert retried is not None and retried["first_audio_window"] is True
+    later = buffer.append(pcm_payload(16_000), chunk_period_ms=1000)
+    assert later is not None and later.get("first_audio_window") is not True
+
+
+def test_accepted_silence_consumes_the_first_audio_window():
+    """A silence continuation is encoded outside the buffer.
+
+    Two buffered seconds after that are two normal chunks, not the single
+    first-window unit.
+    """
+    buffer = MiniCPMO45PcmAppendBuffer()
+    vision = buffer.prepare_append(
+        dict(pcm_payload(0, speech=False), video_frames=["frame"]),
+        operation_id="vision",
+        chunk_period_ms=1000,
+    )
+    assert vision is not None
+    vision.commit()
+    buffer.note_audio_window_started()
+
+    speech = buffer.prepare_append(pcm_payload(32_000), operation_id="two-seconds", chunk_period_ms=1000)
+    assert speech is not None and speech.payload is not None
+    assert speech.payload.get("first_audio_window") is not True
+
+
+def test_vision_only_append_emits_without_audio_and_survives_rollback():
+    buffer = MiniCPMO45PcmAppendBuffer()
+    payload = dict(pcm_payload(0, speech=False), video_frames=["base", "stack"])
+    payload.pop("audio")
+    reserved = buffer.prepare_append(payload, operation_id="vision", chunk_period_ms=1000)
+    assert reserved is not None
+    assert reserved.payload["audio"] == ""
+    assert reserved.payload["video_frames"] == ["base", "stack"]
+    reserved.rollback()
+    assert buffer.has_pending()
+    retried = buffer.flush(chunk_period_ms=1000)
+    assert retried["video_frames"] == ["base", "stack"]
+    assert retried["audio"] == ""
+    assert not buffer.has_pending()
+    assert buffer.commit(chunk_period_ms=1000) is None
+
+
+def test_video_only_bypasses_partial_microphone_audio_and_restores_on_rollback():
+    buffer = MiniCPMO45PcmAppendBuffer()
+    partial = dict(pcm_payload(3200), video_frames=["audio-frame"])
+    assert buffer.append(partial, chunk_period_ms=1000) is None
+    vision = dict(pcm_payload(0, speech=False), video_frames=["muted-frame"])
+    reservation = buffer.prepare_append(vision, operation_id="muted", chunk_period_ms=1000)
+    assert reservation.payload["video_frames"] == ["muted-frame"]
+    assert not reservation.payload["audio"]
+    reservation.rollback()
+    retry = buffer.flush(chunk_period_ms=1000)
+    assert retry["video_frames"] == ["muted-frame"]
+    assert not retry["audio"]
+    assert buffer.pending_byte_count == 3200 * 4
+    resumed = buffer.append(pcm_payload(12800), chunk_period_ms=1000)
+    assert resumed is not None
+    assert len(_b64_audio(resumed)) == 16000 * 4
+    assert resumed["video_frames"] == ["audio-frame"]
+    assert not buffer.has_pending()
+
+
+def test_commit_prefix_rollback_preserves_frames_and_speech_tail():
+    buffer = MiniCPMO45PcmAppendBuffer()
+    for frame in ("first", "second"):
+        buffer.prepare_append(
+            dict(pcm_payload(0, speech=False), video_frames=[frame]),
+            operation_id=frame,
+            chunk_period_ms=1000,
+            allow_emit=False,
+        )
+    buffer.prepare_append(pcm_payload(1600), operation_id="speech", chunk_period_ms=1000, allow_emit=False)
+    first = buffer.prepare_commit_prefix(operation_id="prefix", chunk_period_ms=1000)
+    assert first is not None
+    assert first.payload["video_frames"] == ["first"]
+    first.rollback()
+    for frame in ("first", "second"):
+        reservation = buffer.prepare_commit_prefix(operation_id=frame, chunk_period_ms=1000)
+        assert reservation is not None
+        assert reservation.payload["video_frames"] == [frame]
+        assert not reservation.payload.get("audio")
+        reservation.commit()
+    assert buffer.prepare_commit_prefix(operation_id="end", chunk_period_ms=1000) is None
+    terminal = buffer.prepare_commit(operation_id="commit", chunk_period_ms=1000)
+    assert terminal.byte_count == 1600 * 4
+    assert terminal.payload["final"] is True
+    assert len(_b64_audio(terminal.payload)) == 16000 * 4
+    terminal.commit()
+    assert not buffer.has_pending()
+    assert not buffer.has_reserved()
