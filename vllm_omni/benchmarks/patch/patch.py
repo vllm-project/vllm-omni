@@ -689,6 +689,20 @@ def get_samples(args, tokenizer, **kwargs):
     any upstream caller reaching this patched replacement keeps working; they are
     forwarded to the original implementation on every delegate path.
     """
+    # Diffusion generation models (not image-edits, which need input images
+    # supplied by the existing dataset path).
+    from vllm_omni.benchmarks.serve import (
+        _is_image_edit_benchmark,
+        is_diffusion_benchmark,
+    )
+
+    if is_diffusion_benchmark(args) and not _is_image_edit_benchmark(args):
+        from vllm_omni.benchmarks.data_modules.diffusion_dataset import (
+            load_diffusion_samples,
+        )
+
+        return load_diffusion_samples(args)
+
     pool_size = getattr(args, "duplex_sample_pool_size", None)
     if pool_size is not None:
         if args.dataset_name not in {"omniinteract", "omni-duplex-eval"}:
