@@ -996,6 +996,58 @@ async with DuplexClient("ws://127.0.0.1:8099/v1/realtime", model="Qwen/Qwen3-Omn
     await DuplexToolRunner(client, {"get_weather": get_weather}).run()
 ```
 
+Failed result writes stay available in `runner.undelivered_results`, with the
+exception in `runner.delivery_errors`. After reconnecting to the same session,
+await `runner.retry_result(call_id)` in an application task while `run()` keeps
+consuming events. The handler is not executed again. Transport success does not
+acknowledge server acceptance. Follow-ups wait for generation and, with
+`ack_only`, playback acknowledgements. Playback ACKs remain the application's job.
+
+#### Command-line example
+
+With the serving environment active, start Qwen's duplex server:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+  --deploy-config vllm_omni/deploy/qwen3_omni_duplex.yaml --port 8099
+```
+
+In your working directory, define an async tool and its declaration:
+
+```bash
+cat > tool_handlers.py <<'PY'
+import json
+
+async def add(arguments):
+    return json.dumps({"sum": arguments["a"] + arguments["b"]})
+PY
+cat > tools.json <<'JSON'
+[{"type":"function","name":"add","description":"Add two numbers",
+  "parameters":{"type":"object","properties":{"a":{"type":"number"},
+  "b":{"type":"number"}},"required":["a","b"]}}]
+JSON
+```
+
+Run the client in another terminal, from the directory containing those files:
+
+```bash
+PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" \
+python -m vllm_omni.clients.tool_calls \
+  --url 'ws://127.0.0.1:8099/v1/realtime?duplex=1' \
+  --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --tools-json tools.json --handler add=tool_handlers:add \
+  --prompt 'Use the add tool to add 12 and 30.' --timeout 30
+```
+
+The client prints JSON events until the timeout or session closure. Repeat
+`--handler NAME=MODULE:ASYNC_FUNCTION` for more tools, and add their declarations
+to the JSON list. Handlers must return strings. The example requests text output,
+so audio playback and ACKs are not needed. List all flags with:
+
+```bash
+python -m vllm_omni.clients.tool_calls --help
+```
+
 Deployment setting `duplex_session.max_tool_calls_per_session` (default 4096)
 bounds the records one session may track, pending calls and settled tombstones
 together, until it closes; it must be a positive integer. At the limit, a new

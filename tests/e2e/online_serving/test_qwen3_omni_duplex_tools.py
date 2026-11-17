@@ -19,6 +19,7 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.clients.duplex import DuplexClient, EventCollector, SessionConfig
+from vllm_omni.clients.tool_calls import DuplexToolRunner
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.omni]
 
@@ -293,5 +294,44 @@ def test_a_failed_tool_ends_the_call_and_the_session_carries_on(omni_server):
         assert "tokyo" in reply.lower(), reply
         assert len(session.calls()) == 1, session.calls()
         assert session.error_codes() == []
+
+    run(omni_server, session_config(), body)
+
+
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+def test_immediate_runner_handler_continues_without_another_client_action(omni_server):
+    async def body(session: ToolSession) -> None:
+        handled = []
+
+        async def get_weather(arguments):
+            handled.append(arguments)
+            return WEATHER_RESULT
+
+        runner = DuplexToolRunner(session.client, {"get_weather": get_weather})
+        task = asyncio.create_task(runner.run())
+        try:
+            await asyncio.sleep(0)
+            await session.ask_for_weather()
+            deadline = asyncio.get_running_loop().time() + TURN_TIMEOUT_S
+            while asyncio.get_running_loop().time() < deadline:
+                if task.done():
+                    await task
+                answers = [
+                    session.collector.response_text(rid)
+                    for event in session.collector.events
+                    if event.get("type") == "response.done"
+                    and (rid := session.collector.response_id(event)) is not None
+                ]
+                if any("17" in text for text in answers):
+                    assert len(handled) == 1
+                    assert session.error_codes() == []
+                    assert runner.undelivered_results == {}
+                    return
+                await asyncio.sleep(0.1)
+            raise AssertionError("runner did not continue the immediate tool result")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     run(omni_server, session_config(), body)

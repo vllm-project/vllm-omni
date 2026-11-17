@@ -46,6 +46,15 @@ class DuplexToolRunner:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         #: Running calls the server ended. Anything sent for one would be refused.
         self._settled: set[str] = set()
+        self.undelivered_results: dict[str, str] = {}
+        self.delivery_errors: dict[str, DuplexClientError] = {}
+        self._active_responses: set[str] = set()
+        self._playback: dict[str, tuple[float, float]] = {}
+        self._ready = asyncio.Event()
+        self._ready.set()
+        self._continuation_lock = asyncio.Lock()
+        self._continuation_generation = 0
+        self._awaiting_response = False
 
     async def run(self) -> None:
         """Handle calls until the session ends; running tools are then cancelled.
@@ -68,6 +77,36 @@ class DuplexToolRunner:
 
     def handle_event(self, event: DuplexEvent) -> None:
         """Start a tool for a new call, or stop one whose call has ended."""
+        response_id = event.response_id
+        if event.type == "response.created" and response_id:
+            self._awaiting_response = False
+            self._active_responses.add(response_id)
+        elif event.type == "response.done" and response_id:
+            self._active_responses.discard(response_id)
+            response = event.raw.get("response", {})
+            metadata = response.get("metadata", {}) if isinstance(response, dict) else {}
+            if isinstance(response, dict) and response.get("status") in {"cancelled", "failed"}:
+                self._playback.pop(response_id, None)
+            else:
+                self._note_playback(response_id, metadata)
+        elif event.type == "playback.acknowledged":
+            details = event.raw.get("event", {})
+            item_id = details.get("item_id") if isinstance(details, dict) else None
+            rid = details.get("response_id") if isinstance(details, dict) else None
+            if not rid and isinstance(item_id, str) and item_id.startswith("item_"):
+                rid = item_id[5:]
+            if isinstance(rid, str):
+                self._note_playback(rid, details)
+        elif event.type == "output_audio_buffer.cleared" and response_id:
+            self._playback.pop(response_id, None)
+        if (
+            self._awaiting_response
+            or self._active_responses
+            or any(sent > committed for sent, committed in self._playback.values())
+        ):
+            self._ready.clear()
+        else:
+            self._ready.set()
         if event.type == "response.output_item.done":
             item = event.raw.get("item")
             if isinstance(item, dict) and item.get("type") == "function_call":
@@ -77,6 +116,8 @@ class DuplexToolRunner:
             call_id = details.get("call_id") if isinstance(details, dict) else None
             if not isinstance(call_id, str):
                 return
+            self.undelivered_results.pop(call_id, None)
+            self.delivery_errors.pop(call_id, None)
             task = self._tasks.get(call_id)
             if task is not None and call_id not in self._settled:
                 # The task stays in ``_tasks`` until it is done; ``_forget``
@@ -86,7 +127,7 @@ class DuplexToolRunner:
 
     def _start(self, item: Mapping[str, object]) -> None:
         call_id = item.get("call_id")
-        if not isinstance(call_id, str) or not call_id or call_id in self._tasks:
+        if not isinstance(call_id, str) or not call_id or call_id in self._tasks or call_id in self.undelivered_results:
             return
         task = asyncio.create_task(self._run_call(call_id, item.get("name"), item.get("arguments")))
         self._tasks[call_id] = task
@@ -119,20 +160,145 @@ class DuplexToolRunner:
             return
         if call_id in self._settled:
             return
-        await self._finish(self._client.send_function_call_output(call_id, output))
-        if call_id in self._settled:
+        await self._deliver_result(call_id, output)
+
+    def _note_playback(self, response_id: str, details: object) -> None:
+        if self._client.session_info.get("playback_commit_policy") != "ack_only" or not isinstance(details, dict):
             return
+        playback = details.get("playback")
+        if isinstance(playback, dict):
+            sent, committed = self._playback.get(response_id, (0.0, 0.0))
+            self._playback[response_id] = (
+                max(sent, float(playback.get("sent_ms", 0))),
+                max(committed, float(playback.get("committed_ms", 0))),
+            )
+            sent, committed = self._playback[response_id]
+            if response_id not in self._active_responses and committed >= sent:
+                self._playback.pop(response_id)
+
+    async def retry_result(self, call_id: str) -> bool:
+        """Resend an undelivered result after reconnecting, without rerunning its tool.
+
+        Await this in an application task while ``run()`` consumes lifecycle events.
+        A successful write is not a server acceptance acknowledgement.
+        """
+        if call_id in self._tasks:
+            raise RuntimeError("The tool task has not finished yet")
+        output = self.undelivered_results[call_id]
+
+        async def deliver() -> None:
+            await self._deliver_result(call_id, output)
+
+        task = asyncio.create_task(deliver())
+        self._tasks[call_id] = task
+        task.add_done_callback(lambda done: self._forget(call_id, done))
+        await task
+        return call_id not in self.undelivered_results
+
+    async def _deliver_result(self, call_id: str, output: str) -> bool:
+        self.undelivered_results[call_id] = output
+        try:
+            await self._client.send_function_call_output(call_id, output)
+        except DuplexClientError as exc:
+            self.delivery_errors[call_id] = exc
+            logger.warning("Tool result %s was not delivered: %s", call_id, exc)
+            return False
+        self.undelivered_results.pop(call_id, None)
+        self.delivery_errors.pop(call_id, None)
+        if call_id in self._settled:
+            return False
         capabilities = self._client.session_info.get("capabilities")
         if (
             isinstance(capabilities, dict)
             and capabilities.get("function_call_output_continuation") == "client_response_create"
         ):
-            await self._finish(self._client.send({"type": "response.create"}))
+            generation = self._continuation_generation
+            async with self._continuation_lock:
+                # Another follow-up already includes results delivered before it.
+                if generation != self._continuation_generation:
+                    return True
+                await self._ready.wait()
+                if call_id not in self._settled:
+                    if await self._finish(self._client.send({"type": "response.create"})):
+                        self._continuation_generation += 1
+                        self._awaiting_response = True
+                        self._ready.clear()
+        return True
 
     @staticmethod
-    async def _finish(send: Awaitable[object]) -> None:
-        """A closed session has already ended the call, so a lost send is final."""
+    async def _finish(send: Awaitable[object]) -> bool:
+        """Log failures of best-effort cancellation/continuation updates."""
         try:
             await send
         except DuplexClientError as exc:
             logger.warning("Could not send a tool-call update: %s", exc)
+            return False
+        return True
+
+
+def main() -> None:
+    """Run application-supplied async tool handlers from the command line."""
+    import argparse
+    from importlib import import_module
+    from pathlib import Path
+
+    from vllm_omni.clients.duplex import DuplexClient, SessionConfig
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--url", required=True)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--tools-json", required=True, help="JSON file containing a list of tool declarations")
+    parser.add_argument("--handler", action="append", required=True, help="NAME=MODULE:ASYNC_FUNCTION; repeat per tool")
+    parser.add_argument("--prompt", required=True)
+    parser.add_argument("--timeout", type=float, default=60, help="Seconds to consume events before closing")
+    args = parser.parse_args()
+    if args.timeout <= 0:
+        parser.error("--timeout must be positive")
+    tools = json.loads(Path(args.tools_json).read_text(encoding="utf-8"))
+    if not isinstance(tools, list):
+        parser.error("--tools-json must contain a JSON list")
+    handlers = {}
+    for spec in args.handler:
+        name, target = spec.split("=", 1)
+        module, function = target.split(":", 1)
+        handlers[name] = getattr(import_module(module), function)
+
+    async def serve() -> None:
+        config = SessionConfig(modalities=("text",), auto_response=False, extra_body=function_call_session_defaults())
+        async with DuplexClient(args.url, model=args.model, config=config) as client:
+            runner = DuplexToolRunner(client, handlers)
+
+            async def print_events() -> None:
+                async for event in client.events():
+                    print(json.dumps(event.raw), flush=True)
+
+            printer = asyncio.create_task(print_events())
+            running = asyncio.create_task(runner.run())
+            try:
+                await asyncio.sleep(0)
+                await client.send({"type": "session.update", "session": {"tools": tools}})
+                await client.send(
+                    {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": args.prompt}],
+                        },
+                    }
+                )
+                await client.send({"type": "response.create"})
+                try:
+                    await asyncio.wait_for(running, args.timeout)
+                except TimeoutError:
+                    pass
+            finally:
+                running.cancel()
+                printer.cancel()
+                await asyncio.gather(running, printer, return_exceptions=True)
+
+    asyncio.run(serve())
+
+
+if __name__ == "__main__":
+    main()
