@@ -149,6 +149,13 @@ condition, closed with `<text_eos><audio_bos>`. The Talker keeps one resumable
 request: it stops at each block's EOS and continues from its KV cache when the
 next block arrives, with the repetition-penalty window carried over.
 
+The Talker context only grows within the request, so the bridge bounds it: each
+open block counts its condition, a cap of 20 codes per reply token that the
+Talker enforces, and the step that samples its EOS. Once the bound has no room
+for another block plus a closing one, the rest of the reply waits for the
+closing block, whose text is cut to what fits. A reply too long for the Talker
+context then ends with truncated audio, as a whole-reply condition does.
+
 This applies to streaming chat completions with audio output. The Thinker then
 reports DELTA outputs, and the orchestrator forwards each one to a bridge that
 sets `accepts_partial_source_outputs`. Non-streaming requests keep the
