@@ -18,13 +18,14 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA is unavailable", allow_module_level=True)
-pytest.importorskip("sol_attn")
+sol_attn = pytest.importorskip("sol_attn").sol_attn
 
 
 @hardware_test(res={"cuda": ["L4", "H100", "B200", "RTX5090"]}, num_cards=1)
 @pytest.mark.parametrize("used,sink_tokens", [(63, 5), (64, 5), (257, 5), (4097, 951)])
 @pytest.mark.parametrize("compiled", [False, True])
-def test_real_sol_kernel_padding_and_sink(used, sink_tokens, compiled):
+@pytest.mark.parametrize("thresh_type", ["diag", "exact"])
+def test_real_sol_kernel_padding_and_sink(used, sink_tokens, compiled, thresh_type):
     generator = torch.Generator(device="cuda").manual_seed(17)
     query, key, value = (
         torch.randn(1, used + 17, 2, 128, device="cuda", dtype=torch.bfloat16, generator=generator) for _ in range(3)
@@ -35,11 +36,30 @@ def test_real_sol_kernel_padding_and_sink(used, sink_tokens, compiled):
         2,
         128,
         0.125,
-        backend_kwargs={"sol_attn": {"dense_steps": 0, "dense_layers": "", "sink_tokens": sink_tokens}},
+        backend_kwargs={
+            "sol_attn": {
+                "dense_steps": 0,
+                "dense_layers": "",
+                "sink_tokens": sink_tokens,
+                "tau": 1.5,
+                "thresh_type": thresh_type,
+            }
+        },
     )
     forward = torch.compile(impl.forward_cuda, fullgraph=True) if compiled else impl.forward_cuda
     with torch.inference_mode():
         actual = forward(query, key, value, metadata)
+        upstream = sol_attn(
+            query[:, :used].contiguous(),
+            key[:, :used].contiguous(),
+            value[:, :used].contiguous(),
+            scale=0.125,
+            tau=1.5,
+            thresh_type=thresh_type,
+            kv_splits=1,
+            sink_start=0,
+            sink_tokens=sink_tokens,
+        )
         reference = torch.nn.functional.scaled_dot_product_attention(
             query[:, :used].transpose(1, 2).float(),
             key[:, :used].transpose(1, 2).float(),
@@ -49,6 +69,7 @@ def test_real_sol_kernel_padding_and_sink(used, sink_tokens, compiled):
     assert actual.shape == query.shape
     assert torch.isfinite(actual).all()
     assert torch.count_nonzero(actual[:, used:]) == 0
+    torch.testing.assert_close(actual[:, sink_tokens:used], upstream[:, sink_tokens:], rtol=1e-3, atol=1e-3)
     compared_rows = used if used <= 64 else sink_tokens
     torch.testing.assert_close(actual[:, :compared_rows].float(), reference[:, :compared_rows], rtol=0.02, atol=0.02)
     torch.compiler.reset()

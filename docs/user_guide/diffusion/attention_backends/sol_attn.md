@@ -30,12 +30,8 @@ for these specialized kernels; upstream falls back to Triton when the optional
 CuTe runtime is unavailable. The default `kv_splits="auto"` uses one split on
 all architectures; explicit splits of 2 or 4 require the Hopper CuTe path.
 
-The external kernel is wrapped in a PyTorch custom op with a fake implementation
-for compilation. Dense guard steps and sink queries use PyTorch SDPA, pinned to
-cuDNN on SM120/SM121. On other CUDA architectures SDPA selects its dense kernel.
-Both paths trim structural padding first and return zero for discarded padding
-rows. These dense kernels can differ numerically from `FLASH_ATTN`.
-An outer HSDP boundary is not covered by the backend's fullgraph guarantee.
+Full-model compilation and outer HSDP boundaries are outside this backend's
+compilation guarantee.
 
 ## MiniMax-H3 configuration
 
@@ -63,9 +59,8 @@ Add this configuration to the hardware profile in the
 `prefix_sink` derives the exact prefix from the model's video layout rather
 than assuming a fixed number of audio/text tokens. For Ref2VA it conservatively
 protects every row before the target-video span, including reference videos.
-The prefix is kept exact as K/V and recomputed densely as queries; a K/V-only
-sink does not protect generated audio queries. A larger reference prefix costs
-more dense work, so measure reference-heavy workloads separately.
+The prefix is kept exact as K/V and recomputed densely as queries. Larger
+reference prefixes increase dense work.
 
 ## Other models
 
@@ -89,8 +84,7 @@ self-attention and leave cross-attention dense:
 Do not apply SOL globally to models that also use cross-attention, masks,
 GQA, or incompatible head dimensions. Models must publish denoising-step
 metadata and parseable layer prefixes for the default guards to permit sparse
-execution. Missing metadata keeps guarded calls dense, and schedules with
-at most ten denoising steps remain dense with the default `dense_steps=10`.
+execution.
 
 ## Controls
 
@@ -107,33 +101,10 @@ Set these fields in `AttentionSpec.sol_attn`, under `default` or `per_role`:
 | `sink_start` | `0` | Sink offset; `null` selects the last `sink_tokens` valid rows. With `prefix_sink`, the union is conservatively covered by one contiguous range. |
 | `kv_splits` | `auto` | `auto` uses the conservative single-split path. Explicit `1`, `2`, or `4`; `2/4` require SM90, CuTe DSL, and at least one 4096-token route group per split. |
 
-`SOL_ATTN` without a `sol_attn` block uses these defaults. Use per-role selection
-for models with unsupported cross-attention or other head dimensions.
+`SOL_ATTN` without a `sol_attn` block uses these defaults. Schedules with at
+most ten denoising steps remain entirely dense with `dense_steps=10`.
 
-## Validation and quality
-
-Sparse attention changes outputs. Compare video and audio against the dense
-baseline on the same prompts, seeds, resolution, duration, and denoising schedule.
-Short distilled schedules can remain entirely dense with `dense_steps=10`;
-change this only after validating quality.
-
-Warm up both dense and sparse branches using a complete request before timing.
-Measure repeated latency, variation, peak GPU memory, video metrics, and audio
-quality on the deployed revision.
-
-CPU contract regressions:
-
-```bash
-pytest -q tests/diffusion/attention/test_sol_attn_backend.py -m 'core_model and cpu'
-```
-
-With the optional kernel installed and one SM80+ GPU, verify the real kernel
-and fullgraph compilation, including non-aligned padding and dense sink rows:
-
-```bash
-pytest -q tests/diffusion/attention/test_sol_attn_cuda.py
-```
-
-With two visible GPUs the same file also compares pure Ulysses execution
-against local attention, including prefix protection and structural padding.
-That case skips when fewer than two GPUs are available.
+Sparse attention is approximate, not dense-equivalent. Validate video and audio
+quality against a matching dense baseline before reducing the guards or
+deploying a configuration. Dense guards use PyTorch SDPA (cuDNN on SM120/SM121),
+which can also differ numerically from `FLASH_ATTN`.
