@@ -26,6 +26,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import (
     DenoiseProgressMixin,
     begin_scheduled_denoise,
+    check_scheduler_sigmas,
     clear_scheduled_denoise_step_on_exit,
 )
 from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
@@ -206,6 +207,9 @@ class Wan22I2VPipeline(
     Wan2.2-style I2V (with expand_timesteps for TI2V-5B).
     """
 
+    # Both CFG branches share latents, timestep and the active expert; UMT5
+    # prompts are zero-padded back to max_sequence_length.
+    supports_cfg_batching = True
     supports_request_batch = True
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder", "image_encoder"]
@@ -647,6 +651,8 @@ class Wan22I2VPipeline(
             self.scheduler.set_timesteps(num_steps, device=device)
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
+        # Bound sigma windows read these sigmas at every step; reject unusable ones before the first forward.
+        check_scheduler_sigmas(self.scheduler.sigmas)
 
         boundary_timestep = None
         if boundary_ratio is not None:

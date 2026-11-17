@@ -1,8 +1,10 @@
 # Attention Schedules
 
-An attention schedule selects a named attention profile at zero-based denoising
-step indices. Profiles are prepared at startup; requests select ranges, not new
-backends. Steps outside a range use the base attention configuration.
+An attention schedule selects a named attention profile by zero-based denoising
+step range or by sigma window (see [Sigma windows](#sigma-windows)).
+Profiles are prepared at startup; requests select ranges or windows, not new
+backends. Steps outside every range or window use the base attention
+configuration.
 
 Wan2.2 T2V, I2V, S2V and VACE publish progress in request mode. MiniMax-H3 and
 HunyuanImage-3.0 publish it in request and step modes. Configured profiles on
@@ -20,7 +22,7 @@ backends at startup instead (see [Compatibility limits](#compatibility-limits)).
 
 ## Format
 
-The server configuration contains `profiles` and `default`:
+The server configuration contains `profiles`, `default` and optional `sigma`:
 
 - `profiles` maps names to complete attention configurations with `default` and
   optional `per_role` specs, as in `--diffusion-attention-config`.
@@ -30,6 +32,8 @@ The server configuration contains `profiles` and `default`:
   underscores or hyphens. All profiles are validated, even unused ones.
 - The top-level `default` is a list of ranges. An empty configuration with no
   profiles is equivalent to not configuring schedules.
+- The top-level `sigma` is a list of windows; see [Sigma
+  windows](#sigma-windows). `default` and `sigma` cannot both be non-empty.
 - Other top-level keys are rejected at startup.
 
 Each range has exactly `start`, `end` and `profile`:
@@ -54,8 +58,46 @@ step-0 DiT forward with the step-0 profile and reuses it on later steps; only
 the AR KV-reuse prefill runs with the base configuration. Deeper layers' prompt
 K/V also depend on earlier layers' step-0 attention outputs, so on this model
 the step-0 profile affects every step, not only step 0. A range that starts at
-step 0 with an approximate profile therefore also changes the later steps; the
-server logs this at startup when its default schedule does so.
+step 0 with an approximate profile therefore also changes the later steps, and
+so does a sigma window that covers 1.0. The server logs this at startup when its
+default schedule does either.
+
+## Sigma windows
+
+Sigma schedules use the same prepared profiles, selected by each step's noise
+level instead of its index. Every supported model publishes the sigma its
+scheduler uses for the step, from 1.0 (pure noise) toward 0.0. Runs start at
+1.0, or just below it under Wan's UniPC solver (0.999 at `flow_shift` 1); the
+MiniMax-H3 `latent_refine` pass starts lower. A step without a valid sigma fails
+rather than silently selecting the base backend.
+
+Each window has exactly `low`, `high` and `profile`. Bounds must be finite
+numbers with `0 <= low < high <= 1`. List windows by ascending `low`, the
+reverse of denoising order, without overlaps. Windows are half-open
+`[low, high)`, except an end at `1.0` includes `1.0`. Adjacent windows are
+allowed; gaps use the base configuration. Thresholds refer to the actual shifted
+trajectory: changing step count or flow shift changes when a threshold is
+crossed, not the threshold itself.
+
+Set service defaults with `sigma` instead of `default` in the existing flag:
+
+```bash
+--diffusion-attention-schedule '{
+  "profiles": {"flash": {"default": "FLASH_ATTN"}},
+  "sigma": [{"low": 0.3, "high": 1.0, "profile": "flash"}]
+}'
+```
+
+The dotted flag is `--diffusion-attention-schedule.sigma`; deploy YAML uses
+`diffusion_attention_schedule.sigma`. CLI lists replace the corresponding stage
+list. There is no separate sigma flag or environment variable.
+
+Use `attention_sigma_schedule` in the same request extras or offline sampling
+parameters as `attention_schedule`. Omitted or `null` inherits the service
+windows, and `[]` turns them off. A request uses one kind: non-empty values in
+either field replace the service defaults of both kinds, and non-empty values in
+both fields are rejected. A stage's `default_sampling_params` count as request
+values, so send `[]` for the other field to switch kinds against such a default.
 
 ## Server configuration
 
@@ -102,15 +144,18 @@ stages that run no denoising, and a schedule on such a stage fails at startup,
 before weights are loaded.
 
 CLI overrides deep-merge profile mappings into the stage configuration. A CLI
-`default` list replaces the stage list rather than appending ranges.
+`default` list replaces the stage list rather than appending ranges. A
+configuration cannot hold both kinds, so switching a stage's `default` ranges to
+CLI `sigma` windows also needs `--diffusion-attention-schedule.default '[]'`,
+and switching the other way needs `--diffusion-attention-schedule.sigma '[]'`.
 
 ## Per-request configuration
 
-| `attention_schedule` value | Effect |
+| `attention_schedule` or `attention_sigma_schedule` value | Effect |
 | --- | --- |
-| Omitted or `null` | Inherit defaults. |
-| `[]` | Disable scheduling for this request. |
-| Non-empty ranges | Replace defaults; do not merge. |
+| Omitted or `null` | Inherit the service default. |
+| `[]` | Disable this kind only. A service default of the other kind still applies; send `[]` in both fields to run every step on the base configuration. |
+| Non-empty | Replace step ranges and sigma windows from the service defaults; do not merge. |
 
 Video endpoints first apply a stage's `default_sampling_params`, if present; an
 omitted or `null` request value preserves that stage default. A schedule from
@@ -136,16 +181,23 @@ request handling.
 
 ## Batching and errors
 
-Requests co-batch only with equal schedules after resolving stage defaults and
-only when they all sent their schedule or all inherited it. An omitted schedule
+Requests co-batch only with equal step ranges and equal sigma windows after
+resolving stage defaults. For step ranges (`attention_schedule`), the requests
+must also all have sent them or all inherited them. An omitted step schedule
 does not co-batch with the same ranges sent explicitly, because an explicit
 schedule is checked against the step count while an inherited default is not.
-For the same reason `[]` never shares a batch with an omitted schedule. A
-scheduled H3 step batch keeps one packed transformer forward when every request
-is at the same step and sigma and the selected profile's backends isolate packed
-requests; otherwise it runs one forward per request so each uses its own
-progress. A scheduled HunyuanImage-3.0 step batch always runs one transformer
-forward per request.
+For the same reason `attention_schedule: []` never shares a batch with an
+omitted one. Sigma windows (`attention_sigma_schedule`) co-batch on their
+resolved value alone, because nothing checks explicit windows differently: an
+inherited service default shares a batch with the same windows sent explicitly,
+and `[]` shares one with an omitted value when the service has no sigma default.
+The step-range rule still applies to requests with equal sigma windows, so one
+that omits `attention_schedule` and one that sends `attention_schedule: []` stay
+in separate batches. A scheduled H3 step batch keeps one packed transformer
+forward when every request is at the same step and sigma and the selected
+profile's backends isolate packed requests; otherwise it runs one forward per
+request so each uses its own progress. A scheduled HunyuanImage-3.0 step batch
+always runs one transformer forward per request.
 
 Malformed schedules return HTTP 400 before dispatch. A request schedule that
 names a profile the denoising stage does not configure returns HTTP 400 when
@@ -153,9 +205,15 @@ that stage admits the request, before denoising. In the disaggregated
 deployments above, this happens after stage 0 has finished: the H3 encoder, the
 HunyuanImage-3.0 AR stage or the Wan2.2 encode stage. A bounded range in the
 request's own schedule that ends after the sequence fails before denoising and
-retains the client error through the runner and multiprocess executor.
-Asynchronous `/v1/videos` reports all of these errors on the job record rather
-than the creation response.
+retains the client error through the runner and multiprocess executor. Under
+sigma windows, Wan2.2 and HunyuanImage-3.0 check the scheduler's sigmas once,
+right after building the timesteps. Sigmas outside `[0, 1]`, for example from an
+infinite Wan2.2 `flow_shift`, raise the same `invalid_attention_schedule` client
+error as the other checks here, before any denoise forward. In step mode the
+request fails during its own preparation, not in a step shared with other
+requests. MiniMax-H3 solvers reject such sigmas when the request's schedule is
+prepared. Asynchronous `/v1/videos` reports all of these errors on the job
+record rather than the creation response.
 
 ## Compatibility limits
 
@@ -178,10 +236,13 @@ than the creation response.
   recompilation. HunyuanImage-3.0 has no repeated blocks, so regional
   compilation skips it and it runs eager; its image attention also sends
   `full_attn_spans`.
-- H3 rejects non-empty schedules with request-scoped Cache-DiT (`quality=high`)
-  or `latent_refine`. Disable the schedule or the conflicting option. Step mode
-  rejects these H3 options regardless of schedule. Non-empty default ranges with
-  a `latent_refine` default in `--additional-config` fail at startup.
+- H3 rejects non-empty step ranges or sigma windows with request-scoped
+  Cache-DiT (`quality=high`), and non-empty step ranges with `latent_refine`.
+  Disable the schedule or the conflicting option. Sigma windows work with
+  `latent_refine`: the refine pass publishes the sigma of its own steps. Step
+  mode rejects these H3 options regardless of schedule. Non-empty default step
+  ranges with a `latent_refine` default in `--additional-config` fail at
+  startup.
 - Auto-padding sequence parallelism with `mask_sp_padding` enabled requires
   mask-capable profiles. Ring and scheduler-managed paged KV require profiles
   equivalent to the base backend and options. AllGather-KV rejects TRTLLM and

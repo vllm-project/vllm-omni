@@ -252,6 +252,12 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         return build_attn_metadata(**kwargs)
 
     @classmethod
+    def apply_diffusion_model_patches(cls, model, od_config) -> None:
+        from vllm_omni.platforms.npu.models.minimax_h3_image import apply_minimax_h3_image_graphs
+
+        apply_minimax_h3_image_graphs(model, od_config)
+
+    @classmethod
     def init_diffusion_model_runner_runtime(cls, vllm_config: Any, od_config: Any, device: torch.device) -> None:
         from vllm_ascend.ascend_forward_context import set_mc2_mask, set_mc2_tokens_capacity
 
