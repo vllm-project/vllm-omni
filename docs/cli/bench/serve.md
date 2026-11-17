@@ -1031,6 +1031,8 @@ This should be seen as an edge case, and if this behavior can be avoided by sett
 
 For `/v1/images/generations`, `/v1/images/edits`, and `/v1/videos`, set `--endpoint` to that path and omit `--backend`. The endpoint path is registered as the bench request adapter, so a separate named backend is not required.
 
+Except for `/v1/images/edits` (whose dataset path needs a real tokenizer), these endpoints skip tokenizer initialization when `--tokenizer` is not passed, so diffusion models without a tokenizer can be benchmarked directly. Pass `--tokenizer` to load one explicitly.
+
 Example (`/v1/images/generations`):
 
 ```bash
