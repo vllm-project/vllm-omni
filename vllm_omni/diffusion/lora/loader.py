@@ -380,6 +380,7 @@ class LoraLoaderMixin:
                     f"Distilled LoRA cannot be fused into quantized parameter {name} ({params.dtype}). "
                     "The distill LoRA backend fuses only into unquantized weights: remove --quantization "
                     "and --diffusion-quantization-config, and use a checkpoint that is not pre-quantized."
+                )
             delta = _shard_lora_delta(delta, layers[base_key], is_bias)
             if delta.shape != params.shape:
                 raise ValueError(
