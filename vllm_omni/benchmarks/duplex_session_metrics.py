@@ -237,11 +237,16 @@ def session_stats_chunk_metrics(session_stats: Mapping[str, object] | None) -> l
     ``in_engine_ms`` is the chunk's ``[submitted_ns, done_ns]`` interval and
     ``queue_ms`` the wait from submission to its first stage span. ``overrun``
     says whether the chunk was still in the engine when the session's next chunk
-    was submitted: duplex input arrives in real time, so the engine finished that
-    unit after the next one was already waiting. The session's last chunk has no
-    successor and gets ``None``. Chunks of turns that get no numbers from
-    :func:`session_stats_turn_metrics` (not final, or an audio turn missing a
-    stage's spans) are left out, but still mark when input arrived.
+    was submitted. ``submitted_ns`` is when the server took the append off the
+    session queue, so a later unit's wait in that queue is not counted and an
+    overrun can only be missed, not invented. For model-native duplex, where a
+    chunk is one fixed-period input unit, an overrun is a unit the engine had
+    not finished when the next one was accepted; for turn-commit plugins a
+    chunk is a whole turn. The session's last chunk has no successor, and a
+    chunk with no stage span has no engine time: their fields are ``None``.
+    Chunks of turns that get no numbers from :func:`session_stats_turn_metrics`
+    (not final, or an audio turn missing a stage's spans) are left out, but
+    still mark when input arrived.
     """
     turns = session_stats.get("turns") if session_stats is not None else None
     if not isinstance(turns, list):
@@ -279,9 +284,9 @@ def session_stats_chunk_metrics(session_stats: Mapping[str, object] | None) -> l
                 "epoch": turn.get("epoch"),
                 "turn_id": turn.get("turn_id"),
                 "seq": chunk.get("seq"),
-                "in_engine_ms": round((done_ns - submitted_ns) / 1e6, 3),
+                "in_engine_ms": round((done_ns - submitted_ns) / 1e6, 3) if starts else None,
                 "queue_ms": round(max(0, min(starts) - submitted_ns) / 1e6, 3) if starts else None,
-                "overrun": None if next_ns is None else done_ns > next_ns,
+                "overrun": done_ns > next_ns if starts and next_ns is not None else None,
             }
         )
     return rows

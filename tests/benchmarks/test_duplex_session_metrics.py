@@ -350,16 +350,33 @@ def test_chunk_metrics_time_each_final_chunk_against_the_next_input() -> None:
 
 
 def test_chunk_metrics_leave_the_last_chunk_and_spanless_chunks_unjudged() -> None:
-    stats = {"turns": [_stats_turn(0, [_stats_chunk(1, 0, 40, {0: [(10, 30)]}), _stats_chunk(2, 1000, 1000, {})])]}
+    stats = {
+        "turns": [
+            _stats_turn(
+                0,
+                [
+                    _stats_chunk(1, 0, 40, {0: [(10, 30)]}),
+                    # No stage span: no engine time, even with a next submission.
+                    _stats_chunk(2, 1000, 1000, {}),
+                    # The session's last chunk has nothing to be late for.
+                    _stats_chunk(3, 2000, 2050, {0: [(2000, 50)]}),
+                ],
+            )
+        ]
+    }
 
     rows = session_stats_chunk_metrics(stats)
 
-    assert [row["overrun"] for row in rows] == [False, None]
-    assert rows[1]["queue_ms"] is None
+    assert [row["overrun"] for row in rows] == [False, None, None]
+    assert (rows[1]["in_engine_ms"], rows[1]["queue_ms"]) == (None, None)
+    assert rows[2]["in_engine_ms"] == 50.0
     # An audio turn without the vocoder's spans would time its chunks short, as busy RTF would read low.
-    speaking = {**_stats_turn(1, [_stats_chunk(3, 2000, 2100, {0: [(2010, 90)]})]), "audio": [_audio(500.0)]}
+    speaking = {**_stats_turn(1, [_stats_chunk(4, 3000, 3100, {0: [(3010, 90)]})]), "audio": [_audio(500.0)]}
     staged = {"stages": [{"stage_id": 0}, {"stage_id": 2}], "turns": [*stats["turns"], speaking]}
-    assert [row["seq"] for row in session_stats_chunk_metrics(staged)] == [1, 2]
+    staged_rows = session_stats_chunk_metrics(staged)
+    assert [row["seq"] for row in staged_rows] == [1, 2, 3]
+    # Its input still arrived: chunk 3 now has a next submission.
+    assert staged_rows[2]["overrun"] is False
     assert session_stats_chunk_metrics(None) == []
     assert session_stats_chunk_metrics({"turns": None}) == []
 
