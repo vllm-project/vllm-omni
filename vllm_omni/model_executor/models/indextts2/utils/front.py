@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
 import warnings
@@ -41,8 +41,6 @@ _CHAR_REP_MAP = {
     "\u00b7": "-",  # ·
     "\u3001": ",",  # 、
     "\n": " ",
-    ";": ",",
-    ":": ",",
 }
 
 _CHAR_REP_PATTERN = re.compile("|".join(re.escape(p) for p in _CHAR_REP_MAP.keys()))
@@ -141,14 +139,9 @@ class TextTokenizer:
     def encode(self, text: str, **kwargs):
         if len(text) == 0:
             return []
+        text = normalize_text(text)
         if len(text.strip()) == 1:
             return self.sp_model.Encode(text, out_type=kwargs.pop("out_type", int), **kwargs)
-        # Normalise Chinese punctuation to ASCII equivalents before
-        # tokenisation so that the BPE model sees the same tokens it was
-        # trained on.  This prevents mispronunciation of Chinese punctuation
-        # marks (e.g. 。→哦) and ensures sentence-segment boundaries are
-        # correctly detected.
-        text = normalize_text(text)
         for pre_tokenizer in self.pre_tokenizers:
             text = pre_tokenizer(text)
         return self.sp_model.Encode(text, out_type=kwargs.pop("out_type", int), **kwargs)
