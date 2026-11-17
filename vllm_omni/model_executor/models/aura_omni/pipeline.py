@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """AURA Omni pipeline topology.
 
 Semantic modules:
@@ -11,6 +11,8 @@ The Qwen3-TTS module is represented as two native engine stages, Talker and
 Code2Wav, to reuse the existing vLLM-Omni implementation without wrapping or
 duplicating codec streaming behavior.
 """
+
+from dataclasses import replace
 
 from vllm_omni.config.stage_config import (
     PipelineConfig,
@@ -83,5 +85,39 @@ AURA_OMNI_PIPELINE = PipelineConfig(
             extras={"tts_args": {"max_instructions_length": 500}},
             requires_full_payload_input=True,
         ),
+    ),
+)
+
+
+# Opt-in variant: a response-judge stage between ASR and AURA. A turn that
+# needs no reply (backchannel, cough, noise, side talk) ends at the judge;
+# AURA and TTS do not run. The judge model is set by the deploy config
+# (``deploy/aura_omni_judged.yaml``); the default ``aura_omni`` pipeline above
+# is unchanged and loads no judge. The other stages are the ones above, shifted
+# by one.
+_ASR, _AURA, _TALKER, _CODE2WAV = AURA_OMNI_PIPELINE.stages
+
+AURA_OMNI_JUDGED_PIPELINE = PipelineConfig(
+    model_type="aura_omni_judged",
+    default_deploy_config_name="aura_omni_judged.yaml",
+    model_arch="Qwen3ASRForConditionalGeneration",
+    duplex_plugin="vllm_omni.model_executor.models.aura_omni.duplex.plugin.AuraDuplexPlugin",
+    stages=(
+        _ASR,
+        StagePipelineConfig(
+            stage_id=1,
+            model_stage="response_judge",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(0,),
+            owns_tokenizer=True,
+            engine_output_type="text",
+            # Default judge; a deploy config may set another model_arch/runner.
+            model_arch="ResponseJudgeQwen3ForCausalLM",
+            custom_process_input_func=f"{_AURA_PROC}.asr2judge",
+            sampling_constraints={"detokenize": True},
+        ),
+        replace(_AURA, stage_id=2, input_sources=(1,), custom_process_input_func=f"{_AURA_PROC}.judge2aura"),
+        replace(_TALKER, stage_id=3, input_sources=(2,)),
+        replace(_CODE2WAV, stage_id=4, input_sources=(3,)),
     ),
 )

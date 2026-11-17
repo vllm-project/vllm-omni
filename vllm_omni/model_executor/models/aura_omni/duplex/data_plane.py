@@ -16,6 +16,7 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_turn_id_from_request_id,
 )
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, EncodeAudio
+from vllm_omni.model_executor.models.aura_omni.duplex.stages import AURA_STAGE_LAYOUT, AuraStageLayout
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     SILENT_TEXT,
     is_effectively_silent,
@@ -184,12 +185,18 @@ def _requested_audio_format(context: object | None) -> tuple[str, float | None]:
 
 
 class AuraDataPlaneSession(DuplexDataPlane):
-    """Map Stage1 text + Stage3 audio (or silent) onto duplex events."""
+    """Map AURA text + Code2Wav audio (or silent) onto duplex events."""
 
-    def __init__(self, encode_audio: EncodeAudio) -> None:
+    def __init__(self, encode_audio: EncodeAudio, *, stages: AuraStageLayout = AURA_STAGE_LAYOUT) -> None:
         self._encode_audio = encode_audio
+        self._stages = stages
         self._requests: dict[str, _RequestState] = {}
         self._closed: set[str] = set()
+
+    def configure_stages(self, stages: AuraStageLayout) -> None:
+        if self._requests or self._closed:
+            raise RuntimeError("AURA stage layout must be configured before serving requests")
+        self._stages = stages
 
     def begin_request(self, request_id: str) -> None:
         self._closed.discard(request_id)
@@ -266,6 +273,7 @@ class AuraDataPlaneSession(DuplexDataPlane):
             state.silent = True
             # DIRECT_RESPONSE skips aura2tts. The session runner commits
             # model context from model_context_text; this projector does not.
+            listen_source = metadata.get("listen_source")
             yield _event(
                 stage_role="thinker",
                 is_listen=True,
@@ -277,6 +285,8 @@ class AuraDataPlaneSession(DuplexDataPlane):
                 # Prewarm already reserved Stage2/3 on Stage0 submit. Silent
                 # short-circuit never feeds codec chunks; abort frees those seats.
                 abort_data_plane_request=True,
+                # Who decided to listen (e.g. "aura_silent", "response_judge").
+                **({"listen_source": listen_source} if isinstance(listen_source, str) and listen_source else {}),
             )
             state.terminal = True
             return
@@ -309,7 +319,7 @@ class AuraDataPlaneSession(DuplexDataPlane):
         finished = bool(outer_finished or getattr(output, "finished", False))
         if (
             finished
-            and stage_id == 1
+            and stage_id == self._stages.aura
             and not state.silent
             and not state.context_committed
             and state.text_sent
@@ -324,7 +334,7 @@ class AuraDataPlaneSession(DuplexDataPlane):
                 end_of_turn=False,
                 model_context_text=state.text_sent,
             )
-        is_final_audio_stage = stage_id is None or stage_id >= 3
+        is_final_audio_stage = stage_id is None or stage_id >= self._stages.code2wav
         mm = _multimodal(output, completion)
         audio = _audio_value(mm)
         if audio is not None and not state.silent:
@@ -374,6 +384,7 @@ class AuraDataPlaneSession(DuplexDataPlane):
                 silent=True,
                 model_context_text=SILENT_TEXT,
                 abort_data_plane_request=True,
+                listen_source="aura_silent",
             )
             state.terminal = True
 

@@ -336,6 +336,7 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
         segment_token_ids: tuple[int, ...],
         segment_output_metadata: dict[str, object],
         output: object,
+        streaming_context: object | None = None,
     ) -> DuplexOutputDecision | None:
         del final_stage_id, segment_finished, output
         if stage_id != 0:
