@@ -16,6 +16,7 @@ from typing import Any, NamedTuple, TypeGuard
 import pytest
 
 from tests.dfx.conftest import (
+    assert_baseline_within_tolerance,
     create_paired_omni_benchmark_pytest_params,
     create_test_parameter_mapping,
     get_benchmark_params_for_server,
@@ -587,6 +588,7 @@ def _maybe_write_omniinteract_aggregate_accuracy_result(
         when=when,
     )
     subsets = params.get(_OMNIINTERACT_AGGREGATE_SUBSETS)
+    max_concurrency = result.get("max_concurrency")
     min_ia_qtf1 = params.get(_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1)
     passed = not _is_finite_number(min_ia_qtf1) or pooled.ia_qtf1 >= float(min_ia_qtf1)
     write_dfx_accuracy_result(
@@ -608,7 +610,7 @@ def _maybe_write_omniinteract_aggregate_accuracy_result(
         },
         branch=str(result.get("branch") or os.environ.get("BUILDKITE_BRANCH", "")),
         num_prompts=pooled.num_prompts,
-        max_concurrency=int(result["max_concurrency"]) if isinstance(result.get("max_concurrency"), int) else None,
+        max_concurrency=max_concurrency if isinstance(max_concurrency, int) else None,
         benchmark_exit_code=0 if passed else 1,
         generation={
             "completed": pooled.completed,
@@ -685,7 +687,7 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
             assert _is_finite_number(score) and 0 <= score <= 1, "Omni-DuplexEval correction score is invalid"
 
 
-def assert_result(result, params, num_prompt) -> None:
+def assert_result(result, params, num_prompt, *, check_baseline: bool = False) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
     _assert_fixed_stage_workloads(result, params, num_prompt)
     assert_duplex_artifact_publication(result, params, num_prompt)
@@ -704,6 +706,14 @@ def assert_result(result, params, num_prompt) -> None:
                 assert _is_finite_number(result.get(f"p{percentile}_{metric}{suffix}")), (
                     f"Missing or invalid P{percentile} {metric}"
                 )
+    hardware = result.get("Hardware")
+    if check_baseline:
+        baseline = result.get("baseline")
+        assert_baseline_within_tolerance(
+            result,
+            baseline if isinstance(baseline, dict) else None,
+            hardware if isinstance(hardware, str) else None,
+        )
     if params.get("duplex_performance_only"):
         return
     if params.get("dataset_name") == "omni-duplex-eval":
@@ -768,7 +778,7 @@ def assert_result(result, params, num_prompt) -> None:
     paired_benchmark_params,
     indirect=["omni_server", "benchmark_params"],
 )
-def test_performance_benchmark(omni_server, benchmark_params):
+def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pytest.Config):
     test_name = benchmark_params["test_name"]
     params = dict(benchmark_params["params"])
     dataset_name = params.get("dataset_name", "")
@@ -842,6 +852,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
         "duplex_eval_score_floor_hardware",
         "duplex_performance_only",
         "required_duplex_metrics",
+        "require_speculative_stage",
         "name",
         "enable_negative_prompt",
         "random_request_config",
@@ -902,7 +913,9 @@ def test_performance_benchmark(omni_server, benchmark_params):
             )
             assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
             try:
-                assert_result(result, assert_params, num_prompt)
+                assert_result(
+                    result, assert_params, num_prompt, check_baseline=pytestconfig.getoption("assert_baseline")
+                )
             finally:
                 _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)
 
@@ -938,9 +951,24 @@ def test_performance_benchmark(omni_server, benchmark_params):
             )
             assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
             try:
-                assert_result(result, assert_params, num_prompt)
+                assert_result(
+                    result, assert_params, num_prompt, check_baseline=pytestconfig.getoption("assert_baseline")
+                )
             finally:
                 _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)
+        if (stage_id := params.get("require_speculative_stage")) is not None:
+            import httpx
+            from prometheus_client.parser import text_string_to_metric_families
+
+            response = httpx.get(f"http://{host}:{port}/metrics", timeout=10)
+            response.raise_for_status()
+            assert any(
+                sample.name == "vllm:spec_decode_num_accepted_tokens_total"
+                and sample.labels.get("stage") == str(stage_id)
+                and sample.value > 0
+                for family in text_string_to_metric_families(response.text)
+                for sample in family.samples
+            ), f"Stage {stage_id} accepted no speculative tokens"
     finally:
         if artifact_root is not None:
             artifact_root.cleanup()

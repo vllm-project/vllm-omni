@@ -97,7 +97,7 @@ def _config(stage="thinker", *, embeds=False):
             encoder_cudagraph_max_vision_items_per_batch=2,
             encoder_cudagraph_max_frames_per_batch=None,
         ),
-        parallel_config=SimpleNamespace(tensor_parallel_size=1),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1),
         device_config=SimpleNamespace(device="cpu"),
         speculative_config=None,
     )
@@ -147,6 +147,8 @@ def _runner_factory(model, cfg, supports_mm_inputs=True):
 @pytest.mark.parametrize("stage,enabled", [("thinker", True), ("talker", False), ("code2wav", False), (None, True)])
 def test_real_wrapper_construction_controls_runner_protocol(monkeypatch, stage, enabled):
     model, cfg = _combined(monkeypatch, stage)
+    # The upstream multimodal draft loader reads the outer target config.
+    assert model.config.image_token_index == cfg.model_config.hf_config.thinker_config.image_token_id
     assert supports_encoder_cudagraph(model) is enabled
     manager = _runner_factory(model, cfg)
     assert (manager is not None) is enabled
@@ -445,3 +447,57 @@ def test_chunked_eager_video_matches_one_forward(monkeypatch):
         chunked = model(x, grid)
         whole = model.forward_with_encoder_metadata(x, model.prepare_encoder_metadata(grid))
     torch.testing.assert_close(chunked, whole)
+
+
+@pytest.mark.parametrize("method", ["eagle3", "extract_hidden_states"])
+def test_thinker_rejects_unsupported_aux_method_before_loading(monkeypatch, method):
+    cfg = _config()
+    cfg.speculative_config = SimpleNamespace(method=method)
+    monkeypatch.setattr(outer_module, "init_vllm_registered_model", lambda **kwargs: pytest.fail("loaded model"))
+    with pytest.raises(ValueError, match="only supports DFlash"):
+        outer_module.Qwen3OmniMoeForConditionalGeneration(vllm_config=cfg)
+
+
+@pytest.mark.parametrize("dflash_config", [None, {}, {"target_layer_ids": []}])
+def test_thinker_rejects_missing_dflash_layers_before_loading(monkeypatch, dflash_config):
+    cfg = _config()
+    cfg.speculative_config = SimpleNamespace(
+        method="dflash",
+        use_dflash=lambda: True,
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(dflash_config=dflash_config)),
+    )
+    monkeypatch.setattr(outer_module, "init_vllm_registered_model", lambda **kwargs: pytest.fail("loaded model"))
+    with pytest.raises(ValueError, match="requires non-empty dflash_config.target_layer_ids"):
+        outer_module.Qwen3OmniMoeForConditionalGeneration(vllm_config=cfg)
+
+
+def test_thinker_rejects_dflash_pipeline_parallel_before_loading(monkeypatch):
+    cfg = _config()
+    cfg.parallel_config.pipeline_parallel_size = 2
+    cfg.speculative_config = SimpleNamespace(
+        method="dflash",
+        use_dflash=lambda: True,
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(dflash_config={"target_layer_ids": [3, 31]})),
+    )
+    monkeypatch.setattr(outer_module, "init_vllm_registered_model", lambda **kwargs: pytest.fail("loaded model"))
+    with pytest.raises(ValueError, match="DFlash requires pipeline_parallel_size=1"):
+        outer_module.Qwen3OmniMoeForConditionalGeneration(vllm_config=cfg)
+
+
+@pytest.mark.parametrize("method, tp, pp", [("dflash", 2, 1), ("ngram", 1, 2)])
+def test_thinker_supported_speculation_reaches_model_loading(monkeypatch, method, tp, pp):
+    cfg = _config()
+    cfg.parallel_config.tensor_parallel_size = tp
+    cfg.parallel_config.pipeline_parallel_size = pp
+    cfg.speculative_config = SimpleNamespace(
+        method=method,
+        use_dflash=lambda: method == "dflash",
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(dflash_config={"target_layer_ids": [1, 3]})),
+    )
+
+    def load_model(**kwargs):
+        raise RuntimeError("reached weight loading")
+
+    monkeypatch.setattr(outer_module, "init_vllm_registered_model", load_model)
+    with pytest.raises(RuntimeError, match="reached weight loading"):
+        outer_module.Qwen3OmniMoeForConditionalGeneration(vllm_config=cfg)

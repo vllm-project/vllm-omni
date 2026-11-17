@@ -10,17 +10,28 @@ from typing import Any
 
 import pytest
 
-from tests.dfx.reliability.helpers import FaultModel, scenario_params
+from tests.dfx.reliability.helpers import (
+    FaultModel,
+    launch_scenario_params,
+    scenario_params,
+    sigterm_serve_root_and_assert_cleanup,
+)
 from tests.dfx.reliability.scenarios import (
-    GpuOomLarge,
-    PartialStageIsolation,
+    FullCrashAtLaunch,
+    GpuOomAtLaunch,
+    GpuOomUnderLoad,
+    GracefulShutdown,
+    PartialCrashAtExit,
+    PartialCrashAtLaunch,
     ProcessKillServeRootNoLoad,
     ProcessKillServeRootWithLoad,
     ProcessKillTreeNoLoad,
     ProcessKillTreeWithLoad,
     ProcessKillWorkerNoLoad,
     ProcessKillWorkerWithLoad,
+    ServeRootCrashAtLaunch,
 )
+from tests.dfx.reliability.scenarios.oom import _assert_image_success, run_oom_under_load
 from tests.helpers.mark import hardware_marks
 from vllm_omni.platforms import current_omni_platform
 
@@ -28,15 +39,15 @@ _IMAGE_FAST_FAIL_HTTP_TIMEOUT_SEC = 30
 _DEPLOY_DIR = Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy"
 
 
-def _image_request(server: Any) -> dict[str, Any]:
+def _image_request(server: Any, *, size: str = "512x512", steps: int = 4) -> dict[str, Any]:
     return {
         "json": {
             "model": server.model,
             "prompt": "A simple red apple on a white background.",
-            "size": "512x512",
+            "size": size,
             "n": 1,
             "response_format": "b64_json",
-            "num_inference_steps": 4,
+            "num_inference_steps": steps,
             "guidance_scale": 7.5,
             "seed": 42,
             "bot_task": "none",
@@ -79,18 +90,6 @@ def _reliability_server_params() -> dict[str, Any]:
     return params
 
 
-FAULT_ERROR_KEYWORDS = (
-    "oom",
-    "out of memory",
-    "cuda",
-    "connection",
-    "job failed",
-    "unknown error",
-    "internal server error",
-    "500 server error",
-)
-
-
 class HunyuanImage(FaultModel):
     model_id = "hunyuan_image"
     res = {"cuda": "H100", "rocm": "MI325"}
@@ -108,10 +107,10 @@ class HunyuanImage(FaultModel):
     hard_oom_config = {
         "target_mem_ratio": 0.95,
         "hold_seconds": 0,
-        "startup_timeout_sec": 20,
-        "strict": True,
+        "startup_timeout_sec": 120,
+        "strict": False,
+        "max_free_bytes": 256 * 1024 * 1024,
     }
-    fault_error_keywords = FAULT_ERROR_KEYWORDS
     process_kill_error_keywords = (
         "timeout",
         "did not complete within",
@@ -123,7 +122,6 @@ class HunyuanImage(FaultModel):
         "500",
         "503",
     )
-    oom_large_fail_message = "expected large /v1/images/generations request failure during GPU OOM injection"
 
     def warmup(self, client: Any, server: Any) -> None:
         client.send_images_generations_http_request(_image_request(server))
@@ -139,9 +137,6 @@ class HunyuanImage(FaultModel):
             err_code=500,
         )
 
-    def oom_large_probe(self, client: Any, server: Any) -> None:
-        client.send_images_generations_http_request(_image_request(server))
-
 
 MODEL = HunyuanImage()
 
@@ -152,23 +147,87 @@ pytestmark = [
 ]
 
 
-@scenario_params(MODEL, GpuOomLarge)
-def test_reliability_fault_gpu_oom_large_request_failure(omni_server_function, online_client_function) -> None:
-    GpuOomLarge().run(MODEL, omni_server_function, online_client_function)
+def _run_image_oom_at_load(server: Any, client: Any) -> None:
+    # A larger spatial workload forces different allocation demand from preflight.
+    run_oom_under_load(
+        MODEL,
+        server,
+        client,
+        warmup=_image_request(server, size="512x512", steps=2)["json"],
+        payload=_image_request(server, size="1024x1024", steps=4)["json"],
+        endpoint="/v1/images/generations",
+        success_check=_assert_image_success,
+    )
+
+
+@scenario_params(MODEL, GpuOomUnderLoad)
+def test_gpu_oom_at_load(omni_server_function, online_client_function) -> None:
+    """One injection and large image request with actual OOM evidence.
+
+    Health 200 after removal requires successful replay; 503/unreachable means
+    restart is required, covered only by later successful serial cases.
+    """
+    _run_image_oom_at_load(omni_server_function, online_client_function)
+
+
+@launch_scenario_params(MODEL, GpuOomAtLaunch)
+def test_gpu_oom_at_launch(launch_params) -> None:
+    """Exhaust GPU memory before startup. The failure is observable, and a later start serves."""
+    GpuOomAtLaunch().run(MODEL, launch_params)
+
+
+@launch_scenario_params(MODEL, PartialCrashAtLaunch)
+def test_stage_crash_at_launch(launch_params) -> None:
+    """Kill a stage before readiness; require failure and cleanup, with recovery covered by later serial cases."""
+    PartialCrashAtLaunch().run(MODEL, launch_params)
+
+
+@launch_scenario_params(MODEL, FullCrashAtLaunch)
+def test_process_tree_crash_at_launch(launch_params) -> None:
+    """Kill the startup process tree; later serial cases cover fresh startup and service.
+
+    This case alone does not verify restart recovery.
+    """
+    FullCrashAtLaunch().run(MODEL, launch_params)
+
+
+@launch_scenario_params(
+    MODEL,
+    ServeRootCrashAtLaunch,
+    skip_reason="Worker survives root crash during startup: https://github.com/vllm-project/vllm-omni/issues/10398",
+)
+def test_serve_root_crash_at_launch(launch_params) -> None:
+    """SIGKILL only root before readiness, after a diffusion worker appears.
+
+    Require startup failure and orphan/resource cleanup before harness teardown.
+    Later successful serial cases provide fresh-start recovery coverage.
+    """
+    ServeRootCrashAtLaunch().run(MODEL, launch_params)
+
+
+@scenario_params(MODEL, PartialCrashAtExit)
+def test_stage_crash_at_exit(omni_server_function, online_client_function) -> None:
+    """Begin shutdown, kill one stage, and require timely cleanup.
+
+    Later serial cases cover fresh startup and service; this case does not
+    independently verify restart recovery.
+    """
+    PartialCrashAtExit().run(MODEL, omni_server_function, online_client_function)
 
 
 @scenario_params(MODEL, ProcessKillWorkerNoLoad)
-def test_reliability_fault_process_kill_worker_no_load(
+def test_stage_crash_at_idle(
     omni_server_function,
     online_client_function,
     signal_name: str,
 ) -> None:
-    """After a quiet worker kill, the next request returns HTTP 500, then concurrent requests fail."""
+    """Kill a worker, check failed requests and health, then require SIGTERM cleanup."""
     ProcessKillWorkerNoLoad().run(MODEL, omni_server_function, online_client_function, signal_name)
+    sigterm_serve_root_and_assert_cleanup(omni_server_function, scenario="stage_crash_at_idle")
 
 
 @scenario_params(MODEL, ProcessKillWorkerWithLoad)
-def test_reliability_fault_process_kill_worker_with_load_request_failure(
+def test_stage_crash_at_load(
     omni_server_function,
     online_client_function,
     signal_name: str,
@@ -177,7 +236,7 @@ def test_reliability_fault_process_kill_worker_with_load_request_failure(
 
 
 @scenario_params(MODEL, ProcessKillServeRootNoLoad)
-def test_reliability_fault_process_kill_serve_root_no_load_fast_fail_and_cleanup(
+def test_serve_root_crash_at_idle(
     omni_server_function,
     online_client_function,
     signal_name: str,
@@ -186,7 +245,7 @@ def test_reliability_fault_process_kill_serve_root_no_load_fast_fail_and_cleanup
 
 
 @scenario_params(MODEL, ProcessKillServeRootWithLoad)
-def test_reliability_fault_process_kill_serve_root_with_load_fast_fail_and_cleanup(
+def test_serve_root_crash_at_load(
     omni_server_function,
     online_client_function,
     signal_name: str,
@@ -195,7 +254,7 @@ def test_reliability_fault_process_kill_serve_root_with_load_fast_fail_and_clean
 
 
 @scenario_params(MODEL, ProcessKillTreeNoLoad)
-def test_reliability_fault_process_kill_tree_no_load_fast_fail_and_cleanup(
+def test_process_tree_crash_at_idle(
     omni_server_function,
     online_client_function,
     signal_name: str,
@@ -204,7 +263,7 @@ def test_reliability_fault_process_kill_tree_no_load_fast_fail_and_cleanup(
 
 
 @scenario_params(MODEL, ProcessKillTreeWithLoad)
-def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
+def test_process_tree_crash_at_load(
     omni_server_function,
     online_client_function,
     signal_name: str,
@@ -212,7 +271,7 @@ def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
     ProcessKillTreeWithLoad().run(MODEL, omni_server_function, online_client_function, signal_name)
 
 
-@scenario_params(MODEL, PartialStageIsolation)
-def test_reliability_fault_partial_stage_isolation(omni_server_function, online_client_function) -> None:
-    """Kill one stage or one worker. Requests bound to it fail, and one SIGTERM still exits the API."""
-    PartialStageIsolation().run(MODEL, omni_server_function, online_client_function)
+@scenario_params(MODEL, GracefulShutdown)
+def test_graceful_shutdown(omni_server_function, online_client_function) -> None:
+    """SIGTERM the healthy root; all children and resources must clear within 60s."""
+    GracefulShutdown().run(MODEL, omni_server_function, online_client_function)

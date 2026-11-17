@@ -158,7 +158,7 @@ def test_v2_load_model_calls_ensure_after_publish(monkeypatch):
     runner = object.__new__(V2OmniGPUModelRunner)
     runner._weight_share_backend = None
     runner.use_aux_hidden_state_outputs = False
-    runner._model_returns_tuple = False
+    runner._model_has_structured_output = False
     runner.model = SimpleNamespace(has_preprocess=False)
     runner.supports_mm_inputs = False
     runner.compilation_config = SimpleNamespace(cudagraph_specialize_moe_routing=True)
