@@ -53,7 +53,7 @@ def test_debug_override_takes_precedence_and_normalizes_input():
     ) == ("nightly", "merge", "ready")
 
 
-def test_debug_weekly_selects_seven_unconditional_reliability_jobs():
+def test_debug_weekly_selects_nine_unconditional_reliability_jobs():
     assert SELECTOR.select_amd_test_suites(
         branch="feature",
         labels=(),
@@ -65,9 +65,11 @@ def test_debug_weekly_selects_seven_unconditional_reliability_jobs():
     assert "if" not in group
     assert [step["label"] for step in group["steps"]] == [
         "Reliability Test · qwen3-omni",
+        "Reliability Test · qwen3-omni replicas probe",
         "Reliability Test · wan22",
         "Reliability Test · hunyuan-image",
         "Reliability Test · minicpmo-4.5",
+        "Reliability Test · minicpmo-4.5 replicas probe",
         "Reliability Test · Invalid parameters · MI300 · Single-GPU",
         "Reliability Test · Invalid parameters · MI300 · 2-GPU",
         "Reliability Test · Invalid parameters · Audio · MI300 · Single-GPU",
