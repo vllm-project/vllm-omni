@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
     from vllm_omni.diffusion.models.lingbot_world.leased_post_attention import Lease
+    from vllm_omni.experimental.ar_diffusion.worldkv import WorldKV
 
 
 @dataclass
@@ -68,6 +69,7 @@ class LingBotTransformerCache:
 
     self_attention: list[LingBotAttentionCache | ARDiffusionPagedLayerContext | ARDiffusionPagedLayerInputs]
     cross_attention: list[LingBotAttentionCache | None]
+    worldkv: WorldKV | None = None
 
 
 def allocate_lingbot_cache(
@@ -317,12 +319,13 @@ class LingBotSelfAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         *,
-        cache: LingBotAttentionCache | ARDiffusionPagedLayerInputs,
+        cache: LingBotAttentionCache | ARDiffusionPagedLayerInputs | None,
         current_start: int,
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         sink_tokens: int,
         update_cache: bool = True,
         _projection_lease: Lease | None = None,
+        worldkv_layer: tuple[WorldKV, int] | None = None,
     ) -> torch.Tensor:
         # Project logical [B, S, D] tokens into TP-local
         # [B, S, num_local_heads, head_dim].
@@ -353,7 +356,11 @@ class LingBotSelfAttention(nn.Module):
             )
             query, key, value = qkv.unbind(2)
 
-        if isinstance(cache, ARDiffusionPagedLayerInputs):
+        if worldkv_layer is not None:
+            memory, layer = worldkv_layer
+            visible_key, visible_value = memory.assemble(layer, query, key, value)
+            output = self.attn(query, visible_key, visible_value)
+        elif isinstance(cache, ARDiffusionPagedLayerInputs):
             if query.shape[0] != 1:
                 raise RuntimeError("LingBot AR-Diffusion paged attention requires batch_size=1.")
             output = paged_write_attn(
@@ -366,6 +373,8 @@ class LingBotSelfAttention(nn.Module):
                 self.head_dim**-0.5,
             ).unsqueeze(0)
         else:
+            if cache is None:
+                raise ValueError("LingBot self-attention requires a cache unless WorldKV owns the history.")
             # The direct path sees history + current K/V even when the caller
             # asks not to mutate persistent cache state.
             visible_key, visible_value = self._update_cache(
@@ -411,6 +420,7 @@ class LingBotSelfAttention(nn.Module):
                     max_query_len=query.shape[1],
                     max_seq_len=visible_key.shape[1],
                     softmax_scale=self.head_dim**-0.5,
+                    npu_lengths=(query.shape[1], visible_key.shape[1]) if query.device.type == "npu" else None,
                 )
             else:
                 output = self.attn(query, visible_key, visible_value)
@@ -635,13 +645,14 @@ class LingBotAttentionBlock(nn.Module):
         timestep_projection: torch.Tensor,
         camera_hidden_states: torch.Tensor,
         *,
-        self_cache: LingBotAttentionCache | ARDiffusionPagedLayerInputs,
+        self_cache: LingBotAttentionCache | ARDiffusionPagedLayerInputs | None,
         cross_cache: LingBotAttentionCache | None,
         current_start: int,
         sink_tokens: int,
         update_cache: bool,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         camera_modulation: tuple[torch.Tensor, torch.Tensor] | None = None,
+        worldkv_layer: tuple[WorldKV, int] | None = None,
     ) -> tuple[torch.Tensor, LingBotAttentionCache]:
         batch_size, token_count, dim = hidden_states.shape
         if (
@@ -676,6 +687,8 @@ class LingBotAttentionBlock(nn.Module):
             post_context = nullcontext(None)
         with post_context as lease:
             projection_kwargs = {"_projection_lease": lease} if lease is not None else {}
+            if worldkv_layer is not None:
+                projection_kwargs["worldkv_layer"] = worldkv_layer
             attention_output = self.self_attn(
                 normalized,
                 cache=self_cache,
@@ -822,10 +835,11 @@ class CameraModulationCache:
     block, ``generate_block`` one per loop, and nothing here checks the camera tensor for change.
     """
 
-    __slots__ = ("entries",)
+    __slots__ = ("entries", "prepared")
 
     def __init__(self) -> None:
         self.entries: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.prepared: tuple[tuple, tuple[torch.Tensor, torch.Tensor], torch.Tensor] | None = None
 
 
 class CausalLingBotWorldTransformer3DModel(nn.Module):
@@ -1092,6 +1106,18 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         )
         max_tokens = int(window_frames * post_patch_height * post_patch_width)
         num_local_heads = self.blocks[0].self_attn.num_sp_heads
+        memory_config = getattr(self, "worldkv_config", None)
+        if memory_config is not None:
+            from vllm_omni.experimental.ar_diffusion.worldkv import WorldKV
+
+            if batch_size != 1:
+                raise ValueError("worldkv requires batch_size=1")
+            memory = WorldKV(
+                memory_config,
+                num_layers=self.config.num_layers,
+                tokens_per_frame=post_patch_height * post_patch_width,
+            )
+            return LingBotTransformerCache([], [None] * self.config.num_layers, worldkv=memory)
         return allocate_lingbot_cache(
             batch_size=batch_size,
             num_layers=self.config.num_layers,
@@ -1198,7 +1224,9 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             raise ValueError("Video, text, and camera tensors must use the same dtype.")
         if timestep.device != hidden_states.device:
             raise ValueError("timestep must be on the same device as hidden_states.")
-        if len(cache.self_attention) != self.config.num_layers or len(cache.cross_attention) != self.config.num_layers:
+        if (cache.worldkv is None and len(cache.self_attention) != self.config.num_layers) or len(
+            cache.cross_attention
+        ) != self.config.num_layers:
             raise ValueError("LingBotTransformerCache layer counts must match num_layers.")
         return batch_size, frames, height, width, patch_frames
 
@@ -1264,6 +1292,35 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         update_cache: bool,
         camera_modulation_cache: CameraModulationCache | None = None,
     ) -> torch.Tensor:
+        transaction = (
+            cache.worldkv.forward(start_frame, hidden_states.shape[2], commit=update_cache)
+            if cache.worldkv is not None
+            else nullcontext()
+        )
+        with transaction:
+            return self._forward(
+                hidden_states,
+                timestep,
+                encoder_hidden_states,
+                camera_hidden_states,
+                cache=cache,
+                start_frame=start_frame,
+                update_cache=update_cache,
+                camera_modulation_cache=camera_modulation_cache,
+            )
+
+    def _forward(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        camera_hidden_states: torch.Tensor,
+        *,
+        cache: LingBotTransformerCache,
+        start_frame: int,
+        update_cache: bool,
+        camera_modulation_cache: CameraModulationCache | None = None,
+    ) -> torch.Tensor:
         if not isinstance(update_cache, bool):
             raise ValueError("update_cache must be a boolean.")
         batch_size, frames, height, width, patch_frames = self._validate_inputs(
@@ -1282,24 +1339,41 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         patched_start_frame = start_frame // patch_frames
         current_start = patched_start_frame * tokens_per_frame
         sink_tokens = self.config.sink_size * tokens_per_frame
-        # Phase 1: create absolute 3D positions for this causal block. The
-        # spatial coordinates restart for every frame; temporal coordinates
-        # begin at ``start_frame`` so cached blocks retain their true ordering.
-        rotary_emb = self._rotary_embedding(
-            frames=patched_frames,
-            height=patched_height,
-            width=patched_width,
-            start_frame=patched_start_frame,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
+        # The caller owns an immutable camera condition for the lifetime of
+        # CameraModulationCache (one AR block). Cache before SP sharding, so
+        # every forward still passes through the same SP hooks and layouts.
+        prepared = None
+        if camera_modulation_cache is not None and not torch.is_grad_enabled():
+            prepared = camera_modulation_cache.prepared
+        signature = (
+            id(self),
+            patched_frames,
+            patched_height,
+            patched_width,
+            patched_start_frame,
+            hidden_states.dtype,
+            hidden_states.device,
         )
-        # Phase 2: independently patchify video and camera grids to identical
-        # token layouts, then project timestep and text conditions.
+        if prepared is not None and prepared[0] != signature:
+            raise ValueError("CameraModulationCache must be recreated for each AR block and model")
+        if prepared is None:
+            rotary_emb = self._rotary_embedding(
+                frames=patched_frames,
+                height=patched_height,
+                width=patched_width,
+                start_frame=patched_start_frame,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            camera_hidden_states = self.patch_embedding_wancamctrl(camera_hidden_states)
+            camera_hidden_states = camera_hidden_states + self.c2ws_hidden_states_layer2(
+                F.silu(self.c2ws_hidden_states_layer1(camera_hidden_states))
+            )
+            if camera_modulation_cache is not None and not torch.is_grad_enabled():
+                camera_modulation_cache.prepared = (signature, rotary_emb, camera_hidden_states)
+        else:
+            _, rotary_emb, camera_hidden_states = prepared
         hidden_states = self.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
-        camera_hidden_states = self.patch_embedding_wancamctrl(camera_hidden_states)
-        camera_hidden_states = camera_hidden_states + self.c2ws_hidden_states_layer2(
-            F.silu(self.c2ws_hidden_states_layer1(camera_hidden_states))
-        )
         if hidden_states.shape != camera_hidden_states.shape:
             raise ValueError("Patched video and camera token shapes must match.")
 
@@ -1331,6 +1405,11 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                 query_len=hidden_states.shape[1],
             )
             cache.self_attention = [layer_context.to_layer_inputs() for layer_context in cache.self_attention]
+            if hidden_states.device.type == "npu":
+                # prepare() already owns these exact valid lengths on the CPU.
+                # Keep them forward-local: max_seq_len includes padded capacity.
+                lengths = (int(forward_context.query_len), int(forward_context.kv_len))
+                cache.self_attention = [entry._replace(npu_lengths=lengths) for entry in cache.self_attention]
         sp_size = self.blocks[0].self_attn.ulysses_world_size
         global_tokens = patched_frames * tokens_per_frame
         hidden_dim = hidden_states.shape[-1]
@@ -1376,7 +1455,8 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                 timestep_projection,
                 camera_hidden_states,
                 camera_modulation=camera_modulation,
-                self_cache=cache.self_attention[index],
+                **({"worldkv_layer": (cache.worldkv, index)} if cache.worldkv is not None else {}),
+                self_cache=cache.self_attention[index] if cache.worldkv is None else None,
                 cross_cache=cache.cross_attention[index],
                 current_start=current_start,
                 sink_tokens=sink_tokens,

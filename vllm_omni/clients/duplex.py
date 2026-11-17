@@ -41,7 +41,7 @@ import time
 import wave
 from abc import ABC, abstractmethod
 from bisect import bisect_left, bisect_right, insort
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Container, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict
@@ -509,6 +509,13 @@ _FATAL_RESUME_CODES = frozenset(
         "session_resume_conflict",
     }
 )
+
+#: Error codes a duplex server uses to refuse a ``response.create``: the
+#: committed turn holds nothing the model can answer, so no response will ever
+#: be produced for that ask. A caller waiting on such a request should treat
+#: these as a definitive answer rather than as a failure -- and, symmetrically,
+#: must not read them as a health signal about the session.
+DEFINITIVE_REFUSAL_CODES = frozenset({"response_create_without_input", "text_only_turn_unsupported"})
 
 
 def wrap_event(raw: dict[str, object]) -> DuplexEvent:
@@ -1275,7 +1282,14 @@ class DuplexClient(DuplexClientBase):
         except ImportError as exc:  # pragma: no cover - websockets is a pinned dep
             raise DuplexConnectionError("The duplex client requires the 'websockets' package") from exc
         try:
-            return await websockets.connect(url, additional_headers=self._extra_headers, max_size=_MAX_FRAME_BYTES)
+            # Startup warmup can hold the HTTP upgrade before session.created.
+            # Use the caller's handshake budget for this transport phase too.
+            return await websockets.connect(
+                url,
+                additional_headers=self._extra_headers,
+                max_size=_MAX_FRAME_BYTES,
+                open_timeout=self._handshake_timeout_s,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1590,8 +1604,18 @@ class EventCollector:
             chunk for response_id in self.response_ids for chunk in self.response_audio.get(response_id, ())
         )
 
-    def errors(self) -> list[dict[str, object]]:
-        return [event for event in self.events if event.get("type") == "error"]
+    def errors(self, exclude_indexes: Container[int] = frozenset()) -> list[dict[str, object]]:
+        """Collected ``error`` events, optionally skipping forgive-list indexes.
+
+        ``exclude_indexes`` refers to positions in :attr:`events`, so callers
+        that forgive specific errors keep a single definition of what an error
+        is instead of re-filtering ``events`` themselves.
+        """
+        return [
+            event
+            for index, event in enumerate(self.events)
+            if event.get("type") == "error" and index not in exclude_indexes
+        ]
 
     def response_is_done(self, response_id: str) -> bool:
         return any(
