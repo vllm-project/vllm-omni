@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import math
 import os
@@ -11,6 +12,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import fields, replace
+from functools import partial
 from itertools import groupby
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
@@ -1336,7 +1338,8 @@ class MiniMaxH3Pipeline(
         self.audio_vae = None
         if self.load_vae_decoder:
             lightvae_decoder_path = resolve_h3_lightvae_decoder_path(od_config.additional_config or {})
-            self.video_vae = MiniMaxH3VideoVAE(
+            video_vae_factory = partial(
+                MiniMaxH3VideoVAE,
                 os.path.join(vae_model_path, "video_vae"),
                 device=self.device,
                 load_device=component_load_device,
@@ -1355,13 +1358,19 @@ class MiniMaxH3Pipeline(
                     current_omni_platform,
                 ),
             )
-            self.audio_vae = MiniMaxH3AudioVAE(
+            audio_vae_factory = partial(
+                MiniMaxH3AudioVAE,
                 os.path.join(vae_model_path, "audio_vae"),
                 device=self.device,
                 load_device=component_load_device,
                 decode_only=not self.load_vae_encoder,
                 trust_remote_code=od_config.trust_remote_code,
             )
+            if file_backed:
+                self._file_backed_vae_factories = (video_vae_factory, audio_vae_factory)
+            else:
+                self.video_vae = video_vae_factory()
+                self.audio_vae = audio_vae_factory()
         # Registry-side VAE patch-parallel discovery uses ``pipeline.vae``.
         self.vae = self.video_vae
 
@@ -1424,6 +1433,32 @@ class MiniMaxH3Pipeline(
             planned_weights.update(source.prefix + entry["runtime_name"] for entry in entries if not entry["buffer"])
         return frozenset(prefixes), planned_weights
 
+    @contextmanager
+    def _file_backed_vaes(self, *, encode_only: bool = False):
+        """Load and release native VAEs per stage only for file-backed offload."""
+        factories = getattr(self, "_file_backed_vae_factories", None)
+        if factories is None:
+            yield
+            return
+        video_factory, audio_factory = factories
+        try:
+            if encode_only:
+                self.video_vae = video_factory(
+                    encode_only=True, decode_only=False, decoder_source=None, lightvae_decoder_path=None, pin_memory=False
+                )
+            else:
+                # Reuse full native loading, including the unused video encoder.
+                self.video_vae = video_factory(decode_only=False, pin_memory=False)
+                self.audio_vae = audio_factory(decode_only=False, pin_memory=False)
+            self.vae = self.video_vae
+            yield
+        finally:
+            self.vae = self.video_vae = self.audio_vae = None
+            # Part proxies retain their VAE owner; discard those cycles and CPU
+            # staging snapshots before the next model allocates its weights.
+            gc.collect()
+            self._release_stage_cache()
+
     def load_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
@@ -1466,8 +1501,8 @@ class MiniMaxH3Pipeline(
                 self._finish_adaln_sidecar(component)
             loaded_prefix = "transformer.controlnet." if prefix == "controlnet." else prefix
             loaded_with_prefix.update(loaded_prefix + name for name in loaded)
-        # Both VAEs load eagerly in ``__init__`` rather than through
-        # ``weights_sources``. The text encoder uses the shared component
+        # Native VAEs load outside ``weights_sources`` (per codec stage for
+        # file-backed offload). The text encoder uses the shared component
         # loader so online quantization and offload processing follow the same
         # path as the DiT.
         for component_name in ("video_vae", "audio_vae", "latent_upscaler"):
@@ -2756,14 +2791,15 @@ class MiniMaxH3Pipeline(
         cached = context.get(_REFINE_KEYFRAME_CONDITION)
         if cached is None:
             target = context["latent_upscale"]
-            cached = self._encode_visual_conditions(
-                [
-                    image.resize((target.width, target.height), Image.Resampling.LANCZOS)
-                    for image in context["keyframe_images"]
-                ],
-                None,
-                video_count=0,
-            )
+            with self._file_backed_vaes(encode_only=True):
+                cached = self._encode_visual_conditions(
+                    [
+                        image.resize((target.width, target.height), Image.Resampling.LANCZOS)
+                        for image in context["keyframe_images"]
+                    ],
+                    None,
+                    video_count=0,
+                )
             context[_REFINE_KEYFRAME_CONDITION] = cached
         return cached
 
@@ -3160,7 +3196,9 @@ class MiniMaxH3Pipeline(
                 for index, prompt in enumerate(prompts[1:], start=2):
                     logger.info("MiniMax H3 encoding continuation prompt %d/%d", index, len(prompts))
                     window_text.append(self.encode_prompt(replace(prepared, prompt=prompt) if rank == 0 else None))
-            media = self._encode_local_media(prepared.media if prepared is not None else None)
+            media_input = prepared.media if prepared is not None else None
+            with self._file_backed_vaes(encode_only=True):
+                media = self._encode_local_media(media_input)
             if initial_noise is not None:
                 assert request_context is not None
                 request_context["precomputed_initial_noise"] = initial_noise.result()
@@ -4001,43 +4039,44 @@ class MiniMaxH3Pipeline(
                 videos.append(video_latent)
                 audios.append(audio_latent)
                 continue
-            if context["preencode_mp4"]:
-                videos.append(
-                    self.decode_to_mp4(
+            with self._file_backed_vaes():
+                if context["preencode_mp4"]:
+                    videos.append(
+                        self.decode_to_mp4(
+                            video_latent,
+                            audio_latent,
+                            height=height,
+                            width=width,
+                            video_codec_options=context["video_codec_options"],
+                            batch_frames=context["preencode_batch_frames"],
+                            frame_counts=frame_counts,
+                            trim=trim,
+                        )
+                    )
+                    audios.append(None)
+                else:
+                    video, audio = self.decode(
                         video_latent,
                         audio_latent,
                         height=height,
                         width=width,
-                        video_codec_options=context["video_codec_options"],
-                        batch_frames=context["preencode_batch_frames"],
-                        frame_counts=frame_counts,
-                        trim=trim,
                     )
-                )
-                audios.append(None)
-            else:
-                video, audio = self.decode(
-                    video_latent,
-                    audio_latent,
-                    height=height,
-                    width=width,
-                )
-                if trim is not None:
-                    # Decode keeps the real tail as causal context; return only new frames.
-                    video, audio = trim_decoded_overlap(video, audio, **trim)
-                # Rebind rather than append the expression: the local would
-                # otherwise keep the decoded frames' device storage alive for the
-                # rest of the iteration, and the next seed's diffuse() -- the DiT
-                # reload this release exists to make room for -- runs before the
-                # loop rebinds it. post_decode() rebinds for the same reason.
-                video = self._offload_model_cpu_stage_output(_prepare_minimax_h3_video_output(video))
-                videos.append(video)
-                # The FP32 decoded frames are quantized into the appended uint8
-                # tensor; drop the reference and return the idle pages instead of
-                # holding them through the next output's denoise/decode.
-                del video
-                self._release_stage_cache()
-                audios.append(audio)
+                    if trim is not None:
+                        # Decode keeps the real tail as causal context; return only new frames.
+                        video, audio = trim_decoded_overlap(video, audio, **trim)
+                    # Rebind rather than append the expression: the local would
+                    # otherwise keep the decoded frames' device storage alive for the
+                    # rest of the iteration, and the next seed's diffuse() -- the DiT
+                    # reload this release exists to make room for -- runs before the
+                    # loop rebinds it. post_decode() rebinds for the same reason.
+                    video = self._offload_model_cpu_stage_output(_prepare_minimax_h3_video_output(video))
+                    videos.append(video)
+                    # The FP32 decoded frames are quantized into the appended uint8
+                    # tensor; drop the reference and return the idle pages instead of
+                    # holding them through the next output's denoise/decode.
+                    del video
+                    self._release_stage_cache()
+                    audios.append(audio)
         if not self.load_vae_decoder:
             return self._decoder_stage_output(
                 videos, audios, {**context, "height": height, "width": width, "trim": trim}

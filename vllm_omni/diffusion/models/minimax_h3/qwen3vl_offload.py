@@ -23,7 +23,7 @@ class Qwen3VLBlockOffloader(FileBackedBlockOffloader):
         encoder: MiniMaxH3Qwen3VLEncoder,
         root: str | Path,
         *,
-        num_slots: int = 6,
+        num_slots: int = 3,
     ) -> None:
         from .encoder import _fused_source_shards
 
