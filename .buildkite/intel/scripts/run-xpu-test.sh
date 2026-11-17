@@ -129,7 +129,7 @@ time timeout -k 30 30m docker run \
     set -e
     echo $ZE_AFFINITY_MASK
     pip install tblib==3.1.0
-    cd /workspace/vllm-omni
+    cd /vllm-omni
     XPU_TEST_PATHS="tests/diffusion tests/dfx tests/e2e tests/platforms"
         case "$XPU_TEST_SUITE" in
             all)

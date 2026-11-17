@@ -19,7 +19,7 @@ steps:
           - intel_xpu_platform_function
         timeout_in_minutes: 60
         commands:
-          - bash /workspace/vllm-omni/.buildkite/intel/scripts/run-xpu-test-k8s.sh core_model
+          - bash /vllm-omni/.buildkite/intel/scripts/run-xpu-test-k8s.sh core_model
         agents:
           queue: intel-gpu-k8s
         plugins: &intel-xpu-k8s-plugins
@@ -81,7 +81,7 @@ steps:
         source_file_dependencies: diffusion_quantization
         timeout_in_minutes: 30
         commands:
-          - bash /workspace/vllm-omni/.buildkite/intel/scripts/run-xpu-test-k8s.sh quantization
+          - bash /vllm-omni/.buildkite/intel/scripts/run-xpu-test-k8s.sh quantization
         agents:
           queue: intel-gpu-k8s
         plugins: *intel-xpu-k8s-plugins
@@ -95,7 +95,7 @@ steps:
           - intel_xpu_platform_function
         timeout_in_minutes: 60
         commands:
-          - bash /workspace/vllm-omni/.buildkite/intel/scripts/run-xpu-test-k8s.sh advanced_model
+          - bash /vllm-omni/.buildkite/intel/scripts/run-xpu-test-k8s.sh advanced_model
         agents:
           queue: intel-gpu-k8s
         plugins: *intel-xpu-k8s-plugins
@@ -104,7 +104,7 @@ steps:
         source_file_dependencies: intel_xpu_omni_tts_function
         timeout_in_minutes: 60
         commands:
-          - bash /workspace/vllm-omni/.buildkite/intel/scripts/run-xpu-test-k8s.sh omni
+          - bash /vllm-omni/.buildkite/intel/scripts/run-xpu-test-k8s.sh omni
         agents:
           queue: intel-gpu-k8s
         plugins: *intel-xpu-k8s-plugins
