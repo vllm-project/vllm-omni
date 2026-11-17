@@ -61,6 +61,7 @@ from vllm_omni.entrypoints.openai.serving_speech import (
     OmniOpenAIServingSpeech,
     _audio_duration_seconds,
     _audio_format_headers,
+    _coerce_sample_rate,
     _create_wav_header,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.base import (
@@ -522,7 +523,8 @@ async def test_server_worker_applies_speech_only_endpoint_restrictions(
     mocker.patch.object(api_server_module, "build_async_omni", fake_build_async_omni)
     mocker.patch.object(api_server_module, "omni_init_app_state", fake_init_app_state)
     mocker.patch.object(api_server_module, "serve_http", fake_serve_http)
-    mocker.patch.object(api_server_module.STORAGE_MANAGER, "start", new=mocker.AsyncMock())
+    storage_start = mocker.patch.object(api_server_module.STORAGE_MANAGER, "start", new=mocker.AsyncMock())
+    storage_stop = mocker.patch.object(api_server_module.STORAGE_MANAGER, "stop", new=mocker.AsyncMock())
     mocker.patch.object(api_server_module.openai_app_state, "_get_vllm_config", new=mocker.AsyncMock(return_value=None))
     mocker.patch.object(api_server_module, "get_uvicorn_log_config", return_value=None)
     args = api_server_module.make_arg_parser(FlexibleArgumentParser()).parse_args([])
@@ -626,6 +628,8 @@ async def test_server_worker_applies_speech_only_endpoint_restrictions(
     speech_handler.create_speech.assert_awaited_once()
     speech_handler.create_speech_batch.assert_awaited_once()
     speech_handler.shutdown.assert_called_once()
+    storage_start.assert_awaited_once_with(on_expire=api_server_module.VIDEO_STORE.remove_many)
+    storage_stop.assert_awaited_once_with()
     engine.generate.assert_not_awaited()
     sock.close.assert_called_once()
 
@@ -3575,8 +3579,8 @@ class TestTTSMethods:
         speech_server._adapter = adapter
         speech_server._tts_tokenizer = mocker.Mock(unk_token_id=-1)
         speech_server._tts_tokenizer.encode.return_value = [1]
-        speech_server._tts_tokenizer.convert_tokens_to_ids.side_effect = (
-            lambda token: 888 if token == "<audioPatch>" else -1
+        speech_server._tts_tokenizer.convert_tokens_to_ids.side_effect = lambda token: (
+            888 if token == "<audioPatch>" else -1
         )
         mock_prompt = mocker.spy(adapter, "_build_ming_dense_prompt")
 
@@ -4117,6 +4121,7 @@ def _build_streaming_speech_app(
     mocker: MockerFixture,
     chunk: torch.Tensor | None = None,
     sample_rate: int | None = None,
+    sparse_first: bool = False,
 ) -> FastAPI:
     """Speech app whose mock engine yields one intermediate then one final chunk.
 
@@ -4128,10 +4133,17 @@ def _build_streaming_speech_app(
     if chunk is None:
         chunk = torch.sin(torch.linspace(0, 440 * 2 * torch.pi, 24000))
 
-    def _make_output(finished: bool) -> OmniRequestOutput:
-        mm_output: dict = {"audio": chunk}
-        if sample_rate is not None:
-            mm_output["sr"] = torch.tensor(sample_rate)
+    def _make_output(
+        finished: bool,
+        *,
+        output_chunk: torch.Tensor = chunk,
+        output_sample_rate: int | torch.Tensor | None = sample_rate,
+    ) -> OmniRequestOutput:
+        mm_output: dict = {"audio": output_chunk}
+        if output_sample_rate is not None:
+            mm_output["sr"] = (
+                output_sample_rate if isinstance(output_sample_rate, torch.Tensor) else torch.tensor(output_sample_rate)
+            )
 
         class MockCompletionOutput:
             def __init__(self, index: int = 0):
@@ -4162,7 +4174,14 @@ def _build_streaming_speech_app(
         )
 
     async def mock_generate_streaming(*args, **kwargs):
-        yield _make_output(finished=False)
+        if sparse_first:
+            yield _make_output(
+                finished=False,
+                output_chunk=torch.empty(0),
+                output_sample_rate=torch.empty(0),
+            )
+        else:
+            yield _make_output(finished=False)
         yield _make_output(finished=True)
 
     mock_engine_client.generate = mocker.MagicMock(side_effect=mock_generate_streaming)
@@ -4231,6 +4250,21 @@ class TestStreamingResponse:
         client = TestClient(streaming_app)
         response = client.post("/v1/audio/speech", json={"input": "Hello", "stream": True, "response_format": "pcm"})
         self._assert_sse_audio_response(response)
+
+    def test_streaming_ignores_empty_sparse_sample_rate_before_audio(self, mocker: MockerFixture):
+        """An empty sparse step must not become the stream's first audio chunk."""
+        app = _build_streaming_speech_app(mocker, sample_rate=22050, sparse_first=True)
+        response = TestClient(app).post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream": True, "response_format": "wav"},
+        )
+
+        self._assert_sse_audio_response(response, response_format="wav")
+        assert "event: speech.audio.error" not in response.text
+
+    def test_sparse_sample_rate_uses_last_nonempty_value(self):
+        """A trailing empty carrier must not hide an earlier request's rate."""
+        assert _coerce_sample_rate([torch.tensor(22050), torch.empty(0)]) == 22050
 
     def test_stream_format_audio_streaming(self, streaming_app):
         """stream_format=audio without stream=True returns raw audio/pcm chunks."""

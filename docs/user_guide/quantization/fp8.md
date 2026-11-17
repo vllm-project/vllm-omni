@@ -28,6 +28,29 @@ in deep DiT blocks.
 Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this
 guide. FP8 on Ampere may use a weight-only path where available.
 
+### Online blockwise FP8
+
+The upstream `fp8_per_block` method is also available through Omni's
+quantization factory. It quantizes checkpoint weights in 128×128 blocks and
+uses dynamic activation scales for groups of 128 elements. For DiT-only
+quantization, use:
+
+```bash
+vllm serve <model> --omni \
+  --diffusion-quantization-config '{"transformer":{"method":"fp8_per_block"}}'
+```
+
+The Python equivalent is
+`quantization_config={"transformer": {"method": "fp8_per_block"}}` when
+constructing `Omni`. Kernel availability depends on the installed vLLM runtime
+and GPU. This path reuses vLLM's online blockwise FP8 implementation; it does
+not require the CUDA MXFP8 adapter. MXFP8 uses a different scaling format and
+is selected with `mxfp8`.
+
+For the separate ROCm-specific `online_block_size` option, which exposes
+32/64/128-element groups through the `fp8` method, see
+[Online FP8 Block Scaling](rocm_online_fp8.md).
+
 ### Faster FP8 GEMM on Blackwell (quack)
 
 On Blackwell (SM 100+), vLLM runs FP8 linears through the FlashInfer kernel, which

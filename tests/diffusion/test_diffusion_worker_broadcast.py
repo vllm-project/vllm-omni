@@ -3,6 +3,7 @@
 
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -76,6 +77,8 @@ def test_busy_loop_releases_failed_rpc_traceback_and_device_cache(monkeypatch):
     original = RuntimeError("model execution failed")
     worker_proc = WorkerProc.__new__(WorkerProc)
     worker_proc.gpu_id = 0
+    worker_proc.od_config = SimpleNamespace(step_execution=False)
+    worker_proc._wait_chunk_outputs = Mock(return_value=True)
     worker_proc.mq = Mock()
     worker_proc.mq.dequeue.side_effect = [
         {
@@ -125,6 +128,8 @@ def test_busy_loop_sync_error_reply_keeps_client_error_metadata(monkeypatch, dp_
 
     worker_proc = WorkerProc.__new__(WorkerProc)
     worker_proc.gpu_id = 0
+    worker_proc.od_config = SimpleNamespace(step_execution=False)
+    worker_proc._wait_chunk_outputs = Mock(return_value=True)
     worker_proc.mq = Mock()
     worker_proc.mq.dequeue.side_effect = [
         {
@@ -167,6 +172,8 @@ def test_busy_loop_logs_client_rpc_errors_without_traceback(monkeypatch, client_
     exc = OmniClientError("bad overlap") if client_error else RuntimeError("cuda failed")
     worker_proc = WorkerProc.__new__(WorkerProc)
     worker_proc.gpu_id = 0
+    worker_proc.od_config = SimpleNamespace(step_execution=False)
+    worker_proc._wait_chunk_outputs = Mock(return_value=True)
     worker_proc.mq = Mock()
     worker_proc.mq.dequeue.side_effect = [
         {"type": "rpc", "method": "execute_model", "args": (), "kwargs": {}, "rpc_id": "7"},
@@ -258,6 +265,8 @@ def test_busy_loop_preserves_order_when_overflow_payload_is_delayed(monkeypatch)
     recording_worker = _RecordingWorker()
     worker_proc = WorkerProc.__new__(WorkerProc)
     worker_proc.gpu_id = 0
+    worker_proc.od_config = SimpleNamespace(step_execution=False)
+    worker_proc._wait_chunk_outputs = Mock(return_value=True)
     worker_proc.mq = reader
     worker_proc.worker = recording_worker
     worker_proc.result_mq = None

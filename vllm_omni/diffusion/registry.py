@@ -54,11 +54,6 @@ _DIFFUSION_MODELS = {
         "pipeline_qwen_image_edit_plus",
         "QwenImageEditPlusPipeline",
     ),
-    "JoyImageEditPipeline": (
-        "joy_image",
-        "pipeline_joy_image_edit",
-        "JoyImageEditPipeline",
-    ),
     "QwenImageLayeredPipeline": (
         "qwen_image",
         "pipeline_qwen_image_layered",
@@ -459,6 +454,11 @@ _DIFFUSION_MODELS = {
         "pipeline_anima",
         "AnimaPipeline",
     ),
+    "Praxis1Pipeline": (
+        "praxis1",
+        "pipeline_praxis1",
+        "Praxis1Pipeline",
+    ),
     "PhysisH3Pipeline": ("physis.h3", "pipeline_physis_h3", "PhysisH3Pipeline"),
     "PhysisLTXPipeline": ("physis.ltx", "pipeline_physis_ltx", "PhysisLTXPipeline"),
     "PhysisWanPipeline": ("physis.wan", "pipeline_physis_wan", "PhysisWanPipeline"),
@@ -542,6 +542,8 @@ def supports_mixfusion(od_config: OmniDiffusionConfig) -> bool:
 
 
 _NO_CACHE_ACCELERATION = {
+    # Praxis-1 jointly denoises video and actions in its own Euler window loop.
+    "Praxis1Pipeline",
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
     "AnimaPipeline",
@@ -776,7 +778,6 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "AnimaPipeline": "get_anima_post_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_post_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_post_process_func",
-    "JoyImageEditPipeline": "get_joy_image_edit_post_process_func",
     "QwenImage21Pipeline": "get_qwen_image_21_post_process_func",
     "GlmImagePipeline": "get_glm_image_post_process_func",
     "ZImagePipeline": "get_post_process_func",
@@ -876,7 +877,6 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "BooguImageTurboPipeline": "get_boogu_image_pre_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_pre_process_func",
-    "JoyImageEditPipeline": "get_joy_image_edit_pre_process_func",
     "QwenImage21Pipeline": "get_qwen_image_21_pre_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_edit_pre_process_func",
     "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_pre_process_func",

@@ -29,6 +29,26 @@ recommended batching deploy isolates the Thinker on GPU 0 and
 co-locates Talker and Code2Wav on GPU 1; 1-GPU, 3-GPU, and 8x4090 layouts are
 also provided.
 
+## Seed-TTS defaults
+
+Seed-TTS optimization settings are included in the default
+[`minicpmo_4_5.yaml`](../../vllm_omni/deploy/minicpmo_4_5.yaml)
+deployment. It places all three stages and two Code2Wav replicas
+on logical GPU 0, enables grouped reference setup and Flow FP16, and disables
+Thinker prefix caching for ngram speculation. Measurements used private CUDA
+MPS and one large-memory L20X; this is not a qualified production preset.
+The CUDA profile also drops unused upstream CFM attention buffers before
+placing Code2Wav on the device; its batched backend owns the active caches.
+
+```bash
+vllm serve openbmb/MiniCPM-o-4_5 --omni --trust-remote-code \
+  --stage-configs-path vllm_omni/deploy/minicpmo_4_5_turn.yaml
+```
+
+See the [performance contract](../../docs/design/minicpm_o45_mrv2_performance.md#seed-tts-experimental-optimization-bundle)
+for controls and performance-evidence limits. CPU background
+reference extraction remains disabled because it regressed the C16 screen.
+
 ## References
 
 - Default deploy configs (auto-loaded by HF `model_type=minicpmo` +
@@ -72,19 +92,14 @@ Code2Wav consumes them through a shared-memory async connector.
 
 ### Default model runner
 
-On CUDA the default deployment runs the Thinker and Code2Wav on Model Runner V2.
-The Talker stays on V1 because its multi-frame decode runs only on V1;
-`minicpmo_4_5_turn_mrv2.yaml` runs all three stages on V2 with single-frame
-Talker decode. Other platforms retain Model Runner V1. Every stage keeps `async_chunk: true`.
+The default CUDA deployment runs all three stages on Model Runner V2. The
+Talker uses FlashAttention and decodes up to sixteen codec frames per K-step.
+`minicpmo_4_5_turn.yaml` inherits these settings for ordinary HTTP serving.
 
-The ordinary turn profile inherits the CUDA V2 default and enables Thinker
-prefix caching on CUDA. MRv2 restores cached latent rows and their token/position
-metadata together for the Talker. NPU, ROCm, XPU and MUSA retain disabled caching.
-`minicpmo_4_5_turn_mrv2.yaml` additionally selects its own capacity and
-scheduling settings, including stage 0 `async_chunk: false`. To select V1 on CUDA, override
-`platforms.cuda.model_runner: v1` in a custom deployment overlay. CUDA turn
-profiles keep Thinker prefix caching enabled with either runner; duplex
-profiles keep it disabled.
+CUDA turn serving inherits Thinker ngram speculation and disabled prefix
+caching, and passes the completed Thinker payload to the Talker. The Talker
+streams codec chunks to Code2Wav. To select V1 on CUDA, set
+`platforms.cuda.model_runner: v1` in a custom deployment overlay.
 
 Stage-0 speculative decoding (including n-gram) cannot be combined with the
 stage-output prefix cache. Existing CUDA turn overlays that enable speculation

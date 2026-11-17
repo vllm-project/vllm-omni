@@ -161,6 +161,7 @@ def _make_engine_with_loop(
     engine in its bootstrap state (no busy-loop thread).
     """
     engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine._request_chunk_states = {}
     engine._closed = False
     engine.od_config = SimpleNamespace(streaming_output=False)
     engine.executor = _ConcurrencyTrackingExecutor(rpc_delay=rpc_delay)
@@ -701,6 +702,7 @@ def test_collective_rpc_before_loop_starts_calls_executor_directly():
     on the caller's thread without enqueueing.
     """
     engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine._request_chunk_states = {}
     engine._closed = False
     engine._loop_started = False
     engine._rpc_lock = threading.RLock()
@@ -722,6 +724,7 @@ def test_collective_rpc_before_loop_starts_serializes_concurrent_callers():
     serialize them so they cannot race on the shared executor MQ pair.
     """
     engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine._request_chunk_states = {}
     engine._closed = False
     engine._loop_started = False
     engine._rpc_lock = threading.RLock()
