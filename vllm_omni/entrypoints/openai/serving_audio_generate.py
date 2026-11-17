@@ -22,6 +22,7 @@ from vllm_omni.entrypoints.openai.stage_params import (
 )
 from vllm_omni.model_extras.registry import get_extra_body_params
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.sample_rate import get_sampling_rate
 
 logger = init_logger(__name__)
 
@@ -67,8 +68,6 @@ class OmniOpenAIServingAudioGenerate(OpenAIServing, AudioMixin):
         request_id = f"audiogen-{random_uuid()}"
 
         try:
-            default_sr = 44100  # Default sample rate for Stable Audio
-
             # Build prompt for diffusion audio generation
             prompt = {
                 "prompt": request.input,
@@ -166,9 +165,12 @@ class OmniOpenAIServingAudioGenerate(OpenAIServing, AudioMixin):
                 return self.create_error_response("Audio generation model did not produce audio output.")
 
             audio_tensor = audio_output[audio_key]
-            sample_rate = audio_output.get("audio_sample_rate", audio_output.get("sr", default_sr))
-            if hasattr(sample_rate, "item"):
-                sample_rate = sample_rate.item()
+            # The audio pipeline advertises its rate on the payload (the
+            # diffusion formatter surfaces it under its legacy
+            # ``audio_sample_rate`` spelling until the formatter PR
+            # normalizes it); the shared reader resolves it — no
+            # Stable-Audio-specific 44100 default.
+            sample_rate = get_sampling_rate(audio_output)
 
             # Convert tensor to numpy
             if hasattr(audio_tensor, "float"):

@@ -358,7 +358,7 @@ def observe_audio_streaming_finalize(
     replica_id: int | None,
     chunk_arrival_times_s: list[float],
     chunk_bytes: list[int],
-    sample_rate: int,
+    sample_rate: int | None,
     channels: int = defs.DEFAULT_AUDIO_CHANNELS,
     threshold_s: float = defs.AUDIO_CONTINUITY_DEFAULT_THRESHOLD_S,
 ) -> None:
@@ -369,7 +369,8 @@ def observe_audio_streaming_finalize(
     for collecting per-chunk arrival timestamps and byte sizes during the
     streaming response.
     """
-    if replica_id is None or not chunk_arrival_times_s:
+    # A stream with no rate (zero-audio) has no continuity stats to report.
+    if replica_id is None or sample_rate is None or not chunk_arrival_times_s:
         return
     # Local import to keep the bench module optional at import time.
     from vllm_omni.benchmarks.audio_continuity import compute_continuity_stats

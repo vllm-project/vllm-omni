@@ -160,6 +160,7 @@ from vllm_omni.errors import OmniClientError
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.output_metadata import DiffusionMetadataMapping, DiffusionMetadataValue
+from vllm_omni.sample_rate import get_sampling_rate
 from vllm_omni.utils.audio import audio_chunk_pcm_bytes, audio_chunk_sample_rate
 from vllm_omni.utils.speakers import (
     get_supported_speakers_from_hf_config,
@@ -3105,18 +3106,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if audio_tensor.ndim > 1:
             audio_tensor = audio_tensor.flatten()
 
-        # Prefer the talker-reported sample rate when present. Qwen3-Omni
-        # omits "sr" and runs at 24kHz; Ming-flash-omni surfaces a 44.1kHz
-        # AudioVAE rate via multimodal_output["sr"].
-        sr_raw = mm_output.get("sr")
-        if isinstance(sr_raw, (list, tuple)):
-            sr_raw = next((item for item in sr_raw if item is not None), None)
-        if sr_raw is None:
-            sample_rate = 24000
-        elif hasattr(sr_raw, "item"):
-            sample_rate = int(sr_raw.item())
-        else:
-            sample_rate = int(sr_raw)
+        # The talker advertises its rate on the multimodal payload (every
+        # audio-emitting model does); the shared reader resolves it — no
+        # silent default.
+        sample_rate = get_sampling_rate(mm_output)
 
         audio_format = self._resolve_audio_format(request)
         if isinstance(audio_format, ErrorResponse):
@@ -4124,15 +4117,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             peak_memory_mb = result.peak_memory_mb
 
             if final_output_type == "audio":
-                sample_rate = 48000
-                for key in ("audio_sample_rate", "sample_rate", "sampling_rate", "sr"):
-                    raw_rate = multimodal_output.get(key)
-                    try:
-                        if raw_rate is not None:
-                            sample_rate = int(raw_rate)
-                            break
-                    except (TypeError, ValueError):
-                        pass
+                # The audio pipeline advertises its rate on the multimodal
+                # payload; the shared reader resolves the canonical key and
+                # the diffusion formatter's legacy spellings (with
+                # deprecation warnings) — no 48000 default and no local
+                # alias walk.
+                sample_rate = get_sampling_rate(multimodal_output)
 
                 audio_payload = multimodal_output.get("audio")
                 if isinstance(audio_payload, list):
