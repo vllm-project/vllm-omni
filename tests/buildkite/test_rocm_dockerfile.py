@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -60,12 +61,14 @@ def test_rocm_defaults_to_building_the_candidate_runtime() -> None:
 
 def test_amd_build_uses_registry_cache() -> None:
     template = AMD_TEMPLATE.read_text(encoding="utf-8")
-    script_command = '"bash .buildkite/amd/scripts/build-ci-image.sh"'
+    cache_command = '"bash .buildkite/amd/scripts/build-ci-image.sh cache"'
+    image_command = '"bash .buildkite/amd/scripts/build-ci-image.sh image"'
     script = AMD_BUILD_SCRIPT.read_text(encoding="utf-8")
     cache_export = script.index("--target deps")
     image_push = script.index("--target test")
 
-    assert template.count(script_command) == 1
+    assert template.count(cache_command) == 1
+    assert template.count(image_command) == 1
     assert "docker buildx build --push" in script
     assert 'docker buildx imagetools inspect "$CACHE_REF"' in script
     assert '--cache-from "type=registry,ref=${CACHE_REF}"' in script
@@ -76,13 +79,24 @@ def test_amd_build_uses_registry_cache() -> None:
     assert "--cache-to" not in script[image_push:]
 
 
-def test_amd_image_publisher_is_serialized_and_bounded() -> None:
+def test_amd_cache_writer_is_serialized_and_image_publishers_are_bounded() -> None:
     template = AMD_TEMPLATE.read_text(encoding="utf-8")
     script = AMD_BUILD_SCRIPT.read_text(encoding="utf-8")
-    build_step = template.split('label: "AMD: :docker: build image"', 1)[1].split("{% for step_group", 1)[0]
+    fixed_steps = template.split("steps:\n", 1)[1].split("{% for step_group", 1)[0]
+    image_stages = yaml.safe_load("steps:\n" + fixed_steps)["steps"][0]["steps"]
 
-    assert "concurrency: 1" in build_step
-    assert 'concurrency_group: "vllm-omni-amd-image-publish"' in build_step
+    assert len(image_stages) == 2
+    cache_step, image_step = image_stages
+    assert cache_step["key"] == "amd-cache"
+    assert cache_step["depends_on"] is None
+    assert cache_step["commands"] == ["bash .buildkite/amd/scripts/build-ci-image.sh cache"]
+    assert cache_step["concurrency"] == 1
+    assert cache_step["concurrency_group"] == "vllm-omni-amd-cache-publish"
+    assert image_step["key"] == "amd-build"
+    assert image_step["depends_on"] == "amd-cache"
+    assert image_step["commands"] == ["bash .buildkite/amd/scripts/build-ci-image.sh image"]
+    assert image_step["concurrency"] == 2
+    assert image_step["concurrency_group"] == "vllm-omni-amd-image-publish"
     assert 'IMAGE_PUSH_TIMEOUT="${AMD_IMAGE_PUSH_TIMEOUT:-15m}"' in script
     assert 'IMAGE_PUSH_ATTEMPTS="${AMD_IMAGE_PUSH_ATTEMPTS:-2}"' in script
     assert 'run_with_retry "ROCm CI image push"' in script
@@ -93,19 +107,13 @@ def _write_executable(path: Path, source: str) -> None:
     path.chmod(0o755)
 
 
-@pytest.mark.parametrize(
-    ("cache_exists", "fail_first_image_push", "expected_targets"),
-    [
-        (True, False, ["test"]),
-        (False, True, ["deps", "test", "test"]),
-    ],
-)
-def test_amd_image_build_cache_and_retry_flow(
+def _run_amd_build_script(
     tmp_path: Path,
-    cache_exists: bool,
-    fail_first_image_push: bool,
-    expected_targets: list[str],
-) -> None:
+    *arguments: str,
+    cache_exists: bool = True,
+    fail_cache_export: bool = False,
+    image_failures: int = 0,
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     docker_log = tmp_path / "docker.log"
@@ -130,6 +138,9 @@ printf '%s\n' "$*" >> "$FAKE_DOCKER_LOG"
 if [[ "$*" == "buildx imagetools inspect "* ]]; then
     exit "$FAKE_CACHE_INSPECT_STATUS"
 fi
+if [[ "$*" == *"buildx build"* && "$*" == *"--target deps"* ]]; then
+    exit "$FAKE_CACHE_EXPORT_STATUS"
+fi
 if [[ "$*" == *"buildx build"* && "$*" == *"--target test"* ]]; then
     attempts=0
     if [[ -f "$FAKE_IMAGE_ATTEMPTS" ]]; then
@@ -137,7 +148,7 @@ if [[ "$*" == *"buildx build"* && "$*" == *"--target test"* ]]; then
     fi
     attempts=$((attempts + 1))
     printf '%s\n' "$attempts" > "$FAKE_IMAGE_ATTEMPTS"
-    if [[ "$FAKE_FAIL_FIRST_IMAGE_PUSH" == "1" && "$attempts" == "1" ]]; then
+    if ((attempts <= FAKE_IMAGE_FAILURES)); then
         exit 1
     fi
 fi
@@ -153,10 +164,11 @@ exit 0
         "FAKE_DOCKER_LOG": str(docker_log),
         "FAKE_IMAGE_ATTEMPTS": str(image_attempts),
         "FAKE_CACHE_INSPECT_STATUS": "0" if cache_exists else "1",
-        "FAKE_FAIL_FIRST_IMAGE_PUSH": "1" if fail_first_image_push else "0",
+        "FAKE_CACHE_EXPORT_STATUS": "1" if fail_cache_export else "0",
+        "FAKE_IMAGE_FAILURES": str(image_failures),
     }
     result = subprocess.run(
-        ["bash", str(AMD_BUILD_SCRIPT)],
+        ["bash", str(AMD_BUILD_SCRIPT), *arguments],
         cwd=REPO_ROOT,
         env=env,
         capture_output=True,
@@ -164,17 +176,91 @@ exit 0
         check=False,
     )
 
+    docker_calls = docker_log.read_text(encoding="utf-8").splitlines() if docker_log.exists() else []
+    return result, docker_calls
+
+
+def _build_calls(docker_calls: list[str]) -> list[str]:
+    return [call for call in docker_calls if "buildx build" in call]
+
+
+def _build_targets(docker_calls: list[str]) -> list[str]:
+    return [call.split("--target ", 1)[1].split()[0] for call in _build_calls(docker_calls)]
+
+
+def test_amd_cache_phase_skips_export_on_hit(tmp_path: Path) -> None:
+    result, docker_calls = _run_amd_build_script(tmp_path, "cache")
+
     assert result.returncode == 0, result.stderr
-    build_calls = [line for line in docker_log.read_text(encoding="utf-8").splitlines() if "buildx build" in line]
-    targets = [line.split("--target ", 1)[1].split()[0] for line in build_calls]
-    assert targets == expected_targets
-    if cache_exists:
-        assert "dependency cache hit; skipping cache export" in result.stdout
-        assert all("--cache-to" not in call for call in build_calls)
-    else:
-        assert "dependency cache miss; exporting dependency layers" in result.stdout
-        assert "--cache-to" in build_calls[0]
-        assert "retrying in 5 seconds" in result.stderr
+    assert any("buildx imagetools inspect" in call for call in docker_calls)
+    assert _build_calls(docker_calls) == []
+    assert "dependency cache hit; skipping cache export" in result.stdout
+
+
+def test_amd_cache_phase_exports_only_dependency_target_on_miss(tmp_path: Path) -> None:
+    result, docker_calls = _run_amd_build_script(tmp_path, "cache", cache_exists=False)
+
+    assert result.returncode == 0, result.stderr
+    assert _build_targets(docker_calls) == ["deps"]
+    assert "--cache-to" in _build_calls(docker_calls)[0]
+    assert "dependency cache miss; exporting dependency layers" in result.stdout
+
+
+def test_amd_cache_export_failure_is_nonblocking(tmp_path: Path) -> None:
+    result, docker_calls = _run_amd_build_script(
+        tmp_path,
+        "cache",
+        cache_exists=False,
+        fail_cache_export=True,
+    )
+
+    assert result.returncode == 0
+    assert _build_targets(docker_calls) == ["deps"]
+    assert "image build may rebuild missing layers" in result.stderr
+
+
+def test_amd_image_phase_skips_cache_publication_and_retries_push(tmp_path: Path) -> None:
+    result, docker_calls = _run_amd_build_script(tmp_path, "image", image_failures=1)
+
+    assert result.returncode == 0, result.stderr
+    assert not any("buildx imagetools inspect" in call for call in docker_calls)
+    assert _build_targets(docker_calls) == ["test", "test"]
+    assert all("--cache-to" not in call for call in _build_calls(docker_calls))
+    assert "retrying in 5 seconds" in result.stderr
+
+
+def test_amd_image_phase_fails_after_bounded_attempts(tmp_path: Path) -> None:
+    result, docker_calls = _run_amd_build_script(tmp_path, "image", image_failures=2)
+
+    assert result.returncode == 1
+    assert _build_targets(docker_calls) == ["test", "test"]
+    assert "failed after 2 attempts" in result.stderr
+
+
+@pytest.mark.parametrize("arguments", [(), ("all",)])
+def test_amd_combined_mode_preserves_cache_then_image_flow(
+    tmp_path: Path,
+    arguments: tuple[str, ...],
+) -> None:
+    result, docker_calls = _run_amd_build_script(tmp_path, *arguments, cache_exists=False)
+
+    assert result.returncode == 0, result.stderr
+    assert any("buildx imagetools inspect" in call for call in docker_calls)
+    assert _build_targets(docker_calls) == ["deps", "test"]
+    assert "--cache-to" in _build_calls(docker_calls)[0]
+    assert "--cache-to" not in _build_calls(docker_calls)[1]
+
+
+@pytest.mark.parametrize("arguments", [("invalid",), ("cache", "extra")])
+def test_amd_build_rejects_invalid_phase_before_docker(
+    tmp_path: Path,
+    arguments: tuple[str, ...],
+) -> None:
+    result, docker_calls = _run_amd_build_script(tmp_path, *arguments)
+
+    assert result.returncode == 2
+    assert docker_calls == []
+    assert "Usage:" in result.stderr
 
 
 def test_amd_cache_key_tracks_dependency_inputs_and_architecture() -> None:
