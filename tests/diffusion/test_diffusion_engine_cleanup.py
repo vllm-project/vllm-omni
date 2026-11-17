@@ -36,6 +36,7 @@ def _make_request(request_id: str) -> OmniDiffusionRequest:
 
 def _make_engine() -> DiffusionEngine:
     engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine._request_chunk_states = {}
     engine.od_config = SimpleNamespace(distributed_executor_backend=None)
     engine.scheduler = RequestScheduler()
     engine.scheduler.initialize(SimpleNamespace())
@@ -707,6 +708,7 @@ def test_init_accepts_custom_scheduler(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     custom_scheduler = RequestScheduler()
     fake_executor = SimpleNamespace(
+        register_chunk_ready_handler=Mock(),
         execute_request=Mock(),
         execute_batch=Mock(),
         execute_step=Mock(),
@@ -746,6 +748,7 @@ def test_scheduler_initialization_failure_closes_scheduler_and_executor(monkeypa
         close=Mock(),
     )
     fake_executor = SimpleNamespace(
+        register_chunk_ready_handler=Mock(),
         shutdown=Mock(),
     )
 
