@@ -50,7 +50,8 @@ class _IdentityFtfy:
 
 
 def _align_wan_prompt_cleaning() -> None:
-    # Always use identity ftfy, installed or not, to match Omni's prompt preprocessing.
+    # Always use identity ftfy, installed or not. Otherwise, offline ftfy cleaning
+    # differs from Omni's online whitespace-only cleaning and breaks accuracy alignment.
     wan_i2v_module.ftfy = _IdentityFtfy()
 
 
