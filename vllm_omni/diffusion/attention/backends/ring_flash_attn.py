@@ -79,10 +79,66 @@ def ring_flash_attn_forward(
     if not v.is_contiguous():
         v = v.contiguous()
 
+    # Circulate K and V as one packed transfer instead of two. This is not
+    # about the number of NCCL calls -- RingComm already batches the two
+    # send_recv calls into a single batch_isend_irecv -- but about moving the
+    # same bytes as one full-size P2P op rather than two half-size ones.
+    # tests/diffusion/attention/bench_ring_comm_packed.py measures the
+    # rotation in isolation, which is an upper bound rather than a prediction:
+    # the loop below issues the hop's transfer, computes the current block's
+    # attention, and only waits afterwards, so part of the transfer is already
+    # hidden behind compute. bench_ring_attention.py measures the full call.
+    #
+    # The packing copy is paid per call while the transfer saving accrues per
+    # hop, so below degree 3 it does not pay for itself. Measured on the full
+    # ring call, three alternated launches per arm, on both gated backends
+    # (FA3 / FA2): degree 4 is 1.06x / 1.04x, degree 3 is 1.07x / 1.03x, and
+    # degree 2 is 0.98x / 0.99x -- a regression on both. Degree 2 has exactly
+    # one hop, so a single copy buys a single transfer, and part of that
+    # transfer is already hidden behind compute. Hence the degree floor below
+    # rather than a tuning constant: it is the point where the mechanism
+    # changes sign, and it changes sign on both backends. (The
+    # degree-2 numbers necessarily come from a variant without that floor,
+    # since the code below does not pack there.)
+    #
+    # The win does not then grow with degree. On FA3, degrees 3 and 4 measure
+    # the same ratio, because the absolute saving per hop is near constant
+    # (0.38 and 0.37 ms) while the call's own cost grows with the hop count
+    # too; on FA2 the ratio declines slightly as the degree falls, its saving
+    # per hop being 0.27 and 0.31 ms. Neither backend shows a high-degree
+    # regime that would justify a second threshold, so the floor stays the only
+    # degree-dependent thing encoded here.
+    #
+    # How much of the saving survives depends on how much of the transfer a
+    # given backend's attention already hides, which is also why the two gated
+    # backends differ: FA2's call is about 1.5x FA3's at the same shape, so a
+    # saving of similar absolute size is diluted into a smaller ratio. Hence
+    # the scope is the same backends as the fused merge, and that scope is
+    # measured rather than guessed: a variant whose gate also admitted VLLM_FA
+    # ran slower there while still paying the memory cost below.
+    #
+    # The receive buffer stays freshly allocated per hop. A reused ping-pong
+    # pair is around half a percent faster on the isolated rotation -- the sign
+    # is consistent across replicates, but it is well below what survives into
+    # the full call -- and it would let one hop's NCCL write race the previous
+    # hop's compute read of the same buffer. That hazard, not the timing, is
+    # why the allocation stays. The cost is allocator footprint: the [2, ...]
+    # blocks are a new size class, so peak *reserved* memory grows even though
+    # peak allocated does not.
+    pack_kv = attn_type in (AttnType.FA, AttnType.FA3) and comm.world_size > 2 and k.shape == v.shape
+    kv_send = None
+    if pack_kv:
+        kv_send = torch.empty((2, *k.shape), dtype=k.dtype, device=k.device)
+        kv_send[0].copy_(k)
+        kv_send[1].copy_(v)
+
     for step in range(comm.world_size):
         if step + 1 != comm.world_size:
-            next_k = comm.send_recv(k)
-            next_v = comm.send_recv(v)
+            if pack_kv:
+                kv_recv = comm.send_recv(kv_send)
+            else:
+                next_k = comm.send_recv(k)
+                next_v = comm.send_recv(v)
             comm.commit()
 
         if not causal or step <= comm.rank:
@@ -130,8 +186,14 @@ def ring_flash_attn_forward(
 
         if step + 1 != comm.world_size:
             comm.wait()
-            k = next_k
-            v = next_v
+            if pack_kv:
+                # The received block is already packed, so the next hop sends
+                # it on without repacking. Both halves stay contiguous.
+                kv_send = kv_recv
+                k, v = kv_recv[0], kv_recv[1]
+            else:
+                k = next_k
+                v = next_v
 
     assert out is not None
     out = out.to(q.dtype)
