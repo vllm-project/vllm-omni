@@ -14,31 +14,45 @@ steps:
 
       - label: "Reliability Test · qwen3-omni"
         source_file_dependencies: omni_qwen3_omni_reliability
-        timeout_in_minutes: 180
+        timeout_in_minutes: 240
         commands:
           - pytest -s -v tests/dfx/reliability/test_qwen3_omni.py -m "slow and cards_2"
         mirror_hardwares: h100_2
 
-      - label: "Reliability Test · wan22"
-        source_file_dependencies: diffusion_wan22_reliability
+      - label: "Reliability Test · qwen3-omni replicas"
+        source_file_dependencies: omni_qwen3_omni_replica_reliability
         timeout_in_minutes: 180
         commands:
-          - pytest -s -v tests/dfx/reliability/test_wan22.py -m "slow and cards_1"
-        mirror_hardwares: h100_1
+          - pytest -s -v tests/dfx/reliability/test_qwen3_omni_replica.py -m "slow and cards_4"
+        mirror_hardwares: h100_4
+
+      - label: "Reliability Test · wan22"
+        source_file_dependencies: diffusion_wan22_reliability
+        timeout_in_minutes: 240
+        commands:
+          - pytest -s -v tests/dfx/reliability/test_wan22.py -m "slow and cards_2"
+        mirror_hardwares: h100_2
 
       - label: "Reliability Test · hunyuan-image"
         source_file_dependencies: diffusion_hunyuan_image3_reliability
-        timeout_in_minutes: 180
+        timeout_in_minutes: 240
         commands:
           - pytest -s -v tests/dfx/reliability/test_hunyuan_image.py -m "slow and cards_4"
         mirror_hardwares: h100_4
 
       - label: "Reliability Test · minicpmo-4.5"
         source_file_dependencies: omni_minicpmo_4_5_reliability
-        timeout_in_minutes: 180
+        timeout_in_minutes: 240
         commands:
           - pytest -s -v tests/dfx/reliability/test_minicpmo_4_5.py -m "slow and cards_1"
         mirror_hardwares: h100_1
+
+      - label: "Reliability Test · minicpmo-4.5 replicas"
+        source_file_dependencies: omni_minicpmo_4_5_replica_reliability
+        timeout_in_minutes: 180
+        commands:
+          - pytest -s -v tests/dfx/reliability/test_minicpmo_4_5_replica.py -m "slow and cards_3"
+        mirror_hardwares: h100_3
 
       - label: "Reliability Test · Invalid parameters · H100 · Single-GPU"
         source_file_dependencies: reliability_invalid_param_h100
@@ -194,10 +208,10 @@ steps:
   # Qualify the CUDA owner of the Ming, GLM, IndexTTS, and Breeze AMD
   # additions on weekly-test PRs without enabling unrelated E2E jobs. Keep
   # each model in a separate process/agent lifetime so full-weight teardown
-  # from one model cannot corrupt or prevent startup of the next model. These
-  # established L4 profiles use model runner v1: forcing v2 corrupts Ming/GLM
-  # online audio and breaks IndexTTS2/Breeze output metadata during execution
-  # or sampler warmup.
+  # from one model cannot corrupt or prevent startup of the next model. The
+  # Ming, GLM and IndexTTS2 L4 profiles use model runner v1: forcing v2
+  # corrupts Ming/GLM online audio and breaks IndexTTS2 output metadata.
+  # Breeze runs on model runner v2.
   - group: ":microphone: Ming GLM IndexTTS and Breeze Weekly Test"
     depends_on: upload-weekly-pipeline
     if: build.env("NON_CRITICAL") == "1" || build.pull_request.labels includes "weekly-test"
@@ -269,9 +283,10 @@ steps:
       - label: "TTS · Breeze TTS 2 · L4"
         source_file_dependencies:
           - tts_breeze_tts2_weekly
+          - tts_breeze_tts2_mrv2_weekly
         timeout_in_minutes: 90
         env:
-          VLLM_OMNI_CI_MODEL_RUNNER: "v1"
+          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - export VLLM_USE_DEEP_GEMM="0"

@@ -31,6 +31,13 @@ from vllm_omni.engine.duplex_omni_engine import DuplexOmniEngine
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+class _OrchestratorPlugin:
+    """Satisfies ``configure_async_chunk`` without a full duplex plugin."""
+
+    def configure_async_chunk(self, *, enabled: bool) -> None:
+        del enabled
+
+
 class _FakeRpcClient:
     def __init__(self, result: Any) -> None:
         self.result = result
@@ -205,7 +212,8 @@ def test_duplex_capabilities_come_from_the_loaded_plugin() -> None:
 @pytest.mark.parametrize(("count", "index"), [(1, 0), (4, 0), (4, 3)])
 def test_orchestrator_receives_real_frontend_identity_and_exposes_warmup_budget(monkeypatch, count, index) -> None:
     engine = object.__new__(DuplexOmniEngine)
-    engine.plugin = object()
+    engine.plugin = _OrchestratorPlugin()
+    engine.async_chunk = False
     engine.duplex_session_config = DuplexSessionRuntimeConfig(max_sessions=64)
     engine.pipeline_config = SimpleNamespace(stages=[SimpleNamespace(stage_id=0, owns_tokenizer=True)])
     engine.stage_pools = []
@@ -252,7 +260,8 @@ def test_duplex_runtime_uses_tokenizer_owner_model_config(monkeypatch):
     from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import JOYAI_VL_INTERACTION_ASR_PIPELINE
 
     engine = object.__new__(DuplexOmniEngine)
-    engine.plugin = object()
+    engine.plugin = _OrchestratorPlugin()
+    engine.async_chunk = False
     engine.pipeline_config = JOYAI_VL_INTERACTION_ASR_PIPELINE
     engine.duplex_session_config = object()
     engine._client_config = None
