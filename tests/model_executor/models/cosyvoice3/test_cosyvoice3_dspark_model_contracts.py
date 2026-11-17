@@ -11,6 +11,7 @@ import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.models.interfaces import EagleModelMixin
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model, _CosyVoice3RejectionSampler
 from vllm_omni.model_executor.models.cosyvoice3.dspark import UNIFIED_MASK_TOKEN_ID, converted_config
@@ -86,10 +87,62 @@ def test_capture_layers_match_converted_checkpoint_conventions():
     assert [int(value[0, 0]) for value in captured] == config["eagle_aux_hidden_state_layer_ids"]
     assert config["target_layer_ids"] == [index - 1 for index in layers]
     assert config["dflash_config"]["target_layer_ids"] == config["target_layer_ids"]
+    assert model.mrv2_forward_returns_tensor is True
     # Drafter layers must not opt into the distinct Omni-owned aux tuple slot.
     assert not getattr(model, "_returns_tuple", False)
     assert not getattr(model, "supports_mrv2_full_graph_aux_outputs", False)
     assert not hasattr(model, "_last_captured_layers")
+
+
+def test_talker_dspark_capture_preserves_upstream_aux_tuple(monkeypatch):
+    hidden = torch.ones(1, 2)
+    aux = [hidden + index for index in (1, 2, 3)]
+    model = CosyVoice3Model.__new__(CosyVoice3Model)
+    torch.nn.Module.__init__(model)
+    model.model_stage = "cosyvoice3_talker"
+    model.have_multimodal_outputs = True
+    model.model = SimpleNamespace(llm=MagicMock(return_value=(hidden, aux)))
+
+    runner = object.__new__(OmniGPUModelRunner)
+    runner._staged_writes = staged_writes.StagedWrites()
+    runner.model = model
+    runner.use_aux_hidden_state_outputs = True
+    runner._configure_cudagraph_output_contract()
+
+    assert runner._model_has_structured_output is False
+    assert runner._model_returns_tuple is False
+    assert runner._exclude_full_graph is False
+    assert runner._aux_hidden_state_contract_conflicts() is False
+
+    def capture_model(self, *, profile_only=False):
+        output = self.model.forward(
+            input_ids=torch.zeros(1, dtype=torch.long),
+            positions=torch.zeros(1, dtype=torch.long),
+            inputs_embeds=hidden,
+        )
+        assert output[0] is hidden
+        assert output[1] is aux
+        assert profile_only is False
+        return 7
+
+    monkeypatch.setattr(GPUModelRunner, "capture_model", capture_model)
+    runner._capture_mtp_graphs = MagicMock(return_value=0)
+    assert runner.capture_model() == 7
+
+
+def test_code2wav_keeps_structured_output_capture_contract():
+    model = CosyVoice3Model.__new__(CosyVoice3Model)
+    torch.nn.Module.__init__(model)
+    model.model_stage = "cosyvoice3_code2wav"
+    model.have_multimodal_outputs = True
+
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = model
+    runner._configure_cudagraph_output_contract()
+
+    assert model.mrv2_forward_returns_tensor is False
+    assert runner._model_has_structured_output is True
+    assert runner._exclude_full_graph is True
 
 
 def test_dspark_language_model_is_the_decoder_not_the_speech_head():

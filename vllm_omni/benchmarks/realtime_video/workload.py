@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Workload construction and metric math for the LingBot-World realtime benchmark.
 
-Nothing here imports torch, vllm, or websockets, so the arithmetic that decides
-what a benchmark number *means* is unit-testable without a GPU or a server.
+The workload and metric logic uses only the standard library, so the arithmetic
+that decides what a benchmark number *means* needs no GPU or server.
 
 Two model properties drive every formula in this module, both read from the
 checkpoint's ``transformer/config.json`` rather than assumed:
@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -429,11 +429,15 @@ class PlaybackResult:
     total_stall_s: float
     playback_span_s: float
     first_underrun_chunk: int | None
+    startup_stall_s: float = 0.0
+    steady_stall_s: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "underrun_count": self.underrun_count,
             "total_stall_ms": self.total_stall_s * 1000.0,
+            "startup_stall_ms": self.startup_stall_s * 1000.0,
+            "steady_stall_ms": self.steady_stall_s * 1000.0,
             "playback_span_s": self.playback_span_s,
             "stall_ratio": (self.total_stall_s / self.playback_span_s) if self.playback_span_s > 0 else 0.0,
             "first_underrun_chunk": self.first_underrun_chunk,
@@ -445,6 +449,7 @@ def simulate_playback(
     *,
     fps: float,
     buffer_chunks: int = 1,
+    startup_chunks: int = 2,
 ) -> PlaybackResult:
     """Replay arrivals against a wall clock and count stalls.
 
@@ -453,11 +458,15 @@ def simulate_playback(
     it is an underrun, and the player resumes only when the bytes land -- which
     is what a viewer experiences, and what a single p99 number cannot tell you:
     the same p99 is harmless behind a three-chunk buffer and fatal behind none.
+    ``startup_chunks`` labels stalls before that media-block boundary separately
+    from later stalls. Both components remain included in the total.
     """
     if fps <= 0:
         raise ValueError("fps must be positive.")
     if buffer_chunks < 1:
         raise ValueError("buffer_chunks must be at least 1.")
+    if startup_chunks < 0:
+        raise ValueError("startup_chunks must be nonnegative.")
     if not records:
         return PlaybackResult(0, 0.0, 0.0, None)
     if buffer_chunks > len(records):
@@ -468,6 +477,8 @@ def simulate_playback(
     cursor = start
     underruns = 0
     total_stall = 0.0
+    startup_stall = 0.0
+    steady_stall = 0.0
     first_underrun: int | None = None
 
     for record in ordered:
@@ -475,6 +486,10 @@ def simulate_playback(
             stall = record.arrival_s - cursor
             underruns += 1
             total_stall += stall
+            if record.index < startup_chunks:
+                startup_stall += stall
+            else:
+                steady_stall += stall
             if first_underrun is None:
                 first_underrun = record.index
             cursor = record.arrival_s
@@ -485,6 +500,8 @@ def simulate_playback(
         total_stall_s=total_stall,
         playback_span_s=cursor - start,
         first_underrun_chunk=first_underrun,
+        startup_stall_s=startup_stall,
+        steady_stall_s=steady_stall,
     )
 
 
@@ -548,12 +565,11 @@ def compute_metrics(
         "total_bytes": sum(record.byte_length for record in ordered),
         "video_seconds": video_seconds,
         "wall_seconds": wall_seconds,
-        # RTF is processing time over content duration, as vLLM-Omni computes it
-        # (`patch.py`: generation_s / video_duration; `compute_audio_rtf`: latency
-        # / audio_duration, "SLO red line < 1"). LOWER IS BETTER and below 1.0 is
-        # real time. RTFX is the reciprocal the repo reports under its own name,
-        # kept here because "fraction of real time achieved" reads better on a
-        # dashboard -- but the two must never be confused for one another.
+        # Client-session RTF uses frames / target playback FPS, independently
+        # of the mux label. It includes first-chunk and terminal receive time;
+        # the ordinary video backend instead prefers server generation time
+        # over payload content duration. Both are cost ratios (lower is better),
+        # with their distinct scopes declared in shared definitions/result JSON.
         "video_rtf": (wall_seconds / video_seconds) if video_seconds > 0 else 0.0,
         "video_rtfx": (video_seconds / wall_seconds) if wall_seconds > 0 else 0.0,
         "frames_per_second": (total_frames / wall_seconds) if wall_seconds > 0 else 0.0,
@@ -578,8 +594,10 @@ def compute_metrics(
         ordered,
         fps=fps,
         buffer_chunks=playback_buffer_chunks,
+        startup_chunks=max(2, warmup_chunks),
     ).to_dict()
     metrics["playback"]["buffer_chunks"] = playback_buffer_chunks
+    metrics["playback"]["startup_chunks"] = max(2, warmup_chunks)
     return metrics
 
 
@@ -629,3 +647,17 @@ def aggregate_metrics(sessions: Iterable[Mapping[str, Any]], *, fps: float) -> d
         "underrun_count": sum(int(entry["playback"]["underrun_count"]) for entry in entries),
         "chunk_deadline_ms": deadline_ms,
     }
+
+
+def warmup_workload(workload: Workload, num_chunks: int | None) -> Workload:
+    """Shorten only the excluded warmup rollout, including its live updates."""
+    if num_chunks is None:
+        return workload
+    if num_chunks < 1:
+        raise ValueError("Warmup chunk count must be positive.")
+    count = min(num_chunks, workload.num_chunks)
+    return replace(
+        workload,
+        camera_script=workload.camera_script[:count],
+        prompt_updates=tuple(update for update in workload.prompt_updates if update.after_chunk < count),
+    )

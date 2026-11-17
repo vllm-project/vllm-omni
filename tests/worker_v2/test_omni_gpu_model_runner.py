@@ -10,10 +10,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from vllm import SamplingParams
+from vllm.compilation.cuda_graph import CUDAGraphEntry, CUDAGraphWrapper
+from vllm.config import SchedulerConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import ForwardContext, override_forward_context
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor, CudaGraphManager
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
@@ -108,6 +110,66 @@ def test_model_input_delivery_follows_new_and_cached_request_ownership(mocker, i
     runner.add_requests(output)
     runner.update_requests(output)
     assert events == ["admit"] + (["input:True:True", "cached"] if is_new else ["cached", "input:True:False", "merged"])
+
+
+def test_native_output_freezes_each_requests_current_perf_chunk():
+    runner = _make_runner()
+    runner._omni_data_plane = SimpleNamespace(reserve_outputs=MagicMock())
+    first, second = {"duplex": {"perf_chunk": [3, 7]}}, {"duplex": {"perf_chunk": [8, 2]}}
+    runner.model_state = SimpleNamespace(intermediate_buffer=SimpleNamespace(buffers=[first, second]))
+    output = SimpleNamespace(req_ids=["r2", "r1"])
+
+    runner._reserve_native_data_plane_outputs(output)
+    first["duplex"]["perf_chunk"][:] = [3, 8]
+    second["duplex"]["perf_chunk"] = [9, 0]
+
+    assert output._duplex_perf_chunks == {"r1": (3, 7), "r2": (8, 2)}
+    runner._omni_data_plane.reserve_outputs.assert_called_once_with(["r2", "r1"])
+
+
+@pytest.mark.parametrize("backbone_mode", [CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE, CUDAGraphMode.NONE])
+@pytest.mark.parametrize("num_reqs,bucket", [(1, 1), (3, 4), (4, 4)])
+def test_mtp_graph_replay_is_independent_of_backbone_mode(mocker, backbone_mode, num_reqs, bucket):
+    runner = _make_runner()
+    runner.scheduler_config = SchedulerConfig(max_model_len=16, is_encoder_decoder=False, max_num_seqs=4)
+    runner.model_state = mocker.Mock(spec=OmniModelState)
+    runner.model_state._get_mtp_capture_sizes.return_value = [4, 1]
+    manager = runner.cudagraph_manager = object.__new__(CudaGraphManager)
+    manager._graphs_captured = True
+    manager._candidates = {
+        (size, 0): [BatchExecutionDescriptor(backbone_mode, size, size, 1)]
+        for size in (1, 4)
+        if backbone_mode != CUDAGraphMode.NONE
+    }
+
+    # MTP capture forces FULL even when the backbone dispatches PIECEWISE/NONE.
+    captured = runner._dispatch_mtp_batch_descriptor(bucket)
+    replay = mocker.Mock()
+    output = torch.ones(bucket, 2)
+    wrapper = object.__new__(CUDAGraphWrapper)
+    wrapper.runtime_mode = CUDAGraphMode.FULL
+    wrapper.runnable = mocker.Mock(side_effect=AssertionError("MTP graph was bypassed"))
+    wrapper.is_debugging_mode = False
+    wrapper.concrete_cudagraph_entries = {
+        captured: CUDAGraphEntry(batch_descriptor=captured, cudagraph=replay, output=output)
+    }
+    dispatched = runner._dispatch_mtp_batch_descriptor(num_reqs)
+    context = ForwardContext({}, {}, {}, cudagraph_runtime_mode=dispatched.cg_mode, batch_descriptor=dispatched)
+    with override_forward_context(context):
+        assert wrapper() is output
+    replay.replay.assert_called_once_with()
+    wrapper.runnable.assert_not_called()
+    assert dispatched.num_tokens == dispatched.num_reqs == bucket
+
+
+@pytest.mark.parametrize("capture_sizes,num_reqs", [([], 1), ([8], 3), ([8, 4, 1], 5)])
+def test_mtp_dispatch_without_supported_bucket_stays_eager(mocker, capture_sizes, num_reqs):
+    runner = _make_runner()
+    runner.scheduler_config = SchedulerConfig(max_model_len=16, is_encoder_decoder=False, max_num_seqs=4)
+    runner.model_state = mocker.Mock(spec=OmniModelState)
+    runner.model_state._get_mtp_capture_sizes.return_value = capture_sizes
+    desc = runner._dispatch_mtp_batch_descriptor(num_reqs)
+    assert desc == BatchExecutionDescriptor(CUDAGraphMode.NONE, num_reqs, num_reqs)
 
 
 @pytest.mark.parametrize("hook_fails", [False, True])
@@ -537,6 +599,24 @@ def test_finish_requests_notifies_model_and_cleans_only_known_slots(monkeypatch)
     runner.finish_requests(SimpleNamespace(finished_req_ids={"released"}, preempted_req_ids={"r1"}))
     assert calls == [{"released"}]
     assert sorted(c.args[0] for c in runner.model_state.remove_request.call_args_list) == [0]
+
+
+def test_aux_hidden_state_contract_uses_tuple_slot_not_structured_output():
+    runner = _make_runner()
+    runner.model = SimpleNamespace(have_multimodal_outputs=True)
+    runner.use_aux_hidden_state_outputs = True
+
+    runner._configure_cudagraph_output_contract()
+
+    assert runner._model_has_structured_output is True
+    assert runner._model_returns_tuple is False
+    assert runner._aux_hidden_state_contract_conflicts() is False
+
+    runner.model = SimpleNamespace(_returns_tuple=True)
+    runner._configure_cudagraph_output_contract()
+
+    assert runner._model_returns_tuple is True
+    assert runner._aux_hidden_state_contract_conflicts() is True
 
 
 @pytest.mark.parametrize("stage,declared", [("thinker", False), ("custom_ar", True)])

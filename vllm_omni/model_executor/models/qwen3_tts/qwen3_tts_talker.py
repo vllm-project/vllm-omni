@@ -41,8 +41,8 @@ from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSTalkerConfig
 from .first_audio import talker_first_audio_enabled
 from .input_stream import Qwen3TTSTextInput
 from .prompt_embeds_builder import (
-    PRECOMPUTED_TEXT_IDS_KEY,
     Qwen3TTSPromptEmbedsBuilder,
+    has_tts_text_conditioning,
     resolve_x_vector_only,
     text_input_is_complete,
 )
@@ -130,22 +130,6 @@ def _ref_audio_artifact_cache_capacity(vllm_config: VllmConfig) -> int:
     return capacity
 
 
-def _has_tts_text_conditioning(info_dict: dict[str, Any], hidden_states: Any | None = None) -> bool:
-    stream = info_dict.get("input_stream")
-    if isinstance(stream, dict) and stream.get("token_ids"):
-        return True
-    text_list = info_dict.get("text")
-    if isinstance(text_list, list) and bool(text_list) and bool(text_list[0]):
-        return True
-    if PRECOMPUTED_TEXT_IDS_KEY in info_dict:
-        return True
-    if isinstance(hidden_states, dict):
-        tail = hidden_states.get("trailing_text")
-        if isinstance(tail, torch.Tensor):
-            return True
-    return False
-
-
 # ---------------------------------------------------------------------------
 # Components ported from the HuggingFace Qwen3-TTS reference implementation.
 # Only the classes actually needed by the vLLM AR Talker are kept here.
@@ -201,6 +185,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
     # Prefill preprocess returns freshly built tensors (or read-only constants)
     # that it never writes again, so the runner stores them without copying.
     preprocess_prefill_updates_owned = True
+
+    # forward returns backbone tensors; make_omni_output packages audio afterward.
+    mrv2_forward_returns_tensor = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -932,7 +919,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             except Exception:
                 is_prefill = span_len > 1
 
-        if not _has_tts_text_conditioning(info_dict, hs):
+        if not has_tts_text_conditioning(info_dict, hs):
             raise ValueError("Missing Qwen3-TTS text conditioning: provide `text` or precomputed text token ids.")
 
         task_type = (info_dict.get("task_type") or ["CustomVoice"])[0]
@@ -1149,7 +1136,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             hs = payload.get("hidden_states", {})
             meta = payload.get("meta", {})
 
-            if not _has_tts_text_conditioning(info_dict, hs):
+            if not has_tts_text_conditioning(info_dict, hs):
                 raise ValueError("Missing Qwen3-TTS text conditioning: provide `text` or precomputed text token ids.")
 
             task_type = (info_dict.get("task_type") or ["CustomVoice"])[0]
@@ -1366,7 +1353,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         for k, (start, span, info) in enumerate(entries):
             if span <= 0 or isinstance(info.get("additional_information"), dict):
                 continue
-            if not _has_tts_text_conditioning(info, info.get("hidden_states")):
+            if not has_tts_text_conditioning(info, info.get("hidden_states")):
                 continue
             stored = (info.get("embed") or {}).get("prefill")
             if isinstance(stored, torch.Tensor) and stored.ndim == 2:

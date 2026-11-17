@@ -41,6 +41,7 @@ from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.multimodal.audio import AudioResampler
 
+from vllm_omni.config.stage_config import skip_on_streaming_updates
 from vllm_omni.utils.audio import mel_filter_bank
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 
@@ -130,6 +131,60 @@ def text_input_is_complete(info_dict: Mapping[str, Any]) -> bool:
     """Read the validated input lifecycle; ordinary requests have complete text."""
     stream = info_dict.get("input_stream")
     return stream.get("final", False) if isinstance(stream, Mapping) else True
+
+
+def has_tts_text_conditioning(
+    info_dict: dict[str, Any], hidden_states: object = None, *, allow_blank_text: bool = True
+) -> bool:
+    """Whether a request carries the text the Talker conditions on.
+
+    That is incremental ``input_stream.token_ids``, ``text`` as a non-empty
+    list with a truthy first item, precomputed text ids, or a trailing-text
+    hidden state. The Talker's ``preprocess`` raises when this is false.
+    ``allow_blank_text=False`` also rejects whitespace-only text and precomputed
+    ids that :func:`coerce_token_ids` would discard, for the stage-0 check.
+    """
+    stream = info_dict.get("input_stream")
+    if isinstance(stream, dict) and stream.get("token_ids"):
+        return True
+    text_list = info_dict.get("text")
+    if isinstance(text_list, list) and text_list and text_list[0]:
+        first = text_list[0]
+        if allow_blank_text or not isinstance(first, str) or first.strip():
+            return True
+    text_ids = info_dict.get(PRECOMPUTED_TEXT_IDS_KEY)
+    if text_ids is not None and (
+        allow_blank_text or coerce_token_ids(text_ids, device=torch.device("cpu")) is not None
+    ):
+        return True
+    return isinstance(hidden_states, dict) and isinstance(hidden_states.get("trailing_text"), torch.Tensor)
+
+
+@skip_on_streaming_updates
+def check_text_prompt(prompt: Any, sampling_params_list: Sequence[Any]) -> Any:
+    """Reject requests without usable text before submission (stage-0 prompt transform).
+
+    The speech API validates input in its adapter, but offline callers pass
+    ``additional_information`` straight to the engine. There, blank text is
+    synthesized, and text that :func:`has_tts_text_conditioning` rejects raises
+    inside the Talker's ``preprocess``, which stops the engine. Rejecting here
+    fails only the caller's request.
+
+    Streaming-input updates skip this check: the Talker builds its prompt from
+    the first chunk only, and ``AsyncOmni`` closes the stream with a text-less
+    ``TokensPrompt([0])`` update.
+    """
+    for item in prompt if isinstance(prompt, list) else (prompt,):
+        info = item.get("additional_information") if isinstance(item, dict) else None
+        ok = isinstance(info, dict) and has_tts_text_conditioning(
+            info, info.get("hidden_states"), allow_blank_text=False
+        )
+        if not ok:
+            raise ValueError(
+                "Qwen3-TTS requests need `additional_information` with `text` as a list whose "
+                "first item is non-blank (e.g. ['Hello.']), or precomputed text token ids"
+            )
+    return prompt
 
 
 def coerce_ref_code_tensor(value: object, *, device: torch.device) -> torch.Tensor | None:

@@ -36,6 +36,7 @@ from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
+from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     uses_native_mrv2_data_plane,
 )
@@ -58,6 +59,7 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 
     from vllm_omni.distributed.weight_sharing.adapters import WeightSharingAdapter
+    from vllm_omni.outputs import OmniModelRunnerOutput
     from vllm_omni.worker_v2.native_output_worker import NativeOutputWorker
 
 logger = init_logger(__name__)
@@ -112,6 +114,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     _kstep_frames: int = 0
     _last_aux_output: Any
     _last_multimodal_outputs: dict[str, Any] | None
+    _model_returns_tuple: bool
     _model_has_structured_output: bool
     # FULL-graph aux-output contract (see _configure_cudagraph_output_contract).
     _full_graph_aux_outputs = False
@@ -119,6 +122,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
 
     def _configure_cudagraph_output_contract(self) -> None:
         """Select the CUDA graph output contract declared by the model."""
+        self._model_returns_tuple = bool(getattr(self.model, "_returns_tuple", False))
         self._model_has_structured_output = _needs_capture_tensor_unwrap(self.model)
         # FULL replay returns what capture stored: the hidden states and, for a
         # declared tuple model, its auxiliary pytree flattened to leaves.
@@ -126,6 +130,18 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         self._aux_output_spec = None
         self._exclude_full_graph = (self._model_has_structured_output and not self._full_graph_aux_outputs) or hasattr(
             self.model, "_last_captured_layers"
+        )
+
+    def _aux_hidden_state_contract_conflicts(self) -> bool:
+        """Whether a target-hidden-layer drafter conflicts with the model output.
+
+        ``_returns_tuple`` declares a model-owned auxiliary tuple. The
+        drafter-owned ``(hidden, aux layers)`` tuple is managed separately by
+        upstream MRv2 and must remain available to speculative decoding.
+        """
+        return bool(
+            self.use_aux_hidden_state_outputs
+            and (self._model_returns_tuple or hasattr(self.model, "_last_captured_layers"))
         )
 
     def _split_fullgraph_output(self, replayed: Any) -> tuple[Any, Any]:
@@ -379,10 +395,19 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         plane = getattr(self, "_omni_data_plane", None)
         return 0 if plane is None else plane.release_shm_resources(request_ids)
 
-    def _reserve_native_data_plane_outputs(self, req_ids: list[str]) -> None:
+    def _reserve_native_data_plane_outputs(self, output: OmniModelRunnerOutput) -> None:
         plane = getattr(self, "_omni_data_plane", None)
         if plane is not None:
-            plane.reserve_outputs(req_ids)
+            # The materializer and transport can run after the next scheduler
+            # update. Bind each tag to this output while its model step is live.
+            buffers = self.model_state.intermediate_buffer.buffers
+            output._duplex_perf_chunks = {
+                req_id: chunk
+                for req_id in output.req_ids
+                if (req_idx := self.req_states.req_id_to_index.get(req_id)) is not None
+                and (chunk := perf_chunk_from_buffer(buffers[req_idx])) is not None
+            }
+            plane.reserve_outputs(output.req_ids)
 
     def _attach_native_data_plane_signals(self, output: Any) -> Any:
         plane = getattr(self, "_omni_data_plane", None)
@@ -421,9 +446,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         self._last_aux_output = None
         self._last_multimodal_outputs = None
         self._configure_cudagraph_output_contract()
-        if self.use_aux_hidden_state_outputs and (
-            self._model_has_structured_output or hasattr(self.model, "_last_captured_layers")
-        ):
+        if self._aux_hidden_state_contract_conflicts():
             # Both would use the forward's tuple output slot.
             raise NotImplementedError(
                 f"{type(self.model).__name__} returns its own auxiliary output; a drafter that "
@@ -610,7 +633,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         torch.accelerator.synchronize()
         return max(free_before - torch.accelerator.get_memory_info()[0], 0)
 
-    def _dispatch_mtp_batch_descriptor(self, num_mtp_reqs: int) -> Any:
+    def _dispatch_mtp_batch_descriptor(self, num_mtp_reqs: int) -> BatchExecutionDescriptor:
         capture_sizes = self.model_state._get_mtp_capture_sizes()
         captured_bucket = next(
             (size for size in sorted(capture_sizes) if num_mtp_reqs <= size <= self.scheduler_config.max_num_seqs),
@@ -622,11 +645,14 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                 num_tokens=num_mtp_reqs,
                 num_reqs=num_mtp_reqs,
             )
-        return self.cudagraph_manager.dispatch(
-            captured_bucket,
-            captured_bucket,
-            1,
-            0,
+        # MTP owns a FULL graph wrapper and capture buckets independently of
+        # the backbone. Its replay must use the same mode as capture even when
+        # the backbone excludes FULL graphs for structured outputs.
+        return BatchExecutionDescriptor(
+            cg_mode=CUDAGraphMode.FULL,
+            num_tokens=captured_bucket,
+            num_reqs=captured_bucket,
+            uniform_token_count=1,
         )
 
     def _make_dummy_input_batch(
