@@ -185,6 +185,11 @@ class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
                         break
                     gap -= cost
                 return
+            # The aged request fits the budget, but the explicit max_num_seqs
+            # count cap still binds: do not push the running count past it.
+            # Leaving it waiting keeps it the preferred head next cycle.
+            if len(scheduler._running) >= self.max_admissions(scheduler.max_num_running_reqs):
+                return
             # The aged request fits: give it the head slot first, then admit in
             # score order for whatever budget is left. Without this, cheaper
             # younger requests in score order would consume the freed slot and
