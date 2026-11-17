@@ -29,7 +29,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_omni_params_are_keyword_only():
-    """The three omni params must be keyword-only after ``*args``.
+    """The omni params must be keyword-only after ``*args``.
 
     Guards against re-introducing the import-time rebind bug where omni params
     came first positionally and broke positional ``Request(...)`` construction.
@@ -40,6 +40,7 @@ def test_omni_params_are_keyword_only():
         "external_req_id",
         "additional_information",
         "model_intermediate_buffer",
+        "session_epoch",
     ):
         assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
 
@@ -132,8 +133,17 @@ def test_kv_hints_survive_omni_upgrade_wire_transport_and_scheduler_conversion()
         kv_hints=hints,
     )
     upgraded = OmniEngineCoreRequest.from_request(core)
+    # A bare core carries no epoch (pre-epoch payload tolerance).
+    assert upgraded.session_epoch is None
+    # The orchestrator stamps the fence epoch on the Omni request at
+    # submit time — a plain assignment to the declared field. (It must
+    # not be stamped on the bare core: EngineCoreRequest is a msgspec
+    # Struct and rejects undeclared attributes.)
+    upgraded.session_epoch = 3
     decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(upgraded), type=OmniEngineCoreRequest)
     scheduled = OmniRequest.from_engine_core_request(decoded, block_hasher=None)
     assert decoded.session_id == "session"
+    assert decoded.session_epoch == 3
     assert scheduled.kv_hints == hints
     assert scheduled.session_id == "session"
+    assert scheduled.session_epoch == 3

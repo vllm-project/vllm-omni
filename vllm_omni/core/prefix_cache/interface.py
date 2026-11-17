@@ -67,6 +67,17 @@ class PrefixCacheConfig:
     staging_claim_timeout_s: float = 30.0
     # Device→host chunk size for JOIN_ON_FINISH (copied a piece at a time).
     copy_chunk_bytes: int = 16 * 1024 * 1024
+    # Host-byte budget for the session-level prefix store (per-session
+    # row copies, independent of the slot pool). Appends that would exceed
+    # it are refused and fall back to the slot pool.
+    session_store_max_bytes: int = 2 * 1024 * 1024 * 1024
+    # Idle seconds after which a session's rows are reaped (see
+    # SessionPrefixStore.drop_idle_sessions): the only worker-visible
+    # session-end signal for ephemeral sessions, whose termination
+    # only unbinds. UNMEASURED starting default, same as the byte
+    # budget above: a safe starting point, not a tuned value. 600s is
+    # far above the gap between turns of a live session.
+    session_store_idle_ttl_s: float = 600.0
 
     @classmethod
     def from_vllm_config(
