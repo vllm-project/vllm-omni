@@ -132,7 +132,7 @@ def test_speech_truncation_includes_either_phase(abc_truncated, semantic_truncat
     assert metadata["audio_truncated"] == (abc_truncated or semantic_truncated)
 
 
-@pytest.mark.parametrize("cot,cfg_scale", [("full", 1), ("full", 1.5), ("off", 1.5)])
+@pytest.mark.parametrize("cot,cfg_scale", [("melody", 1), ("full", 1), ("full", 1.5), ("off", 1.5)])
 @pytest.mark.asyncio
 async def test_http_song_sampling_isolated_from_defaults(mocker, cot, cfg_scale):
     engine = mocker.Mock(
