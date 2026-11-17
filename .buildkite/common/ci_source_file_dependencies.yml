@@ -697,6 +697,18 @@ source_file_dependencies:
   omni_qwen3_omni_reliability:
     - *qwen3_omni
     - tests/dfx/reliability/test_qwen3_omni.py
+    - tests/helpers/stage_config.py
+    - tests/dfx/reliability/scenarios/
+    - tests/dfx/reliability/helpers.py
+    - tests/dfx/conftest.py
+    - tests/dfx/reliability/conftest.py
+    - tests/helpers/runtime.py
+
+  omni_qwen3_omni_replica_reliability:
+    - *qwen3_omni
+    - tests/dfx/reliability/test_qwen3_omni.py
+    - tests/dfx/reliability/test_qwen3_omni_replica.py
+    - tests/helpers/stage_config.py
     - tests/dfx/reliability/scenarios/
     - tests/dfx/reliability/helpers.py
     - tests/dfx/conftest.py
@@ -792,7 +804,20 @@ source_file_dependencies:
     - tests/dfx/reliability/helpers.py
     - tests/dfx/conftest.py
     - tests/dfx/reliability/conftest.py
+    - tests/helpers/stage_config.py
     - tests/helpers/runtime.py
+
+  omni_minicpmo_4_5_replica_reliability:
+    - *minicpmo_4_5
+    - tests/dfx/reliability/test_minicpmo_4_5.py
+    - tests/dfx/reliability/test_minicpmo_4_5_replica.py
+    - tests/dfx/reliability/scenarios/
+    - tests/dfx/reliability/helpers.py
+    - tests/dfx/conftest.py
+    - tests/dfx/reliability/conftest.py
+    - tests/helpers/stage_config.py
+    - tests/helpers/runtime.py
+    - vllm_omni/deploy/minicpmo_4_5_3gpu_stage1_replicas.yaml
 
   omni_minicpmo_4_5_accuracy:
     - *minicpmo_4_5
@@ -1360,6 +1385,7 @@ source_file_dependencies:
     - tests/dfx/reliability/helpers.py
     - tests/dfx/conftest.py
     - tests/dfx/reliability/conftest.py
+    - tests/helpers/stage_config.py
     - tests/helpers/runtime.py
 
   diffusion_image_to_video_doc:
@@ -1476,6 +1502,7 @@ source_file_dependencies:
     - tests/dfx/reliability/helpers.py
     - tests/dfx/conftest.py
     - tests/dfx/reliability/conftest.py
+    - tests/helpers/stage_config.py
     - tests/helpers/runtime.py
 
   diffusion_minimax_h3_function:
