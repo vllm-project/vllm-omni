@@ -128,7 +128,7 @@ The following fields belong under `duplex_session` and apply when
 | `max_sessions` | int | `1` | Global session limit, including sessions being opened or closed. |
 | `replica_policy` | `legacy` \| `least_sessions` | `legacy` | `legacy` preserves existing request routing and worker capacities. `least_sessions` reserves a replica group once when a session opens. |
 | `max_sessions_per_replica` | int \| null | `null` | Required and at least `1` for `least_sessions`. Bounds reserved sessions and model-owned session resources on each replica of every stage. |
-| `replica_groups` | list of stage-to-replica maps \| null | `null` | Omitted or `null` generates every combination of one replica per stage (a Cartesian product / SQL `CROSS JOIN`). Explicit maps restrict the allowed paths. Stage and replica IDs must be nonnegative integers. |
+| `replica_groups` | list of stage-to-replica maps \| null | `null` | Omitted or `null` allows every combination of one replica per stage (a Cartesian product / SQL `CROSS JOIN`), selected lazily without expanding the product. Explicit maps restrict the allowed paths. Stage and replica IDs must be nonnegative integers. |
 
 For example, a two-stage local pipeline with two replicas per stage can use:
 

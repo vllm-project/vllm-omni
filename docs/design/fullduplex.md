@@ -1128,7 +1128,11 @@ Omitting `replica_groups` generates the Cartesian product of the stage replica
 slots, equivalent to a SQL `CROSS JOIN`, for both equal and unequal stage counts.
 The example above automatically gets three groups `{0: 0, 1: i, 2: 0}` for
 `i = 0, 1, 2`; `[2, 2]` gets all four pairs. The last stage's replica index
-changes fastest when assigning group IDs. Explicit groups restrict the paths
+changes fastest when assigning group IDs.
+Implicit paths are selected lazily from the least occupied replicas at each
+stage, preserving the same group IDs and round-robin tie-breaking without
+enumerating the product. Diagnostics record stage counts and the total group
+count instead of expanding every implicit path. Explicit groups restrict the paths
 instead of adding to the generated product. Each session reserves one path;
 replicas shared across paths retain one capacity counter. Stage 0 and stage 2
 each need a per-replica session cap of at

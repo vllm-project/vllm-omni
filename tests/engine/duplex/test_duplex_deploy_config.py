@@ -115,7 +115,13 @@ def test_deploy_yaml_joins_unequal_replica_counts_without_explicit_groups(tmp_pa
         max_sessions_per_replica=config.max_sessions_per_replica,
         replica_groups=config.replica_groups,
     )
-    assert placement.snapshot()["groups"] == [{0: 0, 1: 0, 2: 0}, {0: 0, 1: 1, 2: 0}, {0: 0, 1: 2, 2: 0}]
+    assert placement.snapshot()["groups"] is None
+    assert placement.snapshot()["stage_replica_counts"] == (1, 3, 1)
+    assert [dict(placement.reserve(f"s{index}").replicas) for index in range(3)] == [
+        {0: 0, 1: 0, 2: 0},
+        {0: 0, 1: 1, 2: 0},
+        {0: 0, 1: 2, 2: 0},
+    ]
 
 
 @pytest.mark.parametrize("policy", ["round_robin", "", None, True])

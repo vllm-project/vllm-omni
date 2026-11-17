@@ -4,6 +4,9 @@
 """Pure session placement and capacity accounting; no engine or GPU execution."""
 
 from dataclasses import FrozenInstanceError
+from itertools import product
+from math import prod
+from random import Random
 
 import pytest
 
@@ -45,7 +48,81 @@ def test_aligned_groups_balance_sessions_and_keep_routes_stable() -> None:
 )
 def test_omitted_groups_join_all_stage_replicas(counts, paths) -> None:
     placement = DuplexReplicaPlacement(stage_replica_counts=counts, max_sessions_per_replica=2)
-    assert placement.snapshot()["groups"] == [dict(enumerate(path)) for path in paths]
+    snapshot = placement.snapshot()
+    assert snapshot["groups"] is None
+    assert snapshot["stage_replica_counts"] == tuple(counts)
+    assert snapshot["group_count"] == len(paths)
+    for group_id, path in enumerate(paths):
+        reservation = placement.reserve("session")
+        assert reservation.group_id == group_id
+        assert dict(reservation.replicas) == dict(enumerate(path))
+        placement.release("session")
+
+
+@pytest.mark.parametrize("counts", [(1, 3, 1), (2, 2), (2, 3, 2), (3, 2, 3)])
+@pytest.mark.parametrize("capacity", [1, 2, 4])
+def test_lazy_join_matches_explicit_product_admission(counts, capacity) -> None:
+    implicit = DuplexReplicaPlacement(stage_replica_counts=counts, max_sessions_per_replica=capacity)
+    explicit = DuplexReplicaPlacement(
+        stage_replica_counts=counts,
+        max_sessions_per_replica=capacity,
+        replica_groups=[dict(enumerate(path)) for path in product(*(range(count) for count in counts))],
+    )
+    random = Random(17)
+    for step in range(200):
+        session = f"s{random.randrange(12)}"
+        if step > 100 and step % 17 == 0:
+            stage = random.randrange(len(counts))
+            replica = random.randrange(counts[stage])
+            assert implicit.mark_unavailable(stage, replica) == explicit.mark_unavailable(stage, replica)
+        elif random.random() < 0.35:
+            implicit.release(session)
+            explicit.release(session)
+        else:
+            try:
+                expected = explicit.reserve(session)
+            except DuplexSessionError as error:
+                with pytest.raises(DuplexSessionError) as actual:
+                    implicit.reserve(session)
+                assert actual.value.code == error.code
+            else:
+                assert implicit.reserve(session) == expected
+        actual_state, expected_state = implicit.snapshot(), explicit.snapshot()
+        assert actual_state["reserved"] == expected_state["reserved"]
+        assert actual_state["sessions"] == expected_state["sessions"]
+        assert actual_state["unavailable"] == expected_state["unavailable"]
+
+
+def test_large_implicit_join_keeps_only_per_replica_state() -> None:
+    counts = (64,) * 3
+    placement = DuplexReplicaPlacement(stage_replica_counts=counts, max_sessions_per_replica=2)
+    assert placement.owned_group_count == prod(counts)
+    assert placement.reserve("first").group_id == 0
+    assert dict(placement.reserve("second").replicas) == dict.fromkeys(range(3), 1)
+    snapshot = placement.snapshot()
+    assert snapshot["groups"] is None
+    assert snapshot["group_count"] == 64**3
+    assert len(snapshot["reserved"]) == 64 * 3
+    assert len(snapshot["sessions"]) == 2
+
+
+@pytest.mark.parametrize("frontend", [0, 1, 2])
+def test_single_stage_lazy_join_preserves_frontend_partition(frontend) -> None:
+    implicit = DuplexReplicaPlacement(
+        stage_replica_counts=[7], max_sessions_per_replica=2, frontend_count=3, frontend_index=frontend
+    )
+    explicit = DuplexReplicaPlacement(
+        stage_replica_counts=[7],
+        max_sessions_per_replica=2,
+        frontend_count=3,
+        frontend_index=frontend,
+        replica_groups=[{0: replica} for replica in range(7)],
+    )
+    assert implicit.owned_group_count == explicit.owned_group_count
+    for _ in range(10):
+        assert implicit.reserve("warmup") == explicit.reserve("warmup")
+        implicit.release("warmup")
+        explicit.release("warmup")
 
 
 def test_join_can_route_across_indexes_when_aligned_paths_are_unavailable() -> None:
@@ -119,13 +196,14 @@ def test_failure_finds_all_owners_and_rejects_routes_through_other_stages() -> N
 
 
 def test_reservations_and_snapshots_do_not_expose_mutable_placement_state() -> None:
-    placement = DuplexReplicaPlacement(stage_replica_counts=[1], max_sessions_per_replica=1)
+    placement = DuplexReplicaPlacement(stage_replica_counts=[1], max_sessions_per_replica=1, replica_groups=[{0: 0}])
     reservation = placement.reserve("a")
     with pytest.raises(TypeError):
         reservation.replicas[0] = 1
     with pytest.raises(FrozenInstanceError):
         reservation.group_id = 1
     snapshot = placement.snapshot()
+    assert snapshot["groups"] is not None
     snapshot["groups"][0][0] = 99
     snapshot["reserved"][(0, 0)] = 99
     snapshot["sessions"].clear()
