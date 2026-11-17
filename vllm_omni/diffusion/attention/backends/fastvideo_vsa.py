@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
@@ -119,10 +119,10 @@ class FastVideoVSABackend(AttentionBackend):
         # FastVideo accepts variable-sized edge blocks. This lets packed
         # [real, pad] inputs run on their valid prefix without materializing an
         # attention mask; the implementation restores the ignored pad rows.
-        # Only forward_cuda honours packed_padding: every other platform hands
-        # the tensors straight to SDPA, which reads attn_mask and nothing else,
-        # so the pad rows would be attended as real keys.
-        return current_omni_platform.is_cuda()
+        # forward_cuda and forward_npu honour packed_padding. The remaining
+        # platforms hand the tensors straight to SDPA, which reads attn_mask
+        # and nothing else, so the pad rows would be attended as real keys.
+        return current_omni_platform.is_cuda() or current_omni_platform.is_npu()
 
     @classmethod
     def validate_available(cls) -> None:
@@ -237,6 +237,7 @@ class FastVideoVSAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
         reason: str,
+        dense: Callable[..., torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Run dense SDPA, honouring the mask-free packed contract this backend claims.
 
@@ -244,16 +245,19 @@ class FastVideoVSAImpl(AttentionImpl):
         padding mask, so on this path there is nothing to stop SDPA attending
         the structural pad rows as real keys. Slice to the valid prefix instead
         and leave the pad rows zeroed, exactly as the VSA path does.
+
+        ``dense`` is the SDPA entry point to run; it defaults to the platform
+        dispatch.
         """
         logger.warning_once("FASTVIDEO_VSA falling back to SDPA: %s", reason)
+        if dense is None:
+            dense = self.sdpa_fallback.forward
         packed = attn_metadata.packed_padding if attn_metadata is not None else None
         if attn_metadata is None or packed is None or attn_metadata.attn_mask is not None:
-            return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+            return dense(query, key, value, attn_metadata)
         q_length = min(int(packed.q_length), query.shape[1])
         kv_length = min(int(packed.kv_length), key.shape[1])
-        output = self.sdpa_fallback.forward(
-            query[:, :q_length], key[:, :kv_length], value[:, :kv_length], attn_metadata
-        )
+        output = dense(query[:, :q_length], key[:, :kv_length], value[:, :kv_length], attn_metadata)
         if q_length == query.shape[1]:
             return output
         restored = torch.zeros(
@@ -442,7 +446,16 @@ class FastVideoVSAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        return self.sdpa_fallback.forward_npu(query, key, value, attn_metadata)
+        # Dense, but through the helper that drops the structural pad rows this
+        # backend told the model not to mask.
+        return self._fallback(
+            query,
+            key,
+            value,
+            attn_metadata,
+            "no NPU sparse kernel for this layout",
+            dense=self.sdpa_fallback.forward_npu,
+        )
 
     def forward_xpu(
         self,

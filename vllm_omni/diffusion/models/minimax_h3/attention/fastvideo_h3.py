@@ -318,8 +318,9 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
             return super().forward_npu(query, key, value, attn_metadata)
         # A checkpoint that pins its sparsity must not be served dense.
         requires_sparse = attn_metadata.extra.get("vsa_h3_sparsity") is not None
-        # The packed document is padded past its valid rows. This platform masks
-        # that tail for the dense path; the sparse path drops it and restores it.
+        # The packed document is padded past its valid rows and, under the
+        # mask-free packed contract, arrives without a mask. Drop that tail and
+        # restore it as zeros; the dense path does the same in ``_fallback``.
         valid = min(int(attn_metadata.extra.get("valid_kv_length", query.shape[1])), query.shape[1])
         try:
             if self.precision != "bf16":
@@ -332,6 +333,7 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
                 raise
             logger.warning_once("FASTVIDEO_VSA falling back to SDPA on NPU: VSA-H3 kernel failed: %s", exc)
             return super().forward_npu(query, key, value, attn_metadata)
+        logger.info_once("FASTVIDEO_VSA: 64-token MiniMax-H3 layouts run on torch_npu.npu_block_sparse_attention")
         if valid == query.shape[1]:
             return output
         restored = torch.zeros_like(query)
