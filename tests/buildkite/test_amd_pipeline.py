@@ -2264,96 +2264,18 @@ def test_cosmos3_weekly_is_blocking_and_replaces_narrow_nightly_owner() -> None:
     assert _steps_selecting_node(AMD_NIGHTLY_PIPELINE, _COSMOS3_T2I_NODE) == []
 
 
-_DRAMA3_WEEKLY_CORE_NODE = "tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]"
-_DRAMA3_WEEKLY_ADVANCED_NODES = (
-    _DRAMA3_WEEKLY_CORE_NODE,
-    "tests/e2e/online_serving/test_drama_3.py::test_voice_clone_streaming_002[seed0-drama_3-rocm]",
-    "tests/e2e/online_serving/test_drama_3.py::test_voice_clone_streaming_002[seed42-drama_3-rocm]",
-    "tests/e2e/online_serving/test_drama_3.py::test_voice_clone_concurrent_003[drama_3-rocm]",
-    "tests/e2e/online_serving/test_drama_3.py::test_voice_clone_requires_ref_text_004[drama_3-rocm]",
+@pytest.mark.parametrize(
+    "pipeline_path",
+    [AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_WEEKLY_PIPELINE],
+    ids=["ready", "merge", "weekly"],
 )
-_DRAMA3_WEEKLY_LABELS = {
-    "Drama 3 text-to-audio · Core · 1-GPU",
-    "Drama 3 full advanced · 1-GPU",
-}
-
-
-def test_drama3_weekly_has_exact_blocking_core_and_advanced_owners() -> None:
-    group = _find_group("TTS E2E Weekly", AMD_WEEKLY_PIPELINE)
-    labels = {step["label"] for step in group["steps"]}
-    assert _DRAMA3_WEEKLY_LABELS <= labels
-
-    expected_dependencies = [
-        "tts_drama_3_function",
-        ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh",
-        "tests/helpers/",
-        "tests/assets/qwen3_tts/clone_2.wav",
-    ]
-    expected_env = {
-        "OPENBLAS_NUM_THREADS": "1",
-        "OMP_NUM_THREADS": "1",
-        "MKL_NUM_THREADS": "1",
-        "NUMEXPR_NUM_THREADS": "1",
-    }
-
-    core = _find_step("Drama 3 text-to-audio · Core · 1-GPU", AMD_WEEKLY_PIPELINE)
-    core_command = "\n".join(core["commands"])
-    assert core["agent_pool"] == "mi300_1"
-    assert core["depends_on"] == "amd-build"
-    assert core["mirror_hardwares"] == ["amdproduction"]
-    assert core["grade"] == "Blocking"
-    assert core["timeout_in_minutes"] == 60
-    assert core["source_file_dependencies"] == expected_dependencies
-    assert core["env"] == expected_env
-    assert core["artifact_paths"] == ["artifacts/rocm-drama3-core-weekly/**/*"]
-    assert "retry" not in core
-    assert "ROCM_E2E_LEVEL_MARKER=slow" in core_command
-    assert "ROCM_E2E_RUN_LEVEL=core_model" in core_command
-    assert "ROCM_E2E_TIMEOUT_MINUTES=45" in core_command
-    assert ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh" in core_command
-    core_tokens = split(next(command for command in core["commands"] if "run-rocm-full-model-nightly.sh" in command))
-    core_runner = core_tokens.index(".buildkite/amd/scripts/run-rocm-full-model-nightly.sh")
-    assert core_tokens[core_runner + 1 :] == [
-        _DRAMA3_WEEKLY_CORE_NODE,
-        "1",
-        "tts",
-        "rocm-drama3-core-weekly",
-    ]
-    for node in _DRAMA3_WEEKLY_ADVANCED_NODES[1:]:
-        assert node not in core_command
-
-    advanced = _find_step("Drama 3 full advanced · 1-GPU", AMD_WEEKLY_PIPELINE)
-    advanced_command = "\n".join(advanced["commands"])
-    assert advanced["agent_pool"] == "mi300_1"
-    assert advanced["depends_on"] == "amd-build"
-    assert advanced["mirror_hardwares"] == ["amdproduction"]
-    assert advanced["grade"] == "Blocking"
-    assert advanced["timeout_in_minutes"] == 150
-    assert advanced["source_file_dependencies"] == expected_dependencies
-    assert advanced["env"] == expected_env
-    assert advanced["artifact_paths"] == ["artifacts/rocm-drama3-advanced-weekly/**/*"]
-    assert "retry" not in advanced
-    assert "ROCM_E2E_LEVEL_MARKER=slow" in advanced_command
-    assert "ROCM_E2E_RUN_LEVEL=advanced_model" in advanced_command
-    assert "ROCM_E2E_TIMEOUT_MINUTES=120" in advanced_command
-    assert ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh" in advanced_command
-    advanced_tokens = split(
-        next(command for command in advanced["commands"] if "run-rocm-full-model-nightly.sh" in command)
-    )
-    advanced_runner = advanced_tokens.index(".buildkite/amd/scripts/run-rocm-full-model-nightly.sh")
-    assert advanced_tokens[advanced_runner + 1 :] == [
-        _DRAMA3_WEEKLY_CORE_NODE,
-        "5",
-        "tts",
-        "rocm-drama3-advanced-weekly",
-        *_DRAMA3_WEEKLY_ADVANCED_NODES[1:],
-    ]
-    for node in _DRAMA3_WEEKLY_ADVANCED_NODES:
-        assert advanced_command.count(node) == 1
-
-    source = Path("tests/e2e/online_serving/test_drama_3.py").read_text(encoding="utf-8")
-    assert source.count('"rocm": "MI325"') == 4
-    assert '@pytest.mark.parametrize("seed", [0, 42]' in source
+def test_v1_only_drama3_is_not_scheduled(pipeline_path: Path) -> None:
+    """The retired V1-only workflow must not be advertised as an executable job."""
+    assert not Path("tests/e2e/online_serving/test_drama_3.py").exists()
+    pipeline = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    for step in _walk_steps(pipeline["steps"]):
+        assert "Drama 3" not in step.get("label", "")
+        assert "test_drama_3.py" not in "\n".join(step.get("commands", []))
 
 
 _MOSS_WEEKLY_NODES = (
@@ -5059,111 +4981,6 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
         assert path not in r2_01_command
 
 
-_DRAMA3_READY_MARKER = "slow and tts and rocm and MI325 and cards_1"
-_DRAMA3_MERGE_MARKER = "slow and tts and rocm and MI325 and cards_1"
-_DRAMA3_READY_NODE = "tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]"
-_DRAMA3_EXCLUDED = (
-    "test_voice_clone_streaming_002",
-    "test_voice_clone_concurrent_003",
-    "test_voice_clone_requires_ref_text_004",
-)
-
-
-def _hardware_decorator(source: str, function_name: str) -> str:
-    head = source.split(f"def {function_name}", 1)[0]
-    return head.rsplit("@hardware_test", 1)[1]
-
-
-def test_drama3_ready_requires_one_blocking_text_to_audio_node() -> None:
-    """READY requires one Blocking MI300 job for the one-card ROCm smoke.
-
-    CUDA uses one card and NPU uses two, so ``hardware_test`` keeps a separate
-    ROCm item. The server param id is ``drama_3`` and the platform id is ``rocm``.
-    """
-    step = _find_step("Drama 3 E2E Test", AMD_READY_PIPELINE)
-    command = "\n".join(step["commands"])
-    source = Path("tests/e2e/online_serving/test_drama_3.py").read_text(encoding="utf-8")
-
-    assert step["agent_pool"] == "mi300_1"
-    assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == "Blocking"
-    assert step["timeout_in_minutes"] == 40
-    assert step["artifact_paths"] == ["artifacts/rocm-drama3-ready/**/*"]
-    assert "timeout 30m" in command
-    assert "timeout 40m" not in command
-    assert _marker_expressions(step) == [_DRAMA3_READY_MARKER, _DRAMA3_READY_MARKER]
-    assert command.count('--run-level "core_model"') == 2
-    assert "full_model" not in command
-    # nodes= + collect-only + run, same as MERGE text-to-audio.
-    assert command.count(_DRAMA3_READY_NODE) == 3
-    for name in _DRAMA3_EXCLUDED:
-        assert name not in command
-    assert "diff -u /tmp/drama3-ready-expected.txt" in command
-    assert "--junitxml=" in command
-    assert "pytest.log" not in command
-    assert "pytest-summary.txt" not in command
-    assert "PIPESTATUS" not in command
-    assert "tee " not in command
-    assert '"rocm": "MI325"' in _hardware_decorator(source, "test_text_to_audio_001")
-    assert '"rocm": 1' in _hardware_decorator(source, "test_text_to_audio_001")
-    for name in _DRAMA3_EXCLUDED:
-        assert '"rocm": "MI325"' in _hardware_decorator(source, name)
-        assert "@pytest.mark.core_model" not in _hardware_decorator(source, name)
-    assert source.count('"rocm": "MI325"') == 4
-
-
-def test_drama3_merge_requires_the_same_text_to_audio_node() -> None:
-    """MERGE runs the READY node at advanced_model. READY stays core_model.
-
-    ``--run-level advanced_model`` drops dummy weights and enables the shared
-    speech transcript check. Voice-clone nodes run in their own MERGE job.
-    """
-    ready = _find_step("Drama 3 E2E Test", AMD_READY_PIPELINE)
-    step = _find_step("MERGE · Drama 3 Text-to-Audio", AMD_MERGE_PIPELINE)
-    command = "\n".join(step["commands"])
-    source = Path("tests/e2e/online_serving/test_drama_3.py").read_text(encoding="utf-8")
-    selected = source.split("def test_text_to_audio_001", 1)[0].rsplit("\n\n", 1)[1]
-    speech_gate = (
-        Path("tests/helpers/assertions.py")
-        .read_text(encoding="utf-8")
-        .split("def _speech_assertion_needs_audio_transcript", 1)[1]
-        .split("\ndef ", 1)[0]
-    )
-    weight_selector = (
-        Path("tests/helpers/stage_config.py")
-        .read_text(encoding="utf-8")
-        .split("def stage_config_path_for_run_level", 1)[1]
-        .split("\ndef ", 1)[0]
-    )
-
-    assert ready["grade"] == "Blocking"
-    assert _marker_expressions(ready) == [_DRAMA3_READY_MARKER, _DRAMA3_READY_MARKER]
-    assert step["agent_pool"] == "mi300_1"
-    assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == "Blocking"
-    assert step["timeout_in_minutes"] == 40
-    assert step["artifact_paths"] == ["artifacts/rocm-drama3-merge/**/*"]
-    assert "timeout 30m" in command
-    assert _marker_expressions(step) == [_DRAMA3_MERGE_MARKER, _DRAMA3_MERGE_MARKER]
-    assert command.count('--run-level "advanced_model"') == 2
-    assert "core_model" not in command
-    assert "full_model" not in command
-    assert command.count(_DRAMA3_READY_NODE) == 3
-    assert "diff -u /tmp/drama3-merge-expected.txt" in command
-    assert "Expected exactly one executed Drama 3 MERGE test" in command
-    assert "@pytest.mark.slow" in selected
-    assert "@pytest.mark.core_model" not in selected
-    assert "@pytest.mark.advanced_model" not in selected
-    text_to_audio = source.split("def test_voice_clone_streaming_002", 1)[0]
-    assert "send_audio_speech_request" in text_to_audio
-    assert 'run_level not in {"advanced_model", "full_model"}' in speech_gate
-    assert 'run_level in {"advanced_model", "full_model"}' in weight_selector
-    assert "_delete_dummy_load_format" in weight_selector
-    for name in _DRAMA3_EXCLUDED:
-        assert name not in command
-        assert '"rocm": "MI325"' in _hardware_decorator(source, name)
-
-
 _DEVICE_REDUCTION_READY_MARKER = "core_model and diffusion and rocm and MI325 and cards_1"
 _DEVICE_REDUCTION_READY_NODES = (
     "tests/diffusion/test_device_reduction.py::test_device_reduction_matches_a_float32_reference[dtype0]",
@@ -5905,5 +5722,5 @@ def test_weekly_all_jobs_are_blocking() -> None:
     weekly = yaml.safe_load(AMD_WEEKLY_PIPELINE.read_text(encoding="utf-8"))
     steps = [step for group in weekly["steps"] for step in group["steps"]]
 
-    assert len(steps) == 38
+    assert len(steps) == 36
     assert all(step["grade"] == "Blocking" for step in steps)

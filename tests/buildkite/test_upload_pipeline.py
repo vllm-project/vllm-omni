@@ -1050,24 +1050,24 @@ def test_h100_tts_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatc
         "tts_step_audio2_weekly",
         "tts_moss_v15_weekly",
         "tts_minimax_music3_weekly",
-        "tts_yue2_weekly",
     ]
     assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": "v2"}
     command = "\n".join(step["commands"])
-    v1_files = (
+    explicit_files = (
         "tests/e2e/offline_inference/test_audex_s2s.py",
         "tests/e2e/online_serving/test_audex_tta.py",
         "tests/e2e/online_serving/test_audex_tts.py",
         "tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py",
         "tests/e2e/online_serving/test_higgs_audio_v3.py",
         "tests/e2e/online_serving/test_minimax_music3.py",
-        "tests/e2e/online_serving/test_yue2.py",
     )
-    assert "VLLM_OMNI_CI_MODEL_RUNNER=v1 pytest" in command
+    assert "VLLM_OMNI_CI_MODEL_RUNNER=v1" not in command
     assert "VLLM_OMNI_CI_MODEL_RUNNER=v2 pytest" in command
-    for path in v1_files:
+    for path in explicit_files:
         assert command.count(path) == 2
         assert f"--ignore={path}" in command
+    assert command.count("tests/e2e/online_serving/test_yue2.py") == 1
+    assert "--ignore=tests/e2e/online_serving/test_yue2.py" in command
     assert "failed=0" in command
     assert "exit $$failed" in command
 
@@ -1077,9 +1077,9 @@ def test_h100_tts_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatc
     for changed_file in (
         "tests/e2e/offline_inference/test_moss_tts_v1_5_expansion.py",
         "tests/e2e/online_serving/test_minimax_music3.py",
-        "tests/e2e/online_serving/test_yue2.py",
     ):
         assert label in _surviving_labels(doc, [changed_file], pipeline_path=pipeline_path)
+    assert label not in _surviving_labels(doc, ["tests/e2e/online_serving/test_yue2.py"], pipeline_path=pipeline_path)
     assert label not in _surviving_labels(doc, ["docs/source/index.md"], pipeline_path=pipeline_path)
 
 
