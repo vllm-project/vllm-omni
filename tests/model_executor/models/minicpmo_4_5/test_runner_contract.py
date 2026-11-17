@@ -15,12 +15,14 @@ membership so a rename cannot quietly drop it again.
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from vllm_omni.model_executor.models.interfaces import (
     SupportsMultiFrameDecode,
     requires_request_sample_eligibility,
     supports_multi_frame_decode,
 )
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -46,18 +48,31 @@ def test_wrapper_satisfies_the_protocol():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,
     )
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        MiniCPMO45OmniTTSForConditionalGeneration,
+    )
 
     # The runner only ever sees the wrapper, so the wrapper is what has to
     # satisfy the contract.
-    assert isinstance(MiniCPMO45OmniForConditionalGeneration, type)  # importable
-    for name in (
-        "supports_multi_frame_decode",
-        "batch_stop_logits",
-        "take_batch_stop_logits",
-        "set_batch_stop_logits",
-        "merge_frame_outputs",
-    ):
-        assert hasattr(MiniCPMO45OmniForConditionalGeneration, name), name
+    wrapper = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.model_stage = "tts"
+    wrapper.talker = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
+    torch.nn.Module.__init__(wrapper.talker)
+    wrapper.talker.batch_stop_logits = None
+
+    assert supports_multi_frame_decode(wrapper) is True
+    assert isinstance(wrapper, SupportsMultiFrameDecode)
+    logits = torch.tensor([[0.0, -torch.inf]])
+    wrapper.set_batch_stop_logits(logits)
+    assert wrapper.batch_stop_logits is logits
+    assert wrapper.take_batch_stop_logits() is logits
+    assert wrapper.batch_stop_logits is None
+    assert wrapper.take_batch_stop_logits() is None
+
+    frame = OmniOutput(text_hidden_states=torch.zeros(1, 4))
+    assert wrapper.merge_frame_outputs([frame], [logits]) is frame
+    assert wrapper.batch_stop_logits is logits
 
 
 def test_flag_off_reads_false_without_contract():
@@ -130,41 +145,6 @@ def test_flag_on_without_members_raises_and_names_them():
         assert member in message
 
 
-def test_armed_model_passes():
-    assert supports_multi_frame_decode(_Model(armed=True)) is True
-
-
-def test_runtime_checkable_protocol_agrees():
-    assert isinstance(_Model(), SupportsMultiFrameDecode)
-
-
 def test_sample_eligibility_flag():
     assert requires_request_sample_eligibility(SimpleNamespace(requires_request_sample_eligibility=True)) is True
     assert requires_request_sample_eligibility(SimpleNamespace()) is False
-
-
-def test_stop_logits_reader_and_definition_agree():
-    """The stop-row holder is read by name from the runner.
-
-    Renaming the model's attribute without the runner's read site makes the
-    lookup return None forever -- the gate then hands over
-    ``text_hidden_states`` and the two-wide stop row never reaches the request.
-    Pin both ends: the attribute exists only under the public name, and no
-    reader still spells the old one.
-    """
-    from pathlib import Path
-
-    import vllm_omni
-
-    root = Path(vllm_omni.__file__).parent
-    talker_src = (root / "model_executor/models/minicpmo_4_5/minicpmo_4_5_omni_tts.py").read_text()
-    # The holder is an instance attribute assigned in __init__ / set_batch_stop_logits.
-    assert "self.batch_stop_logits" in talker_src
-    assert "self._batch_stop_logits" not in talker_src
-
-    stale = [
-        str(path.relative_to(root))
-        for path in root.rglob("*.py")
-        if '"_batch_stop_logits"' in path.read_text() or "'_batch_stop_logits'" in path.read_text()
-    ]
-    assert not stale, f"readers still use the private name: {stale}"

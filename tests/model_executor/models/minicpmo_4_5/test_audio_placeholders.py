@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Regression tests for the MiniCPM-o 4.5 ``audio_embeds`` input path.
+"""MiniCPM-o 4.5 audio placeholders follow embedding length and checkpoint pooling.
 
 Two defects made the OpenAI ``audio_embeds`` content part unusable with this model:
 
@@ -28,6 +28,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMMultiModalProcessor,
     MiniCPMO45OmniLLMProcessingInfo,
     MiniCPMOAudioEmbeddingItems,
+    MiniCPMOConfig,
     _minicpmo_field_config,
 )
 
@@ -43,7 +44,8 @@ class _FakeProcessor:
     """Minimal processor surface used by ``get_audio_placeholder``."""
 
     def __init__(self) -> None:
-        self.pool_step = POOL_STEP
+        # The cached processor can retain the legacy pool step until configured.
+        self.pool_step = 2
         self.audio_processor = SimpleNamespace(hop_length=160)
         self.image_processor = SimpleNamespace(mean=[0.0], std=[1.0])
 
@@ -78,14 +80,13 @@ class _IdentityTokenizer:
         return 0
 
 
-def _processing_info() -> MiniCPMO45OmniLLMProcessingInfo:
-    processor = _FakeProcessor()
+def _processing_info(processor: _FakeProcessor, pool_step: int = POOL_STEP) -> MiniCPMO45OmniLLMProcessingInfo:
     tokenizer = _IdentityTokenizer()
     info = object.__new__(MiniCPMO45OmniLLMProcessingInfo)
     info.ctx = SimpleNamespace(
         tokenizer=tokenizer,
         get_tokenizer=lambda: tokenizer,
-        get_hf_config=lambda: SimpleNamespace(audio_pool_step=POOL_STEP),
+        get_hf_config=lambda: SimpleNamespace(audio_pool_step=pool_step),
         get_hf_processor=lambda **kwargs: processor,
     )
     return info
@@ -97,7 +98,7 @@ def _audio_placeholder_for(single_audio_embeds: torch.Tensor) -> str:
     Goes through ``_get_prompt_updates`` rather than recomputing the length, so the
     ``sum(map(len, ...))`` regression is actually exercised.
     """
-    info = _processing_info()
+    info = _processing_info(_FakeProcessor())
     proc = object.__new__(MiniCPMO45OmniLLMMultiModalProcessor)
     proc.info = info
 
@@ -105,6 +106,7 @@ def _audio_placeholder_for(single_audio_embeds: torch.Tensor) -> str:
         {"audio_embeds": single_audio_embeds.unsqueeze(0)},
         fields_factory=_minicpmo_field_config,
     )
+    assert items.modality == "audio"
     mm_items = MultiModalDataItems({"audio": items})
 
     updates = proc._get_prompt_updates(mm_items, {}, {})
@@ -112,33 +114,35 @@ def _audio_placeholder_for(single_audio_embeds: torch.Tensor) -> str:
     return audio_update.content(0).full
 
 
-def test_audio_embedding_items_use_the_audio_modality() -> None:
-    """Registering under ``image`` makes every ``audio_embeds`` request fail."""
-    items = MiniCPMOAudioEmbeddingItems(
-        {"audio_embeds": torch.zeros(1, EMBEDS_PER_SECOND, HIDDEN_SIZE)},
-        fields_factory=_minicpmo_field_config,
-    )
-
-    assert items.modality == "audio"
-
-
-@pytest.mark.parametrize("num_seconds", [1, 3, 30])
-def test_placeholder_length_matches_embedding_count(num_seconds: int) -> None:
+@pytest.mark.parametrize(
+    ("num_seconds", "hidden_size"),
+    [(1, HIDDEN_SIZE), (3, HIDDEN_SIZE), (30, HIDDEN_SIZE), (1, 8)],
+)
+def test_placeholder_length_matches_embedding_count(num_seconds: int, hidden_size: int) -> None:
     """An ``(s, h)`` item must yield exactly ``s`` placeholder tokens."""
     num_embeds = num_seconds * EMBEDS_PER_SECOND
 
-    placeholder = _audio_placeholder_for(torch.zeros(num_embeds, HIDDEN_SIZE))
+    placeholder = _audio_placeholder_for(torch.zeros(num_embeds, hidden_size))
 
     assert placeholder.count("<unk>") == num_embeds
 
 
-def test_placeholder_does_not_scale_with_hidden_size() -> None:
-    """The count must depend on ``s`` alone, never on ``h``.
+@pytest.mark.parametrize(
+    ("configured_pool_step", "expected_placeholders"),
+    [(5, 50), (2, 125)],
+)
+def test_audio_placeholders_follow_checkpoint_pool_step(
+    configured_pool_step: int,
+    expected_placeholders: int,
+) -> None:
+    processor = _FakeProcessor()
+    info = _processing_info(processor, configured_pool_step)
 
-    ``sum(map(len, ...))`` returned ``s * h``, so the placeholder grew with the model's
-    hidden size. Two items with the same ``s`` but different ``h`` must agree.
-    """
-    narrow = _audio_placeholder_for(torch.zeros(EMBEDS_PER_SECOND, 8))
-    wide = _audio_placeholder_for(torch.zeros(EMBEDS_PER_SECOND, HIDDEN_SIZE))
+    placeholder = info.get_audio_placeholder(5 * 16_000)
 
-    assert narrow.count("<unk>") == wide.count("<unk>") == EMBEDS_PER_SECOND
+    assert processor.pool_step == configured_pool_step
+    assert placeholder.count("<unk>") == expected_placeholders
+
+
+def test_minicpmo_4_5_pool_step_defaults_to_checkpoint_value() -> None:
+    assert MiniCPMOConfig().audio_pool_step == 5
