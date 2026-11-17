@@ -109,11 +109,8 @@ class DuplexOmniEngine(AsyncOmniEngine):
         assert self.pipeline_config is not None, "Duplex deployment must resolve a model pipeline"
         # ``self.async_chunk`` is the deploy-resolved flag (per-stage connector
         # override included). Plugins that gate their own streaming on it
-        # receive it here, before any session can be admitted. Optional: the
-        # base plugin does not need it and test doubles may not implement it.
-        configure_async_chunk = getattr(self.plugin, "configure_async_chunk", None)
-        if callable(configure_async_chunk) and hasattr(self, "async_chunk"):
-            configure_async_chunk(enabled=bool(self.async_chunk))
+        # receive it here, before any session can be admitted.
+        self.plugin.configure_async_chunk(enabled=bool(self.async_chunk))
         # Match the frontend's comprehension-stage selection. An optional ASR
         # stage does not own the served model's tokenizer or prompt policy.
         model_stage_id = next((stage.stage_id for stage in self.pipeline_config.stages if stage.owns_tokenizer), 0)

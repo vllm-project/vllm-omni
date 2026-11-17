@@ -468,6 +468,15 @@ class DuplexModelPlugin(ABC):
     def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
         """Bind model policy to the resolved deployment topology before admission."""
 
+    def configure_async_chunk(self, *, enabled: bool) -> None:
+        """Receive the deploy-resolved ``async_chunk`` flag before admission.
+
+        The engine always calls this. Models that do not gate streaming on the
+        flag keep this no-op; JoyAI overrides it to switch sentence TTS, Talker
+        DELTA parks, and draining.
+        """
+        del enabled
+
     def configure_server(self, runtime_config: DuplexSessionRuntimeConfig) -> None:
         """Validate server-owned model options before accepting sessions."""
         if runtime_config.model_custom_options:
