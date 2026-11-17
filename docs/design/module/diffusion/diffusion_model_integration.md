@@ -73,9 +73,12 @@ The runtime invalidates prepared values at a chunk boundary and releases them
 when a request completes, fails, or is cancelled. A model defines which inputs
 are safe to prepare, invalidates them on any other relevant dependency change,
 and defines how CFG branches and rank-local layouts consume them.
-Request-mode pipelines use `prepared_denoise_scope()` after encoding and layout
-finalization. The scope publishes into the same lifecycle object and releases
-it after the denoise loop, including on failure or cancellation.
+Request-mode pipelines enter `prepared_denoise_scope(prepare=..., bind=...)`
+after encoding and layout finalization. The scope invokes the model's builder,
+publishes its complete result, and calls the model's binding hook before the
+denoise loop begins. It releases the result after the loop, including on
+preparation failure or cancellation. Unlike step execution, request-mode
+pipelines do not use `StepRequestState` or `InputBatch`.
 
 Qwen-Image-Edit-Plus initializes its Qwen2.5-VL encoder on CPU before sharding
 and moving it to the execution device. Its non-persistent FP32 RoPE frequency

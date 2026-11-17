@@ -415,10 +415,11 @@ def minimax_h3_denoise_loop(
         return step_profiler(states[0].step_index) if step_profiler is not None else nullcontext()
 
     try:
-        with prepared_denoise_scope() as prepared:
-            if current_omni_platform.is_npu():
-                prepared.prepare(lambda: positive.build_rope_table(model))
-                positive.bind_prepared_rope(prepared)
+        prepare_rope = current_omni_platform.is_npu()
+        with prepared_denoise_scope(
+            prepare=(lambda: positive.build_rope_table(model)) if prepare_rope else None,
+            bind=positive.bind_prepared_rope if prepare_rope else None,
+        ):
             with torch.inference_mode():
                 sampler_object(sampler).sample(
                     MiniMaxH3ModelBatch({state: adapter}),

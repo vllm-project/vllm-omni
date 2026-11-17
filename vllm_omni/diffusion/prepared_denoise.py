@@ -47,14 +47,24 @@ class PreparedDenoiseInputs(Generic[T]):
 
 
 @contextmanager
-def prepared_denoise_scope() -> Iterator[PreparedDenoiseInputs[object]]:
+def prepared_denoise_scope(
+    prepare: Callable[[], T] | None = None,
+    bind: Callable[[PreparedDenoiseInputs[T]], None] | None = None,
+) -> Iterator[PreparedDenoiseInputs[T]]:
     """Own prepared inputs across a request-mode denoise loop.
 
-    Enter after encoding and layout finalization. The same store used by step
-    execution is released on success, cancellation, or any exception.
+    Enter after encoding and layout finalization. Invoke the model's optional
+    preparation and binding hooks before yielding to denoising. The same store
+    used by step execution is released on success, cancellation, or any error.
     """
-    prepared = PreparedDenoiseInputs[object]()
+    prepared = PreparedDenoiseInputs[T]()
     try:
+        if prepare is not None:
+            prepared.prepare(prepare)
+            if bind is not None:
+                bind(prepared)
+        elif bind is not None:
+            raise ValueError("Binding prepared inputs requires a preparation hook")
         yield prepared
     finally:
         prepared.release()

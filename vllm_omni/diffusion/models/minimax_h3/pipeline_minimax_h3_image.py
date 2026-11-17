@@ -702,9 +702,10 @@ class MiniMaxH3ImagePipeline(
         sigmas = minimax_h3_image_run_sigmas(self.pdd_sigmas)
         sigma_values = torch.tensor(sigmas, dtype=torch.float32, device=self.device)
         deltas = sigma_values[:-1] - sigma_values[1:]
-        with prepared_denoise_scope() as prepared:
-            prepared.prepare(lambda: branch.build_rope_table(self.transformer))
-            branch.bind_prepared_rope(prepared)
+        with prepared_denoise_scope(
+            prepare=lambda: branch.build_rope_table(self.transformer),
+            bind=branch.bind_prepared_rope,
+        ):
             with self.progress_bar(total=num_steps) as progress_bar:
                 for step in range(num_steps):
                     check_request_cancellation()

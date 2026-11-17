@@ -38,12 +38,43 @@ def test_prepared_denoise_inputs_publish_only_complete_generations():
 def test_request_mode_prepared_scope_releases_after_failure():
     from vllm_omni.diffusion.prepared_denoise import prepared_denoise_scope
 
+    events = []
+
+    value = object()
+
+    def prepare():
+        events.append("prepare")
+        return value
+
+    def bind(prepared):
+        assert prepared.bind() is value
+        events.append("bind")
+
     with pytest.raises(ValueError, match="denoise failed"):
-        with prepared_denoise_scope() as prepared:
-            prepared.prepare(object)
+        with prepared_denoise_scope(prepare=prepare, bind=bind) as prepared:
+            events.append("denoise")
             raise ValueError("denoise failed")
+    assert events == ["prepare", "bind", "denoise"]
     with pytest.raises(RuntimeError, match="stale"):
         prepared.bind()
+
+
+def test_request_mode_prepared_scope_does_not_bind_failed_preparation():
+    from vllm_omni.diffusion.prepared_denoise import prepared_denoise_scope
+
+    bound = False
+
+    def fail_prepare():
+        raise ValueError("preparation failed")
+
+    def bind(_prepared):
+        nonlocal bound
+        bound = True
+
+    with pytest.raises(ValueError, match="preparation failed"):
+        with prepared_denoise_scope(prepare=fail_prepare, bind=bind):
+            pytest.fail("denoise should not start")
+    assert not bound
 
 
 def test_grouped_qkv_checkpoint_reorder():
