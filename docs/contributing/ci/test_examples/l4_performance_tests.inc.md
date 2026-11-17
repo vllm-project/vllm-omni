@@ -230,7 +230,7 @@ The two Qwen3-Omni NPU nightly performance jobs intentionally omit
 AMD calibration uses the recorded runtime label `MI300`, even though existing
 selection expressions contain the `MI325` pytest marker. An actual MI325 device
 does not inherit MI300 thresholds. See the
-[AMD performance qualification notes](../../../../.buildkite/amd/performance-qualification.md)
+[AMD performance qualification notes](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/amd/performance-qualification.md)
 for calibration provenance, historical failures and native validation criteria.
 
 | Parameter       | Type          | Required | Example/Values       | Description                                                         |
