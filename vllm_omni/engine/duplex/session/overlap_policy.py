@@ -312,6 +312,10 @@ def merge_audio_payloads(first: dict[str, object], second: dict[str, object]) ->
         for frame in source
         if isinstance(frame, str) and frame
     ]
+    if first.get("video_frames") and not first.get("audio"):
+        # Coalesce the response, not its committed visual history. A camera
+        # payload has no PCM format; the audio fallback below would drop it.
+        return {**second, "video_frames": merged_frames}
     if (
         first.get("format") == "pcm_f32le"
         and first.get("audio")

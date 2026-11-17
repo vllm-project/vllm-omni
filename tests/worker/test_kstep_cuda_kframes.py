@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CUDA entry points into the Talker's vertical K-frame loop.
 
-The loop itself is ``talker_multiframe.run`` (main's own NPU-side module, pure
+The loop itself is ``talker_multiframe.run`` (the shared worker module, pure
 Python + torch). CUDA only adds two hooks:
 
 * ``gpu_model_runner.OmniGPUModelRunner._model_forward`` calls the loop when a
@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.platforms.npu.worker import talker_multiframe
+from vllm_omni.worker import talker_multiframe
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

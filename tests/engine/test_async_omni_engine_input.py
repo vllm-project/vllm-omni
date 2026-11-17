@@ -13,14 +13,18 @@ from vllm.inputs.engine import tokens_input
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import renderer_from_config
 from vllm.sampling_params import SamplingParams
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
+from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_config
+from vllm_omni.config.stage_config import SKIP_STREAMING_UPDATES_ATTR, skip_on_streaming_updates
 from vllm_omni.data_entry_keys import returns_stage_payload
 from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_engine_utils import scope_stage_replica_mm_uuids
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
+from vllm_omni.engine.messages import AddCompanionRequestMessage, StageSubmissionMessage
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.errors import OmniClientError
@@ -367,6 +371,57 @@ def test_build_add_request_message_with_resumable_streaming(mocker: MockerFixtur
     assert msg.type == "streaming_update"
     input_processor.process_inputs.assert_called_once()
     assert input_processor.process_inputs.call_args.kwargs["resumable"] is True
+
+
+@pytest.mark.parametrize("message_type", ["add_request", "streaming_update"])
+@pytest.mark.parametrize("skips_updates", [False, True])
+def test_prompt_transform_skips_streaming_updates_only_when_marked(
+    mocker: MockerFixture, message_type: str, skips_updates: bool
+):
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.default_sampling_params_list = [params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("generate",)
+    engine.input_processor = mocker.Mock()
+    engine.input_processor.process_inputs.return_value = _make_engine_core_request()
+    engine.output_processors = [mocker.Mock()]
+
+    calls = []
+
+    def transform(prompt, sampling_params_list):
+        calls.append(prompt)
+        return prompt
+
+    if skips_updates:
+        skip_on_streaming_updates(transform)
+    engine.prompt_transform_func = transform
+
+    engine._build_add_request_message(
+        request_id="req-stream",
+        prompt={"prompt_token_ids": [1, 2, 3]},
+        sampling_params_list=[params],
+        final_stage_id=0,
+        resumable=True,
+        message_type=message_type,
+    )
+
+    # Unmarked transforms keep running on every message, as before.
+    assert bool(calls) is not (skips_updates and message_type == "streaming_update")
+
+
+def test_only_the_qwen3_tts_check_skips_streaming_updates():
+    # Every other stage-0 transform keeps running on streaming updates.
+    pipelines = [resolve_pipeline_config(key) for key in OMNI_PIPELINES]
+    hooks = {
+        stage.prompt_transform_func
+        for pipeline in pipelines
+        if pipeline is not None
+        for stage in pipeline.stages
+        if stage.prompt_transform_func
+    }
+    marked = {path for path in hooks if getattr(resolve_obj_by_qualname(path), SKIP_STREAMING_UPDATES_ATTR, False)}
+    assert marked == {"vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder.check_text_prompt"}
 
 
 class _FakeStageClient:
@@ -893,6 +948,40 @@ def test_cfg_companion_build_returns_messages_without_enqueueing(mocker: MockerF
     assert companions[0].companion_id == "req__cfg_text"
     assert companions[0].parent_id == "req"
     engine.request_queue.sync_q.put.assert_not_called()
+
+
+def test_add_request_announces_cfg_companions_with_parent(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    parent = StageSubmissionMessage(
+        type="add_request",
+        request_id="req",
+        prompt=_make_engine_core_request("req"),
+        original_prompt={"prompt": "positive"},
+        output_prompt_text=None,
+        sampling_params_list=[SamplingParams(max_tokens=8)],
+        final_stage_id=1,
+        preprocess_ms=0,
+        request_timestamp=0,
+        enqueue_ts=0,
+    )
+    companion = AddCompanionRequestMessage(
+        companion_id="req__cfg_text",
+        parent_id="req",
+        role="cfg_text",
+        prompt=_make_engine_core_request("req__cfg_text"),
+        companion_prompt_text=None,
+        sampling_params_list=parent.sampling_params_list,
+    )
+    engine.prompt_expand_func = object()
+    engine.request_queue = mocker.Mock()
+    mocker.patch.object(engine, "_build_add_request_message", return_value=parent)
+    mocker.patch.object(engine, "_build_cfg_companions", return_value=[companion])
+
+    engine.add_request("req", {"prompt": "positive"}, final_stage_id=1)
+
+    queued = [call.args[0] for call in engine.request_queue.sync_q.put.call_args_list]
+    assert queued == [parent, companion]
+    assert parent.cfg_companion_ids == {"cfg_text": "req__cfg_text"}
 
 
 def test_cfg_expansion_returning_nothing_is_not_an_error(mocker: MockerFixture):

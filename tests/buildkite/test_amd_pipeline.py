@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import ast
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
-from importlib.util import find_spec, module_from_spec, spec_from_file_location
+import xml.etree.ElementTree as ET
+from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from shlex import split
 from typing import cast
@@ -28,12 +30,9 @@ AMD_SUITE_COMBINER = Path(__file__).resolve().parents[2] / ".buildkite/amd/scrip
 AMD_RUNNER = Path(".buildkite/amd/scripts/run-amd-test.sh")
 AMD_TEMPLATE = Path(".buildkite/amd/test-template-amd-omni.j2")
 AMD_OMNI_PROCESSOR_RUNNER = Path(".buildkite/amd/scripts/run-omni-processor-test.sh")
-CUDA_READY_PIPELINE = Path(".buildkite/cuda/test-ready.yml")
 AR_PAGED_ATTENTION_LABEL = "ROCm · AR Diffusion Paged Attention GPU Test"
 DIFFUSION_GROUP = ":card_index_dividers: Diffusion Test"
 AR_PAGED_ATTENTION_MARKERS = "core_model and rocm and MI325 and cards_1"
-JOY_GPU_LABEL = "Diffusion · JoyImage GPU Inference Test"
-JOY_GPU_PATH = "tests/diffusion/models/joy_image/test_joy_image_gpu.py"
 MODEL_EXECUTOR_CPU_MARKERS = "core_model and cpu and not omni"
 PERSONAPLEX_TEMPORAL_LABEL = "Simple · PersonaPlex Temporal Streaming Test"
 PERSONAPLEX_TEMPORAL_PATH = "tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py"
@@ -66,6 +65,20 @@ OMNI_PROCESSOR_TEST = "tests/model_executor/models/test_omni_processing.py"
 OMNI_PROCESSOR_TIMING_ENV = "VLLM_OMNI_AMD_PROCESSOR_TIMING"
 QWEN_IMAGE_SMOKE_LABEL = "Qwen-Image Official-Weight Smoke"
 QWEN_IMAGE_SMOKE_NODE = "tests/e2e/online_serving/test_qwen_image.py::test_text_to_image_001[default]"
+NIGHTLY_CROSS_PIPELINE_PARITY_OWNER_LABELS = (
+    "Wan2.2 Diffusers Backend Similarity",
+    "Qwen-Image Diffusers Accuracy",
+)
+NIGHTLY_BLOCKING_COLLECTIVE_JOBS = (
+    ("Diffusion Exchange, Ring and CFG Parity · 2 GPUs", "mi300_2"),
+    ("Diffusion Exchange and Ring Parity · 4 GPUs", "mi300_4"),
+    ("Diffusion CFG Parity · 3 Ranks on 4 GPUs", "mi300_4"),
+)
+NIGHTLY_BLOCKING_FULL_MODEL_LABELS = (
+    "Qwen3-TTS Base Full-Model Expansion",
+    "MiniCPM-o Offline Full-Model Modalities",
+    "MiniCPM-o Online Full-Model Modalities",
+)
 TINY_DIFFUSION_PATH = "tests/model_tests/diffusion/test_common_offline.py"
 TINY_DIFFUSION_JOBS = (
     (
@@ -87,7 +100,7 @@ ENTRYPOINTS_FULL_SELECTOR = "full_model and omni and rocm and MI325 and cards_2 
 ENTRYPOINTS_FULL_NIGHTLY_JOBS = (
     (
         "Qwen3-Omni Duplex Playback",
-        "tests/entrypoints/openai_api/test_qwen3_omni_realtime_websocket.py::"
+        "tests/entrypoints/openai_api/test_qwen3_omni_duplex_playback.py::"
         "TestQwen3OmniDuplexPlayback::test_speech_interrupts_playback_full",
         40,
         "omni_qwen3_omni_duplex_playback_function",
@@ -167,6 +180,50 @@ def _steps_selecting_node(pipeline_path: Path, node: str) -> list[dict]:
     ]
 
 
+@pytest.mark.parametrize("label", NIGHTLY_CROSS_PIPELINE_PARITY_OWNER_LABELS)
+def test_cross_pipeline_parity_nightly_owner_is_blocking(label: str) -> None:
+    pipeline = yaml.safe_load(AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8"))
+    matches = [step for step in _walk_steps(pipeline["steps"]) if step.get("label") == label]
+
+    assert len(matches) == 1
+    step = matches[0]
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "Blocking"
+    assert "retry" not in step
+
+
+@pytest.mark.parametrize(("label", "agent_pool"), NIGHTLY_BLOCKING_COLLECTIVE_JOBS)
+def test_nightly_collective_owner_is_blocking(label: str, agent_pool: str) -> None:
+    pipeline = yaml.safe_load(AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8"))
+    matches = [step for step in _walk_steps(pipeline["steps"]) if step.get("label") == label]
+
+    assert len(matches) == 1
+    step = matches[0]
+    assert step["agent_pool"] == agent_pool
+    assert step["depends_on"] == "amd-build"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "Blocking"
+    assert step["timeout_in_minutes"] == 60
+    assert step["source_file_dependencies"] == "diffusion_collective_parity"
+    assert "retry" not in step
+
+
+@pytest.mark.parametrize("label", NIGHTLY_BLOCKING_FULL_MODEL_LABELS)
+def test_nightly_full_model_owner_is_blocking(label: str) -> None:
+    pipeline = yaml.safe_load(AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8"))
+    matches = [step for step in _walk_steps(pipeline["steps"]) if step.get("label") == label]
+
+    assert len(matches) == 1
+    step = matches[0]
+    assert step["agent_pool"] == "mi300_1"
+    assert step["depends_on"] == "amd-build"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "Blocking"
+    assert step["timeout_in_minutes"] == 120
+    assert "retry" not in step
+
+
 def test_qwen_image_has_one_amd_official_weight_nightly_owner() -> None:
     nightly = _steps_selecting_node(AMD_NIGHTLY_PIPELINE, QWEN_IMAGE_SMOKE_NODE)
     ready = _steps_selecting_node(AMD_READY_PIPELINE, QWEN_IMAGE_SMOKE_NODE)
@@ -191,7 +248,7 @@ def test_qwen_image_merge_smoke_is_one_blocking_sdpa_job() -> None:
     assert "VLLM_ROCM_USE_AITER=1" not in command
     assert "AITER_JIT_DIR" not in command
     assert QWEN_IMAGE_SMOKE_NODE in command
-    assert "advanced_model and diffusion and rocm and MI325 and cards_1" in command
+    assert "slow and diffusion and rocm and MI325 and cards_1" in command
     assert "--run-level advanced_model" in command
     assert "full_model" not in command
     assert "Expected exactly one executed Qwen-Image MERGE test" in command
@@ -199,15 +256,16 @@ def test_qwen_image_merge_smoke_is_one_blocking_sdpa_job() -> None:
 
 
 QWEN_IMAGE_BATCH_NODE = "tests/e2e/online_serving/test_qwen_image.py::test_batch_001[default]"
-_QWEN_IMAGE_BATCH_READY_MARKER = "core_model and diffusion and rocm and MI325 and cards_1"
-_QWEN_IMAGE_BATCH_MERGE_MARKER = "advanced_model and diffusion and rocm and MI325 and cards_1"
+_QWEN_IMAGE_BATCH_READY_MARKER = "slow and diffusion and rocm and MI325 and cards_1"
+_QWEN_IMAGE_BATCH_MERGE_MARKER = "slow and diffusion and rocm and MI325 and cards_1"
 
 
 def test_qwen_image_batch_is_core_on_ready_and_advanced_on_merge() -> None:
-    """READY runs the batch node at core_model. MERGE runs it at advanced_model.
+    """READY runs the batch node at core_model depth. MERGE runs it at advanced_model depth.
 
-    The single-request MERGE smoke stays. Nightly does not gain this node.
-    Step and command timeouts are copied from that smoke, not measured here.
+    Both jobs select the same ``slow`` mark. The single-request MERGE smoke stays.
+    Nightly does not gain this node. Step and command timeouts are copied from that
+    smoke, not measured here.
     """
     ready = _find_step("READY · Qwen-Image Batch", AMD_READY_PIPELINE)
     merge = _find_step("MERGE · Qwen-Image Batch", AMD_MERGE_PIPELINE)
@@ -215,7 +273,7 @@ def test_qwen_image_batch_is_core_on_ready_and_advanced_on_merge() -> None:
     ready_command = "\n".join(ready["commands"])
     merge_command = "\n".join(merge["commands"])
     source = Path("tests/e2e/online_serving/test_qwen_image.py").read_text(encoding="utf-8")
-    batch_head = source.split("def test_batch_001", 1)[0].rsplit("@pytest.mark.core_model", 1)[1]
+    batch_head = source.split("def test_batch_001", 1)[0].rsplit("@pytest.mark.slow", 1)[1]
 
     for step, command, marker, artifact, message in (
         (
@@ -252,9 +310,12 @@ def test_qwen_image_batch_is_core_on_ready_and_advanced_on_merge() -> None:
         assert "timeout --signal=TERM --kill-after=2m 45m" in command
 
     assert "--run-level core_model" in ready_command
-    assert "advanced_model" not in ready_command
+    assert "--run-level advanced_model" not in ready_command
     assert "--run-level advanced_model" in merge_command
-    assert "core_model" not in merge_command
+    assert "--run-level core_model" not in merge_command
+    assert "@pytest.mark.core_model" not in source
+    assert "@pytest.mark.advanced_model" not in source
+    assert "@pytest.mark.full_model" not in source
     assert QWEN_IMAGE_BATCH_NODE not in "\n".join(smoke["commands"])
     assert _steps_selecting_node(AMD_NIGHTLY_PIPELINE, QWEN_IMAGE_BATCH_NODE) == []
     assert "SINGLE_CARD_FEATURE_MARKS" in batch_head
@@ -265,13 +326,13 @@ def test_qwen_image_batch_is_core_on_ready_and_advanced_on_merge() -> None:
     assert "rocm" not in parallel_line
 
 
-def test_qwen_image_official_weight_nightly_smoke_follows_burn_in_contract() -> None:
+def test_qwen_image_official_weight_nightly_smoke_is_blocking() -> None:
     step = _find_step(QWEN_IMAGE_SMOKE_LABEL, AMD_NIGHTLY_PIPELINE)
 
     assert step["agent_pool"].startswith("mi300_")
     card_count = step["agent_pool"].rsplit("_", 1)[1]
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["timeout_in_minutes"] >= 90
     assert "depends_on" not in step
     assert "retry" not in step
@@ -303,7 +364,7 @@ def test_qwen_image_official_weight_nightly_smoke_follows_burn_in_contract() -> 
     assert len(collect_nodes) == 1
     assert run_nodes == collect_nodes
 
-    expected_markers = f"full_model and diffusion and rocm and MI325 and cards_{card_count}"
+    expected_markers = f"slow and diffusion and rocm and MI325 and cards_{card_count}"
     assert collect_argv[collect_argv.index("-m") + 1] == expected_markers
     assert run_argv[run_argv.index("-m") + 1] == expected_markers
     assert collect_argv[collect_argv.index("--run-level") + 1] == "full_model"
@@ -493,14 +554,13 @@ def test_omni_processor_full_matrix_moves_to_nightly_with_blocking_rocm_smoke() 
     step = lane_definitions[0]
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["timeout_in_minutes"] == 60
     assert step["env"] == {OMNI_PROCESSOR_TIMING_ENV: "1"}
     assert step["artifact_paths"] == ["artifacts/omni-processor/**/*"]
-    assert step["commands"] == [
-        "export VLLM_ROCM_USE_AITER=0",
-        "bash .buildkite/amd/scripts/run-omni-processor-test.sh",
-    ]
+    assert step["commands"][0] == "export VLLM_ROCM_USE_AITER=0"
+    assert step["commands"][1].startswith("bash .buildkite/amd/scripts/run-omni-processor-test.sh\n")
+    assert "Expected exactly 24 executed Omni Processor tests" in step["commands"][1]
     assert [
         candidate["label"]
         for candidate in nightly_steps
@@ -553,7 +613,7 @@ def test_model_executor_cpu_shards_keep_fast_personaplex_and_exclude_slow_stress
     assert "-k" not in argv
 
 
-def test_personaplex_temporal_stress_has_one_nonblocking_nightly_owner() -> None:
+def test_personaplex_temporal_stress_has_one_blocking_nightly_owner() -> None:
     steps = _find_steps_selecting_path(
         AMD_NIGHTLY_PIPELINE,
         PERSONAPLEX_TEMPORAL_PATH,
@@ -564,7 +624,7 @@ def test_personaplex_temporal_stress_has_one_nonblocking_nightly_owner() -> None
     assert step["label"] == PERSONAPLEX_TEMPORAL_LABEL
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["timeout_in_minutes"] == 120
     assert step["artifact_paths"] == [PERSONAPLEX_TEMPORAL_ARTIFACTS]
     assert "depends_on" not in step
@@ -612,41 +672,53 @@ def test_personaplex_temporal_stress_has_one_nonblocking_nightly_owner() -> None
     assert "$$PERSONAPLEX_TEMPORAL_ARTIFACT_DIR/pytest-summary.txt" in all_commands
 
 
-def test_cuda_ready_retains_full_model_executor_coverage() -> None:
-    step = _find_step("Simple · Model Executor Test", CUDA_READY_PIPELINE)
-    assert "source_file_dependencies" not in step
+_NIGHTLY_UNITS_PROMOTIONS = (
+    (
+        "Simple · Omni Processor Test",
+        24,
+        "Omni Processor",
+        "UNUSED_ARTIFACT_DIR",
+        "bash .buildkite/amd/scripts/run-omni-processor-test.sh",
+    ),
+    ("Simple · Pi0.5 CPU Test", 103, "Pi0.5 CPU", "PI05_CPU_ARTIFACT_DIR", "pytest -sv"),
+    (
+        "Simple · PersonaPlex Temporal Streaming Test",
+        3,
+        "PersonaPlex temporal streaming",
+        "PERSONAPLEX_TEMPORAL_ARTIFACT_DIR",
+        "pytest -s -v",
+    ),
+)
 
-    pytest_command = next(command for command in step["commands"] if "pytest" in command)
-    argv = split(pytest_command)
-    marker_expression = argv[argv.index("-m") + 1]
 
-    assert "tests/model_executor" in argv
-    assert marker_expression == "core_model and cpu"
-    assert "not omni" not in marker_expression
-    assert all(not arg.startswith("--ignore") for arg in argv)
-    assert all(not arg.startswith("--deselect") for arg in argv)
-
-    test_source = Path(PERSONAPLEX_TEMPORAL_PATH).read_text(encoding="utf-8")
-    assert "pytestmark = [pytest.mark.core_model, pytest.mark.cpu]" in test_source
-    assert "@pytest.mark.slow" not in test_source
-
-
-def test_cuda_ready_engine_entrypoints_diffusion_has_cleanup_headroom() -> None:
-    step = _find_step("Simple · Engine&Entrypoints&Diffusion Test", CUDA_READY_PIPELINE)
-    assert step["timeout_in_minutes"] == 25
-
-    pytest_command = next(command for command in step["commands"] if "pytest" in command)
-    argv = split(pytest_command)
-    assert argv == [
-        "pytest",
-        "-sv",
-        "tests/entrypoints",
-        "tests/engine",
-        "tests/diffusion",
-        "--ignore=tests/diffusion/models",
-        "-m",
-        "core_model and cpu",
-    ]
+@pytest.mark.parametrize("label,count,name,artifact_env,command_fragment", _NIGHTLY_UNITS_PROMOTIONS)
+@pytest.mark.parametrize(
+    "scenario", ["pass", "skipped", "wrong-count", "zero-tests", "failure", "error", "pytest-failure", "timeout"]
+)
+def test_nightly_units_promotion_execution_guard(
+    tmp_path: Path, label: str, count: int, name: str, artifact_env: str, command_fragment: str, scenario: str
+) -> None:
+    assert _find_step(label, AMD_NIGHTLY_PIPELINE)["grade"] == "Blocking"
+    # The CPU processor and Pi0.5 jobs have a step timeout, not an inner timeout command.
+    pytest_status = 1 if scenario == "pytest-failure" else 124 if scenario == "timeout" else 0
+    timeout_status = 124 if scenario == "timeout" else None
+    tests = 0 if scenario == "zero-tests" else count + int(scenario == "wrong-count")
+    _assert_nightly_junit_guard(
+        tmp_path,
+        step_label=label,
+        command_fragment=command_fragment,
+        expected_message=f"Expected exactly {count} executed {name} tests",
+        artifact_env=artifact_env,
+        job_id_prefix="nightly-units-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=int(scenario == "skipped"),
+        failures=int(scenario == "failure"),
+        errors=int(scenario == "error"),
+        timeout_status=timeout_status,
+        expected_status={"pass": 0, "pytest-failure": 1, "timeout": 124}.get(scenario, 5),
+        extra_env={"BUILDKITE_BUILD_CHECKOUT_PATH": str(tmp_path)},
+    )
 
 
 def test_ar_paged_attention_gpu_lane_is_blocking_and_pinned() -> None:
@@ -679,70 +751,6 @@ def test_ar_paged_attention_gpu_lane_is_blocking_and_pinned() -> None:
     assert lane_definitions[0] == lane_definitions[1]
 
 
-def _find_joy_gpu_steps(pipeline_path: Path) -> list[dict]:
-    pipeline = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
-    matches = []
-
-    def walk(steps: list[dict]) -> None:
-        for step in steps:
-            if step.get("label") == JOY_GPU_LABEL or any(
-                arg == JOY_GPU_PATH or arg.startswith(f"{JOY_GPU_PATH}::")
-                for command in step.get("commands", [])
-                for arg in split(command)
-            ):
-                matches.append(step)
-            walk(step.get("steps", []))
-
-    walk(pipeline.get("steps", []))
-    return matches
-
-
-@pytest.mark.parametrize("pipeline_path", [AMD_READY_PIPELINE, AMD_MERGE_PIPELINE], ids=["ready", "merge"])
-def test_joy_gpu_lane_is_not_on_amd_ready_or_merge_critical_path(pipeline_path: Path) -> None:
-    assert not _find_joy_gpu_steps(pipeline_path)
-
-
-def test_joy_gpu_nightly_lane_is_unique_nonblocking_and_preserves_default_backend() -> None:
-    steps = _find_joy_gpu_steps(AMD_NIGHTLY_PIPELINE)
-    assert len(steps) == 1
-    step = steps[0]
-    assert step["label"] == JOY_GPU_LABEL
-    assert step["grade"] == "NonBlocking"
-    assert step["agent_pool"] == "mi300_1"
-    assert step["depends_on"] == "amd-build"
-    assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["timeout_in_minutes"] == 90
-    assert step["artifact_paths"] == ["artifacts/joy-image-gpu/*.xml"]
-    assert 'export JOY_GPU_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/joy-image-gpu"' in step["commands"]
-    assert 'export AITER_JIT_DIR="/tmp/vllm-omni-joy-aiter-$$BUILDKITE_JOB_ID"' in step["commands"]
-    assert 'export TORCH_EXTENSIONS_DIR="/tmp/vllm-omni-joy-torch-$$BUILDKITE_JOB_ID"' in step["commands"]
-    assert 'mkdir -p "$$AITER_JIT_DIR" "$$TORCH_EXTENSIONS_DIR" "$$JOY_GPU_ARTIFACT_DIR"' in step["commands"]
-    assert "export VLLM_ROCM_USE_AITER=1" in step["commands"]
-    assert all("DIFFUSION_ATTENTION_BACKEND" not in command for command in step["commands"])
-    pytest_commands = [command for command in step["commands"] if "pytest" in split(command)]
-    assert len(pytest_commands) == 1
-    assert "|| true" not in pytest_commands[0]
-    argv = split(pytest_commands[0])
-    assert argv[:4] == ["timeout", "--signal=TERM", "--kill-after=2m", "80m"]
-    assert argv.count(JOY_GPU_PATH) == 1
-    assert "-k" not in argv
-    assert argv[argv.index("-m") + 1] == AR_PAGED_ATTENTION_MARKERS
-    assert argv[argv.index("--run-level") + 1] == "core_model"
-    assert "--durations=20" in argv
-    assert "--junitxml=$$JOY_GPU_ARTIFACT_DIR/pytest.xml" in argv
-
-
-def test_joy_gpu_suite_remains_selected_by_cuda_model_lane() -> None:
-    pipeline_path = Path(".buildkite/cuda/test-ready.yml")
-    step = _find_step("Diffusion · Model Test", pipeline_path)
-    argv = split(next(command for command in step["commands"] if "pytest" in command))
-    assert "tests/diffusion/models/" in argv
-    assert f"--ignore={JOY_GPU_PATH}" not in argv
-    assert argv[argv.index("-m") + 1] == "core_model and cuda"
-    # Module-level CPU marks cannot be cancelled by adding GPU marks.
-    assert "pytest.mark.cpu" not in Path(JOY_GPU_PATH).read_text(encoding="utf-8")
-
-
 # These jobs previously selected CUDA-marked items on AMD. Each migrated lane
 # now selects its qualified ROCm variants and verifies the exact collection
 # before running the GPU workload.
@@ -751,7 +759,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "Diffusion · Model Test",
         AMD_READY_PIPELINE,
         "Blocking",
-        117,
+        120,
         "core_model and rocm and MI325 and not nvidia_only and not "
         "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
     ),
@@ -759,7 +767,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t",
         AMD_READY_PIPELINE,
         "NonBlocking",
-        1424,
+        1438,
         "core_model and rocm and MI325 and not nvidia_only and not "
         "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
     ),
@@ -796,7 +804,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "Omni Model Test Qwen3-Omni",
         AMD_MERGE_PIPELINE,
         "Blocking",
-        13,
+        11,
         "advanced_model and rocm and MI325 and not nvidia_only",
     ),
     (
@@ -1057,34 +1065,6 @@ def test_wan_sdpa_alignment_cpu_case_stays_shared_and_cuda_kernel_stays_nvidia()
     assert "rocm" not in cuda_case
 
 
-def test_joy_gpu_suite_is_not_duplicated_in_amd_model_lane() -> None:
-    step = _find_step("Diffusion · Model Test", AMD_READY_PIPELINE)
-    argv = split(
-        next(command for command in step["commands"] if split(command)[:4] == ["timeout", "15m", "pytest", "-sv"])
-    )
-
-    assert step["grade"] == "Blocking"
-    assert step["agent_pool"] == "mi300_1"
-    assert argv[:4] == ["timeout", "15m", "pytest", "-sv"]
-    assert f"--ignore={JOY_GPU_PATH}" in argv
-    assert "--ignore=tests/diffusion/models/auk/test_auk_vae_fastpath.py" in argv
-    assert "--ignore=tests/diffusion/models/mammoth_moda2/test_dit_attention_cuda.py" in argv
-    assert argv[argv.index("-m") + 1] == (
-        "core_model and rocm and MI325 and not nvidia_only and not "
-        "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
-    )
-    assert argv[argv.index("--run-level") + 1] == "core_model"
-
-
-def test_joy_gpu_helper_import_does_not_require_pytest_package_mode() -> None:
-    source = Path(JOY_GPU_PATH).read_text(encoding="utf-8")
-    assert "from . import" not in source
-    assert "from tests.diffusion.models.joy_image import test_joy_image as joy_units" in source
-    spec = find_spec("tests.diffusion.models.joy_image.test_joy_image")
-    assert spec is not None and spec.origin is not None
-    assert Path(spec.origin).resolve() == Path(JOY_GPU_PATH).with_name("test_joy_image.py").resolve()
-
-
 @pytest.mark.parametrize("label", ["Diffusion · Batch Test", "Diffusion · Offloader Test", "Diffusion · Cache Test"])
 def test_ready_diffusion_gpu_lanes_select_rocm_variants(label: str) -> None:
     step = _find_step(label, AMD_READY_PIPELINE)
@@ -1117,31 +1097,6 @@ def test_amd_ulysses_lanes_cover_uaa_and_attention_sp(label: str, pipeline: Path
     assert "--durations=20" in argv
 
 
-@pytest.mark.parametrize(
-    ("label", "cards"),
-    [
-        ("Diffusion · Distributed Test · 2-GPU", "cards_2"),
-        ("Diffusion · Distributed & Attention Test · 4-GPU", "cards_4"),
-    ],
-)
-def test_cuda_distributed_lanes_cover_both_attention_files_within_the_job_budget(label: str, cards: str) -> None:
-    step = _find_step(label, CUDA_READY_PIPELINE)
-    argv = [split(command) for command in step["commands"] if "pytest" in split(command)]
-
-    paths = {arg for command in argv for arg in command if arg.startswith("tests/")}
-    assert paths == {
-        "tests/diffusion/distributed",
-        "tests/diffusion/attention/test_ulysses_uaa.py",
-        "tests/diffusion/attention/test_attention_sp.py",
-    }
-    assert step["mirror_hardwares"] == f"l4_{cards.removeprefix('cards_')}"
-    for command in argv:
-        assert command[command.index("-m") + 1] == f"core_model and cuda and L4 and {cards}"
-        assert command[command.index("--run-level") + 1] == "core_model"
-    command_budget = sum(int(command[1].removesuffix("m")) for command in argv)
-    assert step["timeout_in_minutes"] >= command_budget + 5
-
-
 def test_qwen3_tts_base_preserves_advanced_model_arguments() -> None:
     step = _find_step("Qwen3-TTS Base E2E Test")
     commands = step["commands"]
@@ -1165,7 +1120,10 @@ def test_qwen3_accuracy_defers_artifact_path_expansion() -> None:
     assert '"$$PWD"' in staging_command
     assert '"$${BUILDKITE_BUILD_CHECKOUT_PATH:?}"' in staging_command
     assert '"$$artifact_dir"' in staging_command
-    assert step["artifact_paths"] == ["tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json"]
+    assert step["artifact_paths"] == [
+        "artifacts/rocm-qwen3-omni-accuracy/**/*",
+        "tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1400,8 +1358,8 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
             "tests/dfx/reliability/test_qwen3_omni.py",
         ),
         "Reliability Test · wan22": (
-            "mi300_1",
-            "slow and rocm and MI325 and cards_1",
+            "mi300_2",
+            "slow and rocm and MI325 and cards_2",
             "tests/dfx/reliability/test_wan22.py",
         ),
         "Reliability Test · hunyuan-image": (
@@ -1439,7 +1397,7 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
         command = "\n".join(step["commands"])
         assert "if" not in step
         assert step["agent_pool"] == pool
-        assert step["grade"] == "NonBlocking"
+        assert step["grade"] == "Blocking"
         assert step["depends_on"] == "amd-build"
         assert marker in command
         assert filename in command
@@ -1454,29 +1412,29 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
         "Reliability Test · qwen3-omni": {
             "artifact_path": "artifacts/rocm-qwen3-omni-reliability/**/*",
             "artifact_env": "ROCM_QWEN3_RELIABILITY_ARTIFACT_DIR",
-            "expected_nodes": 37,
-            "expected_skipped": 10,
-            "timeout": "165m",
-            "collection_message": "Expected exactly 37 Qwen3-Omni reliability nodes",
-            "junit_message": ("Expected exactly 37 executed Qwen3-Omni reliability tests with 10 known skips"),
+            "expected_nodes": 14,
+            "expected_skipped": 4,
+            "timeout": "220m",
+            "collection_message": "Expected exactly 14 Qwen3-Omni reliability nodes",
+            "junit_message": ("Expected exactly 14 executed Qwen3-Omni reliability tests with 4 known skips"),
         },
         "Reliability Test · wan22": {
             "artifact_path": "artifacts/rocm-wan22-reliability/**/*",
             "artifact_env": "ROCM_WAN22_RELIABILITY_ARTIFACT_DIR",
-            "expected_nodes": 17,
-            "expected_skipped": 5,
-            "timeout": "165m",
-            "collection_message": "Expected exactly 17 Wan2.2 reliability nodes",
-            "junit_message": "Expected exactly 17 executed Wan2.2 reliability tests with 5 known skips",
+            "expected_nodes": 13,
+            "expected_skipped": 1,
+            "timeout": "220m",
+            "collection_message": "Expected exactly 13 Wan2.2 reliability nodes",
+            "junit_message": "Expected exactly 13 executed Wan2.2 reliability tests with 1 known skip",
         },
         "Reliability Test · minicpmo-4.5": {
             "artifact_path": "artifacts/rocm-minicpmo-reliability/**/*",
             "artifact_env": "ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR",
-            "expected_nodes": 3,
-            "expected_skipped": 0,
-            "timeout": "165m",
-            "collection_message": "Expected exactly 3 MiniCPM-o 4.5 reliability nodes",
-            "junit_message": "Expected exactly 3 executed MiniCPM-o 4.5 reliability tests",
+            "expected_nodes": 14,
+            "expected_skipped": 3,
+            "timeout": "220m",
+            "collection_message": "Expected exactly 14 MiniCPM-o 4.5 reliability nodes",
+            "junit_message": "Expected exactly 14 executed MiniCPM-o 4.5 reliability tests with 3 known skips",
         },
         "Reliability Test · Invalid parameters · MI300 · Single-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-single/**/*",
@@ -1568,25 +1526,25 @@ def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
             "Reliability Test · qwen3-omni",
             "ROCM_QWEN3_RELIABILITY_ARTIFACT_DIR",
             "qwen3-reliability-guard",
-            37,
-            10,
-            "Expected exactly 37 executed Qwen3-Omni reliability tests with 10 known skips",
+            14,
+            4,
+            "Expected exactly 14 executed Qwen3-Omni reliability tests with 4 known skips",
         ),
         (
             "Reliability Test · wan22",
             "ROCM_WAN22_RELIABILITY_ARTIFACT_DIR",
             "wan22-reliability-guard",
-            17,
-            5,
-            "Expected exactly 17 executed Wan2.2 reliability tests with 5 known skips",
+            13,
+            1,
+            "Expected exactly 13 executed Wan2.2 reliability tests with 1 known skip",
         ),
         (
             "Reliability Test · minicpmo-4.5",
             "ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR",
             "minicpmo-reliability-guard",
+            14,
             3,
-            0,
-            "Expected exactly 3 executed MiniCPM-o 4.5 reliability tests",
+            "Expected exactly 14 executed MiniCPM-o 4.5 reliability tests with 3 known skips",
         ),
         (
             "Reliability Test · Invalid parameters · MI300 · Single-GPU",
@@ -1676,6 +1634,7 @@ def test_hunyuan_rocm_reliability_disables_expert_parallel() -> None:
     base = resolve_deploy_yaml("vllm_omni/deploy/hunyuan_image3_dit.yaml")
     base_parallel = base["stages"][0]["parallel_config"]
     reliability = Path("tests/dfx/reliability/test_hunyuan_image.py").read_text(encoding="utf-8")
+    reliability_fixtures = Path("tests/dfx/conftest.py").read_text(encoding="utf-8")
     startup = Path("tests/dfx/reliability/test_hunyuan_image_ep_startup.py").read_text(encoding="utf-8")
     accuracy = Path("tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py").read_text(encoding="utf-8")
     step = _find_step("HunyuanImage Expert Parallel Startup", AMD_WEEKLY_PIPELINE)
@@ -1693,6 +1652,10 @@ def test_hunyuan_rocm_reliability_disables_expert_parallel() -> None:
     assert "hunyuan_image3_dit.yaml" in reliability
     assert '"parallel_config.enable_expert_parallel": False' in reliability
     assert 'params["update"]' in reliability
+    assert 'params["stage_init_timeout"] = 1800' in reliability
+    assert 'params["init_timeout"] = 2100' in reliability
+    assert 'stage_init_timeout=runtime_params_by_name[test_name].get("stage_init_timeout")' in reliability_fixtures
+    assert 'init_timeout=runtime_params_by_name[test_name].get("init_timeout")' in reliability_fixtures
     assert "hunyuan_image3_dit_rocm_reliability.yaml" not in reliability
     assert "hunyuan_image3_dit.yaml" in startup
     assert "send_health_http_request" in startup
@@ -1700,7 +1663,7 @@ def test_hunyuan_rocm_reliability_disables_expert_parallel() -> None:
     assert "hunyuan_image3_dit_rocm_reliability.yaml" not in startup
     assert '"enable_expert_parallel": True' in accuracy
     assert step["agent_pool"] == "mi300_4"
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["depends_on"] == "amd-build"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 45
@@ -1720,9 +1683,9 @@ def test_hunyuan_rocm_reliability_disables_expert_parallel() -> None:
     }
     assert reliability_step["artifact_paths"] == ["artifacts/rocm-hunyuan-image-reliability/**/*"]
     assert reliability_command.count("--shard-id=0 --num-shards=1") == 2
-    assert "Expected exactly 16 HunyuanImage reliability nodes" in reliability_command
-    assert "Expected exactly 16 executed HunyuanImage reliability tests" in reliability_command
-    assert "skipped != 0" in reliability_command
+    assert "Expected exactly 13 HunyuanImage reliability nodes" in reliability_command
+    assert "Expected exactly 13 executed HunyuanImage reliability tests" in reliability_command
+    assert "skipped != 1" in reliability_command
     assert "vllm_omni/deploy/hunyuan_image3_dit_rocm_reliability.yaml" not in dependencies
     assert "tests/dfx/reliability/test_hunyuan_image_ep_startup.py" in dependencies
     assert "env" not in step
@@ -1811,7 +1774,7 @@ def test_weekly_omni_e2e_is_full_weight_and_weekly_only() -> None:
         command = "\n".join(step["commands"])
         assert "if" not in step
         assert step["agent_pool"] == pool
-        assert step["grade"] == "NonBlocking"
+        assert step["grade"] == "Blocking"
         assert step["depends_on"] == "amd-build"
         assert step["mirror_hardwares"] == ["amdproduction"]
         assert step["timeout_in_minutes"] == timeout
@@ -1877,6 +1840,46 @@ def test_weekly_omni_e2e_is_full_weight_and_weekly_only() -> None:
         text = pipeline_path.read_text(encoding="utf-8")
         for label in jobs:
             assert label not in text
+
+
+def test_ming_weekly_uses_rocm_stage_init_allowance() -> None:
+    path = Path("tests/e2e/offline_inference/test_ming_flash_omni_expansion.py")
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    assignments: dict[str, ast.AST] = {}
+    for statement in tree.body:
+        if not isinstance(statement, ast.Assign):
+            continue
+        for target in statement.targets:
+            if isinstance(target, ast.Name):
+                assignments[target.id] = statement.value
+
+    timeout = assignments["MING_FLASH_OMNI_ROCM_STAGE_INIT_TIMEOUT_S"]
+    assert isinstance(timeout, ast.Constant)
+    assert ast.literal_eval(timeout) == 1800
+
+    rocm_kwargs = assignments["_ROCM_STAGE_INIT_KWARGS"]
+    assert isinstance(rocm_kwargs, ast.IfExp)
+    assert ast.unparse(rocm_kwargs.test) == "current_omni_platform.is_rocm()"
+    assert isinstance(rocm_kwargs.body, ast.Dict)
+    assert len(rocm_kwargs.body.keys) == 1
+    timeout_key = rocm_kwargs.body.keys[0]
+    assert isinstance(timeout_key, ast.Constant)
+    assert timeout_key.value == "stage_init_timeout"
+    assert len(rocm_kwargs.body.values) == 1
+    timeout_ref = rocm_kwargs.body.values[0]
+    assert isinstance(timeout_ref, ast.Name)
+    assert timeout_ref.id == "MING_FLASH_OMNI_ROCM_STAGE_INIT_TIMEOUT_S"
+    assert isinstance(rocm_kwargs.orelse, ast.Dict)
+    assert not rocm_kwargs.orelse.keys
+
+    for params_name in ("test_params_thinker", "test_params"):
+        params = assignments[params_name]
+        assert isinstance(params, ast.ListComp)
+        assert isinstance(params.elt, ast.Tuple)
+        assert len(params.elt.elts) == 3
+        kwargs_ref = params.elt.elts[2]
+        assert isinstance(kwargs_ref, ast.Name)
+        assert kwargs_ref.id == "_ROCM_STAGE_INIT_KWARGS"
 
 
 @pytest.mark.parametrize(
@@ -1964,7 +1967,7 @@ def test_bagel_weekly_selects_only_the_rocm_img2img_node() -> None:
     node = "tests/e2e/online_serving/test_bagel.py::test_bagel_img2img_online[omni_server0]"
     dependencies = yaml.safe_load(AMD_SOURCE_DEPENDENCIES.read_text(encoding="utf-8"))["source_file_dependencies"]
 
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 90
@@ -2055,6 +2058,279 @@ def test_bagel_weekly_executes_junit_guard_before_exit(
     )
 
 
+_BAGEL_OFFLINE_WEEKLY_NODES = (
+    "tests/e2e/offline_inference/test_bagel.py::test_bagel_text2text[omni_runner0]",
+    "tests/e2e/offline_inference/test_bagel.py::test_bagel_img2text[omni_runner0]",
+    "tests/e2e/offline_inference/test_bagel_expansion.py::test_bagel_lora_scale_and_deactivation[omni_runner0]",
+)
+
+
+def test_bagel_weekly_covers_shared_offline_rocm_nodes() -> None:
+    def flatten_paths(items: list) -> set[str]:
+        paths: set[str] = set()
+        for item in items:
+            if isinstance(item, list):
+                paths.update(flatten_paths(item))
+            else:
+                paths.add(item)
+        return paths
+
+    step = _find_step("Bagel offline shared · 1-GPU", AMD_WEEKLY_PIPELINE)
+    command = "\n".join(step["commands"])
+    dependencies = yaml.safe_load(AMD_SOURCE_DEPENDENCIES.read_text(encoding="utf-8"))["source_file_dependencies"]
+
+    assert step["grade"] == "Blocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 180
+    assert step["source_file_dependencies"] == "diffusion_bagel_offline_weekly"
+    assert step["artifact_paths"] == ["artifacts/rocm-bagel-offline-weekly/**/*"]
+    assert "slow and diffusion and rocm and MI325 and cards_1" in command
+    assert "--run-level full_model" in command
+    assert "timeout --signal=TERM --kill-after=2m 165m" in command
+    assert "Expected exactly three shared offline Bagel ROCm nodes" in command
+    assert "Expected exactly three executed shared offline Bagel tests" in command
+    assert "collection_status=$$?" in command
+    assert 'exit "$$collection_status"' in command
+    assert "skipped != 0" in command
+    for node in _BAGEL_OFFLINE_WEEKLY_NODES:
+        assert node in command
+
+    bagel_deps = flatten_paths(dependencies["diffusion_bagel_offline_weekly"])
+    assert {
+        "tests/e2e/offline_inference/test_bagel.py",
+        "tests/e2e/offline_inference/test_bagel_expansion.py",
+        "tests/conftest.py",
+        "tests/helpers/fixtures/runtime.py",
+        "tests/helpers/runtime.py",
+        "tests/helpers/stage_config.py",
+        "vllm_omni/deploy/bagel.yaml",
+        "vllm_omni/diffusion/lora/",
+        "vllm_omni/diffusion/models/bagel/",
+        "vllm_omni/lora/",
+        "vllm_omni/model_executor/models/bagel/",
+    } <= bagel_deps
+
+    source_by_test = {
+        "test_bagel_text2text": Path("tests/e2e/offline_inference/test_bagel.py"),
+        "test_bagel_img2text": Path("tests/e2e/offline_inference/test_bagel.py"),
+        "test_bagel_lora_scale_and_deactivation": Path("tests/e2e/offline_inference/test_bagel_expansion.py"),
+    }
+    for test_name, source_path in source_by_test.items():
+        source = source_path.read_text(encoding="utf-8")
+        marks = source.split(f"def {test_name}", maxsplit=1)[0].rsplit("\n\n", maxsplit=1)[-1]
+        assert '@hardware_test(res={"cuda": "H100", "rocm": "MI325"})' in marks
+        assert '"stage_init_timeout": 1800' in source
+        assert '"init_timeout": 2100' in source
+
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
+        assert "Bagel offline shared · 1-GPU" not in pipeline_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, 3, 0, None, 0),
+        (0, 3, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, 3, 0, None, 1),
+        (0, 3, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_bagel_offline_weekly_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    pytest_status: int,
+    tests: int,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=AMD_WEEKLY_PIPELINE,
+        step_label="Bagel offline shared · 1-GPU",
+        command_fragment='pytest -s -v -ra "$${nodes[@]}"',
+        expected_message="Expected exactly three executed shared offline Bagel tests",
+        artifact_env="ROCM_BAGEL_OFFLINE_WEEKLY_ARTIFACT_DIR",
+        job_id_prefix="bagel-offline-weekly-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
+
+
+_COSMOS3_WEEKLY_NODES = (
+    "test_text_to_image_001",
+    "test_video_generation_modes_001",
+)
+_COSMOS3_T2I_NODE = "tests/e2e/online_serving/test_cosmos3.py::test_text_to_image_001"
+
+
+def test_cosmos3_weekly_is_blocking_and_replaces_narrow_nightly_owner() -> None:
+    def flatten_paths(items: list) -> set[str]:
+        paths: set[str] = set()
+        for item in items:
+            if isinstance(item, list):
+                paths.update(flatten_paths(item))
+            else:
+                paths.add(item)
+        return paths
+
+    step = _find_step("Cosmos3 generation modes · 1-GPU", AMD_WEEKLY_PIPELINE)
+    command = "\n".join(step["commands"])
+    dependencies = yaml.safe_load(AMD_SOURCE_DEPENDENCIES.read_text(encoding="utf-8"))["source_file_dependencies"]
+
+    assert step["grade"] == "Blocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["depends_on"] == "amd-build"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 300
+    assert step["source_file_dependencies"] == [
+        "diffusion_cosmos3_function",
+        ".buildkite/amd/scripts/prewarm_cosmos3_aiter.py",
+        ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh",
+        "tests/helpers/",
+    ]
+    assert step["artifact_paths"] == ["artifacts/rocm-cosmos3-weekly/**/*"]
+    assert "retry" not in step
+    assert Path(".buildkite/amd/scripts/prewarm_cosmos3_aiter.py").is_file()
+    assert "export VLLM_ROCM_USE_AITER=1" in step["commands"]
+    assert 'export AITER_JIT_DIR="/tmp/vllm-omni-cosmos3-aiter-$$BUILDKITE_JOB_ID"' in step["commands"]
+    assert (
+        'export TORCH_EXTENSIONS_DIR="/tmp/vllm-omni-cosmos3-torch-extensions-$$BUILDKITE_JOB_ID"' in step["commands"]
+    )
+    assert 'mkdir -p "$$AITER_JIT_DIR" "$$TORCH_EXTENSIONS_DIR"' in step["commands"]
+    prewarm_command = next(item for item in step["commands"] if "prewarm_cosmos3_aiter.py" in item)
+    assert "timeout --signal=TERM --kill-after=2m 55m" in prewarm_command
+    runner_command = next(item for item in step["commands"] if "run-rocm-full-model-nightly.sh" in item)
+    assert step["commands"].index(prewarm_command) < step["commands"].index(runner_command)
+    assert "ROCM_E2E_LEVEL_MARKER=slow" in command
+    assert "ROCM_E2E_RUN_LEVEL=full_model" in command
+    assert "ROCM_E2E_TIMEOUT_MINUTES=210" in command
+
+    tokens = split(runner_command)
+    runner_index = tokens.index(".buildkite/amd/scripts/run-rocm-full-model-nightly.sh")
+    assert tokens[runner_index + 1 :] == [
+        "tests/e2e/online_serving/test_cosmos3.py",
+        "2",
+        "diffusion",
+        "rocm-cosmos3-weekly",
+    ]
+
+    dependency_paths = flatten_paths(dependencies["diffusion_cosmos3_function"])
+    assert {
+        "tests/e2e/online_serving/test_cosmos3.py",
+        "vllm_omni/diffusion/models/cosmos3/",
+        "vllm_omni/model_extras/cosmos3.py",
+    } <= dependency_paths
+
+    source = Path("tests/e2e/online_serving/test_cosmos3.py").read_text(encoding="utf-8")
+    assert 'SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"})' in source
+    assert source.count("def test_") == len(_COSMOS3_WEEKLY_NODES)
+    for node in _COSMOS3_WEEKLY_NODES:
+        assert f"def {node}" in source
+
+    nightly_source = AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8")
+    assert "Cosmos3 T2I Function" not in nightly_source
+    assert ":full_moon: Cosmos3 MI300 Nightly" not in nightly_source
+    assert _steps_selecting_node(AMD_NIGHTLY_PIPELINE, _COSMOS3_T2I_NODE) == []
+
+
+_DRAMA3_WEEKLY_CORE_NODE = "tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]"
+_DRAMA3_WEEKLY_ADVANCED_NODES = (
+    _DRAMA3_WEEKLY_CORE_NODE,
+    "tests/e2e/online_serving/test_drama_3.py::test_voice_clone_streaming_002[seed0-drama_3-rocm]",
+    "tests/e2e/online_serving/test_drama_3.py::test_voice_clone_streaming_002[seed42-drama_3-rocm]",
+    "tests/e2e/online_serving/test_drama_3.py::test_voice_clone_concurrent_003[drama_3-rocm]",
+    "tests/e2e/online_serving/test_drama_3.py::test_voice_clone_requires_ref_text_004[drama_3-rocm]",
+)
+_DRAMA3_WEEKLY_LABELS = {
+    "Drama 3 text-to-audio · Core · 1-GPU",
+    "Drama 3 full advanced · 1-GPU",
+}
+
+
+def test_drama3_weekly_has_exact_blocking_core_and_advanced_owners() -> None:
+    group = _find_group("TTS E2E Weekly", AMD_WEEKLY_PIPELINE)
+    labels = {step["label"] for step in group["steps"]}
+    assert _DRAMA3_WEEKLY_LABELS <= labels
+
+    expected_dependencies = [
+        "tts_drama_3_function",
+        ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh",
+        "tests/helpers/",
+        "tests/assets/qwen3_tts/clone_2.wav",
+    ]
+    expected_env = {
+        "OPENBLAS_NUM_THREADS": "1",
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+    }
+
+    core = _find_step("Drama 3 text-to-audio · Core · 1-GPU", AMD_WEEKLY_PIPELINE)
+    core_command = "\n".join(core["commands"])
+    assert core["agent_pool"] == "mi300_1"
+    assert core["depends_on"] == "amd-build"
+    assert core["mirror_hardwares"] == ["amdproduction"]
+    assert core["grade"] == "Blocking"
+    assert core["timeout_in_minutes"] == 60
+    assert core["source_file_dependencies"] == expected_dependencies
+    assert core["env"] == expected_env
+    assert core["artifact_paths"] == ["artifacts/rocm-drama3-core-weekly/**/*"]
+    assert "retry" not in core
+    assert "ROCM_E2E_LEVEL_MARKER=slow" in core_command
+    assert "ROCM_E2E_RUN_LEVEL=core_model" in core_command
+    assert "ROCM_E2E_TIMEOUT_MINUTES=45" in core_command
+    assert ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh" in core_command
+    core_tokens = split(next(command for command in core["commands"] if "run-rocm-full-model-nightly.sh" in command))
+    core_runner = core_tokens.index(".buildkite/amd/scripts/run-rocm-full-model-nightly.sh")
+    assert core_tokens[core_runner + 1 :] == [
+        _DRAMA3_WEEKLY_CORE_NODE,
+        "1",
+        "tts",
+        "rocm-drama3-core-weekly",
+    ]
+    for node in _DRAMA3_WEEKLY_ADVANCED_NODES[1:]:
+        assert node not in core_command
+
+    advanced = _find_step("Drama 3 full advanced · 1-GPU", AMD_WEEKLY_PIPELINE)
+    advanced_command = "\n".join(advanced["commands"])
+    assert advanced["agent_pool"] == "mi300_1"
+    assert advanced["depends_on"] == "amd-build"
+    assert advanced["mirror_hardwares"] == ["amdproduction"]
+    assert advanced["grade"] == "Blocking"
+    assert advanced["timeout_in_minutes"] == 150
+    assert advanced["source_file_dependencies"] == expected_dependencies
+    assert advanced["env"] == expected_env
+    assert advanced["artifact_paths"] == ["artifacts/rocm-drama3-advanced-weekly/**/*"]
+    assert "retry" not in advanced
+    assert "ROCM_E2E_LEVEL_MARKER=slow" in advanced_command
+    assert "ROCM_E2E_RUN_LEVEL=advanced_model" in advanced_command
+    assert "ROCM_E2E_TIMEOUT_MINUTES=120" in advanced_command
+    assert ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh" in advanced_command
+    advanced_tokens = split(
+        next(command for command in advanced["commands"] if "run-rocm-full-model-nightly.sh" in command)
+    )
+    advanced_runner = advanced_tokens.index(".buildkite/amd/scripts/run-rocm-full-model-nightly.sh")
+    assert advanced_tokens[advanced_runner + 1 :] == [
+        _DRAMA3_WEEKLY_CORE_NODE,
+        "5",
+        "tts",
+        "rocm-drama3-advanced-weekly",
+        *_DRAMA3_WEEKLY_ADVANCED_NODES[1:],
+    ]
+    for node in _DRAMA3_WEEKLY_ADVANCED_NODES:
+        assert advanced_command.count(node) == 1
+
+    source = Path("tests/e2e/online_serving/test_drama_3.py").read_text(encoding="utf-8")
+    assert source.count('"rocm": "MI325"') == 4
+    assert '@pytest.mark.parametrize("seed", [0, 42]' in source
+
+
 _MOSS_WEEKLY_NODES = (
     "tests/e2e/offline_inference/test_moss_tts_expansion.py::test_moss_tts_delay_english[omni_runner0]",
     "tests/e2e/offline_inference/test_moss_tts_expansion.py::test_moss_tts_delay_chinese[omni_runner0]",
@@ -2067,7 +2343,7 @@ def test_moss_tts_weekly_selects_three_marked_nodes() -> None:
     command = "\n".join(step["commands"])
     dependencies = yaml.safe_load(AMD_SOURCE_DEPENDENCIES.read_text(encoding="utf-8"))["source_file_dependencies"]
 
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 90
@@ -2143,41 +2419,373 @@ def test_moss_tts_weekly_executes_junit_guard_before_exit(
     )
 
 
-def test_cosyvoice_offline_zero_shot_runs_nightly_on_rocm() -> None:
-    path = "tests/e2e/offline_inference/test_cosyvoice3_expansion.py"
-    markers = "slow and tts and rocm and MI325 and cards_1"
-    step = _find_step("CosyVoice3 Offline Zero-shot Smoke", AMD_NIGHTLY_PIPELINE)
+def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
+    def flatten_paths(items: list) -> set[str]:
+        paths: set[str] = set()
+        for item in items:
+            if isinstance(item, list):
+                paths.update(flatten_paths(item))
+            else:
+                paths.add(item)
+        return paths
 
-    assert step["grade"] == "NonBlocking"
-    assert step["agent_pool"] == "mi300_1"
-    assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["timeout_in_minutes"] == 90
-    assert step["retry"] == {"automatic": [{"exit_status": 134, "limit": 1}]}
-    assert step["artifact_paths"] == ["artifacts/rocm-cosyvoice3-offline-nightly/**/*"]
-    assert "env" not in step
+    jobs = {
+        "Audex TTS/TTA/S2S · 1-GPU": {
+            "timeout": 360,
+            "test_timeout": 330,
+            "count": 15,
+            "artifact_name": "rocm-audex-weekly",
+            "dependency": "tts_audex_weekly",
+            "env": {
+                "VLLM_OMNI_CI_MODEL_RUNNER": "v1",
+            },
+            "files": (
+                "tests/e2e/offline_inference/test_audex_tts.py",
+                "tests/e2e/offline_inference/test_audex_s2s.py",
+                "tests/e2e/offline_inference/test_audex_s2t.py",
+                "tests/e2e/offline_inference/test_audex_tta.py",
+                "tests/e2e/online_serving/test_audex_tta.py",
+                "tests/e2e/online_serving/test_audex_tts.py",
+            ),
+        },
+        "CosyVoice3 offline and online · 1-GPU": {
+            "timeout": 180,
+            "test_timeout": 150,
+            "count": 5,
+            "artifact_name": "rocm-cosyvoice3-weekly",
+            "dependency": "tts_cosyvoice3_function",
+            "files": (
+                "tests/e2e/offline_inference/test_cosyvoice3_expansion.py",
+                "tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py",
+            ),
+        },
+        "Qwen3-TTS word timestamps · 1-GPU": {
+            "timeout": 120,
+            "test_timeout": 90,
+            "count": 3,
+            "artifact_name": "rocm-qwen3-tts-word-timestamps-weekly",
+            "dependency": "tts_qwen3_tts_function",
+            "files": ("tests/e2e/online_serving/test_qwen3_tts_word_timestamps.py",),
+        },
+        "VoxCPM2 TTS · 1-GPU": {
+            "timeout": 180,
+            "test_timeout": 150,
+            "count": 9,
+            "artifact_name": "rocm-voxcpm2-tts-weekly",
+            "dependency": "tts_voxcpm2_weekly",
+            "env": {
+                "VLLM_OMNI_CI_MODEL_RUNNER": "v2",
+            },
+            "files": (
+                "tests/e2e/offline_inference/test_voxcpm2_tts.py",
+                "tests/e2e/online_serving/test_voxcpm2_tts.py",
+                "tests/e2e/online_serving/test_voxcpm2_tts_expansion.py",
+                "tests/e2e/online_serving/test_voxcpm2_tts_lora.py",
+            ),
+        },
+        "Voxtral TTS · 1-GPU": {
+            "timeout": 210,
+            "test_timeout": 180,
+            "count": 10,
+            "artifact_name": "rocm-voxtral-tts-weekly",
+            "dependency": "tts_voxtral_weekly",
+            "env": {
+                "VLLM_OMNI_CI_MODEL_RUNNER": "v2",
+            },
+            "files": (
+                "tests/e2e/offline_inference/test_voxtral_tts_expansion.py",
+                "tests/e2e/online_serving/test_voxtral_tts_expansion.py",
+            ),
+        },
+        "Moss TTS realtime and online · 1-GPU": {
+            "timeout": 180,
+            "test_timeout": 150,
+            "count": 6,
+            "artifact_name": "rocm-moss-tts-extended-weekly",
+            "dependency": "tts_moss_tts_extended_weekly",
+            "files": (
+                "tests/e2e/offline_inference/test_moss_tts_realtime.py",
+                "tests/e2e/offline_inference/test_moss_tts_realtime_expansion.py",
+                "tests/e2e/online_serving/test_moss_tts_expansion.py",
+            ),
+        },
+        "Moss TTS Nano · 1-GPU": {
+            "timeout": 210,
+            "test_timeout": 180,
+            "count": 9,
+            "artifact_name": "rocm-moss-tts-nano-weekly",
+            "dependency": "tts_moss_tts_nano_weekly",
+            "files": (
+                "tests/e2e/offline_inference/test_moss_tts_nano_expansion.py",
+                "tests/e2e/online_serving/test_moss_tts_nano_expansion.py",
+            ),
+        },
+        "Higgs Audio V2 · 1-GPU": {
+            "timeout": 210,
+            "test_timeout": 180,
+            "count": 9,
+            "artifact_name": "rocm-higgs-audio-v2-weekly",
+            "dependency": "tts_higgs_audio_v2_weekly",
+            "files": (
+                "tests/e2e/offline_inference/test_higgs_audio_v2_expansion.py",
+                "tests/e2e/online_serving/test_higgs_audio_v2_expansion.py",
+            ),
+        },
+        "Higgs Audio V3 · 1-GPU": {
+            "timeout": 240,
+            "test_timeout": 210,
+            "count": 13,
+            "artifact_name": "rocm-higgs-audio-v3-weekly",
+            "dependency": "tts_higgs_audio_v3_weekly",
+            "files": ("tests/e2e/online_serving/test_higgs_audio_v3.py",),
+        },
+        "OmniVoice offline and graph parity · 1-GPU": {
+            "timeout": 240,
+            "test_timeout": 210,
+            "count": 4,
+            "artifact_name": "rocm-omnivoice-offline-parity-weekly",
+            "dependency": "tts_omnivoice_offline_parity_weekly",
+            "files": (
+                "tests/e2e/offline_inference/test_omnivoice_expansion.py",
+                "tests/e2e/online_serving/test_omnivoice_parity.py",
+            ),
+        },
+        "OmniVoice online · 1-GPU": {
+            "timeout": 300,
+            "test_timeout": 270,
+            "count": 19,
+            "artifact_name": "rocm-omnivoice-online-weekly",
+            "dependency": "tts_omnivoice_online_weekly",
+            "files": ("tests/e2e/online_serving/test_omnivoice_expansion.py",),
+        },
+        "Step-Audio-2 offline and online · 1-GPU": {
+            "timeout": 300,
+            "test_timeout": 270,
+            "count": 5,
+            "artifact_name": "rocm-step-audio2-weekly",
+            "dependency": "tts_step_audio2_weekly",
+            "files": (
+                "tests/e2e/offline_inference/test_step_audio2_expansion.py",
+                "tests/e2e/online_serving/test_step_audio2_expansion.py",
+            ),
+        },
+        "Ming TTS · 1-GPU": {
+            "timeout": 240,
+            "test_timeout": 210,
+            "count": 6,
+            "artifact_name": "rocm-ming-tts-weekly",
+            "dependency": "tts_ming_weekly",
+            "files": (
+                "tests/e2e/offline_inference/test_ming_tts_expansion.py",
+                "tests/e2e/online_serving/test_ming_tts_expansion.py",
+            ),
+        },
+        "GLM TTS · 1-GPU": {
+            "timeout": 240,
+            "test_timeout": 210,
+            "count": 5,
+            "artifact_name": "rocm-glm-tts-weekly",
+            "dependency": "tts_glm_weekly",
+            "files": (
+                "tests/e2e/offline_inference/test_glm_tts_expansion.py",
+                "tests/e2e/online_serving/test_glm_tts_expansion.py",
+            ),
+        },
+        "IndexTTS2 · 1-GPU": {
+            "timeout": 240,
+            "test_timeout": 210,
+            "count": 3,
+            "artifact_name": "rocm-indextts2-weekly",
+            "dependency": "tts_indextts2_weekly",
+            "files": (
+                "tests/e2e/offline_inference/test_indextts2_expansion.py",
+                "tests/e2e/online_serving/test_indextts2_expansion.py",
+            ),
+        },
+        "Breeze TTS 2 · 1-GPU": {
+            "timeout": 210,
+            "test_timeout": 180,
+            "count": 5,
+            "artifact_name": "rocm-breeze-tts2-weekly",
+            "dependency": "tts_breeze_tts2_weekly",
+            "files": ("tests/e2e/online_serving/test_breeze_tts_2.py",),
+        },
+        "Gepard-1.0 · 1-GPU": {
+            "timeout": 360,
+            "test_timeout": 300,
+            "count": 16,
+            "artifact_name": "rocm-gepard-weekly",
+            "dependency": "tts_gepard_weekly",
+            "level_marker": "all",
+            "run_level": "full_model",
+            "setup_fragments": (
+                "nemo_toolkit[tts]==2.7.3",
+                "--overrides /tmp/gepard-overrides.txt",
+            ),
+            "files": (
+                "tests/e2e/offline_inference/test_gepard_tts.py",
+                "tests/e2e/online_serving/test_gepard_tts.py",
+            ),
+        },
+        "MOSS-TTS v1.5 · 1-GPU": {
+            "timeout": 240,
+            "test_timeout": 210,
+            "count": 1,
+            "artifact_name": "rocm-moss-tts-v15-weekly",
+            "dependency": "tts_moss_v15_weekly",
+            "files": ("tests/e2e/offline_inference/test_moss_tts_v1_5_expansion.py",),
+        },
+        "MiniMax Music3 · 1-GPU": {
+            "timeout": 360,
+            "test_timeout": 330,
+            "count": 2,
+            "artifact_name": "rocm-minimax-music3-weekly",
+            "dependency": "tts_minimax_music3_weekly",
+            "files": ("tests/e2e/online_serving/test_minimax_music3.py",),
+        },
+        "YuE2 online · 1-GPU": {
+            "timeout": 480,
+            "test_timeout": 450,
+            "count": 6,
+            "artifact_name": "rocm-yue2-weekly",
+            "dependency": "tts_yue2_weekly",
+            "files": ("tests/e2e/online_serving/test_yue2.py",),
+        },
+    }
+    expected_env = {
+        "OPENBLAS_NUM_THREADS": "1",
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+    }
+    dependencies = yaml.safe_load(AMD_SOURCE_DEPENDENCIES.read_text(encoding="utf-8"))["source_file_dependencies"]
+    group = _find_group("TTS E2E Weekly", AMD_WEEKLY_PIPELINE)
+    labels = [step["label"] for step in group["steps"]]
 
-    pytest_commands = [command for command in step["commands"] if "pytest" in split(command)]
-    assert len(pytest_commands) == 2
-    collect_command = next(command for command in pytest_commands if "--collect-only" in split(command))
-    run_command = next(command for command in pytest_commands if "--collect-only" not in split(command))
-    for command in (collect_command, run_command):
-        argv = split(command)
-        assert path in argv
-        assert argv[argv.index("-m") + 1] == markers
-        assert argv[argv.index("--run-level") + 1] == "full_model"
-    assert "--junitxml=/tmp/cosyvoice3-offline-pytest.xml" in split(run_command)
+    assert set(jobs) < set(labels)
+    for label, expected in jobs.items():
+        step = _find_step(label, AMD_WEEKLY_PIPELINE)
+        command = "\n".join(step["commands"])
+        artifact_name = cast(str, expected["artifact_name"])
+        dependency = cast(str, expected["dependency"])
+        files = cast(tuple[str, ...], expected["files"])
+        level_marker = cast(str, expected.get("level_marker", "slow"))
+        run_level = cast(str, expected.get("run_level", "full_model"))
+        setup_fragments = cast(tuple[str, ...], expected.get("setup_fragments", ()))
 
-    commands = "\n".join(step["commands"])
-    assert "DIFFUSION_ATTENTION_BACKEND" not in commands
-    assert "VLLM_ROCM_USE_AITER" not in commands
-    assert "cp -v /tmp/cosyvoice3-offline-pytest.xml" in commands
+        assert step["agent_pool"] == "mi300_1"
+        assert step["depends_on"] == "amd-build"
+        assert step["mirror_hardwares"] == ["amdproduction"]
+        assert step["grade"] == "Blocking"
+        assert step["timeout_in_minutes"] == expected["timeout"]
+        assert step["source_file_dependencies"] == dependency
+        assert step["env"] == expected_env | cast(dict[str, str], expected.get("env", {}))
+        assert step["artifact_paths"] == [f"artifacts/{artifact_name}/**/*"]
+        assert "retry" not in step
+        assert "VLLM_ALLOW_LONG_MAX_MODEL_LEN" in command
+        assert "VLLM_USE_DEEP_GEMM" in command
+        assert "VLLM_MOE_USE_DEEP_GEMM" in command
+        assert ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh" in command
+        assert f"ROCM_E2E_LEVEL_MARKER={level_marker}" in command
+        if "run_level" in expected:
+            assert f"ROCM_E2E_RUN_LEVEL={run_level}" in command
+        assert f"ROCM_E2E_TIMEOUT_MINUTES={expected['test_timeout']}" in command
+        assert f"{files[0]} {expected['count']} tts {artifact_name}" in command
+        for path in files:
+            assert path in command
+        for fragment in setup_fragments:
+            assert fragment in command
 
-    source = Path(path).read_text(encoding="utf-8")
-    decorator = source.rsplit("@hardware_test", 1)[1].split("def test_cosyvoice3_offline_reference_zero_shot", 1)[0]
-    assert '"cuda": "L4"' in decorator
-    assert '"rocm": "MI325"' in decorator
-    assert 'id="sync"' in source
-    assert 'id="async_chunk"' in source
+        dependency_paths = flatten_paths(dependencies[dependency])
+        assert ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh" in dependency_paths
+        assert set(files) <= dependency_paths
+        assert "vllm_omni/entrypoints/omni_base.py" in dependency_paths
+        assert "vllm_omni/metrics/utils.py" in dependency_paths
+        assert "vllm_omni/outputs/" in dependency_paths
+        if dependency == "tts_audex_weekly":
+            assert "tests/assets/" not in dependency_paths
+        if dependency == "tts_breeze_tts2_weekly":
+            # The ROCm Breeze step runs V1; MRv2 paths live in a CUDA-only key.
+            assert not any(path.startswith("vllm_omni/worker_v2/") for path in dependency_paths)
+
+        for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
+            assert label not in pipeline_path.read_text(encoding="utf-8")
+
+    marker_counts = {
+        "tests/e2e/offline_inference/test_audex_tts.py": 3,
+        "tests/e2e/offline_inference/test_audex_s2s.py": 1,
+        "tests/e2e/offline_inference/test_audex_s2t.py": 1,
+        "tests/e2e/offline_inference/test_audex_tta.py": 1,
+        "tests/e2e/online_serving/test_audex_tta.py": 1,
+        "tests/e2e/online_serving/test_audex_tts.py": 8,
+        "tests/e2e/offline_inference/test_cosyvoice3_expansion.py": 1,
+        "tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py": 3,
+        "tests/e2e/online_serving/test_qwen3_tts_word_timestamps.py": 3,
+        "tests/e2e/offline_inference/test_voxcpm2_tts.py": 3,
+        "tests/e2e/online_serving/test_voxcpm2_tts.py": 2,
+        "tests/e2e/online_serving/test_voxcpm2_tts_expansion.py": 2,
+        "tests/e2e/online_serving/test_voxcpm2_tts_lora.py": 2,
+        "tests/e2e/offline_inference/test_voxtral_tts_expansion.py": 2,
+        "tests/e2e/online_serving/test_voxtral_tts_expansion.py": 8,
+        "tests/e2e/offline_inference/test_moss_tts_realtime.py": 2,
+        "tests/e2e/offline_inference/test_moss_tts_realtime_expansion.py": 1,
+        "tests/e2e/online_serving/test_moss_tts_expansion.py": 3,
+        "tests/e2e/offline_inference/test_moss_tts_nano_expansion.py": 4,
+        "tests/e2e/online_serving/test_moss_tts_nano_expansion.py": 5,
+        "tests/e2e/offline_inference/test_higgs_audio_v2_expansion.py": 3,
+        "tests/e2e/online_serving/test_higgs_audio_v2_expansion.py": 6,
+        "tests/e2e/online_serving/test_higgs_audio_v3.py": 13,
+        "tests/e2e/offline_inference/test_omnivoice_expansion.py": 2,
+        "tests/e2e/online_serving/test_omnivoice_expansion.py": 18,
+        "tests/e2e/online_serving/test_omnivoice_parity.py": 2,
+        "tests/e2e/offline_inference/test_step_audio2_expansion.py": 2,
+        "tests/e2e/online_serving/test_step_audio2_expansion.py": 2,
+        "tests/e2e/offline_inference/test_ming_tts_expansion.py": 4,
+        "tests/e2e/online_serving/test_ming_tts_expansion.py": 2,
+        "tests/e2e/offline_inference/test_glm_tts_expansion.py": 1,
+        "tests/e2e/online_serving/test_glm_tts_expansion.py": 3,
+        "tests/e2e/offline_inference/test_indextts2_expansion.py": 1,
+        "tests/e2e/online_serving/test_indextts2_expansion.py": 2,
+        "tests/e2e/online_serving/test_breeze_tts_2.py": 4,
+        "tests/e2e/offline_inference/test_gepard_tts.py": 3,
+        "tests/e2e/online_serving/test_gepard_tts.py": 11,
+        "tests/e2e/offline_inference/test_moss_tts_v1_5_expansion.py": 1,
+        "tests/e2e/online_serving/test_minimax_music3.py": 2,
+        "tests/e2e/online_serving/test_yue2.py": 3,
+    }
+    for path, expected_count in marker_counts.items():
+        assert Path(path).read_text(encoding="utf-8").count('"rocm": "MI325"') == expected_count
+
+    breeze_source = Path("tests/e2e/online_serving/test_breeze_tts_2.py").read_text(encoding="utf-8")
+    assert '"input": "今天天气很好，非常适合去公园散步。"' in breeze_source
+    assert '"input": "你好，欢迎使用语音合成系统。今天的天气很好。"' not in breeze_source
+    assert '"transcript_escalation_model": "large-v3"' in breeze_source
+    assert '"transcript_model":' not in breeze_source
+
+    indextts_source = Path("tests/e2e/online_serving/test_indextts2_expansion.py").read_text(encoding="utf-8")
+    stable_indextts_prompt = '"input": "Please read this sentence clearly and naturally."'
+    assert indextts_source.count(stable_indextts_prompt) == 1
+    assert indextts_source.count('"input": "Hello, this is a voice cloning demo."') == 1
+    assert indextts_source.count('"transcript_language": "en"') == 1
+    assert indextts_source.count('"transcript_escalation_model": "large-v3"') == 1
+    assert "SAMPLE_RATE = 22050" in indextts_source
+    assert '"expected_sample_rate": SAMPLE_RATE' in indextts_source
+
+    cosy_source = Path("tests/e2e/offline_inference/test_cosyvoice3_expansion.py").read_text(encoding="utf-8")
+    assert 'id="sync"' in cosy_source
+    assert 'id="async_chunk"' in cosy_source
+    nightly_text = AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8")
+    assert "CosyVoice3 Offline Zero-shot Smoke" not in nightly_text
+    assert "rocm-cosyvoice3-offline-nightly" not in nightly_text
+
+    runner = Path(".buildkite/amd/scripts/run-rocm-full-model-nightly.sh")
+    assert os.access(runner, os.X_OK)
+    runner_text = runner.read_text(encoding="utf-8")
+    assert "ROCM_E2E_RUN_LEVEL" in runner_text
+    assert '"$level_marker" == advanced_model' in runner_text
+    assert '"$level_marker" == all' in runner_text
+    assert '-m "$marker_expression"' in runner_text
+    assert '--run-level "$run_level"' in runner_text
 
 
 def test_stable_audio_cpu_offload_has_one_nonblocking_nightly_owner() -> None:
@@ -2214,15 +2822,16 @@ def test_stable_audio_cpu_offload_has_one_nonblocking_nightly_owner() -> None:
         assert "full_model and rocm and MI325 and cards_1" not in text
 
 
-def test_stable_audio_layerwise_offload_is_one_nonblocking_nightly_job() -> None:
+def test_stable_audio_layerwise_offload_is_one_blocking_nightly_job() -> None:
     step = _find_step("Stable Audio Layerwise Offload", AMD_NIGHTLY_PIPELINE)
     command = "\n".join(step["commands"])
     nightly = yaml.safe_load(AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8"))
     nightly_labels = [item.get("label") for item in _walk_steps(nightly["steps"])]
 
     assert nightly_labels.count("Stable Audio Layerwise Offload") == 1
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
+    assert step["depends_on"] == "amd-build"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 60
     assert step["source_file_dependencies"] == [
@@ -2230,6 +2839,7 @@ def test_stable_audio_layerwise_offload_is_one_nonblocking_nightly_job() -> None
         "diffusion_stable_audio_function",
     ]
     assert step["artifact_paths"] == ["artifacts/rocm-stable-audio-layerwise-offload/**/*"]
+    assert "retry" not in step
     assert "full_model and diffusion and rocm and MI325 and cards_1" in command
     assert "--run-level full_model" in command
     assert "timeout --signal=TERM --kill-after=2m 45m" in command
@@ -2301,14 +2911,14 @@ def test_amd_runner_preserves_piped_failures_and_empty_collection() -> None:
     assert template.count("soft_fail: true") == 2
 
 
-def test_qwen_image_diffusers_accuracy_is_one_nonblocking_nightly_job() -> None:
+def test_qwen_image_diffusers_accuracy_is_one_blocking_nightly_job() -> None:
     step = _find_step("Qwen-Image Diffusers Accuracy", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
     commands = "\n".join(step["commands"])
-    assert "full_model and diffusion and rocm and MI325 and cards_1" in commands
+    assert "slow and diffusion and rocm and MI325 and cards_1" in commands
     assert "--run-level full_model" in commands
     assert "--collect-only" in commands
     nodes = (
@@ -2338,13 +2948,13 @@ WAN22_2GPU_NODES = (
 )
 
 
-def test_wan22_accuracy_has_one_nonblocking_comparison_job() -> None:
+def test_wan22_accuracy_has_one_blocking_comparison_job() -> None:
     two = _find_step("Wan2.2 I2V Accuracy 2 GPU", AMD_NIGHTLY_PIPELINE)
     group = _find_group(":full_moon: Wan2.2 Accuracy MI300 Nightly", AMD_NIGHTLY_PIPELINE)
     assert [step["label"] for step in group["steps"]] == ["Wan2.2 I2V Accuracy 2 GPU"]
     assert two["agent_pool"] == "mi300_2"
     two_commands = "\n".join(two["commands"])
-    assert two["grade"] == "NonBlocking"
+    assert two["grade"] == "Blocking"
     assert two["timeout_in_minutes"] == 180
     assert two["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
     two_marker = "full_model and diffusion and rocm and MI325 and (cards_1 or cards_2)"
@@ -2394,9 +3004,9 @@ def test_wan22_similarity_accepts_complete_artifacts(tmp_path: Path) -> None:
     require_similarity_artifacts(paths)
 
 
-def test_hunyuan_image3_lora_accuracy_is_one_nonblocking_nightly_job() -> None:
+def test_hunyuan_image3_lora_accuracy_is_one_blocking_nightly_job() -> None:
     step = _find_step("HunyuanImage3 LoRA Accuracy", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_4"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
@@ -2417,9 +3027,9 @@ def test_hunyuan_image3_lora_accuracy_is_one_nonblocking_nightly_job() -> None:
         assert "HunyuanImage3 LoRA Accuracy" not in text
 
 
-def test_hunyuanvideo15_accuracy_is_one_nonblocking_nightly_job() -> None:
+def test_hunyuanvideo15_accuracy_is_one_blocking_nightly_job() -> None:
     step = _find_step("HunyuanVideo-1.5 Video Similarity", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
@@ -2449,7 +3059,7 @@ def test_hunyuanvideo15_accuracy_is_one_nonblocking_nightly_job() -> None:
         assert "HunyuanVideo-1.5 Video Similarity" not in text
 
 
-def test_minimax_h3_accuracy_has_two_nonblocking_nightly_jobs() -> None:
+def test_minimax_h3_accuracy_keeps_i2va_nonblocking_and_promotes_timeline() -> None:
     timeline = _find_step("MiniMax-H3 Timeline Guide Accuracy", AMD_NIGHTLY_PIPELINE)
     i2va = _find_step("MiniMax-H3 I2VA Ref2VA Accuracy", AMD_NIGHTLY_PIPELINE)
     assert timeline["agent_pool"] == "mi300_2"
@@ -2467,7 +3077,7 @@ def test_minimax_h3_accuracy_has_two_nonblocking_nightly_jobs() -> None:
         ),
     )
     for step, marker, path in pairs:
-        assert step["grade"] == "NonBlocking"
+        assert step["grade"] == ("Blocking" if step is timeline else "NonBlocking")
         assert step["timeout_in_minutes"] == 180
         assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
         commands = "\n".join(step["commands"])
@@ -2797,7 +3407,7 @@ def test_qwen_image_backend_similarity_is_one_blocking_nightly_job() -> None:
     assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
     assert step["artifact_paths"] == ["artifacts/rocm-qwen-image-backend-similarity/**/*"]
     commands = "\n".join(step["commands"])
-    assert "full_model and diffusion and rocm and MI325 and cards_1" in commands
+    assert "slow and diffusion and rocm and MI325 and cards_1" in commands
     assert '-k "2i_matches_diffusers"' in commands
     assert "test_diffusers_backend_t2i_matches_diffusers" in commands
     assert "Expected exactly one Qwen-Image backend similarity node" in commands
@@ -2807,9 +3417,101 @@ def test_qwen_image_backend_similarity_is_one_blocking_nightly_job() -> None:
     assert "Expected exactly one executed Qwen-Image backend similarity test" in commands
     accuracy_test = Path("tests/e2e/accuracy/test_diffusers_backend_similarity.py").read_text(encoding="utf-8")
     assert "torch.version.hip is not None" in accuracy_test
+    assert "@pytest.mark.slow" in accuracy_test
+    assert "pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]" not in accuracy_test
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert "Qwen-Image Diffusers Backend Similarity" not in text
+
+
+_NIGHTLY_PROMOTED_ACCURACY_DOC_JOBS = (
+    ("Qwen3-Omni Accuracy", 4, "Qwen3-Omni accuracy", "ROCM_QWEN3_ACCURACY_ARTIFACT_DIR"),
+    ("Qwen3-Omni Documentation Examples", 7, "Qwen3-Omni documentation", "ROCM_QWEN3_DOC_ARTIFACT_DIR"),
+    ("Qwen2.5-Omni Documentation Examples", 7, "Qwen2.5-Omni documentation", "QWEN25_OMNI_DOC_ARTIFACT_DIR"),
+    ("Wan2.2 I2V Accuracy 2 GPU", 3, "Wan2.2 I2V accuracy", "ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR"),
+    ("HunyuanImage3 LoRA Accuracy", 1, "HunyuanImage3 LoRA accuracy", "ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR"),
+    (
+        "HunyuanVideo-1.5 Video Similarity",
+        6,
+        "HunyuanVideo-1.5 video similarity",
+        "ROCM_HUNYUANVIDEO15_ACCURACY_ARTIFACT_DIR",
+    ),
+    ("MiniMax-H3 Timeline Guide Accuracy", 1, "MiniMax-H3 timeline accuracy", "ROCM_MINIMAX_H3_TIMELINE_ARTIFACT_DIR"),
+)
+
+
+@pytest.mark.parametrize("label,count,name,artifact_env", _NIGHTLY_PROMOTED_ACCURACY_DOC_JOBS)
+@pytest.mark.parametrize(
+    "scenario", ["pass", "skipped", "wrong-count", "zero-tests", "failure", "error", "pytest-failure", "timeout"]
+)
+def test_promoted_nightly_accuracy_doc_execution_guard(
+    tmp_path: Path, label: str, count: int, name: str, artifact_env: str, scenario: str
+) -> None:
+    assert _find_step(label, AMD_NIGHTLY_PIPELINE)["grade"] == "Blocking"
+    pytest_status = 1 if scenario == "pytest-failure" else 0
+    timeout_status = 124 if scenario == "timeout" else None
+    tests = 0 if scenario == "zero-tests" else count + int(scenario == "wrong-count")
+    expected_status = {"pass": 0, "pytest-failure": 1, "timeout": 124}.get(scenario, 5)
+    _assert_nightly_junit_guard(
+        tmp_path,
+        step_label=label,
+        command_fragment="pytest -s -v",
+        expected_message=f"Expected exactly {count} executed {name} tests",
+        artifact_env=artifact_env,
+        job_id_prefix="nightly-promotion-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=int(scenario == "skipped"),
+        failures=int(scenario == "failure"),
+        errors=int(scenario == "error"),
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+        extra_env={"BUILDKITE_BUILD_CHECKOUT_PATH": str(tmp_path)},
+    )
+
+
+_NIGHTLY_SMOKES_PROMOTIONS = (
+    ("HunyuanVideo-1.5 Default T2V Smoke", 1, "HunyuanVideo-1.5 T2V smoke", "UNUSED_ARTIFACT_DIR", "pytest -s -v"),
+    ("LingBot-Video Dense CFG-off Smoke", 1, "LingBot CFG-off smoke", "UNUSED_ARTIFACT_DIR", "pytest -s -v"),
+    (
+        "Qwen-Image Official-Weight Smoke",
+        1,
+        "Qwen-Image official-weight smoke",
+        "QWEN_IMAGE_ARTIFACT_DIR",
+        "pytest -s -v",
+    ),
+    ("MiniMax-H3 Official T2VA Smoke", 1, "MiniMax-H3 T2VA smoke", "MINIMAX_H3_ARTIFACT_DIR", "pytest -s -v"),
+)
+
+
+@pytest.mark.parametrize("label,count,name,artifact_env,command_fragment", _NIGHTLY_SMOKES_PROMOTIONS)
+@pytest.mark.parametrize(
+    "scenario", ["pass", "skipped", "wrong-count", "zero-tests", "failure", "error", "pytest-failure", "timeout"]
+)
+def test_nightly_smokes_promotion_execution_guard(
+    tmp_path: Path, label: str, count: int, name: str, artifact_env: str, command_fragment: str, scenario: str
+) -> None:
+    assert _find_step(label, AMD_NIGHTLY_PIPELINE)["grade"] == "Blocking"
+    # LingBot and HunyuanVideo have a step timeout, not an inner timeout command.
+    pytest_status = 1 if scenario == "pytest-failure" else 124 if scenario == "timeout" else 0
+    timeout_status = 124 if scenario == "timeout" else None
+    tests = 0 if scenario == "zero-tests" else count + int(scenario == "wrong-count")
+    _assert_nightly_junit_guard(
+        tmp_path,
+        step_label=label,
+        command_fragment=command_fragment,
+        expected_message=f"Expected exactly {count} executed {name} tests",
+        artifact_env=artifact_env,
+        job_id_prefix="nightly-smokes-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=int(scenario == "skipped"),
+        failures=int(scenario == "failure"),
+        errors=int(scenario == "error"),
+        timeout_status=timeout_status,
+        expected_status={"pass": 0, "pytest-failure": 1, "timeout": 124}.get(scenario, 5),
+        extra_env={"BUILDKITE_BUILD_CHECKOUT_PATH": str(tmp_path)},
+    )
 
 
 def _assert_nightly_junit_guard(
@@ -3196,7 +3898,7 @@ def test_qwen_image_expansion_has_separate_blocking_card_jobs() -> None:
         (
             one,
             "mi300_1",
-            "full_model and diffusion and rocm and MI325 and cards_1",
+            "slow and diffusion and rocm and MI325 and cards_1",
             "artifacts/rocm-qwen-image-expansion-1gpu/**/*",
             (
                 "cpu_offload",
@@ -3209,7 +3911,7 @@ def test_qwen_image_expansion_has_separate_blocking_card_jobs() -> None:
         (
             two,
             "mi300_2",
-            "full_model and diffusion and rocm and MI325 and cards_2",
+            "slow and diffusion and rocm and MI325 and cards_2",
             "artifacts/rocm-qwen-image-expansion-2gpu/**/*",
             (
                 "ulysses_2",
@@ -3545,8 +4247,9 @@ def test_qwen3_omni_shm_leak_is_a_separate_blocking_merge_job() -> None:
 
     assert blocking_step["agent_pool"] == "mi300_2"
     assert blocking_step["grade"] == "Blocking"
-    assert "assert-pytest-collection.sh 13" in blocking_commands
+    assert "assert-pytest-collection.sh 11" in blocking_commands
     assert shm_path not in blocking_commands
+    assert "test_qwen3_omni_colocate_async.py" not in blocking_commands
 
     step = _find_step("Qwen3-Omni SHM Leak Test", AMD_MERGE_PIPELINE)
     commands = "\n".join(step["commands"])
@@ -3766,7 +4469,7 @@ def test_entrypoints_full_nightly_uses_focused_source_dependencies() -> None:
 
 
 def test_qwen_duplex_rocm_mark_is_limited_to_the_full_model_method() -> None:
-    source = Path("tests/entrypoints/openai_api/test_qwen3_omni_realtime_websocket.py").read_text(encoding="utf-8")
+    source = Path("tests/entrypoints/openai_api/test_qwen3_omni_duplex_playback.py").read_text(encoding="utf-8")
     assert ('@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)\nclass TestQwen3OmniDuplexPlayback:') in source
     assert source.count('@hardware_test(res={"rocm": "MI325"}, num_cards=2)') == 1
     full_method_prefix = source.split("def test_speech_interrupts_playback_full", maxsplit=1)[0].rsplit(
@@ -4304,7 +5007,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
     """READY blocks on the collected one-card worker nodes.
 
     Local collection of the three files with the MI325 marker returned these
-    35 ids. R2-01 still collects 1424 model-executor nodes and does not run them.
+    35 ids. R2-01 still collects 1438 model-executor nodes and does not run them.
     """
     step = _find_step("ROCm · One-Card Worker GPU Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -4350,14 +5053,14 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1424" in r2_01_command
+    assert "assert-pytest-collection.sh 1438" in r2_01_command
     assert "tests/model_executor/" in r2_01_command
     for path in _WORKER_ONE_CARD_FILES:
         assert path not in r2_01_command
 
 
-_DRAMA3_READY_MARKER = "core_model and tts and rocm and MI325 and cards_1"
-_DRAMA3_MERGE_MARKER = "advanced_model and tts and rocm and MI325 and cards_1"
+_DRAMA3_READY_MARKER = "slow and tts and rocm and MI325 and cards_1"
+_DRAMA3_MERGE_MARKER = "slow and tts and rocm and MI325 and cards_1"
 _DRAMA3_READY_NODE = "tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]"
 _DRAMA3_EXCLUDED = (
     "test_voice_clone_streaming_002",
@@ -4391,7 +5094,8 @@ def test_drama3_ready_requires_one_blocking_text_to_audio_node() -> None:
     assert _marker_expressions(step) == [_DRAMA3_READY_MARKER, _DRAMA3_READY_MARKER]
     assert command.count('--run-level "core_model"') == 2
     assert "full_model" not in command
-    assert command.count(_DRAMA3_READY_NODE) == 1
+    # nodes= + collect-only + run, same as MERGE text-to-audio.
+    assert command.count(_DRAMA3_READY_NODE) == 3
     for name in _DRAMA3_EXCLUDED:
         assert name not in command
     assert "diff -u /tmp/drama3-ready-expected.txt" in command
@@ -4447,8 +5151,9 @@ def test_drama3_merge_requires_the_same_text_to_audio_node() -> None:
     assert command.count(_DRAMA3_READY_NODE) == 3
     assert "diff -u /tmp/drama3-merge-expected.txt" in command
     assert "Expected exactly one executed Drama 3 MERGE test" in command
-    assert "@pytest.mark.core_model" in selected
-    assert "@pytest.mark.advanced_model" in selected
+    assert "@pytest.mark.slow" in selected
+    assert "@pytest.mark.core_model" not in selected
+    assert "@pytest.mark.advanced_model" not in selected
     text_to_audio = source.split("def test_voice_clone_streaming_002", 1)[0]
     assert "send_audio_speech_request" in text_to_audio
     assert 'run_level not in {"advanced_model", "full_model"}' in speech_gate
@@ -4562,7 +5267,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
 
     The marker selects both intermediate-buffer residency rows and the three
     device-copy GPU tests. #9552's worker files stay on the other job. R2-01
-    still collects 1424 model-executor nodes.
+    still collects 1438 model-executor nodes.
     """
     step = _find_step("ROCm · One-Card Worker Copy Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -4614,7 +5319,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1424" in r2_01_command
+    assert "assert-pytest-collection.sh 1438" in r2_01_command
     for path in _WORKER_COPY_FILES:
         assert path not in r2_01_command
 
@@ -4754,7 +5459,7 @@ def test_tiny_diffusion_base_ready_pins_one_card_nodes() -> None:
 
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
     assert step["timeout_in_minutes"] == 60
     assert step["artifact_paths"] == ["artifacts/rocm-tiny-diffusion-base/**/*"]
@@ -4786,6 +5491,42 @@ def test_tiny_diffusion_base_ready_pins_one_card_nodes() -> None:
         AMD_NIGHTLY_PIPELINE,
     )
     assert all("cards_1" not in marker for marker in _marker_expressions(nightly))
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ["pass", "subtests", "missing", "duplicate", "wrong-node", "skipped", "failure", "error", "subtest-skip"],
+)
+def test_tiny_diffusion_base_ready_checks_executed_nodes(tmp_path: Path, scenario: str) -> None:
+    step = _find_step("ROCm · Tiny Diffusion Base GPU Test", AMD_READY_PIPELINE)
+    command = "\n".join(step["commands"])
+    guard = split(command[command.index("python -c ") :])[2]
+    expected = tmp_path / "expected.txt"
+    expected.write_text("\n".join(_TINY_DIFFUSION_BASE_NODES), encoding="utf-8")
+    root = ET.Element("testsuites")
+    # Pytest 9 counts successful subtests in this total without adding testcase nodes.
+    suite = ET.SubElement(
+        root, "testsuite", tests="80" if scenario == "subtests" else "22", skipped="0", failures="0", errors="0"
+    )
+    for node in _TINY_DIFFUSION_BASE_NODES:
+        module, name = node.split("::", 1)
+        ET.SubElement(suite, "testcase", classname=module.removesuffix(".py").replace("/", "."), name=name)
+    if scenario == "missing":
+        suite.remove(suite[-1])
+    elif scenario == "duplicate":
+        suite[-1].attrib.update(suite[0].attrib)
+    elif scenario == "wrong-node":
+        suite[-1].set("name", "unexpected_test")
+    elif scenario in {"skipped", "failure", "error"}:
+        ET.SubElement(suite[-1], scenario)
+    elif scenario == "subtest-skip":
+        suite.set("skipped", "1")
+    report = tmp_path / "pytest.xml"
+    ET.ElementTree(root).write(report)
+    result = subprocess.run(
+        [sys.executable, "-c", guard, str(report), str(expected)], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == (0 if scenario in {"pass", "subtests"} else 5), result.stdout + result.stderr
 
 
 _DISTRIBUTED_BUFFER_READY_LABEL = "ROCm · Distributed Buffer GPU Smokes"
@@ -5272,3 +6013,11 @@ def test_minicpmo_rocm_v1_duplex_ready_executes_junit_guard_before_exit(
         timeout_status=timeout_status,
         expected_status=expected_status,
     )
+
+
+def test_weekly_all_jobs_are_blocking() -> None:
+    weekly = yaml.safe_load(AMD_WEEKLY_PIPELINE.read_text(encoding="utf-8"))
+    steps = [step for group in weekly["steps"] for step in group["steps"]]
+
+    assert len(steps) == 38
+    assert all(step["grade"] == "Blocking" for step in steps)

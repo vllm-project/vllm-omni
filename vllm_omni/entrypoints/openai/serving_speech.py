@@ -167,6 +167,27 @@ def _is_default_voice(voice, supported_speakers):
     return voice == _DEFAULT_VOICE_NAME and voice not in supported_speakers
 
 
+def _coerce_sample_rate(value: object) -> int | None:
+    """Return scalar sample-rate metadata, ignoring empty sparse carriers."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        for candidate in reversed(value):
+            sample_rate = _coerce_sample_rate(candidate)
+            if sample_rate is not None:
+                return sample_rate
+        return None
+    numel = getattr(value, "numel", None)
+    if callable(numel) and numel() == 0:
+        return None
+    size = getattr(value, "size", None)
+    if isinstance(size, (int, np.integer)) and int(size) == 0:
+        return None
+    if hasattr(value, "item"):
+        value = value.item()
+    return int(cast(int | float | str, value))
+
+
 def _create_wav_header(sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
     """Create a WAV header with placeholder size values for streaming.
 
@@ -1221,10 +1242,23 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 mime_type = "audio/aac"
             elif filename_lower.endswith(".webm"):
                 mime_type = "audio/webm"
-            elif filename_lower.endswith(".mp4"):
+            elif filename_lower.endswith((".mp4", ".m4a")):
                 mime_type = "audio/mp4"
             else:
                 mime_type = "audio/wav"  # Default
+
+        # MP4/M4A (the same ISO-BMFF container) is accepted upstream as a
+        # transfer format but soundfile cannot decode it, so an upload would
+        # pass the MIME whitelist below and then die at the decode step with
+        # a misleading "Could not decode audio file". Reject it here with the
+        # actual fix instead.
+        if mime_type in ("audio/mp4", "audio/x-m4a", "video/mp4"):
+            raise ValueError(
+                "MP4/M4A uploads are not supported for voice registration: the "
+                "audio decoder cannot read the MP4 container. Extract the audio "
+                "track as WAV first, e.g. `ffmpeg -i clip.mp4 -vn -ar 48000 -ac 1 "
+                "-sample_fmt s16 clip.wav`, then upload the WAV."
+            )
 
         # Validate MIME type
         allowed_mime_types = {
@@ -1235,7 +1269,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "audio/aac",
             "audio/flac",
             "audio/webm",
-            "audio/mp4",
         }
 
         if mime_type not in allowed_mime_types:
@@ -1909,10 +1942,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     continue
                 audio_output = cast(dict, audio_output)
 
-                sr_raw = audio_output.get("sr")
-                if sr_raw is not None:
-                    sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
-                    sample_rate_val = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+                reported_sample_rate = _coerce_sample_rate(audio_output.get("sr"))
+                if reported_sample_rate is not None:
+                    sample_rate_val = reported_sample_rate
                     if source_sample_rate is not None and sample_rate_val != source_sample_rate:
                         raise ValueError(
                             "Audio sample rate changed during streaming: "
@@ -1931,13 +1963,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     else:
                         new_chunks = []
 
-                if new_chunks and source_sample_rate is None:
-                    if response_format == "wav" and sr_raw is None:
-                        raise ValueError("First audio output must include sample rate metadata for WAV streaming")
-                    source_sample_rate = sample_rate_val
-                    if target_sample_rate is not None and target_sample_rate != source_sample_rate:
-                        resampler = StreamingAudioResampler(source_sample_rate, target_sample_rate)
-
                 output_sample_rate = target_sample_rate or sample_rate_val
 
                 for chunk_tensor in new_chunks:
@@ -1953,17 +1978,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         total_samples = chunk_np.shape[-1]
                         chunk_np = chunk_np[..., emitted_samples:]
                         emitted_samples = total_samples
-                        if chunk_np.size == 0:
-                            continue
+                    if int(np.size(chunk_np)) == 0:
+                        # Sparse steps may carry empty audio and an empty ``sr``
+                        # tensor. They are not the first audio chunk.
+                        continue
+                    if source_sample_rate is None:
+                        if response_format == "wav" and reported_sample_rate is None:
+                            raise ValueError("First audio output must include sample rate metadata for WAV streaming")
+                        source_sample_rate = sample_rate_val
+                        if target_sample_rate is not None and target_sample_rate != source_sample_rate:
+                            resampler = StreamingAudioResampler(source_sample_rate, target_sample_rate)
+                        output_sample_rate = target_sample_rate or source_sample_rate
                     if resampler is not None:
                         chunk_np = resampler.process(chunk_np)
                         if chunk_np.size == 0:
                             continue
-                    if int(np.size(chunk_np)) == 0:
-                        # Zero-size chunks must not emit a WAV header or count
-                        # as first audio; the post-loop guard below needs to
-                        # see an audio-less stream to fail the request.
-                        continue
                     wav_header: bytes | None = None
                     # For WAV format, emit header before first audio chunk
                     if response_format == "wav" and first_chunk:
@@ -2292,6 +2321,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # in place. The builders need to know whether the caller supplied audio
         # inline vs. via an uploaded voice.
         model_type: str | None = None
+        additional_prompts: list[dict[str, Any]] = []
+        segment_silence_ms = 200
         has_inline_ref_audio = (request.ref_audio is not None) if has_inline_ref_audio is None else has_inline_ref_audio
         if (adapter := self._get_tts_adapter()) is not None:
             adapter.normalize(request)
@@ -2304,6 +2335,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             model_type = prepared.model_type
             output_policy = prepared.output_policy
             _ensure_cache_salt(adapter, request, prompt, tts_params)
+            additional_prompts = prepared.additional_prompts
+            for segment_prompt in additional_prompts:
+                _ensure_cache_salt(adapter, request, segment_prompt, segment_prompt.get("additional_information"))
+            segment_silence_ms = prepared.segment_silence_ms
         else:
             # Qwen omni models (Qwen3-Omni, Qwen2.5-Omni) use a "talker"
             # stage whose preprocess requires chat-templated tokens.  The
@@ -2394,14 +2429,30 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     if isinstance(sp, SamplingParams):
                         sp.output_kind = RequestOutputKind.CUMULATIVE
 
-        generator = self.engine_client.generate(
-            prompt=prompt,
-            request_id=request_id,
-            sampling_params_list=sampling_params_list,
-            output_modalities=output_modalities,
-            arrival_time=arrival_time,
-            watermarking=request.watermarking,
-        )
+        if additional_prompts:
+            from vllm_omni.entrypoints.openai.speech_segments import generate_speech_segments
+
+            if request.is_streaming() or request.word_timestamps:
+                raise ValueError("Segmented speech requires non-streaming audio without word timestamps")
+            generator = generate_speech_segments(
+                self.engine_client,
+                prompts=[prompt, *additional_prompts],
+                request_id=request_id,
+                sampling_params_list=sampling_params_list,
+                silence_ms=segment_silence_ms,
+                extract_audio=self._extract_audio_output,
+                arrival_time=arrival_time,
+                watermarking=request.watermarking,
+            )
+        else:
+            generator = self.engine_client.generate(
+                prompt=prompt,
+                request_id=request_id,
+                sampling_params_list=sampling_params_list,
+                output_modalities=output_modalities,
+                arrival_time=arrival_time,
+                watermarking=request.watermarking,
+            )
         # Only the non-streaming path consumes output policies (in
         # `_generate_audio_bytes`); streaming never reads them. Store late —
         # after every fallible step above — and skip streaming requests
@@ -2409,6 +2460,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # unique per request, so a stranded entry would never be reclaimed).
         if not request.is_streaming():
             self._speech_output_policies[request_id] = output_policy
+
         return request_id, generator, tts_params
 
     async def _generate_pcm_chunks(
@@ -2515,9 +2567,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if hasattr(cand, "numel") and cand.numel() > 0:
                     delta_chunks.append(cand)
             sr_step = step_audio.get("sr")
-            if sr_step is not None:
-                sr_val_step = sr_step[-1] if isinstance(sr_step, list) and sr_step else sr_step
-                delta_sample_rate = int(sr_val_step.item()) if hasattr(sr_val_step, "item") else int(sr_val_step)
+            coerced_step_rate = _coerce_sample_rate(sr_step)
+            if coerced_step_rate is not None:
+                delta_sample_rate = coerced_step_rate
 
         if final_output is None:
             raise ValueError("No output generated from the model.")
@@ -2562,9 +2614,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             )
 
         audio_tensor = audio_output[audio_key]
-        sr_raw = audio_output.get("sr", 24000)
-        sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
-        sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+        sample_rate = _coerce_sample_rate(audio_output.get("sr"))
+        if sample_rate is None:
+            sample_rate = delta_sample_rate or 24000
 
         if accumulate_nonstreaming:
             # Prefer the engine's own consolidated audio when present. After the
@@ -2762,9 +2814,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             audio_output = cast(dict, audio_output)
 
             audio_tensor = audio_output[audio_key]
-            sr_raw = audio_output.get("sr", 24000)
-            sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
-            sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+            sample_rate = _coerce_sample_rate(audio_output.get("sr")) or 24000
 
             if isinstance(audio_tensor, list):
                 non_empty = [c for c in audio_tensor if c.numel() > 0]

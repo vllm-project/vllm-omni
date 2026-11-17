@@ -3,8 +3,10 @@
 
 import json
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+import torch
 from PIL import Image
 
 from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import (
@@ -51,6 +53,8 @@ def make_request(request_id, sizes, color="red"):
         pytest.param([(64, 64)], [(64, 64)], True, id="different-image-content"),
         pytest.param([(64, 64)], [(128, 128)], True, id="same-resized-layout"),
         pytest.param([(64, 64), (128, 64)], [(128, 128), (256, 128)], True, id="same-multi-image-layout"),
+        pytest.param([(64, 64)] * 5, [(64, 64)] * 10, False, id="five-and-ten-images"),
+        pytest.param([(64, 64)] * 10, [(64, 64)] * 10, True, id="ten-image-layout"),
     ],
 )
 def test_scheduler_groups_by_condition_layout(preprocess, scheduler_class, first_sizes, second_sizes, compatible):
@@ -138,14 +142,38 @@ def test_preprocess_normalizes_tuple_images_like_a_list(preprocess):
     assert len(info["input_image_sizes"]) == 1
 
 
-def test_preprocess_rejects_more_images_than_the_model_supports(preprocess):
-    from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import (
-        MAX_QWEN_IMAGE_21_INPUT_IMAGES,
-    )
+@pytest.mark.parametrize("num_images", [4, 5, 10])
+@pytest.mark.parametrize("container", [list, tuple], ids=["list", "tuple"])
+def test_preprocess_preserves_reference_images(preprocess, monkeypatch, num_images, container):
+    # Keep the real image processors while avoiding large tensors in this CPU test.
+    monkeypatch.setattr("vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21.OUTPUT_RESOLUTION", 64)
+    colors = [(20 * i, 255 - 20 * i, i) for i in range(num_images)]
+    request = make_request("references", [])
+    request.prompt["multi_modal_data"]["image"] = container(Image.new("RGB", (64, 64), color) for color in colors)
 
-    request = make_request("too-many", [(64, 64)] * (MAX_QWEN_IMAGE_21_INPUT_IMAGES + 1))
-    with pytest.raises(ValueError, match="At most"):
+    processed = preprocess(request)
+
+    info = processed.prompt["additional_information"]
+    assert len(info["prompt_image"]) == num_images
+    assert len(info["vae_images"]) == num_images
+    assert info["input_image_sizes"] == [(64, 64)] * num_images
+    assert processed.batch_compatibility_key == ("qwen_image_21", ((64, 64),) * num_images)
+    for color, prompt_image, vae_image in zip(colors, info["prompt_image"], info["vae_images"]):
+        assert prompt_image.getpixel((0, 0)) == color
+        assert vae_image.shape == (1, 4, 1, 64, 64)
+        torch.testing.assert_close(vae_image[0, :3, 0, 0, 0], torch.tensor(color) / 127.5 - 1)
+        assert vae_image[0, 3, 0, 0, 0] == 1
+
+
+def test_preprocess_rejects_eleven_images_before_loading(preprocess, monkeypatch):
+    load = Mock(side_effect=AssertionError("Over-limit images must not be loaded"))
+    monkeypatch.setattr(Image, "open", load)
+    request = make_request("too-many", [])
+    request.prompt["multi_modal_data"]["image"] = ["unused.png"] * 11
+
+    with pytest.raises(ValueError, match="Received 11 input images. At most 10 images are supported"):
         preprocess(request)
+    load.assert_not_called()
 
 
 def test_preprocess_defaults_true_cfg_scale(preprocess):
