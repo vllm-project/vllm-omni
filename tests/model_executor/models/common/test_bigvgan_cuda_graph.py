@@ -132,7 +132,11 @@ def test_shape_above_largest_bucket_falls_back_eager():
     wrapper.warmup(DEVICE, torch.float32)
     mel = _mel(100, seed=4)
 
-    out = wrapper(mel)
+    # Both calls under no_grad: the fused alias-free dispatch is grad-gated,
+    # so a grad-enabled call and a no_grad call take different (eager vs
+    # fused) paths whose outputs differ at the tap-summation floor.
+    with torch.no_grad():
+        out = wrapper(mel)
     assert wrapper.last_call_info["mode"] == "eager"
     with torch.no_grad():
         eager = model.vocode(mel)
@@ -147,7 +151,9 @@ def test_batch2_stays_eager():
     torch.manual_seed(5)
     mel = torch.randn(2, 80, 64, device=DEVICE) - 5.0
 
-    out = wrapper(mel)
+    # Same-regime comparison as G5 (fused dispatch is grad-gated).
+    with torch.no_grad():
+        out = wrapper(mel)
     assert wrapper.last_call_info["mode"] == "eager"
     assert out.shape == (2, 1, 64 * HOP)
     with torch.no_grad():
@@ -205,7 +211,9 @@ def test_capture_failure_skips_size_and_warns(monkeypatch):
     assert len([w for w in warnings if "128" in str(w)]) == 1
 
     # The failing size still produces correct output via eager.
-    out = wrapper(_mel(128, seed=7))
+    # Same-regime comparison as G5 (fused dispatch is grad-gated).
+    with torch.no_grad():
+        out = wrapper(_mel(128, seed=7))
     assert wrapper.last_call_info["mode"] == "eager"
     with torch.no_grad():
         eager = original(_mel(128, seed=7))
