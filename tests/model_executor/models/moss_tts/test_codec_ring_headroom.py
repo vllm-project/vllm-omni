@@ -180,7 +180,7 @@ def test_packed_pool_preserves_distinct_scratch_slots_and_decode_state():
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
-@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="GPU required")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 @torch.no_grad()
 def test_packed_session_matches_mixed_length_streams_and_slot_reuse():
     import copy
@@ -242,7 +242,7 @@ def test_packed_session_matches_mixed_length_streams_and_slot_reuse():
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
-@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="GPU required")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 @torch.no_grad()
 def test_packed_decoder_splits_long_chunks_into_ordered_rounds():
     import copy

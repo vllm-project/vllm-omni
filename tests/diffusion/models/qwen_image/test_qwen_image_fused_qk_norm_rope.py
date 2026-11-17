@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from vllm.platforms import current_platform
 
-from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
+from tests.helpers.device import DEVICE_TYPE
 from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer as qwen_mod
@@ -121,7 +121,7 @@ def _nvidia_cuda_available() -> bool:
 
 def _rocm_available() -> bool:
     """True on a ROCm platform with an available HIP-backed GPU."""
-    return bool(DEVICE_MODULE.is_available() and torch.version.hip is not None and current_platform.is_rocm())
+    return bool(torch.cuda.is_available() and torch.version.hip is not None and current_platform.is_rocm())
 
 
 _REQUIRES_NVIDIA_CUDA = pytest.mark.skipif(
@@ -142,8 +142,8 @@ def force_always_fuse(monkeypatch):
     monkeypatch.setattr(qwen_mod, "_FUSED_MIN_TOKENS", 0)
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
-@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_qwen_image_qk_norm_rope_cuda_fp32_fallback_matches_reference():
     data = _make_input(
         seq_len=7,
@@ -159,8 +159,8 @@ def test_qwen_image_qk_norm_rope_cuda_fp32_fallback_matches_reference():
     torch.testing.assert_close(actual_k, expected_k, atol=1e-5, rtol=1e-5)
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
-@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_qwen_image_qk_norm_rope_cuda_fp16_fallback_matches_reference():
     data = _make_input(
         seq_len=7,

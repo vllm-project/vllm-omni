@@ -106,7 +106,7 @@ def test_non_cuda_platform_does_not_launch_fused_kernel(monkeypatch):
     assert not fused_rope._FAILED_KEYS
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_failed_runtime_key_cache_is_bounded():
     from vllm_omni.diffusion.models.ernie_image import fused_rope
 

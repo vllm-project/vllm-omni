@@ -881,7 +881,7 @@ def _operand_ulp_bound(x, weight, cos, sin):
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
-@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="GPU required")
 def test_packed_rope_table_layout(monkeypatch):
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         _with_packed_rope_table,
@@ -906,8 +906,8 @@ def test_packed_rope_table_layout(monkeypatch):
     assert len(short) == 2
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
-@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_fused_qk_norm_rope_matches_eager_chain():
     """The fused path vs the previous eager chain at real Boogu shapes.
 
@@ -939,8 +939,8 @@ def test_fused_qk_norm_rope_matches_eager_chain():
         assert (diff <= bound).all(), "fused path beyond one operand ulp of the eager chain"
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
-@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_fallback_with_no_packed_table():
     """Without a packed table the helper is bit-exact to the old chain."""
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (

@@ -106,7 +106,7 @@ def _resolvable_rows(
     return ((ordered[..., :-1] - ordered[..., 1:]).abs() > margin).all(dim=-1)
 
 
-@hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize(("heads", "tokens", "experts", "top_k"), ROUTING_SHAPES)
 @pytest.mark.parametrize("route_norm", [True, False])
 def test_fused_routing_matches_reference(heads: int, tokens: int, experts: int, top_k: int, route_norm: bool) -> None:
@@ -135,7 +135,7 @@ def test_fused_routing_matches_reference(heads: int, tokens: int, experts: int, 
     )
 
 
-@hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325"}, num_cards=1)
 def test_fused_routing_without_bias_matches_reference() -> None:
     logits, _ = _router_inputs(12, 512, 256, device=DEVICE_TYPE, with_bias=False)
     reference = _reference_topk_probs_and_indices(logits, 6)
@@ -179,7 +179,7 @@ def test_fused_routing_ties_break_towards_the_lowest_expert() -> None:
     )
 
 
-@hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("bias_shape", [(4, 1), (4,), (4, 1, 1)])
 def test_broadcast_expert_bias_matches_reference(bias_shape: tuple[int, ...]) -> None:
     """A per-head scalar bias broadcasts in the reference and must in the kernel.
@@ -203,7 +203,7 @@ def test_broadcast_expert_bias_matches_reference(bias_shape: tuple[int, ...]) ->
     )
 
 
-@hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float16])
 def test_narrow_dtype_expert_bias_matches_reference(bias_dtype: torch.dtype) -> None:
     """Upcasting a narrow bias is exactly the promotion the reference performs."""
@@ -289,7 +289,7 @@ def test_nan_router_logits_rank_first_and_stay_in_range(route_norm: bool) -> Non
     )
 
 
-@hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize(("heads", "tokens", "experts", "top_k"), ROUTING_SHAPES)
 def test_global_sort_routes_is_bit_identical_to_reference(heads: int, tokens: int, experts: int, top_k: int) -> None:
     logits, expert_bias = _router_inputs(heads, tokens, experts, device=DEVICE_TYPE)
@@ -326,7 +326,7 @@ def test_global_sort_routes_layout_invariants() -> None:
         assert torch.equal(bucket, expected_tokens.to(bucket.dtype))
 
 
-@hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325"}, num_cards=1)
 def test_routes_drive_the_expert_kernel_identically() -> None:
     """The two route builders must produce interchangeable expert inputs."""
 

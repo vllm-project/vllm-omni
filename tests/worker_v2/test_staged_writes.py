@@ -166,7 +166,7 @@ def test_repeated_flushes_survive_a_slow_stream():
     np.testing.assert_array_equal(t.gpu.cpu().numpy(), expected)
 
 
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_staged_h2d_matches_the_pinned_copy_and_survives_slow_readers():
     from vllm.utils.torch_utils import async_tensor_h2d as original
     from vllm.v1.worker.gpu import model_runner

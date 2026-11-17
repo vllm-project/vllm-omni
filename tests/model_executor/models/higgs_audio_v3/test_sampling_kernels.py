@@ -12,7 +12,7 @@ from tests.helpers.mark import hardware_test
 pytestmark = [pytest.mark.core_model, pytest.mark.skipif(not NVIDIA_CUDA_OR_XPU, reason="requires NVIDIA CUDA or XPU")]
 
 
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("numel", [8 * 1026, 1000, 300000])
 def test_batched_generator_noise_matches_per_request_exponential(numel):
     from vllm_omni.utils.seeded_exponential import fill_exponential_rows

@@ -49,7 +49,7 @@ def test_mrv2_thinker_payload_uses_output_channel_contract():
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
-@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="GPU required")
 @pytest.mark.parametrize("partial_prefill", [True, False])
 def test_mrv2_sampler_preserves_history_seed_counts_and_prefill_eligibility(mocker, partial_prefill):
     device = DEVICE_TYPE

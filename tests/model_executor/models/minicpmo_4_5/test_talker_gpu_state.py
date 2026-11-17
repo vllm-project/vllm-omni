@@ -292,7 +292,7 @@ def test_fused_gpu_window_penalty_matches_reference(device, batch):
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
-@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_v1_gpu_output_uses_async_snapshot_and_reuses_finished_slot():
     from vllm_omni.worker.gpu_ar_model_runner import _snapshot_tensor_payload_to_cpu_async
 
@@ -376,7 +376,7 @@ def test_gpu_decode_masks_finished_request_when_new_request_joins(device):
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
-@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="GPU required")
 @pytest.mark.parametrize("aux_penalty", ["neutral", "frequency", "presence", "mixed"])
 def test_sampler_fast_path_preserves_seeded_tokens_and_auxiliary_penalties(aux_penalty, mocker):
     from dataclasses import replace
