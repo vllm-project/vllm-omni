@@ -35,7 +35,6 @@ from vllm_omni.diffusion.offloader.config import (
 )
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
-from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
 if TYPE_CHECKING:
@@ -93,9 +92,6 @@ def _ltx2_use_diffusion_decoder(od_config: Any, model_version: str) -> bool:
     use_conv_vae = extras.get(_LTX2_CONV_VAE_EXTRA, False)
     if not isinstance(use_conv_vae, bool):
         raise TypeError(f"{_LTX2_CONV_VAE_EXTRA} must be a bool, got {type(use_conv_vae)!r}")
-    if model_version == "2.5" and _LTX2_CONV_VAE_EXTRA not in extras and current_omni_platform.is_xpu():
-        logger.warning("LTX-2.5 DiffVAE NATTEN has no XPU build; falling back to ConvVAE.")
-        return False
     return model_version == "2.5" and not use_conv_vae
 
 

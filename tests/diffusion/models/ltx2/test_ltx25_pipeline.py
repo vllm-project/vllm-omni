@@ -611,7 +611,6 @@ def test_ltx25_four_public_pipeline_semantics_are_disjoint():
 def test_ltx25_all_public_pipelines_default_to_diffvae_with_conv_opt_in(
     tmp_path, monkeypatch, pipeline_cls, extras, use_diffusion_decoder
 ):
-    monkeypatch.setattr(ltx2_components.current_omni_platform, "is_xpu", lambda: False)
     (tmp_path / "model_index.json").write_text(
         json.dumps({"text_encoder": ["transformers", "Gemma4UnifiedForConditionalGeneration"]})
     )
