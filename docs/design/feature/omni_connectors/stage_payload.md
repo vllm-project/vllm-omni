@@ -98,6 +98,38 @@ An unsupported backend must implement this capability before being used for
 synchronous remote-only payloads. Existing asynchronous `get()` users are
 unchanged.
 
+### Connector support at startup
+
+For diffusion stages with `stage_input_payload_keys`, regular and headless
+startup validate every incoming edge before worker launch. Errors name the
+stage, edge (for example, `0→1`), and connector. The runtime uses one connector
+per stage, preferring outgoing edges, so incoming types must match the resolved
+type: `E --NIXL--> G --SHM--> D` and mixed Mooncake/SHM edges are rejected.
+
+On edges attached to a payload receiver, `ConnectorSpec.name` selects the
+backend; `extra.type` may be omitted or repeat it, but cannot override it.
+This applies to deploy YAMLs and programmatic specs before edge resolution.
+Validation does not establish parameter compatibility or peer connectivity.
+
+Direct `OmniDiffusionConfig` callers also reject unsupported connectors and
+missing or empty `type` values; unknown names receive a separate error.
+An unsupported pairing is rejected even when a request supplies inline data.
+
+| Connector | Synchronous diffusion payload receive | Backend responsibility |
+| --- | --- | --- |
+| `SharedMemoryConnector` | Supported between processes sharing host memory | Nonblocking read-lock acquisition; return absence on contention; shared runtime retries. Copy and deserialize after acquiring the lock. |
+| `NixlConnector` | Supported, including network transfers | Deadline-aware socket and completion waits, generation-scoped claims, deferred active-DMA cleanup, discovery recovery. |
+| `MooncakeStoreConnector` / `MooncakeConnector` | Not supported | Implement the deadline contract and explicitly register the capability before enabling this path. |
+| `MooncakeTransferEngineConnector` | Not supported | Same deadline contract and registration requirement. |
+| `MoriTransferEngineConnector` | Not supported | Same deadline contract and registration requirement. |
+| `YuanrongConnector` / `YuanrongTransferEngineConnector` | Not supported | Same deadline contract and registration requirement. |
+| Other/custom connectors | Opt-in required | Implement `get_with_deadline` and register with `supports_deadline_receive=True`; implement `abandon_get` when discovery creates ownership. Do not inherit an unbounded blocking call. |
+
+Capability inspection uses registration metadata without loading or constructing
+backends. Stages without payload input keys and inline configurations without a
+connector are unaffected. This matrix covers stage payloads, not native KV
+transfer; it does not add mixed-backend or multi-input routing.
+
 The deadline covers retry sleeps, metadata socket waits, and NIXL completion
 polling. It is **not a hard real-time bound** on Python execution, allocation,
 serialization, individual native driver calls, device copies, or payload-group
@@ -247,16 +279,14 @@ a recoverable discovery claim.
 
 ## Reusing the Interface
 
-| Backend | Synchronous support | Backend responsibility |
-| --- | --- | --- |
-| SharedMemory | Implemented | Nonblocking read-lock acquisition; return absence on contention; shared runtime retries. Copy and deserialize after acquiring the lock. |
-| NIXL | Implemented | Deadline-aware socket and completion waits, generation-scoped claims, deferred active-DMA cleanup, discovery recovery. |
-| Other existing connectors | Opt-in required | Implement `get_with_deadline`; implement `abandon_get` only when discovery creates ownership. Do not inherit an unbounded blocking call. |
+See [Connector support at startup](#connector-support-at-startup) for the support
+matrix and backend responsibilities.
 
 To add a model, declare input/output keys and use ordinary prompt and output
 structures. To add a backend, implement the connector capability and ownership
-tests, register it through the existing factory, and select it in deploy
-configuration. Neither requires a backend-specific diffusion model runner.
+tests, register it through the existing factory with
+`supports_deadline_receive=True`, and select it in deploy configuration. Neither
+requires a backend-specific diffusion model runner.
 
 Worker teardown disables offloading, closes the manager after draining
 prefetch, then tears down native KV and distributed resources in `finally`
@@ -267,6 +297,8 @@ Repeated manager close is safe, including for an unused manager.
 
 | Test module | Main invariants |
 | --- | --- |
+| `tests/diffusion/test_stage_payload_topology_validation.py` | Incoming-edge checks, mixed-type rejection before startup, shipped deploy YAMLs, legacy and explicit empty-key configurations. |
+| `tests/diffusion/test_stage_payload_connector_validation.py` | Lazy capability checks, explicit type/name errors, custom registration, built-in implementation consistency, platform SHM selection. |
 | `tests/diffusion/test_diffusion_stage_payload.py` | Warmup bypass, strict missing-payload errors, valid inline fallback, source-stage endpoints, TP/SP fanout, standalone HSDP election and SHM fanout, handle publication. |
 | `tests/diffusion/test_diffusion_model_runner.py` | New-request receive and final-only stepwise publication with cached external identity. |
 | `tests/distributed/omni_connectors/test_nixl_connector.py` | Lost replies, same-claim recovery, deadlines, generation isolation, active DMA retention, deferred close and ACKs. |
