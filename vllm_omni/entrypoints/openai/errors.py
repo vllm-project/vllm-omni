@@ -12,6 +12,9 @@ from http import HTTPStatus
 from fastapi.responses import JSONResponse
 from vllm.entrypoints.serve import create_error_response
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
+from vllm.exceptions import VLLMClientError
+
+from vllm_omni.errors import OmniClientError
 
 
 class InvalidInputReferenceError(ValueError):
@@ -59,3 +62,11 @@ def _create_speech_error_json_response(
         status_code=status_code,
     )
     return _error_response_to_json_response(err, status_code=status_code)
+
+
+def _create_client_error_json_response(exc: VLLMClientError | OmniClientError) -> JSONResponse:
+    """Convert a semantic client error to an OpenAI-compatible JSON error response."""
+    if isinstance(exc, OmniClientError):
+        err = create_error_response(message=exc.message, err_type=exc.error_type)
+        return _error_response_to_json_response(err, status_code=exc.status_code)
+    return _error_response_to_json_response(create_error_response(exc))

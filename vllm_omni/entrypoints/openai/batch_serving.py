@@ -15,6 +15,7 @@ from vllm.entrypoints.serve.engine.protocol import (
     ErrorResponse,
     UsageInfo,
 )
+from vllm.exceptions import VLLMClientError
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
@@ -97,6 +98,8 @@ class OmniOpenAIServingChatBatch(OmniOpenAIServingChat):
                 return self._create_error_response(
                     f"Message {idx} could not be converted to a chat completion request: {e}",
                 )
+            except VLLMClientError as e:
+                return self.create_error_response(e)
             # Streaming isn't supported for batch chat completions,
             # so always set to False & warn if it was requested.
             enabled_streaming |= chat_cmp_request.stream

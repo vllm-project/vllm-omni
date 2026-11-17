@@ -18,7 +18,7 @@ from fastapi import Request
 from openai.types.chat.chat_completion_audio import ChatCompletionAudio as OpenAIChatCompletionAudio
 from PIL import Image
 from pydantic import TypeAdapter
-from vllm.exceptions import RetryableRequestError
+from vllm.exceptions import RetryableRequestError, VLLMClientError
 from vllm.parser.utils import (
     count_chat_history_tool_calls as get_history_tool_calls_cnt,
 )
@@ -804,6 +804,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     request, should_include_tools
                 )
 
+        except VLLMClientError as e:
+            return self.create_error_response(e)
+        except OmniClientError as e:
+            return self._create_error_response(e.message, err_type=e.error_type, status_code=e.status_code)
         except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
             message = str(e)
@@ -1055,7 +1059,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 )
 
                 generators.append(generator)
-        except ValueError as e:
+        except OmniClientError as e:
+            return self._create_error_response(e.message, err_type=e.error_type, status_code=e.status_code)
+        except (ValueError, VLLMClientError) as e:
             return self.create_error_response(e)
 
         assert len(generators) == 1
@@ -1088,7 +1094,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 reasoning_parser,
                 mm_token_counts=mm_token_counts,
             )
-        except ValueError as e:
+        except OmniClientError as e:
+            return self._create_error_response(e.message, err_type=e.error_type, status_code=e.status_code)
+        except (ValueError, VLLMClientError) as e:
             return self.create_error_response(e)
 
     async def _preprocess_chat(
@@ -2617,7 +2625,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 final_outputs.append(res)
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
-        except (ValueError, RetryableRequestError) as e:
+        except OmniClientError as e:
+            return self._create_error_response(e.message, err_type=e.error_type, status_code=e.status_code)
+        except (ValueError, RetryableRequestError, VLLMClientError) as e:
             return self.create_error_response(e)
 
         assert final_outputs is not None
