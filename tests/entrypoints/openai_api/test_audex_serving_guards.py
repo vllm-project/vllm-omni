@@ -11,6 +11,7 @@ contract covers both audex pipelines (``audex`` TTS and ``audex_tta``).
 """
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -126,7 +127,7 @@ def _adapter() -> AudexAdapter:
 
 
 def _speech_request(**extra_params) -> OpenAICreateSpeechRequest:
-    payload = {"model": "audex", "input": "Hello world."}
+    payload: dict[str, Any] = {"model": "audex", "input": "Hello world."}
     if extra_params:
         payload["extra_params"] = extra_params
     return OpenAICreateSpeechRequest(**payload)
@@ -299,7 +300,7 @@ def test_typed_full_pipeline_uses_full_checkpoint_tokenizer(mocker):
         "vllm_omni.model_executor.models.audex.checkpoint.ensure_audex_snapshot",
         return_value="/snapshots/audex",
     )
-    from_pretrained = mocker.patch("transformers.AutoTokenizer.from_pretrained", return_value=object())
+    from_pretrained = mocker.patch("transformers.PreTrainedTokenizerFast.from_pretrained", return_value=object())
 
     adapter = AudexAdapter(SpeechServingContext(server=serving, engine_client=serving.engine_client))
     adapter._get_tokenizer()

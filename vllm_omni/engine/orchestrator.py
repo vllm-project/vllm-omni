@@ -15,6 +15,7 @@ handled by :class:`MembershipController`, which is injected optionally.
 from __future__ import annotations
 
 import asyncio
+import copy
 import os
 import shutil
 import threading
@@ -36,6 +37,7 @@ from vllm.multimodal.cache.shm import ShmObjectStoreSenderCache
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequest, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
@@ -49,6 +51,7 @@ from vllm_omni.data_entry_keys import (
 )
 from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import PER_SAMPLE_KV_COUNT_KEY
 from vllm_omni.distributed.weight_sharing.runtime import SharingRuntime
 from vllm_omni.engine import (
     AdditionalInformationEntry,
@@ -188,14 +191,17 @@ def build_engine_core_request_from_tokens(
     if arrival_time is None:
         arrival_time = _time.time()
 
-    prompt_token_ids = prompt["prompt_token_ids"]
+    prompt_token_ids = prompt.get("prompt_token_ids")
+    prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
 
     sampling_params = None
     pooling_params = None
     if isinstance(params, SamplingParams):
         sampling_params = params.clone()
         if model_config is not None:
-            remaining = model_config.max_model_len - len(prompt_token_ids)
+            remaining = model_config.max_model_len - length_from_prompt_token_ids_or_embeds(
+                prompt_token_ids, prompt_embeds
+            )
             if sampling_params.max_tokens is None:
                 sampling_params.max_tokens = remaining
             # ``check_stop`` returns early while ``min_tokens`` is unmet, so a
@@ -207,7 +213,6 @@ def build_engine_core_request_from_tokens(
     else:
         pooling_params = params.clone()
 
-    prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
     raw_additional_information = prompt.get("additional_information")
     model_intermediate_buffer = prompt.get("model_intermediate_buffer")
     wire_payload: dict[str, Any] | None = None
@@ -379,6 +384,16 @@ class StreamingInputState:
         """
         segment = self.segments.get(stage_id) if stage_id is not None else None
         return segment if segment is not None else StreamingSegmentState()
+
+
+def _without_per_sample_kv_count(params: Any) -> Any:
+    """Drop a client-supplied per-sample KV count; only the orchestrator sets it."""
+    extra_args = getattr(params, "extra_args", None)
+    if not extra_args or PER_SAMPLE_KV_COUNT_KEY not in extra_args:
+        return params
+    params = copy.copy(params)
+    params.extra_args = {key: value for key, value in extra_args.items() if key != PER_SAMPLE_KV_COUNT_KEY}
+    return params
 
 
 class OrchestratorBase:
@@ -2509,10 +2524,33 @@ class OrchestratorBase:
             model_intermediate_buffer=model_intermediate_buffer,
         )
 
-    async def _process_stage_inputs(self, stage_id: int, **kwargs: Any) -> Any:
+    def _process_stage_inputs_in_worker(
+        self, stage_id: int, *, validate_input_tokens: Callable[[int], None] | None = None, **kwargs: Any
+    ) -> EngineCoreRequest:
+        """Process inputs under the shared lock; subclasses may prepare them first.
+
+        Called only from the joined CPU worker. Generic stages use the ordinary
+        processor; duplex specializes preparation before backend admission.
+        """
+        request = self._get_stage_input_processor(stage_id).process_inputs(**kwargs)
+        if validate_input_tokens is not None:
+            validate_input_tokens(
+                length_from_prompt_token_ids_or_embeds(
+                    request.prompt_token_ids, getattr(request, "prompt_embeds", None)
+                )
+            )
+        return request
+
+    async def _process_stage_inputs(
+        self, stage_id: int, *, validate_input_tokens: Callable[[int], None] | None = None, **kwargs: Any
+    ) -> Any:
+        """Join serialized CPU input processing on success, rejection or cancellation."""
+
         def process() -> Any:
             with self._prompt_processing_lock:
-                return self._get_stage_input_processor(stage_id).process_inputs(**kwargs)
+                return self._process_stage_inputs_in_worker(
+                    stage_id, validate_input_tokens=validate_input_tokens, **kwargs
+                )
 
         worker = asyncio.create_task(asyncio.to_thread(process))
         try:
@@ -2687,6 +2725,7 @@ class OrchestratorBase:
         resumable: bool = False,
         payload_sender_info: PayloadSenderInfo | None = None,
         replica_id: int | None = None,
+        validate_input_tokens: Callable[[int], None] | None = None,
     ) -> EngineCoreRequest:
         next_pool = self.stage_pools[next_stage_id]
         if self._next_stage_input_is_tokens(next_input):
@@ -2700,6 +2739,10 @@ class OrchestratorBase:
             )
             request.external_req_id = request.request_id
             request.payload_sender_info = payload_sender_info
+            if validate_input_tokens is not None:
+                validate_input_tokens(
+                    length_from_prompt_token_ids_or_embeds(request.prompt_token_ids, request.prompt_embeds)
+                )
             return request
 
         if replica_id is not None:
@@ -2714,6 +2757,7 @@ class OrchestratorBase:
             supported_tasks = tuple(getattr(model_cfg, "supported_tasks", ()) or ()) or (params.task,)
         else:
             supported_tasks = ("generate",)
+        validation = {} if validate_input_tokens is None else {"validate_input_tokens": validate_input_tokens}
         request = await self._process_stage_inputs(
             next_stage_id,
             request_id=req_id,
@@ -2722,6 +2766,7 @@ class OrchestratorBase:
             supported_tasks=supported_tasks,
             arrival_time=_time.time(),
             resumable=resumable,
+            **validation,
         )
         request = self._upgrade_processed_stage_request(request, next_input)
         request.external_req_id = req_id
@@ -2915,6 +2960,16 @@ class OrchestratorBase:
                 request_id,
                 exc_info=True,
             )
+
+    def _diffusion_params_for_samples(self, req_state: OrchestratorRequestState, src_stage_id: int, params: Any) -> Any:
+        """Tell the diffusion stage how many per-sample KV caches to receive."""
+        params = _without_per_sample_kv_count(params)
+        n = getattr(req_state.sampling_params_list[src_stage_id], "n", 1) or 1
+        if n <= 1 or not self.stage_pools[src_stage_id].per_sample_kv:
+            return params
+        params = copy.copy(params)
+        params.extra_args = {**(params.extra_args or {}), PER_SAMPLE_KV_COUNT_KEY: n}
+        return params
 
     async def _forward_to_next_stage(
         self,
@@ -3122,7 +3177,9 @@ class OrchestratorBase:
                 already_submitted=already_submitted,
                 t_submit_start=_t_submit_start,
                 submit_kwargs=submit_kwargs,
-                params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
+                params_override=self._diffusion_params_for_samples(
+                    req_state, src_stage_id, self._maybe_clone_diffusion_params_for_cfg(req_id, params)
+                ),
                 pinned_replica_id=pinned_replica_id,
             )
             return
@@ -3826,13 +3883,13 @@ class Orchestrator(OrchestratorBase):
                 self._interaction_queue.put_nowait(interaction)
             except asyncio.QueueFull:
                 # This is a request-scoped failure: terminate the overloaded
-                # stream rather than silently dropping camera commands.
+                # stream rather than silently dropping camera commands. No
+                # event_id: an event-scoped rejection would keep the stream.
                 await self.output_async_queue.put(
                     ErrorMessage(
                         error="Too many pending interactions",
                         fatal=False,
                         request_id=interaction.request_id,
-                        event_id=interaction.interaction.get("event_id"),
                         stage_id=0,
                     )
                 )
@@ -3934,6 +3991,22 @@ class Orchestrator(OrchestratorBase):
                 return stage_id
         return None
 
+    def _feeds_per_sample_kv_stage(self, stage_id: int, final_stage_id: int) -> bool:
+        """Whether ``stage_id`` sends one KV per sample to the diffusion stage that ends the request."""
+        # Async-chunk prewarm submits the diffusion stage before the sample count is known.
+        return (
+            not self.async_chunk
+            and final_stage_id == stage_id + 1
+            and self.stage_pools[stage_id].per_sample_kv
+            and self.stage_pools[final_stage_id].stage_type == "diffusion"
+        )
+
+    def _per_sample_kv_limit(self, stage_id: int) -> float:
+        """Largest n for a per-sample KV request: the sending stage's ``max_num_seqs``."""
+        scheduler_config = getattr(self.stage_pools[stage_id].stage_vllm_config, "scheduler_config", None)
+        max_num_seqs = getattr(scheduler_config, "max_num_seqs", None)
+        return float("inf") if max_num_seqs is None else int(max_num_seqs)
+
     async def _handle_add_request(self, msg: StageSubmissionMessage) -> None:
         """Handle an add_request message from the main thread."""
         stage_id = msg.entry_stage_id
@@ -3945,6 +4018,7 @@ class Orchestrator(OrchestratorBase):
             raise ValueError(f"Missing sampling params for stage 0. Got {len(sampling_params_list)} stage params.")
         final_stage_id = msg.final_stage_id
         final_output_stage_ids = set(msg.final_output_stage_ids or [final_stage_id])
+        sampling_params_list = [_without_per_sample_kv_count(params) for params in sampling_params_list]
 
         if msg.requested_replica_id is not None:
             try:
@@ -3962,6 +4036,23 @@ class Orchestrator(OrchestratorBase):
             return
 
         if getattr(prompt, "resumable", False):
+            for active_stage_id in range(stage_id, min(final_stage_id, len(self.stage_pools) - 1) + 1):
+                vllm_config = getattr(self.stage_pools[active_stage_id], "stage_vllm_config", None)
+                model_config = getattr(vllm_config, "model_config", None)
+                hf_config = getattr(model_config, "hf_config", None)
+                spec_config = getattr(vllm_config, "speculative_config", None)
+                if (
+                    getattr(hf_config, "model_type", None) == "qwen3_omni_moe"
+                    and spec_config is not None
+                    and spec_config.use_dflash()
+                ):
+                    await self._fail_request_client_error(
+                        request_id,
+                        stage_id,
+                        f"streaming (resumable) input is not supported with Qwen3-Omni DFlash on stage "
+                        f"{active_stage_id}; disable DFlash for streaming input or use a non-resumable request",
+                    )
+                    return
             mrv2_stage_id = self._native_mrv2_receiver_stage(final_stage_id)
             if mrv2_stage_id is not None:
                 # Streaming-input sessions replace downstream prompts through
@@ -3986,14 +4077,20 @@ class Orchestrator(OrchestratorBase):
                 )
                 return
         entry_params = sampling_params_list[stage_id]
-        if (getattr(entry_params, "n", 1) or 1) > 1:
+        entry_n = getattr(entry_params, "n", 1) or 1
+        if entry_n > 1:
             reason = None
-            # An LLM stage returns its n samples as one output; later stages cannot take one input per sample.
-            if final_stage_id != stage_id:
+            # An LLM stage returns its n samples as one output; later stages cannot take one input per sample,
+            # except a diffusion stage that receives one KV per sample from this stage.
+            if final_stage_id != stage_id and not self._feeds_per_sample_kv_stage(stage_id, final_stage_id):
                 reason = (
                     f"n > 1 is supported only when stage {stage_id} gives the final output; this request continues "
                     f"to stage {final_stage_id}"
                 )
+            # The diffusion stage holds every sample's KV prefix at once: no more samples than the
+            # sending stage runs requests at a time.
+            elif final_stage_id != stage_id and entry_n > (limit := self._per_sample_kv_limit(stage_id)):
+                reason = f"n={entry_n} exceeds stage {stage_id}'s max_num_seqs={limit} for per-sample KV transfer"
             # Streaming-input errors take the segment path, which does not resolve samples to their request.
             elif getattr(prompt, "resumable", False):
                 reason = "n > 1 is not supported for streaming (resumable) input"
@@ -4130,7 +4227,7 @@ class Orchestrator(OrchestratorBase):
 
         stage_id = req_state.entry_stage_id
         if msg.sampling_params_list:
-            req_state.sampling_params_list = msg.sampling_params_list
+            req_state.sampling_params_list = [_without_per_sample_kv_count(p) for p in msg.sampling_params_list]
 
         req_state.streaming.enabled = True
         req_state.stage_submit_ts[stage_id] = _time.time()

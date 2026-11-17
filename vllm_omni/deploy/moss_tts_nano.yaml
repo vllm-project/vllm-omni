@@ -12,6 +12,7 @@
 #
 # MOSS-TTS-Nano has no multimodal input preprocessing, so skip_mm_profiling
 # bypasses the dummy-MM pass at profile time.
+model_runner: v2
 async_chunk: false
 trust_remote_code: true
 
@@ -31,3 +32,22 @@ stages:
       top_k: 50
       max_tokens: 4096
       seed: 42
+
+platforms:
+  rocm:
+    model_runner: v1
+    stages:
+      - stage_id: 0
+        # The root custom config omits the nested GPT-2 attention metadata.
+        # hidden_size=768 and gpt2_config.n_head=12 give the actual 64-wide
+        # head used by the model. Supplying it here keeps ROCm backend
+        # validation from interpreting the missing root value as unsupported;
+        # it does not alter the model weights or CUDA configuration.
+        hf_overrides:
+          head_dim: 64
+  npu:
+    model_runner: v1
+  xpu:
+    model_runner: v1
+  musa:
+    model_runner: v1
