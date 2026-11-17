@@ -860,17 +860,12 @@ def test_moss_higgs_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPa
             "tts_moss_tts_extended_weekly",
             "tts_moss_tts_nano_weekly",
         ],
-        "TTS · Higgs · L4": [
-            "tts_higgs_audio_v2_weekly",
-            "tts_higgs_audio_v3_weekly",
-        ],
     }
     expected_env = {
         "TTS · Moss · L4": {
             "VLLM_OMNI_CI_MODEL_RUNNER": "v2",
             "VLLM_OMNI_MOSS_REALTIME_REF_ENCODER_DEVICE": "cpu",
         },
-        "TTS · Higgs · L4": {"VLLM_OMNI_CI_MODEL_RUNNER": "v1"},
     }
     for label, dependencies in expected_dependencies.items():
         matching_steps = [step for step in _iter_steps(doc) if step.get("label") == label]
@@ -879,13 +874,16 @@ def test_moss_higgs_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPa
         assert step["source_file_dependencies"] == dependencies
         assert step["env"] == expected_env[label]
 
-    group = next(step for step in doc["steps"] if "Moss and Higgs Weekly" in step.get("group", ""))
+    group = next(step for step in doc["steps"] if "Moss Weekly" in step.get("group", ""))
     assert group["if"] == ('build.env("NON_CRITICAL") == "1" || build.pull_request.labels includes "weekly-test"')
 
     changed_files = {
         "tests/e2e/offline_inference/test_moss_tts_realtime.py": "TTS · Moss · L4",
-        "tests/e2e/online_serving/test_higgs_audio_v3.py": "TTS · Higgs · L4",
     }
+    assert "TTS · Higgs · L4" not in {step.get("label") for step in _iter_steps(doc)}
+    assert "TTS · Moss · L4" not in _surviving_labels(
+        doc, ["tests/e2e/online_serving/test_higgs_audio_v3.py"], pipeline_path=pipeline_path
+    )
     for changed_file, label in changed_files.items():
         assert label in _surviving_labels(doc, [changed_file], pipeline_path=pipeline_path)
     assert not set(expected_dependencies) & set(
@@ -922,34 +920,35 @@ def test_ming_glm_indextts_breeze_weekly_pr_validation_is_focused(monkeypatch: p
     pipeline_path = Path(".buildkite/cuda/test-weekly.yml")
     doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
     expected = {
-        "TTS · Ming · L4": {
+        "TTS · Ming Offline · L4": {
             "dependency": "tts_ming_weekly",
-            "files": (
-                "tests/e2e/offline_inference/test_ming_tts_expansion.py",
-                "tests/e2e/online_serving/test_ming_tts_expansion.py",
-            ),
+            "files": ("tests/e2e/offline_inference/test_ming_tts_expansion.py",),
+            "retired_files": ("tests/e2e/online_serving/test_ming_tts_expansion.py",),
+            "env": {},
         },
-        "TTS · GLM · L4": {
+        "TTS · GLM Offline · L4": {
             "dependency": "tts_glm_weekly",
-            "files": (
-                "tests/e2e/offline_inference/test_glm_tts_expansion.py",
-                "tests/e2e/online_serving/test_glm_tts_expansion.py",
-            ),
-        },
-        "TTS · IndexTTS2 · L4": {
-            "dependency": "tts_indextts2_weekly",
-            "files": (
-                "tests/e2e/offline_inference/test_indextts2_expansion.py",
-                "tests/e2e/online_serving/test_indextts2_expansion.py",
-            ),
+            "files": ("tests/e2e/offline_inference/test_glm_tts_expansion.py",),
+            "retired_files": ("tests/e2e/online_serving/test_glm_tts_expansion.py",),
+            "env": {},
         },
         "TTS · Breeze TTS 2 · L4": {
             "dependency": "tts_breeze_tts2_weekly",
             "extra_dependencies": ("tts_breeze_tts2_mrv2_weekly",),
             "files": ("tests/e2e/online_serving/test_breeze_tts_2.py",),
-            "runner": "v2",
+            "env": {"VLLM_OMNI_CI_MODEL_RUNNER": "v2"},
         },
     }
+    retired = {
+        "TTS · IndexTTS2 · L4": (
+            "tests/e2e/offline_inference/test_indextts2_expansion.py",
+            "tests/e2e/online_serving/test_indextts2_expansion.py",
+        ),
+    }
+    assert not set(retired) & {step.get("label") for step in _iter_steps(doc)}
+    for files in retired.values():
+        for path in files:
+            assert not set(expected) & set(_surviving_labels(doc, [path], pipeline_path=pipeline_path))
     all_files = {path for item in expected.values() for path in item["files"]}
     for label, item in expected.items():
         matching_steps = [step for step in _iter_steps(doc) if step.get("label") == label]
@@ -957,16 +956,18 @@ def test_ming_glm_indextts_breeze_weekly_pr_validation_is_focused(monkeypatch: p
         step = matching_steps[0]
         assert step["source_file_dependencies"] == [item["dependency"], *item.get("extra_dependencies", ())]
         assert step["timeout_in_minutes"] == 90
-        assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": item.get("runner", "v1")}
+        assert step.get("env", {}) == item["env"]
         assert step["mirror_hardwares"] == "l4_1"
         command = "\n".join(step["commands"])
         assert set(item["files"]) <= {path for path in all_files if path in command}
         assert not ({path for path in all_files if path in command} - set(item["files"]))
+        for path in item.get("retired_files", ()):
+            assert path not in command
         assert "VLLM_ALLOW_LONG_MAX_MODEL_LEN" in command
         assert "VLLM_USE_DEEP_GEMM" in command
         assert "VLLM_MOE_USE_DEEP_GEMM" in command
 
-    group = next(step for step in doc["steps"] if "Ming GLM IndexTTS and Breeze Weekly" in step.get("group", ""))
+    group = next(step for step in doc["steps"] if "Ming GLM and Breeze Weekly" in step.get("group", ""))
     assert group["if"] == ('build.env("NON_CRITICAL") == "1" || build.pull_request.labels includes "weekly-test"')
 
     for label, item in expected.items():
@@ -984,29 +985,32 @@ def test_audex_cosyvoice_qwen3_weekly_pr_validation_is_focused(monkeypatch: pyte
     monkeypatch.delenv("MIRROR_HW", raising=False)
     pipeline_path = Path(".buildkite/cuda/test-weekly.yml")
     doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
-    label = "TTS · Audex · CosyVoice · Qwen3-TTS · L4"
+    label = "TTS · Qwen3-TTS Word Timestamps · L4"
     matching_steps = [step for step in _iter_steps(doc) if step.get("label") == label]
     assert len(matching_steps) == 1
     step = matching_steps[0]
     assert step["source_file_dependencies"] == [
-        "tts_audex_weekly",
-        "tts_cosyvoice3_function",
         "tts_qwen3_tts_function",
     ]
     assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": "v2"}
     command = "\n".join(step["commands"])
-    assert "tests/e2e/offline_inference/test_audex_*) runner=v1" in command
-    assert "tests/e2e/offline_inference/test_cosyvoice3_expansion.py) runner=v1" in command
-    assert 'VLLM_OMNI_CI_MODEL_RUNNER="$$runner"' in command
+    assert "VLLM_OMNI_CI_MODEL_RUNNER" not in command
+    assert "failed=0" in command
+    assert "exit $$failed" in command
+    assert 'pytest -s -v "$$f" -m "slow and L4 and tts" --run-level "full_model" || failed=1' in command
+    for path in (
+        "tests/e2e/offline_inference/test_audex_tts.py",
+        "tests/e2e/offline_inference/test_audex_s2t.py",
+        "tests/e2e/offline_inference/test_audex_tta.py",
+        "tests/e2e/offline_inference/test_cosyvoice3_expansion.py",
+    ):
+        assert path not in command
+        assert label not in _surviving_labels(doc, [path], pipeline_path=pipeline_path)
 
-    group = next(step for step in doc["steps"] if "Audex CosyVoice and Qwen3-TTS Weekly" in step.get("group", ""))
+    group = next(step for step in doc["steps"] if "Qwen3-TTS Word Timestamps Weekly" in step.get("group", ""))
     assert group["if"] == ('build.env("NON_CRITICAL") == "1" || build.pull_request.labels includes "weekly-test"')
 
-    for changed_file in (
-        "tests/e2e/offline_inference/test_audex_tts.py",
-        "tests/e2e/offline_inference/test_cosyvoice3_expansion.py",
-        "tests/e2e/online_serving/test_qwen3_tts_word_timestamps.py",
-    ):
+    for changed_file in ("tests/e2e/online_serving/test_qwen3_tts_word_timestamps.py",):
         assert label in _surviving_labels(doc, [changed_file], pipeline_path=pipeline_path)
     assert label not in _surviving_labels(doc, ["docs/source/index.md"], pipeline_path=pipeline_path)
 

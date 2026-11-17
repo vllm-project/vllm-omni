@@ -2377,24 +2377,6 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
         return paths
 
     jobs = {
-        "Audex TTS/TTA/S2S · 1-GPU": {
-            "timeout": 360,
-            "test_timeout": 330,
-            "count": 15,
-            "artifact_name": "rocm-audex-weekly",
-            "dependency": "tts_audex_weekly",
-            "env": {
-                "VLLM_OMNI_CI_MODEL_RUNNER": "v1",
-            },
-            "files": (
-                "tests/e2e/offline_inference/test_audex_tts.py",
-                "tests/e2e/offline_inference/test_audex_s2s.py",
-                "tests/e2e/offline_inference/test_audex_s2t.py",
-                "tests/e2e/offline_inference/test_audex_tta.py",
-                "tests/e2e/online_serving/test_audex_tta.py",
-                "tests/e2e/online_serving/test_audex_tts.py",
-            ),
-        },
         "CosyVoice3 offline and online · 1-GPU": {
             "timeout": 180,
             "test_timeout": 150,
@@ -2590,14 +2572,6 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
             "dependency": "tts_minimax_music3_weekly",
             "files": ("tests/e2e/online_serving/test_minimax_music3.py",),
         },
-        "YuE2 online · 1-GPU": {
-            "timeout": 480,
-            "test_timeout": 450,
-            "count": 6,
-            "artifact_name": "rocm-yue2-weekly",
-            "dependency": "tts_yue2_weekly",
-            "files": ("tests/e2e/online_serving/test_yue2.py",),
-        },
     }
     expected_env = {
         "OPENBLAS_NUM_THREADS": "1",
@@ -2609,6 +2583,18 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
     group = _find_group("TTS E2E Weekly", AMD_WEEKLY_PIPELINE)
     labels = [step["label"] for step in group["steps"]]
 
+    assert "Audex TTS/TTA/S2S · 1-GPU" not in labels
+    for path in (
+        "tests/e2e/offline_inference/test_audex_tts.py",
+        "tests/e2e/offline_inference/test_audex_s2s.py",
+        "tests/e2e/offline_inference/test_audex_s2t.py",
+        "tests/e2e/offline_inference/test_audex_tta.py",
+        "tests/e2e/online_serving/test_audex_tta.py",
+        "tests/e2e/online_serving/test_audex_tts.py",
+    ):
+        assert _steps_selecting_node(AMD_WEEKLY_PIPELINE, path) == []
+    assert "YuE2 online · 1-GPU" not in labels
+    assert _steps_selecting_node(AMD_WEEKLY_PIPELINE, "tests/e2e/online_serving/test_yue2.py") == []
     assert set(jobs) < set(labels)
     for label, expected in jobs.items():
         step = _find_step(label, AMD_WEEKLY_PIPELINE)
@@ -2649,22 +2635,14 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
         assert "vllm_omni/entrypoints/omni_base.py" in dependency_paths
         assert "vllm_omni/metrics/utils.py" in dependency_paths
         assert "vllm_omni/outputs/" in dependency_paths
-        if dependency == "tts_audex_weekly":
-            assert "tests/assets/" not in dependency_paths
         if dependency == "tts_breeze_tts2_weekly":
-            # The ROCm Breeze step runs V1; MRv2 paths live in a CUDA-only key.
+            # This focused ROCm key excludes CUDA-specific MRv2 dependency paths.
             assert not any(path.startswith("vllm_omni/worker_v2/") for path in dependency_paths)
 
         for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
             assert label not in pipeline_path.read_text(encoding="utf-8")
 
     marker_counts = {
-        "tests/e2e/offline_inference/test_audex_tts.py": 3,
-        "tests/e2e/offline_inference/test_audex_s2s.py": 1,
-        "tests/e2e/offline_inference/test_audex_s2t.py": 1,
-        "tests/e2e/offline_inference/test_audex_tta.py": 1,
-        "tests/e2e/online_serving/test_audex_tta.py": 1,
-        "tests/e2e/online_serving/test_audex_tts.py": 8,
         "tests/e2e/offline_inference/test_cosyvoice3_expansion.py": 1,
         "tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py": 3,
         "tests/e2e/online_serving/test_qwen3_tts_word_timestamps.py": 3,
@@ -2698,7 +2676,6 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
         "tests/e2e/online_serving/test_gepard_tts.py": 11,
         "tests/e2e/offline_inference/test_moss_tts_v1_5_expansion.py": 1,
         "tests/e2e/online_serving/test_minimax_music3.py": 2,
-        "tests/e2e/online_serving/test_yue2.py": 3,
     }
     for path, expected_count in marker_counts.items():
         assert Path(path).read_text(encoding="utf-8").count('"rocm": "MI325"') == expected_count
@@ -5722,5 +5699,5 @@ def test_weekly_all_jobs_are_blocking() -> None:
     weekly = yaml.safe_load(AMD_WEEKLY_PIPELINE.read_text(encoding="utf-8"))
     steps = [step for group in weekly["steps"] for step in group["steps"]]
 
-    assert len(steps) == 36
+    assert len(steps) == 34
     assert all(step["grade"] == "Blocking" for step in steps)
