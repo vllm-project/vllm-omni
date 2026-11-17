@@ -588,6 +588,55 @@ def test_model_binding_rebinds_a_new_duplex_condition_for_the_same_request():
     assert model._request_audio_states["a"]["step"] == 2
 
 
+def test_fused_duplex_steps_keep_every_frame_a_prompt_recompute_reads():
+    """Fused steps confirm a whole duplex chunk; the next condition's recompute reads all of it.
+
+    The sampling window is 16 frames, but streaming prompt recompute rebuilds
+    the prompt from every frame confirmed since the current prompt (25 on a
+    normal chunk), so the fused host bookkeeping must not trim the confirmed
+    history to the window.
+    """
+    from torch import nn
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        MiniCPMO45OmniTTSForConditionalGeneration,
+    )
+
+    model = _binding_model()
+    model._request_audio_states["a"] = {"step": 0, "finished": False, "max_tokens": 40}
+    hidden = torch.zeros(1, 4)
+    infos = [_duplex_info("a", epoch=0, turn_id=1, condition_seq=3, text="one")]
+    frames, confirmed = 8, 25
+    sampled = [1 + index % (VOCAB_SIZE - 2) for index in range(frames * 4)]
+    for start in range(0, len(sampled), frames):
+        state = MiniCPMO45OmniTTSForConditionalGeneration.prepare_cuda_kstep(
+            model, hidden, frames, model_intermediate_buffer=infos, request_token_spans=[(0, 1)]
+        )
+        assert state is not None
+        for frame, token in enumerate(sampled[start : start + frames]):
+            state.sample(logits([token]), frame, VOCAB_SIZE - 1)
+        MiniCPMO45OmniTTSForConditionalGeneration.commit_cuda_kstep(model, hidden)
+    assert model._request_codec_history["a"][-confirmed:] == sampled[-confirmed:]
+
+    model._request_condition_states = {
+        "a": {"condition_seq": 3, "condition": torch.zeros(2, 4), "base_recent_codes": ()}
+    }
+    model._k_step_frames = frames
+    model.emb_code = nn.ModuleList([nn.Embedding(VOCAB_SIZE, 4)])
+    with torch.no_grad():
+        model.emb_code[0].weight.copy_(torch.arange(VOCAB_SIZE, dtype=torch.float).unsqueeze(1).expand(-1, 4))
+    embeds = MiniCPMO45OmniTTSForConditionalGeneration._build_streaming_recompute_embeddings(
+        model,
+        torch.ones(3, 4),
+        request_id="a",
+        # The scheduler's confirmed slice holds the K-step head's 0/1 control rows.
+        info_dict={"ids": {"streaming_prompt_previous_codes": [0] * confirmed}},
+        meta={"streaming_condition_seq": 4, "streaming_prompt_recompute": True},
+    )
+    assert embeds.shape == (2 + confirmed + 3, 4)
+    assert embeds[2 : 2 + confirmed, 0].long().tolist() == sampled[-confirmed:]
+
+
 def test_model_binding_turn_mode_commit_carries_no_duplex_metadata():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
         MiniCPMO45OmniTTSForConditionalGeneration,

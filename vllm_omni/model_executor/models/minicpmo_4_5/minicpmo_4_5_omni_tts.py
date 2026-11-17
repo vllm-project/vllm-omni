@@ -132,6 +132,10 @@ _OFFLINE_CODEC_MAX_NEW_TOKENS = 2048
 # until codec EOS / 4096 and Thinker never starts the next model turn.
 _DUPLEX_CODEC_TOKENS_PER_CHUNK = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
 _DUPLEX_TURN_END_CODEC_TOKENS = MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS
+#: Confirmed frames the fused K-step keeps per request. Streaming prompt
+#: recompute reads every frame confirmed since the current prompt (at most
+#: ``_DUPLEX_TURN_END_CODEC_TOKENS - 1``), more than the penalty window.
+_CONFIRMED_CODEC_LEDGER_FRAMES = max(HISTORY_WINDOW, _DUPLEX_TURN_END_CODEC_TOKENS)
 #: Frames the Talker forwards per generate_chunk before its cadence EOS.
 _DUPLEX_CODEC_FRAMES_PER_CHUNK = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK - 1
 #: On a turn-end chunk drained with the boundary mask (``_DRAIN_BOUNDARY_MASK``)
@@ -753,7 +757,7 @@ def _apply_cuda_kstep_host_frames(
                     )
         history = model._request_codec_history.setdefault(request_id, [])
         history.extend(emitted)
-        del history[:-HISTORY_WINDOW]
+        del history[:-_CONFIRMED_CODEC_LEDGER_FRAMES]
         if emitted:
             state["last_code"] = emitted[-1]
         bank = getattr(model, "_cuda_kstep_request_bank", None)
