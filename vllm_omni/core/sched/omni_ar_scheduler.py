@@ -34,6 +34,7 @@ from vllm_omni.core.sched.omni_scheduler_mixin import (
     _request_finishes_on_next_stop,
 )
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniChunkCommit, OmniNewRequestData
+from vllm_omni.core.sched.preemption_reserve import install_preemption_reserve
 from vllm_omni.core.sched.seeded_isolation import isolation_plan, request_is_seeded
 from vllm_omni.core.sched.utils import (
     free_kv_blocks_in_physical_order,
@@ -323,6 +324,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # _emit_kv_wait_output for the engine-core → orchestrator carry.
         self._kv_wait_start_ts: dict[str, float] = {}
         self._init_omni_io_scheduling_state()
+        # A stage that cannot replay drops a preempted request (#9249): keep the
+        # expected growth of admitted requests in reserve when admitting more.
+        self._preemption_reserve = (
+            install_preemption_reserve(self.kv_cache_manager) if self.recompute_preemption_fails else None
+        )
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
         self._finished_req_output_token_ids: dict[str, list[int]] = {}
@@ -2761,6 +2767,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if streams is not None:
             streams.pop(request.request_id, None)
         self._omits_kv_transfer_cache.pop(request.request_id, None)
+        preemption_reserve = getattr(self, "_preemption_reserve", None)
+        if preemption_reserve is not None:
+            preemption_reserve.on_free(request)
 
         # [Upstream compat] Discard request from in-flight prefills set added
         # upstream for routed-experts in-flight reservation tracking.
