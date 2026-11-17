@@ -431,3 +431,159 @@ async def test_two_ready_tool_results_share_one_followup():
         assert len(sent(sock, "response.create")) == 1
         assert runner._tasks == {}
         sock.feed(SESSION_CLOSED)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("done_during_send", [False, True])
+async def test_response_lifecycle_during_send_does_not_block_next_tool(monkeypatch, done_during_send):
+    sock = FakeSocket()
+    sock.feed(session_with("client_response_create"))
+    client, _ = make_client(sock)
+
+    async def handler(arguments):
+        return "25C"
+
+    async with client:
+        runner = DuplexToolRunner(client, {"get_weather": handler})
+        original = client.send
+        sending = asyncio.Event()
+        release = asyncio.Event()
+
+        async def backpressured(event):
+            await original(event)
+            if event.get("type") == "response.create" and len(sent(sock, "response.create")) == 1:
+                sending.set()
+                await release.wait()
+
+        monkeypatch.setattr(client, "send", backpressured)
+        runner.handle_event(wrap_event(call_event()))
+        await asyncio.wait_for(sending.wait(), 2)
+        runner.handle_event(wrap_event({"type": "response.created", "response": {"id": "followup"}}))
+        if done_during_send:
+            runner.handle_event(wrap_event({"type": "response.done", "response": {"id": "followup"}}))
+        release.set()
+        await settle()
+        if not done_during_send:
+            runner.handle_event(wrap_event({"type": "response.done", "response": {"id": "followup"}}))
+        runner.handle_event(wrap_event(call_event("call_b")))
+        await settle()
+        assert len(sent(sock, "response.create")) == 2
+        sock.feed(SESSION_CLOSED)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("created_before_failure", [False, True])
+async def test_failed_continuation_is_retryable_without_resending_result(monkeypatch, created_before_failure):
+    from vllm_omni.clients.duplex import DuplexConnectionError
+
+    sock = FakeSocket()
+    sock.feed(session_with("client_response_create"))
+    client, _ = make_client(sock)
+    handled = []
+
+    async def handler(arguments):
+        handled.append(arguments)
+        return "25C"
+
+    async with client:
+        runner = DuplexToolRunner(client, {"get_weather": handler})
+        original = client.send
+
+        async def fail(event):
+            if event.get("type") == "response.create":
+                if created_before_failure:
+                    runner.handle_event(wrap_event({"type": "response.created", "response": {"id": "observed"}}))
+                raise DuplexConnectionError("continuation disconnected")
+            return await original(event)
+
+        monkeypatch.setattr(client, "send", fail)
+        runner.handle_event(wrap_event(call_event()))
+        await settle()
+        assert runner.undelivered_results == {}
+        assert runner.pending_continuations == {"call_a"}
+        assert isinstance(runner.continuation_errors["call_a"], DuplexConnectionError)
+        assert runner._ready.is_set() is not created_before_failure
+        monkeypatch.setattr(client, "send", original)
+        retry = asyncio.create_task(runner.retry_continuation("call_a"))
+        await settle()
+        if created_before_failure:
+            assert not retry.done()
+            runner.handle_event(wrap_event({"type": "response.done", "response": {"id": "observed"}}))
+        assert await asyncio.wait_for(retry, 2)
+        assert len(handled) == 1
+        assert len(sent(sock, "conversation.item.create")) == 1
+        assert len(sent(sock, "response.create")) == 1
+        assert runner.pending_continuations == set()
+        assert runner.continuation_errors == {}
+        sock.feed(SESSION_CLOSED)
+
+
+@pytest.mark.asyncio
+async def test_result_delivered_during_followup_send_gets_its_own_continuation(monkeypatch):
+    sock = FakeSocket()
+    sock.feed(session_with("client_response_create"))
+    client, _ = make_client(sock)
+
+    async def handler(arguments):
+        return "25C"
+
+    async with client:
+        runner = DuplexToolRunner(client, {"get_weather": handler})
+        original = client.send
+        sending = asyncio.Event()
+        release = asyncio.Event()
+
+        async def backpressured(event):
+            await original(event)
+            if event.get("type") == "response.create" and len(sent(sock, "response.create")) == 1:
+                sending.set()
+                await release.wait()
+
+        monkeypatch.setattr(client, "send", backpressured)
+        runner.handle_event(wrap_event(call_event()))
+        await asyncio.wait_for(sending.wait(), 2)
+        runner.handle_event(wrap_event(call_event("call_b")))
+        await settle()
+        release.set()
+        await settle()
+        assert len(sent(sock, "conversation.item.create")) == 2
+        assert len(sent(sock, "response.create")) == 1
+        runner.handle_event(wrap_event({"type": "response.created", "response": {"id": "followup"}}))
+        runner.handle_event(wrap_event({"type": "response.done", "response": {"id": "followup"}}))
+        await settle()
+        assert len(sent(sock, "response.create")) == 2
+        assert runner.pending_continuations == set()
+        sock.feed(SESSION_CLOSED)
+
+
+@pytest.mark.asyncio
+async def test_settlement_discards_a_failed_continuation(monkeypatch):
+    from vllm_omni.clients.duplex import DuplexConnectionError
+
+    sock = FakeSocket()
+    sock.feed(session_with("client_response_create"))
+    client, _ = make_client(sock)
+
+    async def handler(arguments):
+        return "25C"
+
+    async with client:
+        runner = DuplexToolRunner(client, {"get_weather": handler})
+        original = client.send
+
+        async def fail(event):
+            if event.get("type") == "response.create":
+                raise DuplexConnectionError("disconnected")
+            return await original(event)
+
+        monkeypatch.setattr(client, "send", fail)
+        runner.handle_event(wrap_event(call_event()))
+        await settle()
+        assert runner.pending_continuations == {"call_a"}
+        runner.handle_event(wrap_event(settled_event()))
+        assert runner.pending_continuations == set()
+        assert runner.continuation_errors == {}
+        with pytest.raises(KeyError):
+            await runner.retry_continuation("call_a")
+        assert sent(sock, "response.create") == []
+        sock.feed(SESSION_CLOSED)

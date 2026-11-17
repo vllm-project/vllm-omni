@@ -1186,6 +1186,11 @@ continuation after all observed responses end and ACK-only playback is committed
 Results delivered before the same continuation share one follow-up. Failed result
 writes stay visible in `undelivered_results` / `delivery_errors`; `retry_result`
 resends the cached output after reconnecting without rerunning the handler.
+A failed continuation write instead retains the call in `pending_continuations`
+with its `continuation_errors` entry; `retry_continuation` retries only that
+follow-up. Continuations reserve awaiting-response state before the send can
+yield, so lifecycle events observed during the write remain authoritative.
+Only results delivered before a follow-up begins are covered by that request.
 A successful write is not proof of server acceptance, and the runner never sends
 playback ACKs on behalf of the application.
 

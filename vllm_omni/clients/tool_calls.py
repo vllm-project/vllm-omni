@@ -48,12 +48,13 @@ class DuplexToolRunner:
         self._settled: set[str] = set()
         self.undelivered_results: dict[str, str] = {}
         self.delivery_errors: dict[str, DuplexClientError] = {}
+        self.pending_continuations: set[str] = set()
+        self.continuation_errors: dict[str, DuplexClientError] = {}
         self._active_responses: set[str] = set()
         self._playback: dict[str, tuple[float, float]] = {}
         self._ready = asyncio.Event()
         self._ready.set()
         self._continuation_lock = asyncio.Lock()
-        self._continuation_generation = 0
         self._awaiting_response = False
 
     async def run(self) -> None:
@@ -99,14 +100,7 @@ class DuplexToolRunner:
                 self._note_playback(rid, details)
         elif event.type == "output_audio_buffer.cleared" and response_id:
             self._playback.pop(response_id, None)
-        if (
-            self._awaiting_response
-            or self._active_responses
-            or any(sent > committed for sent, committed in self._playback.values())
-        ):
-            self._ready.clear()
-        else:
-            self._ready.set()
+        self._update_readiness()
         if event.type == "response.output_item.done":
             item = event.raw.get("item")
             if isinstance(item, dict) and item.get("type") == "function_call":
@@ -118,6 +112,8 @@ class DuplexToolRunner:
                 return
             self.undelivered_results.pop(call_id, None)
             self.delivery_errors.pop(call_id, None)
+            self.pending_continuations.discard(call_id)
+            self.continuation_errors.pop(call_id, None)
             task = self._tasks.get(call_id)
             if task is not None and call_id not in self._settled:
                 # The task stays in ``_tasks`` until it is done; ``_forget``
@@ -127,7 +123,13 @@ class DuplexToolRunner:
 
     def _start(self, item: Mapping[str, object]) -> None:
         call_id = item.get("call_id")
-        if not isinstance(call_id, str) or not call_id or call_id in self._tasks or call_id in self.undelivered_results:
+        if (
+            not isinstance(call_id, str)
+            or not call_id
+            or call_id in self._tasks
+            or call_id in self.undelivered_results
+            or call_id in self.pending_continuations
+        ):
             return
         task = asyncio.create_task(self._run_call(call_id, item.get("name"), item.get("arguments")))
         self._tasks[call_id] = task
@@ -182,18 +184,34 @@ class DuplexToolRunner:
         Await this in an application task while ``run()`` consumes lifecycle events.
         A successful write is not a server acceptance acknowledgement.
         """
+        return await self._retry_update(
+            call_id, lambda: self._deliver_result(call_id, self.undelivered_results[call_id])
+        )
+
+    async def retry_continuation(self, call_id: str) -> bool:
+        """Retry a pending follow-up without rerunning its handler or resending output.
+
+        Await this while ``run()`` consumes lifecycle events. A failed write may
+        have reached the server; the application decides when recovery is safe.
+        """
+        if call_id not in self.pending_continuations:
+            raise KeyError(call_id)
+        return await self._retry_update(call_id, lambda: self._continue(call_id))
+
+    async def _retry_update(self, call_id: str, operation: Callable[[], Awaitable[bool]]) -> bool:
         if call_id in self._tasks:
             raise RuntimeError("The tool task has not finished yet")
-        output = self.undelivered_results[call_id]
+        succeeded = False
 
         async def deliver() -> None:
-            await self._deliver_result(call_id, output)
+            nonlocal succeeded
+            succeeded = await operation()
 
         task = asyncio.create_task(deliver())
         self._tasks[call_id] = task
         task.add_done_callback(lambda done: self._forget(call_id, done))
         await task
-        return call_id not in self.undelivered_results
+        return succeeded
 
     async def _deliver_result(self, call_id: str, output: str) -> bool:
         self.undelivered_results[call_id] = output
@@ -212,22 +230,56 @@ class DuplexToolRunner:
             isinstance(capabilities, dict)
             and capabilities.get("function_call_output_continuation") == "client_response_create"
         ):
-            generation = self._continuation_generation
-            async with self._continuation_lock:
-                # Another follow-up already includes results delivered before it.
-                if generation != self._continuation_generation:
-                    return True
-                await self._ready.wait()
-                if call_id not in self._settled:
-                    if await self._finish(self._client.send({"type": "response.create"})):
-                        self._continuation_generation += 1
-                        self._awaiting_response = True
-                        self._ready.clear()
+            self.pending_continuations.add(call_id)
+            return await self._continue(call_id)
         return True
+
+    def _update_readiness(self) -> None:
+        if (
+            self._awaiting_response
+            or self._active_responses
+            or any(sent > committed for sent, committed in self._playback.values())
+        ):
+            self._ready.clear()
+        else:
+            self._ready.set()
+
+    async def _continue(self, call_id: str) -> bool:
+        async with self._continuation_lock:
+            # A prior follow-up may already cover this result.
+            if call_id not in self.pending_continuations:
+                return True
+            await self._ready.wait()
+            if call_id in self._settled:
+                return False
+            covered = set(self.pending_continuations)
+            # The reader can observe created/done before send() returns. Its
+            # lifecycle updates must win over our pre-send reservation.
+            self._awaiting_response = True
+            self._ready.clear()
+            written = False
+            try:
+                await self._client.send({"type": "response.create"})
+                written = True
+            except DuplexClientError as exc:
+                for pending in covered & self.pending_continuations:
+                    self.continuation_errors[pending] = exc
+                logger.warning("Tool continuation was not delivered: %s", exc)
+                return False
+            finally:
+                # On failure/cancellation roll back only the reservation;
+                # observed active responses and playback remain authoritative.
+                if not written:
+                    self._awaiting_response = False
+                    self._update_readiness()
+            self.pending_continuations.difference_update(covered)
+            for pending in covered:
+                self.continuation_errors.pop(pending, None)
+            return True
 
     @staticmethod
     async def _finish(send: Awaitable[object]) -> bool:
-        """Log failures of best-effort cancellation/continuation updates."""
+        """Log failures of best-effort cancellation updates."""
         try:
             await send
         except DuplexClientError as exc:

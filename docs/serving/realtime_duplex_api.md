@@ -1003,6 +1003,14 @@ consuming events. The handler is not executed again. Transport success does not
 acknowledge server acceptance. Follow-ups wait for generation and, with
 `ack_only`, playback acknowledgements. Playback ACKs remain the application's job.
 
+If the result write succeeds but its required `response.create` write fails,
+`runner.pending_continuations` retains the call ID and
+`runner.continuation_errors` exposes the error. After transport recovery, await
+`runner.retry_continuation(call_id)` while `run()` consumes events. This retries
+only the follow-up, without rerunning the handler or resending the result.
+Settling the call removes its recovery state. A failed write can still have
+reached the server, so the application must decide when a retry is safe.
+
 #### Command-line example
 
 With the serving environment active, start Qwen's duplex server:
