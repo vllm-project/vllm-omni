@@ -1461,6 +1461,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self._warmup_profile_records = None
         return records
 
+    def stop_warmup_batch_profile(self) -> None:
+        """Stop per-step warmup profile recording without returning records."""
+        self._warmup_profile_records = None
+
     def _log_batch_profile(
         self,
         states: list[StepRequestState],
