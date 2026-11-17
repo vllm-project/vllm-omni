@@ -246,6 +246,8 @@ datasets/
 !recipes/cosmos3/negative_prompt.json
 !benchmarks/mammoth_moda2/reference_results.json
 !tests/dfx/perf/tests/*.json
+!tests/e2e/accuracy/lingbot_world/*.lock.json
+!tests/e2e/accuracy/lingbot_world/configs/*.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
 !apps/ComfyUI-ABC-Preview/example_workflows/*.json
 !vllm_omni/model_executor/models/ming_flash_omni/talker_tn/talker_re.json
@@ -300,3 +302,6 @@ shellcheck*/
 
 # Fixed custom-image workload for Hunyuan Image performance CI.
 !tests/assets/hunyuan_image3/perf_it2i.jsonl
+
+# LingBot benchmark and accuracy outputs
+lingbot-artifacts/
