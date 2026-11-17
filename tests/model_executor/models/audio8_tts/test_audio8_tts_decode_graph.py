@@ -92,9 +92,7 @@ def test_runner_validates_arguments() -> None:
 @pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="CUDA required")
 def test_graph_replay_matches_eager_bit_exactly() -> None:
     codec = _make_codec(CUDA_DEVICE)
-    runner = ArkttsDecodeGraphRunner(
-        codec, num_codebooks=NUM_CODEBOOKS, frames=CAPTURED_FRAMES, device=CUDA_DEVICE
-    )
+    runner = ArkttsDecodeGraphRunner(codec, num_codebooks=NUM_CODEBOOKS, frames=CAPTURED_FRAMES, device=CUDA_DEVICE)
     assert runner.frames == tuple(CAPTURED_FRAMES)
 
     with torch.inference_mode():
@@ -116,9 +114,7 @@ def test_graph_replay_matches_eager_bit_exactly() -> None:
 @pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="CUDA required")
 def test_repeated_replays_are_deterministic_and_interleave_cleanly() -> None:
     codec = _make_codec(CUDA_DEVICE)
-    runner = ArkttsDecodeGraphRunner(
-        codec, num_codebooks=NUM_CODEBOOKS, frames=CAPTURED_FRAMES, device=CUDA_DEVICE
-    )
+    runner = ArkttsDecodeGraphRunner(codec, num_codebooks=NUM_CODEBOOKS, frames=CAPTURED_FRAMES, device=CUDA_DEVICE)
     with torch.inference_mode():
         codes = {frames: _codes(frames, seed=11, device=CUDA_DEVICE) for frames in CAPTURED_FRAMES}
         first = {frames: runner.decode(codes[frames]) for frames in CAPTURED_FRAMES}
@@ -135,9 +131,7 @@ def test_repeated_replays_are_deterministic_and_interleave_cleanly() -> None:
 @pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="CUDA required")
 def test_uncaptured_shapes_fall_back() -> None:
     codec = _make_codec(CUDA_DEVICE)
-    runner = ArkttsDecodeGraphRunner(
-        codec, num_codebooks=NUM_CODEBOOKS, frames=CAPTURED_FRAMES, device=CUDA_DEVICE
-    )
+    runner = ArkttsDecodeGraphRunner(codec, num_codebooks=NUM_CODEBOOKS, frames=CAPTURED_FRAMES, device=CUDA_DEVICE)
     with torch.inference_mode():
         for frames in (4, 24, 49, 50, 64):
             assert runner.can_decode(_codes(frames, seed=13, device=CUDA_DEVICE)) == (frames in CAPTURED_FRAMES)
@@ -163,7 +157,9 @@ def test_decoder_forward_matches_eager_with_graphs_enabled() -> None:
         decoder._frame_size = 2048
         decoder._logged_stats = True
         decoder._decode_graph = (
-            ArkttsDecodeGraphRunner(decoder._codec, num_codebooks=NUM_CODEBOOKS, frames=CAPTURED_FRAMES, device=CUDA_DEVICE)
+            ArkttsDecodeGraphRunner(
+                decoder._codec, num_codebooks=NUM_CODEBOOKS, frames=CAPTURED_FRAMES, device=CUDA_DEVICE
+            )
             if graph
             else None
         )
@@ -178,7 +174,9 @@ def test_decoder_forward_matches_eager_with_graphs_enabled() -> None:
         for total, left in ((50, 25), (49, 24)):
             codes = _codes(total, seed=14, device=CUDA_DEVICE).squeeze(0)
             payload = [{"codes": {"audio": codes.clone()}, "meta": {"left_context_size": left}}]
-            out_g = graphed.forward(input_ids=torch.tensor([0], dtype=torch.long), runtime_additional_information=payload)
+            out_g = graphed.forward(
+                input_ids=torch.tensor([0], dtype=torch.long), runtime_additional_information=payload
+            )
             out_e = eager.forward(input_ids=torch.tensor([0], dtype=torch.long), runtime_additional_information=payload)
             audio_g = out_g.multimodal_outputs["model_outputs"][0]
             audio_e = out_e.multimodal_outputs["model_outputs"][0]
