@@ -64,10 +64,13 @@ positive block size. The conversion below reads that size back off the spec the
 parent produced, so the kernel's choice -- not this module's -- is the one the
 chunk arithmetic uses.
 
-Nothing here has been executed: it needs an engine, a checkpoint and a GPU. The
-arithmetic it delegates to is CPU-covered by
+The arithmetic it delegates to is CPU-covered by
 ``tests/model_executor/models/minicpmo_4_5/duplex/test_window_plan.py``, which
 also checks the RoPE identity behind :func:`rotate_cached_keys` numerically.
+``tests/worker_v2/test_minicpmo_duplex_block_table.py`` exercises MRv2's actual
+GPU block-table gather across the allocation bound and after compaction. The
+spec disables ordinary sliding-window masking: that bound sizes admission,
+but does not authorize the worker to hide the manager's retained pages.
 
 Wiring, in the order the pieces get used
 ----------------------------------------
@@ -117,21 +120,6 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
 #: Default block size for sliding window on CUDA. Hardware like Ascend NPU may
 #: use larger page sizes (e.g. 128).
 DUPLEX_WINDOW_BLOCK_SIZE = 16
-
-
-def compute_slot_mapping(
-    block_ids: list[int] | torch.Tensor,
-    positions: list[int] | torch.Tensor,
-    block_size: int,
-) -> torch.Tensor:
-    """Map token positions to physical slot indices across a block table."""
-    if block_size <= 0:
-        raise ValueError(f"block_size must be positive, got {block_size}")
-    pos = torch.as_tensor(positions, dtype=torch.long)
-    table = torch.as_tensor(block_ids, dtype=torch.long, device=pos.device)
-    block_index = torch.div(pos, block_size, rounding_mode="floor")
-    offset = pos % block_size
-    return table[block_index] * block_size + offset
 
 
 def duplex_window_geometry(
@@ -207,22 +195,6 @@ class MiniCPMO45DuplexWindowManager(ChunkWindowManager):
         """Never free behind the compaction's back."""
         del num_computed_tokens
         return 0
-
-    def plan_reanchor(
-        self,
-        geometry: DuplexWindowGeometry,
-        *,
-        computed_tokens: int,
-        pending_tokens: int,
-        unit_tokens: list[int] | None = None,
-    ) -> PositionReanchor | None:
-        """Whether the next append pushes the session past its window."""
-        return plan_position_reanchor(
-            geometry,
-            computed_tokens=computed_tokens,
-            pending_tokens=pending_tokens,
-            unit_tokens=unit_tokens,
-        )
 
     def compact_block_table(self, request_id: str, sink_blocks: int | None = None) -> int:
         if getattr(self, "enable_caching", False):
@@ -302,6 +274,18 @@ class MiniCPMO45DuplexWindowSpec(ChunkWindowSpec):
     MRO, so an unregistered subclass silently keeps the parent manager and the
     trim entry point is never reachable.
     """
+
+    @property
+    def num_retained_tokens(self) -> int:
+        """Disable MRv2's ordinary sliding-window block-table masking.
+
+        Zero tells BlockTables to preserve the manager's complete table. Our
+        sliding_window is an admission bound, not an attention mask: only the
+        duplex manager may remove history, retaining sink pages and reanchoring
+        the remaining positions. Sessions with windowing off can also exceed
+        that bound. Masking their leading blocks silently loses live context.
+        """
+        return 0
 
 
 def duplex_window_spec(geometry: DuplexWindowGeometry, layer_spec: SlidingWindowSpec) -> MiniCPMO45DuplexWindowSpec:
@@ -448,14 +432,35 @@ def rotate_keys(keys: torch.Tensor, delta: int, inv_freq: torch.Tensor) -> torch
     return torch.cat([k1 * cos + k2 * sin, k2 * cos - k1 * sin], dim=-1)
 
 
+def flattened_key_cache_view(
+    key: torch.Tensor,
+    block_size: int | None,
+    head_dim: int | None,
+    rotary_dim: int,
+) -> torch.Tensor:
+    """Return a storage-sharing view or reject an unsupported flattened layout."""
+    if head_dim is None or head_dim <= 0 or head_dim != rotary_dim:
+        raise ValueError("flattened key cache requires explicit head_dim and full rotary")
+    if block_size is None or key.shape[1] != block_size or key.shape[2] % head_dim:
+        raise ValueError(f"unsupported flattened key cache shape {tuple(key.shape)}")
+    try:
+        return key.view(key.shape[0], block_size, -1, head_dim)
+    except RuntimeError as exc:
+        raise ValueError(
+            f"cannot view flattened key cache in place: shape={tuple(key.shape)}, "
+            f"stride={key.stride()}, head_dim={head_dim}"
+        ) from exc
+
+
 def rotate_cached_keys(
-    k_pool: torch.Tensor,
+    k_pool: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor],
     *,
     block_ids: list[int],
     positions: torch.Tensor,
     plan: PositionReanchor,
     inv_freq: torch.Tensor,
     block_size: int | None = None,
+    head_dim: int | None = None,
 ) -> int:
     """Re-RoPE the retained tail where it stands; return the rows touched.
 
@@ -473,6 +478,18 @@ def rotate_cached_keys(
     """
     if positions.numel() == 0:
         return 0
+
+    # Ascend keeps K and V in separate tensors. Operate on the original K
+    # storage only; stacking the pair would rotate a copy and leave KV stale.
+    if isinstance(k_pool, (tuple, list)):
+        if len(k_pool) != 2:
+            raise ValueError("split KV cache must contain exactly K and V")
+        k_pool = k_pool[0]
+
+    # Ascend's standard paged layout can flatten heads into the last axis:
+    # (num_blocks, block_size, num_kv_heads * head_dim).
+    if k_pool.dim() == 3:
+        k_pool = flattened_key_cache_view(k_pool, block_size, head_dim, inv_freq.numel() * 2)
 
     if k_pool.dim() == 5:
         if k_pool.shape[0] == 2:
@@ -778,30 +795,17 @@ class MiniCPMO45DuplexSchedulerHelper:
 
         return plan
 
-    @classmethod
-    def maybe_reanchor_session(
-        cls,
-        scheduler: Any,
-        session: Any,
-        update: Any,
-        *,
-        segment_output_ids: list[int] | None = None,
-        completed_terminator: int | None = None,
-        unit_tokens: list[int] | None = None,
-    ) -> PositionReanchor | None:
-        """Backward-compatible alias for apply_session_window."""
-        return cls.apply_session_window(
-            scheduler,
-            session,
-            update,
-            segment_output_ids=segment_output_ids,
-            completed_terminator=completed_terminator,
-            unit_tokens=unit_tokens,
-        )
-
 
 class MiniCPMO45DuplexWorkerHelper:
     """Worker-side KV cache rotation and position metadata helper for MiniCPM-o 4.5 duplex."""
+
+    @classmethod
+    def get_reanchor_parameters(cls, runner: Any) -> tuple[int, int | None, torch.Tensor]:
+        """Resolve the same cache geometry for startup validation and rotation."""
+        block_size = int(getattr(getattr(runner, "cache_config", None), "block_size", 16) or 16)
+        model_config = getattr(runner, "model_config", None)
+        head_dim = model_config.get_head_size() if model_config is not None else None
+        return block_size, head_dim, cls.get_rope_inv_freq(runner)
 
     @classmethod
     def get_rope_inv_freq(cls, runner: Any) -> torch.Tensor:
@@ -843,6 +847,15 @@ class MiniCPMO45DuplexWorkerHelper:
                     actual_group = group_idx if group_idx < len(raw_blocks) else 0
                     return [int(b) for b in raw_blocks[actual_group]]
                 return [int(b) for b in raw_blocks]
+        # MRv2 owns request slots and block tables on the runner, rather than
+        # on its transient InputBatch. Read after staged writes are applied.
+        req_states = getattr(runner, "req_states", None)
+        block_tables = getattr(runner, "block_tables", None)
+        if req_states is not None and block_tables is not None:
+            slot = req_states.req_id_to_index.get(req_id)
+            if slot is not None:
+                num_blocks = int(block_tables.num_blocks.np[group_idx, slot])
+                return block_tables.block_tables[group_idx].gpu[slot, :num_blocks].tolist()
         # Fallback to input_batch block_table
         bt = getattr(getattr(runner, "input_batch", None), "block_table", None)
         if bt is not None:
@@ -859,16 +872,26 @@ class MiniCPMO45DuplexWorkerHelper:
     @classmethod
     def maybe_apply_reanchor(cls, runner: Any, scheduler_output: Any = None) -> None:
         """Apply in-place KV reanchor and rotation on worker before model forward."""
-        if not hasattr(runner, "input_batch") or runner.input_batch is None:
-            return
-        num_reqs = getattr(runner.input_batch, "num_reqs", len(runner.input_batch.req_ids))
-        req_ids = runner.input_batch.req_ids[:num_reqs]
+        req_states = getattr(runner, "req_states", None)
+        if req_states is not None and scheduler_output is not None:
+            req_ids = list(scheduler_output.num_scheduled_tokens)
+        else:
+            if not hasattr(runner, "input_batch") or runner.input_batch is None:
+                return
+            num_reqs = getattr(runner.input_batch, "num_reqs", len(runner.input_batch.req_ids))
+            req_ids = runner.input_batch.req_ids[:num_reqs]
         applied_reanchors = getattr(runner, "_applied_stage0_reanchor_ids", None)
         if applied_reanchors is None:
             applied_reanchors = runner._applied_stage0_reanchor_ids = set()
 
         for req_idx, req_id in enumerate(req_ids):
-            info = runner.model_intermediate_buffer.get(req_id)
+            if req_states is not None:
+                slot = req_states.req_id_to_index.get(req_id)
+                if slot is None:
+                    continue
+                info = runner.model_state.intermediate_buffer.buffers[slot]
+            else:
+                info = runner.model_intermediate_buffer.get(req_id)
             if not isinstance(info, dict):
                 continue
             duplex = info.get("duplex")
@@ -906,12 +929,14 @@ class MiniCPMO45DuplexWorkerHelper:
             # Scheduler is authoritative for logical state (block_table and computed tokens).
             # The parent runner's _update_states() already installed the post-compaction block IDs
             # and decremented num_computed_tokens_cpu. We do NOT double-compact or double-decrement here.
-            old_computed = int(
-                reanchor.get(
-                    "old_computed_tokens",
-                    int(runner.input_batch.num_computed_tokens_cpu[req_idx]) + plan.delta,
-                )
-            )
+            old_computed = reanchor.get("old_computed_tokens")
+            if old_computed is None:
+                if req_states is not None:
+                    slot = req_states.req_id_to_index[req_id]
+                    old_computed = int(req_states.num_computed_tokens_np[slot]) + plan.delta
+                else:
+                    old_computed = int(runner.input_batch.num_computed_tokens_cpu[req_idx]) + plan.delta
+            old_computed = int(old_computed)
 
             req_state = runner.requests.get(req_id) if hasattr(runner, "requests") else None
             mrope_pos = getattr(req_state, "mrope_positions", None) if req_state is not None else None
@@ -935,12 +960,16 @@ class MiniCPMO45DuplexWorkerHelper:
                 assert_uniform_position_shift(positions, plan.moved_from)
 
             if positions.numel() > 0 and hasattr(runner, "kv_caches") and runner.kv_caches:
-                inv_freq = cls.get_rope_inv_freq(runner)
+                block_size, head_dim, inv_freq = cls.get_reanchor_parameters(runner)
                 kv_groups = getattr(runner, "kv_cache_group_ids", None)
-                block_size = int(getattr(getattr(runner, "cache_config", None), "block_size", 16) or 16)
+                # Layers share their KV group's table; on MRv2 each lookup is a device read.
+                group_block_ids: dict[int, list[int]] = {}
                 for layer_idx, kv_cache in enumerate(runner.kv_caches):
                     group_idx = kv_groups[layer_idx] if (kv_groups and layer_idx < len(kv_groups)) else 0
-                    layer_block_ids = cls.resolve_group_block_ids(runner, req_id, req_idx, group_idx=group_idx)
+                    layer_block_ids = group_block_ids.get(group_idx)
+                    if layer_block_ids is None:
+                        layer_block_ids = cls.resolve_group_block_ids(runner, req_id, req_idx, group_idx=group_idx)
+                        group_block_ids[group_idx] = layer_block_ids
                     rotate_cached_keys(
                         kv_cache,
                         block_ids=layer_block_ids,
@@ -948,6 +977,7 @@ class MiniCPMO45DuplexWorkerHelper:
                         plan=plan,
                         inv_freq=inv_freq,
                         block_size=block_size,
+                        head_dim=head_dim,
                     )
 
             # Evict worker-held unit history so state.window_units remains bounded

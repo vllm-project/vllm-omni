@@ -7,8 +7,19 @@ pull request review.
 
 ## Directory Structure
 
-Each skill lives in its own directory under `.claude/skills/`. A skill may
-include:
+Each skill lives in its own directory under `.claude/skills/`. The Ascend
+optimization router has a single root-level skill entry for discovery:
+
+```text
+.claude/skills/
+├── readme.md
+├── dit-npu-fusion-analysis/
+│   ├── SKILL.md                  # MindIE-SD routing instructions
+│   └── agents/openai.yaml       # English UI metadata
+└── ...                          # Other existing skills
+```
+
+A skill may include:
 
 - `SKILL.md`: the main workflow and operating instructions
 - `references/`: focused reference material used by the skill
@@ -26,6 +37,9 @@ self-check.
 
 - [`add-diffusion-model`](add-diffusion-model/SKILL.md): guides integration of
   a new diffusion model into `vllm-omni`
+- [`add-omni-model`](add-omni-model/SKILL.md): integrates a new multi-stage
+  thinker/talker/code2wav omni model, from the HF reference through pipeline,
+  stage hand-off processors, deploy YAML, parity ladder, tests, and recipe
 - [`add-recipe`](add-recipe/SKILL.md): creates or updates in-repository model
   recipes with verified task/input/output contracts, concrete hardware,
   shared feature-guide links, exact commands, and qualification evidence
@@ -34,9 +48,29 @@ self-check.
 - [`diffusion-perf-opt`](diffusion-perf-opt/SKILL.md): guides diffusion model
   performance optimization, including profiling traces, parallel strategies,
   stage timing analysis, and benchmark-driven tuning
+- [`diffusion-accuracy-test`](diffusion-accuracy-test/SKILL.md): adds or extends
+  image/video numerical accuracy tests with aligned references, scoped
+  tolerances, and explicit Buildkite Accuracy coverage
+- [`diffusion-perf-test`](diffusion-perf-test/SKILL.md): adds or extends
+  image/video performance-benchmark cases and their nightly/weekly Buildkite
+  Perf coverage, using the `run_benchmark.py` config schema and a fixed
+  measurement contract
+- [`dit-npu-fusion-analysis`](dit-npu-fusion-analysis/SKILL.md):
+  routes Ascend NPU diffusion model and operator optimization to the applicable
+  MindIE-SD skill, supplying Omni context and retaining repository-local tests;
+  the existing name remains a discovery entry, with optimization methods and
+  acceptance guidance maintained in MindIE-SD
 - [`find-simplifications`](find-simplifications/SKILL.md): finds evidence-backed
   opportunities to remove or merge dead, duplicated, speculative,
   over-generalized, or unnecessarily defensive vLLM-Omni code
+- [`omni-perf-opt`](omni-perf-opt/SKILL.md): guides multi-stage omni serving
+  optimization, including stage attribution, TTFT / AUDIO_TTFP / AUDIO_RTF
+  tuning, async_chunk codec chunking, CUDA graphs, MRv2, replicas, and
+  quality-gated A/B evidence
+- [`omni-perf-ceiling`](omni-perf-ceiling/SKILL.md): estimates the best
+  reachable omni serving performance (for example AUDIO_RTF at a target
+  concurrency) from measured cells and per-stage calibrated roofline estimates, and reports the remaining unattributed gap, on CUDA GPUs
+  or Ascend NPUs
 - [`precheck-pr`](precheck-pr/SKILL.md): self-checks a branch before creating a
   PR by validating title format, dead code, simplification opportunities,
   accuracy and performance claims, and merge readiness
@@ -50,6 +84,9 @@ self-check.
 - [`review-pr`](review-pr/SKILL.md): provides a frozen-snapshot, contract-aware
   workflow for maintainers and reviewers; contributors should use
   `precheck-pr` for self-review
+- [`vllm-omni`](vllm-omni/SKILL.md): entry skill for multi-stage omni models;
+  covers deploy YAML, serving, debugging, benchmarking, and the code map, and
+  routes model integration and performance work to the dedicated skills
 - [`vllm-omni-npu-model-runner-upgrade`](vllm-omni-npu-upgrade/SKILL.md):
   upgrades NPU model runners to align with the latest vllm-ascend
   `NPUModelRunner`
@@ -59,6 +96,25 @@ self-check.
   wiring (`test-ready.yml`, `test-merge.yml`, `test-nightly.yml`,
   `test-weekly.yml`), and copy-paste local plus CI-like `pytest` commands; see
   `references/test-routing.md` for level-to-command mapping
+
+## Ascend Optimization Routing
+
+For Ascend NPU diffusion tasks, `diffusion-perf-opt` consults the
+[MindIE-SD router](dit-npu-fusion-analysis/SKILL.md)
+before hardware-specific analysis. The router locates an existing checkout or
+the official dev skill index and reads the selected instructions. It does not
+copy SD's operator catalogue, benefit model or acceptance protocol into Omni.
+
+| Task | Guidance owner | Omni responsibility |
+| --- | --- | --- |
+| Model optimization, bottleneck unknown | MindIE-SD model optimization entry | Supply active source, workload/configuration and existing evidence |
+| Fusion, kernel, pattern or focused profiling task | Relevant MindIE-SD capability | Preserve repository ownership and authorized execution scope |
+| Changes to Omni | Omni test/accuracy skills plus SD NPU acceptance guidance | Implement/test the Omni changes and return actual artifacts |
+| Production qualification | production-add-diffusion-model | Retain independent API, lifecycle and feature-combination checks |
+
+Read the external index at execution time; selected names and support can vary
+by revision. If guidance is inaccessible, disclose the gap rather than claiming
+that the external workflow ran.
 
 ## MiniMax H3 Creative Skills
 

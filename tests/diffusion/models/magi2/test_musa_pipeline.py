@@ -10,10 +10,12 @@ import torch
 
 from tests.diffusion.models.magi2.test_native_preview import _initialize_tiny_model, _tiny_config
 from tests.diffusion.models.magi2.test_pipeline_magi2 import _pipeline, _request
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.models.magi2 import attention
 from vllm_omni.diffusion.models.magi2 import pipeline_magi2 as pipeline
 from vllm_omni.diffusion.models.magi2.attention import VarlenHandler
+from vllm_omni.diffusion.models.magi2.layers.cuda import attention_ops as cuda_attention
 from vllm_omni.diffusion.models.magi2.modeling_magi2 import Magi2PreviewTransformer, Modality
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
@@ -25,6 +27,7 @@ def fake_platform(device_type: str, available: bool = True):
         is_available=lambda: available,
         is_cuda=lambda: device_type == "cuda",
         is_musa=lambda: device_type == "musa",
+        is_npu=lambda: False,
     )
 
 
@@ -59,11 +62,11 @@ def test_constructor_uses_selected_device(monkeypatch, device_type):
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("device_type,available", [("cuda", False), ("musa", False), ("cpu", True), ("xpu", True)])
+@pytest.mark.parametrize("device_type,available", [("cuda", False), ("musa", False), ("cpu", True)])
 def test_constructor_rejects_unsupported_or_unavailable(monkeypatch, device_type, available):
     monkeypatch.setattr(pipeline, "current_omni_platform", fake_platform(device_type, available))
     resolver = stop_before_weights(monkeypatch)
-    with pytest.raises(RuntimeError, match="available CUDA or MUSA"):
+    with pytest.raises(RuntimeError, match="requires an accelerator"):
         pipeline.Magi2Pipeline(od_config=config())
     resolver.assert_not_called()
 
@@ -119,7 +122,8 @@ def require_musa():
 @pytest.mark.cpu
 @pytest.mark.parametrize("device_type,is_cuda", [("cuda", True), ("musa", True), ("cuda", False)])
 def test_bundled_flash_attention_requires_cuda_platform(monkeypatch, device_type, is_cuda):
-    monkeypatch.setattr(attention, "current_omni_platform", fake_platform(device_type))
+    monkeypatch.setattr(cuda_attention, "current_omni_platform", fake_platform(device_type))
+    monkeypatch.setattr(attention, "varlen_attention_with_sink", cuda_attention.varlen_attention_with_sink)
     # Compatibility layers can expose is_cuda on non-CUDA tensors.
     q = SimpleNamespace(is_cuda=is_cuda, shape=(2, 1, 4), device=torch.device("cpu"))
     k = v = torch.empty(2, 1, 4)
@@ -129,9 +133,9 @@ def test_bundled_flash_attention_requires_cuda_platform(monkeypatch, device_type
     reference = Mock(return_value=expected)
     flash = Mock(return_value=(expected, torch.zeros(1, 2)))
     resolver = Mock(return_value=3)
-    monkeypatch.setattr(attention, "torch_varlen_attention_with_sink", reference)
-    monkeypatch.setattr(attention, "vllm_flash_attn_varlen_with_lse", flash)
-    monkeypatch.setattr(attention, "_resolve_flash_attn_version", resolver)
+    monkeypatch.setattr(cuda_attention, "torch_varlen_attention_with_sink", reference)
+    monkeypatch.setattr(cuda_attention, "vllm_flash_attn_varlen_with_lse", flash)
+    monkeypatch.setattr(cuda_attention, "_resolve_flash_attn_version", resolver)
     assert attention.packed_attention_with_sink(q, k, v, varlen) is expected
     if device_type == "cuda" and is_cuda:
         flash.assert_called_once()
@@ -143,7 +147,7 @@ def test_bundled_flash_attention_requires_cuda_platform(monkeypatch, device_type
         resolver.assert_not_called()
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 def test_actual_musa_constructor_selects_device(monkeypatch):
     require_musa()
     assert pipeline.current_omni_platform.is_musa()
@@ -154,7 +158,7 @@ def test_actual_musa_constructor_selects_device(monkeypatch):
     assert pipe.device_str == f"musa:{torch.accelerator.current_device_index()}"
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 def test_request_seed_reaches_musa_rng():
     require_musa()
     pipeline._seed_request(1927)
@@ -167,7 +171,7 @@ def test_request_seed_reaches_musa_rng():
     assert not torch.equal(first, different)
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 def test_musa_tiny_native_transformer_matches_cpu():
     """Component smoke, not a full checkpoint/video or optimized FA3 test."""
     require_musa()
@@ -193,7 +197,7 @@ def test_musa_tiny_native_transformer_matches_cpu():
     torch.testing.assert_close(actual.cpu(), expected, rtol=2e-4, atol=2e-5)
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 def test_actual_musa_forward_instrumentation():
     require_musa()
     pipe, runtime = _pipeline()

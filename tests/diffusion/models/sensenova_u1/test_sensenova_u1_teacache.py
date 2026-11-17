@@ -52,7 +52,7 @@ def tiny_model():
 
 @pytest.mark.parametrize("prefix_len", [0, 3])
 @pytest.mark.parametrize("masked", [False, True])
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 @torch.inference_mode()
 def test_teacache_matches_real_decoder(tiny_model, prefix_len, masked):
     past = None

@@ -1102,7 +1102,7 @@ class SiglipAttention(nn.Module):
         value_states = value_states.view(batch_size, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         k_v_seq_len = key_states.shape[-2]
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scale
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3))
 
         if attn_weights.size() != (batch_size, self.num_heads, q_len, k_v_seq_len):
             raise ValueError(
@@ -1115,10 +1115,8 @@ class SiglipAttention(nn.Module):
                 raise ValueError(
                     f"Attention mask should be of size {(batch_size, 1, q_len, k_v_seq_len)}, but is {attention_mask.size()}"
                 )
-            attn_weights = attn_weights + attention_mask
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = self._normalize_attention_weights(attn_weights, attention_mask)
         attn_weights = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
         attn_output = torch.matmul(attn_weights, value_states)
 
@@ -1135,11 +1133,32 @@ class SiglipAttention(nn.Module):
 
         return attn_output, attn_weights
 
+    def _normalize_attention_weights(
+        self, scores: torch.Tensor, attention_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if (
+            scores.is_cuda
+            and torch.version.hip is None
+            and scores.dtype == torch.bfloat16
+            and scores.is_contiguous()
+            and 0 < scores.shape[-1] <= 2048
+            and attention_mask is None
+            and not self.training
+            and not scores.requires_grad
+        ):
+            from .ops.scaled_softmax import scaled_softmax
+
+            return scaled_softmax(scores, self.scale)
+        dtype = scores.dtype
+        scores = scores * self.scale
+        if attention_mask is not None:
+            scores = scores + attention_mask
+        return nn.functional.softmax(scores, dim=-1, dtype=torch.float32).to(dtype)
+
     def _attend_unpadded(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         """Attention over ``(n, L, heads, head_dim)`` items with no padding; same layout out."""
         query, key, value = (x.transpose(1, 2) for x in (query, key, value))
-        attn_weights = torch.matmul(query, key.transpose(2, 3)) * self.scale
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+        attn_weights = self._normalize_attention_weights(torch.matmul(query, key.transpose(2, 3)))
         return torch.matmul(attn_weights, value).transpose(1, 2)
 
     def forward_packed(self, hidden_states: torch.Tensor, seq_groups: Sequence[tuple[int, int, int]]) -> torch.Tensor:
@@ -4234,6 +4253,8 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        from vllm_omni.platforms import current_omni_platform
+
         config: MiniCPMOConfig = vllm_config.model_config.hf_config
         multimodal_config = vllm_config.model_config.multimodal_config
 
@@ -4257,12 +4278,21 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         # Initialize vision encoder (SigLIP)
         if multimodal_config.get_limit_per_prompt("image"):
             # Set attention implementation
-            # (an engine override, else the vision config, else SDPA: eager math without the (B, H, L, L) scores)
+            # Match the reference vision attention for CUDA duplex: SDPA can
+            # change the generated scene descriptions over a long AV session.
+            # Keep explicit engine/vision overrides and turn/NPU defaults.
             if getattr(getattr(vllm_config, "model_config", None), "_attn_implementation", None) is not None:
                 config.vision_config._attn_implementation = vllm_config.model_config._attn_implementation
             else:
                 vision_implementation = getattr(config.vision_config, "_attn_implementation", None)
-                config.vision_config._attn_implementation = vision_implementation or "sdpa"
+                cuda_duplex = (
+                    current_omni_platform.is_cuda()
+                    and getattr(vllm_config.model_config, "dtype", None) == torch.bfloat16
+                    and getattr(vllm_config.model_config, "session_mode", "turn") == "duplex"
+                )
+                config.vision_config._attn_implementation = vision_implementation or (
+                    "eager" if cuda_duplex else "sdpa"
+                )
             if config.vision_config._attn_implementation == "flash_attention_2" and not is_flash_attn_2_available():
                 logger.warning("flash_attention_2 requested for the MiniCPM-o vision tower but unavailable; using sdpa")
                 config.vision_config._attn_implementation = "sdpa"
@@ -4343,8 +4373,6 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
 
         # Ascend Conv1d must stay outside NPUGraph; CUDA retains the full
         # stateless encoder/projection/pooling capture merged in #8332.
-        from vllm_omni.platforms import current_omni_platform
-
         audio_forward = (
             self._encode_audio_transformer if current_omni_platform.is_npu() else self._encode_audio_features
         )

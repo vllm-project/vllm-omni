@@ -6,11 +6,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import math
 import os
 from pathlib import Path
 from typing import Any
 
-from vllm.benchmarks.serve import main_async
+from vllm.benchmarks.serve import main_async as vllm_main_async
 
 # Import patch to register daily-omni dataset and omni backends
 # This monkey-patches vllm.benchmarks.datasets.get_samples before it's used
@@ -19,6 +20,8 @@ import vllm_omni.benchmarks.patch.patch  # noqa: F401
 from vllm_omni.benchmarks.omniinteract import omniinteract_output_lock
 from vllm_omni.benchmarks.patch.patch import (
     maybe_enable_stage_metrics,
+    set_duplex_metric_aggregation,
+    set_fail_fast_on_timeout,
     set_print_stage,
     set_request_timeout_s,
     should_request_stage_metrics,
@@ -56,7 +59,28 @@ def _use_endpoint_backend_when_implicit(args: argparse.Namespace) -> None:
         args.backend = endpoint
 
 
-def main(args: argparse.Namespace) -> dict[str, Any]:
+def _validate_fail_fast_on_timeout(args: argparse.Namespace) -> None:
+    if not getattr(args, "omni_fail_fast_on_timeout", False):
+        return
+    backend = getattr(args, "backend", None)
+    request_rate = float(getattr(args, "request_rate", math.inf))
+    self_timed = bool(getattr(args, "self_timed", False))
+    if backend != "openai-chat-omni" or request_rate != math.inf or self_timed:
+        raise ValueError(
+            "--omni-fail-fast-on-timeout requires --backend openai-chat-omni "
+            "with --request-rate inf and a non-self-timed workload; "
+            f"got backend={backend!r}, request_rate={request_rate!r}, self_timed={self_timed!r}"
+        )
+
+
+async def main_async(args: argparse.Namespace) -> dict[str, Any]:
+    """Run the common serving lifecycle from async protocol/CI callers too."""
+    if getattr(args, "realtime_video_evaluate", None):
+        # Saved outputs are scored after the generation server has released its
+        # devices; no server discovery, tokenizer or benchmark traffic is needed.
+        from vllm_omni.benchmarks.realtime_video.eval import evaluate_from_args
+
+        return await asyncio.to_thread(evaluate_from_args, args)
     if getattr(args, "seed_tts_wer_eval", False):
         os.environ["SEED_TTS_WER_EVAL"] = "1"
     if getattr(args, "seed_tts_wer_save_items", False):
@@ -69,7 +93,10 @@ def main(args: argparse.Namespace) -> dict[str, Any]:
     if request_timeout_s is not None:
         set_request_timeout_s(request_timeout_s)
     _use_endpoint_backend_when_implicit(args)
+    _validate_fail_fast_on_timeout(args)
+    set_fail_fast_on_timeout(getattr(args, "omni_fail_fast_on_timeout", False))
     set_print_stage(getattr(args, "print_stage", False))
+    set_duplex_metric_aggregation(getattr(args, "duplex_metric_aggregation", "session"))
     args.extra_body = maybe_enable_stage_metrics(
         getattr(args, "extra_body", None),
         enabled=should_request_stage_metrics(args),
@@ -80,4 +107,8 @@ def main(args: argparse.Namespace) -> dict[str, Any]:
         else contextlib.nullcontext()
     )
     with lock:
-        return asyncio.run(main_async(args))
+        return await vllm_main_async(args)
+
+
+def main(args: argparse.Namespace) -> dict[str, Any]:
+    return asyncio.run(main_async(args))

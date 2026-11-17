@@ -5,7 +5,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const root = path.resolve(__dirname, '../../examples/online_serving/realtime_web/app/static');
 const context = vm.createContext({ URL });
-for (const name of ['common', 'minicpm_native', 'qwen3_turn', 'aura_ptt']) {
+for (const name of ['common', 'minicpm_native', 'qwen3_turn', 'aura_ptt', 'joyai_turn']) {
   vm.runInContext(fs.readFileSync(path.join(root, `profiles/${name}.js`), 'utf8'), context);
 }
 const profiles = context.OmniRealtimeProfiles;
@@ -95,6 +95,22 @@ test('VAD uses nested format and interruptible endpoint detection', () => {
   assert.match(vad.mapEvent({ type: 'error', code: 'server_vad_initialization_failed' }).message, /Silero/);
 });
 
+test('Qwen semantic VAD is explicit and reports its extra dependency and latency', () => {
+  const semantic = profiles['qwen3-turn']({ ...config, turnMode: 'semantic_vad' });
+  const [update] = plain(semantic.initialMessages(config, 'help'));
+  assert.deepEqual(update.session.audio.input.turn_detection, {
+    type: 'semantic_vad', eagerness: 'auto', create_response: true, interrupt_response: true,
+  });
+  assert.equal(new URL(semantic.url(config, 'https://localhost/')).searchParams.get('duplex'), '1');
+  assert.match(semantic.description, /Smart Turn/);
+  assert.match(semantic.description, /1\.2/);
+  const error = semantic.mapEvent({ type: 'error', error: { code: 'semantic_vad_unavailable', message: 'Missing model' } });
+  assert.equal(error.kind, 'error');
+  assert.equal(error.fatal, true);
+  assert.match(error.message, /Smart Turn/);
+  assert.match(error.message, /--vad/);
+});
+
 function shell(profileName, turnMode = 'manual', options = {}) {
   const elements = new Map();
   class Element {
@@ -114,6 +130,7 @@ function shell(profileName, turnMode = 'manual', options = {}) {
   let timerId = 0;
   const sockets = [];
   const nodes = [];
+  const mediaRequests = [];
   class Socket {
     static OPEN = 1;
     constructor() {
@@ -156,9 +173,12 @@ function shell(profileName, turnMode = 'manual', options = {}) {
   }
   const ctx = vm.createContext({
     URL, document, AudioContext, AudioWorkletNode, WebSocket: Socket,
-    navigator: { mediaDevices: { getUserMedia: async () => ({ getTracks: () => [{ stop() {} }] }) } },
+    navigator: { mediaDevices: { getUserMedia: async (constraints) => {
+      mediaRequests.push(constraints);
+      return { getTracks: () => [{ stop() {} }] };
+    } } },
     location: { href: 'https://localhost/' },
-    OMNI_REALTIME_CONFIG: { ...config, profile: profileName, turnMode },
+    OMNI_REALTIME_CONFIG: { ...config, profile: profileName, turnMode, speechInput: options.speechInput },
     addEventListener() {},
     setTimeout(fn, ms) { const id = ++timerId; timers.set(id, { fn, ms }); return id; },
     clearTimeout(id) { timers.delete(id); },
@@ -167,20 +187,20 @@ function shell(profileName, turnMode = 'manual', options = {}) {
     atob: (value) => Buffer.from(value, 'base64').toString('binary'),
   });
   ctx.window = ctx;
-  for (const name of ['common', 'minicpm_native', 'qwen3_turn', 'aura_ptt']) {
+  for (const name of ['common', 'minicpm_native', 'qwen3_turn', 'aura_ptt', 'joyai_turn']) {
     vm.runInContext(fs.readFileSync(path.join(root, `profiles/${name}.js`), 'utf8'), ctx);
   }
   // Expose closure controls only in the test VM; production has no test API.
   const source = fs.readFileSync(path.join(root, 'app.js'), 'utf8').replace(/\}\)\(\);\s*$/, `
     globalThis.testUI = { startSession, stopSession, handleEvent, playbackDrained,
-      microphoneUploadEnabled, flushCapture, setPttHeld, awaitQueue: () => audioChain,
-      capture() { pendingCapture.push(new Int16Array([100, 200])); },
+      microphoneUploadEnabled, flushCapture, setPttHeld, toggleMute, awaitQueue: () => audioChain,
+      capture(samples = [100, 200]) { pendingCapture.push(new Int16Array(samples)); },
       setPendingFrame(frame) { cameraPendingFrame = frame; if (profile.stickyCamera) cameraLastFrame = frame; },
-      state() { return { running, connectionReady, assistantActive, pttHeld }; }
+      state() { return { running, connectionReady, assistantActive, pttHeld, turnSubmitted, visionTurnLocked }; }
     };
   })();`);
   vm.runInContext(source, ctx);
-  return { ui: ctx.testUI, elements, sockets, nodes,
+  return { ui: ctx.testUI, elements, sockets, nodes, mediaRequests,
     timeout() { for (const timer of timers.values()) if (timer.ms === 15000) timer.fn(); },
     async echo() {
       for (const [id, timer] of timers) if (timer.ms === 300) { timers.delete(id); await timer.fn(); }
@@ -190,6 +210,245 @@ function shell(profileName, turnMode = 'manual', options = {}) {
     },
   };
 }
+
+test('JoyAI profile sends camera commits and playback acknowledgements', () => {
+  const profile = profiles['joyai-turn']();
+  const url = new URL(profile.url({}, 'https://localhost/'));
+  assert.equal(url.searchParams.get('duplex'), '1');
+  assert.equal(url.searchParams.get('model'), 'jdopensource/JoyAI-VL-Interaction-Preview');
+  assert.deepEqual(plain(profile.initialMessages({}, 'Watch the pot.')), [{
+    type: 'session.update', session: { modalities: ['audio', 'text'], instructions: 'Watch the pot.',
+      extra_body: { auto_response: false } },
+  }]);
+  assert.deepEqual(plain(profile.append(null, 'JPEG')), { type: 'input_audio_buffer.append', video_frames: ['JPEG'] });
+  assert.deepEqual(plain(profile.commitMessages()), [{ type: 'input_audio_buffer.commit', final: true, create_response: true }]);
+  assert.deepEqual(plain(profile.ack('r1', 1000)), { type: 'playback.ack', response_id: 'r1',
+    item_id: 'item_r1', played_ms: 1000, committed_ms: 1000 });
+  assert.equal(profile.mapEvent({ type: 'response.output_text.delta', delta: 'Smoke!' }).text, 'Smoke!');
+  assert.equal(profile.mapEvent({ type: 'response.output_text.done', text: 'Smoke!' }).kind, 'text-final');
+});
+
+test('JoyAI observes without a microphone and waits for both response.done and playback', async () => {
+  const app = shell('joyai-turn');
+  await app.ui.startSession();
+  assert.equal(app.mediaRequests.length, 0);
+  assert.equal(app.nodes.some(node => node.name === 'fullduplex-pcm-capture'), false);
+  assert.equal(app.elements.get('muteButton').hidden, true);
+  assert.equal(app.elements.get('microphoneMeter').hidden, true);
+  const socket = app.sockets[0];
+  app.elements.get('sendTurnButton').listeners.click();
+  assert.equal(socket.sent.length, 1, 'no commit without a frame');
+  app.ui.setPendingFrame('frame-a'); app.ui.flushCapture();
+  assert.deepEqual(socket.sent.slice(-2), [
+    { type: 'input_audio_buffer.append', video_frames: ['frame-a'] },
+    { type: 'input_audio_buffer.commit', final: true, create_response: true, event_id: 'web-commit-1' },
+  ]);
+  await app.ui.handleEvent({ type: 'response.created', response: { id: 'r1' } });
+  app.ui.setPendingFrame('frame-b'); app.ui.flushCapture();
+  assert.equal(socket.sent.length, 3, 'busy observations stay local');
+  await app.ui.handleEvent({ type: 'response.output_audio.delta', delta: 'AAAAAA==', response_id: 'r1' });
+  await app.ui.handleEvent({ type: 'response.done', response: { id: 'r1', status: 'completed' } });
+  await app.echo(); app.ui.flushCapture();
+  assert.equal(socket.sent.filter(e => e.type === 'input_audio_buffer.commit').length, 1);
+  app.ui.playbackDrained({ responseId: 'r1', playedMs: 1000 });
+  assert.equal(socket.sent.at(-1).type, 'playback.ack');
+  await app.echo();
+  app.ui.setPendingFrame('frame-c'); app.ui.flushCapture();
+  assert.deepEqual(socket.sent.at(-2).video_frames, ['frame-c'], 'only the latest frame is submitted');
+  assert.equal(socket.sent.filter(e => e.type === 'input_audio_buffer.commit').length, 2);
+  assert.equal(socket.sent.some(e => 'audio' in e), false);
+});
+
+test('JoyAI opt-in microphone commits speech and resumes camera observations', async () => {
+  const app = shell('joyai-turn', 'manual', { speechInput: true });
+  await app.ui.startSession();
+  assert.equal(app.mediaRequests.length, 1);
+  assert.equal(app.elements.get('pttButton').hidden, false);
+  const socket = app.sockets[0];
+  app.ui.setPttHeld(true);
+  app.ui.capture();
+  app.ui.setPendingFrame('speech-frame');
+  app.ui.setPttHeld(false);
+  assert.equal(socket.sent.at(-1).type, 'input_audio_buffer.commit');
+  assert.equal(socket.sent.at(-2).format, 'pcm16');
+  assert.equal(socket.sent.at(-2).sample_rate_hz, 16000);
+  assert.deepEqual(socket.sent.at(-2).video_frames, ['speech-frame']);
+  app.ui.setPendingFrame('pending-frame'); app.ui.flushCapture();
+  assert.equal(socket.sent.filter(e => e.type === 'input_audio_buffer.commit').length, 1);
+  await app.ui.handleEvent({ type: 'response.created', response: { id: 'speech' } });
+  await app.ui.handleEvent({ type: 'response.done', response: { id: 'speech', status: 'completed' } });
+  await app.echo(); app.ui.flushCapture();
+  assert.deepEqual(socket.sent.at(-2), { type: 'input_audio_buffer.append', video_frames: ['pending-frame'] });
+  assert.equal(socket.sent.at(-1).type, 'input_audio_buffer.commit');
+});
+
+test('JoyAI VAD microphone uses shared server commits and carries camera frames', () => {
+  const profile = profiles['joyai-turn']({ speechInput: true, turnMode: 'vad' });
+  assert.equal(profile.clientCommit, false);
+  assert.equal(profile.videoOnly, false);
+  assert.equal(profile.pushToTalk, false);
+  assert.equal(profile.cameraObservations, false);
+  const session = profile.initialMessages({}, 'Watch the pot.')[0].session;
+  assert.equal(session.audio.input.turn_detection.type, 'server_vad');
+  assert.equal(session.audio.input.turn_detection.create_response, true);
+  assert.equal(session.audio.input.turn_detection.interrupt_response, true);
+  assert.deepEqual(plain(profile.append('PCM', 'FRAME')), {
+    type: 'input_audio_buffer.append', audio: 'PCM', format: 'pcm16', sample_rate_hz: 16000, video_frames: ['FRAME'],
+  });
+});
+
+for (const profileName of ['joyai-turn', 'aura-ptt']) {
+  for (const muted of [false, true]) {
+    test(`${profileName} empty ${muted ? 'muted' : 'zero-sample'} PTT leaves camera turns available`, async () => {
+      const app = shell(profileName, 'manual', { speechInput: true });
+      await app.ui.startSession();
+      if (muted) app.elements.get('muteButton').listeners.click();
+      app.ui.setPttHeld(true);
+      app.ui.capture(muted ? [100, 200] : []); // Captured samples are not an upload while muted.
+      app.ui.setPttHeld(false);
+      assert.equal(app.sockets[0].sent.some(event => event.type === 'input_audio_buffer.commit'), false);
+      assert.equal(app.ui.state().assistantActive, false);
+      assert.equal(app.ui.state().turnSubmitted, false);
+      assert.equal(app.ui.state().visionTurnLocked, false);
+      await app.turnWatchdog();
+      assert.equal(app.ui.state().running, true);
+      for (const frame of ['frame-a', 'frame-b']) {
+        app.ui.setPendingFrame(frame); app.ui.flushCapture();
+      }
+      assert.equal(app.sockets[0].sent.filter(event => event.type === 'input_audio_buffer.commit').length, 1);
+      await app.ui.stopSession({ terminal: false });
+    });
+  }
+}
+
+test('JoyAI rejects only its own pending commit and resumes camera observations without a watchdog', async () => {
+  const app = shell('joyai-turn', 'manual', { speechInput: true });
+  await app.ui.startSession();
+  app.ui.setPttHeld(true); app.ui.capture(); app.ui.flushCapture(); app.ui.setPttHeld(false);
+  const commit = app.sockets[0].sent.at(-1);
+  assert.equal(commit.type, 'input_audio_buffer.commit', 'a previously flushed hold still commits');
+  const error = { type: 'error', error: { code: 'input_audio_buffer_empty',
+    message: 'Input buffer was empty', event_id: commit.event_id } };
+  await app.ui.handleEvent({ ...error, error: { ...error.error, event_id: 'unrelated-operation' } });
+  assert.equal(app.ui.state().assistantActive, true);
+  await app.ui.handleEvent(error);
+  assert.equal(app.ui.state().assistantActive, false);
+  assert.equal(app.ui.state().turnSubmitted, false);
+  assert.equal(app.elements.get('sendTurnButton').disabled, false);
+  await app.turnWatchdog();
+  assert.equal(app.ui.state().running, true);
+  app.ui.setPendingFrame('after-rejection'); app.ui.flushCapture();
+  assert.deepEqual(app.sockets[0].sent.at(-2).video_frames, ['after-rejection']);
+  assert.equal(app.sockets[0].sent.at(-1).type, 'input_audio_buffer.commit');
+  await app.ui.handleEvent(error); // An old rejection must not release the new observation.
+  assert.equal(app.ui.state().assistantActive, true);
+  assert.equal(app.ui.state().turnSubmitted, true);
+  await app.ui.stopSession({ terminal: false });
+});
+
+function settledCommit(kind, commit) {
+  return kind === 'silent'
+    ? { type: 'input_audio_buffer.committed', event: { no_response: true, realtime_event_id: commit.event_id } }
+    : { type: 'error', error: { code: 'commit_aborted', message: 'Commit rejected', event_id: commit.event_id } };
+}
+
+test('JoyAI quiet nonempty PTT finishes without a response and leaves camera observations available', async () => {
+  const app = shell('joyai-turn', 'manual', { speechInput: true });
+  await app.ui.startSession();
+  app.ui.setPttHeld(true); app.ui.capture([1, 1, 1, 1]); app.ui.setPttHeld(false);
+  const commit = app.sockets[0].sent.at(-1);
+  assert.equal(commit.type, 'input_audio_buffer.commit');
+  assert.ok(app.sockets[0].sent.at(-2).audio);
+  for (const event of [
+    settledCommit('silent', {}), settledCommit('silent', { event_id: 'unrelated' }),
+    { type: 'response.listen', reason: 'silence_or_noise' },
+    { type: 'input_audio_buffer.committed', event: { realtime_event_id: commit.event_id } },
+  ]) {
+    await app.ui.handleEvent(event);
+    assert.equal(app.ui.state().turnSubmitted, true, 'only the matching no-response acknowledgement settles a commit');
+  }
+  await app.ui.handleEvent(settledCommit('silent', commit));
+  await app.ui.handleEvent({ type: 'response.listen', reason: 'silence_or_noise' });
+  assert.equal(app.ui.state().turnSubmitted, false);
+  assert.equal(app.ui.state().assistantActive, false);
+  assert.equal(app.elements.get('sendTurnButton').disabled, false);
+  await app.turnWatchdog();
+  assert.equal(app.ui.state().running, true);
+  app.ui.setPendingFrame('after-quiet-hold'); app.ui.flushCapture();
+  assert.deepEqual(app.sockets[0].sent.at(-2).video_frames, ['after-quiet-hold']);
+  await app.ui.stopSession({ terminal: false });
+});
+
+for (const outcome of ['rejected', 'silent']) for (const responseStarted of [false, true]) {
+  test(`JoyAI ${outcome} overlapping PTT preserves an older ${responseStarted ? 'active' : 'pending'} response`, async () => {
+    const app = shell('joyai-turn', 'manual', { speechInput: true });
+    await app.ui.startSession();
+    app.ui.setPendingFrame('first'); app.ui.flushCapture();
+    if (responseStarted) await app.ui.handleEvent({ type: 'response.created', response: { id: 'first' } });
+    app.ui.setPttHeld(true); app.ui.capture(); app.ui.setPttHeld(false);
+    const commit = app.sockets[0].sent.at(-1);
+    await app.ui.handleEvent(settledCommit(outcome, commit));
+    assert.equal(app.ui.state().assistantActive, true);
+    assert.equal(app.ui.state().turnSubmitted, true);
+    const count = app.sockets[0].sent.length;
+    app.ui.setPendingFrame('waiting'); app.ui.flushCapture();
+    assert.equal(app.sockets[0].sent.length, count);
+    await app.ui.handleEvent({ type: 'response.done', response: { id: 'first', status: 'completed' } });
+    await app.echo(); app.ui.flushCapture();
+    assert.deepEqual(app.sockets[0].sent.at(-2).video_frames, ['waiting']);
+    await app.ui.stopSession({ terminal: false });
+  });
+}
+
+for (const outcomes of [['rejected', 'rejected'], ['silent', 'silent'], ['silent', 'rejected']]) for (const reverseOrder of [false, true]) {
+  test(`JoyAI releases busy after ${outcomes.join('/')} commits settle in ${reverseOrder ? 'reverse' : 'send'} order`, async () => {
+    const app = shell('joyai-turn', 'manual', { speechInput: true });
+    await app.ui.startSession();
+    for (let index = 0; index < 2; index += 1) {
+      app.ui.setPttHeld(true); app.ui.capture(); app.ui.setPttHeld(false);
+    }
+    const commits = app.sockets[0].sent.filter(event => event.type === 'input_audio_buffer.commit');
+    assert.equal(commits.length, 2);
+    const settled = commits.map((commit, index) => settledCommit(outcomes[index], commit));
+    if (reverseOrder) settled.reverse();
+    await app.ui.handleEvent(settled[0]);
+    assert.equal(app.ui.state().assistantActive, true, 'the other commit may still succeed');
+    assert.equal(app.ui.state().turnSubmitted, true);
+    const before = app.sockets[0].sent.length;
+    app.ui.setPendingFrame('after-rejections'); app.ui.flushCapture();
+    assert.equal(app.sockets[0].sent.length, before);
+
+    await app.ui.handleEvent(settled[1]);
+    assert.equal(app.ui.state().assistantActive, false);
+    assert.equal(app.ui.state().turnSubmitted, false);
+    await app.turnWatchdog();
+    assert.equal(app.ui.state().running, true, 'settled commits must disarm their watchdog');
+    app.ui.flushCapture();
+    assert.deepEqual(app.sockets[0].sent.at(-2).video_frames, ['after-rejections']);
+    const newCommit = app.sockets[0].sent.at(-1);
+    for (const event of settled) await app.ui.handleEvent(event);
+    assert.equal(app.ui.state().assistantActive, true, 'late acknowledgements do not release a newer pending commit');
+    await app.ui.handleEvent({ type: 'response.created', response: { id: 'new-response' } });
+    await app.ui.handleEvent(settledCommit(outcomes[0], newCommit));
+    assert.equal(app.ui.state().assistantActive, true, 'a begun response owns its lifecycle');
+    await app.ui.stopSession({ terminal: false });
+  });
+}
+
+test('JoyAI resumes after a silent decision and supports manual observations', async () => {
+  const app = shell('joyai-turn');
+  await app.ui.startSession();
+  app.ui.setPendingFrame('frame-a');
+  app.elements.get('sendTurnButton').listeners.click();
+  await app.ui.handleEvent({ type: 'response.created', response: { id: 'r1' } });
+  await app.ui.handleEvent({ type: 'response.listen', response_id: 'r1' });
+  await app.ui.handleEvent({ type: 'response.done', response: { id: 'r1', status: 'completed' } });
+  await app.echo();
+  app.elements.get('sendTurnButton').listeners.click();
+  assert.equal(app.sockets[0].sent.filter(e => e.type === 'input_audio_buffer.commit').length, 2);
+  assert.deepEqual(app.sockets[0].sent.at(-2).video_frames, ['frame-a']);
+  assert.equal(app.sockets.length, 1);
+});
 
 test('shared shell sends standard manual turns and keeps the Realtime session open', async () => {
   const app = shell('qwen3-turn');
@@ -215,7 +474,7 @@ test('shared shell sends standard manual turns and keeps the Realtime session op
   assert.equal(append.sample_rate_hz, undefined);
   app.elements.get('sendTurnButton').listeners.click();
   assert.deepEqual(app.sockets[0].sent.slice(-2), [
-    { type: 'input_audio_buffer.commit' },
+    { type: 'input_audio_buffer.commit', event_id: 'web-commit-1' },
     { type: 'response.create' },
   ]);
   assert.equal(app.ui.microphoneUploadEnabled(), false);
@@ -234,7 +493,7 @@ test('shared shell sends standard manual turns and keeps the Realtime session op
   app.ui.capture(); app.ui.flushCapture();
   app.elements.get('sendTurnButton').listeners.click();
   assert.deepEqual(app.sockets[0].sent.slice(-2), [
-    { type: 'input_audio_buffer.commit' },
+    { type: 'input_audio_buffer.commit', event_id: 'web-commit-2' },
     { type: 'response.create' },
   ]);
   assert.equal(app.sockets.length, 1);
@@ -314,6 +573,16 @@ test('VAD handshake errors remain visible after resource cleanup', async () => {
   assert.equal(app.elements.get('connectionState').textContent, 'Error');
   assert.match(app.elements.get('runtimeDetail').textContent, /session_mode: duplex/);
   assert.equal(app.sockets[0].readyState, 3);
+});
+
+test('missing Smart Turn stops the session and preserves actionable guidance', async () => {
+  const app = shell('qwen3-turn', 'semantic_vad');
+  await app.ui.startSession();
+  await app.ui.handleEvent({ type: 'error', error: { code: 'semantic_vad_unavailable', message: 'Missing model' } });
+  assert.equal(app.ui.state().running, false);
+  assert.equal(app.elements.get('connectionState').textContent, 'Error');
+  assert.match(app.elements.get('runtimeDetail').textContent, /Smart Turn/);
+  assert.match(app.elements.get('runtimeDetail').textContent, /--vad/);
 });
 
 test('missing session acknowledgement fails instead of leaving Start disabled forever', async () => {
@@ -421,6 +690,9 @@ test('interrupted playback reports its cursor before clear resets it', () => {
   const player = new Playback();
   player.handleMessage({ type: 'audio', responseId: 'old', pcm: new Int16Array(24000), initialBufferMs: 0 });
   player.process([], [[new Float32Array(2400)]]);
+  player.handleMessage({ type: 'drain', responseId: 'old' });
+  player.handleMessage({ type: 'audio', responseId: 'unplayed', pcm: new Int16Array(24000) });
+  player.handleMessage({ type: 'drain', responseId: 'unplayed' });
   player.handleMessage({ type: 'clear' });
   const report = messages.find(m => m.type === 'playback-stopped');
   assert.equal(report.responseId, 'old');
@@ -429,6 +701,11 @@ test('interrupted playback reports its cursor before clear resets it', () => {
   assert.equal(player.bufferedFrames(), 0);
   player.handleMessage({ type: 'clear' });
   assert.equal(messages.filter(m => m.type === 'playback-stopped').length, 1);
+  player.handleMessage({ type: 'audio', responseId: 'fresh', pcm: new Int16Array(4800), initialBufferMs: 0 });
+  player.handleMessage({ type: 'drain', responseId: 'fresh' });
+  player.process([], [[new Float32Array(4800)]]);
+  assert.deepEqual(messages.filter(m => m.type === 'playback-drained').map(m => [m.responseId, m.playedMs]),
+    [['fresh', 200]], 'clear must discard unplayed queued responses and reset the next cursor');
 });
 
 test('late interruption cursor acknowledges old response without finishing the new response', async () => {
@@ -586,6 +863,53 @@ test('AURA shell holds speech until PTT and opens one vision turn per two frames
   await app.ui.stopSession({ terminal: false });
 });
 
+test('AURA shows one bubble per item and keeps repeated syllables', async () => {
+  const app = shell('aura-ptt');
+  await app.ui.startSession();
+  const said = '哎，你看到我吗？';
+  const reply = '看到了，我正盯着你呢。';
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.completed', transcript: said, item_id: 'u1',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.completed', transcript: said, item_id: 'u1',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.completed', transcript: said, item_id: 'u3',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.delta', delta: '哈', item_id: 'u2',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.delta', delta: '哈', item_id: 'u2',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.completed', transcript: '哈哈', item_id: 'u2',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.delta', delta: '哈', item_id: 'u4',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.delta', delta: '哈哈', item_id: 'u4',
+  });
+  await app.ui.handleEvent({
+    type: 'response.output_audio_transcript.delta', delta: reply, response_id: 'a1',
+  });
+  await app.ui.handleEvent({
+    type: 'response.output_audio_transcript.done', transcript: reply, response_id: 'a1',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.done',
+    item: { id: 'item_a1', role: 'assistant', content: [{ type: 'output_audio', transcript: reply }] },
+  });
+  await app.ui.handleEvent({
+    type: 'response.output_audio.delta', text: reply, audio: '', response_id: 'a1',
+  });
+  const turns = [...app.elements.get('conversation').children];
+  assert.deepEqual(turns.map(row => row.children[1].textContent), [said, said, '哈哈', '哈哈哈', reply]);
+  await app.ui.stopSession({ terminal: false });
+});
+
 test('AURA hold-to-talk stops local playback and does not cancel the response', async () => {
   const app = shell('aura-ptt', 'manual', { realPlayback: true });
   await app.ui.startSession();
@@ -639,8 +963,77 @@ function renderPlayback(player) {
   return output;
 }
 
-async function playingQwen(options = {}) {
-  const app = shell('qwen3-turn', 'vad', { realPlayback: true, ...options });
+for (const queueNextAudio of [false, true]) {
+  test(`JoyAI overlapping PTT acknowledges each response with next audio ${queueNextAudio ? 'queued' : 'pending'}`, async () => {
+    const app = shell('joyai-turn', 'manual', { speechInput: true, realPlayback: true });
+    await app.ui.startSession();
+    receive(app, { type: 'response.created', response: { id: 'old' } });
+    receive(app, audioChunk('old'));
+    await app.ui.awaitQueue();
+    app.ui.setPttHeld(true); app.ui.capture([1, 1, 1, 1]); app.ui.setPttHeld(false);
+    assert.equal(app.sockets[0].sent.at(-1).type, 'input_audio_buffer.commit');
+    receive(app, { type: 'response.done', response: { id: 'old', status: 'completed' } });
+    receive(app, { type: 'response.created', response: { id: 'new' } });
+    if (queueNextAudio) {
+      receive(app, audioChunk('new'));
+      receive(app, { type: 'response.done', response: { id: 'new', status: 'completed' } });
+    }
+    await app.ui.awaitQueue();
+    const player = app.nodes.find(node => node.name === 'fullduplex-pcm-playback').player;
+    for (let i = 0; i < 188; i += 1) renderPlayback(player);
+    await Promise.resolve();
+    const acks = () => app.sockets[0].sent.filter(message => message.type === 'playback.ack');
+    assert.deepEqual(acks().map(message => [message.response_id, message.played_ms]), [['old', 1000]]);
+    assert.equal(app.ui.state().assistantActive, true, 'draining old audio must not finish the new turn');
+    if (!queueNextAudio) {
+      receive(app, audioChunk('new'));
+      receive(app, { type: 'response.done', response: { id: 'new', status: 'completed' } });
+      await app.ui.awaitQueue();
+    }
+    for (let i = 0; i < 188; i += 1) renderPlayback(player);
+    await Promise.resolve();
+    assert.deepEqual(acks().map(message => [message.response_id, message.played_ms]), [['old', 1000], ['new', 1000]]);
+    await app.echo();
+    assert.equal(app.ui.state().assistantActive, false);
+    await app.ui.stopSession({ terminal: false });
+  });
+}
+
+for (const outcome of ['rejected', 'silent']) for (const settleBeforeDrain of [false, true]) {
+  test(`JoyAI ${outcome} PTT after response.done settles ${settleBeforeDrain ? 'before' : 'after'} playback drains`, async () => {
+    const app = shell('joyai-turn', 'manual', { speechInput: true, realPlayback: true });
+    await app.ui.startSession();
+    receive(app, { type: 'response.created', response: { id: 'old' } });
+    receive(app, audioChunk('old'));
+    receive(app, { type: 'response.done', response: { id: 'old', status: 'completed' } });
+    await app.ui.awaitQueue();
+    const player = app.nodes.find(node => node.name === 'fullduplex-pcm-playback').player;
+    assert.ok(player.bufferedFrames() > 0);
+    app.ui.setPttHeld(true); app.ui.capture([1, 1, 1, 1]); app.ui.setPttHeld(false);
+    const commit = app.sockets[0].sent.at(-1);
+    if (settleBeforeDrain) await app.ui.handleEvent(settledCommit(outcome, commit));
+    while (player.bufferedFrames()) renderPlayback(player);
+    renderPlayback(player);
+    await Promise.resolve(); // Deliver the worklet's playback-drained message.
+    if (!settleBeforeDrain) {
+      await app.echo();
+      assert.equal(app.ui.state().turnSubmitted, true, 'the pending hold must remain owned');
+      await app.ui.handleEvent(settledCommit(outcome, commit));
+    }
+    await app.echo();
+    assert.equal(app.ui.state().assistantActive, false);
+    assert.equal(app.ui.state().turnSubmitted, false);
+    assert.ok(app.sockets[0].sent.some(event => event.type === 'playback.ack' && event.response_id === 'old'));
+    await app.turnWatchdog();
+    assert.equal(app.ui.state().running, true);
+    app.ui.setPendingFrame('next'); app.ui.flushCapture();
+    assert.deepEqual(app.sockets[0].sent.at(-2).video_frames, ['next']);
+    await app.ui.stopSession({ terminal: false });
+  });
+}
+
+async function playingVad(options = {}) {
+  const app = shell(options.profile || 'qwen3-turn', 'vad', { realPlayback: true, speechInput: true, ...options });
   await app.ui.startSession();
   receive(app, { type: 'response.created', response: { id: 'old' } });
   receive(app, audioChunk('old'));
@@ -659,7 +1052,7 @@ function assertSilent(player) {
 
 for (const terminal of [false, true]) {
   test(`Qwen speech interrupts actual playback after generation completed=${terminal}`, async () => {
-    const app = await playingQwen();
+    const app = await playingVad();
     if (terminal) {
       receive(app, { type: 'response.output_audio.done', response_id: 'old' });
       receive(app, { type: 'response.done', response: { id: 'old', status: 'completed' } });
@@ -678,7 +1071,7 @@ for (const terminal of [false, true]) {
 
 test('Qwen cancellation preempts pending decode and does not delay the next response', async () => {
   let releaseDecode;
-  const app = await playingQwen({ decodeAudioData: () => new Promise(resolve => { releaseDecode = resolve; }) });
+  const app = await playingVad({ decodeAudioData: () => new Promise(resolve => { releaseDecode = resolve; }) });
   receive(app, audioChunk('old', { format: 'wav' }));
   await flushTasks();
   assert.equal(typeof releaseDecode, 'function');
@@ -697,7 +1090,7 @@ test('Qwen cancellation preempts pending decode and does not delay the next resp
 });
 
 test('Qwen interruption rejects queued and late audio for the cancelled response', async () => {
-  const app = await playingQwen();
+  const app = await playingVad();
   receive(app, audioChunk('old'));
   receive(app, { type: 'response.done', response: { id: 'old', status: 'cancelled' } });
   receive(app, audioChunk('old'));
@@ -707,7 +1100,7 @@ test('Qwen interruption rejects queued and late audio for the cancelled response
 });
 
 test('late cancellation of an old Qwen response does not clear a newer response', async () => {
-  const app = await playingQwen();
+  const app = await playingVad();
   receive(app, { type: 'response.done', response: { id: 'old', status: 'cancelled' } });
   await app.ui.awaitQueue();
   receive(app, { type: 'response.created', response: { id: 'new' } });
@@ -742,7 +1135,7 @@ test('Qwen speech interruption follows accepted turn detection; MiniCPM mapping 
 
 test('late old-response controls cannot invalidate a newer pending decode', async () => {
   let releaseDecode;
-  const app = await playingQwen({ decodeAudioData: () => new Promise(resolve => { releaseDecode = resolve; }) });
+  const app = await playingVad({ decodeAudioData: () => new Promise(resolve => { releaseDecode = resolve; }) });
   receive(app, { type: 'input_audio_buffer.speech_started', item_id: 'next', audio_start_ms: 1000 });
   await app.ui.awaitQueue();
   receive(app, { type: 'response.created', response: { id: 'new' } });
@@ -761,7 +1154,7 @@ test('late old-response controls cannot invalidate a newer pending decode', asyn
 
 test('normal completion still waits for decoding before draining playback', async () => {
   let releaseDecode;
-  const app = await playingQwen({ decodeAudioData: () => new Promise(resolve => { releaseDecode = resolve; }) });
+  const app = await playingVad({ decodeAudioData: () => new Promise(resolve => { releaseDecode = resolve; }) });
   receive(app, audioChunk('old', { format: 'wav' }));
   await flushTasks();
   receive(app, { type: 'response.output_audio.done', response_id: 'old' });
@@ -777,7 +1170,7 @@ test('normal completion still waits for decoding before draining playback', asyn
 
 test('interrupting an old decode preserves a newer response already waiting in the event queue', async () => {
   let releaseDecode;
-  const app = await playingQwen({ decodeAudioData: () => new Promise(resolve => { releaseDecode = resolve; }) });
+  const app = await playingVad({ decodeAudioData: () => new Promise(resolve => { releaseDecode = resolve; }) });
   receive(app, audioChunk('old', { format: 'wav' }));
   await flushTasks();
   receive(app, { type: 'response.created', response: { id: 'new' } });
@@ -790,4 +1183,105 @@ test('interrupting an old decode preserves a newer response already waiting in t
   await flushTasks();
   assert.equal(app.player.bufferedFrames(), 24000);
   await app.ui.stopSession({ terminal: false });
+});
+
+for (const terminal of [false, true]) {
+  for (const interrupt of [
+    { type: 'input_audio_buffer.speech_started', item_id: 'next', audio_start_ms: 1000 },
+    { type: 'output_audio_buffer.cleared', response_id: 'old' },
+    { type: 'response.done', response: { id: 'old', status: 'cancelled' } },
+  ]) {
+    test(`JoyAI VAD ${interrupt.type} clears playback after generation completed=${terminal}`, async () => {
+      const app = await playingVad({ profile: 'joyai-turn' });
+      if (terminal) {
+        receive(app, { type: 'response.done', response: { id: 'old', status: 'completed' } });
+        await app.ui.awaitQueue();
+      }
+      receive(app, interrupt);
+      await app.ui.awaitQueue();
+      assertSilent(app.player);
+      assert.equal(app.ui.microphoneUploadEnabled(), true);
+      const ack = app.sockets[0].sent.find(event => event.type === 'playback.ack');
+      assert.equal(ack.response_id, 'old');
+      assert.equal(ack.played_ms, 5);
+      receive(app, audioChunk('old'));
+      await app.ui.awaitQueue();
+      assertSilent(app.player);
+      receive(app, { type: 'response.created', response: { id: 'new' } });
+      receive(app, audioChunk('new'));
+      await app.ui.awaitQueue();
+      receive(app, { type: 'output_audio_buffer.cleared', response_id: 'old' });
+      receive(app, { type: 'response.done', response: { id: 'old', status: 'cancelled' } });
+      await app.ui.awaitQueue();
+      assert.equal(app.player.activeResponseId, 'new');
+      assert.equal(app.player.bufferedFrames(), 24000);
+      assert.equal(app.ui.state().assistantActive, true);
+      await app.ui.stopSession({ terminal: false });
+    });
+  }
+}
+
+test('JoyAI camera and PTT profiles keep their existing speech-start handling', () => {
+  const speech = { type: 'input_audio_buffer.speech_started', item_id: 'next' };
+  for (const config of [{}, { speechInput: true, turnMode: 'manual' }]) {
+    assert.equal(profiles['joyai-turn'](config).mapEvent(speech).kind, 'ignore');
+  }
+});
+
+
+test('MiniCPM muted microphone sends each fresh camera frame without audio or commit', async () => {
+  const app = shell('minicpm-native');
+  await app.ui.startSession();
+  app.ui.capture();
+  app.ui.flushCapture();
+  app.ui.capture();
+  app.ui.setPendingFrame('PRE_MUTE');
+  app.ui.toggleMute();
+  const audioSamples = app.sockets[0].sent
+    .filter(e => typeof e.audio === 'string')
+    .reduce((total, e) => total + Buffer.from(e.audio, 'base64').length / 2, 0);
+  assert.equal(audioSamples, 16000, 'mute closes the open 1 s unit with silence');
+  assert.deepEqual(app.sockets[0].sent.at(-1).video_frames, ['PRE_MUTE']);
+  app.ui.setPendingFrame('VISION1');
+  app.ui.flushCapture();
+  assert.deepEqual(app.sockets[0].sent.at(-1), {
+    type: 'input_audio_buffer.append', video_frames: ['VISION1'],
+  });
+  const count = app.sockets[0].sent.length;
+  app.ui.flushCapture();
+  assert.equal(app.sockets[0].sent.length, count, 'no repeated frame or empty append');
+  app.ui.setPendingFrame('VISION2');
+  app.ui.flushCapture();
+  assert.deepEqual(app.sockets[0].sent.at(-1).video_frames, ['VISION2']);
+  app.ui.toggleMute();
+  app.ui.flushCapture();
+  assert.equal(app.sockets[0].sent.length, count + 1, 'old captured audio was discarded');
+  app.ui.capture();
+  app.ui.setPendingFrame('OMNI');
+  app.ui.flushCapture();
+  assert.equal(typeof app.sockets[0].sent.at(-1).audio, 'string');
+  assert.deepEqual(app.sockets[0].sent.at(-1).video_frames, ['OMNI']);
+  assert.equal(app.sockets[0].sent.some(e => e.type === 'input_audio_buffer.commit'), false);
+  const sentBeforeBoundaryMute = app.sockets[0].sent.length;
+  app.ui.toggleMute();
+  app.ui.toggleMute();
+  const unitSamples = app.sockets[0].sent
+    .filter(e => typeof e.audio === 'string')
+    .reduce((total, e) => total + Buffer.from(e.audio, 'base64').length / 2, 0);
+  assert.equal(unitSamples % 16000, 0, 'a second mute also lands on a unit boundary');
+  app.ui.toggleMute();
+  assert.equal(
+    app.sockets[0].sent.length,
+    sentBeforeBoundaryMute + 1,
+    'muting on a unit boundary sends no extra silence',
+  );
+});
+
+test('muted Qwen manual profile does not send MiniCPM frame-only input', async () => {
+  const app = shell('qwen3-turn');
+  await app.ui.startSession();
+  app.ui.toggleMute();
+  app.ui.setPendingFrame('FRAME');
+  app.ui.flushCapture();
+  assert.equal(app.sockets[0].sent.some(e => e.type === 'input_audio_buffer.append'), false);
 });
