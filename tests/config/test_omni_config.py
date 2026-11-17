@@ -1262,6 +1262,24 @@ def test_mrv2_config_is_allowed_on_npu_and_xpu(platform, stage_override):
         assert deploy.model_runner == "v2"
 
 
+# PersonaPlex's talker is V1-only on every platform (excluded from the 0.34 move).
+_V1_ONLY_DEPLOYS = {"personaplex_duplex_mrv2.yaml"}
+
+
+@pytest.mark.parametrize(
+    "deploy_path",
+    [p for p in sorted(_DEPLOY_DIR.glob("*.yaml")) if p.name not in _V1_ONLY_DEPLOYS],
+    ids=lambda p: p.name,
+)
+def test_xpu_platform_sections_do_not_pin_model_runner_v1(deploy_path):
+    # vLLM 0.34 removed Model Runner V1, so an XPU V1 pin would only make the
+    # stage fail at startup instead of running on the XPU V2 runners.
+    deploy = load_deploy_config(deploy_path)
+    xpu = (deploy.platforms or {}).get("xpu") or {}
+    assert xpu.get("model_runner") != "v1"
+    assert all(stage.get("model_runner") != "v1" for stage in xpu.get("stages", []))
+
+
 def test_fish_omni_npu_profile_is_mrv2_tp_ep():
     deploy = _apply_platform_overrides(load_deploy_config(_DEPLOY_DIR / "fish_omni.yaml"), platform="npu")
     stage0, stage1 = deploy.stages
@@ -1351,9 +1369,10 @@ def test_qwen3_tts_default_profile_is_experimental_mrv2_with_v1_platform_fallbac
     stages = merge_pipeline_deploy(pipeline, load_deploy_config(deploy_path))
     assert all(stage.yaml_engine_args["use_v2_model_runner"] is True for stage in stages)
 
-    for platform in ("cuda", "npu"):
+    # XPU has no V1 fallback: vLLM 0.34 removed Model Runner V1.
+    for platform in ("cuda", "npu", "xpu"):
         assert _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform).model_runner == "v2"
-    for platform in ("xpu", "rocm", "musa"):
+    for platform in ("rocm", "musa"):
         assert _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform).model_runner == "v1"
 
 
