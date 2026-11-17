@@ -285,7 +285,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # A stage that cannot replay drops a preempted request (#9249): keep the
         # expected growth of admitted requests in reserve when admitting more.
         self._preemption_reserve = (
-            install_preemption_reserve(self.kv_cache_manager) if self.recompute_preemption_fails else None
+            install_preemption_reserve(self.kv_cache_manager, self._scheduler_reserved_blocks)
+            if self.recompute_preemption_fails
+            else None
         )
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
@@ -2488,6 +2490,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 )
             )
         overflow.clear()
+
+    def _scheduler_reserved_blocks(self, request: Request) -> int:
+        """Per-request term of vLLM's ``_inflight_prefill_reserved_blocks`` (the async-load ``reserved_blocks``).
+
+        Must match it: the blocks an in-flight prefill still needs, including speculative-decode slots.
+        """
+        return self._request_remaining_blocks(request) if request in self._inflight_prefills else 0
 
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False

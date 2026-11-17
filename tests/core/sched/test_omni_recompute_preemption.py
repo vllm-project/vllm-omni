@@ -25,6 +25,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 
 from vllm_omni.core.sched import omni_ar_scheduler
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+from vllm_omni.core.sched.preemption_reserve import PreemptionReserve
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -201,17 +202,17 @@ def test_prefix_cache_reset_scope_is_cleared_on_error(monkeypatch):
 
 def _reserve_scheduler(monkeypatch, reserve=True, **kwargs):
     if not reserve:  # control: the same scheduler without the admission reserve
-        monkeypatch.setattr(omni_ar_scheduler, "install_preemption_reserve", lambda manager: None)
+        monkeypatch.setattr(omni_ar_scheduler, "install_preemption_reserve", lambda *args: None)
     kwargs.setdefault("max_model_len", 256)
     kwargs.setdefault("max_num_seqs", 8)
     kwargs.setdefault("max_num_batched_tokens", 256)
     return _scheduler(**kwargs)
 
 
-def _request(rid, prompt_len, max_tokens, block_hasher=None):
+def _request(rid, prompt_len, max_tokens, block_hasher=None, first_token=2):
     request = Request(
         rid,
-        list(range(2, 2 + prompt_len)),
+        list(range(first_token, first_token + prompt_len)),
         SamplingParams(max_tokens=max_tokens, ignore_eos=True),
         None,
         block_hasher=block_hasher,
@@ -352,6 +353,59 @@ def test_reserve_passes_resumable_sessions_through_untracked(monkeypatch):
     # 90 free - 10 for s: only fits without a reserve for it.
     assert manager.allocate_slots(session, 160, reserved_blocks=80) is not None
     assert "s" not in reserve.admitted
+
+
+@pytest.mark.parametrize("num_blocks, admitted", [(25, True), (24, False)])
+def test_reserve_counts_an_in_flight_prefill_once_with_an_async_kv_load(monkeypatch, num_blocks, admitted):
+    # A is in chunked prefill (160-token prompt, 16 tokens per step); B then loads 32 of its 48 tokens
+    # asynchronously. When B is considered, A holds 2 blocks. The scheduler reserves A's unfinished prompt
+    # (10 - 2 = 8 blocks); the admission reserve expects A to need 20 - 2 = 18, so only 10 more are added for
+    # A, plus 2 for B's own growth. B needs 2 blocks for its loaded tokens: 8 + 10 + 2 + 2 = 22 free, i.e. 25
+    # blocks with the null block and A's 2. Adding both reservations for A would need 30 free (33 blocks).
+    scheduler = _reserve_scheduler(monkeypatch, num_blocks=num_blocks, max_model_len=512, max_num_seqs=4)
+    scheduler.scheduler_config.long_prefill_token_threshold = 16  # applies while B is also waiting
+    lookups = []
+
+    def matched_tokens(request, _):
+        if request.request_id != "b":
+            return 0, False
+        lookups.append(request.request_id)
+        return (None, False) if len(lookups) == 1 else (32, True)  # B's lookup resolves in the second step
+
+    connector = Mock(spec=KVConnectorBase_V1)
+    connector.requires_kv_delivery = False
+    connector.has_pending_block_frees.return_value = False
+    connector.get_num_new_matched_tokens.side_effect = matched_tokens
+    connector.get_loaded_kv_cache_group_ids.return_value = ()
+    connector.request_finished.return_value = (False, None)
+    connector.build_connector_meta.return_value = None
+    connector.take_events.return_value = ()
+    connector.get_kv_connector_stats.return_value = None
+    scheduler.connector = connector
+    a, b = _request("a", 160, 160), _request("b", 48, 16, first_token=1000)
+    scheduler.add_request(a)
+    scheduler.add_request(b)
+    _step(scheduler, scheduler.schedule())
+    assert a.num_computed_tokens < a.num_prompt_tokens and b.status == RequestStatus.WAITING
+    scheduler.schedule()
+    assert b.status == (RequestStatus.WAITING_FOR_REMOTE_KVS if admitted else RequestStatus.WAITING)
+
+
+@pytest.mark.parametrize(
+    "scheduler_blocks, caller_blocks, added",
+    [
+        (8, 9, 10),  # the caller covers 8 of the 18 blocks A needs: add the other 10
+        (20, 21, 0),  # the caller covers more than A needs (speculative-decode slots): add nothing
+        (8, 3, 15),  # a caller reservation smaller than its in-flight terms is never undercut
+        (0, 5, 18),  # A is not one of the caller's in-flight requests
+    ],
+)
+def test_reserve_adds_only_what_the_callers_reservation_does_not_cover(scheduler_blocks, caller_blocks, added):
+    # A (160-token prompt, max_tokens 160) is expected to hold 20 blocks and holds 2, so it needs 18.
+    reserve = PreemptionReserve(16, 512, {"a": [None, None]}, lambda request: scheduler_blocks)
+    reserve.admitted["a"] = (_request("a", 160, 160), 160)
+    assert reserve.reserved_blocks(caller_blocks) == added
+    assert reserve.reserved_blocks() == 18
 
 
 @pytest.mark.parametrize("mode, sliding_window", [("allow", None), ("fail", 32)])

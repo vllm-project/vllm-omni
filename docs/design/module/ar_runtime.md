@@ -139,8 +139,10 @@ A stage declared `recompute_preemption: fail` ends a preempted request with
 `OmniARScheduler` wraps `allocate_slots` (`core/sched/preemption_reserve.py`):
 a request that is not yet admitted gets blocks only if the free pool also
 covers, through `reserved_blocks`, what every admitted request may still need
-(the rest of its prompt and its expected growth) plus its own. Requests that do
-not fit stay waiting. Expected growth is the largest growth of a request that
+(the rest of its prompt and its expected growth) plus its own; a request the
+scheduler's own `reserved_blocks` already covers (an in-flight prefill during an
+async KV load) is counted once, at the larger of the two. Requests that do not
+fit stay waiting. Expected growth is the largest growth of a request that
 finished normally, capped by `max_tokens`, or `max_tokens` until one finishes;
 a request that grows beyond it can still be preempted. Running requests,
 resumable sessions and the first admission into an empty stage are not held
