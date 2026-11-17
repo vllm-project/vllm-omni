@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CPU bytewise gates against the interpolation frozen at 32e1a2dba."""
+"""CPU bytewise gates for global and rank-local position interpolation."""
 
 import ast
 import importlib.util
@@ -155,30 +155,30 @@ def test_large_bf16_representative_grid(mocker):
         torch.set_num_threads(threads)
 
 
-def sp_namespace(mocker, monkeypatch, rank):
+def extracted_module(*nodes: ast.stmt) -> ast.Module:
+    """Wrap extracted statements, keeping annotations lazy as in their own module."""
+    future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+    return ast.fix_missing_locations(ast.Module(body=[future, *nodes], type_ignores=[]))
+
+
+def sp_namespace(mocker, rank):
     path = Path(__file__).resolve().parents[4] / "vllm_omni/diffusion/models/minimax_h3/vision_sp.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
     method = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "forward_sp8")
     parallel = load_module()
     namespace = {
         "torch": torch,
-        "dist": parallel.dist,
         "build_vision_plan": parallel.build_vision_plan,
-        "vision_permutation_enabled": parallel.vision_permutation_enabled,
         "VisionAllToAll": lambda *args, **kwargs: mocker.Mock(rank=rank),
         "gather_vision_outputs": lambda result, *args, **kwargs: result,
     }
-    exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), namespace)
-    monkeypatch.setattr(parallel.dist, "all_reduce", lambda status, **kwargs: None)
+    exec(compile(extracted_module(method), str(path), "exec"), namespace)
     return namespace
 
 
-@pytest.mark.parametrize("enabled,verify", [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize("rank", [0, 7])
-def test_sp8_position_dispatch(mocker, monkeypatch, enabled, verify, rank):
-    monkeypatch.setenv("VLLM_OMNI_H3_VISION_LOCAL_POS", str(int(enabled)))
-    monkeypatch.setenv("VLLM_OMNI_H3_VISION_LOCAL_POS_VERIFY", str(int(verify)))
-    namespace = sp_namespace(mocker, monkeypatch, rank)
+def test_sp8_position_dispatches_only_local_tokens(mocker, rank):
+    namespace = sp_namespace(mocker, rank)
     model = mocker.Mock(
         pos_embed=torch.nn.Embedding(49, 4),
         num_grid_per_side=7,
@@ -202,30 +202,4 @@ def test_sp8_position_dispatch(mocker, monkeypatch, enabled, verify, rank):
     ids = namespace["build_vision_plan"]((12, 12), 8).rank_token_indices[rank]
     assert_bytes(result, reference_interpolate(model, grid)[list(ids)])
     assert deep == []
-    assert calls[0] == ({"token_indices": ids} if enabled else {})
-    assert len(calls) == 1 + int(verify)
-
-
-def test_sp8_remote_rank_failure_is_propagated(mocker, monkeypatch):
-    monkeypatch.setenv("VLLM_OMNI_H3_VISION_LOCAL_POS", "1")
-    monkeypatch.setenv("VLLM_OMNI_H3_VISION_LOCAL_POS_VERIFY", "1")
-    namespace = sp_namespace(mocker, monkeypatch, 0)
-    monkeypatch.setattr(namespace["dist"], "all_reduce", lambda status, **kwargs: status.fill_(1))
-    model = mocker.Mock(
-        config=mocker.Mock(num_heads=16),
-        spatial_merge_size=2,
-        patch_embed=lambda pixels: pixels,
-        fast_pos_embed_interpolate=lambda grid, **kwargs: torch.zeros(4, 2),
-    )
-    with pytest.raises(RuntimeError, match="changed bytes"):
-        namespace["forward_sp8"](model, torch.zeros(32, 2), torch.tensor([[1, 4, 8]]), group=None)
-
-
-@pytest.mark.parametrize("name", ["VLLM_OMNI_H3_VISION_LOCAL_POS", "VLLM_OMNI_H3_VISION_LOCAL_POS_VERIFY"])
-def test_local_position_flags_default_off_and_strict(monkeypatch, name):
-    parallel = load_module()
-    monkeypatch.delenv(name, raising=False)
-    assert not parallel.vision_permutation_enabled(name)
-    monkeypatch.setenv(name, "yes")
-    with pytest.raises(ValueError, match="must be 0 or 1"):
-        parallel.vision_permutation_enabled(name)
+    assert calls == [{"token_indices": ids}]

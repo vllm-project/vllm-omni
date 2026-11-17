@@ -34,15 +34,12 @@ def _collective_worker(rank, rendezvous):
             plan = module.build_vision_plan(lengths, 2, num_heads=4)
             full = torch.arange(sum(lengths) * 8, dtype=torch.float32).reshape(sum(lengths), 4, 2)
             local = full[list(plan.rank_token_indices[rank])]
-            for use_permutation in (False, True):
-                transport = module.VisionAllToAll(
-                    plan, group=dist.group.WORLD, use_permutation=use_permutation, verify_permutation=True
-                )
-                heads = transport.to_heads(local)
-                torch.testing.assert_close(heads, full[:, rank * 2 : (rank + 1) * 2], rtol=0, atol=0)
-                restored = transport.to_tokens(heads)
-                torch.testing.assert_close(restored, local, rtol=0, atol=0)
-                assert transport.calls == 2
+            transport = module.VisionAllToAll(plan, group=dist.group.WORLD)
+            heads = transport.to_heads(local)
+            torch.testing.assert_close(heads, full[:, rank * 2 : (rank + 1) * 2], rtol=0, atol=0)
+            restored = transport.to_tokens(heads)
+            torch.testing.assert_close(restored, local, rtol=0, atol=0)
+            assert transport.calls == 2
             final = torch.arange(sum(lengths) // 4 * 6, dtype=torch.float32).reshape(sum(lengths) // 4, 6)
             ids = list(plan.rank_merger_indices[rank])
             gathered, deepstack = module.gather_vision_outputs(
@@ -125,7 +122,9 @@ def test_empty_rank_shard_keeps_explicit_hidden_dimension(mocker):
     tree = ast.parse(path.read_text())
     function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "attention_sp8")
     namespace = {"torch": torch, "segment_attention": lambda q, k, v: v}
-    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
+    future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+    module = ast.fix_missing_locations(ast.Module(body=[future, function], type_ignores=[]))
+    exec(compile(module, str(path), "exec"), namespace)
     attention = mocker.Mock(num_heads=16, head_dim=2, qkv=lambda x: x.new_empty((0, 96)), proj=lambda x: x)
     transport = mocker.Mock(
         plan=mocker.Mock(segment_lengths=(4,)),
@@ -135,3 +134,35 @@ def test_empty_rank_shard_keeps_explicit_hidden_dimension(mocker):
     hidden = torch.empty(0, 32)
     result = namespace["attention_sp8"](attention, hidden, (None, None), transport, lambda q, k, c, s: (q, k))
     assert result.shape == (0, 32)
+
+
+def load_segment_attention():
+    # Load the real short-segment body without importing the serving dependency tree.
+    import ast
+
+    path = Path(__file__).resolve().parents[4] / "vllm_omni/diffusion/models/minimax_h3/vision_sp.py"
+    tree = ast.parse(path.read_text())
+    nodes = [
+        node
+        for node in tree.body
+        if (isinstance(node, ast.FunctionDef) and node.name == "segment_attention")
+        or (isinstance(node, ast.Assign) and getattr(node.targets[0], "id", None) == "_MIN_SHORT_SEGMENT_HEADS")
+    ]
+    namespace = {"torch": torch, "F": torch.nn.functional}
+    future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+    exec(
+        compile(ast.fix_missing_locations(ast.Module(body=[future, *nodes], type_ignores=[])), str(path), "exec"),
+        namespace,
+    )
+    return namespace["segment_attention"]
+
+
+@pytest.mark.parametrize("heads", [1, 2, 4])
+@pytest.mark.parametrize("seq_len", [7, 1024])
+def test_short_segment_head_tiling_preserves_values(heads, seq_len):
+    generator = torch.Generator().manual_seed(20261118)
+    q, k, v = (torch.randn(1, heads, seq_len, 16, generator=generator, dtype=torch.float32) for _ in range(3))
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+    actual = load_segment_attention()(q, k, v)
+    assert actual.shape == expected.shape
+    assert torch.equal(actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8))

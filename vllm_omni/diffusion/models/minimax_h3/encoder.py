@@ -51,6 +51,8 @@ from vllm_omni.diffusion.offloader.module_residency import (
 )
 
 if TYPE_CHECKING:
+    import torch.distributed as dist
+
     from .vision_parallel import VisionAllToAll
 
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
@@ -677,6 +679,9 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
                 for _ in range(len(config.deepstack_visual_indexes))
             ]
         )
+        # Set by MiniMaxH3Qwen3VLEncoder when the SP8 opt-in is enabled; ``None``
+        # keeps the replicated vision path.
+        self.sequence_parallel_group: dist.ProcessGroup | None = None
 
     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
         merge_size = self.spatial_merge_size
@@ -793,7 +798,7 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
         hidden_states: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        group = getattr(self, "sequence_parallel_group", None)
+        group = self.sequence_parallel_group
         if group is not None:
             from .vision_sp import forward_sp8
 
@@ -1232,12 +1237,11 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             self.quant_config = quant_config
         _validate_encoder_quant_config(quant_config)
         dtype = torch.bfloat16
+        vision_sp_size = os.environ.get("VLLM_OMNI_H3_VISION_SP_SIZE", "0")
         self.vision = MiniMaxH3Qwen3VLVisionModel(config.vision_config)
         from .vision_parallel import resolve_vision_sp_group
 
-        self.vision.sequence_parallel_group = resolve_vision_sp_group(
-            os.environ.get("VLLM_OMNI_H3_VISION_SP_SIZE", "0"), encoder_group
-        )
+        self.vision.sequence_parallel_group = resolve_vision_sp_group(vision_sp_size, encoder_group)
         self.vision.to(dtype=dtype)
         self.text_model = MiniMaxH3Qwen3VLTextModel(
             encoder_group,
@@ -1252,7 +1256,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, text_encoder_tp_size=%d, vision_sp=%s",
             MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER,
             self._tp_size,
-            os.environ.get("VLLM_OMNI_H3_VISION_SP_SIZE", "0"),
+            vision_sp_size,
         )
 
     @property

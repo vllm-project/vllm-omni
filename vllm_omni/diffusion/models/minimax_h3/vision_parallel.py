@@ -6,8 +6,9 @@ Padding is removed before attention, never masked
 into the model's sequence. Equal-sized A2A avoids variable-split HCCL calls.
 """
 
-import os
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Protocol
 
 import torch
 import torch.distributed as dist
@@ -18,10 +19,20 @@ class VisionShardPlan:
     segment_lengths: tuple[int, ...]
     rank_token_indices: tuple[tuple[int, ...], ...]
     rank_merger_indices: tuple[tuple[int, ...], ...]
-    heads_per_rank: int
 
 
-def build_vision_plan(lengths, sp_size, *, num_heads=16, merge_size=2):
+class _EncoderGroup(Protocol):
+    world_size: int
+    device_group: dist.ProcessGroup
+
+
+def build_vision_plan(
+    lengths: Sequence[int],
+    sp_size: int,
+    *,
+    num_heads: int = 16,
+    merge_size: int = 2,
+) -> VisionShardPlan:
     """Partition each segment into contiguous whole spatial merger groups.
 
     Uneven/empty shards are explicit. This does not imply that padded attention
@@ -47,10 +58,10 @@ def build_vision_plan(lengths, sp_size, *, num_heads=16, merge_size=2):
             mergers[rank].extend(range(start // unit, stop // unit))
             start = stop
         offset += length
-    return VisionShardPlan(lengths, tuple(map(tuple, tokens)), tuple(map(tuple, mergers)), num_heads // sp_size)
+    return VisionShardPlan(lengths, tuple(map(tuple, tokens)), tuple(map(tuple, mergers)))
 
 
-def pack_heads(local, size, capacity):
+def pack_heads(local: torch.Tensor, size: int, capacity: int) -> torch.Tensor:
     count, heads, dim = local.shape
     if heads % size or count > capacity:
         raise ValueError("invalid head split or capacity")
@@ -59,65 +70,39 @@ def pack_heads(local, size, capacity):
     return output
 
 
-def unpack_tokens(received, plan, *, token_indices=None, permutation=None):
-    if permutation is not None:
-        return received.flatten(0, 1).index_select(0, permutation)
-    output = received.new_empty((sum(plan.segment_lengths), *received.shape[2:]))
-    for rank, indices in enumerate(plan.rank_token_indices):
-        ids = (
-            torch.tensor(indices, dtype=torch.long, device=received.device)
-            if token_indices is None
-            else token_indices[rank]
-        )
-        output.index_copy_(0, ids, received[rank, : len(indices)])
-    return output
+def unpack_tokens(received: torch.Tensor, permutation: torch.Tensor) -> torch.Tensor:
+    return received.flatten(0, 1).index_select(0, permutation)
 
 
-def pack_tokens(full, plan, *, token_indices=None, permutation=None, padding_mask=None):
+def pack_tokens(
+    full: torch.Tensor,
+    plan: VisionShardPlan,
+    permutation: torch.Tensor,
+    padding_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     capacity = max(1, max(map(len, plan.rank_token_indices)))
-    if permutation is not None:
-        shape = (len(plan.rank_token_indices), capacity, *full.shape[1:])
-        if full.shape[0] == 0:
-            return full.new_zeros(shape)
-        packed = full.index_select(0, permutation)
-        if padding_mask is not None:
-            packed.masked_fill_(padding_mask.reshape(-1, *([1] * (full.ndim - 1))), 0)
-        return packed.reshape(shape)
-    output = full.new_zeros((len(plan.rank_token_indices), capacity, *full.shape[1:]))
-    for rank, indices in enumerate(plan.rank_token_indices):
-        ids = (
-            torch.tensor(indices, dtype=torch.long, device=full.device)
-            if token_indices is None
-            else token_indices[rank]
-        )
-        output[rank, : len(indices)] = full.index_select(0, ids)
-    return output
+    shape = (len(plan.rank_token_indices), capacity, *full.shape[1:])
+    if full.shape[0] == 0:
+        return full.new_zeros(shape)
+    packed = full.index_select(0, permutation)
+    if padding_mask is not None:
+        packed.masked_fill_(padding_mask.reshape(-1, *([1] * (full.ndim - 1))), 0)
+    return packed.reshape(shape)
 
 
-def unpack_heads(received, count):
+def unpack_heads(received: torch.Tensor, count: int) -> torch.Tensor:
     size, capacity, heads, dim = received.shape
     if count > capacity:
         raise ValueError("local count exceeds capacity")
     return received[:, :count].permute(1, 0, 2, 3).reshape(count, size * heads, dim).contiguous()
 
 
-def vision_permutation_enabled(name="VLLM_OMNI_H3_VISION_PERMUTE"):
-    """Keep the candidate opt-in until device correctness and performance gates pass."""
-    value = os.environ.get(name, "0")
-    if value not in ("0", "1"):
-        raise ValueError(f"{name} must be 0 or 1")
-    return value == "1"
-
-
 class VisionAllToAll:
-    """Explicit-group transport; callers coordinate validation failures."""
+    """Permutation-backed token/head transport on an explicit process group."""
 
-    def __init__(self, plan, *, group=None, use_permutation=False, verify_permutation=False):
+    def __init__(self, plan: VisionShardPlan, *, group: dist.ProcessGroup | None = None) -> None:
         self.plan = plan
         self.group = group
-        self.use_permutation = use_permutation
-        self.verify_permutation = verify_permutation
-        self._verified_layouts: set[tuple] = set()
         self.rank = dist.get_rank(group=group)
         self.size = dist.get_world_size(group=group)
         if self.size != len(plan.rank_token_indices):
@@ -127,12 +112,10 @@ class VisionAllToAll:
         self.sent_bytes = 0
         # One transport belongs to one vision forward; never retain activations
         # or indices across requests with different segment layouts.
-        self._token_indices_device: torch.device | None = None
-        self._token_indices: tuple[torch.Tensor, ...] = ()
         self._permutation_device: torch.device | None = None
         self._permutation: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None
 
-    def _permutation_for(self, device):
+    def _permutation_for(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         if device != self._permutation_device:
             inverse = [0] * sum(self.plan.segment_lengths)
             source = []
@@ -152,69 +135,26 @@ class VisionAllToAll:
         assert self._permutation is not None
         return self._permutation
 
-    def _indices_for(self, device):
-        if device != self._token_indices_device:
-            self._token_indices = tuple(
-                torch.tensor(indices, dtype=torch.long, device=device) for indices in self.plan.rank_token_indices
-            )
-            self._token_indices_device = device
-        return self._token_indices
-
-    def exchange(self, packed):
+    def exchange(self, packed: torch.Tensor) -> torch.Tensor:
+        packed = packed.contiguous()
         received = torch.empty_like(packed)
-        dist.all_to_all_single(received, packed.contiguous(), group=self.group)
+        dist.all_to_all_single(received, packed, group=self.group)
         self.calls += 1
         self.sent_bytes += packed.numel() * packed.element_size()
         return received
 
-    def _verify_layout(self, operation, value, result):
-        # Diagnostic only: never enable this synchronization in performance runs.
-        key = (operation, tuple(value.shape), value.stride(), value.dtype, value.device)
-        if not self.verify_permutation:
-            return
-        failed = False
-        if key not in self._verified_layouts:
-            indices = self._indices_for(value.device)
-            reference = (
-                unpack_tokens(value, self.plan, token_indices=indices)
-                if operation == "unpack"
-                else pack_tokens(value, self.plan, token_indices=indices)
-            )
-            failed = result.stride() != reference.stride() or not torch.equal(
-                result.contiguous().view(torch.uint8), reference.contiguous().view(torch.uint8)
-            )
-        # Every rank participates on every diagnostic call, even when its shape
-        # was checked before. Uneven shards can have different cache keys.
-        status = torch.tensor([int(failed)], dtype=torch.int32, device=value.device)
-        dist.all_reduce(status, op=dist.ReduceOp.MAX, group=self.group)
-        if status.item():
-            raise RuntimeError(f"vision {operation} permutation changed bytes or strides")
-        self._verified_layouts.add(key)
+    def to_heads(self, local: torch.Tensor) -> torch.Tensor:
+        inverse, _, _ = self._permutation_for(local.device)
+        received = self.exchange(pack_heads(local, self.size, self.capacity))
+        return unpack_tokens(received, inverse)
 
-    def to_heads(self, local):
-        if self.use_permutation:
-            inverse, _, _ = self._permutation_for(local.device)
-            received = self.exchange(pack_heads(local, self.size, self.capacity))
-            result = unpack_tokens(received, self.plan, permutation=inverse)
-            self._verify_layout("unpack", received, result)
-            return result
-        return unpack_tokens(
-            self.exchange(pack_heads(local, self.size, self.capacity)),
-            self.plan,
-            token_indices=self._indices_for(local.device),
-        )
-
-    def to_tokens(self, full):
-        if self.use_permutation:
-            _, source, padding = self._permutation_for(full.device)
-            packed = pack_tokens(full, self.plan, permutation=source, padding_mask=padding)
-            self._verify_layout("pack", full, packed)
-            return unpack_heads(self.exchange(packed), len(self.plan.rank_token_indices[self.rank]))
-        packed = pack_tokens(full, self.plan, token_indices=self._indices_for(full.device))
+    def to_tokens(self, full: torch.Tensor) -> torch.Tensor:
+        _, source, padding = self._permutation_for(full.device)
+        packed = pack_tokens(full, self.plan, source, padding_mask=padding)
         return unpack_heads(self.exchange(packed), len(self.plan.rank_token_indices[self.rank]))
 
 
-def resolve_vision_sp_group(value, encoder_group):
+def resolve_vision_sp_group(value: str, encoder_group: _EncoderGroup | None) -> dist.ProcessGroup | None:
     """Serve only the validated opt-in SP8/TP8 layout; never silently fall back."""
     if value == "0":
         return None
@@ -225,12 +165,18 @@ def resolve_vision_sp_group(value, encoder_group):
     return encoder_group.device_group
 
 
-def gather_vision_outputs(value, plan, *, group):
+def gather_vision_outputs(
+    value: tuple[torch.Tensor, list[torch.Tensor]],
+    plan: VisionShardPlan,
+    *,
+    group: dist.ProcessGroup,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """Replicate final + DeepStack in original global merger order on every rank."""
     tensors = [value[0], *value[1]]
     capacity = max(1, max(map(len, plan.rank_merger_indices)))
     packed = tensors[0].new_zeros((len(tensors), capacity, tensors[0].shape[-1]))
-    packed[:, : tensors[0].shape[0]] = torch.stack(tensors)
+    for index, tensor in enumerate(tensors):
+        packed[index, : tensor.shape[0]] = tensor
     received = [torch.empty_like(packed) for _ in plan.rank_merger_indices]
     dist.all_gather(received, packed, group=group)
     total = sum(map(len, plan.rank_merger_indices))

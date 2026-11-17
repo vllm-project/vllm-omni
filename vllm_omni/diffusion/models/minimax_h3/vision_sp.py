@@ -3,61 +3,55 @@
 """Opt-in SP8 vision, preserving full replicated downstream output contracts.
 
 Batch is deliberately disabled. Weights and module boundaries remain owned by
-encoder.py, retaining its offloader hooks. This path has been validated on A5 fixed-six
-inputs; A2 and other shapes still require their own bitwise runtime validation.
+encoder.py, retaining its offloader hooks. Expanding the supported input layouts
+requires model-level bitwise validation on the target NPU.
 """
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from .vision_parallel import VisionAllToAll, build_vision_plan, gather_vision_outputs, vision_permutation_enabled
+from .vision_parallel import VisionAllToAll, build_vision_plan, gather_vision_outputs
+
+if TYPE_CHECKING:
+    from .encoder import MiniMaxH3Qwen3VLVisionAttention, MiniMaxH3Qwen3VLVisionModel
+
+# The short-segment path was validated with at least this many heads; below it
+# the head shard is tiled up and sliced back. Tiled heads are independent copies,
+# so the retained rows are unchanged.
+_MIN_SHORT_SEGMENT_HEADS = 8
 
 
-def segment_attention(q, k, v):
-    """Preserve the A5 short-segment SDPA head shape validated by the probe."""
+def segment_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Run SDPA per segment, padding short segments to the validated head count."""
     heads = q.shape[1]
-    if q.shape[2] <= 1024 and heads < 8:
-        inputs = [t.repeat(1, 8 // heads, 1, 1).transpose(1, 2).contiguous().transpose(1, 2) for t in (q, k, v)]
+    if q.shape[2] <= 1024 and heads < _MIN_SHORT_SEGMENT_HEADS:
+        repeat = -(-_MIN_SHORT_SEGMENT_HEADS // heads)
+        inputs = [t.repeat(1, repeat, 1, 1).transpose(1, 2).contiguous().transpose(1, 2) for t in (q, k, v)]
         return F.scaled_dot_product_attention(*inputs, dropout_p=0.0, is_causal=False)[:, :heads]
     return F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
 
 
-def forward_sp8(model, pixels, grid, *, group):
+def forward_sp8(
+    model: MiniMaxH3Qwen3VLVisionModel,
+    pixels: torch.Tensor,
+    grid: torch.Tensor,
+    *,
+    group: dist.ProcessGroup,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """Shard whole spatial merger groups, exchange heads, then gather all outputs."""
     lengths = tuple(h * w for t, h, w in grid.cpu().tolist() for _ in range(t))
     plan = build_vision_plan(lengths, 8, num_heads=model.config.num_heads, merge_size=model.spatial_merge_size)
-    transport = VisionAllToAll(
-        plan,
-        group=group,
-        use_permutation=vision_permutation_enabled(),
-        verify_permutation=vision_permutation_enabled("VLLM_OMNI_H3_VISION_PERMUTE_VERIFY"),
-    )
+    transport = VisionAllToAll(plan, group=group)
     ids = plan.rank_token_indices[transport.rank]
     select = torch.tensor(ids, dtype=torch.long, device=pixels.device)
     hidden = model.patch_embed(pixels.index_select(0, select))
-    local_pos = vision_permutation_enabled("VLLM_OMNI_H3_VISION_LOCAL_POS")
-    verify_pos = vision_permutation_enabled("VLLM_OMNI_H3_VISION_LOCAL_POS_VERIFY")
-    position = (
-        model.fast_pos_embed_interpolate(grid, token_indices=ids)
-        if local_pos
-        else model.fast_pos_embed_interpolate(grid).index_select(0, select)
-    )
-    if verify_pos:
-        if not local_pos:
-            raise ValueError("VLLM_OMNI_H3_VISION_LOCAL_POS_VERIFY requires VLLM_OMNI_H3_VISION_LOCAL_POS=1")
-        reference = model.fast_pos_embed_interpolate(grid).index_select(0, select)
-        failed = (
-            position.shape != reference.shape
-            or position.dtype != reference.dtype
-            or position.stride() != reference.stride()
-            or not torch.equal(position.contiguous().view(torch.uint8), reference.contiguous().view(torch.uint8))
-        )
-        # All ranks fail together before entering attention collectives.
-        status = torch.tensor([int(failed)], dtype=torch.int32, device=position.device)
-        dist.all_reduce(status, op=dist.ReduceOp.MAX, group=group)
-        if status.item():
-            raise RuntimeError("vision local position interpolation changed bytes or strides")
+    position = model.fast_pos_embed_interpolate(grid, token_indices=ids)
     hidden = hidden + position
     rope = model.rot_pos_emb(grid).reshape(sum(lengths), -1)
     emb = torch.cat((rope, rope), dim=-1)
@@ -73,7 +67,13 @@ def forward_sp8(model, pixels, grid, *, group):
     return gather_vision_outputs((final, deepstack), plan, group=group)
 
 
-def attention_sp8(attention, hidden, position_embeddings, transport, rotate):
+def attention_sp8(
+    attention: MiniMaxH3Qwen3VLVisionAttention,
+    hidden: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    transport: VisionAllToAll,
+    rotate: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
+) -> torch.Tensor:
     """Attention body called inside the original offloader-managed block."""
     qkv = attention.qkv(hidden)
     q, k, v = qkv.reshape(hidden.shape[0], 3, attention.num_heads, attention.head_dim).permute(1, 0, 2, 3).unbind(0)
