@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Frontend rejection of unusable Qwen3-TTS Base requests (#3707, #3708)."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -15,11 +17,14 @@ from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
 from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import _ref_audio_wire_waveform
 from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_FUSED_PIPELINE, QWEN3_TTS_PIPELINE
-from vllm_omni.model_executor.models.qwen3_tts.prompt_checks import check_voice_clone_prompt
+from vllm_omni.model_executor.models.qwen3_tts.prompt_checks import _overlay, check_voice_clone_prompt
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+    PRECOMPUTED_REF_CODE_KEY,
     PRECOMPUTED_REF_IDS_KEY,
+    REF_AUDIO_CACHE_KEY,
     Qwen3TTSPromptEmbedsBuilder,
 )
+from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -40,6 +45,14 @@ def _prompt(**info):
 
 def _base(**info):
     return _prompt(task_type=["Base"], **info)
+
+
+def _buffered(prompt, **buffer):
+    return {**prompt, "model_intermediate_buffer": buffer}
+
+
+VCP_SPK = [{"ref_spk_embedding": SPK}]
+CACHED = {REF_AUDIO_CACHE_KEY: ["ref-artifacts"]}
 
 
 @pytest.mark.parametrize(
@@ -64,6 +77,56 @@ def _base(**info):
             id="list-ref-code",
         ),
         pytest.param(_base(speaker=[""], ref_text=TEXT), NO_REF, id="blank-speaker"),
+        # The Talker takes the speaker embedding from ref_audio when the prompt has none.
+        pytest.param(
+            _base(codes={PRECOMPUTED_REF_CODE_KEY: CODE}, ref_text=TEXT), NO_REF, id="precomputed-ref-code-only"
+        ),
+        pytest.param(
+            _base(codes={PRECOMPUTED_REF_CODE_KEY: torch.empty((0, 16))}, voice_clone_prompt=VCP_SPK, ref_text=TEXT),
+            NO_REF,
+            id="empty-precomputed-ref-code",
+        ),
+        pytest.param(
+            _base(codes={PRECOMPUTED_REF_CODE_KEY: CODE.tolist()}, voice_clone_prompt=VCP_SPK, ref_text=TEXT),
+            NO_REF,
+            id="flat-list-precomputed-ref-code",
+        ),
+        pytest.param(_base(**{REF_AUDIO_CACHE_KEY: [""]}, ref_text=TEXT), NO_REF, id="empty-cache-key"),
+        # The Talker's cached ref-audio artifacts hold no transcript.
+        pytest.param(_base(**CACHED), NO_TEXT, id="cache-key-no-ref-text"),
+        pytest.param(
+            _base(codes={PRECOMPUTED_REF_CODE_KEY: CODE}, voice_clone_prompt=VCP_SPK),
+            NO_TEXT,
+            id="precomputed-ref-code-no-ref-text",
+        ),
+        # Model Runner V2 serves the request from the buffer laid over additional_information.
+        pytest.param(
+            _buffered(_base(ref_audio=AUDIO, ref_text=TEXT), ref_audio=None), NO_REF, id="buffer-drops-ref-audio"
+        ),
+        pytest.param(
+            _buffered(_base(ref_audio=AUDIO, ref_text=TEXT), ref_text=["  "]), NO_TEXT, id="buffer-blanks-ref-text"
+        ),
+        pytest.param(
+            _buffered(_base(ref_audio=AUDIO, x_vector_only_mode=[True]), x_vector_only_mode=[False]),
+            NO_TEXT,
+            id="buffer-turns-off-xvec",
+        ),
+        # A plain streaming update replaces the buffer, so the reference must not live there alone.
+        pytest.param(_buffered(_base(ref_text=TEXT), ref_audio=AUDIO), NO_REF, id="buffer-only-ref-audio"),
+        pytest.param(
+            _buffered(_base(ref_audio=AUDIO, ref_text=TEXT), ref_audio=[(np.zeros(1024, dtype=np.float32), 24000)]),
+            NOT_INTACT,
+            id="buffer-array-ref-audio",
+        ),
+        # The buffer travels as a plain dict: even a top-level tensor arrives as a raw buffer list.
+        pytest.param(
+            _buffered(_base(ref_audio=AUDIO, ref_text=TEXT), codes={PRECOMPUTED_REF_CODE_KEY: CODE}),
+            NOT_INTACT,
+            id="buffer-tensor-ref-code",
+        ),
+        pytest.param(
+            _buffered(_base(ref_audio=AUDIO, ref_text=TEXT), ref_ids=IDS), NOT_INTACT, id="buffer-tensor-ref-ids"
+        ),
         pytest.param(_base(ref_audio=AUDIO), NO_TEXT, id="no-ref-text"),
         pytest.param(_base(ref_audio=AUDIO, ref_text=[""]), NO_TEXT, id="empty-ref-text"),
         pytest.param(_base(ref_audio=AUDIO, ref_text=["  \t"]), NO_TEXT, id="blank-ref-text"),
@@ -102,6 +165,11 @@ def _base(**info):
             _base(ref_audio=[(np.zeros(16000, dtype=np.float32), 16000)], ref_text=TEXT),
             NOT_INTACT,
             id="array-ref-audio",
+        ),
+        pytest.param(
+            _base(codes={PRECOMPUTED_REF_CODE_KEY: CODE.numpy()}, voice_clone_prompt=VCP_SPK, ref_text=TEXT),
+            NOT_INTACT,
+            id="array-precomputed-ref-code",
         ),
         pytest.param(_base(ref_audio=AUDIO, speaker=["clone"]), NO_TEXT, id="issue-3708-shape"),
         pytest.param(
@@ -147,6 +215,33 @@ _USABLE_BASE = [
         id="api-uploaded-audio",
     ),
     pytest.param(_base(speaker=["pre"], x_vector_only_mode=[False], ref_text=TEXT), id="api-precomputed"),
+    # Offline shapes the Talker serves without ref_audio.
+    pytest.param(
+        _base(codes={PRECOMPUTED_REF_CODE_KEY: CODE}, voice_clone_prompt=VCP_SPK, ref_text=TEXT),
+        id="icl-precomputed-ref-code",
+    ),
+    pytest.param(
+        # The Talker unwraps one list level, as it does for ref ids.
+        _base(codes={PRECOMPUTED_REF_CODE_KEY: [CODE.tolist()]}, voice_clone_prompt=VCP_SPK, ref_text=TEXT),
+        id="icl-list-precomputed-ref-code",
+    ),
+    pytest.param(_base(**CACHED, ref_text=TEXT), id="icl-cached-artifacts"),
+    pytest.param(_base(**CACHED, x_vector_only_mode=[True]), id="xvec-cached-artifacts"),
+    pytest.param(
+        _buffered(_base(ref_audio=AUDIO, ref_text=TEXT), ref_text=["Other words."], codes={"audio": CODE}),
+        id="buffer-keeps-reference",
+    ),
+    # Both runners serve these as their merged task; a plain streaming update falls back to the info's.
+    pytest.param(_buffered(_prompt(), task_type=["Base"], ref_audio=AUDIO, ref_text=TEXT), id="buffer-sets-base-task"),
+    pytest.param(
+        _buffered(
+            _base(ref_audio=AUDIO, x_vector_only_mode=[True]),
+            task_type=["CustomVoice"],
+            speaker=["vivian"],
+            x_vector_only_mode=[False],
+        ),
+        id="buffer-sets-custom-voice-task",
+    ),
 ]
 # Not Base, or not a request with additional_information: never checked.
 _UNCHECKED = [
@@ -164,7 +259,7 @@ def test_passes_usable_or_unchecked_prompt(prompt):
     assert check_voice_clone_prompt(prompt, []) is prompt
 
 
-def _ipc(info):
+def _ipc_request(info, buffer=None):
     # The engine-core path: serialize, then the msgpack round trip of the core request.
     request = OmniEngineCoreRequest(
         request_id="r",
@@ -177,9 +272,21 @@ def _ipc(info):
         cache_salt=None,
         data_parallel_rank=None,
         additional_information=serialize_additional_information(info),
+        model_intermediate_buffer=buffer,
     )
-    decoded = MsgpackDecoder(OmniEngineCoreRequest).decode(MsgpackEncoder().encode(request))
-    return deserialize_additional_information(decoded.additional_information)
+    return MsgpackDecoder(OmniEngineCoreRequest).decode(MsgpackEncoder().encode(request))
+
+
+def _ipc(info):
+    return deserialize_additional_information(_ipc_request(info).additional_information)
+
+
+def _same(a, b):
+    if isinstance(a, torch.Tensor):
+        return isinstance(b, torch.Tensor) and torch.equal(a, b)
+    if isinstance(a, dict):
+        return isinstance(b, dict) and a.keys() == b.keys() and all(_same(a[k], b[k]) for k in a)
+    return a == b
 
 
 @pytest.mark.parametrize("prompt", _USABLE_BASE)
@@ -188,12 +295,70 @@ def test_accepted_base_prompts_reach_the_engine_intact(prompt):
     received = _ipc(info)
     assert received.keys() == info.keys()
     for key, value in info.items():
-        assert torch.equal(received[key], value) if isinstance(value, torch.Tensor) else received[key] == value, key
+        assert _same(value, received[key]), key
     check_voice_clone_prompt({**prompt, "additional_information": received}, [])
     ref_audio = received.get("ref_audio")
     if ref_audio is not None and not isinstance(ref_audio[0], str):
         # The Talker decodes an inline waveform without loading anything.
         object.__new__(Qwen3TTSPromptEmbedsBuilder).normalize_ref_audio(ref_audio[0])
+
+
+_BUFFERS = {
+    "drops-ref-audio": {"ref_audio": None},
+    "blanks-ref-text": {"ref_text": [""]},
+    "new-ref-text": {"ref_text": ["Other words."]},
+    "turns-off-xvec": {"x_vector_only_mode": [False]},
+    "merges-codes": {"codes": {"audio": CODE.tolist()}},
+    "replaces-vcp": {"voice_clone_prompt": {"icl_mode": True}},
+    "tensor-ref-code": {"codes": {PRECOMPUTED_REF_CODE_KEY: CODE}},
+    "tensor-ref-ids": {PRECOMPUTED_REF_IDS_KEY: IDS},
+}
+
+
+@pytest.mark.parametrize("buffer", list(_BUFFERS.values()), ids=list(_BUFFERS))
+@pytest.mark.parametrize(
+    "info",
+    [
+        {"ref_audio": AUDIO, "ref_text": TEXT},
+        {"ref_audio": AUDIO, "x_vector_only_mode": [True]},
+        {"voice_clone_prompt": VCP_SPK, "x_vector_only_mode": [True]},
+        {"codes": {PRECOMPUTED_REF_CODE_KEY: CODE}, "voice_clone_prompt": VCP_SPK, "ref_text": TEXT},
+    ],
+    ids=["icl", "xvec", "xvec-embedding", "icl-precomputed-ref-code"],
+)
+def test_buffer_check_matches_the_mrv2_talker_view(info, buffer):
+    # After the real engine-core round trip, Model Runner V2 builds the overlaid view, and the check
+    # accepts a buffered request only when that view still passes.
+    info = _base(**info)["additional_information"]
+    check_voice_clone_prompt({"additional_information": info}, [])
+    try:
+        check_voice_clone_prompt({"additional_information": info, "model_intermediate_buffer": buffer}, [])
+        accepted = True
+    except ValueError:
+        accepted = False
+    received = _ipc_request(info, buffer)
+    mrv2 = OmniIntermediateBuffer(1)
+    new_req = SimpleNamespace(
+        req_id="r",
+        prompt_embeds=None,
+        additional_information=received.additional_information,
+        model_intermediate_buffer=received.model_intermediate_buffer,
+        mm_features=None,
+        sampling_params=None,
+    )
+    mrv2.add_request(0, new_req)
+    talker_info = {k: v for k, v in mrv2.buffers[0].items() if k != "req_id"}
+    received_info = deserialize_additional_information(received.additional_information)
+    assert _same(_overlay(received_info, received.model_intermediate_buffer), talker_info)
+    try:
+        check_voice_clone_prompt({"additional_information": talker_info}, [])
+        served = True
+    except ValueError:
+        served = False
+    # A buffer tensor arrives as a raw buffer list, so the value the caller meant is lost even when
+    # the view still has another reference: always rejected.
+    values = [v for section in buffer.values() for v in (section.values() if isinstance(section, dict) else [section])]
+    assert accepted == (served and not any(isinstance(v, torch.Tensor) for v in values))
 
 
 @pytest.mark.parametrize("pipeline", [QWEN3_TTS_PIPELINE, QWEN3_TTS_FUSED_PIPELINE], ids=lambda p: p.model_type)
