@@ -3,6 +3,8 @@
 """FlowEncoderGraphs: shared startup arena, dynamic CUDA capture and NPU fallback."""
 
 import functools
+import gc
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -841,6 +843,57 @@ def test_capture_streams_are_not_reused_by_torch_pool():
     assert wrapper.stats["evictions"] == 0
     assert wrapper.stats["captures"] == 2
     assert wrapper.stats["capacity"] == 6
+
+
+def _leave_stale_graphs_in_a_cycle():
+    # Mimics an earlier test whose wrapper stays reachable only through a
+    # reference cycle, so its CUDA graphs are freed by cyclic GC, not refcount.
+    weight = torch.randn(64, 64, device="cuda")
+    stale = FlowEncoderGraphs(lambda x, **kw: ((x @ weight).sin(),) * 3, max_graphs=2)
+    for size in (4, 6):
+        x = torch.randn(size, 64, device="cuda")
+        for _ in range(2):
+            stale(x, last_chunk=False, cnn_cache=None, att_cache=None)
+    torch.accelerator.synchronize()
+    stale.cycle = stale
+    return weakref.ref(stale), [weakref.ref(entry[0]) for entry in stale.exact_graphs.values()]
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.nvidia_only
+@_requires_nvidia_capture
+@torch.inference_mode()
+def test_capture_survives_a_cyclic_gc_of_a_stale_graph():
+    # Regression for an order-dependent CI failure: a GC cycle landing inside
+    # capture reset a stale CUDAGraph and invalidated the capture.
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        stale, stale_graphs = _leave_stale_graphs_in_a_cycle()
+        assert stale() is not None
+        assert stale_graphs and all(ref() is not None for ref in stale_graphs)
+        collected: list[int] = []
+        weight = torch.randn(32, 32, device="cuda")
+
+        def forward(x, **kw):
+            if torch.cuda.is_current_stream_capturing() and not collected:
+                collected.append(gc.collect())
+            y = (x @ weight).sin()
+            return y, y + 1, y + 2
+
+        wrapper = FlowEncoderGraphs(forward, max_graphs=2)
+        for size in (1, 2):
+            x = torch.randn(size, 32, device="cuda")
+            for _ in range(2):
+                wrapper(x, last_chunk=False, cnn_cache=None, att_cache=None)
+        torch.accelerator.synchronize()
+        assert collected, "no GC ran during capture"
+        assert wrapper.stats["captures"] == 2
+        assert stale() is None
+    finally:
+        if was_enabled:
+            gc.enable()
+        gc.collect()
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
