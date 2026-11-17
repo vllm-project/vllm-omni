@@ -8,15 +8,13 @@ from __future__ import annotations
 def test_module_exports():
     """Verify the abot_world module exports the expected symbols."""
     from vllm_omni.diffusion.models.abot_world import (
-        ABOT_CAMERA_ACTION_SCHEMA,
-        ABotCameraControlReducer,
+        ABotCameraInteractionHandler,
         ABotWorldCausalPipeline,
         get_abot_world_post_process_func,
         get_abot_world_pre_process_func,
     )
 
-    assert ABOT_CAMERA_ACTION_SCHEMA == "abot.camera_actions.v1"
-    assert ABotCameraControlReducer is not None
+    assert ABotCameraInteractionHandler.modality == "camera"
     assert ABotWorldCausalPipeline is not None
     assert callable(get_abot_world_post_process_func)
     assert callable(get_abot_world_pre_process_func)
@@ -48,14 +46,12 @@ def test_transformer_exports():
 def test_actions_exports():
     """Verify the actions module exports the expected symbols."""
     from vllm_omni.diffusion.models.abot_world.actions import (
-        ABOT_CAMERA_ACTION_SCHEMA,
-        ABotCameraControlReducer,
-        parse_abot_camera_action_frames,
+        parse_abot_camera_action_script,
+        parse_abot_camera_update,
     )
 
-    assert ABOT_CAMERA_ACTION_SCHEMA == "abot.camera_actions.v1"
-    assert ABotCameraControlReducer is not None
-    assert callable(parse_abot_camera_action_frames)
+    assert callable(parse_abot_camera_action_script)
+    assert callable(parse_abot_camera_update)
 
 
 def test_registry_entry():

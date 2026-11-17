@@ -369,7 +369,11 @@ def _ras_mrv2_sample(
     row_temperature = temperature[rows]
     scores = torch.log_softmax(logits / row_temperature.clamp_min(eps).unsqueeze(1), dim=1)
     num_rows, vocab = scores.shape
-    top_k, top_p = states.get_top_k_top_p(expanded_idx_mapping, idx_mapping_np)
+    top_k, top_p, _ = states.get_top_k_top_p(
+        expanded_idx_mapping,
+        idx_mapping_np,
+        scores.shape[-1],
+    )
     if top_p is None:
         top_p = scores.new_full((num_rows,), default_top_p)
     if top_k is None:
@@ -837,6 +841,17 @@ class CosyVoice3Model(
     model_sampler_can_defer_rng = True
     supports_sampled_token_ids_cpu_override = True
     _sampling_eps = 1e-5
+
+    @property
+    def mrv2_forward_returns_tensor(self) -> bool:
+        """Declare the Talker's base MRv2 output contract.
+
+        The Talker returns hidden states directly. When DSpark requests target
+        layers, upstream MRv2 owns the resulting ``(hidden, aux)`` tuple via
+        ``use_aux_hidden_state_outputs``. Code2Wav returns ``OmniOutput`` and
+        still needs the structured-output capture path.
+        """
+        return self.model_stage == "cosyvoice3_talker"
 
     @property
     def owns_generation_output_storage(self) -> bool:
