@@ -88,8 +88,13 @@ campaign directories to copy the chosen coefficients, input range, threshold,
 warmup policy, prompt/model manifests and checksums into a new directory. Pass a
 separate, clean checkout through `--source-checkout` and use that checkout for
 evaluation. Point `WAN_VALIDATION_ROOT` at the frozen directory for those runs.
-The selector refuses held-out inputs and candidates without real skips in every
-stage/branch. It selects the fastest qualified candidate. If none qualifies, it
+Pass the same `--pp` and `--cfg` as the campaign. The selector refuses held-out
+inputs and candidates whose audit does not cover every stage, CFG rank, branch,
+request and step with real skips. A candidate qualifies only with a receipt: the
+complete calibration manifest (24 prompts x 2 seeds) at that topology, plus a
+matched minimal-trace timing run of the same source commit and production profile.
+Refinement subsets and runs without that timing run stay diagnostic. It selects
+the fastest qualified candidate. If none qualifies, it
 selects the candidate with the smallest worst normalized gate violation and marks
 it `diagnostic_only: true`. Such a run remains a failed production candidate;
 independent evaluation must not be used to tune it further.
