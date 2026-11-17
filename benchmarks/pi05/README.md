@@ -5,6 +5,7 @@ Latency benchmarks for π0.5 (`lerobot/pi05_base`) serving, used for the measure
 | Script | Measures | Needs |
 | --- | --- | --- |
 | `e2e_latency_pi05.py` | Client E2E round trip over the OpenPI websocket: msgpack pack, send, engine, denoise, unpack. Reports p50/p95/min/max and the device memory peak sampled from `nvidia-smi`. | A running server |
+| `e2e_concurrent_pi05.py` | N simulated robots on N websocket connections against a server with `max_num_seqs > 1`: per-client round-trip p50/p95, aggregate req/s, and each client's chunks for a comparison with the same stream served alone. | A running server |
 | `bench_pi05.py` | Model-level `sample_actions` latency and output shape over a batch size × camera-view sweep, with no serving stack. Writes `pi05_sweep.csv` and `pi05_sweep.md`. | A GPU and the checkpoint |
 | `bench_batch_pi05.py` | Stage profile of `sample_actions` in rounds of B requests: time per stage (prefix embedding, prefill, denoising) and the DCGM activity of each stage looped alone. Writes one JSON per chain and a Markdown report over them. | A GPU and the checkpoint; `dcgmi` for the activity columns |
 
@@ -20,6 +21,15 @@ vllm serve lerobot/pi05_base --omni --port 8000 --deploy-config vllm_omni/deploy
 vllm serve lerobot/pi05_base --omni --port 8000 --deploy-config vllm_omni/deploy/pi05.yaml --enforce-eager --disable-log-stats
 
 python benchmarks/pi05/e2e_latency_pi05.py --host 127.0.0.1 --port 8000 --views 3 --warmup 3 --iters 30 --out e2e.json
+```
+
+With `max_num_seqs: 8` (and `request_batch_max_wait_ms: 5`) in the stage, `e2e_concurrent_pi05.py` drives N robots
+at once; the engine batches the requests that are queued together. Each client seeds its requests, so its
+stream can be replayed alone and the chunks compared:
+
+```bash
+python benchmarks/pi05/e2e_concurrent_pi05.py --port 8000 --clients 8 --iters 20 --save-actions conc8.npz
+python benchmarks/pi05/e2e_concurrent_pi05.py --port 8000 --clients 1 --client-offset 3 --iters 20 --save-actions alone3.npz
 ```
 
 ## Model-level latency

@@ -60,6 +60,7 @@ from vllm_omni.diffusion.models.pi05.processor_pi05 import (
 )
 from vllm_omni.diffusion.models.pi05.runtime_pi05 import Pi05RuntimeOptions
 from vllm_omni.diffusion.models.pi05.vision_pi05 import Pi05VisionOptions
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -2042,17 +2043,22 @@ def test_state_rejects_a_multi_row_matrix():
 # Per-request denoising steps reach the model
 # ----------------------------------------------------------------------------
 class _SpyModel:
-    """Records the ``num_steps`` ``forward`` hands to ``sample_actions``."""
+    """Records the ``num_steps``, generators and batch ``forward`` hands to
+    ``sample_actions``; row ``i`` of the chunk it returns is all ``i``."""
 
     def __init__(self):
         self.seen: list = []
         self.generators: list = []
+        self.batches: list = []
 
     def sample_actions(self, *, images, image_masks, lang_tokens, lang_masks, num_steps, generator):
-        del images, image_masks, lang_tokens, lang_masks
+        batch = lang_tokens.shape[0]
+        assert all(img.shape[0] == batch for img in images) and all(m.shape == (batch,) for m in image_masks)
+        assert lang_masks.shape == lang_tokens.shape
         self.seen.append(num_steps)
         self.generators.append(generator)
-        return torch.zeros(1, 50, 32)
+        self.batches.append(batch)
+        return torch.arange(batch, dtype=torch.float32).view(batch, 1, 1).expand(batch, 50, 32).clone()
 
 
 def _spy_pipeline(spy: _SpyModel):
@@ -2067,19 +2073,22 @@ def _spy_pipeline(spy: _SpyModel):
     return pipeline
 
 
-def _spy_request(num_inference_steps, generator=None):
+def _spy_request(num_inference_steps, generator=None, *, observation: bool = True, prompt: str = ""):
     params = type("_Params", (), {})()
-    params.extra_args = {
-        "robot_obs": {
+    params.extra_args = {}
+    if observation:
+        params.extra_args["robot_obs"] = {
             "state": np.zeros(32, dtype=np.float32),
             "images": {key: np.zeros((4, 4, 3), dtype=np.uint8) for key in _EXPECTED_CAMERA_ORDER},
         }
-    }
     params.num_inference_steps = num_inference_steps
     params.generator = generator
-    request = type("_Request", (), {})()
-    request.sampling_params = params
-    return request
+    # What OmniDiffusionRequest.__post_init__ reads; the pipeline reads none of it.
+    params.seed = params.guidance_scale = params.guidance_scale_2 = None
+    params.do_classifier_free_guidance = False
+    # The engine's request type (one prompt), around params the pipeline must
+    # validate itself (the real OmniDiffusionSamplingParams would reject some).
+    return OmniDiffusionRequest(prompt=prompt, sampling_params=params, request_id=f"spy-{id(params)}")
 
 
 @pytest.mark.parametrize("requested", [None, 2, 25])
@@ -2108,3 +2117,57 @@ def test_request_denoising_steps_must_be_a_positive_integer(bad):
     with pytest.raises(ValueError, match="num_inference_steps must be a positive integer"):
         _spy_pipeline(spy).forward(_spy_request(bad))
     assert spy.seen == []
+
+
+def test_request_batch_runs_as_one_call_and_returns_each_request_its_rows():
+    """A ``DiffusionRequestBatch`` runs ``sample_actions`` once over the stacked
+    observations, with the shared step count and every request's generator,
+    and each request gets the output of its own row."""
+    from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+
+    spy = _SpyModel()
+    pipeline = _spy_pipeline(spy)
+    assert type(pipeline).supports_request_batch is True
+    generators = [torch.Generator().manual_seed(1), None, torch.Generator().manual_seed(3)]
+    requests = [_spy_request(4, generator) for generator in generators]
+    outputs = pipeline.forward(DiffusionRequestBatch(requests=requests))
+
+    assert spy.seen == [4] and spy.batches == [3] and spy.generators == [generators]
+    assert isinstance(outputs, list) and len(outputs) == 3
+    robot_obs = requests[0].sampling_params.extra_args["robot_obs"]
+    for row, output in enumerate(outputs):
+        expected = pipeline.processor.build_model_outputs(torch.full((1, 50, 32), float(row)), robot_obs)
+        np.testing.assert_array_equal(output.output["actions"], expected)
+    # A single request keeps its single output and its generator as it is.
+    output = pipeline.forward(requests[0])
+    assert output.output["actions"].shape == (50, 32) and spy.generators[-1] is generators[0]
+
+
+def test_request_batch_must_share_the_denoising_steps():
+    from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+
+    spy = _SpyModel()
+    with pytest.raises(ValueError, match="share num_inference_steps"):
+        _spy_pipeline(spy).forward(DiffusionRequestBatch(requests=[_spy_request(4), _spy_request(8)]))
+    assert spy.seen == []
+
+
+def test_request_batch_serves_dummy_and_live_requests_apart():
+    """Dummy warmup requests (no observation) get zeros without touching the
+    model; the requests with an observation run together, in the batch's order."""
+    from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+
+    spy = _SpyModel()
+    requests = [
+        _spy_request(None, observation=False, prompt="dummy run"),
+        _spy_request(2),
+        _spy_request(None, observation=False),
+        _spy_request(2),
+    ]
+    outputs = _spy_pipeline(spy).forward(DiffusionRequestBatch(requests=requests))
+
+    assert spy.seen == [2] and spy.batches == [2]
+    assert np.count_nonzero(outputs[0].output["actions"]) == 0 and outputs[0].error is None
+    assert outputs[2].output is None and "robot_obs" in outputs[2].error
+    assert outputs[1].output["actions"].shape == outputs[3].output["actions"].shape == (50, 32)
+    assert not np.array_equal(outputs[1].output["actions"], outputs[3].output["actions"])

@@ -1,6 +1,6 @@
 # π0.5 VLA: one diffusion stage, one GPU, fused Triton kernels under CUDA graphs, bsz 1 (OpenPI policy serving
-# is one observation -> one action reply). Every key below is documented in
-# recipes/lerobot/Pi05.md.
+# is one observation -> one action reply; raise max_num_seqs to batch the requests of several robots). Every
+# key below is documented in recipes/lerobot/Pi05.md.
 
 pipeline: pi05
 async_chunk: false
