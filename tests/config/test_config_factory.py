@@ -3355,8 +3355,9 @@ class TestPlatformOverrides:
     ):
         deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
         deploy = _apply_platform_overrides(deploy, platform=platform)
-        # Qwen3-TTS and these MiniCPM-o profiles also default to V2 on NPU.
-        # The remaining non-CUDA platform/profile combinations keep V1.
+        # MOSS realtime inherits V2 on every platform; other profiles retain
+        # their explicit platform overrides.
+        all_platforms_mrv2 = filename == "moss_tts_realtime.yaml"
         npu_full_mrv2 = platform == "npu" and filename in (
             "qwen3_tts.yaml",
             "minicpmo_4_5.yaml",
@@ -3367,7 +3368,7 @@ class TestPlatformOverrides:
         xpu_full_mrv2 = platform == "xpu" and filename in ("qwen3_tts.yaml", "moss_tts_nano.yaml")
         if platform == "cuda":
             expected_runner = cuda_default_runner
-        elif npu_full_mrv2 or xpu_full_mrv2:
+        elif all_platforms_mrv2 or npu_full_mrv2 or xpu_full_mrv2:
             expected_runner = "v2"
         else:
             expected_runner = "v1"
@@ -3383,7 +3384,7 @@ class TestPlatformOverrides:
         stages = merge_pipeline_deploy(pipeline, deploy)
         if platform == "cuda":
             expected = [stage.stage_id not in cuda_v1_stages for stage in stages]
-        elif npu_full_mrv2 or xpu_full_mrv2:
+        elif all_platforms_mrv2 or npu_full_mrv2 or xpu_full_mrv2:
             expected = [True for _ in stages]
         else:
             expected = [False for _ in stages]
