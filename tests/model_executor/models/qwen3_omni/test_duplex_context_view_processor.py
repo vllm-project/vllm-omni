@@ -78,8 +78,8 @@ def _pcm(index: int) -> np.ndarray:
 async def _open(processor: Qwen3OmniMoeProcessor, keep: int | None) -> Harness:
     plugin = Qwen3OmniDuplexPlugin(lambda *args: "")
     plugin.processor = processor
-    runtime_config = (
-        DuplexSessionRuntimeConfig() if keep is None else DuplexSessionRuntimeConfig(context_keep_media_turns=keep)
+    runtime_config = DuplexSessionRuntimeConfig(
+        context_keep_media_turns=keep, model_custom_options={"history_policy": "recent"}
     )
     return await open_harness(
         plugin=plugin,

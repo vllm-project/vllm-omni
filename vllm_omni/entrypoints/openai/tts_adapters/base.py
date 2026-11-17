@@ -269,6 +269,15 @@ class TTSModelAdapter(ABC):
     backend: ClassVar[str] = "ar"
     #: Whether streaming entrypoints must retain terminal metrics for validation.
     validates_generation: ClassVar[bool] = False
+    #: Whether to report a ``length`` finish of the AR entry stage (stopped at
+    #: ``max_new_tokens`` or the context window before end-of-speech) as
+    #: truncated audio: ``X-Audio-Truncated`` on non-streaming responses and
+    #: ``truncated`` on the SSE ``speech.audio.done`` event. Enable it only
+    #: after checking that this model's entry stage emits the speech itself, so
+    #: that a ``length`` finish means the audio was cut off. A
+    #: ``validate_generation`` error takes precedence: rejected audio is never
+    #: returned with the flag.
+    reports_length_truncation: ClassVar[bool] = False
     #: Whether the model consumes ``request.speed`` in its native parameters.
     native_speed_control: ClassVar[bool] = False
     #: None disables commitment. Opt-in adapters describe their complete

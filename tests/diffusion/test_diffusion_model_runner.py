@@ -359,6 +359,7 @@ def test_request_batch_binds_whether_its_requests_sent_their_schedule(explicit, 
         record_output_peak_memory=False,
     )
 
+    assert runner.pipeline.bound is not None
     schedule, from_request = runner.pipeline.bound
     assert schedule == runner.od_config.diffusion_attention_schedule.default
     assert from_request is explicit
@@ -1184,6 +1185,7 @@ def _make_batch_runner(pipeline):
     runner.offload_backend = None
     runner.od_config = SimpleNamespace(
         cache_backend="none",
+        streaming_output=False,
         enable_cache_dit_summary=False,
         parallel_config=SimpleNamespace(use_hsdp=False),
         video_output_transport=VideoOutputTransportConfig(),
