@@ -44,8 +44,8 @@ pytest -sv tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py \
   --run-level advanced_model -m 'core_model and cuda'
 ```
 
-Run this test explicitly while the intermittent H100 scene-coverage failure
-is tracked in [#10417](https://github.com/vllm-project/vllm-omni/issues/10417).
+CUDA ready reports this test as skipped while [#10417](https://github.com/vllm-project/vllm-omni/issues/10417)
+tracks the intermittent H100 scene-coverage failure. The command above runs it directly.
 It writes the transcript, events, recognition report, input timeline and
 generated audio under `tests/e2e/online_serving/results/minicpmo_duplex_recognition/`.
 `--run-level advanced_model` loads real weights.

@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import importlib.util
 import json
+import os
 import uuid
 from pathlib import Path
 
@@ -19,6 +20,11 @@ from tests.helpers.mark import hardware_test
 pytestmark = [pytest.mark.omni, pytest.mark.core_model]
 
 
+# Re-enable in CUDA ready once the intermittent coverage failure in #10417 is fixed.
+@pytest.mark.skipif(
+    os.environ.get("VLLM_OMNI_CI_SKIP_MINICPMO_LONG_VIDEO") == "1",
+    reason="Intermittent H100 scene coverage failure: https://github.com/vllm-project/vllm-omni/issues/10417",
+)
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 def test_duplex_long_video_scene_recognition(omni_server, tmp_path: Path, monkeypatch) -> None:
