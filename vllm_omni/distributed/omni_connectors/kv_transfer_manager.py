@@ -1003,7 +1003,21 @@ class OmniKVTransferManager:
         if not self.config.need_send_cache:
             return list(finished_reqs.keys())
 
-        if not self.connector:
+        # Touch the property so a failed init is cached before any rank returns.
+        # ``_connector is False`` is an initialization failure, not "no connector
+        # configured". That rank must still enter ``_send_success_consensus``;
+        # an early ack leaves healthy peers blocked in the collective.
+        connector = self.connector
+        if connector is None:
+            if self._connector is False:
+                logger.warning(
+                    "OmniConnector initialization failed; withholding KV publication "
+                    "acknowledgements for %s request(s)",
+                    len(finished_reqs),
+                )
+                for _req_id in finished_reqs:
+                    self._send_success_consensus(False)
+                return []
             logger.warning("No connector available, skipping KV transfer but freeing resources")
             return list(finished_reqs.keys())
 

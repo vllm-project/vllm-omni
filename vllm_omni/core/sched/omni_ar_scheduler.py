@@ -2375,13 +2375,37 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _retry_unacknowledged_kv_transfers(
         self, scheduler_output: SchedulerOutput, model_runner_output: ModelRunnerOutput
     ) -> None:
-        # An unacknowledged publication retains its pinned KV blocks and is
-        # resubmitted next step. Never resurrect a concurrently aborted request.
+        """Resubmit publications the runner did not acknowledge.
+
+        Membership in ``self.requests`` is not enough to retry. ``_free_request``
+        keeps a ``FINISHED_ABORTED`` request and its blocks while a transfer is
+        active. ``update_from_output`` runs after that read, so the abort is
+        retired here instead of being published again.
+        """
         transfer_batch = getattr(scheduler_output, "finished_requests_needing_kv_transfer", {})
         transfer_acks = set(getattr(model_runner_output, "kv_extracted_req_ids", None) or ())
         for req_id, transfer_data in transfer_batch.items():
-            if req_id not in transfer_acks and req_id in self.requests:
-                self.requests_needing_kv_transfer[req_id] = transfer_data
+            if req_id in transfer_acks:
+                continue
+            request = self.requests.get(req_id)
+            if request is None:
+                continue
+            if getattr(request, "status", None) == RequestStatus.FINISHED_ABORTED:
+                self._retire_aborted_kv_transfer(req_id, request)
+                continue
+            self.requests_needing_kv_transfer[req_id] = transfer_data
+
+    def _retire_aborted_kv_transfer(self, req_id: str, request: Request) -> None:
+        """Drop a cancelled request's transfer state and pinned KV blocks."""
+        self.requests_needing_kv_transfer.pop(req_id, None)
+        self.waiting_for_transfer_free.discard(req_id)
+        self.active_kv_transfers.discard(req_id)
+        self.transfer_triggered_requests.discard(req_id)
+        self.pending_stop_after_extraction.discard(req_id)
+        self._kv_wait_start_ts.pop(req_id, None)
+        # ``_free_blocks`` returns blocks immediately or parks them on the
+        # in-flight GPU fence, then removes the request.
+        self._free_blocks(request)
 
     def get_finished_requests_needing_kv_transfer(self) -> dict[str, dict]:
         """Get and clear the list of requests needing KV cache transfer.

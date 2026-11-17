@@ -678,6 +678,86 @@ def test_real_shm_capacity_rejection_remains_retryable(kv_config, monkeypatch):
         connector.close()
 
 
+def test_one_rank_connector_init_failure_withholds_acks(kv_config, monkeypatch):
+    """A rank whose connector init failed must join the success collective.
+
+    Otherwise healthy peers block in all_reduce, and the failed rank would
+    acknowledge every request without publishing.
+    """
+    import threading
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from vllm_omni.distributed.omni_connectors.utils.kv_utils import KVTPTopology
+
+    class _MinAllReduce:
+        def __init__(self, parties: int) -> None:
+            self._parties = parties
+            self._enter = threading.Barrier(parties)
+            self._leave = threading.Barrier(parties)
+            self._lock = threading.Lock()
+            self._votes: list[int] = []
+            self.calls = 0
+
+        def __call__(self, verdict, op, group):
+            with self._lock:
+                self._votes.append(int(verdict.item()))
+                self.calls += 1
+            self._enter.wait(timeout=5)
+            with self._lock:
+                reduced = min(self._votes)
+            verdict.fill_(reduced)
+            self._leave.wait(timeout=5)
+            with self._lock:
+                self._votes.clear()
+
+    exchange = _MinAllReduce(2)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "all_reduce", exchange)
+    monkeypatch.setattr("vllm.distributed.get_tp_group", lambda: SimpleNamespace(cpu_group=object()))
+
+    def make_manager(rank: int, connector):
+        manager = OmniKVTransferManager(kv_config)
+        manager._tp_topo = KVTPTopology(2, 2, rank)
+        manager._connector = connector
+        return manager
+
+    failed = make_manager(0, False)
+    healthy = make_manager(1, Mock())
+    transferred: list[str] = []
+
+    def publish(kv_data, transfer_req_id):
+        transferred.append(transfer_req_id)
+        return True
+
+    healthy._extract_kv_cache = lambda *args, **kwargs: object()
+    healthy._transfer_kv_cache = publish
+    finished = {"req-init": {"block_ids": [0], "seq_len": 1}}
+    results: dict[str, list[str] | BaseException] = {}
+
+    def run(name: str, manager: OmniKVTransferManager) -> None:
+        try:
+            results[name] = manager.handle_finished_requests_kv_transfer(finished, [], 1, "float32")
+        except BaseException as exc:  # barrier timeout or assertion in the worker
+            results[name] = exc
+
+    workers = [
+        threading.Thread(target=run, args=("failed", failed)),
+        threading.Thread(target=run, args=("healthy", healthy)),
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=5)
+
+    assert [worker.is_alive() for worker in workers] == [False, False]
+    assert results["failed"] == []
+    assert results["healthy"] == []
+    assert transferred == ["req-init"]
+    assert exchange.calls == 2
+    healthy.connector.cleanup.assert_called_once()
+
+
 def test_sender_rank_does_not_ack_when_peer_failed(kv_config, monkeypatch):
     from types import SimpleNamespace
     from unittest.mock import Mock

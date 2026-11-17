@@ -233,14 +233,29 @@ def test_omits_cache_misses_when_payload_object_is_replaced():
 
 def test_failed_kv_publication_requeues_without_releasing_blocks():
     sched = OmniARScheduler.__new__(OmniARScheduler)
-    sched.requests = {"retry": object(), "done": object()}
+    # Still in self.requests because an active transfer skipped _free_blocks.
+    aborted = SimpleNamespace(status=RequestStatus.FINISHED_ABORTED, request_id="aborted")
+    sched.requests = {"retry": object(), "done": object(), "aborted": aborted}
     sched.requests_needing_kv_transfer = {}
-    sched.active_kv_transfers = {"retry", "done"}
+    sched.active_kv_transfers = {"retry", "done", "aborted"}
+    sched.waiting_for_transfer_free = {"aborted"}
+    sched.transfer_triggered_requests = {"aborted"}
+    sched.pending_stop_after_extraction = {"aborted"}
+    sched._kv_wait_start_ts = {"aborted": 1.0}
+    freed: list[object] = []
+    sched._free_blocks = freed.append
     data = {"block_ids": [4], "seq_len": 8}
     step = SimpleNamespace(finished_requests_needing_kv_transfer={"retry": data, "done": data, "aborted": data})
     output = SimpleNamespace(kv_extracted_req_ids=["done"])
     sched._retry_unacknowledged_kv_transfers(step, output)
     assert sched.requests_needing_kv_transfer == {"retry": data}
+    assert "aborted" not in sched.requests_needing_kv_transfer
+    assert freed == [aborted]
+    assert "aborted" not in sched.active_kv_transfers
+    assert "aborted" not in sched.waiting_for_transfer_free
+    assert "aborted" not in sched.transfer_triggered_requests
+    assert "aborted" not in sched.pending_stop_after_extraction
+    assert "aborted" not in sched._kv_wait_start_ts
     assert "retry" in sched.active_kv_transfers
     assert sched.get_finished_requests_needing_kv_transfer() == {"retry": data}
     assert sched.requests_needing_kv_transfer == {}
