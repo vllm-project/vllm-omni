@@ -83,24 +83,29 @@ def assert_baseline_within_tolerance(
     (``{"H100": {"request_throughput": 1.2}}``). Missing or empty baselines
     and missing or unmatched hardware log a warning and skip comparison.
     """
+    baseline_hardware = hardware
+    # Ascend runtime labels use the A2 resource bucket when no exact bucket exists.
+    if isinstance(baseline, dict) and hardware in ("910B", "910B4") and hardware not in baseline and "A2" in baseline:
+        baseline_hardware = "A2"
     if (
         not isinstance(baseline, dict)
         or not baseline
-        or not isinstance(hardware, str)
-        or not hardware
-        or hardware not in baseline
+        or not isinstance(baseline_hardware, str)
+        or not baseline_hardware
+        or baseline_hardware not in baseline
     ):
         available = list(baseline) if isinstance(baseline, dict) else []
         message = f"No matching baseline for hardware {hardware!r}; available hardware: {available}"
         logging.getLogger(__name__).warning("[baseline-check] SKIP: %s", message)
         print(f"[baseline-check] WARNING SKIP: {message}", flush=True)
         return
-    bucket = baseline[hardware]
+    bucket = baseline[baseline_hardware]
     if not isinstance(bucket, dict) or not bucket:
-        raise AssertionError(f"baseline[{hardware!r}] must be a non-empty metric map, got {bucket!r}")
+        raise AssertionError(f"baseline[{baseline_hardware!r}] must be a non-empty metric map, got {bucket!r}")
 
     print(
-        f"[baseline-check] START hardware={hardware} tolerance={tolerance:.0%} metrics={len(bucket)}",
+        f"[baseline-check] START hardware={hardware} baseline_hardware={baseline_hardware} "
+        f"tolerance={tolerance:.0%} metrics={len(bucket)}",
         flush=True,
     )
     failures: list[str] = []
