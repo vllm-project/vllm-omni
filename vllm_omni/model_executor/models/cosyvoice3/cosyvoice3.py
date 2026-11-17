@@ -897,8 +897,6 @@ class CosyVoice3Model(
         # Full-response codec consumes tokens and conditioning, not LLM hidden states.
         self.omni_pooler_payload_include_hidden = not cosyvoice3_packed_inference_enabled()
         self.model_stage = vllm_config.model_config.model_stage
-        # The Talker attaches OmniOutput after forward, including on MRv2 replay.
-        self.mrv2_forward_returns_tensor = self.model_stage == "cosyvoice3_talker"
         model_dir = vllm_config.model_config.model
         if not os.path.isdir(model_dir):
             model_dir = hf_api().snapshot_download(model_dir)
@@ -1320,6 +1318,9 @@ class CosyVoice3Model(
         state = getattr(sampler, "penalties_state", None)
         if state is not None:
             state.apply_staged_writes = MethodType(_generated_only_penalty_writes, state)
+        # MRv2 captures tensor outputs and constructs OmniOutput afterwards.
+        # This contract also applies when only the codec stage enables packed Flow.
+        self._mrv2_tensor_output = True
         # MRv2 hands make_omni_output no multimodal kwargs; carry each prompt's
         # conditioning from the encoder call to its batch row instead.
         self._mrv2_encoded_conditioning = OrderedDict()
