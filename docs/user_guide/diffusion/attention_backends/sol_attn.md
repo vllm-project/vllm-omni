@@ -60,6 +60,36 @@ The prefix is kept exact as K/V and recomputed densely as queries; a K/V-only
 sink does not protect generated audio queries. A larger reference prefix costs
 more dense work, so measure reference-heavy workloads separately.
 
+## Other models
+
+The backend is not tied to MiniMax-H3. Other models can opt in when their
+attention calls meet the geometry, dtype and metadata requirements above.
+Wan exposes separate `self` and `cross` roles, so select SOL only for
+self-attention and leave cross-attention dense:
+
+```bash
+--diffusion-attention-config '{
+  "default": {"backend": "TORCH_SDPA"},
+  "per_role": {
+    "self": {
+      "backend": "SOL_ATTN",
+      "sol_attn": {"dense_steps": 10, "dense_layers": "0,1"}
+    }
+  }
+}'
+```
+
+The CUDA regression suite exercises this configuration through a small Wan
+transformer with synthetic weights, checking both dense guards and actual
+sparse-kernel dispatch. This is forward-path compatibility coverage, not
+pretrained-model quality or end-to-end speed evidence.
+
+Do not apply SOL globally to models that also use cross-attention, masks,
+GQA, or incompatible head dimensions. Models must publish denoising-step
+metadata and parseable layer prefixes for the default guards to permit sparse
+execution. Missing metadata keeps guarded calls dense, and schedules with
+at most ten denoising steps remain dense with the default `dense_steps=10`.
+
 ## Controls
 
 Set these fields in `AttentionSpec.sol_attn`, under `default` or `per_role`:
@@ -87,7 +117,10 @@ change this only after validating quality.
 
 Warm up both dense and sparse branches using a complete request before timing.
 Report repeated latency, variation, peak GPU memory, video metrics, and audio
-quality on the tested revision. The old
+quality on the tested revision. The
+[original-H3 E2E report](../../../../benchmarks/diffusion/sol_attn_h3_e2e_results.md)
+records a matched dense/SOL comparison and its outstanding perceptual checks.
+The old
 [SM120 sweep](../../../../benchmarks/diffusion/sol_attn_sm120_results.md)
 predates the current sink and metadata handling and is historical evidence only.
 
