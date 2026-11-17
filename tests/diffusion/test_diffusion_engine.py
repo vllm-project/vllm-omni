@@ -1515,3 +1515,63 @@ class TestPreTokenizedPromptCustomPipelines:
         )
 
         assert len(engine.scheduler._waiting_queue) == 1
+
+
+def test_warmup_profile_stops_recording_when_sweep_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed ladder request must stop worker recording before re-raising."""
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda: "fake-gpu")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (8, 0))
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda index: SimpleNamespace(total_memory=1024),
+    )
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+
+    batching_config = DiffusionBatchingConfig(
+        policy="compute_budget",
+        warmup_auto_calibrate=True,
+        warmup_profile_max_batch=2,
+        warmup_profile_cache=False,
+    )
+    saved_policy = object()
+    scheduler = SimpleNamespace(
+        batching_config=batching_config,
+        batching_policy=saved_policy,
+        max_num_running_reqs=1,
+        user_request_budget_units=None,
+        get_request_state=lambda request_id: None,
+    )
+    engine = SimpleNamespace(
+        scheduler=scheduler,
+        od_config=SimpleNamespace(
+            model="fake-model",
+            model_class_name="FakePipeline",
+            parallel_config=SimpleNamespace(),
+        ),
+        step_execution=True,
+        _request_cancellations=None,
+    )
+
+    rpc_calls: list[str] = []
+
+    def fake_collective_rpc(method: str, **_kwargs: Any) -> Any:
+        rpc_calls.append(method)
+        return []
+
+    engine.collective_rpc = fake_collective_rpc
+    engine._make_warmup_profile_request = lambda *args, **kwargs: SimpleNamespace(request_id="warmup-req")
+    engine._add_requests_and_wait = lambda requests: [SimpleNamespace(error="boom")]
+
+    with pytest.raises(RuntimeError, match="Warmup profile request failed"):
+        DiffusionEngine.run_warmup_batch_profile(engine)
+
+    # The request fails before the collect RPC, so only the finally block can
+    # stop recording; otherwise every later denoise step would keep syncing
+    # the device and appending records.
+    assert rpc_calls == ["start_warmup_batch_profile", "stop_warmup_batch_profile"]
+    assert scheduler.max_num_running_reqs == 1
+    assert scheduler.batching_policy is saved_policy
+    assert batching_config.policy == "compute_budget"

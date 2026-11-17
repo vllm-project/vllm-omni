@@ -2413,6 +2413,13 @@ class DiffusionEngine:
             logger.warning("Warmup batch profile failed (%s); restored original policy.", exc, exc_info=True)
             raise
         finally:
+            # Stop recording on every rank even when the sweep fails before
+            # its collect RPC: a live recorder adds two device syncs to each
+            # later denoise step and grows without bound.
+            try:
+                self.collective_rpc("stop_warmup_batch_profile", unique_reply_rank=0, exec_all_ranks=True)
+            except Exception:
+                logger.warning("Failed to stop warmup batch profile recording on workers.", exc_info=True)
             self.scheduler.max_num_running_reqs = saved_max_num_reqs
             # Never leak warmup requests into the scheduler: a residual request
             # in _running/_waiting with popped state poisons every later
