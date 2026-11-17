@@ -234,7 +234,7 @@ def test_omni_rejects_distilled_adapter_schedule(adapter_kind, ref2va_turbo_spec
     pipeline.od_config = SimpleNamespace()
     pipeline._fasth3_checkpoint = FastH3OmniCheckpointSpec()
     pipeline._turbo_lora_specs = {1: ref2va_turbo_spec} if adapter_kind == "turbo" else {}
-    pipeline._native_distilled_lora_adapter_ids = {1} if adapter_kind == "distilled" else set()
+    pipeline._native_lora_specs = {1: object()} if adapter_kind == "distilled" else {}
     conditioning = SimpleNamespace(task="ref2va", num_frames=56, video_edit_clean_rows=None, audio_edit_clean_rows=None)
     request = LoRARequest(adapter_kind, 1, f"/models/{adapter_kind}")
     with pytest.raises(OmniClientError, match="not Turbo or distilled adapters"):
@@ -253,7 +253,7 @@ def test_local_encoder_accepts_lora_composition(variant, ref2va_turbo_spec):
     pipeline._turbo_lora_specs = {2: ref2va_turbo_spec} if variant.startswith("turbo") else {}
     pipeline.default_video_shift = 12.0
     pipeline.default_audio_shift = 3.0
-    pipeline._native_distilled_lora_adapter_ids = set()
+    pipeline._native_lora_specs = {}
     pipeline.encode_prompt = Mock(return_value=(torch.ones(2, 5120, dtype=torch.bfloat16), torch.tensor([0, 1])))
     pipeline.video_vae = Mock()
     pipeline.audio_vae = Mock()
@@ -284,7 +284,7 @@ def test_lora_composition_rejects_conflicting_schedules(kind, ref2va_turbo_spec)
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline._turbo_lora_specs = {1: ref2va_turbo_spec, 2: ref2va_turbo_spec} if kind == "two_turbo" else {}
-    pipeline._native_distilled_lora_adapter_ids = {1} if kind == "distilled_with_swap" else set()
+    pipeline._native_lora_specs = {1: object()} if kind == "distilled_with_swap" else {}
     requests = [LoRARequest("one", 1, "/models/one"), LoRARequest("two", 2, "/models/two")]
     message = "at most one Turbo" if kind == "two_turbo" else "cannot be composed"
     with pytest.raises(OmniClientError, match=message):

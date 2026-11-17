@@ -182,7 +182,7 @@ def test_encoder_preparation_routes_edit_sources_without_qwen_inputs(
     pipeline.od_config = SimpleNamespace(step_execution=False)
     pipeline._fasth3 = None
     pipeline._active_turbo_spec = lambda _sampling: None
-    pipeline._has_active_native_lora = lambda _sampling: False
+    pipeline._active_native_spec = lambda _sampling: None
     pipeline._resolve_task = lambda task, **_kwargs: task
     pipeline._resolve_sigma_positions = lambda _task, _sampling: (None, 3)
     pipeline._quality_policy = SimpleNamespace(resolve=lambda **_kwargs: SimpleNamespace(cache_dit=None))

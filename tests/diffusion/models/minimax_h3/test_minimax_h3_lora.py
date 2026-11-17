@@ -270,6 +270,35 @@ def test_h3_turbo_rejects_offload_modes(tmp_path, offload_mode):
         )
 
 
+@pytest.mark.parametrize(
+    "sibling",
+    ["minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors", "unrelated.safetensors"],
+)
+def test_pipeline_turbo_directory_ignores_other_format_files(tmp_path, sibling):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    path = tmp_path / _spec().filename
+    _write_tiny_turbo(path)
+    # A different format's file must not be opened before the selected Turbo.
+    (tmp_path / sibling).write_bytes(b"invalid safetensors header")
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.partition = "fl2va"
+    pipeline._turbo_lora_specs = {}
+    pipeline._native_lora_specs = {}
+
+    loaded = pipeline._load_diffusion_lora_adapter(
+        lora_request=_request(tmp_path),
+        lora_path=tmp_path,
+        dtype=torch.float32,
+    )
+
+    assert loaded is not None
+    assert len(loaded[0].loras) == 312
+    assert pipeline._turbo_lora_specs[1].filename == path.name
+    assert pipeline._native_lora_specs == {}
+
+
 def test_h3_turbo_allows_distributed_layerwise_offload(monkeypatch):
     """DLO keeps the LoRA buffers resident, so it is not an unsupported mode."""
 
@@ -282,8 +311,7 @@ def test_h3_turbo_allows_distributed_layerwise_offload(monkeypatch):
     torch.nn.Module.__init__(pipeline)
     pipeline.partition = "fl2va"
     pipeline._turbo_lora_specs = {}
-    pipeline._native_distilled_lora_adapter_ids = set()
-    pipeline._lora_sigma_schedules = {}
+    pipeline._native_lora_specs = {}
     pipeline.od_config = SimpleNamespace(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
@@ -333,8 +361,7 @@ def test_h3_turbo_offload_compatibility_follows_dit_selection(
     torch.nn.Module.__init__(pipeline)
     pipeline.partition = "fl2va"
     pipeline._turbo_lora_specs = {}
-    pipeline._native_distilled_lora_adapter_ids = set()
-    pipeline._lora_sigma_schedules = {}
+    pipeline._native_lora_specs = {}
     pipeline.od_config = SimpleNamespace(
         diffusion_offload_config={"mode": mode, "components": components},
         enable_cpu_offload=False,
@@ -490,8 +517,7 @@ def test_only_an_active_recognized_turbo_adapter_restricts_ref2va(monkeypatch):
     pipeline.partition = "combined"
     pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
     pipeline._turbo_lora_specs = {}
-    pipeline._native_distilled_lora_adapter_ids = set()
-    pipeline._lora_sigma_schedules = {}
+    pipeline._native_lora_specs = {}
     request = _request("generic-peft")
     pipeline.transformer = torch.nn.Module()
 
@@ -592,7 +618,7 @@ def test_h3_finds_turbo_in_composition(turbo_scale):
     pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
     spec = _spec()
     pipeline._turbo_lora_specs = {2: spec}
-    pipeline._native_distilled_lora_adapter_ids = set()
+    pipeline._native_lora_specs = {}
     first = _request("swap")
     first.lora_int_id = 1
     turbo = _request("turbo")

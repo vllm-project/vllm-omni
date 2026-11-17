@@ -684,7 +684,7 @@ def test_encoder_conditioning_keeps_control_separate_from_latent_edit(monkeypatc
     pipeline._release_stage_cache = lambda: None
     pipeline._resolve_task = lambda *args, **kwargs: "t2va"
     pipeline._active_turbo_spec = lambda sampling: None
-    pipeline._has_active_native_lora = lambda sampling: False
+    pipeline._active_native_spec = lambda sampling: None
     pipeline._fasth3_checkpoint = None
     pipeline._fasth3 = None
     pipeline._resolve_sigma_positions = lambda task, sampling: (None, 2)

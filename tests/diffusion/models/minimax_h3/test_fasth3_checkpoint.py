@@ -889,7 +889,7 @@ def test_resolve_sigma_positions_uses_release_metadata_schedule():
     pipeline = object.__new__(MiniMaxH3Pipeline)
     nn.Module.__init__(pipeline)
     pipeline._fasth3 = None
-    pipeline._lora_sigma_schedules = {}
+    pipeline._native_lora_specs = {}
     spec = FastH3CheckpointSpec.from_metadata(_fastvideo_metadata())
     pipeline._base_schedule_by_partition = {
         "fl2va": DMD2SigmaSchedule.from_metadata(spec.release_metadata()),

@@ -15,13 +15,17 @@ device is chosen later by the pipeline, so the same file serves on CUDA too.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from typing import get_args
 
 import torch
 from safetensors import safe_open
+from vllm.config.lora import MaxLoRARanks
 from vllm.lora.lora_model import LoRAModel
-from vllm.lora.lora_weights import PackedLoRALayerWeights
+from vllm.lora.lora_weights import LoRALayerWeights, PackedLoRALayerWeights
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.model_executor.models.utils import WeightsMapper
 
@@ -96,6 +100,23 @@ _NATIVE_WEIGHTS_MAPPER = WeightsMapper(
 )
 
 
+@dataclass(frozen=True)
+class NativeDistilledLoRASpec:
+    schedule: DMD2SigmaSchedule
+    task: str = "t2va"
+    rank: int = _NATIVE_RANK
+    qkv_rank: int = _NATIVE_RANK
+
+    def rank_for(self, name: str) -> int:
+        return self.qkv_rank if name.endswith(".attn.qkv_proj") else self.rank
+
+    @property
+    def targets(self) -> frozenset[str]:
+        if self.task == "ref2va":
+            return frozenset(name for name in _NATIVE_EXPECTED_TARGETS if not name.endswith("adaln_proj.linear"))
+        return _NATIVE_EXPECTED_TARGETS
+
+
 def _select_native_file(artifact_path: str | Path) -> Path | None:
     path = Path(artifact_path)
     if path.is_file():
@@ -103,8 +124,20 @@ def _select_native_file(artifact_path: str | Path) -> Path | None:
     if not path.is_dir():
         return None
 
-    candidate = path / _NATIVE_FILENAME
-    return candidate if candidate.is_file() else None
+    candidates = []
+    for candidate in sorted(path.glob("*.safetensors")):
+        if not candidate.is_file():
+            continue
+        if candidate.name == _NATIVE_FILENAME:
+            candidates.append(candidate)
+            continue
+        with safe_open(candidate, framework="pt", device="cpu") as checkpoint:
+            metadata = checkpoint.metadata() or {}
+            if metadata.get("key_format") == _NATIVE_KEY_FORMAT:
+                candidates.append(candidate)
+    if len(candidates) > 1:
+        raise ValueError(f"Multiple MiniMax-H3 native LoRA files in {path}; pass a specific file")
+    return candidates[0] if candidates else None
 
 
 def _native_target_dims(target: str) -> tuple[int, int]:
@@ -166,7 +199,53 @@ def _validate_native_metadata(metadata: Mapping[str, str]) -> DMD2SigmaSchedule:
     return schedule
 
 
-def _validate_native_tensors(checkpoint) -> dict[str, torch.Tensor]:
+def _parse_native_v2(metadata: Mapping[str, str], partition: str) -> NativeDistilledLoRASpec:
+    task = metadata.get("partition")
+    if task not in ("fl2va", "ref2va"):
+        raise ValueError("MiniMax-H3 native LoRA v2 requires partition=fl2va or ref2va")
+    if partition != task and not (partition == "combined" and task == "fl2va"):
+        raise ValueError(f"MiniMax-H3 native LoRA for {task} requires a matching base; service partition={partition}")
+    ref2va = task == "ref2va"
+    rank = 128 if ref2va else _NATIVE_RANK
+    qkv_rank = 384 if ref2va else rank
+    expected = {
+        "tasks": task,
+        "target_profile": "h3_ref2va_208_v1" if ref2va else "h3_i2va_259_v1",
+        "qkv_layout": "grouped",
+        "fc1_layout": "gate_up",
+        "lora_rank": str(rank),
+        "scaling_mode": "unit_delta",
+    }
+    for key, value in expected.items():
+        if metadata.get(key) != value:
+            raise ValueError(f"MiniMax-H3 native LoRA v2 requires {key}={value!r}")
+    if metadata.get("sampler", "euler") != "euler":
+        raise ValueError("MiniMax-H3 native LoRA v2 requires an Euler-compatible export")
+    try:
+        overrides = json.loads(metadata.get("rank_overrides", ""))
+        scale, video_shift, audio_shift = (
+            float(metadata.get(key, "")) for key in ("delta_scale", "video_shift", "audio_shift")
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid native LoRA v2 rank_overrides, delta_scale or flow shifts") from exc
+    expected_overrides = {"attn.qkv_proj": 384} if ref2va else {}
+    if (
+        not isinstance(overrides, dict)
+        or overrides != expected_overrides
+        or any(type(value) is not int for value in overrides.values())
+    ):
+        raise ValueError(f"MiniMax-H3 native LoRA v2 requires rank_overrides={expected_overrides}")
+    if (scale, video_shift, audio_shift) != (1.0, 12.0, 3.0):
+        raise ValueError("MiniMax-H3 native LoRA v2 requires delta_scale=1, video_shift=12, audio_shift=3")
+    schedule = _parse_native_base_schedule(metadata)
+    if schedule is None or schedule.base_schedule != (1.0, 0.7, 0.4, 0.15, 0.0):
+        raise ValueError("MiniMax-H3 native LoRA v2 requires base_schedule=1,0.7,0.4,0.15,0")
+    if qkv_rank > max(get_args(MaxLoRARanks)):
+        raise ValueError(f"Installed vLLM cannot allocate MiniMax-H3 native LoRA rank {qkv_rank}")
+    return NativeDistilledLoRASpec(schedule, task=task, rank=rank, qkv_rank=qkv_rank)
+
+
+def _validate_native_tensors(checkpoint, spec: NativeDistilledLoRASpec | None = None) -> dict[str, torch.Tensor]:
     tensors: dict[str, torch.Tensor] = {}
     pairs: dict[str, set[str]] = {}
     raw_targets: set[str] = set()
@@ -193,7 +272,10 @@ def _validate_native_tensors(checkpoint) -> dict[str, torch.Tensor]:
         if tensor.ndim != 2:
             raise ValueError(f"MiniMax-H3 native LoRA tensors must be matrices, got {name}={tuple(tensor.shape)}")
         input_dim, output_dim = _native_target_dims(mapped_target)
-        expected_shape = (_NATIVE_RANK, input_dim) if side == "a" else (output_dim, _NATIVE_RANK)
+        rank = _NATIVE_RANK if spec is None else spec.rank_for(mapped_target)
+        expected_shape = (rank, input_dim) if side == "a" else (output_dim, rank)
+        if spec is not None and tensor.dtype != torch.bfloat16:
+            raise ValueError(f"MiniMax-H3 native LoRA v2 tensor must be BF16: {name}")
         if tuple(tensor.shape) != expected_shape:
             raise ValueError(
                 f"MiniMax-H3 native tensor has invalid global shape: {name}={tuple(tensor.shape)}, "
@@ -207,11 +289,12 @@ def _validate_native_tensors(checkpoint) -> dict[str, torch.Tensor]:
     incomplete = sorted(target for target, sides in pairs.items() if sides != {"a", "b"})
     if incomplete:
         raise ValueError(f"Incomplete MiniMax-H3 native LoRA pairs: {incomplete}")
-    missing = sorted(_NATIVE_EXPECTED_TARGETS - raw_targets)
-    unexpected = sorted(raw_targets - _NATIVE_EXPECTED_TARGETS)
+    targets = _NATIVE_EXPECTED_TARGETS if spec is None else spec.targets
+    missing = sorted(targets - raw_targets)
+    unexpected = sorted(raw_targets - targets)
     if missing or unexpected:
         raise ValueError(
-            "MiniMax-H3 native target set does not match the supported v1.0 artifact: "
+            "MiniMax-H3 native target set does not match the supported artifact: "
             f"missing={len(missing)} {missing[:5]}, unexpected={len(unexpected)} {unexpected[:5]}"
         )
     return tensors
@@ -264,7 +347,7 @@ def load_minimax_h3_native_distilled_lora(
     lora_path: str | Path,
     dtype: torch.dtype,
     unsupported_offload_mode: str | None = None,
-) -> tuple[LoRAModel, PEFTHelper, DMD2SigmaSchedule] | None:
+) -> tuple[LoRAModel, PEFTHelper, NativeDistilledLoRASpec] | None:
     """Load a native-layout MiniMax-H3 distilled LoRA through the legacy manager."""
 
     lora_file = _select_native_file(lora_path)
@@ -278,30 +361,57 @@ def load_minimax_h3_native_distilled_lora(
                     f"MiniMax-H3 native LoRA requires safetensors metadata key_format={_NATIVE_KEY_FORMAT!r}"
                 )
             return None
-        if lora_file.name != _NATIVE_FILENAME:
-            raise ValueError(f"MiniMax-H3 native LoRA supports only {_NATIVE_FILENAME!r}, got {lora_file.name!r}")
-        sigma_schedule = _validate_native_metadata(metadata)
-        if partition == "ref2va":
-            raise ValueError("MiniMax-H3 native LoRA supports T2VA only")
+        version = metadata.get("native_format_version")
+        if version is None:
+            if lora_file.name != _NATIVE_FILENAME:
+                raise ValueError(f"MiniMax-H3 native LoRA supports only {_NATIVE_FILENAME!r}, got {lora_file.name!r}")
+            sigma_schedule = _validate_native_metadata(metadata)
+            if partition == "ref2va":
+                raise ValueError("MiniMax-H3 legacy T2VA native LoRA cannot be loaded into the ref2va partition")
+            spec = NativeDistilledLoRASpec(sigma_schedule, rank=_NATIVE_RANK, qkv_rank=_NATIVE_RANK)
+        elif version == "2":
+            spec = _parse_native_v2(metadata, partition)
+        else:
+            raise ValueError(f"Unsupported MiniMax-H3 native LoRA format version: {version!r}")
         if unsupported_offload_mode is not None:
             raise ValueError(f"MiniMax-H3 native dynamic LoRA does not support {unsupported_offload_mode}")
-        tensors = _validate_native_tensors(checkpoint)
+        tensors = _validate_native_tensors(checkpoint, spec if version == "2" else None)
 
     peft_helper = PEFTHelper.from_dict(
         {
-            "r": _NATIVE_RANK,
-            "lora_alpha": _NATIVE_ALPHA,
-            "target_modules": _NATIVE_TARGET_PATTERN,
+            "r": spec.qkv_rank,
+            "lora_alpha": _NATIVE_ALPHA if version is None else spec.qkv_rank,
+            "target_modules": (
+                _NATIVE_TARGET_PATTERN
+                if spec.task != "ref2va"
+                else [f"transformer.{target}" for target in sorted(spec.targets)]
+            ),
         }
     )
-    lora_model = LoRAModel.from_lora_tensors(
-        lora_model_id=lora_request.lora_int_id,
-        tensors=tensors,
-        peft_helper=peft_helper,
-        device="cpu",
-        dtype=dtype,
-        weights_mapper=_NATIVE_WEIGHTS_MAPPER,
-    )
+    if version is None:
+        lora_model = LoRAModel.from_lora_tensors(
+            lora_model_id=lora_request.lora_int_id,
+            tensors=tensors,
+            peft_helper=peft_helper,
+            device="cpu",
+            dtype=dtype,
+            weights_mapper=_NATIVE_WEIGHTS_MAPPER,
+        )
+    else:
+        # The exported A already includes its effective scale. Keep each
+        # projection's rank while advertising the largest allocation need.
+        loras = {}
+        for target in sorted(spec.targets):
+            rank = spec.rank_for(target)
+            loras[target] = LoRALayerWeights(
+                module_name=target,
+                rank=rank,
+                lora_alpha=rank,
+                lora_a=tensors[f"transformer.{target}.lora_A.weight"].to(dtype=dtype),
+                lora_b=tensors[f"transformer.{target}.lora_B.weight"].to(dtype=dtype),
+                scaling=1.0,
+            )
+        lora_model = LoRAModel(lora_model_id=lora_request.lora_int_id, rank=spec.qkv_rank, loras=loras)
     _pack_h3_native_qkv(lora_model)
     _pack_h3_native_fc1(lora_model)
-    return lora_model, peft_helper, sigma_schedule
+    return lora_model, peft_helper, spec

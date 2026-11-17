@@ -195,7 +195,7 @@ def test_request_encodes_only_window_prompts_and_prepares_references_once(monkey
     pipeline.device = torch.device("cpu")
     pipeline.od_config = None
     pipeline._active_turbo_spec = lambda sampling: None
-    pipeline._has_active_native_lora = lambda sampling: False
+    pipeline._active_native_spec = lambda sampling: None
     pipeline._resolve_task = lambda *args, **kwargs: "ref2va"
     encoded, prepared_inputs, encoded_media = [], [], []
     prepare = module.prepare_encoder_inputs

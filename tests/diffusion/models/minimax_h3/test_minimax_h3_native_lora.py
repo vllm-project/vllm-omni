@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Literal
 
 import pytest
 import torch
@@ -99,13 +100,14 @@ def _write_tiny_native(
     omit_target: str | None = None,
     shape_overrides: dict[str, tuple[int, int]] | None = None,
     metadata: dict[str, str] | None = None,
+    spec: lora_module.NativeDistilledLoRASpec | None = None,
 ) -> None:
-    rank = _TINY_RANK
     tensors = {}
     overrides = shape_overrides or {}
-    for target in sorted(lora_module._NATIVE_EXPECTED_TARGETS):
+    for target in sorted(lora_module._NATIVE_EXPECTED_TARGETS if spec is None else spec.targets):
         if target == omit_target:
             continue
+        rank = _TINY_RANK if spec is None else spec.rank_for(target)
         input_dim, output_dim = lora_module._native_target_dims(target)
         raw_target = f"transformer.{target}"
         a_name = f"{raw_target}.lora_A.default.weight"
@@ -133,19 +135,103 @@ def _write_tiny_native(
         else:
             tensors[b_name] = torch.ones(overrides.get(b_name, (output_dim, rank)))
     save_file(
-        tensors,
+        tensors if spec is None else {name: value.bfloat16() for name, value in tensors.items()},
         str(path),
         metadata=metadata
         or {
             "format": "pt",
             "key_format": "minimax-h3-native",
             "qkv_layout": "grouped",
-            "lora_rank": str(rank),
-            "lora_alpha": str(rank),
+            "lora_rank": str(_TINY_RANK),
+            "lora_alpha": str(_TINY_RANK),
             "base_schedule": "1.0,0.7,0.4,0.15,0.0",
             "tasks": "t2va",
         },
     )
+
+
+def _v2_metadata(task: str) -> dict[str, str]:
+    reference = task == "ref2va"
+    return {
+        "key_format": "minimax-h3-native",
+        "native_format_version": "2",
+        "partition": task,
+        "tasks": task,
+        "target_profile": "h3_ref2va_208_v1" if reference else "h3_i2va_259_v1",
+        "qkv_layout": "grouped",
+        "fc1_layout": "gate_up",
+        "lora_rank": "128" if reference else str(_TINY_RANK),
+        "rank_overrides": '{"attn.qkv_proj":384}' if reference else "{}",
+        "scaling_mode": "unit_delta",
+        "delta_scale": "1.0",
+        "source_sha256": "1" * 64,
+        "base_manifest_sha256": "2" * 64,
+        "base_schedule": "1,0.7,0.4,0.15,0",
+        "video_shift": "12",
+        "audio_shift": "3",
+    }
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(("task", "target_count", "qkv_rank"), [("fl2va", 259, _TINY_RANK), ("ref2va", 208, 384)])
+def test_native_v2_loads_published_profiles(tmp_path, monkeypatch, task, target_count, qkv_rank):
+    monkeypatch.setattr(lora_module, "MaxLoRARanks", Literal[4, 128, 512])
+    metadata = _v2_metadata(task)
+    spec = lora_module.NativeDistilledLoRASpec(
+        DMD2SigmaSchedule.from_positions([1, 0.7, 0.4, 0.15, 0]),
+        task=task,
+        rank=128 if task == "ref2va" else _TINY_RANK,
+        qkv_rank=qkv_rank,
+    )
+    path = tmp_path / f"published-{task}.safetensors"
+    _write_tiny_native(path, metadata=metadata, spec=spec)
+    loaded = load_minimax_h3_native_distilled_lora(
+        partition=task, lora_request=_request(path), lora_path=tmp_path, dtype=torch.float32
+    )
+    assert loaded is not None
+    model, helper, parsed = loaded
+    assert parsed.task == task
+    assert parsed.schedule.base_schedule == (1.0, 0.7, 0.4, 0.15, 0.0)
+    assert len(model.loras) == target_count
+    assert helper.r == qkv_rank
+    qkv = model.loras["blocks.0.attn.qkv_proj"]
+    assert all(a.shape[0] == qkv_rank for a in qkv.lora_a)
+    assert qkv.scaling == [1.0, 1.0, 1.0]
+    output = model.loras["blocks.0.attn.out_proj"]
+    assert output.rank == spec.rank and output.scaling == 1.0
+    with pytest.raises(ValueError, match="matching base"):
+        load_minimax_h3_native_distilled_lora(
+            partition="ref2va" if task == "fl2va" else "combined",
+            lora_request=_request(path),
+            lora_path=path,
+            dtype=torch.float32,
+        )
+
+
+@pytest.mark.cpu
+def test_native_v2_request_validation():
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline._native_lora_specs = {7: lora_module._parse_native_v2(_v2_metadata("fl2va"), "fl2va")}
+    sampling = SimpleNamespace(lora_request=_request("i2va"), lora_scale=1.0, num_inference_steps=4, extra_args={})
+    pipeline._validate_native_sampling(sampling, task="fl2va")
+    with pytest.raises(OmniClientError, match="active adapter requires task='fl2va', got task='t2va'"):
+        pipeline._validate_native_sampling(sampling, task="t2va")
+    sampling.extra_args = {"sampler": "euler"}
+    pipeline._validate_native_sampling(sampling, task="fl2va")
+    with pytest.raises(ValueError, match="Euler-compatible export"):
+        lora_module._parse_native_v2({**_v2_metadata("fl2va"), "sampler": "sde"}, "fl2va")
+    sampling.lora_scale = 0
+    assert pipeline._active_native_spec(sampling) is None
+
+
+@pytest.mark.cpu
+def test_native_v2_ref2va_requires_backend_rank_capacity(monkeypatch):
+    monkeypatch.setattr(lora_module, "MaxLoRARanks", Literal[64, 128, 256])
+    with pytest.raises(ValueError, match="cannot allocate MiniMax-H3 native LoRA rank 384"):
+        lora_module._parse_native_v2(_v2_metadata("ref2va"), "ref2va")
 
 
 @pytest.mark.cpu
@@ -163,7 +249,7 @@ def test_h3_native_loads_and_packs_qkv_and_fc1(tmp_path):
     assert loaded is not None
     lora_model, peft_helper, schedule = loaded
     assert peft_helper.r == _TINY_RANK
-    assert schedule.num_inference_steps == 4
+    assert schedule.schedule.num_inference_steps == 4
     assert len(lora_model.loras) == 259
     assert "blocks.0.adaln_proj.linear" in lora_model.loras
     assert "final_layer.adaln_proj.linear" in lora_model.loras
@@ -200,7 +286,7 @@ def test_h3_native_rejects_bad_metadata_and_ref2va(tmp_path):
     valid_dir.mkdir()
     valid = valid_dir / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
     _write_tiny_native(valid)
-    with pytest.raises(ValueError, match="supports T2VA only"):
+    with pytest.raises(ValueError, match="legacy T2VA native LoRA cannot be loaded into the ref2va partition"):
         load_minimax_h3_native_distilled_lora(
             partition="ref2va",
             lora_request=_request(valid),
@@ -318,8 +404,9 @@ def test_pipeline_native_schedule_and_task_validation(monkeypatch):
     pipeline.partition = "fl2va"
     pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
     pipeline._turbo_lora_specs = {}
-    pipeline._native_distilled_lora_adapter_ids = {7}
-    pipeline._lora_sigma_schedules = {7: DMD2SigmaSchedule.from_positions([1.0, 0.7, 0.4, 0.15, 0.0])}
+    pipeline._native_lora_specs = {
+        7: lora_module.NativeDistilledLoRASpec(DMD2SigmaSchedule.from_positions([1.0, 0.7, 0.4, 0.15, 0.0]))
+    }
     pipeline._base_schedule_by_partition = {"fl2va": None}
 
     sampling = SimpleNamespace(
@@ -331,15 +418,15 @@ def test_pipeline_native_schedule_and_task_validation(monkeypatch):
     assert pipeline._sigma_schedule_for_request(sampling, "t2va").num_inference_steps == 4
     with pytest.raises(OmniClientError, match="num_inference_steps must be 4"):
         pipeline._validate_native_sampling(
-            SimpleNamespace(lora_request=sampling.lora_request, num_inference_steps=5),
+            SimpleNamespace(lora_request=sampling.lora_request, lora_scale=1.0, num_inference_steps=5),
             task="t2va",
         )
-    with pytest.raises(OmniClientError, match="supports T2VA requests only"):
+    with pytest.raises(OmniClientError, match="active adapter requires task='t2va', got task='fl2va'"):
         pipeline._resolve_task(
             "fl2va",
             {},
             turbo_spec=None,
-            has_native_lora=True,
+            native_spec=pipeline._native_lora_specs[7],
         )
 
     pipeline._base_schedule_by_partition = {"fl2va": DMD2SigmaSchedule.from_positions([1.0, 0.5, 0.0])}
@@ -355,22 +442,23 @@ def test_pipeline_native_step_count_follows_adapter_schedule():
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.partition = "fl2va"
-    pipeline._native_distilled_lora_adapter_ids = {7}
-    pipeline._lora_sigma_schedules = {7: DMD2SigmaSchedule.from_positions([1.0, 0.5, 0.0])}
+    pipeline._native_lora_specs = {
+        7: lora_module.NativeDistilledLoRASpec(DMD2SigmaSchedule.from_positions([1.0, 0.5, 0.0]))
+    }
     request = LoRARequest("flashgen", 7, "/tmp/native.safetensors")
 
     pipeline._validate_native_sampling(
-        SimpleNamespace(lora_request=request, num_inference_steps=2),
+        SimpleNamespace(lora_request=request, lora_scale=1.0, num_inference_steps=2),
         task="t2va",
     )
     with pytest.raises(OmniClientError, match="num_inference_steps must be 2 or omitted, not 3"):
         pipeline._validate_native_sampling(
-            SimpleNamespace(lora_request=request, num_inference_steps=3),
+            SimpleNamespace(lora_request=request, lora_scale=1.0, num_inference_steps=3),
             task="t2va",
         )
     with pytest.raises(OmniClientError, match="requires num_inference_steps=2"):
         pipeline._validate_native_sampling(
-            SimpleNamespace(lora_request=request, num_inference_steps=4),
+            SimpleNamespace(lora_request=request, lora_scale=1.0, num_inference_steps=4),
             task="t2va",
         )
 
@@ -389,11 +477,13 @@ def test_pipeline_native_omitted_step_count_follows_execution_mode(step_executio
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.partition = "fl2va"
-    pipeline._native_distilled_lora_adapter_ids = {7}
-    pipeline._lora_sigma_schedules = {7: DMD2SigmaSchedule.from_positions([1.0, 0.7, 0.4, 0.15, 0.0])}
+    pipeline._native_lora_specs = {
+        7: lora_module.NativeDistilledLoRASpec(DMD2SigmaSchedule.from_positions([1.0, 0.7, 0.4, 0.15, 0.0]))
+    }
     pipeline.od_config = SimpleNamespace(step_execution=step_execution)
     sampling = SimpleNamespace(
         lora_request=LoRARequest("flashgen", 7, "/tmp/native.safetensors"),
+        lora_scale=1.0,
         num_inference_steps=None,
     )
 
@@ -407,7 +497,7 @@ def test_pipeline_native_omitted_step_count_follows_execution_mode(step_executio
     # The step-mode message must not offer omission it cannot accept.
     with pytest.raises(OmniClientError, match=r"must be 4, not 5$"):
         pipeline._validate_native_sampling(
-            SimpleNamespace(lora_request=sampling.lora_request, num_inference_steps=5),
+            SimpleNamespace(lora_request=sampling.lora_request, lora_scale=1.0, num_inference_steps=5),
             task="t2va",
         )
 
@@ -430,8 +520,7 @@ def test_pipeline_replaces_native_classification_after_reload(monkeypatch, tmp_p
         enable_distributed_layerwise_offload=False,
     )
     pipeline._turbo_lora_specs = {}
-    pipeline._native_distilled_lora_adapter_ids = set()
-    pipeline._lora_sigma_schedules = {}
+    pipeline._native_lora_specs = {}
 
     loaded = pipeline._load_diffusion_lora_adapter(
         lora_request=request,
@@ -439,16 +528,14 @@ def test_pipeline_replaces_native_classification_after_reload(monkeypatch, tmp_p
         dtype=torch.float32,
     )
     assert loaded is not None
-    assert request.lora_int_id in pipeline._native_distilled_lora_adapter_ids
-    assert request.lora_int_id in pipeline._lora_sigma_schedules
+    assert request.lora_int_id in pipeline._native_lora_specs
 
     monkeypatch.setattr(pipeline_module, "load_minimax_h3_turbo_lora", lambda **_: None)
     monkeypatch.setattr(pipeline_module, "load_minimax_h3_native_distilled_lora", lambda **_: None)
     pipeline.transformer = torch.nn.Module()
     monkeypatch.setattr(pipeline_module, "load_minimax_h3_native_adapter", lambda **_: None)
     assert pipeline._load_diffusion_lora_adapter(lora_request=request, lora_path=path, dtype=torch.float32) is None
-    assert request.lora_int_id not in pipeline._native_distilled_lora_adapter_ids
-    assert request.lora_int_id not in pipeline._lora_sigma_schedules
+    assert request.lora_int_id not in pipeline._native_lora_specs
 
 
 @pytest.mark.cpu
@@ -488,14 +575,13 @@ def test_h3_native_allows_distributed_layerwise_offload(monkeypatch):
         enable_distributed_layerwise_offload=True,
     )
     pipeline._turbo_lora_specs = {}
-    pipeline._native_distilled_lora_adapter_ids = set()
-    pipeline._lora_sigma_schedules = {}
+    pipeline._native_lora_specs = {}
     captured: dict[str, object] = {}
     schedule = DMD2SigmaSchedule.from_positions([1.0, 0.7, 0.4, 0.15, 0.0])
 
     def load_native(**kwargs):
         captured.update(kwargs)
-        return object(), object(), schedule
+        return object(), object(), lora_module.NativeDistilledLoRASpec(schedule)
 
     monkeypatch.setattr(pipeline_module, "load_minimax_h3_turbo_lora", lambda **_: None)
     monkeypatch.setattr(pipeline_module, "load_minimax_h3_native_distilled_lora", load_native)
@@ -509,8 +595,8 @@ def test_h3_native_allows_distributed_layerwise_offload(monkeypatch):
 
     assert loaded is not None
     assert captured["unsupported_offload_mode"] is None
-    assert request.lora_int_id in pipeline._native_distilled_lora_adapter_ids
-    assert pipeline._lora_sigma_schedules[request.lora_int_id] is schedule
+    assert request.lora_int_id in pipeline._native_lora_specs
+    assert pipeline._native_lora_specs[request.lora_int_id].schedule is schedule
 
 
 @pytest.mark.cpu
@@ -632,8 +718,7 @@ def test_legacy_manager_uses_native_loader(tmp_path):
                 enable_distributed_layerwise_offload=False,
             )
             pipeline._turbo_lora_specs = {}
-            pipeline._native_distilled_lora_adapter_ids = set()
-            pipeline._lora_sigma_schedules = {}
+            pipeline._native_lora_specs = {}
             return pipeline._load_diffusion_lora_adapter(**kwargs)
 
     manager = object.__new__(DiffusionLoRAManager)
@@ -655,8 +740,9 @@ def test_pipeline_schedule_inactive_when_scale_zero():
     torch.nn.Module.__init__(pipeline)
     pipeline.partition = "fl2va"
     pipeline._turbo_lora_specs = {}
-    pipeline._native_distilled_lora_adapter_ids = {7}
-    pipeline._lora_sigma_schedules = {7: DMD2SigmaSchedule.from_positions([1.0, 0.7, 0.4, 0.15, 0.0])}
+    pipeline._native_lora_specs = {
+        7: lora_module.NativeDistilledLoRASpec(DMD2SigmaSchedule.from_positions([1.0, 0.7, 0.4, 0.15, 0.0]))
+    }
     pipeline._base_schedule_by_partition = {"fl2va": None}
 
     sampling = SimpleNamespace(
@@ -665,7 +751,7 @@ def test_pipeline_schedule_inactive_when_scale_zero():
         num_inference_steps=4,
     )
     assert pipeline._sigma_schedule_for_request(sampling, "t2va") is None
-    assert not pipeline._has_active_native_lora(sampling)
+    assert not pipeline._active_native_spec(sampling)
 
 
 @pytest.mark.cpu
@@ -686,8 +772,7 @@ def test_pipeline_schedule_falls_back_after_eviction(monkeypatch, tmp_path):
         enable_distributed_layerwise_offload=False,
     )
     pipeline._turbo_lora_specs = {}
-    pipeline._native_distilled_lora_adapter_ids = set()
-    pipeline._lora_sigma_schedules = {}
+    pipeline._native_lora_specs = {}
     pipeline._base_schedule_by_partition = {"fl2va": None}
 
     loaded = pipeline._load_diffusion_lora_adapter(
@@ -696,14 +781,14 @@ def test_pipeline_schedule_falls_back_after_eviction(monkeypatch, tmp_path):
         dtype=torch.float32,
     )
     assert loaded is not None
-    assert request.lora_int_id in pipeline._lora_sigma_schedules
+    assert request.lora_int_id in pipeline._native_lora_specs
 
     monkeypatch.setattr(pipeline_module, "load_minimax_h3_turbo_lora", lambda **_: None)
     monkeypatch.setattr(pipeline_module, "load_minimax_h3_native_distilled_lora", lambda **_: None)
     pipeline.transformer = torch.nn.Module()
     monkeypatch.setattr(pipeline_module, "load_minimax_h3_native_adapter", lambda **_: None)
     assert pipeline._load_diffusion_lora_adapter(lora_request=request, lora_path=path, dtype=torch.float32) is None
-    assert request.lora_int_id not in pipeline._lora_sigma_schedules
+    assert request.lora_int_id not in pipeline._native_lora_specs
 
     sampling = SimpleNamespace(
         lora_request=request,

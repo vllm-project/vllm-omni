@@ -199,8 +199,7 @@ def test_pipeline_loads_native_adapter_without_distilled_schedule(
     pipeline.od_config = SimpleNamespace(enable_distributed_layerwise_offload=distributed_offload)
     pipeline.transformer = transformer
     pipeline._turbo_lora_specs = {}
-    pipeline._native_distilled_lora_adapter_ids = set()
-    pipeline._lora_sigma_schedules = {}
+    pipeline._native_lora_specs = {}
     model, _ = pipeline._load_diffusion_lora_adapter(
         lora_request=LoRARequest("native_adapter", 42, str(path)),
         lora_path=path,
@@ -208,8 +207,7 @@ def test_pipeline_loads_native_adapter_without_distilled_schedule(
     )
     assert model.rank == 32
     assert pipeline._turbo_lora_specs == {}
-    assert pipeline._native_distilled_lora_adapter_ids == set()
-    assert pipeline._lora_sigma_schedules == {}
+    assert pipeline._native_lora_specs == {}
 
 
 def test_loaded_packed_adapters_compose_without_double_scaling(tmp_path, transformer):

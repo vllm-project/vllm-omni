@@ -1602,7 +1602,7 @@ Each request must use T2VA and the distilled interval-count contract:
 -F "lora={\"name\":\"h3-flashgen-v1.0\",\"path\":\"${FLASHGEN_LORA}\",\"scale\":1.0}"
 ```
 
-This path rejects Ref2VA and checkpoints that already pin `base_schedule` in
+The T2VA v1 artifact rejects Ref2VA and checkpoints that already pin `base_schedule` in
 `model_index.json`. The adapter metadata carries
 `base_schedule=1.0,0.7,0.4,0.15,0.0`, so `num_inference_steps=4` means four
 denoiser evaluations, not five sigma points. Request-mode generation may omit
@@ -1626,6 +1626,25 @@ To validate a deployment, post the same fixed-seed T2VA request twice with the
 adapter and twice without it, then compare the four output digests. The adapter
 is bound and deterministic when each pair matches internally and the two pairs
 differ from each other.
+
+#### FlashGen native LoRA v2 for I2VA and Ref2VA
+
+Use the published v2 safetensors file exported for the matching official base
+partition. For I2VA, start a FL2VA server with `--task-type fl2va` and send a
+single first frame in `input_reference`. Set `task=fl2va` and
+`frame_indices=[0]` in `extra_params`. For Ref2VA, start a dedicated Ref2VA
+server with `--task-type ref2va`; set `task=ref2va` and send the reference
+image in `input_reference`. Both services use `--lora-backend peft` and may
+preload the published file with `--lora-path`. Select it in the request with
+the usual `lora` field and `scale=1.0`.
+
+The artifact supplies a four-interval base sigma schedule. Omit `sampler`
+to use the H3 default Euler sampler. The standard H3 video and audio shifts
+are 12 and 3. Send `num_inference_steps=4` when using step execution.
+Ref2VA requires LoRA
+buffers and an execution backend capable of QKV rank 384. The other Ref2VA
+projections use rank 128. The loader applies the exported factors at unit
+scale before applying the request multiplier.
 
 ### FastH3 adapter
 
