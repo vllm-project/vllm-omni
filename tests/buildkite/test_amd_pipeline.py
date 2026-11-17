@@ -1381,36 +1381,55 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
             "mi300_2",
             "slow and rocm and MI325 and cards_2",
             "tests/dfx/reliability/test_qwen3_omni.py",
+            "Blocking",
+        ),
+        "Reliability Test · qwen3-omni replicas probe": (
+            "mi300_4",
+            "slow and cards_4",
+            "tests/dfx/reliability/test_qwen3_omni_replica.py",
+            "NonBlocking",
         ),
         "Reliability Test · wan22": (
             "mi300_2",
             "slow and rocm and MI325 and cards_2",
             "tests/dfx/reliability/test_wan22.py",
+            "Blocking",
         ),
         "Reliability Test · hunyuan-image": (
             "mi300_4",
             "slow and rocm and MI325 and cards_4",
             "tests/dfx/reliability/test_hunyuan_image.py",
+            "Blocking",
         ),
         "Reliability Test · minicpmo-4.5": (
             "mi300_1",
             "slow and rocm and MI325 and cards_1",
             "tests/dfx/reliability/test_minicpmo_4_5.py",
+            "Blocking",
+        ),
+        "Reliability Test · minicpmo-4.5 replicas probe": (
+            "mi300_4",
+            "slow and cards_3",
+            "tests/dfx/reliability/test_minicpmo_4_5_replica.py",
+            "NonBlocking",
         ),
         "Reliability Test · Invalid parameters · MI300 · Single-GPU": (
             "mi300_1",
             "slow and rocm and MI325 and H100 and cards_1",
             "tests/dfx/reliability/invalid_param_test/",
+            "Blocking",
         ),
         "Reliability Test · Invalid parameters · MI300 · 2-GPU": (
             "mi300_2",
             "slow and rocm and MI325 and H100 and cards_2",
             "test_invalid_omni_chat.py",
+            "Blocking",
         ),
         "Reliability Test · Invalid parameters · Audio · MI300 · Single-GPU": (
             "mi300_1",
             "slow and rocm and MI325 and L4 and cards_1",
             "tests/dfx/reliability/invalid_param_test/",
+            "Blocking",
         ),
     }
 
@@ -1418,11 +1437,11 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
     assert "if" not in group
     assert [step["label"] for step in group["steps"]] == list(jobs)
     for step in group["steps"]:
-        pool, marker, filename = jobs[step["label"]]
+        pool, marker, filename, grade = jobs[step["label"]]
         command = "\n".join(step["commands"])
         assert "if" not in step
         assert step["agent_pool"] == pool
-        assert step["grade"] == "Blocking"
+        assert step["grade"] == grade
         assert step["depends_on"] == "amd-build"
         assert marker in command
         assert filename in command
@@ -1443,6 +1462,15 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
             "collection_message": "Expected exactly 14 Qwen3-Omni reliability nodes",
             "junit_message": ("Expected exactly 14 executed Qwen3-Omni reliability tests with 4 known skips"),
         },
+        "Reliability Test · qwen3-omni replicas probe": {
+            "artifact_path": "artifacts/rocm-qwen3-omni-replica-reliability/**/*",
+            "artifact_env": "ROCM_QWEN3_REPLICA_ARTIFACT_DIR",
+            "expected_nodes": 5,
+            "expected_skipped": 1,
+            "timeout": "220m",
+            "collection_message": "Expected exactly 5 Qwen3-Omni replica reliability nodes",
+            "junit_message": ("Expected exactly 5 executed Qwen3-Omni replica reliability tests with 1 known skip"),
+        },
         "Reliability Test · wan22": {
             "artifact_path": "artifacts/rocm-wan22-reliability/**/*",
             "artifact_env": "ROCM_WAN22_RELIABILITY_ARTIFACT_DIR",
@@ -1460,6 +1488,15 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
             "timeout": "220m",
             "collection_message": "Expected exactly 14 MiniCPM-o 4.5 reliability nodes",
             "junit_message": "Expected exactly 14 executed MiniCPM-o 4.5 reliability tests with 3 known skips",
+        },
+        "Reliability Test · minicpmo-4.5 replicas probe": {
+            "artifact_path": "artifacts/rocm-minicpmo-replica-reliability/**/*",
+            "artifact_env": "ROCM_MINICPMO_REPLICA_ARTIFACT_DIR",
+            "expected_nodes": 5,
+            "expected_skipped": 3,
+            "timeout": "220m",
+            "collection_message": "Expected exactly 5 MiniCPM-o 4.5 replica reliability nodes",
+            "junit_message": ("Expected exactly 5 executed MiniCPM-o 4.5 replica reliability tests with 3 known skips"),
         },
         "Reliability Test · Invalid parameters · MI300 · Single-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-single/**/*",
@@ -1511,6 +1548,42 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
         assert f"tests != {expected_nodes} or skipped != {expected_skipped}" in command
 
 
+def test_weekly_replica_reliability_probes_keep_cuda_source_marks_until_burn_in() -> None:
+    probes = {
+        "Reliability Test · qwen3-omni replicas probe": (
+            "omni_qwen3_omni_replica_reliability",
+            Path("tests/dfx/reliability/test_qwen3_omni_replica.py"),
+            "slow and cards_4",
+        ),
+        "Reliability Test · minicpmo-4.5 replicas probe": (
+            "omni_minicpmo_4_5_replica_reliability",
+            Path("tests/dfx/reliability/test_minicpmo_4_5_replica.py"),
+            "slow and cards_3",
+        ),
+    }
+
+    for label, (dependency, source_path, marker) in probes.items():
+        step = _find_step(label, AMD_WEEKLY_PIPELINE)
+        command = "\n".join(step["commands"])
+
+        assert step["grade"] == "NonBlocking"
+        assert step["agent_pool"] == "mi300_4"
+        assert step["depends_on"] == "amd-build"
+        assert step["mirror_hardwares"] == ["amdproduction"]
+        assert step["timeout_in_minutes"] == 240
+        assert step["source_file_dependencies"] == dependency
+        assert "retry" not in step
+        assert marker in command
+        assert "-m rocm" not in command
+        assert "MI325" not in command
+
+        source = source_path.read_text(encoding="utf-8")
+        assert 'res = {"cuda": "H100"}' in source
+        assert '"rocm": "MI325"' not in source
+        for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
+            assert label not in pipeline_path.read_text(encoding="utf-8")
+
+
 def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
     group = _find_group("Reliability Test", AMD_WEEKLY_PIPELINE)
     affected_labels = {
@@ -1556,6 +1629,14 @@ def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
             "Expected exactly 14 executed Qwen3-Omni reliability tests with 4 known skips",
         ),
         (
+            "Reliability Test · qwen3-omni replicas probe",
+            "ROCM_QWEN3_REPLICA_ARTIFACT_DIR",
+            "qwen3-replica-reliability-guard",
+            5,
+            1,
+            "Expected exactly 5 executed Qwen3-Omni replica reliability tests with 1 known skip",
+        ),
+        (
             "Reliability Test · wan22",
             "ROCM_WAN22_RELIABILITY_ARTIFACT_DIR",
             "wan22-reliability-guard",
@@ -1570,6 +1651,14 @@ def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
             14,
             3,
             "Expected exactly 14 executed MiniCPM-o 4.5 reliability tests with 3 known skips",
+        ),
+        (
+            "Reliability Test · minicpmo-4.5 replicas probe",
+            "ROCM_MINICPMO_REPLICA_ARTIFACT_DIR",
+            "minicpmo-replica-reliability-guard",
+            5,
+            3,
+            "Expected exactly 5 executed MiniCPM-o 4.5 replica reliability tests with 3 known skips",
         ),
         (
             "Reliability Test · Invalid parameters · MI300 · Single-GPU",
@@ -1596,7 +1685,16 @@ def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
             "Expected exactly 127 audio invalid-parameter tests with 26 known skips",
         ),
     ),
-    ids=("qwen3-omni", "wan22", "minicpmo", "invalid-parameters-single", "invalid-parameters-2gpu", "audio"),
+    ids=(
+        "qwen3-omni",
+        "qwen3-omni-replicas",
+        "wan22",
+        "minicpmo",
+        "minicpmo-replicas",
+        "invalid-parameters-single",
+        "invalid-parameters-2gpu",
+        "audio",
+    ),
 )
 def test_weekly_reliability_executes_junit_guard_before_exit(
     tmp_path: Path,
@@ -5721,9 +5819,13 @@ def test_minicpmo_ready_grades_render_blocking() -> None:
         assert rendered["env"]["VLLM_ROCM_USE_AITER"] == "0"
 
 
-def test_weekly_all_jobs_are_blocking() -> None:
+def test_weekly_keeps_only_replica_burn_in_nonblocking() -> None:
     weekly = yaml.safe_load(AMD_WEEKLY_PIPELINE.read_text(encoding="utf-8"))
     steps = [step for group in weekly["steps"] for step in group["steps"]]
 
-    assert len(steps) == 34
-    assert all(step["grade"] == "Blocking" for step in steps)
+    assert len(steps) == 36
+    assert sum(step["grade"] == "Blocking" for step in steps) == 34
+    assert {step["label"] for step in steps if step["grade"] == "NonBlocking"} == {
+        "Reliability Test · qwen3-omni replicas probe",
+        "Reliability Test · minicpmo-4.5 replicas probe",
+    }
