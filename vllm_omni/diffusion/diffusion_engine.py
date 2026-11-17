@@ -1887,6 +1887,8 @@ class DiffusionEngine:
         output = self.add_req_and_wait_for_response(req)
         if output.error:
             raise RuntimeError(f"Dummy run failed: {output.error}")
+        # The warmup shape differs from real requests; its cached blocks would stay reserved.
+        self.executor.collective_rpc("empty_cache")
 
     def _submit_rpc(
         self,

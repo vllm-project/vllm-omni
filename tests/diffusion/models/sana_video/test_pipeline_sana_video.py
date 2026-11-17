@@ -3,6 +3,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -772,6 +773,7 @@ def test_diffusers_adapter_sana_i2v_warmup_supplies_image():
         return SimpleNamespace(error=None)
 
     engine.add_req_and_wait_for_response = capture_request
+    engine.executor = MagicMock()
 
     engine._dummy_run()
 

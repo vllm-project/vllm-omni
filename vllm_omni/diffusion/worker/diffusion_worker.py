@@ -865,6 +865,10 @@ class DiffusionWorker:
             "MixFusion capability discovery", lambda: inspect_mixfusion_capability(pipeline)
         )
 
+    def empty_cache(self) -> None:
+        """Return cached allocator blocks to the device."""
+        current_omni_platform.empty_cache()
+
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         """Return native rank-local specs for every diffusion Worker."""
 
