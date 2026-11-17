@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """E2E online tests for Audex (Nemotron-Labs-Audex-2B) TTS.
 
 Covers /v1/audio/speech non-streaming and audio-byte streaming, plus the
@@ -47,7 +47,7 @@ if os.environ.get("AUDEX_E2E_30B") == "1":
     )
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", audex_server_params, indirect=True)
 def test_audex_tts_nonstream(omni_server, openai_client) -> None:
     """Plain English TTS, non-streaming WAV response."""
@@ -60,7 +60,7 @@ def test_audex_tts_nonstream(omni_server, openai_client) -> None:
     openai_client.send_audio_speech_request(request_config)
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", audex_server_params, indirect=True)
 def test_audex_tts_stream_audio(omni_server, openai_client) -> None:
     """Plain English TTS, raw audio-byte streaming."""
@@ -74,7 +74,7 @@ def test_audex_tts_stream_audio(omni_server, openai_client) -> None:
     openai_client.send_audio_speech_request(request_config)
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", audex_server_params, indirect=True)
 def test_audex_tts_max_new_tokens_caps_duration(omni_server, openai_client, run_level) -> None:
     """max_new_tokens must cap stage-0 generation (review P2 regression)."""
@@ -104,7 +104,7 @@ def test_audex_tts_max_new_tokens_caps_duration(omni_server, openai_client, run_
     assert duration_s <= 1.0, f"max_new_tokens ignored: duration={duration_s:.2f}s"
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", audex_server_params, indirect=True)
 def test_audex_tts_request_policies(omni_server, openai_client) -> None:
     """Unsupported voice / CFG / empty input must be rejected with 400."""
@@ -130,7 +130,7 @@ def test_audex_tts_request_policies(omni_server, openai_client) -> None:
         assert needle in resp.text, f"{bad_payload} error missing {needle!r}: {resp.text[:200]}"
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", audex_server_params, indirect=True)
 def test_audex_tts_cfg_nonstream(omni_server, openai_client) -> None:
     """Guided (cfg_scale=1.5) non-streaming request returns one WAV."""
@@ -144,7 +144,7 @@ def test_audex_tts_cfg_nonstream(omni_server, openai_client) -> None:
     openai_client.send_audio_speech_request(request_config)
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", audex_server_params, indirect=True)
 def test_audex_tts_cfg_stream_audio(omni_server, openai_client) -> None:
     """Guided (cfg_scale=1.5) streaming request yields a single audio stream."""
@@ -159,7 +159,7 @@ def test_audex_tts_cfg_stream_audio(omni_server, openai_client) -> None:
     openai_client.send_audio_speech_request(request_config)
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", audex_server_params, indirect=True)
 def test_audex_tts_mixed_cfg_concurrency(omni_server, openai_client) -> None:
     """Mixed guided/unguided requests at concurrency 4 all complete with audio."""
@@ -186,7 +186,7 @@ def test_audex_tts_mixed_cfg_concurrency(omni_server, openai_client) -> None:
         assert len(resp.content) > 44, f"{payload}: empty audio body"
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", audex_server_params, indirect=True)
 def test_audex_tts_stream_abort_leaves_server_healthy(omni_server, openai_client) -> None:
     """Aborting a guided streaming request mid-flight must not wedge the server.

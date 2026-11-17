@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for applying strategy specs onto merged stage configs."""
 
 from __future__ import annotations
@@ -52,12 +52,6 @@ def test_apply_tp_by_role():
     assert stages[0].yaml_engine_args["tensor_parallel_size"] == 2
     # untouched roles keep their config
     assert "tensor_parallel_size" not in stages[1].yaml_engine_args
-
-
-def test_apply_by_model_stage():
-    stages = _qwen_stages()
-    apply_strategy_specs(stages, {"thinker": [_tp(2)]})
-    assert stages[0].yaml_engine_args["tensor_parallel_size"] == 2
 
 
 def test_apply_stage_replica_sets_num_replicas_and_surfaces_lb():

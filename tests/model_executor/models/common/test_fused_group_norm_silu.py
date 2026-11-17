@@ -21,7 +21,7 @@ from vllm_omni.model_executor.models.common.ops._group_norm_reduction import (
 # Skip tests if CUDA not available
 pytestmark = [
     pytest.mark.core_model,
-    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
+    *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1),
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton kernels"),
 ]
 

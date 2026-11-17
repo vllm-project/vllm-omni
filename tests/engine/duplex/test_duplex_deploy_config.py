@@ -17,6 +17,21 @@ from vllm_omni.config.stage_config import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_model_custom_options_round_trip_through_deploy_yaml(tmp_path):
+    deploy_path = tmp_path / "deploy.yaml"
+    deploy_path.write_text(
+        "duplex_session:\n  model_custom_options:\n    history_policy: incremental\nstages: []\n",
+        encoding="utf-8",
+    )
+    config = load_deploy_config(deploy_path).duplex_session
+    assert config.model_custom_options == {"history_policy": "incremental"}
+
+
+def test_model_custom_options_requires_mapping():
+    with pytest.raises(ValueError, match="model_custom_options"):
+        DuplexSessionRuntimeConfig(model_custom_options=[])
+
+
 def test_duplex_session_runtime_defaults_are_typed_and_immutable(tmp_path) -> None:
     deploy_path = tmp_path / "duplex.yaml"
     deploy_path.write_text("duplex_session: {}\nstages: []\n", encoding="utf-8")
@@ -200,3 +215,18 @@ def test_deploy_duplex_max_sessions_tracks_the_deploy_config(deploy_yaml: str, e
 def test_history_calibration_requires_bounded_server_configuration(patch):
     with pytest.raises(ValueError):
         DuplexSessionRuntimeConfig(**patch)
+
+
+def test_context_keep_media_turns_defaults_to_none_and_loads(tmp_path) -> None:
+    deploy_path = tmp_path / "duplex.yaml"
+    deploy_path.write_text("duplex_session:\n  context_keep_media_turns: 2\nstages: []\n", encoding="utf-8")
+
+    assert DuplexSessionRuntimeConfig().context_keep_media_turns is None
+    assert DuplexSessionRuntimeConfig(context_keep_media_turns=0).context_keep_media_turns == 0
+    assert load_deploy_config(deploy_path).duplex_session.context_keep_media_turns == 2
+
+
+@pytest.mark.parametrize("value", [-1, True, "2", 1.5])
+def test_context_keep_media_turns_validation(value) -> None:
+    with pytest.raises(ValueError, match="duplex_session.context_keep_media_turns must be an integer >= 0 or null"):
+        DuplexSessionRuntimeConfig(context_keep_media_turns=value)

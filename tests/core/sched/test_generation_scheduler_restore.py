@@ -17,7 +17,9 @@ from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import Request, RequestStatus
 
+from tests.helpers.omni_scheduler import make_kv_cache_manager
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler, _has_async_chunk_payload_to_run
+from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
 from vllm_omni.engine.serialization import serialize_additional_information
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -78,6 +80,7 @@ def _make_generation_scheduler(waiting_request, *, use_v2_model_runner=False):
     scheduler.policy = SchedulingPolicy.FCFS
     scheduler.chunk_transfer_adapter = FakeAdapter()
     scheduler.chunk_transfer_adapter.requests_with_ready_chunks.add(waiting_request.request_id)
+    scheduler._native_data_plane = False
     scheduler.input_coordinator = None
     scheduler.log_stats = False
     scheduler.scheduler_config = SimpleNamespace(enable_chunked_prefill=True)
@@ -125,8 +128,11 @@ def _make_generation_scheduler(waiting_request, *, use_v2_model_runner=False):
 def test_generation_scheduler_preserves_auxiliary_output_metadata() -> None:
     request = Request("aux-contract", [1, 2], SamplingParams(max_tokens=2), pooling_params=None)
     request.block_hashes.append(b"block-hash")
+    # Hashes are emitted only for a completed hash block. One scheduled token
+    # does not cover the default 16-token block, so count a full block computed.
+    request.num_computed_tokens = 16
     scheduler = _make_generation_scheduler(request, use_v2_model_runner=True)
-    scheduler.aux_output_connector = AuxOutputSchedulerConnector()
+    scheduler.aux_output_connector = AuxOutputSchedulerConnector(make_kv_cache_manager(block_size=16))
 
     output = scheduler._build_generation_scheduler_output(
         new_reqs_data=[],
@@ -197,9 +203,7 @@ def test_chunk_lifecycle_no_resubmit_and_state_survives_requeue(monkeypatch) -> 
     monkeypatch.setattr("vllm_omni.core.sched.omni_generation_scheduler.create_request_queue", create_request_queue)
     scheduler._native_data_plane = True
     scheduler.chunk_transfer_adapter = None
-    scheduler.input_coordinator = SimpleNamespace(
-        _async_chunk=True, finished_requests=set(), restore_queues=lambda *args, **kwargs: None
-    )
+    scheduler.input_coordinator = OmniSchedulingCoordinator(stage_id=1, async_chunk=True)
     scheduler.running = []
     scheduler.waiting = create_request_queue(scheduler.policy)
     scheduler.kv_holding_waiting = create_request_queue(scheduler.policy)
@@ -379,9 +383,7 @@ def _express_scheduler():
     scheduler.max_num_running_reqs = 4
     scheduler._native_data_plane = True
     scheduler.chunk_transfer_adapter = None
-    scheduler.input_coordinator = SimpleNamespace(
-        _async_chunk=True, finished_requests=set(), restore_queues=lambda *args, **kwargs: None
-    )
+    scheduler.input_coordinator = OmniSchedulingCoordinator(stage_id=1, async_chunk=True)
     scheduler._first_chunk_express = True
     scheduler._last_step_express = False
     scheduler._chunk_started = {"continuation"}

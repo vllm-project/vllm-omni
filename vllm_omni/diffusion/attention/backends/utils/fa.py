@@ -288,10 +288,13 @@ def resolve_vllm_flash_attn_version(requested: str | int | None = None) -> int:
 
 
 @cache
-def _vllm_varlen_dispatcher() -> FlashAttnFn | None:
-    """Cache dispatcher availability for the lifetime of this process."""
-    # Failed imports are removed from sys.modules. Cache None too, so ROCm
-    # does not retry the unavailable CUDA extensions on every attention call.
+def _vllm_flash_attn_varlen() -> FlashAttnFn | None:
+    """vLLM's versioned varlen dispatcher, or None where vLLM does not bundle it.
+
+    Cached because this runs on every attention call: Python does not cache a
+    failed import, so without it each call off CUDA (e.g. XPU) repeats the full
+    module search on the filesystem.
+    """
     try:
         from vllm.vllm_flash_attn import flash_attn_varlen_func as vllm_func
     except ImportError:
@@ -304,7 +307,7 @@ def _is_vllm_flash_attn_varlen(attn_func: FlashAttnFn) -> bool:
 
     Identity by design; compiled-specs variants intentionally fall through.
     """
-    vllm_func = _vllm_varlen_dispatcher()
+    vllm_func = _vllm_flash_attn_varlen()
     return vllm_func is not None and attn_func is vllm_func
 
 

@@ -715,6 +715,13 @@
           "link": null
         },
         {
+          "localized_name": "timeline_guides",
+          "name": "timeline_guides",
+          "shape": 7,
+          "type": "H3_TIMELINE_GUIDES",
+          "link": null
+        },
+        {
           "localized_name": "url",
           "name": "url",
           "type": "STRING",
@@ -1084,6 +1091,13 @@
           "name": "latent_edit",
           "shape": 7,
           "type": "LATENT_MASK_EDITING",
+          "link": null
+        },
+        {
+          "localized_name": "timeline_guides",
+          "name": "timeline_guides",
+          "shape": 7,
+          "type": "H3_TIMELINE_GUIDES",
           "link": null
         },
         {
@@ -1459,6 +1473,13 @@
           "link": null
         },
         {
+          "localized_name": "timeline_guides",
+          "name": "timeline_guides",
+          "shape": 7,
+          "type": "H3_TIMELINE_GUIDES",
+          "link": null
+        },
+        {
           "localized_name": "url",
           "name": "url",
           "type": "STRING",
@@ -1826,7 +1847,7 @@
       1,
       0,
       12,
-      9,
+      10,
       "STRING"
     ],
     [
@@ -1834,7 +1855,7 @@
       2,
       0,
       12,
-      10,
+      11,
       "STRING"
     ],
     [
@@ -1842,7 +1863,7 @@
       3,
       0,
       12,
-      16,
+      17,
       "FLOAT"
     ],
     [
@@ -1906,7 +1927,7 @@
       1,
       0,
       22,
-      9,
+      10,
       "STRING"
     ],
     [
@@ -1914,7 +1935,7 @@
       2,
       0,
       22,
-      10,
+      11,
       "STRING"
     ],
     [
@@ -1922,7 +1943,7 @@
       3,
       0,
       22,
-      16,
+      17,
       "FLOAT"
     ],
     [
@@ -1986,7 +2007,7 @@
       1,
       0,
       32,
-      9,
+      10,
       "STRING"
     ],
     [
@@ -1994,7 +2015,7 @@
       2,
       0,
       32,
-      10,
+      11,
       "STRING"
     ],
     [
@@ -2002,7 +2023,7 @@
       3,
       0,
       32,
-      16,
+      17,
       "FLOAT"
     ],
     [

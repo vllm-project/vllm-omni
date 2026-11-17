@@ -19,11 +19,14 @@ import pytest
 import torch
 import zmq
 
+from tests.helpers.runtime import get_open_port
 from vllm_omni.data_entry_keys import HiddenStatesStruct, MetaStruct, OmniPayloadStruct
 
 pytestmark = [pytest.mark.cpu, pytest.mark.parallel, pytest.mark.core_model]
 
-PORT = 47431
+# One port per worker process. A module-level literal is bound by every
+# xdist worker at once when tests from this file are not kept together.
+PORT = get_open_port()
 
 
 def _wait_for_metadata(consumer, key, metadata=None, *, timeout=2.0):
@@ -548,6 +551,61 @@ def reliable_claim_queries(producer, nixl_connector_cls, monkeypatch):
     monkeypatch.setattr(nixl_connector_cls, "_query_metadata_at", query)
 
 
+def test_stream_writes_are_fenced_once_per_accelerator_device(nixl_connector_cls, monkeypatch):
+    from vllm_omni.distributed.omni_connectors.connectors import nixl_connector
+
+    synchronized = []
+    monkeypatch.setattr(
+        torch.accelerator,
+        "current_stream",
+        lambda device: types.SimpleNamespace(synchronize=lambda: synchronized.append(device)),
+    )
+    tensors = [types.SimpleNamespace(device=torch.device(name)) for name in ("cuda:0", "cuda:0", "cuda:1", "cpu")]
+
+    nixl_connector._wait_for_stream_writes(tensors)
+
+    assert sorted(map(str, synchronized)) == ["cuda:0", "cuda:1"]
+
+
+def test_put_fences_payload_writes_before_registration(producer, monkeypatch):
+    from vllm_omni.distributed.omni_connectors.connectors import nixl_connector
+
+    events = []
+    monkeypatch.setattr(nixl_connector, "_wait_for_stream_writes", lambda tensors: events.append("fence"))
+    register = producer._agent.register_memory
+
+    def register_memory(descs, backends=None):
+        events.append("register")
+        register(descs, backends=backends)
+
+    monkeypatch.setattr(producer._agent, "register_memory", register_memory)
+
+    assert producer.put("0", "1", "fenced-put", torch.arange(4, dtype=torch.float32))[0]
+    assert events == ["fence", "register"]
+
+
+def test_get_fences_receive_memory_before_read(producer, consumer, ownership_copying_agent, monkeypatch):
+    from vllm_omni.distributed.omni_connectors.connectors import nixl_connector
+
+    monkeypatch.setattr(consumer, "_metadata_query_timeout_ms", consumer._handshake_timeout_ms)
+    payload = torch.arange(6, dtype=torch.float32)
+    _, _, metadata = producer.put("0", "1", "fenced-get", payload)
+    events = []
+    monkeypatch.setattr(nixl_connector, "_wait_for_stream_writes", lambda tensors: events.append("fence"))
+    transfer = consumer._agent.transfer
+
+    def read(pairs):
+        events.append("read")
+        transfer(pairs)
+
+    monkeypatch.setattr(consumer._agent, "transfer", read)
+
+    actual, _ = consumer.get("0", "1", "fenced-get", metadata)
+
+    torch.testing.assert_close(actual, payload, rtol=0, atol=0)
+    assert events == ["fence", "read"]
+
+
 def test_put_publishes_its_handshake_endpoint(producer):
     ok, size, metadata = producer.put("0", "1", "req-0", torch.arange(8, dtype=torch.float32))
 
@@ -760,16 +818,47 @@ def test_transfer_done_releases_the_producer_buffer(producer, consumer):
     assert producer._agent.registered == []
 
 
-def test_direct_metadata_has_ephemeral_ownership_endpoint(nixl_connector_cls):
-    connector = nixl_connector_cls({})
+@pytest.mark.parametrize("direct", [False, True])
+def test_ephemeral_ownership_endpoint_supports_metadata_discovery(nixl_connector_cls, direct):
+    connector = nixl_connector_cls({"host": "127.0.0.1", "zmq_port": 0})
+    receiver = None
     try:
         assert connector._zmq_ctx is not None
         assert connector._listener_thread is not None
         _, _, metadata = connector.put("0", "1", "req-4", torch.zeros(2))
-        assert metadata["sender_host"]
-        assert metadata["sender_zmq_port"] > 0
+        endpoint = connector.get_connection_info()
+        assert endpoint["host"] == metadata["sender_host"] == "127.0.0.1"
+        assert endpoint["zmq_port"] == metadata["sender_zmq_port"] > 0
+        receiver = nixl_connector_cls({"role": "receiver"})
+        forwarded = {"source_host": endpoint["host"], "source_port": endpoint["zmq_port"]}
+        resolved = _wait_for_metadata(receiver, "req-4", metadata if direct else forwarded)
+        assert resolved["generation"] == metadata["generation"]
+        assert receiver._notify_transfer_done("req-4", resolved)
+        assert not connector._pending
     finally:
+        if receiver is not None:
+            receiver.close()
+        for pending in connector._pending.values():
+            pending.claims.clear()  # This probe only queries metadata; it never submits DMA.
         connector.close()
+
+
+@pytest.mark.parametrize("role", ["sender", None])
+def test_handshake_bind_failure_cleans_up_partial_initialization(nixl_connector_cls, role):
+    with zmq.Context() as context, context.socket(zmq.ROUTER) as occupied:
+        port = occupied.bind_to_random_port("tcp://127.0.0.1")
+        connector = nixl_connector_cls.__new__(nixl_connector_cls)
+        try:
+            with pytest.raises(RuntimeError, match="failed to bind handshake socket"):
+                connector.__init__({"role": role, "host": "127.0.0.1", "zmq_port": port})
+            assert connector._closed
+            assert connector._zmq_ctx is None
+            assert connector._listener_thread is None
+            assert connector._lease_thread is None
+            assert connector._transfer_thread is None
+            connector.close()  # Cleanup remains safe when __del__ calls it again.
+        finally:
+            connector.close()
 
 
 def test_idle_producer_lease_expires_without_another_put(nixl_connector_cls):

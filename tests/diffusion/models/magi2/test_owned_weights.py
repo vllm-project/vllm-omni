@@ -17,8 +17,8 @@ import torch
 
 from tests.diffusion.models.magi2.test_bf16_moe_wiring import _gpu_device
 from tests.helpers.mark import hardware_marks
-from vllm_omni.diffusion.models.magi2 import mh_moe
-from vllm_omni.diffusion.models.magi2.mh_moe import (
+from vllm_omni.diffusion.models.magi2.layers.cuda import mh_moe
+from vllm_omni.diffusion.models.magi2.layers.cuda.mh_moe import (
     Magi2MultiHeadMoE,
     Magi2MultiHeadMoEConfig,
 )
@@ -269,6 +269,8 @@ def test_owned_bank_forward_matches_the_unowned_module():
 @pytest.mark.parametrize("deterministic", ["0", "1"])
 def test_owned_bank_forward_matches_the_unowned_module_on_device(monkeypatch, device_type, deterministic):
     """The fused path and the deterministic Triton kernel read the strided gate/up views exactly like the contiguous banks."""
+
+    from vllm_omni.diffusion.models.magi2.layers import Magi2MultiHeadMoE
 
     device = _gpu_device(device_type)
     monkeypatch.setenv("MAGI2_DETERMINISTIC", deterministic)

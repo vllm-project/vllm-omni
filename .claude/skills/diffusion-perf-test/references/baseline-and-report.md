@@ -24,43 +24,49 @@ baseline raises. Keep list lengths aligned with the sweep.
 Use the result field names of the runner that would read them. The example above
 uses the legacy runner's names (`throughput_qps`, `latency_mean`,
 `peak_memory_mb_mean`); a unified-runner row should use `request_throughput`,
-`mean_e2el_ms`, and `mean_peak_memory_mb`. `mean_tpot_ms` is the exception: it
-is the only key that has an effect today (`assert_result` checks its finiteness;
-see below). Nothing else consumes these names yet, but a future gate should use
-the runner's own field names.
+`mean_e2el_ms`, and `mean_peak_memory_mb`. With `--assert-baseline`, every
+finite metric in the matching hardware bucket is compared (see below).
+`mean_tpot_ms` is also checked for a finite sample even when the flag is off.
 
 The runtime `Hardware` value selects the bucket. If it is not one of the keys
 (for example a machine whose device name normalizes to an unlisted token), the
-baseline is recorded but never matched.
+baseline check logs a warning and skips comparison.
 
-## What a baseline actually does today
+## What a baseline does
 
-With the unified runner, `run_benchmark()` writes the resolved `baseline` into
-the result JSON (`result["baseline"]`). `assert_result` only asserts metric
-finiteness when a *TPOT* baseline is configured
-(`baseline[<hardware>]["mean_tpot_ms"]`); it does **not** compare throughput or
-latency against the configured thresholds. So:
+With the unified runner, `run_benchmark()` writes the sweep-resolved `baseline`
+into the result JSON (`result["baseline"]`). The legacy diffusion runner stores
+the same resolved map on the metrics it returns.
 
-- A `baseline` block is **recorded evidence**, not an enforced gate.
-- Omitting `baseline` runs the case without any threshold assertion.
-- `--assert-baseline` is registered in `tests/dfx/conftest.py`
-  (`pytest_addoption`) with help text saying "default: off", but **no runner
-  consumes it** — grep for `getoption` / `assert-baseline` in the runners returns
-  nothing.
+`--assert-baseline` (registered in `tests/dfx/conftest.py`, default off) makes
+both runners call `assert_baseline_within_tolerance()` in
+`tests/dfx/conftest.py`:
 
-Do not tell a user a regression is "gated" when the value is only recorded.
+- Compare the bucket whose key is the runtime `Hardware` value. Missing or
+  unmatched hardware logs a warning and skips comparison.
+- Throughput and QPS (`throughput`, `qps` in the metric name) fail when the
+  measured value is **more than 10% below** the baseline (`measured < baseline * 0.9`).
+- Latency, memory, and real-time factor (`latency`, `ttft`, `tpot`, `itl`,
+  `e2el`, `ttfp`, `rtf`, `memory`) fail when the measured value is **more than
+  10% above** the baseline (`measured > baseline * 1.1`).
+- An exact 10% boundary passes. A metric name that matches neither family fails
+  the case instead of being skipped.
+- Omitting `baseline`, or leaving it empty, still runs the case with no
+  threshold assertion. The existing TPOT finiteness check still runs whenever
+  `mean_tpot_ms` is configured, even without the flag.
 
-## Proposing an enforced regression gate (new capability)
+CUDA and NPU perf jobs pass `--assert-baseline`, except for the Qwen3-Omni NPU
+jobs described below. AMD jobs do not, until that
+hardware has its own bucket. A run without the flag records the baseline and
+does not apply this gate. Do not call a row gated unless the command includes
+the flag and the result hardware matches a bucket.
 
-If the task is to make regressions fail CI, that is new work, not wiring:
-
-1. Decide the comparison: last-known-good committed baseline, or previous run.
-2. Decide the metric and tolerance per row, and the hardware bucket.
-3. Implement the consumer (extend the runner to read `--assert-baseline`, or add
-   a compare script) and a place to store baselines.
-4. Re-run the rows enough times to set a defensible tolerance; quote the spread.
-
-Keep this separate from "add a watch case", which only records results.
+CUDA/NPU ready performance jobs and the MiniCPM-o 4.5 A3 two-card nightly
+job currently have no configured baseline, so the flag only enables the check
+entry point and those cases skip threshold validation until baselines are added.
+The two Qwen3-Omni NPU nightly performance jobs intentionally omit
+`--assert-baseline` while the known performance issue
+[#10055](https://github.com/vllm-project/vllm-omni/issues/10055) is evaluated.
 
 ## Nightly report chain
 

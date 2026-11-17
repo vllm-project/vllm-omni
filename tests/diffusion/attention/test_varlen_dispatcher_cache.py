@@ -18,9 +18,9 @@ pytestmark = [pytest.mark.cpu, pytest.mark.core_model, pytest.mark.diffusion]
 
 @pytest.fixture(autouse=True)
 def clear_dispatcher_cache():
-    fa._vllm_varlen_dispatcher.cache_clear()
+    fa._vllm_flash_attn_varlen.cache_clear()
     yield
-    fa._vllm_varlen_dispatcher.cache_clear()
+    fa._vllm_flash_attn_varlen.cache_clear()
 
 
 def test_unavailable_dispatcher_is_imported_only_once(monkeypatch):
@@ -63,27 +63,27 @@ def test_available_dispatcher_uses_identity_and_retains_version_selection(monkey
     # Availability is fixed until the cache is explicitly cleared.
     monkeypatch.setitem(sys.modules, module.__name__, None)
     assert fa.vllm_varlen_version_kwargs(dispatcher) == {"fa_version": 3}
-    assert fa._vllm_varlen_dispatcher.cache_info().misses == 1
+    assert fa._vllm_flash_attn_varlen.cache_info().misses == 1
     assert resolver.call_count == 2
 
 
 def test_missing_dispatcher_can_be_resolved_after_cache_clear(monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm.vllm_flash_attn", None)
-    assert fa._vllm_varlen_dispatcher() is None
+    assert fa._vllm_flash_attn_varlen() is None
     module = ModuleType("vllm.vllm_flash_attn")
     dispatcher = Mock()
     setattr(module, "flash_attn_varlen_func", dispatcher)
     monkeypatch.setitem(sys.modules, module.__name__, module)
-    assert fa._vllm_varlen_dispatcher() is None
-    fa._vllm_varlen_dispatcher.cache_clear()
-    assert fa._vllm_varlen_dispatcher() is dispatcher
+    assert fa._vllm_flash_attn_varlen() is None
+    fa._vllm_flash_attn_varlen.cache_clear()
+    assert fa._vllm_flash_attn_varlen() is dispatcher
 
 
 def test_none_skips_dispatcher_lookup_and_version_resolution(monkeypatch):
     resolver = Mock(side_effect=AssertionError("None must not resolve a version"))
     monkeypatch.setattr(fa, "resolve_vllm_flash_attn_version", resolver)
     assert fa.vllm_varlen_version_kwargs(None) == {}
-    assert fa._vllm_varlen_dispatcher.cache_info().misses == 0
+    assert fa._vllm_flash_attn_varlen.cache_info().misses == 0
     resolver.assert_not_called()
 
 
@@ -148,7 +148,7 @@ def test_prepared_masked_forward_preserves_dispatcher_identity_and_cache(monkeyp
             assert "fa_version" not in kwargs
     assert resolver.call_count == 2
     assert all(not call.args and not call.kwargs for call in resolver.call_args_list)
-    assert fa._vllm_varlen_dispatcher.cache_info().misses == 1
+    assert fa._vllm_flash_attn_varlen.cache_info().misses == 1
 
 
 def test_dispatcher_runtime_import_failure_propagates_and_is_retried(monkeypatch):
@@ -166,5 +166,5 @@ def test_dispatcher_runtime_import_failure_propagates_and_is_retried(monkeypatch
         with pytest.raises(RuntimeError, match="Broken extension initialization"):
             fa.vllm_varlen_version_kwargs(Mock())
     assert len(attempts) == 2
-    assert fa._vllm_varlen_dispatcher.cache_info().misses == 2
-    assert fa._vllm_varlen_dispatcher.cache_info().currsize == 0
+    assert fa._vllm_flash_attn_varlen.cache_info().misses == 2
+    assert fa._vllm_flash_attn_varlen.cache_info().currsize == 0

@@ -10,7 +10,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.minicpmo_4_5.cfm_attention import cfm_attention
 
-pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
