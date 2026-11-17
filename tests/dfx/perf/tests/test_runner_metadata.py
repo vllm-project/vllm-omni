@@ -313,7 +313,7 @@ def test_merge_omni_default_server_args_respects_json():
     ]
 
 
-def test_prefix_benchmark_uses_unified_runner(monkeypatch):
+def test_prefix_benchmark_uses_unified_runner(monkeypatch, pytestconfig):
     from pathlib import Path
 
     from tests.dfx.conftest import is_diffusion_perf_config, load_benchmark_configs
@@ -342,6 +342,7 @@ def test_prefix_benchmark_uses_unified_runner(monkeypatch):
             run_benchmark.test_performance_benchmark(
                 SimpleNamespace(host="localhost", port=8000, model="test-model"),
                 {"test_name": config["test_name"], "params": params},
+                pytestconfig=pytestconfig,
             )
     assert len(calls) == 3
 
@@ -726,7 +727,7 @@ def test_num_warmups_preserves_explicit_zero():
 
 
 @pytest.mark.parametrize("dataset", ["omniinteract", "omni_duplex_eval"])
-def test_qwen3_duplex_c8_measures_and_judges_distinct_samples(monkeypatch, dataset):
+def test_qwen3_duplex_c8_measures_and_judges_distinct_samples(monkeypatch, dataset, pytestconfig):
     from dataclasses import dataclass
     from pathlib import Path
 
@@ -759,8 +760,10 @@ def test_qwen3_duplex_c8_measures_and_judges_distinct_samples(monkeypatch, datas
     monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
     monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
     monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
-    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args: None)
-    run_benchmark.test_performance_benchmark(ServerEndpoint(), {"test_name": config["test_name"], "params": params})
+    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args, check_baseline=False: None)
+    run_benchmark.test_performance_benchmark(
+        ServerEndpoint(), {"test_name": config["test_name"], "params": params}, pytestconfig=pytestconfig
+    )
     assert len(calls) == 1
     call = calls[0]
     assert (call["flow"], call["num_prompt"], call["num_warmups"]) == (8, count, 8)
@@ -946,7 +949,7 @@ def test_duplex_eval_result_rejects_missing_measurements(field, metric):
 
 @pytest.mark.parametrize("prefix", ["omniinteract", "duplex_eval"])
 @pytest.mark.parametrize("judge_url", [None, "http://127.0.0.1:8001"])
-def test_dataset_judging_uses_launched_judge(monkeypatch, prefix, judge_url):
+def test_dataset_judging_uses_launched_judge(monkeypatch, prefix, judge_url, pytestconfig):
     from tests.dfx.perf.scripts import run_benchmark
 
     monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [])
@@ -959,7 +962,7 @@ def test_dataset_judging_uses_launched_judge(monkeypatch, prefix, judge_url):
 
     monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
     # The result contract is covered above; exercise actual CLI assembly here.
-    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args: None)
+    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args, check_baseline=False: None)
     server = ServerEndpoint(judge_base_url=judge_url)
     case = {
         "test_name": "test_duplex",
@@ -967,16 +970,18 @@ def test_dataset_judging_uses_launched_judge(monkeypatch, prefix, judge_url):
     }
     if judge_url is None:
         with pytest.raises(ValueError, match="requires top-level judge_server_params"):
-            run_benchmark.test_performance_benchmark(server, case)
+            run_benchmark.test_performance_benchmark(server, case, pytestconfig=pytestconfig)
         assert not calls
     else:
-        run_benchmark.test_performance_benchmark(server, case)
+        run_benchmark.test_performance_benchmark(server, case, pytestconfig=pytestconfig)
         args = calls[0]["args"]
         assert args[args.index(f"--{prefix.replace('_', '-')}-judge-base-url") + 1] == judge_url
 
 
 @pytest.mark.parametrize(("hardware", "enforce_score_floors"), [("H100", True), ("MI300", False)])
-def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(monkeypatch, hardware, enforce_score_floors):
+def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(
+    monkeypatch, hardware, enforce_score_floors, pytestconfig
+):
     from pathlib import Path
 
     from tests.dfx.perf.scripts import run_benchmark
@@ -1019,10 +1024,11 @@ def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(monkeypatch, har
         return {"completed": 66}
 
     monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
-    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args: None)
+    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args, check_baseline=False: None)
     run_benchmark.test_performance_benchmark(
         ServerEndpoint(model="openbmb/MiniCPM-o-4_5", judge_base_url="http://localhost:8001"),
         {"test_name": config["test_name"], "params": params},
+        pytestconfig=pytestconfig,
     )
     assert len(calls) == 1
     call = calls[0]
@@ -1370,7 +1376,7 @@ def test_omniinteract_run_benchmark_writes_result_acc(tmp_path, monkeypatch):
     assert result["omniinteract"]["accuracy"]["summary"]["IA_QTF1"] == 0.25
 
 
-def test_omniinteract_ephemeral_artifacts_override_output_dir(tmp_path, monkeypatch):
+def test_omniinteract_ephemeral_artifacts_override_output_dir(tmp_path, monkeypatch, pytestconfig):
     from tests.dfx.perf.scripts import run_benchmark
 
     persistent = tmp_path / "should-not-use"
@@ -1381,7 +1387,7 @@ def test_omniinteract_ephemeral_artifacts_override_output_dir(tmp_path, monkeypa
         return {"completed": 4}
 
     monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
-    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args: None)
+    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args, check_baseline=False: None)
     monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [])
     monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
     server = ServerEndpoint(judge_base_url="http://127.0.0.1:8001")
@@ -1398,6 +1404,7 @@ def test_omniinteract_ephemeral_artifacts_override_output_dir(tmp_path, monkeypa
                 "max_concurrency": [8],
             },
         },
+        pytestconfig=pytestconfig,
     )
     args = calls[0]["args"]
     assert "--omniinteract-persist-artifacts" not in args
@@ -1407,7 +1414,7 @@ def test_omniinteract_ephemeral_artifacts_override_output_dir(tmp_path, monkeypa
     assert not persistent.exists()
 
 
-def test_omniinteract_persisted_artifacts_keep_configured_output_dir(tmp_path, monkeypatch):
+def test_omniinteract_persisted_artifacts_keep_configured_output_dir(tmp_path, monkeypatch, pytestconfig):
     from tests.dfx.perf.scripts import run_benchmark
 
     persistent = tmp_path / "keep"
@@ -1418,7 +1425,7 @@ def test_omniinteract_persisted_artifacts_keep_configured_output_dir(tmp_path, m
         return {"completed": 4}
 
     monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
-    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args: None)
+    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args, check_baseline=False: None)
     monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [])
     monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
     server = ServerEndpoint(judge_base_url="http://127.0.0.1:8001")
@@ -1435,6 +1442,7 @@ def test_omniinteract_persisted_artifacts_keep_configured_output_dir(tmp_path, m
                 "max_concurrency": [8],
             },
         },
+        pytestconfig=pytestconfig,
     )
     args = calls[0]["args"]
     assert args[args.index("--omniinteract-output-dir") + 1] == str(persistent)

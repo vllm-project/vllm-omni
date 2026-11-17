@@ -1,23 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""CPU reliability coverage: resources."""
 
 from __future__ import annotations
 
 import ast
 import os
+import select
 import signal
+import stat
 import subprocess
+import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
 from tests.dfx.reliability import helpers
-
-_THINKER_STAGE_PATTERN = "StageEngineCoreProc_stage0"
+from tests.dfx.reliability.unit._loader import RELIABILITY_ROOT, exec_ast_nodes
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+_THINKER_STAGE_PATTERN = "StageEngineCoreProc_stage0"
 
 
 def test_parse_nvidia_compute_pid_used_memory_mb() -> None:
@@ -105,6 +114,7 @@ def test_process_cleanup_remains_mandatory_without_gpu_telemetry(
     monkeypatch.setattr(helpers.time, "sleep", lambda _: None)
     monkeypatch.setattr(helpers, "list_alive_pids", lambda _: [42])
     monkeypatch.setattr(helpers, "query_gpu_compute_pid_used_memory_mb", lambda: None)
+    monkeypatch.setattr(helpers, "_linux_fd_counts", lambda _: {})
 
     with pytest.raises(AssertionError, match="residual server-tree processes remain alive"):
         helpers.assert_no_server_tree_process_residual_and_gpu_release(
@@ -120,6 +130,7 @@ def test_process_cleanup_can_pass_without_gpu_telemetry(monkeypatch: pytest.Monk
     monkeypatch.setattr(helpers.time, "monotonic", lambda: next(monotonic_values))
     monkeypatch.setattr(helpers, "list_alive_pids", lambda _: [])
     monkeypatch.setattr(helpers, "query_gpu_compute_pid_used_memory_mb", lambda: None)
+    monkeypatch.setattr(helpers, "_linux_fd_counts", lambda _: {})
 
     helpers.assert_no_server_tree_process_residual_and_gpu_release(
         server,
@@ -129,7 +140,7 @@ def test_process_cleanup_can_pass_without_gpu_telemetry(monkeypatch: pytest.Monk
 
 
 def test_qwen_worker_pattern_is_the_thinker_stage() -> None:
-    source = (Path(__file__).resolve().parent / "test_qwen3_omni.py").read_text(encoding="utf-8")
+    source = (RELIABILITY_ROOT / "test_qwen3_omni.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     assignment = next(
         node
@@ -273,6 +284,45 @@ def test_sidecar_program_uses_rejection_helper_and_compiles() -> None:
 
     assert "allocate_device_chunk" in program
     compile(program, "<oom-sidecar>", "exec")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="OOM sidecar pipe polling requires Linux")
+@pytest.mark.parametrize("outcome", ["ready", "error", "eof", "timeout", "partial_line"])
+def test_sidecar_startup_drains_progress_and_reaps_failed_process(monkeypatch, outcome):
+    payloads = {
+        "ready": b"STARTING:import_torch\nREADY:fake\n",
+        "error": b"STARTING:initialize_device\nERROR:allocation failed\n",
+        "eof": b"STARTING:import_torch\nimport failed\n",
+        "timeout": b"STARTING:initialize_device\n",
+        "partial_line": b"STARTING:initialize_device",
+    }
+    # One write exposes the old TextIOWrapper/select read-ahead failure. An
+    # incomplete line must not block readline past the startup deadline either.
+    code = f"import os,time; os.write(1, {payloads[outcome]!r}); "
+    code += "raise SystemExit(7)" if outcome == "eof" else "time.sleep(60)"
+    monkeypatch.setattr(helpers, "_build_sidecar_cmd", lambda *args: [sys.executable, "-u", "-c", code])
+    popen = subprocess.Popen
+    processes = []
+
+    def capture_process(*args, **kwargs):
+        proc = popen(*args, **kwargs)
+        processes.append(proc)
+        return proc
+
+    monkeypatch.setattr(helpers.subprocess, "Popen", capture_process)
+    started = time.monotonic()
+    if outcome == "ready":
+        handle = helpers.start_gpu_oom_hog(startup_timeout_sec=2)
+        helpers.stop_gpu_oom_hog(handle)
+    else:
+        error = TimeoutError if outcome in {"timeout", "partial_line"} else RuntimeError
+        with pytest.raises(error, match="STARTING:"):
+            helpers.start_gpu_oom_hog(startup_timeout_sec=1)
+    assert time.monotonic() - started < 10
+    assert len(processes) == 1
+    assert processes[0].poll() is not None
+    assert processes[0].stdout is not None
+    assert processes[0].stdout.closed
 
 
 def test_sidecar_program_runs_in_fresh_subprocess(tmp_path: Path) -> None:
@@ -608,7 +658,7 @@ def test_stage_config_device_spec_uses_inherited_platform_devices(tmp_path: Path
         ),
         encoding="utf-8",
     )
-    hunyuan = Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy" / "hunyuan_image3_dit.yaml"
+    hunyuan = RELIABILITY_ROOT.parents[2] / "vllm_omni" / "deploy" / "hunyuan_image3_dit.yaml"
 
     assert helpers.stage_config_device_spec(base, None) == "0,1"
     assert helpers.stage_config_device_spec(base, "cuda") == "0,1"
@@ -642,3 +692,295 @@ def test_qwen_cuda_oom_scenarios_preserve_normal_runtime_config() -> None:
 
     assert scenarios == base
     assert scenarios is not base
+
+
+@pytest.mark.skipif(os.name == "nt", reason="SIGKILL is not a Windows signal")
+def test_stuck_pid_is_escalated_to_sigkill() -> None:
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('READY', flush=True); time.sleep(30)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert proc.stdout is not None
+        ready, _, _ = select.select([proc.stdout], [], [], 5)
+        assert ready, "child did not install its SIGTERM handler within 5 seconds"
+        assert proc.stdout.readline().strip() == "READY"
+        os.kill(proc.pid, signal.SIGTERM)
+        assert helpers.escalate_live_pids([proc.pid], grace_sec=0.4) is True
+        proc.wait(timeout=5)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+        if proc.stdout is not None:
+            proc.stdout.close()
+
+
+@pytest.mark.parametrize("mapped", [True, False])
+def test_linux_shm_snapshot_tracks_mapped_objects(tmp_path, monkeypatch, mapped):
+    monkeypatch.setattr(helpers.sys, "platform", "linux")
+    monkeypatch.setattr(helpers, "_LINUX_PROC_ROOT", tmp_path / "proc")
+    monkeypatch.setattr(helpers, "_LINUX_SHM_ROOT", tmp_path / "shm")
+    shm = tmp_path / "shm"
+    shm.mkdir()
+    owned = shm / "psm_owned"
+    owned.write_bytes(b"payload")
+    unrelated = shm / "psm_unrelated"
+    unrelated.write_bytes(b"other task")
+    proc = tmp_path / "proc" / "42"
+    (proc / "fd").mkdir(parents=True)
+    stat = owned.stat()
+    # Device conversion is the OS seam; keep this fake /proc test portable.
+    monkeypatch.setattr(helpers.os, "makedev", lambda major, minor: major, raising=False)
+    (proc / "maps").write_text(f"1000-2000 rw-s 0000 {stat.st_dev:x}:0 {stat.st_ino} {owned}\n" if mapped else "")
+    objects = helpers._capture_linux_shm_objects([42, 999])
+    assert helpers._remaining_linux_shm_objects(objects) == ([str(owned)] if mapped else [])
+    owned.unlink()
+    assert helpers._remaining_linux_shm_objects(objects) == []
+    assert unrelated.exists()
+
+
+def test_linux_shm_reused_name_is_not_a_residual(tmp_path):
+    shm = tmp_path / "psm_reused"
+    shm.write_bytes(b"new object")
+    stat = shm.stat()
+    assert helpers._remaining_linux_shm_objects([(str(shm), stat.st_dev, stat.st_ino + 1)]) == []
+
+
+def test_linux_fd_check_includes_pids_excluded_from_alive_list(tmp_path, monkeypatch):
+    monkeypatch.setattr(helpers.sys, "platform", "linux")
+    monkeypatch.setattr(helpers, "_LINUX_PROC_ROOT", tmp_path)
+    descriptors = tmp_path / "42" / "fd"
+    descriptors.mkdir(parents=True)
+    fd = descriptors / "3"
+    fd.touch()
+    assert helpers._linux_fd_counts([42, 999]) == {42: 1}
+    fd.unlink()
+    assert helpers._linux_fd_counts([42, 999]) == {}
+
+
+@pytest.mark.parametrize("resource", ["fd", "shm"])
+def test_cleanup_rejects_linux_resource_residual_after_process_exit(monkeypatch, resource):
+    server = SimpleNamespace(reliability_fault_snapshot={"tree_pids": [42]})
+    ticks = iter([0.0, 0.0, 2.0])
+    monkeypatch.setattr(helpers.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(helpers.time, "sleep", lambda _: None)
+    monkeypatch.setattr(helpers, "list_alive_pids", lambda _: [])
+    monkeypatch.setattr(helpers, "query_gpu_compute_pid_used_memory_mb", lambda: None)
+    monkeypatch.setattr(helpers, "_linux_fd_counts", lambda _: {42: 1} if resource == "fd" else {})
+    monkeypatch.setattr(
+        helpers, "_remaining_linux_shm_objects", lambda _: ["/dev/shm/owned"] if resource == "shm" else []
+    )
+    message = "file descriptors remain open" if resource == "fd" else "named shared memory/semaphores remain"
+    with pytest.raises(AssertionError, match=message):
+        helpers.assert_no_server_tree_process_residual_and_gpu_release(server, scenario="linux", timeout_sec=1)
+
+
+def test_fault_snapshot_preserves_resources_of_previously_killed_stage(monkeypatch):
+    server = SimpleNamespace(reliability_fault_snapshot={"tree_pids": [41, 42], "shm_objects": [("old", 1, 2)]})
+    monkeypatch.setattr(helpers, "_resolve_runtime_worker_markers", lambda *args: ())
+    monkeypatch.setattr(helpers, "_list_server_process_tree", lambda _: [41])
+    monkeypatch.setattr(helpers, "_capture_linux_shm_objects", lambda _: [("new", 1, 3)])
+    snapshot = helpers._capture_server_fault_snapshot(server)
+    assert snapshot["tree_pids"] == [41, 42]
+    assert set(snapshot["shm_objects"]) == {("old", 1, 2), ("new", 1, 3)}
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux /proc and /dev/shm")
+@pytest.mark.parametrize("mapping_only", [False, True])
+def test_linux_shm_snapshot_reads_real_proc(mapping_only):
+    import mmap
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(prefix="omni-reliability-", dir="/dev/shm", delete=False) as backing:
+        path = Path(backing.name)
+        backing.write(b"x" * 4096)
+        backing.flush()
+        mapping = mmap.mmap(backing.fileno(), 4096) if mapping_only else None
+        try:
+            if mapping_only:
+                backing.close()
+            objects = helpers._capture_linux_shm_objects([os.getpid()])
+            captured = [item for item in objects if item[0] == str(path)]
+            assert len(captured) == 1
+            assert helpers._remaining_linux_shm_objects(captured) == [str(path)]
+            path.unlink()
+            assert helpers._remaining_linux_shm_objects(captured) == []
+        finally:
+            if mapping is not None:
+                mapping.close()
+            path.unlink(missing_ok=True)
+
+
+@pytest.fixture
+def cleanup():
+    module = ModuleType("cleanup_under_test")
+    module.__dict__.update(Any=Any, Sequence=Sequence, stat_module=stat, pytest=pytest)
+    root = RELIABILITY_ROOT
+    for path, names in [
+        (
+            root / "helpers.py",
+            {
+                "_remaining_linux_shm_objects",
+                "assert_no_server_tree_process_residual_and_gpu_release",
+                "capture_exclusive_fifo_objects",
+            },
+        ),
+        (root / "scenarios/process_kill.py", {"_assert_cleanup"}),
+    ]:
+        nodes: list[ast.stmt] = [
+            n
+            for n in ast.parse(path.read_text(encoding="utf-8")).body
+            if isinstance(n, ast.FunctionDef) and n.name in names
+        ]
+        exec_ast_nodes(nodes, path, module.__dict__)
+    return module
+
+
+@pytest.mark.parametrize("allow_fifo", [False, True])
+@pytest.mark.parametrize("resource", ["fifo", "shm", "fd", "gpu", "process"])
+def test_fifo_exception_never_disables_other_resource_checks(cleanup, allow_fifo, resource):
+    mode = stat.S_IFIFO if resource == "fifo" else stat.S_IFREG
+    cleanup.Path = lambda name: SimpleNamespace(stat=lambda: SimpleNamespace(st_dev=1, st_ino=2, st_mode=mode))
+    clock = [0.0]
+    cleanup.time = SimpleNamespace(
+        monotonic=lambda: clock[0], sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    )
+    cleanup.logger = Mock()
+    cleanup.list_alive_pids = lambda pids: [42] if resource == "process" else []
+    cleanup.query_gpu_compute_pid_used_memory_mb = lambda: {42: 100} if resource == "gpu" else {}
+    cleanup._linux_fd_counts = lambda pids: {42: 1} if resource == "fd" else {}
+    server = SimpleNamespace(
+        reliability_fault_snapshot={
+            "tree_pids": [42],
+            "shm_objects": [("owned", 1, 2)] if resource in {"fifo", "shm"} else [],
+        }
+    )
+    if allow_fifo and resource == "fifo":
+        cleanup.assert_no_server_tree_process_residual_and_gpu_release(
+            server, scenario="tree", timeout_sec=1, allow_fifo_residual=True
+        )
+        assert clock[0] == 0.0
+        cleanup.logger.warning.assert_called_once()
+    else:
+        with pytest.raises(AssertionError):
+            cleanup.assert_no_server_tree_process_residual_and_gpu_release(
+                server, scenario="strict", timeout_sec=1, allow_fifo_residual=allow_fifo
+            )
+
+
+@pytest.mark.parametrize(
+    "scenario,allowed",
+    [
+        ("kill_serve_tree_no_load_sigkill", True),
+        ("kill_serve_tree_with_load_sigkill", True),
+        ("kill_serve_root_no_load_sigkill", False),
+    ],
+)
+def test_only_tree_crash_selects_fifo_exception(cleanup, scenario, allowed):
+    cleanup.worker_residual_timeout_after_kill_signal = lambda signal: 30
+    cleanup.assert_no_server_tree_process_residual_and_gpu_release = Mock()
+    server = object()
+    cleanup._assert_cleanup(server, scenario=scenario, signal_name="SIGKILL")
+    cleanup.assert_no_server_tree_process_residual_and_gpu_release.assert_called_once_with(
+        server,
+        scenario=scenario,
+        timeout_sec=30,
+        allow_fifo_residual=allowed,
+        allowed_fifo_objects=(),
+    )
+
+
+@pytest.mark.parametrize("phase", ["no_load", "with_load"])
+def test_root_crash_passes_only_captured_root_fifo_exceptions(cleanup, phase):
+    root_fifo = ("root_fifo", 1, 2)
+    server = SimpleNamespace(reliability_fault_snapshot={"killed_root_fifo_objects": [root_fifo]})
+    cleanup.worker_residual_timeout_after_kill_signal = lambda signal: 30
+    cleanup.assert_no_server_tree_process_residual_and_gpu_release = Mock()
+    cleanup._assert_cleanup(server, scenario=f"kill_serve_root_{phase}_sigkill", signal_name="SIGKILL")
+    kwargs = cleanup.assert_no_server_tree_process_residual_and_gpu_release.call_args.kwargs
+    assert kwargs["allowed_fifo_objects"] == [root_fifo]
+    assert kwargs["allow_fifo_residual"] is False
+
+
+def test_partial_crash_exempts_only_target_exclusive_fifo_identities(cleanup):
+    target = ("target", 1, 2)
+    shared = ("shared", 1, 3)
+    regular = ("data_segment", 1, 4)
+    survivor = ("survivor", 1, 5)
+    objects = [target, shared, regular, survivor]
+    modes = {name: stat.S_IFIFO if name != "data_segment" else stat.S_IFREG for name, _, _ in objects}
+    inodes = {name: inode for name, _, inode in objects}
+    cleanup.Path = lambda name: SimpleNamespace(
+        stat=lambda: SimpleNamespace(st_dev=1, st_ino=inodes[name], st_mode=modes[name])
+    )
+    cleanup._capture_linux_shm_objects = lambda pids: [target, shared, regular] if pids == [11] else [shared, survivor]
+    allowed = cleanup.capture_exclusive_fifo_objects([11], [10, 11, 12])
+    assert allowed == [target]
+    assert cleanup._remaining_linux_shm_objects(objects, allowed_fifo_objects=allowed) == [
+        "shared",
+        "data_segment",
+        "survivor",
+    ]
+    assert cleanup._remaining_linux_shm_objects(objects) == ["target", "shared", "data_segment", "survivor"]
+    # A wrong inode must not exempt a different object with the same name.
+    assert cleanup._remaining_linux_shm_objects([target], allowed_fifo_objects=[("target", 1, 999)]) == ["target"]
+    assert cleanup._remaining_linux_shm_objects([regular], allowed_fifo_objects=[regular]) == ["data_segment"]
+
+
+def test_tree_crash_preserves_trackers_and_keeps_them_in_snapshot():
+    path = RELIABILITY_ROOT / "helpers.py"
+    node = next(
+        node
+        for node in ast.parse(path.read_text(encoding="utf-8")).body
+        if isinstance(node, ast.FunctionDef) and node.name == "make_server_tree_kill_fault_injector"
+    )
+    module: Any = ModuleType("tree_injection")
+    module.__dict__.update(Any=Any, Sequence=list, FaultInjector=Any, pytest=pytest)
+    exec_ast_nodes([node], path, module.__dict__)
+    snapshot = {"tree_pids": [10, 11, 12, 13, 14, 15]}
+    server = SimpleNamespace(reliability_fault_snapshot=snapshot)
+    commands = {
+        10: "serve model",
+        11: "python -c from multiprocessing.resource_tracker import main;main(63)",
+        12: "vLLM-Omni::DiffusionWorker",
+        13: "python -m joblib.externals.loky.backend.resource_tracker",
+        14: "python -m multiprocessing.semaphore_tracker",
+        15: "ordinary helper",
+    }
+    killed = []
+    module._log_server_process_tree = lambda server: None
+    module._capture_server_fault_snapshot = lambda server, **kwargs: snapshot
+    module._safe_proc_info = lambda pid: ("python", commands[pid])
+    module.psutil = SimpleNamespace(pid_exists=lambda pid: True)
+    module.signal = SimpleNamespace(SIGKILL=9)
+    module.os = SimpleNamespace(kill=lambda pid, sig: killed.append((pid, sig)))
+    module.time = SimpleNamespace(sleep=lambda seconds: None)
+    module.make_server_tree_kill_fault_injector()(server)
+    assert killed == [(10, 9), (12, 9), (15, 9)]
+    assert server.reliability_fault_snapshot["tree_pids"] == [10, 11, 12, 13, 14, 15]
+
+
+def test_minicpm_fault_cli_pins_single_replica_without_changing_replica_suite():
+    import json
+
+    source = RELIABILITY_ROOT / "test_minicpmo_4_5.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    model = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "MiniCPMO45")
+    scenarios = next(
+        n.value
+        for n in model.body
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "scenarios" for t in n.targets)
+    )
+    namespace: dict[str, Any] = {"_MODEL": "model", "_NATIVE_CHAT_TEMPLATE": "template"}
+    cases = eval(compile(ast.Expression(scenarios), str(source), "eval"), namespace)
+    args = cases[0]["server_params"]["server_args"]
+    overrides = json.loads(args[args.index("--stage-overrides") + 1])
+    assert overrides == {str(stage): {"num_replicas": 1, "devices": "0"} for stage in range(3)}
+    replica = (RELIABILITY_ROOT / "test_minicpmo_4_5_replica.py").read_text(encoding="utf-8")
+    assert "--stage-overrides" not in replica

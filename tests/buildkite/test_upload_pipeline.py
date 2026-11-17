@@ -774,6 +774,21 @@ def test_source_file_dependencies_key_expands_from_registry() -> None:
     assert "Diffusion · Qwen Image Test" not in _surviving_labels(doc, ["vllm_omni/unrelated.py"])
 
 
+def test_cosyvoice3_dspark_ready_tracks_mrv2_runtime() -> None:
+    pipeline_path = Path(".buildkite/cuda/test-ready.yml")
+    doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    label = "TTS · CosyVoice3 DSpark Test"
+    matching_steps = [step for step in _iter_steps(doc) if step.get("label") == label]
+    assert len(matching_steps) == 1
+    assert matching_steps[0]["source_file_dependencies"] == ["tts_cosyvoice3_function", "omni_v2_runtime"]
+    assert label in _surviving_labels(
+        doc,
+        ["vllm_omni/worker_v2/omni_model_runner.py"],
+        pipeline_path=pipeline_path,
+    )
+    assert label not in _surviving_labels(doc, ["docs/source/index.md"], pipeline_path=pipeline_path)
+
+
 def test_npu_platform_change_does_not_select_shared_minimax_h3_jobs() -> None:
     doc = {
         "steps": [
@@ -930,7 +945,9 @@ def test_ming_glm_indextts_breeze_weekly_pr_validation_is_focused(monkeypatch: p
         },
         "TTS · Breeze TTS 2 · L4": {
             "dependency": "tts_breeze_tts2_weekly",
+            "extra_dependencies": ("tts_breeze_tts2_mrv2_weekly",),
             "files": ("tests/e2e/online_serving/test_breeze_tts_2.py",),
+            "runner": "v2",
         },
     }
     all_files = {path for item in expected.values() for path in item["files"]}
@@ -938,9 +955,9 @@ def test_ming_glm_indextts_breeze_weekly_pr_validation_is_focused(monkeypatch: p
         matching_steps = [step for step in _iter_steps(doc) if step.get("label") == label]
         assert len(matching_steps) == 1
         step = matching_steps[0]
-        assert step["source_file_dependencies"] == [item["dependency"]]
+        assert step["source_file_dependencies"] == [item["dependency"], *item.get("extra_dependencies", ())]
         assert step["timeout_in_minutes"] == 90
-        assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": "v1"}
+        assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": item.get("runner", "v1")}
         assert step["mirror_hardwares"] == "l4_1"
         command = "\n".join(step["commands"])
         assert set(item["files"]) <= {path for path in all_files if path in command}
@@ -955,6 +972,9 @@ def test_ming_glm_indextts_breeze_weekly_pr_validation_is_focused(monkeypatch: p
     for label, item in expected.items():
         for changed_file in item["files"]:
             assert label in _surviving_labels(doc, [changed_file], pipeline_path=pipeline_path)
+    # Breeze stage 0 implements the Model Runner V2 hook contract.
+    for changed_file in ("vllm_omni/worker_v2/model_states/omni_model_state.py", "vllm_omni/worker_v2/warmup.py"):
+        assert "TTS · Breeze TTS 2 · L4" in _surviving_labels(doc, [changed_file], pipeline_path=pipeline_path)
     labels = set(expected)
     assert not labels & set(_surviving_labels(doc, ["docs/source/index.md"], pipeline_path=pipeline_path))
     assert "TTS · Ming · GLM · IndexTTS · Breeze · L4" not in {step.get("label") for step in _iter_steps(doc)}
@@ -1535,6 +1555,7 @@ def test_lingbot_nightly_uses_independent_perf_and_accuracy_frameworks(monkeypat
     assert not perf.get("matrix")
     command = " ".join(perf["commands"])
     assert "tests/dfx/perf/scripts/run_benchmark.py" in command
+    assert "--assert-baseline" in command
     assert "--test-config-file tests/dfx/perf/tests/test_lingbot_world_realtime.json" in command
     assert "run_ci.sh" not in command
     assert perf["artifact_paths"] == ["tests/dfx/perf/results/*.json"]

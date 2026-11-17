@@ -16,6 +16,7 @@ from typing import Any, NamedTuple, TypeGuard
 import pytest
 
 from tests.dfx.conftest import (
+    assert_baseline_within_tolerance,
     create_paired_omni_benchmark_pytest_params,
     create_test_parameter_mapping,
     get_benchmark_params_for_server,
@@ -597,8 +598,8 @@ def _maybe_write_omniinteract_aggregate_accuracy_result(
         when=when,
     )
     subsets = params.get(_OMNIINTERACT_AGGREGATE_SUBSETS)
-    min_ia_qtf1 = params.get(_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1)
     max_concurrency = result.get("max_concurrency")
+    min_ia_qtf1 = params.get(_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1)
     passed = not _is_finite_number(min_ia_qtf1) or pooled.ia_qtf1 >= float(min_ia_qtf1)
     write_dfx_accuracy_result(
         accuracy_path,
@@ -619,7 +620,7 @@ def _maybe_write_omniinteract_aggregate_accuracy_result(
         },
         branch=str(result.get("branch") or os.environ.get("BUILDKITE_BRANCH", "")),
         num_prompts=pooled.num_prompts,
-        max_concurrency=int(max_concurrency) if isinstance(max_concurrency, int) else None,
+        max_concurrency=max_concurrency if isinstance(max_concurrency, int) else None,
         benchmark_exit_code=0 if passed else 1,
         generation={
             "completed": pooled.completed,
@@ -696,7 +697,7 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
             assert _is_finite_number(score) and 0 <= score <= 1, "Omni-DuplexEval correction score is invalid"
 
 
-def assert_result(result, params, num_prompt) -> None:
+def assert_result(result, params, num_prompt, *, check_baseline: bool = False) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
     if params.get("dataset_name") == "realtime-video":
         video = result.get("realtime_video")
@@ -739,6 +740,14 @@ def assert_result(result, params, num_prompt) -> None:
                 assert _is_finite_number(result.get(f"p{percentile}_{metric}{suffix}")), (
                     f"Missing or invalid P{percentile} {metric}"
                 )
+    hardware = result.get("Hardware")
+    if check_baseline:
+        baseline = result.get("baseline")
+        assert_baseline_within_tolerance(
+            result,
+            baseline if isinstance(baseline, dict) else None,
+            hardware if isinstance(hardware, str) else None,
+        )
     if params.get("duplex_performance_only"):
         return
     if params.get("dataset_name") == "omni-duplex-eval":
@@ -803,7 +812,7 @@ def assert_result(result, params, num_prompt) -> None:
     paired_benchmark_params,
     indirect=["omni_server", "benchmark_params"],
 )
-def test_performance_benchmark(omni_server, benchmark_params):
+def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pytest.Config):
     test_name = benchmark_params["test_name"]
     params = dict(benchmark_params["params"])
     dataset_name = params.get("dataset_name", "")
@@ -938,7 +947,9 @@ def test_performance_benchmark(omni_server, benchmark_params):
             )
             assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
             try:
-                assert_result(result, assert_params, num_prompt)
+                assert_result(
+                    result, assert_params, num_prompt, check_baseline=pytestconfig.getoption("assert_baseline")
+                )
             finally:
                 _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)
 
@@ -974,7 +985,9 @@ def test_performance_benchmark(omni_server, benchmark_params):
             )
             assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
             try:
-                assert_result(result, assert_params, num_prompt)
+                assert_result(
+                    result, assert_params, num_prompt, check_baseline=pytestconfig.getoption("assert_baseline")
+                )
             finally:
                 _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)
         if (stage_id := params.get("require_speculative_stage")) is not None:

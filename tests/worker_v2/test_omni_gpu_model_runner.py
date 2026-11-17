@@ -517,6 +517,24 @@ def test_finish_requests_notifies_model_and_cleans_only_known_slots(monkeypatch)
     assert sorted(c.args[0] for c in runner.model_state.remove_request.call_args_list) == [0]
 
 
+def test_aux_hidden_state_contract_uses_tuple_slot_not_structured_output():
+    runner = _make_runner()
+    runner.model = SimpleNamespace(have_multimodal_outputs=True)
+    runner.use_aux_hidden_state_outputs = True
+
+    runner._configure_cudagraph_output_contract()
+
+    assert runner._model_has_structured_output is True
+    assert runner._model_returns_tuple is False
+    assert runner._aux_hidden_state_contract_conflicts() is False
+
+    runner.model = SimpleNamespace(_returns_tuple=True)
+    runner._configure_cudagraph_output_contract()
+
+    assert runner._model_returns_tuple is True
+    assert runner._aux_hidden_state_contract_conflicts() is True
+
+
 @pytest.mark.parametrize("stage,declared", [("thinker", False), ("custom_ar", True)])
 def test_capture_contract_uses_model_declaration(stage, declared):
     runner = _make_runner()
