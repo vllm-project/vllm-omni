@@ -84,7 +84,7 @@ def test_minicpmo_duplex_command_runs_from_sh_and_preserves_pytest_status(tmp_pa
     )
     assert result.returncode == pytest_exit, result.stderr
     args = json.loads(calls_path.read_text())
-    assert "tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py" in args
+    assert "tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py" not in args
     assert args[args.index("-m") + 1] == "(core_model or advanced_model) and cuda"
     assert "pytest-stdout" in result.stdout
     assert "pytest-stderr" in result.stderr
