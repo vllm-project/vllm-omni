@@ -78,15 +78,14 @@ steps:
             fi
             (exit "$$status")
 
-      # Burn in the CUDA-owned four-GPU replica fault contract before adding
-      # MI325 source marks. The released deploy overlay already has blocking
-      # four-GPU ROCm functional coverage; this probe isolates process-kill,
-      # convergence, and cleanup behavior without weakening the CUDA owner.
-      - label: "Reliability Test · qwen3-omni replicas probe"
+      # Exercise the same four-GPU replica fault contract on MI325. The
+      # released deploy overlay already has blocking four-GPU ROCm functional
+      # coverage; this job adds process-kill, convergence, and cleanup coverage.
+      - label: "Reliability Test · qwen3-omni replicas"
         agent_pool: mi300_4
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 240
         source_file_dependencies: omni_qwen3_omni_replica_reliability
         artifact_paths:
@@ -97,7 +96,7 @@ steps:
           - |
             pytest --collect-only -q tests/dfx/reliability/test_qwen3_omni_replica.py \
               --shard-id=0 --num-shards=1 \
-              -m "slow and cards_4" \
+              -m "slow and rocm and MI325 and cards_4" \
               > "$$ROCM_QWEN3_REPLICA_ARTIFACT_DIR/collection.txt"
             count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
               "$$ROCM_QWEN3_REPLICA_ARTIFACT_DIR/collection.txt")
@@ -113,7 +112,7 @@ steps:
               timeout --signal=TERM --kill-after=2m 220m \
                 pytest -s -v -ra tests/dfx/reliability/test_qwen3_omni_replica.py \
                 --shard-id=0 --num-shards=1 \
-                -m "slow and cards_4" \
+                -m "slow and rocm and MI325 and cards_4" \
                 --junitxml="$$ROCM_QWEN3_REPLICA_ARTIFACT_DIR/pytest.xml" \
                 2>&1 | tee "$$ROCM_QWEN3_REPLICA_ARTIFACT_DIR/pytest.log"
               exit "$${PIPESTATUS[0]}"
@@ -342,13 +341,12 @@ steps:
             (exit "$$status")
 
       # The replica deploy uses devices 0,1,2. Run it on the available
-      # four-GPU MI300 pool with the fourth device idle, and keep the CUDA-only
-      # source marks unchanged until this exact fault contract passes on ROCm.
-      - label: "Reliability Test · minicpmo-4.5 replicas probe"
+      # four-GPU MI300 pool with the fourth device intentionally idle.
+      - label: "Reliability Test · minicpmo-4.5 replicas"
         agent_pool: mi300_4
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 240
         source_file_dependencies: omni_minicpmo_4_5_replica_reliability
         artifact_paths:
@@ -359,7 +357,7 @@ steps:
           - |
             pytest --collect-only -q tests/dfx/reliability/test_minicpmo_4_5_replica.py \
               --shard-id=0 --num-shards=1 \
-              -m "slow and cards_3" \
+              -m "slow and rocm and MI325 and cards_3" \
               > "$$ROCM_MINICPMO_REPLICA_ARTIFACT_DIR/collection.txt"
             count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
               "$$ROCM_MINICPMO_REPLICA_ARTIFACT_DIR/collection.txt")
@@ -375,7 +373,7 @@ steps:
               timeout --signal=TERM --kill-after=2m 220m \
                 pytest -s -v -ra tests/dfx/reliability/test_minicpmo_4_5_replica.py \
                 --shard-id=0 --num-shards=1 \
-                -m "slow and cards_3" \
+                -m "slow and rocm and MI325 and cards_3" \
                 --junitxml="$$ROCM_MINICPMO_REPLICA_ARTIFACT_DIR/pytest.xml" \
                 2>&1 | tee "$$ROCM_MINICPMO_REPLICA_ARTIFACT_DIR/pytest.log"
               exit "$${PIPESTATUS[0]}"
@@ -392,9 +390,9 @@ steps:
             suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
             tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
             skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-            if tests != 5 or skipped != 3:
+            if tests != 5 or skipped != 1:
                 print(
-                    f"Expected exactly 5 executed MiniCPM-o 4.5 replica reliability tests with 3 known skips; "
+                    f"Expected exactly 5 executed MiniCPM-o 4.5 replica reliability tests with 1 known skip; "
                     f"reported tests={tests}, skipped={skipped}.",
                     file=sys.stderr,
                 )
