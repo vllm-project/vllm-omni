@@ -885,6 +885,7 @@ source_file_dependencies:
     - vllm_omni/deploy/minicpmo_4_5_3gpu_stage1_replicas.yaml
 
   omni_minicpmo_4_5_accuracy:
+    - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
     - *minicpmo_4_5
     - tests/e2e/accuracy/minicpmo_4_5/
 

@@ -1317,14 +1317,23 @@ def test_cosyvoice_ready_smoke_uses_sdpa() -> None:
 def test_cosyvoice_full_default_backend_suite_runs_nightly() -> None:
     step = _find_step("CosyVoice3-TTS E2E Test", AMD_NIGHTLY_PIPELINE)
 
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["timeout_in_minutes"] == 90
     assert step["retry"] == {"automatic": [{"exit_status": 134, "limit": 1}]}
-    assert all("DIFFUSION_ATTENTION_BACKEND" not in command for command in step["commands"])
-
-    pytest_command = next(command for command in step["commands"] if "pytest" in command)
-    assert "tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py" in pytest_command
-    assert "::" not in pytest_command
+    assert step["env"] == {
+        "ROCM_E2E_LEVEL_MARKER": "slow",
+        "ROCM_E2E_RUN_LEVEL": "core_model",
+        "ROCM_E2E_TIMEOUT_MINUTES": "75",
+    }
+    assert step["artifact_paths"] == ["artifacts/rocm-cosyvoice3-e2e-nightly/**/*"]
+    assert split(step["commands"][0]) == [
+        "bash",
+        ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh",
+        "tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py",
+        "3",
+        "tts",
+        "rocm-cosyvoice3-e2e-nightly",
+    ]
 
 
 def test_amd_template_preserves_step_retry_policy() -> None:
@@ -3239,7 +3248,7 @@ def test_qwen3_tts_perf_is_one_nonblocking_nightly_job() -> None:
         assert "Qwen3-TTS Perf" not in text
 
 
-def test_minicpmo_accuracy_is_two_nonblocking_nightly_jobs() -> None:
+def test_minicpmo_accuracy_keeps_daily_nonblocking_and_promotes_seed_tts() -> None:
     group = _find_group(":full_moon: MiniCPM-o 4.5 Accuracy MI300 Nightly", AMD_NIGHTLY_PIPELINE)
     jobs: tuple[tuple[str, str, str, str, str, dict[str, str]], ...] = (
         (
@@ -3257,6 +3266,7 @@ def test_minicpmo_accuracy_is_two_nonblocking_nightly_jobs() -> None:
             "ROCM_MINICPMO_SEED_ACCURACY_ARTIFACT_DIR",
             "Expected exactly one MiniCPM-o 4.5 Seed-TTS accuracy node",
             {
+                "ROCM_E2E_TIMEOUT_MINUTES": "165",
                 "SEED_TTS_WER_EVAL": "1",
                 "SEED_TTS_SIM_EVAL": "1",
                 "VLLM_OMNI_CODE2WAV_WATCHDOG_TIMEOUT_S": "60",
@@ -3269,22 +3279,35 @@ def test_minicpmo_accuracy_is_two_nonblocking_nightly_jobs() -> None:
     for step, (label, node, artifact, artifact_env, collection_guard, env) in zip(group["steps"], jobs, strict=True):
         commands = "\n".join(step["commands"])
         assert step["label"] == label
-        assert step["grade"] == "NonBlocking"
+        assert step["grade"] == ("Blocking" if env else "NonBlocking")
         assert step["agent_pool"] == "mi300_1"
         assert step["mirror_hardwares"] == ["amdproduction"]
         assert step["timeout_in_minutes"] == 180
         assert step["source_file_dependencies"] == "omni_minicpmo_4_5_accuracy"
         assert step["artifact_paths"] == [artifact]
         assert step.get("env", {}) == env
-        assert "full_model and omni and rocm and MI325 and cards_1" in commands
-        assert "--run-level full_model" in commands
-        assert commands.count("--collect-only") == 1
-        assert "exit 5" in commands
-        assert "pytest.xml" in commands
-        assert "timeout --signal=TERM --kill-after=2m 165m" in commands
-        assert artifact_env in commands
-        assert collection_guard in commands
-        assert commands.count(node) == 2
+        if env:
+            runner_command = commands.split("; then", 1)[0].removeprefix("if ")
+            assert split(runner_command.replace("\\\n", " ")) == [
+                "bash",
+                ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh",
+                f"tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py::{node}",
+                "1",
+                "omni",
+                "rocm-minicpmo-seed-tts-accuracy",
+            ]
+            assert "cp -a tests/e2e/accuracy/minicpmo_4_5/results/." in commands
+            assert 'exit "$$status"' in commands
+        else:
+            assert "full_model and omni and rocm and MI325 and cards_1" in commands
+            assert "--run-level full_model" in commands
+            assert commands.count("--collect-only") == 1
+            assert "exit 5" in commands
+            assert "pytest.xml" in commands
+            assert "timeout --signal=TERM --kill-after=2m 165m" in commands
+            assert artifact_env in commands
+            assert collection_guard in commands
+            assert commands.count(node) == 2
         for other_node in all_nodes - {node}:
             assert other_node not in commands
         assert "SEED_TTS_EVAL_DEVICE" not in commands
