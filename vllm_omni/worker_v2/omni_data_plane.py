@@ -324,16 +324,19 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             raise RuntimeError("MRv2 output worker did not stop within its shutdown deadline")
         self._native_output_worker = None
 
+    def _uses_resumable_commits(self, resumable: bool) -> bool:
+        return resumable and self._native_resumable and self._can_send
+
     def register_request(self, request_data: Any) -> None:
         self._raise_output_error()
         req_id = str(request_data.req_id)
         external_req_id = str(getattr(request_data, "external_req_id", None) or req_id)
         with self._native_output_lock:
             if (
-                getattr(self, "_native_resumable", False)
-                and self._can_send
-                and getattr(request_data, "resumable", False)
+                self._uses_resumable_commits(bool(getattr(request_data, "resumable", False)))
+                and self.is_data_transfer_rank()
             ):
+                # Only the connector sender can commit materialized outputs.
                 self._uncommitted_payloads.setdefault(req_id, deque())
             if req_id not in self._uncommitted_payloads:
                 self._native_outputs_in_flight.pop(req_id, None)
@@ -383,8 +386,12 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         self._raise_output_error()
         with self._native_output_lock:
             for req_id in dict.fromkeys(req_ids):
-                if req_id in self._native_requests:
-                    self._native_outputs_in_flight[req_id] += 1
+                state = self._native_requests.get(req_id)
+                if state is None:
+                    continue
+                if self._uses_resumable_commits(state.resumable) and req_id not in self._uncommitted_payloads:
+                    continue
+                self._native_outputs_in_flight[req_id] += 1
 
     def _release_output_reservation(self, req_id: str) -> None:
         """Release one output hold while the caller holds the native output lock."""

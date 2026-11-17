@@ -532,8 +532,9 @@ follow the normal completion path.
 Thinker-only Qwen3-Omni requests can use DFlash with resumable
 (streaming-input) requests. The scheduler discards late drafts from the
 previous segment before admitting the next prompt. With the default
-Qwen3-Omni pipeline on MRv2, workers retain completed step payloads until the
-scheduler returns the accepted token IDs and segment decision. The native
+Qwen3-Omni pipeline on MRv2, the connector sender rank retains completed step
+payloads until the scheduler returns the accepted token IDs and segment
+decision. The native
 connector sends those payloads in order. A segment marker stops input polling
 until the receiver processes the segment, so the next Talker prompt and
 Code2Wav chunk cannot overwrite unconsumed data. Resumable DFlash speech uses

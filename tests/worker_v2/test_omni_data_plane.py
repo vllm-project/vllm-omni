@@ -280,6 +280,30 @@ def test_native_resumable_publishes_only_scheduler_commits(plane, reserve_output
     assert terminal_payload is None
 
 
+def test_tp_follower_does_not_hold_resumable_outputs(raw_plane):
+    from vllm_omni.core.sched.output import OmniChunkCommit
+
+    raw_plane._native_resumable = True
+    raw_plane._local_tp_group = SimpleNamespace(world_size=2, rank_in_group=1)
+    raw_plane._omni_connector = object()
+    request = _new_request()
+    req_id = request.req_id
+    raw_plane.register_request(request)
+
+    # A non-replying worker executes the step without materializing its output.
+    raw_plane.reserve_outputs([req_id])
+    raw_plane.commit_resumable_outputs([OmniChunkCommit(req_id, [21], segment_finished=True)])
+
+    assert req_id in raw_plane._native_requests
+    assert req_id not in raw_plane._uncommitted_payloads
+    assert req_id not in raw_plane._native_outputs_in_flight
+
+    raw_plane.request_terminal({req_id})
+    assert req_id not in raw_plane._native_requests
+    assert not raw_plane._native_terminal_pending
+    assert raw_plane.record.cleaned == [req_id]
+
+
 def test_full_payload_qwen_builder_receives_complete_codec(raw_plane, monkeypatch):
     from vllm_omni.model_executor.stage_input_processors.qwen3_tts import talker2code2wav_full_payload
 
