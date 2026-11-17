@@ -160,6 +160,11 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
 
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
+            if backend_upper == "SOL_ATTN":
+                if not compute_supported:
+                    raise ValueError("SOL_ATTN requires an SM80+ CUDA GPU.")
+                if head_size > 0 and head_size != 128:
+                    raise ValueError(f"SOL_ATTN requires head_dim=128, got {head_size}.")
             # Architecture / package probes for optional kernels must run before
             # validate_diffusion_attn_backend, which imports the backend module
             # and would otherwise load sageattention / sageattn3 on unsupported GPUs.
@@ -304,31 +309,6 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
                         "TRTLLM_ATTN was explicitly selected, but the installed FlashInfer build does not "
                         "provide trtllm_ragged_attention_deepseek. Install a compatible build."
                     )
-            if backend_upper == "SOL_ATTN":
-                if not compute_supported:
-                    raise ValueError(
-                        "SOL_ATTN diffusion attention backend requires an SM80+ CUDA GPU. "
-                        f"Detected {sm_str or 'an unknown compute capability'}. Select a "
-                        "different --diffusion-attention-backend."
-                    )
-                if head_size != 128:
-                    raise ValueError(
-                        "SOL_ATTN diffusion attention backend requires head_dim=128 "
-                        f"(MiniMax-H3's attention head dim), got {head_size}. Select a "
-                        "different --diffusion-attention-backend."
-                    )
-                try:
-                    importlib.import_module("sol_attn")
-                except ImportError as e:
-                    raise ImportError(
-                        "Sol-Attn backend is not installed. Install it with "
-                        "`pip install git+https://github.com/NVlabs/Sana.git@sol-engine"
-                        "#subdirectory=techniques/sparse_backends`."
-                    ) from e
-                logger.info(
-                    "Using Sol-Attn diffusion attention backend (head_dim=%d, BF16 activations)",
-                    head_size,
-                )
             backend = DiffusionAttentionBackendEnum[backend_upper]
             logger.debug("Using diffusion attention backend '%s'", backend_upper)
             return backend.get_path()

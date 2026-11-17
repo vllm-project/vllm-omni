@@ -363,6 +363,15 @@ steady-state latency. H3 is CFG-distilled, so `--cfg-parallel-size` must remain
 
 ### Attention Backends
 
+`SOL_ATTN` is an optional, training-free sparse attention backend for CUDA
+SM80+ with BF16 activations. See the [Sol-Attn guide](../../docs/user_guide/diffusion/attention_backends/sol_attn.md)
+for installation and the per-role configuration that keeps the token refiner
+dense. It supports local attention and pure Ulysses, not Ring or AllGather-KV.
+The default dense-step/layer guards and model-derived audio/text/reference
+prefix protection are quality safeguards, not a guarantee of dense-equivalent
+outputs. Validate both video and audio quality before enabling it in production.
+This opt-in does not change the default backend described below.
+
 On supported datacenter Blackwell systems, MiniMax H3 defaults to dense BF16
 `TRTLLM_ATTN`; no attention backend flag is required. To select it explicitly,
 use:

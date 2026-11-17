@@ -2379,18 +2379,20 @@ class SolAttnSpec:
 
     ``tau`` scales the routing threshold (higher selects fewer exact KV
     blocks), ``thresh_type`` is ``diag`` (approximate diagonal routing) or
-    ``exact``, ``sink_tokens``/``sink_start`` pin an exact-KV prefix such as
-    the text/audio rows of a packed layout, ``dense_steps`` keeps the first N
-    denoise steps dense, ``dense_layers`` exempts individual DiT blocks, and
-    ``kv_splits`` sets the number of KV splits used by the kernel.
+    ``exact``. ``prefix_sink`` derives a protected prefix from model-owned
+    video layout; ``sink_tokens``/``sink_start`` add an explicit range. Sink
+    rows are exact as K/V and recomputed densely as queries. ``dense_steps``
+    keeps the first N denoise steps dense, ``dense_layers`` exempts individual
+    DiT blocks, and ``kv_splits`` sets the number of KV splits used by the kernel.
     """
 
     tau: float = 1.0
     thresh_type: str = "diag"
     sink_tokens: int = 0
     sink_start: int | None = 0
+    prefix_sink: bool = True
     dense_steps: int = 10
-    dense_layers: str | int = "0,1"
+    dense_layers: str | int | list[int] | None = "0,1"
     kv_splits: int | str = "auto"
 
     _VALID_THRESH_TYPES = frozenset({"diag", "exact"})
@@ -2401,13 +2403,20 @@ class SolAttnSpec:
             raise ValueError(
                 f"sol_attn.thresh_type={self.thresh_type!r} unsupported; use one of {sorted(self._VALID_THRESH_TYPES)}."
             )
-        if self.sink_tokens < 0:
-            raise ValueError(f"sol_attn.sink_tokens must be >= 0; got {self.sink_tokens!r}.")
-        if self.sink_start is not None and self.sink_start < 0:
-            raise ValueError(f"sol_attn.sink_start must be >= 0 or None; got {self.sink_start!r}.")
-        if self.dense_steps < 0:
-            raise ValueError(f"sol_attn.dense_steps must be >= 0; got {self.dense_steps!r}.")
-        if isinstance(self.kv_splits, int):
+        for name in ("sink_tokens", "sink_start", "dense_steps"):
+            value = getattr(self, name)
+            if name == "sink_start" and value is None:
+                continue
+            if type(value) is not int or value < 0:
+                raise ValueError(f"sol_attn.{name} must be a non-negative integer; got {value!r}.")
+        if type(self.prefix_sink) is not bool:
+            raise ValueError("sol_attn.prefix_sink must be a boolean.")
+        if isinstance(self.dense_layers, bool):
+            raise ValueError("sol_attn.dense_layers must be a layer selector, not a boolean.")
+        if isinstance(self.dense_layers, int):
+            self.dense_layers = [self.dense_layers]
+        parse_kv_cache_skip_selector(self.dense_layers)
+        if type(self.kv_splits) is int:
             if self.kv_splits not in (1, 2, 4):
                 raise ValueError(f"sol_attn.kv_splits must be 1, 2, or 4; got {self.kv_splits!r}.")
         elif isinstance(self.kv_splits, str) and self.kv_splits.lower() == "auto":
@@ -2540,15 +2549,16 @@ class AttentionSpec:
             if bs.skip_layer_indices:
                 kw["skip_layers"] = sorted(bs.skip_layer_indices)
         if self.sol_attn is not None:
-            s = self.sol_attn
+            sol = self.sol_attn
             kw["sol_attn"] = {
-                "tau": s.tau,
-                "thresh_type": s.thresh_type,
-                "sink_tokens": s.sink_tokens,
-                "sink_start": s.sink_start,
-                "dense_steps": s.dense_steps,
-                "dense_layers": s.dense_layers,
-                "kv_splits": s.kv_splits,
+                "tau": sol.tau,
+                "thresh_type": sol.thresh_type,
+                "sink_tokens": sol.sink_tokens,
+                "sink_start": sol.sink_start,
+                "prefix_sink": sol.prefix_sink,
+                "dense_steps": sol.dense_steps,
+                "dense_layers": sol.dense_layers,
+                "kv_splits": sol.kv_splits,
             }
         return kw or None
 

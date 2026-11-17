@@ -74,7 +74,16 @@ unstructured keyword dictionaries:
 - `skip_softmax` is consumed by TRTLLM; and
 - `block_sparse` is consumed by block-sparse backends such as RainFusion; and
 - `fastvideo_vsa_topk` is consumed by FastVideo VSA; and
-- `sparge` is consumed by the XPU SPARGE INT8 sparse attention backend.
+- `sparge` is consumed by the XPU SPARGE INT8 sparse attention backend; and
+- `sol_attn` is consumed by the CUDA Sol-Attn backend. It accepts a single
+  noncausal BF16 sequence with equal Q/KV heads and head dimension 128.
+
+Sol-Attn consumes producer-owned `PackedPaddingMetadata` to trim structural
+suffix padding before both dense and sparse work. Arbitrary packed documents
+are rejected rather than inferred from maximum sequence lengths. Its optional
+`prefix_sink` uses model-owned video layout to protect the prefix as keys and
+as dense queries. The sparse kernel has an opaque custom-op compilation boundary;
+Ring and AllGather-KV cannot bypass its full-sequence contract.
 
 A backend reads only the fields it owns and rejects incompatible values. New
 options should be added to a shared typed spec only when more than one backend

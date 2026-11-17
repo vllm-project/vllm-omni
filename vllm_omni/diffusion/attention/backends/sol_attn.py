@@ -1,117 +1,103 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Sol-Attn sparse attention backend for diffusion transformers.
-
-This backend registers the NVlabs Sol-Attn training-free sparse attention
-kernel (https://nvlabs.github.io/Sana/Sol-Attn/) as a diffusion attention
-backend. Sol-Attn routes attention blocks on the fly during an online-softmax
-pass instead of materializing a full proxy score map, which makes it a good
-fit for packed-sequence DiTs whose attention is sequence-bound (e.g.
-MiniMax-H3: ~50 layers x tens of thousands of packed tokens per denoise step).
-
-The upstream ``sol_attn`` package is imported lazily so that selecting the
-backend without it fails with a clear message at model-build time while other
-backends remain unaffected. The kernel requires BF16 activations and
-``head_dim=128`` (CUDA only).
-"""
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Opt-in Sol-Attn for a single noncausal BF16 self-attention sequence."""
 
 from __future__ import annotations
 
-import re
-from dataclasses import dataclass
+from dataclasses import replace
 
 import torch
-import torch.nn.functional as F
-from vllm.logger import init_logger
+from vllm.model_executor.models.utils import extract_layer_index
 
-from vllm_omni.diffusion.attention.backends.abstract import (
-    AttentionBackend,
-    AttentionImpl,
-    AttentionMetadata,
-)
+from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionImpl, AttentionMetadata
 from vllm_omni.diffusion.attention.backends.cudnn_attn import CuDNNAttentionImpl
-from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
-from vllm_omni.diffusion.forward_context import (
-    get_forward_context,
-    is_forward_context_available,
+from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
+from vllm_omni.diffusion.attention.capabilities import (
+    AttentionComputation,
+    CapabilityResult,
+    CompilationMode,
+    ExecutionContext,
+    ExecutionPathResult,
+    MaskMode,
+    PackingMode,
+    ParallelStrategy,
 )
+from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
+from vllm_omni.diffusion.data import SolAttnSpec, parse_kv_cache_skip_selector
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.platforms import current_omni_platform
 
-logger = init_logger(__name__)
+if not hasattr(torch.ops.vllm_omni, "sol_attention"):
 
-_SOL_ATTN_HEAD_DIM = 128
+    @torch.library.custom_op("vllm_omni::sol_attention", mutates_args=())
+    def _sol_attention(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        scale: float,
+        tau: float,
+        thresh_type: str,
+        kv_splits: int,
+        sink_start: int,
+        sink_tokens: int,
+    ) -> torch.Tensor:
+        from sol_attn import sol_attn
 
-
-def _parse_layer_ranges(spec: str | int | None) -> frozenset[int]:
-    """Parse a dense-layer spec such as ``"0,1"`` or ``"3-5"`` into a set."""
-    if spec is None:
-        return frozenset()
-    if isinstance(spec, int):
-        return frozenset({spec})
-    layers: set[int] = set()
-    for item in str(spec).split(","):
-        item = item.strip()
-        if not item:
-            continue
-        if "-" in item:
-            start, end = item.split("-", 1)
-            layers.update(range(int(start), int(end) + 1))
-        else:
-            layers.add(int(item))
-    return frozenset(layers)
-
-
-def _resolve_kv_splits(q: torch.Tensor, kv_splits: int | str | None) -> int:
-    """Resolve the ``kv_splits`` knob, auto-tuning only for known fast paths."""
-    if kv_splits not in (None, "auto"):
-        return int(kv_splits)
-    arch = tuple(torch.cuda.get_device_capability(q.device))
-    if arch == (9, 0) and q.shape[1] >= 65536:
-        try:
-            import cuda.bindings.driver  # noqa: F401
-            import cutlass.cute  # noqa: F401
-
-            return 4
-        except ImportError:
-            pass
-    return 1
-
-
-@dataclass(frozen=True)
-class SolAttnConfig:
-    """Typed runtime config for the Sol-Attn kernel, defaults match upstream."""
-
-    tau: float = 1.0
-    thresh_type: str = "diag"
-    kv_splits: int | str = "auto"
-    sink_tokens: int = 0
-    sink_start: int | None = 0
-    dense_steps: int = 10
-    dense_layers: frozenset[int] = frozenset({0, 1})
-
-    @classmethod
-    def from_backend_kwargs(cls, backend_kwargs: dict | None) -> SolAttnConfig:
-        raw = (backend_kwargs or {}).get("sol_attn") or {}
-        if not isinstance(raw, dict):
-            raise TypeError(f"sol_attn config must be a dict, got {type(raw)!r}")
-        return cls(
-            tau=float(raw.get("tau", 1.0)),
-            thresh_type=str(raw.get("thresh_type", "diag")),
-            kv_splits=raw.get("kv_splits", "auto"),
-            sink_tokens=int(raw.get("sink_tokens", 0)),
-            sink_start=None if raw.get("sink_start") is None else int(raw["sink_start"]),
-            dense_steps=int(raw.get("dense_steps", 10)),
-            dense_layers=_parse_layer_ranges(raw.get("dense_layers", "0,1")),
+        return sol_attn(
+            query,
+            key,
+            value,
+            scale=scale,
+            tau=tau,
+            thresh_type=thresh_type,
+            kv_splits=kv_splits,
+            sink_start=sink_start,
+            sink_tokens=sink_tokens,
         )
+
+    @_sol_attention.register_fake
+    def _sol_attention_fake(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        scale: float,
+        tau: float,
+        thresh_type: str,
+        kv_splits: int,
+        sink_start: int,
+        sink_tokens: int,
+    ) -> torch.Tensor:
+        return torch.empty_like(query)
+
+
+_sol_attention_op = torch.ops.vllm_omni.sol_attention
 
 
 class SolAttnBackend(AttentionBackend):
-    accept_output_buffer: bool = True
-    supports_prefix_kv_slicing: bool = True
-    supported_platforms: tuple[str, ...] = ("cuda",)
+    accept_output_buffer = True
+    supports_prefix_kv_slicing = True
+    supported_platforms = ("cuda",)
+
+    @classmethod
+    def supports_packed_mask_free(cls) -> bool:
+        return True
+
+    @classmethod
+    def validate_available(cls) -> None:
+        try:
+            from sol_attn import sol_attn
+        except ImportError as error:
+            raise ImportError(
+                "SOL_ATTN requires the upstream sol_attn package. Install it with "
+                "`pip install 'git+https://github.com/NVlabs/Sana.git@sol-engine"
+                "#subdirectory=techniques/sparse_backends'`."
+            ) from error
+        if not callable(sol_attn):
+            raise ImportError("SOL_ATTN requires a sol_attn package exporting the callable sol_attn kernel.")
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
-        return [_SOL_ATTN_HEAD_DIM]
+        return [128]
 
     @staticmethod
     def get_name() -> str:
@@ -123,13 +109,6 @@ class SolAttnBackend(AttentionBackend):
 
 
 class SolAttnImpl(AttentionImpl):
-    """Packed-varlen Sol-Attn kernel with an exact dense fallback.
-
-    Dense guard steps use packed-varlen FlashAttention except on SM120, where
-    the CuTe varlen kernel cannot compile MiniMax-H3's packed shape. SM120 uses
-    the platform-native cuDNN dense backend while sparse steps still use Sol.
-    """
-
     def __init__(
         self,
         num_heads: int,
@@ -140,248 +119,176 @@ class SolAttnImpl(AttentionImpl):
         prefix: str = "",
         qkv_layout: str | None = None,
         backend_kwargs: dict | None = None,
+        computation: AttentionComputation | str = AttentionComputation.SELF,
         **extra_impl_args,
     ) -> None:
-        del qkv_layout, extra_impl_args
-        if head_size != _SOL_ATTN_HEAD_DIM:
-            raise ValueError(f"Sol-Attn requires head_size={_SOL_ATTN_HEAD_DIM}, got {head_size}")
-        if causal:
-            raise ValueError("SOL_ATTN does not support causal attention; select a dense backend for causal roles")
-        if num_kv_heads is not None and num_kv_heads != num_heads:
-            raise ValueError(
-                f"SOL_ATTN does not support GQA/MQA; num_kv_heads ({num_kv_heads}) must equal num_heads ({num_heads})"
-            )
-        self.causal = causal
+        if head_size != 128:
+            raise ValueError("SOL_ATTN requires head_size=128.")
+        if causal or (num_kv_heads is not None and num_kv_heads != num_heads):
+            raise ValueError("SOL_ATTN requires noncausal attention with equal Q/KV heads; GQA/MQA is unsupported.")
+        if AttentionComputation(computation) is not AttentionComputation.SELF:
+            raise ValueError("SOL_ATTN supports self-attention only.")
+        if qkv_layout not in (None, "BSND"):
+            raise ValueError("SOL_ATTN requires qkv_layout='BSND'.")
+        options = backend_kwargs or {}
+        if set(options) - {"sol_attn"}:
+            raise ValueError(f"Unknown SOL_ATTN backend options: {sorted(set(options) - {'sol_attn'})}")
+        settings = options.get("sol_attn")
+        self.config = SolAttnSpec(**({} if settings is None else settings))
         self.softmax_scale = softmax_scale
-        self.config = SolAttnConfig.from_backend_kwargs(backend_kwargs)
-        self._validate_parallel_config()
-        self._validate_kv_splits()
-        self.layer_idx = self._parse_layer_idx(prefix)
-        self._cudnn_dense_fallback = CuDNNAttentionImpl(
-            num_heads=num_heads,
-            head_size=head_size,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            num_kv_heads=num_kv_heads,
-            prefix=prefix,
-        )
-
-    @staticmethod
-    def _validate_parallel_config() -> None:
-        config = get_current_diffusion_config_or_none()
-        parallel_config = getattr(config, "parallel_config", None)
-        ring_degree = getattr(parallel_config, "ring_degree", 1)
-        if ring_degree > 1:
-            raise ValueError(
-                "SOL_ATTN is not compatible with ring sequence parallelism "
-                f"(ring_degree={ring_degree}): the sparse kernel needs the whole key sequence. "
-                "Use Ulysses SP (ring_degree=1) instead."
-            )
-
-    def _validate_kv_splits(self) -> None:
-        if self.config.kv_splits not in (2, 4):
-            return
-        capability = tuple(torch.cuda.get_device_capability())
-        if capability != (9, 0):
-            raise ValueError(
-                f"SOL_ATTN kv_splits={self.config.kv_splits} is supported on SM90 only; "
-                f"current device is SM{capability[0]}{capability[1]}. Use kv_splits=1 or 'auto'."
-            )
-
-    @staticmethod
-    def _parse_layer_idx(prefix: str) -> int | None:
-        match = re.search(r"blocks\.(\d+)", prefix)
-        if match is None:
-            return None
-        return int(match.group(1))
-
-    def _current_denoise_step(self) -> int | None:
-        if not is_forward_context_available():
-            return None
-        return getattr(get_forward_context(), "denoise_step_idx", None)
+        selector = self.config.dense_layers
+        self.dense_layers = parse_kv_cache_skip_selector([selector] if isinstance(selector, int) else selector) or set()
+        try:
+            self.layer_idx = extract_layer_index(prefix) if prefix else None
+        except (AssertionError, ValueError):
+            self.layer_idx = None
+        diffusion_config = get_current_diffusion_config_or_none()
+        parallel = getattr(diffusion_config, "parallel_config", None)
+        if getattr(parallel, "ring_degree", 1) > 1 or getattr(parallel, "allgather_degree", 1) > 1:
+            raise ValueError("SOL_ATTN needs full Q/K/V sequences; use local attention or Ulysses with ring_degree=1.")
+        capability = current_omni_platform.get_device_capability()
+        self.kv_splits = 1 if isinstance(self.config.kv_splits, str) else self.config.kv_splits
+        if self.kv_splits != 1:
+            if capability is None or tuple(capability) != (9, 0):
+                raise ValueError("SOL_ATTN kv_splits=2/4 requires SM90; use kv_splits=1 or 'auto'.")
+            try:
+                import cuda.bindings.driver  # noqa: F401
+                import cutlass.cute  # noqa: F401
+            except ImportError as error:
+                raise ImportError("SOL_ATTN kv_splits=2/4 requires the CuTe DSL runtime; use kv_splits=1.") from error
+        dense_impl = CuDNNAttentionImpl if capability is not None and capability.major == 12 else SDPAImpl
+        self.dense_attention = dense_impl(num_heads, head_size, softmax_scale, num_kv_heads=num_kv_heads)
 
     def _should_use_dense(self) -> bool:
-        step = self._current_denoise_step()
-        if step is not None and step < self.config.dense_steps:
+        if self.layer_idx is None and self.dense_layers:
             return True
-        if self.layer_idx is not None and self.layer_idx in self.config.dense_layers:
+        if self.layer_idx in self.dense_layers:
             return True
-        return False
+        step = get_forward_context().denoise_step_idx if is_forward_context_available() else None
+        return self.config.dense_steps > 0 and (step is None or step < self.config.dense_steps)
 
     @staticmethod
-    def _requires_sm120_dense_fallback(device: torch.device) -> bool:
-        return device.type == "cuda" and torch.cuda.get_device_capability(device) == (12, 0)
-
-    @staticmethod
-    def _clamp_sink_range(
-        used: int,
-        sink_start: int | None,
-        sink_tokens: int,
-    ) -> tuple[int, int]:
-        """Clamp the exact-KV sink range to ``[0, used]``.
-
-        The kernel requires ``sink_start + sink_tokens <= T``. Short sequences
-        (e.g. the text-refiner attention, which runs on the text rows only) can
-        be shorter than the configured sink, so clamp instead of failing.
-        """
-        start = 0 if sink_start is None else min(int(sink_start), used)
-        tokens = min(int(sink_tokens), used - start)
-        return start, tokens
-
-    @staticmethod
-    def _used_length(attn_metadata: AttentionMetadata | None, seq_len: int) -> int:
-        if attn_metadata is None:
-            return seq_len
-        used = attn_metadata.extra.get("max_seqlen_q")
-        if used is None:
-            used = attn_metadata.extra.get("valid_kv_length")
-        if used is None:
-            return seq_len
-        return min(int(used), seq_len)
-
-    def _forward_dense_varlen(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-    ) -> torch.Tensor:
-        """Run the exact packed dense fallback selected for this platform."""
-        if self._requires_sm120_dense_fallback(query.device):
-            logger.info_once("Using cuDNN for the Sol-Attn dense guard on SM120")
-            return self._cudnn_dense_fallback.forward_cuda(
-                query,
-                key,
-                value,
-                attn_metadata,
+    def _used_length(
+        query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, metadata: AttentionMetadata | None
+    ) -> int:
+        if query.ndim != 4 or query.shape != key.shape or query.shape != value.shape:
+            raise ValueError("SOL_ATTN requires matching Q/K/V shapes [1, S, H, 128].")
+        if query.shape[0] != 1 or query.shape[-1] != 128 or any(size == 0 for size in query.shape):
+            raise ValueError("SOL_ATTN requires a single nonempty sequence with head_dim=128.")
+        if any(tensor.dtype != torch.bfloat16 for tensor in (query, key, value)):
+            raise TypeError("SOL_ATTN requires BF16 Q/K/V, including dense guard steps.")
+        if query.device != key.device or query.device != value.device:
+            raise ValueError("SOL_ATTN requires Q/K/V on the same device.")
+        if metadata is None:
+            return query.shape[1]
+        if any(
+            item is not None
+            for item in (
+                metadata.attn_mask,
+                metadata.joint_attn_mask,
+                metadata.joint_query,
+                metadata.joint_key,
+                metadata.joint_value,
+                metadata.full_attn_spans,
+                metadata.query_ranges,
+                metadata.cross_query_mask,
             )
+        ):
+            raise ValueError("SOL_ATTN does not support masks, joint attention, or piecewise attention.")
+        if metadata.extra.get("kv_cache_dtype") not in (None, "auto", "float"):
+            raise ValueError("SOL_ATTN does not support quantized KV caches.")
+        packed = metadata.packed_padding
+        used = metadata.extra.get("valid_kv_length", query.shape[1])
+        if packed is not None:
+            if packed.q_length != packed.kv_length:
+                raise ValueError("SOL_ATTN requires equal packed Q/KV lengths; compact reference KV is unsupported.")
+            if "valid_kv_length" in metadata.extra and used != packed.kv_length:
+                raise ValueError("SOL_ATTN packed_padding and valid_kv_length disagree.")
+            used = packed.q_length
+        elif "cu_seqlens_q" in metadata.extra or "cu_seqlens_k" in metadata.extra:
+            raise ValueError(
+                "SOL_ATTN requires producer-owned packed_padding; multi-document attention is unsupported."
+            )
+        if type(used) is not int or not 0 < used <= query.shape[1]:
+            raise ValueError("SOL_ATTN valid length must be a positive host integer within the sequence.")
+        return used
 
-        from vllm_omni.diffusion.attention.backends.utils.fa import (
-            flash_attn_varlen_func,
-        )
+    def _sink_range(self, metadata: AttentionMetadata | None, used: int) -> tuple[int, int]:
+        tokens = min(self.config.sink_tokens, used)
+        start = used - tokens if self.config.sink_start is None else min(self.config.sink_start, used)
+        end = min(start + tokens, used)
+        layout = metadata.video_layout if metadata is not None else None
+        if self.config.prefix_sink and layout is not None:
+            if layout.used_len is not None and layout.used_len != used:
+                raise ValueError("SOL_ATTN video layout and valid sequence length disagree.")
+            prefix = layout.prefix_len
+            if layout.video_spans:
+                targets = [span for span in layout.video_spans if span.role == "target"]
+                if len(targets) != 1:
+                    raise ValueError("SOL_ATTN prefix_sink requires exactly one target-video span.")
+                prefix = targets[0].start
+            if type(prefix) is not int or not 0 <= prefix <= used:
+                raise ValueError("SOL_ATTN prefix_sink requires a valid video prefix length.")
+            if prefix:
+                end = max(end if tokens else 0, prefix)
+                start = 0
+        return start, end - start
 
-        if flash_attn_varlen_func is None:
-            raise ImportError("Sol-Attn dense fallback requires flash_attn_varlen_func")
-        extra = attn_metadata.extra
-        out = flash_attn_varlen_func(
-            q=query.flatten(0, 1),
-            k=key.flatten(0, 1),
-            v=value.flatten(0, 1),
-            cu_seqlens_q=extra["cu_seqlens_q"],
-            cu_seqlens_k=extra["cu_seqlens_k"],
-            max_seqlen_q=extra["max_seqlen_q"],
-            max_seqlen_k=extra["max_seqlen_k"],
-            causal=self.causal,
-            softmax_scale=self.softmax_scale,
-        )
-        out = out[0] if isinstance(out, tuple) else out
-        return out.reshape_as(query)
-
-    def _forward_dense_batched(
+    def resolve_execution_path(
         self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-    ) -> torch.Tensor:
-        """Dense fallback for a plain (B, S, H, D) batch with no packed metadata."""
-        batch_size, seq_len = query.shape[:2]
-        cu_seqlens = torch.arange(
-            0,
-            (batch_size + 1) * seq_len,
-            seq_len,
-            device=query.device,
-            dtype=torch.int32,
-        )
-        out = self._forward_dense_varlen(
-            query,
-            key,
-            value,
-            AttentionMetadata(
-                extra={
-                    "cu_seqlens_q": cu_seqlens,
-                    "cu_seqlens_k": cu_seqlens,
-                    "max_seqlen_q": seq_len,
-                    "max_seqlen_k": seq_len,
-                }
-            ),
-        )
-        return out.reshape(batch_size, seq_len, *out.shape[2:])
-
-    def _forward_dense_queries(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        *,
-        start: int,
-        tokens: int,
-    ) -> torch.Tensor:
-        """Recompute selected query rows densely against every key/value row."""
-        return F.scaled_dot_product_attention(
-            query[:, start : start + tokens].transpose(1, 2),
-            key.transpose(1, 2),
-            value.transpose(1, 2),
-            dropout_p=0.0,
-            is_causal=False,
-            scale=self.softmax_scale,
-        ).transpose(1, 2)
-
-    def _forward_sol_attn(
-        self,
+        context: ExecutionContext,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
-    ) -> torch.Tensor:
-        from sol_attn import sol_attn
+    ) -> ExecutionPathResult:
+        result = ExecutionPathResult(
+            backend="SOL_ATTN",
+            path="dense_guard" if self._should_use_dense() else "sol_sparse",
+            support=CapabilityResult.supported(),
+            compilation_mode=CompilationMode.CUSTOM_OP,
+            platform=context.platform,
+            kernel_variant=None,
+            parallel_strategy=context.parallel_strategy,
+        )
+        if context.platform != "cuda":
+            reason = "SOL_ATTN runs on CUDA only."
+        elif context.parallel_strategy not in (ParallelStrategy.NONE, ParallelStrategy.ULYSSES):
+            reason = "SOL_ATTN supports local attention and pure Ulysses only."
+        elif (
+            context.causal
+            or context.computation is not AttentionComputation.SELF
+            or context.mask_mode is not MaskMode.NONE
+            or context.packing_mode is PackingMode.MULTI_DOCUMENT
+            or context.piecewise
+            or context.paged_kv
+            or context.cross_parallel_layout is not None
+            or context.kv_cache_dtype not in (None, "auto", "float")
+        ):
+            reason = "SOL_ATTN requires mask-free noncausal self attention without paged/quantized KV."
+        else:
+            try:
+                used = self._used_length(query, key, value, attn_metadata)
+                _, sink_tokens = self._sink_range(attn_metadata, used)
+                if sink_tokens == used:
+                    result = replace(result, path="dense_guard")
+                if result.path == "sol_sparse":
+                    self._validate_split_length(used)
+            except (TypeError, ValueError) as error:
+                reason = str(error)
+            else:
+                if context.outer_boundaries:
+                    return replace(
+                        result,
+                        support=CapabilityResult.unmigrated("SOL_ATTN outer compilation boundaries are unverified."),
+                        compilation_mode=CompilationMode.EAGER_ONLY,
+                    )
+                return result
+        return replace(result, support=CapabilityResult.unsupported(reason))
 
-        batch_size, seq_len = query.shape[:2]
-        if batch_size != 1:
-            raise NotImplementedError(
-                "Sol-Attn sparse attention currently requires batch size 1 "
-                "(packed single-document layout, e.g. MiniMax-H3)."
-            )
-        # The packed layout may append an alignment-padding document. The
-        # kernel has no cu_seqlens support, so slice to the real length first;
-        # the padding rows are masked by the model and their outputs discarded.
-        used = self._used_length(attn_metadata, seq_len)
-        sink_start, sink_tokens = self._clamp_sink_range(
-            used,
-            self.config.sink_start,
-            self.config.sink_tokens,
-        )
-        q = query[:, :used].contiguous()
-        k = key[:, :used].contiguous()
-        v = value[:, :used].contiguous()
-        if q.dtype != torch.bfloat16:
-            raise TypeError(
-                f"Sol-Attn requires bfloat16 activations, got {q.dtype}. "
-                "Select a backend that supports the model dtype instead."
-            )
-        out = sol_attn(
-            q,
-            k,
-            v,
-            scale=self.softmax_scale,
-            tau=self.config.tau,
-            thresh_type=self.config.thresh_type,
-            kv_splits=_resolve_kv_splits(q, self.config.kv_splits),
-            sink_start=sink_start,
-            sink_tokens=sink_tokens,
-        )
-        if sink_tokens:
-            out[:, sink_start : sink_start + sink_tokens] = self._forward_dense_queries(
-                q,
-                k,
-                v,
-                start=sink_start,
-                tokens=sink_tokens,
-            )
-        if out.shape[1] < seq_len:
-            padded = torch.zeros_like(query)
-            padded[:, :used] = out
-            out = padded
-        return out
+    def _validate_split_length(self, used: int) -> None:
+        if self.kv_splits > (used + 4095) // 4096:
+            raise ValueError("SOL_ATTN needs at least one 4096-token route group per KV split; use kv_splits=1.")
 
     def forward_cuda(
         self,
@@ -390,8 +297,28 @@ class SolAttnImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        if self._should_use_dense():
-            if attn_metadata is not None and "cu_seqlens_q" in attn_metadata.extra:
-                return self._forward_dense_varlen(query, key, value, attn_metadata)
-            return self._forward_dense_batched(query, key, value)
-        return self._forward_sol_attn(query, key, value, attn_metadata)
+        used = self._used_length(query, key, value, attn_metadata)
+        sink_start, sink_tokens = self._sink_range(attn_metadata, used)
+        query_used, key_used, value_used = (tensor[:, :used].contiguous() for tensor in (query, key, value))
+        if self._should_use_dense() or sink_tokens == used:
+            output = self.dense_attention.forward_cuda(query_used, key_used, value_used)
+        else:
+            self._validate_split_length(used)
+            output = _sol_attention_op(
+                query_used,
+                key_used,
+                value_used,
+                self.softmax_scale,
+                self.config.tau,
+                self.config.thresh_type,
+                self.kv_splits,
+                sink_start,
+                sink_tokens,
+            )
+            if sink_tokens:
+                output[:, sink_start : sink_start + sink_tokens] = self.dense_attention.forward_cuda(
+                    query_used[:, sink_start : sink_start + sink_tokens], key_used, value_used
+                )
+        if used == query.shape[1]:
+            return output
+        return torch.cat((output, torch.zeros_like(query[:, used:])), dim=1)

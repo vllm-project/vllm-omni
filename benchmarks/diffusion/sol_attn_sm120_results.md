@@ -4,6 +4,11 @@ This report records an end-to-end BF16 speed/quality sweep of the Sol-Attn
 backend added by this pull request. A canonical copy is also retained in the
 [vLLM-Omni rankings repository](https://github.com/lishunyang12/vllm-omni-rankings/tree/main/scripts/minimax_h3_sol_attn_sm120).
 
+These are historical measurements from the original PR. They do not validate
+the rebased implementation's model-owned prefix sink, packed-padding handling,
+custom-op boundary, or SDPA dense guards. Rerun matched video/audio and latency
+validation on the current head before making performance or quality claims.
+
 ## Test configuration
 
 - Hardware: 4x NVIDIA RTX PRO 5000 Blackwell (SM120), 73,415 MiB per GPU
@@ -36,7 +41,7 @@ configuration that passed every gate was `sol_dense_steps_5` at 1.161x. The
 more aggressive preset reached 1.205x, but failed the LPIPS gate.
 
 | Configuration | Median (s) | Speedup | Latency reduction | SSIM | PSNR (dB) | LPIPS | Quality |
-|---|---:|---:|---:|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Dense cuDNN | 142.49 | 1.000x | 0.00% | 1.00000 | inf | 0.00000 | PASS |
 | Sol-Attn recommended (`tau=1.0`, dense steps 10) | 129.91 | 1.097x | 8.83% | 0.93344 | 33.28 | 0.08563 | PASS |
 | Sol-Attn balanced (`tau=1.5`, dense steps 8) | 124.95 | 1.140x | 12.31% | 0.91780 | 31.49 | 0.11771 | PASS |
@@ -50,7 +55,7 @@ the sparse Sol-Attn kernel. Five dense steps was the fastest point that still
 passed all configured quality gates in this sweep.
 
 | Dense steps | Median (s) | Speedup | SSIM | PSNR (dB) | LPIPS | Quality |
-|---:|---:|---:|---:|---:|---:|---:|
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 20 | 142.73 | 0.998x | 0.95825 | 35.60 | 0.05441 | PASS |
 | 15 | 136.73 | 1.042x | 0.95129 | 35.10 | 0.05834 | PASS |
 | 8 | 127.13 | 1.121x | 0.93170 | 32.66 | 0.08395 | PASS |
@@ -60,7 +65,7 @@ passed all configured quality gates in this sweep.
 ## Full sweep
 
 | Case | Group | Median (s) | Speedup | Latency reduction | SSIM | PSNR (dB) | LPIPS | Quality |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `dense_cudnn` | baseline | 142.49 | 1.000x | 0.00% | 1.00000 | inf | 0.00000 | PASS |
 | `sol_recommended` | preset | 129.91 | 1.097x | 8.83% | 0.93344 | 33.28 | 0.08563 | PASS |
 | `sol_medium` | preset | 124.95 | 1.140x | 12.31% | 0.91780 | 31.49 | 0.11771 | PASS |
