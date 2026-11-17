@@ -228,6 +228,16 @@ class DuoPipeline(nn.Module):
         if adapter_format == "torchtitan_split_qkv":
             from .checkpoint import load_training_adapter
 
+            # The release manifest lists exactly which projections the adapter
+            # trained; pass it so the loader cross-checks the file against it
+            # instead of demanding LoRA for every 2D weight in the tree.
+            manifest_modules = self.options.get("adapter_manifest_modules")
+            manifest_path = self.options.get("adapter_manifest_path")
+            if manifest_modules is None and manifest_path:
+                from pathlib import Path
+
+                release = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+                manifest_modules = (release.get("models", {}).get("student", {}).get("lora") or {}).get("modules")
             identity = load_training_adapter(
                 self.transformer,
                 adapter,
@@ -235,6 +245,7 @@ class DuoPipeline(nn.Module):
                 alpha=self.options.get("alpha", 128),
                 role_embedding=self.options.get("role_embedding", False),
                 target_modules=self.options.get("adapter_modules"),
+                manifest_modules=manifest_modules,
             )
         elif adapter_format == "native":
             identity = load_fixed_adapter(

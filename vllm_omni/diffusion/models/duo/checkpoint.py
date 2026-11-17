@@ -72,29 +72,72 @@ class SplitQKVRealizationLoRALinear(nn.Module):
 
 
 @torch.no_grad()
-def load_training_adapter(model, path, *, rank=128, alpha=128, role_embedding=False, target_modules=None):
+def load_training_adapter(
+    model, path, *, rank=128, alpha=128, role_embedding=False, target_modules=None, manifest_modules=None
+):
     if not getattr(model, "_realization_base_loaded", False) or getattr(model, "_realization_adapter_loaded", False):
         raise ValueError("Training adapter requires complete base and cannot be stacked")
     if rank != 128 or alpha != 128 or role_embedding is not False:
         raise ValueError("Exported causal student requires rank/alpha128 and no role embedding")
-    modules = {
+    all_linears = {
         n: m for n, m in model.named_modules() if hasattr(m, "weight") and m.weight.ndim == 2 and n != "role_embeddings"
     }
     if target_modules is not None:
-        modules = {
+        all_linears = {
             name: module
-            for name, module in modules.items()
+            for name, module in all_linears.items()
             if all(
                 any(target == suffix or target.endswith("." + suffix) for suffix in target_modules)
                 for target in _targets(name)
             )
         }
-    expected = {"role_embeddings.weight"} | {
-        t + f".lora_{side}.default.weight" for n in modules for t in _targets(n) for side in ("A", "B")
-    }
+    # The released adapter covers a manifest-declared subset of the projections
+    # (the causal-base export trains the media/attention/FFN projections and
+    # leaves the AdaLN, time-embedder and output-norm linears at their base
+    # weights). Deriving the inventory from every 2D weight in the module tree
+    # would demand LoRA tensors that the checkpoint deliberately does not have,
+    # so the file itself defines the set and `manifest_modules` only verifies it.
+    by_target = {t: n for n in all_linears for t in _targets(n)}
+    expected = {"role_embeddings.weight"}
     replacements = {}
     with safe_open(str(path), framework="pt", device="cpu") as source:
         meta = source.metadata() or {}
+        keys = set(source.keys())
+        covered = set()
+        for key in keys:
+            for side in ("A", "B"):
+                suffix = f".lora_{side}.default.weight"
+                if key.endswith(suffix):
+                    target = key[: -len(suffix)]
+                    if target not in by_target:
+                        raise ValueError("Adapter targets a projection the model does not have: " + target)
+                    covered.add(target)
+        unknown = covered - set(by_target)
+        if unknown:
+            raise ValueError("Adapter targets unknown projections: " + ", ".join(sorted(unknown)[:5]))
+        modules = {by_target[t]: all_linears[by_target[t]] for t in sorted(covered)}
+        expected |= {t + f".lora_{side}.default.weight" for t in covered for side in ("A", "B")}
+        if manifest_modules is not None:
+            declared = {t for name in manifest_modules for t in _targets(name)}
+            if declared != covered:
+                raise ValueError(
+                    "Adapter inventory disagrees with the release manifest: "
+                    f"missing={sorted(declared - covered)[:5]}, extra={sorted(covered - declared)[:5]}"
+                )
+        if (
+            meta.get("layout") != "diffusers_split_qkv"
+            or meta.get("rank") != "128"
+            or meta.get("alpha") != "128"
+            or meta.get("role_embedding") != "false"
+        ):
+            raise ValueError("Missing explicit exported student layout/rank/role identity")
+        if keys != expected:
+            raise ValueError(
+                "Training adapter inventory mismatch: "
+                f"missing={sorted(expected - keys)}, extra={sorted(keys - expected)}"
+            )
+    replacements = {}
+    with safe_open(str(path), framework="pt", device="cpu") as source:
         if (
             meta.get("layout") != "diffusers_split_qkv"
             or meta.get("rank") != "128"
