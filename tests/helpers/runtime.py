@@ -57,6 +57,11 @@ SERVER_SHUTDOWN_TIMEOUT_S = 60
 # Auto-port OmniServer launches can lose the reserved TCP port between the
 # parent's probe close and the child bind under xdist; retry a few times.
 SERVER_PORT_IN_USE_RETRIES = 3
+# Reliability fault tests inspect server stderr after multi-rank workers have
+# emitted their shutdown traces. Keep enough bounded history to retain the
+# original fault line, while diagnostics below still print only a short tail.
+SERVER_STDERR_HISTORY_LINES = 4096
+SERVER_STDERR_DIAGNOSTIC_TAIL_LINES = 100
 
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
@@ -214,8 +219,10 @@ class OmniServer:
         self._auto_port = port is None
         self._port_lock: FileLock | None = None
         self.port = get_open_port() if port is None else port
-        # Bounded ring buffer of child stderr for early-exit diagnostics.
-        self._server_error_lines: deque[str] = deque(maxlen=100)
+        # Bounded history is also fault evidence for reliability tests. A
+        # 100-line buffer can discard the originating OOM before several ranks
+        # finish printing their secondary shutdown traces.
+        self._server_error_lines: deque[str] = deque(maxlen=SERVER_STDERR_HISTORY_LINES)
         self._server_log_thread: threading.Thread | None = None
 
     def _reserve_port(self) -> None:
@@ -290,7 +297,7 @@ class OmniServer:
         if self._port_lock is not None:
             self._port_lock.release()
             self._port_lock = None
-        self._server_error_lines = deque(maxlen=100)
+        self._server_error_lines = deque(maxlen=SERVER_STDERR_HISTORY_LINES)
 
     def _start_server(self) -> None:
         attempts = SERVER_PORT_IN_USE_RETRIES if self._auto_port else 1
@@ -349,7 +356,7 @@ class OmniServer:
         # Inherit stdout (INFO still shows in CI); capture stderr only for the
         # exited-before-ready RuntimeError message. errors=replace keeps the
         # reader alive on undecodable bytes so a full pipe cannot hang serve.
-        self._server_error_lines = deque(maxlen=100)
+        self._server_error_lines = deque(maxlen=SERVER_STDERR_HISTORY_LINES)
         self._server_log_thread = None
         self.proc = subprocess.Popen(
             cmd,
@@ -545,7 +552,8 @@ class OmniServer:
             self._server_log_thread.join(timeout=2)
         if not self._server_error_lines:
             return ""
-        return "\n=== OmniServer stderr ===\n{}".format("".join(self._server_error_lines))
+        lines = list(self._server_error_lines)[-SERVER_STDERR_DIAGNOSTIC_TAIL_LINES:]
+        return "\n=== OmniServer stderr ===\n{}".format("".join(lines))
 
     def _stop_stderr_reader(self) -> None:
         """Join the drain thread; close stderr only if the reader has stopped.

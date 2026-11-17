@@ -199,3 +199,20 @@ def test_startup_timeout_does_not_retry_on_address_in_use_log(monkeypatch):
     with pytest.raises(RuntimeError, match="failed to start within"):
         server._start_server()
     assert calls["n"] == 1
+
+
+def test_server_stderr_history_retains_fault_before_noisy_shutdown():
+    server = runtime.OmniServer("fake-model", [])
+    marker = "torch.OutOfMemoryError: HIP out of memory\n"
+    server._server_error_lines.append(marker)
+    for index in range(runtime.SERVER_STDERR_DIAGNOSTIC_TAIL_LINES + 50):
+        server._server_error_lines.append(f"secondary shutdown trace {index}\n")
+
+    assert server._server_error_lines.maxlen == runtime.SERVER_STDERR_HISTORY_LINES
+    assert marker in server._server_error_lines
+    diagnostic_tail = server._server_error_tail()
+    assert marker not in diagnostic_tail
+    assert "secondary shutdown trace 149" in diagnostic_tail
+
+    server._abandon_launch_attempt()
+    assert server._server_error_lines.maxlen == runtime.SERVER_STDERR_HISTORY_LINES
