@@ -1133,6 +1133,96 @@ def test_runner_runtime_switches_from_prefill_to_reusable_denoise_metadata(
         runtime.ensure_active(1)
 
 
+def _cfg_row(request_id: str, sequence_id: int, seq_len: int, kv_start_pos: int) -> DiffusionPagedAttentionRow:
+    return DiffusionPagedAttentionRow(
+        request_id=request_id,
+        sequence_id=sequence_id,
+        query_len=seq_len - kv_start_pos,
+        seq_len=seq_len,
+        kv_start_pos=kv_start_pos,
+    )
+
+
+def test_filter_rows_for_requests_preserves_scheduler_order() -> None:
+    # Scheduler metadata is request-major: both CFG sequences of req-0, then req-1.
+    rows = (
+        _cfg_row("req-0", 0, 17, 9),
+        _cfg_row("req-0", 1, 17, 9),
+        _cfg_row("req-1", 0, 13, 5),
+        _cfg_row("req-1", 1, 13, 5),
+    )
+
+    filtered = DiffusionPagedAttentionRuntime._filter_rows_for_requests(rows, ["req-0", "req-1"])
+    assert [(row.request_id, row.sequence_id, row.seq_len) for row in filtered] == [
+        ("req-0", 0, 17),
+        ("req-0", 1, 17),
+        ("req-1", 0, 13),
+        ("req-1", 1, 13),
+    ]
+
+    single = DiffusionPagedAttentionRuntime._filter_rows_for_requests(rows, ["req-1"])
+    assert [(row.request_id, row.sequence_id, row.seq_len) for row in single] == [
+        ("req-1", 0, 13),
+        ("req-1", 1, 13),
+    ]
+
+
+def test_rows_for_keys_applies_caller_order() -> None:
+    rows = (
+        _cfg_row("req-0", 0, 17, 9),
+        _cfg_row("req-0", 1, 17, 9),
+        _cfg_row("req-1", 0, 13, 5),
+        _cfg_row("req-1", 1, 13, 5),
+    )
+    ordered = DiffusionPagedAttentionRuntime._rows_for_keys(
+        rows,
+        [("req-0", 0), ("req-1", 0), ("req-0", 1), ("req-1", 1)],
+    )
+    assert [(row.request_id, row.sequence_id, row.seq_len) for row in ordered] == [
+        ("req-0", 0, 17),
+        ("req-1", 0, 13),
+        ("req-0", 1, 17),
+        ("req-1", 1, 13),
+    ]
+
+
+def test_ensure_active_uses_explicit_row_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, _, _, _ = _make_adapter(monkeypatch)
+    captured: list[tuple[tuple[str, int | None], ...]] = []
+
+    def fake_prepare(rows):
+        captured.append(tuple((row.request_id, row.sequence_id) for row in rows))
+        return SimpleNamespace(rows=tuple(rows))
+
+    monkeypatch.setattr(adapter, "prepare_batch", fake_prepare)
+    monkeypatch.setattr(adapter, "activate", lambda _batch: nullcontext())
+
+    metadata = DiffusionPagedAttentionMetadata(
+        prefill_rows=(
+            _cfg_row("req-0", 0, 17, 0),
+            _cfg_row("req-0", 1, 17, 0),
+            _cfg_row("req-1", 0, 13, 0),
+            _cfg_row("req-1", 1, 13, 0),
+        ),
+        denoise_rows=(
+            _cfg_row("req-0", 0, 17, 9),
+            _cfg_row("req-0", 1, 17, 9),
+            _cfg_row("req-1", 0, 13, 5),
+            _cfg_row("req-1", 1, 13, 5),
+        ),
+    )
+    runtime = DiffusionPagedAttentionRuntime(adapter, metadata)
+    runtime.ensure_active(
+        1,
+        request_ids=["req-0", "req-1"],
+        row_keys=[("req-0", 0), ("req-1", 0), ("req-0", 1), ("req-1", 1)],
+    )
+
+    assert captured == [
+        (("req-0", 0), ("req-1", 0), ("req-0", 1), ("req-1", 1)),
+    ]
+
+
 def test_causal_batch_rejects_non_suffix_write(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter, _, _, _ = _make_adapter(monkeypatch, non_causal=False)
     row = DiffusionPagedAttentionRow(

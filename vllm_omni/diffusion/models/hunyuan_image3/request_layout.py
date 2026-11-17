@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 
 from vllm_omni.diffusion.diffusion_kv.kv_cache_utils import get_cache_namespace, hash_prefix_cache_value
@@ -531,6 +533,79 @@ def prepare_hunyuan_prefix_cache(request: OmniDiffusionRequest) -> None:
         row.cache_token_ids = tokens
         row.mm_features = features
         row.cache_namespace = namespace
+
+
+def _generated_image_geometry(image_info: ImageInfo) -> tuple[Any, ...]:
+    return (
+        int(image_info.image_width or 0),
+        int(image_info.image_height or 0),
+        int(image_info.image_token_length or 0),
+        bool(image_info.add_timestep_token),
+        bool(image_info.add_guidance_token),
+        bool(image_info.add_timestep_r_token),
+    )
+
+
+def _pad_tokenizer_rows(rows: list[torch.Tensor], pad_value: int | float | bool) -> list[torch.Tensor]:
+    max_len = max(int(row.shape[-1]) for row in rows)
+    padded = []
+    for row in rows:
+        pad = max_len - int(row.shape[-1])
+        padded.append(row if pad == 0 else F.pad(row, (0, pad), value=pad_value))
+    return padded
+
+
+def pack_hunyuan_prepared_layouts(
+    layouts: Sequence[HunyuanPreparedLayout],
+    *,
+    pad_token_id: int,
+) -> HunyuanPreparedLayout:
+    """Stack per-request layouts into one CFG-major tokenizer batch.
+
+    Hunyuan's tokenizer already emits cond rows of every public request, then
+    uncond rows. Independent prepared layouts are request-major (both CFG
+    branches of request 0, then request 1), so packing reorders to that
+    CFG-major contract before ``prepare_model_inputs``.
+    """
+    if not layouts:
+        raise ValueError("Hunyuan request packing requires at least one prepared layout")
+    if len(layouts) == 1:
+        return layouts[0]
+    geometries = {_generated_image_geometry(layout.generated_image_info) for layout in layouts}
+    if len(geometries) != 1:
+        raise ValueError("Cannot pack Hunyuan layouts with different generated-image geometry")
+    cfg_factor = layouts[0].num_branches
+    if any(layout.num_branches != cfg_factor for layout in layouts):
+        raise ValueError("Cannot pack Hunyuan layouts with different CFG branch counts")
+
+    order = [(branch, layout_idx) for branch in range(cfg_factor) for layout_idx in range(len(layouts))]
+    outputs = [layout.tokenizer_output for layout in layouts]
+    packed: dict[str, Any] = {}
+    for key in outputs[0].keys():
+        values = [getattr(output, key) for output in outputs]
+        first = next((value for value in values if value is not None), None)
+        if first is None:
+            continue
+        if isinstance(first, torch.Tensor):
+            if "mask" in key:
+                pad_value: int | float | bool = 0
+            elif key == "tokens":
+                pad_value = pad_token_id
+            else:
+                pad_value = 0
+            rows = [values[layout_idx][branch : branch + 1] for branch, layout_idx in order]
+            packed[key] = torch.cat(_pad_tokenizer_rows(rows, pad_value), dim=0)
+        elif isinstance(first, list):
+            packed[key] = [values[layout_idx][branch] for branch, layout_idx in order]
+        else:
+            raise ValueError(f"Cannot pack Hunyuan tokenizer field {key!r}: {type(first).__name__}")
+
+    rope_image_info = [layouts[layout_idx].rope_image_info[branch] for branch, layout_idx in order]
+    return HunyuanPreparedLayout(
+        tokenizer_output=TokenizerEncodeOutput(**packed),
+        rope_image_info=rope_image_info,
+        generated_image_info=layouts[0].generated_image_info,
+    )
 
 
 def get_hunyuan_prepared_layout(source: Any) -> HunyuanPreparedLayout | None:
