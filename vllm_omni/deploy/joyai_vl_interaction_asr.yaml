@@ -97,4 +97,6 @@ platforms:
     model_runner: v2
     stages:
       - stage_id: 0
+        # 0.10 failed the native V2 stage-0 8K KV check on H100; 0.11 passed.
+        # The combined four-stage peak remains unmeasured.
         gpu_memory_utilization: 0.11

@@ -400,6 +400,8 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
 
         # request_id -> per-request state (audio frames, prefill embeds, counters).
         self._sessions: dict[str, dict[str, Any]] = {}
+        # postprocess() owns feedback until the MRv2 duplex sampler is registered.
+        self._mrv2_duplex_sampling = False
         self._duplex_sampling_rows: dict[int, str] = {}
         self._duplex_previous_text_tokens: dict[str, int] = {}
         self._nvc_function_sampling_tokens: torch.Tensor | None = None

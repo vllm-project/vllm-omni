@@ -1,4 +1,6 @@
-# BAGEL-7B-MoT deploy: CUDA defaults, verified on NVIDIA A100 (80GB).
+# BAGEL-7B-MoT deploy: CUDA defaults.
+# Native vLLM 0.34 stage-0 KV capacity was checked on H100 (80GB).
+# Shared-GPU DiT peak memory and A100 operation remain unqualified here.
 #
 # Stage 0 (Thinker) and Stage 1 (DiT) share a single GPU by default.
 # For dual-GPU setups, set stage 1 devices to "1".

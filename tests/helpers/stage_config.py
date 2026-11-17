@@ -308,10 +308,9 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                 "max_model_len": 16384,
                 "max_num_batched_tokens": 16384,
                 "max_num_seqs": 1,
-                # Thinker owns its card. On a 22 GiB L4 (build 18653, vLLM 0.32.0),
-                # util 0.9 left 0.8 GiB of KV after the 16.78 GiB weights, runner
-                # buffers and the 16384-token prefill peak; one 16384-token request
-                # needs 0.88 GiB.
+                # Shared overlay: Thinker owns one card; some consumers have only two.
+                # Native V2's 16K context did not fit one L4 at 0.95 in the rc3 run.
+                # The four-card documentation suite adds TP2 locally; keep it there.
                 "gpu_memory_utilization": 0.95,
                 "skip_mm_profiling": True,
                 "default_sampling_params": {"max_tokens": 128},
