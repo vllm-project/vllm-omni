@@ -21,6 +21,7 @@ from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
     Qwen2_5OmniDiTConfig,
 )
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model]
@@ -136,6 +137,7 @@ def dit_model():
     return model
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @_requires_cuda
 @pytest.mark.parametrize("apply_cfg", [True, False])
 def test_single_eval_bit_exact_with_invariants(dit_model, apply_cfg):
@@ -170,6 +172,7 @@ def test_single_eval_bit_exact_with_invariants(dit_model, apply_cfg):
     assert torch.equal(out_legacy, out_hoisted)
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @_requires_cuda
 @pytest.mark.parametrize("guidance_scale", [0.5, 0.0])
 def test_hoisted_solve_bit_exact_vs_legacy_ode_function(dit_model, guidance_scale):
@@ -206,6 +209,7 @@ def test_hoisted_solve_bit_exact_vs_legacy_ode_function(dit_model, guidance_scal
     assert torch.equal(out_legacy.permute(0, 2, 1), out_hoisted)
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @_requires_cuda
 @pytest.mark.parametrize(
     ("guidance_scale", "expected_spk", "expected_text", "expected_rotary"),
@@ -274,6 +278,7 @@ def test_invariants_computed_once_per_solve(
     assert calls["rotary"] == 12
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @_requires_cuda
 def test_graph_replay_with_hoist_is_bit_exact(dit_model):
     """The whole-solve CUDA graph (captured around the hoisted solve) must
