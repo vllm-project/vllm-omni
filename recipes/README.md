@@ -78,8 +78,8 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`fishaudio/Drama-3.md`](./fishaudio/Drama-3.md) | Online serving for TTS | 1x H200 141GB / 2x Ascend 910B 64GB |
 | [`fishaudio/Fish-Speech-S2-Pro.md`](./fishaudio/Fish-Speech-S2-Pro.md) | Online serving for TTS | 1x A800 80GB |
 | [`Helios/Helios.md`](./Helios/Helios.md) | Text-to-video, image-to-video, and video-to-video generation | 1x NVIDIA H20 |
-| [`hexgrad/Kokoro-82M-A6000.md`](./hexgrad/Kokoro-82M-A6000.md) | Online + offline TTS with 54 built-in voices (streaming PCM/WAV, SSE) | 1x RTX A6000 48GB |
 | [`HiDream-ai/HiDream-O1-Image.md`](./HiDream-ai/HiDream-O1-Image.md) | Text-to-image with shared offline example | 1x or 2x H100 80GB |
+| [`higurashi-ai/Haru-4B-H200.md`](./higurashi-ai/Haru-4B-H200.md) | Live full-duplex spoken dialogue over `/v1/realtime?duplex=1` (character card + voice reference) | 1x NVIDIA H200 141GB |
 | [`inclusionAI/Ming-3.0-audio-flash.md`](./inclusionAI/Ming-3.0-audio-flash.md) | Online multilingual ASR and speech QA with optional 44.1 kHz speech output | 4x 80GB GPU / 2x H200 141GB |
 | [`inclusionAI/Ming-flash-omni-2.0.md`](./inclusionAI/Ming-flash-omni-2.0.md) | Online serving for multimodal chat + standalone TTS | 4x H100 / 1x H100 80GB |
 | [`inclusionAI/Ming-omni-tts.md`](./inclusionAI/Ming-omni-tts.md) | Offline + online dense Ming TTS/audio generation | 1x H100 80GB / 1x AMD MI300X (ROCm 7.2) |
@@ -91,19 +91,21 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`IndexTeam/IndexTTS-2_5.md`](./IndexTeam/IndexTTS-2_5.md) | Online + offline multilingual voice-cloned TTS with native speed and emotion control | 1x NVIDIA H20 96GB |
 | [`Microsoft/VibeVoice-1.5B-H100.md`](./Microsoft/VibeVoice-1.5B-H100.md) | Offline single-speaker TTS with optional voice clone (eager) | 1x H100 80GB |
 | [`MiniMaxAI/MiniMax-H3.md`](./MiniMaxAI/MiniMax-H3.md) | T2VA, FL2VA, image+audio Ref2VA, and multi-video Ref2VA serving | 1x GPU with CPU offload / 4x B300 |
-| [`MiniMaxAI/MiniMax-H3-Image-AMD.md`](./MiniMaxAI/MiniMax-H3-Image-AMD.md) | Six-step text-to-image HTTP serving | 4x AMD Instinct MI350X (validated profile) |
+| [`MiniMaxAI/MiniMax-H3-Image-AMD.md`](./MiniMaxAI/MiniMax-H3-Image-AMD.md) | Six-step text-to-image and image editing HTTP serving | 1x–8x AMD Instinct MI325X or MI350X (measured) |
 | [`MiniMaxAI/MiniMax-H3-Spark-GB10.md`](./MiniMaxAI/MiniMax-H3-Spark-GB10.md) | MiniMax H3 T2VA and Ref2VA on DGX Spark | 1x or 2x DGX Spark (GB10) |
 | [`MiniMaxAI/MiniMax-H3-MUSA.md`](./MiniMaxAI/MiniMax-H3-MUSA.md) | MiniMax H3 T2VA, FL2VA, and Ref2VA on MUSA | 4x MTT S5000 (TP4 Ref2VA profile) |
+| [`MiniMaxAI/MiniMax-H3-Image-4090.md`](./MiniMaxAI/MiniMax-H3-Image-4090.md) | MiniMax-H3-Image text-to-image serving with layerwise offload | 1x RTX 4090 24GB (community deployment) |
 | [`MiniMaxAI/MiniMax-H3-Image-H200.md`](./MiniMaxAI/MiniMax-H3-Image-H200.md) | MiniMax-H3-Image text-to-image and reference editing | 1x (offload), 2x or 4x H200 141GB (measured) |
 | [`MiniMaxAI/MiniMax-H3-Image-H100.md`](./MiniMaxAI/MiniMax-H3-Image-H100.md) | MiniMax-H3-Image text-to-image and reference editing | 1x or 2x with DLO, 4x H100 80GB (configuration-only) |
 | [`MiniMaxAI/MiniMax-H3-Image-B200.md`](./MiniMaxAI/MiniMax-H3-Image-B200.md) | MiniMax-H3-Image text-to-image and reference editing | 1x, 2x or 4x B200 180GB (configuration-only) |
 | [`MiniMaxAI/MiniMax-H3-Image-B300.md`](./MiniMaxAI/MiniMax-H3-Image-B300.md) | MiniMax-H3-Image text-to-image and reference editing | 1x, 2x or 4x B300 288GB (configuration-only) |
 | [`MiniMaxAI/MiniMax-H3-Image-RTX-PRO-6000.md`](./MiniMaxAI/MiniMax-H3-Image-RTX-PRO-6000.md) | MiniMax-H3-Image text-to-image and reference editing | 1x (offload), 2x or 4x RTX PRO 6000 Blackwell 96GB (measured) |
+| [`MiniMaxAI/MiniMax-H3-Image-XPU.md`](./MiniMaxAI/MiniMax-H3-Image-XPU.md) | MiniMax-H3-Image text-to-image and reference editing on XPU | 1x or 2x with DLO, 4x Intel Arc Pro B70 32GB (measured) |
+| [`MiniMaxAI/MiniMax-H3-Image-NPU.md`](./MiniMaxAI/MiniMax-H3-Image-NPU.md) | MiniMax-H3-Image text-to-image and reference editing on Ascend | 1x or 8x Atlas 800T A3 / Atlas 800I A2 / Atlas 350 |
 | [`krea/Krea-2.md`](./krea/Krea-2.md) | Text-to-image (Turbo + Raw), offline + online, with LoRA | 1x H100 80GB / 1x Intel Arc Pro B70 32GB |
 | [`Kandinsky/Kandinsky6-TI2VA.md`](./Kandinsky/Kandinsky6-TI2VA.md) | Text/image-to-video-and-audio, offline and `/v1/videos` | 1x H100 80GB with CPU offload; 2x H100 for parallel modes |
 | [`LTX/LTX-2.md`](./LTX/LTX-2.md) | LTX-2/LTX-2.3 text-to-video and image-to-video with synchronized audio | H200 141GB / 96GB-class GPU / 1x Intel Arc Pro B70 32GB |
 | [`LTX/LTX-2.5.md`](./LTX/LTX-2.5.md) | LTX-2.5-Diffusers: Full/SFT one-stage and distilled two-stage T2V/I2V with synchronized audio | NVIDIA B300; cuDNN-qualified / 1x Intel Arc Pro B70 32GB |
-| [`JD/JoyAI-Image-Edit.md`](./JD/JoyAI-Image-Edit.md) | Text-guided single-image editing | 1x H800 PCIe 80GB |
 | [`m-a-p/SheetSage2-H200.md`](./m-a-p/SheetSage2-H200.md) | Official audio-to-score preprocessing and YuE2 request export | 1x H200 141GB |
 | [`m-a-p/YuE2-3B.md`](./m-a-p/YuE2-3B.md) | Offline and online text-to-music with optional ABC score | 1x RTX 4090 24GB |
 | [`MammothModa2/MammothModa2.md`](./MammothModa2/MammothModa2.md) | Preview and Dev text-to-image (AR → DiT); Dev text/image understanding | Preview: 1x L40S 48GB / 1x ≥40GB GPU; Dev: 1x NVIDIA GPU with sufficient cache headroom |
@@ -111,7 +113,8 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`NVIDIA/SANA-Video-2B.md`](./NVIDIA/SANA-Video-2B.md) | Native and Diffusers-adapter 480p/720p T2V+I2V | 1x RTX 5090 32GB |
 | [`meituan-longcat/LongCat-Video-Avatar-1.5.md`](./meituan-longcat/LongCat-Video-Avatar-1.5.md) | Audio-driven avatar video generation (AT2V / AI2V, single- and multi-speaker, AVC continuation) | 1x H100 80GB |
 | [`mistralai/Voxtral-TTS.md`](./mistralai/Voxtral-TTS.md) | Online serving for TTS | 1x RTX 4090 24GB |
-| [`Robbyant/LingBot-Video.md`](./Robbyant/LingBot-Video.md) | Native dense and MoE text-to-video serving | Dense: 1x L20X; MoE: 1x L20X (~67.7 GiB peak) |
+| [`Robbyant/LingBot-Video.md`](./Robbyant/LingBot-Video.md) | Native dense and MoE text-to-video serving | Dense: 1x L20X; MoE: 1x L20X (~67.7 GiB peak) or 1x RTX 5090 32GB with layerwise offload |
+| [`Runway/Praxis-1.md`](./Runway/Praxis-1.md) | Closed-loop video/action robot policy (DROID single arm, YAM two arms): offline, OpenPI and Positronic serving | 1x NVIDIA H100 80GB |
 | [`SandAI/MAGI-2-preview-L20X.md`](./SandAI/MAGI-2-preview-L20X.md) | Native Preview-stage text/image-to-video-and-audio generation | 1x/4x NVIDIA L20X 140 GiB qualified |
 | [`SandAI/MAGI-2-preview-NPU.md`](./SandAI/MAGI-2-preview-NPU.md) | Online Preview-stage T2VA at 272p | 4x NPU, 112 GiB each; TP1/SP4 eager |
 | [`Robbyant/LingBot-World-2.0.md`](./Robbyant/LingBot-World-2.0.md) | Offline and experimental realtime interactive world generation | 1x H200/B200 or 2x B200 for TP=2 |

@@ -1234,6 +1234,7 @@ class Kandinsky6Transformer3DModel(nn.Module):
             "visual_cond",
             "is_multimodal",
             "in_audio_dim",
+            "out_audio_dim",
             "model_dim_a",
             "time_dim_a",
             "ff_dim_a",
@@ -1299,6 +1300,7 @@ class Kandinsky6Transformer3DModel(nn.Module):
         is_multimodal: bool = False,
         # Audio (T2VA only)
         in_audio_dim: int = 20,
+        out_audio_dim: int | None = None,
         model_dim_a: int | None = None,
         time_dim_a: int | None = None,
         ff_dim_a: int | None = None,
@@ -1399,7 +1401,11 @@ class Kandinsky6Transformer3DModel(nn.Module):
             )
             self.audio_rope_embeddings = RoPE1D(head_dim_a, freqs_scaling=audio_freqs_scaling)
             self.audio_out_layer = Kandinsky6OutLayerAudio(
-                model_dim_a, time_dim_a, in_audio_dim, quant_config=quant_config, prefix=f"{prefix}.audio_out_layer"
+                model_dim_a,
+                time_dim_a,
+                in_audio_dim if out_audio_dim is None else out_audio_dim,
+                quant_config=quant_config,
+                prefix=f"{prefix}.audio_out_layer",
             )
 
             for mod_prefix, md, td, fd, hd in [

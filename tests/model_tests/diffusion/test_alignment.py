@@ -25,9 +25,6 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
 # for adding a new tiny model builder and corresponding entry in DIFFUSION_TEST_SETTINGS.
 EXCLUDED_MODELS = [
     "QwenImageLayeredPipeline",
-    # Uses a custom multi-image editing contract; covered by the dedicated
-    # JoyImage tiny-pipeline tests and real-checkpoint E2E accuracy test.
-    "JoyImageEditPipeline",
     # Dedicated CPU/unit coverage in tests/diffusion/models/qwen_image_21/.
     # Tiny-model offline suite is not wired yet (2.1 transformer/VAE configs).
     "QwenImage21Pipeline",
@@ -61,6 +58,9 @@ EXCLUDED_MODELS = [
     "PhysisWanPipeline",
     "MiniMaxH3Pipeline",
     "MiniMaxH3ModularPipeline",
+    # Needs the full MiniMax-H3-Image checkpoint (126 GiB); covered by
+    # tests/diffusion/models/minimax_h3/test_minimax_h3_image*.py.
+    "MiniMaxH3ImagePipeline",
     # Decoder-only stage consumes upstream latents; covered by H3 decoder
     # handoff tests and real-checkpoint disaggregated E2E validation.
     "MiniMaxH3DecoderPipeline",
@@ -119,6 +119,9 @@ EXCLUDED_MODELS = [
     "DiffusersAdapterPipeline",
     "HiDreamO1ImagePipeline",
     "DreamZeroPipeline",
+    # Robot observations require local policy/VAE/text weights; dedicated CPU
+    # contracts and the checkpoint-gated GPU E2E cover this integration.
+    "Praxis1Pipeline",
     # Experimental Noisy PP / cell path; covered by tests/diffusion/models/causvid_wan
     # and tests/diffusion/ar_diffusion instead of the tiny-model offline suite.
     "CausVidWanPipeline",

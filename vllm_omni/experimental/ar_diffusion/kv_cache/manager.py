@@ -17,6 +17,7 @@ import os
 from collections.abc import Callable, Collection, Iterable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, cast
 
 import torch
@@ -36,6 +37,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.config import (
     ARDiffusionKVConfig,
     contiguous_kv_gather_enabled,
 )
+from vllm_omni.experimental.ar_diffusion.kv_cache.lifecycle import KVCacheLifecycle
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
     ChunkWindowManager,
     ChunkWindowSpec,
@@ -48,6 +50,75 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
 from vllm_omni.experimental.ar_diffusion.kv_cache.segmented import SegmentedStaging
 
 _log = init_logger(__name__)
+
+
+def _cross_pool_bytes(
+    length: int,
+    heads: int,
+    *,
+    num_branches: int,
+    head_size: int,
+    dtype: torch.dtype,
+    num_layers: int,
+) -> int:
+    """Bytes one linear-attention session needs for its cross-attention K/V."""
+    return int(2 * num_branches * length * heads * head_size * dtype.itemsize * num_layers)
+
+
+def _required_managed_blocks(
+    capacity: int,
+    *,
+    num_local_kv_branches: int,
+    segmented: SegmentedStaging | None,
+    block_size: int,
+    resident_frames: int,
+    blocks_per_frame: int,
+    frames_per_block: int,
+) -> int:
+    """Managed blocks needed to hold ``capacity`` resident sessions.
+
+    Every term here counts *frames*, so each is converted to blocks. Before
+    block size and frame size were allowed to differ this conversion was the
+    identity and the frame counts could be used directly; they cannot once a
+    frame spans several blocks.
+
+    Converting rather than rewriting keeps the budget the same number of
+    *tokens* it always was, so a finer block size does not inflate the
+    requirement -- it only stops the final block of each term from rounding up
+    a whole frame's worth of memory.
+    """
+    if segmented is not None:
+        return (
+            num_local_kv_branches
+            * (capacity * segmented.retained_blocks(block_size) + segmented.pending_blocks(block_size))
+            + 2
+        )
+    per_session_blocks = resident_frames * blocks_per_frame
+    in_flight_blocks = frames_per_block * blocks_per_frame
+    headroom_blocks = 2 * blocks_per_frame
+    return num_local_kv_branches * (capacity * per_session_blocks + in_flight_blocks) + headroom_blocks
+
+
+def _session_required_bytes(
+    capacity: int,
+    *,
+    scratch_reserved_bytes: int,
+    superpage_reserved_bytes: int,
+    history_staging_reserved_bytes: int,
+    cross_attention_bytes_per_session: int,
+    model_owned_state_bytes_per_session: int,
+    managed_blocks_for: Callable[[int], int],
+    page_size_bytes: int,
+) -> int:
+    """Total device bytes needed to hold ``capacity`` resident sessions."""
+    return (
+        scratch_reserved_bytes
+        + superpage_reserved_bytes
+        + history_staging_reserved_bytes
+        + capacity * cross_attention_bytes_per_session
+        + capacity * model_owned_state_bytes_per_session
+        + managed_blocks_for(capacity) * page_size_bytes
+    )
 
 
 class ARDiffusionRequestAdapter:
@@ -178,7 +249,7 @@ class HistoryStagingState:
     signature: tuple[Any, ...] | None = None
 
 
-class ARDiffusionKVCache:
+class ARDiffusionKVCache(KVCacheLifecycle[ARDiffusionRequestAdapter]):
     """Own the paged KV pool and KV-branch-local storage for one model.
 
     Build once per loaded model (dimensions known); then per request:
@@ -342,40 +413,28 @@ class ARDiffusionKVCache:
         compute_num_blocks(available_bytes, config.gpu_memory_fraction, page_size_bytes)
         self.scratch_reserved_bytes = self.scratch_num_blocks * page_size_bytes
         self.model_owned_state_bytes_per_session = model_owned_state_bytes_per_session
-
-        def _cross_pool_bytes(length: int, heads: int) -> int:
-            return int(2 * len(self.kv_branches) * length * heads * head_size * dtype.itemsize * num_layers)
-
         self.cross_attention_bytes_per_session = sum(
-            _cross_pool_bytes(length, self.cross_attention_kv_heads[name])
+            _cross_pool_bytes(
+                length,
+                self.cross_attention_kv_heads[name],
+                num_branches=len(self.kv_branches),
+                head_size=head_size,
+                dtype=dtype,
+                num_layers=num_layers,
+            )
             for name, length in self.cross_attention_lengths.items()
         )
 
         resident_frames = config.sink_chunks + config.window_chunks
-
-        def _required_managed_blocks(capacity: int) -> int:
-            """Managed blocks needed to hold ``capacity`` resident sessions.
-
-            Every term here counts *frames*, so each is converted to blocks.
-            Before block size and frame size were allowed to differ this
-            conversion was the identity and the frame counts could be used
-            directly; they cannot once a frame spans several blocks.
-
-            Converting rather than rewriting keeps the budget the same number
-            of *tokens* it always was, so a finer block size does not inflate
-            the requirement -- it only stops the final block of each term from
-            rounding up a whole frame's worth of memory.
-            """
-            if segmented is not None:
-                return (
-                    self.num_local_kv_branches
-                    * (capacity * segmented.retained_blocks(block_size) + segmented.pending_blocks(block_size))
-                    + 2
-                )
-            per_session_blocks = resident_frames * self.blocks_per_frame
-            in_flight_blocks = self.frames_per_block * self.blocks_per_frame
-            headroom_blocks = 2 * self.blocks_per_frame
-            return self.num_local_kv_branches * (capacity * per_session_blocks + in_flight_blocks) + headroom_blocks
+        required_managed_blocks = partial(
+            _required_managed_blocks,
+            num_local_kv_branches=self.num_local_kv_branches,
+            segmented=segmented,
+            block_size=block_size,
+            resident_frames=resident_frames,
+            blocks_per_frame=self.blocks_per_frame,
+            frames_per_block=self.frames_per_block,
+        )
 
         # reuse_history_staging keeps one contiguous K and V buffer per layer,
         # sized to the padded visible window (sink + window plus the
@@ -417,18 +476,18 @@ class ARDiffusionKVCache:
                     "staging has no consumer and is neither budgeted nor allocated.",
                     KV_GATHER_ENV,
                 )
+        required_bytes = partial(
+            _session_required_bytes,
+            scratch_reserved_bytes=self.scratch_reserved_bytes,
+            superpage_reserved_bytes=self.superpage_reserved_bytes,
+            history_staging_reserved_bytes=self.history_staging_reserved_bytes,
+            cross_attention_bytes_per_session=self.cross_attention_bytes_per_session,
+            model_owned_state_bytes_per_session=self.model_owned_state_bytes_per_session,
+            managed_blocks_for=required_managed_blocks,
+            page_size_bytes=page_size_bytes,
+        )
 
-        def _required_bytes(capacity: int) -> int:
-            return (
-                self.scratch_reserved_bytes
-                + self.superpage_reserved_bytes
-                + self.history_staging_reserved_bytes
-                + capacity * self.cross_attention_bytes_per_session
-                + capacity * self.model_owned_state_bytes_per_session
-                + _required_managed_blocks(capacity) * page_size_bytes
-            )
-
-        one_session_bytes = _required_bytes(1)
+        one_session_bytes = required_bytes(1)
         if one_session_bytes > available_bytes:
             raise ValueError(
                 "AR-Diffusion available device memory cannot fit one session: "
@@ -445,12 +504,12 @@ class ARDiffusionKVCache:
             )
 
         effective_capacity = 0
-        required_managed_blocks = 0
+        effective_managed_blocks = 0
         for candidate in range(session_capacity, 0, -1):
-            candidate_managed_blocks = _required_managed_blocks(candidate)
-            if _required_bytes(candidate) <= self.memory_budget_bytes:
+            candidate_managed_blocks = required_managed_blocks(candidate)
+            if required_bytes(candidate) <= self.memory_budget_bytes:
                 effective_capacity = candidate
-                required_managed_blocks = candidate_managed_blocks
+                effective_managed_blocks = candidate_managed_blocks
                 break
         assert effective_capacity > 0
 
@@ -466,7 +525,7 @@ class ARDiffusionKVCache:
             - self.model_owned_state_reserved_bytes
         )
         num_blocks = self_attn_budget_bytes // page_size_bytes
-        assert num_blocks >= required_managed_blocks
+        assert num_blocks >= effective_managed_blocks
         if effective_capacity < session_capacity:
             _log.warning(
                 "AR-Diffusion resident session capacity reduced from %d to %d by the KV memory budget",
@@ -812,7 +871,18 @@ class ARDiffusionKVCache:
         _log.debug("AR-Diffusion begin_request: req=%s prefill=%d", request_id, prefill_prefix_tokens)
         return adapter
 
-    def end_request(self, adapter: ARDiffusionRequestAdapter) -> None:
+    def finish_request(self, owner: ARDiffusionRequestAdapter) -> None:
+        """Finish a call without releasing the session branch's history.
+
+        Window/segment commit already applies the history policy. This backend
+        has no additional per-call allocation to retire; the adapter remains
+        installed until explicit history release, reset or close.
+        """
+        self._require_current_adapter(owner)
+
+    def release_history(self, owner: ARDiffusionRequestAdapter) -> None:
+        """Release one branch/segment allocation after computation stops."""
+        adapter = owner
         self._require_current_adapter(adapter)
         _log.debug(
             "AR-Diffusion end_request: req=%s chunks=%d free=%d",
@@ -822,6 +892,10 @@ class ARDiffusionKVCache:
         )
         self.manager.free(adapter)
         self._adapters.pop(adapter.request_id, None)
+
+    def end_request(self, adapter: ARDiffusionRequestAdapter) -> None:
+        """Compatibility entry point for releasing an owner's entire history."""
+        self.release_history(adapter)
 
     # -- per-chunk operations ------------------------------------------------
 

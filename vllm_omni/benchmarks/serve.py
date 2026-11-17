@@ -20,6 +20,7 @@ import vllm_omni.benchmarks.patch.patch  # noqa: F401
 from vllm_omni.benchmarks.omniinteract import omniinteract_output_lock
 from vllm_omni.benchmarks.patch.patch import (
     maybe_enable_stage_metrics,
+    set_duplex_metric_aggregation,
     set_fail_fast_on_timeout,
     set_print_stage,
     set_request_timeout_s,
@@ -88,6 +89,7 @@ def main(args: argparse.Namespace) -> dict[str, Any]:
     _validate_fail_fast_on_timeout(args)
     set_fail_fast_on_timeout(getattr(args, "omni_fail_fast_on_timeout", False))
     set_print_stage(getattr(args, "print_stage", False))
+    set_duplex_metric_aggregation(getattr(args, "duplex_metric_aggregation", "session"))
     args.extra_body = maybe_enable_stage_metrics(
         getattr(args, "extra_body", None),
         enabled=should_request_stage_metrics(args),

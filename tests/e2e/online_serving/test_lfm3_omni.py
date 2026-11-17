@@ -40,6 +40,7 @@ def test_speech_response_and_concurrent_streaming(omni_server, openai_client, st
         "expected_sample_rate": 24000,
         "min_audio_bytes": 24000,
         "timeout": 240,
+        "min_hnr_db": 0.0,
     }
     if stream:
         request["stream_format"] = "audio"

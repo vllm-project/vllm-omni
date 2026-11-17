@@ -36,6 +36,7 @@ from vllm_omni.diffusion.offloader.config import (
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
 from vllm_omni.diffusion.utils.future_utils import try_set_exception, try_set_result
 from vllm_omni.diffusion.worker import WorkerProc
+from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
@@ -46,6 +47,8 @@ logger = init_logger(__name__)
 _DEQUEUE_TIMEOUT_S = 5.0
 _DLO_DP_WAVE_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_DLO_DP_WAVE_TIMEOUT", 600.0))
 _WORKER_SHUTDOWN_GRACE_S = 15.0
+# TorchNPU runtime finalization can outlast application-level worker cleanup.
+_NPU_WORKER_SHUTDOWN_GRACE_S = 60.0
 _WORKER_TERMINATE_GRACE_S = 5.0
 _WORKER_KILL_GRACE_S = 5.0
 _RESULT_PUMP_JOIN_TIMEOUT_S = 2.0
@@ -136,8 +139,11 @@ class _ExecutorShutdownCleaner:
 
         if self.processes:
             alive = [proc for proc in self.processes if proc.is_alive()]
+            shutdown_grace = (
+                _NPU_WORKER_SHUTDOWN_GRACE_S if current_omni_platform.is_npu() else _WORKER_SHUTDOWN_GRACE_S
+            )
             for action, grace in (
-                (None, _WORKER_SHUTDOWN_GRACE_S),
+                (None, shutdown_grace),
                 ("terminate", _WORKER_TERMINATE_GRACE_S),
                 ("kill", _WORKER_KILL_GRACE_S),
             ):
@@ -159,6 +165,7 @@ class _ExecutorShutdownCleaner:
                         logger.exception("Failed to join diffusion worker %s (pid=%s)", proc.name, proc.pid)
                 alive = [proc for proc in alive if proc.is_alive()]
 
+            logger.info("Diffusion worker exit codes: %s", [(proc.pid, proc.exitcode) for proc in self.processes])
             self.processes = alive
             if alive:
                 logger.error(
@@ -179,12 +186,20 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._closed = False
         self._is_failed = False
         self._failure_callbacks: list[Callable[[], None]] = []
+        # The executor pins a spawn context instead of relying on the global
+        # start method: wake_events below are created here, in _init_executor,
+        # while _launch_workers only switches the global start method to spawn
+        # later. mp.Event() would therefore come from the default (fork)
+        # context and then be pickled into spawn-Process args, which is
+        # unsupported — sync primitives must come from the same context as the
+        # processes that consume them.
+        self._mp_context = mp.get_context("spawn")
         self._result_mq: MessageQueue | None = None
         self._result_mqs: list[MessageQueue] = []
         self._rpc_wave_id: int = 0
 
         num_workers = cast(int, self.od_config.num_gpus)
-        self.wake_events = [mp.Event() for _ in range(num_workers)]
+        self.wake_events = [self._mp_context.Event() for _ in range(num_workers)]
 
         self._broadcast_mq = self._init_broadcast_queue(num_workers)
         broadcast_handle = self._broadcast_mq.export_handle()
@@ -376,14 +391,19 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         wake_events: list[Event],
     ) -> tuple[list[mp.Process], list[Handle]]:
         od_config = self.od_config
+        # The shared registry is only valid as a spawn argument. Request RPCs
+        # serialize od_config with ordinary pickle, which cannot carry it.
+        sharing_registry = vars(od_config).pop("_sharing_worker_registry", None)
         logger.info("Starting server...")
 
         num_gpus = cast(int, od_config.num_gpus)
         # Without this, every worker inherits one Torch thread per core, so an
         # N-GPU run oversubscribes the host by N x core_count. Honours a
         # user-provided OMP_NUM_THREADS.
-        set_multiprocessing_worker_envs()
+        # Fix the per-worker thread count: core_count -> core_count / N.
+        set_multiprocessing_worker_envs(local_world_size=num_gpus)
         mp.set_start_method("spawn", force=True)
+        mp_context = getattr(self, "_mp_context", mp.get_context("spawn"))
         processes = []
 
         # Extract worker_extension_cls and custom_pipeline_args from od_config
@@ -395,9 +415,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         scheduler_pipe_writers = []
 
         for i in range(num_gpus):
-            reader, writer = mp.Pipe(duplex=False)
+            reader, writer = mp_context.Pipe(duplex=False)
             scheduler_pipe_writers.append(writer)
-            process = mp.Process(
+            process = mp_context.Process(
                 target=WorkerProc.worker_main,
                 args=(
                     i,  # rank
@@ -408,6 +428,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     worker_extension_cls,
                     custom_pipeline_args,
                 ),
+                kwargs={"sharing_registry": sharing_registry},
                 name=f"DiffusionWorker-{i}",
                 daemon=True,
             )
