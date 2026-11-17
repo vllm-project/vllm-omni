@@ -183,6 +183,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
     # that it never writes again, so the runner stores them without copying.
     preprocess_prefill_updates_owned = True
 
+    # forward returns backbone tensors; make_omni_output packages audio afterward.
+    mrv2_forward_returns_tensor = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         from vllm_omni.platforms import current_omni_platform
