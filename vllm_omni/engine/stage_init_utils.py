@@ -351,10 +351,10 @@ def terminate_alive_proc(proc, timeout=5):
             proc.kill()
 
 
-def set_death_signal(sig: int) -> None:
+def set_death_signal(sig: int, *, expected_parent_pid: int | None = None) -> None:
     """Arm Linux parent-death signaling; self-signal if the parent is gone.
 
-    Reparenting to a subreaper before the first PID check is not detected.
+    Pass the PID captured before spawn to detect an already-exited parent.
     Non-Linux is a no-op; registration failures are logged.
     """
     try:
@@ -364,8 +364,8 @@ def set_death_signal(sig: int) -> None:
         if platform.system() != "Linux":
             return
 
-        parent = os.getppid()
-        if parent <= 1:
+        parent = os.getppid() if expected_parent_pid is None else expected_parent_pid
+        if os.getppid() != parent:
             os.kill(os.getpid(), sig)
             return
 

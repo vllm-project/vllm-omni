@@ -1521,7 +1521,7 @@ class TestExecutorShutdownCleaner:
     def test_worker_uses_hard_parent_death_signal(self, monkeypatch):
         import vllm_omni.plugins as omni_plugins
 
-        events = []
+        events: list[tuple[str, object]] = []
         worker_main = WorkerProc.worker_main
 
         class StopWorkerError(Exception):
@@ -1541,7 +1541,7 @@ class TestExecutorShutdownCleaner:
         monkeypatch.setattr(
             diffusion_worker_module,
             "set_death_signal",
-            lambda sig: events.append(("death_signal", sig)),
+            lambda sig, *, expected_parent_pid: events.append(("death_signal", (sig, expected_parent_pid))),
         )
         monkeypatch.setattr(
             diffusion_worker_module,
@@ -1570,10 +1570,11 @@ class TestExecutorShutdownCleaner:
                 pipe_writer=Mock(),
                 broadcast_handle=None,
                 wake_event=Mock(),
+                parent_pid=321,
             )
 
         assert events == [
-            ("death_signal", signal.SIGKILL),
+            ("death_signal", (signal.SIGKILL, 321)),
             ("logging", None),
             ("handler", signal.SIGTERM),
             ("handler", signal.SIGINT),
@@ -1999,11 +2000,12 @@ def test_set_death_signal_noop_on_non_linux(monkeypatch, death_signal_env) -> No
     assert killed == []
 
 
-def test_set_death_signal_self_kills_when_already_orphaned(monkeypatch, death_signal_env) -> None:
+@pytest.mark.parametrize("adopter_pid", [1, 123])
+def test_set_death_signal_self_kills_when_already_orphaned(monkeypatch, death_signal_env, adopter_pid) -> None:
     fake, killed = death_signal_env
-    monkeypatch.setattr(stage_init_utils.os, "getppid", lambda: 1)
+    monkeypatch.setattr(stage_init_utils.os, "getppid", lambda: adopter_pid)
 
-    stage_init_utils.set_death_signal(signal.SIGKILL)
+    stage_init_utils.set_death_signal(signal.SIGKILL, expected_parent_pid=321)
 
     assert fake.calls == []
     assert killed == [(654, signal.SIGKILL)]
@@ -2011,7 +2013,7 @@ def test_set_death_signal_self_kills_when_already_orphaned(monkeypatch, death_si
 
 def test_set_death_signal_self_kills_if_parent_dies_during_prctl(monkeypatch, death_signal_env) -> None:
     fake, killed = death_signal_env
-    ppids = iter([321, 1])
+    ppids = iter([321, 321, 1])
     monkeypatch.setattr(stage_init_utils.os, "getppid", lambda: next(ppids))
 
     stage_init_utils.set_death_signal(signal.SIGKILL)
@@ -2035,7 +2037,7 @@ def test_set_death_signal_logs_prctl_failure_without_self_kill_if_parent_alive(d
 def test_set_death_signal_self_kills_on_prctl_failure_if_parent_gone(monkeypatch, death_signal_env) -> None:
     fake, killed = death_signal_env
     fake.rc = -1
-    ppids = iter([321, 1])
+    ppids = iter([321, 321, 1])
     monkeypatch.setattr(stage_init_utils.os, "getppid", lambda: next(ppids))
 
     stage_init_utils.set_death_signal(signal.SIGKILL)
@@ -2048,6 +2050,17 @@ def test_set_death_signal_success_when_parent_stable(death_signal_env) -> None:
     fake, killed = death_signal_env
 
     stage_init_utils.set_death_signal(signal.SIGKILL)
+
+    assert fake.calls == [(1, signal.SIGKILL)]
+    assert killed == []
+
+
+@pytest.mark.parametrize("expected_parent_pid", [None, 1])
+def test_set_death_signal_keeps_live_pid_one_parent(monkeypatch, death_signal_env, expected_parent_pid) -> None:
+    fake, killed = death_signal_env
+    monkeypatch.setattr(stage_init_utils.os, "getppid", lambda: 1)
+
+    stage_init_utils.set_death_signal(signal.SIGKILL, expected_parent_pid=expected_parent_pid)
 
     assert fake.calls == [(1, signal.SIGKILL)]
     assert killed == []
