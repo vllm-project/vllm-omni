@@ -410,3 +410,52 @@ def test_incomplete_pair_defers_instead_of_splitting(monkeypatch) -> None:
     assert seen["waiting_len"] == 0
     assert seen["kv_len"] == 0
     assert seen["admitted"] is None
+
+
+def test_common_cfg_pair_is_one_isolation_unit() -> None:
+    """Audex registers its CFG pair on the ordinary AR scheduler."""
+    cond = _StubRequest("cond", seed=7)
+    uncond = _StubRequest("uncond")  # the companion is not marked
+    scheduler = _make_scheduler(parked=0, waiting=[cond, uncond])
+    scheduler._cfg_pairs = {"pair": {"cond": "cond", "uncond": "uncond"}}
+    scheduler._cfg_req_to_pair = {"cond": "pair", "uncond": "pair"}
+    scheduler.requests = {"cond": cond, "uncond": uncond}
+
+    assert scheduler._isolation_unit(cond) == [cond, uncond]
+    assert scheduler._isolation_group_size(cond) == 2
+
+    scheduler._cfg_pairs["pair"] = {"cond": "cond"}
+    assert scheduler._isolation_unit(cond) is None
+
+
+def test_unseeded_holder_drains_before_a_seeded_holder(monkeypatch) -> None:
+    """A seeded holder that needs a block must not hide a holder that can finish."""
+    fresh = _StubRequest("seeded-fresh", seed=7)
+    seeded_holder = _StubRequest("seeded-holder", seed=9)
+    unseeded_holder = _StubRequest("unseeded-holder")
+    scheduler = _make_scheduler(parked=0, waiting=[fresh], kv_holding=[unseeded_holder, seeded_holder])
+
+    seen = _run_schedule(scheduler, monkeypatch)
+
+    # Only the unseeded holder is admitted so it can release its blocks; the
+    # seeded holder stays queued for its own solo step.
+    assert seen["waiting_len"] == 0
+    assert seen["kv_len"] == 1
+    assert seen["limit"] == 8
+
+
+def test_solo_step_admits_a_common_cfg_pair_together(monkeypatch) -> None:
+    """Audex-shaped pair: the companion does not carry the marker but must run too."""
+    other = _StubRequest("other")
+    cond = _StubRequest("cond", seed=7)
+    uncond = _StubRequest("uncond")
+    scheduler = _make_scheduler(parked=0, waiting=[other, cond, uncond])
+    scheduler._cfg_pairs = {"pair": {"cond": "cond", "uncond": "uncond"}}
+    scheduler._cfg_req_to_pair = {"cond": "pair", "uncond": "pair"}
+    scheduler.requests = {"other": other, "cond": cond, "uncond": uncond}
+
+    seen = _run_schedule(scheduler, monkeypatch)
+
+    assert seen["limit"] == 2
+    assert seen["waiting_len"] == 2
+    assert seen["admitted"] == "cond"

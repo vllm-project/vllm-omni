@@ -911,8 +911,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             return name, target
         return None
 
-    def _has_runnable_kv_holders(self) -> bool:
-        return any(self._request_is_runnable(request) for request in self.kv_holding_waiting)
+    def _runnable_kv_holders(self, *, seeded: bool) -> list[object]:
+        return [
+            request
+            for request in self.kv_holding_waiting
+            if self._request_is_runnable(request)
+            and request_is_seeded(getattr(request, "sampling_params", None)) == seeded
+        ]
 
     def _isolation_unit(self, request: object) -> list[object] | None:
         """Requests that must be admitted together with the isolated request.
@@ -920,7 +925,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         ``None`` means the request cannot be isolated safely this step (e.g. an
         incomplete CFG pair); the caller then defers admission instead.
         """
-        return [request]
+        request_id = getattr(request, "request_id", None)
+        pair_id = getattr(self, "_cfg_req_to_pair", {}).get(request_id)
+        if pair_id is None:
+            return [request]
+        # Audex and the other common pairing pipelines register their CFG pair
+        # on the ordinary AR scheduler; restricting admission to the
+        # conditioned branch would make the pairing wrapper drop the pair and
+        # release it unguided (review P1 on #9937).
+        roles = getattr(self, "_cfg_pairs", {}).get(pair_id) or {}
+        if len(roles) != 2:
+            return None
+        members = [self.requests.get(roles[role]) for role in ("cond", "uncond")]
+        return members if all(member is not None for member in members) else None
 
     def _isolation_group_size(self, request: object) -> int | None:
         unit = self._isolation_unit(request)
@@ -954,11 +971,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # them this step (normal limit, ``waiting`` hidden) instead of
             # solo-admitting a fresh request that may not be able to allocate -
             # that would repeat the same failing plan and livelock (#9937).
-            promoted = self._promote_seeded_request(queues=("kv_holding",))
-            if promoted is None and self._has_runnable_kv_holders():
+            # Holders that already own their blocks can finish and release
+            # memory without a new allocation, so let the unseeded ones drain
+            # first - even when a seeded holder is queued. A seeded holder may
+            # still need a block, and solo-admitting it would hide a holder that
+            # could have made progress (P2 on #9937).
+            drain_unit = self._runnable_kv_holders(seeded=False)
+            promoted = None
+            if drain_unit:
                 drain_kv = True
-            elif promoted is None:
-                promoted = self._promote_seeded_request(queues=("waiting",))
+            else:
+                promoted = self._promote_seeded_request(queues=("kv_holding",))
+                if promoted is None:
+                    promoted = self._promote_seeded_request(queues=("waiting",))
             if promoted is not None:
                 solo_queue, solo_request = promoted
                 unit = self._isolation_unit(solo_request)
@@ -983,7 +1008,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.waiting = create_request_queue(self.policy)
                 self.kv_holding_waiting = create_request_queue(self.policy)
             elif drain_kv:
-                # Keep the holders and let them drain at the normal limit.
+                # Keep only the unseeded holders (a seeded holder must not join
+                # their batch) and let them drain at the normal limit.
+                self.kv_holding_waiting.remove_requests(drain_unit)
+                restricted = create_request_queue(self.policy)
+                for request in drain_unit:
+                    restricted.add_request(request)
+                self.kv_holding_waiting = restricted
                 self.waiting = create_request_queue(self.policy)
             else:
                 # Restrict the promoted queue to the isolation unit, not just
