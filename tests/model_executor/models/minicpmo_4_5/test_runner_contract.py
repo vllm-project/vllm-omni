@@ -22,6 +22,10 @@ from vllm_omni.model_executor.models.interfaces import (
     requires_request_sample_eligibility,
     supports_multi_frame_decode,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+    MiniCPMO45OmniTTSForConditionalGeneration,
+    _request_key,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -44,12 +48,17 @@ class _Model:
         return frame_outputs
 
 
+def _talker(k_frames=8):
+    talker = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
+    torch.nn.Module.__init__(talker)
+    talker.batch_stop_logits = None
+    talker._k_step_frames = k_frames
+    return talker
+
+
 def test_wrapper_satisfies_the_protocol():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,
-    )
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
-        MiniCPMO45OmniTTSForConditionalGeneration,
     )
 
     # The runner only ever sees the wrapper, so the wrapper is what has to
@@ -57,9 +66,7 @@ def test_wrapper_satisfies_the_protocol():
     wrapper = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
     torch.nn.Module.__init__(wrapper)
     wrapper.model_stage = "tts"
-    wrapper.talker = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
-    torch.nn.Module.__init__(wrapper.talker)
-    wrapper.talker.batch_stop_logits = None
+    wrapper.talker = _talker()
 
     assert supports_multi_frame_decode(wrapper) is True
     assert isinstance(wrapper, SupportsMultiFrameDecode)
@@ -148,3 +155,23 @@ def test_flag_on_without_members_raises_and_names_them():
 def test_sample_eligibility_flag():
     assert requires_request_sample_eligibility(SimpleNamespace(requires_request_sample_eligibility=True)) is True
     assert requires_request_sample_eligibility(SimpleNamespace()) is False
+
+
+@pytest.mark.parametrize(
+    ("info", "row", "expected"),
+    [
+        pytest.param({"req_id": "7", "request_id": "stale"}, 0, "7", id="mrv2-id-wins"),
+        pytest.param({"request_id": "engine-9"}, 3, "engine-9", id="v1-id"),
+        pytest.param({}, 5, "5", id="missing-id"),
+        pytest.param(None, 2, "2", id="missing-info"),
+        pytest.param({"req_id": 11}, 0, "11", id="integer-id"),
+    ],
+)
+def test_request_key_matches_runner_identity(info, row, expected):
+    assert _request_key(info, row) == expected
+
+
+@pytest.mark.parametrize(("k_frames", "identity"), [(0, True), (1, True), (8, False)])
+def test_mrv2_decode_preprocess_identity(k_frames, identity):
+    # K-step rows must re-embed the previous real codec frame, not placeholders.
+    assert _talker(k_frames).mrv2_decode_preprocess_is_identity is identity
