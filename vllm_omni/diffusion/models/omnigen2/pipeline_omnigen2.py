@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import inspect
-import json
 import logging
 import os
 import warnings
@@ -38,7 +37,7 @@ from vllm_omni.diffusion.models.omnigen2.omnigen2_transformer import (
     OmniGen2RotaryPosEmbed,
     OmniGen2Transformer2DModel,
 )
-from vllm_omni.diffusion.models.utils import load_vae_scale_factor
+from vllm_omni.diffusion.models.utils import _load_json, load_vae_scale_factor
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -248,12 +247,15 @@ def get_omnigen2_pre_process_func(
         model_path = model_name
     else:
         model_path = download_weights_from_hf_specific(model_name, None, ["*"])
-    vae_scale_factor = load_vae_scale_factor(model_path, config_key="temporal_downsample", exponent_offset=0)
+    vae_config = _load_json(model_path, "vae/config.json")
+    vae_scale_factor = load_vae_scale_factor(
+        model_path,
+        vae_config=vae_config,
+        config_key="temporal_downsample",
+        exponent_offset=0,
+    )
 
     image_processor = OmniGen2ImageProcessor(vae_scale_factor=vae_scale_factor * 2, do_resize=True)
-    vae_config_path = os.path.join(model_path, "vae/config.json")
-    with open(vae_config_path) as f:
-        vae_config = json.load(f)
     latent_channels = vae_config.get("z_dim", 16)
 
     def pre_process_func(

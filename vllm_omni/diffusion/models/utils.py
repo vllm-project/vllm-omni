@@ -259,15 +259,20 @@ def _load_json(model_path: str, filename: str, local_files_only: bool = True) ->
 def load_vae_scale_factor(
     model_path: str,
     *,
+    config_key: str = "block_out_channels",
+    exponent_offset: int = -1,
     default: int = 8,
     vae_config: dict | None = None,
 ) -> int:
     """Read ``vae/config.json`` and compute the VAE spatial downsampling factor.
 
     Most diffusion pipelines need the scale factor before VAE weights are
-    loaded.  The standard formula is ``2 ** (len(block_out_channels) - 1)``.
+    loaded.  The standard formula is ``2 ** (len(channels) + exponent_offset)``
+    where *channels* is a list in the VAE config (``block_out_channels`` for
+    image VAEs with offset -1, ``temporal_downsample`` for video VAEs with
+    offset 0).
 
-    Returns *default* when ``block_out_channels`` is missing or empty.
+    Returns *default* when *config_key* is missing or empty.
     Raises ``FileNotFoundError`` when the config file is missing and
     ``ValueError`` when it cannot be parsed, so a partially-downloaded
     snapshot fails loudly instead of silently producing incorrectly sized images.
@@ -287,7 +292,7 @@ def load_vae_scale_factor(
                 vae_config = json.load(f)
         except json.JSONDecodeError as exc:
             raise ValueError(f"Failed to parse VAE config at {vae_config_path}: {exc}") from exc
-    channels = vae_config.get("block_out_channels")
+    channels = vae_config.get(config_key)
     if not channels:
         return default
-    return int(2 ** (len(channels) - 1))
+    return int(2 ** (len(channels) + exponent_offset))

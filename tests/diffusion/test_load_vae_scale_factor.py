@@ -23,6 +23,17 @@ def test_standard_block_out_channels(tmp_path):
     assert load_vae_scale_factor(path) == 8
 
 
+def test_temporal_downsample(tmp_path):
+    """Video VAEs read ``temporal_downsample`` with exponent offset 0."""
+    path = _make_vae_config(tmp_path, {"temporal_downsample": [True, True, True]})
+    assert load_vae_scale_factor(path, config_key="temporal_downsample", exponent_offset=0) == 8
+
+
+def test_exponent_offset_zero(tmp_path):
+    path = _make_vae_config(tmp_path, {"block_out_channels": [128, 256, 512, 512]})
+    assert load_vae_scale_factor(path, exponent_offset=0) == 16
+
+
 def test_missing_config_raises(tmp_path):
     """A missing config file must fail loudly, not silently assume a default."""
     with pytest.raises(FileNotFoundError, match="VAE config not found"):
