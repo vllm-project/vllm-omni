@@ -27,7 +27,12 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
+from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    AsyncModelRunnerOutput,
+    KVConnectorOutput,
+    make_empty_encoder_model_runner_output,
+)
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -70,6 +75,11 @@ class _AsyncGenerationOutput(AsyncModelRunnerOutput):
     def get_output(self) -> OmniModelRunnerOutput:
         self._snapshot.wait()
         return self._output
+
+    def get_kv_connector_output(self) -> KVConnectorOutput | None:
+        # Salvage does not wait on the payload copy. The connector output is
+        # already stored on the model-runner output before that copy starts.
+        return self._output.kv_connector_output
 
 
 def _copy_owned_generation_payload_to_cpu_async(

@@ -80,6 +80,9 @@ def test_adapter_fuses_every_lora_into_the_native_layout(tmp_path):
     lora = _write_bundle(tmp_path)
     adapter = _load(tmp_path)
     assert adapter is not None
+    # This CPU test reconstructs real deltas on the host.
+    # Production fusion selects the serving accelerator for checkpoint loading.
+    adapter.fusion._device = torch.device("cpu")
 
     def delta(prefix, target):
         return lora[f"{prefix}{target}.lora_B.weight"] @ lora[f"{prefix}{target}.lora_A.weight"]
@@ -297,6 +300,7 @@ def _sampling(**extra):
         seed=17,
         num_outputs_per_prompt=1,
         lora_request=None,
+        lora_scale=1.0,
         num_inference_steps=None,
     )
 
@@ -325,6 +329,16 @@ def test_pipeline_turns_the_draft_into_one_refine_pass(tmp_path):
 
     silent = pipeline._prepare_encoder_conditioning_inputs(_draft_conditioning(audio=False), _sampling())
     assert silent["regenerate_output_audio"] is None
+
+
+def test_regenerate_context_is_compatible_with_denoise_kwargs(tmp_path):
+    _write_bundle(tmp_path)
+    pipeline, _ = _regenerate_pipeline(_load(tmp_path))
+    context = pipeline._prepare_encoder_conditioning_inputs(_draft_conditioning(), _sampling())
+
+    denoise_kwargs = pipeline._denoise_kwargs(context)
+    assert denoise_kwargs["control_rows"] is None
+    assert denoise_kwargs["control_context_scale"] == 1.0
 
 
 def test_pipeline_refuses_requests_outside_the_regenerate_contract(tmp_path):
