@@ -32,10 +32,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
-from vllm_omni.diffusion.offloader.config import (
-    OffloadStrategy,
-    resolve_offload_strategy,
-)
+from vllm_omni.diffusion.offloader.config import offload_streams_blocks
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -355,6 +352,29 @@ class SiglipNaViTWrapper(nn.Module):
         return outputs.last_hidden_state.squeeze(0)
 
 
+def should_defer_device_placement(od_config: Any, quant_config: Any = None) -> bool:
+    """Whether the loader/offloader owns device placement instead of eager ``.to()``.
+
+    Eager ``self.to(self.device)`` must be skipped when:
+
+    * quantization is enabled (vLLM linears live on ``meta`` until the loader
+      materializes them), or
+    * a streaming offload policy is active (both ``LAYER_WISE`` and
+      ``DISTRIBUTED_LAYER_WISE`` stream blocks; ``offload_streams_blocks()`` is
+      the single helper that expresses that two-mode check), or
+    * HSDP shards the weights after a CPU-side load.
+
+    Kept as a module-level function so the placement guard is testable without
+    building a pipeline or touching a device.
+    """
+    if quant_config is not None:
+        return True
+    if offload_streams_blocks(od_config):
+        return True
+    parallel_config = getattr(od_config, "parallel_config", None)
+    return bool(getattr(parallel_config, "use_hsdp", False))
+
+
 class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin):
     """Bagel generation pipeline (MoT) packaged for vllm-omni diffusion engine.
 
@@ -504,9 +524,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         #    selectively materialized/moved by the offloader.
         # 3. HSDP: weights should be loaded on CPU first and sharded afterwards,
         #    rather than eagerly placing the full model on one GPU.
-        if quant_config is None and not (
-            resolve_offload_strategy(od_config) is OffloadStrategy.LAYER_WISE or od_config.parallel_config.use_hsdp
-        ):
+        if not should_defer_device_placement(od_config, quant_config):
             self.to(self.device)
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
