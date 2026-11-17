@@ -39,7 +39,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoResponse,
 )
 from vllm_omni.entrypoints.openai.serving_video import EncodedVideoResult, OmniOpenAIServingVideo, ReferenceImage
-from vllm_omni.entrypoints.openai.storage import LocalStorageManager
+from vllm_omni.entrypoints.openai.storage import LocalStorageManager, LocalStorageTTLManager
 from vllm_omni.entrypoints.openai.stores import AsyncDictStore, TaskRegistry
 from vllm_omni.entrypoints.openai.video.generation import helpers as video_generation_helpers
 from vllm_omni.entrypoints.openai.video.generation.helpers import (
@@ -548,8 +548,12 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch,
 
         return asyncio.create_task(wait_for_shutdown())
 
-    async def fake_storage_start():
+    async def fake_storage_start(*, on_expire):
+        assert on_expire == api_server.VIDEO_STORE.remove_many
         events.append("storage_start")
+
+    async def fake_storage_stop():
+        events.append("storage_stop")
 
     async def fake_get_vllm_config(engine_client):
         del engine_client
@@ -563,6 +567,7 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch,
     monkeypatch.setattr(api_server, "build_openai_app", lambda args, supported_tasks: app)
     monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
     monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", fake_storage_start)
+    monkeypatch.setattr(api_server.STORAGE_MANAGER, "stop", fake_storage_stop)
     monkeypatch.setattr(api_server.openai_app_state, "_get_vllm_config", fake_get_vllm_config)
     monkeypatch.setattr(api_server, "omni_init_app_state", fake_init_app_state)
     monkeypatch.setattr(api_server, "get_uvicorn_log_config", lambda args: None)
@@ -603,6 +608,7 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch,
 
     assert sock.closed
     assert events.index("http_shutdown") < events.index("engine_exit")
+    assert events.index("http_shutdown") < events.index("storage_stop") < events.index("engine_exit")
 
 
 @pytest.fixture
@@ -3255,6 +3261,61 @@ def test_list_videos_supports_order_after_and_limit(test_client, mocker: MockerF
     assert zero_limit_after_body["first_id"] is None
     assert zero_limit_after_body["last_id"] is None
     assert zero_limit_after_body["has_more"] is False
+
+
+def test_ttl_expiration_removes_video_from_metadata_and_content_endpoints(
+    test_client, isolated_video_backends, monkeypatch, mocker: MockerFixture, tmp_path
+):
+    store, _, _ = isolated_video_backends
+    storage = LocalStorageTTLManager(
+        storage_path=str(tmp_path / "ttl-storage"),
+        ttl_seconds=60,
+        sweep_interval_seconds=3600,
+    )
+    monkeypatch.setattr(api_server, "STORAGE_MANAGER", storage)
+    monkeypatch.setattr(video_generation_helpers, "STORAGE_MANAGER", storage)
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"stored-video")
+
+    async def start_storage():
+        await storage.start(on_expire=store.remove_many)
+        await asyncio.sleep(0)
+
+    test_client.portal.call(start_storage)
+    try:
+        completed_ids = []
+        for prompt in ("expired video", "retained video"):
+            response = test_client.post("/v1/videos", data={"prompt": prompt})
+            assert response.status_code == 200
+            video_id = response.json()["id"]
+            completed = _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+            assert completed["expires_at"] is not None
+            assert test_client.get(f"/v1/videos/{video_id}/content").status_code == 200
+            completed_ids.append(video_id)
+        expired_id, retained_id = completed_ids
+
+        for status in (VideoGenerationStatus.QUEUED, VideoGenerationStatus.FAILED):
+            job = VideoResponse(id=status.value, model="test-model", prompt="unrelated job", status=status)
+            test_client.portal.call(store.upsert, job.id, job)
+
+        old_mtime = time.time() - 70
+        expired_path = storage.get_full_file_path(expired_id)
+        os.utime(expired_path, (old_mtime, old_mtime))
+        assert test_client.portal.call(storage._sweep_once, time.time() - 60) == 1
+
+        assert not os.path.exists(expired_path)
+        listing = test_client.get("/v1/videos")
+        assert listing.status_code == 200
+        assert {job["id"] for job in listing.json()["data"]} == {retained_id, "queued", "failed"}
+        assert test_client.get(f"/v1/videos/{expired_id}").status_code == 404
+        assert test_client.get(f"/v1/videos/{expired_id}/content").status_code == 404
+        assert test_client.get(f"/v1/videos/{retained_id}").json()["status"] == "completed"
+        retained_content = test_client.get(f"/v1/videos/{retained_id}/content")
+        assert retained_content.status_code == 200
+        assert retained_content.content == b"stored-video"
+        assert test_client.portal.call(store.get, "queued").status == VideoGenerationStatus.QUEUED
+        assert test_client.portal.call(store.get, "failed").status == VideoGenerationStatus.FAILED
+    finally:
+        test_client.portal.call(storage.stop)
 
 
 def test_delete_completed_job_removes_file_and_metadata(test_client, mocker: MockerFixture):
