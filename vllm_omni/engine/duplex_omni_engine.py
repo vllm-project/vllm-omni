@@ -107,6 +107,10 @@ class DuplexOmniEngine(AsyncOmniEngine):
 
         assert self.plugin is not None, "_validate_deployment() must run before the orchestrator is created"
         assert self.pipeline_config is not None, "Duplex deployment must resolve a model pipeline"
+        # ``self.async_chunk`` is the deploy-resolved flag (per-stage connector
+        # override included). Plugins that gate their own streaming on it
+        # receive it here, before any session can be admitted.
+        self.plugin.configure_async_chunk(enabled=bool(self.async_chunk))
         # Match the frontend's comprehension-stage selection. An optional ASR
         # stage does not own the served model's tokenizer or prompt policy.
         model_stage_id = next((stage.stage_id for stage in self.pipeline_config.stages if stage.owns_tokenizer), 0)
