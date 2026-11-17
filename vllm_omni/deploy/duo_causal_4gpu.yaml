@@ -27,9 +27,11 @@ stages:
   step_execution: true
   streaming_output: false
   diffusion_model_runner_cls: vllm_omni.diffusion.models.duo.model_runner.DuoModelRunner
-  parallel_config:
-    tensor_parallel_size: 4
-    sequence_parallel_size: 1
+  # Stage-deploy parallelism fields are top-level members of StageDeployConfig.
+  # A nested `parallel_config:` block is silently dropped, which leaves the whole
+  # 66 GB backbone on one card and OOMs the first denoise step.
+  tensor_parallel_size: 4
+  gpu_memory_utilization: 0.9
   default_sampling_params:
     num_inference_steps: 50
     seed: 42

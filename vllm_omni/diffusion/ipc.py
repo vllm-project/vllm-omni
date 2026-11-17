@@ -79,6 +79,17 @@ def _array_to_shm(array: np.ndarray) -> dict[str, Any]:
         raise TypeError("NumPy object arrays cannot be transferred through raw shared memory")
 
     array = np.ascontiguousarray(array)
+    if array.size == 0:
+        # A zero-element tensor is legitimate (Duo's Realization prefix carries
+        # an empty audio track) and `multiprocessing.shared_memory` refuses a
+        # zero-length segment. Describe it inline: there are no bytes to move and
+        # the shape alone reconstructs it on the far side.
+        return {
+            "name": None,
+            "shape": list(array.shape),
+            "numpy_dtype": str(array.dtype),
+            "nbytes": 0,
+        }
     shm, shm_array, handle = _new_shm_array(array.shape, array.dtype)
     np.copyto(shm_array, array)
     del shm_array
@@ -90,6 +101,9 @@ def _array_from_shm(handle: dict[str, Any]) -> np.ndarray:
     """Materialize or borrow an array from shared memory and unlink its name."""
     from multiprocessing import shared_memory
 
+    if handle["nbytes"] == 0:
+        # Matches the empty-array case in `_array_to_shm`: no segment exists.
+        return np.empty(tuple(handle["shape"]), dtype=np.dtype(handle["numpy_dtype"]))
     shm = shared_memory.SharedMemory(name=handle["name"])
     array = np.ndarray(
         handle["shape"],

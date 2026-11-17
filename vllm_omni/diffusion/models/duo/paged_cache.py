@@ -285,6 +285,10 @@ def prefix_identity(sequence, *, namespace):
                 value = value.contiguous()
             value = value.to(device="cpu")
             digest.update(str((name, tuple(value.shape), value.dtype)).encode())
-            raw = value.view(torch.uint8)
-            digest.update(memoryview(raw.numpy()).cast("B"))
+            # A zero-element tensor is legitimate here (the prefix carries an
+            # empty audio track); `memoryview` of a zero-size array raises
+            # "cannot cast view with zeros in shape or strides". Shape and dtype
+            # are already in the digest, so nothing else is needed for it.
+            if value.numel():
+                digest.update(memoryview(value.view(torch.uint8).numpy()).cast("B"))
     return digest.hexdigest()

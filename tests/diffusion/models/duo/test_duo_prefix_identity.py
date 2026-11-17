@@ -91,6 +91,18 @@ def test_prefix_identity_still_separates_different_content():
     assert prefix_identity(a, namespace="ns") != prefix_identity(b, namespace="ns")
 
 
+def test_prefix_identity_accepts_an_empty_track():
+    # Duo's Realization prefix carries a zero-length audio track, and a
+    # zero-element array must not abort the digest computation.
+    torch.manual_seed(0)
+    seq = _sequence(torch.zeros(1, 5, 24), torch.zeros(1, 0, 32))
+    identity = prefix_identity(seq, namespace="ns")
+    assert isinstance(identity, str) and len(identity) == 64
+    # Shape still participates, so an empty track is distinct from 29 latents.
+    other = _sequence(torch.zeros(1, 5, 24), torch.zeros(1, 29, 32))
+    assert identity != prefix_identity(other, namespace="ns")
+
+
 def test_prefix_identity_rejects_non_prefix_groups():
     seq = _sequence(torch.zeros(1, 5, 24), torch.zeros(1, 29, 32), groups=(RealizationGroup(0, 0, "noisy", 0, 4),))
     with pytest.raises(ValueError, match="prefix-only"):
