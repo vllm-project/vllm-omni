@@ -10,6 +10,32 @@ from vllm_omni.benchmarks.duplex.omni_duplex_eval_metrics import PROTOCOL_PIN
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import MIX_QUESTION
 
 
+def select_duplex_eval_baseline(accuracy_config: dict, hardware: object) -> dict:
+    """Return this hardware's score floors, or ``{}`` to record scores without gating.
+
+    Nested accuracy-config baselines (``{"H100": {...}, "A3": {...}}``) enforce only
+    when the runtime label has a non-empty metric dict. An omitted label or an
+    empty ``{}`` entry records scores without a floor. A nested map requires a
+    non-empty hardware label: missing or blank labels fail rather than silently
+    disabling calibrated gates. Flat metric dicts still apply to every hardware
+    label. Mixing hardware maps with flat metric keys is rejected.
+    """
+    baseline = accuracy_config.get("baseline") or {}
+    if not isinstance(baseline, dict) or not baseline:
+        return {}
+    nested_flags = [isinstance(value, dict) for value in baseline.values()]
+    if any(nested_flags) and not all(nested_flags):
+        raise ValueError("duplex-eval baseline mixes hardware maps and flat metrics")
+    if all(nested_flags):
+        if not isinstance(hardware, str) or not hardware:
+            raise ValueError("nested duplex-eval baseline requires a runtime hardware label")
+        selected = baseline.get(hardware)
+        if not isinstance(selected, dict) or not selected:
+            return {}
+        return {str(key): value for key, value in selected.items() if value is not None}
+    return {str(key): value for key, value in baseline.items() if value is not None}
+
+
 def load_accuracy_config(path: str, params: dict) -> dict:
     config = json.loads(Path(path).read_text(encoding="utf-8"))
     if config.get("dataset_revision"):

@@ -47,7 +47,6 @@ python end2end.py -m /path/to/Covo-Audio-Chat --output-dir ./my_output
 | `--stage-init-timeout` | | `300` | Stage initialization timeout (seconds) |
 | `--batch-timeout` | | `5` | Batching timeout (seconds) |
 | `--init-timeout` | | `300` | Overall initialization timeout (seconds) |
-| `--shm-threshold-bytes` | | `65536` | Shared memory threshold (bytes) |
 
 ## Pipeline
 

@@ -41,6 +41,9 @@ class _FakeAttention(nn.Module):
         del kwargs
         super().__init__()
 
+    def add_schedule_candidate_check(self, check):
+        del check
+
 
 def _small_od_config(*, class_name=None):
     arch = {

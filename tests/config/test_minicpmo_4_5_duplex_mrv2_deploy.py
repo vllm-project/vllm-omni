@@ -28,23 +28,93 @@ def _resolve_cuda_stages(monkeypatch):
 def test_duplex_mrv2_cuda_profile(monkeypatch) -> None:
     config, stages = _resolve_cuda_stages(monkeypatch)
     assert config.session_mode == "duplex"
-    # Thinker and Code2Wav use MRv2. The Talker stays on V1 because its
-    # multi-frame decode re-embeds the previous codec frame only there.
-    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, False, True]
+    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True, True]
+    assert stages[1].yaml_engine_args["attention_backend"] == "FLASH_ATTN"
     assert [s.yaml_engine_args["async_chunk"] for s in stages] == [True, True, True]
     assert stages[0].yaml_engine_args["async_scheduling"] is True
     # K-step books its span with the synchronous runner contract.
-    assert stages[1].yaml_engine_args["speculative_config"]["num_speculative_tokens"] == 7
+    assert stages[1].yaml_engine_args["speculative_config"]["num_speculative_tokens"] == 15
     assert stages[1].yaml_engine_args["async_scheduling"] is False
     assert stages[2].yaml_engine_args.get("async_scheduling") is not False
     # Retain the base profile capacity and Talker KV budget.
-    assert [s.yaml_engine_args["max_num_seqs"] for s in stages] == [16, 16, 16]
+    assert [s.yaml_engine_args["max_num_seqs"] for s in stages] == [16, 16, 8]
     assert stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 4 * 1024**3
 
 
-@pytest.mark.parametrize("platform", ["npu", "xpu", "rocm", "musa"])
+@pytest.mark.parametrize("platform", ["xpu", "rocm", "musa"])
 def test_duplex_mrv2_profile_keeps_non_cuda_on_v1(monkeypatch, platform) -> None:
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
     config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform=platform)
     stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
+    # The non-CUDA, non-NPU platforms still resolve to the v1 data plane.
     assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [False, False, False]
+
+
+def test_duplex_mrv2_profile_npu_full_mrv2(monkeypatch) -> None:
+    # PR #10062 enables full-MRv2 three-stage serving on NPU.
+    monkeypatch.setattr(current_omni_platform, "device_name", "npu")
+    config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform="npu")
+    stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
+    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True, True]
+
+
+@pytest.mark.parametrize("deploy_name", [_DEPLOY, "minicpmo_4_5_turn.yaml"])
+@pytest.mark.parametrize("platform", ["cuda", "npu", "rocm", "xpu", "musa", "cpu"])
+def test_reference_optimizations_are_cuda_only(monkeypatch, deploy_name, platform):
+    from vllm_omni.config.stage_config import resolve_deploy_yaml
+    from vllm_omni.distributed.omni_connectors.utils.initialization import load_omni_transfer_config
+    from vllm_omni.engine.stage_init_utils import get_stage_connector_spec
+
+    monkeypatch.setattr(current_omni_platform, "device_name", platform)
+    path = get_deploy_config_path(deploy_name)
+    deploy = _apply_platform_overrides(load_deploy_config(path), platform=platform)
+    transfer = load_omni_transfer_config(config_dict=resolve_deploy_yaml(path))
+    stage_extra = get_stage_connector_spec(transfer, stage_id=2, async_chunk=True)["extra"]
+    resolved_extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+    for extra in (stage_extra, resolved_extra):
+        for flag in (
+            "token2wav_float16",
+            "token2wav_spk_cuda_graph",
+            "token2wav_s3_cuda_graph",
+            "cfm_drop_upstream_att_buffer",
+        ):
+            assert extra.get(flag, False) is (platform == "cuda")
+        # CUDA overrides retain the shared NPU option and chunk geometry.
+        assert extra["cfm_npu_cross_reference_batching"] is True
+        assert extra["codec_chunk_frames"] == 25
+
+
+@pytest.mark.parametrize("deploy_name", [_DEPLOY, "minicpmo_4_5_turn.yaml"])
+@pytest.mark.parametrize("platform", ["cuda", "npu"])
+@pytest.mark.parametrize("depth", [1, 2])
+def test_platform_connector_overlay_preserves_inherited_options(tmp_path, monkeypatch, deploy_name, platform, depth):
+    from vllm_omni.config.stage_config import resolve_deploy_yaml
+    from vllm_omni.distributed.omni_connectors.utils.initialization import load_omni_transfer_config
+    from vllm_omni.engine.stage_init_utils import get_stage_connector_spec
+
+    monkeypatch.setattr(current_omni_platform, "device_name", platform)
+    path = get_deploy_config_path(deploy_name)
+    expected = _apply_platform_overrides(load_deploy_config(path), platform=platform).connectors
+    options = ("token2wav_float16", "token2wav_spk_cuda_graph")
+    for level, option in enumerate(options[:depth]):
+        overlay = tmp_path / f"overlay-{level}.yaml"
+        overlay.write_text(
+            f"base_config: {path}\n"
+            "platforms:\n"
+            "  cuda:\n"
+            "    connectors:\n"
+            "      connector_of_shared_memory:\n"
+            "        extra:\n"
+            f"          {option}: false\n"
+        )
+        path = overlay
+        if platform == "cuda":
+            expected["connector_of_shared_memory"]["extra"][option] = False
+
+    deploy = _apply_platform_overrides(load_deploy_config(path), platform=platform)
+    transfer = load_omni_transfer_config(config_dict=resolve_deploy_yaml(path))
+    stage_extra = get_stage_connector_spec(transfer, stage_id=2, async_chunk=True)["extra"]
+    assert deploy.connectors == expected
+    # Worker resolution also adds transport-owned role/wakeup metadata.
+    for key, value in expected["connector_of_shared_memory"]["extra"].items():
+        assert stage_extra[key] == value

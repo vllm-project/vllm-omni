@@ -28,7 +28,7 @@ INDEXTTS2_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
-            extras={"skip_tokenizer_init": True, "tokenizer": "gpt2"},
+            extras={"skip_tokenizer_init": True},
             custom_process_next_stage_input_func=f"{_PROC}.talker2s2mel_full_payload",
             sampling_constraints={
                 "detokenize": False,

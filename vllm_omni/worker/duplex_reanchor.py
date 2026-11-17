@@ -3,14 +3,14 @@
 """Shared V1 duplex reanchor dispatch; no backend runner imports."""
 
 import inspect
-from functools import lru_cache
 from typing import Any
 
 
-@lru_cache(maxsize=128)
 def _accepts_scheduler_output(hook: Any) -> bool:
     # Bind arguments without executing the hook. Internal TypeError must propagate:
     # a retry could apply a non-idempotent in-place rotation twice.
+    # Do not cache callable instances or bound methods: they may be unhashable
+    # and retaining them also retains the model across engine restarts.
     signature = inspect.signature(hook)
     try:
         signature.bind(object(), scheduler_output=None)
@@ -37,17 +37,15 @@ def validate_duplex_kv_cache(runner: Any) -> None:
     )
 
     caches = getattr(runner, "kv_caches", ())
+    parameters = None
     for cache in caches:
         key = cache[0] if isinstance(cache, (tuple, list)) else cache
         if key.dim() != 3:
             continue
-        inv_freq = MiniCPMO45DuplexWorkerHelper.get_rope_inv_freq(runner)
-        flattened_key_cache_view(
-            key,
-            runner.cache_config.block_size,
-            runner.model_config.get_head_size(),
-            inv_freq.numel() * 2,
-        )
+        if parameters is None:
+            parameters = MiniCPMO45DuplexWorkerHelper.get_reanchor_parameters(runner)
+        block_size, head_dim, inv_freq = parameters
+        flattened_key_cache_view(key, block_size, head_dim, inv_freq.numel() * 2)
 
 
 def apply_duplex_window_reanchor(runner: Any, scheduler_output: Any = None) -> None:
