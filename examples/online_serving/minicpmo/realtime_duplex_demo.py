@@ -1064,6 +1064,84 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         except TimeoutError as exc:
             wait_error = str(exc)
         forced_response_fallback_sent = forced_response_fallback_sent or fallback_progress["sent"]
+        # Native duplex can end the model's own answer mid-sentence: the
+        # model samples <|turn_eos|> between units and the sentence never
+        # finishes, and the forced post-commit response then answers the
+        # trailing silence by listening instead of speaking, so whatever
+        # the cut sentence never said is lost for good. Re-asking through
+        # the protocol's text channels is refused for speech-native
+        # duplex models (text_only_turn_unsupported), so the one recovery
+        # path that stays inside supported protocol is to replay the tail
+        # of the input -- audio and the matching video frames -- and let
+        # a fresh forced response answer fresh, answerable input.
+        post_commit_replay_seconds = float(getattr(args, "post_commit_replay_seconds", 0.0) or 0.0)
+        post_commit_replay_triggered = False
+        post_commit_replay_error: str | None = None
+        post_commit_replay_frames_sent = 0
+        if (
+            post_commit_replay_seconds > 0
+            and final_create_response
+            and committed_index is not None
+            and not wait_error
+            and _event_count_after(collector.events, "response.output_audio_transcript.delta", committed_index) == 0
+        ):
+            transcript_so_far = "".join(
+                str(event.get("delta", ""))
+                for event in collector.events
+                if event.get("type") in {"response.output_audio_transcript.delta", "response.output_text.delta"}
+            )
+            # Trailing-silence answers can legitimately be listen-only, so
+            # only a transcript that stops mid-sentence marks the lost tail
+            # as a truncated answer rather than a finished one.
+            if transcript_so_far and transcript_so_far[-1] not in ".!?…。!?…;":
+                try:
+                    input_format = client.config.input_audio
+                    replay_samples = min(
+                        int(round(post_commit_replay_seconds * PCM16_SAMPLE_RATE)),
+                        len(input_pcm16) // PCM16_BYTES_PER_SAMPLE,
+                    )
+                    replay_pcm = input_pcm16[replay_samples * PCM16_BYTES_PER_SAMPLE :]
+                    replay_frames = None
+                    replay_stacked = None
+                    if video_frames:
+                        replay_frame_count = min(int(round(post_commit_replay_seconds)), len(video_frames))
+                        replay_frames = video_frames[-replay_frame_count:]
+                        replay_stacked = stacked_video_frames[-replay_frame_count:]
+                    post_commit_replay_triggered = True
+                    post_commit_replay_frames_sent = await client.stream_pcm(
+                        replay_pcm,
+                        chunk_ms=args.chunk_ms,
+                        realtime=not args.no_realtime_pacing,
+                        video_frames=replay_frames,
+                        stacked_video_frames=replay_stacked,
+                        # Continue the media clock after every appended
+                        # audio (input plus tail), but restart the frame
+                        # index so the replayed window shows its own first
+                        # frame on the first appended unit.
+                        media_origin_ms=input_format.duration_ms(len(input_pcm16)),
+                        unit_index=0,
+                    )
+                    replay_commit_cursor = len(collector.events)
+                    await _commit_input_after_playback_checkpoint(client, collector, create_response=True)
+                    await wait_for_condition(
+                        lambda: _input_committed_index(collector.events, replay_commit_cursor) is not None,
+                        timeout_s=args.timeout_s,
+                        label="replay input_audio_buffer.committed",
+                    )
+                    replay_committed_index = _input_committed_index(collector.events, replay_commit_cursor)
+                    await _drain_forced_post_commit_response(
+                        client,
+                        collector,
+                        committed_index=replay_committed_index,
+                        timeout_s=args.timeout_s,
+                        create_timeout_s=min(_FORCED_RESPONSE_CREATE_TIMEOUT_S, float(args.timeout_s)),
+                        # Same deferral reading as the first drain: the
+                        # session still auto-responds and still carries
+                        # video frames.
+                        commit_may_defer_create=(not client.config.auto_response or bool(video_frames)),
+                    )
+                except TimeoutError as exc:
+                    post_commit_replay_error = str(exc)
         await acknowledge_collected_playback(client, collector)
         close_error: str | None = None
         await client.close(timeout_s=args.timeout_s)
@@ -1191,6 +1269,10 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                     "response.done",
                     committed_index,
                 ),
+                "replay_seconds": post_commit_replay_seconds,
+                "replay_triggered": post_commit_replay_triggered,
+                "replay_frames_sent": post_commit_replay_frames_sent,
+                "replay_error": post_commit_replay_error,
             },
             "input_video": args.input_video,
             "input_wav": args.input_wav,
@@ -1325,10 +1407,23 @@ def parse_args() -> argparse.Namespace:
             "without this the last user turn can stay unanswered."
         ),
     )
+    parser.add_argument(
+        "--post-commit-replay-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "When the post-commit forced response stays silent and the "
+            "transcript stops mid-sentence, replay this many seconds of the "
+            "input (audio plus the matching video frames), commit again and "
+            "drain one more forced response. 0 disables the replay."
+        ),
+    )
     parser.add_argument("--require-audio", action="store_true")
     args = parser.parse_args()
     if args.tail_silence_s < 0:
         parser.error("--tail-silence-s must be nonnegative")
+    if args.post_commit_replay_seconds < 0:
+        parser.error("--post-commit-replay-seconds must be nonnegative")
     if not 0 < args.basic_window_low_tokens < args.basic_window_high_tokens:
         parser.error("window watermarks must satisfy 0 < low < high")
     if args.context_max_units <= 0 or args.context_previous_max_tokens <= 0:
