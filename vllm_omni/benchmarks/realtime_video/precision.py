@@ -9,7 +9,9 @@ operation. Independently generated autoregressive latents are not replay samples
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -18,6 +20,12 @@ import numpy as np
 
 _METADATA_KEY = "__metadata__"
 _SCHEMA_VERSION = 1
+_SAMPLE_COUNT = 64
+
+
+def _sample_indices(size: int) -> list[int]:
+    count = min(_SAMPLE_COUNT, size)
+    return [0] if count == 1 else [i * (size - 1) // (count - 1) for i in range(count)]
 
 
 def _array(value: Any) -> tuple[np.ndarray, str]:
@@ -104,6 +112,7 @@ def describe_tensor_sample(path: Path) -> dict[str, Any]:
         }
         if any(not np.isfinite(number) for number in statistics.values()):
             raise ValueError(f"Replay descriptive statistics overflow: {name}")
+        indices = _sample_indices(value.size)
         measurements[name] = {
             "shape": list(value.shape),
             "dtype": document["dtypes"][name],
@@ -111,5 +120,78 @@ def describe_tensor_sample(path: Path) -> dict[str, Any]:
             "element_count": int(value.size),
             "finite": True,
             **statistics,
+            "samples": {
+                "indices": indices,
+                "values": value.reshape(-1)[indices].tolist(),
+            },
         }
+        if name.startswith("input/"):
+            measurements[name]["sha256"] = hashlib.sha256(value.tobytes(order="C")).hexdigest()
     return {"metadata": document["metadata"], "tensors": measurements}
+
+
+def compare_tensor_sample(description: Mapping[str, Any], baseline: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Compare recorded output points after checking the complete replay input.
+
+    This is a sampled regression check, not full-tensor or official-model
+    equivalence. Source revisions describe the recording, not the candidate.
+    """
+    if not isinstance(baseline, Mapping) or baseline.get("scope") != "fixed_input_vae_regression":
+        raise ValueError("A recorded fixed-input VAE precision baseline is required")
+    source = baseline.get("source")
+    if not isinstance(source, Mapping):
+        raise ValueError("Precision baseline source is missing")
+    for key, length in (("revision", 40), ("model_revision", 40), ("artifact_sha256", 64), ("model_assets_sha256", 64)):
+        value = source.get(key)
+        if not isinstance(value, str) or len(value) != length or any(c not in "0123456789abcdef" for c in value):
+            raise ValueError(f"Invalid precision baseline source {key}")
+    context = baseline.get("context")
+    if not isinstance(context, Mapping) or not context or description["metadata"].get("context") != context:
+        raise ValueError("Precision replay context differs from the baseline")
+    expected_tensors = baseline.get("tensors")
+    if not isinstance(expected_tensors, Mapping) or set(expected_tensors) != set(description["tensors"]):
+        raise ValueError("Precision baseline must cover every replay tensor")
+    tolerances: dict[str, float] = {}
+    for name in ("atol", "rtol"):
+        value = baseline.get(name)
+        if not isinstance(value, int | float) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
+            raise ValueError("Precision tolerances must be finite and nonnegative")
+        tolerances[name] = float(value)
+    violations = []
+    differences = {}
+    compared = 0
+    for name, actual in description["tensors"].items():
+        expected = expected_tensors[name]
+        if not isinstance(expected, Mapping) or any(
+            actual[field] != expected.get(field) for field in ("shape", "dtype", "stored_dtype")
+        ):
+            raise ValueError(f"Precision tensor shape/dtype differs: {name}")
+        if name.startswith("input/"):
+            if actual["sha256"] != expected.get("sha256"):
+                raise ValueError(f"Precision replay input differs: {name}")
+            continue
+        samples = expected.get("samples")
+        indices = _sample_indices(actual["element_count"])
+        if (
+            not isinstance(samples, Mapping)
+            or samples.get("indices") != indices
+            or any(type(index) is not int for index in samples["indices"])
+            or actual["samples"]["indices"] != indices
+            or not isinstance(samples.get("values"), list)
+            or len(samples["values"]) != len(indices)
+            or len(actual["samples"]["values"]) != len(indices)
+        ):
+            raise ValueError(f"Precision sample positions/count differ: {name}")
+        values = samples["values"]
+        if any(type(v) not in (int, float) or not math.isfinite(v) for v in values):
+            raise ValueError(f"Precision baseline contains nonfinite/nonnumeric values: {name}")
+        differences[name] = 0.0
+        for index, value, reference in zip(indices, actual["samples"]["values"], values, strict=True):
+            error = abs(value - reference)
+            differences[name] = max(differences[name], error)
+            compared += 1
+            if not math.isfinite(value) or error > tolerances["atol"] + tolerances["rtol"] * abs(reference):
+                violations.append(f"{name}[{index}]: {value} != {reference} ({error=})")
+    if not compared:
+        raise ValueError("Precision baseline has no output samples")
+    return {"passed": not violations, "sample_count": compared, "max_abs": differences, "violations": violations}

@@ -13,17 +13,43 @@ floors is rejected.
   `49a7059849dd235e26ce43221bf33c06ea2f7ba7` (A2 generation, H100 scoring).
   The largest per-dimension difference against CUDA build 19532 was 0.0499.
 
-Known limitation: numerical precision has no stored reference tensors, so
-tensor error, PSNR and SSIM are not computed. `test_numeric_precision` reports
-`comparison_status: finite_only` and checks only that the fixed-input replay is
-complete and finite. Adding a reference needs an immutable artifact location
-for the NPZ; it is not generated from the candidate.
+The numerical profiles contain recorded `precision_baseline` values from
+successful CUDA build [19900](https://buildkite.com/vllm/vllm-omni/builds/19900)
+and NPU build [11754](https://buildkite.com/vllm/vllm-omni-npu-ci/builds/11754),
+both at `980d9e5858956e1dfdd50be294bf755799986846`. Source, model, hardware,
+artifact IDs and NPZ SHA256 hashes are retained beside the values. Normal CI
+reads these baselines; it never regenerates them from the candidate.
+
+`test_numeric_precision` checks the existing seed-42, single-device BF16 Wan
+VAE decode of a fixed latent. It records 64 C-order points per tensor at
+`i * (size - 1) // 63`, including both endpoints, and compares the 64 decoded
+output values with that generation platform's baseline. These points cover
+every output channel and temporal slice. The full stored input-array SHA256,
+operation/seed, tensor shapes, native/stored dtypes and exact sample positions
+must match. Small test tensors use `min(64, size)` points, evenly spaced with
+the same rule. Missing, empty, nonfinite or incompatible baselines fail.
+
+The initial output tolerance is absolute `0.04`, with zero relative tolerance.
+For normalized `[-1, 1]` output this is approximately 5.1 RGB levels before
+quantization, informed by Bagel's fixed-pixel regression convention. It is not
+calibrated from repeated LingBot runs. CUDA and NPU have separate recorded
+values and input hashes; an NPU capture evaluated on H100 uses the NPU
+baseline. Source/software revisions are recording provenance and need not
+equal a future candidate revision; the pinned model/assets contract must match.
+
+This is a sparse VAE regression check, not official-model equivalence or
+denoiser/full-rollout tensor precision. Full-tensor error, PSNR and SSIM are
+not computed. The actual generated videos remain independently covered by
+WBench and VBench. The numerical result reports
+`comparison_status: sampled_baseline`, actual sample values, maximum absolute
+sample errors, tolerance violations and the recorded baseline source.
 
 The three independent tests use the packaged `vllm bench serve --omni` scoring
 path after the candidate server has stopped:
 
-- `test_precision.py::test_numeric_precision` reports fixed-input Wan VAE NPZ
-  arrays, native/stored dtype, shape, finite checks and descriptive statistics.
+- `test_precision.py::test_numeric_precision` compares recorded Wan VAE output
+  samples and reports native/stored dtype, shape, input identity, finite checks
+  and descriptive statistics.
 - `test_wbench.py::test_wbench_quality` checks native WBench dimensions against
   the profile floors.
 - `test_vbench.py::test_vbench_quality` checks native VBench dimensions,
@@ -40,7 +66,8 @@ reference/candidate campaign in routine CI.
 from steady-cadence statistics in a measured rollout.
 
 Each test checks its own authenticated inputs, prints real measurements as JSON,
-and writes `result_acc_*.json` (with the floors under `baseline`) before
+and writes `result_acc_*.json` (with the score floors or expected output points
+under `baseline`) before
 asserting. A missing NPZ fails the numerical test without hiding complete
 videos from the semantic
 tests. Server/cleanup failures remain failures. Generation hardware, source,

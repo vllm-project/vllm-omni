@@ -3,8 +3,8 @@
 """Run packaged benchmark scoring, apply profile score floors and publish the accuracy record.
 
 WBench and VBench scores are compared with the profile's ``score_floors``.
-Numerical precision has no stored reference tensors, so tensor error, PSNR and
-SSIM are not computed; that suite checks a complete, finite fixed-input replay.
+Numerical precision compares fixed-input VAE output samples with recorded
+platform baselines. It does not claim full-tensor or full-model equivalence.
 """
 
 from __future__ import annotations
@@ -83,6 +83,14 @@ def run_accuracy(settings, data, suite):
             for name, row in measurements.get("replay", {}).get("tensors", {}).items()
             for statistic in ("minimum", "maximum", "mean", "std")
         }
+        metrics.update(
+            {
+                f"{name.replace('/', '_')}_sample_{index}": value
+                for name, row in measurements.get("replay", {}).get("tensors", {}).items()
+                if name.startswith("output/")
+                for index, value in zip(row["samples"]["indices"], row["samples"]["values"], strict=True)
+            }
+        )
     else:
         metrics = {
             f"{case}_{dimension}": value
@@ -90,8 +98,41 @@ def run_accuracy(settings, data, suite):
             for dimension, value in dimensions.items()
         }
     floors = {} if suite == "precision" else settings["score_floors"][suite]
+    baseline_values = floors
     # bench_serve returns a fresh report, so the status is set after measurement.
-    report["comparison_status"] = "finite_only" if suite == "precision" else "score_floor"
+    report["comparison_status"] = "unavailable" if suite == "precision" else "score_floor"
+    if suite == "precision" and report["passed"]:
+        from vllm_omni.benchmarks.realtime_video.precision import compare_tensor_sample
+
+        try:
+            baseline = settings.get("precision_baseline")
+            comparison = compare_tensor_sample(measurements["replay"], baseline)
+            source = baseline["source"]
+            expected_source = {
+                "generation_platform": settings["platform"],
+                "hardware": settings["hardware"],
+                "model_revision": settings["model_revision"],
+                "model_assets_sha256": manifest["contract"]["model_assets_sha256"],
+            }
+            if any(source.get(key) != value for key, value in expected_source.items()):
+                raise ValueError("Precision baseline model/assets/generation platform differs")
+            baseline_values = {
+                f"{name.replace('/', '_')}_sample_{index}": value
+                for name, row in baseline["tensors"].items()
+                if name.startswith("output/")
+                for index, value in zip(row["samples"]["indices"], row["samples"]["values"], strict=True)
+            }
+            report.update(
+                comparison_status="sampled_baseline",
+                sample_comparison=comparison,
+                baseline_source=source,
+                tolerance={key: baseline[key] for key in ("atol", "rtol")},
+                passed=comparison["passed"],
+            )
+            report["errors"].extend(f"Sample precision exceeded tolerance: {row}" for row in comparison["violations"])
+        except (KeyError, TypeError, ValueError) as error:
+            report["passed"] = False
+            report["errors"].append(f"Precision baseline comparison failed: {error}")
     if floors:
         report["floor_violations"] = []
     if floors and report["passed"]:
@@ -111,7 +152,7 @@ def run_accuracy(settings, data, suite):
         model_id=read_json(ROOT / "tests/e2e/accuracy/lingbot_world/assets.lock.json")["model_id"],
         dataset=f"lingbot_world_{suite}",
         metrics=metrics,
-        baseline={settings["hardware"]: floors} if floors else {},
+        baseline={settings["hardware"]: baseline_values} if baseline_values else {},
         extra={
             "Hardware": settings["hardware"],
             "generation_platform": settings["platform"],
@@ -132,6 +173,14 @@ def run_accuracy(settings, data, suite):
         print(
             f"LingBot {suite}: {report['status']}; {len(violations)} of {len(floors)} score floors failed", flush=True
         )
+    elif suite == "precision" and report["comparison_status"] == "sampled_baseline":
+        comparison = report["sample_comparison"]
+        print(
+            f"LingBot precision: {len(comparison['violations'])} of {comparison['sample_count']} "
+            f"recorded VAE output samples exceeded tolerance; max_abs={comparison['max_abs']}; "
+            f"baseline={report['baseline_source']['revision']}; tolerance={report['tolerance']}",
+            flush=True,
+        )
     else:
-        print(f"LingBot {suite}: {report['status']}; finite replay only, no stored reference tensors", flush=True)
+        print(f"LingBot {suite}: baseline comparison unavailable; see {settings['output'] / suite}.json", flush=True)
     return report

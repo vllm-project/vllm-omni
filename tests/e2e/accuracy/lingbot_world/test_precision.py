@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Check a complete, finite fixed-input replay; no stored reference tensors exist yet."""
+"""Compare fixed-input VAE output points with the generation platform's baseline."""
 
 import pytest
 

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Candidate capture lifecycle, independent shared scoring and profile score floors."""
 
+import hashlib
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,7 +27,34 @@ def measurements(tmp_path, monkeypatch):
     settings = runner.load_settings(profile, tmp_path / "judgments", generation=root)
     monkeypatch.setattr(runner, "git_revision", lambda _: "c" * 40)
     arm = root / "candidate"
-    save_tensor_sample(arm / "precision.npz", inputs={"latent": np.ones(2)}, outputs={"decoded": np.ones(2)})
+    context = {"operation": "wan_vae_decode", "dtype": "bfloat16", "seed": 42}
+    save_tensor_sample(
+        arm / "precision.npz",
+        inputs={"latent": np.ones(2)},
+        outputs={"decoded": np.ones(2)},
+        metadata={"context": context},
+    )
+    settings["precision_baseline"] = {
+        "scope": "fixed_input_vae_regression",
+        "source": {**settings["precision_baseline"]["source"]},
+        "context": context,
+        "atol": 0.04,
+        "rtol": 0.0,
+        "tensors": {
+            "input/latent": {
+                "shape": [2],
+                "dtype": "float64",
+                "stored_dtype": "float64",
+                "sha256": hashlib.sha256(np.ones(2).tobytes()).hexdigest(),
+            },
+            "output/decoded": {
+                "shape": [2],
+                "dtype": "float64",
+                "stored_dtype": "float64",
+                "samples": {"indices": [0, 1], "values": [1.0, 1.0]},
+            },
+        },
+    }
     write_json(arm / "cleanup.json", {"passed": True})
     for case in settings["cases"]:
         path = arm / case["id"]
@@ -84,13 +112,13 @@ def test_three_scorers_use_shared_frontend_and_keep_independent_verdicts(measure
     reports = {suite: checks.run_accuracy(settings, data, suite) for suite in ("wbench", "vbench", "precision")}
     assert not reports["wbench"]["passed"]
     assert reports["vbench"]["passed"] and reports["precision"]["passed"]
-    assert reports["precision"]["comparison_status"] == "finite_only"
+    assert reports["precision"]["comparison_status"] == "sampled_baseline"
     assert reports["vbench"]["comparison_status"] == "score_floor"
     assert reports["wbench"]["comparison_status"] == "unavailable"
     assert reports["wbench"]["floor_violations"] == []
     assert not any("Score below floor" in error for error in reports["wbench"]["errors"])
     assert reports["precision"]["measurements"]["replay"]["tensors"]["output/decoded"]["mean"] == 1.0
-    assert "no stored reference tensors" in capsys.readouterr().out
+    assert "recorded VAE output samples" in capsys.readouterr().out
     files = list((tmp_path / "accuracy-results").glob("result_acc_*.json"))
     assert len(files) == 3
     records = [read_json(path) for path in files]
@@ -134,12 +162,30 @@ def test_cuda_score_floors_gate_semantic_suites_only(measurements, monkeypatch, 
     scores["street-42_imaging_quality"] = floors["street-42_imaging_quality"]
     assert checks.run_accuracy(settings, data, "vbench")["passed"]
     precision = checks.run_accuracy(settings, data, "precision")
-    assert precision["passed"] and precision["comparison_status"] == "finite_only"
+    assert precision["passed"] and precision["comparison_status"] == "sampled_baseline"
     records = {row["dataset"]: row for row in map(read_json, (tmp_path / "accuracy-results").glob("result_acc_*.json"))}
     assert records["lingbot_world_vbench"]["baseline"] == {"H100": floors}
     assert records["lingbot_world_vbench"]["comparison_status"] == "score_floor"
-    assert records["lingbot_world_precision"]["baseline"] == {}
+    assert records["lingbot_world_precision"]["baseline"] == {
+        "H100": {"output_decoded_sample_0": 1.0, "output_decoded_sample_1": 1.0}
+    }
     assert "score floors failed" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_numeric_baseline_failures_are_published_before_assertion(measurements, monkeypatch, tmp_path, missing):
+    settings, data = measurements
+    stub_semantic_boundary(monkeypatch, tmp_path)
+    if missing:
+        del settings["precision_baseline"]
+    else:
+        settings["precision_baseline"]["tensors"]["output/decoded"]["samples"]["values"][0] = 0.9
+    report = checks.run_accuracy(settings, data, "precision")
+    assert not report["passed"] and report["errors"]
+    assert report["comparison_status"] == ("unavailable" if missing else "sampled_baseline")
+    record = read_json(next((tmp_path / "accuracy-results").glob("result_acc_*.json")))
+    assert record["measurement_report"] == report
+    assert checks.run_accuracy(settings, data, "vbench")["passed"]
 
 
 def test_partial_numerical_capture_does_not_hide_valid_semantic_inputs(measurements, monkeypatch, tmp_path):
@@ -186,6 +232,16 @@ def test_npu_results_preserve_generation_identity_separate_from_h100_evaluator(m
     assert result["generation_hardware"]["devices"] == ["Ascend 910B"] * 4
     assert result["evaluator_hardware"] == "H100"
     assert result["candidate_revision"] == "c" * 40 and "reference_revision" not in result
+    settings["precision_baseline"]["source"].update(generation_platform="npu", hardware="A2")
+    assert checks.run_accuracy(settings, (root, manifest), "precision")["passed"]
+    numerical = next(
+        row
+        for row in map(read_json, (tmp_path / "accuracy-results").glob("result_acc_*.json"))
+        if row["dataset"] == "lingbot_world_precision"
+    )
+    assert set(numerical["baseline"]) == {"A2"} and numerical["evaluator_hardware"] == "H100"
+    settings["precision_baseline"]["source"]["generation_platform"] = "cuda"
+    assert not checks.run_accuracy(settings, (root, manifest), "precision")["passed"]
 
 
 @dataclass
