@@ -1116,6 +1116,103 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             out[:, start:end].copy_(chunk)
         return out
 
+    def _stream_encode_video_tiles(
+        self,
+        frames: np.ndarray,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        """Upload only the current rank's tiles, preserving native clip order.
+
+        The supported CNN path has no class-token aggregation or isolated
+        frames. All other checkpoint contracts retain ordinary preparation.
+        Collectives run once per clip, exactly as in native tiled_encode.
+        """
+        model = self.model
+        metadata = self._stream_video_prep_metadata(frames)
+        if metadata is None or device.type not in ("cpu", "npu"):
+            return None
+        if (
+            model.training
+            or not getattr(model, "encoder_tiling", False)
+            or getattr(model, "encoder_parallel", False)
+            or getattr(model, "stack_tiling", False)
+            or model.encoder.__class__.__name__ != "EncoderFCN3D"
+            or hasattr(model.encoder, "loss_info")
+            or any(
+                getattr(model, name, False)
+                for name in ("isolated_first_frame", "isolated_last_frame", "isolated_key_frame")
+            )
+        ):
+            return None
+        sample = getattr(model.encode_base, "__func__", model.encode_base).__globals__.get(
+            "DiagonalGaussianDistribution"
+        )
+        if not callable(sample):
+            return None
+        clip_length, prep_pad, mean, std = metadata
+        processor = model.processor
+        crop_mode = getattr(processor, "crop_mode", "top_left")
+        if crop_mode not in ("top_left", "center"):
+            return None
+        used = int(processor.get_suitable_video_length(len(frames) + prep_pad))
+        height, width = frames.shape[1:3]
+        aligned_h, aligned_w = processor._align_to_total_patch_size(height, width)
+        if used <= 0 or not (0 < aligned_h <= height and 0 < aligned_w <= width):
+            return None
+        top, left = ((height - aligned_h) // 2, (width - aligned_w) // 2) if crop_mode == "center" else (0, 0)
+        y_idx, y_len, y_overlap = model.split_tiles(aligned_h, False)
+        x_idx, x_len, x_overlap = model.split_tiles(aligned_w, False)
+        if len(set(y_len)) != 1 or len(set(x_len)) != 1:
+            return None
+        tile_count = len(y_idx) * len(x_idx)
+        parallel = bool(getattr(model, "parallel_tiling", False))
+        state = self._native_parallel_state() if parallel else {}
+        rank, world = int(state.get("sp_rank", 0)), int(state.get("sp_size", 1))
+        if tile_count < world:
+            return None
+        mean_t = torch.as_tensor(mean, dtype=torch.float32, device=device).view(3, 1, 1, 1)
+        std_t = torch.as_tensor(std, dtype=torch.float32, device=device).view(3, 1, 1, 1)
+        total = used + (-used) % clip_length
+        last_real = min(used, len(frames)) - 1
+        clips: list[torch.Tensor] = []
+        ratio = int(model.vae_ratio)
+        for start in range(0, total, clip_length):
+            indices = np.minimum(np.arange(start, start + clip_length), last_real)
+            tasks = []
+            for index in range(rank, tile_count, world):
+                row, col = divmod(index, len(x_idx))
+                y, x = top + y_idx[row], left + x_idx[col]
+                host = np.ascontiguousarray(frames[indices, y : y + y_len[row], x : x + x_len[col]])
+                tile = torch.from_numpy(host).to(device=device)
+                tile = tile.permute(3, 0, 1, 2).float().div_(255.0).sub_(mean_t).div_(std_t)
+                tasks.append(model.encode(tile.unsqueeze(0).contiguous()))
+            if world > 1:
+                dist.barrier(group=state["sp_process_group"])
+                encoded = model._all_gather_tiled_results(tasks, tile_count)
+            else:
+                encoded = tasks
+            rows = []
+            for row in range(len(y_idx)):
+                columns = []
+                for col in range(len(x_idx)):
+                    index = row * len(x_idx) + col
+                    value = encoded[index]
+                    if row > 0:
+                        value = model.blend(encoded[index - len(x_idx)], value, y_overlap[row - 1] // ratio, dim=-2)
+                    if col > 0:
+                        value = model.blend(encoded[index - 1], value, x_overlap[col - 1] // ratio, dim=-1)
+                    if row < len(y_idx) - 1:
+                        value = value[..., : -(y_overlap[row] // ratio), :]
+                    if col < len(x_idx) - 1:
+                        value = value[..., :, : -(x_overlap[col] // ratio)]
+                    columns.append(value)
+                rows.append(torch.cat(columns, dim=-1))
+            clips.append(torch.cat(rows, dim=-2))
+        moments = torch.cat(clips, dim=2)
+        if model.token_drop > 0:
+            moments = moments[:, :, : -int(model.token_drop)]
+        return sample(moments).sample().squeeze(0).contiguous().half()
+
     @torch.inference_mode()
     def encode_video(
         self,
@@ -1145,18 +1242,21 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 for device in devices:
                     with self.device_module.device(device):
                         self.device_module.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
+                latent = None
                 prepared = None
                 if isinstance(frames, np.ndarray) and not _legacy_encode_prep_enabled():
-                    prepared = self._stream_prepare_video_tensor(frames, parameter.device)
-                if prepared is not None:
-                    # Tensor inputs already carry the checkpoint's expected
-                    # (3, T, H, W) normalized-FP32 contract, so encode_videos
-                    # skips its own convert/transform/pad whole-video copies.
-                    frames = [prepared]
-                latent = self.model.encode_videos(
-                    frames,
-                    use_fp16_latent=True,
-                )[0]
+                    if os.environ.get("VLLM_OMNI_H3_VAE_STREAM_TILE", "0") == "1":
+                        latent = self._stream_encode_video_tiles(frames, parameter.device)
+                    if latent is None:
+                        prepared = self._stream_prepare_video_tensor(frames, parameter.device)
+                if latent is None:
+                    if prepared is not None:
+                        # Preserve the normalized-FP32 checkpoint input contract.
+                        frames = [prepared]
+                    latent = self.model.encode_videos(
+                        frames,
+                        use_fp16_latent=True,
+                    )[0]
         finally:
             if previous_dtype != torch.float32:
                 self.to(previous_dtype)
