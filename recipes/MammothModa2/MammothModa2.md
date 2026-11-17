@@ -66,6 +66,9 @@ stage 0 and 0.3 for stage 1. The A800 validation section below also shows a
 two-GPU placement with one stage per GPU for attributable timing and memory;
 the measured results are summarized below.
 
+For the Ascend 910B3 profile, see the separate
+[MammothModa2 NPU recipe](./MammothModa2-NPU.md).
+
 ## GPU
 
 ### Optional FP8 AR KV cache
