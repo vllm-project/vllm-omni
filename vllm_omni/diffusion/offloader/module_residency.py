@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import chain
 from typing import Any
 
@@ -20,6 +20,9 @@ from .tensor_utils import dtype_size, is_dtensor, set_tensor_storage
 logger = init_logger(__name__)
 
 _PINNED_ALIGNMENT_BYTES = 256
+# Keep every supported element size on an element boundary inside a pack and
+# match the granularity of the H2D copies the pack feeds.
+_PACKED_ALIGNMENT_BYTES = 512
 _PINNED_SLAB_BYTES = 4 * 1024 * 1024 * 1024
 
 
@@ -443,6 +446,12 @@ class PinnedModuleStager:
     immutable, so no H2D copy repeats). The stable storage addresses keep
     CUDA-graph-captured weight pointers valid across offload/load swaps, at
     the cost of keeping the device storage resident while offloaded.
+
+    With ``pack_by_dtype`` the host masters are merged into one pinned pack
+    per module and dtype, so ``load`` issues fewer, larger H2D copies. A
+    pinned-allocation failure falls back to separate pinned masters.
+    ``pack_by_dtype`` records the selected mode for callers that must verify
+    it before reusing a stager.
     """
 
     def __init__(
@@ -454,6 +463,7 @@ class PinnedModuleStager:
         copy_stream: Any | None = None,
         cache_retention: BoundedAllocatorCache | None = None,
         retain_device_storage: bool = False,
+        pack_by_dtype: bool = False,
     ) -> None:
         modules = (module,) if isinstance(module, nn.Module) else tuple(module)
         if not modules or not all(isinstance(item, nn.Module) for item in modules):
@@ -464,11 +474,13 @@ class PinnedModuleStager:
         self._ready_event = current_omni_platform.Event()
         self.cache_retention = cache_retention
         self.retain_device_storage = retain_device_storage
+        self.pack_by_dtype = pack_by_dtype
         self.loaded = False
         self._groups = self._snapshot_groups(
             modules,
             pin_memory=pin_memory,
             pack_pinned=pin_memory and current_omni_platform.is_rocm(),
+            pack_by_dtype=pack_by_dtype,
         )
         self._device_storages: list[torch.Tensor] = []
         self._restore_masters()
@@ -479,8 +491,35 @@ class PinnedModuleStager:
         *,
         pin_memory: bool,
         pack_pinned: bool = False,
+        pack_by_dtype: bool = False,
     ) -> list[_StorageGroup]:
         source_groups = _collect_source_groups(modules)
+        if pack_by_dtype:
+            groups = _copy_groups_to_cpu(
+                source_groups,
+                pin_memory=False,
+                pack_pinned=False,
+                non_blocking=False,
+            )
+            module_indices: dict[int, int] = {}
+            for index, module in enumerate(modules):
+                for target in chain(module.parameters(), module.buffers()):
+                    module_indices.setdefault(id(target), index)
+            packs: dict[tuple[int, torch.dtype], list[_StorageGroup]] = {}
+            for group in groups:
+                binding = group.bindings[0]
+                key = (module_indices[id(binding.target)], binding.dtype)
+                packs.setdefault(key, []).append(group)
+            try:
+                return [PinnedModuleStager._pack_groups(pack, pin_memory) for pack in packs.values()]
+            except _PinnedSlabAllocationError:
+                logger.debug("Module pinned-host allocation failed; using separate pinned masters", exc_info=True)
+                return _copy_groups_to_cpu(
+                    source_groups,
+                    pin_memory=pin_memory,
+                    pack_pinned=False,
+                    non_blocking=False,
+                )
         try:
             return _copy_groups_to_cpu(
                 source_groups,
@@ -496,6 +535,29 @@ class PinnedModuleStager:
                 pack_pinned=False,
                 non_blocking=False,
             )
+
+    @staticmethod
+    def _pack_groups(groups: list[_StorageGroup], pin_memory: bool) -> _StorageGroup:
+        # Keep each backing storage aligned and preserve aliases by moving
+        # all bindings of that storage together.
+        alignment = _PACKED_ALIGNMENT_BYTES
+        lengths = [group.master.numel() for group in groups]
+        spans = [(length + alignment - 1) // alignment * alignment for length in lengths]
+        try:
+            master = torch.empty(sum(spans), dtype=torch.uint8, device="cpu", pin_memory=pin_memory)
+        except (RuntimeError, MemoryError) as exc:
+            if not pin_memory:
+                raise
+            raise _PinnedSlabAllocationError("Module pinned-host allocation failed") from exc
+        bindings = []
+        offset = 0
+        for group, length, span in zip(groups, lengths, spans, strict=True):
+            master[offset : offset + length].copy_(group.master)
+            for binding in group.bindings:
+                element_size = binding.target.element_size()
+                bindings.append(replace(binding, storage_offset=binding.storage_offset + offset // element_size))
+            offset += span
+        return _StorageGroup(master, bindings)
 
     @staticmethod
     def _view(backing: torch.Tensor, binding: _TensorBinding) -> torch.Tensor:
