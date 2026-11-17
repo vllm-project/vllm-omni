@@ -58,14 +58,14 @@ def aggregate_step_records(
         Mapping ``batch -> median step ms`` (only for batches with at least
         one surviving step).
     """
-    by_batch: dict[int, list[float]] = defaultdict(list)
-    for batch, _step_index, ms in records:
-        by_batch[int(batch)].append(float(ms))
+    by_batch: dict[int, list[tuple[int, float]]] = defaultdict(list)
+    for batch, step_index, ms in records:
+        by_batch[int(batch)].append((int(step_index), float(ms)))
 
     discard = max(0, int(discard_steps))
     out: dict[int, float] = {}
-    for batch, times in by_batch.items():
-        kept = sorted(times)[discard:]
+    for batch, entries in by_batch.items():
+        kept = [ms for _step_index, ms in sorted(entries)][discard:]
         if kept:
             out[batch] = statistics.median(kept)
     return out
