@@ -54,6 +54,9 @@ QWEN3_OMNI_COLD_INIT_TIMEOUT_S = 1200
 # Diffusion workers alone may need 15s + 5s + 5s for cooperative cleanup
 # and signal escalation. Keep their tracker alive while the API owns teardown.
 SERVER_SHUTDOWN_TIMEOUT_S = 60
+# Auto-port OmniServer launches can lose the reserved TCP port between the
+# parent's probe close and the child bind under xdist; retry a few times.
+SERVER_PORT_IN_USE_RETRIES = 3
 
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
@@ -254,7 +257,68 @@ class OmniServer:
             # A child can exit between enumeration and inspecting its sockets.
             return False
 
+    @staticmethod
+    def _is_address_in_use_failure(message: str) -> bool:
+        """Return True when *message* looks like a TCP bind collision."""
+        text = message.lower()
+        return any(
+            needle in text
+            for needle in (
+                "address already in use",
+                "errno 98",
+                "eaddrinuse",
+                "only one usage of each socket address",
+                "error 10048",
+            )
+        )
+
+    def _abandon_launch_attempt(self) -> None:
+        """Kill a failed child and drop the port lock so a retry can rebind."""
+        if self.proc is not None:
+            try:
+                if self.proc.poll() is None:
+                    self._kill_process_tree(self.proc.pid)
+            except Exception:
+                pass
+            self._stop_stderr_reader()
+            self.proc = None
+        if self._port_lock is not None:
+            self._port_lock.release()
+            self._port_lock = None
+        self._server_error_lines = deque(maxlen=100)
+
     def _start_server(self) -> None:
+        attempts = SERVER_PORT_IN_USE_RETRIES if self._auto_port else 1
+        last_error: BaseException | None = None
+        for attempt in range(attempts):
+            try:
+                self._start_server_once()
+                return
+            except RuntimeError as exc:
+                last_error = exc
+                failure_text = f"{exc}{''.join(self._server_error_lines)}"
+                # Only early bind exits may retry. A still-running child that
+                # merely logged an unrelated EADDRINUSE (then hit the startup
+                # timeout) must not consume additional full startup budgets.
+                child_exited = self.proc is not None and self.proc.poll() is not None
+                can_retry = (
+                    self._auto_port
+                    and attempt + 1 < attempts
+                    and child_exited
+                    and self._is_address_in_use_failure(failure_text)
+                )
+                self._abandon_launch_attempt()
+                if not can_retry:
+                    raise
+                print(
+                    f"OmniServer port bind failed (attempt {attempt + 1}/{attempts}); "
+                    "retrying with a new auto-selected port",
+                    flush=True,
+                )
+        assert last_error is not None
+        raise last_error
+
+    def _start_server_once(self) -> None:
         self._reserve_port()
         env = os.environ.copy()
         if self.env_dict is not None:
@@ -1260,14 +1324,59 @@ def get_model_prefix() -> str:
     return f"{prefix.rstrip('/')}/" if prefix else ""
 
 
+def _deploy_config_arg_index(server_args: list[str]) -> int | None:
+    for index, arg in enumerate(server_args):
+        if arg == "--deploy-config" or arg.startswith("--deploy-config="):
+            return index
+    return None
+
+
+def _deploy_config_value(server_args: list[str], index: int) -> str:
+    arg = server_args[index]
+    if arg.startswith("--deploy-config="):
+        return arg.split("=", 1)[1]
+    if index + 1 >= len(server_args):
+        raise ValueError("--deploy-config requires a path")
+    return server_args[index + 1]
+
+
+def _resolve_server_deploy_args(
+    server_args: list[str] | None,
+    stage_config_path: str | None,
+    run_level: str,
+) -> tuple[list[str], str | None, bool]:
+    """Return launch args, the deploy path, and whether args already carry it.
+
+    A ``--deploy-config`` that exists only in ``server_args`` is rewritten when
+    the weekly runner override is set. Otherwise that argument, including its
+    ``load_format``, is left as the test wrote it.
+    """
+    from tests.helpers.stage_config import _ci_model_runner_override, stage_config_path_for_run_level
+
+    args = list(server_args or [])
+    deploy_arg_index = None
+    deploy_path = stage_config_path
+    if deploy_path is None and _ci_model_runner_override() is not None:
+        deploy_arg_index = _deploy_config_arg_index(args)
+        if deploy_arg_index is not None:
+            deploy_path = _deploy_config_value(args, deploy_arg_index)
+    resolved = stage_config_path_for_run_level(deploy_path, run_level)
+    replaced = False
+    if deploy_arg_index is not None and resolved is not None:
+        if args[deploy_arg_index].startswith("--deploy-config="):
+            args[deploy_arg_index] = f"--deploy-config={resolved}"
+        else:
+            args[deploy_arg_index + 1] = resolved
+        replaced = True
+    return args, resolved, replaced
+
+
 def iter_omni_server(
     request: Any,
     run_level: str,
     omni_fixture_lock: threading.Lock,
 ) -> Generator[Any, Any, None]:
     """Start/stop an Omni HTTP server; used by ``omni_server`` / ``omni_server_function`` fixtures."""
-    from tests.helpers.stage_config import stage_config_path_for_run_level
-
     model_prefix = get_model_prefix()
     with omni_fixture_lock, _whisper_device_free_around():
         params: OmniServerParams = request.param
@@ -1284,9 +1393,9 @@ def iter_omni_server(
         if run_level == "core_model" and request.node.get_closest_marker("diffusion"):
             model = resolve_tiny_model_path(model)
         port = params.port
-        stage_config_path = stage_config_path_for_run_level(params.stage_config_path, run_level)
-
-        server_args = params.server_args or []
+        server_args, stage_config_path, deploy_arg_replaced = _resolve_server_deploy_args(
+            params.server_args, params.stage_config_path, run_level
+        )
         if model != original_model:
             server_args = [*server_args, "--served-model-name", original_model]
         if params.use_omni:
@@ -1321,7 +1430,7 @@ def iter_omni_server(
                 yield server
                 print("OmniServer stopping...")
         else:
-            if stage_config_path is not None:
+            if stage_config_path is not None and not deploy_arg_replaced:
                 server_args += ["--deploy-config", stage_config_path]
 
             with (

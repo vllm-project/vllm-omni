@@ -327,6 +327,13 @@ accepted for interface parity but are not enforced: a hung worker blocks the
 calling thread. Sticky accelerator faults mark the executor dead through
 failure callbacks; ordinary request errors stay per-request.
 
+Before returning device-backed output, UNI records a producer-stream completion
+event. The output stream waits on that event before handing the result to its
+consumer thread and records tensor storage on the consumer stream. This applies
+only to materialized outputs, including streamed chunks; denoising steps without
+an output do not synchronize. CPU outputs need no device event. Platforms without
+event support finish the producer before returning the output.
+
 ### Multiproc backend
 
 `MultiprocDiffusionExecutor`:
@@ -428,6 +435,11 @@ ownership of scheduler cleanup.
 
 ### Shutdown and worker failure
 
+For shared-weight consumers, the worker closes and drops its LoRA manager
+before detaching the runner and closing imported weights. The default manager
+retains the pipeline even when no adapter is loaded. A cleanup failure poisons
+the consumer session; it does not authorize the provider to release its weights.
+
 `DiffusionEngine.close()` is idempotent. It stops the busy loop, wakes pending
 streams with an error, closes scheduler state, and shuts down the executor.
 
@@ -528,3 +540,19 @@ at idle through the engine, executor, worker, and runner using two CPU regressio
 - [Async diffusion output](../../feature/async_diffusion_output.md)
 - [Engine orchestration](../engine_orchestration.md)
 - [Stage runtime](../stage_runtime.md)
+
+### NPU worker finalization
+
+NPU runtime finalization can continue after the worker reports application
+shutdown. The multiprocess executor allows a shared 60-second graceful join
+window on NPU, retaining the 15-second window on other platforms and the
+existing bounded terminate/kill escalation. Exit-code logging distinguishes
+natural process exit from a completed application cleanup message.
+
+The out-of-process NPU `mp` stage client waits up to 80 seconds for a sent
+shutdown request: the worker grace plus both escalation windows and stage
+finalization. It then falls back to the bounded signal-based shutdown. This
+prevents the outer process manager from cutting short the worker deadline.
+This grace is gated on the resolved executor's `uses_multiproc` capability,
+including default and custom executors. Single-device default `uni` stages
+retain the normal bounded signal-based shutdown without the 80-second wait.
