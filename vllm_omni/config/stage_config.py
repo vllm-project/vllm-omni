@@ -47,6 +47,18 @@ _TOPOLOGY_OWNED_ENGINE_FIELDS = frozenset(
     }
 )
 
+SKIP_STREAMING_UPDATES_ATTR = "_omni_skip_streaming_updates"
+
+
+def skip_on_streaming_updates(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Mark a ``prompt_transform_func`` to run only when a request is first submitted.
+
+    The engine then does not call it on streaming-input updates, which carry
+    the later chunks of a request that already passed the transform.
+    """
+    setattr(func, SKIP_STREAMING_UPDATES_ATTR, True)
+    return func
+
 
 def _normalize_stage_backend_fields(stage: StageDeployConfig) -> None:
     """Normalize promoted backends and enforce their precedence over extras."""
@@ -395,7 +407,8 @@ class StagePipelineConfig:
     supports_duplex_mrv2: bool = False
     # Rewrites the Stage-0 view of a raw prompt before vLLM input processing.
     # The callable receives ``(prompt, sampling_params_list)``; downstream
-    # stages continue to receive the original prompt.
+    # stages continue to receive the original prompt. It also runs on
+    # streaming-input updates unless marked with ``skip_on_streaming_updates``.
     prompt_transform_func: str | None = None
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
@@ -725,6 +738,7 @@ class DuplexSessionRuntimeConfig:
     max_tool_calls_per_session: int = 4096
     replica_policy: Literal["legacy", "least_sessions"] = "legacy"
     max_sessions_per_replica: int | None = None
+    # Omitted groups join every replica combination across the pipeline stages.
     replica_groups: list[dict[int, int]] | None = None
     # Unread by the plugin framework. It used to bound the per-session
     # completed-append table that made a retried append RPC submit once; the
