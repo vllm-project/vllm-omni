@@ -14,6 +14,9 @@ KV allocation. A model adapter owns model-specific controls and conditioning.
 LingBot World v2 is the first single-KV-branch integration. DreamZero uses the
 same runner capability with two logical CFG branches.
 
+See the [KV backend and compute-member contract](ar_diffusion_kv_backends.md)
+for the storage-independent interfaces beneath the existing Session layer.
+
 ## Identities
 
 Four identifiers have distinct lifetimes:
@@ -109,6 +112,17 @@ retry that succeeds removes the session. Transport disconnect uses the same
 path.
 
 ## KV ownership and capacity
+
+The storage boundary `KVCacheLifecycle[OwnerT]` separates finishing a compute
+request from releasing retained history. Legacy owners are session/branch
+adapters, not individual service request IDs. `ARDiffusionKVCache.finish_request`
+validates the owner and preserves its window/segment history; the successful
+request or emitted-chunk boundary in the runner calls it through
+`ARDiffusionKVState.finish_request`. Session close/reset and segment eviction
+use `release_history` to return pages to the existing pool. The old
+`end_request` method remains a compatibility entry point for full release.
+These operations do not add per-step synchronization or change history policy,
+layout, capacity, or model sampling.
 
 `ARDiffusionKVCacheSpec` is the pipeline-owned immutable geometry contract. It
 declares:
@@ -208,6 +222,13 @@ uses each shard's global token offset, including shards that split a frame. Only
 `ulysses_mode="strict"` is supported; `advanced_uaa`, Ring, and AllGather-KV modes
 remain unsupported for this model.
 
+## NPU host lengths
+
+On NPU, LingBot passes the singleton forward's valid query and KV lengths
+from the CPU-owned forward context into paged attention after preparation.
+Direct replay uses the visible tensor shapes. The NPU custom op declares
+the KV pools as mutable inputs.
+
 ## Non-goals
 
 This contract does not currently provide:
@@ -241,3 +262,99 @@ CPU contract tests cover:
 GPU validation must additionally exercise real model loading, action input,
 prompt switching, rolling-window replacement, reset, close, finite output
 latents, and exact metadata/request identity.
+
+## Experimental WorldKV memory for LingBot World
+
+`model_config.worldkv` opts LingBot into training-free, pose-indexed KV memory.
+Without it, the native sink and window paths are unchanged. Units are latent
+frames; `window_frames` includes the 3-frame current chunk.
+
+```yaml
+model_config:
+  worldkv:
+    window_frames: 18
+    sink_frames: 3            # multiple of the chunk size when retrieving
+    retrieval_frames: 9       # budget after compression; 0 disables retrieval
+    bank_bytes: 51539607552   # per-memory CPU bank, FIFO eviction
+    world_keep_ratio: 0.25    # 1.0 disables compression; needs retrieval
+    world_score: pairwise_mean  # or centroid, as in the released code
+    reuse_attention_kv: false  # cache assembled windows across denoising forwards
+    prefetch_kv: false         # CUDA host-bank retrieval on a dedicated stream
+    prefetch_bank_allocation: false  # allocate the next host chunk during denoising
+    layerwise_bank_copy: false  # overlap uncompressed CUDA publication with later layers
+    # host_bank_limit_bytes: process-wide cap, defaults to physical memory
+```
+
+- **Retrieval:** every chunk committed after the sink is copied to the bank
+  at commit, keyed by its middle-frame C2W pose, while it may still be in the
+  local window. Only chunks that have left the visible sink and recent window
+  are retrieval candidates. Each chunk ranks them by translation plus rotation
+  distance and fits whole chunks into the budget, in time order with original RoPE.
+- **Compression:** only bank rows; the anchor frame is kept in full.
+- **Assembly:** canonical GPU history contains an uncompressed sink and a
+  contiguous recent suffix. Host-known frame boundaries select views of these
+  regions before concatenation with retrieved and current rows, avoiding
+  per-layer GPU index discovery and scalar synchronization. Bank compression
+  does not change these history boundaries. With `reuse_attention_kv`, each layer
+  assembles its window once per chunk and overwrites only the current K/V tail
+  on later forwards. These borrowed attention views are consumed before the next
+  forward on the same compute stream. Pose/geometry changes, commit, failure and
+  close invalidate them. GPU admission includes one extra full window per layer.
+- **Transfers:** CUDA commits copy K/V into pinned host memory on a separate
+  stream. Host-bank retrieval waits for that copy; uncompressed chunks still
+  resident in GPU history are read directly. At most one publication remains
+  in flight. By default, uncompressed publication borrows the new history's tail; separately
+  owned compressed source storage is included in the GPU reservation.
+  Each publication packs K/V into one host allocation per dtype, with disjoint
+  views for individual layers. Live chunks never share backing storage.
+  History and bank rows store only K/V. Keys already carry their RoPE
+  positions, and frame boundaries come from host-side chunk bookkeeping.
+  With `prefetch_kv`, the first layer queues selected K/V for all layers on a
+  dedicated CUDA stream. Each consumer waits for its own layer event and records
+  destination storage on the compute stream. Cancellation drains outstanding
+  prefetches before releasing cached rows. CPU execution uses ordinary retrieval.
+  These options default to false and can be enabled independently.
+  With `prefetch_bank_allocation`, a worker prepares at most one upcoming
+  publication's pinned allocation once layer geometry is known. Commit consumes
+  it; forward failure and close wait for the worker and discard it. The worker
+  owns allocation sizes and a device index, not request or GPU tensor references.
+  This option does not preallocate the entire bank; its benefit depends on the
+  host allocator and must be measured with the selected process-wide settings.
+  With `layerwise_bank_copy` and uncompressed CUDA banks, each clean layer
+  queues its K/V copy as soon as the layer produces it. Later layers can compute
+  while earlier copies run. Publication remains transactional: all layers,
+  the output head and retention must succeed before the bank changes. Failures
+  drain staged copies before releasing their host storage. GPU admission also
+  reserves the pending chunk's K/V storage while copies remain in flight.
+  CPU, compressed banks and unavailable prior geometry use ordinary publication.
+  This option defaults to false and does not require background allocation.
+  Pinned allocations use PyTorch's caching allocator; initial bank filling
+  still incurs allocation costs. `bank_bytes` bounds live entries, not allocator
+  caches or the temporary replacement chunk needed for transactional publication.
+- **Bank size:** about 1.79 GiB per chunk at 480x832, bf16, ratio 0.25. A
+  revisit is recalled only while its chunk is still in the bank; the first
+  eviction logs a warning.
+- **Limits:** single rank, single sequence, eager, clean-x0 commits. Deep
+  Sink, Participative Compression, RoPE rebasing and CausVid keys are rejected.
+- **State:** history and bank publish only after an all-layer clean forward;
+  failures, reset and close leave canonical state unchanged.
+
+For large CUDA host banks, PyTorch's host-registration allocator can reduce
+cold pinned-allocation cost. Before starting the process, add
+`pinned_use_cuda_host_register:True,pinned_num_register_threads:8` to
+`PYTORCH_ALLOC_CONF`, preserving any existing allocator options. This is a
+process-wide PyTorch setting, not a WorldKV configuration field; benchmark it
+with the actual workload and host CPU resources. It changes how pages are
+allocated and registered rather than preallocating the entire bank. See
+[PyTorch CUDA memory management](https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf).
+
+For fixed-size large chunks, PyTorch versions supporting
+`pinned_max_round_threshold_mb` can also use
+`pinned_max_round_threshold_mb:128` in the same allocator configuration.
+Allocations larger than that threshold use their requested size rather than
+rounding up to a power of two. This can reduce physical pinned-memory overhead;
+it does not change the logical `bank_bytes` limit or guarantee a latency gain.
+Measure allocator memory and E2E latency separately for the actual chunk sizes.
+
+This is a method transfer, not a reproduction of the paper's benchmark.
+Quality and performance claims need E2E results for the exact revision.

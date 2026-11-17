@@ -67,6 +67,10 @@ self-check.
   optimization, including stage attribution, TTFT / AUDIO_TTFP / AUDIO_RTF
   tuning, async_chunk codec chunking, CUDA graphs, MRv2, replicas, and
   quality-gated A/B evidence
+- [`omni-perf-ceiling`](omni-perf-ceiling/SKILL.md): estimates the best
+  reachable omni serving performance (for example AUDIO_RTF at a target
+  concurrency) from measured cells and per-stage calibrated roofline estimates, and reports the remaining unattributed gap, on CUDA GPUs
+  or Ascend NPUs
 - [`precheck-pr`](precheck-pr/SKILL.md): self-checks a branch before creating a
   PR by validating title format, dead code, simplification opportunities,
   accuracy and performance claims, and merge readiness

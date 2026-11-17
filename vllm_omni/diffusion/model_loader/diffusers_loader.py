@@ -30,6 +30,8 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+from vllm_omni.diffusion.attention.backends.trtllm_calibration import apply_skip_softmax_calibration
+from vllm_omni.diffusion.attention.layer import validate_attention_schedule_candidates
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp import (
@@ -289,12 +291,12 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
     def _prepare_weights(
         self,
-        model_name_or_path: Path | str,
+        model_name_or_path: str,
         subfolder: str | None,
         revision: str | None,
         fall_back_to_pt: bool,
         allow_patterns_overrides: list[str] | None,
-    ) -> tuple[Path | str, list[str], bool]:
+    ) -> tuple[str, list[str], bool]:
         """Prepare weights for the model.
 
         If the model is not local, it will be downloaded."""
@@ -377,7 +379,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         if len(hf_weights_files) == 0:
             raise RuntimeError(f"Cannot find any model weights with `{model_name_or_path}`")
 
-        return hf_folder, hf_weights_files, use_safetensors
+        return str(hf_folder), hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
         self,
@@ -968,6 +970,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     del model
                     return self.load_fresh_canonical_model()
             raise
+        self._validate_attention_schedule_candidates(model)
         self._log_w4a8_fallback_load_summaries(model)
         self._attach_offload_startup_state(model)
         return model
@@ -1088,12 +1091,22 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         return tuple(sorted(unsupported))
 
     def _apply_skip_softmax_calibration(self, model: nn.Module) -> None:
-        from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
-            apply_skip_softmax_calibration,
-        )
-
         cfg = getattr(self.od_config, "diffusion_attention_config", None)
-        apply_skip_softmax_calibration(cfg, model)
+        # A schedule profile can be the only spec carrying calibration, so discovery has to
+        # look past the baseline config or that candidate would stay dense at runtime.
+        schedule = getattr(self.od_config, "diffusion_attention_schedule", None)
+        apply_skip_softmax_calibration(cfg, model, schedule=schedule)
+
+    def _validate_attention_schedule_candidates(self, model: nn.Module) -> None:
+        """Reject an incompatible prepared candidate before the model is served.
+
+        The traversal resolves the same per-candidate calibration dict that stamping uses. It does
+        not read stamped impl state. Without a schedule it walks nothing.
+        """
+        if getattr(self.od_config, "diffusion_attention_schedule", None) is None:
+            return
+        validated = validate_attention_schedule_candidates(model, self.od_config)
+        logger.debug("Attention schedule: %d prepared candidate(s) passed startup checks.", validated)
 
     def _process_weights_after_loading(
         self,

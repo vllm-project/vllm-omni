@@ -521,7 +521,7 @@ class TestSupportedPipelines:
         assert supports_step_execution(pipeline) is True
         assert isinstance(pipeline, SupportsStepExecution) is True
 
-    def test_load_model_rejects_streaming_output_without_step_execution(self, monkeypatch) -> None:
+    def test_load_model_accepts_request_streaming_without_step_execution(self, monkeypatch) -> None:
         class _NoStepPipeline:
             def forward(self): ...
 
@@ -569,5 +569,6 @@ class TestSupportedPipelines:
         )
         monkeypatch.setattr(model_runner_module, "get_cache_backend", lambda *args, **kwargs: None)
 
-        with pytest.raises(ValueError, match="NoStepPipeline"):
-            DiffusionModelRunner.load_model(runner)
+        DiffusionModelRunner.load_model(runner)
+        assert isinstance(runner.pipeline, _NoStepPipeline)
+        assert runner.od_config.step_execution is False
