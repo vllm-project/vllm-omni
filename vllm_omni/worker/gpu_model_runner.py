@@ -139,6 +139,10 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         self._has_lmcache = False
 
     def shutdown(self) -> None:
+        shutdown_connectors = getattr(self, "shutdown_omni_connectors", None)
+        if callable(shutdown_connectors):
+            shutdown_connectors()
+
         # Also inherited by OmniNPUModelRunner. GPU AR stops the cache
         # earlier in its teardown; the shared helper is idempotent.
         self._shutdown_omni_prefix_cache()
