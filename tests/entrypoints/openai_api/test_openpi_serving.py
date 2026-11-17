@@ -12,6 +12,7 @@ import pytest
 from fastapi import FastAPI, WebSocket
 from omegaconf import OmegaConf
 from starlette.testclient import TestClient
+from vllm import SamplingParams
 
 from vllm_omni.entrypoints.openpi import connection as openpi_connection
 from vllm_omni.entrypoints.openpi import serving as openpi_serving
@@ -506,6 +507,87 @@ def test_infer_preserves_dict_actions_from_multimodal_output():
     np.testing.assert_allclose(actions["right_arm"], np.array([[3.0, 4.0]], dtype=np.float32))
     assert actions["left_arm"].dtype == np.float32
     assert actions["right_arm"].dtype == np.float32
+
+
+class FakePromptBuilder:
+    def __init__(self, model_config, policy_server_config):
+        self.model_config = model_config
+        self.policy_server_config = policy_server_config
+
+    def build_prompt(self, obs):
+        return {"prompt_token_ids": [1, 2], "obs_keys": sorted(obs)}
+
+
+class MultiStageEngine:
+    """Autoregressive stage 0, diffusion stage 1 that returns the actions."""
+
+    def __init__(self, model_config=None):
+        if model_config is None:
+            model_config = {
+                "policy_server_config": TEST_POLICY_SERVER_CONFIG,
+                "openpi_prompt_builder": "tests.fake.FakePromptBuilder",
+            }
+        self.od_config = SimpleNamespace(model_config=model_config)
+        self.model_config = SimpleNamespace(model="reasoning-model")
+        self.stage_configs = [SimpleNamespace(stage_type="llm"), SimpleNamespace(stage_type="diffusion")]
+        self.default_sampling_params_list = [
+            SamplingParams(temperature=0.6, max_tokens=8),
+            OmniDiffusionSamplingParams(),
+        ]
+        self.generate_calls = []
+
+    def get_diffusion_od_config(self):
+        return self.od_config
+
+    def generate(self, *, prompt, request_id, sampling_params_list):
+        async def _generate():
+            self.generate_calls.append({"prompt": prompt, "sampling_params_list": sampling_params_list})
+            yield SimpleNamespace(multimodal_output={"actions": [1.0, 2.0]})
+            # The reasoning stage's final output can arrive after the actions.
+            yield SimpleNamespace(multimodal_output={})
+
+        return _generate()
+
+
+def test_multi_stage_policy_gets_prompt_and_params_for_every_stage(monkeypatch):
+    monkeypatch.setattr(openpi_serving, "resolve_obj_by_qualname", lambda path: FakePromptBuilder)
+    engine = MultiStageEngine()
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
+    assert serving.prompt_builder.model_config is engine.model_config
+    assert serving.prompt_builder.policy_server_config == serving.policy_server_config.to_dict()
+
+    actions = asyncio.run(serving.infer({"state": np.zeros(2), "seed": 7}, session_id="s", reset=False))
+
+    np.testing.assert_array_equal(actions, np.array([1.0, 2.0], dtype=np.float32))
+    (call,) = engine.generate_calls
+    assert call["prompt"] == {"prompt_token_ids": [1, 2], "obs_keys": ["state"]}
+    reasoning, diffusion = call["sampling_params_list"]
+    assert isinstance(reasoning, SamplingParams) and reasoning.temperature == 0.6 and reasoning.seed == 7
+    assert isinstance(diffusion, OmniDiffusionSamplingParams) and diffusion.seed == 7
+    assert sorted(diffusion.extra_args["robot_obs"]) == ["state"]
+    # Stage defaults are cloned, not mutated.
+    assert engine.default_sampling_params_list[0].seed is None
+
+
+def test_multi_stage_policy_without_prompt_builder_keeps_observation_prompt():
+    engine = MultiStageEngine(model_config={"policy_server_config": TEST_POLICY_SERVER_CONFIG})
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
+
+    asyncio.run(serving.infer({"prompt": "pick up the cube"}, session_id="s", reset=False))
+
+    (call,) = engine.generate_calls
+    assert call["prompt"] == "pick up the cube"
+    reasoning, diffusion = call["sampling_params_list"]
+    # Without an observation seed every stage shares the request's random seed.
+    assert diffusion.seed is not None and reasoning.seed == diffusion.seed
+
+
+def test_unloadable_prompt_builder_names_the_setting():
+    engine = MultiStageEngine(
+        model_config={"policy_server_config": TEST_POLICY_SERVER_CONFIG, "openpi_prompt_builder": "no.such.Builder"}
+    )
+    with pytest.raises(RuntimeError, match="openpi_prompt_builder"):
+        openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
 
 
 def test_extract_actions_does_not_iterate_result_object():

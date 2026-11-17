@@ -115,6 +115,15 @@ class DuplexOutputContext:
 class DuplexStagePort(ABC):
     """Narrow stage-management surface the session runner/manager use (implemented by DuplexOrchestrator)."""
 
+    def reserve_session(self, session_id: str) -> None:
+        """Atomically reserve capacity, leaving none on error; legacy ports do nothing."""
+
+    def release_session(self, session_id: str) -> None:
+        """Idempotently release a session's replica reservation after cleanup."""
+
+    def reject_session(self, reason: str) -> None:
+        """Observe admission rejection when the stage port enables placement."""
+
     @property
     @abstractmethod
     def stage_count(self) -> int: ...
@@ -165,6 +174,11 @@ def duplex_resource_request_id(fence: DuplexFence, role: str) -> str:
 def duplex_ephemeral_stage_request_id(fence: DuplexFence, *, stage_id: int) -> str:
     """Turn-scoped Stage request id for non-resumable (ephemeral) duplex models."""
     return duplex_resource_request_id(fence, f"stage{stage_id}-turn{fence.turn_id}")
+
+
+def duplex_is_auxiliary_request(request_id: str | None) -> bool:
+    fields = _duplex_resource_request_fields(request_id)
+    return fields is not None and fields[2].startswith("auxiliary-")
 
 
 _EPHEMERAL_TURN_IN_REQUEST_ID = re.compile(r"\.r\.stage\d+-turn(\d+)$")

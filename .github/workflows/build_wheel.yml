@@ -2,8 +2,10 @@ name: Build Wheel
 
 on:
   push:
+    # release/v* covers release/vX.Y.Z and release/vX.Y.ZrcN.
     branches:
       - main
+      - "release/v*"
     paths-ignore:
       - 'docs/**'
       - 'examples/**'
@@ -18,6 +20,7 @@ on:
   pull_request:
     branches:
       - main
+      - "release/v*"
     paths-ignore:
       - 'docs/**'
       - 'examples/**'
@@ -30,6 +33,10 @@ on:
       - '.gitattributes'
       - 'LICENSE'
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:

@@ -183,13 +183,16 @@ Failed jobs: 1/2
     pytest -s -v dfx/stability/scripts/run_stability_wan22.py -m slow
 
     # Reliability: Qwen3-Omni (H100 × 2)
-    pytest -s -v dfx/reliability/test_reliability_qwen3_omni.py -m slow
+    pytest -s -v dfx/reliability/test_qwen3_omni.py -m "slow and cards_2"
 
     # Reliability: Wan2.2 (H100)
-    pytest -s -v dfx/reliability/test_reliability_wan22.py -m slow
+    pytest -s -v dfx/reliability/test_wan22.py -m "slow and cards_1"
 
     # Reliability: HunyuanImage DiT (H100 × 4)
-    pytest -s -v dfx/reliability/test_reliability_hunyuan_image.py -m slow
+    pytest -s -v dfx/reliability/test_hunyuan_image.py -m "slow and cards_4"
+
+    # Reliability: MiniCPM-o 4.5 (H100). SIGTERM serve-root only, plus partial isolation.
+    pytest -s -v dfx/reliability/test_minicpmo_4_5.py -m "slow and cards_1"
 
     ```
 

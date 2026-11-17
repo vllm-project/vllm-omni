@@ -1479,7 +1479,7 @@ class MMModule(nn.Module):
 
 
 class RMSNorm(nn.Module):
-    """Reference ``CustomRMSNorm``: normalise in the input dtype, optional affine."""
+    """RMS normalization with FP32 accumulation for low-precision inputs."""
 
     def __init__(self, dim: int, eps: float = 1e-5, elementwise_affine: bool = True) -> None:
         super().__init__()
@@ -1490,8 +1490,13 @@ class RMSNorm(nn.Module):
             self.register_parameter("weight", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_dtype = x.dtype
+        # Squaring finite FP16 activations above ~256 overflows to infinity,
+        # silently zeroing the entire token when it is divided by the RMS.
+        if input_dtype in (torch.float16, torch.bfloat16):
+            x = x.float()
         variance = x.pow(2).mean(dim=-1, keepdim=True)
-        x = x / torch.sqrt(variance + self.eps)
+        x = (x / torch.sqrt(variance + self.eps)).to(input_dtype)
         if self.weight is not None:
             x = x * self.weight.to(x.dtype)
         return x

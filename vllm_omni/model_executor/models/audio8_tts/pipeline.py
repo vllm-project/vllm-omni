@@ -34,6 +34,10 @@ AUDIO8_TTS_PIPELINE = PipelineConfig(
                 "detokenize": False,
                 "stop_token_ids": [AUDIO8_TTS_EOS_TOKEN_ID],
             },
+            # talker_mtp folds the sampled codebook embeddings into this
+            # step's inputs_embeds; a replay rebuilds only the text part and
+            # pads the rest (vllm-project/vllm-omni#6179).
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,

@@ -2,12 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import hashlib
+import io
+from contextlib import contextmanager
+from threading import Event
+from types import SimpleNamespace
 
 import av
 import numpy as np
 import pytest
 
-from vllm_omni.diffusion.utils.media_utils import ChunkedMP4Encoder, mux_av_video_audio_bytes
+from vllm_omni.diffusion.utils.chunked_video import ChunkedVideoMP4Session
+from vllm_omni.diffusion.utils.media_utils import ChunkedMP4Encoder, mux_av_video_audio_bytes, mux_video_audio_bytes
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -15,6 +20,138 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 def _frames() -> np.ndarray:
     rng = np.random.default_rng(6872)
     return rng.integers(0, 256, size=(8, 16, 24, 3), dtype=np.uint8)
+
+
+@pytest.fixture
+def audio_done(monkeypatch):
+    audio_done = Event()
+    open_container = av.open
+
+    class AudioStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        @property
+        def layout(self):
+            return self.stream.layout
+
+        @layout.setter
+        def layout(self, value):
+            self.stream.layout = value
+
+        def encode(self, frame=None):
+            packets = self.stream.encode(frame)
+            if frame is None:
+                audio_done.set()
+            return packets
+
+    @contextmanager
+    def recorded_container(*args, **kwargs):
+        with open_container(*args, **kwargs) as container:
+
+            def add_stream(*args, **kwargs):
+                stream = container.add_stream(*args, **kwargs)
+                return AudioStream(stream) if stream.type == "audio" else stream
+
+            yield SimpleNamespace(add_stream=add_stream, mux=container.mux)
+
+    monkeypatch.setattr(av, "open", recorded_container)
+    return audio_done
+
+
+@pytest.mark.parametrize("encode_audio_first", [None, False, True])
+def test_audio_priority_is_opt_in(audio_done, encode_audio_first) -> None:
+    def video():
+        assert audio_done.is_set() == (encode_audio_first is True)
+        yield from (av.VideoFrame.from_ndarray(frame, format="rgb24") for frame in _frames())
+
+    options = {} if encode_audio_first is None else {"encode_audio_first": encode_audio_first}
+    assert mux_av_video_audio_bytes(
+        video(),
+        width=24,
+        height=16,
+        fps=24,
+        audio_waveform=np.zeros((2, 8000), dtype=np.float32),
+        audio_sample_rate=24000,
+        **options,
+    )
+    assert audio_done.is_set()
+
+
+@pytest.mark.parametrize("eager_session", [False, True])
+def test_ready_audio_is_encoded_before_waiting_for_video(audio_done, eager_session) -> None:
+    """Audio work should overlap a producer that has not delivered video yet."""
+
+    if eager_session:
+        import torch
+
+        session = ChunkedVideoMP4Session(
+            value_range=(0.0, 1.0),
+            fps=24,
+            audio_waveforms=[np.zeros((2, 8000), dtype=np.float32)],
+            audio_sample_rate=24000,
+            transfer_slots=0,
+        )
+        try:
+            session.start(width=24, height=16, batch_size=1)
+            assert audio_done.wait(timeout=5), "AAC waited for the first video chunk"
+            session.push(torch.zeros(1, 3, 8, 16, 24))
+            assert session.finish()
+        finally:
+            session.abort()
+        return
+
+    def delayed_video():
+        assert audio_done.is_set(), "audio encoding was deferred until video completion"
+        yield from (av.VideoFrame.from_ndarray(frame, format="rgb24") for frame in _frames())
+
+    result = mux_av_video_audio_bytes(
+        delayed_video(),
+        width=24,
+        height=16,
+        fps=24,
+        audio_waveform=np.zeros((2, 8000), dtype=np.float32),
+        audio_sample_rate=24000,
+        encode_audio_first=True,
+    )
+    assert result
+
+
+@pytest.mark.parametrize("encode_audio_first", [False, True])
+def test_early_audio_preserves_decoded_media_and_timestamps(encode_audio_first) -> None:
+    """Moving AAC work must preserve samples, video pixels and stream timing."""
+    frames = _frames()
+    time = np.arange(8000, dtype=np.float32) / 24000
+    audio = np.stack([0.1 * np.sin(2 * np.pi * frequency * time) for frequency in (440, 660)])
+    options = dict(fps=24, audio_sample_rate=24000, video_codec_options={"threads": "1"})
+    baseline = mux_video_audio_bytes(frames, audio, **options)
+    result = mux_av_video_audio_bytes(
+        (av.VideoFrame.from_ndarray(frame, format="rgb24") for frame in frames),
+        width=24,
+        height=16,
+        audio_waveform=audio,
+        encode_audio_first=encode_audio_first,
+        **options,
+    )
+
+    def decoded(data):
+        with av.open(io.BytesIO(data)) as container:
+            timing = [
+                (stream.type, stream.start_time, stream.duration, stream.time_base) for stream in container.streams
+            ]
+            video = np.stack([frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)])
+        with av.open(io.BytesIO(data)) as container:
+            audio_frames = list(container.decode(audio=0))
+            samples = np.concatenate([frame.to_ndarray() for frame in audio_frames], axis=1)
+            audio_timing = [(frame.pts, frame.time_base, frame.sample_rate) for frame in audio_frames]
+        return video, samples, timing, audio_timing
+
+    old_video, old_audio, old_timing, old_audio_timing = decoded(baseline)
+    new_video, new_audio, new_timing, new_audio_timing = decoded(result)
+    np.testing.assert_array_equal(new_video, old_video)
+    np.testing.assert_array_equal(new_audio, old_audio)
+    assert new_timing == old_timing
+    assert new_audio_timing == old_audio_timing
 
 
 def test_chunked_mp4_is_byte_identical_to_whole_mux() -> None:
@@ -49,6 +186,7 @@ def test_chunked_mp4_is_byte_identical_to_whole_mux() -> None:
         audio_waveform=audio,
         audio_sample_rate=32000,
         video_codec_options={"threads": "1"},
+        encode_audio_first=True,
     )
     encoder_audio = ChunkedMP4Encoder(
         width=24,

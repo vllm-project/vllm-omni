@@ -15,7 +15,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import math
 import os
 from collections.abc import Callable, Iterable
@@ -43,9 +42,10 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
     Flux2Transformer2DModel,
+    _use_local_single_stream_tp,
 )
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
-from vllm_omni.diffusion.models.utils import latent_channels_from_vae
+from vllm_omni.diffusion.models.utils import latent_channels_from_vae, load_vae_scale_factor, vae_scale_factor_from_vae
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -151,10 +151,7 @@ def get_flux2_klein_post_process_func(
     else:
         model_path = download_weights_from_hf_specific(model_name, None, ["*"])
 
-    vae_config_path = os.path.join(model_path, "vae/config.json")
-    with open(vae_config_path) as f:
-        vae_config = json.load(f)
-        vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
+    vae_scale_factor = load_vae_scale_factor(model_path)
 
     image_processor = Flux2ImageProcessor(vae_scale_factor=vae_scale_factor * 2)
 
@@ -263,9 +260,13 @@ class Flux2KleinPipeline(
         ).to(self._execution_device)
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, Flux2Transformer2DModel)
-        self.transformer = Flux2Transformer2DModel(quant_config=od_config.quantization_config, **transformer_kwargs)
+        self.transformer = Flux2Transformer2DModel(
+            quant_config=od_config.quantization_config,
+            local_tp=_use_local_single_stream_tp(od_config),
+            **transformer_kwargs,
+        )
 
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
+        self.vae_scale_factor = vae_scale_factor_from_vae(getattr(self, "vae", None))
         self.latent_channels = latent_channels_from_vae(self.vae)
         self.image_processor = Flux2ImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
         self.mask_processor = VaeImageProcessor(

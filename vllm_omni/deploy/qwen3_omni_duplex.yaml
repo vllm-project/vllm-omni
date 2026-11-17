@@ -3,6 +3,8 @@ base_config: qwen3_omni_moe.yaml
 session_mode: duplex
 stages:
   - stage_id: 0
+    # The base profile's Thinker prefix cache is validated for turn serving only.
+    enable_prefix_caching: false
     limit_mm_per_prompt:
       audio: 4
       image: 8

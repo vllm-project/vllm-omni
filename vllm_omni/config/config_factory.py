@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import functools
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
@@ -94,6 +94,17 @@ def _name_match_candidate(model: str) -> str:
     not resolve to the ``qwen3_tts`` pipeline.
     """
     return model.rstrip("/").rsplit("/", 1)[-1]
+
+
+def _match_pipeline_key(model: str, keys: Iterable[str]) -> str | None:
+    model_lower = _name_match_candidate(model).lower().replace("-", "").replace("_", "")
+    best: str | None = None
+    best_len = 0
+    for key in keys:
+        candidate = key.lower().replace("-", "").replace("_", "")
+        if candidate and candidate in model_lower and len(candidate) > best_len:
+            best, best_len = key, len(candidate)
+    return best
 
 
 def with_trust_remote_code_override(
@@ -244,6 +255,7 @@ class StageConfigFactory:
             model_index = get_hf_file_to_dict("model_index.json", config_source, revision=None)
             if model_index and "_class_name" in model_index:
                 class_name = model_index["_class_name"]
+                matches: list[PipelineConfig] = []
                 for obj in OMNI_PIPELINES.values():
                     # If we have a resolver, call it with the optional hf_config
                     # to get the default pipeline config for this key
@@ -252,12 +264,17 @@ class StageConfigFactory:
                         pipeline_cfg.diffusers_class_name,
                         *pipeline_cfg.diffusers_class_aliases,
                     ):
-                        logger.info(
-                            "Detected pipeline %r from model_index.json (_class_name=%r)",
-                            pipeline_cfg.model_type,
-                            class_name,
-                        )
-                        return pipeline_cfg.model_type
+                        matches.append(pipeline_cfg)
+                if matches:
+                    # Disambiguate a shared Diffusers class by basename; keep the default for ordinary Wan.
+                    matched_key = _match_pipeline_key(model, (cfg.model_type for cfg in matches))
+                    pipeline_cfg = next((cfg for cfg in matches if cfg.model_type == matched_key), matches[0])
+                    logger.info(
+                        "Detected pipeline %r from model_index.json (_class_name=%r)",
+                        pipeline_cfg.model_type,
+                        class_name,
+                    )
+                    return pipeline_cfg.model_type
         except Exception as e:
             logger.debug(f"Failed to detect model type for diffusers-style models: {e}")
 
@@ -267,18 +284,7 @@ class StageConfigFactory:
         # so "cosyvoice3" (length 10) beats "cosyvoice" (length 9). Only
         # the basename is scanned so URI segments such as the bucket name
         # cannot select an unrelated pipeline.
-        model_lower = _name_match_candidate(model).lower().replace("-", "").replace("_", "")
-        best: str | None = None
-        best_len = 0
-        for registered_key in OMNI_PIPELINES.keys():
-            candidate = registered_key.lower().replace("-", "").replace("_", "")
-            if candidate and candidate in model_lower and len(candidate) > best_len:
-                best = registered_key
-                best_len = len(candidate)
-        if best is not None:
-            return best
-
-        return None
+        return _match_pipeline_key(model, OMNI_PIPELINES.keys())
 
     @classmethod
     def get_pipeline_config(
@@ -648,13 +654,6 @@ class StageConfigFactory:
         kwargs: dict[str, Any],
     ) -> tuple[dict[str, Any], DiffusionParallelConfig, dict[str, Any], str]:
         """Normalize inputs shared by typed and compatibility diffusion builders."""
-        # Preserve the default builder's explicit top-level override of model
-        # extras before the strict same-source alias validator runs.
-        if kwargs.get("auxiliary_text_encoder") is not None:
-            kwargs = dict(kwargs)
-            extras = dict(kwargs.get("extras") or {})
-            extras.pop("auxiliary_text_encoder", None)
-            kwargs["extras"] = extras
         kwargs = normalize_and_validate_diffusion_engine_ingress_kwargs(kwargs, stage_id=0)
         raw_sampling_params = kwargs.get("default_sampling_params")
         if isinstance(raw_sampling_params, str):
@@ -679,18 +678,6 @@ class StageConfigFactory:
         engine_args = OmniDiffusionConfig.normalize_init_kwargs(
             {name: value for name, value in kwargs.items() if name in diffusion_config_fields}
         )
-
-        extras = dict(engine_args.get("extras") or {})
-        for key, default in (
-            ("auxiliary_text_encoder", None),
-            ("default_llama_model_id", "meta-llama/Meta-Llama-3.1-8B-Instruct"),
-        ):
-            value = kwargs.get(key)
-            if value is not None:
-                extras[key] = value
-            else:
-                extras.setdefault(key, default)
-        engine_args["extras"] = extras
 
         model_class_name = engine_args.get("model_class_name")
         final_output_type = get_diffusion_output_type(model_class_name)
@@ -735,8 +722,40 @@ class StageConfigFactory:
         cls,
         model: str,
         kwargs: dict[str, Any],
+        *,
+        deploy_config_path: str | None = None,
     ) -> VllmOmniConfig:
         """Build generic diffusion directly into the structured runtime config."""
+        deploy = cls._load_user_deploy_config(deploy_config_path) or DeployConfig()
+        stage_deploy = next((stage for stage in deploy.stages if stage.stage_id == 0), None)
+        if stage_deploy is None:
+            stage_deploy = StageDeployConfig(stage_id=0)
+            deploy.stages.append(stage_deploy)
+
+        # Resolve deploy parallel degrees before inserting defaults. Otherwise
+        # the CLI-default degrees would overwrite YAML and leave SP/world size
+        # inconsistent with the requested device layout.
+        parallel_fields = {item.name for item in fields(DiffusionParallelConfig) if item.init}
+        deploy_parallel = {
+            name: value
+            for source in (deploy, stage_deploy)
+            for name in parallel_fields
+            if (value := getattr(source, name, None)) is not None
+        }
+        if deploy_parallel:
+            cli_parallel = {name: kwargs[name] for name in parallel_fields if kwargs.get(name) is not None}
+            nested_parallel = kwargs.get("parallel_config")
+            if isinstance(nested_parallel, Mapping):
+                cli_parallel.update({name: value for name, value in nested_parallel.items() if value is not None})
+            elif nested_parallel is not None:
+                cli_parallel.update(asdict(DiffusionParallelConfig.from_stage_overrides(kwargs)))
+            merged_parallel = {**deploy_parallel, **cli_parallel}
+            if any(name in cli_parallel for name in ("ulysses_degree", "ring_degree", "allgather_degree")):
+                if "sequence_parallel_size" not in cli_parallel:
+                    merged_parallel.pop("sequence_parallel_size", None)
+            merged_parallel.pop("world_size", None)
+            kwargs = {**kwargs, "parallel_config": merged_parallel}
+
         engine_overrides, parallel_config, default_sampling_params, final_output_type = (
             cls._normalize_default_diffusion(kwargs)
         )
@@ -765,13 +784,24 @@ class StageConfigFactory:
         stage_overrides["stage_0_devices"] = (
             kwargs.get("stage_0_devices")
             or kwargs.get("devices")
+            or stage_deploy.devices
             or ",".join(str(i) for i in range(parallel_config.world_size))
         )
+        for name in ("num_replicas", "env"):
+            if kwargs.get(name) is not None:
+                stage_overrides[f"stage_0_{name}"] = kwargs[name]
         # Caller defaults belong to deployment, not immutable pipeline constraints:
         # explicit request sampling parameters must still be able to override them.
-        deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, default_sampling_params=default_sampling_params)])
+        if default_sampling_params:
+            stage_deploy.default_sampling_params = {
+                **(stage_deploy.default_sampling_params or {}),
+                **default_sampling_params,
+            }
         return VllmOmniConfig.from_pipeline_config(
-            pipeline, user_deploy_config=deploy, cli_overrides={"model": model, **stage_overrides}
+            pipeline,
+            user_deploy_config=deploy,
+            deploy_config_path=deploy_config_path,
+            cli_overrides={"model": model, **stage_overrides},
         )
 
     @classmethod

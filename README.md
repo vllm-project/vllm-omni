@@ -9,13 +9,14 @@ Easy, fast, and cheap omni-modality model serving for everyone
 </h3>
 
 <p align="center">
-| <a href="https://vllm-omni.readthedocs.io/en/latest/"><b>Documentation</b></a> | <a href="https://deepwiki.com/vllm-project/vllm-omni"><b>DeepWiki</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> | <a href="docs/assets/WeChat.jpg"><b>WeChat</b></a> | <a href="https://arxiv.org/abs/2602.02204"><b>Paper</b></a> | <a href="https://docs.google.com/presentation/d/1aPj0OGl_-ZVoib-Qne5dGDAlrRFB-PdHl6E-EE99g8E/edit?usp=sharing"><b>Slides</b></a> |
+| <a href="https://vllm-omni.readthedocs.io/en/latest/"><b>Documentation</b></a> | <a href="https://deepwiki.com/vllm-project/vllm-omni"><b>DeepWiki</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> | <a href="docs/assets/WeChat.jpg"><b>WeChat</b></a> | <a href="https://arxiv.org/abs/2610.09307"><b>Technical Report</b></a> | <a href="https://arxiv.org/abs/2602.02204"><b>Paper</b></a> | <a href="https://docs.google.com/presentation/d/1SV7-4AoSrnK25syLG9XmnEgC0D4lcjP7/edit?usp=sharing"><b>Slides</b></a> |
 </p>
 
 ---
 
 *Latest News* 🔥
 
+- [2026/10] We released the [vLLM-Omni Technical Report](https://arxiv.org/abs/2610.09307), describing a unified serving runtime for text, audio, image, video, and action generation.
 - [2026/09] We released [0.30.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.30.0), rebased onto vLLM 0.30.0, featuring a unified full-duplex serving framework around engine-owned sessions for [MiniCPM-o 4.5](recipes/OpenBMB/MiniCPM-o-4_5.md) and AURA, native cross-stage KV and multimodal payload transfer (Mooncake AR-to-DiT handoff and NIXL connectors), interactive world-model serving with [LingBot World](recipes/Robbyant/LingBot-World-2.0.md), and realtime [MiniMax H3](recipes/MiniMaxAI/MiniMax-H3.md) Turbo inference on NVIDIA Blackwell and Ascend 950.
 - [2026/08] We released [0.28.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.28.0), featuring production-ready [MiniMax H3](recipes/MiniMaxAI/MiniMax-H3.md) serving on GPU and NPU, a unified AR/DiT paged KV cache runtime, and enhanced realtime full-duplex serving for the [MiniCPM-o series](recipes/OpenBMB/MiniCPM-o-4_5.md).
 - [2026/08] [VeRL-Omni](https://github.com/verl-project/verl-omni) `v0.2.0` is released: faster diffusion RL powered by vLLM-Omni (request-level/step-wise batching with FA3), rebuilt Qwen3-Omni multimodal training (DPO & GSPO), plus LTX-2.3, Qwen-Image-Edit support and more. See the [release notes](https://github.com/verl-project/verl-omni/releases/tag/v0.2.0).
@@ -80,9 +81,16 @@ Please check out [Contributing to vLLM-Omni](https://vllm-omni.readthedocs.io/en
 
 ## Citation
 
-If you use vLLM-Omni for your research, please cite our [paper](https://arxiv.org/abs/2602.02204):
+If you use vLLM-Omni for your research, please cite our [technical report](https://arxiv.org/abs/2610.09307) and [original paper](https://arxiv.org/abs/2602.02204):
 
 ```bibtex
+@article{vllmomni2026technicalreport,
+  title={vLLM-Omni Technical Report: A Unified Serving Runtime for Omni-Modality Generation},
+  author={{vLLM-Omni Team}},
+  journal={arXiv preprint arXiv:2610.09307},
+  year={2026}
+}
+
 @article{yin2026vllmomni,
   title={vLLM-Omni: Fully Disaggregated Serving for Any-to-Any Multimodal Models},
   author={Peiqi Yin, Jiangyun Zhu, Han Gao, Chenguang Zheng, Yongxiang Huang, Taichang Zhou, Ruirui Yang, Weizhi Liu, Weiqing Chen, Canlin Guo, Didan Deng, Zifeng Mo, Cong Wang, James Cheng, Roger Wang, Hongsheng Liu},

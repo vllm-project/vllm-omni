@@ -1,3 +1,25 @@
 # MiniCPM-o 4.5 using the turn-based engine and ordinary HTTP serving.
 base_config: minicpmo_4_5.yaml
 session_mode: turn
+
+stages:
+  - stage_id: 0
+    # Thinker prefix cache for turn serving on CUDA. The NPU platform block in
+    # the base and the blocks below keep it off on other platforms; the MRv2
+    # turn profile turns it back off. An overlay that sets this key to false
+    # turns it off (see qwen3_omni_moe.yaml).
+    enable_prefix_caching: true
+
+platforms:
+  rocm:
+    stages:
+      - stage_id: 0
+        enable_prefix_caching: false
+  xpu:
+    stages:
+      - stage_id: 0
+        enable_prefix_caching: false
+  musa:
+    stages:
+      - stage_id: 0
+        enable_prefix_caching: false

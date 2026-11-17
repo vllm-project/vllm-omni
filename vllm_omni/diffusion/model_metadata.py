@@ -21,13 +21,19 @@ class DiffusionModelMetadata:
     # noise masks for latent initialization. Unknown pipelines must remain
     # opted out so uploaded files never reach a model that cannot consume them.
     supports_latent_mask_editing: bool = False
+    # Whether ``/v1/videos`` accepts the ``timeline_guides`` manifest plus
+    # ``guide_files`` uploads, forwarded as ``multi_modal_data["timeline_guides"]``.
+    supports_timeline_guides: bool = False
 
 
 # FLUX.2 Klein supports up to four reference images.
 FLUX2_KLEIN_MAX_INPUT_IMAGES = 4
 QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES = 4
+# Qwen-Image 2.1 image-conditioned generation caps condition images at 4.
+QWEN_IMAGE_21_MAX_INPUT_IMAGES = 4
 # Upstream HunyuanImage-3.0 "Multi-Image Fusion" caps reference images at 3.
 HUNYUAN_IMAGE3_MAX_INPUT_IMAGES = 3
+JOY_IMAGE_EDIT_MAX_INPUT_IMAGES = 1
 # Boogu-Image editing (TI2I) supports a single reference image for now.
 BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
 
@@ -42,6 +48,12 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES,
     ),
+    # Qwen-Image 2.1 handles both text-to-image (no image) and
+    # image-conditioned requests through the same pipeline class.
+    "QwenImage21Pipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=QWEN_IMAGE_21_MAX_INPUT_IMAGES,
+    ),
     "HunyuanImage3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=HUNYUAN_IMAGE3_MAX_INPUT_IMAGES,
@@ -53,11 +65,16 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=BOOGU_IMAGE_MAX_INPUT_IMAGES,
     ),
+    "JoyImageEditPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=JOY_IMAGE_EDIT_MAX_INPUT_IMAGES,
+    ),
     "MiniMaxH3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=9,
         supports_mixed_reference_inputs=True,
         supports_latent_mask_editing=True,
+        supports_timeline_guides=True,
         final_output_type="video",
         # H3 represents alignment padding as a second packed sequence.  The
         # packed TRTLLM backend consumes cu_seqlens and isolates that padding.
@@ -73,6 +90,13 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         max_multimodal_image_inputs=9,
         supports_mixed_reference_inputs=True,
         supports_latent_mask_editing=True,
+        supports_timeline_guides=True,
+        final_output_type="video",
+        attention_mask_free=True,
+    ),
+    # TaoMate-H3 is a text-prompted streaming model on the MiniMax-H3 packed
+    # layout; alignment padding is a second packed document, as for H3.
+    "TaoMateH3Pipeline": DiffusionModelMetadata(
         final_output_type="video",
         attention_mask_free=True,
     ),

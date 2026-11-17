@@ -1,4 +1,4 @@
-# Quantized KV Cache
+# Diffusion Attention Runtime Quantization
 
 ## Overview
 
@@ -7,40 +7,69 @@ denoising time, especially for high-resolution or long-frame workloads.
 vLLM-Omni supports online Q/K/V quantization for eligible diffusion attention
 paths while keeping model weights in their original dtype.
 
-Runtime attention precision is configured through `diffusion_kv_cache_dtype`
-on `OmniDiffusionConfig` (CLI: `--diffusion-kv-cache-dtype`). This setting is
-separate from vLLM's `--kv-cache-dtype`, which controls autoregressive
-language-model KV cache storage.
+Runtime attention precision is configured through the historically named
+`diffusion_kv_cache_dtype` field on `OmniDiffusionConfig` (CLI:
+`--diffusion-kv-cache-dtype`). Despite the `kv_cache` name, this setting is a
+**dense diffusion attention compute selector** in the current implementation;
+it does not change the dtype or allocation of a persistent KV cache.
+
+Do not use vLLM's `--kv-cache-dtype` for this feature. That upstream option
+controls autoregressive language-model KV-cache storage and is intentionally
+separate from Omni's diffusion setting.
 
 In vLLM-Omni diffusion pipelines, this is a runtime FA path: Q/K/V tensors are
-dynamically quantized before the attention operator. It does not quantize model
-weights and is separate from [FP8 W8A8](fp8.md), [Int8 W8A8](int8.md), or
-pre-quantized checkpoint formats.
+quantized for the current attention call and then discarded. It does not
+quantize model weights, does not write a persistent FP8 KV buffer, and is
+separate from [FP8 W8A8](fp8.md), [Int8 W8A8](int8.md), or pre-quantized
+checkpoint formats.
+
+The platform implementations use different quantization runtimes:
+
+- CUDA SM90 calls vLLM's upstream dynamic per-tensor `scaled_fp8_quant` for
+  Q, K and V separately. The upstream operator computes the scales and
+  converts the inputs to FP8. Omni passes those FP8 tensors and their scales
+  to FA3, broadcasting each scalar to `(batch_size, num_kv_heads)`.
+- Ascend NPU passes the BF16/FP16 Q/K/V and `precision=fp8`, `mxfp8`, or
+  `mxfp4` to MindIE-SD `quant_attention`, which performs the vendor-side
+  quantization and attention within that runtime call.
+
+Persistent KV storage quantization is a separate cache lifecycle and is not
+part of this option.
+
+CUDA FP8 attention returns the input dtype (BF16 or FP16), casting FA3's BF16
+output back to FP16 when needed by the model's output projection. The current
+CUDA path requires dense inputs without caller masks, packed-sequence
+metadata, or piecewise spans. Dynamic quantization adds reductions,
+conversions, and kernel launches, so enabling it can increase latency,
+especially for short sequences. Faster generation or lower peak memory use
+is not guaranteed.
 
 If `diffusion_kv_cache_dtype` is not set, attention runs in the native dtype.
 
 ## Hardware Support
 
 | Device | Dense FP8 | Dense MXFP8/MXFP4 | BSA FP8/MXFP4 |
-|--------|------------|-------------------|----------------|
+| -------- | ------------ | ------------------- | ---------------- |
 | Ascend NPU | ✅ | ✅ | ✅ |
-| NVIDIA GPU | ❌ | ❌ | ❌ |
+| NVIDIA GPU (SM90 Hopper) | ✅ | ❌ | ❌ |
 | AMD ROCm | ❌ | ❌ | ❌ |
 | Intel XPU | ❌ | ❌ | ❌ |
 
 Legend: `✅` supported, `❌` unsupported.
 
-These runtime methods are implemented only by the NPU Flash Attention and BSA
-backends. Other backends reject an incompatible explicit configuration.
+Dense FP8 is available through CUDA FA3 on SM90 and through the NPU Flash
+Attention backend. MXFP and BSA variants remain NPU-only. Other backends reject
+an incompatible explicit configuration.
 
 ## Model Type Support
 
 ### Diffusion Model
 
 | Model | Scope | Status | Notes |
-|-------|-------|--------|-------|
+| --- | --- | --- | --- |
 | Wan2.2 | Self-attention on Ascend NPU | NPU interface and T2V smoke tested | Compare quality and latency against a BF16 baseline before production use |
-| Other diffusion models | Eligible DiT full-attention FA on Ascend NPU | Not tested | You can try `diffusion_kv_cache_dtype="fp8"`; tune `diffusion_kv_cache_skip_steps` and `diffusion_kv_cache_skip_layers` when higher precision is needed |
+| Wan2.2 | Self-attention on CUDA SM90 | Full-video E2E exercised | Experimental: quality differences and latency overhead observed |
+| Other diffusion models | Eligible DiT full-attention FA on Ascend NPU or CUDA SM90 | Not tested | Validate `diffusion_kv_cache_dtype="fp8"` and the skip-step/layer settings for each model |
 
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
 
@@ -49,7 +78,7 @@ guide documents support.
 
 ### Multi-Stage Diffusion Model (BAGEL, GLM-Image)
 
-Not tested. If the diffusion stage uses the same NPU Flash Attention backend,
+Not tested. If the diffusion stage uses a supported Flash Attention backend,
 `diffusion_kv_cache_dtype` may apply in theory; validate quality and latency for
 each stage and model.
 
@@ -99,8 +128,8 @@ The legacy keyword aliases `kv_cache_dtype`, `kv_cache_skip_steps`, and
 ## Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `diffusion_kv_cache_dtype` | str \| None | `None` | Runtime attention method. Dense FA supports `fp8`, `mxfp8`, and `mxfp4`; BSA supports `fp8` and `mxfp4` |
+| ----------- | ------ | --------- | ------------- |
+| `diffusion_kv_cache_dtype` | str \| None | `None` | Dense diffusion attention compute precision selector (historical `kv_cache` name; it does not select persistent cache storage). CUDA SM90 dense FA supports `fp8`; NPU dense FA supports `fp8`, `mxfp8`, and `mxfp4`; NPU BSA supports `fp8` and `mxfp4` |
 | `diffusion_kv_cache_skip_steps` | str \| None | `None` | Denoising step selector to keep in native dtype, for example `"0,1,4-6"` |
 | `diffusion_kv_cache_skip_layers` | str \| None | `None` | Transformer layer selector to keep in native dtype, for example `"0-2,10"` |
 

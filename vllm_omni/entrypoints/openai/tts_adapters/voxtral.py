@@ -87,13 +87,7 @@ class VoxtralTTSAdapter(ARTTSAdapter):
             if available_speakers and request.voice not in available_speakers:
                 return f"Invalid speaker '{request.voice}'. Supported: {', '.join(sorted(available_speakers))}"
 
-        if request.max_new_tokens is not None:
-            if request.max_new_tokens < self.max_new_tokens_min:
-                return f"max_new_tokens must be at least {self.max_new_tokens_min}"
-            if request.max_new_tokens > self.max_new_tokens_max:
-                return f"max_new_tokens cannot exceed {self.max_new_tokens_max}"
-
-        return None
+        return self._validate_max_new_tokens(request)
 
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool

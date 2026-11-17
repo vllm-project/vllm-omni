@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -11,18 +11,18 @@ from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.models.common.ming.continuous_tts import (
+    STOP_REASON_BY_CODE,
+)
 from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
     INITIAL_LATENT_CHUNK_SIZE,
     KEY_CHUNK_ID,
     KEY_REQUEST_ID,
+    KEY_STOP_REASON,
     LATENT_CHUNK_SIZE,
     LATENT_DIM,
     LATENT_LEFT_CONTEXT,
     PATCH_SIZE,
-)
-from vllm_omni.model_executor.models.ming_tts.patch_emission import (
-    MING_STOP_REASON_CODES,
-    MING_STOP_REASON_KEY,
 )
 
 logger = init_logger(__name__)
@@ -32,7 +32,6 @@ MING_LATENT_SHAPE_KEY = "ming_latent_shape"
 MING_ESTIMATED_BYTES_KEY = "ming_estimated_bytes"
 MING_FINAL_FLUSH_KEY = "ming_final_flush"
 MING_FINAL_DECODE_STEP_KEY = "ming_final_decode_step"
-MING_STOP_REASON_BY_CODE = {code: reason for reason, code in MING_STOP_REASON_CODES.items()}
 
 
 def _extract_last_patch(pooling_output: Mapping[str, Any] | None) -> torch.Tensor | None:
@@ -114,7 +113,7 @@ def _decode_stop_reason(value: Any) -> str | None:
         return None
     if isinstance(value, str):
         return value
-    return MING_STOP_REASON_BY_CODE.get(int(value))
+    return STOP_REASON_BY_CODE.get(int(value))
 
 
 def _get_async_chunk_config(transfer_manager: Any) -> tuple[int, int, int]:
@@ -188,7 +187,7 @@ def llm2audio_vae_async_chunk(
     chunk_id = int(transfer_manager.put_req_chunk[request_id])
     finished = bool(is_finished or request.is_finished())
     final_decode_step = _extract_last_value(pooling_output, "ming_decode_step")
-    stop_reason = _decode_stop_reason(_extract_last_value(pooling_output, MING_STOP_REASON_KEY))
+    stop_reason = _decode_stop_reason(_extract_last_value(pooling_output, KEY_STOP_REASON))
     request_payload = transfer_manager.request_payload
     request_state = request_payload.get(request_id)
     if not isinstance(request_state, dict) or "_ming_async_state" not in request_state:
@@ -224,7 +223,7 @@ def llm2audio_vae_async_chunk(
             if final_decode_step is not None:
                 kv_meta[MING_FINAL_DECODE_STEP_KEY] = int(final_decode_step)
             if stop_reason is not None:
-                kv_meta[MING_STOP_REASON_KEY] = stop_reason
+                kv_meta[KEY_STOP_REASON] = stop_reason
             state["terminal_sent"] = True
             return OmniPayloadStruct(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
@@ -260,7 +259,7 @@ def llm2audio_vae_async_chunk(
     if final_decode_step is not None:
         kv_meta[MING_FINAL_DECODE_STEP_KEY] = int(final_decode_step)
     if stop_reason is not None:
-        kv_meta[MING_STOP_REASON_KEY] = stop_reason
+        kv_meta[KEY_STOP_REASON] = stop_reason
     if finished:
         state["terminal_sent"] = True
     return OmniPayloadStruct(
@@ -299,11 +298,11 @@ def llm2audio_vae(
             "finished": torch.tensor(finished, dtype=torch.bool),
         }
         final_decode_step = _extract_last_value(output.multimodal_output, "ming_decode_step")
-        stop_reason = _decode_stop_reason(_extract_last_value(output.multimodal_output, MING_STOP_REASON_KEY))
+        stop_reason = _decode_stop_reason(_extract_last_value(output.multimodal_output, KEY_STOP_REASON))
         if final_decode_step is not None:
             additional_information[MING_FINAL_DECODE_STEP_KEY] = int(final_decode_step)
         if stop_reason is not None:
-            additional_information[MING_STOP_REASON_KEY] = stop_reason
+            additional_information[KEY_STOP_REASON] = stop_reason
         outputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=[0],

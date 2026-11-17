@@ -15,6 +15,7 @@ from tests.helpers.assertions import (
     _assert_transcript_matches,
     _resolve_audio_transcript,
     assert_audio_speech_response,
+    assert_http_error,
 )
 from tests.helpers.client import OmniResponse
 
@@ -483,3 +484,23 @@ def test_speech_timestamp_header_is_required_and_decoded():
         else:
             with pytest.raises(AssertionError, match="X-Word-Timestamps"):
                 assert_audio_speech_response(response, request)
+
+
+def test_http_200_err_code_uses_json_error_code():
+    failed = SimpleNamespace(
+        status_code=200,
+        json_body={"status": "failed", "error": {"code": 500, "message": "CUDA out of memory"}},
+        error_message=None,
+    )
+    assert_http_error(failed, err_code=500)
+
+    queued = SimpleNamespace(status_code=200, json_body={"status": "queued"}, error_message=None)
+    with pytest.raises(AssertionError):
+        assert_http_error(queued, err_code=500)
+
+    sync_error = SimpleNamespace(
+        status_code=500,
+        json_body={"error": {"code": 500, "message": "engine dead"}},
+        error_message=None,
+    )
+    assert_http_error(sync_error, err_code=500)

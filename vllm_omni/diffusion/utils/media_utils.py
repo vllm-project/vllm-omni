@@ -101,6 +101,7 @@ class ChunkedMP4Encoder:
         self.height = int(height)
         self._queue: queue.Queue[object] = queue.Queue(maxsize=max_pending)
         self._result: bytes | None = None
+        self.frame_count = 0
         self._error: BaseException | None = None
         self._closed = False
         self._aborted = False
@@ -121,6 +122,7 @@ class ChunkedMP4Encoder:
                     audio_codec=audio_codec,
                     crf=crf,
                     video_codec_options=video_codec_options,
+                    encode_audio_first=True,
                 )
             except BaseException as exc:
                 self._error = exc
@@ -154,6 +156,7 @@ class ChunkedMP4Encoder:
             try:
                 for frame_data in entry.frames:
                     yield av.VideoFrame.from_ndarray(frame_data, format="rgb24")
+                    self.frame_count += 1
             finally:
                 # Also runs when the muxer raises part-way through this chunk
                 # and abandons the generator, so a lent buffer is never
@@ -444,8 +447,9 @@ def mux_av_video_audio_bytes(
     audio_codec: str = "aac",
     crf: str = "18",
     video_codec_options: dict[str, str] | None = None,
+    encode_audio_first: bool = False,
 ) -> bytes:
-    """Mux preconstructed video frames and optional audio into MP4 bytes."""
+    """Mux MP4 bytes, optionally encoding ready audio before waiting for video."""
     buf = io.BytesIO()
     with cast(Any, av.open(buf, mode="w", format="mp4")) as container:
         v_stream = cast(
@@ -476,25 +480,32 @@ def mux_av_video_audio_bytes(
             a_stream = cast(av.AudioStream, container.add_stream(audio_codec, rate=effective_audio_sample_rate))
             a_stream.layout = layout
 
+        def encode_audio() -> None:
+            if a_stream is not None and audio_waveform is not None:
+                if samples is None or layout is None:
+                    raise ValueError("Audio samples were not prepared for muxing.")
+                audio_frame = av.AudioFrame.from_ndarray(samples, format="fltp", layout=layout)
+                audio_frame.sample_rate = effective_audio_sample_rate
+                # AAC has a one-frame encoder delay. Mark the input waveform as
+                # starting at t=0 so the MP4 muxer writes the corresponding negative
+                # priming timestamp instead of exposing the delay as leading silence.
+                audio_frame.pts = 0
+                audio_frame.time_base = Fraction(1, effective_audio_sample_rate)
+                for packet in a_stream.encode(audio_frame):
+                    container.mux(packet)
+                for packet in a_stream.encode():
+                    container.mux(packet)
+
+        if encode_audio_first:
+            encode_audio()
+
         for frame in video_frames:
             for packet in v_stream.encode(frame):
                 container.mux(packet)
         for packet in v_stream.encode():
             container.mux(packet)
 
-        if a_stream is not None and audio_waveform is not None:
-            if samples is None or layout is None:
-                raise ValueError("Audio samples were not prepared for muxing.")
-            audio_frame = av.AudioFrame.from_ndarray(samples, format="fltp", layout=layout)
-            audio_frame.sample_rate = effective_audio_sample_rate
-            # AAC has a one-frame encoder delay. Mark the input waveform as
-            # starting at t=0 so the MP4 muxer writes the corresponding negative
-            # priming timestamp instead of exposing the delay as leading silence.
-            audio_frame.pts = 0
-            audio_frame.time_base = Fraction(1, effective_audio_sample_rate)
-            for packet in a_stream.encode(audio_frame):
-                container.mux(packet)
-            for packet in a_stream.encode():
-                container.mux(packet)
+        if not encode_audio_first:
+            encode_audio()
 
     return buf.getvalue()

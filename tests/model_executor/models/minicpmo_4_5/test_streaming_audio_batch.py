@@ -10,6 +10,7 @@ import torch
 from torch import nn
 from transformers.models.whisper.modeling_whisper import WhisperConfig
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMForConditionalGeneration,
@@ -18,7 +19,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.streaming_audio_encoder import StreamingAudioChunk
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model]
 
 N_MELS, POOL = 16, 5
 # Per round, each session's unit frames (None: sits the round out): 22 / 24 frames mirror 1020 / 1040 ms
@@ -49,6 +50,7 @@ def _thinker() -> Any:
     return thinker
 
 
+@pytest.mark.cpu
 def test_batched_rounds_match_sequential_sessions() -> None:
     thinker = _thinker()
     legacy: list[Any] = [None] * 4
@@ -84,6 +86,7 @@ def test_batched_rounds_match_sequential_sessions() -> None:
     assert resets >= 2, "the schedule must cross the max_source_positions reset"
 
 
+@pytest.mark.cpu
 def test_graph_build_honors_eager_without_engine_config() -> None:
     # The thinker keeps no vllm_config: the gate reads the flag __init__ stored.
     thinker = _thinker()
@@ -92,7 +95,7 @@ def test_graph_build_honors_eager_without_engine_config() -> None:
     assert thinker._duplex_audio_cuda_graph_encoder is None
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_graph_build_captures_on_cuda() -> None:
     thinker = _thinker().cuda()
@@ -103,6 +106,7 @@ def test_graph_build_captures_on_cuda() -> None:
     assert thinker._duplex_audio_cuda_graph_encoder is not None
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize(
     ("session_mode", "device", "captures"),
     [("duplex", "cuda", 1), ("turn", "cuda", 0), ("duplex", "cpu", 0)],

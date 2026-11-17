@@ -13,10 +13,11 @@ from pathlib import Path
 
 import pytest
 
-from tests.helpers.assertions import assert_video_first_frames_differ, assert_video_valid
+from tests.helpers.assertions import assert_video_first_frames_differ, assert_video_valid, video_mean_absolute_error
 from tests.helpers.mark import hardware_marks
 from tests.helpers.media import generate_synthetic_image
 from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
+from vllm_omni.platforms import current_omni_platform
 
 MODEL = os.environ.get("VLLM_TEST_MINIMAX_H3_MODEL", "MiniMaxAI/MiniMax-H3")
 UPSCALER = os.environ.get("VLLM_TEST_MINIMAX_H3_LATENT_UPSCALER")
@@ -49,22 +50,31 @@ pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
                     "--vae-parallel-mode",
                     "tile",
                     "--vae-use-tiling",
-                    "--enable-cpu-offload",
+                    *(
+                        ["--enable-distributed-layerwise-offload", "--dlo-no-use-allgather"]
+                        if current_omni_platform.is_npu()
+                        else ["--enable-cpu-offload"]
+                    ),
                     "--enforce-eager",
                     "--diffusion-attention-backend",
-                    "FLASH_ATTN",
+                    "TORCH_SDPA" if current_omni_platform.is_npu() else "FLASH_ATTN",
                     "--additional-config",
                     json.dumps({"latent_upscaler_path": UPSCALER, "latent_upscaler_dtype": "bf16"}),
                 ],
                 env_dict={"VLLM_WORKER_MULTIPROC_METHOD": "spawn"},
             ),
             id="minimax_h3_latent_upscale_refine_tp2",
-            marks=hardware_marks(res={"cuda": "H100"}, num_cards=2),
         ),
     ],
     indirect=True,
 )
-@pytest.mark.parametrize("task", ["t2va", "fl2va"])
+@pytest.mark.parametrize(
+    "task",
+    [
+        pytest.param("t2va", marks=hardware_marks(res={"cuda": "H100", "npu": "A3"}, num_cards=2)),
+        pytest.param("fl2va", marks=hardware_marks(res={"cuda": "H100", "npu": "A3"}, num_cards=2)),
+    ],
+)
 def test_latent_upscale_and_refine(
     omni_server: OmniServer,
     online_client: OnlineOmniClient,
@@ -82,12 +92,15 @@ def test_latent_upscale_and_refine(
     # both VAE ranks must encode it before broadcasting the condition latents.
     # Four base steps and the minimum four-second clip keep real-weight CI affordable.
     # Use size rather than width/height: upscale intentionally changes output dimensions.
-    for name, upscale, refine, width, height in [
+    requests = [
         ("original", False, False, 512, 288),
         ("upscaled", 2.0, False, 1024, 576),
         ("refined", 2.0, 0.5, 1024, 576),
         ("disabled_again", False, False, 512, 288),
-    ]:
+    ]
+    if task == "fl2va":
+        requests.append(("upscaled_again", 2.0, False, 1024, 576))
+    for name, upscale, refine, width, height in requests:
         responses = online_client.send_video_diffusion_request(
             {
                 "model": omni_server.model,
@@ -123,4 +136,13 @@ def test_latent_upscale_and_refine(
     assert frame_counts[0] > 0
     assert len(set(frame_counts)) == 1, f"Upscale/refinement changed the frame count: {frame_counts}"
     # Equal output resolution alone would miss a silently ignored second denoise pass.
-    assert_video_first_frames_differ(videos[2], videos[1], min_mean_absolute_error=1 / 255)
+    if task == "fl2va":
+        # A same-seed request without refinement must stay stable, so request-to-request variance is not misread as refinement.
+        repeat_error = video_mean_absolute_error(videos[4], videos[1])
+        print(f"repeat_error={repeat_error:.6f}")
+        assert repeat_error < 1 / 255, f"Unrefined repeat video MAE is {repeat_error:.6f}."
+        refinement_error = video_mean_absolute_error(videos[2], videos[1])
+        print(f"refinement_error={refinement_error:.6f}")
+        assert refinement_error > 1 / 255, f"Expected refinement video MAE > {1 / 255}, got {refinement_error:.6f}."
+    else:
+        assert_video_first_frames_differ(videos[2], videos[1], min_mean_absolute_error=1 / 255)

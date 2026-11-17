@@ -1832,6 +1832,8 @@ def test_engine_close_interrupts_only_ray_before_join(backend):
     engine._shutdown_complete = False
     engine.stop_event = threading.Event()
     engine._out_streams = {}
+    engine._unclaimed_async_outputs = {}
+    engine._shutdown_output_futures = {}
     interrupted = threading.Event()
     engine.executor = MagicMock()
     engine.executor.shutdown.side_effect = interrupted.set

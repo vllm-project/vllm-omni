@@ -31,7 +31,12 @@ from vllm_omni.engine.duplex.messages import (
     ResumeDuplexSessionMessage,
     TouchDuplexSessionMessage,
 )
-from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, EncodeAudio, load_duplex_plugin
+from vllm_omni.engine.duplex.plugin import (
+    DuplexModelPlugin,
+    EncodeAudio,
+    load_duplex_plugin,
+    validate_duplex_replica_policy,
+)
 from vllm_omni.engine.messages import EngineQueueMessage
 from vllm_omni.engine.orchestrator import OrchestratorBase
 
@@ -42,6 +47,12 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _DEFAULT_CONTROL_TIMEOUT_S = 10.0
+# Opening a session also initializes per-session runner state (session runner,
+# talker admission, first stage reservation), so the first open on a cold engine
+# can take tens of seconds while later opens are fast. Keep the short control
+# budget for control ops on a live session and give open its own budget, or a
+# cold start fails the first open with a spurious timeout (#9072).
+_DEFAULT_OPEN_TIMEOUT_S = 60.0
 _COMMAND_PUT_TIMEOUT_S = 30.0
 
 
@@ -51,6 +62,9 @@ class DuplexOmniEngine(AsyncOmniEngine):
     plugin: DuplexModelPlugin | None = None
     #: Set by ``_validate_deployment`` from the deploy config before any stage starts.
     duplex_session_config: DuplexSessionRuntimeConfig
+    #: Local startup warmup uses the same ownership and budget as session admission.
+    duplex_frontend_group_count: int
+    duplex_frontend_max_sessions: int
 
     # Any: **kwargs is forwarded verbatim to ``OmniEngineBase.__init__``.
     def __init__(self, model: str, *, duplex_audio_encoder: EncodeAudio, **kwargs: Any) -> None:
@@ -82,20 +96,32 @@ class DuplexOmniEngine(AsyncOmniEngine):
             )
         self.duplex_session_config = deploy_config.duplex_session
         self.plugin = load_duplex_plugin(plugin_path, self._audio_encoder)
+        self.plugin.configure_pipeline(pipeline_config)
+        validate_duplex_replica_policy(self.plugin, self.duplex_session_config, distributed=self.single_stage_mode)
 
     # Any: signature of the ``OmniEngineBase._create_orchestrator`` seam it overrides.
     def _create_orchestrator(self, **orchestrator_kwargs: Any) -> OrchestratorBase:
         from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator
 
         assert self.plugin is not None, "_validate_deployment() must run before the orchestrator is created"
-        stage0_vllm_config = self.stage_pools[0].stage_vllm_config if self.stage_pools else None
-        model_config = getattr(stage0_vllm_config, "model_config", None)
-        return DuplexOrchestrator(
+        # Match the frontend's comprehension-stage selection. An optional ASR
+        # stage does not own the served model's tokenizer or prompt policy.
+        model_stage_id = next((stage.stage_id for stage in self.pipeline_config.stages if stage.owns_tokenizer), 0)
+        stage_vllm_config = self.stage_pools[model_stage_id].stage_vllm_config if self.stage_pools else None
+        model_config = getattr(stage_vllm_config, "model_config", None)
+        client_config = self._client_config or {}
+        orchestrator = DuplexOrchestrator(
             plugin=self.plugin,
             duplex_session_config=self.duplex_session_config,
             model_config=model_config,
+            frontend_count=int(client_config.get("client_count", 1)),
+            frontend_index=int(client_config.get("client_index", 0)),
             **orchestrator_kwargs,
         )
+        placement = orchestrator.replica_placement
+        self.duplex_frontend_group_count = placement.owned_group_count if placement is not None else 1
+        self.duplex_frontend_max_sessions = orchestrator.session_manager.admission_limit
+        return orchestrator
 
     # ---- deployment facts ----
 
@@ -153,7 +179,7 @@ class DuplexOmniEngine(AsyncOmniEngine):
         session_config: DuplexSessionConfig,
         *,
         output_buffer: DuplexOutputBuffer,
-        timeout: float | None = _DEFAULT_CONTROL_TIMEOUT_S,
+        timeout: float | None = _DEFAULT_OPEN_TIMEOUT_S,
     ) -> DuplexControlResultMessage:
         control_id = uuid.uuid4().hex
         return self._execute_control(
@@ -175,7 +201,7 @@ class DuplexOmniEngine(AsyncOmniEngine):
         session_config: DuplexSessionConfig,
         *,
         output_buffer: DuplexOutputBuffer,
-        timeout: float | None = _DEFAULT_CONTROL_TIMEOUT_S,
+        timeout: float | None = _DEFAULT_OPEN_TIMEOUT_S,
     ) -> DuplexControlResultMessage:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(

@@ -28,7 +28,6 @@ MODEL = os.environ.get("VLLM_OMNI_DEVICE_POSTPROCESS_MODEL")
 pytestmark = [
     pytest.mark.full_model,
     pytest.mark.diffusion,
-    pytest.mark.gpu,
     pytest.mark.skipif(
         not MODEL,
         reason="Set VLLM_OMNI_DEVICE_POSTPROCESS_MODEL to a WAN2.2 checkpoint to run this.",

@@ -1,0 +1,169 @@
+meta:
+  title: "Stable Diffusion 3.5"
+  slug: "stable-diffusion-3.5"
+  provider: "Stability AI"
+  description: "Stability AI's Stable Diffusion 3.5 text-to-image family (medium 2.5B, large 8.1B, large-turbo) via vLLM-Omni with Cache-DiT acceleration"
+  date_added: 2026-01-03
+  date_updated: 2026-04-17
+  tasks:
+    - omni
+  related_recipes:
+    - stabilityai/stable-audio-open-1.0
+  hardware:
+    mi300x: verified
+    mi325x: verified
+    mi355x: verified
+
+model:
+  model_id: "stabilityai/stable-diffusion-3.5-medium"
+  min_vllm_version: "0.12.0"
+  architecture: dense
+  parameter_count: "2.5B"
+  active_parameters: "2.5B"
+  context_length: 0
+  base_args: []
+  base_env: {}
+
+omni:
+  tasks:
+    - t2i
+
+dependencies:
+  - note: "Pin vllm==0.12.0 for Stable Diffusion 3.5"
+    command: "uv pip install vllm==0.12.0"
+    brand: NVIDIA
+  - note: "vllm-omni provides the image generation backend"
+    command: "uv pip install git+https://github.com/vllm-project/vllm-omni.git"
+    brand: NVIDIA
+  - note: "AMD ROCm: install vLLM for ROCm and vLLM-Omni from source"
+    command: "VLLM_OMNI_TARGET_DEVICE=rocm uv pip install git+https://github.com/vllm-project/vllm-omni.git vllm==0.20.0+rocm721 --extra-index-url https://wheels.vllm.ai/rocm/0.20.0/rocm721"
+    brand: AMD
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 44
+    description: "Stable Diffusion 3.5 medium (2.5B)"
+
+  large:
+    model_id: "stabilityai/stable-diffusion-3.5-large"
+    precision: bf16
+    vram_minimum_gb: 24
+    description: "Stable Diffusion 3.5 large (8.1B)"
+
+  large_turbo:
+    model_id: "stabilityai/stable-diffusion-3.5-large-turbo"
+    precision: bf16
+    vram_minimum_gb: 24
+    description: "Stable Diffusion 3.5 large-turbo (8.1B, timestep-distilled for few-step inference)"
+
+compatible_strategies: []
+
+hardware_overrides:
+  amd:
+    extra_args: []
+    extra_env:
+      VLLM_OMNI_TARGET_DEVICE: "rocm"
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  Stable Diffusion 3.5 text-to-image generation models, served via **vLLM-Omni** with
+  optional **Cache-DiT** acceleration.
+
+  Supported variants:
+  - `stabilityai/stable-diffusion-3.5-medium` — 2.5B params
+  - `stabilityai/stable-diffusion-3.5-large` — 8.1B params
+  - `stabilityai/stable-diffusion-3.5-large-turbo` — 8.1B params (timestep-distilled for few-step inference)
+
+  ## Prerequisites
+
+  - vLLM-Omni on top of vLLM 0.12.0
+  - `diffusers` library
+
+  ## Installation
+
+  ```bash
+  uv venv
+  source .venv/bin/activate
+  uv pip install vllm==0.12.0
+  uv pip install git+https://github.com/vllm-project/vllm-omni.git
+  ```
+
+  ### AMD ROCm (MI300X, MI325X, MI355X)
+
+  > **Note:** The vLLM wheel for ROCm requires Python 3.12, ROCm 7.2.1, and glibc >= 2.35.
+  > If your environment does not meet these requirements, please use the Docker-based setup.
+
+  ```bash
+  uv venv --python 3.12
+  source .venv/bin/activate
+  VLLM_OMNI_TARGET_DEVICE=rocm uv pip install git+https://github.com/vllm-project/vllm-omni.git vllm==0.20.0+rocm721 --extra-index-url https://wheels.vllm.ai/rocm/0.20.0/rocm721
+  ```
+
+  ## Python Usage
+
+  ```python
+  from vllm_omni.entrypoints.omni import Omni
+
+  omni = Omni(model="stabilityai/stable-diffusion-3.5-medium")
+
+  images = omni.generate(
+      prompt="a cat wearing sunglasses, cyberpunk style",
+      negative_prompt="blurry, low quality",
+      height=1024, width=1024,
+      num_inference_steps=28,
+      guidance_scale=7.5,
+      num_outputs_per_prompt=2,
+  )
+  ```
+
+  ## CLI Usage
+
+  ```bash
+  python examples/offline_inference/text_to_image/text_to_image.py \
+    --model stabilityai/stable-diffusion-3.5-medium \
+    --prompt "a cat wearing sunglasses, cyberpunk style" \
+    --negative-prompt "blurry, low quality" \
+    --height 1024 --width 1024 \
+    --num-inference-steps 28 \
+    --guidance-scale 7.5
+  ```
+
+  ## Cache-DiT Acceleration
+
+  Enable caching for significant speed-ups:
+
+  ```python
+  omni = Omni(
+      model="stabilityai/stable-diffusion-3.5-medium",
+      cache_backend="cache_dit",
+      cache_config={
+          "Fn_compute_blocks": 8,
+          "Bn_compute_blocks": 0,
+          "max_warmup_steps": 4,
+          "residual_diff_threshold": 0.12,
+      },
+  )
+  ```
+
+  ## Key Parameters
+
+  | Parameter | Default | Description |
+  |-----------|---------|-------------|
+  | `height` | 1024 | Image height (multiples of 16) |
+  | `width` | 1024 | Image width (multiples of 16) |
+  | `num_inference_steps` | 28 | Denoising steps |
+  | `guidance_scale` | 1.0 | Classifier-free guidance scale |
+
+  ## References
+
+  - [SD3.5 Medium](https://huggingface.co/stabilityai/stable-diffusion-3.5-medium)
+  - [SD3.5 Large](https://huggingface.co/stabilityai/stable-diffusion-3.5-large)
+  - [SD3.5 Large Turbo](https://huggingface.co/stabilityai/stable-diffusion-3.5-large-turbo)
+  - [Cache-DiT Acceleration](https://github.com/vipshop/cache-dit)

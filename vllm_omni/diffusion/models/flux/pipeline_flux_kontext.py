@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # This implementation is heavily inspired by the diffusers project.
 # Original implementation: https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/flux/pipeline_flux_kontext.py
 
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import Callable, Iterable
 from typing import Any, ClassVar, cast
@@ -33,7 +32,7 @@ from vllm_omni.diffusion.models.flux import (
 from vllm_omni.diffusion.models.flux.flux_pipeline_mixin import FluxPipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
-from vllm_omni.diffusion.models.utils import latent_channels_from_vae
+from vllm_omni.diffusion.models.utils import latent_channels_from_vae, load_vae_scale_factor, vae_scale_factor_from_vae
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -52,15 +51,7 @@ def get_flux_kontext_post_process_func(od_config: OmniDiffusionConfig) -> Callab
 
         model_path = download_weights_from_hf_specific(model_name, None, ["*"])
 
-    vae_config_path = os.path.join(model_path, "vae/config.json")
-    if not os.path.exists(vae_config_path):
-        raise FileNotFoundError(
-            f"VAE config not found at {vae_config_path}. "
-            "Please ensure the model path contains a valid VAE configuration."
-        )
-    with open(vae_config_path) as f:
-        vae_config = json.load(f)
-        vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
+    vae_scale_factor = load_vae_scale_factor(model_path)
 
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
 
@@ -150,7 +141,7 @@ class FluxKontextPipeline(
         transformer_kwargs["quant_config"] = od_config.quantization_config
         self.transformer = FluxKontextTransformer2DModel(**transformer_kwargs)
 
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
+        self.vae_scale_factor = vae_scale_factor_from_vae(getattr(self, "vae", None))
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
         self.tokenizer_max_length = (
             self.tokenizer.model_max_length if hasattr(self, "tokenizer") and self.tokenizer is not None else 77
@@ -516,7 +507,6 @@ class FluxKontextPipeline(
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
     ) -> torch.Tensor:
         self.scheduler.set_begin_index(0)
-        self.transformer.do_true_cfg = do_true_cfg
         with self.progress_bar(total=len(timesteps)) as pbar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:

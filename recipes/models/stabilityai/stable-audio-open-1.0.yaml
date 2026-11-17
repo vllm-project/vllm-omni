@@ -1,0 +1,136 @@
+meta:
+  title: "Stable Audio Open"
+  slug: "stable-audio-open"
+  provider: "Stability AI"
+  description: "Text-to-audio generation model (1.2B params) producing up to ~47 s stereo audio at 44.1 kHz, served via vLLM-Omni"
+  date_added: 2026-01-26
+  date_updated: 2026-08-15
+  tasks:
+    - omni
+  related_recipes:
+    - stabilityai/stable-diffusion-3.5-medium
+
+model:
+  model_id: "stabilityai/stable-audio-open-1.0"
+  min_vllm_version: "0.22.0"
+  architecture: dense
+  parameter_count: "1.2B"
+  active_parameters: "1.2B"
+  context_length: 0
+  base_args:
+    - "--trust-remote-code"
+    - "--enforce-eager"
+    - "--gpu-memory-utilization"
+    - "0.9"
+  base_env: {}
+
+omni:
+  tasks:
+    - t2a
+
+dependencies:
+  - note: "vLLM 0.22.0 or newer"
+    command: "uv pip install 'vllm>=0.22.0'"
+  - note: "vllm-omni provides the audio generation backend"
+    command: "uv pip install git+https://github.com/vllm-project/vllm-omni.git"
+  - note: "soundfile (recommended) or scipy for WAV output"
+    command: "uv pip install soundfile"
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 19
+    description: "BF16 weights for text-to-audio generation (via vLLM-Omni)"
+
+compatible_strategies: []
+
+hardware_overrides: {}
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  [Stable Audio Open 1.0](https://huggingface.co/stabilityai/stable-audio-open-1.0) is
+  Stability AI's text-to-audio generation model (~1.2B parameters). It produces stereo
+  audio at 44.1 kHz, up to ~47 seconds. Served via **vLLM-Omni** (not standard vLLM).
+
+  Limitations:
+  - No realistic vocals (no singing or speech).
+  - English-only training data.
+  - Better at sound effects than complex music.
+
+  ## Prerequisites
+
+  - vLLM-Omni on top of vLLM 0.22.0 or newer
+  - `soundfile` or `scipy` for saving audio
+
+  ## Installation
+
+  ```bash
+  uv venv
+  source .venv/bin/activate
+  uv pip install git+https://github.com/vllm-project/vllm-omni.git
+
+  # Audio saving
+  uv pip install soundfile
+  ```
+
+  ## Python Usage
+
+  ```python
+  import torch
+  import soundfile as sf
+  from vllm_omni.entrypoints.omni import Omni
+
+  omni = Omni(model="stabilityai/stable-audio-open-1.0")
+  generator = torch.Generator(device="cuda").manual_seed(42)
+
+  audio = omni.generate(
+      "The sound of a dog barking",
+      negative_prompt="Low quality.",
+      generator=generator,
+      guidance_scale=7.0,
+      num_inference_steps=100,
+      extra={"audio_start_in_s": 0.0, "audio_end_in_s": 10.0},
+  )
+
+  audio_data = audio[0].cpu().float().numpy().T  # [samples, channels]
+  sf.write("output.wav", audio_data, 44100)
+  ```
+
+  ## CLI Usage (from vLLM-Omni repo)
+
+  ```bash
+  python examples/offline_inference/text_to_audio/text_to_audio.py \
+    --model stabilityai/stable-audio-open-1.0 \
+    --prompt "The sound of a dog barking" \
+    --audio-length 10.0 \
+    --num-inference-steps 100 \
+    --guidance-scale 7.0 \
+    --output dog_barking.wav
+  ```
+
+  ## Key Parameters
+
+  | Parameter | Default | Description |
+  |-----------|---------|-------------|
+  | `audio_start_in_s` | 0.0 | Start time in seconds |
+  | `audio_end_in_s` | 10.0 | End time in seconds |
+  | `num_inference_steps` | 100 | Denoising steps (higher = better quality, slower) |
+  | `guidance_scale` | 7.0 | Classifier-free guidance scale |
+  | `negative_prompt` | "Low quality." | Text to avoid |
+  | `num_waveforms` | 1 | Samples per prompt |
+  | `sample_rate` | 44100 | Output sample rate (Hz) |
+
+  ## License
+
+  Released under the Stability AI Community License. Commercial use requires a separate license.
+
+  ## References
+
+  - [Stable Audio Open on Hugging Face](https://huggingface.co/stabilityai/stable-audio-open-1.0)
+  - [vLLM-Omni text-to-audio example](https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/text_to_audio/text_to_audio.py)

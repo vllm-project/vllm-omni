@@ -5,6 +5,8 @@ import pytest
 
 from vllm_omni.diffusion.models.utils import latent_channels_from_vae
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 class _FakeConfig:
     def __init__(self, **kwargs):

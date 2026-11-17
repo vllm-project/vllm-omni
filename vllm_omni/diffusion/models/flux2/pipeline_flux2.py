@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import inspect
-import json
 import logging
 import math
 import os
@@ -34,6 +33,7 @@ from vllm_omni.diffusion.models.flux2 import Flux2Transformer2DModel
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.mistral_encoder import MistralEncoderModel
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.models.utils import load_vae_scale_factor, vae_scale_factor_from_vae
 from vllm_omni.diffusion.offloader.config import (
     OffloadStrategy,
     resolve_offload_strategy,
@@ -147,10 +147,7 @@ def get_flux2_post_process_func(
     else:
         model_path = download_weights_from_hf_specific(model_name, None, ["*"])
 
-    vae_config_path = os.path.join(model_path, "vae/config.json")
-    with open(vae_config_path) as f:
-        vae_config = json.load(f)
-        vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
+    vae_scale_factor = load_vae_scale_factor(model_path)
 
     image_processor = Flux2ImageProcessor(vae_scale_factor=vae_scale_factor * 2)
 
@@ -425,7 +422,7 @@ class Flux2Pipeline(
             quant_config=transformer_quant_config, od_config=od_config, **transformer_kwargs
         )
 
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
+        self.vae_scale_factor = vae_scale_factor_from_vae(getattr(self, "vae", None))
         self.image_processor = Flux2ImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
         self.tokenizer_max_length = 512
         self.default_sample_size = 128

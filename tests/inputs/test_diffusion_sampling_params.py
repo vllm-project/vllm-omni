@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # SPDX-License-Identifier: Apache-2.0
 """Regression tests for diffusion sampling params coercion."""
 
@@ -82,3 +83,20 @@ def test_from_params_preserves_unknown_extra_args() -> None:
 def test_from_params_rejects_unsupported_types() -> None:
     with pytest.raises(TypeError, match="Diffusion stage requires OmniDiffusionSamplingParams"):
         OmniDiffusionSamplingParams.from_params({"height": 512})
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("streaming_max_output_bytes", 0),
+        ("streaming_max_output_bytes", True),
+        ("streaming_max_output_bytes", 1.5),
+        ("streaming_idle_timeout_s", 0),
+        ("streaming_idle_timeout_s", True),
+        ("streaming_idle_timeout_s", float("inf")),
+        ("streaming_idle_timeout_s", float("nan")),
+    ],
+)
+def test_streaming_resource_limits_reject_invalid_values(field, value):
+    with pytest.raises(ValueError, match=field):
+        OmniDiffusionSamplingParams(**{field: value})

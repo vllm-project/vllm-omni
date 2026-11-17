@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 from typing import Any
@@ -5,7 +8,7 @@ from typing import Any
 import torch
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
@@ -25,6 +28,10 @@ def _to_device(value: Any, device: torch.device) -> Any:
 
 class DiffusionStagePayloadMixin(OmniConnectorModelRunnerMixin):
     """Adapt diffusion prompts and outputs to shared connector transport."""
+
+    od_config: OmniDiffusionConfig
+    device: torch.device
+    _target_device: torch.device | None
 
     _STAGE_PAYLOAD_HANDLE_KEY = "_stage_payload_transfer"
 
@@ -84,6 +91,8 @@ class DiffusionStagePayloadMixin(OmniConnectorModelRunnerMixin):
                 if not expected_keys or name in expected_keys:
                     additional[name] = _to_device(value, target_device)
         required_keys = expected_keys or (handle.get("payload_keys", ()) if isinstance(handle, dict) else ())
+        optional_keys = set(self.od_config.stage_input_optional_payload_keys or ())
+        required_keys = tuple(name for name in required_keys if name not in optional_keys)
         missing = [name for name in required_keys if additional.get(name) is None]
         if missing or (isinstance(handle, dict) and not required_keys and not isinstance(payload, dict)):
             raise RuntimeError(f"Stage payload unavailable for {req.request_id}; missing keys: {missing}")

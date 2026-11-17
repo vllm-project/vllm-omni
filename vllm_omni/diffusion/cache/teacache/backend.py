@@ -14,7 +14,7 @@ import torch.nn as nn
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.cache.base import CacheBackend
-from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
+from vllm_omni.diffusion.cache.teacache.config import _MODEL_COEFFICIENTS, TeaCacheConfig
 from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook, apply_teacache_hook
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 
@@ -124,6 +124,25 @@ def enable_minimax_h3_teacache(pipeline: Any, config: DiffusionCacheConfig) -> N
     )
 
 
+def enable_ming_image_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
+    """Use the Design or Design-Layer calibration for the shared Ming transformer."""
+    threshold = 0.13 if config.rel_l1_thresh is None and pipeline.is_layer_decomposition else config.rel_l1_thresh
+    coefficients = config.coefficients
+    if coefficients is None and pipeline.is_layer_decomposition:
+        coefficients = _MODEL_COEFFICIENTS["MingImageTransformer2DModel:Design-Layer"]
+    teacache_config = TeaCacheConfig(
+        transformer_type="MingImageTransformer2DModel",
+        rel_l1_thresh=threshold,
+        coefficients=coefficients,
+    )
+    apply_teacache_hook(pipeline.transformer, teacache_config)
+    logger.info(
+        "TeaCache applied to Ming-Image variant=%s with rel_l1_thresh=%s",
+        "Design-Layer" if pipeline.is_layer_decomposition else "Design",
+        teacache_config.rel_l1_thresh,
+    )
+
+
 def enable_flux2_klein_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
     """
     Enable TeaCache for Flux2 Klein model.
@@ -165,6 +184,7 @@ CUSTOM_TEACACHE_ENABLERS = {
     "BagelPipeline": enable_bagel_teacache,
     "Flux2KleinPipeline": enable_flux2_klein_teacache,
     "HunyuanImage3Pipeline": enable_hunyuan_image3_teacache,
+    "MingImageDiffusionPipeline": enable_ming_image_teacache,
     "MammothModa2DiTPipeline": enable_mammoth_moda2_teacache,
     "Kandinsky6TI2VAPipeline": enable_kandinsky6_teacache,
     "MiniMaxH3Pipeline": enable_minimax_h3_teacache,

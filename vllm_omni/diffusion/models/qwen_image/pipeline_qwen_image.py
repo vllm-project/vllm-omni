@@ -3,7 +3,6 @@
 
 import copy
 import inspect
-import json
 import logging
 import math
 import os
@@ -37,6 +36,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
+from vllm_omni.diffusion.models.utils import load_vae_scale_factor, vae_scale_factor_from_vae
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.prompt_utils import (
@@ -67,10 +67,7 @@ def get_qwen_image_post_process_func(
         model_path = model_name
     else:
         model_path = download_weights_from_hf_specific(model_name, None, ["*"])
-    vae_config_path = os.path.join(model_path, "vae/config.json")
-    with open(vae_config_path) as f:
-        vae_config = json.load(f)
-        vae_scale_factor = 2 ** len(vae_config["temporal_downsample"]) if "temporal_downsample" in vae_config else 8
+    vae_scale_factor = load_vae_scale_factor(model_path, config_key="temporal_downsample", exponent_offset=0)
 
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
 
@@ -279,6 +276,8 @@ class QwenImagePipeline(
 
     supports_step_execution: ClassVar[bool] = True
 
+    supports_weight_reload: ClassVar[bool] = True
+
     def __init__(
         self,
         *,
@@ -363,7 +362,11 @@ class QwenImagePipeline(
 
         self.stage = None
 
-        self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
+        self.vae_scale_factor = vae_scale_factor_from_vae(
+            getattr(self, "vae", None),
+            config_key="temperal_downsample",
+            exponent_offset=0,
+        )
         # QwenImage latents are turned into 2x2 patches and packed.
         # This means the latent width and height has to be divisible
         # by the patch size. So the vae scale factor is multiplied by the patch size to account for this
@@ -939,7 +942,6 @@ class QwenImagePipeline(
 
         t = input_batch.timesteps
         self._current_timestep = t
-        self.transformer.do_true_cfg = input_batch.do_true_cfg
 
         positive_kwargs, negative_kwargs, output_slice = self._build_denoise_kwargs(
             latents=input_batch.latents,

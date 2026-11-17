@@ -282,12 +282,12 @@ def turbo_form(seed: int) -> dict[str, str]:
     }
 
 
-def fasth3_params(lora_path: str | None) -> OmniServerParams:
-    """Build the requested two-card FastH3 parallel layout.
+def fasth3_params(lora_path: str | None, *, num_cards: int = 2) -> OmniServerParams:
+    """Build the FastH3 parallel layout for two H100s or four A3 dies.
 
     HSDP owns DiT sharding (the model tensor-parallel degree stays at its
-    default 1), USP2 shards the sequence, text-encoder TP2 shards Qwen3-VL,
-    and VAE patch parallel 2 is the project's VPP2 setting.
+    default 1). USP, text-encoder TP, and VAE patch parallel use the same
+    card count as the HSDP shard group.
     """
     return OmniServerParams(
         model=MODEL,
@@ -296,18 +296,18 @@ def fasth3_params(lora_path: str | None) -> OmniServerParams:
             "--task-type",
             "fl2va",
             "--num-gpus",
-            "2",
+            str(num_cards),
             "--usp",
-            "2",
+            str(num_cards),
             "--ring",
             "1",
             "--use-hsdp",
             "--hsdp-shard-size",
-            "2",
+            str(num_cards),
             "--text-encoder-tp-size",
-            "2",
+            str(num_cards),
             "--vae-patch-parallel-size",
-            "2",
+            str(num_cards),
             "--vae-parallel-mode",
             "tile",
             "--vae-use-tiling",

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The vLLM-Omni team.
 
 """Ming-flash-omni-2.0 imagegen (text-to-image / img2img) diffusion pipeline.
@@ -47,6 +48,7 @@ from vllm_omni.diffusion.models.ming_flash_omni.condition_encoder import (
 from vllm_omni.diffusion.models.ming_flash_omni.ming_zimage_transformer import (
     MingZImageTransformer2DModel,
 )
+from vllm_omni.diffusion.models.utils import load_vae_scale_factor, vae_scale_factor_from_vae
 from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -79,6 +81,8 @@ class MingImagePipeline(ZImagePipeline):
         # Skip ZImagePipeline.__init__ (it would eagerly load the Z-Image text
         # encoder/tokenizer that Ming replaces with its own condition_encoder).
         nn.Module.__init__(self)
+        self.od_config = od_config
+        self._raise_unsupported_features()
 
         model_path = od_config.model
         if not os.path.exists(model_path):
@@ -87,7 +91,6 @@ class MingImagePipeline(ZImagePipeline):
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         local_files_only = os.path.exists(model_path)
 
-        self.od_config = od_config
         self._execution_device = get_local_device()
         self.device = self._execution_device  # Ming convention alias
         self._dtype = dtype
@@ -161,7 +164,7 @@ class MingImagePipeline(ZImagePipeline):
         self.text_encoder = None
         self.tokenizer = None
 
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.vae_scale_factor = vae_scale_factor_from_vae(self.vae)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2, do_convert_rgb=True)
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=getattr(od_config, "enable_diffusion_pipeline_profiler", False)
@@ -186,6 +189,14 @@ class MingImagePipeline(ZImagePipeline):
             logger.info("[MingImagePipeline] no byt5/ subfolder at %s; ByT5 enhancement disabled", byte5_dir)
 
         logger.info("[MingImagePipeline] ready — vae_scale_factor=%d", self.vae_scale_factor)
+
+    def _raise_unsupported_features(self) -> None:
+        """Reject execution modes that do not have Ming-specific support."""
+        if self.od_config.cache_backend == "tea_cache":
+            raise NotImplementedError(
+                "TeaCache is not supported by MingImagePipeline because "
+                "MingZImageTransformer2DModel has not been calibrated."
+            )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -483,16 +494,12 @@ def get_ming_image_post_process_func(od_config: OmniDiffusionConfig):
     Registered via ``_DIFFUSION_POST_PROCESS_FUNCS["MingImagePipeline"]``
     in vllm_omni/diffusion/registry.py.
     """
-    import json
-
     model_path = od_config.model
-    vae_config_path = os.path.join(model_path, "vae", "config.json")
+    # The VAE config is optional for Ming's Flux-format VAE; preserve the
+    # pre-refactor tolerance for its absence instead of failing fast.
     try:
-        with open(vae_config_path) as f:
-            vae_cfg = json.load(f)
-        block_out_channels = vae_cfg.get("block_out_channels", [128, 256, 512, 512])
-        vae_scale_factor = 2 ** (len(block_out_channels) - 1)
-    except Exception:
+        vae_scale_factor = load_vae_scale_factor(model_path)
+    except (OSError, ValueError):
         vae_scale_factor = 8  # Ming's Flux-format VAE default
 
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2, do_convert_rgb=True)
