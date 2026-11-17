@@ -73,6 +73,36 @@ def _make_values(start: float) -> torch.Tensor:
     return torch.arange(start, start + 4, dtype=torch.float32)
 
 
+def _install_flat_shards(hook: DistributedLayerwiseOffloadHook, source_block: nn.Module) -> None:
+    """Replace chunk-packed shards with the legacy flat-shard layout."""
+    params = dict(source_block.named_parameters())
+    bufs = dict(source_block.named_buffers())
+    hook.cpu_shards, hook.metadata = DistributedLayerwiseOffloadHook._shard_and_pin(
+        params,
+        bufs,
+        hook.dp_size,
+        hook.rank,
+        hook.pin_memory,
+        hook.tensor_transforms,
+    )
+    hook.manifest = None
+    hook._ag_output_sizes = {dtype: sum(meta["numel"] for meta in metas) for dtype, metas in hook.metadata.items()}
+    hook._cached_repoint = tuple(
+        (
+            hook.next_block_parameters[m["name"]]
+            if m["name"] in hook.next_block_parameters
+            else hook.next_block_buffers[m["name"]],
+            dtype,
+            m["offset"],
+            m["numel"],
+            m["shape"],
+            m["stride"],
+        )
+        for dtype, metas in hook.metadata.items()
+        for m in metas
+    )
+
+
 class TestDistributedLayerwiseOffloadHook:
     def test_buffer_only_block_reports_offloaded_state(self, patched_offload_runtime):
         current_block = nn.Module()
@@ -430,10 +460,12 @@ class TestDistributedLayerwiseOffloadHook:
                 atol=0,
             )
 
+    @pytest.mark.parametrize("chunked", [True, False], ids=["manifest", "flat"])
     def test_allgather_reconstructs_online_mxfp8_weight_and_scale(
         self,
         patched_offload_runtime,
         monkeypatch,
+        chunked,
     ):
         """DLO must reconstruct finalized online-MXFP8 tensors byte-for-byte.
 
@@ -484,16 +516,23 @@ class TestDistributedLayerwiseOffloadHook:
 
         rank0_hook = make_hook(rank0_block, 0)
         rank1_hook = make_hook(rank1_block, 1)
+        rank0_flat_source = OnlineMxfp8Block()
+        rank1_flat_source = OnlineMxfp8Block()
         rank0_hook.initialize_hook(current_block)
         rank1_hook.initialize_hook(OnlineMxfp8Block())
-        # dp_size > 1 uses the chunk-manifest path.
-        assert rank0_hook.manifest is not None
+        if chunked:
+            # dp_size > 1 normally takes the chunk-manifest path.
+            assert rank0_hook.manifest is not None
+        else:
+            _install_flat_shards(rank0_hook, rank0_flat_source)
+            _install_flat_shards(rank1_hook, rank1_flat_source)
+            assert rank0_hook.manifest is None
         rank0_hook.gpu_shard_buffers = [
             {dtype: torch.empty_like(shard) for dtype, shard in rank0_hook.cpu_shards.items()} for _ in range(2)
         ]
 
         source_dtypes = []
-        original_all_gather = dist_backend_module._all_gather_into_tensor
+        original_all_gather = dist_backend_module._all_gather_shard
 
         def recording_all_gather(output, input_tensor, group):
             # Record the dtype before the helper applies its uint8 byte view,
@@ -502,7 +541,7 @@ class TestDistributedLayerwiseOffloadHook:
             source_dtypes.append(input_tensor.dtype)
             original_all_gather(output, input_tensor, group)
 
-        monkeypatch.setattr(dist_backend_module, "_all_gather_into_tensor", recording_all_gather)
+        monkeypatch.setattr(dist_backend_module, "_all_gather_shard", recording_all_gather)
         collective_dtypes = []
 
         def fake_allgather(output, local_shard, *, group):

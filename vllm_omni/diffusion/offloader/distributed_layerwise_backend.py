@@ -89,7 +89,7 @@ _ACTIVE_HWR_REGISTRATIONS_LOCK = threading.Lock()
 _BYTE_VIEW_ALLGATHER_DTYPES = frozenset({torch.float8_e8m0fnu})
 
 
-def _all_gather_into_tensor(
+def _all_gather_shard(
     output: torch.Tensor,
     input_tensor: torch.Tensor,
     group: torch.distributed.ProcessGroup | None,
@@ -679,7 +679,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 with current_omni_platform.stream(self.comm_stream):
                     for dtype, local_shard in gpu_shards.items():
                         gw = gpu_weights[dtype][: self._ag_output_sizes[dtype]]
-                        _all_gather_into_tensor(
+                        _all_gather_shard(
                             gw,
                             local_shard,
                             self.dp_group,
@@ -709,7 +709,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                             full_out = gpu_weights[dtype_manifest.dtype][
                                 chunk.full_offset : chunk.full_offset + chunk.padded_numel
                             ]
-                            _all_gather_into_tensor(
+                            _all_gather_shard(
                                 full_out,
                                 local_input,
                                 self.dp_group,
