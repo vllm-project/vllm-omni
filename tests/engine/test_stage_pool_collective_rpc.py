@@ -24,6 +24,13 @@ def _make_pool(*, stage_type: str = "llm", **client_methods: AsyncMock) -> tuple
     return pool, client
 
 
+def _coerce_stage_bool(result):
+    """Reduce a stage result exactly like ``AsyncOmni`` does before returning it."""
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
+
+    return AsyncOmni._coerce_stage_bool(result)
+
+
 @pytest.mark.cpu
 def test_collective_rpc_normalizes_none_args_on_control_helper():
     async def run() -> None:
@@ -79,6 +86,27 @@ def test_collective_rpc_control_method_reraises_worker_error():
         pool, _client = _make_pool(wake_up_async=AsyncMock(side_effect=RuntimeError("worker died")))
         with pytest.raises(RuntimeError, match="worker died"):
             await pool.collective_rpc(0, "wake_up")
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_kv_memory_release_uses_engine_core_and_propagates_pause_errors():
+    async def run() -> None:
+        release = AsyncMock(return_value=None)
+        pool, client = _make_pool(release_kv_cache_memory_async=release)
+        await pool.collective_rpc(0, "release_kv_cache_memory", timeout=2.0)
+        release.assert_awaited_once_with()
+        client.collective_rpc_async.assert_not_awaited()
+
+        release.side_effect = RuntimeError("requires a completed pause first")
+        with pytest.raises(RuntimeError, match="completed pause"):
+            await pool.collective_rpc(0, "release_kv_cache_memory")
+
+        del client.release_kv_cache_memory_async
+        result = await pool.collective_rpc(0, "release_kv_cache_memory")
+        assert result["supported"] is False
+        client.collective_rpc_async.assert_not_awaited()
 
     asyncio.run(run())
 
@@ -155,6 +183,23 @@ def test_abort_requests_does_not_commit_op_state_when_engine_abort_fails():
 
 
 @pytest.mark.cpu
+def test_release_request_resources_skips_without_async_chunk():
+    async def run() -> None:
+        call = AsyncMock()
+        pool = StagePool(
+            0,
+            [SimpleNamespace(call_utility_async=call)],  # type: ignore[list-item]
+            stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(async_chunk=False)),
+        )
+
+        pool.schedule_release_request_resources(["req-1"])
+        await asyncio.sleep(0.01)
+        call.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize("method", ["reset_prefix_cache", "reset_encoder_cache", "reset_mm_cache"])
 @pytest.mark.parametrize("failure", ["error", "timeout", "missing"])
 def test_cache_reset_failure_is_serialized_and_pool_remains_usable(method, failure):
@@ -175,5 +220,102 @@ def test_cache_reset_failure_is_serialized_and_pool_remains_usable(method, failu
         client.collective_rpc_async.assert_not_awaited()
         # A subsequent control request still completes on the same pool.
         assert await pool.collective_rpc(0, "is_sleeping") == {"via": "collective"}
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_add_lora_uses_the_typed_client_helper():
+    async def run() -> None:
+        add_lora = AsyncMock(return_value=True)
+        pool, client = _make_pool(add_lora_async=add_lora)
+        request = object()
+
+        result = await pool.collective_rpc(0, "add_lora", args=(request,))
+
+        assert result is True
+        add_lora.assert_awaited_once_with(request)
+        client.collective_rpc_async.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_add_lora_without_typed_helper_does_not_fall_back():
+    async def run() -> None:
+        pool, client = _make_pool()
+
+        result = await pool.collective_rpc(0, "add_lora", args=(object(),))
+
+        # A failure must be a plain False, not an error dict: AsyncOmni reduces
+        # a non-empty dict to True and would report a load that never happened.
+        assert result is False
+        assert _coerce_stage_bool(result) is False
+        client.collective_rpc_async.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_add_lora_helper_failure_is_reported_as_false():
+    async def run() -> None:
+        pool, _client = _make_pool(
+            add_lora_async=AsyncMock(side_effect=AttributeError("'list' object has no attribute 'lora_int_id'"))
+        )
+
+        result = await pool.collective_rpc(0, "add_lora", args=(object(),))
+
+        assert result is False
+        assert _coerce_stage_bool(result) is False
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_add_lora_helper_honors_timeout():
+    async def run() -> None:
+        async def never_returns(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        pool, _client = _make_pool(add_lora_async=AsyncMock(side_effect=never_returns))
+
+        result = await pool.collective_rpc(0, "add_lora", timeout=0.01, args=(object(),))
+
+        assert result is False
+        assert _coerce_stage_bool(result) is False
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("method,args", [("remove_lora", (7,)), ("pin_lora", (7,)), ("list_loras", ())])
+def test_other_lora_methods_keep_the_generic_path(method, args):
+    async def run() -> None:
+        pool, client = _make_pool(add_lora_async=AsyncMock(return_value=True))
+
+        result = await pool.collective_rpc(0, method, args=args)
+
+        assert result == {"via": "collective"}
+        client.collective_rpc_async.assert_awaited_once_with(
+            method=method,
+            timeout=None,
+            args=args,
+            kwargs={},
+        )
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_diffusion_stage_keeps_add_lora_on_the_generic_path():
+    async def run() -> None:
+        add_lora = AsyncMock(return_value=True)
+        pool, client = _make_pool(stage_type="diffusion", add_lora_async=add_lora)
+
+        result = await pool.collective_rpc(0, "add_lora", args=(object(),))
+
+        assert result == {"via": "collective"}
+        add_lora.assert_not_awaited()
+        client.collective_rpc_async.assert_awaited_once()
 
     asyncio.run(run())

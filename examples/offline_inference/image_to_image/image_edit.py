@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Example script for image editing with OmniGen2.
@@ -209,14 +209,14 @@ def parse_profiler_config(value: str) -> dict[str, Any]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Edit an image with Qwen-Image-Edit.")
+    parser = argparse.ArgumentParser(description="Edit images with vLLM-Omni.")
     parser.add_argument(
         "--model",
         default="Qwen/Qwen-Image-Edit",
         help=(
             "Diffusion model name or local path. "
-            "For multiple image inputs, use Qwen/Qwen-Image-Edit-2509 or Qwen/Qwen-Image-Edit-2511"
-            "which supports QwenImageEditPlusPipeline."
+            "For multiple image inputs, use Qwen/Qwen-Image-Edit-2509, "
+            "Qwen/Qwen-Image-Edit-2511, or Qwen/Qwen-Image-2.1."
         ),
     )
     parser.add_argument(
@@ -270,9 +270,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cfg-scale",
         type=float,
-        default=4.0,
+        default=None,
         help=(
-            "True classifier-free guidance scale (default: 4.0). Guidance scale as defined in Classifier-Free "
+            "True classifier-free guidance scale. When omitted, the pipeline uses its model-specific default. "
+            "Guidance scale as defined in Classifier-Free "
             "Diffusion Guidance. Classifier-free guidance is enabled by setting cfg_scale > 1 and providing "
             "a negative_prompt. Higher guidance scale encourages images closely linked to the text prompt, "
             "usually at the expense of lower image quality."
@@ -281,9 +282,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--guidance-scale",
         type=float,
-        default=1.0,
+        default=None,
         help=(
-            "Guidance scale for guidance-distilled models (default: 1.0, disabled). "
+            "Guidance scale for guidance-distilled models. When omitted, the pipeline uses its model-specific default. "
             "Unlike classifier-free guidance (--cfg-scale), guidance-distilled models take the guidance scale "
             "directly as an input parameter. Enabled when guidance_scale > 1. Ignored when not using guidance-distilled models."
         ),
@@ -368,7 +369,7 @@ def parse_args() -> argparse.Namespace:
         "--color-format",
         type=str,
         default="RGB",
-        help="For Qwen-Image-Layered, set to RGBA.",
+        help="For Qwen-Image-Layered or Qwen-Image-2.1, set to RGBA to preserve transparency.",
     )
 
     # Cache-DiT specific parameters
@@ -523,6 +524,12 @@ def parse_args() -> argparse.Namespace:
             "silently masking with a possibly-wrong prompt."
         ),
     )
+    parser.add_argument(
+        "--init-timeout",
+        type=int,
+        default=600,
+        help="Overall pipeline initialization timeout in seconds.",
+    )
     return parser.parse_args()
 
 
@@ -593,6 +600,7 @@ def main():
         enable_cpu_offload=args.enable_cpu_offload,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
+        init_timeout=args.init_timeout,
     )
     if args.enforce_eager is not None:
         omni_kwargs["enforce_eager"] = args.enforce_eager
@@ -647,6 +655,7 @@ def main():
 
     diffusion_params = OmniDiffusionSamplingParams(
         generator=generator,
+        seed=args.seed,
         true_cfg_scale=args.cfg_scale,
         guidance_scale=args.guidance_scale,
         guidance_scale_2=args.guidance_scale_2,

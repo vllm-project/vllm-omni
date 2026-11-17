@@ -31,7 +31,6 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091
 
 ### Start with Parameters
 
-
 Or use the startup script:
 
 ```bash
@@ -212,7 +211,7 @@ Start the server with:
 vllm serve Qwen/Qwen-Image-Layered --omni --port 8093
 ```
 
-**Using curl**
+#### Using curl
 
 ```bash
 IMG_B64=$(base64 -w0 input.png)
@@ -241,7 +240,7 @@ curl -sS http://localhost:8093/v1/chat/completions \
     done
 ```
 
-**Using Python**
+#### Using Python
 
 ```python
 import base64
@@ -286,13 +285,13 @@ The response contains multiple images in `choices[0].message.content` — one pe
 
 #### Qwen-Image-Layered Parameters
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `layers` | int | 4 | Number of layers to decompose |
-| `resolution` | int | 640 | Resolution for dimension calculation (640 or 1024) |
-| `cfg_scale` | float | 4.0 | Classifier-free guidance scale (alias for `true_cfg_scale`) |
-| `num_inference_steps` | int | 50 | Number of denoising steps |
-| `seed` | int | None | Random seed for reproducibility |
+| Parameter             | Type   | Default   | Description                                                 |
+| --------------------- | ------ | --------- | ----------------------------------------------------------- |
+| `layers`              | int    | 4         | Number of layers to decompose                               |
+| `resolution`          | int    | 640       | Resolution for dimension calculation (640 or 1024)          |
+| `cfg_scale`           | float  | 4.0       | Classifier-free guidance scale (alias for `true_cfg_scale`) |
+| `num_inference_steps` | int    | 50        | Number of denoising steps                                   |
+| `seed`                | int    | None      | Random seed for reproducibility                             |
 
 ### Multi-Image Editing (Qwen-Image-Edit-2509)
 
@@ -322,19 +321,19 @@ generation controls as top-level form fields directly. For image dimensions and
 count, use `size` and `n` rather than `height`, `width`, or
 `num_outputs_per_prompt`.
 
-| Parameter                | Type  | Default | Description                           |
-| ------------------------ | ----- | ------- | ------------------------------------- |
-| `height`                 | int   | None    | Output image height in pixels         |
-| `width`                  | int   | None    | Output image width in pixels          |
-| `size`                   | str   | None    | Output image size (e.g., "1024x1024") |
-| `num_inference_steps`    | int   | 50      | Number of denoising steps             |
-| `guidance_scale`         | float | 1.0     | CFG guidance scale                    |
-| `seed`                   | int   | None    | Random seed (reproducible)            |
-| `negative_prompt`        | str   | None    | Negative prompt                       |
-| `num_outputs_per_prompt` | int   | 1       | Number of images to generate          |
+| Parameter                | Type  | Default | Description                                                                                                     |
+| ------------------------ | ----- | ------- | --------------------------------------------------------------------------------------------------------------- |
+| `height`                 | int   | None    | Output image height in pixels                                                                                   |
+| `width`                  | int   | None    | Output image width in pixels                                                                                    |
+| `size`                   | str   | None    | Output image size (e.g., "1024x1024")                                                                           |
+| `num_inference_steps`    | int   | 50      | Number of denoising steps                                                                                       |
+| `guidance_scale`         | float | 1.0     | CFG guidance scale                                                                                              |
+| `seed`                   | int   | None    | Random seed (reproducible)                                                                                      |
+| `negative_prompt`        | str   | None    | Negative prompt                                                                                                 |
+| `num_outputs_per_prompt` | int   | 1       | Number of images to generate                                                                                    |
 | `strength`               | float | 0.6     | **Z-Image only** - Denoising start timestep for I2I. Range: [0.0, 1.0]. Lower preserves more of original image. |
-| `layers`                 | int   | 4       | Number of layers (Qwen-Image-Layered) |
-| `resolution`             | int   | 640     | Resolution, 640 or 1024 (Qwen-Image-Layered) |
+| `layers`                 | int   | 4       | Number of layers (Qwen-Image-Layered)                                                                           |
+| `resolution`             | int   | 640     | Resolution, 640 or 1024 (Qwen-Image-Layered)                                                                    |
 
 Models like BAGEL accept additional parameters via `extra_body` (e.g.
 `cfg_text_scale`, `cfg_img_scale`). See the [BAGEL recipe](../../../recipes/Bagel/BAGEL-7B-MoT.md) for the full list.

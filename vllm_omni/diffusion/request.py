@@ -12,6 +12,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
+    from vllm_omni.diffusion.mixfusion.scheduling import MixFusionRequestInfo
 
 DUMMY_DIFFUSION_REQUEST_ID = "dummy_req_id"
 _DUMMY_DIFFUSION_REQUEST_ID_PREFIX = f"{DUMMY_DIFFUSION_REQUEST_ID}/"
@@ -68,6 +69,8 @@ class OmniDiffusionRequest:
     # This is populated by a pipeline preprocessor before the request reaches
     # the scheduler; ``None`` keeps the default behavior for other pipelines.
     batch_compatibility_key: tuple[Any, ...] | None = None
+    # Host-prepared admission cost; the worker owns the packed tensor layout.
+    mixfusion_info: MixFusionRequestInfo | None = None
     # Opaque native vLLM connector parameters. The Orchestrator and Scheduler
     # transport this bag without interpreting local pages or block IDs.
     kv_transfer_params: dict[str, Any] | None = None
@@ -76,6 +79,8 @@ class OmniDiffusionRequest:
     # A model preprocessor may keep selected requests on the legacy full-forward
     # path even when the engine is globally configured for step execution.
     use_step_execution: bool = True
+    # Whether first and later denoising steps may share a step batch.
+    allow_mixed_step_phases: bool = True
     # KV-recv wall-clock (ms), set by the runner's _prepare_request_for_forward
     # and carried to DiffusionOutput for the vllm_omni:diffusion_kv_load_s metric.
     kv_recv_ms: float = 0.0

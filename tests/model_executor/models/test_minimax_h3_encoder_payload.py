@@ -28,7 +28,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def test_edit_mask_boundary_canonicalizes_supported_request_shapes() -> None:
     video_token = torch.arange(168, dtype=torch.float32).reshape(7, 4, 6) / 168
     video_full = video_token.repeat_interleave(2, dim=1).repeat_interleave(2, dim=2)
-    video_kwargs = {"latent_t": 7, "latent_h": 8, "latent_w": 12}
+    video_kwargs = {"latent_t": 7, "latent_h": 8, "latent_w": 12, "num_frames": 22}
     for value in (video_token.flatten()[None, None], video_token[None], video_full[None]):
         torch.testing.assert_close(_canonical_video_edit_mask(value, **video_kwargs), video_full)
     torch.testing.assert_close(
@@ -46,14 +46,40 @@ def test_edit_mask_boundary_canonicalizes_supported_request_shapes() -> None:
     )
 
 
+def test_edit_mask_resizes_raw_spatial_and_frame_space_masks() -> None:
+    video_kwargs = {"latent_t": 7, "latent_h": 8, "latent_w": 12, "num_frames": 22}
+
+    spatial = torch.full((16, 24), 0.5)
+    spatial_grid = _canonical_video_edit_mask(spatial, **video_kwargs)
+    assert spatial_grid.shape == (7, 8, 12)
+    torch.testing.assert_close(spatial_grid, torch.full((7, 8, 12), 0.5))
+
+    frame_space = torch.zeros(22, 16, 24)
+    frame_space[7] = 1.0  # frame 7 -> token 2
+    frame_grid = _canonical_video_edit_mask(frame_space, **video_kwargs)
+    assert frame_grid.shape == (7, 8, 12)
+    assert bool(torch.all(frame_grid[2] > 0.5).item())
+    assert bool(torch.all(frame_grid[0] == 0.0).item())
+
+
 @pytest.mark.parametrize(
     ("canonicalize", "value", "kwargs", "message"),
     [
-        (_canonical_video_edit_mask, [True], {"latent_t": 7, "latent_h": 8, "latent_w": 12}, "booleans"),
+        (
+            _canonical_video_edit_mask,
+            [True],
+            {"latent_t": 7, "latent_h": 8, "latent_w": 12, "num_frames": 22},
+            "booleans",
+        ),
         (_canonical_audio_edit_mask, float("nan"), {"audio_t": 37}, "finite"),
         (_canonical_audio_edit_mask, 10**400, {"audio_t": 37}, "finite"),
         (_canonical_audio_edit_mask, 1.01, {"audio_t": 37}, r"\[0, 1\]"),
-        (_canonical_video_edit_mask, [0.0, 0.5], {"latent_t": 7, "latent_h": 8, "latent_w": 12}, "shape"),
+        (
+            _canonical_video_edit_mask,
+            [0.0, 0.5],
+            {"latent_t": 7, "latent_h": 8, "latent_w": 12, "num_frames": 22},
+            "shape",
+        ),
     ],
 )
 def test_edit_mask_boundary_rejects_invalid_values(canonicalize, value, kwargs, message) -> None:
@@ -532,6 +558,66 @@ def test_encoder_releases_workspace_after_cpu_payload(monkeypatch) -> None:
     assert output.multimodal_outputs["embed"]["embedding"][0].device.type == "cpu"
 
 
+def _bare_encoder(*, leader: bool = True):
+    from vllm_omni.model_executor.models.minimax_h3 import encoder as encoder_module
+
+    model = encoder_module.MiniMaxH3Encoder.__new__(encoder_module.MiniMaxH3Encoder)
+    torch.nn.Module.__init__(model)
+    model._component_leader = leader
+    model._token_tags = torch.tensor([1])
+    return model
+
+
+def _cached_encoder_info():
+    return {
+        "req_id": "request-1",
+        "meta": {"minimax_h3_encoder_request": {}},
+        "_minimax_h3_encoder_media_conditioning": MiniMaxH3EncoderMediaConditioning(
+            task="t2va",
+            height=256,
+            width=448,
+            num_frames=17,
+            latent_t=5,
+            audio_t=10,
+        ),
+    }
+
+
+def test_make_omni_output_mixed_warmup_and_real_request_metadata() -> None:
+    model = _bare_encoder()
+    real = _cached_encoder_info()
+    output = model.make_omni_output(
+        torch.zeros(2, 5120),
+        model_intermediate_buffer=[{"req_id": "_warmup_0_"}, real],
+        request_sample_eligible=[False, True],
+    )
+    multimodal = output.multimodal_outputs
+    assert multimodal is not None
+    embed = multimodal["embed"]["embedding"]
+    assert len(embed) == 2
+    assert embed[0].numel() == 0  # skipped warmup slot placeholder
+    assert embed[1] is not None
+
+    fresh = _bare_encoder()
+    with pytest.raises(RuntimeError, match="request metadata is missing from the runner"):
+        fresh.make_omni_output(
+            torch.zeros(2, 5120),
+            model_intermediate_buffer=[{"req_id": "_warmup_0_"}, {"req_id": "request-1"}],
+            request_sample_eligible=[False, True],
+        )
+
+    # All-ineligible batch: do not emit embed / layout keys. The mixed case
+    # above already covers the eligible emit and missing-metadata raise.
+    skipped = _bare_encoder().make_omni_output(
+        torch.zeros(1, 5120),
+        model_intermediate_buffer=[{"req_id": "chunked_prefill"}],
+        request_sample_eligible=[False],
+    )
+    skipped_mm = skipped.multimodal_outputs or {}
+    assert "embed" not in skipped_mm
+    assert "kv_metadata.minimax_h3_encoder_layout" not in skipped_mm
+
+
 def test_driving_audio_is_not_a_short_reference_and_survives_stage_transport():
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
     from vllm_omni.model_executor.models.minimax_h3 import encoder_processing as processing
@@ -592,3 +678,47 @@ def test_driving_audio_does_not_override_fl2va_task_inference():
     assert prepared.media.task == "fl2va"
     assert prepared.media.audio_mode == "lock_source"
     assert prepared.condition_labels == [("image", 1)]
+
+
+def test_audio_edit_mask_rejects_raw_temporal_lengths() -> None:
+    from vllm_omni.errors import OmniClientError
+
+    for value in (torch.zeros(100), torch.zeros(1, 100), torch.zeros(2, 100), torch.zeros(3, 37)):
+        with pytest.raises(OmniClientError, match="shape"):
+            _canonical_audio_edit_mask(value, audio_t=37)
+
+
+def test_temporal_group_max_pool_rejects_count_mismatch() -> None:
+    from vllm_omni.errors import OmniClientError
+    from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
+        _temporal_group_max_pool,
+    )
+
+    with pytest.raises(OmniClientError, match="does not map"):
+        _temporal_group_max_pool(torch.zeros(34, 1, 1), latent_t=6)
+
+
+def test_video_edit_mask_aligns_frame_space_mask_to_num_frames() -> None:
+    video_kwargs = {"latent_t": 7, "latent_h": 8, "latent_w": 12, "num_frames": 22}
+    mask = torch.zeros(17, 16, 24)
+    mask[0] = 1.0
+    grid = _canonical_video_edit_mask(mask, **video_kwargs)
+    assert grid.shape == (7, 8, 12)
+    assert bool(torch.all(grid[0] > 0.5).item())
+    assert bool(torch.all(grid[1] == 0.0).item())
+
+
+def test_temporal_group_max_pool_causal_boundaries() -> None:
+    from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
+        _temporal_group_max_pool,
+    )
+
+    def lit(frame: int) -> list[int]:
+        mask = torch.zeros(34, 1, 1)
+        mask[frame] = 1.0
+        out = _temporal_group_max_pool(mask, latent_t=7)
+        return [i for i in range(out.shape[0]) if out[i, 0, 0].item() > 0]
+
+    assert lit(0) == [0]
+    assert lit(4) == [1]
+    assert lit(5) == [2]

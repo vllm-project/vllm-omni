@@ -25,7 +25,7 @@ from vllm_omni.diffusion.utils.chunked_video import (
     quantize_chunk,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 def _frames(value: int = 7, *, batch: int = 1) -> torch.Tensor:
@@ -33,10 +33,11 @@ def _frames(value: int = 7, *, batch: int = 1) -> torch.Tensor:
     return torch.full((batch, 2, 4, 6, 3), value, dtype=torch.uint8)
 
 
-def _cpu_ring(depth: int) -> PinnedChunkRing:
-    return PinnedChunkRing(depth=depth, device=torch.device("cpu"))
+def _cpu_ring(depth: int, *, max_pending_bytes: int | None = None) -> PinnedChunkRing:
+    return PinnedChunkRing(depth=depth, device=torch.device("cpu"), max_pending_bytes=max_pending_bytes)
 
 
+@pytest.mark.cpu
 def test_slot_returns_only_after_its_last_reader():
     """Each batch entry reads the same buffer, so one release must not free it."""
     ring = _cpu_ring(2)
@@ -59,6 +60,22 @@ def test_slot_returns_only_after_its_last_reader():
     assert ring.slots_in_use == 0
 
 
+@pytest.mark.cpu
+def test_slot_can_be_reused_after_inference_mode_producer():
+    """The final flush may reuse a VAE callback's slot outside inference mode."""
+    ring = _cpu_ring(1)
+    with torch.inference_mode():
+        first = ring.transfer(_frames(11), readers=1)
+        assert np.all(first.wait() == 11)
+        first.release()
+
+    final = ring.transfer(_frames(23), readers=1)
+    assert np.all(final.wait() == 23)
+    final.release()
+    assert ring.slots_in_use == 0
+
+
+@pytest.mark.cpu
 def test_transfer_waits_for_a_slot_instead_of_growing_the_pool():
     """Depth is the bound on in-flight host buffers, so a full ring blocks."""
     ring = _cpu_ring(1)
@@ -81,6 +98,47 @@ def test_transfer_waits_for_a_slot_instead_of_growing_the_pool():
     assert ring.stats.slot_wait_seconds > 0
 
 
+@pytest.mark.cpu
+def test_transfer_waits_for_byte_budget_even_when_a_slot_is_free():
+    """Variable-sized chunks cannot bypass the memory bound via free slots."""
+    small = _frames()
+    large = _frames(batch=2)
+    large_bytes = large.numel() * large.element_size()
+    ring = _cpu_ring(3, max_pending_bytes=large_bytes)
+    held = ring.transfer(small, readers=1)
+    second: list[ChunkLease] = []
+
+    waiter = threading.Thread(target=lambda: second.append(ring.transfer(large, readers=1)))
+    waiter.start()
+    waiter.join(timeout=0.3)
+    assert waiter.is_alive(), "the byte budget must backpressure a producer even with free slots"
+
+    held.wait()
+    held.release()
+    waiter.join(timeout=5)
+    assert not waiter.is_alive()
+    assert ring.slots_in_use == 1
+    assert ring.pending_bytes == large_bytes
+    second[0].wait()
+    second[0].release()
+
+
+@pytest.mark.cpu
+def test_one_oversized_chunk_is_admitted_without_deadlock():
+    """A native VAE chunk larger than the budget must make progress alone."""
+    chunk = _frames()
+    chunk_bytes = chunk.numel() * chunk.element_size()
+    ring = _cpu_ring(2, max_pending_bytes=chunk_bytes - 1)
+
+    lease = ring.transfer(chunk, readers=1)
+
+    assert ring.pending_bytes == chunk_bytes
+    assert ring.stats.peak_pending_bytes == chunk_bytes
+    lease.wait()
+    lease.release()
+
+
+@pytest.mark.cpu
 def test_abort_wakes_a_transfer_waiting_for_a_slot():
     """A dead consumer must surface as an error, not as a stuck producer."""
     ring = _cpu_ring(1)
@@ -106,6 +164,7 @@ def test_abort_wakes_a_transfer_waiting_for_a_slot():
         ring.transfer(_frames(), readers=1)
 
 
+@pytest.mark.cpu
 def test_encoder_releases_the_chunk_it_was_reading_when_muxing_fails(monkeypatch):
     """A failed mux abandons the frame generator, which still owns a lent slot."""
     from vllm_omni.diffusion.utils import media_utils
@@ -171,6 +230,7 @@ def _push_ramp(session: ChunkedVideoMP4Session, values: list[int]) -> None:
         session.push(torch.full((1, 3, 1, 4, 6), value / 255.0))
 
 
+@pytest.mark.cpu
 def test_session_feeds_chunks_in_producer_order(recording_encoders):
     """Copies complete in issue order, and the encoder must see that order."""
     session = ChunkedVideoMP4Session(value_range=(0.0, 1.0), fps=24)
@@ -180,6 +240,28 @@ def test_session_feeds_chunks_in_producer_order(recording_encoders):
     assert recording_encoders[0].pushes == [10, 20, 30, 40]
 
 
+@pytest.mark.cpu
+def test_session_drains_oldest_chunk_when_byte_budget_fills(recording_encoders, monkeypatch):
+    """Byte pressure must drain queued D2H work instead of deadlocking it."""
+    monkeypatch.setattr(ChunkLease, "ready", lambda self: False)
+    chunk_bytes = 1 * 1 * 4 * 6 * 3  # one quantized BTHWC chunk from _push_ramp
+    session = ChunkedVideoMP4Session(
+        value_range=(0.0, 1.0),
+        fps=24,
+        transfer_slots=2,
+        max_pending_bytes=chunk_bytes,
+    )
+
+    _push_ramp(session, [10, 20, 30])
+
+    assert session.finish() == [b"mp4"]
+    assert recording_encoders[0].pushes == [10, 20, 30]
+    assert session.ring is not None
+    assert session.ring.stats.peak_slots_in_use == 1
+    assert session.ring.stats.peak_pending_bytes == chunk_bytes
+
+
+@pytest.mark.cpu
 def test_session_returns_the_slot_when_an_encoder_rejects_a_chunk(recording_encoders):
     """A rejected chunk must not strand the buffer it was lent."""
     session = ChunkedVideoMP4Session(value_range=(0.0, 1.0), fps=24, transfer_slots=1)
@@ -193,6 +275,7 @@ def test_session_returns_the_slot_when_an_encoder_rejects_a_chunk(recording_enco
     assert session.ring.slots_in_use == 0
 
 
+@pytest.mark.cpu
 def test_session_abort_releases_every_slot_still_in_flight(recording_encoders):
     """Teardown returns the pool even when nothing consumed the chunks."""
     session = ChunkedVideoMP4Session(value_range=(0.0, 1.0), fps=24, transfer_slots=2)
@@ -204,6 +287,7 @@ def test_session_abort_releases_every_slot_still_in_flight(recording_encoders):
     assert session.ring.slots_in_use == 0
 
 
+@pytest.mark.cpu
 def test_session_gets_its_slot_back_after_a_real_encoder_failure():
     """A real libx264 error must not strand the producer on the slot it lent."""
     session = ChunkedVideoMP4Session(
@@ -235,8 +319,9 @@ def test_session_gets_its_slot_back_after_a_real_encoder_failure():
     assert session.ring.slots_in_use == 0
 
 
-@hardware_test(res={"cuda": ["H100", "B200"]})
-def test_device_chunks_land_intact_through_the_pinned_ring():
+@hardware_test(res={"cuda": ["L4", "H100", "B200"], "rocm": "MI325"})
+@pytest.mark.parametrize("inference_producer", [False, True])
+def test_device_chunks_land_intact_through_the_pinned_ring(inference_producer):
     """On an accelerator the copy is deferred, so its event must order the read."""
     if not torch.accelerator.is_available():
         pytest.skip("no accelerator available")
@@ -248,8 +333,11 @@ def test_device_chunks_land_intact_through_the_pinned_ring():
         value = 10 * step + 1
         # Quantize on the compute stream immediately before handing the chunk
         # over: without the source-ready event the copy would race this work.
-        chunk = torch.full((1, 3, 2, 4, 6), value / 255.0, device=device)
-        pending.append((value, ring.transfer(quantize_chunk(chunk, (0.0, 1.0)), readers=1)))
+        # The VAE callback can fill both slots in inference mode before a
+        # final flush reuses them outside that context.
+        with torch.inference_mode(inference_producer and step < 2):
+            chunk = torch.full((1, 3, 2, 4, 6), value / 255.0, device=device)
+            pending.append((value, ring.transfer(quantize_chunk(chunk, (0.0, 1.0)), readers=1)))
         if len(pending) == 2:
             for expected, lease in pending:
                 assert int(lease.wait()[0, 0, 0, 0, 0]) == expected

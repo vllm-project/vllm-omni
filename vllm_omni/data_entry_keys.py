@@ -19,8 +19,20 @@ import msgspec
 import numpy as np
 import torch
 
+# Internal output routing markers shared by first-frame producers and orchestration.
+FIRST_AUDIO_KEY = "_omni_first_audio"
+FIRST_AUDIO_REQUIRED_KEY = "_omni_first_audio_required"
+
 REQUEST_ARTIFACT_DIRS_KEY = "_omni_request_artifact_dirs"
+# Routing tag: the stage returns its full payload on its output instead of sending it to the
+# next stage. Set on run requests whose next stage takes a full payload.
+RETURN_STAGE_PAYLOAD_KEY = "omni_return_stage_payload"
 TRANSFORM_OWNED_META_KEYS = frozenset({"minimax_h3_prepared_reference_videos"})
+# Prefix of the flat ``f"{NS}.<name>"`` additional_information keys that carry
+# an async-chunk placeholder's prewarm payload. Values stay top-level tensors or
+# scalars (a dict holding a tensor would come back as a list); the receiving
+# scheduler pops these keys before the request reaches the model.
+ASYNC_CHUNK_PREWARM_NS = "_async_chunk_prewarm"
 
 if TYPE_CHECKING:
     from vllm_omni.engine import AdditionalInformationEntry, AdditionalInformationPayload
@@ -37,6 +49,8 @@ class Embeddings(TypedDict, total=False):
     prepared_prefill: torch.Tensor
     prefill: torch.Tensor
     decode: torch.Tensor
+    # [1, H] embedding of the token sampled by a row's final prefill step (MRv2 producers).
+    sampled: torch.Tensor
     decode_token_start: int
     decode_token_end: int
     cached_decode: torch.Tensor
@@ -84,6 +98,7 @@ class OmniPayloadMeta(TypedDict, total=False):
     right_holdback_size: int
     override_keys: list[tuple[str, str]]
     num_processed_tokens: int
+    resumable: bool
     next_stage_prompt_len: int
     next_stage_generation_tokens: int
     replace_streaming_prompt: bool
@@ -101,12 +116,16 @@ class OmniPayloadMeta(TypedDict, total=False):
     width: int
     decode_flag: bool
     codec_streaming: bool
+    first_audio: bool | torch.Tensor
     codec_frame_valid: bool | torch.Tensor
     ref_code_len: int
     ref_context_size: int
     ref_context_request_id: str
     ref_context_included: bool
     talker_prefill_offset: int
+    # embed.prefill also holds the accept-layer hidden state at multimodal
+    # placeholder rows, so no hidden_states.output is sent (Qwen3-Omni chunk 0).
+    prefill_holds_accept_hidden: bool
     omni_final_stage_id: int
     # Per-request audio seed. Stages that draw their own noise (flow-matching
     # / diffusion decoders) need the producing stage's seed to stay
@@ -115,6 +134,11 @@ class OmniPayloadMeta(TypedDict, total=False):
     audio_seed: int
     token_role_ids: torch.Tensor
     minimax_h3_prepared_reference_videos: str
+    decode_span: bool
+    # Talker runtime state only: MRv1's indexed cache has become a pending queue.
+    decode_span_queue_started: bool
+    committed_token_count: int
+    consumed_input_span: bool
 
 
 class OmniPayload(TypedDict, total=False):
@@ -130,6 +154,7 @@ class OmniPayload(TypedDict, total=False):
     speaker: Any
     language: Any
     request_id: str
+    additional_information: dict[str, Any]
 
 
 # ── msgspec.Struct mirror of the TypedDicts (runtime-validated) ──
@@ -197,6 +222,8 @@ class MetaStruct(_StructBase):
     right_holdback_size: int | None = None
     override_keys: list[tuple[str, str]] | None = None
     num_processed_tokens: int | None = None
+    # The model runner sets this when a streaming request is resumed.
+    resumable: bool | None = None
     next_stage_prompt_len: int | None = None
     next_stage_generation_tokens: int | None = None
     replace_streaming_prompt: bool | None = None
@@ -214,6 +241,7 @@ class MetaStruct(_StructBase):
     width: int | None = None
     decode_flag: bool | None = None
     codec_streaming: bool | None = None
+    first_audio: torch.Tensor | None = None
     codec_frame_valid: torch.Tensor | None = None
     ref_code_len: int | None = None
     # Expected FINAL length of a growing async-chunk sequence, when the
@@ -226,6 +254,7 @@ class MetaStruct(_StructBase):
     ref_context_request_id: str | None = None
     ref_context_included: bool | None = None
     talker_prefill_offset: int | None = None
+    prefill_holds_accept_hidden: bool | None = None
     codec_chunk_frames: int | None = None
     codec_left_context_frames: int | None = None
     code_flat_numel: int | None = None
@@ -233,6 +262,18 @@ class MetaStruct(_StructBase):
     audio_seed: int | None = None
     token_role_ids: torch.Tensor | None = None
     minimax_h3_prepared_reference_videos: str | None = None
+    # Assistant text-token count the request's prompt has reached when this
+    # payload was produced: a running count over the request's text ids, which
+    # covers every segment a resumable request has been fed so far.  A consumer
+    # derives one segment's n_k as the increase between consecutive segment
+    # boundaries; the value itself is not segment-local.
+    request_text_tokens: int | None = None
+    # Duplex session stats (RFC #8325): [epoch, seq] of the chunk the sending
+    # request worked on, stamped by the chunk transfer adapter.
+    duplex_perf_chunk: list[int] | None = None
+    decode_span: bool | None = None
+    committed_token_count: int | None = None
+    consumed_input_span: bool | None = None
 
 
 class OmniPayloadStruct(_StructBase):
@@ -249,6 +290,7 @@ class OmniPayloadStruct(_StructBase):
     speaker: list[str] | str | None = None
     language: list[str] | str | None = None
     request_id: str | None = None
+    additional_information: dict[str, Any] | None = None
     past_key_values: list[int] | None = None
     kv_metadata: dict[str, Any] | None = None
 
@@ -464,3 +506,18 @@ def deserialize_payload(
             flat[key] = entry.scalar_data
 
     return unflatten_payload(flat)  # type: ignore[return-value]
+
+
+def returns_stage_payload(tags: Mapping[str, object] | AdditionalInformationPayload | None) -> bool:
+    """Return whether a request's routing tags ask its stage to return its full payload.
+
+    NOTE: Currently we support reading the serialized or deserialized format for compatibility
+    with both model runner v1 & v2.
+    """
+    if tags is None:
+        return False
+    if isinstance(tags, Mapping):
+        return bool(tags.get(RETURN_STAGE_PAYLOAD_KEY))
+    # Serialized tags: read the one scalar without decoding the payload's tensors.
+    entry = tags.entries.get(RETURN_STAGE_PAYLOAD_KEY)
+    return entry is not None and bool(entry.scalar_data)

@@ -147,6 +147,7 @@ _PIPELINE_STAGES = [
     "dac_decoder",
     "diffusion",
     "dit",
+    "fish_omni",
     "fish_speech_slow_ar",
     "fused_thinker_talker",
     "gepard",
@@ -158,9 +159,12 @@ _PIPELINE_STAGES = [
     "indextts2_s2mel_decoder",
     "indextts2_talker",
     "latent_generator",
+    "lfm3_code2wav",
+    "lfm3_temporal",
     "llm",
     "minimax_music3_ar",
     "ming_tts",
+    "ming3_tts",
     "moss_tts",
     "moss_tts_codec",
     "moss_tts_local",
@@ -182,6 +186,8 @@ _PIPELINE_STAGES = [
     "token2text",
     "token2wav",
     "tts",
+    "encoder",
+    "yue2",
 ]
 
 _STAGES = [*_PIPELINE_STAGES, None, "vae", "not_a_real_stage"]
@@ -283,14 +289,29 @@ def test_pipeline_stage_list_is_complete():
     assert not missing, f"stage keys claimed by adapters but absent from _PIPELINE_STAGES: {sorted(missing)}"
 
 
-def test_entry_stage_archs_is_ming_only():
-    """Only Ming dense identifies its entry stage by architecture.
+def test_entry_stage_archs_are_explicit():
+    """Ming dense, AuK, and Ming3 identify entry stages by architecture.
 
-    Widening this set would change which stage ``_find_tts_stage`` selects in
-    mixed deployments — notably VoxCPM2, which declares ``model_archs`` but is
-    found by its ``latent_generator`` stage key.
+    They use generic ``model_stage`` values (``llm`` and ``encoder``) that other
+    pipelines share. Widening this set would change which stage
+    ``_find_tts_stage`` selects in mixed deployments — notably VoxCPM2, which
+    declares ``model_archs`` but is found by its ``latent_generator`` stage key.
     """
-    assert tts_entry_stage_archs() == frozenset({"MingTTSForConditionalGeneration"})
+    assert tts_entry_stage_archs() == frozenset(
+        {
+            "MingTTSForConditionalGeneration",
+            "AuKForConditionalGeneration",
+            "Ming3TTSForConditionalGeneration",
+            "LingV3TTSForConditionalGeneration",
+        }
+    )
+
+
+def test_minimax_h3_encoder_is_not_a_tts_stage():
+    """MiniMax H3 shares AuK's ``encoder`` stage key but is not a speech model."""
+    assert "encoder" not in all_tts_stage_keys()
+    assert detect_tts_model_type("encoder", "MiniMaxH3Encoder") is None
+    assert detect_tts_model_type("encoder", "AuKForConditionalGeneration") == "auk"
 
 
 def test_every_detected_type_is_adapter_backed():
@@ -346,7 +367,8 @@ def test_audex_omni_requires_speech_decoder():
 
 def test_default_stage_serves_speech_is_unconditional():
     for name, cls in TTS_ADAPTER_REGISTRY.items():
-        if name == "audex":
+        # Speech-capable only when their codec stage is deployed.
+        if name in ("audex", "lfm3_omni"):
             continue
         for key in cls.stage_keys:
             assert cls.stage_serves_speech(key, frozenset({key})) is True

@@ -38,10 +38,13 @@ async def run_window_turn(
         temperature=0.0,
         extra_body={
             "sliding_window_mode": mode,
-            "context_max_units": 1,
+            # Keep a complete ~5.5 s fixture utterance available to the
+            # native listen/speak policy. These limits still rebuild KV
+            # during the two-repeat input and its response.
+            "context_max_units": 8,
             "context_previous_max_tokens": 16,
-            "basic_window_high_tokens": 64,
-            "basic_window_low_tokens": 32,
+            "basic_window_high_tokens": 192,
+            "basic_window_low_tokens": 128,
         },
     )
     client = DuplexClient(
@@ -58,6 +61,10 @@ async def run_window_turn(
                 is_speech=True,
                 video_frames=video_frames,
             )
+            # The fixture ends in speech. A native duplex commit seals input
+            # but does not force an answer; keep the microphone clock running
+            # through a pause so the model can choose to speak.
+            await client.stream_pcm(bytes(5 * 32000), chunk_ms=200, realtime=True, is_speech=False)
             await client.commit(final=True)
             await wait_for_condition(
                 lambda: collector.count("input_audio_buffer.committed") > 0 or bool(collector.errors()),

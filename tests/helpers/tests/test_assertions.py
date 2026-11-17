@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import io
+import json
 import wave
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import numpy as np
@@ -13,6 +15,7 @@ from tests.helpers.assertions import (
     _assert_transcript_matches,
     _resolve_audio_transcript,
     assert_audio_speech_response,
+    assert_http_error,
 )
 from tests.helpers.client import OmniResponse
 
@@ -158,9 +161,14 @@ def _pcm_sine(*, sample_rate: int = 24_000, frequency_hz: float = 220.0, duratio
     return np.rint(waveform * np.iinfo(np.int16).max).astype("<i2").tobytes()
 
 
-def _assert_wav_wraps_pcm(wav_bytes: bytes, pcm_bytes: bytes, sample_rate: int) -> None:
+def _interleave_stereo(pcm_bytes: bytes) -> bytes:
+    mono = np.frombuffer(pcm_bytes, dtype="<i2")
+    return np.repeat(mono, 2).astype("<i2").tobytes()
+
+
+def _assert_wav_wraps_pcm(wav_bytes: bytes, pcm_bytes: bytes, sample_rate: int, channels: int = 1) -> None:
     with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
-        assert wav_file.getnchannels() == 1
+        assert wav_file.getnchannels() == channels
         assert wav_file.getsampwidth() == 2
         assert wav_file.getframerate() == sample_rate
         assert wav_file.readframes(wav_file.getnframes()) == pcm_bytes
@@ -249,6 +257,118 @@ def test_pcm_transcript_escalation_uses_same_valid_wav_and_rejects_two_wrong_tra
         _assert_wav_wraps_pcm(wav_bytes, pcm_bytes, 24_000)
 
 
+@pytest.mark.parametrize("response_format", ["wav", "pcm"])
+@pytest.mark.parametrize("escalation_model", [None, "large-v3"])
+def test_failed_speech_capture_retains_exact_asr_input_and_original_failure(
+    monkeypatch, tmp_path, response_format, escalation_model
+):
+    pcm_bytes = _pcm_sine()
+    wav = io.BytesIO()
+    with wave.open(wav, "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(24_000)
+        writer.writeframes(pcm_bytes)
+    audio_bytes = wav.getvalue() if response_format == "wav" else pcm_bytes
+    transcribed = []
+
+    def transcribe(audio_bytes, **kwargs):
+        transcribed.append(audio_bytes)
+        return "this is unrelated speech"
+
+    directory = tmp_path / "failed_audio"
+    monkeypatch.setenv("VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR", str(directory))
+    monkeypatch.setattr(assertions, "convert_audio_bytes_to_text", transcribe)
+    config = {
+        "input": "please read this requested sentence accurately",
+        "response_format": response_format,
+        "transcript_pcm_sample_rate": 24_000,
+        "transcript_escalation_model": escalation_model,
+    }
+    response = OmniResponse(success=True, audio_bytes=audio_bytes, audio_format=f"audio/{response_format}")
+    with pytest.raises(AssertionError, match="Transcript doesn't match input") as error:
+        assert_audio_speech_response(response, config, "full_model")
+
+    clips = list(directory.glob("*.wav"))
+    assert len(clips) == 1
+    assert all(clip == clips[0].read_bytes() for clip in transcribed)
+    _assert_wav_wraps_pcm(clips[0].read_bytes(), pcm_bytes, 24_000)
+    metadata = json.loads(clips[0].with_suffix(".json").read_text())
+    assert metadata["expected_text"] == config["input"]
+    assert metadata["transcript"] == "this is unrelated speech"
+    assert metadata["assertion"] == str(error.value)
+
+
+@pytest.mark.parametrize("capture_enabled", [False, True])
+@pytest.mark.parametrize("content_failure", [False, True])
+def test_speech_capture_is_opt_in_and_does_not_write_successes(monkeypatch, tmp_path, capture_enabled, content_failure):
+    directory = tmp_path / "failed_audio"
+    if capture_enabled:
+        monkeypatch.setenv("VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR", str(directory))
+    else:
+        monkeypatch.delenv("VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR", raising=False)
+    expected = "please read this requested sentence accurately"
+    monkeypatch.setattr(
+        assertions,
+        "convert_audio_bytes_to_text",
+        lambda *_args, **_kwargs: "this is unrelated speech" if content_failure else expected,
+    )
+    with pytest.raises(AssertionError, match="Transcript doesn't match input") if content_failure else nullcontext():
+        assert_audio_speech_response(
+            OmniResponse(success=True, audio_bytes=b"audio", audio_format="audio/wav"),
+            {"input": expected, "response_format": "wav"},
+            "full_model",
+        )
+    assert directory.exists() is (capture_enabled and content_failure)
+    assert len(list(tmp_path.rglob("*.wav"))) == int(capture_enabled and content_failure)
+
+
+def test_speech_capture_io_failure_does_not_mask_content_failure(monkeypatch, tmp_path):
+    directory = tmp_path / "blocked"
+    directory.write_text("a file cannot be an output directory")
+    monkeypatch.setenv("VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR", str(directory))
+    monkeypatch.setattr(assertions, "convert_audio_bytes_to_text", lambda *_args, **_kwargs: "this is unrelated speech")
+    with pytest.raises(AssertionError, match="Transcript doesn't match input"):
+        assert_audio_speech_response(
+            OmniResponse(success=True, audio_bytes=b"audio", audio_format="audio/wav"),
+            {"input": "please read this requested sentence accurately", "response_format": "wav"},
+            "full_model",
+        )
+
+
+@pytest.mark.parametrize("capture_mode", ["enabled", "disabled", "unwritable"])
+def test_failed_pcm_capture_preserves_bytes_rate_and_original_hnr_failure(monkeypatch, tmp_path, capture_mode):
+    directory = tmp_path / "failed_audio"
+    if capture_mode == "disabled":
+        monkeypatch.delenv("VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR", str(directory))
+    if capture_mode == "unwritable":
+        directory.write_text("not a directory")
+    original_error = AssertionError("PCM speech HNR is below the configured floor")
+
+    def fail_hnr(audio_bytes, min_hnr_db, sr, channels):
+        assert (audio_bytes, min_hnr_db, sr, channels) == (b"\x00\x00" * 100, -1.0, 24_000, 1)
+        raise original_error
+
+    monkeypatch.setattr(assertions, "_assert_pcm_int16_speech_hnr", fail_hnr)
+    with pytest.raises(AssertionError) as error:
+        assert_audio_speech_response(
+            OmniResponse(success=True, audio_bytes=b"\x00\x00" * 100, audio_format="audio/pcm"),
+            {"input": "expected speech", "response_format": "pcm", "min_hnr_db": -1.0},
+            "full_model",
+        )
+    assert error.value is original_error
+    clips = list(tmp_path.rglob("*.pcm"))
+    assert len(clips) == int(capture_mode == "enabled")
+    if clips:
+        assert clips[0].read_bytes() == b"\x00\x00" * 100
+        metadata = json.loads(clips[0].with_suffix(".json").read_text())
+        assert metadata["sample_rate"] == 24_000
+        assert metadata["audio_format"] == "pcm"
+        assert metadata["assertion"] == str(original_error)
+
+
 @pytest.mark.parametrize(
     "pcm_bytes",
     [
@@ -296,6 +416,97 @@ def test_pcm_transcript_opt_in_rejects_invalid_declared_sample_rate(sample_rate)
                 "input": "hello",
                 "response_format": "pcm",
                 "transcript_pcm_sample_rate": sample_rate,
+            },
+            "advanced_model",
+        )
+
+
+def test_stereo_pcm_transcript_wraps_interleaved_frames_as_two_channel_wav(monkeypatch):
+    pcm_bytes = _interleave_stereo(_pcm_sine(sample_rate=48_000))
+    transcriptions: list[bytes] = []
+
+    def transcribe(audio_bytes, model_size="small", language=None):
+        transcriptions.append(audio_bytes)
+        return "hello from stereo pcm"
+
+    monkeypatch.setattr(assertions, "convert_audio_bytes_to_text", transcribe)
+
+    assert_audio_speech_response(
+        OmniResponse(success=True, audio_bytes=pcm_bytes, audio_format="audio/pcm"),
+        {
+            "input": "hello from stereo pcm",
+            "response_format": "pcm",
+            "expected_sample_rate": 48_000,
+            "transcript_pcm_sample_rate": 48_000,
+            "transcript_pcm_channels": 2,
+        },
+        "advanced_model",
+    )
+
+    assert len(transcriptions) == 1
+    _assert_wav_wraps_pcm(transcriptions[0], pcm_bytes, 48_000, channels=2)
+
+
+def test_stereo_pcm_hnr_matches_the_mono_signal(capsys):
+    mono = _pcm_sine(sample_rate=48_000)
+    for audio_bytes, channels in ((mono, 1), (_interleave_stereo(mono), 2)):
+        assert_audio_speech_response(
+            OmniResponse(success=True, audio_bytes=audio_bytes, audio_format="audio/pcm"),
+            {"response_format": "pcm", "expected_sample_rate": 48_000, "transcript_pcm_channels": channels},
+            "advanced_model",
+        )
+    hnr_lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("PCM speech HNR")]
+    assert len(hnr_lines) == 2
+    assert hnr_lines[0] == hnr_lines[1]
+
+
+@pytest.mark.parametrize("channels", [0, -1, True, 2.0, "2"])
+def test_pcm_rejects_invalid_channel_count(channels, monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR", str(tmp_path))
+    with pytest.raises(AssertionError, match="transcript_pcm_channels"):
+        assert_audio_speech_response(
+            OmniResponse(success=True, audio_bytes=_pcm_sine(), audio_format="audio/pcm"),
+            {"input": "hello", "response_format": "pcm", "transcript_pcm_channels": channels},
+            "advanced_model",
+        )
+    assert not list(tmp_path.iterdir())
+
+
+def test_stereo_pcm_hnr_rejects_partial_frame():
+    pcm_bytes = _interleave_stereo(_pcm_sine(sample_rate=48_000)) + bytes(2)
+    with pytest.raises(AssertionError, match="aligned to int16 frames"):
+        assertions._assert_pcm_int16_speech_hnr(pcm_bytes, sr=48_000, channels=2)
+
+
+def test_stereo_pcm_frame_failure_retains_original_audio(monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR", str(tmp_path))
+    pcm_bytes = _interleave_stereo(_pcm_sine(sample_rate=48_000)) + bytes(2)
+    response = OmniResponse(success=True, audio_bytes=pcm_bytes, audio_format="audio/pcm")
+
+    with pytest.raises(AssertionError, match="aligned to int16 frames"):
+        assert_audio_speech_response(
+            response,
+            {"response_format": "pcm", "expected_sample_rate": 48_000, "transcript_pcm_channels": 2},
+            "advanced_model",
+        )
+
+    (retained_audio,) = tmp_path.glob("*.pcm")
+    assert retained_audio.read_bytes() == pcm_bytes
+    metadata = json.loads(retained_audio.with_suffix(".json").read_text())
+    assert metadata["sample_rate"] == 48_000
+    assert metadata["audio_format"] == "pcm"
+    assert "aligned to int16 frames" in metadata["assertion"]
+
+
+def test_stereo_pcm_transcript_rejects_partial_frame():
+    with pytest.raises(AssertionError, match="aligned to int16 frames"):
+        assert_audio_speech_response(
+            OmniResponse(success=True, audio_bytes=_pcm_sine()[:-2], audio_format="audio/pcm"),
+            {
+                "input": "hello",
+                "response_format": "pcm",
+                "transcript_pcm_sample_rate": 24_000,
+                "transcript_pcm_channels": 2,
             },
             "advanced_model",
         )
@@ -402,3 +613,23 @@ def test_speech_timestamp_header_is_required_and_decoded():
         else:
             with pytest.raises(AssertionError, match="X-Word-Timestamps"):
                 assert_audio_speech_response(response, request)
+
+
+def test_http_200_err_code_uses_json_error_code():
+    failed = SimpleNamespace(
+        status_code=200,
+        json_body={"status": "failed", "error": {"code": 500, "message": "CUDA out of memory"}},
+        error_message=None,
+    )
+    assert_http_error(failed, err_code=500)
+
+    queued = SimpleNamespace(status_code=200, json_body={"status": "queued"}, error_message=None)
+    with pytest.raises(AssertionError):
+        assert_http_error(queued, err_code=500)
+
+    sync_error = SimpleNamespace(
+        status_code=500,
+        json_body={"error": {"code": 500, "message": "engine dead"}},
+        error_message=None,
+    )
+    assert_http_error(sync_error, err_code=500)

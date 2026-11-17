@@ -9,7 +9,7 @@
 The *wire* half of each command --- which client event it decodes from and what
 fields survive decoding --- now lives in ``vllm_omni.protocol.duplex.commands``,
 which carries the whole vocabulary: the eight Tier 1 classes re-exported from
-``vllm_omni.protocol.realtime.commands``, the two Tier 2 ones and the seven
+``vllm_omni.protocol.realtime.commands``, the two Tier 2 ones and the eight
 Tier 3 ones. The engine imports that module and never the Tier 1 one directly,
 so a command that later grows a duplex extension changes one file
 (RFC #6592 P0a).
@@ -47,13 +47,19 @@ class DuplexCommandError(RealtimeProtocolError):
     """
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
+@dataclass(frozen=True, kw_only=True)
 class DuplexCommand(RealtimeCommand):
     """A Realtime command as the duplex engine handles it.
 
     Adds the mailbox channel (``type``) and its rendering on top of the wire
     command; every concrete class below pairs this with its protocol twin.
     """
+
+    # No instance fields of its own, so the slots are empty. Spelled out rather
+    # than ``slots=True`` because on Python 3.10 ``dataclass`` repeats the
+    # inherited fields in ``__slots__`` (fixed in 3.11); the concrete classes
+    # below would then combine two slotted layouts and fail to import.
+    __slots__ = ()
 
     #: Mailbox event type this command renders to (see ``payload()``).
     type: ClassVar[str] = ""
@@ -97,7 +103,8 @@ class AppendAudio(DuplexCommand, _duplex_wire.AppendAudio):
     #: Empty ``audio`` with ``video_frames`` is legal when capabilities allow video without audio.
     audio: bytes = b""
 
-    def payload(self) -> dict[str, object]:
+    def payload(self, *, encode_audio: bool = True) -> dict[str, object]:
+        """The legacy append dict; ``encode_audio=False`` keeps ``audio`` as the decoded bytes."""
         data = DuplexCommand.payload(self)
         hints = data.pop("hints", None)
         if isinstance(hints, Mapping):
@@ -111,7 +118,7 @@ class AppendAudio(DuplexCommand, _duplex_wire.AppendAudio):
             merged.update(data)
             data = merged
         if self.audio:
-            data["audio"] = base64.b64encode(self.audio).decode("ascii")
+            data["audio"] = base64.b64encode(self.audio).decode("ascii") if encode_audio else self.audio
         else:
             data.pop("audio", None)
         if not data.get("video_frames"):
@@ -239,6 +246,11 @@ class Heartbeat(DuplexCommand, _duplex_wire.Heartbeat):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class GetSessionStats(DuplexCommand, _duplex_wire.GetSessionStats):
+    type: ClassVar[str] = "session.stats.get"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class CloseSession(DuplexCommand, _duplex_wire.CloseSession):
     type: ClassVar[str] = "session.close"
 
@@ -257,6 +269,7 @@ REALTIME_COMMAND_TYPES: frozenset[str] = frozenset(
         "session.update",
         "playback.ack",
         "session.heartbeat",
+        "session.stats.get",
         "session.close",
         "turn.signal",
         "input.text.append",
@@ -301,6 +314,7 @@ __all__ = [
     "DeleteItem",
     "DuplexCommand",
     "DuplexCommandError",
+    "GetSessionStats",
     "Heartbeat",
     "REALTIME_COMMAND_TYPES",
     "RealtimeCommand",

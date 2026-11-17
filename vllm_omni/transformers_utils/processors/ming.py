@@ -177,6 +177,7 @@ class MingFlashOmniProcessor(ProcessorMixin):
         video_processor_class = "AutoVideoProcessor"
     audio_processor_class = "AutoFeatureExtractor"
     tokenizer_class = "AutoTokenizer"
+    chat_template: str | dict[str, str] | None
 
     def __init__(
         self,
@@ -551,6 +552,19 @@ class MingImageProcessor(ProcessorMixin):
                 image_index += 1
             expanded.append(sample)
         return expanded
+
+    def _apply_image_generation_template(
+        self,
+        prompt: str,
+        *,
+        has_reference_image: bool = False,
+    ) -> str:
+        if prompt.startswith("<role>SYSTEM</role>"):
+            return prompt
+        # Ming-Image uses a fixed single-turn template, so build it directly here
+        image_prefix = PLACEHOLDER_IMAGE_TOKEN_IN_TEXT if has_reference_image else ""
+        eos = self.tokenizer.eos_token
+        return SYSTEM_PROMPT_NOTHINK + eos + USER_PREFIX + image_prefix + prompt + eos + ASSISTANT_PREFIX
 
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)

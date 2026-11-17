@@ -1,0 +1,120 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""CUDA-only optimizations leave unsupported platforms and samplers upstream."""
+
+import pytest
+import torch
+from vllm.config import CUDAGraphMode
+from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
+from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
+from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
+from vllm.v1.worker.gpu.sample.sampler import Sampler
+from vllm.v1.worker.gpu.sample.states import SamplingStates
+from vllm.v1.worker.gpu.states import RequestState
+
+from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import Qwen3TTSTalkerForConditionalGeneration
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def _base_sampler():
+    base = object.__new__(Sampler)
+    base.req_states = object.__new__(RequestState)
+    base.req_states.max_num_reqs = 8
+    base.sampling_states = object.__new__(SamplingStates)
+    base.sampling_states.vocab_size = 3072
+    base.compute_nans = False
+    base.use_fp64_gumbel = False
+    base.trace_replay_state = None
+    base.return_sampling_mask = False
+    base.logits_processors = [object.__new__(c) for c in (LogitBiasState, PenaltiesState, BadWordsState)]
+    return base
+
+
+@pytest.mark.parametrize("reason", ["platform", "fp64", "plugin"])
+def test_disabled_custom_sampler_preserves_stock_registration(monkeypatch, reason):
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: reason != "platform")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    base = _base_sampler()
+    if reason == "fp64":
+        base.use_fp64_gumbel = True
+    if reason == "plugin":
+        base.logits_processors.append(object())
+    talker = object.__new__(Qwen3TTSTalkerForConditionalGeneration)
+    assert talker.mrv2_custom_sampler(base) is None
+
+
+def test_cuda_sampler_registers_when_supported(monkeypatch):
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    talker = object.__new__(Qwen3TTSTalkerForConditionalGeneration)
+    registered = talker.mrv2_custom_sampler(_base_sampler())
+    assert registered is not None
+    sampler, rejection = registered
+    assert sampler.enabled and rejection is None
+
+
+def test_rocm_does_not_probe_cuda_pdl_capability(monkeypatch):
+    from vllm_omni.model_executor.models.qwen3_tts.fused_code_predictor import _pdl_supported
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: pytest.fail("NVIDIA-only capability probe"))
+    assert not _pdl_supported(torch.device("cuda"))
+
+
+@pytest.mark.parametrize(
+    "is_npu,v2,mode,eager,enabled,rejected",
+    [
+        (False, False, CUDAGraphMode.FULL_AND_PIECEWISE, False, True, False),
+        (True, True, CUDAGraphMode.FULL_AND_PIECEWISE, False, True, False),
+        (True, False, CUDAGraphMode.PIECEWISE, False, True, False),
+        (True, False, CUDAGraphMode.PIECEWISE, False, False, False),
+        (True, False, CUDAGraphMode.NONE, False, True, False),
+        (True, False, CUDAGraphMode.FULL_AND_PIECEWISE, True, True, False),
+        (True, False, CUDAGraphMode.FULL_AND_PIECEWISE, False, True, True),
+        (True, False, CUDAGraphMode.FULL_AND_PIECEWISE, False, False, True),
+        (True, False, CUDAGraphMode.FULL_DECODE_ONLY, False, True, True),
+        (True, False, CUDAGraphMode.FULL, False, True, True),
+    ],
+)
+def test_talker_graph_configuration_before_loading_weights(monkeypatch, is_npu, v2, mode, eager, enabled, rejected):
+    from types import SimpleNamespace
+
+    from vllm_omni.model_executor.models.qwen3_tts import qwen3_tts_talker as talker_module
+    from vllm_omni.platforms import current_omni_platform
+
+    class ReachedBackboneError(Exception):
+        pass
+
+    def stop_before_weights(**kwargs):
+        raise ReachedBackboneError
+
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: is_npu)
+    monkeypatch.setattr(talker_module, "talker_stream_decode_enabled", lambda _: False)
+    monkeypatch.setattr(talker_module, "Qwen3Model", stop_before_weights)
+    config = SimpleNamespace(
+        model="unused",
+        use_v2_model_runner=v2,
+        enforce_eager=eager,
+        stage_connector_config={"extra": {"code_predictor_frame_graph": enabled}},
+        hf_config=SimpleNamespace(
+            talker_config=SimpleNamespace(
+                code_predictor_config=SimpleNamespace(vocab_size=32),
+                hidden_size=16,
+                num_code_groups=2,
+            )
+        ),
+    )
+    talker = Qwen3TTSTalkerForConditionalGeneration.__new__(Qwen3TTSTalkerForConditionalGeneration)
+    vllm_config = SimpleNamespace(model_config=config, compilation_config=SimpleNamespace(cudagraph_mode=mode))
+    if rejected:
+        with pytest.raises(ValueError, match="Model Runner V1.*PIECEWISE"):
+            talker.__init__(vllm_config=vllm_config)
+        return
+    with pytest.raises(ReachedBackboneError):
+        talker.__init__(vllm_config=vllm_config)
+    assert talker.talker_mtp_graph_safe is not (is_npu and enabled)

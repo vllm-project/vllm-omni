@@ -1,0 +1,10 @@
+# MammothModa2 AR→DiT with step execution and continuous batching.
+
+base_config: mammoth_moda2.yaml
+
+stages:
+  - stage_id: 1
+    step_execution: true
+    request_batch_max_wait_ms: 0
+    # Step mode does not support diffusion cache backends.
+    cache_backend: none

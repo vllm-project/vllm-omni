@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Benchmark and exactness check for the Wan VAE decoder fast path.
 
 Loads a diffusers Wan VAE (by default the Cosmos3 one), decodes seeded latents
@@ -30,10 +30,13 @@ return the full video on rank 0 only, so equality and PSNR are computed there.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
+import statistics
 import time
 from collections.abc import Iterable
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -78,10 +81,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fast-path", default=",".join(VAE_FAST_PATH_LEVELS), help="Comma-separated levels")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=2)
+    parser.add_argument("--tiling", action="store_true", help="Decode with the VAE's spatial tiling (single GPU)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--profile", action="store_true", help="Print a torch.profiler CUDA kernel table")
     parser.add_argument("--profile-rows", type=int, default=25)
     parser.add_argument("--save-output", default=None, help="Save the `off` decode output to this .pt path")
+    parser.add_argument(
+        "--first-frame-ablation", action="store_true", help="Compare channels_last with/without first-frame Conv2d"
+    )
+    parser.add_argument("--latents", help="For ablation: saved VAE-input tensor (.pt), after latent mean/std scaling")
     parser.add_argument(
         "--vae-patch-parallel-size",
         type=int,
@@ -125,6 +133,8 @@ def load_vae(
             vae.init_distributed()
     else:
         vae = cls.from_pretrained(args.model, subfolder=args.subfolder, torch_dtype=dtype).to(device).eval()
+    if args.tiling:
+        vae.use_tiling = True
     if parallel:
         # Same setup as the registry: parallel decode needs tiling on.
         vae.use_tiling = True
@@ -241,7 +251,8 @@ def run_level(
         "reason": report.reason,
         "fused_silu": report.fused_silu_dtypes,
         "patched": dict(report.patched),
-        "time_s": min(timings),
+        "time_s": statistics.median(timings),
+        "times_s": timings,
         "peak_gib": peak.item(),
     }
     if args.profile:
@@ -254,10 +265,104 @@ def run_level(
     return output.detach(), stats
 
 
+@torch.inference_mode()
+def run_first_frame_ablation(args: argparse.Namespace, dtype: torch.dtype, device: torch.device) -> None:
+    """Same-model ABBA comparison; disable only the first-frame helper in the reference arm."""
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import forwards
+
+    if args.iters < 2 or args.warmup < 0:
+        raise ValueError("Ablation requires --iters >= 2 and --warmup >= 0")
+    vae = load_vae(args, dtype, device, parallel=False)
+    report = install_wan_vae_fastpath(vae, level="channels_last")
+    if not report.installed:
+        raise RuntimeError(f"channels_last installation failed: {report.reason}")
+    latents = make_latents(vae, args, dtype, device)
+    if args.latents:
+        saved = torch.load(args.latents, map_location="cpu", weights_only=True)
+        saved = saved[:, :, : latents.shape[2]]
+        if saved.shape != latents.shape:
+            raise ValueError(f"Saved latent shape {saved.shape} does not match {latents.shape}")
+        latents = saved.to(device=device, dtype=dtype).contiguous()
+    helpers = {"baseline": lambda conv, x, bias: None, "candidate": forwards._first_frame_conv2d}
+    optimized_calls = 0
+
+    def counted(conv, x, bias):
+        nonlocal optimized_calls
+        result = helpers["candidate"](conv, x, bias)
+        optimized_calls += result is not None
+        return result
+
+    with patch.object(forwards, "_first_frame_conv2d", counted):
+        decode(vae, latents)
+        sync()
+    if optimized_calls == 0:
+        raise RuntimeError("The selected workload did not exercise first-frame Conv2d")
+    measurements = []
+    outputs: dict[str, list[torch.Tensor]] = {arm: [] for arm in helpers}
+    for _ in range(args.warmup):
+        for helper in helpers.values():
+            with patch.object(forwards, "_first_frame_conv2d", helper):
+                decode(vae, latents)
+                sync()
+    for iteration in range(args.iters):
+        # Alternating AB and BA pairs give ABBA order without dropping odd runs.
+        arms = ("baseline", "candidate") if iteration % 2 == 0 else ("candidate", "baseline")
+        for arm in arms:
+            with patch.object(forwards, "_first_frame_conv2d", helpers[arm]):
+                sync()
+                torch.accelerator.reset_peak_memory_stats()
+                start = time.perf_counter()
+                output = decode(vae, latents)
+                sync()
+                elapsed = (time.perf_counter() - start) * 1000
+                peak = torch.accelerator.max_memory_allocated()
+            measurements.append({"arm": arm, "wall_ms": elapsed, "peak_allocated_bytes": peak})
+            if len(outputs[arm]) < 2:
+                outputs[arm].append(output.cpu())
+            del output
+    baseline, candidate = outputs["baseline"][0], outputs["candidate"][0]
+    difference = candidate.float() - baseline.float()
+    stats = {}
+    for arm in helpers:
+        times = [row["wall_ms"] for row in measurements if row["arm"] == arm]
+        stats[arm] = {
+            "median_ms": statistics.median(times),
+            "mean_ms": statistics.mean(times),
+            "std_ms": statistics.pstdev(times),
+            "min_ms": min(times),
+            "max_ms": max(times),
+        }
+    result = {
+        "scope": "VAE decode; same-head channels_last first-frame Conv2d ablation",
+        "args": vars(args),
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "baseline": stats["baseline"],
+        "candidate": stats["candidate"],
+        "latency_reduction": 1 - stats["candidate"]["median_ms"] / stats["baseline"]["median_ms"],
+        "optimized_calls_per_decode": optimized_calls,
+        "outputs_finite": bool(torch.isfinite(baseline).all() and torch.isfinite(candidate).all()),
+        "self_repeat_equal": {arm: torch.equal(*values) for arm, values in outputs.items()},
+        "candidate_vs_baseline": {
+            "torch_equal": torch.equal(candidate, baseline),
+            "max_abs": difference.abs().max().item(),
+            "relative_l2": (difference.norm() / baseline.float().norm().clamp_min(1e-30)).item(),
+            "psnr_db": psnr(candidate, baseline),
+        },
+        "measurements": measurements,
+    }
+    print("FIRST_FRAME_ABLATION " + json.dumps(result))
+
+
 def main() -> None:
     args = parse_args()
-    if not torch.cuda.is_available():
-        raise SystemExit("CUDA device required")
+    if args.latents and not args.first_frame_ablation:
+        raise SystemExit("--latents requires --first-frame-ablation")
+    accelerator = torch.accelerator.current_accelerator()
+    if accelerator is None or accelerator.type not in ("cuda", "xpu"):
+        raise SystemExit("CUDA or XPU device required")
+    if args.profile and accelerator.type != "cuda":
+        raise SystemExit("--profile requires CUDA")
     rank, world_size = init_distributed()
     parallel = args.vae_patch_parallel_size > 1
     if parallel and world_size < args.vae_patch_parallel_size:
@@ -265,8 +370,14 @@ def main() -> None:
             f"--vae-patch-parallel-size {args.vae_patch_parallel_size} needs torchrun with at least that many "
             f"processes (WORLD_SIZE={world_size})"
         )
-    device = torch.device("cuda", torch.accelerator.current_device_index()) if world_size > 1 else torch.device("cuda")
+    device = torch.device(accelerator.type, torch.accelerator.current_device_index())
     dtype = DTYPES[args.dtype]
+    if args.first_frame_ablation:
+        if world_size != 1 or parallel:
+            raise SystemExit("--first-frame-ablation requires one GPU")
+        with torch.backends.cudnn.flags(benchmark=False, allow_tf32=False):
+            run_first_frame_ablation(args, dtype, device)
+        return
     levels: Iterable[str] = [level.strip() for level in args.fast_path.split(",") if level.strip()]
     for level in levels:
         if level not in VAE_FAST_PATH_LEVELS:
@@ -297,8 +408,11 @@ def main() -> None:
                 del output
                 continue
             speedup = baseline_time / stats["time_s"] if baseline_time else float("nan")
+            times = stats["times_s"]
             line = (
-                f"[{level:13s}] decode {stats['time_s'] * 1e3:9.1f} ms  speedup {speedup:5.2f}x  "
+                f"[{level:13s}] decode median {stats['time_s'] * 1e3:9.1f} ms  "
+                f"min {min(times) * 1e3:9.1f}  max {max(times) * 1e3:9.1f}  "
+                f"stdev {statistics.pstdev(times) * 1e3:7.1f} (n={len(times)})  speedup {speedup:5.2f}x  "
                 f"peak {stats['peak_gib']:5.2f} GiB  installed={stats['installed']}"
             )
             if level != "off":
@@ -313,6 +427,7 @@ def main() -> None:
                 else:
                     line += f"  reason={stats['reason']}"
             print(line)
+            print(f"[{level:13s}] raw_ms " + json.dumps([round(t * 1e3, 1) for t in times]))
             del output
             torch.accelerator.empty_cache()
     finally:

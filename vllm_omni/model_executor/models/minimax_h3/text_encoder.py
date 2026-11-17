@@ -94,9 +94,9 @@ class MiniMaxH3MultiModalProcessor(Qwen3VLMultiModalProcessor):
     def _apply_hf_processor_main(
         self,
         mm_items: Any,
-        hf_processor_mm_kwargs: Mapping[str, object],
+        hf_kwargs: Mapping[str, object],
     ):
-        base_kwargs = self._base_processor_kwargs(hf_processor_mm_kwargs)
+        base_kwargs = self._base_processor_kwargs(hf_kwargs)
         return super()._apply_hf_processor_main(
             mm_items,
             base_kwargs,
