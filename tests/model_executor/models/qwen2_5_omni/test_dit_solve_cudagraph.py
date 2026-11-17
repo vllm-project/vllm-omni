@@ -176,6 +176,14 @@ def dit_model():
     )
     torch.manual_seed(1234)
     model = Qwen2_5OmniToken2WavDiTModel(config).to("cuda").eval()
+    # vLLM 0.33's QKVParallelLinear leaves weights uninitialized (torch.empty;
+    # load_weights normally fills them) and HF-style _init_weights never touches
+    # vLLM layers, so the tiny model can start with NaN weights. Re-seed every
+    # parameter so the random-weight model is finite and deterministic.
+    torch.manual_seed(4321)
+    with torch.no_grad():
+        for param in model.parameters():
+            torch.nn.init.normal_(param, mean=0.0, std=0.02)
     assert model._solve_graph_wrapper is not None  # enabled by default
     return model
 
