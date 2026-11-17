@@ -32,7 +32,9 @@ Omni Sleep Mode is optimized for high-performance computing backends:
 
 ### Hardware Requirements
 
-* **Memory Considerations**: System RAM must be sufficient to hold offloaded weights during sleep.
+* **Memory Considerations**: System RAM must hold what sleep backs up: the weights (level 1) and,
+  at both levels, the runtime state built with the KV cache (block tables, attention metadata).
+  With `--sleep-mode-offload-cudagraph`, the CUDA graph memory is backed up too.
 * **TP Support**: Tensor Parallel groups synchronize sleep/wake transitions across all workers.
 
 ### Quiescing a busy diffusion stage: `pause_generation(mode="keep")`

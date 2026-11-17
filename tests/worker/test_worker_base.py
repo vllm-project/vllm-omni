@@ -565,9 +565,11 @@ def _fake_platform():
     )
 
 
+# Same tags as vLLM's CuMemBackend.suspend: the runtime state and the CUDA graph pool
+# must survive sleep at every level, or the first request after wake_up fails.
 @pytest.mark.parametrize(
     ("level", "expected_tags"),
-    [(1, ("weights",)), (2, tuple())],
+    [(1, ("weights", "runtime", "cudagraph")), (2, ("runtime", "cudagraph"))],
 )
 def test_sleep_offload_tags_by_level(monkeypatch, level, expected_tags):
     import vllm.device_allocator.cumem as cumem_mod
