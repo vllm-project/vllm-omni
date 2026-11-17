@@ -8,9 +8,9 @@ import math
 import os
 import subprocess
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -994,6 +994,23 @@ def _timeline_guide_conditioning(
     )
 
 
+@contextmanager
+def _prepare_audio_during_visual_encode(
+    audio_inputs: Sequence[tuple[torch.Tensor, int]],
+    prepare: Callable[[torch.Tensor, int], tuple[torch.Tensor, int]] | None,
+) -> Iterator[Sequence[Future[tuple[torch.Tensor, int]] | None]]:
+    """Own request-local CPU preparation through codec success or failure."""
+    if prepare is None:
+        yield [None] * len(audio_inputs)
+        return
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="h3-audio-prepare")
+    try:
+        futures = [pool.submit(prepare, waveform, sample_rate) for waveform, sample_rate in audio_inputs]
+        yield futures
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
 def encode_media(
     media: MiniMaxH3EncoderMediaInput,
     *,
@@ -1023,62 +1040,78 @@ def encode_media(
     video_edit_clean_rows: torch.Tensor | None = None
     guide_visual_rows: list[torch.Tensor | None] = [None] * len(media.timeline_guides)
     has_guide_frames = any(guide.frames is not None for guide in media.timeline_guides)
-    if media.images or media.videos or media.video_edit is not None or has_guide_frames:
-        if video_vae is None:
-            raise RuntimeError("MiniMax H3 video VAE is not resident on this rank")
-        with component_scope(video_vae):
-            for value in media.images:
-                image = _image_from_tensor(value)
-                visual_rows.append(video_vae.encode_image(image))
-                visual_shapes.append((1, image.height // 16, image.width // 16))
-            for value in media.videos:
-                frames = np.asarray(value.detach().cpu().to(torch.uint8).contiguous().numpy())
-                rows, shape = video_vae.encode_video(frames)
-                visual_rows.append(rows)
-                visual_shapes.append(tuple(int(item) for item in shape))
-            if media.video_edit is not None:
-                frames = np.asarray(media.video_edit.detach().cpu().to(torch.uint8).contiguous().numpy())
-                rows, shape = video_vae.encode_video(frames)
-                shape = tuple(int(item) for item in shape)
-                expected_shape = (media.latent_t, media.height // 16, media.width // 16)
-                expected_rows = media.latent_t * (media.height // 32) * (media.width // 32)
-                if shape != expected_shape or tuple(rows.shape) != (expected_rows, 96):
-                    raise ValueError(
-                        "MiniMax H3 video edit encoder shape mismatch: "
-                        f"got latent shape {shape} and rows {tuple(rows.shape)}, "
-                        f"expected {expected_shape} and ({expected_rows}, 96)"
+    has_visual = bool(media.images or media.videos or media.video_edit is not None or has_guide_frames)
+    prepare_waveform = getattr(audio_vae, "_prepare_waveform", None)
+    target_rate = getattr(audio_vae, "sample_rate", None)
+    if not (
+        emit_conditioning
+        and has_visual
+        and audio_inputs
+        and callable(prepare_waveform)
+        and not torch.is_autocast_enabled("cpu")
+        and all(waveform.device.type == "cpu" for waveform, _ in audio_inputs)
+        and any(int(rate) != target_rate for _, rate in audio_inputs)
+    ):
+        prepare_waveform = None
+    with _prepare_audio_during_visual_encode(audio_inputs, prepare_waveform) as audio_futures:
+        if has_visual:
+            if video_vae is None:
+                raise RuntimeError("MiniMax H3 video VAE is not resident on this rank")
+            with component_scope(video_vae):
+                for value in media.images:
+                    image = _image_from_tensor(value)
+                    visual_rows.append(video_vae.encode_image(image))
+                    visual_shapes.append((1, image.height // 16, image.width // 16))
+                for value in media.videos:
+                    frames = np.asarray(value.detach().cpu().to(torch.uint8).contiguous().numpy())
+                    rows, shape = video_vae.encode_video(frames)
+                    visual_rows.append(rows)
+                    visual_shapes.append(tuple(int(item) for item in shape))
+                if media.video_edit is not None:
+                    frames = np.asarray(media.video_edit.detach().cpu().to(torch.uint8).contiguous().numpy())
+                    rows, shape = video_vae.encode_video(frames)
+                    shape = tuple(int(item) for item in shape)
+                    expected_shape = (media.latent_t, media.height // 16, media.width // 16)
+                    expected_rows = media.latent_t * (media.height // 32) * (media.width // 32)
+                    if shape != expected_shape or tuple(rows.shape) != (expected_rows, 96):
+                        raise ValueError(
+                            "MiniMax H3 video edit encoder shape mismatch: "
+                            f"got latent shape {shape} and rows {tuple(rows.shape)}, "
+                            f"expected {expected_shape} and ({expected_rows}, 96)"
+                        )
+                    video_edit_clean_rows = rows.to(dtype=torch.float32).contiguous()
+                # Guide stills and clips share the video VAE collective with the
+                # references, so every visual participant encodes them as well.
+                guide_visual_rows = [
+                    _encode_guide_frames(guide, video_vae, media.height, media.width) for guide in media.timeline_guides
+                ]
+
+        if not emit_conditioning:
+            return None
+
+        audio_rows: list[torch.Tensor] = []
+        audio_lengths: list[int] = []
+        audio_edit_clean_rows: torch.Tensor | None = None
+        audio_edit_source_t = 0
+        if audio_inputs or media.audio_edit is not None:
+            if audio_vae is None:
+                raise RuntimeError("MiniMax H3 audio WVAE is not resident on the encoder leader")
+            with component_scope(audio_vae):
+                for (waveform, sample_rate), future in zip(audio_inputs, audio_futures, strict=True):
+                    if future is not None:
+                        waveform, sample_rate = future.result()
+                    rows, length = audio_vae.encode_waveform(waveform, sample_rate)
+                    audio_rows.append(rows)
+                    audio_lengths.append(int(length))
+                if media.audio_edit is not None:
+                    waveform, sample_rate = media.audio_edit
+                    rows, source_audio_t = audio_vae.encode_waveform(waveform, sample_rate)
+                    rows = rows.to(dtype=torch.float32).contiguous()
+                    audio_edit_clean_rows, audio_edit_source_t = _fit_audio_edit_rows(
+                        rows,
+                        int(source_audio_t),
+                        target_audio_t=media.audio_t,
                     )
-                video_edit_clean_rows = rows.to(dtype=torch.float32).contiguous()
-            # Guide stills and clips share the video VAE collective with the
-            # references, so every visual participant encodes them as well.
-            guide_visual_rows = [
-                _encode_guide_frames(guide, video_vae, media.height, media.width) for guide in media.timeline_guides
-            ]
-
-    if not emit_conditioning:
-        return None
-
-    audio_rows: list[torch.Tensor] = []
-    audio_lengths: list[int] = []
-    audio_edit_clean_rows: torch.Tensor | None = None
-    audio_edit_source_t = 0
-    if audio_inputs or media.audio_edit is not None:
-        if audio_vae is None:
-            raise RuntimeError("MiniMax H3 audio WVAE is not resident on the encoder leader")
-        with component_scope(audio_vae):
-            for waveform, sample_rate in audio_inputs:
-                rows, length = audio_vae.encode_waveform(waveform, sample_rate)
-                audio_rows.append(rows)
-                audio_lengths.append(int(length))
-            if media.audio_edit is not None:
-                waveform, sample_rate = media.audio_edit
-                rows, source_audio_t = audio_vae.encode_waveform(waveform, sample_rate)
-                rows = rows.to(dtype=torch.float32).contiguous()
-                audio_edit_clean_rows, audio_edit_source_t = _fit_audio_edit_rows(
-                    rows,
-                    int(source_audio_t),
-                    target_audio_t=media.audio_t,
-                )
     guide_blocks, guide_visual, guide_audio = _timeline_guide_conditioning(
         media,
         guide_visual_rows,

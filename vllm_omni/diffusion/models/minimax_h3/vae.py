@@ -1423,6 +1423,35 @@ class MiniMaxH3AudioVAE(nn.Module):
             else:
                 cache.release_if_needed()
 
+    @staticmethod
+    @torch.inference_mode()
+    def _prepare_waveform(
+        waveform: torch.Tensor,
+        sample_rate: int,
+    ) -> tuple[torch.Tensor, int]:
+        """Prepare one waveform without touching weights or accelerator state."""
+        import torchaudio
+
+        waveform = waveform.float()
+        if waveform.ndim == 1:
+            waveform = waveform[None]
+        if int(sample_rate) != MINIMAX_H3_AUDIO_SAMPLE_RATE:
+            # Worker threads must build the filter on CPU for CPU references.
+            context = torch.device("cpu") if waveform.device.type == "cpu" else nullcontext()
+            with context:
+                resample = torchaudio.transforms.Resample(
+                    int(sample_rate),
+                    MINIMAX_H3_AUDIO_SAMPLE_RATE,
+                )
+            waveform = resample(waveform)
+        if waveform.shape[0] < MINIMAX_H3_AUDIO_CHANNELS:
+            waveform = waveform.repeat(
+                MINIMAX_H3_AUDIO_CHANNELS,
+                1,
+            )
+        waveform = waveform[:MINIMAX_H3_AUDIO_CHANNELS]
+        return waveform, MINIMAX_H3_AUDIO_SAMPLE_RATE
+
     @torch.inference_mode()
     def encode_waveform(
         self,
@@ -1431,22 +1460,7 @@ class MiniMaxH3AudioVAE(nn.Module):
     ) -> tuple[torch.Tensor, int]:
         if getattr(self, "decode_only", False):
             raise RuntimeError("MiniMax H3 decode-only audio VAE cannot encode waveforms")
-        import torchaudio
-
-        waveform = waveform.float()
-        if waveform.ndim == 1:
-            waveform = waveform[None]
-        if int(sample_rate) != MINIMAX_H3_AUDIO_SAMPLE_RATE:
-            waveform = torchaudio.transforms.Resample(
-                int(sample_rate),
-                MINIMAX_H3_AUDIO_SAMPLE_RATE,
-            )(waveform)
-        if waveform.shape[0] < MINIMAX_H3_AUDIO_CHANNELS:
-            waveform = waveform.repeat(
-                MINIMAX_H3_AUDIO_CHANNELS,
-                1,
-            )
-        waveform = waveform[:MINIMAX_H3_AUDIO_CHANNELS]
+        waveform, sample_rate = self._prepare_waveform(waveform, sample_rate)
         device = next(self.model.parameters()).device
         waveform = waveform.to(device)
 
