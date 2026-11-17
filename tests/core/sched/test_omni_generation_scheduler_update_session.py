@@ -343,7 +343,7 @@ def test_native_input_terminal_finishes_resumable_code2wav() -> None:
     model_runner_output.kv_connector_output = None
     model_runner_output.cudagraph_stats = None
     model_runner_output.pending_generation_req_ids = set()
-    model_runner_output.req_id_to_index = {session.request_id: 0}
+    model_runner_output.req_ids = [session.request_id]
     model_runner_output.routed_experts = None
 
     outputs = OmniGenerationScheduler.update_from_output(

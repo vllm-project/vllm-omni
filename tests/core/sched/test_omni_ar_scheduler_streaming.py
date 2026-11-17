@@ -1015,7 +1015,7 @@ def _parked_talker_after_first_sentence() -> Request:
     session = _make_request()
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
     session.prompt_token_ids = [0] * 40
-    session._all_token_ids.clear()
+    del session._all_token_ids[:]
     session._all_token_ids.extend(session.prompt_token_ids)
     session._output_token_ids.clear()
     session.append_output_token_ids([100, 101, 2150])
