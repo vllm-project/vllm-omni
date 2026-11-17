@@ -295,8 +295,8 @@ steps:
               > "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/collection.txt"
             count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
               "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/collection.txt")
-            if [[ "$$count" != 76 ]]; then
-              echo "Expected exactly 76 single-GPU invalid-parameter nodes, found $$count." >&2
+            if [[ "$$count" != 75 ]]; then
+              echo "Expected exactly 75 single-GPU invalid-parameter nodes, found $$count." >&2
               cat "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/collection.txt" >&2
               exit 5
             fi
@@ -324,9 +324,9 @@ steps:
             suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
             tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
             skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-            if tests != 76 or skipped != 5:
+            if tests != 75 or skipped != 5:
                 print(
-                    f"Expected exactly 76 single-GPU invalid-parameter tests with 5 known skips; "
+                    f"Expected exactly 75 single-GPU invalid-parameter tests with 5 known skips; "
                     f"reported tests={tests}, skipped={skipped}.",
                     file=sys.stderr,
                 )

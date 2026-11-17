@@ -1052,9 +1052,11 @@ def test_minimax_music3_speech_invalid_field_values(
 
 # ─── POST /v1/audio/speech · YuE2-3B ───
 
-# Text-to-music like MiniMax Music 3, with one twist: the ABC score span is
-# request-controlled via extra_params.cot/abc and the two must agree, and
-# sampling is pinned by the checkpoint preset so sampling knobs are rejected.
+# Text-to-music like MiniMax Music 3, with one twist: an external ABC score is
+# request-controlled via extra_params.cot/abc and requires cot=melody|full.
+# Omitting ABC with either mode intentionally enables automatic score
+# generation, and sampling is pinned by the checkpoint preset so sampling
+# knobs are rejected.
 _YUE2_SPEECH = [
     pytest.param(
         OmniServerParams(
@@ -1088,11 +1090,6 @@ _YUE2_MAX_FRAMES = 9000
             id="max_new_tokens_over_cap",
         ),
         pytest.param({"max_new_tokens": 199}, ("max_new_tokens",), id="max_new_tokens_below_min"),
-        pytest.param(
-            {"extra_params": {"cot": "melody"}},
-            ("abc",),
-            id="cot_melody_without_abc",
-        ),
         pytest.param(
             {"extra_params": {"abc": _YUE2_ABC}},
             ("cot",),
