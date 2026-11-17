@@ -50,7 +50,7 @@ class _IdentityFtfy:
 
 
 def _align_wan_prompt_cleaning() -> None:
-    # Always use identity ftfy, installed or not, to preserve punctuation like Omni.
+    # Always use identity ftfy, installed or not, to match Omni's prompt preprocessing.
     wan_i2v_module.ftfy = _IdentityFtfy()
 
 
