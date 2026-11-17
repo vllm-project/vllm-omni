@@ -400,6 +400,8 @@ def test_mrv2_abort_and_publish_output_with_indextts_full_payload():
         assert stage0["enable_prefix_caching"] is False
         assert stage0["enable_chunked_prefill"] is False
         assert stage0["max_num_batched_tokens"] >= stage0["max_model_len"]
+        assert "tokenizer" not in stage0
+        assert "tokenizer" not in stage1
         assert stage1["hf_overrides"]["s2mel_allow_tf32"] is True
 
 
@@ -698,3 +700,20 @@ def test_ensure_dit_caches_avoids_runtime_reallocation_across_batch_growth():
     decoder._ensure_dit_caches(estimator, cfm_batch_size=8)
     assert setup_calls == [(32, 16384)]
     assert transformer.max_batch_size == 32
+
+
+def test_indextts2_talker_mrv2_enables_full_cuda_graph_capture():
+    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+    model = object.__new__(IndexTTS2TalkerForConditionalGeneration)
+    nn.Module.__init__(model)
+    assert model.have_multimodal_outputs is True
+    assert model.mrv2_forward_returns_tensor is True
+
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = model
+    runner._configure_cudagraph_output_contract()
+
+    assert runner._model_has_structured_output is False
+    assert runner._full_graph_aux_outputs is False
+    assert runner._exclude_full_graph is False

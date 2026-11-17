@@ -128,6 +128,9 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
     and accumulates hidden_states as latent for Stage 1 S2Mel decoder.
     """
 
+    have_multimodal_outputs = True
+    mrv2_forward_returns_tensor = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.vllm_config = vllm_config
@@ -150,6 +153,9 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
 
         # --- Flags for vLLM-Omni framework ---
         self.have_multimodal_outputs = True
+        # forward() returns a plain hidden_states tensor; MRv2 builds multimodal
+        # outputs from the live batch after CUDA graph replay (#10435).
+        self.mrv2_forward_returns_tensor = True
         self.has_preprocess = True
         self.has_postprocess = True
         self.requires_raw_input_tokens = True

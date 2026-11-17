@@ -17,7 +17,6 @@ stages:
     enable_prefix_caching: false
     enable_chunked_prefill: false
     skip_tokenizer_init: true
-    tokenizer: gpt2
     async_scheduling: true
     max_num_batched_tokens: 2560
     max_model_len: 2560
@@ -38,7 +37,6 @@ stages:
     gpu_memory_utilization: 0.35
     enable_prefix_caching: false
     skip_tokenizer_init: true
-    tokenizer: gpt2
     enforce_eager: true
     async_scheduling: true
     max_num_batched_tokens: 8192
