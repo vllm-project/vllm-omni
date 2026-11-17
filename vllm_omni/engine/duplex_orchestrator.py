@@ -193,7 +193,6 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         replica_id: int,
         req_state: OrchestratorRequestState,
     ) -> None:
-        del replica_id
         if not isinstance(req_state, DuplexOrchestratorRequestState) or req_state.fence is None:
             return
         runner = self.session_manager.runner_for_request_id(request_id)
@@ -203,6 +202,14 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         req_state.stage_fences[stage_id] = fence
         try:
             runner.session.bind_stage_request(stage_id, request_id, fence=fence)
+            if req_state.parent_request_id is not None:
+                # The input stream owns native model KV across child retirement.
+                # Keep its replica binding until epoch/session teardown, otherwise
+                # cleaning a forked child unbinds the parent that the next block
+                # still needs.
+                parent_id = req_state.parent_request_id
+                self.stage_pools[stage_id].bind_request_to_replica(parent_id, replica_id)
+                runner.session.bind_stage_request(stage_id, parent_id, fence=fence)
         except DuplexFenceMismatchError:
             # The session already advanced past this request's epoch (cancel
             # raced the submit); the cancel path aborts the stale request id.
@@ -400,7 +407,16 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             raise
         if closing_session_ids:
             self.session_manager.finalize_closed_sessions(closing_session_ids)
+        # A forked child must not retire its parent: the parent owns the Intent-side
+        # KV that the next block reads, so it stays registered until the session or
+        # an abort ends it. `fork_stage_request` sets `parent_request_id` on children.
+        retiring_parents = (
+            set() if abort else {getattr(s, "parent_request_id", None) for s in self.request_states.values()}
+        )
         for request_id in cleanup_ids:
+            if request_id in retiring_parents:
+                logger.debug("[DuplexOrchestrator] keeping forked parent %s registered", request_id)
+                continue
             self.session_manager.unregister_request(request_id)
         return outputs
 
