@@ -234,6 +234,16 @@ class _StampOwner:
     request_states: dict[str, object] = field(default_factory=dict)
 
 
+@dataclass
+class _FreshTalkerRequest:
+    request_id: str = "req-1"
+    resumable: bool = True
+    trace_headers: object | None = None
+
+    def take_events(self) -> list[object]:
+        return []
+
+
 def _stage0_output(text: str, *, finished: bool = False) -> _FakeOutput:
     return _FakeOutput(
         finished=finished,
@@ -646,6 +656,70 @@ def test_talker_park_releases_same_stop_token_when_generation_advances():
     park_two = _stage0_output("park-2")
     park_two.outputs[0].token_ids = [2150]
     _stamp_talker_park(park_two, generation=1)
+    second = plan_partial_stage_output(orchestrator, 1, 0, park_two, req_state, joyai_stage_id=0)
+    assert second is not None
+    assert "还在烧" in second.output.text
+
+
+def test_fresh_request_first_park_releases_next_sentence_inside_leftover_window():
+    """None→1 used the 200 ms fallback and could swallow sentence three.
+
+    Producer helpers start from a request with no generation attribute, publish
+    0 on the first park envelope, then bump to 1. The consumer must release the
+    queued sentence on that 1 even when the token ids still match [2150].
+    """
+    from vllm_omni.core.sched.omni_ar_scheduler import _segment_generation_of
+    from vllm_omni.core.sched.omni_scheduler_mixin import (
+        OmniSchedulerMixin,
+        _initialize_resumable_segment_generation,
+    )
+
+    request = _FreshTalkerRequest()
+    assert not hasattr(request, "_omni_segment_generation")
+    _initialize_resumable_segment_generation(request)
+    first_park_generation = _segment_generation_of(request)
+    assert first_park_generation == 0
+    request._omni_segment_generation = int(getattr(request, "_omni_segment_generation", 0) or 0) + 1
+    envelope = OmniSchedulerMixin._make_omni_engine_output(
+        object.__new__(OmniSchedulerMixin),
+        request,
+        new_token_ids=[2150],
+        is_segment_finished=True,
+        segment_generation=first_park_generation,
+    )
+    assert envelope.segment_generation == 0
+    assert _segment_generation_of(request) == 1
+
+    orchestrator = _FakeOrchestrator()
+    req_state = _FakeReqState()
+    opened = plan_partial_stage_output(
+        orchestrator, 0, 0, _stage0_output("</response> 水开了。关"), req_state, joyai_stage_id=0
+    )
+    assert opened is not None
+    bridge = req_state.streaming.bridge_states["joyai_sentence_tts"]
+    bridge["queued"] = ["关火。", "还在烧。"]
+    bridge["talker_busy"] = True
+    req_state.streaming.enabled = True
+    req_state.streaming.segments[1] = _FakeSegment(finished=True)
+
+    park_one = _stage0_output("park-1")
+    park_one.outputs[0].token_ids = [2150]
+    DuplexOrchestrator._stamp_poll_segment_finished(
+        _StampOwner(), 1, OmniEngineCoreOutputs(outputs=[envelope]), [park_one]
+    )
+    assert park_one.segment_generation == 0
+    first = plan_partial_stage_output(orchestrator, 1, 0, park_one, req_state, joyai_stage_id=0)
+    assert first is not None
+    assert "关火" in first.output.text
+
+    leftover = _stage0_output("leftover")
+    leftover.outputs[0].token_ids = [2150]
+    _stamp_talker_park(leftover, generation=0)
+    assert plan_partial_stage_output(orchestrator, 1, 0, leftover, req_state, joyai_stage_id=0) is None
+
+    park_two = _stage0_output("park-2")
+    park_two.outputs[0].token_ids = [2150]
+    _stamp_talker_park(park_two, generation=int(request._omni_segment_generation))
     second = plan_partial_stage_output(orchestrator, 1, 0, park_two, req_state, joyai_stage_id=0)
     assert second is not None
     assert "还在烧" in second.output.text

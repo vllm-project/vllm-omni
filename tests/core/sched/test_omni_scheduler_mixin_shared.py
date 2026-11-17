@@ -15,8 +15,12 @@ from vllm.v1.request import Request
 
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.core.sched import omni_scheduler_mixin
+from vllm_omni.core.sched.omni_ar_scheduler import _segment_generation_of
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
-from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.core.sched.omni_scheduler_mixin import (
+    OmniSchedulerMixin,
+    _initialize_resumable_segment_generation,
+)
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
 from vllm_omni.data_entry_keys import RETURN_STAGE_PAYLOAD_KEY
 from vllm_omni.outputs import OmniConnectorOutput
@@ -33,6 +37,18 @@ class _OutputRequest:
     request_id: str = "req-output"
     trace_headers: object | None = None
     _omni_segment_generation: int | None = None
+
+    def take_events(self) -> list[object]:
+        return []
+
+
+@dataclass
+class _FreshRequest:
+    request_id: str = "req-fresh"
+    resumable: bool = True
+    additional_information: object | None = None
+    model_intermediate_buffer: object | None = None
+    trace_headers: object | None = None
 
     def take_events(self) -> list[object]:
         return []
@@ -253,6 +269,66 @@ def test_output_helper_keeps_explicit_segment_generation_over_request():
     output = scheduler._make_omni_engine_output(request, new_token_ids=[2150], segment_generation=0)
 
     assert output.segment_generation == 0
+
+
+def test_initialize_resumable_generation_seeds_missing_counter_only():
+    fresh = _FreshRequest()
+    assert not hasattr(fresh, "_omni_segment_generation")
+    _initialize_resumable_segment_generation(fresh)
+    assert fresh._omni_segment_generation == 0
+    _initialize_resumable_segment_generation(fresh)
+    assert fresh._omni_segment_generation == 0
+
+    one_shot = _FreshRequest(request_id="req-oneshot", resumable=False)
+    _initialize_resumable_segment_generation(one_shot)
+    assert not hasattr(one_shot, "_omni_segment_generation")
+
+
+def test_add_request_seeds_generation_zero_on_fresh_resumable(monkeypatch):
+    added: list[object] = []
+
+    def fake_add_request(self, request: object) -> None:
+        added.append(request)
+        self.requests[request.request_id] = request
+
+    monkeypatch.setattr(Scheduler, "add_request", fake_add_request)
+    scheduler = OmniGenerationScheduler.__new__(OmniGenerationScheduler)
+    scheduler.requests = {}
+    scheduler.chunk_transfer_adapter = None
+    scheduler._pending_request_prewarms = {}
+    scheduler._outputs_awaiting_stage_payload = {}
+    scheduler._omni_talker_kstep_cache = False
+
+    request = _FreshRequest()
+    assert not hasattr(request, "_omni_segment_generation")
+    scheduler.add_request(request)
+    assert request._omni_segment_generation == 0
+    assert added == [request]
+
+    one_shot = _FreshRequest(request_id="req-oneshot", resumable=False)
+    scheduler.add_request(one_shot)
+    assert not hasattr(one_shot, "_omni_segment_generation")
+
+
+def test_park_output_keeps_pre_stop_generation_after_queued_replacement():
+    """First park must keep 0 when stop handling already incremented to 1."""
+    scheduler = _Scheduler()
+    request = _FreshRequest()
+    assert not hasattr(request, "_omni_segment_generation")
+    _initialize_resumable_segment_generation(request)
+    snapshot = _segment_generation_of(request)
+    assert snapshot == 0
+
+    request._omni_segment_generation = int(getattr(request, "_omni_segment_generation", 0) or 0) + 1
+    assert request._omni_segment_generation == 1
+    output = scheduler._make_omni_engine_output(
+        request,
+        new_token_ids=[2150],
+        is_segment_finished=True,
+        segment_generation=snapshot,
+    )
+    assert output.segment_generation == 0
+    assert _segment_generation_of(request) == 1
 
 
 @pytest.mark.parametrize(("role", "coordinated"), [("sender", False), ("receiver", True), (None, True)])

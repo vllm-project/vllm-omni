@@ -71,6 +71,22 @@ def _request_finishes_on_next_stop(request: Request) -> bool:
     return request_flag_is_set(request, JOYAI_FINISH_ON_NEXT_STOP_KEY)
 
 
+def _initialize_resumable_segment_generation(request: Request) -> None:
+    """Publish generation 0 on a fresh resumable request before its first park.
+
+    Streaming replacements increment with ``int(getattr(..., 0) or 0) + 1``.
+    A missing counter made the first 2150 publish ``None``, so sentence-TTS
+    compared ``None`` to ``1`` with the 200 ms token-identity fallback.
+    One-shot requests stay unset so connector watermarking does not
+    speculate ``generation + 1`` (#6816).
+    """
+    if not getattr(request, "resumable", False):
+        return
+    if getattr(request, "_omni_segment_generation", None) is not None:
+        return
+    request._omni_segment_generation = 0
+
+
 # Upper bound on how long a request may wait for stage input before the
 # scheduler force-fails it.  Defends against stuck consumer-side requests when
 # the producer drops a payload, send fails, or recv never arrives.  Override
@@ -1353,6 +1369,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             # Only a fresh prewarm placeholder carries the payload; streaming
             # updates re-add a live id and are left untouched.
             self._take_async_chunk_prewarm(request)
+            _initialize_resumable_segment_generation(request)
         else:
             if finishes_on_next_stop:
                 setattr(existing, _FINISH_ON_NEXT_STOP_ATTR, True)
