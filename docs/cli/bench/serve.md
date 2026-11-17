@@ -681,6 +681,13 @@ comparable within one adapter / chunk size.
 `session.stats` (RFC #8325): OmniInteract and Omni-DuplexEval ask once before close; Seed-TTS asks per turn.
 The keys appear only when serve has `duplex_session.collect_stats: true` and the turn is final; otherwise the
 flatten keys are omitted. Compare them only on a single-host deployment that collected stats.
+The same snapshot gives per-chunk keys, pooled over the final turns of every session:
+`duplex_chunk_in_engine_ms` (a chunk's submission to the end of its last stage span) and `duplex_chunk_queue_ms`
+(submission to its first stage span) as `num_/mean_/median_/p99_` keys, and `duplex_chunk_overrun_ratio`, the share
+of chunks still in the engine when the session's next chunk was submitted. With real-time input an overrun is a unit
+the engine finished after the next one was already waiting; each session's last chunk has no next one and is not
+counted. The final-turn and missing-stage rules of `duplex_busy_rtf` apply, and each session row lists its chunks
+under `chunk_metrics`.
 Qwen3-Omni duplex reports no per-token timing, so TPOT and ITL are unavailable. A turn-based model acknowledges a proactive request right away but does not speak again when the
 event later happens, so proactive and 1QnA scenarios score low by construction.
 

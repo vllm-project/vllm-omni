@@ -4313,7 +4313,12 @@ async def benchmark(
     ]
     if duplex_session_metrics:
         result["duplex_session_metrics"] = duplex_session_metrics
+        from vllm_omni.benchmarks.duplex_session_metrics import duplex_chunk_metrics, print_duplex_chunk_metrics
         from vllm_omni.clients.duplex import distribution_summary
+
+        chunk_latency = duplex_chunk_metrics(duplex_session_metrics)
+        result.update(chunk_latency)
+        print_duplex_chunk_metrics(chunk_latency)
 
         for session_key, result_key, digits in (
             ("stream_ttft_ms", "duplex_stream_ttft_ms", 3),

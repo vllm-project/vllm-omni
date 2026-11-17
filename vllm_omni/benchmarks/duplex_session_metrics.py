@@ -11,6 +11,7 @@ per-session ``stream_*`` values into a run-level report.
 
 from __future__ import annotations
 
+import bisect
 import json
 import math
 from collections.abc import Mapping, Sequence
@@ -221,6 +222,71 @@ def apply_session_stats_to_request_metrics(
         )
 
 
+#: Per-chunk latencies pooled over every session's final turns, exported as
+#: ``num_/mean_/median_/p99_<name>`` keys like the per-response ones.
+#: ``(row field, flatten name, console label)``.
+DUPLEX_CHUNK_LATENCY_FIELDS = (
+    ("in_engine_ms", "duplex_chunk_in_engine_ms", "chunk in-engine time"),
+    ("queue_ms", "duplex_chunk_queue_ms", "chunk queue time"),
+)
+
+
+def session_stats_chunk_metrics(session_stats: Mapping[str, object] | None) -> list[dict[str, object]]:
+    """One row per chunk of the snapshot's final turns, in submission order.
+
+    ``in_engine_ms`` is the chunk's ``[submitted_ns, done_ns]`` interval and
+    ``queue_ms`` the wait from submission to its first stage span. ``overrun``
+    says whether the chunk was still in the engine when the session's next chunk
+    was submitted: duplex input arrives in real time, so the engine finished that
+    unit after the next one was already waiting. The session's last chunk has no
+    successor and gets ``None``. Chunks of turns that get no numbers from
+    :func:`session_stats_turn_metrics` (not final, or an audio turn missing a
+    stage's spans) are left out, but still mark when input arrived.
+    """
+    turns = session_stats.get("turns") if session_stats is not None else None
+    if not isinstance(turns, list):
+        return []
+    stages = session_stats.get("stages")
+    stage_ids = (
+        [stage["stage_id"] for stage in stages if isinstance(stage, Mapping)] if isinstance(stages, list) else None
+    )
+    submitted: list[int] = []
+    final_chunks: list[tuple[Mapping[str, object], Mapping[str, object]]] = []
+    for turn in turns:
+        if not isinstance(turn, Mapping) or not isinstance(turn.get("chunks"), list):
+            continue
+        final = session_stats_turn_metrics(turn, stage_ids=stage_ids)["final"] is True
+        for chunk in turn["chunks"]:
+            if isinstance(chunk, Mapping) and isinstance(chunk.get("submitted_ns"), int):
+                submitted.append(chunk["submitted_ns"])
+                if final:
+                    final_chunks.append((turn, chunk))
+    submitted.sort()
+    rows: list[dict[str, object]] = []
+    for turn, chunk in sorted(final_chunks, key=lambda item: item[1]["submitted_ns"]):
+        submitted_ns = int(chunk["submitted_ns"])
+        done_ns = int(chunk["done_ns"])
+        starts = [
+            int(span[0])
+            for work in chunk.get("stage_work") or ()
+            if isinstance(work, Mapping)
+            for span in work.get("spans") or ()
+        ]
+        later = bisect.bisect_right(submitted, submitted_ns)
+        next_ns = submitted[later] if later < len(submitted) else None
+        rows.append(
+            {
+                "epoch": turn.get("epoch"),
+                "turn_id": turn.get("turn_id"),
+                "seq": chunk.get("seq"),
+                "in_engine_ms": round((done_ns - submitted_ns) / 1e6, 3),
+                "queue_ms": round(max(0, min(starts) - submitted_ns) / 1e6, 3) if starts else None,
+                "overrun": None if next_ns is None else done_ns > next_ns,
+            }
+        )
+    return rows
+
+
 def _client_response_latencies(
     collector: EventCollector,
     response_id: str,
@@ -317,6 +383,8 @@ def collect_duplex_session_metrics(
         request_metrics,
         session_id=session_id,
     )
+    if chunk_metrics := session_stats_chunk_metrics(session_stats):
+        session_metrics["chunk_metrics"] = chunk_metrics
     from vllm_omni.clients.duplex import distribution_summary
 
     for field in ("client_ttft_ms", "client_ttfp_ms"):
@@ -388,6 +456,48 @@ def print_duplex_response_latency_metrics(metrics: Mapping[str, float | int]) ->
     print("=" * 50)
 
 
+def duplex_chunk_metrics(session_metrics: Sequence[Mapping[str, object]]) -> dict[str, float | int]:
+    """Pool every session's ``chunk_metrics`` into flat chunk latency keys and the overrun ratio."""
+    from vllm_omni.clients.duplex import distribution_summary
+
+    rows = [
+        row
+        for metric in session_metrics
+        if isinstance(chunks := metric.get("chunk_metrics"), list)
+        for row in chunks
+        if isinstance(row, Mapping)
+    ]
+    result: dict[str, float | int] = {}
+    for field, name, _label in DUPLEX_CHUNK_LATENCY_FIELDS:
+        summary = distribution_summary(_finite_nonnegative(rows, field))
+        if summary is None:
+            continue
+        result[f"num_{name}_samples"] = summary["count"]
+        result[f"mean_{name}"] = summary["mean"]
+        result[f"median_{name}"] = summary["p50"]
+        result[f"p99_{name}"] = summary["p99"]
+    overruns = [row["overrun"] for row in rows if isinstance(row.get("overrun"), bool)]
+    if overruns:
+        result["num_duplex_chunk_overrun_samples"] = len(overruns)
+        result["duplex_chunk_overrun_ratio"] = round(sum(overruns) / len(overruns), 6)
+    return result
+
+
+def print_duplex_chunk_metrics(metrics: Mapping[str, float | int]) -> None:
+    """Print the per-chunk block of a benchmark summary."""
+    if not metrics:
+        return
+    print("{s:{c}^{n}}".format(s=" Duplex Per-Chunk Latency ", n=50, c="="))
+    for _field, name, label in DUPLEX_CHUNK_LATENCY_FIELDS:
+        if f"mean_{name}" not in metrics:
+            continue
+        for stat, title in (("mean", "Mean"), ("median", "Median"), ("p99", "P99")):
+            print("{:<40} {:<10.2f}".format(f"{title} {label} (ms):", metrics[f"{stat}_{name}"]))
+    if "duplex_chunk_overrun_ratio" in metrics:
+        print("{:<40} {:<10.6f}".format("Chunk overrun ratio:", metrics["duplex_chunk_overrun_ratio"]))
+    print("=" * 50)
+
+
 def duplex_stream_metrics(session_metrics: Sequence[Mapping[str, object]]) -> dict[str, object]:
     """Summarize finite, non-negative per-session ``stream_*`` values."""
     from vllm_omni.clients.duplex import distribution_summary
@@ -424,6 +534,7 @@ def build_duplex_metrics_report(
     }
     report.update(duplex_stream_metrics(session_metrics))
     report.update(duplex_response_latency_metrics(request_metrics))
+    report.update(duplex_chunk_metrics(session_metrics))
     return report
 
 
