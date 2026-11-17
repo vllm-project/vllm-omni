@@ -44,6 +44,20 @@ def _encode_audio(audio: object, sample_rate: int, fmt: str, speed: float | None
     return "ZmFrZQ=="
 
 
+def test_aura_warmup_turn_is_spoken_pcm16() -> None:
+    plugin = load_duplex_plugin(
+        "vllm_omni.model_executor.models.aura_omni.duplex.plugin.AuraDuplexPlugin",
+        _encode_audio,
+    )
+    turn = plugin.startup_warmup_turn()
+    assert turn is not None
+    assert turn["format"] == "pcm16"
+    assert turn["sample_rate_hz"] == 16000
+    pcm = base64.b64decode(str(turn["audio"]))
+    assert len(pcm) > 16000 and len(pcm) % 2 == 0
+    assert any(pcm)
+
+
 def test_load_aura_duplex_plugin_and_sampling_arity() -> None:
     plugin = load_duplex_plugin(
         "vllm_omni.model_executor.models.aura_omni.duplex.plugin.AuraDuplexPlugin",
@@ -294,7 +308,7 @@ def test_configure_sampling_keeps_explicit_talker_limits() -> None:
             SamplingParams(max_tokens=16),
         ),
     )
-    assert unset[2].max_tokens == 240
+    assert unset[2].max_tokens == 1024
     assert unset[2].stop_token_ids == [2150]
 
 
@@ -427,6 +441,24 @@ def test_session_history_strips_oldest_silent_videos() -> None:
     drop_session_history("hist-ut")
 
 
+def test_forty_sixth_clip_is_trimmed_before_it_enters_the_prompt() -> None:
+    drop_session_history("hist-cap")
+    history = get_or_create_session_history("hist-cap")
+    for index in range(45):
+        history.begin_user_turn("", video=(f"clip-{index}",))
+        history.commit_turn(SILENT_TEXT)
+    assert len(history.retained_videos()) == 45
+    history.begin_user_turn("", video=("clip-45",))
+    # Oldest 30 are gone before render. The prompt is those 15 plus this clip.
+    assert len(history.retained_videos()) == 15
+    assert history.retained_videos()[0] == ("clip-30",)
+    history.commit_turn(SILENT_TEXT)
+    kept = history.retained_videos()
+    assert len(kept) == 16
+    assert kept[-1] == ("clip-45",)
+    drop_session_history("hist-cap")
+
+
 def test_pipeline_declares_aura_duplex_plugin() -> None:
     from vllm_omni.model_executor.models.aura_omni.pipeline import AURA_OMNI_PIPELINE
 
@@ -513,12 +545,14 @@ def test_plan_partial_stage_output_hands_a_sentence_to_talker() -> None:
         request_id="req-1",
         outputs=[SimpleNamespace(cumulative_text=sentence)],
     )
+    assert AuraDuplexPlugin(_encode_audio).plan_partial_stage_output(orchestrator, 1, 0, output, req_state) is None
 
+    output.finished = True
     plan = AuraDuplexPlugin(_encode_audio).plan_partial_stage_output(orchestrator, 1, 0, output, req_state)
 
     assert plan is not None
     assert plan.close_only is False
-    assert plan.is_final_update is False
+    assert plan.is_final_update is True
     assert plan.output.text == sentence.strip()
     assert req_state.prompt["additional_information"]["aura_tts_partial"] is True
     assert AuraDuplexPlugin(_encode_audio).plan_partial_stage_output(orchestrator, 0, 0, output, req_state) is None
@@ -553,38 +587,27 @@ def _stage1_output(text: str, *, finished: bool) -> SimpleNamespace:
     )
 
 
-def test_finished_remainder_stays_resumable_until_close_sentinel() -> None:
-    """A second sentence at Stage1 finish must not be the Talker end sentinel.
+def test_multi_sentence_utterance_is_one_submit_when_stage1_finishes() -> None:
+    """CustomVoice bakes the first prefill's text and then ends.
 
-    The first sentence is already a resumable Talker request. Marking the
-    remainder ``is_final_update`` makes ``StreamingUpdate.from_request``
-    return None, which aborts that in-flight sentence before Code2Wav has a
-    full codec group.
+    Handing the first clause off early left the rest out of that prefill, so
+    playback stopped at the first comma. Wait for the whole utterance and
+    submit it once, the same way a single finished sentence already works.
     """
     orchestrator, req_state = _sentence_plan_fixture()
     plugin = AuraDuplexPlugin(_encode_audio)
     first = "我看到你身后是一个很明亮的办公室环境，天花板上能看到白色的管道和通风口，"
     full = first + "远处还有办公桌和绿植。"
     opened = plugin.plan_partial_stage_output(orchestrator, 1, 0, _stage1_output(first, finished=False), req_state)
-    assert opened is not None
-    assert opened.is_final_update is False
-    assert opened.queue_close_after is False
-    assert req_state.prompt["additional_information"]["aura_tts_close_only"] is False
+    assert opened is None
 
     tail = plugin.plan_partial_stage_output(orchestrator, 1, 0, _stage1_output(full, finished=True), req_state)
     assert tail is not None
     assert tail.close_only is False
-    assert tail.queue_close_after is True
-    assert tail.is_final_update is False
-    assert tail.output.text == "远处还有办公桌和绿植。"
-    assert req_state.prompt["additional_information"]["aura_tts_close_only"] is False
-
-    followup = plugin.partial_stage_followup(tail, req_state)
-    assert followup is not None
-    assert followup.is_final_update is True
-    assert followup.close_only is True
-    assert followup.output.text == ""
-    assert req_state.prompt["additional_information"]["aura_tts_close_only"] is True
+    assert tail.queue_close_after is False
+    assert tail.is_final_update is True
+    assert tail.output.text == full
+    assert plugin.partial_stage_followup(tail, req_state) is None
 
 
 def test_single_finished_sentence_is_one_non_resumable_submit() -> None:
@@ -599,25 +622,19 @@ def test_single_finished_sentence_is_one_non_resumable_submit() -> None:
     assert plugin.partial_stage_followup(plan, req_state) is None
 
 
-def test_empty_remainder_after_mid_gen_emit_is_one_end_sentinel() -> None:
-    """16:35/17:30: full sentence emitted mid-gen, then finish with no remainder.
-
-    The sentence is already on Talker. The finish is one close sentinel.
-    Queueing another close_only submits twice and never reaches stage 2/3.
-    """
+def test_one_sentence_still_submits_once_at_stage1_finish() -> None:
     orchestrator, req_state = _sentence_plan_fixture()
     plugin = AuraDuplexPlugin(_encode_audio)
     sentence = "我看到外面的天空呈现出灰蒙蒙的色调，光线比较昏暗，没有阳光直射，看起来像是阴天或者有雾霾。"
     opened = plugin.plan_partial_stage_output(orchestrator, 1, 0, _stage1_output(sentence, finished=False), req_state)
-    assert opened is not None
-    assert opened.close_only is False
-    assert opened.is_final_update is False
+    assert opened is None
 
     finished = plugin.plan_partial_stage_output(orchestrator, 1, 0, _stage1_output(sentence, finished=True), req_state)
     assert finished is not None
-    assert finished.close_only is True
+    assert finished.close_only is False
     assert finished.queue_close_after is False
     assert finished.is_final_update is True
+    assert finished.output.text == sentence
     assert plugin.partial_stage_followup(finished, req_state) is None
 
 

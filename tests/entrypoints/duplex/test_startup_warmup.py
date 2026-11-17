@@ -2,17 +2,23 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pybase64 as base64
+import pytest
 
 from vllm_omni.engine.duplex.config import DuplexCapabilities
 from vllm_omni.entrypoints.duplex.warmup import (
     _WARMUP_AUDIO_SECONDS,
     _WARMUP_FRAME_HEIGHT,
     _WARMUP_FRAME_WIDTH,
+    _WARMUP_INSTRUCTIONS,
     _WARMUP_SAMPLE_RATE_HZ,
     _short_pcm_f32le_b64,
     _warmup_jpeg_b64,
     startup_warmup_kind,
+    video_warmup_turn,
+    warmup_output_kind,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _Plugin:
@@ -44,6 +50,35 @@ def test_startup_turn_audio_is_short_and_not_silent() -> None:
     raw = base64.b64decode(_short_pcm_f32le_b64())
     assert len(raw) == int(_WARMUP_SAMPLE_RATE_HZ * _WARMUP_AUDIO_SECONDS) * 4
     assert any(raw)
+
+
+def test_plugin_warmup_turn_replaces_the_shared_tone() -> None:
+    class _Plugin:
+        def startup_warmup_turn(self) -> dict[str, object]:
+            return {"audio": "c3BlZWNo", "format": "pcm16", "sample_rate_hz": 16000}
+
+    turn = video_warmup_turn(_Plugin())
+    assert turn["audio"] == "c3BlZWNo"
+    assert turn["format"] == "pcm16"
+    assert turn["sample_rate_hz"] == 16000
+    assert turn["instructions"] == _WARMUP_INSTRUCTIONS
+    assert turn["video_frames"]
+
+
+def test_incomplete_plugin_warmup_turn_keeps_the_shared_tone() -> None:
+    class _Plugin:
+        def startup_warmup_turn(self) -> dict[str, object]:
+            return {"audio": ""}
+
+    turn = video_warmup_turn(_Plugin())
+    assert turn["format"] == "pcm_f32le"
+    assert turn["audio"] == _short_pcm_f32le_b64()
+
+
+def test_warmup_stops_on_audio_or_listen() -> None:
+    assert warmup_output_kind({"type": "response.output_audio.delta"}) == "audio"
+    assert warmup_output_kind({"type": "response.listen"}) == "listen"
+    assert warmup_output_kind({"type": "response.created"}) is None
 
 
 def test_startup_turn_frame_is_a_camera_sized_jpeg() -> None:

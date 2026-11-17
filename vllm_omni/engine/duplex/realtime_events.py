@@ -127,6 +127,7 @@ class _ResponseProjection:
     output_item_done: bool = False
     conversation_item_done: bool = False
     speak_emitted: bool = False
+    function_call_items: list[dict[str, object]] = field(default_factory=list)
 
     @property
     def transcript(self) -> str:
@@ -634,6 +635,8 @@ def _realtime_response_done_event(
     status_details: dict[str, object] | None = None,
 ) -> ResponseDone:
     response_id = event.get("response_id")
+    projection = _response_state(state, response_id)
+    calls = [dict(item) for item in projection.function_call_items] if projection is not None else []
     return ResponseDone(
         response_id=_str_or_none(response_id),
         response={
@@ -641,7 +644,7 @@ def _realtime_response_done_event(
             "object": "realtime.response",
             "status": status,
             "status_details": status_details,
-            "output": [_response_done_output_item(state, response_id, status=status)],
+            "output": [_response_done_output_item(state, response_id, status=status), *calls],
             # Audio was delivered by output_audio.delta. Copying the waveform
             # into the terminal doubles queue usage and defeats its reserve.
             "metadata": {key: value for key, value in event.items() if key != "audio"},
@@ -1202,6 +1205,20 @@ def _function_call_done_events(state: RealtimeProjectionState, event: dict[str, 
         "arguments": arguments,
     }
     state.conversation_items[item_id] = item
+    item_events: list[DuplexEvent] = [
+        *_conversation_item_added_events(state, item),
+        OutputItemAdded(response_id=response_id, item=_item_snapshot(item)),
+        FunctionCallArgumentsDelta(response_id=response_id, item_id=item_id, call_id=call_id, delta=arguments),
+        FunctionCallArgumentsDone(response_id=response_id, item_id=item_id, call_id=call_id, arguments=arguments),
+        OutputItemDone(response_id=response_id, item=_item_snapshot(item)),
+        _conversation_item_done_event(state, item),
+    ]
+    # A call published into a response that is still open belongs to it; that
+    # response's own response.done then carries the call in its output.
+    open_response = _response_state(state, response_id)
+    if open_response is not None:
+        open_response.function_call_items.append(dict(item))
+        return item_events
     response = {
         "id": response_id,
         "object": "realtime.response",
@@ -1212,12 +1229,7 @@ def _function_call_done_events(state: RealtimeProjectionState, event: dict[str, 
     }
     return [
         ResponseCreated(response_id=response_id, response={**response, "status": "in_progress", "output": []}),
-        *_conversation_item_added_events(state, item),
-        OutputItemAdded(response_id=response_id, item=_item_snapshot(item)),
-        FunctionCallArgumentsDelta(response_id=response_id, item_id=item_id, call_id=call_id, delta=arguments),
-        FunctionCallArgumentsDone(response_id=response_id, item_id=item_id, call_id=call_id, arguments=arguments),
-        OutputItemDone(response_id=response_id, item=_item_snapshot(item)),
-        _conversation_item_done_event(state, item),
+        *item_events,
         ResponseDone(response_id=response_id, response=response),
     ]
 

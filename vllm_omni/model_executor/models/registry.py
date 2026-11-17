@@ -522,6 +522,11 @@ _OMNI_MODELS = {
         "qwen3_vl",
         "AuraQwen3VLForConditionalGeneration",
     ),
+    "AuraQwen3_5ForConditionalGeneration": (
+        "aura_omni",
+        "qwen3_5",
+        "AuraQwen3_5ForConditionalGeneration",
+    ),
     "MiniMaxH3Encoder": (
         "minimax_h3",
         "encoder",

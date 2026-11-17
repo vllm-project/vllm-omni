@@ -25,7 +25,10 @@
           <button id="pttButton" class="secondary" type="button" hidden disabled>Hold to talk</button>
           <button id="muteButton" class="secondary" type="button" disabled>Mute</button>
           <button id="cameraButton" class="secondary" type="button" disabled>Camera</button>
-          <video id="cameraPreview" muted playsinline style="display:none;width:96px;height:72px;border-radius:8px;object-fit:cover;background:#000"></video>
+          <div id="cameraStage" class="camera-stage">
+            <video id="cameraPreview" muted playsinline style="display:none;width:96px;height:72px;border-radius:8px;object-fit:contain;background:#000"></video>
+            <div id="highlightLayer"></div>
+          </div>
         </div>
         <div id="promptControls" style="display:flex;gap:8px;align-items:flex-start;margin-top:8px;width:100%">
           <label style="display:inline-flex;flex-direction:column;gap:4px;font-size:13px;opacity:.85;white-space:nowrap">

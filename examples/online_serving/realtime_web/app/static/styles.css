@@ -71,16 +71,40 @@ main { width: min(1040px, calc(100% - 40px)); margin: 28px auto 48px; }
 }
 
 .call-actions { display: flex; gap: 8px; }
+.camera-stage { display: contents; }
+#highlightLayer { display: none; }
 /* AURA only: class is added solely by the aura-ptt profile. */
 .call-bar:has(.camera-preview-large) .call-actions { grid-column: 1 / -1; }
 .call-actions:has(.camera-preview-large) { flex-wrap: wrap; align-items: center; }
-.call-actions:has(.camera-preview-large) .camera-preview-large {
+.call-actions:has(.camera-preview-large) .camera-stage {
+  display: block;
+  position: relative;
   order: -1;
   flex: 0 0 100%;
+  width: 100%;
+}
+.call-actions:has(.camera-preview-large) .camera-preview-large {
+  order: 0;
+  flex: none;
   width: 100% !important;
   height: auto !important;
   max-height: 480px;
-  aspect-ratio: 4 / 3;
+  object-fit: contain;
+  background: #000;
+}
+.call-actions:has(.camera-preview-large) #highlightLayer {
+  display: block;
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  overflow: hidden;
+  pointer-events: none;
+}
+.highlight-box {
+  position: absolute;
+  border: 3px solid #ffeb3b;
+  border-radius: 10px;
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.28), 0 0 24px rgba(255, 235, 59, 0.65);
 }
 .call-actions:has(.camera-preview-large) button { flex: 0 0 auto; }
 button { border-radius: 5px; border: 1px solid transparent; cursor: pointer; }

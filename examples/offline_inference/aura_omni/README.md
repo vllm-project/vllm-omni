@@ -6,6 +6,10 @@ This example runs the native AURA Omni pipeline offline:
 Qwen3-ASR -> AURA/Qwen3-VL -> Qwen3-TTS Talker -> Qwen3-TTS Code2Wav
 ```
 
+This offline script targets AURA v1 (Qwen3-VL). AURA_v2 is served online
+only, through Realtime duplex; see
+[`examples/online_serving/aura_omni`](../../online_serving/aura_omni/README.md).
+
 The first stage consumes speech and produces a transcript. The AURA stage then combines the transcript with the video frames from the original request and returns text or `<|silent|>`. Non-silent responses are passed to Qwen3-TTS as AURA-generated token ids.
 
 ## Run

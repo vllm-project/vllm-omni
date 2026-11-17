@@ -15,6 +15,7 @@ from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav import (
     Qwen3TTSCode2Wav,
 )
 from vllm_omni.model_executor.stage_input_processors.qwen3_tts import talker2code2wav_async_chunk
+from vllm_omni.utils.mm_outputs import split_mapping_outputs
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -456,6 +457,36 @@ def test_forward_emits_zero_samples_for_empty_codec_payload():
     out = model.forward(input_ids=torch.zeros(0, dtype=torch.long))
 
     assert out.multimodal_outputs["model_outputs"][0].numel() == 0
+
+
+def test_forward_emits_one_empty_output_per_request_for_empty_batch():
+    """Several silent finishes in one Stage3 step must not collapse to one output."""
+    model = _make_model()
+
+    out = model.forward(
+        input_ids=torch.zeros(0, dtype=torch.long),
+        request_ids=["req-0", "req-1", "req-2", "req-3"],
+        seq_token_counts=[0, 0, 0, 0],
+    )
+
+    assert len(out.multimodal_outputs["model_outputs"]) == 4
+    assert len(out.multimodal_outputs["sr"]) == 4
+    assert all(audio.numel() == 0 for audio in out.multimodal_outputs["model_outputs"])
+    payloads = split_mapping_outputs(out.multimodal_outputs, 4, torch.Tensor.detach)
+    assert [payload["model_outputs"].numel() for payload in payloads] == [0, 0, 0, 0]
+
+
+@pytest.mark.parametrize("buffer_key", ["runtime_additional_information", "model_intermediate_buffer"])
+def test_forward_counts_empty_batch_from_runtime_info_without_runner_ids(buffer_key):
+    model = _make_model()
+
+    out = model.forward(
+        input_ids=None,
+        **{buffer_key: [{"meta": {"finished": torch.tensor(True)}} for _ in range(3)]},
+    )
+
+    assert len(out.multimodal_outputs["model_outputs"]) == 3
+    assert len(out.multimodal_outputs["sr"]) == 3
 
 
 def test_dummy_runtime_information_provides_finished_request_state():

@@ -127,12 +127,13 @@ def plan_partial_stage_output(
     output: Any,
     req_state: Any,
 ) -> PartialStageForward | None:
-    """Hand a finished sentence to Talker before Stage1 finishes.
+    """Hand the finished Stage1 utterance to Talker in one submit.
 
     Same request id as the turn (Code2Wav was prewarmed on it). Text goes
     through ``aura2tts`` in the orchestrator, not the ``from_stage_1`` SHM
-    edge that clears ``additional_information.text``. Talker stays resumable
-    until Stage1 finishes. The orchestrator submits the returned plan.
+    edge that clears ``additional_information.text``. CustomVoice bakes the
+    text from the first prefill, so a clause sent earlier is all the user
+    hears. The orchestrator submits the returned plan.
     """
     del replica_id
     if not req_state.session_owned or stage_id != 1:

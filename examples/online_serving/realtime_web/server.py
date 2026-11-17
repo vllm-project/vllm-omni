@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 from pathlib import Path
+from typing import Any, Protocol
 from urllib.parse import urlencode
 
 import uvicorn
@@ -30,7 +31,172 @@ def _join_ws_url(base: str, path: str, query: str) -> str:
     return base.rstrip("/") + path + (("?" + query) if query else "")
 
 
-async def _pump_client_to_backend(client: WebSocket, backend) -> None:
+class ToolExecutor(Protocol):
+    """Runs the client side of function calling on the browser's behalf.
+
+    An executor that sets ``uses_latest_frame`` also receives the newest
+    camera frame from ``input_audio_buffer.append``. Executors that do not
+    set it keep the two-argument ``run`` and never see the frame.
+    """
+
+    @property
+    def realtime_tools(self) -> list[dict[str, Any]]: ...
+
+    async def run(self, name: str, arguments: str, frame_b64: str = "") -> str: ...
+
+
+def _json_event(text: str) -> dict[str, Any] | None:
+    try:
+        event = json.loads(text)
+    except ValueError:
+        return None
+    return event if isinstance(event, dict) else None
+
+
+def _session_update_with_tools(event: dict[str, Any], tools: ToolExecutor) -> str | None:
+    """Return a ``session.update`` that gained tools, or None when it already has them."""
+    if event.get("type") != "session.update" or not isinstance(event.get("session"), dict):
+        return None
+    if "tools" in event["session"]:
+        return None
+    session = {**event["session"], "tools": tools.realtime_tools}
+    return json.dumps({**event, "session": session})
+
+
+def _with_session_tools(text: str, tools: ToolExecutor) -> str:
+    """Add the executor's tools to a ``session.update`` that has none."""
+    event = _json_event(text)
+    if event is None:
+        return text
+    updated = _session_update_with_tools(event, tools)
+    return text if updated is None else updated
+
+
+def _note_client_event(state: dict[str, Any], event: dict[str, Any]) -> None:
+    """Reset a follow-up on a user commit, and keep the newest camera frame."""
+    if event.get("type") == "input_audio_buffer.commit":
+        state["gen"] += 1
+        state["count"] = 0
+        state["awaiting_done"] = False
+        state["ready"] = False
+        state["final_answer"] = False
+        return
+    if event.get("type") != "input_audio_buffer.append":
+        return
+    frames = event.get("video_frames")
+    if not isinstance(frames, list):
+        return
+    for frame in reversed(frames):
+        if isinstance(frame, str) and frame:
+            state["last_frame"] = frame
+            return
+
+
+def _begin_tool_call(state: dict[str, Any]) -> None:
+    """Count one in-flight call for this user turn. A new turn starts from zero."""
+    if state.get("inflight_gen") != state["gen"]:
+        state["inflight_gen"] = state["gen"]
+        state["inflight"] = 0
+    state["inflight"] = int(state.get("inflight") or 0) + 1
+
+
+def _executor_uses_latest_frame(tools: ToolExecutor) -> bool:
+    return getattr(tools, "uses_latest_frame", False) is True
+
+
+def _finished_function_call(event: dict[str, Any]) -> dict[str, Any] | None:
+    """The call in a ``response.output_item.done``; the arguments event carries no name."""
+    item = event.get("item")
+    if event.get("type") != "response.output_item.done" or not isinstance(item, dict):
+        return None
+    if item.get("type") != "function_call" or not isinstance(item.get("call_id"), str) or not item["call_id"]:
+        return None
+    return item
+
+
+# A failed search result makes the model call again. Stop opening follow-ups
+# after this many, or one question can spin for the life of the session.
+# Matches the native gateway MAX_TOOL_ROUNDS=5; one extra create after the
+# cap lets AURA inject its silent+nudge answer turn.
+_MAX_TOOL_FOLLOWUPS = 5
+
+
+def _is_user_commit(text: str) -> bool:
+    event = _json_event(text)
+    return event is not None and event.get("type") == "input_audio_buffer.commit"
+
+
+def _hold_follow_up_for_response_done(state: dict[str, Any]) -> None:
+    """The function-call item is published before ``response.done``.
+
+    A follow-up ``response.create`` in that gap is rejected with
+    ``response_already_active``.
+    """
+    state["awaiting_done"] = True
+    state["pending_gen"] = state["gen"]
+
+
+def _calls_still_running(state: dict[str, Any]) -> bool:
+    return state.get("inflight_gen") == state["gen"] and int(state.get("inflight") or 0) > 0
+
+
+def _follow_up_ready(state: dict[str, Any], generation: int) -> bool:
+    """True when this finished call may start the one follow-up for the turn.
+
+    False while ``response.done`` has not arrived, or while another call from
+    the same turn is still running. The done handler starts it in the first
+    case; the last call starts it in the second.
+    """
+    if state.get("inflight_gen") == generation:
+        state["inflight"] = max(0, int(state.get("inflight") or 0) - 1)
+    if state["gen"] != generation:
+        return False
+    if state["awaiting_done"] or _calls_still_running(state):
+        state["ready"] = True
+        return False
+    return True
+
+
+def _take_deferred_follow_up(state: dict[str, Any]) -> bool:
+    """Call on ``response.done``. True when every tool result for this turn is in."""
+    state["awaiting_done"] = False
+    if state["ready"] and state["pending_gen"] == state["gen"] and not _calls_still_running(state):
+        state["ready"] = False
+        return True
+    return False
+
+
+async def _answer_function_call(
+    backend,
+    tools: ToolExecutor,
+    call: dict[str, Any],
+    *,
+    follow_up: bool = True,
+    follow_state: dict[str, Any] | None = None,
+) -> None:
+    generation = follow_state["gen"] if follow_state is not None else None
+    name = str(call.get("name") or "")
+    arguments = str(call.get("arguments") or "")
+    if _executor_uses_latest_frame(tools):
+        frame = str(follow_state.get("last_frame") or "") if follow_state is not None else ""
+        output = await tools.run(name, arguments, frame_b64=frame)
+    else:
+        output = await tools.run(name, arguments)
+    item = {"type": "function_call_output", "call_id": call["call_id"], "output": output}
+    await backend.send(json.dumps({"type": "conversation.item.create", "item": item}))
+    if not follow_up:
+        return
+    if follow_state is not None and not _follow_up_ready(follow_state, generation):
+        return
+    await backend.send(json.dumps({"type": "response.create"}))
+
+
+async def _pump_client_to_backend(
+    client: WebSocket,
+    backend,
+    tools: ToolExecutor | None = None,
+    tool_followups: dict[str, Any] | None = None,
+) -> None:
     try:
         while True:
             message = await client.receive()
@@ -38,7 +204,15 @@ async def _pump_client_to_backend(client: WebSocket, backend) -> None:
                 await backend.close()
                 return
             if message.get("text") is not None:
-                await backend.send(message["text"])
+                text = message["text"]
+                event = _json_event(text)
+                if event is not None and tool_followups is not None:
+                    _note_client_event(tool_followups, event)
+                if event is not None and tools is not None:
+                    updated = _session_update_with_tools(event, tools)
+                    if updated is not None:
+                        text = updated
+                await backend.send(text)
             elif message.get("bytes") is not None:
                 await backend.send(message["bytes"])
     except (WebSocketDisconnect, websockets.ConnectionClosed):
@@ -46,13 +220,50 @@ async def _pump_client_to_backend(client: WebSocket, backend) -> None:
             await backend.close()
 
 
-async def _pump_backend_to_client(client: WebSocket, backend) -> None:
+async def _pump_backend_to_client(
+    client: WebSocket,
+    backend,
+    tools: ToolExecutor | None = None,
+    tool_followups: dict[str, Any] | None = None,
+) -> None:
+    calls: set[asyncio.Task] = set()
     try:
         async for message in backend:
             if isinstance(message, bytes):
                 await client.send_bytes(message)
-            else:
-                await client.send_text(message)
+                continue
+            await client.send_text(message)
+            if tools is None:
+                continue
+            event = _json_event(message)
+            if event is None:
+                continue
+            kind = event.get("type")
+            if tool_followups is not None and kind == "response.done" and _take_deferred_follow_up(tool_followups):
+                await backend.send(json.dumps({"type": "response.create"}))
+            call = _finished_function_call(event) if event is not None else None
+            if call is not None:
+                count = tool_followups["count"] if tool_followups is not None else 0
+                follow_up = count < _MAX_TOOL_FOLLOWUPS
+                final_answer = tool_followups is not None and not follow_up and not tool_followups.get("final_answer")
+                if tool_followups is not None and (follow_up or final_answer):
+                    if follow_up:
+                        tool_followups["count"] = count + 1
+                    else:
+                        tool_followups["final_answer"] = True
+                    _hold_follow_up_for_response_done(tool_followups)
+                    _begin_tool_call(tool_followups)
+                task = asyncio.create_task(
+                    _answer_function_call(
+                        backend,
+                        tools,
+                        call,
+                        follow_up=follow_up or final_answer,
+                        follow_state=tool_followups,
+                    )
+                )
+                calls.add(task)
+                task.add_done_callback(calls.discard)
     except (WebSocketDisconnect, websockets.ConnectionClosed):
         return
     except RuntimeError as exc:
@@ -76,6 +287,7 @@ def build_app(
     profile: str = "minicpm-native",
     turn_mode: str = "manual",
     speech_input: bool = False,
+    tool_executor: ToolExecutor | None = None,
 ) -> FastAPI:
     if profile not in {"minicpm-native", "qwen3-turn", "aura-ptt", "joyai-turn"}:
         raise ValueError(f"Unknown profile: {profile}")
@@ -155,9 +367,20 @@ def build_app(
                 backend_url,
                 max_size=64 * 1024 * 1024,
             ) as backend:
+                tool_followups = {
+                    "count": 0,
+                    "gen": 0,
+                    "pending_gen": 0,
+                    "awaiting_done": False,
+                    "ready": False,
+                    "final_answer": False,
+                    "inflight": 0,
+                    "inflight_gen": None,
+                    "last_frame": "",
+                }
                 tasks = {
-                    asyncio.create_task(_pump_client_to_backend(websocket, backend)),
-                    asyncio.create_task(_pump_backend_to_client(websocket, backend)),
+                    asyncio.create_task(_pump_client_to_backend(websocket, backend, tool_executor, tool_followups)),
+                    asyncio.create_task(_pump_backend_to_client(websocket, backend, tool_executor, tool_followups)),
                 }
                 done, pending = await asyncio.wait(
                     tasks,
@@ -193,7 +416,7 @@ def build_app(
     return app
 
 
-def main(default_profile: str = "minicpm-native") -> None:
+def main(default_profile: str = "minicpm-native", tool_executor: ToolExecutor | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7862)
@@ -239,6 +462,7 @@ def main(default_profile: str = "minicpm-native") -> None:
             profile=args.profile,
             turn_mode=args.turn_mode,
             speech_input=args.speech_input,
+            tool_executor=tool_executor,
         ),
         host=args.host,
         port=args.port,

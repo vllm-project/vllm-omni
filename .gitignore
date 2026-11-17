@@ -302,3 +302,5 @@ shellcheck*/
 
 # LingBot benchmark and accuracy outputs
 lingbot-artifacts/
+
+.local_private/

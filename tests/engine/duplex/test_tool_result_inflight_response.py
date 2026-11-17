@@ -132,6 +132,46 @@ async def test_stale_finished_segment_does_not_close_the_next_response():
         await close_harness(h)
 
 
+@pytest.mark.asyncio
+async def test_call_that_releases_the_turn_ends_inside_its_own_response(monkeypatch):
+    """The response that ends the turn must carry the call in its done output.
+
+    A ``response.done`` without the call reads as a finished turn, so a client
+    may open the next turn before the tool follow-up.
+    """
+    h = await open_harness(auto_response=True)
+    try:
+        h.session.capabilities = replace(h.session.capabilities, supports_core_resumable_request=False)
+        assert error_codes(await h.run(append_audio())) == []
+        request_id = h.port.submissions[-1].context.request_id
+        await h.deliver_and_settle(
+            tts_output(request_id, text="partial", turn_id=h.session.turn_id, epoch=h.session.epoch)
+        )
+        response_id = h.session.active_response_id
+        assert response_id is not None and h.session.active_request_id == request_id
+        call = {"call_id": "call_only", "name": "lookup", "arguments": "{}"}
+        monkeypatch.setattr(h.runner.plugin, "parse_function_call", lambda result: call, raising=False)
+        monkeypatch.setattr(h.runner.plugin, "function_call_releases_turn", lambda result: True)
+
+        await h.runner.model._send_one_model_output_event({"data_plane_request_id": request_id})
+        events = await h.settle()
+
+        assert [event.type for event in events].count("response.created") == 0
+        done = [event for event in events if event.type == "response.done"]
+        assert len(done) == 1 and done[0].response_id == response_id
+        assert [item["type"] for item in done[0].response["output"]][-1] == "function_call"
+        call_done = next(
+            index
+            for index, event in enumerate(events)
+            if event.type == "response.output_item.done" and event.item.get("type") == "function_call"
+        )
+        assert call_done < events.index(done[0])
+        assert h.runner.tool_calls.record("call_only").origin.response_id == response_id
+        assert h.session.active_request_id is None and h.session.active_response_id is None
+    finally:
+        await close_harness(h)
+
+
 async def _hold_one_final_segment(h, held: list[Coroutine[object, object, None]]) -> tuple[str, str]:
     """Deliver one final TTS segment and hold its continuation before it runs."""
     h.session.capabilities = replace(h.session.capabilities, supports_core_resumable_request=False)

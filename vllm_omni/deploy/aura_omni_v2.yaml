@@ -1,0 +1,136 @@
+# AURA_v2 full-duplex, single GPU: Qwen3-ASR -> AURA_v2 (Qwen3.5 hybrid) ->
+# Qwen3-TTS Talker -> Code2Wav, all on GPU 0, one session.
+#
+# Verified on 1x NVIDIA H200 (141 GB). All stages run eager; use
+# aura_omni_v2_2gpu.yaml for CUDA graphs and concurrent sessions.
+#
+#   vllm serve aurateam/AURA_2 --omni --trust-remote-code \
+#     --deploy-config vllm_omni/deploy/aura_omni_v2.yaml
+#
+# Served on /v1/realtime?duplex=1 only.
+pipeline: aura_omni
+# Qwen3-TTS Stage2 -> Stage3 codec handoff needs async_chunk; without it the
+# Talker runs but no audio reaches Stage3 or the client.
+async_chunk: true
+session_mode: duplex
+duplex_session:
+  # Session admission only, orthogonal to per-stage max_num_seqs.
+  max_sessions: 1
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 72
+      # initial=1 can stall Code2Wav on the first undersized chunk under duplex.
+      initial_codec_chunk_frames: 8
+      decode_cudagraph_capture_sizes: [25, 73, 97, 169, 325]
+
+stages:
+  - stage_id: 0
+    # 1: the next turn may queue behind an in-flight ASR request.
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.08
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: true
+    async_scheduling: true
+    max_model_len: 4096
+    max_num_batched_tokens: 2048
+    devices: "0"
+    model: Qwen/Qwen3-ASR-1.7B
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 256
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.55
+    enforce_eager: true
+    trust_remote_code: true
+    # Native hybrid KV / Mamba prefix cache (uses_native_kv_cache_only).
+    enable_prefix_caching: true
+    engine_extras:
+      mamba_cache_mode: align
+    # The two-token logits processor reads the live output list, which async
+    # scheduling can leave one step stale.
+    async_scheduling: false
+    max_model_len: 65536
+    max_num_batched_tokens: 8192
+    devices: "0"
+    model: aurateam/AURA_2
+    model_arch: AuraQwen3_5ForConditionalGeneration
+    logits_processors:
+      - "vllm_omni.model_executor.models.aura_omni.two_token_logits:AuraTwoTokenLogitsProcessor"
+    default_sampling_params:
+      temperature: 0.2
+      top_p: 1.0
+      top_k: -1
+      # One control token plus the reply body.
+      max_tokens: 1025
+      min_tokens: 0
+      repetition_penalty: 1.0
+      # <|silent|>, <|im_end|>. <|respond|> (248077) is not a stop.
+      stop_token_ids: [248070, 248046]
+
+  - stage_id: 2
+    # 2: the prior reply's TTS can drain while the next Talker request starts.
+    max_num_seqs: 2
+    gpu_memory_utilization: 0.12
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    # Stage1 -> Stage2 is fed by the orchestrator (aura2tts). A from_stage_1
+    # connector edge would park the Talker in WAITING_FOR_CHUNK and clear its
+    # text conditioning; only Stage2 -> Stage3 uses a connector.
+    output_connectors:
+      to_stage_3: connector_of_shared_memory
+    model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+    default_sampling_params:
+      temperature: 0.5
+      top_k: 50
+      # Headroom for long tool answers; 12 Hz x 1024 is about 85 s.
+      max_tokens: 1024
+      # A one-character reply wants EOS within ~5 frames. Holding it to 8
+      # pushes it into trailing silence, where it often never samples EOS.
+      min_tokens: 2
+      repetition_penalty: 1.05
+      # Talker codec EOS; without it the Talker can run to max_tokens.
+      stop_token_ids: [2150]
+    subtalker_sampling_params:
+      do_sample: true
+      temperature: 0.5
+      top_k: 50
+      top_p: 1.0
+
+  - stage_id: 3
+    max_num_seqs: 2
+    gpu_memory_utilization: 0.12
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 16384
+    max_model_len: 16384
+    devices: "0"
+    input_connectors:
+      from_stage_2: connector_of_shared_memory
+    model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 16384
+      seed: 42
+      repetition_penalty: 1.0

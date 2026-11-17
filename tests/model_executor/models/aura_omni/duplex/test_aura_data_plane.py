@@ -8,8 +8,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from vllm_omni.model_executor.models.aura_omni.duplex.data_plane import AuraDataPlaneSession
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _encode_audio(audio: object, sample_rate: int, fmt: str, speed: float | None) -> str | None:
@@ -42,6 +45,7 @@ def test_project_unwraps_data_plane_outputs_and_emits_audio_then_done() -> None:
     assert events, "project must not silently drop the runner envelope"
     assert any(event.get("audio") == "encoded-audio" for event in events)
     assert events[-1].get("end_of_turn") is True
+    assert events[-1].get("abort_data_plane_request") is True
     assert events[0].get("data_plane_request_id") == request_id
 
 
@@ -80,6 +84,10 @@ def test_project_sends_only_the_new_tail_of_a_growing_waveform() -> None:
     assert first[0]["audio_duration_ms"] == round(8 * 1000 / 24000)
     assert second[0]["audio_duration_ms"] == round(4 * 1000 / 24000)
     assert second[-1].get("end_of_turn") is True
+    # A parked sentence-TTS Talker request must be aborted with the turn, not
+    # only forgotten; mid-turn chunks must not abort it.
+    assert not first[0].get("abort_data_plane_request")
+    assert second[-1].get("abort_data_plane_request") is True
 
 
 def test_project_holds_silent_token_prefix() -> None:
@@ -144,8 +152,12 @@ def test_project_marks_finished_silent_text_as_listen() -> None:
         outputs=[SimpleNamespace(text="<|silent|>", cumulative_text="<|silent|>", finished=True)],
     )
     events = list(plane.project({"data_plane_outputs": [final]}))
-    assert any(e.get("silent") and e.get("is_listen") for e in events)
+    listen = [e for e in events if e.get("silent") and e.get("is_listen")]
+    assert listen
     assert any(e.get("abort_data_plane_request") is True for e in events)
+    assert listen[-1].get("listen_source") == "aura_silent"
+    assert listen[-1].get("reason") == "aura_silent"
+    assert listen[-1].get("model_listen") is True
 
 
 def test_project_finished_spoken_turn_carries_model_context() -> None:
@@ -163,3 +175,48 @@ def test_project_finished_spoken_turn_carries_model_context() -> None:
     assert context and context[-1]["model_context_text"] == "你好。"
     assert context[-1].get("is_listen") is False
     assert context[-1].get("text") == ""
+    assert context[-1].get("listen_source") is None
+    assert context[-1].get("reason") is None
+
+
+def test_project_box_only_turn_keeps_the_tokens_and_ends_without_audio() -> None:
+    plane = AuraDataPlaneSession(_encode_audio)
+    request_id = "duplex-s.abc.e.0.r.stage1-turn6"
+    plane.begin_request(request_id)
+    box = "<|box_start|>(712.0,531.0),(888.0,662.0)<|box_end|>"
+    final = SimpleNamespace(
+        request_id=request_id,
+        finished=True,
+        stage_id=1,
+        outputs=[SimpleNamespace(text=box, cumulative_text=box, finished=True)],
+    )
+    events = list(plane.project({"data_plane_outputs": [final]}))
+    assert any(event.get("text") == box for event in events)
+    context = [event for event in events if event.get("model_context_text")]
+    assert context and context[-1]["model_context_text"] == box
+    assert events[-1].get("end_of_turn") is True
+    assert events[-1].get("abort_data_plane_request") is True
+    assert all(event.get("is_listen") is not True for event in events)
+    assert all(not event.get("audio") for event in events)
+
+
+def test_project_emits_every_tool_call_and_only_the_last_releases_the_turn() -> None:
+    plane = AuraDataPlaneSession(_encode_audio)
+    request_id = "duplex-s.abc.e.0.r.stage1-turn7"
+    plane.begin_request(request_id)
+    text = (
+        "<|respond|><tool_call>\n<function=get_current_datetime>\n</function>\n</tool_call>\n"
+        "<tool_call>\n<function=get_current_location>\n</function>\n</tool_call>"
+    )
+    final = SimpleNamespace(
+        request_id=request_id,
+        finished=True,
+        stage_id=1,
+        outputs=[SimpleNamespace(text=text, cumulative_text=text, finished=True)],
+    )
+    calls = [event for event in plane.project({"data_plane_outputs": [final]}) if event.get("aura_function_call")]
+    assert [event["aura_function_call"]["name"] for event in calls] == [
+        "get_current_datetime",
+        "get_current_location",
+    ]
+    assert [event["aura_tool_call_ends_turn"] for event in calls] == [False, True]

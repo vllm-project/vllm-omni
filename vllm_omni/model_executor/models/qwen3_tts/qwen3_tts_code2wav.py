@@ -477,9 +477,22 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         if input_ids is None or input_ids.numel() == 0:
             self._rho_stats.flush_empty_payload(runtime_additional_information, kwargs.get("request_ids"))
+            # The runner requires one output per request, and several silent
+            # finishes can share one empty step.
+            request_ids = kwargs.get("request_ids")
+            seq_token_counts = kwargs.get("seq_token_counts")
+            runtime_infos = runtime_additional_information or model_intermediate_buffer
+            if request_ids is not None:
+                num_req = len(request_ids)
+            elif seq_token_counts is not None:
+                num_req = len(seq_token_counts)
+            elif runtime_infos:
+                num_req = len(runtime_infos)
+            else:
+                num_req = 1
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
+                multimodal_outputs={"model_outputs": [empty] * num_req, "sr": [sr_tensor] * num_req},
             )
 
         # vLLM's runner renamed this per-request side channel to

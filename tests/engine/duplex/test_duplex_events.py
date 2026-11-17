@@ -386,6 +386,43 @@ def test_projection_of_the_main_internal_event_sequence():
     assert closed[0].to_realtime()["reason"] == "client_close"
 
 
+def _function_call_done(response_id: str) -> dict[str, object]:
+    return {
+        "type": "function_call.done",
+        "call_id": "call_1",
+        "name": "lookup",
+        "arguments": "{}",
+        "item_id": "item_call_1",
+        "response_id": response_id,
+    }
+
+
+def test_function_call_published_into_an_open_response_ends_with_that_response():
+    state = RealtimeProjectionState(session_id="duplex-call")
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_1"})
+
+    call_events = project_internal_event(state, _function_call_done("resp_1"))
+    done = project_internal_event(state, {"type": "response.done", "response_id": "resp_1"})
+
+    assert "response.created" not in _types(call_events)
+    assert "response.done" not in _types(call_events)
+    assert "response.output_item.done" in _types(call_events)
+    response_done = next(event for event in done if isinstance(event, ResponseDone))
+    output = response_done.response["output"]
+    assert [item["type"] for item in output] == ["message", "function_call"]
+    assert output[1]["call_id"] == "call_1"
+
+
+def test_function_call_without_an_open_response_gets_its_own_response():
+    state = RealtimeProjectionState(session_id="duplex-call")
+
+    call_events = project_internal_event(state, _function_call_done("resp_call"))
+
+    assert _types(call_events)[0] == "response.created"
+    response_done = next(event for event in call_events if isinstance(event, ResponseDone))
+    assert [item["type"] for item in response_done.response["output"]] == ["function_call"]
+
+
 def test_projection_of_output_audio_buffer_clear_emits_cleared_before_terminals():
     state = RealtimeProjectionState(session_id="duplex-clear")
     pcm = base64.b64encode(b"\x00\x10" * 8).decode("ascii")

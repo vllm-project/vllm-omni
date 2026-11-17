@@ -3727,6 +3727,27 @@ class TestAuraOmniDeploy:
         assert stages[2].yaml_engine_args["model_arch"] == "Qwen3TTSTalkerForConditionalGeneration"
         assert stages[3].yaml_engine_args["model_arch"] == "Qwen3TTSCode2Wav"
 
+    @pytest.mark.parametrize("deploy_name", ["aura_omni_v2.yaml", "aura_omni_v2_2gpu.yaml"])
+    def test_aura_omni_v2_deploy_uses_qwen3_5_thinker(self, deploy_name):
+        stages, _ = StageConfigFactory._create_legacy_from_registry(
+            resolve_pipeline_config("aura_omni"),
+            cli_overrides={},
+            deploy_config_path=get_deploy_config_path(deploy_name),
+        )
+
+        assert [stage.model_stage for stage in stages] == ["asr", "aura", "qwen3_tts", "code2wav"]
+        thinker = stages[1].yaml_engine_args
+        assert thinker["model_arch"] == "AuraQwen3_5ForConditionalGeneration"
+        assert thinker["async_scheduling"] is False
+        assert thinker["enable_prefix_caching"] is True
+        assert thinker["mamba_cache_mode"] == "align"
+        assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [248070, 248046]
+        assert stages[1].yaml_extras["default_sampling_params"]["temperature"] == 0.2
+        talker_sampling = stages[2].yaml_extras["default_sampling_params"]
+        assert talker_sampling["min_tokens"] == 2
+        assert talker_sampling["max_tokens"] == 1024
+        assert talker_sampling["stop_token_ids"] == [2150]
+
 
 class TestDeployCliOverrideFlow:
     """Test deploy-YAML baselines overridden by CLI runtime overrides."""

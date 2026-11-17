@@ -211,6 +211,19 @@ function shell(profileName, turnMode = 'manual', options = {}) {
   };
 }
 
+test('AURA grounding box is coordinates for the preview, not transcript text', () => {
+  const aura = profiles['aura-ptt']();
+  const only = aura.presentAssistantText('<|box_start|>(712.0,531.0),(888.0,662.0)<|box_end|>');
+  assert.equal(only.displayText, '');
+  assert.deepEqual(plain(only.boxes), [[712, 531, 888, 662]]);
+  const mixed = aura.presentAssistantText('在這裡<|box_start|>10,20,30,40<|box_end|>。');
+  assert.equal(mixed.displayText, '在這裡。');
+  assert.deepEqual(plain(mixed.boxes), [[10, 20, 30, 40]]);
+  const partial = aura.presentAssistantText('看<|box_start|>(1,2)');
+  assert.equal(partial.displayText, '看');
+  assert.deepEqual(plain(partial.boxes), []);
+});
+
 test('JoyAI profile sends camera commits and playback acknowledgements', () => {
   const profile = profiles['joyai-turn']();
   const url = new URL(profile.url({}, 'https://localhost/'));
@@ -596,6 +609,21 @@ test('missing session acknowledgement fails instead of leaving Start disabled fo
   assert.match(app.elements.get('runtimeDetail').textContent, /handshake timed out/);
 });
 
+test('AURA hides a box-only reply in the transcript', async () => {
+  const app = shell('aura-ptt');
+  await app.ui.startSession();
+  await app.ui.handleEvent({
+    type: 'response.output_text.delta',
+    delta: '<|box_start|>(712.0,531.0),(888.0,662.0)<|box_end|>',
+    response_id: 'r-box',
+  });
+  const turns = app.elements.get('conversation').children;
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].hidden, true);
+  assert.equal(turns[0].children[1].textContent, '');
+  await app.ui.stopSession({ terminal: false });
+});
+
 test('Qwen does not duplicate text and audio-transcript channels', async () => {
   const app = shell('qwen3-turn', 'vad');
   await app.ui.startSession();
@@ -796,6 +824,72 @@ test('AURA does not open a second bubble for the same sentence after response.do
   await app.ui.stopSession({ terminal: false });
 });
 
+test('AURA holds vision-follow from a tool call until its follow-up answers', async () => {
+  const app = shell('aura-ptt');
+  await app.ui.startSession();
+  await app.ui.handleEvent({ type: 'response.created', response_id: 'r1' });
+  assert.equal(app.ui.state().visionTurnLocked, true);
+  await app.ui.handleEvent({
+    type: 'response.done',
+    response_id: 'r1',
+    response: { id: 'r1', output: [{ type: 'function_call', name: 'calculator', call_id: 'c1', arguments: '{}' }] },
+  });
+  assert.equal(app.ui.state().visionTurnLocked, true);
+  const notice = app.elements.get('conversation').children
+    .flatMap(row => row.children.map(child => child.textContent))
+    .join('\n');
+  assert.match(notice, /正在調用計算機，請稍等。/);
+  await app.ui.handleEvent({ type: 'response.created', response_id: 'r2' });
+  await app.ui.handleEvent({ type: 'response.done', response_id: 'r2' });
+  assert.equal(app.ui.state().visionTurnLocked, false);
+  await app.ui.stopSession({ terminal: false });
+});
+
+test('AURA playback at 1.5x shortens audio without raising its pitch', async () => {
+  const app = shell('aura-ptt', 'manual', { realPlayback: true });
+  await app.ui.startSession();
+  receive(app, { type: 'response.created', response: { id: 'r1' } });
+  const rate = 24000;
+  const pcm = new Int16Array(rate);
+  for (let index = 0; index < pcm.length; index += 1) {
+    pcm[index] = Math.round(12000 * Math.sin((2 * Math.PI * 200 * index) / rate));
+  }
+  receive(app, {
+    type: 'response.output_audio.delta',
+    response_id: 'r1',
+    delta: Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength).toString('base64'),
+    format: 'pcm16',
+    sample_rate_hz: rate,
+  });
+  await app.ui.awaitQueue();
+  receive(app, { type: 'response.output_audio.done', response_id: 'r1' });
+  receive(app, { type: 'response.done', response: { id: 'r1', status: 'completed' } });
+  await app.ui.awaitQueue();
+  const player = app.nodes.find(node => node.name === 'fullduplex-pcm-playback').player;
+  const heard = [];
+  let silent = 0;
+  for (let frame = 0; frame < 400 && heard.length < rate; frame += 1) {
+    const block = renderPlayback(player);
+    const peak = block.reduce((max, sample) => Math.max(max, Math.abs(sample)), 0);
+    if (peak < 1e-4) {
+      silent += 1;
+      if (heard.length > 0 && silent > 5) break;
+      continue;
+    }
+    silent = 0;
+    for (const sample of block) heard.push(sample);
+  }
+  const body = heard.slice(2000, 10000);
+  const corr = (lag) => {
+    let score = 0;
+    for (let index = 0; index < body.length - lag; index += 4) score += body[index] * body[index + lag];
+    return score;
+  };
+  assert.ok(heard.length > 12000 && heard.length < 19000, `played ${heard.length} samples`);
+  assert.ok(corr(120) > corr(80), 'a 200 Hz tone must not become 300 Hz');
+  await app.ui.stopSession({ terminal: false });
+});
+
 function visionAppends(app) {
   return app.sockets[0].sent.filter(e => e.type === 'input_audio_buffer.append' && e.is_speech === false);
 }
@@ -914,6 +1008,7 @@ test('AURA hold-to-talk stops local playback and does not cancel the response', 
   const app = shell('aura-ptt', 'manual', { realPlayback: true });
   await app.ui.startSession();
   receive(app, { type: 'response.created', response: { id: 'old' } });
+  receive(app, audioChunk('old'));
   receive(app, audioChunk('old'));
   await app.ui.awaitQueue();
   const player = app.nodes.find(node => node.name === 'fullduplex-pcm-playback').player;
