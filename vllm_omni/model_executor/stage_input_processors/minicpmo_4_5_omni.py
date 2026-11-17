@@ -1327,6 +1327,186 @@ def llm2tts(
     return tts_inputs
 
 
+#: Reply tokens per Talker condition in turn-chunked serving, as HF
+#: ``streaming_generate`` (``generate_chunk_size``).
+MINICPMO45_TURN_CHUNK_TOKENS = 10
+_TURN_CHUNK_STATE = "minicpmo45_turn_chunks"
+
+
+def _stacked_rows(value: Any) -> torch.Tensor | None:
+    """One tensor from a DELTA-mode payload value, which accumulates per-step tensors in a list."""
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, (list, tuple)) and value and all(isinstance(item, torch.Tensor) for item in value):
+        parts = [
+            item.squeeze(0) if item.ndim == 3 and item.shape[0] == 1 else item.reshape(-1, *item.shape[1:])
+            for item in value
+        ]
+        return torch.cat(parts, dim=0)
+    return None
+
+
+def _next_turn_chunk(llm_output, prompt, requires_multimodal_data: bool, state: dict[str, Any]):
+    """Build the next Talker condition for one turn request, or None while a block is incomplete."""
+    request_id = str(llm_output.request_id)
+    finished = bool(getattr(llm_output, "finished", False))
+    output = llm_output.outputs[0]
+    request_mm_output = getattr(llm_output, "multimodal_output", None)
+    completion_mm_output = getattr(output, "multimodal_output", None)
+    if isinstance(request_mm_output, Mapping):
+        mm_output = request_mm_output
+    elif isinstance(completion_mm_output, Mapping):
+        mm_output = completion_mm_output
+    else:
+        mm_output = {}
+    if _has_native_duplex_prompt_metadata(mm_output):
+        raise ValueError("MiniCPM-o turn-chunked Talker handoff does not serve native duplex requests")
+    prompt_token_ids = list(llm_output.prompt_token_ids or ())
+    output_ids = list(getattr(output, "token_ids", None) or ())
+    cumulative_output_ids = getattr(output, "cumulative_token_ids", None)
+    if cumulative_output_ids is not None and len(cumulative_output_ids) > len(output_ids):
+        # DELTA outputs carry only the newest tokens.
+        output_ids = list(cumulative_output_ids)
+    full_token_ids = prompt_token_ids + output_ids
+
+    special_token_ids = _special_token_ids_from_mm_output(mm_output)
+    tts_bos_id = special_token_ids.get("tts_bos_token_id")
+    tts_end_ids = _native_tts_boundary_token_ids(special_token_ids)
+    if tts_bos_id is None:
+        # Same fixed MiniCPM-o 4.5 boundaries as llm2tts.
+        tts_bos_id = 151703
+        tts_end_ids = set(tts_end_ids) | {151704, 151645}
+    start = state.get("start")
+    if start is None:
+        for index, token_id in enumerate(full_token_ids):
+            if token_id == tts_bos_id:
+                start = index + 1
+        if start is None and output_ids:
+            # Plain chat templates carry no <|tts_bos|>: speak the reply.
+            start = len(prompt_token_ids)
+        if start is not None:
+            state["start"] = start
+    end = len(full_token_ids)
+    if start is not None:
+        for index in range(start, len(full_token_ids)):
+            if full_token_ids[index] in tts_end_ids:
+                end = index
+                break
+    block_start = (start or 0) + int(state["sent"])
+
+    if not finished:
+        # Wait for a full block of tokens with Thinker rows. The newest sampled
+        # token has no row yet, and holding it back keeps the closing block
+        # non-empty.
+        if start is None or end - block_start <= MINICPMO45_TURN_CHUNK_TOKENS:
+            return None
+        block_end = block_start + MINICPMO45_TURN_CHUNK_TOKENS
+    else:
+        block_end = end
+    latent = _stacked_rows(mm_output.get("latent"))
+    if latent is None:
+        latent = getattr(output, "hidden_states", None)
+    if start is None or block_end <= block_start:
+        rows = torch.empty(0, 0)
+    elif latent is None:
+        if not finished:
+            return None
+        raise ValueError("No latent or hidden_states found in thinker output")
+    else:
+        if latent.ndim == 3 and latent.shape[0] == 1:
+            latent = latent.squeeze(0)
+        ledger = {key: _stacked_rows(mm_output.get(key)) for key in ("latent_input_ids", "latent_positions")}
+        rows = _turn_hidden_rows(ledger, latent.detach(), full_token_ids, block_start, block_end, request_id)
+        if not finished and rows.shape[0] < MINICPMO45_TURN_CHUNK_TOKENS:
+            return None
+    block_ids = full_token_ids[block_start : block_start + rows.shape[0]]
+
+    output_text = getattr(output, "cumulative_text", None) or getattr(output, "text", "") or ""
+    buffer = build_duplex_intermediate_buffer(
+        request_id=request_id,
+        prompt_token_ids=prompt_token_ids,
+        output_token_ids=output_ids,
+        output_text=output_text,
+    )
+    if "ref_audio" not in state:
+        ref_audio = _extract_prompt_reference_audio(prompt)
+        state["ref_audio"] = None if ref_audio is None else (pack_handoff_tensor(ref_audio[0]), ref_audio[1])
+    if state["ref_audio"] is not None:
+        set_ref_audio(buffer, *state["ref_audio"])
+    set_tts_handoff(buffer, block_ids, pack_handoff_tensor(rows.to(torch.float32)))
+    # Blocks before the last end in <audio_bos>, the last one (and an empty
+    # reply) in <text_eos><audio_bos>.
+    condition_length = len(block_ids) + (2 if finished or not block_ids else 1)
+    condition_seq = int(state["condition_seq"])
+    meta = buffer.setdefault("meta", {})
+    meta["next_stage_prompt_len"] = condition_length
+    meta["turn_chunk"] = True
+    meta["turn_chunk_close"] = finished
+    meta["streaming_condition_seq"] = condition_seq
+    if condition_seq == 0:
+        meta["replace_streaming_prompt"] = True
+    multi_modal_data = None
+    if requires_multimodal_data:
+        multi_modal_data = (
+            prompt.get("multi_modal_data") if isinstance(prompt, Mapping) else getattr(prompt, "multi_modal_data", None)
+        )
+    tts_input = OmniTokensPrompt(
+        # Dummy ids reserve the condition's scheduler slots, as in llm2tts.
+        prompt_token_ids=[0] * condition_length,
+        model_intermediate_buffer=buffer,
+        multi_modal_data=multi_modal_data,
+        mm_processor_kwargs=None,
+    )
+    state["sent"] = int(state["sent"]) + len(block_ids)
+    state["condition_seq"] = condition_seq + 1
+    if finished:
+        state["closed"] = tts_input
+    return tts_input
+
+
+def llm2tts_chunked(
+    source_outputs,
+    prompt: OmniTokensPrompt | TextPrompt = None,
+    requires_multimodal_data: bool = False,
+    _streaming_context=None,
+):
+    """Hand the Talker the reply one block of tokens at a time (opt-in turn profile).
+
+    The orchestrator calls this on every Stage-0 output, because it sets
+    ``accepts_partial_source_outputs``. Each block of
+    ``MINICPMO45_TURN_CHUNK_TOKENS`` reply tokens becomes a Talker condition
+    ending in <audio_bos>; once Stage 0 finishes, the rest of the reply becomes
+    the last condition, closed with <text_eos><audio_bos>, as in HF
+    ``streaming_generate``. The Talker keeps one resumable request: it stops at
+    each block's EOS and continues from its KV cache on the next block.
+    """
+    if not source_outputs:
+        raise ValueError("source_outputs cannot be empty")
+    bridge_states = getattr(_streaming_context, "bridge_states", None)
+    if not isinstance(bridge_states, dict):
+        # No request-local state to track blocks: hand over whole replies.
+        if all(getattr(llm_output, "finished", False) for llm_output in source_outputs):
+            return llm2tts(source_outputs, prompt, requires_multimodal_data, _streaming_context)
+        return []
+    chunk_states = bridge_states.setdefault(_TURN_CHUNK_STATE, {})
+    prompts = prompt if isinstance(prompt, list) else [prompt] * len(source_outputs)
+    tts_inputs = []
+    for llm_output, prompt_item in zip(source_outputs, prompts):
+        state = chunk_states.setdefault(str(llm_output.request_id), {"sent": 0, "condition_seq": 0, "closed": None})
+        if state["closed"] is not None:
+            # The terminal update after the last block ends the resumable
+            # Talker request; vLLM ignores its prompt.
+            tts_inputs.append(state["closed"])
+            continue
+        tts_input = _next_turn_chunk(llm_output, prompt_item, requires_multimodal_data, state)
+        if tts_input is not None:
+            tts_inputs.append(tts_input)
+    return tts_inputs
+
+
+llm2tts_chunked.accepts_partial_source_outputs = True
+
+
 def _update_native_talker_prompt(model_config: Any, session: Any, payload: dict[str, Any]) -> bool | None:
     """Apply the existing Talker window recipe without a V1 transfer adapter.
 

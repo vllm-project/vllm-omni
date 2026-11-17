@@ -137,6 +137,24 @@ continues producing its existing lists. Each decode owns its storage, and the
 packed snapshot cannot be changed by later producer mutations. Transport
 microbenchmarks alone do not establish service throughput or speech quality.
 
+## Turn-mode chunked Talker handoff
+
+`minicpmo_4_5_turn.yaml` hands the Talker the whole reply when the Thinker
+finishes, so first audio grows with the reply length. The opt-in
+`minicpmo_4_5_turn_chunked.yaml` selects the `minicpmo_4_5_turn_chunked`
+pipeline, whose Talker bridge `llm2tts_chunked` follows HF
+`streaming_generate`: every 10 reply tokens with Thinker rows become one Talker
+condition ending in `<audio_bos>`, and the rest of the reply becomes the last
+condition, closed with `<text_eos><audio_bos>`. The Talker keeps one resumable
+request: it stops at each block's EOS and continues from its KV cache when the
+next block arrives, with the repetition-penalty window carried over.
+
+This applies to streaming chat completions with audio output. The Thinker then
+reports DELTA outputs, and the orchestrator forwards each one to a bridge that
+sets `accepts_partial_source_outputs`. Non-streaming requests keep the
+whole-reply handoff. Audio differs from the default profile, since each block
+is conditioned on part of the reply, as in the reference streaming path.
+
 ## Thinker speculative decoding
 
 The MRv2 Thinker accepts a stage-0 `speculative_config` whose drafter reads

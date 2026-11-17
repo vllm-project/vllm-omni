@@ -1123,6 +1123,99 @@ def test_native_duplex_condition_matches_official_text_plus_audio_bos() -> None:
     assert condition.shape[0] == token_ids.shape[0] + 1
 
 
+def _condition_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
+    talker = _make_talker()
+    talker.emb_text = nn.Embedding(16, 2)
+    talker.projector_semantic = nn.Identity()
+    talker._normalize = False
+    talker._text_eos_id = 14
+    talker._tts_bos_id = 15
+    with torch.no_grad():
+        talker.emb_text.weight.copy_(torch.arange(32, dtype=torch.float32).reshape(16, 2))
+    return talker
+
+
+@pytest.mark.parametrize(("close", "suffix_ids"), [(False, [15]), (True, [14, 15])], ids=["open", "last"])
+def test_turn_chunk_condition_closes_text_only_on_the_last_block(close, suffix_ids) -> None:
+    """Blocks before the last end in <audio_bos>; the last adds <text_eos>, as generate_with_buffer."""
+    talker = _condition_talker()
+    token_ids = torch.tensor([2, 3])
+    hidden_states = torch.tensor([[0.5, 1.0], [1.5, 2.0]])
+    length = token_ids.shape[0] + len(suffix_ids)
+
+    _, embeds, _ = talker.preprocess(
+        torch.zeros(length, dtype=torch.long),
+        None,
+        _omni_is_prefill=True,
+        _omni_prompt_len=length,
+        request_id="req-chunk",
+        meta={"turn_chunk": True, "turn_chunk_close": close, "streaming_condition_seq": 0},
+        tts_token_ids=token_ids,
+        tts_hidden_states=hidden_states,
+    )
+
+    expected = torch.cat(
+        [talker.emb_text(token_ids) + hidden_states, talker.emb_text(torch.tensor(suffix_ids))],
+        dim=0,
+    )
+    assert torch.equal(embeds, expected)
+
+
+def test_turn_chunk_next_block_resumes_with_the_confirmed_penalty_window() -> None:
+    """The next block's prefill builds only its own condition and restarts the codec segment."""
+    talker = _condition_talker()
+    confirmed = [1, 2, 3, 4, 5, 6] * 4
+    talker._request_codec_history = {"req-chunk": list(confirmed)}
+    talker._request_audio_states["req-chunk"] = {"finished": True, "step": 40}
+    talker._request_codec_device_states = {"req-chunk": object()}
+    talker._request_codec_device_inputs = {"req-chunk": object()}
+    talker._request_host_codec_states = {"req-chunk": {"finished": True, "condition_seq": 0}}
+    token_ids = torch.tensor([2, 3])
+    hidden_states = torch.ones(2, 2)
+    # The scheduler kept the previous prompt and confirmed codes (40 tokens)
+    # and appended this block's three condition slots.
+    _, embeds, updates = talker.preprocess(
+        torch.zeros(3, dtype=torch.long),
+        None,
+        _omni_is_prefill=True,
+        _omni_prompt_len=43,
+        _omni_num_computed_tokens=40,
+        request_id="req-chunk",
+        meta={"turn_chunk": True, "turn_chunk_close": False, "streaming_condition_seq": 1},
+        tts_token_ids=token_ids,
+        tts_hidden_states=hidden_states,
+    )
+
+    expected = torch.cat([talker.emb_text(token_ids) + hidden_states, talker.emb_text(torch.tensor([15]))], dim=0)
+    assert torch.equal(embeds, expected)
+    state = updates["audio_state"]
+    assert state["finished"] is False
+    assert state["step"] == 0
+    assert state["recent_codes"] == confirmed[-16:]
+    assert state["max_tokens"] == 500
+    assert state["host_condition_seq"] == 1
+    assert "req-chunk" not in talker._request_codec_device_states
+    assert "req-chunk" not in talker._request_codec_device_inputs
+    assert talker._request_host_codec_states["req-chunk"] == {"finished": False, "condition_seq": 1}
+
+
+def test_ordinary_turn_condition_keeps_the_whole_reply_ceiling() -> None:
+    talker = _condition_talker()
+    _, _, updates = talker.preprocess(
+        torch.zeros(4, dtype=torch.long),
+        None,
+        _omni_is_prefill=True,
+        _omni_prompt_len=4,
+        request_id="req-turn",
+        tts_token_ids=torch.tensor([2, 3]),
+        tts_hidden_states=torch.ones(2, 2),
+    )
+    state = updates["audio_state"]
+    assert state["max_tokens"] == 2048
+    assert "recent_codes" not in state
+    assert "host_condition_seq" not in state
+
+
 def test_native_duplex_rollover_matches_official_sliding_recompute(mocker) -> None:
     talker = _make_talker()
     talker.emb_text = nn.Embedding(1, 2)

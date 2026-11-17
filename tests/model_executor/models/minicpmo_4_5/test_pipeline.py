@@ -165,6 +165,7 @@ class TestDeployTopology:
             "minicpmo_4_5_4gpu_stage1_replicas.yaml",
             "minicpmo_4_5_npu_2card.yaml",
             "minicpmo_4_5_turn.yaml",
+            "minicpmo_4_5_turn_chunked.yaml",
             "minicpmo_4_5_duplex_h200.yaml",
         }
         talker_backend = "FLASH_ATTN" if platform == "cuda" and filename in cuda_flash_talker_profiles else None
@@ -381,3 +382,35 @@ class TestHfConfigPredicate:
 
     def test_rejects_empty_version(self, predicate) -> None:
         assert predicate(SimpleNamespace(version="")) is False
+
+
+class TestTurnChunkedProfile:
+    """Opt-in turn profile whose Talker takes the reply a block of Thinker tokens at a time."""
+
+    def test_variant_only_swaps_the_talker_bridge(self) -> None:
+        default = OMNI_PIPELINES[_PIPELINE_KEY]
+        variant = OMNI_PIPELINES["minicpmo_4_5_turn_chunked"]
+        assert variant.model_type == "minicpmo_4_5_turn_chunked"
+        assert variant.get_stage(1).custom_process_input_func.endswith(".llm2tts_chunked")
+        assert default.get_stage(1).custom_process_input_func.endswith(".llm2tts")
+        assert variant.get_stage(0) == default.get_stage(0)
+        assert variant.get_stage(2) == default.get_stage(2)
+        # Selected by its deploy profile only, never by architecture inference.
+        assert variant.hf_architectures == ()
+        assert variant.duplex_plugin is None
+
+    @pytest.mark.parametrize("platform", ["cuda", "cpu"])
+    def test_deploy_profile_resolves_to_the_variant(self, platform: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(current_omni_platform, "device_name", platform)
+        deploy = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5_turn_chunked.yaml")
+        assert deploy.pipeline == "minicpmo_4_5_turn_chunked"
+        assert deploy.session_mode == "turn"
+        stages = merge_pipeline_deploy(OMNI_PIPELINES[deploy.pipeline], deploy)
+        assert stages[1].custom_process_input_func.endswith(".llm2tts_chunked")
+        assert stages[1].yaml_extras["default_sampling_params"]["min_tokens"] == 0
+        assert stages[1].yaml_extras["default_sampling_params"]["temperature"] == 0.8
+
+        turn = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5_turn.yaml")
+        turn_stages = merge_pipeline_deploy(OMNI_PIPELINES[turn.pipeline], turn)
+        assert turn_stages[1].custom_process_input_func.endswith(".llm2tts")
+        assert turn_stages[1].yaml_extras["default_sampling_params"]["min_tokens"] == 50

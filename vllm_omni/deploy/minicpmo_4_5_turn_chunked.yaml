@@ -1,0 +1,16 @@
+# Opt-in MiniCPM-o 4.5 turn serving where the Talker starts on the first
+# block of reply tokens. With a streaming chat request, every 10 Thinker
+# tokens become one Talker condition (llm2tts_chunked), as in HF
+# streaming_generate: the Talker keeps one resumable request, stops at each
+# block's EOS and finishes after the last block. Audio differs from
+# minicpmo_4_5_turn.yaml, which conditions on the whole reply at once.
+# Non-streaming requests still hand over the whole reply when it finishes.
+base_config: minicpmo_4_5_turn.yaml
+pipeline: minicpmo_4_5_turn_chunked
+
+stages:
+  - stage_id: 1
+    default_sampling_params:
+      # generate_with_buffer sets no per-block floor; a block may end on its
+      # first codec.
+      min_tokens: 0
