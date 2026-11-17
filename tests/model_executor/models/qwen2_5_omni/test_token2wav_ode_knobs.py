@@ -21,11 +21,11 @@ import torch
 import yaml
 
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_token2wav import (
+    _DEFAULT_DIT_NUM_STEPS,
+    _ODE_SOLVERS,
     EulerODESolver,
     MidpointODESolver,
     RungeKutta4ODESolver,
-    _DEFAULT_DIT_NUM_STEPS,
-    _ODE_SOLVERS,
     _build_ode_solver,
     _resolve_dit_solver_knobs,
 )
@@ -58,9 +58,7 @@ def test_absent_knobs_keep_released_recipe():
 
 
 def test_override_values_are_resolved_and_normalized():
-    knobs = _resolve_dit_solver_knobs(
-        _config(dit_num_steps=6, dit_guidance_scale=1, dit_sway_coefficient=0)
-    )
+    knobs = _resolve_dit_solver_knobs(_config(dit_num_steps=6, dit_guidance_scale=1, dit_sway_coefficient=0))
     assert knobs == {"num_steps": 6, "guidance_scale": 1.0, "sway_coefficient": 0.0, "integrator": "rk4"}
 
 
