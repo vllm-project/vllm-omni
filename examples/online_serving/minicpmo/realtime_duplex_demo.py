@@ -1092,15 +1092,21 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             )
             # Trailing-silence answers can legitimately be listen-only, so
             # only a transcript that stops mid-sentence marks the lost tail
-            # as a truncated answer rather than a finished one.
-            if transcript_so_far and transcript_so_far[-1] not in ".!?…。!?…;":
+            # as a truncated answer rather than a finished one. Both ASCII
+            # and fullwidth CJK sentence-final marks are listed, because
+            # speech-native models answer with fullwidth punctuation.
+            SENTENCE_FINAL_MARKS = ".!?;。！？；…"
+            if transcript_so_far and transcript_so_far[-1] not in SENTENCE_FINAL_MARKS:
                 try:
                     input_format = client.config.input_audio
                     replay_samples = min(
                         int(round(post_commit_replay_seconds * PCM16_SAMPLE_RATE)),
                         len(input_pcm16) // PCM16_BYTES_PER_SAMPLE,
                     )
-                    replay_pcm = input_pcm16[replay_samples * PCM16_BYTES_PER_SAMPLE :]
+                    # Keep the last N seconds of audio -- the same tail
+                    # window as video_frames[-replay_frame_count:] below,
+                    # so the replayed audio and video stay in sync.
+                    replay_pcm = input_pcm16[-replay_samples * PCM16_BYTES_PER_SAMPLE :]
                     replay_frames = None
                     replay_stacked = None
                     if video_frames:
