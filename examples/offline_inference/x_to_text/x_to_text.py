@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Shared offline example for any supported input modality to text."""
 
 from __future__ import annotations
@@ -61,7 +61,6 @@ def main() -> None:
 
     omni_kwargs: dict[str, Any] = {
         "model": args.model,
-        "mode": "image-to-text" if image is not None else "text-to-text",
         "trust_remote_code": args.trust_remote_code or family in {"hunyuan_image3", "mammoth_moda2"},
         "log_stats": args.log_stats,
     }
