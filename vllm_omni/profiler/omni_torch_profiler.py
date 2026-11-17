@@ -146,7 +146,6 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
         Args:
             filename: Base filename without extension or rank suffix.
                       e.g. "stage_0_llm_1234567890"
-                      Can also be a full path (e.g. from diffusion engine).
         """
         self._trace_filename = filename
         self._session_dir = None
@@ -160,15 +159,7 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
 
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         base_name = self._trace_filename or self._worker_name
-
-        if os.path.dirname(base_name):
-            parent_dir = os.path.dirname(base_name)
-            leaf_name = os.path.basename(base_name)
-            session_name = f"{ts}_{leaf_name}"
-            self._session_dir = os.path.join(parent_dir, session_name)
-        else:
-            session_name = f"{ts}_{base_name}"
-            self._session_dir = os.path.join(self._trace_dir, session_name)
+        self._session_dir = os.path.join(self._trace_dir, f"{ts}_{base_name}")
 
         os.makedirs(self._session_dir, exist_ok=True)
         self._artifact_paths["session_dir"] = self._session_dir

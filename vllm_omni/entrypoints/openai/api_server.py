@@ -3502,6 +3502,8 @@ async def start_profile(raw_request: Request, request: ProfileRequest | None = N
         await engine_client.start_profile(stages=stages, **profile_kwargs)
         logger.info("Profiler started.")
         return JSONResponse(content={"status": "SUCCESS"})
+    except ValueError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e)) from e
     except Exception as e:
         logger.exception("Failed to start profiler: %s", e)
         raise HTTPException(

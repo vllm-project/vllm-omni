@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any, NoReturn, cast
 import anyio
 import msgspec
 from vllm import TokensPrompt
-from vllm.config.profiler import validate_profile_iteration_bounds
+from vllm.config.profiler import validate_profile_iteration_bounds, validate_profile_prefix
 from vllm.engine.protocol import EngineClient, StreamingInput
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -1254,6 +1254,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             max_iterations: Optional per-session iteration cap (vLLM compat).
             profiler_kwargs: Optional per-session profiler constructor overrides.
         """
+        validate_profile_prefix(profile_prefix)
         validate_profile_iteration_bounds(delay_iterations, max_iterations)
         # Mirror upstream ExecutorBase.profile: forward the per-session
         # controls as kwargs only when set, so workers without them keep

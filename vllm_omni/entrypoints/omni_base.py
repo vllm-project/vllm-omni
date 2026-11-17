@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import huggingface_hub
 import vllm.envs as envs
 from omegaconf import OmegaConf
-from vllm.config.profiler import validate_profile_iteration_bounds
+from vllm.config.profiler import validate_profile_iteration_bounds, validate_profile_prefix
 from vllm.exceptions import RetryableRequestError
 from vllm.logger import init_logger
 from vllm.transformers_utils.repo_utils import file_or_path_exists
@@ -815,6 +815,7 @@ class OmniBase(PDDisaggregationMixin):
         Returns:
             List of results from each stage.
         """
+        validate_profile_prefix(profile_prefix)
         validate_profile_iteration_bounds(delay_iterations, max_iterations)
         kwargs: dict[str, Any] = {}
         if delay_iterations is not None:

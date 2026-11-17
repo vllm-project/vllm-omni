@@ -29,6 +29,7 @@ import torch.distributed as dist
 import zmq
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.logging import LoggingConfig
+from vllm.config.profiler import validate_profile_prefix
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.distributed.parallel_state import get_ep_group, get_tp_group
 from vllm.logger import configure_logging, init_logger
@@ -1099,6 +1100,7 @@ class DiffusionWorker:
             return
 
         if is_start:
+            validate_profile_prefix(profile_prefix)
             if isinstance(profiler, OmniTorchProfilerWrapper):
                 import time
 

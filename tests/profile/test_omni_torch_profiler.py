@@ -324,27 +324,6 @@ def test_set_trace_filename_creates_timestamped_session_dir(wrapper, monkeypatch
     assert session_dir.name == "20260403-034200_stage_0_llm_1234567890"
 
 
-def test_set_trace_filename_with_full_path_creates_timestamped_leaf(wrapper, monkeypatch, tmp_path):
-    class FixedDatetime:
-        @classmethod
-        def now(cls):
-            class _Now:
-                def strftime(self, fmt):
-                    return "20260403-111111"
-
-            return _Now()
-
-    monkeypatch.setattr(profiler_mod, "datetime", FixedDatetime)
-
-    target = tmp_path / "nested" / "stage_x"
-    wrapper.set_trace_filename(str(target))
-
-    session_dir = Path(wrapper._session_dir)
-    assert session_dir.exists()
-    assert session_dir.parent == target.parent
-    assert session_dir.name == "20260403-111111_stage_x"
-
-
 def test_on_trace_ready_exports_trace_json(wrapper):
     wrapper.set_trace_filename("case_trace")
 

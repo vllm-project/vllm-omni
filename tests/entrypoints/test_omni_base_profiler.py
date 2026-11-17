@@ -97,6 +97,14 @@ class TestOmniBaseProfiler:
             stage_ids=[1],
         )
 
+    @pytest.mark.parametrize("profile_prefix", ["/tmp/outside/trace", "../outside"])
+    def test_start_profile_rejects_path_prefix(self, omni_base_instance, mock_engine, profile_prefix):
+        """A prefix that names a path is rejected before any stage is reached."""
+        with pytest.raises(ValueError, match="profile_prefix"):
+            omni_base_instance.start_profile(profile_prefix=profile_prefix)
+
+        mock_engine.collective_rpc.assert_not_called()
+
     def test_start_profile_returns_rpc_result(self, omni_base_instance, mock_engine):
         """Test that start_profile returns the result from collective_rpc."""
         expected_result = [{"stage_0": "started"}, {"stage_1": "started"}]

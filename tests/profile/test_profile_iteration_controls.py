@@ -83,7 +83,15 @@ async def test_frontend_profile_controls_reach_diffusion_profiler(route, control
         assert not profiler.is_running
 
 
-@pytest.mark.parametrize("controls", [{"delay_iterations": -1}, {"max_iterations": -1}])
+@pytest.mark.parametrize(
+    "controls",
+    [
+        {"delay_iterations": -1},
+        {"max_iterations": -1},
+        {"profile_prefix": "/tmp/outside/trace"},
+        {"profile_prefix": "../outside"},
+    ],
+)
 async def test_invalid_controls_fail_before_stage_dispatch(controls, mocker):
     frontend = SimpleNamespace(collective_rpc=mocker.AsyncMock())
     with pytest.raises(ValueError):
@@ -124,6 +132,20 @@ def test_worker_profile_forwards_controls_and_preserves_default_call(
     profiler.set_profiler_kwargs.assert_called_once_with(profiler_overrides)
     cls.profile(worker, False)
     profiler.stop.assert_called_once_with()
+
+
+@pytest.mark.parametrize("kind", ["ar", "diffusion", "npu"])
+@pytest.mark.parametrize("profile_prefix", ["/tmp/outside/trace", "../outside", "nested/trace"])
+def test_worker_profile_rejects_prefix_before_starting(monkeypatch, mocker, kind, profile_prefix):
+    profiler = RecordingProfiler()
+    profiler.start = mocker.Mock(wraps=profiler.start)
+    worker = SimpleNamespace(profiler=profiler, _get_profiler=lambda: profiler)
+    cls = {"ar": OmniGPUWorkerBase, "diffusion": DiffusionWorker}.get(kind)
+    if cls is None:
+        cls = _npu_worker_class(monkeypatch)
+    with pytest.raises(ValueError, match="profile_prefix"):
+        cls.profile(worker, True, profile_prefix)
+    profiler.start.assert_not_called()
 
 
 @pytest.mark.parametrize("execution", ["execute_model", "execute_model_batch", "execute_stepwise"])

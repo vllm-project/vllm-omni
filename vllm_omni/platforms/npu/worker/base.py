@@ -5,6 +5,8 @@
 
 import time
 
+from vllm.config.profiler import validate_profile_prefix
+
 from vllm_omni.platforms.npu._310p import is_310p
 
 if is_310p():
@@ -86,6 +88,7 @@ class OmniNPUWorkerBase(NPUWorker):
                 "For omni models, add profiler_config to the relevant deploy config stage."
             )
         if is_start:
+            validate_profile_prefix(profile_prefix)
             from vllm_omni.profiler import OmniTorchProfilerWrapper
 
             if isinstance(self.profiler, OmniTorchProfilerWrapper):
