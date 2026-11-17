@@ -126,7 +126,8 @@ def test_mrope_matches_hf_rotary(device: str, dtype: torch.dtype, positions_dim:
     k = torch.randn(n, kv_heads * d, dtype=dtype, device=device)
     if positions_dim == 1:
         positions = torch.arange(n, device=device)
-        hf_positions = positions[None]
+        # Text positions are shared by all three axes of the Hugging Face reference.
+        hf_positions = positions[None, None, :].expand(3, -1, -1)
     else:
         positions = torch.stack([torch.arange(n), torch.arange(n) // 2, torch.arange(n) % 3]).to(device)
         hf_positions = positions[:, None, :]
