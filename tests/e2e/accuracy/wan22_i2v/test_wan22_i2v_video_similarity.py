@@ -65,6 +65,8 @@ SERVER_CASES = [
                 "--use-hsdp",
                 "--hsdp-shard-size",
                 "2",
+                "--vae-fast-path",
+                "off",
             ],
             use_omni=True,
         ),
