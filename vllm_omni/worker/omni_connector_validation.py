@@ -10,15 +10,26 @@ from typing import Any
 def validate_worker_omni_connector(
     worker_cls_path: str | type[Any] | None,
     required: bool,
+    *,
+    use_v2_model_runner: bool = False,
 ) -> None:
-    """Require the selected worker's runner to implement the connector mixin."""
+    """Require the selected worker's runner to implement the connector mixin.
+
+    Workers that pick their runner at ``init_device`` time expose the MRv2
+    runner as ``v2_model_runner_cls``; validate that one for MRv2 stages so
+    the check never imports the Model Runner V1 stack it will not use.
+    """
     if not required:
         return
     if worker_cls_path is None:
         raise ValueError("Omni connector support requires a resolved worker_cls.")
 
     worker_cls = _resolve_worker_cls(worker_cls_path)
-    model_runner_cls = getattr(worker_cls, "model_runner_cls", None)
+    model_runner_cls = None
+    if use_v2_model_runner:
+        model_runner_cls = getattr(worker_cls, "v2_model_runner_cls", None)
+    if model_runner_cls is None:
+        model_runner_cls = getattr(worker_cls, "model_runner_cls", None)
 
     from vllm_omni.worker.omni_connector_model_runner_mixin import (
         OmniConnectorModelRunnerMixin,

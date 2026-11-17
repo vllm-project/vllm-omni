@@ -17,7 +17,7 @@ from vllm.v1.worker.workspace import init_workspace_manager
 from vllm_omni.diffusion.data import OmniACK, OmniSleepTask, OmniWakeTask
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.base import OmniGPUWorkerBase
-from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+from vllm_omni.worker.lazy_runner_cls import LazyModelRunnerCls
 from vllm_omni.worker.memory_utils import request_memory_tolerant
 from vllm_omni.worker.mixins import OmniWorkerMixin
 from vllm_omni.worker.moe_prefill_warmup import warm_up_moe_prefill_kernels
@@ -67,7 +67,10 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
     model runners for text generation stages (e.g., thinker stages).
     """
 
-    model_runner_cls = GPUARModelRunner
+    # Resolved on first use so an MRv2 stage never imports the Model Runner V1
+    # stack (removed upstream in vllm-project/vllm#63373).
+    model_runner_cls = LazyModelRunnerCls("vllm_omni.worker.gpu_ar_model_runner.GPUARModelRunner")
+    v2_model_runner_cls = LazyModelRunnerCls("vllm_omni.worker_v2.omni_ar_model_runner.OmniARModelRunner")
 
     def weight_sharing_control(self, operation: str, messages: tuple[bytes, ...] = ()) -> dict[str, object]:
         from vllm_omni.distributed.weight_sharing.worker_session import control_runner
@@ -173,16 +176,12 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
         self.use_v2_model_runner = bool(getattr(self.model_config, "use_v2_model_runner", False))
         if self.use_v2_model_runner:
-            from vllm_omni.worker_v2.omni_ar_model_runner import (
-                OmniARModelRunner,
-            )
-
             logger.info(
                 "Using MR v2 OmniARModelRunner for omni AR stage (stage_id=%s model_stage=%s).",
                 stage_id,
                 model_stage,
             )
-            self.model_runner = OmniARModelRunner(self.vllm_config, self.device)
+            self.model_runner = self.v2_model_runner_cls(self.vllm_config, self.device)
         else:
             self.use_v2_model_runner = False
             runner_cls = resolve_gpu_ar_model_runner_cls(self.vllm_config, self.model_runner_cls)

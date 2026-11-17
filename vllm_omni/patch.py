@@ -52,8 +52,10 @@ apply_img2img_mm_prefix_patch()
 # Omni's deploy config selects a runner per stage. vLLM 0.31's config property
 # otherwise defaults to v2 independently of the runner selected by our workers,
 # making shared consumers such as InputProcessor choose the wrong API.
-_runner_property = _OriginalVllmConfig.use_v2_model_runner
-if not getattr(_runner_property.fget, "_omni_stage_runner", False):
+# vLLM without Model Runner V1 (vllm-project/vllm#63373) drops the property:
+# its only runner is v2, so there is nothing to override.
+_runner_property = getattr(_OriginalVllmConfig, "use_v2_model_runner", None)
+if isinstance(_runner_property, property) and not getattr(_runner_property.fget, "_omni_stage_runner", False):
 
     def _patched_use_v2_model_runner(self, _upstream=_runner_property.fget):
         # Lazy import keeps the package's patch/config initialization acyclic.
