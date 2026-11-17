@@ -29,10 +29,15 @@ from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
 _MISSING_REFERENCE = (
     "Base task requires 'ref_audio' or 'speaker_embedding' for voice cloning: pass "
     "additional_information['ref_audio'] as a list (e.g. ['ref.wav']), or 'voice_clone_prompt' with "
-    "'ref_spk_embedding' (and 'ref_code' unless 'x_vector_only_mode' is enabled)"
+    "'ref_spk_embedding' and 'x_vector_only_mode' enabled"
 )
 _MISSING_TRANSCRIPT = (
     "Base task requires non-empty 'ref_text' (transcript of the reference audio) unless 'x_vector_only_mode' is enabled"
+)
+_NOT_TRANSPORTABLE = (
+    "Qwen3-TTS additional_information[{key!r}] holds a NumPy array or a tensor nested in a list or dict, which "
+    "does not reach the engine intact; pass plain Python lists (e.g. 'ref_audio': [[waveform.tolist(), sr]]) "
+    "or a file path/URL"
 )
 
 
@@ -40,19 +45,33 @@ def _is_text(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+def _has_array(value: object) -> bool:
+    if isinstance(value, (torch.Tensor, np.ndarray)):
+        return True
+    if isinstance(value, dict):
+        value = list(value.values())
+    return isinstance(value, (list, tuple)) and any(_has_array(v) for v in value)
+
+
+def _reaches_engine(value: object) -> bool:
+    # The engine-core msgpack round trip keeps only a top-level tensor; an ndarray, or a tensor
+    # inside a list or dict, arrives as a raw [dtype, shape, buffer] list the Talker cannot read.
+    return isinstance(value, torch.Tensor) or not _has_array(value)
+
+
 def _is_token_ids(value: object) -> bool:
-    # Whether the Talker can turn this into non-empty ``ref_ids``: empty ids fall back to x-vector mode,
-    # and arrays torch.from_numpy rejects (str/object dtype, negative strides) raise in the engine core.
-    try:
-        return coerce_token_ids(value, device=torch.device("cpu")) is not None
-    except (TypeError, ValueError):
-        return False
+    # Whether the Talker can read a transcript from these ids: it takes ids[:, 3:-2] of one request.
+    ids = coerce_token_ids(value, device=torch.device("cpu"))
+    return ids is not None and ids.shape[0] == 1 and ids.shape[1] > 5
 
 
 def validate_voice_clone_request(info: Mapping[str, Any]) -> None:
     """Raise ``ValueError`` if a Base request lacks what the Talker needs."""
     if first_value(info.get("task_type"), "CustomVoice") != "Base":
         return
+    for key in ("ref_audio", "voice_clone_prompt", "ref_ids", PRECOMPUTED_REF_IDS_KEY):
+        if not _reaches_engine(info.get(key)):
+            raise ValueError(_NOT_TRANSPORTABLE.format(key=key))
     ref_audio = info.get("ref_audio")
     has_ref_audio = isinstance(ref_audio, list) and bool(ref_audio) and ref_audio[0] is not None
     if has_ref_audio and isinstance(ref_audio[0], str):
@@ -66,13 +85,9 @@ def validate_voice_clone_request(info: Mapping[str, Any]) -> None:
 
     xvec = resolve_x_vector_only(dict(info))
     spk = prompt.get("ref_spk_embedding")
-    has_spk = isinstance(spk, torch.Tensor) or (isinstance(spk, (list, np.ndarray)) and len(spk) > 0)
-    ref_code = prompt.get("ref_code")
-    # The Talker only reads a voice_clone_prompt ref_code that is a tensor or an array.
-    has_ref_code = Qwen3TTSPromptEmbedsBuilder._has_ref_code_like(ref_code) and isinstance(
-        first_value(ref_code), (torch.Tensor, np.ndarray)
-    )
-    if not (has_ref_audio or (has_spk and (xvec or has_ref_code))):
+    # A voice_clone_prompt arrives as plain lists, but the Talker reads its ref_code only as a tensor or array.
+    has_spk = isinstance(spk, list) and bool(spk)
+    if not (has_ref_audio or (has_spk and xvec)):
         raise ValueError(_MISSING_REFERENCE)
 
     if xvec:

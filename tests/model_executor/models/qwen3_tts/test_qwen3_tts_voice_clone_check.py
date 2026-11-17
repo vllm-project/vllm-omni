@@ -8,8 +8,12 @@ import torch
 from pytest_mock import MockerFixture
 from vllm.sampling_params import SamplingParams
 from vllm.utils.import_utils import resolve_obj_by_qualname
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
+from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
+from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
+from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import _ref_audio_wire_waveform
 from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_FUSED_PIPELINE, QWEN3_TTS_PIPELINE
 from vllm_omni.model_executor.models.qwen3_tts.prompt_checks import check_voice_clone_prompt
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import PRECOMPUTED_REF_IDS_KEY
@@ -18,10 +22,12 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 NO_REF = "requires 'ref_audio' or 'speaker_embedding'"
 NO_TEXT = "requires non-empty 'ref_text'"
+NOT_INTACT = "does not reach the engine intact"
 AUDIO = ["ref.wav"]
 TEXT = ["Reference words."]
 SPK = [0.1] * 8
 CODE = torch.zeros(4, 16, dtype=torch.long)
+IDS = torch.arange(100, 112).reshape(1, 12)
 
 
 def _prompt(**info):
@@ -44,7 +50,9 @@ def _base(**info):
         pytest.param(
             _base(voice_clone_prompt=[{"ref_spk_embedding": SPK}], ref_text=TEXT), NO_REF, id="icl-embedding-only"
         ),
-        pytest.param(_base(voice_clone_prompt=[{"ref_code": CODE}], ref_text=TEXT), NO_REF, id="ref-code-only"),
+        pytest.param(
+            _base(voice_clone_prompt=[{"ref_code": CODE.tolist()}], ref_text=TEXT), NO_REF, id="ref-code-only"
+        ),
         pytest.param(
             # The Talker reads only a tensor/array ref_code from voice_clone_prompt.
             _base(voice_clone_prompt=[{"ref_code": CODE.tolist(), "ref_spk_embedding": SPK}], ref_text=TEXT),
@@ -58,11 +66,38 @@ def _base(**info):
         pytest.param(_base(ref_audio=AUDIO, x_vector_only_mode=[False]), NO_TEXT, id="explicit-icl"),
         # The Talker unwraps one list level, so flat ids fall back to x-vector mode.
         pytest.param(_base(ref_audio=AUDIO, ref_ids=[1, 2, 3]), NO_TEXT, id="flat-ref-ids"),
-        # Ids the Talker cannot convert: empty ones fall back to x-vector mode, a str array raises.
+        # The Talker reads the transcript as ids[:, 3:-2] of one request.
         *(
             pytest.param(_base(ref_audio=AUDIO, **{key: ids}), NO_TEXT, id=f"{name}-{key}")
             for key in (PRECOMPUTED_REF_IDS_KEY, "ref_ids")
-            for name, ids in (("empty", torch.empty((1, 0), dtype=torch.long)), ("str-array", np.array(["invalid"])))
+            for name, ids in (
+                ("empty", torch.empty((1, 0), dtype=torch.long)),
+                ("four-ids", IDS[:, :4]),
+                ("two-requests", torch.arange(24).reshape(2, 12)),
+            )
+        ),
+        # Only a top-level tensor survives the engine-core msgpack round trip; the rest arrive as raw buffers.
+        *(
+            pytest.param(_base(ref_audio=AUDIO, **{key: ids}), NOT_INTACT, id=f"{name}-{key}")
+            for key in (PRECOMPUTED_REF_IDS_KEY, "ref_ids")
+            for name, ids in (("str-array", np.array(["invalid"])), ("array", IDS.numpy()), ("listed-tensor", [IDS]))
+        ),
+        pytest.param(_base(ref_audio=AUDIO, voice_clone_prompt={"ref_ids": [IDS]}), NOT_INTACT, id="vcp-ref-ids"),
+        pytest.param(_base(ref_audio=AUDIO, voice_clone_prompt={"ref_id": IDS}), NOT_INTACT, id="vcp-ref-id"),
+        pytest.param(
+            _base(voice_clone_prompt=[{"ref_code": CODE, "ref_spk_embedding": SPK, "ref_text": "Words."}]),
+            NOT_INTACT,
+            id="vcp-tensor-ref-code",
+        ),
+        pytest.param(
+            _base(voice_clone_prompt=[{"ref_spk_embedding": torch.ones(8)}], x_vector_only_mode=[True]),
+            NOT_INTACT,
+            id="vcp-tensor-embedding",
+        ),
+        pytest.param(
+            _base(ref_audio=[(np.zeros(16000, dtype=np.float32), 16000)], ref_text=TEXT),
+            NOT_INTACT,
+            id="array-ref-audio",
         ),
         pytest.param(_base(ref_audio=AUDIO, speaker=["clone"]), NO_TEXT, id="issue-3708-shape"),
         pytest.param(
@@ -82,44 +117,75 @@ def test_rejects_unusable_base_request(prompt, error):
         check_voice_clone_prompt(prompt, [])
 
 
-@pytest.mark.parametrize(
-    "prompt",
-    [
-        pytest.param(_base(ref_audio=AUDIO, ref_text=TEXT), id="icl-list-ref-text"),
-        pytest.param(_base(ref_audio=AUDIO, ref_text="Reference words."), id="icl-scalar-ref-text"),
-        pytest.param(_base(ref_audio=AUDIO, x_vector_only_mode=[True]), id="xvec-ref-audio"),
-        pytest.param(_base(ref_audio=AUDIO, ref_ids=[[1, 2, 3]]), id="ref-ids"),
-        pytest.param(
-            _base(voice_clone_prompt=[{"ref_code": CODE, "ref_spk_embedding": SPK, "ref_text": "Words."}]),
-            id="voice-clone-prompt-icl",
-        ),
-        # Intentionally passed to the Talker: it resolves a stored voice from a cache this check cannot see.
-        pytest.param(_base(speaker=["stored"]), id="stored-speaker-no-ref-left-to-talker"),
-        # Shapes the speech API's _build_tts_params sends.
-        pytest.param(_base(ref_audio=[[[0.0, 0.1], 24000]], ref_text=TEXT), id="api-inline-audio"),
-        pytest.param(
-            _base(voice_clone_prompt=[{"ref_spk_embedding": SPK}], x_vector_only_mode=[True]), id="api-embedding"
-        ),
-        pytest.param(
-            _base(speaker=["up"], voice_clone_prompt=[{"ref_spk_embedding": SPK}], x_vector_only_mode=[True]),
-            id="api-uploaded-embedding",
-        ),
-        pytest.param(
-            _base(speaker=["up"], ref_audio=["data:audio/wav;base64,AA"], ref_text=TEXT, x_vector_only_mode=[False]),
-            id="api-uploaded-audio",
-        ),
-        pytest.param(_base(speaker=["pre"], x_vector_only_mode=[False], ref_text=TEXT), id="api-precomputed"),
-        # Not Base, or not a request with additional_information: never checked.
-        pytest.param(_prompt(task_type=["CustomVoice"], speaker=["vivian"]), id="custom-voice"),
-        pytest.param(_prompt(task_type=["VoiceDesign"], instruct=["calm"]), id="voice-design"),
-        pytest.param(_prompt(ref_audio=AUDIO), id="no-task-type"),
-        pytest.param({"prompt_token_ids": [0]}, id="streaming-close"),
-        pytest.param("plain text", id="string"),
-        pytest.param({"prompt_token_ids": [0, 0], "additional_information": {"text": ["more"]}}, id="text-chunk"),
-    ],
-)
+_USABLE_BASE = [
+    pytest.param(_base(ref_audio=AUDIO, ref_text=TEXT), id="icl-list-ref-text"),
+    pytest.param(_base(ref_audio=AUDIO, ref_text="Reference words."), id="icl-scalar-ref-text"),
+    pytest.param(_base(ref_audio=AUDIO, x_vector_only_mode=[True]), id="xvec-ref-audio"),
+    pytest.param(_base(ref_audio=AUDIO, ref_ids=[list(range(100, 106))]), id="ref-ids"),
+    pytest.param(_base(ref_audio=AUDIO, ref_ids=IDS), id="tensor-ref-ids"),
+    pytest.param(_base(ref_audio=AUDIO, **{PRECOMPUTED_REF_IDS_KEY: IDS}), id="precomputed-ref-ids"),
+    pytest.param(_base(ref_audio=AUDIO, voice_clone_prompt=[{"ref_ids": IDS.tolist()}]), id="vcp-ref-ids"),
+    # Intentionally passed to the Talker: it resolves a stored voice from a cache this check cannot see.
+    pytest.param(_base(speaker=["stored"]), id="stored-speaker-no-ref-left-to-talker"),
+    # Shapes the speech API's _build_tts_params sends.
+    pytest.param(_base(ref_audio=[[[0.0, 0.1], 24000]], ref_text=TEXT), id="api-inline-audio"),
+    pytest.param(
+        _base(ref_audio=[[_ref_audio_wire_waveform(np.zeros(4, dtype=np.float32)), 24000]], ref_text=TEXT),
+        id="api-wire-audio",
+    ),
+    pytest.param(_base(voice_clone_prompt=[{"ref_spk_embedding": SPK}], x_vector_only_mode=[True]), id="api-embedding"),
+    pytest.param(
+        _base(speaker=["up"], voice_clone_prompt=[{"ref_spk_embedding": SPK}], x_vector_only_mode=[True]),
+        id="api-uploaded-embedding",
+    ),
+    pytest.param(
+        _base(speaker=["up"], ref_audio=["data:audio/wav;base64,AA"], ref_text=TEXT, x_vector_only_mode=[False]),
+        id="api-uploaded-audio",
+    ),
+    pytest.param(_base(speaker=["pre"], x_vector_only_mode=[False], ref_text=TEXT), id="api-precomputed"),
+]
+# Not Base, or not a request with additional_information: never checked.
+_UNCHECKED = [
+    pytest.param(_prompt(task_type=["CustomVoice"], speaker=["vivian"]), id="custom-voice"),
+    pytest.param(_prompt(task_type=["VoiceDesign"], instruct=["calm"]), id="voice-design"),
+    pytest.param(_prompt(ref_audio=AUDIO), id="no-task-type"),
+    pytest.param({"prompt_token_ids": [0]}, id="streaming-close"),
+    pytest.param("plain text", id="string"),
+    pytest.param({"prompt_token_ids": [0, 0], "additional_information": {"text": ["more"]}}, id="text-chunk"),
+]
+
+
+@pytest.mark.parametrize("prompt", _USABLE_BASE + _UNCHECKED)
 def test_passes_usable_or_unchecked_prompt(prompt):
     assert check_voice_clone_prompt(prompt, []) is prompt
+
+
+def _ipc(info):
+    # The engine-core path: serialize, then the msgpack round trip of the core request.
+    request = OmniEngineCoreRequest(
+        request_id="r",
+        prompt_token_ids=[0],
+        mm_features=None,
+        sampling_params=SamplingParams(),
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        additional_information=serialize_additional_information(info),
+    )
+    decoded = MsgpackDecoder(OmniEngineCoreRequest).decode(MsgpackEncoder().encode(request))
+    return deserialize_additional_information(decoded.additional_information)
+
+
+@pytest.mark.parametrize("prompt", _USABLE_BASE)
+def test_accepted_base_prompts_reach_the_engine_intact(prompt):
+    info = prompt["additional_information"]
+    received = _ipc(info)
+    assert received.keys() == info.keys()
+    for key, value in info.items():
+        assert torch.equal(received[key], value) if isinstance(value, torch.Tensor) else received[key] == value, key
+    check_voice_clone_prompt({**prompt, "additional_information": received}, [])
 
 
 @pytest.mark.parametrize("pipeline", [QWEN3_TTS_PIPELINE, QWEN3_TTS_FUSED_PIPELINE], ids=lambda p: p.model_type)
