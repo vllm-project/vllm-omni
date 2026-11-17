@@ -259,25 +259,35 @@ def _load_json(model_path: str, filename: str, local_files_only: bool = True) ->
 def load_vae_scale_factor(
     model_path: str,
     *,
-    config_key: str = "block_out_channels",
-    exponent_offset: int = -1,
     default: int = 8,
+    vae_config: dict | None = None,
 ) -> int:
     """Read ``vae/config.json`` and compute the VAE spatial downsampling factor.
 
     Most diffusion pipelines need the scale factor before VAE weights are
-    loaded.  The standard formula is ``2 ** (len(channels) + exponent_offset)``
-    where *channels* is a list in the VAE config (``block_out_channels`` for
-    image VAEs, ``temporal_downsample`` for video VAEs).
+    loaded.  The standard formula is ``2 ** (len(block_out_channels) - 1)``.
 
-    Returns *default* when the config file or key is missing.
+    Returns *default* when ``block_out_channels`` is missing or empty.
+    Raises ``FileNotFoundError`` when the config file is missing and
+    ``ValueError`` when it cannot be parsed, so a partially-downloaded
+    snapshot fails loudly instead of silently producing mis-sized images.
+
+    Callers that need more values from the same file can pass the already
+    loaded mapping via *vae_config* to avoid reading it twice.
     """
-    vae_config_path = os.path.join(model_path, "vae", "config.json")
-    if not os.path.exists(vae_config_path):
+    if vae_config is None:
+        vae_config_path = os.path.join(model_path, "vae", "config.json")
+        if not os.path.exists(vae_config_path):
+            raise FileNotFoundError(
+                f"VAE config not found at {vae_config_path}. "
+                "Please ensure the model path contains a valid VAE configuration."
+            )
+        try:
+            with open(vae_config_path) as f:
+                vae_config = json.load(f)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Failed to parse VAE config at {vae_config_path}: {exc}") from exc
+    channels = vae_config.get("block_out_channels")
+    if not channels:
         return default
-    with open(vae_config_path) as f:
-        vae_config = json.load(f)
-    channels = vae_config.get(config_key)
-    if channels is None:
-        return default
-    return 2 ** (len(channels) + exponent_offset)
+    return int(2 ** (len(channels) - 1))
