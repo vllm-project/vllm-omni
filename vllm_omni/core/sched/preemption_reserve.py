@@ -31,6 +31,8 @@ from vllm.logger import init_logger
 from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
     from vllm.v1.core.kv_cache_utils import KVCacheBlock
     from vllm.v1.request import Request
@@ -44,12 +46,20 @@ _LOG_INTERVAL_S = 30.0
 class PreemptionReserve:
     """Expected KV need of the admitted requests of one stage, in blocks."""
 
-    def __init__(self, block_size: int, max_model_len: int, req_to_blocks: dict[str, list[KVCacheBlock]]):
+    def __init__(
+        self,
+        block_size: int,
+        max_model_len: int,
+        req_to_blocks: dict[str, list[KVCacheBlock]],
+        scheduler_reserved: Callable[[Request], int],
+    ):
         self.block_size = block_size
         self.max_model_len = max_model_len
         # The manager's own block lists: what a request holds, including blocks
         # allocated earlier in the current step (``num_computed_tokens`` lags them).
         self.req_to_blocks = req_to_blocks
+        # Blocks the scheduler's own ``reserved_blocks`` already counts for a request.
+        self.scheduler_reserved = scheduler_reserved
         # request_id -> (request, num_tokens when it was admitted)
         self.admitted: dict[str, tuple[Request, int]] = {}
         self.max_growth: int | None = None
@@ -66,12 +76,22 @@ class PreemptionReserve:
         target = max(num_tokens_at_admission + self.growth(request), request.num_tokens)
         return self.blocks(min(target, self.max_model_len))
 
-    def reserved_blocks(self) -> int:
-        """Blocks the admitted requests may still need beyond what they hold."""
-        return sum(
-            max(0, self.final_blocks(req, at) - len(self.req_to_blocks.get(rid, ())))
-            for rid, (req, at) in self.admitted.items()
-        )
+    def reserved_blocks(self, caller_reserved: int = 0) -> int:
+        """Blocks the admitted requests may still need beyond what they hold, on top of ``caller_reserved``.
+
+        For an async KV load the caller's reservation covers the unfinished prefill
+        of every in-flight request (plus speculative-decode headroom). Requests that
+        are also admitted here count once, at the larger of the two estimates; the
+        rest of the caller's reservation stays on top.
+        """
+        total = overlap = 0
+        for rid, (req, at) in self.admitted.items():
+            need = max(0, self.final_blocks(req, at) - len(self.req_to_blocks.get(rid, ())))
+            total += need
+            if caller_reserved:
+                overlap += min(need, self.scheduler_reserved(req))
+        # Guard: a caller whose reservation does not cover these requests is never undercut.
+        return total - min(overlap, caller_reserved)
 
     def on_free(self, request: Request) -> None:
         entry = self.admitted.pop(request.request_id, None)
@@ -92,12 +112,17 @@ class PreemptionReserve:
             )
 
 
-def install_preemption_reserve(kv_cache_manager: KVCacheManager) -> PreemptionReserve | None:
+def install_preemption_reserve(
+    kv_cache_manager: KVCacheManager,
+    scheduler_reserved: Callable[[Request], int],
+) -> PreemptionReserve | None:
     """Wrap ``kv_cache_manager.allocate_slots`` on this instance; return the bookkeeping object.
 
-    Only for a single full-attention KV cache group, where one token takes one
-    slot of one block; otherwise the block estimate would be wrong, so nothing
-    is installed.
+    ``scheduler_reserved(request)`` gives the blocks the caller's own
+    ``reserved_blocks`` counts for ``request``, so a request reserved by both is
+    counted once. Only for a single full-attention KV cache group, where one
+    token takes one slot of one block; otherwise the block estimate would be
+    wrong, so nothing is installed.
     """
     from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 
@@ -107,7 +132,10 @@ def install_preemption_reserve(kv_cache_manager: KVCacheManager) -> PreemptionRe
         logger.warning("Preemption reserve not enabled: it supports a single full-attention KV cache group only")
         return None
     reserve = PreemptionReserve(
-        int(managers[0].block_size), int(kv_cache_manager.max_model_len), managers[0].req_to_blocks
+        int(managers[0].block_size),
+        int(kv_cache_manager.max_model_len),
+        managers[0].req_to_blocks,
+        scheduler_reserved,
     )
     original = kv_cache_manager.allocate_slots
 
@@ -137,7 +165,7 @@ def install_preemption_reserve(kv_cache_manager: KVCacheManager) -> PreemptionRe
                 + num_new_tokens
                 + num_lookahead_tokens
             )
-            reserved = reserve.reserved_blocks()
+            reserved = reserve.reserved_blocks(reserved_blocks)
             own = max(0, reserve.final_blocks(request, request.num_tokens) - reserve.blocks(covered))
         result = original(
             request,
