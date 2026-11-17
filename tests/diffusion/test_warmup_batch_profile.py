@@ -57,6 +57,18 @@ def test_aggregate_discard_and_median():
     assert out == {4: 115.0}
 
 
+def test_aggregate_discards_leading_steps_not_slowest():
+    # The first step is compile/lazy-init noise and is the slowest sample.
+    # Discarding must follow step order, not discard the fastest samples.
+    records = [
+        (4, 0, 1000.0),
+        (4, 1, 10.0),
+        (4, 2, 12.0),
+    ]
+    out = aggregate_step_records(records, discard_steps=1)
+    assert out == {4: 11.0}
+
+
 def test_aggregate_groups_by_batch():
     records = [
         (2, 0, 50.0),
