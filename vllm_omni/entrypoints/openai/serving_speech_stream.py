@@ -88,7 +88,6 @@ logger = init_logger(__name__)
 
 _DEFAULT_IDLE_TIMEOUT = 30.0  # seconds
 _DEFAULT_CONFIG_TIMEOUT = 10.0  # seconds
-_PCM_SAMPLE_RATE = 24000
 _BYTES_PER_SAMPLE = 2  # 16-bit PCM, per channel
 _MAX_CONFIG_MESSAGE_SIZE = 4 * 1024 * 1024  # allow large ref_audio payloads
 _MAX_INPUT_TEXT_MESSAGE_SIZE = 128 * 1024
@@ -1020,7 +1019,10 @@ class OmniStreamingSpeechHandler:
         """
         audio_bytes_seen = 0
         total_bytes = 0
-        sample_rate = _PCM_SAMPLE_RATE
+        # The model's rate arrives with the first chunk (every chunk carries
+        # it — see _generate_audio_chunks); None until then, never a
+        # fabricated default.
+        sample_rate: int | None = None
         chunk_id = 0
         # Receives the aligner stage's pooling output from the generator.
         collect: dict = {}
@@ -1031,7 +1033,7 @@ class OmniStreamingSpeechHandler:
 
         async def send_chunk(
             chunk: bytes,
-            chunk_sample_rate: int,
+            chunk_sample_rate: int | None,
             timestamps_payload: list[dict] | None,
             chunk_start_ms: int,
             chunk_end_ms: int,
@@ -1069,10 +1071,13 @@ class OmniStreamingSpeechHandler:
             )
         ) as stream:
             async for chunk, chunk_sample_rate in stream:
+                # include_sample_rate=True: audio ships only after the
+                # producer's first-audio guard set the rate.
+                assert chunk_sample_rate is not None
                 sample_rate = chunk_sample_rate
-                chunk_start_ms = int(round((audio_bytes_seen / frame_bytes() / sample_rate) * 1000.0))
+                chunk_start_ms = int(round((audio_bytes_seen / frame_bytes() / chunk_sample_rate) * 1000.0))
                 audio_bytes_seen += len(chunk)
-                chunk_end_ms = int(round((audio_bytes_seen / frame_bytes() / sample_rate) * 1000.0))
+                chunk_end_ms = int(round((audio_bytes_seen / frame_bytes() / chunk_sample_rate) * 1000.0))
                 total_bytes += len(chunk)
                 # Audio first, timestamps after the whole sentence is aligned.
                 await send_chunk(chunk, chunk_sample_rate, None, chunk_start_ms, chunk_end_ms)
@@ -1084,7 +1089,14 @@ class OmniStreamingSpeechHandler:
         timestamps_payload = (
             extract_word_timestamps(aligner_res, sentence_text, language) if aligner_res is not None else None
         )
-        sentence_end_ms = int(round((audio_bytes_seen / frame_bytes() / sample_rate) * 1000.0))
+        if sample_rate is not None:
+            sentence_end_ms = int(round((audio_bytes_seen / frame_bytes() / sample_rate) * 1000.0))
+        else:
+            # Degenerate no-audio sentence: every chunk carried its own rate,
+            # so reaching here with None means no audio ever arrived and the
+            # byte offset is zero — there is no rate to report either.
+            assert audio_bytes_seen == 0
+            sentence_end_ms = 0
         await send_chunk(b"", sample_rate, timestamps_payload, 0, sentence_end_ms)
 
         return total_bytes
