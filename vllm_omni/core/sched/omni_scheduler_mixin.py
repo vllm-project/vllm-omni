@@ -1017,6 +1017,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         routed_experts: Any = None,
         num_nans_in_logits: int = 0,
         is_segment_finished: bool | None = False,
+        segment_generation: int | None = None,
         new_prompt_len_snapshot: int | None = None,
         num_generation_tokens: int | None = None,
         error: Any = None,
@@ -1026,6 +1027,10 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         if isinstance(pooling_output, dict):
             pooling_output_payload = serialize_additional_information(pooling_output)
             pooling_output = None
+        if segment_generation is None:
+            raw_generation = getattr(request, "_omni_segment_generation", None)
+            if not isinstance(raw_generation, bool) and isinstance(raw_generation, int):
+                segment_generation = raw_generation
 
         return OmniEngineCoreOutput(
             request_id=request.request_id,
@@ -1046,6 +1051,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             routed_experts=routed_experts,
             num_nans_in_logits=num_nans_in_logits,
             is_segment_finished=is_segment_finished,
+            segment_generation=segment_generation,
             new_prompt_len_snapshot=new_prompt_len_snapshot,
             num_generation_tokens=num_generation_tokens,
             error=error,

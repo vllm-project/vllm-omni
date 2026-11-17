@@ -356,12 +356,15 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
     ) -> None:
         """Bind this poll's ``is_segment_finished`` onto processed outputs.
 
-        Intercept must not read a leftover ``streaming.segments[stage].finished``
-        from an earlier sentence park. A real request-end eco (``finish_reason`` set,
-        ``is_segment_finished=False``) wins over a later eco in the same poll so
-        ``RequestOutput.finished`` is not stripped before ``response.done``.
+        Also copies ``segment_generation`` so sentence-TTS park can tell a
+        leftover 2150 from the next utterance. Intercept must not read a leftover
+        ``streaming.segments[stage].finished`` from an earlier sentence park. A
+        real request-end eco (``finish_reason`` set, ``is_segment_finished=False``)
+        wins over a later eco in the same poll so ``RequestOutput.finished`` is
+        not stripped before ``response.done``.
         """
         poll_is_segment_finished: dict[str, bool] = {}
+        poll_segment_generation: dict[str, int] = {}
         poll_request_end: set[str] = set()
         for eco in getattr(raw_outputs, "outputs", ()) or ():
             rid = getattr(eco, "request_id", None)
@@ -369,6 +372,9 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 continue
             segment_finished = bool(getattr(eco, "is_segment_finished", False))
             poll_is_segment_finished[rid] = segment_finished
+            generation = getattr(eco, "segment_generation", None)
+            if not isinstance(generation, bool) and isinstance(generation, int):
+                poll_segment_generation[rid] = generation
             if getattr(eco, "finish_reason", None) is not None and not segment_finished:
                 poll_request_end.add(rid)
 
@@ -378,6 +384,9 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 continue
             this_poll_segment = bool(poll_is_segment_finished.get(rid)) and rid not in poll_request_end
             setattr(output, "is_segment_finished", this_poll_segment)
+            generation = poll_segment_generation.get(rid)
+            if generation is not None:
+                setattr(output, "segment_generation", generation)
             if rid not in poll_request_end:
                 continue
             req_state = self.request_states.get(rid)
@@ -824,6 +833,16 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         source = plan.source_stage_id
         return stage_id if source is None else source
 
+    def _partial_forward_source_replica(
+        self,
+        source_stage_id: int,
+        req_state: OrchestratorRequestState,
+        poll_replica_id: int,
+    ) -> int:
+        """Replica of ``source_stage_id``. The poll replica may belong to another stage."""
+        bound = self.stage_pools[source_stage_id].get_bound_replica_id(req_state.request_id)
+        return poll_replica_id if bound is None else bound
+
     async def _submit_partial_stage_forward(
         self,
         plan: PartialStageForward,
@@ -842,7 +861,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             source_stage_id,
             plan.output,
             req_state,
-            src_replica_id=replica_id,
+            src_replica_id=self._partial_forward_source_replica(source_stage_id, req_state, replica_id),
             is_streaming_session=True,
             is_final_update=plan.is_final_update and not plan.queue_close_after,
         )
@@ -855,7 +874,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             followup_source,
             followup.output,
             req_state,
-            src_replica_id=replica_id,
+            src_replica_id=self._partial_forward_source_replica(followup_source, req_state, replica_id),
             is_streaming_session=True,
             is_final_update=followup.is_final_update,
         )

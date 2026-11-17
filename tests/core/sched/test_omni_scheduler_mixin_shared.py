@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections import defaultdict
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
@@ -25,6 +26,16 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 class _Scheduler(OmniSchedulerMixin):
     _is_blocked_waiting_status = staticmethod(Scheduler._is_blocked_waiting_status)
+
+
+@dataclass
+class _OutputRequest:
+    request_id: str = "req-output"
+    trace_headers: object | None = None
+    _omni_segment_generation: int | None = None
+
+    def take_events(self) -> list[object]:
+        return []
 
 
 def test_async_chunk_adapter_initializes_for_stage_zero_sender_and_stage_one_receiver(monkeypatch):
@@ -222,6 +233,26 @@ def test_output_helper_preserves_required_nan_counter_default():
     output = scheduler._make_omni_engine_output(request, new_token_ids=[])
 
     assert output.num_nans_in_logits == 0
+    assert output.segment_generation is None
+
+
+def test_output_helper_copies_request_segment_generation():
+    scheduler = _Scheduler()
+    request = _OutputRequest(_omni_segment_generation=4)
+
+    output = scheduler._make_omni_engine_output(request, new_token_ids=[2150], is_segment_finished=True)
+
+    assert output.is_segment_finished is True
+    assert output.segment_generation == 4
+
+
+def test_output_helper_keeps_explicit_segment_generation_over_request():
+    scheduler = _Scheduler()
+    request = _OutputRequest(_omni_segment_generation=4)
+
+    output = scheduler._make_omni_engine_output(request, new_token_ids=[2150], segment_generation=0)
+
+    assert output.segment_generation == 0
 
 
 @pytest.mark.parametrize(("role", "coordinated"), [("sender", False), ("receiver", True), (None, True)])

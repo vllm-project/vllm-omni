@@ -29,12 +29,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.engine import EngineCoreRequestType, FinishReason
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
-from vllm_omni.core.sched.omni_ar_scheduler import (
-    OmniARAsyncScheduler,
-    OmniARScheduler,
-)
-from vllm_omni.core.sched.utils import streaming_update_replaces_prompt as _streaming_update_replaces_prompt
-from vllm_omni.data_entry_keys import serialize_payload
+from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
 from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2code2wav_async_chunk
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
@@ -869,6 +864,8 @@ def test_stage0_window_open_start_falls_back_to_the_context_reserve_when_unset()
 
 def _joyai_sentence_payload(*, replace: bool) -> object:
     """Wire shape ``joyai_action_to_tts`` actually sends after serialize_payload."""
+    from vllm_omni.data_entry_keys import serialize_payload
+
     info: dict[str, object] = {
         "task_type": ["CustomVoice"],
         "language": ["Auto"],
@@ -903,6 +900,8 @@ def _parked_talker_after_first_sentence() -> Request:
 
 
 def test_serialized_joyai_meta_is_a_replace_flag() -> None:
+    from vllm_omni.core.sched.utils import streaming_update_replaces_prompt as _streaming_update_replaces_prompt
+
     payload = _joyai_sentence_payload(replace=True)
     assert _streaming_update_replaces_prompt((None, payload)) is True
     assert _streaming_update_replaces_prompt((None, _joyai_sentence_payload(replace=False))) is False

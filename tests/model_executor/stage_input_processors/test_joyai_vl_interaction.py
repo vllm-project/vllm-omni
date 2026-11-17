@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for the JoyAI stage input processors."""
 
+from collections import defaultdict
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +21,50 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _IMAGE = "<|vision_start|><|image_pad|><|vision_end|>"
 _VIDEO = "<|vision_start|><|video_pad|><|vision_end|>"
+
+
+@dataclass
+class _TalkerConfig:
+    spk_id: dict[str, int] = field(default_factory=lambda: {"vivian": 1})
+
+
+@dataclass
+class _HfConfig:
+    talker_config: _TalkerConfig = field(default_factory=_TalkerConfig)
+
+
+@dataclass
+class _TalkerModelConfig:
+    hf_config: _HfConfig = field(default_factory=_HfConfig)
+
+
+@dataclass
+class _FlagRequest:
+    additional_information: object | None = None
+    model_intermediate_buffer: object | None = None
+    external_req_id: str = "req-1"
+    output_token_ids: list[object] = field(default_factory=list)
+    _joyai_finish_on_next_stop: bool = False
+    _finished: bool = False
+
+    def is_finished(self) -> bool:
+        return self._finished
+
+
+@dataclass
+class _Connector:
+    config: dict[str, object]
+
+
+@dataclass
+class _ChunkTransfer:
+    connector: _Connector
+    code_prompt_token_ids: dict = field(default_factory=lambda: defaultdict(list))
+    scheduler_max_num_seqs: int = 1
+    put_req_chunk: dict = field(default_factory=lambda: defaultdict(int))
+    ramp_chunk_count: dict = field(default_factory=lambda: defaultdict(int))
+    _adaptive_states: dict = field(default_factory=dict)
+    request_payload: dict = field(default_factory=dict)
 
 
 @pytest.mark.parametrize("salt", [None, "tenant-a", "tenant-b"])
@@ -257,9 +303,7 @@ def test_joyai_action_to_tts_close_only_keeps_a_one_token_prompt(monkeypatch: py
         SentenceTtsOutput,
     )
 
-    target_model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(talker_config=SimpleNamespace(spk_id={"vivian": 1}))
-    )
+    target_model_config = _TalkerModelConfig()
 
     def fail_prompt_length(*_args, **_kwargs):
         raise AssertionError("close_only must not estimate a Talker prompt")
@@ -288,9 +332,7 @@ def test_joyai_action_to_tts_partial_keeps_the_sentence_view(monkeypatch: pytest
         SentenceTtsOutput,
     )
 
-    target_model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(talker_config=SimpleNamespace(spk_id={"vivian": 1}))
-    )
+    target_model_config = _TalkerModelConfig()
     prompt_lengths: dict[str, int] = {}
 
     def fake_prompt_length(additional_information, talker_model_config):
@@ -337,9 +379,7 @@ def test_joyai_action_to_tts_stamps_finish_on_next_stop(monkeypatch: pytest.Monk
         SentenceTtsOutput,
     )
 
-    target_model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(talker_config=SimpleNamespace(spk_id={"vivian": 1}))
-    )
+    target_model_config = _TalkerModelConfig()
     monkeypatch.setattr(joyai_bridge, "_compute_talker_prompt_length", lambda *_args, **_kwargs: 4)
     talker_inputs = joyai_bridge.joyai_action_to_tts(
         [SentenceTtsOutput("req-1", "关火。")],
@@ -355,7 +395,7 @@ def test_joyai_action_to_tts_stamps_finish_on_next_stop(monkeypatch: pytest.Monk
     )
     [talker_input] = talker_inputs
     assert talker_input["additional_information"]["meta"][JOYAI_TTS_FINISH_ON_NEXT_STOP_KEY] is True
-    request = SimpleNamespace(
+    request = _FlagRequest(
         additional_information=talker_input["additional_information"],
         model_intermediate_buffer=talker_input["model_intermediate_buffer"],
     )
@@ -378,26 +418,17 @@ def test_joyai_action_to_tts_stamps_finish_on_next_stop(monkeypatch: pytest.Monk
     )
     assert structured.meta is not None
     assert structured.meta.joyai_finish_on_next_stop is True
-    wire = SimpleNamespace(
-        additional_information=serialize_payload(talker_input["additional_information"]),
-        model_intermediate_buffer=None,
-    )
+    wire = _FlagRequest(additional_information=serialize_payload(talker_input["additional_information"]))
     assert _request_finishes_on_next_stop(wire) is True
-    top_level = SimpleNamespace(
-        additional_information={JOYAI_TTS_FINISH_ON_NEXT_STOP_KEY: True},
-        model_intermediate_buffer=None,
-    )
+    top_level = _FlagRequest(additional_information={JOYAI_TTS_FINISH_ON_NEXT_STOP_KEY: True})
     assert _request_finishes_on_next_stop(top_level) is True
-    absent = SimpleNamespace(additional_information={"meta": {}}, model_intermediate_buffer=None)
+    absent = _FlagRequest(additional_information={"meta": {}})
     assert _request_finishes_on_next_stop(absent) is False
 
 
 def test_talker2code2wav_empty_finished_preserves_finish_on_next_stop() -> None:
-    from collections import defaultdict
-
     import torch
 
-    from vllm_omni.data_entry_keys import JOYAI_FINISH_ON_NEXT_STOP_KEY
     from vllm_omni.model_executor.stage_input_processors.qwen3_tts import talker2code2wav_async_chunk
 
     extra = {
@@ -405,22 +436,8 @@ def test_talker2code2wav_empty_finished_preserves_finish_on_next_stop() -> None:
         "codec_left_context_frames": 25,
         "initial_codec_chunk_frames": 1,
     }
-    tm = SimpleNamespace(
-        code_prompt_token_ids=defaultdict(list),
-        scheduler_max_num_seqs=1,
-        put_req_chunk=defaultdict(int),
-        ramp_chunk_count=defaultdict(int),
-        _adaptive_states={},
-        request_payload={},
-        connector=SimpleNamespace(config={"extra": extra}),
-    )
-    request = SimpleNamespace(
-        external_req_id="req-1",
-        is_finished=lambda: False,
-        additional_information=None,
-        output_token_ids=[],
-    )
-    setattr(request, f"_{JOYAI_FINISH_ON_NEXT_STOP_KEY}", True)
+    tm = _ChunkTransfer(connector=_Connector(config={"extra": extra}))
+    request = _FlagRequest(_joyai_finish_on_next_stop=True)
     first = talker2code2wav_async_chunk(
         tm,
         {"codes": {"audio": torch.tensor([[1, 2, 3, 4]], dtype=torch.long)}},
@@ -428,7 +445,7 @@ def test_talker2code2wav_empty_finished_preserves_finish_on_next_stop() -> None:
     )
     assert first is not None
     tm.put_req_chunk["req-1"] += 1
-    request.is_finished = lambda: True
+    request._finished = True
     terminal = talker2code2wav_async_chunk(
         tm,
         {"codes": {"audio": torch.zeros((0,))}},

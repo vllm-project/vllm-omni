@@ -10,7 +10,7 @@ the integration through the real JoyAI plugin is covered by
 """
 
 import json
-from types import SimpleNamespace
+from dataclasses import dataclass
 
 import pytest
 
@@ -28,8 +28,26 @@ def delegate_action() -> ParsedAction:
     return parse_action(DELEGATED)
 
 
-def _stage0(text: str, *, finished: bool = False) -> SimpleNamespace:
-    return SimpleNamespace(request_id="req", stage_id=0, finished=finished, outputs=[SimpleNamespace(text=text)])
+@dataclass
+class _StageCompletion:
+    text: str
+
+
+@dataclass
+class _Stage0Output:
+    request_id: str
+    stage_id: int
+    finished: bool
+    outputs: list[_StageCompletion]
+
+
+def _stage0(text: str, *, finished: bool = False) -> _Stage0Output:
+    return _Stage0Output(
+        request_id="req",
+        stage_id=0,
+        finished=finished,
+        outputs=[_StageCompletion(text=text)],
+    )
 
 
 def _delegation_calls(events: list[dict[str, object]]) -> list[dict[str, object]]:

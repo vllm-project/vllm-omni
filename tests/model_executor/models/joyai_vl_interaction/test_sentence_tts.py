@@ -5,7 +5,9 @@ from dataclasses import dataclass, field
 
 import pytest
 
+from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
 from vllm_omni.engine.duplex.plugin import PartialStageForward
+from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts import (
     JOYAI_TTS_CLOSE_ONLY_KEY,
     JOYAI_TTS_FINISH_ON_NEXT_STOP_KEY,
@@ -19,6 +21,35 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts im
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_consume_growing_text_takes_the_unseen_suffix() -> None:
+    from vllm_omni.engine.duplex.sentence_tts import consume_growing_text
+
+    delta = consume_growing_text("水开了。", "水开了。关火。")
+    assert delta.seen == "水开了。关火。"
+    assert delta.tail == "关火。"
+    assert delta.restarted is False
+
+
+def test_consume_growing_text_resets_when_the_prefix_diverges() -> None:
+    from vllm_omni.engine.duplex.sentence_tts import consume_growing_text
+
+    delta = consume_growing_text("水开了。", "关火。")
+    assert delta.seen == "关火。"
+    assert delta.tail == "关火。"
+    assert delta.restarted is True
+
+
+def test_consume_growing_text_empty_prefix_is_the_whole_text() -> None:
+    from vllm_omni.engine.duplex.sentence_tts import consume_growing_text
+
+    delta = consume_growing_text("", "水开了。")
+    assert delta.tail == "水开了。"
+    assert delta.restarted is False
+    same = consume_growing_text("水开了。", "水开了。")
+    assert same.tail == ""
+    assert same.restarted is False
 
 
 def test_sentence_tts_output_is_shared_with_aura():
@@ -198,12 +229,32 @@ class _FakeOutput:
     segment_generation: int | None = None
 
 
+@dataclass
+class _StampOwner:
+    request_states: dict[str, object] = field(default_factory=dict)
+
+
 def _stage0_output(text: str, *, finished: bool = False) -> _FakeOutput:
     return _FakeOutput(
         finished=finished,
         request_id="req-1",
         outputs=[_FakeCompletion(text=text, cumulative_text=text if finished else None)],
     )
+
+
+def _stamp_talker_park(processed: _FakeOutput, *, generation: int) -> None:
+    """Copy generation through the production eco → processed stamp."""
+    raw = OmniEngineCoreOutputs(
+        outputs=[
+            OmniEngineCoreOutput(
+                request_id=processed.request_id,
+                new_token_ids=[2150],
+                is_segment_finished=True,
+                segment_generation=generation,
+            )
+        ]
+    )
+    DuplexOrchestrator._stamp_poll_segment_finished(_StampOwner(), 1, raw, [processed])
 
 
 def test_plan_partial_holds_a_prefix_of_the_previous_response():
@@ -560,8 +611,10 @@ def test_talker_park_releases_repeated_stop_token_after_rebroadcast_window(monke
 def test_talker_park_releases_same_stop_token_when_generation_advances():
     """A short sentence can park again within the leftover window.
 
-    Both polls report ``[2150]``; the next utterance is a new segment
-    generation, not elapsed time.
+    Both polls report ``[2150]``. Generation must arrive through
+    ``OmniEngineCoreOutput`` and ``_stamp_poll_segment_finished``, not a
+    hand-set fake field: without it the 200 ms leftover window would hold
+    the next sentence.
     """
     orchestrator = _FakeOrchestrator()
     req_state = _FakeReqState()
@@ -575,25 +628,24 @@ def test_talker_park_releases_same_stop_token_when_generation_advances():
     req_state.streaming.enabled = True
     req_state.streaming.segments[1] = _FakeSegment(finished=True)
     park_one = _stage0_output("park-1")
-    park_one.is_segment_finished = True
-    park_one.segment_generation = 0
     park_one.outputs[0].token_ids = [2150]
+    _stamp_talker_park(park_one, generation=0)
+    assert park_one.is_segment_finished is True
+    assert park_one.segment_generation == 0
     first = plan_partial_stage_output(orchestrator, 1, 0, park_one, req_state, joyai_stage_id=0)
     assert first is not None
     assert first.source_stage_id == 0
     assert "关火" in first.output.text
 
     leftover = _stage0_output("leftover")
-    leftover.is_segment_finished = True
-    leftover.segment_generation = 0
     leftover.outputs[0].token_ids = [2150]
+    _stamp_talker_park(leftover, generation=0)
     assert plan_partial_stage_output(orchestrator, 1, 0, leftover, req_state, joyai_stage_id=0) is None
 
     bridge["closed"] = True
     park_two = _stage0_output("park-2")
-    park_two.is_segment_finished = True
-    park_two.segment_generation = 1
     park_two.outputs[0].token_ids = [2150]
+    _stamp_talker_park(park_two, generation=1)
     second = plan_partial_stage_output(orchestrator, 1, 0, park_two, req_state, joyai_stage_id=0)
     assert second is not None
     assert "还在烧" in second.output.text

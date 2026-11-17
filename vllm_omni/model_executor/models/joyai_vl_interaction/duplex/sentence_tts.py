@@ -35,7 +35,7 @@ import regex as re
 
 from vllm_omni.data_entry_keys import JOYAI_FINISH_ON_NEXT_STOP_KEY
 from vllm_omni.engine.duplex.plugin import PartialStageForward
-from vllm_omni.engine.duplex.sentence_tts import SentenceTtsOutput
+from vllm_omni.engine.duplex.sentence_tts import SentenceTtsOutput, consume_growing_text
 from vllm_omni.entrypoints.openai.speech_text_splitter import SpeechTextSplitter
 from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import (
     DELEGATION_TAG,
@@ -192,15 +192,13 @@ def next_spoken_sentence_chunk(state: dict[str, object], spoken: str, *, finishe
         state["fed_text"] = ""
         state["pending_units"] = []
     pending_units = _pending_units(state)
-    fed = str(state.get("fed_text", ""))
-    if text.startswith(fed):
-        tail = text[len(fed) :]
-    else:
+    delta = consume_growing_text(str(state.get("fed_text", "")), text)
+    if delta.restarted:
         splitter = SpeechTextSplitter("sentence")
         state["splitter"] = splitter
         pending_units.clear()
-        tail = text
-    state["fed_text"] = text
+    state["fed_text"] = delta.seen
+    tail = delta.tail
     if tail:
         pending_units.extend(unit.strip() for unit in splitter.feed(tail) if unit.strip())
     if finished:
