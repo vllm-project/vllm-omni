@@ -306,6 +306,7 @@ steps:
           - tts_audex_weekly
           - tts_cosyvoice3_function
           - tts_qwen3_tts_function
+          - omni_v2_runtime
         timeout_in_minutes: 90
         env:
           VLLM_OMNI_CI_MODEL_RUNNER: "v2"

@@ -626,24 +626,69 @@ E2E model jobs stay one job. A hung command is bounded only by `timeout_in_minut
 - **Always uploaded** (no key): L2 **Simple Test** except **Simple · ROCm R2-01 Collection Count**, plus L2/L3 groups outside **E2E Test** (Diffusion unit tests, Engine/Model Executor, Distributed, Custom Pipeline, Entrypoints on L2, LoRA / Entrypoints on L3).
 - **Diff-gated**: every **E2E Test** leaf job in L2/L3, the L2 **Simple · ROCm R2-01 Collection Count** check (it runs the exact collection guard of the non-blocking AMD READY R2-01 job), L4 nightly leaf jobs (CUDA and NPU), and L5 weekly jobs whose `if` includes the `weekly-test` label (Reliability / Perf). Jobs gated only by `WEEKLY=1`, `NON_CRITICAL=1`, or the nightly **Simple · CPU Coverage Test** (`NIGHTLY=1`) have no `source_file_dependencies`. Registry layout: YAML anchors group model code and shared runtime dependencies. Job keys alias the relevant anchors and **also** list the scripts that job runs (pytest files, `run_cov_split.sh --offline` / `--online` targets, example README runners). Feature keys stay cross-cutting. A **group** may define the key instead; the whole group drops if no prefix matches.
 
-Qwen3-Omni nightly accuracy and performance jobs compose their evaluation key
-with the reusable platform key `ci_cuda`, `ci_npu`, or `ci_rocm`. CUDA jobs also
-compose `omni_v2_runtime` for their V2 and prefix-cache dependencies.
-Other models can opt into a platform key without inheriting these runtime choices.
-Shared scheduling, engine, SHM transport, data contracts, serving, configuration,
-benchmark infrastructure, and test fixtures select both accuracy and performance
-on all three platforms, including the existing CUDA Duplex performance jobs.
-Platform workers, CI images, requirements, build scripts,
-and nightly YAML select the corresponding platform. Accuracy datasets/evaluators
-and performance runners also have their own dependencies; Duplex helpers select
-the existing CUDA Duplex jobs.
+Model accuracy and performance jobs compose dependencies by responsibility:
 
-These are direct dependencies, so a diff containing both `tests/helpers/runtime.py`
-and MiniCPM model code retains Qwen3 accuracy/performance even when another job
-matches. CUDA V2 and prefix-cache dependencies select the existing CUDA jobs;
-selection alone does not add a cache-hit workload or exercise every deploy
-override. Scheduled full uploads still keep every job. Routing regressions live
-in `tests/buildkite/test_qwen3_omni_source_dependencies.py`.
+| Layer | Registry definitions | Selection responsibility |
+| --- | --- | --- |
+| Model | Model anchors and each job's scripts | Model code, deployment profiles, datasets, and the test or benchmark entrypoint. |
+| Shared runtime | `runtime_common`, `omni_runtime`, `diffusion_runtime` anchors | Stage lifecycle, serving and data contracts; AR scheduling and runners; or shared diffusion execution. Include package entrypoints and their eager imports when replacing directory prefixes. Shared diffusion prefixes exclude `diffusion/models/` so editing one model does not select every model. |
+| Measurement | `serving_benchmark`, `accuracy_tests`, `perf_tests`, and speech data anchors | Select the jobs that consume the changed benchmark client, evaluator, or dataset. HunyuanImage3 performance uses the separate `benchmarks/diffusion/` client. |
+| Test infrastructure | `test_infrastructure` anchor | Shared fixtures, hardware marks, runtime helpers, and test configuration. |
+| Platform environment | `ci_cuda`, `ci_npu`, `ci_rocm` keys, each including `ci_common` | Build inputs, platform dispatch, CI images, requirements, and the corresponding nightly YAML. |
+| Runner capability | `omni_gpu_v1_runtime`, `omni_npu_workers`, `omni_v2_runtime`, `npu_omni_v2_worker` keys | Select only the jobs that use those workers. A platform environment does not imply AR V1 or V2 execution. |
+
+The three nightly files compose their model evaluation keys with their platform
+environment. Speech jobs also compose their worker dependencies. CUDA Qwen3-Omni,
+Qwen3-TTS, and MiniCPM evaluations include the shared V2/prefix-cache key.
+MiniCPM's CUDA deployment also has a V1 Talker. MiniCPM NPU evaluations,
+including the A3 two-card job, compose the shared V2 key and Ascend V2 adapter.
+Qwen3-TTS's default NPU deployment also uses MRv2 and composes both keys;
+Qwen3-Omni NPU and ROCm nightly speech evaluations retain V1. NPU worker
+capabilities include the shared `worker/talker_multiframe.py` and NPU-specific
+`talker_narrow_replay.py` paths. Diffusion jobs do not inherit AR workers.
+Eager imports follow the same ownership: `worker_v2/mooncake_capture.py` belongs
+to shared V2 execution, while `worker_v2/ngram_adapter.py` belongs to the NPU V2
+adapter that imports it.
+The same shared runtime anchors protect the existing CUDA model E2E jobs on
+READY/MERGE without adding accuracy or performance tooling to those jobs.
+The CUDA weekly L4 invalid-parameter suite composes both runtime anchors,
+test infrastructure and the worker capabilities used by its deployments:
+Qwen3-TTS uses MRv2, Higgs Audio V3 and Audex TTA use V1, and Stable Audio uses
+diffusion. Its model-specific speech adapters remain direct dependencies.
+The CUDA weekly Qwen3-TTS group explicitly composes the V2 capability selected
+by its CI runner override. AMD's word-timestamp job retains the default ROCm V1
+profile unless an explicit override selects V2. AMD bootstrap source-filters
+only the nightly group in combined uploads and preserves weekly groups intact;
+the weekly metadata probes do not change that admission policy.
+
+CI routing metadata (`ci_source_file_dependencies.yml`, `upload_pipeline.py`,
+and `ci_conditions.py`) is validated by CPU routing tests and is excluded from
+`ci_common`. A registry edit accompanying model code retains that model's
+evaluation selection instead of selecting every platform's model evaluations.
+AMD's existing routing-only fallback still keeps the full admitted nightly for
+registry-only or uploader-only changes; a matching model change disables that
+fallback and narrows selection to the model's consumers.
+
+These are direct dependencies. For example, a diff containing both
+`tests/helpers/runtime.py` and Qwen3 model code retains the other models'
+evaluation jobs even when the Qwen3 match disables fallback. Common runtime
+changes also retain the existing CUDA Qwen3 duplex evaluations. Relevant labeled
+PRs can therefore run more jobs and consume more CI time. Job commands, resource
+requirements, workloads, and numerical baselines remain unchanged; selecting a
+job does not add a cache-hit workload or exercise every deployment override.
+Scheduled full uploads still keep every job.
+
+Dependency values are exact files or directory prefixes, not glob patterns.
+Use `vllm_omni/benchmarks/duplex/`, not a suffix such as `duplex/**`.
+Routing regressions in `tests/buildkite/test_model_source_dependencies.py` and
+`test_qwen3_omni_source_dependencies.py` discover families from the live pipelines,
+cover mixed-model diffs, and check platform/runner isolation without pinning job
+counts. `tests/buildkite/conftest.py` owns their CPU-only platform fixture;
+`source_dependency_helpers.py` loads pipelines and applies production platform
+filters, including the AMD wrapper. Run isolated CPU checks with
+`pytest --confcutdir=tests/buildkite tests/buildkite/` to exclude model fixtures.
+Package-entry regressions exercise function, performance, coverage and weekly
+consumers affected by shared dependency extraction.
 
 ### YAML examples
 
