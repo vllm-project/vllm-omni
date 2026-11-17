@@ -525,6 +525,7 @@ source_file_dependencies:
 
   # Tiny-model diffusion jobs (shared across many model trees under models/).
   diffusion_tiny_model:
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
     - tests/model_tests/diffusion/
     - vllm_omni/diffusion/models/
 
@@ -885,6 +886,7 @@ source_file_dependencies:
     - vllm_omni/deploy/minicpmo_4_5_3gpu_stage1_replicas.yaml
 
   omni_minicpmo_4_5_accuracy:
+    - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
     - *minicpmo_4_5
     - tests/e2e/accuracy/minicpmo_4_5/
 
