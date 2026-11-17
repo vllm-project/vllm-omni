@@ -20,6 +20,7 @@ from vllm_omni.diffusion.data import (
     AttentionConfig,
     AttentionScheduleConfig,
     AttentionSpec,
+    DiffusionBatchingConfig,
     DiffusionOutput,
     DiffusionRequestAbortedError,
     OmniDiffusionConfig,
@@ -34,6 +35,10 @@ from vllm_omni.diffusion.sched import (
     RequestScheduler,
     Scheduler,
     StepScheduler,
+)
+from vllm_omni.diffusion.sched.batching_policy import (
+    ComputeBudgetDiffusionBatchingPolicy,
+    FixedDiffusionBatchingPolicy,
 )
 from vllm_omni.diffusion.sched.interface import CachedRequestData, NewRequestData, SchedulerRequestState
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
@@ -1574,9 +1579,10 @@ class TestRequestScheduler:
         scheduler = RequestScheduler()
         scheduler.initialize(
             _scheduler_config(
-                max_num_seqs=3,
+                max_num_seqs=1,
                 diffusion_batching_config={
                     "policy": "compute_budget",
+                    "compute_unit_budget": 10240,
                 },
             )
         )
@@ -2393,7 +2399,12 @@ class TestStepScheduler:
         scheduler.initialize(
             SimpleNamespace(
                 max_num_seqs=1,
-                diffusion_batching_config={"policy": "compute_budget"},
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                    # Room for exactly one 1024x1024 request, so the aged
+                    # expensive request wins the only slot.
+                    "compute_unit_budget": 4096,
+                },
             )
         )
 
@@ -2478,13 +2489,16 @@ class TestStepScheduler:
         assert _new_ids(second) == [req_cheap]
         assert second.num_waiting_reqs == 1
 
-    def test_compute_budget_batching_caps_1024_requests_from_512_profile(self) -> None:
+    def test_explicit_max_num_seqs_ignores_compute_unit_budget(self) -> None:
+        """max_num_seqs > 1 pins the budget: 128 slots of 512x512 = 131072 units."""
         scheduler = StepScheduler()
         scheduler.initialize(
             SimpleNamespace(
                 max_num_seqs=128,
                 diffusion_batching_config={
                     "policy": "compute_budget",
+                    # Deliberately small: an explicit max_num_seqs must win.
+                    "compute_unit_budget": 2048,
                 },
             )
         )
@@ -2505,20 +2519,19 @@ class TestStepScheduler:
 
         sched_output = scheduler.schedule()
 
-        # Qwen-Image packed latent units:
-        # 512x512 -> (512 / 16)^2 = 1024, profiled budget = 1024 * 10.
-        # 1024x1024 -> (1024 / 16)^2 = 4096. DRR admits by compute-unit sum,
-        # not by ceil(budget / cost) count: 2 * 4096 = 8192 <= 10240, a third
-        # would exceed it.
-        assert _new_ids(sched_output) == req_ids[:2]
-        assert sched_output.num_running_reqs == 2
-        assert sched_output.num_waiting_reqs == 6
+        # User-stated budget: 128 slots * 1024 units = 131072. Qwen-Image
+        # 1024x1024 requests cost (1024 / 16)^2 = 4096 each, so all 8 fit
+        # (8 * 4096 = 32768) even though compute_unit_budget=2048 is tiny.
+        assert _new_ids(sched_output) == req_ids
+        assert sched_output.num_running_reqs == 8
+        assert sched_output.num_waiting_reqs == 0
 
-    def test_compute_budget_batching_keeps_profiled_512_batch_size(self) -> None:
+    def test_unset_max_num_seqs_replaces_default_cap_with_computed_budget(self) -> None:
+        """max_num_seqs=1 (unset) must not pin the batch to one request."""
         scheduler = StepScheduler()
         scheduler.initialize(
             SimpleNamespace(
-                max_num_seqs=128,
+                max_num_seqs=1,
                 diffusion_batching_config={
                     "policy": "compute_budget",
                 },
@@ -2541,6 +2554,8 @@ class TestStepScheduler:
 
         sched_output = scheduler.schedule()
 
+        # compute_unit_budget=10240 and 512x512 -> 1024 units each: the derived
+        # cap of 10 replaces the max_num_seqs=1 sentinel.
         assert _new_ids(sched_output) == req_ids[:10]
         assert sched_output.num_running_reqs == 10
         assert sched_output.num_waiting_reqs == 2
@@ -2572,6 +2587,9 @@ class TestStepScheduler:
 
         sched_output = scheduler.schedule()
 
+        # Explicit max_num_seqs=4 -> budget 4 * 1024 = 4096 units, which also
+        # caps the 8 * 512x512 requests at 4 (compute_unit_budget=10240 is
+        # ignored, otherwise all 8 would fit).
         assert _new_ids(sched_output) == req_ids[:4]
         assert sched_output.num_running_reqs == 4
         assert sched_output.num_waiting_reqs == 4
@@ -2891,6 +2909,37 @@ class TestStepScheduler:
 
         with pytest.raises(ValueError):
             self.scheduler.add_request(request)
+
+
+class TestBatchingPolicyResolution:
+    def _initialize(self, *, enable_mixfusion: bool, policy: str | None = None) -> BaseScheduler:
+        scheduler = StepScheduler()
+        config = DiffusionBatchingConfig() if policy is None else DiffusionBatchingConfig(policy=policy)
+        scheduler.initialize(
+            SimpleNamespace(
+                enable_mixfusion=enable_mixfusion,
+                diffusion_batching_config=config,
+            )
+        )
+        return scheduler
+
+    def test_auto_enables_drr_when_mixfusion_is_on(self) -> None:
+        scheduler = self._initialize(enable_mixfusion=True)
+
+        assert scheduler.batching_config.policy == "compute_budget"
+        assert isinstance(scheduler.batching_policy, ComputeBudgetDiffusionBatchingPolicy)
+
+    def test_auto_keeps_fixed_policy_when_mixfusion_is_off(self) -> None:
+        scheduler = self._initialize(enable_mixfusion=False)
+
+        assert scheduler.batching_config.policy == "fixed"
+        assert isinstance(scheduler.batching_policy, FixedDiffusionBatchingPolicy)
+
+    def test_explicit_fixed_policy_disables_drr_with_mixfusion(self) -> None:
+        scheduler = self._initialize(enable_mixfusion=True, policy="fixed")
+
+        assert scheduler.batching_config.policy == "fixed"
+        assert isinstance(scheduler.batching_policy, FixedDiffusionBatchingPolicy)
 
 
 class TestPendingFinishedRequestIds:

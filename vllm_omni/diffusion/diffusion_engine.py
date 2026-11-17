@@ -409,7 +409,7 @@ class DiffusionEngine:
         ):
             raise ValueError(
                 "diffusion_batching_config policy='compute_budget' (DRR admission) requires "
-                "enable_mixfusion=True. Enable MixFusion, or use the default 'fixed' policy."
+                "enable_mixfusion=True. Enable MixFusion, or use policy='fixed' to disable DRR."
             )
 
         self.step_execution = bool(getattr(od_config, "step_execution", False))
@@ -2213,8 +2213,12 @@ class DiffusionEngine:
         """Auto-calibrate ``compute_unit_budget`` at startup via a ladder sweep.
 
         Preconditions (skip with an INFO log otherwise): step_execution enabled,
-        ``max_num_running_reqs > 1``, and ``warmup_auto_calibrate`` opted in via
-        the diffusion batching config. The sweep forces a ``fixed`` policy so the
+        the resolved policy is DRR (``compute_budget``), ``warmup_auto_calibrate``
+        opted in via the diffusion batching config, and no explicit
+        ``max_num_seqs > 1`` (that value already pins the budget).
+        ``max_num_seqs <= 1`` is the default "unset" sentinel, so the ladder is
+        bounded by ``warmup_profile_max_batch`` and the scheduler cap is raised
+        temporarily for the sweep. The sweep forces a ``fixed`` policy so the
         target ladder batches are not truncated, then applies the sweet-spot batch
         as ``compute_unit_budget = ref_units * B*`` and switches to
         ``compute_budget``. Any failure restores the original policy and never
@@ -2223,17 +2227,25 @@ class DiffusionEngine:
         batching_config = getattr(self.scheduler, "batching_config", None)
         if batching_config is None or not getattr(batching_config, "warmup_auto_calibrate", False):
             return
+        if not getattr(batching_config, "uses_compute_budget", False):
+            logger.info("Warmup batch profile skipped: DRR (compute_budget) policy is not enabled.")
+            return
         if not self.step_execution:
             logger.info("Warmup batch profile skipped: requires step_execution.")
             return
-        max_num_reqs = int(getattr(self.scheduler, "max_num_running_reqs", 1))
-        if max_num_reqs <= 1:
-            logger.info("Warmup batch profile skipped: max_num_running_reqs=%s <= 1.", max_num_reqs)
+        explicit_budget = getattr(self.scheduler, "user_request_budget_units", None)
+        if explicit_budget is not None:
+            logger.info(
+                "Warmup batch profile skipped: explicit max_num_seqs=%s already defines the "
+                "DRR budget (%s compute units).",
+                getattr(self.scheduler, "max_num_running_reqs", 1),
+                explicit_budget,
+            )
             return
 
         start_wall = time.perf_counter()
         deadline = time.monotonic() + float(batching_config.warmup_profile_timeout_s)
-        b_max = min(max_num_reqs, int(batching_config.warmup_profile_max_batch))
+        b_max = max(2, int(batching_config.warmup_profile_max_batch))
         levels = generate_sparse_ladder(b_max)
         ref_h = int(batching_config.warmup_reference_height)
         ref_w = int(batching_config.warmup_reference_width)
@@ -2298,6 +2310,7 @@ class DiffusionEngine:
 
         saved_policy = self.scheduler.batching_policy
         saved_config_policy = batching_config.policy
+        saved_max_num_reqs = int(getattr(self.scheduler, "max_num_running_reqs", 1))
         points: list[dict[str, float]] = []
         stop_reason: str | None = None
         warmup_request_ids: list[str] = []
@@ -2307,6 +2320,9 @@ class DiffusionEngine:
             # batching_config.uses_compute_budget, not the policy object.
             self.scheduler.batching_policy = FixedDiffusionBatchingPolicy()
             batching_config.policy = "fixed"
+            # max_num_seqs <= 1 is the unset sentinel; temporarily lift the
+            # scheduler cap so the ladder batches can actually be admitted.
+            self.scheduler.max_num_running_reqs = b_max
 
             for batch in levels:
                 if time.monotonic() > deadline:
@@ -2397,6 +2413,7 @@ class DiffusionEngine:
             logger.warning("Warmup batch profile failed (%s); restored original policy.", exc, exc_info=True)
             raise
         finally:
+            self.scheduler.max_num_running_reqs = saved_max_num_reqs
             # Never leak warmup requests into the scheduler: a residual request
             # in _running/_waiting with popped state poisons every later
             # schedule() call (KeyError) and kills server startup.

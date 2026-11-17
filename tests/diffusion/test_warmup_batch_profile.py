@@ -197,7 +197,7 @@ def test_config_new_fields_from_dict():
     assert cfg.warmup_auto_calibrate is True
     assert cfg.warmup_profile_max_batch == 64
     assert cfg.warmup_profile_max_step_ms == 1500.0
-    assert cfg.policy == "fixed"
+    assert cfg.policy == "auto"
 
 
 # ---------------------------------------------------------------------------

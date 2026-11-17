@@ -7,7 +7,7 @@ import time
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable
-from dataclasses import fields
+from dataclasses import fields, replace
 from typing import Any
 
 from vllm.config import VllmConfig
@@ -99,6 +99,9 @@ class BaseScheduler(ABC):
         self._running_sampling_params_key: BatchSamplingParamsKey | None = None
         self._finished_req_ids: set[str] = set()
         self.max_num_running_reqs: int = 1
+        # DRR budget pinned by an explicit max_num_seqs (> 1), in compute
+        # units. None means the policy derives the budget itself.
+        self.user_request_budget_units: int | None = None
         self._prefetch_enabled: bool = False
         self._diffusion_kv_manager: DiffusionKVCacheManager | None = None
         self._kv_connector = None
@@ -142,7 +145,11 @@ class BaseScheduler(ABC):
         except (TypeError, ValueError):
             self.max_num_running_reqs = 1
         self.batching_config = self._resolve_batching_config(od_config)
-        self.batching_policy = create_diffusion_batching_policy(self.batching_config)
+        self.user_request_budget_units = self._explicit_request_budget_units()
+        self.batching_policy = create_diffusion_batching_policy(
+            self.batching_config,
+            request_budget_units=self.user_request_budget_units,
+        )
         omni_kv = getattr(od_config, "omni_kv_config", None) or {}
         self._prefetch_enabled = bool(omni_kv.get("enable_kv_async_prefetch", False))
         diffusion_kv_enabled = od_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
@@ -808,10 +815,31 @@ class BaseScheduler(ABC):
     def _resolve_batching_config(self, od_config: OmniDiffusionConfig) -> DiffusionBatchingConfig:
         cfg: Any = getattr(od_config, "diffusion_batching_config", None)
         if isinstance(cfg, DiffusionBatchingConfig):
-            return cfg
-        if isinstance(cfg, dict):
-            return DiffusionBatchingConfig.from_dict(cfg)
-        return DiffusionBatchingConfig()
+            config = cfg
+        elif isinstance(cfg, dict):
+            config = DiffusionBatchingConfig.from_dict(cfg)
+        else:
+            config = DiffusionBatchingConfig()
+        resolved_policy = config.resolve_policy(enable_mixfusion=bool(getattr(od_config, "enable_mixfusion", False)))
+        if resolved_policy != config.policy:
+            logger.info(
+                "Diffusion batching policy 'auto' resolved to %s (enable_mixfusion=%s).",
+                resolved_policy,
+                getattr(od_config, "enable_mixfusion", False),
+            )
+            return replace(config, policy=resolved_policy)
+        return config
+
+    def _explicit_request_budget_units(self) -> int | None:
+        """Return the DRR budget pinned by an explicit ``max_num_seqs > 1``.
+
+        ``max_num_seqs <= 1`` is the default/unset sentinel: the policy computes
+        the budget from ``compute_unit_budget`` (or warmup calibration) instead
+        and replaces the literal cap with the budget-derived request count.
+        """
+        if self.max_num_running_reqs <= 1:
+            return None
+        return self.max_num_running_reqs * self.batching_config.reference_compute_units()
 
     def _effective_max_running_reqs(self, candidate_state: SchedulerRequestState) -> int:
         """Return the request-count cap for the current homogeneous batch."""

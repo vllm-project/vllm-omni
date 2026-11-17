@@ -90,8 +90,23 @@ class FixedDiffusionBatchingPolicy(DiffusionBatchingPolicy):
 class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
     """DRR admission: order by cost-normalized aging, fill a compute budget."""
 
-    def __init__(self, config: DiffusionBatchingConfig) -> None:
+    def __init__(
+        self,
+        config: DiffusionBatchingConfig,
+        *,
+        request_budget_units: int | None = None,
+    ) -> None:
         self.config = config
+        # An explicit ``max_num_seqs > 1`` pins the admission budget to
+        # ``max_num_seqs * reference_compute_units``. None means the scheduler
+        # saw the default/unset ``max_num_seqs <= 1`` sentinel, so the budget
+        # comes from ``compute_unit_budget`` (optionally warmup-calibrated).
+        self.request_budget_units = max(1, int(request_budget_units)) if request_budget_units is not None else None
+
+    def admission_budget(self) -> int:
+        if self.request_budget_units is not None:
+            return self.request_budget_units
+        return self.config.effective_compute_unit_budget()
 
     def admit_waiting(
         self,
@@ -111,7 +126,7 @@ class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
         scheduled_new_reqs: list[Any],
         scheduled_cached_request_ids: list[str],
     ) -> None:
-        budget = self.config.effective_compute_unit_budget()
+        budget = self.admission_budget()
         running_units = self.running_compute_units(scheduler)
         reserve_time = max(0.0, float(self.config.drr_reserve_time_s))
         now = time.perf_counter()
@@ -159,13 +174,13 @@ class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
                 for state in candidates:
                     if state is reserve_state:
                         continue
-                    if len(scheduler._running) >= scheduler.max_num_running_reqs:
-                        break
                     if not scheduler._can_schedule_waiting(state):
                         continue
                     cost = self.request_units(state)
                     if cost > gap:
                         continue
+                    if len(scheduler._running) >= self.max_admissions(scheduler.max_num_running_reqs):
+                        break
                     if scheduler._admit_state(state, scheduled_new_reqs, scheduled_cached_request_ids) == "stalled":
                         break
                     gap -= cost
@@ -182,10 +197,14 @@ class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
         # No aged request is blocked: admit in score order, skipping requests
         # that do not fit so cheaper ones can fill the remaining budget.
         index = 0
-        while index < len(candidates) and len(scheduler._running) < scheduler.max_num_running_reqs:
+        while index < len(candidates):
             head = candidates[index]
             head_cost = self.request_units(head)
-            if running_units + head_cost <= budget and scheduler._can_schedule_waiting(head):
+            if (
+                running_units + head_cost <= budget
+                and len(scheduler._running) < self.max_admissions(scheduler.max_num_running_reqs)
+                and scheduler._can_schedule_waiting(head)
+            ):
                 if scheduler._admit_state(head, scheduled_new_reqs, scheduled_cached_request_ids) == "stalled":
                     break
                 running_units += head_cost
@@ -235,26 +254,41 @@ class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
             units = int(units * float(config.cfg_compute_multiplier))
         return max(1, units)
 
+    def max_admissions(self, hard_cap: int) -> int:
+        """Request-count bound for the budgeted admission loops.
+
+        The compute-unit sum is the real admission constraint, so the count
+        bound only matters when the caller pinned ``max_num_seqs`` explicitly.
+        With an unset ``max_num_seqs <= 1`` sentinel no literal count cap
+        applies; the budget decides how many requests fit.
+        """
+        if self.request_budget_units is not None:
+            return max(1, int(hard_cap))
+        return 1 << 30
+
     def get_max_running_reqs(
         self,
         hard_cap: int,
         candidate_state: SchedulerRequestState,
     ) -> int:
         hard_cap = max(1, int(hard_cap))
-        request_units = self.config.request_compute_units(
-            candidate_state.req.sampling_params,
-            candidate_state.req.prompts,
-        )
-        budget = self.config.effective_compute_unit_budget()
+        request_units = self.request_units(candidate_state)
+        budget = self.admission_budget()
         dynamic_cap = (budget + request_units - 1) // request_units
-        capped = max(1, min(hard_cap, dynamic_cap))
+        if self.request_budget_units is not None:
+            capped = max(1, min(hard_cap, dynamic_cap))
+        else:
+            # ``max_num_seqs <= 1`` is the "unset" sentinel: the computed
+            # budget replaces it as the request-count cap.
+            capped = max(1, dynamic_cap)
 
         if self.config.log_stats:
             logger.info(
-                "[DiffusionBatching] request_compute_units=%s compute_unit_budget=%s "
+                "[DiffusionBatching] request_compute_units=%s budget=%s budget_source=%s "
                 "dynamic_max_num_seqs=%s hard_max_num_seqs=%s effective_max_num_seqs=%s",
                 request_units,
                 budget,
+                "max_num_seqs" if self.request_budget_units is not None else "compute_unit_budget",
                 dynamic_cap,
                 hard_cap,
                 capped,
@@ -291,13 +325,24 @@ class DiffusionBatchProfilerPolicy(DiffusionBatchingPolicy):
         return cap
 
 
-def create_diffusion_batching_policy(config: DiffusionBatchingConfig) -> DiffusionBatchingPolicy:
+def create_diffusion_batching_policy(
+    config: DiffusionBatchingConfig,
+    *,
+    request_budget_units: int | None = None,
+) -> DiffusionBatchingPolicy:
     if config.uses_compute_budget:
-        logger.info(
-            "ComputeBudgetDiffusionBatchingPolicy enabled (compute_unit_budget=%s)",
-            config.effective_compute_unit_budget(),
+        budget_source = "max_num_seqs" if request_budget_units is not None else "compute_unit_budget"
+        budget = (
+            max(1, int(request_budget_units))
+            if request_budget_units is not None
+            else config.effective_compute_unit_budget()
         )
-        return ComputeBudgetDiffusionBatchingPolicy(config)
+        logger.info(
+            "ComputeBudgetDiffusionBatchingPolicy enabled (%s=%s)",
+            budget_source,
+            budget,
+        )
+        return ComputeBudgetDiffusionBatchingPolicy(config, request_budget_units=request_budget_units)
     if config.uses_profiler:
         return DiffusionBatchProfilerPolicy(config)
     return FixedDiffusionBatchingPolicy()
