@@ -50,7 +50,7 @@ class _IdentityFtfy:
 
 
 def _align_wan_prompt_cleaning() -> None:
-    # Omni preserves full-width punctuation, even when ftfy is installed.
+    # Always use identity ftfy, installed or not, to preserve punctuation like Omni.
     wan_i2v_module.ftfy = _IdentityFtfy()
 
 
