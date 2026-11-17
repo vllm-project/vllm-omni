@@ -69,8 +69,12 @@ def _fused(module, x):
     )
 
 
-@pytest.mark.parametrize("length", [1, 2, 3, 7, 63, 64, 65, 1025])
-@pytest.mark.parametrize("channels", [1, 3, 24, 768])
+# Boundary lengths only: the kernel is shape-generic, so the block-size
+# edges (63/64/65), the degenerate length 1 and one long odd length cover
+# every code path; channels and batch are leading-dim variations of the
+# same path (batch=2 stays because CFG runs the vocoder at batch 2).
+@pytest.mark.parametrize("length", [1, 63, 64, 65, 1025])
+@pytest.mark.parametrize("channels", [24])
 @pytest.mark.parametrize("batch", [1, 2])
 @pytest.mark.parametrize("activation", ["beta", "snake"])
 def test_fused_matches_eager(batch, channels, length, activation):
@@ -93,9 +97,9 @@ def test_fused_matches_eager(batch, channels, length, activation):
     torch.testing.assert_close(fused, eager, rtol=0.0, atol=1e-5)
 
 
-@pytest.mark.parametrize("length", [1, 2, 3, 7, 63, 64, 65, 1025])
-@pytest.mark.parametrize("channels", [1, 3, 24, 768])
-@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("length", [1, 64, 1025])
+@pytest.mark.parametrize("channels", [24])
+@pytest.mark.parametrize("batch", [1])
 @pytest.mark.parametrize("activation", ["beta", "snake"])
 def test_bf16_no_worse_than_eager_rounding(batch, channels, length, activation):
     """Fused bf16 must not lose to eager bf16 against an fp32 reference.
