@@ -470,7 +470,7 @@ class PinnedModuleStager:
         self._nz_mode = weight_nz.get_weight_nz_mode()
         self._nz_masters: dict[torch.Tensor, torch.Tensor] = {}
         self._nz_host_weights: dict[torch.Tensor, torch.Tensor] = {}
-        if self._nz_mode is not None:
+        if self._nz_mode in ("cast", "reactor"):
             for item in modules:
                 for name in weight_nz.int8_weight_names(item):
                     target = item.get_parameter(name)

@@ -129,14 +129,6 @@ Packing preserves each parameter and buffer's physical layout, including
 strides. Loader-provided transforms may change strides but must preserve dtype
 and shape; invalid transforms raise before the source weights are released.
 
-On NPU, `VLLM_OMNI_NPU_INT8_WEIGHT_NZ=1` optionally changes finalized online
-and offline INT8 linear weights to FRACTAL_NZ. The default `reactor` mode packs
-NZ bytes on CPU, includes their padded size in transport buffers, and binds an
-NZ view after upload and any AllGather. `VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE=cast`
-instead converts after each upload. Both paths leave scales unchanged and
-restore ordinary CPU weights when DLO is disabled. These options do not enable
-DLO; weights outside offload ownership are converted once after placement.
-
 ```text
 Compute:    [Block N]             [Block N+1]          [Block N+2]
 H2D:                      [shard N+1]           [shard N+2]
@@ -160,6 +152,37 @@ rank-local transfer path described below.
 When DP is greater than one, the engine can process one request per DP rank in
 the same denoising wave. Because AllGather is a collective, all participating
 requests must take the same execution path at every denoising step.
+
+### NPU INT8 weight layout
+
+`VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE` controls the layout of weights from NPU
+INT8 linear layers. It applies after loading and quantization, so resident
+weights can come from an INT8 checkpoint or from online quantization. Scales,
+biases and floating-point weights keep their original layout. Other platforms
+ignore this setting. On NPU, an unknown value raises `ValueError`. A model
+without eligible weights can use any of the four modes.
+
+The default `auto` converts resident weights to `FRACTAL_NZ` once on Ascend
+A2/A3 devices with a 910B, 910C or 910_93 SoC when internal formats are
+enabled and the runtime provides NZ allocation. With `enable_sleep_mode=True`,
+`auto` preserves the resident layout so sleep can reclaim the `weights` pool.
+Ordinary model-level and layer-wise CPU offload keep their existing layout.
+
+For DLO, `auto` selects `reactor` for the streamed MiniMax-H3 DiT stacks
+`blocks` and `token_refiner.blocks` when online INT8 weights use the ordinary
+loader, pinned host memory and multi-rank AllGather. Every participating rank
+must have an Ascend 910B4-1, `torch_npu`
+2.10.0.post4 (local build suffixes are accepted), internal formats enabled and
+a working NZ view over the transfer buffer. Leading resident blocks retain ND.
+Other DLO paths keep the ordinary layout, including mmap sources, rank-local
+transfers and staged components.
+
+Set the mode to `off` to disable conversion. To force an upload path, use
+`cast` to convert on device after each upload or `reactor` to pack padded NZ
+bytes on the host and bind an NZ view after transfer. Both explicit modes
+convert resident weights once. Disabling DLO restores ordinary CPU weights.
+Forcing either mode with ordinary CPU offload raises an error when the model
+contains eligible weights.
 
 ### Rank-local path without DLO AllGather
 

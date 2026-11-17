@@ -166,9 +166,11 @@ def enable_offload_backend(
     host plans and optional fresh-model recovery callbacks stay inside the
     startup state consumed here.
     """
-    from vllm_omni.quantization.npu_int8_weight_nz import get_weight_nz_mode, prepare_resident_weights
-
-    nz_mode = get_weight_nz_mode()
+    from vllm_omni.quantization.npu_int8_weight_nz import (
+        get_weight_nz_mode,
+        int8_weight_names,
+        prepare_resident_weights,
+    )
 
     def enable_once(model: torch.nn.Module, state: OffloadStartupState | None) -> OffloadBackend | None:
         backend: OffloadBackend | None = None
@@ -178,18 +180,17 @@ def enable_offload_backend(
                 device=device,
                 host_weight_plan=state.host_weight_plan if state is not None else None,
             )
-            if (
-                nz_mode is not None
-                and backend is not None
-                and not isinstance(backend, DistributedLayerwiseOffloadBackend)
-            ):
+            supports_nz = backend is None or isinstance(backend, DistributedLayerwiseOffloadBackend)
+            if not supports_nz and get_weight_nz_mode() in ("cast", "reactor") and int8_weight_names(model):
                 raise ValueError("NPU INT8 weight NZ supports resident weights and distributed layerwise offload")
             if backend is not None:
                 logger.info("Enabling offloader backend: %s", backend.__class__.__name__)
                 backend.enable(model)
             elif state is not None:
                 state.close_loader_ownership()
-            if nz_mode is not None:
+            resident_mode = get_weight_nz_mode() if supports_nz else None
+            # Sleep can reclaim only weights allocated inside the loader's memory pool.
+            if resident_mode is not None and not (resident_mode == "auto" and od_config.enable_sleep_mode):
                 owned = (
                     backend.weight_nz_owned_parameter_ids()
                     if isinstance(backend, DistributedLayerwiseOffloadBackend)

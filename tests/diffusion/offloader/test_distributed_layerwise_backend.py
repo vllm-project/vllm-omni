@@ -2956,6 +2956,107 @@ class _GenericDistributedEncoderPipeline(nn.Module):
 
 
 class TestDistributedComponentSelection:
+    @pytest.fixture
+    def nz_backend(self, patched_offload_runtime, mocker):
+        config = OffloadConfig(strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE, dp_size=2)
+        backend = DistributedLayerwiseOffloadBackend(config, torch.device("cpu"))
+        backend.device = SimpleNamespace(type="npu")
+        backend.dp_group = object()
+        backend._dp_cpu_group = object()
+        mocker.patch.object(dist_backend_module.npu_int8_weight_nz, "get_weight_nz_mode", return_value="auto")
+        return backend
+
+    @pytest.fixture
+    def h3_pipeline(self):
+        class Pipeline(nn.Module):
+            dlo_auto_nz_block_paths = ("transformer.blocks", "transformer.token_refiner.blocks")
+
+        pipeline = Pipeline()
+        pipeline.transformer = _SingleBlockModel(num_blocks=2)
+        pipeline.transformer.token_refiner = _SingleBlockModel(num_blocks=2)
+        return pipeline
+
+    @pytest.mark.parametrize("peer_supports_reactor", [True, False])
+    def test_auto_nz_agrees_before_packing_only_online_dit_weights(
+        self, nz_backend, h3_pipeline, mocker, peer_supports_reactor
+    ):
+        from vllm_omni.quantization.int8_config import NPUInt8LinearMethod, NPUInt8OnlineLinearMethod
+
+        dit = h3_pipeline.transformer
+        for stack in (dit.blocks, dit.token_refiner.blocks):
+            for block, method in zip(stack, (NPUInt8OnlineLinearMethod, NPUInt8LinearMethod), strict=True):
+                block.weight = nn.Parameter(torch.ones(17, 33, dtype=torch.int8), requires_grad=False)
+                block.quant_method = mocker.Mock(spec=method)
+        mocker.patch.object(dist_backend_module.npu_int8_weight_nz, "auto_reactor_available", return_value=True)
+
+        def gather(votes, local, group):
+            assert group is nz_backend._dp_cpu_group
+            mode, signature, error = local
+            assert mode == "auto" and signature and error is None
+            votes[:] = [local, local if peer_supports_reactor else (mode, None, None)]
+
+        gather_op = mocker.patch.object(dist, "all_gather_object", side_effect=gather)
+        ids = nz_backend._agree_auto_nz_weights(h3_pipeline)
+        nz_backend.device = torch.device("cpu")
+        mocker.patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor)
+        nz_backend._install_hook_group(dit.blocks, "dit", auto_weight_ids=ids)
+        component = ResolvedComponent(
+            path="transformer.token_refiner",
+            module=dit.token_refiner,
+            selected=True,
+            stacks=(plan_resolver.BlockStack(tuple(dit.token_refiner.blocks), attrs=("blocks",)),),
+        )
+        nz_backend._offload_nested_submodule(component, ids)
+        assert len(nz_backend._all_hook_groups) == 2
+        for hooks in nz_backend._all_hook_groups:
+            first, second = (hook.metadata[torch.int8][0] for hook in hooks)
+            assert (first.get("weight_nz"), first["numel"]) == (
+                ("reactor", 2048) if peer_supports_reactor else (None, 561)
+            )
+            assert "weight_nz" not in second and second["numel"] == 561
+        gather_op.assert_called_once()
+
+    @pytest.mark.parametrize("exclusion", ["other_model", "unpinned", "rank_local", "mmap"])
+    def test_auto_nz_skips_unverified_routes(self, nz_backend, h3_pipeline, mocker, exclusion):
+        pipeline = nn.Module() if exclusion == "other_model" else h3_pipeline
+        if exclusion == "unpinned":
+            nz_backend.config.pin_cpu_memory = False
+        elif exclusion == "rank_local":
+            nz_backend.config = OffloadConfig(strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE, dlo_use_allgather=False)
+        elif exclusion == "mmap":
+            nz_backend.host_weight_plan = object()
+        probe = mocker.patch.object(dist_backend_module.npu_int8_weight_nz, "auto_reactor_available")
+
+        def gather(votes, local, group):
+            votes[:] = [local, local]
+
+        vote = mocker.patch.object(dist, "all_gather_object", side_effect=gather)
+        assert not nz_backend._agree_auto_nz_weights(pipeline)
+        assert vote.call_count == int(exclusion == "mmap")
+        probe.assert_not_called()
+
+    def test_auto_nz_reports_probe_error_to_peers(self, nz_backend, h3_pipeline, mocker):
+        mocker.patch.object(nz_backend, "_auto_nz_weights", side_effect=torch.OutOfMemoryError("probe OOM"))
+
+        def gather(votes, local, group):
+            assert "probe OOM" in local[2]
+            votes[:] = [local, ("auto", None, None)]
+
+        vote = mocker.patch.object(dist, "all_gather_object", side_effect=gather)
+        with pytest.raises(torch.OutOfMemoryError, match="probe OOM"):
+            nz_backend._agree_auto_nz_weights(h3_pipeline)
+        vote.assert_called_once()
+
+    def test_explicit_off_still_checks_peer_mode(self, nz_backend, h3_pipeline, mocker):
+        mocker.patch.object(dist_backend_module.npu_int8_weight_nz, "get_weight_nz_mode", return_value=None)
+
+        def gather(votes, local, group):
+            votes[:] = [local, ("auto", None, None)]
+
+        mocker.patch.object(dist, "all_gather_object", side_effect=gather)
+        with pytest.raises(ValueError, match="mode must match"):
+            nz_backend._agree_auto_nz_weights(h3_pipeline)
+
     def test_on_demand_only_encoder_cannot_claim_allgather(self, patched_offload_runtime):
         class Pipeline(nn.Module):
             _offload_plan = OffloadPlan(

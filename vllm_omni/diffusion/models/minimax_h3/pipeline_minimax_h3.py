@@ -714,6 +714,7 @@ class MiniMaxH3Pipeline(
     supports_request_cancellation: ClassVar[bool] = True
 
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformers_ref"]
+    dlo_auto_nz_block_paths: ClassVar[tuple[str, ...]] = ("transformer.blocks", "transformer.token_refiner.blocks")
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["video_vae", "audio_vae"]
     _offload_plan: ClassVar[OffloadPlan] = OffloadPlan(

@@ -507,14 +507,30 @@ def test_npu_int8_resident_weight_nz(mocker: MockerFixture, monkeypatch: pytest.
 
     npu.empty_with_format.side_effect = empty_with_format
     npu.get_npu_format.side_effect = lambda weight: formats.get(weight.data_ptr(), 2)
+    npu.npu.get_device_name.return_value = "Ascend910B4-1"
+    npu._C._npu_getOption.return_value = b"enable"
     npu_device = mocker.Mock(type="npu")
-    monkeypatch.delenv("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE", raising=False)
     with monkeypatch.context() as npu_tensors:
         npu_tensors.setattr(torch.Tensor, "device", property(lambda _: npu_device))
-        monkeypatch.delenv("VLLM_OMNI_NPU_INT8_WEIGHT_NZ", raising=False)
+        monkeypatch.setenv("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE", "off")
         prepare_resident_weights(model, excluded_parameter_ids=frozenset())
         npu.empty_with_format.assert_not_called()
-        monkeypatch.setenv("VLLM_OMNI_NPU_INT8_WEIGHT_NZ", "1")
+        monkeypatch.delenv("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE")
+        npu._C._npu_getOption.return_value = b"disable"
+        prepare_resident_weights(model)
+        npu.empty_with_format.assert_not_called()
+        npu._C._npu_getOption.return_value = b"enable"
+        # Some runtimes accept the allocation request but return ordinary storage.
+        npu.empty_with_format.side_effect = lambda shape, **_: torch.empty(shape, dtype=torch.int8)
+        original_ptr = layer.weight.data_ptr()
+        prepare_resident_weights(model)
+        assert layer.weight.data_ptr() == original_ptr
+        monkeypatch.setenv("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE", "cast")
+        with pytest.raises(RuntimeError, match="allow_internal_format"):
+            prepare_resident_weights(model)
+        monkeypatch.delenv("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE")
+        npu.empty_with_format.reset_mock()
+        npu.empty_with_format.side_effect = empty_with_format
         prepare_resident_weights(model, excluded_parameter_ids=frozenset())
         prepare_resident_weights(model, excluded_parameter_ids=frozenset())
 
@@ -537,6 +553,78 @@ def test_npu_int8_resident_weight_nz(mocker: MockerFixture, monkeypatch: pytest.
         quantized_x, layer.weight, scale, bias=None, pertoken_scale=pertoken_scale, output_dtype=x.dtype
     )
     assert output.shape == (1, 2, 64)
+
+
+@pytest.mark.parametrize("sleep_mode", [False, True])
+def test_npu_int8_auto_respects_sleep_weight_pool(mocker, monkeypatch, sleep_mode):
+    from vllm_omni.diffusion import offloader
+    from vllm_omni.quantization import npu_int8_weight_nz as nz
+
+    model = Module()
+    config = mocker.Mock(enable_sleep_mode=sleep_mode)
+    mocker.patch.object(offloader, "get_offload_backend", return_value=None)
+    mocker.patch.object(current_omni_platform, "is_npu", return_value=True)
+    prepare = mocker.patch.object(nz, "prepare_resident_weights")
+    monkeypatch.delenv("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE", raising=False)
+    assert offloader.enable_offload_backend(config, model) == (model, None)
+    assert prepare.called is not sleep_mode
+
+
+@pytest.mark.parametrize("mode,quantized", [("auto", True), ("reactor", False), ("cast", True)])
+def test_npu_int8_nz_ordinary_offload(mocker, monkeypatch, mode, quantized):
+    from vllm_omni.diffusion import offloader
+    from vllm_omni.quantization import npu_int8_weight_nz as nz
+    from vllm_omni.quantization.int8_config import NPUInt8LinearMethod
+
+    model = torch.nn.Linear(4, 4)
+    if quantized:
+        model.quant_method = mocker.Mock(spec=NPUInt8LinearMethod)
+    backend = mocker.Mock(spec=offloader.LayerWiseOffloadBackend)
+    mocker.patch.object(offloader, "get_offload_backend", return_value=backend)
+    mocker.patch.object(current_omni_platform, "is_npu", return_value=True)
+    prepare = mocker.patch.object(nz, "prepare_resident_weights")
+    monkeypatch.setenv("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE", mode)
+
+    if mode != "auto" and quantized:
+        with pytest.raises(ValueError, match="distributed layerwise offload"):
+            offloader.enable_offload_backend(mocker.Mock(), model)
+        backend.enable.assert_not_called()
+    else:
+        assert offloader.enable_offload_backend(mocker.Mock(), model) == (model, backend)
+        backend.enable.assert_called_once_with(model)
+    prepare.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "soc,version,expected",
+    [
+        ("Ascend910B4-1", "2.10.0.post4+build", True),
+        ("Ascend910B1", "2.10.0.post4", False),
+        ("Ascend910B4-1", "2.10.0.post5", False),
+    ],
+)
+def test_npu_int8_auto_reactor_runtime(mocker, soc, version, expected):
+    from vllm_omni.quantization import npu_int8_weight_nz as nz
+
+    npu = mocker.Mock(__version__=version)
+    npu.npu.get_device_name.return_value = soc
+    npu._C._npu_getOption.return_value = b"enable"
+    mocker.patch.dict("sys.modules", {"torch_npu": npu})
+    probe = mocker.patch.object(nz, "_reactor_descriptor_supported", return_value=True)
+    assert nz.auto_reactor_available() is expected
+    assert probe.called is expected
+
+
+def test_npu_int8_reactor_checks_current_internal_format_option(mocker):
+    from vllm_omni.quantization import npu_int8_weight_nz as nz
+
+    npu = mocker.Mock()
+    npu._C._npu_getOption.return_value = b"disable"
+    mocker.patch.dict("sys.modules", {"torch_npu": npu})
+    probe = mocker.patch.object(nz, "_reactor_descriptor_supported", return_value=True)
+    with pytest.raises(RuntimeError, match="allow_internal_format"):
+        nz.check_reactor_support()
+    probe.assert_not_called()
 
 
 @npu_available

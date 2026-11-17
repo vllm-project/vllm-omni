@@ -18,6 +18,7 @@ This module implements the RFC-1 "Distributed Layerwise Offload" mechanism that:
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 import weakref
@@ -78,8 +79,15 @@ from .tensor_utils import (
 logger = init_logger(__name__)
 
 
-def _weight_nz_policy(module: nn.Module) -> tuple[str | None, frozenset[str]]:
+def _weight_nz_policy(
+    module: nn.Module, auto_weight_ids: frozenset[int] = frozenset()
+) -> tuple[str | None, frozenset[str]]:
     mode = npu_int8_weight_nz.get_weight_nz_mode()
+    if mode == "auto":
+        if not auto_weight_ids:
+            return None, frozenset()
+        names = frozenset(name for name, weight in module.named_parameters() if id(weight) in auto_weight_ids)
+        return ("reactor" if names else None), names
     names = frozenset(npu_int8_weight_nz.int8_weight_names(module)) if mode is not None else frozenset()
     if names and mode == "reactor":
         npu_int8_weight_nz.check_reactor_support()
@@ -167,6 +175,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         tensor_transforms: dict[int, Any] | None = None,
         materialization_probe_tensor: torch.Tensor | None = None,
         chunk_size_bytes: int = 64 * 1024 * 1024,
+        auto_weight_ids: frozenset[int] = frozenset(),
     ):
         assert isinstance(next_block, nn.Module), "transformer block must be type `torch.nn.Module`"
         if type(dp_size) is not int or dp_size < 1:
@@ -187,7 +196,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.rank_local_mmap = rank_local_mmap
         self.registered_mmap = False
         self.tensor_transforms = tensor_transforms or {}
-        self._nz_mode, self._nz_names = _weight_nz_policy(next_block)
+        self._nz_mode, self._nz_names = _weight_nz_policy(next_block, auto_weight_ids)
         # Pointer-backed NZ views must not outlive the device slot they borrow.
         self._nz_keepalive: dict[torch.dtype, torch.Tensor] | None = None
 
@@ -965,6 +974,7 @@ def apply_distributed_block_hook(
     tensor_transforms: dict[int, Any] | None = None,
     materialization_probe_tensor: torch.Tensor | None = None,
     chunk_size_bytes: int = 64 * 1024 * 1024,
+    auto_weight_ids: frozenset[int] = frozenset(),
 ) -> DistributedLayerwiseOffloadHook:
     """Register a DistributedLayerwiseOffloadHook on *module*."""
     registry = HookRegistry.get_or_create(module)
@@ -982,6 +992,7 @@ def apply_distributed_block_hook(
         tensor_transforms=tensor_transforms,
         materialization_probe_tensor=materialization_probe_tensor,
         chunk_size_bytes=chunk_size_bytes,
+        auto_weight_ids=auto_weight_ids,
     )
     registry.register_hook(DistributedLayerwiseOffloadHook._HOOK_NAME, hook)
     return hook
@@ -1230,6 +1241,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self.copy_stream = current_omni_platform.Stream()
         self.comm_stream = current_omni_platform.Stream()
         self.dp_group: torch.distributed.ProcessGroup | None = None
+        self._dp_cpu_group: torch.distributed.ProcessGroup | None = None
         self.dp_size = config.dp_size
         self.rank = 0
         self._blocks: list[list[nn.Module]] = []
@@ -1637,6 +1649,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             )
 
         self.dp_group = coord.device_group
+        self._dp_cpu_group = coord.cpu_group
         self.rank = coord.rank_in_group
         self.dp_size = coord.world_size
 
@@ -1660,12 +1673,75 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         components = self.config.components or frozenset({DIT_COMPONENT})
         return self.dp_size > 1 and any(self.config.uses_allgather(component) for component in components)
 
+    def _auto_nz_weights(self, pipeline: nn.Module, block_paths: tuple[str, ...]) -> dict[str, nn.Parameter]:
+        if self.host_weight_plan is not None:
+            return {}
+        weights = {}
+        for path in block_paths:
+            try:
+                blocks = pipeline.get_submodule(path)
+            except AttributeError:
+                continue  # This partition has no local weights at the declared path.
+            for name in npu_int8_weight_nz.int8_weight_names(blocks, online_only=True):
+                weights[f"{path}.{name}"] = blocks.get_parameter(name)
+        return weights if weights and npu_int8_weight_nz.auto_reactor_available() else {}
+
+    def _agree_auto_nz_weights(self, pipeline: nn.Module) -> frozenset[int]:
+        # Group-wide model and transport settings only. Host backing, selected
+        # tensors and runtime capabilities can differ locally and must be voted on.
+        block_paths = vars(type(pipeline)).get("dlo_auto_nz_block_paths")
+        if (
+            self.device.type != "npu"
+            or self.dp_group is None
+            or self.dp_size <= 1
+            or not block_paths
+            or not self.config.offloads(DIT_COMPONENT)
+            or not self.config.uses_allgather(DIT_COMPONENT)
+            or not self.config.pin_cpu_memory
+        ):
+            return frozenset()
+        assert self._dp_cpu_group is not None
+
+        # Every member votes before rank-local hook setup, including ranks that
+        # opt out. Exchange one signature across exactly the weight-sharding group.
+        mode = None
+        signature = None
+        weights: dict[str, nn.Parameter] = {}
+        error = None
+        try:
+            mode = npu_int8_weight_nz.get_weight_nz_mode()
+            if mode == "auto":
+                weights = self._auto_nz_weights(pipeline, block_paths)
+                if weights:
+                    signature = hashlib.sha256("\n".join(sorted(weights)).encode()).digest()
+        except Exception as exc:
+            error = exc
+
+        votes: list[Any] = [None] * self.dp_size
+        torch.distributed.all_gather_object(
+            votes, (mode, signature, repr(error) if error is not None else None), group=self._dp_cpu_group
+        )
+        for rank, (_, _, failure) in enumerate(votes):
+            if failure is not None:
+                if error is not None:
+                    raise error
+                raise RuntimeError(f"DLO INT8 NZ capability check failed on group rank {rank}: {failure}")
+        if any(peer_mode != mode for peer_mode, _, _ in votes):
+            raise ValueError("DLO INT8 NZ mode must match on all ranks in the AllGather group")
+        if mode == "auto":
+            if any(peer_signature != signature for _, peer_signature, _ in votes):
+                weights.clear()
+            if not weights and self.rank == 0:
+                logger.info("DLO auto kept streamed INT8 weights in ND across %d ranks", self.dp_size)
+        return frozenset(id(weight) for weight in weights.values())
+
     def _install_hook_group(
         self,
         blocks: Sequence[nn.Module] | nn.ModuleList,
         component: str,
         *,
         use_dit_mmap: bool = False,
+        auto_weight_ids: frozenset[int] = frozenset(),
     ) -> list[DistributedLayerwiseOffloadHook]:
         """Install one circular block ring with the shared slot protocol."""
         block_list = list(blocks)
@@ -1698,6 +1774,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     tensor_transforms=self._mmap_transforms_by_tensor_id if use_dit_mmap else None,
                     materialization_probe_tensor=probes[id(block)],
                     chunk_size_bytes=self.config.chunk_size_bytes,
+                    auto_weight_ids=auto_weight_ids,
                 )
             )
 
@@ -1746,7 +1823,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         )
         return True
 
-    def _offload_nested_submodule(self, component: ResolvedComponent) -> None:
+    def _offload_nested_submodule(self, component: ResolvedComponent, auto_weight_ids: frozenset[int]) -> None:
         """Stream one resolved DiT submodule through its own hook ring."""
         stack = component.stacks[0]
         logger.info(
@@ -1760,12 +1837,13 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # Keep the submodule's own non-block state resident by block identity,
         # so an attribute aliasing a streamed block is not placed with it.
         move_non_block_state_to_device(component.module, (stack.blocks,), self.device)
-        self._install_hook_group(stack.blocks, DIT_COMPONENT, use_dit_mmap=True)
+        self._install_hook_group(stack.blocks, DIT_COMPONENT, use_dit_mmap=True, auto_weight_ids=auto_weight_ids)
 
     def _prepare_dit_non_block_modules(
         self,
         component: ResolvedComponent,
         stack: BlockStack,
+        auto_weight_ids: frozenset[int] = frozenset(),
     ) -> None:
         """Place or hook the DiT parts that are outside its repeated blocks.
 
@@ -1786,7 +1864,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 if not child.selected:
                     logger.info("Submodule '%s' is already a DiT module, skipping layerwise offload", name)
                 elif child.stacks:
-                    self._offload_nested_submodule(child)
+                    self._offload_nested_submodule(child, auto_weight_ids)
                 else:
                     prepare_component(
                         child.module,
@@ -1859,6 +1937,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # Initialize DP group (if not already done by early init)
         if self.dp_group is None and self._has_multirank_allgather():
             self._init_dp_group()
+        auto_weight_ids = self._agree_auto_nz_weights(pipeline)
 
         # One resolver call validates the whole topology; an explicit selection
         # has already failed by the time any of the checks below run.
@@ -1952,13 +2031,13 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     len(streaming),
                 )
 
-            self._prepare_dit_non_block_modules(component, stack)
+            self._prepare_dit_non_block_modules(component, stack, auto_weight_ids)
 
             if not streaming:
                 logger.info("All blocks for %s are resident; no streaming hooks required", component.path)
                 continue
 
-            self._install_hook_group(streaming, DIT_COMPONENT, use_dit_mmap=True)
+            self._install_hook_group(streaming, DIT_COMPONENT, use_dit_mmap=True, auto_weight_ids=auto_weight_ids)
         if self._resident_blocks:
             self._resident_layer_group = PinnedResidentLayerGroup(
                 self._resident_blocks,
@@ -1973,6 +2052,12 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             self._residency_pipeline_ref = weakref.ref(pipeline)
 
         all_hooks = [hook for group in self._all_hook_groups for hook in group]
+        if auto_weight_ids and self.rank == 0:
+            logger.info(
+                "DLO auto selected reactor for %d streamed INT8 weights across %d ranks",
+                sum(len(hook._nz_names) for hook in all_hooks),
+                self.dp_size,
+            )
         self._configure_hwr_transfer(all_hooks)
 
         if not self._all_hook_groups:

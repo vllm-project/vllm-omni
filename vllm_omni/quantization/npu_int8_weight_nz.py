@@ -21,27 +21,65 @@ _COL_BLOCK = 32
 
 
 def get_weight_nz_mode() -> str | None:
-    """Resolve the opt-in once per storage owner, without enabling offload."""
+    """Read the requested layout policy; each storage owner resolves auto."""
     from vllm_omni.diffusion import envs
 
-    if not envs.VLLM_OMNI_NPU_INT8_WEIGHT_NZ or not current_omni_platform.is_npu():
+    if not current_omni_platform.is_npu():
         return None
     mode = envs.VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE.strip().lower()
-    if mode not in ("cast", "reactor"):
-        raise ValueError("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE must be 'cast' or 'reactor'")
+    if mode == "off":
+        return None
+    if mode not in ("auto", "cast", "reactor"):
+        raise ValueError("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE must be 'auto', 'off', 'cast' or 'reactor'")
     return mode
 
 
-def int8_weight_names(model: nn.Module) -> set[str]:
-    """Select weights owned by NPU INT8 methods, including the online subclass."""
-    from vllm_omni.quantization.int8_config import NPUInt8LinearMethod
+def _internal_format_enabled() -> bool:
+    import torch_npu
 
+    get_option = getattr(getattr(torch_npu, "_C", None), "_npu_getOption", None)
+    return get_option is not None and get_option("ALLOW_INTERNAL_FORMAT") == b"enable"
+
+
+def _auto_cast_available(device: torch.device) -> bool:
+    import torch_npu
+
+    # A2/A3 accept the finalized [K, N] right operand in FRACTAL_NZ.
+    soc = torch_npu.npu.get_device_name(device).lower()
+    return (
+        soc.startswith(("ascend910b", "ascend910c", "ascend910_93"))
+        and _internal_format_enabled()
+        and callable(getattr(torch_npu, "empty_with_format", None))
+        and callable(getattr(torch_npu, "get_npu_format", None))
+    )
+
+
+def auto_reactor_available() -> bool:
+    """Limit automatic use of the borrowed-storage API to the validated runtime."""
+    import torch_npu
+
+    return (
+        torch_npu.npu.get_device_name() == "Ascend910B4-1"
+        and getattr(torch_npu, "__version__", "").partition("+")[0] == "2.10.0.post4"
+        and _internal_format_enabled()
+        and _reactor_descriptor_supported(torch_npu.npu.current_device())
+    )
+
+
+def int8_weight_names(model: nn.Module, *, online_only: bool = False) -> set[str]:
+    """Select finalized NPU INT8 linear weights, optionally only online weights."""
+    from vllm_omni.quantization.int8_config import NPUInt8LinearMethod, NPUInt8OnlineLinearMethod
+
+    method = NPUInt8OnlineLinearMethod if online_only else NPUInt8LinearMethod
     return {
         f"{name}.weight" if name else "weight"
         for name, layer in model.named_modules()
-        if isinstance(getattr(layer, "quant_method", None), NPUInt8LinearMethod)
-        and layer._parameters.get("weight") is not None
+        if isinstance(getattr(layer, "quant_method", None), method) and layer._parameters.get("weight") is not None
     }
+
+
+class _NZFormatUnavailableError(RuntimeError):
+    """The allocator returned ordinary storage after a request for NZ."""
 
 
 def cast_weight_to_nz(weight: torch.Tensor) -> torch.Tensor:
@@ -53,20 +91,30 @@ def cast_weight_to_nz(weight: torch.Tensor) -> torch.Tensor:
     result = torch_npu.empty_with_format(
         tuple(weight.shape), dtype=weight.dtype, device=weight.device, acl_format=_NZ_FORMAT
     )
-    result.copy_(weight)
     if torch_npu.get_npu_format(result) != _NZ_FORMAT:
-        raise RuntimeError("INT8 weight NZ requires torch.npu.config.allow_internal_format=True")
+        raise _NZFormatUnavailableError("INT8 weight NZ requires torch.npu.config.allow_internal_format=True")
+    result.copy_(weight)
     return result
 
 
 def prepare_resident_weights(model: nn.Module, excluded_parameter_ids: Set[int] = frozenset()) -> None:
     """Cast finalized resident weights, leaving offloader-owned parameters alone."""
-    if get_weight_nz_mode() is None:
+    mode = get_weight_nz_mode()
+    if mode is None:
         return
+    # Query each device at most once per model load, after finding an eligible weight.
+    auto_cast_available = cache(_auto_cast_available)
     for name in int8_weight_names(model):
         weight = model.get_parameter(name)
-        if id(weight) not in excluded_parameter_ids and weight.device.type == "npu":
+        if id(weight) in excluded_parameter_ids or weight.device.type != "npu":
+            continue
+        if mode == "auto" and not auto_cast_available(weight.device):
+            continue
+        try:
             weight.data = cast_weight_to_nz(weight.data)
+        except _NZFormatUnavailableError:
+            if mode != "auto":
+                raise
 
 
 def nz_storage_numel(shape: Sequence[int]) -> int:
@@ -128,14 +176,26 @@ def nz_view(buffer: torch.Tensor, offset: int, shape: Sequence[int]) -> torch.Te
 
 
 @cache
-def check_reactor_support() -> None:
-    """Check the private storage API once before preparing reactor host bytes."""
+def _reactor_descriptor_supported(device_index: int) -> bool:
     import torch_npu
 
+    if not all(
+        callable(getattr(torch_npu._C, name, None))
+        for name in ("_construct_storage_from_data_pointer", "_construct_NPU_Tensor_From_Storage_And_Metadata")
+    ) or not callable(getattr(torch_npu, "get_npu_format", None)):
+        return False
+    buffer = torch.zeros(_ROW_BLOCK * _COL_BLOCK, dtype=torch.int8, device=torch.device("npu", device_index))
     try:
-        buffer = torch.zeros(_ROW_BLOCK * _COL_BLOCK, dtype=torch.int8, device="npu")
-        if torch_npu.get_npu_format(nz_view(buffer, 0, (_ROW_BLOCK, _COL_BLOCK))) == _NZ_FORMAT:
-            return
-    except (AttributeError, RuntimeError) as exc:
-        raise RuntimeError("INT8 NZ reactor is unavailable on this torch_npu; select NZ mode 'cast'") from exc
-    raise RuntimeError("INT8 NZ reactor requires internal-format support; select NZ mode 'cast'")
+        return torch_npu.get_npu_format(nz_view(buffer, 0, (_ROW_BLOCK, _COL_BLOCK))) == _NZ_FORMAT
+    except (NotImplementedError, TypeError):
+        return False
+
+
+def check_reactor_support() -> None:
+    """An explicit reactor request fails if this device cannot build NZ views."""
+    import torch_npu
+
+    if not _internal_format_enabled():
+        raise RuntimeError("INT8 NZ reactor requires torch.npu.config.allow_internal_format=True")
+    if not _reactor_descriptor_supported(torch_npu.npu.current_device()):
+        raise RuntimeError("INT8 NZ reactor is unavailable on this torch_npu; select NZ mode 'cast'")
