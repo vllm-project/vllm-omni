@@ -606,6 +606,7 @@ def _make_engine(scheduler, execute_fn=None) -> DiffusionEngine:
     engine._cv = threading.Condition(engine._rpc_lock)
     engine._closed = False
     engine.abort_queue = queue.Queue()
+    engine._request_chunk_states = {}
     return engine
 
 

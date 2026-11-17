@@ -22,6 +22,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 import pybase64 as base64
+from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.config import (
     DEFAULT_IMAGE_HISTORY_MAX_BYTES,
@@ -34,6 +35,8 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexAppendPlan,
     DuplexFence,
     DuplexOutputDecision,
+    ToolCallAbandonReason,
+    abandoned_tool_call_notice,
 )
 
 if TYPE_CHECKING:
@@ -43,7 +46,10 @@ if TYPE_CHECKING:
     from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLedger
     from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibrationPolicy
     from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot
-    from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallSettlement
+    from vllm_omni.engine.duplex.session.tool_calls import ToolCallAbandonment, ToolCallOrigin, ToolCallSettlement
+
+
+logger = init_logger(__name__)
 
 
 class DuplexRuntimeConfigError(ValueError):
@@ -52,6 +58,31 @@ class DuplexRuntimeConfigError(ValueError):
     def __init__(self, message: str, *, code: str = "invalid_duplex_runtime_config") -> None:
         super().__init__(message)
         self.code = code
+
+
+def validate_session_tools(capabilities: DuplexCapabilities, extra_body: Mapping[str, object]) -> None:
+    """Refuse tool settings this model would otherwise silently ignore.
+
+    It is not part of ``validate_client_extra_body``, which plugins override
+    and which does not see the top-level ``tools`` of a ``session.update``.
+    """
+    tools = extra_body.get("realtime_tools")
+    if not tools:
+        return
+    if capabilities.tool_mode == "none":
+        raise DuplexRuntimeConfigError("This duplex model does not support tools", code="tools_unsupported")
+    max_tools = capabilities.max_tools
+    if max_tools is not None and isinstance(tools, list | tuple) and len(tools) > max_tools:
+        raise DuplexRuntimeConfigError(
+            f"This duplex model supports at most {max_tools} tools per session",
+            code="too_many_tools",
+        )
+    tool_choice = extra_body.get("realtime_tool_choice")
+    if tool_choice not in (None, "auto"):
+        raise DuplexRuntimeConfigError(
+            "Duplex sessions only support tool_choice auto",
+            code="unsupported_tool_choice",
+        )
 
 
 class DuplexInputCapacityError(ValueError):
@@ -355,12 +386,18 @@ class PartialStageForward:
     finished and an earlier sentence is already in flight. The text must be
     submitted resumable. A non-resumable submit is an end sentinel
     (``StreamingUpdate.from_request`` returns None) and aborts that sentence.
+
+    ``source_stage_id`` is the stage the orchestrator forwards *from*
+    (``_forward_to_next_stage`` always goes to source + 1). ``None`` means
+    the producing stage that just emitted ``output``. A Talker-park follow-up
+    must name the thinker stage; forwarding from Talker would hit Code2Wav.
     """
 
     output: object
     is_final_update: bool
     close_only: bool = False
     queue_close_after: bool = False
+    source_stage_id: int | None = None
 
 
 def duplex_text_history(conversation: Iterable[Mapping[str, object]]) -> tuple[tuple[str, str], ...]:
@@ -448,6 +485,9 @@ class DuplexModelPlugin(ABC):
     supports_auxiliary_requests: bool = False
     plugin_id: str = ""
     private_runtime_config_keys: frozenset[str] = frozenset()
+    #: Reasons this model can show a notice for. The notice goes through the
+    #: model's own ``runtime_config_for_function_output``.
+    abandoned_tool_call_reasons: frozenset[ToolCallAbandonReason] = frozenset()
     #: Samples per silence unit the runner appends to keep a model turn going.
     silence_continuation_samples: int = 16000
     #: Sample rate of that unit: the runner submits it through ``plan_append``
@@ -461,6 +501,15 @@ class DuplexModelPlugin(ABC):
 
     def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
         """Bind model policy to the resolved deployment topology before admission."""
+
+    def configure_async_chunk(self, *, enabled: bool) -> None:
+        """Receive the deploy-resolved ``async_chunk`` flag before admission.
+
+        The engine always calls this. Models that do not gate streaming on the
+        flag keep this no-op; JoyAI overrides it to switch sentence TTS, Talker
+        DELTA parks, and draining.
+        """
+        del enabled
 
     def configure_server(self, runtime_config: DuplexSessionRuntimeConfig) -> None:
         """Validate server-owned model options before accepting sessions."""
@@ -662,7 +711,8 @@ class DuplexModelPlugin(ABC):
         """Return a Talker update the orchestrator should submit, or None.
 
         Default models do not split Stage1 text. The orchestrator owns the
-        actual ``_forward_to_next_stage`` call.
+        actual ``_forward_to_next_stage`` call, including follow-ups whose
+        ``source_stage_id`` is not the producing stage.
         """
         del orchestrator, stage_id, replica_id, output, req_state
         return None
@@ -922,29 +972,48 @@ class DuplexModelPlugin(ABC):
         """
         del origins
 
-    def runtime_config_for_tool_call_timeout(
+    def runtime_config_for_abandoned_tool_call(
         self,
         config: DuplexSessionConfig,
         current: Mapping[str, object],
-        settlement: ToolCallSettlement,
+        abandonment: ToolCallAbandonment,
+        *,
+        history_len: int,
     ) -> dict[str, object] | None:
-        """Prepare model recovery for one newly timed-out call on the mailbox.
+        """Tell the model one call is over, in this model's own format.
 
-        This is called only for a timeout still in the current epoch,
-        never during speculative result conversion. Cached metadata cleanup
-        belongs in ``on_tool_call_settled`` and runs even if an epoch changed.
-        Plugins may prepare call-scoped model recovery here. Returning ``None``
-        requests no runtime-config change; it is
-        not an acknowledgement that the worker consumed anything. A timeout
-        must not reset the session or retire another call's queued result.
+        Called for a timed-out or cancelled call still in the current epoch,
+        and for a repeat the session refused to expose (``suppressed``, which
+        has no ledger record). For a reason in ``abandoned_tool_call_reasons``,
+        the fixed ``abandoned_tool_call_notice`` goes through the model's own
+        result path, as if the client had returned it; it never carries client
+        text. A refusal on that path skips the notice, because the session
+        already refuses a repeat of the call. So a suppressed repeat can be the
+        first notice the model gets for an epoch-cancelled call.
 
-        Raising closes the session: the owner cannot safely retry partial
-        model/bookkeeping effects. Closed or superseded decisions are skipped.
-        Accepted and cancelled calls never enter this hook. Their prepared
-        delivery or epoch-wide cancellation path remains the only model effect.
+        Cached metadata cleanup belongs in ``on_tool_call_settled`` and runs
+        even if an epoch changed. Returning ``None`` requests no change; it is
+        not an acknowledgement that the worker consumed anything. Any other
+        exception closes the session: the owner cannot safely retry partial
+        model/bookkeeping effects. Accepted calls never enter this hook.
         """
-        del config, current, settlement
-        return None
+        if abandonment.reason not in self.abandoned_tool_call_reasons:
+            return None
+        origin = abandonment.origin
+        item: dict[str, object] = {
+            "type": "function_call_output",
+            "call_id": origin.call_id,
+            "output": abandoned_tool_call_notice(abandonment.reason),
+        }
+        if origin.name is not None:
+            item["name"] = origin.name
+        if origin.arguments is not None:
+            item["arguments"] = origin.arguments
+        try:
+            return self.runtime_config_for_function_output(config, current, item, history_len=history_len)
+        except DuplexRuntimeConfigError as exc:
+            logger.warning("Skipping the notice for abandoned function call %s: %s", origin.call_id, exc)
+            return None
 
     def runtime_config_after_model_output(
         self,

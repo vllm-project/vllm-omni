@@ -523,7 +523,8 @@ async def test_server_worker_applies_speech_only_endpoint_restrictions(
     mocker.patch.object(api_server_module, "build_async_omni", fake_build_async_omni)
     mocker.patch.object(api_server_module, "omni_init_app_state", fake_init_app_state)
     mocker.patch.object(api_server_module, "serve_http", fake_serve_http)
-    mocker.patch.object(api_server_module.STORAGE_MANAGER, "start", new=mocker.AsyncMock())
+    storage_start = mocker.patch.object(api_server_module.STORAGE_MANAGER, "start", new=mocker.AsyncMock())
+    storage_stop = mocker.patch.object(api_server_module.STORAGE_MANAGER, "stop", new=mocker.AsyncMock())
     mocker.patch.object(api_server_module.openai_app_state, "_get_vllm_config", new=mocker.AsyncMock(return_value=None))
     mocker.patch.object(api_server_module, "get_uvicorn_log_config", return_value=None)
     args = api_server_module.make_arg_parser(FlexibleArgumentParser()).parse_args([])
@@ -627,6 +628,8 @@ async def test_server_worker_applies_speech_only_endpoint_restrictions(
     speech_handler.create_speech.assert_awaited_once()
     speech_handler.create_speech_batch.assert_awaited_once()
     speech_handler.shutdown.assert_called_once()
+    storage_start.assert_awaited_once_with(on_expire=api_server_module.VIDEO_STORE.remove_many)
+    storage_stop.assert_awaited_once_with()
     engine.generate.assert_not_awaited()
     sock.close.assert_called_once()
 
@@ -3576,8 +3579,8 @@ class TestTTSMethods:
         speech_server._adapter = adapter
         speech_server._tts_tokenizer = mocker.Mock(unk_token_id=-1)
         speech_server._tts_tokenizer.encode.return_value = [1]
-        speech_server._tts_tokenizer.convert_tokens_to_ids.side_effect = (
-            lambda token: 888 if token == "<audioPatch>" else -1
+        speech_server._tts_tokenizer.convert_tokens_to_ids.side_effect = lambda token: (
+            888 if token == "<audioPatch>" else -1
         )
         mock_prompt = mocker.spy(adapter, "_build_ming_dense_prompt")
 

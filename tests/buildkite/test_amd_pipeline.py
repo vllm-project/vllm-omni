@@ -69,6 +69,16 @@ NIGHTLY_CROSS_PIPELINE_PARITY_OWNER_LABELS = (
     "Wan2.2 Diffusers Backend Similarity",
     "Qwen-Image Diffusers Accuracy",
 )
+NIGHTLY_BLOCKING_COLLECTIVE_JOBS = (
+    ("Diffusion Exchange, Ring and CFG Parity · 2 GPUs", "mi300_2"),
+    ("Diffusion Exchange and Ring Parity · 4 GPUs", "mi300_4"),
+    ("Diffusion CFG Parity · 3 Ranks on 4 GPUs", "mi300_4"),
+)
+NIGHTLY_BLOCKING_FULL_MODEL_LABELS = (
+    "Qwen3-TTS Base Full-Model Expansion",
+    "MiniCPM-o Offline Full-Model Modalities",
+    "MiniCPM-o Online Full-Model Modalities",
+)
 TINY_DIFFUSION_PATH = "tests/model_tests/diffusion/test_common_offline.py"
 TINY_DIFFUSION_JOBS = (
     (
@@ -180,6 +190,37 @@ def test_cross_pipeline_parity_nightly_owner_is_blocking(label: str) -> None:
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["grade"] == "Blocking"
+    assert "retry" not in step
+
+
+@pytest.mark.parametrize(("label", "agent_pool"), NIGHTLY_BLOCKING_COLLECTIVE_JOBS)
+def test_nightly_collective_owner_is_blocking(label: str, agent_pool: str) -> None:
+    pipeline = yaml.safe_load(AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8"))
+    matches = [step for step in _walk_steps(pipeline["steps"]) if step.get("label") == label]
+
+    assert len(matches) == 1
+    step = matches[0]
+    assert step["agent_pool"] == agent_pool
+    assert step["depends_on"] == "amd-build"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "Blocking"
+    assert step["timeout_in_minutes"] == 60
+    assert step["source_file_dependencies"] == "diffusion_collective_parity"
+    assert "retry" not in step
+
+
+@pytest.mark.parametrize("label", NIGHTLY_BLOCKING_FULL_MODEL_LABELS)
+def test_nightly_full_model_owner_is_blocking(label: str) -> None:
+    pipeline = yaml.safe_load(AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8"))
+    matches = [step for step in _walk_steps(pipeline["steps"]) if step.get("label") == label]
+
+    assert len(matches) == 1
+    step = matches[0]
+    assert step["agent_pool"] == "mi300_1"
+    assert step["depends_on"] == "amd-build"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "Blocking"
+    assert step["timeout_in_minutes"] == 120
     assert "retry" not in step
 
 
@@ -1317,8 +1358,8 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
             "tests/dfx/reliability/test_qwen3_omni.py",
         ),
         "Reliability Test · wan22": (
-            "mi300_1",
-            "slow and rocm and MI325 and cards_1",
+            "mi300_2",
+            "slow and rocm and MI325 and cards_2",
             "tests/dfx/reliability/test_wan22.py",
         ),
         "Reliability Test · hunyuan-image": (
@@ -1371,29 +1412,29 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
         "Reliability Test · qwen3-omni": {
             "artifact_path": "artifacts/rocm-qwen3-omni-reliability/**/*",
             "artifact_env": "ROCM_QWEN3_RELIABILITY_ARTIFACT_DIR",
-            "expected_nodes": 37,
-            "expected_skipped": 10,
-            "timeout": "165m",
-            "collection_message": "Expected exactly 37 Qwen3-Omni reliability nodes",
-            "junit_message": ("Expected exactly 37 executed Qwen3-Omni reliability tests with 10 known skips"),
+            "expected_nodes": 14,
+            "expected_skipped": 4,
+            "timeout": "220m",
+            "collection_message": "Expected exactly 14 Qwen3-Omni reliability nodes",
+            "junit_message": ("Expected exactly 14 executed Qwen3-Omni reliability tests with 4 known skips"),
         },
         "Reliability Test · wan22": {
             "artifact_path": "artifacts/rocm-wan22-reliability/**/*",
             "artifact_env": "ROCM_WAN22_RELIABILITY_ARTIFACT_DIR",
-            "expected_nodes": 17,
-            "expected_skipped": 5,
-            "timeout": "165m",
-            "collection_message": "Expected exactly 17 Wan2.2 reliability nodes",
-            "junit_message": "Expected exactly 17 executed Wan2.2 reliability tests with 5 known skips",
+            "expected_nodes": 13,
+            "expected_skipped": 1,
+            "timeout": "220m",
+            "collection_message": "Expected exactly 13 Wan2.2 reliability nodes",
+            "junit_message": "Expected exactly 13 executed Wan2.2 reliability tests with 1 known skip",
         },
         "Reliability Test · minicpmo-4.5": {
             "artifact_path": "artifacts/rocm-minicpmo-reliability/**/*",
             "artifact_env": "ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR",
-            "expected_nodes": 3,
-            "expected_skipped": 0,
-            "timeout": "165m",
-            "collection_message": "Expected exactly 3 MiniCPM-o 4.5 reliability nodes",
-            "junit_message": "Expected exactly 3 executed MiniCPM-o 4.5 reliability tests",
+            "expected_nodes": 14,
+            "expected_skipped": 3,
+            "timeout": "220m",
+            "collection_message": "Expected exactly 14 MiniCPM-o 4.5 reliability nodes",
+            "junit_message": "Expected exactly 14 executed MiniCPM-o 4.5 reliability tests with 3 known skips",
         },
         "Reliability Test · Invalid parameters · MI300 · Single-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-single/**/*",
@@ -1485,25 +1526,25 @@ def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
             "Reliability Test · qwen3-omni",
             "ROCM_QWEN3_RELIABILITY_ARTIFACT_DIR",
             "qwen3-reliability-guard",
-            37,
-            10,
-            "Expected exactly 37 executed Qwen3-Omni reliability tests with 10 known skips",
+            14,
+            4,
+            "Expected exactly 14 executed Qwen3-Omni reliability tests with 4 known skips",
         ),
         (
             "Reliability Test · wan22",
             "ROCM_WAN22_RELIABILITY_ARTIFACT_DIR",
             "wan22-reliability-guard",
-            17,
-            5,
-            "Expected exactly 17 executed Wan2.2 reliability tests with 5 known skips",
+            13,
+            1,
+            "Expected exactly 13 executed Wan2.2 reliability tests with 1 known skip",
         ),
         (
             "Reliability Test · minicpmo-4.5",
             "ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR",
             "minicpmo-reliability-guard",
+            14,
             3,
-            0,
-            "Expected exactly 3 executed MiniCPM-o 4.5 reliability tests",
+            "Expected exactly 14 executed MiniCPM-o 4.5 reliability tests with 3 known skips",
         ),
         (
             "Reliability Test · Invalid parameters · MI300 · Single-GPU",
@@ -1642,9 +1683,9 @@ def test_hunyuan_rocm_reliability_disables_expert_parallel() -> None:
     }
     assert reliability_step["artifact_paths"] == ["artifacts/rocm-hunyuan-image-reliability/**/*"]
     assert reliability_command.count("--shard-id=0 --num-shards=1") == 2
-    assert "Expected exactly 16 HunyuanImage reliability nodes" in reliability_command
-    assert "Expected exactly 16 executed HunyuanImage reliability tests" in reliability_command
-    assert "skipped != 0" in reliability_command
+    assert "Expected exactly 13 HunyuanImage reliability nodes" in reliability_command
+    assert "Expected exactly 13 executed HunyuanImage reliability tests" in reliability_command
+    assert "skipped != 1" in reliability_command
     assert "vllm_omni/deploy/hunyuan_image3_dit_rocm_reliability.yaml" not in dependencies
     assert "tests/dfx/reliability/test_hunyuan_image_ep_startup.py" in dependencies
     assert "env" not in step
@@ -2781,15 +2822,16 @@ def test_stable_audio_cpu_offload_has_one_nonblocking_nightly_owner() -> None:
         assert "full_model and rocm and MI325 and cards_1" not in text
 
 
-def test_stable_audio_layerwise_offload_is_one_nonblocking_nightly_job() -> None:
+def test_stable_audio_layerwise_offload_is_one_blocking_nightly_job() -> None:
     step = _find_step("Stable Audio Layerwise Offload", AMD_NIGHTLY_PIPELINE)
     command = "\n".join(step["commands"])
     nightly = yaml.safe_load(AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8"))
     nightly_labels = [item.get("label") for item in _walk_steps(nightly["steps"])]
 
     assert nightly_labels.count("Stable Audio Layerwise Offload") == 1
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
+    assert step["depends_on"] == "amd-build"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 60
     assert step["source_file_dependencies"] == [
@@ -2797,6 +2839,7 @@ def test_stable_audio_layerwise_offload_is_one_nonblocking_nightly_job() -> None
         "diffusion_stable_audio_function",
     ]
     assert step["artifact_paths"] == ["artifacts/rocm-stable-audio-layerwise-offload/**/*"]
+    assert "retry" not in step
     assert "full_model and diffusion and rocm and MI325 and cards_1" in command
     assert "--run-level full_model" in command
     assert "timeout --signal=TERM --kill-after=2m 45m" in command

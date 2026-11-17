@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import gc
+import weakref
+
 import pytest
 import torch
 
@@ -378,3 +381,73 @@ def test_shared_pools_are_isolated_by_encoder_and_replay_stream():
     assert all(len(graph._capture_pools) == 2 for graph in graphs)
     for actual, expected in retained:
         torch.testing.assert_close(actual, expected)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("gc_enabled", [True, False])
+@torch.inference_mode()
+def test_capture_does_not_collect_an_older_cuda_graph(monkeypatch, gc_enabled):
+    """A prior model's graph must be finalized outside a later capture."""
+    monkeypatch.setattr(torch.compiler.config, "force_cudagraph_gc", False)
+    previous_threshold = gc.get_threshold()
+    previously_enabled = gc.isenabled()
+    in_capture = False
+    finalized_during_capture = []
+
+    def on_finalize():
+        finalized_during_capture.append(in_capture)
+
+    def forward(value):
+        nonlocal in_capture
+        if not torch.cuda.is_current_stream_capturing():
+            return value.sin()
+        in_capture = True
+        try:
+            # Ordinary Python allocations trigger automatic cyclic GC. Do not
+            # explicitly collect inside capture: that is unsafe even when the
+            # owner correctly disables automatic GC around capture.
+            gc.set_threshold(1, 1, 1)
+            _churn: list[list[object]] = [[] for _ in range(32)]
+            return value.sin()
+        finally:
+            in_capture = False
+
+    try:
+        gc.collect()
+        gc.disable()
+        value = torch.randn(4, 8, device="cuda")
+        graph = _make_graph(forward, min_free_bytes=0)
+        graph(value)
+
+        old_graph = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            _old_output = value.cos()
+        with torch.cuda.graph(old_graph, stream=stream):
+            _old_output = value.cos()
+        torch.cuda.current_stream().wait_stream(stream)
+        weakref.finalize(old_graph, on_finalize)
+        # Reproduce a model -> graph -> bound-method -> model ownership cycle.
+        cycle: list[object] = [old_graph]
+        cycle.append(cycle)
+        del old_graph, cycle
+
+        # Keep the old cycle pending until the captured forward lowers the GC
+        # threshold. The encoder's capture guard may collect it safely first.
+        gc.set_threshold(1_000_000_000, 1_000_000_000, 1_000_000_000)
+        if gc_enabled:
+            gc.enable()
+        actual = graph(value)
+        torch.testing.assert_close(actual, value.sin())
+        assert len(graph.graphs) == 1
+        assert gc.isenabled() == gc_enabled
+        gc.collect()
+        assert finalized_during_capture == [False]
+    finally:
+        gc.disable()
+        gc.set_threshold(*previous_threshold)
+        gc.collect()
+        if previously_enabled:
+            gc.enable()

@@ -1185,6 +1185,7 @@ def _make_batch_runner(pipeline):
     runner.offload_backend = None
     runner.od_config = SimpleNamespace(
         cache_backend="none",
+        streaming_output=False,
         enable_cache_dit_summary=False,
         parallel_config=SimpleNamespace(use_hsdp=False),
         video_output_transport=VideoOutputTransportConfig(),
