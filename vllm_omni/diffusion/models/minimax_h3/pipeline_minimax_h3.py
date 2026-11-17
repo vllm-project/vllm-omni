@@ -1447,7 +1447,14 @@ class MiniMaxH3Pipeline(
             self._fasth3.validate_fully_applied(transformer_loaded)
         if self._regenerate is not None:
             self._regenerate.validate_fully_applied(transformer_loaded)
-        if self._fasth3_checkpoint is not None:
+        if self._fasth3_checkpoint is not None and "transformer." in loaded_prefixes:
+            # Only the streamed checkpoint is checked here. A DLO host-weight
+            # plan owns the ``transformer.`` source and installs the DiT
+            # without this method (the loader drops that source before calling
+            # us), after binding every DiT parameter, gates included, and
+            # restored final layouts were checked by the canonical load that
+            # produced them. Checking an empty stream would blame a complete
+            # checkpoint for all of its gates.
             parameter_names = set(dict(self.transformer.named_parameters()))
             required_gates = set()
             for i in range(self.transformer.arch.num_layers):

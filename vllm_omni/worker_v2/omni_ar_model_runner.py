@@ -366,7 +366,6 @@ class OmniARModelRunner(OmniGPUModelRunner):
             prompt_logprobs_dict=prompt_logprobs_dict,
             prompt_token_id_logprobs_dict=prompt_token_id_logprobs_dict,
             kv_connector_output=None,
-            duplex_perf_chunks=getattr(self, "_duplex_perf_chunks", None),
         )
         model_runner_output.kv_extracted_req_ids = kv_extracted
         model_runner_output._async_chunk = bool(getattr(self.model_config, "async_chunk", False))
@@ -442,7 +441,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         model_runner_output.kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.ec_connector_output = ec_connector_output
 
-        self._reserve_native_data_plane_outputs(list(model_runner_output.req_ids))
+        self._reserve_native_data_plane_outputs(model_runner_output)
         if materialize_native:
             return self._materialize_native_output(async_output)
         return async_output

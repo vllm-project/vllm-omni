@@ -1730,7 +1730,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 # A terminal request still needs a finish marker so its
                 # receiver stops waiting when the processor has no data left.
                 payload = self._finish_marker_payload()
-            elif (chunk := getattr(request, "duplex_perf_chunk", None)) is not None:
+            elif (chunk := getattr(request, "_omni_duplex_perf_chunk", None)) is not None:
                 # Reuse the wire key read by the downstream scheduler. The
                 # model's payload may still be shared with another consumer.
                 if isinstance(payload, OmniPayloadStruct):

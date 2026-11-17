@@ -920,7 +920,7 @@ def test_native_publication_preserves_the_scheduled_duplex_chunk(raw_plane, monk
             inter_stage_outputs=[{"codes.audio": audio}],
         )
         if chunk is not None:
-            output.duplex_perf_chunks = {"internal": chunk}
+            output._duplex_perf_chunks = {"internal": chunk}
         raw_plane.reserve_outputs(["internal"])
         raw_plane.publish_output(output)
     raw_plane.drain_outputs()
@@ -981,7 +981,7 @@ def test_terminal_marker_without_payload_has_no_duplex_chunk(raw_plane, monkeypa
     monkeypatch.setattr(raw_plane, "_enqueue_chunk_payload", enqueue)
     request = _new_request()
     request.is_finished = lambda: True
-    request.duplex_perf_chunk = (0, 1)
+    request._omni_duplex_perf_chunk = (0, 1)
     assert raw_plane._publish_chunk_cohort([(request, None)], wait_for_delivery=False) == 1
     [payload] = enqueued
     assert payload["meta"]["finished"].item() is True
@@ -1091,3 +1091,95 @@ def test_release_reclaims_segments_no_downstream_stage_consumed(plane):
         assert plane.release_shm_resources([ext_id, "unknown"]) == 1
     finally:
         connector.close()
+
+
+@pytest.mark.parametrize("typed_payload", [False, True])
+def test_native_perf_tags_survive_deferred_cohort_wire_and_shared_payload(raw_plane, typed_payload):
+    """Frozen tags survive dict and native Struct builders without shared-state mutation."""
+    from vllm_omni.data_entry_keys import CodesStruct, OmniPayloadStruct
+    from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
+    from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import _MiniCPMO45MetaStruct
+    from vllm_omni.worker.scheduling_metadata_adapter import DefaultSchedulingMetadataAdapter
+    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+    shared = (
+        OmniPayloadStruct(
+            codes=CodesStruct(audio=torch.tensor([1, 2])),
+            meta=_MiniCPMO45MetaStruct(duplex_turn_id=7, duplex_epoch=3),
+        )
+        if typed_payload
+        else {"codes": {"audio": [1, 2]}, "meta": {"duplex_turn_id": 7, "duplex_epoch": 3}}
+    )
+    shared_meta = shared.meta if typed_payload else shared["meta"]
+    first, second = {"duplex": {"perf_chunk": [3, 7]}}, {"duplex": {"perf_chunk": [4, 2]}}
+    req_ids = ["first", "second", "unmeasured"]
+    for req_id in req_ids:
+        raw_plane.register_request(_new_request(req_id, req_id))
+    # Exercise the actual synchronous capture boundary before the async handoff.
+    runner = object.__new__(OmniGPUModelRunner)
+    runner._omni_data_plane = raw_plane
+    runner.req_states = SimpleNamespace(req_id_to_index={rid: i for i, rid in enumerate(req_ids)})
+    runner.model_state = SimpleNamespace(intermediate_buffer=SimpleNamespace(buffers=[first, second, {}]))
+    output = OmniModelRunnerOutput(
+        req_ids=req_ids,
+        req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+        sampled_token_ids=[[21], [22], [23]],
+        prompt_logprobs_dict={},
+        inter_stage_outputs=[shared] * 3,
+        sampled_token_ids_materialized=True,
+    )
+    runner._reserve_native_data_plane_outputs(output)
+    # Leave the completed batch queued while a later scheduler update mutates
+    # the same nested buffers. The old payload must keep its producing tags.
+    from queue import Queue
+
+    raw_plane._native_output_queue = Queue()
+    raw_plane.publish_output(output)
+    first["duplex"]["perf_chunk"][:] = [3, 8]
+    second["duplex"]["perf_chunk"][:] = [4, 3]
+    batch = raw_plane._native_output_queue.get_nowait()
+    raw_plane._omni_connector = object()
+    raw_plane._request_ids_mapping = {}
+    raw_plane._stage_id, raw_plane._next_stage_id = 1, 2
+    raw_plane._pending_save_reqs = {}
+    raw_plane._pending_save_counts = defaultdict(int)
+    raw_plane._save_work_available = threading.Event()
+    raw_plane._lock = threading.RLock()
+    raw_plane._custom_process_batch_func = None
+    raw_plane._custom_process_func = None
+    raw_plane.is_data_transfer_rank = lambda: True
+    raw_plane._return_stage_payload = lambda *_args: False
+    # Reuse one builder result to expose accidental in-place metadata stamping.
+    raw_plane._build_custom_process_payload = lambda **_kwargs: shared
+    entries, _ = raw_plane._build_chunk_entries(
+        req_ids=batch.req_ids,
+        inter_stage_outputs=batch.inter_stage_outputs,
+        sampled_token_ids=batch.sampled_token_ids,
+        terminal_req_ids=set(),
+        perf_chunks=batch.perf_chunks,
+    )
+    assert raw_plane.send_chunks(entries, propagate_errors=True, wait_for_delivery=False) == 3
+
+    serializer = OmniSerializer
+    adapter = DefaultSchedulingMetadataAdapter()
+    expected = {"first": (3, 7), "second": (4, 2)}
+    for req_id in req_ids:
+        task = raw_plane._pending_save_reqs[req_id][0]
+        payload = task["data"]
+        received = serializer.deserialize(serializer.serialize(payload))
+        update = adapter.extract(received, model_mode="generation")
+        if req_id in expected:
+            assert update.duplex_perf_chunk == expected[req_id]
+            payload_meta = payload.meta if typed_payload else payload["meta"]
+            assert payload is not shared and payload_meta is not shared_meta
+        else:
+            assert update is not None and update.duplex_perf_chunk is None
+            assert payload is shared
+        assert received["meta"]["duplex_turn_id"] == 7
+        assert received["meta"]["duplex_epoch"] == 3
+    if typed_payload:
+        assert shared.meta.duplex_perf_chunk is None
+        assert shared.meta.duplex_turn_id == 7 and shared.meta.duplex_epoch == 3
+        torch.testing.assert_close(shared.codes.audio, torch.tensor([1, 2]))
+    else:
+        assert shared == {"codes": {"audio": [1, 2]}, "meta": {"duplex_turn_id": 7, "duplex_epoch": 3}}

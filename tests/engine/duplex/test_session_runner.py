@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import struct
+import time
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
@@ -185,6 +186,7 @@ class Harness:
             busy = (
                 drained
                 or not self.runner._mailbox.empty()
+                or self.runner._pending_input_appends > 0
                 or any(not task.done() for task in self.runner.tasks.append_tasks)
                 or any(not task.done() for task in self.runner._background_tasks)
             )
@@ -4010,6 +4012,13 @@ async def test_semantic_timeout_logs_session_and_last_decision(answer, decision,
     h = await open_harness(auto_response=False)
     try:
         h.runner.control._detector = _semantic_detector(answer)
+        score_turn = h.runner.control._detector.score_turn
+
+        def slow_score_turn(audio: np.ndarray) -> float:
+            time.sleep(0.2)
+            return score_turn(audio)
+
+        monkeypatch.setattr(h.runner.control._detector, "score_turn", slow_score_turn)
         await h.run(append_audio(samples=8000, is_speech=None))
         pause = await h.run(append_audio(samples=9600, value=0.0, is_speech=None))
         assert "input_audio_buffer.committed" not in types(pause)
