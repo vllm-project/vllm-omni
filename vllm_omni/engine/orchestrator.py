@@ -3563,6 +3563,13 @@ class OrchestratorBase:
             )
         )
 
+    def _prewarm_downstream_resumable(
+        self, stage_id: int, entry_request: Any, req_state: OrchestratorRequestState
+    ) -> bool:
+        """Keep the entry request's streaming lifetime on downstream stages."""
+        del stage_id
+        return bool(getattr(entry_request, "resumable", req_state.streaming.enabled))
+
     async def _prewarm_async_chunk_stages(
         self,
         request_id: str,
@@ -3701,13 +3708,7 @@ class OrchestratorBase:
                 base_input["prompt_token_ids"] = [0] * next_prompt_len
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
-                # Turn-commit duplex (JoyAI/AURA) submits a non-resumable Stage0,
-                # but Code2Wav must stay parked across Talker 2150 so later
-                # sentences can reuse this prewarmed request. MiniCPM-style
-                # Stage0 is already resumable; turn-based HTTP is not session-owned.
-                downstream_resumable = bool(
-                    getattr(entry_request, "resumable", req_state.streaming.enabled) or req_state.session_owned
-                )
+                downstream_resumable = self._prewarm_downstream_resumable(next_stage_id, entry_request, req_state)
                 # Session-owned and resumable requests keep their downstream
                 # request across turns, so they stay on the chunk-0 path.
                 if attach_prewarm_payload and not req_state.session_owned and not downstream_resumable:
