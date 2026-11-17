@@ -961,7 +961,7 @@ def test_typed_engine_args_match_current_registry_backend_semantics(model_type, 
     )
     monkeypatch.setattr("vllm_omni.platforms.current_omni_platform.device_name", "cuda")
     model = _fake_model_root(pipeline, tmp_path)
-    if model_type in {"fish_omni", "lfm3_audio", "lfm3_audio_text", "lfm3_omni", "lfm3_omni_text"}:
+    if model_type in {"fish_omni", "lfm3_audio", "lfm3_audio_text", "lfm3_omni", "lfm3_omni_text", "yue2"}:
         with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
             _legacy_and_typed_stages(pipeline, deploy, model=model)
         return
@@ -1018,6 +1018,14 @@ def test_skip_tokenizer_init_deploy_configs_do_not_pin_unrelated_hub_tokenizer_o
     deploy = load_deploy_config(_DEPLOY_DIR / deploy_yaml)
     model_dir = _fake_model_root(pipeline, tmp_path)
     monkeypatch.setattr(stage_init_utils, "_resolve_model_path", _resolve_test_model_path)
+    if model_type == "yue2":
+        assert deploy.model_runner == "v1"
+        for stage in deploy.stages:
+            assert stage.engine_extras.get("skip_tokenizer_init") is True
+            assert stage.engine_extras.get("tokenizer") is None
+        with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
+            _legacy_and_typed_stages(pipeline, deploy, model=model_dir)
+        return
     legacy_stages, omni_config = _legacy_and_typed_stages(pipeline, deploy, model=model_dir)
 
     for legacy_stage in legacy_stages:

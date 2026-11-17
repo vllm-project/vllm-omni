@@ -1329,9 +1329,6 @@ class CosyVoice3Model(
         state = getattr(sampler, "penalties_state", None)
         if state is not None:
             state.apply_staged_writes = MethodType(_generated_only_penalty_writes, state)
-        # MRv2 captures tensor outputs and constructs OmniOutput afterwards.
-        # This contract also applies when only the codec stage enables packed Flow.
-        self.mrv2_forward_returns_tensor = True
         # MRv2 hands make_omni_output no multimodal kwargs; carry each prompt's
         # conditioning from the encoder call to its batch row instead.
         self._mrv2_encoded_conditioning = OrderedDict()
