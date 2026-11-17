@@ -749,6 +749,79 @@ def test_explicit_extra_body_precedence_over_cli_flags() -> None:
     assert merged["guidance_scale"] == 3.0
 
 
+def test_extra_body_generation_values_survive_when_flags_omitted() -> None:
+    """Omitted generation flags must not clobber explicit --extra-body values."""
+    from vllm_omni.benchmarks.patch.patch import _merge_overrides, get_samples
+
+    args = _parse_real_serve_args(
+        [
+            "--model",
+            "test-model",
+            "--diffusion-task",
+            "t2i",
+            "--extra-body",
+            '{"width": 512, "height": 768, "num_inference_steps": 7, "guidance_scale": 3.0}',
+            "--num-prompts",
+            "1",
+        ]
+    )
+    samples = get_samples(args, tokenizer=None)
+    merged = _merge_overrides(args.extra_body, samples[0].request_overrides)
+    assert merged["width"] == 512
+    assert merged["height"] == 768
+    assert merged["num_inference_steps"] == 7
+    assert merged["guidance_scale"] == 3.0
+
+
+def test_generation_defaults_fill_fields_missing_from_extra_body() -> None:
+    """Argparse defaults still apply to fields --extra-body does not provide."""
+    from vllm_omni.benchmarks.patch.patch import _merge_overrides, get_samples
+
+    args = _parse_real_serve_args(
+        [
+            "--model",
+            "test-model",
+            "--diffusion-task",
+            "t2i",
+            "--extra-body",
+            '{"guidance_scale": 3.0}',
+            "--num-prompts",
+            "1",
+        ]
+    )
+    samples = get_samples(args, tokenizer=None)
+    merged = _merge_overrides(args.extra_body, samples[0].request_overrides)
+    assert merged["width"] == 1024
+    assert merged["height"] == 1024
+    assert merged["num_inference_steps"] == 20
+    assert merged["guidance_scale"] == 3.0
+
+
+def test_legacy_dataset_name_custom_reads_file(tmp_path: Path) -> None:
+    """An endpoint-only legacy command with an explicit dataset reads the file."""
+    from vllm_omni.benchmarks.patch.patch import get_samples
+
+    prompts = tmp_path / "prompts.jsonl"
+    prompts.write_text(json.dumps({"prompt": "a cat sitting on a mat"}) + "\n", encoding="utf-8")
+    args = _parse_real_serve_args(
+        [
+            "--model",
+            "test-model",
+            "--endpoint",
+            "/v1/images/generations",
+            "--dataset-name",
+            "custom",
+            "--dataset-path",
+            str(prompts),
+            "--num-prompts",
+            "1",
+        ]
+    )
+    samples = get_samples(args, tokenizer=None)
+    assert len(samples) == 1
+    assert samples[0].prompt == "a cat sitting on a mat"
+
+
 def test_diffusion_random_request_config_profiles() -> None:
     """--random-request-config samples weighted profiles into per-request overrides."""
     from vllm_omni.benchmarks.patch.patch import get_samples

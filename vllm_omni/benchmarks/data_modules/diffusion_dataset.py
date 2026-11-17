@@ -36,14 +36,21 @@ _CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "vllm-omni")
 
 
 def _build_overrides(args: Namespace) -> dict[str, Any]:
-    """Build ``request_overrides`` from CLI args for diffusion generation."""
+    """Build ``request_overrides`` from CLI args for diffusion generation.
+
+    An explicitly passed flag wins over ``--extra-body``; the argparse
+    defaults are applied only to fields ``--extra-body`` does not provide,
+    so an explicit body value survives when the flag is omitted.
+    """
+    explicit = frozenset(getattr(args, "explicit_keys", ()) or ())
+    extra_body = getattr(args, "extra_body", None) or {}
     overrides: dict[str, Any] = {}
     for key in ("width", "height", "num_inference_steps", "num_frames", "fps"):
         val = getattr(args, key, None)
-        if val is not None:
+        if val is not None and (key in explicit or key not in extra_body):
             overrides[key] = val
     seed = getattr(args, "seed", None)
-    if seed is not None:
+    if seed is not None and ("seed" in explicit or "seed" not in extra_body):
         overrides["seed"] = seed
     return overrides
 

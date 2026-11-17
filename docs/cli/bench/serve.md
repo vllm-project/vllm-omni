@@ -1151,9 +1151,6 @@ vllm bench serve --omni \
   --max-concurrency 1 \
   --num-warmups 2 \
   --num-prompts 10 \
-  --random-input-len 64 \
-  --random-output-len 1 \
-  --ignore-eos \
   --percentile-metrics e2el \
   --extra-body '{
     "num_inference_steps": 20,
@@ -1161,6 +1158,8 @@ vllm bench serve --omni \
     "true_cfg_scale": 4.0
   }'
 ```
+
+`--dataset-name` selects the prompt source together with `--diffusion-dataset`: `random` generates synthetic prompts (the `--random-input-len`/`--random-output-len`/`--ignore-eos` length knobs do not apply), `custom` reads `--dataset-path` JSONL, and `--diffusion-dataset vbench` downloads the VBench set. Generation parameters (`--width`, `--height`, `--num-inference-steps`, `--num-frames`, `--fps`) win over the same keys in `--extra-body`; when a flag is omitted, an explicit `--extra-body` value is preserved.
 
 If successful, following output is like:
 

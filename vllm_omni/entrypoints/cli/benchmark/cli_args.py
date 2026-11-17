@@ -310,11 +310,12 @@ def add_diffusion_cli_args(parser: argparse.ArgumentParser) -> None:
         "--diffusion-dataset",
         type=str,
         choices=["random", "vbench", "custom"],
-        default="random",
+        default=None,
         help="Prompt source for diffusion benchmarks. "
-        "'random' generates synthetic prompts (default), "
+        "'random' generates synthetic prompts, "
         "'vbench' downloads VBench prompts, "
-        "'custom' reads from --dataset-path JSONL.",
+        "'custom' reads from --dataset-path JSONL. "
+        "Defaults to --dataset-name when it names a diffusion loader, else 'random'.",
     )
     group.add_argument(
         "--diffusion-task",
