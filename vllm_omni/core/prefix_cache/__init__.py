@@ -20,6 +20,7 @@ mm does not.
 """
 
 from vllm_omni.core.prefix_cache.adapter import (
+    PrefixCacheDelivery,
     PrefixCacheEventKind,
     PrefixCacheRequestEvent,
     PrefixCacheSchedulerAdapter,
@@ -31,6 +32,8 @@ from vllm_omni.core.prefix_cache.block_pool import PrefixBlockPool
 from vllm_omni.core.prefix_cache.controller import OmniPrefixCacheController
 from vllm_omni.core.prefix_cache.group_view import (
     FullAttentionGroupView,
+    MRv2FullAttentionGroupView,
+    check_mrv2_prefix_cache_layout,
     check_prefix_cache_kv_groups,
     check_prefix_cache_kv_transfer,
     get_prefix_cache_group_view,
@@ -50,9 +53,11 @@ from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
 __all__ = [
     "HIDDEN_KEY",
     "FullAttentionGroupView",
+    "MRv2FullAttentionGroupView",
     "ModelCachePolicy",
     "OmniPrefixCacheController",
     "OmniPrefixCacheManager",
+    "PrefixCacheDelivery",
     "PrefixCacheEventKind",
     "PrefixCacheRequestEvent",
     "PrefixCacheSchedulerAdapter",
@@ -65,6 +70,7 @@ __all__ = [
     "PrefixBlockPool",
     "PrefixCacheConfig",
     "WriteSchedule",
+    "check_mrv2_prefix_cache_layout",
     "check_prefix_cache_kv_groups",
     "check_prefix_cache_kv_transfer",
     "get_prefix_cache_group_view",

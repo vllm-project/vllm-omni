@@ -33,8 +33,17 @@ class DuplexOutputAction(str, Enum):
 
 
 @dataclass(frozen=True)
+class DuplexInputCapacity:
+    """Model-selected context allowance checked on the engine's expanded input."""
+
+    max_context_tokens: int
+    reserved_output_tokens: int
+
+
+@dataclass(frozen=True)
 class DuplexAppendPlan:
     prompt: dict[str, object]
+    input_capacity: DuplexInputCapacity | None = None
 
 
 @dataclass(frozen=True)
@@ -83,6 +92,7 @@ class DuplexStageSubmission:
     # True: resume/update an existing stage0 id. False: open a new ephemeral id.
     # Distinct from DuplexCapabilities.supports_core_resumable_request.
     resumable: bool = True
+    input_capacity: DuplexInputCapacity | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "prompt", MappingProxyType(dict(self.prompt)))
@@ -102,6 +112,9 @@ class DuplexOutputContext:
     segment_finished: bool
     segment_token_ids: tuple[int, ...] = ()
     segment_output_metadata: Mapping[str, object] = field(default_factory=dict)
+    # Session stats (RFC #8325): the (epoch, seq) chunks this output finishes
+    # handling for. Their spans reach the ledger directly (``on_stage_work``).
+    perf_chunks: frozenset[tuple[int, int]] = frozenset()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "segment_token_ids", tuple(self.segment_token_ids))
@@ -110,6 +123,7 @@ class DuplexOutputContext:
             "segment_output_metadata",
             MappingProxyType(dict(self.segment_output_metadata)),
         )
+        object.__setattr__(self, "perf_chunks", frozenset(self.perf_chunks))
 
 
 class DuplexStagePort(ABC):
@@ -174,6 +188,11 @@ def duplex_resource_request_id(fence: DuplexFence, role: str) -> str:
 def duplex_ephemeral_stage_request_id(fence: DuplexFence, *, stage_id: int) -> str:
     """Turn-scoped Stage request id for non-resumable (ephemeral) duplex models."""
     return duplex_resource_request_id(fence, f"stage{stage_id}-turn{fence.turn_id}")
+
+
+def duplex_is_auxiliary_request(request_id: str | None) -> bool:
+    fields = _duplex_resource_request_fields(request_id)
+    return fields is not None and fields[2].startswith("auxiliary-")
 
 
 _EPHEMERAL_TURN_IN_REQUEST_ID = re.compile(r"\.r\.stage\d+-turn(\d+)$")

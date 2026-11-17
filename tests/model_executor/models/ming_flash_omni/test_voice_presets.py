@@ -51,10 +51,15 @@ def test_weight_loading_registers_only_legacy_voice_presets(strict: bool, mocker
     talker._standalone = False
     talker._vae_weight_source = None
     talker.voice_presets = mocker.Mock()
+    talker._batch_rows = 2
+    prepare = mocker.patch.object(talker, "_ensure_batch_engine")
+    mocker.patch.object(type(talker), "device", new_callable=mocker.PropertyMock, return_value=torch.device("cuda"))
     loaded = set(dict(talker.named_parameters()))
     mocker.patch.object(talker_module, "AutoWeightsLoader").return_value.load_weights.return_value = loaded
 
     assert talker.load_weights([]) == loaded
+    assert talker.training
+    prepare.assert_not_called()
 
     if strict:
         talker.voice_presets.load_presets_from_manifest.assert_not_called()
@@ -96,3 +101,37 @@ def test_inline_reference_audio_reuses_features_by_content(tmp_path: Path, mocke
     changed = resolve([*samples[:-1], 0.0])
     assert changed is not first
     assert extractor.call_count == 2
+
+
+def test_reference_cache_evicts_least_recently_used_voice(tmp_path: Path, mocker: MockerFixture) -> None:
+    registry = VoicePresetRegistry(
+        talker_dir=str(tmp_path),
+        model_path=str(tmp_path),
+        download_dir=None,
+        audio_vae=None,
+        aggregator=mocker.Mock(),
+        spk_head=torch.nn.Linear(2, 4),
+        patch_size=1,
+    )
+    registry.REFERENCE_CACHE_SIZE = 2
+    extractor = mocker.Mock(return_value=torch.ones(1, 2))
+    registry.__dict__["_spkemb_extractor"] = extractor
+
+    def resolve(value):
+        return registry.resolve_reference(
+            None,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            need_speaker=True,
+            need_latents=False,
+            reference_audio=[{"samples": [value] * 1600, "sample_rate": 16000}],
+        )
+
+    first = resolve(0.1)
+    resolve(0.2)
+    assert resolve(0.1) is first  # refreshes 0.1, so 0.2 is now the oldest
+    resolve(0.3)
+    assert extractor.call_count == 3
+    assert resolve(0.1) is first
+    resolve(0.2)
+    assert extractor.call_count == 4

@@ -58,7 +58,7 @@ class _ReqInfo:
         max_tokens = kwargs.get("_omni_max_tokens")
         seed = kwargs.get("_omni_seed")
         return cls(
-            request_id=str(kwargs.get("request_id", "default")),
+            request_id=str(kwargs.get("request_id") or kwargs.get("req_id") or "default"),
             is_prefill=bool(kwargs.get("_omni_is_prefill", span > 1)),
             prompt_len=int(kwargs.get("_omni_prompt_len") or 0),
             num_computed_tokens=int(kwargs.get("_omni_num_computed_tokens") or 0),

@@ -71,7 +71,10 @@ def _validate_dreamzero_openpi_session(response: OpenPIWebSocketResponse) -> Non
     assert metadata["needs_stereo_camera"] is False
     assert metadata["needs_session_id"] is True
     assert metadata["action_space"] == "joint_position"
-    assert response.operation_responses[-1]["status"] == "reset successful"
+    # Session order is infer, infer, reset, infer. Reset is not the last frame.
+    reset_responses = [item for item in response.operation_responses if isinstance(item, dict) and "status" in item]
+    assert reset_responses, "expected a reset response in the DreamZero OpenPI session"
+    assert reset_responses[-1]["status"] == "reset successful"
 
     action_tensors = response.action_tensors
     assert action_tensors is not None

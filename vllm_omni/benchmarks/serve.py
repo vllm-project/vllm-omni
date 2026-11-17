@@ -20,6 +20,7 @@ import vllm_omni.benchmarks.patch.patch  # noqa: F401
 from vllm_omni.benchmarks.omniinteract import omniinteract_output_lock
 from vllm_omni.benchmarks.patch.patch import (
     maybe_enable_stage_metrics,
+    set_duplex_metric_aggregation,
     set_fail_fast_on_timeout,
     set_print_stage,
     set_request_timeout_s,
@@ -86,12 +87,21 @@ _DIFFUSION_BACKENDS = frozenset(
     }
 )
 
+_IMAGE_EDIT_BACKENDS = frozenset(
+    {
+        "/v1/images/edits",
+        "openai-image-edits-omni",
+    }
+)
+
 
 def is_diffusion_benchmark(args) -> bool:
     """Return True when the benchmark targets a diffusion/image/video endpoint."""
     endpoint = _normalize_endpoint(getattr(args, "endpoint", None)) or ""
     backend = getattr(args, "backend", None) or ""
-    return endpoint in _DIFFUSION_ENDPOINTS or backend in _DIFFUSION_BACKENDS
+    # Endpoint paths double as backend spellings (they are registered as
+    # request adapters in ASYNC_REQUEST_FUNCS), so match both.
+    return endpoint in _DIFFUSION_ENDPOINTS or backend in _DIFFUSION_ENDPOINTS or backend in _DIFFUSION_BACKENDS
 
 
 def _is_image_edit_benchmark(args) -> bool:
@@ -102,7 +112,7 @@ def _is_image_edit_benchmark(args) -> bool:
     """
     endpoint = _normalize_endpoint(getattr(args, "endpoint", None)) or ""
     backend = getattr(args, "backend", None) or ""
-    return endpoint == "/v1/images/edits" or backend == "openai-image-edits-omni"
+    return endpoint == "/v1/images/edits" or backend in _IMAGE_EDIT_BACKENDS
 
 
 def _prepare_diffusion_args(args: argparse.Namespace) -> None:
@@ -128,6 +138,7 @@ def main(args: argparse.Namespace) -> dict[str, Any]:
     _validate_fail_fast_on_timeout(args)
     set_fail_fast_on_timeout(getattr(args, "omni_fail_fast_on_timeout", False))
     set_print_stage(getattr(args, "print_stage", False))
+    set_duplex_metric_aggregation(getattr(args, "duplex_metric_aggregation", "session"))
     args.extra_body = maybe_enable_stage_metrics(
         getattr(args, "extra_body", None),
         enabled=should_request_stage_metrics(args),

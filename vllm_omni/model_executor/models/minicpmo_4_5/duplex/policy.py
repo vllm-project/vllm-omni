@@ -96,8 +96,24 @@ class MiniCPMO45DuplexPolicy:
     VISION_EMBEDS_PER_FRAME = 64
     VISION_TOKENS_PER_FRAME = VISION_EMBEDS_PER_FRAME + 2  # <image> + embeds + </image>
     DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK = 20
-    DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK = 28
+    # Official streaming_generate uses this token budget as its length limit;
+    # sampled terminators can close the chunk earlier.
+    # A 28-character cap fired earlier (16 tokens into "……数字") and the next
+    # unit then sampled <|turn_eos|>, so the number never followed. 0 disables
+    # the character cap; a positive max_speak_chars_per_chunk still opts in.
+    DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK = 0
     REPETITION_HISTORY_SIZE = 512
+    # Talker handoff. A tail that still ends with one of these, after closing
+    # quotes and brackets, has finished a sentence.
+    SENTENCE_END_PUNCTUATION = "。！？.!?…"
+    CLOSING_PUNCTUATION = "\"'”’」』）)】"
+    TURN_TEXT_TAIL_CHARS = 16
+
+    @staticmethod
+    def turn_text_ends_sentence(text: str) -> bool:
+        """Whether ``text`` ends a sentence, ignoring trailing closing punctuation."""
+        tail = text.rstrip().rstrip(MiniCPMO45DuplexPolicy.CLOSING_PUNCTUATION)
+        return bool(tail) and tail[-1] in MiniCPMO45DuplexPolicy.SENTENCE_END_PUNCTUATION
 
     @staticmethod
     def speech_unit_closed_by_listen(token_ids: Sequence[int], special_token_ids: Mapping[str, int]) -> bool:
