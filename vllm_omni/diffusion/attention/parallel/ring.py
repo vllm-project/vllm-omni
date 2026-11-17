@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import torch
 from vllm.logger import init_logger
+
+from vllm_omni.diffusion.attention.backends.abstract import QueryRange
 
 # import torch.distributed as dist # Not used directly here, but good practice if needed
 from vllm_omni.diffusion.attention.backends.ring.ring_globals import (
@@ -115,6 +117,48 @@ class RingParallelAttention:
     def name(self) -> str:
         return "ring"
 
+    @property
+    def paged_kv_ring_layout(self) -> bool:
+        """Whether this runner publishes the Paged Ring placement contract."""
+        return True
+
+    @property
+    def paged_kv_sequence_parallel_degree(self) -> int:
+        """Input sequence-sharding degree before Ulysses/Ring communication."""
+        return self._sp_group.ulysses_world_size * self._sp_group.ring_world_size
+
+    def with_paged_kv_ranges(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> AttentionMetadata:
+        """Attach Scheduler-global ranges to one rank-local Ring shard."""
+        query_len = int(query.shape[1])
+        key_len = int(key.shape[1])
+        value_len = int(value.shape[1])
+
+        if query_len != key_len or key_len != value_len:
+            raise ValueError(
+                "Ring attention requires query, key, and value to have "
+                "the same length, but got "
+                f"query_len={query_len}, key_len={key_len}, "
+                f"and value_len={value_len}."
+            )
+
+        local_range = QueryRange(
+            local_start=0,
+            local_end=query_len,
+            global_start=self._sp_group.ring_rank * query_len,
+        )
+
+        return replace(
+            attn_metadata,
+            query_ranges=(local_range,),
+            kv_write_ranges=(local_range,),
+        )
+
     def pre_attention(
         self,
         query: torch.Tensor,
@@ -128,6 +172,18 @@ class RingParallelAttention:
         if attn_metadata is not None:
             joint_tensor_query = attn_metadata.joint_query
             joint_strategy = attn_metadata.joint_strategy
+            has_joint_tensors = any(
+                tensor is not None
+                for tensor in (
+                    attn_metadata.joint_query,
+                    attn_metadata.joint_key,
+                    attn_metadata.joint_value,
+                )
+            )
+
+            # pure ring: every rank owns one contiguous local Q/K/V shard
+            if not has_joint_tensors:
+                attn_metadata = self.with_paged_kv_ranges(query, key, value, attn_metadata)
 
         if joint_tensor_query is not None:
             supported_joint_strategy = ["front", "rear"]
@@ -139,9 +195,7 @@ class RingParallelAttention:
             else:
                 query = torch.cat([query, joint_tensor_query], dim=1)
 
-            # Note: We do NOT concatenate joint_key/value here.
-            # They are preserved in attn_metadata and will be passed
-            # explicitly to ring_flash_attn_func.
+            # joint_key/value remain separate and are passed to the Ring kernel.
 
         ctx = _RingCtx(name=self.name)
         return query, key, value, attn_metadata, ctx

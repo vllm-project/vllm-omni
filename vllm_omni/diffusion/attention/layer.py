@@ -468,6 +468,10 @@ class Attention(nn.Module):
         # attention remains dense and contributes no native KVCacheSpec.
         paged_kv_cache_role: str | None = None,
         paged_kv_cache_dtype: torch.dtype | None = None,
+        # Model-owned opt-in for the deliberately narrow Paged Ring MVP.
+        # The Worker fails closed at KV-layer registration when Ring is
+        # configured and a Scheduler-paged layer does not publish this flag.
+        supports_paged_ring: bool = False,
         # Model-owned kernel for architectures whose attention contract cannot
         # be represented by the generic backend interface (for example packed
         # varlen attention with learned sink logits). The shared Attention
@@ -522,6 +526,7 @@ class Attention(nn.Module):
             raise ValueError("paged_kv_cache_role must be non-empty when provided")
         self.paged_kv_cache_role = paged_kv_cache_role
         self.paged_kv_cache_dtype = paged_kv_cache_dtype
+        self.supports_paged_ring = supports_paged_ring
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.head_size = head_size
@@ -1159,6 +1164,8 @@ class Attention(nn.Module):
             reason = self._cross_backend_limitation(attn_metadata)
             if reason is not None:
                 blocked = self._cross_fallback_blocker(attn_metadata)
+                assert self.sdpa_fallback is not None
+                assert self.attn_backend is not None
                 result = self.sdpa_fallback.resolve_execution_path(resolved_context, query, key, value, attn_metadata)
                 return replace(
                     result,
@@ -1231,6 +1238,7 @@ class Attention(nn.Module):
                 "Only the startup KV memory profile may execute before paged KV initialization."
             )
         use_paged_attention = paged_adapter is not None and self.paged_kv_cache_role is not None
+
         if use_paged_attention and not getattr(self.attn_backend, "supports_paged_kv", False):
             backend_name = (
                 self.attn_backend.get_name() if self.attn_backend is not None else type(self.attention).__name__
@@ -1238,19 +1246,64 @@ class Attention(nn.Module):
             raise NotImplementedError(
                 f"Diffusion paged KV requires an Omni backend with paged support; selected {backend_name}"
             )
+        is_paged_ring = False
+        paged_ring_degree: int | None = None
+        if use_paged_attention and strategy is not self._no_parallel_strategy and self.use_ring:
+            ring_runner = getattr(self, "ring_runner", None)
+            published_ring_layout = getattr(ring_runner, "paged_kv_ring_layout", None)
+            if published_ring_layout is not True:
+                raise RuntimeError(
+                    f"Paged Ring runner did not publish its rank-local KV layout: layout={published_ring_layout!r}"
+                )
+            paged_ring_degree = getattr(ring_runner, "paged_kv_sequence_parallel_degree", None)
+            if type(paged_ring_degree) is not int or paged_ring_degree <= 1:
+                raise RuntimeError(
+                    "Paged Ring runner did not publish a valid input sequence-sharding degree: "
+                    f"degree={paged_ring_degree!r}"
+                )
+            is_paged_ring = True
         if use_paged_attention and strategy is not self._no_parallel_strategy:
             strategy_name = strategy.name
-            if self.use_ring or strategy_name == "ring":
-                raise NotImplementedError(
-                    "paged Scheduler KV is not supported with Ring attention; use strict Ulysses or no SP"
-                )
-            if strategy_name in ("allgather_kv", "ulysses_allgather_kv"):
-                raise NotImplementedError(
-                    f"paged Scheduler KV is not supported with the {strategy_name!r} sequence-parallel strategy"
-                )
-            if strategy_name == "ulysses" and get_ulysses_mode(default="strict") != "strict":
+            if strategy_name in ("ulysses", "ulysses_allgather_kv") and get_ulysses_mode(default="strict") != "strict":
                 raise NotImplementedError("paged Scheduler KV currently supports only strict Ulysses")
+            if strategy_name == "ulysses_allgather_kv":
+                forward_ctx = get_forward_context() if is_forward_context_available() else None
+                sp_padding_size = int(getattr(forward_ctx, "sp_padding_size", 0))
+                if sp_padding_size:
+                    raise NotImplementedError(
+                        "Paged Ulysses + AllGather-KV currently requires the "
+                        "sequence length to be divisible by "
+                        "ulysses_degree * allgather_degree; "
+                        f"got sp_padding_size={sp_padding_size}"
+                    )
+            if is_paged_ring:
+                forward_ctx = get_forward_context() if is_forward_context_available() else None
+                sp_padding_size = int(getattr(forward_ctx, "sp_padding_size", 0))
+                if sp_padding_size:
+                    raise NotImplementedError(
+                        "Paged Ring currently requires the sequence length to be "
+                        "divisible by its effective sequence-parallel degree; "
+                        f"got sp_padding_size={sp_padding_size}"
+                    )
 
+        if (
+            use_paged_attention
+            and strategy is not self._no_parallel_strategy
+            and (strategy.name in ("allgather_kv", "ulysses_allgather_kv") or is_paged_ring)
+            and attn_metadata is None
+        ):
+            attn_metadata = AttentionMetadata()
+        if is_paged_ring:
+            assert paged_adapter is not None
+            assert paged_ring_degree is not None
+            paged_adapter.validate_ring_sp_before_collective(
+                self.prefix,
+                query,
+                key,
+                value,
+                omni_attn_metadata=attn_metadata,
+                sequence_parallel_degree=paged_ring_degree,
+            )
         # 1. Prepare inputs (Communication / Resharding)
         # For Ulysses: AllToAll Q/K/V; Slicing joint_q/k/v
         # For Ring: Concat joint_q
@@ -1310,19 +1363,40 @@ class Attention(nn.Module):
                 key = _remove_paged_sp_padding(key)
                 value = _remove_paged_sp_padding(value)
 
+        if is_paged_ring and strategy.name == "ulysses":
+            assert self.ring_runner is not None
+            assert attn_metadata is not None
+            attn_metadata = self.ring_runner.with_paged_kv_ranges(
+                query,
+                key,
+                value,
+                attn_metadata,
+            )
+
         # 2. This is the shared GPU/NPU boundary. The Worker adapter prepares
         # the native page-table context after SP has produced rank-local Q/K/V;
         # backend resolution below selects CUDA or Ascend execution.
         if use_paged_attention:
             assert paged_adapter is not None
-            paged_kv_context = paged_adapter.prepare_layer_context(
-                self.prefix,
-                query,
-                key,
-                value,
-                omni_attn_metadata=attn_metadata,
-            )
-            out = self.attention.forward_paged(paged_kv_context)
+            if is_paged_ring:
+                paged_ring_context = paged_adapter.prepare_ring_layer_context(
+                    self.prefix,
+                    key,
+                    value,
+                    omni_attn_metadata=attn_metadata,
+                )
+                key, value = self.attention.materialize_paged_ring_kv(paged_ring_context)
+                attn_metadata = self._with_kv_cache_dtype(attn_metadata)
+                out = self._run_ring_attention(query, key, value, attn_metadata)
+            else:
+                paged_kv_context = paged_adapter.prepare_layer_context(
+                    self.prefix,
+                    query,
+                    key,
+                    value,
+                    omni_attn_metadata=attn_metadata,
+                )
+                out = self.attention.forward_paged(paged_kv_context)
         else:
             attn_metadata = self._with_kv_cache_dtype(attn_metadata)
             if self.use_ring and strategy is not self._no_parallel_strategy:
@@ -1453,6 +1527,7 @@ class Attention(nn.Module):
         explicit = self.backend_explicit if backend is None else spec is not None
         if explicit:
             selected = self.attn_backend if backend is None else backend
+            assert selected is not None
             return (
                 f"Explicit backend {selected.get_name()} does not support "
                 f"{self._cross_backend_limitation(attn_metadata, backend=backend, spec=spec)}"
@@ -1493,6 +1568,7 @@ class Attention(nn.Module):
                 blocked = self._cross_fallback_blocker(attn_metadata, backend=cross_backend, spec=cross_spec)
                 if blocked is not None:
                     raise NotImplementedError(blocked)
+                assert self.sdpa_fallback is not None
                 return self.sdpa_fallback.forward(query, key, value, attn_metadata)
         dense_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         # Piecewise backends honor full_attn_spans ahead of attn_mask and never read the

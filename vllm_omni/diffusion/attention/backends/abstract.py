@@ -288,6 +288,9 @@ class AttentionMetadata:
     full_attn_spans: list[list[tuple[int, int]]] | None = None
     query_ranges: tuple[QueryRange, ...] | None = None
 
+    # Maps local K/V payload rows to Scheduler-global token positions.
+    # None preserves the existing aligned or global-K/V-write behavior.
+    kv_write_ranges: tuple[QueryRange, ...] | None = None
     # Geometry of the video segment for backends that exploit spatiotemporal
     # locality (block-sparse selection, tiled masks). Dense backends ignore it.
     video_layout: VideoTokenLayout | None = None
@@ -411,6 +414,15 @@ class AttentionImpl(ABC, Generic[T]):
 
         del paged_kv_context
         raise NotImplementedError(f"{type(self).__name__} does not support paged KV attention")
+
+    def materialize_paged_ring_kv(
+        self,
+        paged_ring_context: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Materialize one paged KV shard for dense Ring execution."""
+
+        del paged_ring_context
+        raise NotImplementedError(f"{type(self).__name__} does not support Paged Ring KV materialization")
 
     def forward_cuda(
         self,

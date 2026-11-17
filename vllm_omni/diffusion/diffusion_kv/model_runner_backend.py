@@ -96,6 +96,7 @@ class DiffusionKVModelRunnerBackend:
                     f"Diffusion KV layer {layer_name!r} produced unsupported spec {type(spec).__name__}; "
                     "only native attention specs are supported"
                 )
+            self._validate_paged_ring_startup(layer_name, layer)
             if not layer.attn_backend.supports_paged_kv:
                 raise NotImplementedError(
                     f"Diffusion paged KV layer {layer_name!r} requires an Omni backend with paged support; "
@@ -170,21 +171,31 @@ class DiffusionKVModelRunnerBackend:
         self._kv_cache_layer_adapters = adapters
         return {layer_name: adapter.spec for layer_name, adapter in adapters.items()}
 
+    def _validate_paged_ring_startup(self, layer_name: str, layer: Any) -> None:
+        """Fail closed before allocating paged state for an unsupported model."""
+
+        if bool(getattr(layer, "skip_sequence_parallel", False)):
+            return
+        parallel_config = getattr(self.od_config, "parallel_config", None)
+        ring_degree = int(getattr(parallel_config, "ring_degree", 1))
+        if ring_degree <= 1:
+            return
+        if getattr(layer, "supports_paged_ring", False) is not True:
+            raise NotImplementedError(
+                f"Diffusion paged KV layer {layer_name!r} does not opt into the "
+                "Paged Ring MVP; the model must set supports_paged_ring=True "
+                "only after validating its attention and KV-write contract"
+            )
+        if not current_omni_platform.is_cuda():
+            raise NotImplementedError("Paged Ring MVP currently supports only CUDA's packed KV-cache layout")
+
     def _get_paged_attention_ulysses_degree(self, layer: Any) -> int:
         if bool(getattr(layer, "skip_sequence_parallel", False)):
             return 1
 
         parallel_config = getattr(self.od_config, "parallel_config", None)
         ulysses_degree = int(getattr(parallel_config, "ulysses_degree", 1))
-        ring_degree = int(getattr(parallel_config, "ring_degree", 1))
-        allgather_degree = int(getattr(parallel_config, "allgather_degree", 1))
         ulysses_mode = str(getattr(parallel_config, "ulysses_mode", "strict"))
-        if ring_degree > 1:
-            raise NotImplementedError(
-                "Diffusion paged attention does not support Ring or hybrid Ulysses+Ring attention"
-            )
-        if allgather_degree > 1:
-            raise NotImplementedError("Diffusion paged attention does not support AllGather-KV sequence parallelism")
         if ulysses_degree > 1 and ulysses_mode != "strict":
             raise NotImplementedError(
                 f"Diffusion paged attention currently supports only strict Ulysses; got ulysses_mode={ulysses_mode!r}"
