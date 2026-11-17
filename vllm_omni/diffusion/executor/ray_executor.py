@@ -21,11 +21,11 @@ from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any
 
 import torch
-
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.network_utils import get_distributed_init_method, get_ip, get_open_port
 from vllm.v1.engine.exceptions import EngineDeadError
+
 from vllm_omni.diffusion.cancellation import (
     RayRequestCancellationRegistry,
     bind_ray_cancel_table,
@@ -310,6 +310,7 @@ class RayDiffusionWorkerWrapper:
 
     def _is_primary_in_replica(self) -> bool:
         from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+
         from vllm_omni.diffusion.distributed.parallel_state import (
             get_classifier_free_guidance_rank,
             get_pipeline_parallel_rank,
