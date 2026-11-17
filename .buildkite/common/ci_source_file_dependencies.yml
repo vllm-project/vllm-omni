@@ -37,7 +37,6 @@ x-qwen3-tts: &qwen3_tts
   - vllm_omni/engine/cuda_mps.py
   - vllm_omni/engine/stage_runtime.py
   - vllm_omni/engine/stage_init_utils.py
-  - vllm_omni/deploy/qwen3_tts_mrv2.yaml
   - vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2.yaml
   - vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2_b4.yaml
 
@@ -698,6 +697,18 @@ source_file_dependencies:
   omni_qwen3_omni_reliability:
     - *qwen3_omni
     - tests/dfx/reliability/test_qwen3_omni.py
+    - tests/helpers/stage_config.py
+    - tests/dfx/reliability/scenarios/
+    - tests/dfx/reliability/helpers.py
+    - tests/dfx/conftest.py
+    - tests/dfx/reliability/conftest.py
+    - tests/helpers/runtime.py
+
+  omni_qwen3_omni_replica_reliability:
+    - *qwen3_omni
+    - tests/dfx/reliability/test_qwen3_omni.py
+    - tests/dfx/reliability/test_qwen3_omni_replica.py
+    - tests/helpers/stage_config.py
     - tests/dfx/reliability/scenarios/
     - tests/dfx/reliability/helpers.py
     - tests/dfx/conftest.py
@@ -793,7 +804,20 @@ source_file_dependencies:
     - tests/dfx/reliability/helpers.py
     - tests/dfx/conftest.py
     - tests/dfx/reliability/conftest.py
+    - tests/helpers/stage_config.py
     - tests/helpers/runtime.py
+
+  omni_minicpmo_4_5_replica_reliability:
+    - *minicpmo_4_5
+    - tests/dfx/reliability/test_minicpmo_4_5.py
+    - tests/dfx/reliability/test_minicpmo_4_5_replica.py
+    - tests/dfx/reliability/scenarios/
+    - tests/dfx/reliability/helpers.py
+    - tests/dfx/conftest.py
+    - tests/dfx/reliability/conftest.py
+    - tests/helpers/stage_config.py
+    - tests/helpers/runtime.py
+    - vllm_omni/deploy/minicpmo_4_5_3gpu_stage1_replicas.yaml
 
   omni_minicpmo_4_5_accuracy:
     - *minicpmo_4_5
@@ -816,6 +840,7 @@ source_file_dependencies:
   omni_minicpmo_4_5_perf:
     - *minicpmo_4_5
     - tests/dfx/perf/scripts/run_benchmark.py
+    - tests/dfx/conftest.py
     - tests/dfx/perf/tests/test_minicpmo_4_5_ready.json
     - tests/dfx/perf/tests/test_minicpmo_4_5.json
 
@@ -1154,6 +1179,11 @@ source_file_dependencies:
     - vllm_omni/model_executor/stage_input_processors/breeze_tts_2.py
     - vllm_omni/outputs/
 
+  # MRv2 paths for the CUDA Breeze weekly step only. The ROCm step shares
+  # tts_breeze_tts2_weekly but still runs on V1.
+  tts_breeze_tts2_mrv2_weekly:
+    - vllm_omni/worker_v2/
+
   tts_gepard_weekly:
     - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
     - tests/assets/
@@ -1274,10 +1304,12 @@ source_file_dependencies:
   tts_qwen3_tts_perf:
     - *qwen3_tts
     - tests/dfx/perf/scripts/run_benchmark.py
+    - tests/dfx/conftest.py
     - tests/dfx/perf/tests/test_tts.json
 
   tts_voxtral_tts_perf:
     - tests/dfx/perf/scripts/run_benchmark.py
+    - tests/dfx/conftest.py
     - tests/dfx/perf/tests/test_tts.json
     - vllm_omni/config/omni_config.py
     - vllm_omni/config/pipeline_registry.py
@@ -1347,6 +1379,7 @@ source_file_dependencies:
   diffusion_wan22_perf:
     - *wan22
     - tests/dfx/perf/scripts/run_benchmark.py
+    - tests/dfx/conftest.py
     - tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json
 
   diffusion_wan22_reliability:
@@ -1356,6 +1389,7 @@ source_file_dependencies:
     - tests/dfx/reliability/helpers.py
     - tests/dfx/conftest.py
     - tests/dfx/reliability/conftest.py
+    - tests/helpers/stage_config.py
     - tests/helpers/runtime.py
 
   diffusion_image_to_video_doc:
@@ -1411,6 +1445,7 @@ source_file_dependencies:
   diffusion_qwen_image_21_perf:
     - *qwen_image_21
     - tests/dfx/perf/scripts/run_benchmark.py
+    - tests/dfx/conftest.py
     - tests/dfx/perf/tests/test_qwen_image_21_vllm_omni.json
 
   diffusion_text_to_image_doc:
@@ -1460,6 +1495,7 @@ source_file_dependencies:
   diffusion_hunyuan_image3_perf:
     - *hunyuan_image3
     - tests/dfx/perf/scripts/run_diffusion_benchmark.py
+    - tests/dfx/conftest.py
     - tests/dfx/perf/tests/test_hunyuan_image_tp2_cfgp2.json
     - tests/dfx/perf/tests/test_hunyuan_image_tp2_sp2.json
     - tests/dfx/perf/tests/test_hunyuan_image_tp4.json
@@ -1472,6 +1508,7 @@ source_file_dependencies:
     - tests/dfx/reliability/helpers.py
     - tests/dfx/conftest.py
     - tests/dfx/reliability/conftest.py
+    - tests/helpers/stage_config.py
     - tests/helpers/runtime.py
 
   diffusion_minimax_h3_function:
@@ -1492,6 +1529,7 @@ source_file_dependencies:
   diffusion_minimax_h3_perf:
     - *minimax_h3
     - tests/dfx/perf/scripts/run_benchmark.py
+    - tests/dfx/conftest.py
     - tests/dfx/perf/tests/test_minimax_h3_vllm_omni.json
 
   diffusion_minimax_h3_rainfusion:
@@ -1532,6 +1570,7 @@ source_file_dependencies:
   diffusion_hunyuan_video_perf:
     - *hunyuan_video
     - tests/dfx/perf/scripts/run_benchmark.py
+    - tests/dfx/conftest.py
     - tests/dfx/perf/tests/test_hunyuanvideo15_t2v_vllm_omni.json
     - tests/dfx/perf/tests/test_hunyuanvideo15_i2v_vllm_omni.json
 
@@ -1562,6 +1601,7 @@ source_file_dependencies:
   diffusion_lingbot_perf:
     - *lingbot_video
     - tests/dfx/perf/scripts/run_benchmark.py
+    - tests/dfx/conftest.py
     - tests/dfx/perf/tests/test_lingbot_video_vllm_omni.json
 
   # Invalid-param jobs: model business code only, plus the reliability scripts.

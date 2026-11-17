@@ -1918,6 +1918,10 @@ stages:
         assert stages[1].yaml_engine_args["model_loaded"] == {"text_encoder": False, "vae_encoder": False}
         assert stages[0].yaml_engine_args["tensor_parallel_size"] == 2
         assert stages[0].yaml_engine_args["max_num_seqs"] == 1
+        assert stages[0].yaml_engine_args["use_v2_model_runner"] is True
+        assert stages[0].yaml_engine_args["supports_native_mrv2_data_plane"] is True
+        assert stages[1].yaml_engine_args["use_v2_model_runner"] is False
+        assert stages[1].yaml_engine_args["supports_native_mrv2_data_plane"] is False
         assert stages[0].yaml_engine_args["hf_overrides"]["minimax_h3_encoder_components"] == {
             "text_encoder": {"parallel_mode": "tp"},
             "video_vae": {"parallel_mode": "patch"},
@@ -1945,6 +1949,35 @@ stages:
         turbo_sampling = turbo_stages[1].yaml_extras["default_sampling_params"]
         assert turbo_sampling["num_inference_steps"] == 5
         assert turbo_sampling["extra_args"] == {"flow_shift": 6.0, "audio_flow_shift": 3.0}
+
+    @pytest.mark.parametrize(
+        ("deploy_name", "pipeline_key"),
+        [
+            ("minimax_h3_disaggregated_decode.yaml", "minimax_h3_disaggregated_decode"),
+            ("minimax_h3_disaggregated_nixl.yaml", "minimax_h3_disaggregated"),
+            ("minimax_h3_disaggregated_turbo_nixl.yaml", "minimax_h3_disaggregated"),
+        ],
+    )
+    def test_minimax_h3_decode_and_nixl_encoder_selects_native_mrv2_data_plane(self, deploy_name, pipeline_key):
+        """The decode split and the Nixl overlays resolve the same MRv2 encoder.
+
+        The Nixl overlays inherit stage 0 through base_config and the decode
+        pipeline reuses the encoder StagePipelineConfig via replace(), so the
+        resolved engine args must match the base deploys: the encoder runs
+        model runner v2 with its native data plane, every later stage stays
+        on v1. Fails before the pipeline declaration, where the encoder
+        resolved v2 without the native data plane.
+        """
+        deploy = load_deploy_config(Path(get_deploy_config_path(deploy_name)))
+        stages = merge_pipeline_deploy(OMNI_PIPELINES[pipeline_key], deploy)
+        encoder = next(stage for stage in stages if stage.model_stage == "encoder")
+        assert encoder.yaml_engine_args["use_v2_model_runner"] is True
+        assert encoder.yaml_engine_args["supports_native_mrv2_data_plane"] is True
+        for stage in stages:
+            if stage is encoder:
+                continue
+            assert stage.yaml_engine_args["use_v2_model_runner"] is False
+            assert stage.yaml_engine_args["supports_native_mrv2_data_plane"] is False
 
     @pytest.mark.parametrize(
         "deploy_name",
@@ -3273,11 +3306,10 @@ class TestPlatformOverrides:
     @pytest.mark.parametrize(
         "filename,pipeline_key,cuda_default_runner,cuda_v1_stages",
         [
-            ("qwen3_tts_mrv2.yaml", "qwen3_tts", "v2", ()),
+            ("qwen3_tts.yaml", "qwen3_tts", "v2", ()),
             ("moss_tts_local.yaml", "moss_tts_local", "v2", ()),
+            ("moss_tts_nano.yaml", "moss_tts_nano", "v2", ()),
             ("minicpmo_4_5.yaml", "minicpmo_4_5", "v2", ()),
-            ("minicpmo_4_5_turn.yaml", "minicpmo_4_5", "v2", ()),
-            ("minicpmo_4_5_duplex_h200.yaml", "minicpmo_4_5", "v2", ()),
         ],
     )
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
@@ -3286,10 +3318,10 @@ class TestPlatformOverrides:
     ):
         deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
         deploy = _apply_platform_overrides(deploy, platform=platform)
-        # PR #10062 turns on full-MRv2 three-stage serving on NPU by default
-        # for the three MiniCPM-o deploy profiles it touches; every other
-        # platform/profile keeps the v1 data plane.
+        # Qwen3-TTS and these MiniCPM-o profiles also default to V2 on NPU.
+        # The remaining non-CUDA platform/profile combinations keep V1.
         npu_full_mrv2 = platform == "npu" and filename in (
+            "qwen3_tts.yaml",
             "minicpmo_4_5.yaml",
             "minicpmo_4_5_turn.yaml",
             "minicpmo_4_5_duplex_h200.yaml",

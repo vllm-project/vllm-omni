@@ -37,6 +37,7 @@ from vllm.multimodal.cache.shm import ShmObjectStoreSenderCache
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequest, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
@@ -193,14 +194,17 @@ def build_engine_core_request_from_tokens(
     if arrival_time is None:
         arrival_time = _time.time()
 
-    prompt_token_ids = prompt["prompt_token_ids"]
+    prompt_token_ids = prompt.get("prompt_token_ids")
+    prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
 
     sampling_params = None
     pooling_params = None
     if isinstance(params, SamplingParams):
         sampling_params = params.clone()
         if model_config is not None:
-            remaining = model_config.max_model_len - len(prompt_token_ids)
+            remaining = model_config.max_model_len - length_from_prompt_token_ids_or_embeds(
+                prompt_token_ids, prompt_embeds
+            )
             if sampling_params.max_tokens is None:
                 sampling_params.max_tokens = remaining
             # ``check_stop`` returns early while ``min_tokens`` is unmet, so a
@@ -212,7 +216,6 @@ def build_engine_core_request_from_tokens(
     else:
         pooling_params = params.clone()
 
-    prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
     raw_additional_information = prompt.get("additional_information")
     model_intermediate_buffer = prompt.get("model_intermediate_buffer")
     wire_payload: dict[str, Any] | None = None
@@ -2534,10 +2537,33 @@ class OrchestratorBase:
             model_intermediate_buffer=model_intermediate_buffer,
         )
 
-    async def _process_stage_inputs(self, stage_id: int, **kwargs: Any) -> Any:
+    def _process_stage_inputs_in_worker(
+        self, stage_id: int, *, validate_input_tokens: Callable[[int], None] | None = None, **kwargs: Any
+    ) -> EngineCoreRequest:
+        """Process inputs under the shared lock; subclasses may prepare them first.
+
+        Called only from the joined CPU worker. Generic stages use the ordinary
+        processor; duplex specializes preparation before backend admission.
+        """
+        request = self._get_stage_input_processor(stage_id).process_inputs(**kwargs)
+        if validate_input_tokens is not None:
+            validate_input_tokens(
+                length_from_prompt_token_ids_or_embeds(
+                    request.prompt_token_ids, getattr(request, "prompt_embeds", None)
+                )
+            )
+        return request
+
+    async def _process_stage_inputs(
+        self, stage_id: int, *, validate_input_tokens: Callable[[int], None] | None = None, **kwargs: Any
+    ) -> Any:
+        """Join serialized CPU input processing on success, rejection or cancellation."""
+
         def process() -> Any:
             with self._prompt_processing_lock:
-                return self._get_stage_input_processor(stage_id).process_inputs(**kwargs)
+                return self._process_stage_inputs_in_worker(
+                    stage_id, validate_input_tokens=validate_input_tokens, **kwargs
+                )
 
         worker = asyncio.create_task(asyncio.to_thread(process))
         try:
@@ -2712,6 +2738,7 @@ class OrchestratorBase:
         resumable: bool = False,
         payload_sender_info: PayloadSenderInfo | None = None,
         replica_id: int | None = None,
+        validate_input_tokens: Callable[[int], None] | None = None,
     ) -> EngineCoreRequest:
         next_pool = self.stage_pools[next_stage_id]
         if self._next_stage_input_is_tokens(next_input):
@@ -2725,6 +2752,10 @@ class OrchestratorBase:
             )
             request.external_req_id = request.request_id
             request.payload_sender_info = payload_sender_info
+            if validate_input_tokens is not None:
+                validate_input_tokens(
+                    length_from_prompt_token_ids_or_embeds(request.prompt_token_ids, request.prompt_embeds)
+                )
             return request
 
         if replica_id is not None:
@@ -2739,6 +2770,7 @@ class OrchestratorBase:
             supported_tasks = tuple(getattr(model_cfg, "supported_tasks", ()) or ()) or (params.task,)
         else:
             supported_tasks = ("generate",)
+        validation = {} if validate_input_tokens is None else {"validate_input_tokens": validate_input_tokens}
         request = await self._process_stage_inputs(
             next_stage_id,
             request_id=req_id,
@@ -2747,6 +2779,7 @@ class OrchestratorBase:
             supported_tasks=supported_tasks,
             arrival_time=_time.time(),
             resumable=resumable,
+            **validation,
         )
         request = self._upgrade_processed_stage_request(request, next_input)
         request.external_req_id = req_id
@@ -2940,6 +2973,16 @@ class OrchestratorBase:
                 request_id,
                 exc_info=True,
             )
+
+    def _diffusion_params_for_samples(self, req_state: OrchestratorRequestState, src_stage_id: int, params: Any) -> Any:
+        """Tell the diffusion stage how many per-sample KV caches to receive."""
+        params = _without_per_sample_kv_count(params)
+        n = getattr(req_state.sampling_params_list[src_stage_id], "n", 1) or 1
+        if n <= 1 or not self.stage_pools[src_stage_id].per_sample_kv:
+            return params
+        params = copy.copy(params)
+        params.extra_args = {**(params.extra_args or {}), PER_SAMPLE_KV_COUNT_KEY: n}
+        return params
 
     async def _forward_to_next_stage(
         self,
