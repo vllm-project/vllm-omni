@@ -4376,7 +4376,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
     @staticmethod
     def _resolve_height_width_from_extra_body(extra_body: dict[str, Any]) -> tuple[Any, Any]:
-        """Extract generation height/width with optional size string fallback."""
+        """Extract generation height/width with optional size string fallback.
+
+        Aspect-ratio "W:H" sizes (e.g., "16:9") are only resolved for image
+        generation. A text-to-video request sets ``num_frames``; for those the
+        ratio is logged and ignored so the video canvas keeps the model
+        defaults (explicit WIDTHxHEIGHT strings still apply).
+        """
         height = extra_body.get("height")
         width = extra_body.get("width")
 
@@ -4384,7 +4390,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             size_str = extra_body["size"]
             if isinstance(size_str, str):
                 try:
-                    width, height = parse_size(size_str.lower(), allow_ratio=True)
+                    if ":" in size_str.lower() and extra_body.get("num_frames") is not None:
+                        logger.warning(
+                            "Invalid size format: %s (aspect-ratio sizes are not supported for video generation)",
+                            size_str,
+                        )
+                    else:
+                        width, height = parse_size(size_str.lower(), allow_ratio=True)
                 except ValueError:
                     logger.warning("Invalid size format: %s", extra_body.get("size"))
 

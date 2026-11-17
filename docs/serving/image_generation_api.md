@@ -212,16 +212,16 @@ Common ratio resolutions:
 | `3:4` | 896x1184 | `21:9` | 1568x672 |
 | `3:2` | 1248x832 | `2:3` | 832x1248 |
 
-Any positive integer pair is accepted (e.g., `"5:4"`, `"32:18"`); extreme ratios that cannot be resolved to 32-aligned positive dimensions are rejected with a 400 error. If you need a different total pixel area for a given ratio, request explicit `WIDTHxHEIGHT` dimensions instead.
+Any positive integer pair is accepted (e.g., `"5:4"`, `"32:18"`); ratios that cannot be resolved to 32-aligned positive dimensions are rejected with a 400 error. Note that the 32-pixel alignment can push a resolved size slightly above 1 megapixel (e.g. `"16:9"` resolves to 1376x768 = 1,056,768 pixels), and resolved sizes are validated against the server's `--max-generated-image-size` cap like any explicit size. If you need a different total pixel area for a given ratio, request explicit `WIDTHxHEIGHT` dimensions instead.
 
-The same formats are accepted for the `size` field of `/v1/images/edits` and for the `size` extra-body field of image generation via `/v1/chat/completions` (where an invalid value is logged and ignored).
+The same formats are accepted for the `size` field of `/v1/images/edits` and for the `size` extra-body field of image generation via `/v1/chat/completions` (where an invalid value is logged and ignored). On the chat path, aspect-ratio values are ignored for text-to-video requests (i.e. when `num_frames` is set) so the video canvas keeps the model defaults; explicit `WIDTHxHEIGHT` values are forwarded as-is.
 
 ## Parameter Handling
 
 The API passes parameters directly to the diffusion pipeline without model-specific transformation:
 
 - **Default values**: When parameters are not specified, the underlying model uses its own defaults
-- **Pass-through design**: User-provided values are forwarded directly to the diffusion engine
+- **Pass-through design**: Explicit `WIDTHxHEIGHT` values are forwarded directly to the diffusion engine; aspect-ratio `size` values are resolved to concrete dimensions in the API layer (see [Size Formats](#size-formats))
 - **Minimal validation**: Only basic type checking and range validation at the API level
 
 ### Parameter Compatibility

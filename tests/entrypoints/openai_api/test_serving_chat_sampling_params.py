@@ -739,10 +739,40 @@ class TestResolveHeightWidth:
         assert w == 1376
         assert h == 768
 
+    def test_size_ratio_ignored_for_video_request(self):
+        """Ratio sizes must not change the video canvas.
+
+        num_frames marks a text-to-video request on the shared diffusion chat
+        path; an aspect-ratio size is logged and ignored there so the video
+        canvas keeps the model defaults (see serving_chat.py).
+        """
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        h, w = OmniOpenAIServingChat._resolve_height_width_from_extra_body({"size": "16:9", "num_frames": 49})
+        assert h is None
+        assert w is None
+
+    def test_size_wxh_still_applies_for_video_request(self):
+        """Explicit WIDTHxHEIGHT sizes keep working for video requests"""
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        h, w = OmniOpenAIServingChat._resolve_height_width_from_extra_body({"size": "768x512", "num_frames": 49})
+        assert w == 768
+        assert h == 512
+
     def test_invalid_ratio_format_ignored(self):
         from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
         h, w = OmniOpenAIServingChat._resolve_height_width_from_extra_body({"size": "16:9:4"})
+        assert h is None
+        assert w is None
+
+    def test_oversized_ratio_terms_fallback_ignored(self):
+        """Oversized ratio terms log-and-ignore on the chat path (no 500)"""
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        huge = "9" * 400
+        h, w = OmniOpenAIServingChat._resolve_height_width_from_extra_body({"size": f"{huge}:1"})
         assert h is None
         assert w is None
 

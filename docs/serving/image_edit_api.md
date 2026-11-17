@@ -216,7 +216,7 @@ edited image.
 The API passes parameters directly to the diffusion pipeline without model-specific transformation:
 
 - **Default values**: When parameters are not specified, the underlying model uses its own defaults
-- **Pass-through design**: User-provided values are forwarded directly to the diffusion engine
+- **Pass-through design**: Explicit `WIDTHxHEIGHT` values are forwarded directly to the diffusion engine; aspect-ratio `size` values are resolved to concrete dimensions in the API layer (see [Size Formats](image_generation_api.md#size-formats))
 - **Minimal validation**: Only basic type checking and range validation at the API level
 
 ### Parameter Compatibility
@@ -237,7 +237,7 @@ Invalid parameters (e.g., model mismatch):
 
 ```json
 {
-  "detail": "Invalid size format: '1024x'. Expected format: 'WIDTHxHEIGHT' (e.g., '1024x1024')."
+  "detail": "Invalid size format: '1024'. Expected format: 'WIDTHxHEIGHT' (e.g., '1024x1024') or aspect-ratio 'W:H' (e.g., '16:9'). Did you mean to use 'x' as separator?"
 }
 ```
 

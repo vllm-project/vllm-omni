@@ -150,6 +150,63 @@ def test_parse_size_ratio_requires_opt_in():
         parse_size("16:9")
 
 
+def test_parse_size_ratio_oversized_terms():
+    """Oversized ratio terms resolve to ValueError instead of float exceptions.
+
+    Terms with hundreds of digits pass the integer/positive validation but
+    overflow (numerator) or underflow (denominator) IEEE-754 floats in a
+    naive ratio/sqrt implementation, leaking OverflowError or
+    ZeroDivisionError; they must surface the documented invalid-size error.
+    """
+    huge = "9" * 400
+    with pytest.raises(ValueError, match="too extreme"):
+        parse_size(f"{huge}:1", allow_ratio=True)
+    with pytest.raises(ValueError, match="too extreme"):
+        parse_size(f"1:{huge}", allow_ratio=True)
+    # ratio near 1 with huge terms stays finitely representable and resolves normally
+    assert parse_size(f"{huge}:{huge}", allow_ratio=True) == (1024, 1024)
+
+
+def test_parse_size_ratio_finite_ratio_multiplication_overflow():
+    """A float-finite ratio whose target-area multiplication overflows is rejected.
+
+    ratio = 10**308 converts to float fine, but TARGET_AREA * ratio overflows
+    to inf in float math (OverflowError on round()); the resolver must reject
+    it as a 400-style ValueError instead.
+    """
+    huge_num = "1" + "0" * 308
+    with pytest.raises(ValueError, match="too extreme"):
+        parse_size(f"{huge_num}:1", allow_ratio=True)
+    with pytest.raises(ValueError, match="too extreme"):
+        parse_size(f"1:{huge_num}", allow_ratio=True)
+
+
+def test_parse_size_ratio_matches_calculate_dimensions():
+    """parse_size(allow_ratio=True) stays in sync with Qwen-Image pipelines.
+
+    Pins the 'keep in sync' contract with calculate_dimensions() (used by the
+    Qwen-Image edit/layered pipelines) for every ratio documented in
+    docs/serving/image_generation_api.md.
+    """
+    from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit import calculate_dimensions
+
+    doc_ratios = ["1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16", "21:9"]
+    for size_str in doc_ratios:
+        w, h = (int(part) for part in size_str.split(":"))
+        expected = calculate_dimensions(1024 * 1024, w / h)
+        assert parse_size(size_str, allow_ratio=True) == expected, size_str
+
+
+def test_parse_size_ratio_error_messages_match_docs():
+    """The 400 samples in docs/serving/image_edit_api.md stay reachable."""
+    with pytest.raises(ValueError) as exc:
+        parse_size("1024", allow_ratio=True)
+    assert str(exc.value) == (
+        "Invalid size format: '1024'. Expected format: 'WIDTHxHEIGHT' (e.g., '1024x1024')"
+        " or aspect-ratio 'W:H' (e.g., '16:9'). Did you mean to use 'x' as separator?"
+    )
+
+
 def test_encode_image_base64():
     """Test image encoding to base64"""
     # Create a simple test image
@@ -1547,6 +1604,40 @@ def test_ratio_size_image_edit(async_omni_test_client):
     captured_sampling_params = engine.captured_sampling_params_list[-1]
     assert captured_sampling_params.width == 832
     assert captured_sampling_params.height == 1248
+
+
+def test_ratio_size_over_max_generated_image_size(async_omni_test_client):
+    """Resolved ratio size competing with --max-generated-image-size -> 400.
+
+    Pins the docs note that 32-alignment rounding can push a resolved ratio
+    slightly above the cap: this fixture caps at 1024*1024 and 16:9 resolves
+    to 1376x768 (1,056,768 px), so the request is rejected like any explicit
+    over-cap size.
+    """
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a wide landscape",
+            "size": "16:9",
+        },
+    )
+    assert response.status_code == 400
+    detail = str(response.json()["detail"])
+    assert "exceeds the maximum allowed size" in detail
+
+
+def test_ratio_size_oversized_terms_400(test_client):
+    """Oversized ratio terms return 400 (not 500) on the images endpoints"""
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat",
+            "size": f"{'9' * 400}:1",
+        },
+    )
+    assert response.status_code == 400
+    detail = str(response.json()["detail"])
+    assert "too extreme" in detail
 
 
 def test_parameter_validation():

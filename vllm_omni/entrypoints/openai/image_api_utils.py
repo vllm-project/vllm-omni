@@ -33,7 +33,8 @@ SUPPORTED_LAYERED_LAYERS_RANGE = range(2, 11)
 # Target pixel area used to resolve aspect-ratio size strings (e.g., "16:9")
 # into concrete dimensions. Matches the ~1 megapixel default canvas of the
 # Qwen-Image family; keep in sync with calculate_dimensions() call sites in
-# vllm_omni/diffusion/models/qwen_image/.
+# vllm_omni/diffusion/models/qwen_image/ (parity pinned by
+# tests/entrypoints/openai_api/test_image_server.py::test_parse_size_ratio_matches_calculate_dimensions).
 RATIO_SIZE_TARGET_AREA = 1024 * 1024
 # Dimensions resolved from an aspect ratio are aligned to multiples of this
 # many pixels so they stay valid for the Qwen-Image family VAE.
@@ -91,6 +92,12 @@ def _parse_ratio_size(size_str: str) -> tuple[int, int]:
     The ratio is scaled to RATIO_SIZE_TARGET_AREA total pixels and each side is
     rounded to the nearest multiple of RATIO_SIZE_ALIGNMENT.
 
+    The resolution uses integer arithmetic only (``math.isqrt``), so ratio
+    terms of arbitrary size are handled exactly: an oversized numerator or
+    denominator that would overflow or underflow IEEE-754 floats falls through
+    to the regular "too extreme" ValueError instead of leaking
+    OverflowError/ZeroDivisionError.
+
     Raises:
         ValueError: If the ratio format is invalid or too extreme to resolve
             to aligned positive dimensions.
@@ -108,9 +115,8 @@ def _parse_ratio_size(size_str: str) -> tuple[int, int]:
     if ratio_w <= 0 or ratio_h <= 0:
         raise ValueError(f"Invalid size: '{size_str}'. Aspect-ratio values must be positive integers.")
 
-    ratio = ratio_w / ratio_h
-    width = round(math.sqrt(RATIO_SIZE_TARGET_AREA * ratio) / RATIO_SIZE_ALIGNMENT) * RATIO_SIZE_ALIGNMENT
-    height = round(math.sqrt(RATIO_SIZE_TARGET_AREA / ratio) / RATIO_SIZE_ALIGNMENT) * RATIO_SIZE_ALIGNMENT
+    width = _round_ratio_side(ratio_w, ratio_h)
+    height = _round_ratio_side(ratio_h, ratio_w)
 
     if width <= 0 or height <= 0:
         raise ValueError(
@@ -119,6 +125,27 @@ def _parse_ratio_size(size_str: str) -> tuple[int, int]:
         )
 
     return width, height
+
+
+def _round_ratio_side(side_w: int, side_h: int) -> int:
+    """``round(sqrt(TARGET_AREA * side_w / side_h) / ALIGNMENT) * ALIGNMENT``.
+
+    Computed exactly with integer arithmetic: the nearest integer k to
+    ``sqrt(TARGET_AREA * side_w / (side_h * ALIGNMENT**2))`` is recovered from
+    ``floor(sqrt(...))`` and its two candidate roundings, so no float
+    conversion (and therefore no overflow/underflow) is involved.
+    """
+    num = RATIO_SIZE_TARGET_AREA * side_w
+    den = side_h * RATIO_SIZE_ALIGNMENT * RATIO_SIZE_ALIGNMENT
+    # floor(sqrt(num / den)) is either isqrt(num // den) or one more.
+    floored = math.isqrt(num // den)
+    if (floored + 1) * (floored + 1) * den <= num:
+        floored += 1
+    # Round to the nearest integer: the boundary between k and k+1 sits at
+    # sqrt(num / den) == k + 0.5, i.e. (2*k + 1)**2 * den == 4 * num.
+    if (2 * floored + 1) * (2 * floored + 1) * den < 4 * num:
+        floored += 1
+    return floored * RATIO_SIZE_ALIGNMENT
 
 
 def encode_image_base64(image: PIL.Image.Image) -> str:
