@@ -27,7 +27,9 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import regex as re
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.multimodal.cache import LruKeyReplicatedSenderCache, ShmObjectStoreSenderCache
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer
 from vllm.sampling_params import SamplingParams
@@ -1680,13 +1682,17 @@ def _build_token_only_renderer(stage_vllm_config: Any) -> BaseRenderer:
     return omni_renderer_cls(_TokenOnlyRenderer)(stage_vllm_config, tokenizer=None)
 
 
-def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
+def build_stage0_input_processor(stage_vllm_config: VllmConfig, *, replicated: bool = False) -> InputProcessor:
     """Build the shared stage-0 input processor.
 
     The renderer is the Omni subclass of the upstream renderer class that
     ``renderer_from_config`` would have picked (or of the token-only renderer
     when the stage skips tokenizer initialization), so upstream's
     ``InputProcessor`` runs unmodified on top of it.
+
+    Replicated frontends reuse processing results but send tensors on every
+    request: a frontend cache hit does not imply a hit in the selected
+    replica's receiver cache. This also applies before dynamic replicas join.
     """
 
     patch_generation_config_if_needed(stage_vllm_config.model_config)
@@ -1694,6 +1700,11 @@ def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
         renderer = _build_token_only_renderer(stage_vllm_config)
     else:
         renderer = build_omni_renderer(stage_vllm_config)
+    if replicated and isinstance(renderer.mm_processor_cache, (LruKeyReplicatedSenderCache, ShmObjectStoreSenderCache)):
+        # vLLM 0.33 owns both caches on the renderer, including their cleanup.
+        # Select its existing processor-only cache before serving/rendering;
+        # chat inputs are already rendered when replica routing runs.
+        renderer._mm_processor_cache = renderer._mm_processor_only_cache
     return InputProcessor(vllm_config=stage_vllm_config, renderer=renderer)
 
 
