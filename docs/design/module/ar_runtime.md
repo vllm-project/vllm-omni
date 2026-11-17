@@ -93,7 +93,10 @@ the scheduler as the engine-core utility call `omni_append_text`, and
 ids, its end, and its deadline. The policy runs once, at admission, and says
 how many ids the request's prompt reads; after the prompt, each sampled frame
 reads one more id (`text_row`). A request that declares a stream on a stage
-without a policy is refused at admission.
+without a policy is refused at admission, and so is one on a stage with prefix
+caching on: the prefix cache hashes the prompt's token ids, never the streamed
+ids, so two streamed requests with the same placeholder prompt would share
+each other's text-conditioned KV.
 
 While some request streams text, each step the scheduler:
 

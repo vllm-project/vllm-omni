@@ -8,6 +8,10 @@ import numpy as np
 import pytest
 import torch
 from pydantic import ValidationError
+from vllm.sampling_params import SamplingParams
+from vllm.utils.hashing import sha256
+from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.request import Request
 
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
@@ -197,3 +201,40 @@ def test_build_refuses_a_text_lead_past_the_text_end(speech_server):
         adapter.build(_request(language="English", non_streaming_mode=False, text_lead=4), [], False)
     )
     assert prepared.tts_params[TEXT_LEAD_KEY] == [4]
+
+
+@pytest.mark.parametrize(
+    ("warm", "submit"),
+    [
+        # A larger lead moves codec BOS: the first prompt's BOS row sits where the larger lead needs codec PAD.
+        ({"non_streaming_mode": False}, {"non_streaming_mode": False, "text_lead": 4}),
+        # The two prompt modes lay the same text out in different rows.
+        ({"non_streaming_mode": True}, {"non_streaming_mode": False}),
+    ],
+)
+def test_a_prompt_in_another_layout_finds_no_cached_block(speech_server, warm, submit):
+    """Warm the prefix cache with one prompt layout, then send the same text and voice in another layout.
+
+    The Talker's prompt is placeholder ids, so the cache salt is all that tells the two prompts apart in vLLM's block
+    hashes, and a block hash the second prompt shares with the first is a cache hit on the first prompt's KV.
+    """
+    server, adapter = speech_server
+    server._tts_tokenizer = _tokenize
+    init_none_hash(sha256)
+    hasher = get_request_block_hasher(4, sha256)
+
+    def block_hashes(fields: dict) -> list:
+        prompt = asyncio.run(adapter.build(_request(language="English", **fields), [], False)).prompt
+        request = Request(
+            "r",
+            prompt["prompt_token_ids"],
+            SamplingParams(max_tokens=8),
+            None,
+            cache_salt=prompt["cache_salt"],
+            block_hasher=hasher,
+        )
+        return request.block_hashes
+
+    cached = set(block_hashes(warm))
+    assert cached
+    assert cached.isdisjoint(block_hashes(submit))

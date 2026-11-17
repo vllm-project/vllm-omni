@@ -69,6 +69,7 @@ def _scheduler(
     test_clock: bool = True,
     scheduler_cls: type[OmniARScheduler] = OmniARScheduler,
     recompute_preemption: str = "allow",
+    prefix_caching: bool = False,
 ):
     config = VllmConfig()
     config.model_config = _ModelConfig(  # type: ignore[assignment]
@@ -82,7 +83,7 @@ def _scheduler(
         max_num_batched_tokens=64,
         is_encoder_decoder=False,
     )
-    config.cache_config = CacheConfig(block_size=BLOCK_SIZE, enable_prefix_caching=False)
+    config.cache_config = CacheConfig(block_size=BLOCK_SIZE, enable_prefix_caching=prefix_caching)
     config.cache_config.num_gpu_blocks = num_blocks
     register_all_kvcache_specs(config)
     kv_config = KVCacheConfig(
@@ -343,6 +344,18 @@ def test_multi_frame_talker_decode_refuses_streamed_text(monkeypatch):
     scheduler.add_request(_request("r"))
     _, outputs = _step(scheduler)
     assert "multi-frame" in _terminal_errors(outputs)["r"]
+
+
+def test_a_stage_with_prefix_caching_refuses_streamed_text():
+    # The prefix cache hashes the prompt's token ids (placeholders) and never the streamed ids, so two streamed
+    # requests with the same placeholders would share each other's text rows. Other requests still run.
+    scheduler, _ = _scheduler(prefix_caching=True)
+    scheduler.add_request(_request("r"))
+    scheduler.add_request(_request("plain", stream=False))
+    scheduled, outputs = _step(scheduler)
+    assert "prefix caching" in _terminal_errors(outputs)["r"]
+    assert "r" not in scheduler.requests and "r" not in scheduler._text_streams
+    assert "plain" in scheduled.num_scheduled_tokens
 
 
 def test_a_streaming_input_session_cannot_stream_its_text():

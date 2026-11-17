@@ -602,7 +602,9 @@ EOS waits for the end of the text. A request that waits for text longer than
 ends with an error output and frees its KV cache and its seat. An append that
 the Talker's AR scheduler cannot apply also ends the request with an error
 output. Multi-frame
-Talker decode does not support streamed text. As with the silence ban, a stage
+Talker decode and prefix caching (`enable_prefix_caching`) do not support
+streamed text: such a stage ends a streamed request with an error at admission.
+As with the silence ban, a stage
 that sets `text_stream_policy` tracks every request's output tokens for the
 codec EOS check.
 

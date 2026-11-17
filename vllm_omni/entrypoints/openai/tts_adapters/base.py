@@ -125,6 +125,12 @@ def conditioning_cache_salt(
     codes_key = tts_params.get("ref_codes_cache_key") if tts_params is not None else None
     if codes_key is not None:
         h.update(b"\x00ref_codes\x00" + str(codes_key).encode("utf-8"))
+    # The prompt layout (also folded only when present): the same text and voice
+    # in another layout put different rows behind the same placeholder ids.
+    for key in ("non_streaming_mode", "text_lead"):
+        value = tts_params.get(key) if tts_params is not None else None
+        if value is not None:
+            h.update(f"\x00{key}\x00{value!r}".encode())
     return h.hexdigest()[:32]
 
 

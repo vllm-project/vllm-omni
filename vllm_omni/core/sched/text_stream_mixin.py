@@ -133,6 +133,10 @@ class TextStreamMixin(_SchedulerBase):
             return
         if self._talker_kstep_armed():
             reason = "Streamed text is not supported with multi-frame Talker decode."
+        elif self.kv_cache_manager.enable_caching:
+            # The prefix cache hashes the prompt's token ids, never the streamed ids, so two streamed requests with the
+            # same placeholder prompt would share each other's text-conditioned KV.
+            reason = "Streamed text is not supported with prefix caching; set enable_prefix_caching to false."
         elif request.resumable or held is not request:
             # A streaming input session (a resumable request, or an update to one): each update re-prefills the
             # request, which a streamed text cannot replay.
