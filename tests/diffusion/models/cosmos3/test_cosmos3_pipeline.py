@@ -936,10 +936,23 @@ def test_pipeline_resolves_scheduler_class_from_checkpoint_file(
         assert not hasattr(pipeline, "_scheduler_init_t_list")
 
 
+@pytest.mark.parametrize("use_graphs", [False, True])
+@pytest.mark.parametrize("cache_backend", ["none", "sea_cache"])
+@pytest.mark.parametrize(
+    ("enforce_eager", "compile_granularity"),
+    [(False, "regional"), (True, "regional"), (True, "full")],
+)
 def test_distilled_pipeline_initializes_sde_scheduler(
     stub_real_pipeline_init,
     monkeypatch: pytest.MonkeyPatch,
+    use_graphs: bool,
+    cache_backend: str,
+    enforce_eager: bool,
+    compile_granularity: str,
+    tmp_path,
 ) -> None:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
         Cosmos3OmniDiffusersPipeline,
         FlowMatchEulerDiscreteScheduler,
@@ -961,11 +974,25 @@ def test_distilled_pipeline_initializes_sde_scheduler(
         classmethod(lambda cls, *args, **kwargs: scheduler_config),
     )
 
-    pipeline = Cosmos3OmniDiffusersPipeline(od_config=_make_od_config(sound_gen=False))
+    config = _make_od_config(sound_gen=False)
+    if use_graphs:
+        monkeypatch.setattr(pipeline_cosmos3, "get_local_device", lambda: torch.device("cuda"))
+    config = OmniDiffusionConfig(
+        model=str(tmp_path),
+        dtype=torch.float32,
+        tf_model_config=TransformerConfig.from_dict(config.tf_model_config),
+        additional_config={"cosmos3_manual_cuda_graphs": use_graphs},
+        cache_backend=cache_backend,
+        enforce_eager=enforce_eager,
+        diffusion_compile_granularity=compile_granularity,
+    )
+    pipeline = Cosmos3OmniDiffusersPipeline(od_config=config)
     assert pipeline.is_distilled_model is True
     assert isinstance(pipeline.scheduler, FlowMatchEulerDiscreteScheduler)
     assert pipeline.scheduler.config.stochastic_sampling is True
     assert pipeline._scheduler_init_t_list == t_list
+    assert (pipeline.transformer._gen_graph is not None) is use_graphs
+    assert (pipeline.transformer._und_graph is not None) is use_graphs
 
 
 @pytest.mark.parametrize(
@@ -3844,3 +3871,54 @@ def test_diffuse_releases_conditioning_after_completion_or_failure(
     assert pipeline.transformer.cached_kv is None
     assert pipeline.transformer.cached_freqs_gen is None
     assert "cache-lifetime" not in pipeline._memory_manager
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"diffusion_compile_granularity": "full"},
+        {"cache_backend": "cache_dit"},
+        {"enable_cpu_offload": True},
+        {"enable_sleep_mode": True},
+    ],
+)
+def test_graph_option_rejects_unsupported_config_before_loading(monkeypatch, override) -> None:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    monkeypatch.setattr(pipeline_cosmos3, "get_local_device", lambda: torch.device("cuda"))
+    config = OmniDiffusionConfig(additional_config={"cosmos3_manual_cuda_graphs": True}, **override)
+    with pytest.raises(ValueError, match="Cosmos3 manual CUDA graphs require"):
+        pipeline_cosmos3.Cosmos3OmniDiffusersPipeline(od_config=config)
+
+
+@pytest.mark.parametrize(
+    ("quant_method", "serialized", "supported"),
+    [("modelopt", True, True), ("modelopt", False, False), ("modelopt_fp4", True, False)],
+)
+def test_graph_option_accepts_only_serialized_modelopt_fp8(monkeypatch, quant_method, serialized, supported) -> None:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+    from vllm_omni.quantization import build_quant_config
+
+    monkeypatch.setattr(pipeline_cosmos3, "get_local_device", lambda: torch.device("cuda"))
+
+    def reached_checkpoint_loading(*args, **kwargs):
+        raise RuntimeError("reached checkpoint loading")
+
+    monkeypatch.setattr(pipeline_cosmos3.FlowUniPCMultistepScheduler, "load_config", reached_checkpoint_loading)
+    config = OmniDiffusionConfig(additional_config={"cosmos3_manual_cuda_graphs": True})
+    config.model = "unused-checkpoint"
+
+    config.quantization_config = build_quant_config(
+        {"quant_method": quant_method, "quant_algo": "FP8" if quant_method == "modelopt" else "NVFP4"}
+    )
+    if quant_method == "modelopt":
+        config.quantization_config.is_checkpoint_fp8_serialized = serialized
+    error, message = (
+        (RuntimeError, "reached checkpoint loading")
+        if supported
+        else (ValueError, "Cosmos3 manual CUDA graphs require")
+    )
+    with pytest.raises(error, match=message):
+        pipeline_cosmos3.Cosmos3OmniDiffusersPipeline(od_config=config)

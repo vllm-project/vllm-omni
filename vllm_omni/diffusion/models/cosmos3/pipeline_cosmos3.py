@@ -1089,6 +1089,36 @@ class Cosmos3OmniDiffusersPipeline(
         self.device = get_local_device()
         self.dtype = od_config.dtype
 
+        use_manual_cuda_graphs = (getattr(od_config, "additional_config", None) or {}).get(
+            "cosmos3_manual_cuda_graphs", False
+        )
+        if not isinstance(use_manual_cuda_graphs, bool):
+            raise ValueError("cosmos3_manual_cuda_graphs must be a boolean")
+        if use_manual_cuda_graphs and (
+            self.device.type != "cuda"
+            or od_config.parallel_config.world_size != 1
+            or od_config.parallel_config.use_hsdp
+            or resolved_offload.strategy is not OffloadStrategy.NONE
+            or od_config.cache_backend not in (None, "none", "sea_cache")
+            or (
+                od_config.quantization_config is not None
+                and (
+                    od_config.quantization_config.get_name() != "modelopt"
+                    or not getattr(od_config.quantization_config, "is_checkpoint_fp8_serialized", False)
+                )
+            )
+            or od_config.lora_path is not None
+            or od_config.enable_sleep_mode
+            or (not od_config.enforce_eager and od_config.diffusion_compile_granularity != "regional")
+            or od_config.diffusion_attention_schedule is not None
+        ):
+            raise ValueError(
+                "Cosmos3 manual CUDA graphs require a single resident CUDA GPU with eager execution "
+                "or regional compilation, "
+                "with no cache or SeaCache and unquantized or serialized ModelOpt FP8 weights, "
+                "without offload, LoRA, sleep or attention schedules."
+            )
+
         model_path = od_config.model
         local_files_only = os.path.exists(model_path)
 
@@ -1148,6 +1178,8 @@ class Cosmos3OmniDiffusersPipeline(
             sound_latent_fps=sound_latent_fps,
         )
         self.is_edge_model = transformer_cls is Cosmos3EdgeVFMTransformer
+        if use_manual_cuda_graphs:
+            self.transformer.enable_cuda_graphs(self.device)
 
         # Opt-in: route the per-CFG-branch UND text K/V through the shared
         # SessionStateManager (RFC #4480) instead of the transformer-instance

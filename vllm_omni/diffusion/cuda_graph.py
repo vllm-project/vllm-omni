@@ -22,7 +22,7 @@ wrapper (a) enters the caller's ``capture_context`` around the capture
 forwards and around eager forwards inside an outer capture (TaoMate uses it
 to bypass its host-keyed AdaLN projection cache),
 and (b) validates the very first capture with
-``torch.cuda.set_sync_debug_mode("error")`` before capturing, so a
+``torch.cuda.set_sync_debug_mode("error")`` after warmup and before capturing, so a
 synchronizing operator fails loudly on every rank at the same program point
 instead of leaving peers waiting in a collective. Any failure disables the
 wrapper for the rest of the process (agreed across the sequence-parallel
@@ -40,7 +40,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-import torch.nn as nn
 from vllm.logger import init_logger
 
 from vllm_omni.platforms import current_omni_platform
@@ -106,26 +105,39 @@ def clone_static(value: Any) -> Any:
     )
 
 
-def copy_into(static: Any, current: Any) -> int:
-    """Copy the tensors of ``current`` into the matching buffers of ``static``.
+def copy_into(static: Any, current: Any, *, batched: bool = False) -> int:
+    """Refresh static inputs, optionally batching their copies into one foreach call.
 
-    Returns the number of tensors copied. The trees must share one signature.
+    Returns the number of tensors visited. The trees must share one signature.
     """
-    if isinstance(static, torch.Tensor):
-        if not isinstance(current, torch.Tensor) or static.shape != current.shape or static.dtype != current.dtype:
-            raise ValueError("graph input differs in shape or dtype from the captured buffer")
-        if static.data_ptr() != current.data_ptr() or static.stride() != current.stride():
-            static.copy_(current)
-        return 1
-    if isinstance(static, dict):
-        if not isinstance(current, dict) or static.keys() != current.keys():
-            raise ValueError("graph input keys differ from the captured kwargs")
-        return sum(copy_into(static[key], current[key]) for key in static)
-    if isinstance(static, (list, tuple)):
-        if not isinstance(current, (list, tuple)) or len(static) != len(current):
-            raise ValueError("graph input sequence differs from the captured kwargs")
-        return sum(copy_into(s, c) for s, c in zip(static, current, strict=True))
-    return 0
+    destinations: list[torch.Tensor] = []
+    sources: list[torch.Tensor] = []
+
+    def visit(dst: Any, src: Any) -> int:
+        if isinstance(dst, torch.Tensor):
+            if not isinstance(src, torch.Tensor) or dst.shape != src.shape or dst.dtype != src.dtype:
+                raise ValueError("graph input differs in shape or dtype from the captured buffer")
+            if dst.data_ptr() != src.data_ptr() or dst.stride() != src.stride():
+                if batched:
+                    destinations.append(dst)
+                    sources.append(src)
+                else:
+                    dst.copy_(src)
+            return 1
+        if isinstance(dst, dict):
+            if not isinstance(src, dict) or dst.keys() != src.keys():
+                raise ValueError("graph input keys differ from the captured kwargs")
+            return sum(visit(dst[key], src[key]) for key in dst)
+        if isinstance(dst, (list, tuple)):
+            if not isinstance(src, (list, tuple)) or len(dst) != len(src):
+                raise ValueError("graph input sequence differs from the captured kwargs")
+            return sum(visit(a, b) for a, b in zip(dst, src, strict=True))
+        return 0
+
+    count = visit(static, current)
+    if destinations:
+        torch._foreach_copy_(destinations, sources)
+    return count
 
 
 @dataclass
@@ -154,12 +166,13 @@ def _sync_debug_mode(mode: str) -> Iterator[None]:
 
 
 class GraphedForward:
-    """Capture-and-replay wrapper around a keyword-only ``nn.Module`` forward.
+    """Capture-and-replay wrapper around a keyword-only forward callable.
 
     The device-specific steps are the hooks ``_graphs_supported``,
     ``_warmup_stream`` and ``_capture_graph`` (plus ``_sync_probe``); a
     platform subclass overrides those and inherits keying, static buffers,
-    replay, LRU eviction and rank agreement.
+    replay, LRU eviction and rank agreement. ``batch_input_copies`` batches
+    tensor refreshes into a foreach copy instead of separate launches.
     """
 
     # Used in log messages.
@@ -169,7 +182,7 @@ class GraphedForward:
 
     def __init__(
         self,
-        module: nn.Module,
+        module: Callable[..., Any],
         *,
         device: torch.device,
         max_entries: int = 16,
@@ -178,10 +191,12 @@ class GraphedForward:
         name: str = "taomate_h3",
         enabled: bool = True,
         capture_context: Callable[[], AbstractContextManager] | None = None,
+        batch_input_copies: bool = False,
     ) -> None:
         if max_entries < 1:
             raise ValueError("max_entries must be at least 1")
         self.module = module
+        self.batch_input_copies = batch_input_copies
         self.device = torch.device(device)
         self.max_entries = int(max_entries)
         self.warmup_iters = int(warmup_iters)
@@ -231,7 +246,7 @@ class GraphedForward:
                 return self.module(**kwargs)
         else:
             entry.pinned = entry.pinned or pin
-            copy_into(entry.static_kwargs, kwargs)
+            copy_into(entry.static_kwargs, kwargs, batched=self.batch_input_copies)
             self._entries.move_to_end(key)
         entry.graph.replay()
         self.replays += 1
@@ -279,18 +294,18 @@ class GraphedForward:
         try:
             static = clone_static(kwargs)
             with self.capture_context():
-                if self._probe_pending:
-                    # A synchronizing operator raises here on every rank at
-                    # the same point, before any capture starts.
-                    with _sync_debug_mode("error"):
-                        self.module(**static)
-                    self._probe_pending = False
                 # The first capture warms lazy kernel/library state for the
                 # whole process; later shapes need a single warm forward.
                 warmups = self.warmup_iters if self.captures == 0 else min(self.warmup_iters, 1)
                 with self._warmup_stream():
                     for _ in range(warmups):
                         self.module(**static)
+                if self._probe_pending:
+                    # Lazy compiler/library initialization may synchronize. Probe
+                    # the warmed callable, before entering graph capture.
+                    with _sync_debug_mode("error"):
+                        self.module(**static)
+                    self._probe_pending = False
                 graph, outputs = self._capture_graph(lambda: self.module(**static))
         except Exception as exc:  # noqa: BLE001 - any capture failure means eager from now on
             failure = f"{type(exc).__name__}: {exc}"
