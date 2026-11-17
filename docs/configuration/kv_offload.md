@@ -303,20 +303,3 @@ The same test file also compares local-only and combined caching with those
 baselines, confirms the local/external token ranges, and covers mixed hits,
 promotion followed by local reuse, failed mixed reads, and changed image/audio
 content.
-
-For timing without tensor dumps or save barriers, use
-`benchmarks/prefix_cache/benchmark_multilayer.py`. Run `--mode off`, `local`,
-`mooncake`, and `two_level` with identical model revision, deployment, GPU block
-count, input lengths and sampling. The harness retains raw latency/audio
-metrics, Store telemetry, configurations and source provenance. Its hot workload
-fits the local cache; the overflow workload revisits a larger working set.
-Reduce `--store-size` separately to test external-capacity pressure. Repeat
-independent runs in alternating mode order, and inspect hit counts and output
-lengths before interpreting latency differences.
-
-Use `--workloads mixed --concurrency 1` for an interleaved locality trace: the
-harness populates all documents, primes one hot document, then alternates that
-document with the overflow documents using fixed questions. Separate untimed
-hot/cold probes check the hit source after the timed trace. This tests the hierarchy
-within one workload; separate hot and overflow phases alone do not establish
-that it outperforms both single-cache modes on an interleaved trace.
