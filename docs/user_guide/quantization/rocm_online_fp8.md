@@ -59,12 +59,21 @@ quantization configuration below.
 Add these options to a working single-GPU MiniMax-H3-Image launch:
 
 ```bash
+VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_SKINNY_GEMM=0 \
+VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS=1 \
 vllm serve <model-path> --omni \
   --num-gpus 1 --usp 1 --ring 1 --text-encoder-tp-size 1 \
   --additional-config '{"minimax_h3_mlp_fp8_hadamard":true}' \
   --diffusion-quantization-config \
   '{"default":null,"text_encoder":null,"vae":null,"transformer":{"method":"online","targets":{"re:blocks\\.[0-9]+\\.mlp\\.(fc1|fc2)":"fp8_per_channel"}}}'
 ```
+
+Enable AITER for the supported per-token FP8 path. The native-ops and
+skinny-GEMM settings above reproduce the tested CI runtime, whose precompiled
+vLLM kernels lack `gfx950` support. A multi-architecture runtime with compatible
+kernels may not require those two overrides; see the
+[AMD H3 image recipe](../../../recipes/MiniMaxAI/MiniMax-H3-Image-AMD.md).
+Keep the same runtime settings for BF16 and FP8 comparisons.
 
 The supported path uses a BF16 checkpoint, ROCm `gfx950`, TP1/SP1 and vLLM's
 online per-channel-weight/per-token-activation FP8 method with the row-wise
