@@ -25,10 +25,17 @@ from vllm_omni.engine.duplex.messages import (
     ResumeDuplexSessionMessage,
     TouchDuplexSessionMessage,
 )
-from vllm_omni.engine.duplex.plugin import validate_duplex_replica_policy
+from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, validate_duplex_replica_policy
 from vllm_omni.engine.duplex_omni_engine import DuplexOmniEngine
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+class _OrchestratorPlugin:
+    """Satisfies ``configure_async_chunk`` without a full duplex plugin."""
+
+    def configure_async_chunk(self, *, enabled: bool) -> None:
+        del enabled
 
 
 class _FakeRpcClient:
@@ -205,7 +212,8 @@ def test_duplex_capabilities_come_from_the_loaded_plugin() -> None:
 @pytest.mark.parametrize(("count", "index"), [(1, 0), (4, 0), (4, 3)])
 def test_orchestrator_receives_real_frontend_identity_and_exposes_warmup_budget(monkeypatch, count, index) -> None:
     engine = object.__new__(DuplexOmniEngine)
-    engine.plugin = object()
+    engine.plugin = _OrchestratorPlugin()
+    engine.async_chunk = False
     engine.duplex_session_config = DuplexSessionRuntimeConfig(max_sessions=64)
     engine.pipeline_config = SimpleNamespace(stages=[SimpleNamespace(stage_id=0, owns_tokenizer=True)])
     engine.stage_pools = []
@@ -252,7 +260,8 @@ def test_duplex_runtime_uses_tokenizer_owner_model_config(monkeypatch):
     from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import JOYAI_VL_INTERACTION_ASR_PIPELINE
 
     engine = object.__new__(DuplexOmniEngine)
-    engine.plugin = object()
+    engine.plugin = _OrchestratorPlugin()
+    engine.async_chunk = False
     engine.pipeline_config = JOYAI_VL_INTERACTION_ASR_PIPELINE
     engine.duplex_session_config = object()
     engine._client_config = None
@@ -275,8 +284,11 @@ def test_duplex_runtime_uses_tokenizer_owner_model_config(monkeypatch):
 @pytest.mark.parametrize(
     ("replica_policy", "replica_cap", "single_stage_mode", "supports_sharing", "error"),
     [
-        ("least_sessions", 1, True, False, "does not support distributed hub/LB mode"),
-        ("least_sessions", 2, True, False, "does not support distributed hub/LB mode"),
+        # Plugin sharing capability is checked in local and distributed mode;
+        # placement validates topology once the stage pools exist.
+        ("least_sessions", 1, True, False, None),
+        ("least_sessions", 2, True, True, None),
+        ("least_sessions", 2, True, False, "set max_sessions_per_replica to 1"),
         ("least_sessions", 2, False, False, "set max_sessions_per_replica to 1"),
         ("least_sessions", 1, False, False, None),
         ("least_sessions", 2, False, True, None),
@@ -286,6 +298,7 @@ def test_duplex_runtime_uses_tokenizer_owner_model_config(monkeypatch):
 )
 def test_validate_deployment_checks_replica_policy_before_starting_workers(
     monkeypatch,
+    mocker,
     replica_policy: str,
     replica_cap: int | None,
     single_stage_mode: bool,
@@ -313,7 +326,7 @@ def test_validate_deployment_checks_replica_policy_before_starting_workers(
         capability_calls.append(max_sessions)
         return DuplexCapabilities(supports_multi_session_same_replica=supports_sharing)
 
-    plugin = SimpleNamespace(capabilities=capabilities, configure_pipeline=configure_pipeline)
+    plugin = mocker.Mock(spec=DuplexModelPlugin, capabilities=capabilities, configure_pipeline=configure_pipeline)
 
     def load_plugin(path: str, audio_encoder):
         assert path == "fake.Plugin"
@@ -323,13 +336,14 @@ def test_validate_deployment_checks_replica_policy_before_starting_workers(
     monkeypatch.setattr("vllm_omni.engine.duplex_omni_engine.load_duplex_plugin", load_plugin)
     validation_calls: list[bool] = []
 
-    def validate_policy(candidate_plugin, candidate_config, *, distributed: bool) -> None:
+    def validate_policy(candidate_plugin, candidate_config) -> None:
         assert candidate_plugin is plugin
         assert candidate_config is runtime_config
         assert len(configure_pipeline_calls) == 1
         assert configure_pipeline_calls[0] is engine.pipeline_config
-        validation_calls.append(distributed)
-        validate_duplex_replica_policy(candidate_plugin, candidate_config, distributed=distributed)
+        plugin.configure_server.assert_called_once_with(runtime_config)
+        validation_calls.append(engine.single_stage_mode)
+        validate_duplex_replica_policy(candidate_plugin, candidate_config)
 
     monkeypatch.setattr("vllm_omni.engine.duplex_omni_engine.validate_duplex_replica_policy", validate_policy)
 
@@ -341,12 +355,10 @@ def test_validate_deployment_checks_replica_policy_before_starting_workers(
         assert engine.plugin is plugin
         assert engine.duplex_session_config is runtime_config
 
-    # Validation uses per-replica capacity, never the global admission limit.
-    # Single-session replicas and legacy deployments need no sharing support.
+    # Validation uses per-replica capacity whenever least_sessions may share a
+    # replica, including single-stage mode; only legacy or cap<=1 skips it.
     expected_calls = (
-        [replica_cap]
-        if replica_policy == "least_sessions" and not single_stage_mode and replica_cap is not None and replica_cap > 1
-        else []
+        [replica_cap] if replica_policy == "least_sessions" and replica_cap is not None and replica_cap > 1 else []
     )
     assert capability_calls == expected_calls
     assert validation_calls == [single_stage_mode]
