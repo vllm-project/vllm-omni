@@ -292,7 +292,8 @@ the same request succeeded: API inference 48.7 seconds, sampling about
 
 The dancer still deviates from the source pose around one second and the
 server audio remains very quiet (RMS about `6.03e-5`). Motion/face/audio quality
-acceptance and a matched author-native Turbo comparison remain open.
+acceptance remained open at that point. The matched author-native comparisons
+are recorded below.
 
 ### Integration regressions (2026-11-16)
 
@@ -315,12 +316,44 @@ do not establish a controlled speedup. All 124 decoded Canny server-output frame
 match the November 8 result. Both server outputs remain quiet: approximately
 -84.39 dBFS RMS for Canny and -61.25 dBFS for ordinary H3.
 
-The ordinary no-Control integration regression is complete. A minimum Inpaint
-regression on this runtime revision remains pending. Depth, Pose, HED, MLSD and
-earlier Inpaint results retain their historical tested revisions; they do not
-establish six-mode coverage on `857dcf4ff`. Human motion/face/audio acceptance,
-the matched native Turbo comparison and known Inpaint editing limitations remain
-open. Turbo results do not establish validation of the template's Base40 recipe.
+### Six-mode completion and Base40 comparison (2026-11-17)
+
+The same runtime revision `857dcf4ff` now has real UI engineering coverage for
+all six modes, plus ordinary H3 without ControlNet. Snow Inpaint used source
+video and a static mask without Canny; Depth/HED/MLSD loaded prepared hints.
+Pose used complete GPU extraction, model unload and the same ComfyUI process's
+cached hint before H3 generation. The following cases passed save/close/reopen,
+124-frame/timestamp checks and audio-track/sample-count preservation.
+
+| Additional case | Recipe | UI execution | API inference |
+| --- | --- | --- | --- |
+| Depth | Turbo4 | 54.28 s | 49.58 s |
+| Pose, generation phase | Turbo4 | 54.58 s | 49.60 s |
+| HED | Turbo4 | 55.26 s | 47.67 s |
+| MLSD | Turbo4 | 52.69 s | 47.14 s |
+| Snow Inpaint | Turbo4 | 54.02 s | 49.04 s |
+| Canny, prepared hint | Base40 | 295.28 s | 285.71 s |
+
+Pose extraction took another 54.34 seconds; model unload, H3 startup and UI
+operations are excluded from its generation time. All cases used the same
+physical GPU and software configuration above. These are single-run regression
+measurements, with preprocessing and startup boundaries recorded separately.
+
+Matched author-native Canny runs used the same input, prompt, seed and GPU.
+With Turbo4, both implementations missed the side bend around 0.75-1 second.
+With Base40 (40 forwards, shifts 12/3, no Turbo LoRA), both followed that motion
+more closely and looked similar in nine aligned frames. The contributor found
+the Base40 sample visibly better. Steps, shift and LoRA changed together, so
+this comparison does not isolate one cause. The template's default Base40
+recipe now has current-runtime UI evidence; historical results keep their own
+revisions. See the [comparison video and recorded configurations](https://github.com/vllm-project/vllm-omni/pull/7507).
+
+Weak generated audio, Pose skeleton gaps, MLSD text artifacts and Inpaint
+coverage/editing limitations remain. Full motion, face and listening acceptance
+are separate from engineering coverage. Dynamic-mask and combined-control
+Inpaint results still retain their historical revisions. Native CPU offload,
+attention and encoding differ from Omni, so the paired timings are not a formal
+performance benchmark.
 
 ## References
 
