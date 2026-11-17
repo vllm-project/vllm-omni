@@ -8,23 +8,31 @@ Please refer to [README.md](../../../README.md)
 
 ## Launch the Server
 
+Run these commands from the repository root. For Chat Completions, `--chat-template`
+selects Step-Audio2's native `<|BOT|>` / `<|EOT|>` format and maps `user` to `human`.
+
 ```bash
 # Async chunk mode (recommended — lower first-packet latency for TTS)
 vllm serve stepfun-ai/Step-Audio-2-mini --omni --port 8092 \
     --deploy-config vllm_omni/deploy/step_audio_2_async_chunk.yaml \
+    --chat-template vllm_omni/transformers_utils/chat_templates/step_audio2.jinja \
     --trust-remote-code --enforce-eager
 ```
 
 Sequential mode:
+
 ```bash
 vllm serve stepfun-ai/Step-Audio-2-mini --omni --port 8092 \
     --deploy-config vllm_omni/deploy/step_audio_2.yaml \
+    --chat-template vllm_omni/transformers_utils/chat_templates/step_audio2.jinja \
     --trust-remote-code --enforce-eager
 ```
 
 With local model:
+
 ```bash
 vllm serve /path/to/Step-Audio-2-mini --omni --port 8092 \
+    --chat-template vllm_omni/transformers_utils/chat_templates/step_audio2.jinja \
     --trust-remote-code --enforce-eager
 ```
 
@@ -70,7 +78,7 @@ python openai_chat_completion_client.py --query-type audio_to_audio --audio-path
 ```
 
 | Argument | Description |
-|----------|-------------|
+| ---------- | ------------- |
 | `--query-type`, `-q` | Query type: `audio_to_text`, `text_to_audio`, `audio_to_audio` |
 | `--audio-path`, `-a` | Path to input audio file (local or URL) |
 | `--text`, `-t` | Text to synthesize (for TTS mode) |
@@ -101,7 +109,7 @@ Transcribe audio to text.
 python openai_chat_completion_client.py \
     --query-type audio_to_text \
     --audio-path /path/to/speech.wav \
-    --prompt "Transcribe this audio."
+    --prompt "请记录下你所听到的语音内容。"
 ```
 
 ### 2. Text to Audio (TTS)
@@ -143,13 +151,12 @@ Step-Audio2 uses the OpenAI-compatible chat completions API:
   "messages": [
     {
       "role": "system",
-      "content": [{"type": "text", "text": "Transcribe the audio."}]
+      "content": [{"type": "text", "text": "请记录下你所听到的语音内容。"}]
     },
     {
       "role": "user",
       "content": [
-        {"type": "audio_url", "audio_url": {"url": "..."}},
-        {"type": "text", "text": "Please transcribe."}
+        {"type": "audio_url", "audio_url": {"url": "..."}}
       ]
     }
   ],
@@ -166,28 +173,32 @@ Step-Audio2 uses the OpenAI-compatible chat completions API:
 
 Benchmark via `/v1/audio/speech` (4x RTX 3090, 10 prompts, concurrency=1):
 
-| Mode | Mean TTFP | Mean E2E | Mean RTF |
-|------|-----------|----------|----------|
-| Sequential | 4316ms | 4316ms | 0.938 |
-| **Async Chunk** | **1437ms** | 4362ms | 0.949 |
+| Mode            | Mean TTFP  | Mean E2E | Mean RTF |
+| --------------- | ---------- | -------- | -------- |
+| Sequential      | 4316ms     | 4316ms   | 0.938    |
+| **Async Chunk** | **1437ms** | 4362ms   | 0.949    |
 
 Async chunk reduces TTFP by **67%** by streaming audio token chunks from Thinker to Token2Wav as they are generated. RTF < 1 in both modes (real-time capable).
 
 ## Troubleshooting
 
 ### Server not responding
+
 - Check if the server is running: `curl http://localhost:8092/v1/models`
 - Verify the port number matches
 
 ### FileNotFoundError: prompt_wav file not found
+
 - Ensure `default_female.wav` exists at `{model_dir}/assets/default_female.wav`
 - Or set `STEP_AUDIO2_DEFAULT_PROMPT_WAV` environment variable when launching the server
 
 ### Audio not generated
+
 - For TTS, use the `/v1/audio/speech` endpoint (recommended) or `openai_speech_client.py`
 - For chat completions TTS, ensure the prompt ends with `<tts_start>`
 - Check server logs for errors
 
 ### Out of memory
+
 - Reduce `gpu_memory_utilization` in the deploy config
 - Use a smaller batch size
