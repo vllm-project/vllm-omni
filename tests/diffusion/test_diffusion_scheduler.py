@@ -2334,6 +2334,48 @@ class TestStepScheduler:
         assert second.num_running_reqs == 6
         assert second.num_waiting_reqs == 2
 
+    def test_drr_aged_admission_respects_explicit_max_num_seqs_count_cap(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                max_num_seqs=2,
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                    "compute_unit_budget": 2048,
+                },
+            )
+        )
+
+        req_ids = [
+            scheduler.add_request(
+                _make_step_request(
+                    f"small-{i}",
+                    sampling_params=OmniDiffusionSamplingParams(
+                        height=256,
+                        width=256,
+                        num_inference_steps=4,
+                    ),
+                )
+            )
+            for i in range(3)
+        ]
+
+        # Budget 2 * 1024 units would admit all three 256x256 requests by cost;
+        # the explicit max_num_seqs=2 count cap must still bind.
+        first = scheduler.schedule()
+        assert _new_ids(first) == req_ids[:2]
+        assert first.num_running_reqs == 2
+        assert first.num_waiting_reqs == 1
+
+        self._age_request(scheduler, req_ids[2], 120.0)
+
+        # The aged request fits the remaining budget, but admitting it here
+        # would push the running count past the explicit cap.
+        second = scheduler.schedule()
+        assert _new_ids(second) == []
+        assert second.num_running_reqs == 2
+        assert second.num_waiting_reqs == 1
+
     def test_drr_young_head_is_skipped_to_fill_budget(self) -> None:
         scheduler = StepScheduler()
         scheduler.initialize(
