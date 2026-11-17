@@ -82,6 +82,7 @@ _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
     {
         "async_chunk",
         "disable_log_stats",
+        "disable_websocket_compression",
         "command",
         "headless",
         "model",
@@ -93,6 +94,8 @@ _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
         "stage_id",
         "subparser",
         "tokenizer",
+        "video_output_warmup",
+        "video_output_warmup_timeout",
     }
 )
 
@@ -2465,7 +2468,8 @@ class VllmOmniConfig:
             from vllm_omni.config.composable_parallel import apply_strategy_specs
 
             strategy_stages = merge_pipeline_deploy(pipeline_cfg, copy.deepcopy(deploy))
-            strategy_result = apply_strategy_specs(strategy_stages, strategy_specs)
+            # Device counts are checked below, once CLI overrides are applied.
+            strategy_result = apply_strategy_specs(strategy_stages, strategy_specs, check_devices=False)
             strategy_overrides: dict[str, Any] = {}
             axis_fields = {
                 "tp": "tensor_parallel_size",

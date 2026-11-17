@@ -159,7 +159,11 @@ Other models with `step_execution=False` are also supported but not yet verified
 
 ### Not Yet Supported (step-mode, `step_execution=True`)
 
-When `step_execution=True` (or `streaming_output=True`, which auto-enables step-mode), models use `execute_stepwise` instead of `execute_model`, which is not in the async Path 1 whitelist. Async output is not applicable.
+When `step_execution=True`, models use `execute_stepwise` instead of
+`execute_model`, which is not in the async Path 1 whitelist. Async output is not
+applicable there. With `streaming_output=True`, pipelines implementing the
+existing Stepwise contract automatically select Stepwise. Request-only pipelines
+remain on Request and can emit in-order `CHUNK_READY` messages during the forward.
 
 **Verified**: Helios (`step_execution=True`, does not benefit from this feature).
 
@@ -173,9 +177,44 @@ Adapting step-mode requires additional design because:
 
 **Planned approach**: first cover only the final step's async D2H, keep intermediate steps synchronous. This matches the request-mode benefit pattern.
 
+## Request streaming output
+
+Pipelines supporting request streaming emit `CHUNK_READY` through the existing
+asynchronous output transport while the forward remains active. Intermediate
+chunks do not complete the request or update the Scheduler. The Engine delivers
+chunks in order and emits one terminal result after resolving the final execution
+outcome, without resending the video.
+
+This supports single-request execution on the multiprocessing executor and on
+the Ray executor (including multi-node). Ray carries ``CHUNK_READY`` over a
+driver-owned ``ray.util.queue.Queue`` with CPU tensors instead of the multiproc
+MessageQueue/SHM path. After the reply rank finishes putting chunks it enqueues
+a barrier sentinel; ``collective_rpc`` waits until the driver pump has delivered
+every prior chunk before returning the execute result, so the Engine does not
+retire stream state while chunks are still queued. Cooperative cancellation on
+Ray uses a per-worker local flag table updated through a dedicated actor
+concurrency group (not POSIX ``SharedMemory`` names). The engine handler and
+``wait_output_ready`` contract are the same. Batched requests retain final-output
+behavior. Request streaming does not pause or resume the computation plan in
+response to output pressure.
+
 ## Configuration
 
-No configuration needed. Async output is automatically enabled when `step_execution=False` (default).
+Client streaming (`streaming_output=True`):
+
+- Step-capable pipelines automatically enable Stepwise.
+- Request-only pipelines keep Request execution. Intermediate `CHUNK_READY`
+  media is emitted only when the pipeline binds the request chunk emitter
+  (currently CausVid); other request pipelines still return a single final.
+- CausVid streaming always uses `async_chunk_decode`. That path requires a
+  vertical topology or single-rank layer PP (`S=1`, `G=1`) and a non-tiled
+  single-owner VAE. Layer PP with `S=1` and `G>1`, or tiled/distributed VAE,
+  hard-fails rather than falling back to sync mid-request decode.
+- For non-streaming decode overlap only, set `extra_args.async_chunk_decode`.
+
+Request-mode async D2H/SHM packing (finals / side-stream transport, separate from
+client streaming) needs no extra flag: it is enabled when `step_execution=False`
+(default).
 
 | `step_execution` | Mode | Async Output | Pump Thread | Worker BG Thread |
 |---|---|---|---|---|
@@ -186,7 +225,9 @@ No configuration needed. Async output is automatically enabled when `step_execut
 
 - `vllm_omni/diffusion/data.py`: `AsyncDiffusionOutput`, `AsyncOutputKind`, `DiffusionOutput.async_output_id`
 - `vllm_omni/diffusion/worker/diffusion_worker.py`: `WorkerProc._return_result()`, `_async_output_loop()`, `_generate_async_output_id()`
-- `vllm_omni/diffusion/executor/multiproc_executor.py`: `ResultPumpThread`, `collective_rpc()` two-path dispatch, `wait_output_ready()`, `_batch_split_map`
+- `vllm_omni/diffusion/executor/multiproc_executor.py`: `ResultPumpThread`, `collective_rpc()` two-path dispatch, `_batch_split_map`
+- `vllm_omni/diffusion/executor/async_output_cache.py`: shared `wait_output_ready()` / `drop_output()` Future lifecycle for multiproc and Ray
+- `vllm_omni/diffusion/executor/ray_executor.py`: Ray `CHUNK_READY` queue/pump and queue-consumption barrier
 - `vllm_omni/diffusion/diffusion_engine.py`: `step()` / `step_streaming()` / `add_req_and_wait_for_response()` async output waiting
 - `vllm_omni/diffusion/sched/request_scheduler.py`: `update_from_output()` — `async_output_id` → `FINISHED_COMPLETED`
 - `vllm_omni/diffusion/ipc.py`: `pack_diffusion_output_shm()` side-stream D2H path
@@ -195,3 +236,12 @@ No configuration needed. Async output is automatically enabled when `step_execut
 - `vllm_omni/platforms/npu/platform.py`: `NPUOmniPlatform.record_device_event()`
 - `vllm_omni/diffusion/models/hunyuan_image3/pipeline_hunyuan_image3.py`: `get_hunyuan_image3_post_process_func()`, postprocess removal
 - `vllm_omni/diffusion/registry.py`: `_DIFFUSION_POST_PROCESS_FUNCS` postprocess registry
+
+Request chunks route by the active `request_id`; `rpc_id` remains an internal
+RPC/Future correlation id. No separate execution identity is registered.
+Before a forward returns or raises, its captured emit callbacks are closed and
+already submitted chunk messages are drained to the same result queue. The
+result pump processes these messages before the execution reply can retire the
+request. This ordering covers cancellation and errors as well as success.
+If draining times out, the Worker stops and the failure monitor tears down the
+group; it must not return a reusable Worker with old chunks still pending.

@@ -43,6 +43,10 @@ def test_taomate_keeps_separate_scheduler_updates(monkeypatch):
         _maybe_send_stage_payload=lambda *_: None,
         _update_states_after=lambda *_: None,
     )
+    # Exercise the real batch builder; the fake only stands in for I/O plumbing.
+    runner._step_execution_batch = lambda states: runner_module.DiffusionModelRunner._step_execution_batch(
+        runner, states
+    )
     output = runner_module.DiffusionModelRunner._execute_stepwise_core(
         runner, SimpleNamespace(), record_output_peak_memory=False
     )
@@ -111,6 +115,10 @@ def test_runner_dispatch_advances_once_and_decodes(monkeypatch, sampler_owned):
         _attach_stepwise_metadata=lambda *_: None,
         _maybe_send_stage_payload=lambda *_: None,
         _update_states_after=lambda *_: None,
+    )
+    # Exercise the real batch builder; the fake only stands in for I/O plumbing.
+    runner._step_execution_batch = lambda states: runner_module.DiffusionModelRunner._step_execution_batch(
+        runner, states
     )
     output = runner_module.DiffusionModelRunner._execute_stepwise_core(
         runner, SimpleNamespace(), record_output_peak_memory=False
