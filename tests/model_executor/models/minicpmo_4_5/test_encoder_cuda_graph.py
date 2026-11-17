@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
-from vllm_omni.model_executor.models.minicpmo_4_5.encoder_cuda_graph import EncoderCudaGraph
+from vllm_omni.model_executor.models.minicpmo_4_5.encoder_cuda_graph import EncoderCudaGraph, _ExactShapeEncoder
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     SiglipVisionConfig,
     SiglipVisionTransformer,
@@ -24,6 +24,22 @@ def _make_graph(forward, **kwargs):
     config.model_config = ModelConfig.__new__(ModelConfig)
     config.model_config.multimodal_config = MultiModalConfig()
     return EncoderCudaGraph(forward, config, **kwargs)
+
+
+@pytest.mark.cpu
+def test_capture_buffers_preserve_length_and_mask_values_without_aliasing():
+    lengths = torch.tensor([60], dtype=torch.int32)
+    mask = torch.tensor([[True, False]])
+    adapter = _ExactShapeEncoder(lambda *inputs: lengths, (lengths, None, mask), lengths.shape)
+    values = adapter.prepare_encoder_cudagraph_capture_inputs(1, 1, 0, lengths.device, lengths.dtype).values
+
+    assert set(values) == {"0", "2"}
+    torch.testing.assert_close(values["0"], lengths)
+    torch.testing.assert_close(values["2"], mask)
+    values["0"].zero_()
+    values["2"].fill_(False)
+    assert lengths.item() == 60
+    assert mask[0, 0]
 
 
 @pytest.mark.cpu

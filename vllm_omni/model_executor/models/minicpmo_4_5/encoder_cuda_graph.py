@@ -36,10 +36,13 @@ class _ExactShapeEncoder(SupportsEncoderCudaGraph):
         self, forward: Callable[..., torch.Tensor], inputs: tuple[torch.Tensor | None, ...], output_shape: torch.Size
     ):
         self.forward = forward
-        self.templates = tuple(None if x is None else (x.shape, x.dtype, x.device) for x in inputs)
+        self.num_inputs = len(inputs)
+        # Warm up and capture with the admitted batch's lengths and masks.
+        # The graph owns these buffers and replay copies into them.
+        self.capture_values = {str(i): value.clone() for i, value in enumerate(inputs) if value is not None}
         self.output_shape = output_shape
         self.tokens = prod(output_shape[:-1]) or 1
-        self.keys = [str(i) for i, x in enumerate(inputs) if x is not None]
+        self.keys = list(self.capture_values)
 
     def get_encoder_cudagraph_config(self) -> EncoderCudaGraphConfig:
         return EncoderCudaGraphConfig(
@@ -71,14 +74,7 @@ class _ExactShapeEncoder(SupportsEncoderCudaGraph):
         path: str = "default",
         axis_keys: tuple[Hashable, ...] | None = (),
     ) -> EncoderCudaGraphCaptureInputs:
-        return EncoderCudaGraphCaptureInputs(
-            {
-                str(i): torch.zeros(shape, dtype=input_dtype, device=input_device)
-                for i, template in enumerate(self.templates)
-                if template is not None
-                for shape, input_dtype, input_device in [template]
-            }
-        )
+        return EncoderCudaGraphCaptureInputs(dict(self.capture_values))
 
     def prepare_encoder_cudagraph_replay_buffers(
         self,
@@ -90,7 +86,7 @@ class _ExactShapeEncoder(SupportsEncoderCudaGraph):
         return EncoderCudaGraphReplayBuffers(mm_kwargs)
 
     def encoder_cudagraph_forward(self, inputs: dict[str, torch.Tensor], path: str = "default") -> torch.Tensor:
-        return self.forward(*(inputs.get(str(i)) for i in range(len(self.templates))))
+        return self.forward(*(inputs.get(str(i)) for i in range(self.num_inputs)))
 
     def encoder_eager_forward(self, mm_kwargs: dict[str, torch.Tensor], path: str = "default") -> torch.Tensor:
         return self.encoder_cudagraph_forward(mm_kwargs, path)
