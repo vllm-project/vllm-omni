@@ -91,7 +91,7 @@ def test_formatter_preserves_single_video_audio_actions_and_metadata(
             "actions": {"action_mode": "policy"},
         },
         "audio": "audio-0",
-        "audio_sample_rate": 48000,
+        "sr": 48000,
         "fps": 24.0,
         "actions": "action-0",
     }
@@ -160,6 +160,65 @@ def test_formatter_normalizes_payload_metadata_envelope(
     assert result.multimodal_output == {
         "metadata": postprocess_output.metadata,
         "actions": "action-0",
+    }
+
+
+def test_normalize_lifts_flat_rates_left_on_an_envelope_payload() -> None:
+    # The kandinsky6 shape: a pipeline returns an envelope but leaves the media
+    # rates flat on the payload. Before the lift, the envelope path dropped them.
+    postprocess_output = normalize_diffusion_postprocess_output(
+        {
+            "payload": {
+                "video": ["frame-0"],
+                "audio": "audio-0",
+                "audio_sample_rate": 44100,
+                "fps": 24.0,
+            },
+            "metadata": {},
+        }
+    )
+
+    assert postprocess_output.outputs == {"video": ["frame-0"], "audio": "audio-0"}
+    assert postprocess_output.metadata == {
+        "audio": {"sample_rate": 44100},
+        "video": {"fps": 24.0},
+    }
+
+
+def test_normalize_lifts_the_canonical_key_and_envelope_metadata_wins() -> None:
+    postprocess_output = normalize_diffusion_postprocess_output(
+        {
+            "payload": {"audio": "audio-0", "sr": 16000},
+            # The envelope already labels the audio; the flat key must not win.
+            "metadata": {"audio": {"sample_rate": 44100, "codec": "wav"}},
+        }
+    )
+
+    assert postprocess_output.metadata == {"audio": {"sample_rate": 44100, "codec": "wav"}}
+    assert "sr" not in postprocess_output.outputs
+
+    # A flat payload rate fills in a group the envelope left unlabeled.
+    postprocess_output = normalize_diffusion_postprocess_output(
+        {
+            "payload": {"audio": "audio-0", "sr": 16000},
+            "metadata": {"video": {"fps": 24.0}},
+        }
+    )
+    assert postprocess_output.metadata == {
+        "video": {"fps": 24.0},
+        "audio": {"sample_rate": 16000},
+    }
+
+
+def test_normalize_lifts_the_canonical_key_from_a_legacy_flat_payload() -> None:
+    postprocess_output = normalize_diffusion_postprocess_output(
+        {"audio": "waveform", "sr": 22050, "audio_sample_rate": 9999, "fps": 16.0}
+    )
+
+    assert postprocess_output.outputs == {"audio": "waveform"}
+    assert postprocess_output.metadata == {
+        "audio": {"sample_rate": 22050},
+        "video": {"fps": 16.0},
     }
 
 
@@ -294,7 +353,7 @@ def test_formatter_preserves_audio_output_with_model_sample_rate_fallback(
     assert result.final_output_type == "audio"
     assert result.multimodal_output == {
         "audio": "waveform",
-        "audio_sample_rate": 44100,
+        "sr": 44100,
     }
 
 
@@ -329,7 +388,7 @@ def test_formatter_preserves_audio_model_video_audio_and_actions(
             "video": {"fps": 30.0},
         },
         "audio": "audio-0",
-        "audio_sample_rate": 16000,
+        "sr": 16000,
         "fps": 30.0,
         "actions": "action-0",
     }
@@ -381,7 +440,7 @@ def test_formatter_preserves_audio_only_postprocess_dict(
             "audio": {"sample_rate": 24000},
         },
         "audio": "waveform",
-        "audio_sample_rate": 24000,
+        "sr": 24000,
     }
 
 

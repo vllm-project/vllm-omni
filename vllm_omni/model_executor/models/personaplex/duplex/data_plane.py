@@ -5,13 +5,15 @@
 from __future__ import annotations
 
 from vllm_omni.model_executor.common.duplex.data_plane import CumulativeAudioTextDataPlane
-from vllm_omni.model_executor.models.personaplex.duplex.config import SAMPLE_RATE
 
 
 class PersonaPlexDataPlaneSession(CumulativeAudioTextDataPlane):
-    """Project staged PersonaPlex output into Realtime deltas (24 kHz by default)."""
+    """Project staged PersonaPlex output into Realtime deltas.
 
-    default_sample_rate_hz = SAMPLE_RATE
+    Code2Wav advertises its rate (``sr``) on every audio payload — see
+    ``personaplex_code2wav.py`` — so the projection needs no default rate.
+    """
+
     # The plugin runs Code2Wav with DELTA output (see configure_sampling_params).
     audio_output_is_delta = True
 

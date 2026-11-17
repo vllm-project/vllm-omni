@@ -19,9 +19,11 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_resource_request_belongs_to_session,
 )
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, EncodeAudio
+from vllm_omni.model_executor.common.request_outputs import sample_rate_hz
 from vllm_omni.outputs.duplex import (
     get_duplex_output_decision,
 )
+from vllm_omni.sample_rate import MissingSampleRateError
 
 logger = init_logger(__name__)
 
@@ -104,15 +106,6 @@ def _audio_value(metadata: Mapping[str, object]) -> object | None:
     if isinstance(value, list) and len(value) == 1:
         return value[0]
     return value
-
-
-def _sample_rate(metadata: Mapping[str, object]) -> int:
-    value = metadata.get("sr", metadata.get("sample_rate_hz", 22050))
-    if isinstance(value, list) and value:
-        value = value[0]
-    if hasattr(value, "item"):
-        value = value.item()
-    return int(value) if isinstance(value, int | float) else 22050
 
 
 def _audio_samples(audio: object | None) -> int:
@@ -289,7 +282,13 @@ class NemotronVoiceChatDataPlaneSession(DuplexDataPlane):
             return
 
         audio = _audio_value(metadata)
-        sample_rate = _sample_rate(metadata)
+        # Zero-audio sparse steps legally carry no rate; audio without one is a producer bug.
+        sample_rate = sample_rate_hz(metadata) if audio is not None else None
+        if audio is not None and sample_rate is None:
+            raise MissingSampleRateError(
+                "Nemotron VoiceChat duplex audio carried no sample rate; the model must emit 'sr' on its "
+                "multimodal output"
+            )
         sample_count = _audio_samples(audio)
         encoded = (
             self._encode_audio(audio, sample_rate, context.response_format, context.speed)

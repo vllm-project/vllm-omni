@@ -34,6 +34,7 @@ from vllm_omni.model_executor.models.fish_speech.dac_utils import (
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.sample_rate import SAMPLE_RATE_KEY, make_sample_rate_tensors
 
 logger = init_logger(__name__)
 
@@ -390,8 +391,6 @@ class FishSpeechDACDecoder(nn.Module):
         Codes are codebook-major: [cb0_f0, cb0_f1, ..., cb0_fN, cb1_f0, ...].
         """
         q = self._num_codebooks
-        sr_val = self._output_sample_rate
-        sr_tensor = torch.tensor(sr_val, dtype=torch.int32)
         empty = torch.zeros((0,), dtype=torch.float32)
 
         self._ensure_codec_loaded()
@@ -400,7 +399,10 @@ class FishSpeechDACDecoder(nn.Module):
         if input_ids is None or input_ids.numel() == 0:
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
+                multimodal_outputs={
+                    "model_outputs": [empty],
+                    SAMPLE_RATE_KEY: make_sample_rate_tensors(self._output_sample_rate),
+                },
             )
 
         ids = input_ids.reshape(-1).to(dtype=torch.long)
@@ -456,7 +458,7 @@ class FishSpeechDACDecoder(nn.Module):
                 text_hidden_states=None,
                 multimodal_outputs={
                     "model_outputs": [empty] * num_req,
-                    "sr": [sr_tensor] * num_req,
+                    SAMPLE_RATE_KEY: make_sample_rate_tensors(self._output_sample_rate, num_req),
                 },
             )
 
@@ -602,7 +604,7 @@ class FishSpeechDACDecoder(nn.Module):
                 _decode_group(bounded_group)
 
         audios: list[torch.Tensor] = [empty] * num_req
-        srs = [sr_tensor] * num_req
+        srs = make_sample_rate_tensors(self._output_sample_rate, num_req)
 
         for j, idx in enumerate(valid_indices):
             ctx_frames = parsed_ctx_frames[idx] - dropped_frames[j]
@@ -628,7 +630,7 @@ class FishSpeechDACDecoder(nn.Module):
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": audios, "sr": srs},
+            multimodal_outputs={"model_outputs": audios, SAMPLE_RATE_KEY: srs},
         )
 
     @staticmethod
@@ -713,7 +715,7 @@ class FishSpeechDACDecoder(nn.Module):
         audio_tensor, sr = model_outputs
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": audio_tensor, "sr": sr},
+            multimodal_outputs={"model_outputs": audio_tensor, SAMPLE_RATE_KEY: sr},
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

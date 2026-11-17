@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """GLM-TTS DiT wrapper: LLM_GENERATION-compatible flow-matching + vocoder."""
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from vllm_omni.model_executor.models.glm_tts.vocoder import (
     mel_to_audio,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.sample_rate import SAMPLE_RATE_KEY, make_sample_rate_tensors
 
 logger = init_logger(__name__)
 
@@ -401,10 +402,12 @@ class GLMTTSDiTForGeneration(nn.Module):
         request_ids_list = split_request_ids(flat_ids, seq_token_counts)
 
         num_reqs = max(1, len(request_ids_list))
-        sample_rate = torch.tensor(int(self.sample_rate), dtype=torch.int32)
         empty_audio = torch.zeros((0,), dtype=torch.float32, device=input_ids.device)
         audios: list[torch.Tensor] = [empty_audio] * num_reqs
-        srs: list[torch.Tensor] = [sample_rate] * num_reqs
+        # The vocoder output is resampled back to `self.sample_rate` (see the
+        # effective_sr handling below), so the flow config's rate is what the
+        # waveform leaves at.
+        srs: list[torch.Tensor] = make_sample_rate_tensors(int(self.sample_rate), num_reqs)
 
         if not isinstance(runtime_info, list):
             runtime_info = []
@@ -537,7 +540,7 @@ class GLMTTSDiTForGeneration(nn.Module):
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"audio": audios, "sr": srs},
+            multimodal_outputs={"audio": audios, SAMPLE_RATE_KEY: srs},
         )
 
     @staticmethod

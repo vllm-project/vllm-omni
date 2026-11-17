@@ -302,8 +302,12 @@ def get_wan22_s2v_post_process_func(
             return video
 
         if isinstance(video, list) and all(isinstance(item, (bytes, bytearray, memoryview)) for item in video):
-            # The worker already muxed the audio into these bytes.
-            return {"video": [bytes(item) for item in video], "audio": None, "fps": S2V_OUTPUT_FPS}
+            # The worker already muxed the audio into these bytes; the rate still
+            # travels with the output so the response labels it correctly.
+            result = {"video": [bytes(item) for item in video], "audio": None, "fps": S2V_OUTPUT_FPS}
+            if audio_sr is not None:
+                result["audio_sample_rate"] = audio_sr
+            return result
 
         processed_video = video_processor.postprocess_video(video, output_type=output_type)
 
@@ -1562,7 +1566,10 @@ class Wan22S2VPipeline(
                 num_outputs_per_prompt=num_outputs_per_prompt,
             )
             if mp4_session is not None:
-                # The waveform is already muxed into each container.
+                # The waveform is already muxed into each container, but the rate
+                # must still travel with the output so responses are labeled.
+                for request_output in outputs:
+                    request_output.output = (request_output.output, None, raw_audio_sr)
                 return outputs
             for request_output, raw_audio_waveform in zip(outputs, raw_audio_waveforms):
                 request_output.output = (request_output.output, raw_audio_waveform, raw_audio_sr)

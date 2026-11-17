@@ -61,7 +61,7 @@ def _text_result(text: str) -> OmniRequestOutput:
     return OmniRequestOutput.from_stage_output(request_output, final_output_type="text")
 
 
-def _audio_result(audio_data: Any) -> OmniRequestOutput:
+def _audio_result(audio_data: Any, sample_rate: int | None = 24000) -> OmniRequestOutput:
     class Output:
         multimodal_output: dict[str, Any]
 
@@ -69,7 +69,11 @@ def _audio_result(audio_data: Any) -> OmniRequestOutput:
         outputs: list[Output]
 
     output = Output()
+    # Post-normalization the producer contract requires the advertised rate
+    # alongside the waveform; fixtures default to the historic 24000.
     output.multimodal_output = {"audio": audio_data}
+    if sample_rate is not None:
+        output.multimodal_output["sr"] = sample_rate
     request_output = RequestOutput()
     request_output.outputs = [output]
     return OmniRequestOutput.from_stage_output(request_output, final_output_type="audio")
@@ -686,12 +690,12 @@ def test_audio_delta_mode_is_read_by_serving_code_at_runtime(monkeypatch):
     monkeypatch.setattr(
         OmniStreamingVideoHandler,
         "_delta_fast",
-        classmethod(lambda cls, audio_data, chunks_drained: ("fast-path", chunks_drained)),
+        classmethod(lambda cls, audio_data, chunks_drained, sample_rate: ("fast-path", chunks_drained)),
     )
     monkeypatch.setattr(
         OmniStreamingVideoHandler,
         "_delta_slow",
-        classmethod(lambda cls, audio_data, chunks_drained: ("slow-path", chunks_drained)),
+        classmethod(lambda cls, audio_data, chunks_drained, sample_rate: ("slow-path", chunks_drained)),
     )
 
     monkeypatch.setenv("VLLM_VIDEO_AUDIO_DELTA_MODE", "fast")
@@ -794,7 +798,7 @@ async def test_audio_events_use_output_audio_names(monkeypatch, async_chunk_mode
     monkeypatch.setattr(
         OmniStreamingVideoHandler,
         "_encode_audio_wav_b64",
-        staticmethod(lambda _audio: "audio-b64"),
+        staticmethod(lambda _audio, _sample_rate: "audio-b64"),
     )
 
     ws = MockWebSocket()

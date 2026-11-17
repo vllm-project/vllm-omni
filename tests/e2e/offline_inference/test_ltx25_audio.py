@@ -65,7 +65,7 @@ def test_ltx25_text_to_audio_offline_generate() -> None:
         assert isinstance(output, OmniRequestOutput)
         multimodal_output = output.multimodal_output or {}
         assert output.final_output_type == "audio"
-        assert int(multimodal_output["audio_sample_rate"]) == SAMPLE_RATE
+        assert int(multimodal_output["sr"]) == SAMPLE_RATE
 
         audio = multimodal_output["audio"]
         if isinstance(audio, torch.Tensor):

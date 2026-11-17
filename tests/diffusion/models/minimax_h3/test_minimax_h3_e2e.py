@@ -24,7 +24,7 @@ def _assert_joint_output(outputs):
     multimodal = outputs[0].multimodal_output
     assert multimodal is not None
     assert np.asarray(multimodal["audio"]).shape[1] == 2
-    assert multimodal["audio_sample_rate"] == 32000
+    assert multimodal["sr"] == 32000
     assert multimodal["fps"] == 24
 
 
@@ -80,7 +80,7 @@ def test_minimax_h3_t2va_ulysses8_smoke():
     multimodal = outputs[0].multimodal_output
     assert multimodal is not None
     assert np.asarray(multimodal["audio"]).shape[1] == 2
-    assert multimodal["audio_sample_rate"] == 32000
+    assert multimodal["sr"] == 32000
     assert multimodal["fps"] == 24
 
 

@@ -16,12 +16,14 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_turn_id_from_request_id,
 )
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, EncodeAudio
+from vllm_omni.model_executor.common.request_outputs import sample_rate_hz
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     SILENT_TEXT,
     is_effectively_silent,
     is_silent_text_prefix,
 )
 from vllm_omni.outputs.duplex import get_duplex_output_decision
+from vllm_omni.sample_rate import MissingSampleRateError
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,15 +127,6 @@ def _audio_value(metadata: Mapping[str, object]) -> object | None:
     if isinstance(value, list) and len(value) == 1:
         return value[0]
     return value
-
-
-def _sample_rate(metadata: Mapping[str, object]) -> int:
-    value = metadata.get("sr", metadata.get("sample_rate_hz", 24000))
-    if isinstance(value, list) and value:
-        value = value[0]
-    if hasattr(value, "item"):
-        value = value.item()
-    return int(value) if isinstance(value, int | float) else 24000
 
 
 def _pcm_sample_count(audio: object) -> int:
@@ -328,7 +321,11 @@ class AuraDataPlaneSession(DuplexDataPlane):
         mm = _multimodal(output, completion)
         audio = _audio_value(mm)
         if audio is not None and not state.silent:
-            sample_rate = _sample_rate(mm)
+            sample_rate = sample_rate_hz(mm)
+            if sample_rate is None:
+                raise MissingSampleRateError(
+                    "AURA duplex audio carried no sample rate; the model must emit 'sr' on its multimodal output"
+                )
             delta = _new_audio_samples(audio, state.audio_offset)
             encoded = None
             n = 0

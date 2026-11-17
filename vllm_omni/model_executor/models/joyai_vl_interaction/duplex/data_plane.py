@@ -18,6 +18,7 @@ from vllm_omni.engine.duplex.visual_memory import (
     VisualMemorySource,
 )
 from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import Action, ParsedAction, parse_action
+from vllm_omni.model_executor.common.request_outputs import sample_rate_hz
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.delegation import (
     DELEGATION_TOOL_NAME,
     delegation_arguments,
@@ -28,6 +29,7 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import (
     SUMMARY_CHUNK_MESSAGES,
     JoyAISummaryMemory,
 )
+from vllm_omni.sample_rate import MissingSampleRateError
 
 
 @dataclass(frozen=True)
@@ -261,12 +263,7 @@ class JoyAIDataPlane(DuplexDataPlane):
                 audio = mm.get("audio") if isinstance(mm, Mapping) else None
                 if audio is None and not output.finished:
                     continue
-                rate = mm.get("sr", mm.get("sample_rate", 24000))
-                if isinstance(rate, (list, tuple)):
-                    rate = rate[0]
-                rate = int(rate)
-                if rate <= 0:
-                    raise ValueError("Invalid JoyAI output audio sample rate")
+                rate = sample_rate_hz(mm) if isinstance(mm, Mapping) else None
                 chunks = [] if audio is None else audio if isinstance(audio, (list, tuple)) else [audio]
                 arrays = [
                     np.asarray(
@@ -287,12 +284,18 @@ class JoyAIDataPlane(DuplexDataPlane):
                     continue
                 if output.finished and observation.state is not None:
                     observation.state.last_response_text = observation.response_text
+                has_audio = bool(samples.size) and "audio" in context.modalities
+                if has_audio and rate is None:
+                    # Zero-audio sparse steps legally carry no rate; audio without one is a producer bug.
+                    raise MissingSampleRateError(
+                        "JoyAI duplex audio carried no sample rate; the model must emit 'sr' on its multimodal output"
+                    )
                 event.update(
                     audio_data=self.encode_audio(samples, rate, context.response_format, context.speed)
-                    if samples.size and "audio" in context.modalities
+                    if has_audio
                     else "",
                     sample_rate_hz=rate,
-                    audio_duration_ms=samples.size * 1000 / rate if "audio" in context.modalities else 0,
+                    audio_duration_ms=samples.size * 1000 / rate if has_audio else 0.0,
                     audio_complete=bool(output.finished),
                     text_requires_complete_audio="audio" in context.modalities,
                     end_of_turn=bool(output.finished),

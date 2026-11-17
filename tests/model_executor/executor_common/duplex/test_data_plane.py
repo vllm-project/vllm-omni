@@ -9,6 +9,7 @@ import pytest
 from vllm_omni.engine.duplex.contracts import DuplexFence, duplex_resource_request_id
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexDataPlaneContext
 from vllm_omni.model_executor.common.duplex.data_plane import CumulativeAudioTextDataPlane
+from vllm_omni.sample_rate import MissingSampleRateError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -31,7 +32,6 @@ def _output(request_id: str, *, text: str, samples: int, sr: int = 24000) -> Sim
 
 class _TestDataPlane(CumulativeAudioTextDataPlane):
     stage_role = "codec"
-    default_sample_rate_hz = 16000
 
 
 def test_is_a_duplex_data_plane_and_projects_cumulative_output_as_deltas() -> None:
@@ -106,12 +106,12 @@ def test_delta_audio_chunks_that_arrive_together_are_joined(as_tensor: bool) -> 
     assert [item["audio_data"] for item in projected] == ["audio-7"]
 
 
-def test_subclass_constants_and_default_sample_rate_reach_the_projection() -> None:
+def test_subclass_constants_and_advertised_rate_reach_the_projection() -> None:
     plane = _TestDataPlane(_encode_audio)
     output = SimpleNamespace(
         request_id="req",
         outputs=[SimpleNamespace(text="", multimodal_output={})],
-        multimodal_output={"audio": np.zeros(160, dtype=np.float32)},
+        multimodal_output={"audio": np.zeros(160, dtype=np.float32), "sr": 16000},
         finished=False,
     )
 
@@ -120,6 +120,42 @@ def test_subclass_constants_and_default_sample_rate_reach_the_projection() -> No
     assert item["stage_role"] == "codec"
     assert item["sample_rate_hz"] == 16000
     assert item["audio_duration_ms"] == 10
+
+
+def test_audio_without_a_rate_fails_loudly() -> None:
+    plane = CumulativeAudioTextDataPlane(_encode_audio)
+    plane.begin_request("req")
+    output = SimpleNamespace(
+        request_id="req",
+        outputs=[SimpleNamespace(text="", multimodal_output={})],
+        multimodal_output={"audio": np.zeros(8, dtype=np.float32)},
+        finished=False,
+    )
+
+    with pytest.raises(MissingSampleRateError, match="must emit 'sr'"):
+        list(plane.project({"data_plane_outputs": [output]}, context=DuplexDataPlaneContext(response_format="wav")))
+
+
+def test_zero_audio_step_without_a_rate_stays_legal_and_carries_no_rate() -> None:
+    plane = CumulativeAudioTextDataPlane(_encode_audio)
+    plane.begin_request("req")
+    output = SimpleNamespace(
+        request_id="req",
+        outputs=[SimpleNamespace(text="hi", multimodal_output={})],
+        multimodal_output={},
+        finished=False,
+    )
+
+    [item] = list(
+        plane.project(
+            {"data_plane_outputs": [output]},
+            context=DuplexDataPlaneContext(response_format="wav", modalities=("text",)),
+        )
+    )
+
+    # No audio shipped, so no rate is required — and none is fabricated.
+    assert item["sample_rate_hz"] is None
+    assert item["audio_duration_ms"] == 0
 
 
 def test_nothing_new_yields_nothing_and_non_results_are_ignored() -> None:

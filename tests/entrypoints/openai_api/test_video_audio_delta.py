@@ -25,18 +25,24 @@ from vllm_omni.entrypoints.openai.video_stream_base import (
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
 from vllm_omni.outputs.output_processor import OmniRequestState
+from vllm_omni.sample_rate import MissingSampleRateError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _audio_result(payload):
+def _audio_result(payload, sample_rate: int | None = 24000):
+    payload_dict = {"audio": payload}
+    if sample_rate is not None:
+        # Post-normalization the producer contract requires the advertised
+        # rate alongside the waveform; fixtures default to the historic 24000.
+        payload_dict["sr"] = torch.tensor(sample_rate, dtype=torch.int32)
     completion = MultimodalCompletionOutput(
         index=0,
         text="",
         token_ids=[],
         cumulative_logprob=None,
         logprobs=None,
-        multimodal_output=MultimodalPayload.from_dict({"audio": payload}),
+        multimodal_output=MultimodalPayload.from_dict(payload_dict),
     )
     return OmniRequestOutput(
         outputs=[completion],
@@ -44,10 +50,10 @@ def _audio_result(payload):
     )
 
 
-def _pcm(encoded):
+def _pcm(encoded, sample_rate: int = 24000):
     assert encoded is not None
     with wave.open(io.BytesIO(base64.b64decode(encoded)), "rb") as wav:
-        assert (wav.getframerate(), wav.getnchannels(), wav.getsampwidth()) == (24000, 1, 2)
+        assert (wav.getframerate(), wav.getnchannels(), wav.getsampwidth()) == (sample_rate, 1, 2)
         return np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2")
 
 
@@ -93,12 +99,37 @@ def test_empty_delta_does_not_consume_first_emission(monkeypatch, mode, empty):
 def test_first_chunk_trim_threshold_is_preserved(first_length):
     first = torch.arange(first_length, dtype=torch.float32) / 32768
     later = torch.arange(5000, 10000, dtype=torch.float32).reshape(1, -1) / 32768
-    encoded, seen = OmniStreamingVideoHandler._delta_fast(first, 0)
+    encoded, seen = OmniStreamingVideoHandler._delta_fast(first, 0, 24000)
     start = _CODEC_FRAME_SAMPLES if first_length > 2 * _CODEC_FRAME_SAMPLES else 0
     np.testing.assert_array_equal(_pcm(encoded), np.arange(start, first_length))
-    encoded, seen = OmniStreamingVideoHandler._delta_fast(later, seen)
+    encoded, seen = OmniStreamingVideoHandler._delta_fast(later, seen, 24000)
     np.testing.assert_array_equal(_pcm(encoded), np.arange(5000, 10000))
     assert seen == 2
+
+
+def test_delta_wav_carries_model_rate_not_a_default():
+    # Regression: the encoder hardcoded 24000 in the WAV header regardless of
+    # the model's advertised rate; an unusual rate proves the fix.
+    encoded, _ = OmniStreamingVideoHandler._extract_audio_delta_b64(_audio_result(_chunks()[0], sample_rate=22050), 0)
+    np.testing.assert_array_equal(_pcm(encoded, sample_rate=22050), np.arange(_CODEC_FRAME_SAMPLES, 5000))
+
+
+@pytest.mark.parametrize("mode", ["fast", "slow"])
+def test_delta_without_rate_fails_loudly(monkeypatch, mode):
+    # Every audio-emitting model advertises its rate; samples without one
+    # must surface as a producer bug, not ship under a fabricated header.
+    monkeypatch.setenv("VLLM_VIDEO_AUDIO_DELTA_MODE", mode)
+    with pytest.raises(MissingSampleRateError):
+        OmniStreamingVideoHandler._extract_audio_delta_b64(_audio_result(_chunks()[0], sample_rate=None), 0)
+
+
+@pytest.mark.parametrize("mode", ["fast", "slow"])
+def test_empty_delta_without_rate_stays_legal(monkeypatch, mode):
+    # Zero-audio deltas are the legal sparse payload shape and carry no rate.
+    monkeypatch.setenv("VLLM_VIDEO_AUDIO_DELTA_MODE", mode)
+    encoded, seen = OmniStreamingVideoHandler._extract_audio_delta_b64(_audio_result([], sample_rate=None), 0)
+    assert encoded is None
+    assert seen == 0
 
 
 @pytest.mark.parametrize("explicit", [False, True])
@@ -161,7 +192,12 @@ async def test_real_producer_deltas_reach_video_client(
     # survive subsequent accumulation and draining under consumer backpressure.
     for index, group in enumerate(groups):
         for chunk in group:
-            state.add_multimodal_tensor(chunk, mm_type="audio")
+            # Generation runners hand off {"model_outputs": ..., "sr": ...}
+            # dicts; bare tensors predate the advertised-rate contract.
+            state.add_multimodal_tensor(
+                {"model_outputs": chunk, "sr": torch.tensor(24000, dtype=torch.int32)},
+                mm_type="audio",
+            )
         finish = FinishReason.STOP if finish_with_payload and index == len(groups) - 1 else None
         result = state.make_request_output([], None, finish, None)
         assert result is not None

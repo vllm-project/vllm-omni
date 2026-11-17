@@ -913,13 +913,11 @@ def get_kandinsky6_post_process_func(od_config: OmniDiffusionConfig):
     "audio": ..., "audio_sample_rate": ..., "fps": ...}`` payload the
     framework's shared audio-output plumbing (``io_support.py`` ->
     ``output_formatter.py`` -> ``media_utils.py`` PyAV muxing) already
-    expects — the same shape MiniMax H3's post-process function produces.
-    ``output_formatter.normalize_diffusion_postprocess_output`` lifts
-    ``audio_sample_rate``/``fps`` from this flat form into metadata; wrapping
-    it in a ``{"payload", "metadata"}`` envelope instead would silently drop
-    the sample rate (the envelope path only reads
-    ``metadata["audio"]["sample_rate"]``) and the MP4 would be muxed at the
-    24 kHz default, i.e. ~1.8x too slow.
+    expects. ``output_formatter.normalize_diffusion_postprocess_output``
+    lifts ``audio_sample_rate``/``fps`` from this flat form into metadata;
+    since the envelope path got the same lift, a ``{"payload", "metadata"}``
+    envelope would work too — the flat form is kept as the historical shape,
+    not a requirement.
 
     ``postprocess_audio`` emits int16 PCM; the muxer (and the OpenAI video
     route) consume float32 in ``[-1, 1]``, so the waveform is rescaled here.
