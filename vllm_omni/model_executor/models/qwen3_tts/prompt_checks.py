@@ -21,6 +21,7 @@ from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     Qwen3TTSPromptEmbedsBuilder,
     check_text_prompt,
     check_text_update,
+    coerce_token_ids,
     first_value,
     resolve_x_vector_only,
 )
@@ -40,11 +41,12 @@ def _is_text(value: object) -> bool:
 
 
 def _is_token_ids(value: object) -> bool:
-    # What the Talker turns into ``ref_ids``; anything else falls back to x-vector mode.
-    value = first_value(value)
-    if isinstance(value, (torch.Tensor, np.ndarray)):
-        return True
-    return isinstance(value, list) and bool(value) and all(isinstance(v, (int, np.integer)) for v in value)
+    # Whether the Talker can turn this into non-empty ``ref_ids``: empty ids fall back to x-vector mode,
+    # and arrays torch.from_numpy rejects (str/object dtype, negative strides) raise in the engine core.
+    try:
+        return coerce_token_ids(value, device=torch.device("cpu")) is not None
+    except (TypeError, ValueError):
+        return False
 
 
 def validate_voice_clone_request(info: Mapping[str, Any]) -> None:

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Frontend rejection of unusable Qwen3-TTS Base requests (#3707, #3708)."""
 
+import numpy as np
 import pytest
 import torch
 from pytest_mock import MockerFixture
@@ -11,6 +12,7 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
 from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_FUSED_PIPELINE, QWEN3_TTS_PIPELINE
 from vllm_omni.model_executor.models.qwen3_tts.prompt_checks import check_voice_clone_prompt
+from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import PRECOMPUTED_REF_IDS_KEY
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -56,6 +58,12 @@ def _base(**info):
         pytest.param(_base(ref_audio=AUDIO, x_vector_only_mode=[False]), NO_TEXT, id="explicit-icl"),
         # The Talker unwraps one list level, so flat ids fall back to x-vector mode.
         pytest.param(_base(ref_audio=AUDIO, ref_ids=[1, 2, 3]), NO_TEXT, id="flat-ref-ids"),
+        # Ids the Talker cannot convert: empty ones fall back to x-vector mode, a str array raises.
+        *(
+            pytest.param(_base(ref_audio=AUDIO, **{key: ids}), NO_TEXT, id=f"{name}-{key}")
+            for key in (PRECOMPUTED_REF_IDS_KEY, "ref_ids")
+            for name, ids in (("empty", torch.empty((1, 0), dtype=torch.long)), ("str-array", np.array(["invalid"])))
+        ),
         pytest.param(_base(ref_audio=AUDIO, speaker=["clone"]), NO_TEXT, id="issue-3708-shape"),
         pytest.param(
             _base(
