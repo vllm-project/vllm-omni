@@ -495,7 +495,12 @@ def get_ming_image_post_process_func(od_config: OmniDiffusionConfig):
     in vllm_omni/diffusion/registry.py.
     """
     model_path = od_config.model
-    vae_scale_factor = load_vae_scale_factor(model_path)
+    # The VAE config is optional for Ming's Flux-format VAE; preserve the
+    # pre-refactor tolerance for its absence instead of failing fast.
+    try:
+        vae_scale_factor = load_vae_scale_factor(model_path)
+    except (OSError, ValueError):
+        vae_scale_factor = 8  # Ming's Flux-format VAE default
 
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2, do_convert_rgb=True)
 

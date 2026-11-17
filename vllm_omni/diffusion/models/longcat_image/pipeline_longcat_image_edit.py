@@ -56,10 +56,10 @@ def get_longcat_image_edit_pre_process_func(
         model_path = model_name
     else:
         model_path = download_weights_from_hf_specific(model_name, None, ["*"])
-    vae_scale_factor = load_vae_scale_factor(model_path)
+    vae_config = _load_json(model_path, "vae/config.json")
+    vae_scale_factor = load_vae_scale_factor(model_path, vae_config=vae_config)
 
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
-    vae_config = _load_json(model_path, "vae/config.json")
     latent_channels = vae_config.get("latent_channels", 16)
 
     def pre_process_func(
