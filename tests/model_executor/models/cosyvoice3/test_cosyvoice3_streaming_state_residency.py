@@ -80,9 +80,7 @@ def _to_host(cache: dict[str, torch.Tensor | int] | None) -> dict[str, torch.Ten
     """Round-trip a cache through host memory, as the pre-change code did."""
     if cache is None:
         return None
-    return {
-        key: value.cpu().contiguous() if isinstance(value, torch.Tensor) else value for key, value in cache.items()
-    }
+    return {key: value.cpu().contiguous() if isinstance(value, torch.Tensor) else value for key, value in cache.items()}
 
 
 def _stream(model: CosyVoice3Code2Wav, chunks: list[torch.Tensor], *, host_cache: bool):
@@ -119,9 +117,7 @@ def test_streaming_state_stays_on_hift_device(config: dict) -> None:
         assert isinstance(cache["mel"], torch.Tensor) and cache["mel"].is_contiguous()
         if cache["phase_acc"] is not None:
             assert cache["phase_acc"].device == device, "phase accumulator must stay on the HiFT device"
-    _, cache = model._stream_hift_from_feat(
-        torch.zeros(1, 80, 0, device=device), cache_state=cache, finalize=True
-    )
+    _, cache = model._stream_hift_from_feat(torch.zeros(1, 80, 0, device=device), cache_state=cache, finalize=True)
     assert cache is None, "finalize must drop the streaming cache"
 
 
