@@ -2,9 +2,9 @@
 # Verified on 1x H100.
 #
 # Runner selection:
-#   Model Runner V2 (MRV2) is EXPERIMENTAL and is the default runner on CUDA and NPU
-#   for this model. Set `model_runner: v1` to opt out on CUDA.
-#   The `platforms:` sections keep V1 on XPU, ROCm and MUSA.
+#   Model Runner V2 (MRV2) is EXPERIMENTAL and is the default on CUDA, NPU
+#   and XPU. V1 overrides are unsupported with vLLM 0.34.
+#   The `platforms:` sections still request V1 on ROCm and MUSA and are rejected.
 #   See docs/configuration/stage_configs.md ("Qwen3-TTS with Model Runner V2").
 #
 # Fields omitted from a stage fall back to StageDeployConfig defaults (see

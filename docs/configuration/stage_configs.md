@@ -655,16 +655,16 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/depl
 
 ## Qwen3-TTS with Model Runner V2
 
-Qwen3-TTS selects Model Runner V2 by default on CUDA and NPU. With vLLM
-0.34.0, V2 is the only supported model runner; overrides that select V1 on
-XPU, ROCm and MUSA are rejected. MRV2 remains experimental for this model.
+Qwen3-TTS selects Model Runner V2 by default on CUDA, NPU and XPU. With
+vLLM 0.34.0, V2 is the only supported model runner; overrides that select V1
+on ROCm and MUSA are rejected. MRV2 remains experimental for this model.
 On NPU, the V2 Talker uses `FULL_AND_PIECEWISE`; Code2Wav retains
 `PIECEWISE`. These settings do not establish hardware qualification.
 Select one of these deployment profiles:
 
 | Profile | Runner | Code2Wav graph batches | Intended use |
 | --- | --- | --- | --- |
-| `qwen3_tts.yaml` | V2 on CUDA/NPU; V1 overrides unsupported | B1 | Shipped default; experimental |
+| `qwen3_tts.yaml` | V2 on CUDA/NPU/XPU; V1 overrides unsupported | B1 | Shipped default; experimental |
 | `qwen3_tts_high_concurrency_mrv2.yaml` | V2 | B1, B2 | Opt-in throughput tuning |
 | `qwen3_tts_high_concurrency_mrv2_b4.yaml` | V2 | B1, B2, B3, B4 | Experimental throughput / buffered playback |
 | `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` | V2 | B1–B8 | Experimental two-stage deployment on one GPU, with MPS |
@@ -672,7 +672,7 @@ Select one of these deployment profiles:
 | `qwen3_tts_fused_single_gpu.yaml` | V2 | N/A (in-Talker decoder) | Opt-in single-stage CUDA pipeline on one GPU |
 
 The former `qwen3_tts_mrv2.yaml` profile has been removed. Use
-`qwen3_tts.yaml` instead; it selects V2 on CUDA and NPU.
+`qwen3_tts.yaml` instead; it selects V2 on CUDA, NPU and XPU.
 
 ```bash
 # Use the bundled V2 profile.
@@ -685,8 +685,9 @@ Talker AR runner and the Code2Wav generation
 runner together. Native inter-stage delivery carries codec payloads directly;
 request-owned snapshots preserve buffers through asynchronous completion and
 CUDA graph reuse. Terminal completion waits for upstream stage metrics before
-releasing request state. Platform sections that retain V1 on XPU, ROCm and
-MUSA are unsupported; this change does not qualify V2 on those backends.
+releasing request state. Platform sections that retain V1 on ROCm and MUSA
+are unsupported. XPU selects V2, but final-release XPU hardware qualification
+remains pending.
 Selecting V2 for a stage without `supports_native_mrv2_data_plane` emits a warning
 when pipeline and deployment settings are merged. That stage retains the legacy
 transport path; the warning does not establish support for that combination.
