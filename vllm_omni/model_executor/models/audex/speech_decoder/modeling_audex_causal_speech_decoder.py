@@ -499,7 +499,9 @@ class AudexCausalSpeechDecoderSession:
             if self._graph_runner is not None and emit_frames == self.chunk_frames:
                 lookahead = self.decoder.lookahead_steps
                 future = self.buffer[emit_frames : emit_frames + lookahead] if lookahead else []
-                if len(future) == lookahead and all(len(frame) == 1 for frame in self.buffer[:emit_frames + lookahead]):
+                if len(future) == lookahead and all(
+                    len(frame) == 1 for frame in self.buffer[: emit_frames + lookahead]
+                ):
                     wav = self._graph_runner.decode(
                         [frame[0] for frame in self.buffer[:emit_frames]],
                         [frame[0] for frame in future],

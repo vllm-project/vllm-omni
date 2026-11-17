@@ -131,27 +131,20 @@ class AudexCausalSpeechDecoderGraphRunner:
         # [layer] -> (k, v) over the shared workspace; per-bucket graphs use
         # k[:, :, :bucket] views, so every bucket shares this allocation
         self.workspace: list[tuple[torch.Tensor, torch.Tensor]] = [
-            (torch.zeros(shape, device=device), torch.zeros(shape, device=device))
-            for _ in range(config.depth)
+            (torch.zeros(shape, device=device), torch.zeros(shape, device=device)) for _ in range(config.depth)
         ]
 
         self.static_idx = torch.zeros(1, self.emit_frames, 1, dtype=torch.long, device=device)
         self.static_look = (
-            torch.zeros(1, self.lookahead_steps, 1, dtype=torch.long, device=device)
-            if self.lookahead_steps
-            else None
+            torch.zeros(1, self.lookahead_steps, 1, dtype=torch.long, device=device) if self.lookahead_steps else None
         )
         self.pos_base = torch.zeros(1, dtype=torch.long, device=device)
 
         self._pin_idx = [
-            torch.zeros(1, self.emit_frames, 1, dtype=torch.long, pin_memory=True)
-            for _ in range(_PINNED_SLOTS)
+            torch.zeros(1, self.emit_frames, 1, dtype=torch.long, pin_memory=True) for _ in range(_PINNED_SLOTS)
         ]
         self._pin_look = (
-            [
-                torch.zeros(1, self.lookahead_steps, 1, dtype=torch.long, pin_memory=True)
-                for _ in range(_PINNED_SLOTS)
-            ]
+            [torch.zeros(1, self.lookahead_steps, 1, dtype=torch.long, pin_memory=True) for _ in range(_PINNED_SLOTS)]
             if self.lookahead_steps
             else [None] * _PINNED_SLOTS
         )
@@ -192,9 +185,7 @@ class AudexCausalSpeechDecoderGraphRunner:
             vq_emb = self.model.audex_speech_token_embedder.get_output_from_indices(self.static_idx)
             lookahead_vq_emb = None
             if self.static_look is not None:
-                lookahead_vq_emb = self.model.audex_speech_token_embedder.get_output_from_indices(
-                    self.static_look
-                )
+                lookahead_vq_emb = self.model.audex_speech_token_embedder.get_output_from_indices(self.static_look)
             return self.model.decode_cached(vq_emb, capture_cache, lookahead_vq_emb=lookahead_vq_emb)
 
         with torch.inference_mode():

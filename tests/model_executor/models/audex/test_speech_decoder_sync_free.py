@@ -197,9 +197,7 @@ def test_embedder_cached_constants_bit_exact_cuda() -> None:
     torch.manual_seed(0)
     device = torch.device("cuda")
     levels = [3, 4, 5, 4]
-    embedder = AudexSpeechTokenEmbedder(
-        output_dim=32, token_embed_dim=4, codebook_levels=levels
-    ).to(device)
+    embedder = AudexSpeechTokenEmbedder(output_dim=32, token_embed_dim=4, codebook_levels=levels).to(device)
     indices = torch.randint(0, 3 * 4 * 5 * 4, (1, 7, 1), device=device)
 
     with torch.inference_mode():

@@ -77,9 +77,7 @@ def test_graphed_session_bit_exact_vs_eager(n_frames: int) -> None:
 def test_graph_runner_falls_back_past_frame_cap_bit_exact() -> None:
     model = _real_model()
     # cap at one bucket: chunks up to position 64 replay, the rest run eager
-    runner = AudexCausalSpeechDecoderGraphRunner(
-        model, emit_frames=CHUNK_FRAMES, max_frames=64, bucket_stride=64
-    )
+    runner = AudexCausalSpeechDecoderGraphRunner(model, emit_frames=CHUNK_FRAMES, max_frames=64, bucket_stride=64)
     frames = _codes(100)
 
     eager = _run_session(model, frames)
@@ -148,9 +146,7 @@ def test_runner_rejects_non_cuda_and_bad_config() -> None:
     with pytest.raises(ValueError, match="emit_frames must be positive"):
         AudexCausalSpeechDecoderGraphRunner(model, emit_frames=0)
     with pytest.raises(ValueError, match="max_frames must be a multiple"):
-        AudexCausalSpeechDecoderGraphRunner(
-            model, emit_frames=CHUNK_FRAMES, max_frames=100, bucket_stride=64
-        )
+        AudexCausalSpeechDecoderGraphRunner(model, emit_frames=CHUNK_FRAMES, max_frames=100, bucket_stride=64)
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
