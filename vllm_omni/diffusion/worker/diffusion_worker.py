@@ -2005,7 +2005,7 @@ class WorkerProc:
     @contextmanager
     def _request_chunk_transport(self, method: str, should_reply: bool) -> Iterator[None]:
         """Close emits and drain chunks before either success or error RPC return."""
-        if self.od_config.step_execution or method not in _REQUEST_CHUNK_EXECUTE_METHODS:
+        if method not in _REQUEST_CHUNK_EXECUTE_METHODS or self.od_config.step_execution:
             yield
             return
         factory = self._make_emit_chunk if should_reply and self.result_mq is not None else None

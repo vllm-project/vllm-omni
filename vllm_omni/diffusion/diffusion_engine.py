@@ -422,7 +422,8 @@ class DiffusionEngine:
     def _init_executor(self, od_config: OmniDiffusionConfig) -> None:
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
-        self.executor.register_chunk_ready_handler(self._on_request_chunk_ready)
+        if od_config.streaming_output and not self.step_execution:
+            self.executor.register_chunk_ready_handler(self._on_request_chunk_ready)
 
     def _init_scheduler(
         self,

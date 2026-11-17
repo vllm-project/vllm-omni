@@ -409,3 +409,19 @@ def test_finalization_does_not_pop_reused_request_output_state() -> None:
     )
     assert engine._request_chunk_states["req"] is replacement
     assert outputs.get_nowait().total_chunks == 2
+
+
+@pytest.mark.parametrize("streaming,step_execution", [(False, False), (True, True), (True, False)])
+def test_engine_registers_chunk_handler_only_for_request_streaming(monkeypatch, streaming, step_execution):
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.step_execution = step_execution
+    executor = MagicMock()
+    executor_class = MagicMock(return_value=executor)
+    monkeypatch.setattr("vllm_omni.diffusion.diffusion_engine.DiffusionExecutor.get_class", lambda _: executor_class)
+
+    engine._init_executor(SimpleNamespace(streaming_output=streaming))
+
+    if streaming and not step_execution:
+        executor.register_chunk_ready_handler.assert_called_once_with(engine._on_request_chunk_ready)
+    else:
+        executor.register_chunk_ready_handler.assert_not_called()
