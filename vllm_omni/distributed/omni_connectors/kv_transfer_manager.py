@@ -1649,9 +1649,10 @@ class OmniKVTransferManager:
         """Receive primary KV cache and optional CFG companion KV caches.
 
         First receives the primary KV cache (existing logic). Then, if the
-        request carries cfg_kv_request_ids and a model-specific
-        cfg_kv_collect_func is provided, calls it to fetch and attach the
-        companion KV caches to sampling_params.
+        request carries cfg_kv_request_ids, requires a model-specific
+        cfg_kv_collect_func to fetch and attach the companion KV caches to
+        sampling_params. Collection errors propagate to the distributed
+        wrapper so every participating rank receives the terminal verdict.
 
         Args:
             req: Request object with request_id and sampling_params.
@@ -1663,6 +1664,10 @@ class OmniKVTransferManager:
 
         Returns:
             True if primary KV cache was received successfully.
+
+        Raises:
+            ValueError: CFG request IDs were supplied without a collector.
+            Exception: Companion collection or application failed.
         """
         # An n > 1 source request sends one primary KV per sample; CFG companions stay shared.
         num_samples = per_sample_kv_count(getattr(req, "sampling_params", None))
@@ -1672,21 +1677,20 @@ class OmniKVTransferManager:
             primary_ok = self.receive_kv_cache(req, target_device)
 
         cfg_ids = getattr(getattr(req, "sampling_params", None), "cfg_kv_request_ids", None)
-        if cfg_ids and cfg_kv_collect_func:
+        if cfg_ids:
+            if cfg_kv_collect_func is None:
+                raise ValueError("CFG KV request IDs require a collector")
             request_id = self._resolve_request_id(req)
-            try:
-                cfg_kvs = cfg_kv_collect_func(
-                    request_id,
-                    cfg_ids,
-                    self,
-                    target_device,
-                )
-                if cfg_kvs and hasattr(req, "sampling_params") and req.sampling_params is not None:
-                    for key, value in cfg_kvs.items():
-                        setattr(req.sampling_params, key, value)
-                    logger.info("Applied CFG KV caches: %s", list(cfg_kvs.keys()))
-            except Exception:
-                logger.exception("Failed to collect CFG KV caches for %s", request_id)
+            cfg_kvs = cfg_kv_collect_func(
+                request_id,
+                cfg_ids,
+                self,
+                target_device,
+            )
+            if cfg_kvs and hasattr(req, "sampling_params") and req.sampling_params is not None:
+                for key, value in cfg_kvs.items():
+                    setattr(req.sampling_params, key, value)
+                logger.info("Applied CFG KV caches: %s", list(cfg_kvs.keys()))
 
         return primary_ok
 

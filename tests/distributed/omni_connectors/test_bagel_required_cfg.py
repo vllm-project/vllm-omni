@@ -72,8 +72,58 @@ def test_primary_success_does_not_hide_required_cfg_timeout(monkeypatch, require
 
 
 def test_companion_connector_exception_ends_request(monkeypatch):
-    with pytest.raises(KVCacheReceiveError, match="cfg_text"):
+    with pytest.raises(KVCacheReceiveError, match="OSError: injected connector failure"):
         _receive(monkeypatch, ("cfg_text",), (), receive_error=True)
+
+
+@pytest.mark.parametrize("primary_ok", [False, True])
+@pytest.mark.parametrize("populated", [False, True])
+@pytest.mark.parametrize("collector_kind", ["custom-error", "bagel-error", "missing"])
+def test_collector_failure_precedes_distribution_and_allows_recovery(primary_ok, populated, collector_kind):
+    manager = OmniKVTransferManager(OmniKVCacheConfig(need_recv_cache=True))
+    manager._topo_config = _TransferTopoConfig(ReceiveRole.LOCAL, False, 1, 0, None, 1, 0, None, None)
+    params = OmniDiffusionSamplingParams(seed=0, cfg_kv_request_ids={"cfg_text": "R__cfg_text"})
+    if populated:
+        # A pre-existing role must not mask a failure to collect this request's KV.
+        params.cfg_text_past_key_values = object()
+    req = OmniDiffusionRequest(prompt="test", request_id="R", sampling_params=params)
+    manager.receive_kv_cache = Mock(return_value=primary_ok)
+    manager.receive_kv_cache_for_request = Mock(side_effect=OSError("injected collector failure"))
+    manager.distribute_kv_cache = Mock(return_value=None)
+    if collector_kind == "missing":
+        collector = None
+        message = "CFG KV request IDs require a collector"
+    elif collector_kind == "bagel-error":
+        collector = collect_cfg_kv_caches
+        message = "OSError: injected collector failure"
+    else:
+        collector = Mock(side_effect=OSError("injected collector failure"))
+        message = "OSError: injected collector failure"
+
+    with pytest.raises(KVCacheReceiveError, match=message):
+        manager.receive_multi_kv_cache_distributed(req, collector)
+    manager.distribute_kv_cache.assert_not_called()
+    assert params.past_key_values is None
+    assert params.cfg_text_past_key_values is None
+
+    # Failure must not poison the same manager's next request.
+    healthy = OmniDiffusionRequest(
+        prompt="test", request_id="next", sampling_params=OmniDiffusionSamplingParams(seed=0)
+    )
+    manager.receive_kv_cache = Mock(return_value=True)
+    assert manager.receive_multi_kv_cache_distributed(healthy)
+    manager.distribute_kv_cache.assert_called_once()
+
+
+@pytest.mark.parametrize("primary_ok", [False, True])
+def test_no_cfg_ids_do_not_require_a_collector(primary_ok):
+    manager = OmniKVTransferManager(OmniKVCacheConfig(need_recv_cache=True))
+    manager._topo_config = _TransferTopoConfig(ReceiveRole.LOCAL, False, 1, 0, None, 1, 0, None, None)
+    req = OmniDiffusionRequest(prompt="test", request_id="R", sampling_params=OmniDiffusionSamplingParams(seed=0))
+    manager.receive_kv_cache = Mock(return_value=primary_ok)
+    manager.distribute_kv_cache = Mock(return_value=None)
+    assert manager.receive_multi_kv_cache_distributed(req) is primary_ok
+    manager.distribute_kv_cache.assert_called_once()
 
 
 @pytest.mark.parametrize("roles", [(), ("cfg_text",), ("cfg_text", "cfg_img")])

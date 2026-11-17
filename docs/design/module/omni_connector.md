@@ -56,6 +56,15 @@ make a request usable when a role explicitly declared in `cfg_kv_request_ids`
 is absent. An explicitly received empty KV object remains valid. Validate the
 receiving rank's full payload before CFG scatter reduces it to rank-local roles.
 
+Companion collector exceptions (including errors inside the Bagel collector)
+propagate to the same verdict even if primary reception returned false or CFG
+slots were already populated. A request declaring companion IDs requires a
+collector; omitting it is a terminal configuration error, not permission to
+reuse existing slots. Requests without companion IDs still allow no collector
+and retain the primary-miss fallback. Collector exceptions abort collection;
+request cleanup owns outstanding companions, rather than retrying a partially
+consumed receive here.
+
 Synchronous reception and prefetch consumption share a terminal receive verdict.
 TP-active participants exchange errors in TP, CFG, then SP order; pure TP
 includes errors in its existing KV-state consensus. This happens before any

@@ -82,9 +82,10 @@ def _run_topology(rank, shape):
 
     # Alternate broken fetching ranks, then use the same groups for healthy work.
     # Replica 1 either processes a different healthy request or does no receive.
+    collector_modes = ("collector-error", "collector-primary-miss", "collector-populated", "collector-missing")
     scenarios: list[tuple[str, int | None, bool]] = [
         (mode, failed_tp, False)
-        for mode in ("sync", "sync-error", "miss-error", "consumed-error")
+        for mode in ("sync", "sync-error", "miss-error", "consumed-error", *collector_modes)
         for failed_tp in range(tp_size)
     ]
     if dp_size > 1:
@@ -99,7 +100,9 @@ def _run_topology(rank, shape):
             rid = f"request-{index}-replica-{dp}"
             params = OmniDiffusionSamplingParams(
                 seed=0,
-                cfg_kv_request_ids={"cfg_text": rid + "__cfg_text"} if mode in ("sync", "sync-all-missing") else None,
+                cfg_kv_request_ids={"cfg_text": rid + "__cfg_text"}
+                if mode in ("sync", "sync-all-missing", *collector_modes)
+                else None,
             )
             req = OmniDiffusionRequest(prompt="test", request_id=rid, sampling_params=params)
             broken = dp == 0 and (tp == failed_tp or mode == "sync-all-missing")
@@ -109,6 +112,12 @@ def _run_topology(rank, shape):
             def fetch(request_id, target_device=None):
                 if broken and mode in ("sync-error", "miss-error"):
                     raise OSError("injected connector failure")
+                if broken and mode == "collector-primary-miss" and request_id == rid:
+                    return None, 0
+                if request_id.endswith("__cfg_text") and broken and mode in collector_modes:
+                    if mode == "collector-populated":
+                        params.cfg_text_past_key_values = params.past_key_values
+                    raise OSError("injected collector failure")
                 if request_id.endswith("__cfg_text") and broken:
                     return None, 0
                 return payload, 1
@@ -122,14 +131,20 @@ def _run_topology(rank, shape):
             manager.consume_prefetched_kv = Mock(side_effect=consume)
             manager.distribute_kv_cache = Mock(wraps=real_distribution)
             try:
-                if mode in ("sync", "sync-error", "sync-all-missing"):
-                    received = manager.receive_multi_kv_cache_distributed(req, collect_cfg_kv_caches)
+                if mode in ("sync", "sync-error", "sync-all-missing", *collector_modes):
+                    collector = None if broken and mode == "collector-missing" else collect_cfg_kv_caches
+                    received = manager.receive_multi_kv_cache_distributed(req, collector)
                 else:
                     received = manager.consume_and_distribute_kv_cache(req)
             except KVCacheReceiveError as exc:
                 assert expected_failure, (shape, rank, mode, str(exc))
                 error_message = str(exc)
-                assert "cfg_text" in error_message or "injected" in error_message
+                if mode == "collector-missing":
+                    assert "CFG KV request IDs require a collector" in error_message
+                elif mode in collector_modes:
+                    assert "OSError: injected collector failure" in error_message
+                else:
+                    assert "cfg_text" in error_message or "injected" in error_message
                 assert getattr(params, "past_key_values", None) is None
                 manager.distribute_kv_cache.assert_not_called()
                 if mode == "sync-all-missing" and local and tp == 0:
