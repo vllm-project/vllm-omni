@@ -297,3 +297,6 @@ lance_compare/
 
 # Linting binaries downloaded by local pre-commit hooks
 shellcheck*/
+
+# Fixed custom-image workload for Hunyuan Image performance CI.
+!tests/assets/hunyuan_image3/perf_it2i.jsonl

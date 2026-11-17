@@ -30,17 +30,17 @@ vLLM-Omni treats ModelOpt checkpoints as pre-quantized checkpoints. The
 checkpoint config must identify ModelOpt as the quantization method or producer,
 and the quantization algorithm must be one of the validated algorithms below.
 
-| Checkpoint field | Supported value |
-|------------------|-----------------|
-| `method` / `quant_method` | `modelopt`, `modelopt_fp4`, `modelopt_mixed` |
-| `producer.name` | `modelopt` |
-| `quant_algo` | `FP8`, `FP8_PER_CHANNEL_PER_TOKEN`, `NVFP4`, `MIXED_PRECISION` |
+| Checkpoint field          | Supported value                                                |
+| ------------------------- | -------------------------------------------------------------- |
+| `method` / `quant_method` | `modelopt`, `modelopt_fp4`, `modelopt_mixed`                   |
+| `producer.name`           | `modelopt`                                                     |
+| `quant_algo`              | `FP8`, `FP8_PER_CHANNEL_PER_TOKEN`, `NVFP4`, `MIXED_PRECISION` |
 
-| `quant_algo` | Runtime method | Typical use |
-|--------------|----------------|-------------|
-| `FP8`, `FP8_PER_CHANNEL_PER_TOKEN` | `modelopt` | FP8 diffusion transformer checkpoints |
-| `NVFP4` | `modelopt_fp4` | NVFP4 diffusion transformer checkpoints |
-| `MIXED_PRECISION` | `modelopt_mixed` | Mixed FP8/NVFP4 checkpoints with a ModelOpt per-layer policy |
+| `quant_algo`                       | Runtime method   | Typical use                                                  |
+| ---------------------------------- | ---------------- | ------------------------------------------------------------ |
+| `FP8`, `FP8_PER_CHANNEL_PER_TOKEN` | `modelopt`       | FP8 diffusion transformer checkpoints                        |
+| `NVFP4`                            | `modelopt_fp4`   | NVFP4 diffusion transformer checkpoints                      |
+| `MIXED_PRECISION`                  | `modelopt_mixed` | Mixed FP8/NVFP4 checkpoints with a ModelOpt per-layer policy |
 
 For multi-component diffusion or omni models, only the checkpoint component
 that contains ModelOpt quantized weights should use the ModelOpt quantization
@@ -49,14 +49,14 @@ stay unquantized unless the model-specific recipe validates otherwise.
 
 ## Hardware Support
 
-| Device | Support |
-|--------|---------|
-| NVIDIA Blackwell GPU (SM 100+) | ✅ |
-| NVIDIA Ada/Hopper GPU (SM 89+) | ✅ |
-| NVIDIA Ampere GPU (SM 80+) | ⭕ |
-| AMD ROCm | ⭕ |
-| Intel XPU | ⭕ |
-| Ascend NPU | ❌ |
+| Device                         | Support |
+| ------------------------------ | ------- |
+| NVIDIA Blackwell GPU (SM 100+) | ✅      |
+| NVIDIA Ada/Hopper GPU (SM 89+) | ✅      |
+| NVIDIA Ampere GPU (SM 80+)     | ⭕      |
+| AMD ROCm                       | ⭕      |
+| Intel XPU                      | ⭕      |
+| Ascend NPU                     | ❌      |
 
 Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this guide.
 The optional CUTLASS FP8 runtime override requires CUDA SM89+. ModelOpt NVFP4
@@ -68,16 +68,16 @@ backend and quality validation.
 
 ### Diffusion Model
 
-| Model | HF checkpoint | Scope | Status |
-|-------|---------------|-------|--------|
-| Qwen-Image 2512 | `feizhai123/qwen-image-2512-modelopt-fp8-dynamic-all` | Diffusion transformer | Validated for ModelOpt FP8 checkpoints |
-| Qwen-Image 2512 | `feizhai123/qwen-image-2512-modelopt-mixed-fp8-sensitive-nvfp4-heavy` | Diffusion transformer | Validated for ModelOpt mixed FP8/NVFP4 checkpoints |
-| Z-Image | `feizhai123/z-image-modelopt-fp8-conservative` | Diffusion transformer | Validated for ModelOpt FP8 checkpoints |
-| FLUX.2-dev | `feizhai123/flux2-dev-modelopt-fp8` | Diffusion transformer | Validated for ModelOpt FP8 checkpoints |
-| FLUX.2-klein 4B | `feizhai123/flux2-klein-4b-modelopt-fp8` | Diffusion transformer | Validated for ModelOpt FP8 checkpoints |
-| HunyuanImage-3.0 | `feizhai123/hunyuan-image3-modelopt-fp8` | MoE diffusion transformer | Validated for ModelOpt FP8 checkpoints |
-| HunyuanImage-3.0 | `feizhai123/hunyuan-image3-modelopt-mixed-experts-nvfp4-dense-fp8` | MoE diffusion transformer | Validated for ModelOpt mixed FP8/NVFP4 checkpoints |
-| Wan2.2 | Not available | Diffusion transformer | Not validated |
+| Model            | HF checkpoint                                                         | Scope                     | Status                                             |
+| ---------------- | --------------------------------------------------------------------- | ------------------------- | -------------------------------------------------- |
+| Qwen-Image 2512  | `feizhai123/qwen-image-2512-modelopt-fp8-dynamic-all`                 | Diffusion transformer     | Validated for ModelOpt FP8 checkpoints             |
+| Qwen-Image 2512  | `feizhai123/qwen-image-2512-modelopt-mixed-fp8-sensitive-nvfp4-heavy` | Diffusion transformer     | Validated for ModelOpt mixed FP8/NVFP4 checkpoints |
+| Z-Image          | `feizhai123/z-image-modelopt-fp8-conservative`                        | Diffusion transformer     | Validated for ModelOpt FP8 checkpoints             |
+| FLUX.2-dev       | `feizhai123/flux2-dev-modelopt-fp8`                                   | Diffusion transformer     | Validated for ModelOpt FP8 checkpoints             |
+| FLUX.2-klein 4B  | `feizhai123/flux2-klein-4b-modelopt-fp8`                              | Diffusion transformer     | Validated for ModelOpt FP8 checkpoints             |
+| HunyuanImage-3.0 | `feizhai123/hunyuan-image3-modelopt-fp8`                              | MoE diffusion transformer | Validated for ModelOpt FP8 checkpoints             |
+| HunyuanImage-3.0 | `feizhai123/hunyuan-image3-modelopt-mixed-experts-nvfp4-dense-fp8`    | MoE diffusion transformer | Validated for ModelOpt mixed FP8/NVFP4 checkpoints |
+| Wan2.2           | Not available                                                         | Diffusion transformer     | Not validated                                      |
 
 For full serving commands and benchmark context, see
 [`recipes/Qwen/Qwen-Image.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen-Image.md)
@@ -86,11 +86,11 @@ and
 
 ### Multi-Stage Omni/TTS Model
 
-| Model | Scope | Status |
-|-------|-------|--------|
-| Qwen3-Omni | Thinker language-model stage | ModelOpt FP8 checkpoint path |
+| Model      | Scope                                     | Status                                                                       |
+| ---------- | ----------------------------------------- | ---------------------------------------------------------------------------- |
+| Qwen3-Omni | Thinker language-model stage              | ModelOpt FP8 checkpoint path                                                 |
 | Qwen3-Omni | Thinker language-model stage (W4A4 NVFP4) | Validated; see [Qwen3-Omni NVFP4 W4A4](#qwen3-omni-nvfp4-w4a4-thinker) below |
-| Qwen3-TTS | TTS language-model stage | Not validated |
+| Qwen3-TTS  | TTS language-model stage                  | Not validated                                                                |
 
 Audio encoder, vision encoder, talker, and code2wav stages stay in BF16 unless
 a model-specific guide documents otherwise.
@@ -102,8 +102,8 @@ Qwen3-Omni-30B-A3B-Instruct thinker language model. The thinker text body
 (attention + MoE experts) is quantized to NVFP4 with FP8 per-tensor input
 scales; the audio encoder, vision encoder, talker, and code2wav stay in BF16.
 
-| Variant | HF checkpoint | Hardware |
-|---------|---------------|----------|
+| Variant                   | HF checkpoint                                                           | Hardware                                 |
+| ------------------------- | ----------------------------------------------------------------------- | ---------------------------------------- |
 | W4A4 NVFP4 (full thinker) | `YihongJin/Qwen3-Omni-30B-A3B-Instruct-NVFP4-W4A4-full-thinker-awqclip` | sm_100+ (Blackwell, FlashInfer FP4 GEMM) |
 
 Calibration uses ModelOpt `mtq.NVFP4_DEFAULT_CFG` with the `awq_clip` algorithm
@@ -198,11 +198,11 @@ omni = Omni(
 
 ## Parameters
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `force_cutlass_fp8` / `--force-cutlass-fp8` | bool | `False` | Force CUTLASS FP8 linear kernels for supported ModelOpt FP8 diffusion stages on CUDA SM89+ |
-| `--linear-backend cutlass` | str | auto | Select the validated CUTLASS linear backend for supported ModelOpt NVFP4 or mixed FP8/NVFP4 diffusion stages |
-| `--moe-backend cutlass` | str | auto | Select the validated CUTLASS MoE backend for supported ModelOpt mixed MoE checkpoints |
+| Parameter                                   | Type | Default | Description                                                                                                  |
+| ------------------------------------------- | ---- | ------- | ------------------------------------------------------------------------------------------------------------ |
+| `force_cutlass_fp8` / `--force-cutlass-fp8` | bool | `False` | Force CUTLASS FP8 linear kernels for supported ModelOpt FP8 diffusion stages on CUDA SM89+                   |
+| `--linear-backend cutlass`                  | str  | auto    | Select the validated CUTLASS linear backend for supported ModelOpt NVFP4 or mixed FP8/NVFP4 diffusion stages |
+| `--moe-backend cutlass`                     | str  | auto    | Select the validated CUTLASS MoE backend for supported ModelOpt mixed MoE checkpoints                        |
 
 ## Cosmos3 Mixed-Precision Schedule
 
@@ -211,9 +211,9 @@ steps and dense 16-bit activation execution for selected first and last steps.
 The schedule supports serialized ModelOpt FP8 and NVFP4 checkpoints:
 
 | Detected weight format | Native middle steps | A16 boundary steps |
-|------------------------|---------------------|--------------------|
-| FP8 | W8A8 | W8A16 |
-| NVFP4 | W4A4 | W4A16 |
+| ---------------------- | ------------------- | ------------------ |
+| FP8                    | W8A8                | W8A16              |
+| NVFP4                  | W4A4                | W4A16              |
 
 The native and A16 paths share one quantized weight representation. The A16
 path dequantizes the live backend weight and calls `F.linear`; it does not keep
@@ -322,21 +322,11 @@ for those modules. Support for `modelopt_fp4` does not remove this limitation.
 2. Use `tests/diffusion/quantization/test_quantization_quality.py` with
    `VLLM_OMNI_QUALITY_CONFIGS` to validate local baseline and quantized model
    paths.
-3. For HunyuanImage-3.0 quantized DiT checkpoints, the opt-in accuracy check is:
-
-   ```bash
-   CUDA_VISIBLE_DEVICES=2,3 \
-   HUNYUAN_IMAGE3_RUN_QUANT_ACCURACY=1 \
-   HUNYUAN_IMAGE3_QUANT_DEVICES=0,1 \
-   HUNYUAN_IMAGE3_QUANT_TP=2 \
-   HUNYUAN_IMAGE3_BF16_MODEL=/path/to/hunyuan-image3-bf16 \
-   HUNYUAN_IMAGE3_FP8_MODEL=/path/to/hunyuan-image3-modelopt-fp8 \
-   HUNYUAN_IMAGE3_NVFP4_MODEL=/path/to/hunyuan-image3-modelopt-mixed-experts-nvfp4-dense-fp8 \
-   PYTHONPATH=/path/to/vllm-omni:${PYTHONPATH:-} \
-   python -m pytest -s -v \
-     tests/e2e/accuracy/test_hunyuan_image3.py \
-     -k quantized_dit_matches_bf16_accuracy
-   ```
+3. HunyuanImage-3.0 CI now uses the performance and accuracy matrix in the
+   [HunyuanImage recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/HunyuanImage-3.0-Instruct.md#ci-performance-and-accuracy-matrix).
+   The former model-specific opt-in BF16 versus FP8/NVFP4 accuracy tests
+   have been removed. Use the generic quantization quality check above
+   for additional local checkpoint comparisons.
 
 4. Report CLIP score deltas, SSIM, PSNR, throughput, latency, and peak memory
    when adding a new validated ModelOpt diffusion checkpoint.
