@@ -28,6 +28,7 @@ import time
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
@@ -99,16 +100,32 @@ class PreemptionReserve:
             grown = request.num_tokens - entry[1]
             self.max_growth = grown if self.max_growth is None else max(self.max_growth, grown)
 
-    def log_held(self, reserved: int, own: int) -> None:
+    def admission_blocks(self, request: Request, covered_tokens: int, caller_reserved: int) -> int:
+        """Blocks to reserve on top of ``caller_reserved`` before ``request`` gets blocks.
+
+        Zero for requests that are not held back: admitted ones, resumable sessions
+        and the first admission into an empty stage. ``covered_tokens`` are the
+        tokens this allocation will cover.
+        """
+        if request.request_id in self.admitted or request.resumable or not self.admitted:
+            return 0
+        own = max(0, self.final_blocks(request, request.num_tokens) - self.blocks(covered_tokens))
+        return self.reserved_blocks(caller_reserved) + own
+
+    def record(self, request: Request, allocated: bool, held: int) -> None:
+        """Track a newly admitted request, or log (rate-limited) that ``held`` blocks kept it waiting."""
+        if allocated:
+            if request.request_id not in self.admitted and not request.resumable:
+                self.admitted[request.request_id] = (request, request.num_tokens)
+            return
         now = time.monotonic()
-        if now - self._last_log >= _LOG_INTERVAL_S:
+        if held and now - self._last_log >= _LOG_INTERVAL_S:
             self._last_log = now
             logger.info(
-                "Preemption reserve: admission held; %d admitted request(s) may still need %d block(s), "
-                "the next waiting request %d more",
+                "Preemption reserve: admission held; %d admitted request(s) and the next waiting request "
+                "may still need %d block(s) beyond the scheduler's own reservation",
                 len(self.admitted),
-                reserved,
-                own,
+                held,
             )
 
 
@@ -124,8 +141,6 @@ def install_preemption_reserve(
     token takes one slot of one block; otherwise the block estimate would be
     wrong, so nothing is installed.
     """
-    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
-
     managers = getattr(getattr(kv_cache_manager, "coordinator", None), "single_type_managers", None)
     # Exact type, as in fast_allocate: subclasses (sliding, circular-buffer, sink, ...) bound KV differently.
     if managers is None or len(managers) != 1 or type(managers[0]) is not FullAttentionManager:
@@ -153,20 +168,14 @@ def install_preemption_reserve(
         has_scheduled_reqs: bool = True,
         skip_zeroing_group_ids: tuple[int, ...] = (),
     ) -> KVCacheBlocks | None:
-        rid = request.request_id
-        # Admitted requests, resumable sessions and the first admission into an empty stage pass through.
-        held_back = not (rid in reserve.admitted or request.resumable or not reserve.admitted)
-        reserved = own = 0
-        if held_back:
-            covered = (
-                request.num_computed_tokens
-                + num_new_computed_tokens
-                + num_external_computed_tokens
-                + num_new_tokens
-                + num_lookahead_tokens
-            )
-            reserved = reserve.reserved_blocks(reserved_blocks)
-            own = max(0, reserve.final_blocks(request, request.num_tokens) - reserve.blocks(covered))
+        covered = (
+            request.num_computed_tokens
+            + num_new_computed_tokens
+            + num_external_computed_tokens
+            + num_new_tokens
+            + num_lookahead_tokens
+        )
+        held = reserve.admission_blocks(request, covered, reserved_blocks)
         result = original(
             request,
             num_new_tokens,
@@ -177,15 +186,11 @@ def install_preemption_reserve(
             delay_cache_blocks=delay_cache_blocks,
             num_encoder_tokens=num_encoder_tokens,
             full_sequence_must_fit=full_sequence_must_fit,
-            reserved_blocks=reserved_blocks + reserved + own,
+            reserved_blocks=reserved_blocks + held,
             has_scheduled_reqs=has_scheduled_reqs,
             skip_zeroing_group_ids=skip_zeroing_group_ids,
         )
-        if result is None:
-            if held_back:
-                reserve.log_held(reserved, own)
-        elif rid not in reserve.admitted and not request.resumable:
-            reserve.admitted[rid] = (request, request.num_tokens)
+        reserve.record(request, result is not None, held)
         return result
 
     kv_cache_manager.allocate_slots = allocate_slots  # type: ignore[method-assign]
