@@ -1679,7 +1679,7 @@ def _realtime_video_perf_record():
     }
 
 
-def test_realtime_video_json_uses_standard_candidate_runner_with_hardware_baselines(monkeypatch):
+def test_realtime_video_json_uses_standard_candidate_runner_with_hardware_baselines(monkeypatch, pytestconfig):
     from pathlib import Path
 
     from tests.dfx.conftest import is_diffusion_perf_config, load_benchmark_configs
@@ -1718,6 +1718,7 @@ def test_realtime_video_json_uses_standard_candidate_runner_with_hardware_baseli
         runner.test_performance_benchmark(
             SimpleNamespace(host="localhost", port=8000, model="fixture-model"),
             {"test_name": config["test_name"], "params": params},
+            pytestconfig=pytestconfig,
         )
     assert len(calls) == 2  # One candidate recipe per hardware, with no reference loop.
 
