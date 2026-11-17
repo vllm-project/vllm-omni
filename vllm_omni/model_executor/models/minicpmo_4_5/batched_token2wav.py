@@ -820,9 +820,9 @@ class BatchedToken2Wav(nn.Module):
             except Exception:
                 logger.debug("Abandoned reference extraction failed", exc_info=True)
         self._prompt_features.pop(prompt_key, None)
-        self._prompt_att_caches.pop(prompt_key, None)
-        self._prompt_att_verified.discard(prompt_key)
-        self._prompt_att_rejected.discard(prompt_key)
+        getattr(self, "_prompt_att_caches", {}).pop(prompt_key, None)
+        getattr(self, "_prompt_att_verified", set()).discard(prompt_key)
+        getattr(self, "_prompt_att_rejected", set()).discard(prompt_key)
         for setup_key in list(self._setup_cache):
             if setup_key[0] == prompt_key:
                 self._setup_cache.pop(setup_key)
@@ -1536,6 +1536,7 @@ class BatchedToken2Wav(nn.Module):
         prompt_lengths: list[int] | None = None,
         prompt_att_cache: torch.Tensor | None = None,
         prompt_cache_key: tuple[str, str] | None = None,
+        prompt_att_segments: list[torch.Tensor | None] | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1666,6 +1667,7 @@ class BatchedToken2Wav(nn.Module):
                 valid_lengths=valid_lengths,
                 att_keep=att_keep,
                 prompt_lengths=prompt_lengths,
+                prompt_att_segments=prompt_att_segments,
             )
             if whole_euler_result is not None:
                 if (
@@ -1957,8 +1959,17 @@ class BatchedToken2Wav(nn.Module):
         shared_len = min(_CACHE_TRIM_SUFFIX, int(prompt.shape[5]))
         if shared_len <= 0:
             return rows
+        shared_rows = [row for row in rows if isinstance(row, SharedPromptAttCache)]
         tensor_rows = [row for row in rows if isinstance(row, torch.Tensor)]
         if not tensor_rows:
+            if shared_rows and cache_key not in self._prompt_att_verified:
+                self._prompt_att_verified.add(cache_key)
+                logger.info(
+                    "CFM prompt attention suffix verified bit-exact (prompt=%s rows=%d frames=%d)",
+                    cache_key[0],
+                    len(shared_rows),
+                    shared_len,
+                )
             return rows
         if any(
             row.ndim != 7
@@ -1970,21 +1981,21 @@ class BatchedToken2Wav(nn.Module):
             for row in tensor_rows
         ):
             self._prompt_att_rejected.add(cache_key)
-            return rows
+            return [row.materialize() if isinstance(row, SharedPromptAttCache) else row for row in rows]
         prompt_segment = prompt[..., -shared_len:, :].detach()
         if any(not torch.equal(row[..., -shared_len:, :], prompt_segment) for row in tensor_rows):
             logger.warning("CFM prompt attention suffix differs; disabling sharing for %s", cache_key[0])
             self._prompt_att_rejected.add(cache_key)
-            return rows
+            return [row.materialize() if isinstance(row, SharedPromptAttCache) else row for row in rows]
         if cache_key not in self._prompt_att_verified:
             self._prompt_att_verified.add(cache_key)
             logger.info(
                 "CFM prompt attention suffix verified bit-exact (prompt=%s rows=%d frames=%d)",
                 cache_key[0],
-                len(tensor_rows),
+                len(rows),
                 shared_len,
             )
-        del tensor_rows
+        del shared_rows, tensor_rows
         if not prompt_segment.is_contiguous():
             prompt_segment = prompt_segment.contiguous()
         for idx in range(len(rows)):
@@ -1993,6 +2004,30 @@ class BatchedToken2Wav(nn.Module):
                 rows[idx] = SharedPromptAttCache(row[..., :-shared_len, :].detach().clone(), prompt_segment)
                 del row
         return rows
+
+    def _prompt_att_segments_for_batch(
+        self,
+        features: PromptFeatures | list[PromptFeatures],
+        batch_size: int,
+    ) -> list[torch.Tensor | None] | None:
+        """Resolve per-row shared prompt suffix views for in-place Whole-Euler replay."""
+        if not self._prompt_att_sharing:
+            return None
+        if not isinstance(features, list):
+            cache_key = features.cache_key
+            if cache_key in self._prompt_att_rejected:
+                return None
+            prompt = self._prompt_att_caches.get(cache_key)
+            return [prompt] * batch_size if prompt is not None else None
+        segments: list[torch.Tensor | None] = []
+        any_present = False
+        for feature in features:
+            cache_key = feature.cache_key
+            prompt = None if cache_key in self._prompt_att_rejected else self._prompt_att_caches.get(cache_key)
+            if prompt is not None:
+                any_present = True
+            segments.append(prompt)
+        return segments if any_present else None
 
     def _apply_prompt_att_sharing(
         self,
@@ -2389,6 +2424,7 @@ class BatchedToken2Wav(nn.Module):
         att_keep = (prompt_len, _CACHE_TRIM_SUFFIX)
         prompt_att_cache = self._prompt_att_caches.get(features.cache_key) if not isinstance(features, list) else None
         prompt_cache_key = features.cache_key if not isinstance(features, list) else None
+        prompt_att_segments = self._prompt_att_segments_for_batch(features, batch_size)
         with self._autocast(tokens.device):
             self._watchdog.phase(
                 "decode/encoder",
@@ -2429,6 +2465,7 @@ class BatchedToken2Wav(nn.Module):
                 prompt_lengths=prompt_lengths,
                 prompt_att_cache=prompt_att_cache,
                 prompt_cache_key=prompt_cache_key,
+                prompt_att_segments=prompt_att_segments,
             )
         self._watchdog.phase(
             "decode/cache_materialization",
@@ -2622,6 +2659,7 @@ class BatchedToken2Wav(nn.Module):
         prompt_lengths, projected_speakers = self._batch_conditioning(features, batch_size)
         prompt_att_cache = self._prompt_att_caches.get(features.cache_key) if not isinstance(features, list) else None
         prompt_cache_key = features.cache_key if not isinstance(features, list) else None
+        prompt_att_segments = self._prompt_att_segments_for_batch(features, batch_size)
         with self._autocast(padded_hidden.device):
             cond = torch.zeros_like(padded_hidden).transpose(1, 2).contiguous()
             self._watchdog.phase(
@@ -2643,6 +2681,7 @@ class BatchedToken2Wav(nn.Module):
                 prompt_lengths=prompt_lengths,
                 prompt_att_cache=prompt_att_cache,
                 prompt_cache_key=prompt_cache_key,
+                prompt_att_segments=prompt_att_segments,
             )
         self._watchdog.phase(
             "decode/cache_materialization",

@@ -746,6 +746,44 @@ def _copy_frame_segments(dst: torch.Tensor, src: torch.Tensor, segments: list[tu
         position += length
 
 
+def _split_segments_before_tail(
+    segments: list[tuple[int, int]],
+    tail_len: int,
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """Split logical frame ``segments`` into prefix segments and trailing ``tail_len`` segments."""
+    total = sum(length for _, length in segments)
+    if tail_len <= 0:
+        return list(segments), []
+    if tail_len >= total:
+        return [], list(segments)
+    split_at = total - tail_len
+    prefix_segments: list[tuple[int, int]] = []
+    tail_segments: list[tuple[int, int]] = []
+    cursor = 0
+    for start, length in segments:
+        end = cursor + length
+        if end <= split_at:
+            prefix_segments.append((start, length))
+        elif cursor >= split_at:
+            tail_segments.append((start, length))
+        else:
+            left_len = split_at - cursor
+            prefix_segments.append((start, left_len))
+            tail_segments.append((start + left_len, length - left_len))
+        cursor = end
+    return prefix_segments, tail_segments
+
+
+def _matches_frame_segments(src: torch.Tensor, segments: list[tuple[int, int]], expected: torch.Tensor) -> bool:
+    """Compare ``segments`` of ``src`` against contiguous ``expected`` without allocating."""
+    pos = 0
+    for start, length in segments:
+        if not torch.equal(src[..., start : start + length, :], expected[..., pos : pos + length, :]):
+            return False
+        pos += length
+    return pos == int(expected.shape[-2])
+
+
 def _tensors_from_key(key: tuple) -> tuple[torch.Tensor, ...]:
     """Rebuild zero tensors from a cache key (shape, dtype, device tuples).
 
@@ -2301,7 +2339,8 @@ class WholeEulerCFMGraphWrapper:
         valid_lengths: list[int] | None = None,
         att_keep: tuple[int, int] | None = None,
         prompt_lengths: list[int] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | list[torch.Tensor]] | None:
+        prompt_att_segments: list[torch.Tensor | None] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | list[torch.Tensor | SharedPromptAttCache]] | None:
         """Solve the chunk through captured graphs; ``None`` sends it to the step/eager path.
 
         ``att_cache`` is the stacked ``(n_t, depth, 2, 2B, heads, L, head_dim)``
@@ -2459,7 +2498,7 @@ class WholeEulerCFMGraphWrapper:
         out_cnn_rows = out_cnn.unflatten(2, (2, batch_size))
         out_att: torch.Tensor | None = None
         out_att_rows = None
-        request_att: list[torch.Tensor] = []
+        request_att: list[torch.Tensor | SharedPromptAttCache] = []
         if not att_rows_out:
             out_att = torch.empty(
                 (self.n_timesteps, arena.depth, 2, 2 * batch_size, arena.heads, keep_len, arena.head_dim),
@@ -2518,19 +2557,60 @@ class WholeEulerCFMGraphWrapper:
                 _copy_frame_segments(out_att_rows[:, :, :, :, start:stop], att_src, segments)
             else:
                 for row in range(rows):
-                    keep = row_keeps[start + row]
-                    row_segments = segments_by_shape[row_lengths[start + row], row_offsets[start + row], keep]
+                    global_row = start + row
+                    keep = row_keeps[global_row]
+                    row_segments = segments_by_shape[row_lengths[global_row], row_offsets[global_row], keep]
+                    total_frames = sum(length for _, length in row_segments)
                     shape = (
                         self.n_timesteps,
                         arena.depth,
                         2,
                         2,
                         arena.heads,
-                        sum(length for _, length in row_segments),
+                        total_frames,
                         arena.head_dim,
                     )
+                    row_src = att_src[:, :, :, :, row]
                     # The row's old cache was copied into the arena by ``fill``.
-                    old = att_rows[start + row] if att_rows is not None else None
+                    old = att_rows[global_row] if att_rows is not None else None
+                    prompt_segment = (
+                        prompt_att_segments[global_row]
+                        if prompt_att_segments is not None and global_row < len(prompt_att_segments)
+                        else None
+                    )
+                    if (
+                        prompt_segment is not None
+                        and prompt_segment.ndim == 7
+                        and int(prompt_segment.shape[5]) > 0
+                        and total_frames >= int(prompt_segment.shape[5])
+                        and prompt_segment.dtype == self.att_cache_dtype
+                        and prompt_segment.device == x.device
+                        and tuple(prompt_segment.shape[:5]) == shape[:5]
+                        and prompt_segment.shape[6] == shape[6]
+                    ):
+                        shared_len = int(prompt_segment.shape[5])
+                        prefix_segments, tail_segments = _split_segments_before_tail(row_segments, shared_len)
+                        if _matches_frame_segments(row_src, tail_segments, prompt_segment):
+                            prefix_len = total_frames - shared_len
+                            prefix = None
+                            if (
+                                isinstance(old, SharedPromptAttCache)
+                                and old.prefix.dtype == self.att_cache_dtype
+                                and owners[old.data_ptr()] == 1
+                            ):
+                                prefix = _resized_frame_view(old.prefix, prefix_len)
+                            if prefix is None:
+                                keep_frames = (sum(keep) if keep is not None else total_frames) - shared_len
+                                prefix_room = max(prefix_len, keep_frames)
+                                prefix = torch.empty(
+                                    (*shape[:5], prefix_room, shape[6]),
+                                    device=x.device,
+                                    dtype=self.att_cache_dtype,
+                                )[..., :prefix_len, :]
+                            _copy_frame_segments(prefix, row_src, prefix_segments)
+                            request_att.append(SharedPromptAttCache(prefix, prompt_segment))
+                            continue
+
                     request = None
                     if (
                         isinstance(old, torch.Tensor)
@@ -2544,7 +2624,7 @@ class WholeEulerCFMGraphWrapper:
                         request = torch.empty(
                             (*shape[:5], room, shape[6]), device=x.device, dtype=self.att_cache_dtype
                         )[..., : shape[5], :]
-                    _copy_frame_segments(request, att_src[:, :, :, :, row], row_segments)
+                    _copy_frame_segments(request, row_src, row_segments)
                     request_att.append(request)
             start = stop
 

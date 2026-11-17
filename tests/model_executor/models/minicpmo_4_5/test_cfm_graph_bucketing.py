@@ -24,6 +24,8 @@ from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
     _att_keep_ranges,
     _build_capture_mask,
     _capture_query_width,
+    _matches_frame_segments,
+    _split_segments_before_tail,
     _whole_euler_att_segments,
     _zero_padded_cnn_cache,
 )
@@ -736,3 +738,211 @@ def test_decode_ragged_batch_shares_prompt_suffix_single_and_mixed_voices(monkey
     monkeypatch.setattr(shared, "_whole_euler_ragged_active", lambda: True)
     mixed_states = [m_next_s[0], mixed_s[1]]
     assert shared.can_merge_state_shapes(mixed_states, [3, 4]) is True
+
+
+def test_split_segments_before_tail_and_matches():
+    assert _split_segments_before_tail([(0, 300), (350, 100)], 100) == ([(0, 300)], [(350, 100)])
+    assert _split_segments_before_tail([(0, 350)], 100) == ([(0, 250)], [(250, 100)])
+    assert _split_segments_before_tail([(0, 200), (250, 150)], 100) == ([(0, 200), (250, 50)], [(300, 100)])
+
+    src = torch.arange(20, dtype=torch.float32).reshape(1, 1, 1, 1, 1, 10, 2)
+    tail = torch.cat((src[..., 2:4, :], src[..., 7:10, :]), dim=5)
+    assert _matches_frame_segments(src, [(2, 2), (7, 3)], tail) is True
+    assert _matches_frame_segments(src, [(2, 2), (7, 3)], tail + 1.0) is False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA for WholeEulerCFMGraphWrapper replay")
+def test_whole_euler_replay_reuses_shared_prompt_att_cache_in_place():
+    import torch.nn as nn
+
+    from vllm_omni.model_executor.models.minicpmo_4_5 import batched_token2wav as btw_mod
+    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
+
+    class _FakePad(nn.Module):
+        def __init__(self, causal_padding=(2, 0)):
+            super().__init__()
+            self.causal_padding = causal_padding
+
+    class _FakeConv(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.in_channels = 1
+            self.out_channels = 1
+            self.block = nn.ModuleList([nn.Identity(), _FakePad()])
+
+    class _FakeAttn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_heads = 1
+            self.head_dim = 2
+
+    class _FakeBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = _FakeConv()
+            self.attn = _FakeAttn()
+
+    class _FakeTEmbedder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(1, 4)
+
+        def forward(self, t):
+            return self.proj(t.unsqueeze(-1))
+
+    class _CudaEstimator(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = nn.ModuleList([_FakeBlock()])
+            self.t_embedder = _FakeTEmbedder()
+            self.bias = nn.Parameter(torch.zeros(1))
+
+        def blocks_forward_chunk(self, inputs, time, mask, cnn_cache, att_cache, cnn_out, att_out):
+            del time, mask, cnn_cache
+            batch_2x, _, frames = inputs.shape
+            x_feat = inputs[:, :1, :].reshape(1, batch_2x, 1, frames, 1)
+            new_kv = torch.cat((x_feat, x_feat + 0.5, x_feat + 1.0, x_feat + 1.5), dim=-1)
+            att_out[:, :, :, :frames].copy_(new_kv)
+            if att_cache is not None and att_cache[0] is not None:
+                att_out[0, :, :, frames : frames + att_cache[0].shape[-2]].copy_(att_cache[0])
+            cnn_out.copy_(inputs[:, :1, :2].reshape(1, batch_2x, 1, 2).expand_as(cnn_out))
+            return inputs[:, :2] + (att_out * 0.01).mean(dim=(0, 2, 3, 4)).reshape(batch_2x, 1, 1)
+
+    estimator = _CudaEstimator().cuda().eval()
+
+    class _FakeDecoder(nn.Module):
+        def __init__(self, estimator):
+            super().__init__()
+            self.estimator = estimator
+            self.inference_cfg_rate = 0.7
+            self.register_buffer("rand_noise", torch.zeros(1, 2, 64, device="cuda"))
+
+    class _FakeFlow(nn.Module):
+        def __init__(self, estimator):
+            super().__init__()
+            self.decoder = _FakeDecoder(estimator)
+            self.encoder = SimpleNamespace(pre_lookahead_layer=SimpleNamespace(pre_lookahead_len=3))
+            self.spk_embed_affine_layer = nn.Identity()
+            self.token_mel_ratio = 2
+
+    class _FakeHift(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(1, 1)
+            self.conv_pre = SimpleNamespace(in_channels=2)
+
+        def inference(self, mel, source):
+            del source
+            return (
+                torch.zeros((1, 1), device=mel.device, dtype=mel.dtype),
+                torch.zeros((1, 1, 0), device=mel.device, dtype=mel.dtype),
+            )
+
+    class _CudaToken2Wav:
+        def __init__(self):
+            self.flow = _FakeFlow(estimator).cuda()
+            self.hift = _FakeHift().cuda()
+            self.float16 = False
+            self.n_timesteps = 1
+            self.mel_cache_len = 1
+            self.source_cache_len = 2
+            self.speech_window = torch.ones(2)
+
+    orig_suffix = btw_mod._CACHE_TRIM_SUFFIX
+    btw_mod._CACHE_TRIM_SUFFIX = 4
+    try:
+        token2wav = _CudaToken2Wav()
+        b_shared = BatchedToken2Wav(
+            token2wav,
+            cfm_graph_config={
+                "enabled": True,
+                "enable_whole_euler": True,
+                "fused_body": False,
+                "prompt_att_sharing": True,
+                "capture_frames": [4],
+                "offset_bucket_frames": 1,
+                "micro_batch_size": 2,
+                "max_graph_batch": 2,
+            },
+        )
+        b_unshared = BatchedToken2Wav(
+            token2wav,
+            cfm_graph_config={
+                "enabled": True,
+                "enable_whole_euler": True,
+                "fused_body": False,
+                "prompt_att_sharing": False,
+                "capture_frames": [4],
+                "offset_bucket_frames": 1,
+                "micro_batch_size": 2,
+                "max_graph_batch": 2,
+            },
+        )
+        assert b_shared._whole_euler_graph_wrapper is not None
+        prompt_att = torch.arange(1 * 1 * 2 * 2 * 1 * 6 * 2, device="cuda", dtype=torch.float32).reshape(
+            1, 1, 2, 2, 1, 6, 2
+        )
+        cache_key = ("cuda-voice", "v1")
+        b_shared._record_prompt_att_cache(cache_key, prompt_att)
+        prompt_seg = b_shared._prompt_att_caches[cache_key]
+
+        att_init_u = [prompt_att.clone(), prompt_att.clone()]
+        att_init_s = [prompt_att.clone(), prompt_att.clone()]
+        kwargs = dict(
+            mu=torch.ones(2, 2, 3, device="cuda"),
+            speakers=torch.ones(2, 1, device="cuda"),
+            cond=torch.zeros(2, 2, 3, device="cuda"),
+            cnn_cache=None,
+            att_keep=(6, 4),
+        )
+        mel_u1, cnn_u1, out_u1 = b_unshared._decode_cfm(**kwargs, att_cache=att_init_u)
+        mel_s1, cnn_s1, out_s1 = b_shared._decode_cfm(
+            **kwargs,
+            att_cache=att_init_s,
+            prompt_att_cache=prompt_seg,
+            prompt_cache_key=cache_key,
+            prompt_att_segments=[prompt_seg, prompt_seg],
+        )
+        torch.testing.assert_close(mel_s1, mel_u1, rtol=0, atol=0)
+        for row in range(2):
+            assert isinstance(out_s1[row], SharedPromptAttCache)
+            assert out_s1[row].prompt.data_ptr() == prompt_seg.data_ptr()
+            # Prefix room is sum(keep) - shared_len (= 6 frames), strictly < 10 frames.
+            assert out_s1[row].prefix.stride(-3) // 2 == 6
+            torch.testing.assert_close(out_s1[row].materialize(), out_u1[row], rtol=0, atol=0)
+
+        prev_ptrs = [row.prefix.data_ptr() for row in out_s1]
+        mel_u2, _, out_u2 = b_unshared._decode_cfm(**kwargs, att_cache=out_u1)
+        mel_s2, _, out_s2 = b_shared._decode_cfm(
+            **kwargs,
+            att_cache=out_s1,
+            prompt_att_cache=prompt_seg,
+            prompt_cache_key=cache_key,
+            prompt_att_segments=[prompt_seg, prompt_seg],
+        )
+        torch.testing.assert_close(mel_s2, mel_u2, rtol=0, atol=0)
+        for row in range(2):
+            assert isinstance(out_s2[row], SharedPromptAttCache)
+            # In-place prefix reuse across chunks: zero fresh cache buffer allocation.
+            assert out_s2[row].prefix.data_ptr() == prev_ptrs[row]
+            torch.testing.assert_close(out_s2[row].materialize(), out_u2[row], rtol=0, atol=0)
+
+        # If one row's prompt suffix mismatches, WholeEuler replay falls back to a full Tensor
+        # for that row and _share_prompt_att_rows materializes sibling SharedPromptAttCache rows.
+        corrupted = out_u2[1].clone()
+        corrupted[..., -1, :] += 5.0
+        mel_u3, _, out_u3 = b_unshared._decode_cfm(**kwargs, att_cache=[out_u2[0], corrupted.clone()])
+        mel_s3, _, out_s3 = b_shared._decode_cfm(
+            **kwargs,
+            att_cache=[out_s2[0], corrupted],
+            prompt_att_cache=prompt_seg,
+            prompt_cache_key=cache_key,
+            prompt_att_segments=[prompt_seg, prompt_seg],
+        )
+        torch.testing.assert_close(mel_s3, mel_u3, rtol=0, atol=0)
+        assert cache_key in b_shared._prompt_att_rejected
+        assert all(isinstance(row, torch.Tensor) for row in out_s3)
+        for row in range(2):
+            torch.testing.assert_close(out_s3[row], out_u3[row], rtol=0, atol=0)
+    finally:
+        btw_mod._CACHE_TRIM_SUFFIX = orig_suffix
