@@ -370,11 +370,20 @@ owns distributed collectives through a shared TCP rendezvous. Global ranks
 are grouped by host, while each actor uses local device 0.
 
 Request batches, step execution, and DLO DP waves use actor RPCs with
-rank-aware replies. Returned tensors move to CPU before Ray serialization;
-this backend does not use the multiproc async output pumps. Driver inference
+rank-aware replies. Returned tensors move to CPU before Ray serialization.
+Final request-mode outputs stay on the synchronous RPC path (no multiproc
+`COMPUTE_DONE` / `OUTPUT_READY` pumps). When `streaming_output=True` keeps
+Request execution, mid-forward `CHUNK_READY` uses a driver-owned
+`ray.util.queue.Queue`: the reply rank binds the request chunk emitter, puts
+CPU-copied chunks onto the queue, then a barrier sentinel; `collective_rpc`
+waits until the pump has delivered every prior chunk before returning the
+execute result to the Engine. Cooperative cancellation uses a `cancel`
+concurrency group that updates per-worker local flags (not POSIX shared
+memory), so multi-node abort does not depend on SHM names. Driver inference
 settings and explicit stage `runtime.env` are forwarded, excluding worker
-identity and device assignment. See [Stage configuration](../../../configuration/stage_configs.md)
-for cluster setup and environment details.
+identity and device assignment. See
+[Stage configuration](../../../configuration/stage_configs.md) for cluster
+setup and environment details.
 
 ## Worker and runner boundary
 
@@ -540,3 +549,19 @@ at idle through the engine, executor, worker, and runner using two CPU regressio
 - [Async diffusion output](../../feature/async_diffusion_output.md)
 - [Engine orchestration](../engine_orchestration.md)
 - [Stage runtime](../stage_runtime.md)
+
+### NPU worker finalization
+
+NPU runtime finalization can continue after the worker reports application
+shutdown. The multiprocess executor allows a shared 60-second graceful join
+window on NPU, retaining the 15-second window on other platforms and the
+existing bounded terminate/kill escalation. Exit-code logging distinguishes
+natural process exit from a completed application cleanup message.
+
+The out-of-process NPU `mp` stage client waits up to 80 seconds for a sent
+shutdown request: the worker grace plus both escalation windows and stage
+finalization. It then falls back to the bounded signal-based shutdown. This
+prevents the outer process manager from cutting short the worker deadline.
+This grace is gated on the resolved executor's `uses_multiproc` capability,
+including default and custom executors. Single-device default `uni` stages
+retain the normal bounded signal-based shutdown without the 80-second wait.

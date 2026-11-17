@@ -33,7 +33,8 @@ The AR runtime extends vLLM scheduling and worker execution for omni-stage
 inputs and outputs while preserving vLLM scheduling and cache semantics.
 
 The experimental Mooncake KV/HS backend uses the existing MRv2 external-load
-state transitions for Qwen3-Omni turn requests. Its connector must withhold
+state transitions for Qwen3-Omni turn requests and duplex utterances, which
+are also ordinary requests. Its connector must withhold
 successful receive completion until both GPU KV and request-local CPU captures
 are ready. For a cancelled or failed load, it reports completion once the
 native KV copy drains, so a CPU-only HS read never holds destination GPU
@@ -55,6 +56,18 @@ FULL captures and their NONE-mode warmup flatten auxiliary tensors into the
 native graph buffers; FULL replay restores the tree before postprocessing.
 Both paths therefore publish the same named hidden-state fields to prefix
 caching and downstream stages.
+
+Models such as Qwen3-TTS whose `forward()` returns a tensor and whose
+`make_omni_output()` builds the multimodal payload afterward declare
+`mrv2_forward_returns_tensor = True`. Their multimodal-output capability does
+not require excluding FULL capture.
+
+Request-batched MTP uses its own FULL graph wrapper. Capture and replay select
+the same FULL descriptor from the MTP capture sizes, bounded by
+`max_num_seqs`, independently of the backbone's graph mode. A backbone that
+uses PIECEWISE graphs must not make the MTP wrapper bypass its captured graph.
+This does not enable graphs for an eager or graph-unsafe MTP implementation;
+requests without a supported capture bucket retain eager execution.
 
 After applying sampled output, the AR scheduler publishes only completed KV
 blocks to upstream prefix caching, including on its plain-decode path. Async

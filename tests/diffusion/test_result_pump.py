@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 import vllm_omni.diffusion.executor.multiproc_executor as executor_module
 from vllm_omni.diffusion.data import AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
@@ -40,6 +41,7 @@ def _make_executor(step_execution=False):
     executor._dropped_output_ids = OrderedDict()
     executor._batch_split_map = {}
     executor._futures_lock = threading.RLock()
+    executor._chunk_ready_handler = None
     executor._pump_running = False
     executor._pump_stop = threading.Event()
     executor._sync_result_buffer = queue.Queue()
@@ -688,7 +690,10 @@ class TestDropOutput:
 
     def test_dropped_ids_memory_is_bounded(self, monkeypatch):
         cap = 8
-        monkeypatch.setattr(executor_module, "_DROPPED_OUTPUT_IDS_MAX", cap)
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.executor.async_output_cache._DROPPED_OUTPUT_IDS_MAX",
+            cap,
+        )
         executor = _make_executor()
         n = cap + 5
         for i in range(n):
@@ -1050,3 +1055,57 @@ def test_dp_wave_key_resolves_attention_schedules_against_the_service(monkeypatc
 
     assert received == [service, service]
     executor.collective_rpc.assert_called_once()
+
+
+def test_result_pump_routes_chunk_ready_without_completing_rpc():
+    executor = _make_executor()
+    rpc_future: concurrent.futures.Future = concurrent.futures.Future()
+    executor._rpc_futures["7"] = rpc_future
+    seen: list[tuple] = []
+    executor.register_chunk_ready_handler(lambda *args: seen.append(args))
+    payload = torch.zeros(2)
+    output = DiffusionOutput(finished=False, chunk_index=0, total_chunks=3, output=payload, async_output_id="chunk-0")
+    msg = AsyncDiffusionOutput(
+        kind=AsyncOutputKind.CHUNK_READY,
+        rpc_id="7",
+        request_id="req",
+        chunk_index=0,
+        async_output_id="chunk-0",
+        output=output,
+    )
+
+    _feed_one_msg_to_pump(executor, msg)
+
+    assert not rpc_future.done()
+    assert "7" in executor._rpc_futures
+    assert len(seen) == 1
+    request_id, chunk_index, delivered, error = seen[0]
+    assert request_id == "req"
+    assert chunk_index == 0
+    assert delivered is output
+    assert error is None
+    ready = executor.wait_output_ready("chunk-0")
+    assert ready.done()
+    assert ready.result().output is payload
+
+
+def test_result_pump_closed_chunk_ready_reclaims_shm(mocker):
+    unpack = mocker.patch("vllm_omni.diffusion.executor.multiproc_executor.unpack_diffusion_output_shm")
+    executor = _make_executor()
+    executor._closed = True
+    seen: list[tuple] = []
+    executor.register_chunk_ready_handler(lambda *args: seen.append(args))
+    output = DiffusionOutput(finished=False, chunk_index=0, output=torch.zeros(1))
+    msg = AsyncDiffusionOutput(
+        kind=AsyncOutputKind.CHUNK_READY,
+        request_id="req",
+        chunk_index=0,
+        async_output_id="chunk-0",
+        output=output,
+    )
+
+    _feed_one_msg_to_pump(executor, msg)
+
+    unpack.assert_called_once_with(output)
+    assert seen == []
+    assert executor._completed_outputs == {}

@@ -746,6 +746,7 @@ def test_failed_capture_blocks_even_eager_retry(monkeypatch, mock_nvidia_platfor
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.nvidia_only
 @_requires_nvidia_capture
+@pytest.mark.usefixtures("clean_gpu_memory_between_tests")
 @torch.inference_mode()
 def test_full_cache_preserves_graphs_outputs_and_bounded_metadata():
     weight = torch.randn(32, 32, device="cuda")
