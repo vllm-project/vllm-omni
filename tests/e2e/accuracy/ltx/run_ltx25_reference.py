@@ -10,11 +10,14 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
 from PIL import Image
+
+if TYPE_CHECKING:
+    from transformers.models.gemma4_unified.configuration_gemma4_unified import Gemma4UnifiedTextConfig
 
 
 def _parse_args() -> argparse.Namespace:
@@ -133,6 +136,43 @@ def _insert_official_paths(official_root: Path) -> None:
             sys.path.insert(0, path)
 
 
+def _gemma4_rope_config_for_layer(
+    config: Gemma4UnifiedTextConfig,
+    layer_type: str | None,
+) -> Gemma4UnifiedTextConfig:
+    """Resolve the homogeneous config used to initialize one Gemma4 layer type."""
+    if layer_type is None or not config.is_heterogeneous:
+        return config
+    return cast("Gemma4UnifiedTextConfig", config.per_layer_config[layer_type])
+
+
+def _configure_official_gemma4_rope_compatibility() -> None:
+    """Make the pinned official Gemma4 buffer setup heterogeneity-safe."""
+    from transformers.models.gemma4_unified.modeling_gemma4_unified import (
+        Gemma4UnifiedTextRotaryEmbedding,
+    )
+
+    original = Gemma4UnifiedTextRotaryEmbedding.compute_default_rope_parameters
+    if getattr(original, "_vllm_omni_heterogeneous_head_dim_compat", False):
+        return
+
+    def compute_default_rope_parameters(
+        config: Gemma4UnifiedTextConfig,
+        device: torch.device | None = None,
+        layer_type: str | None = None,
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, float]:
+        layer_config = _gemma4_rope_config_for_layer(config, layer_type)
+        return original(config=layer_config, device=device, layer_type=layer_type, **kwargs)
+
+    setattr(compute_default_rope_parameters, "_vllm_omni_heterogeneous_head_dim_compat", True)
+    setattr(
+        Gemma4UnifiedTextRotaryEmbedding,
+        "compute_default_rope_parameters",
+        staticmethod(compute_default_rope_parameters),
+    )
+
+
 def _configure_official_vocoder_determinism() -> None:
     """Make the pinned official LTX-2.5 vocoder a stable reference."""
     from ltx_core.model.audio_vae.vocoder import VocoderWithBWE
@@ -248,6 +288,7 @@ def _prepare_official_runtime(args: argparse.Namespace) -> None:
     if args.official_root is None:
         raise ValueError("Official backend requires --official-root")
     _insert_official_paths(args.official_root)
+    _configure_official_gemma4_rope_compatibility()
     _configure_official_vocoder_determinism()
     # Keep Gemma on the same SDPA path in both subprocesses. DiT attention is
     # still pinned independently to the explicit cuDNN backend below.

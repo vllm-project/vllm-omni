@@ -293,6 +293,11 @@ async def prepare(h: Harness) -> str:
     return call_id
 
 
+def decode_a_different_call(h: Harness) -> None:
+    """Make the next function call differ, so it is not a repeat of the last."""
+    h.tokenizer.decode = lambda ids, **kwargs: '[{"name":"lookup","arguments":{"x":2}}]'
+
+
 def generation(h: Harness) -> int:
     return int(h.session.runtime_config.get("nvc_function_response_generation", 0))
 
@@ -325,6 +330,7 @@ async def test_call_budget_refuses_new_calls_without_interrupting_pending_result
     async with open_nemotron_harness(monkeypatch, runtime_config=limits) as h:
         call_id = await prepare(h)
         pending = h.runner.tool_calls.record(call_id)
+        decode_a_different_call(h)
         events = []
         for token_id in (20, 7, 21):
             events.extend(await deliver(h, nvc_function_token=[token_id]))
@@ -825,15 +831,18 @@ async def test_the_expiry_timer_settles_through_the_mailbox_and_refuses_a_late_r
         error = errors(late)[0]
         assert error.param == "item.call_id"
         assert "tool_result_timeout_s" in error.message
-        assert generation(h) == 0 and batches(h) == []
+        # The only queued batch is the session's notice; the late result was refused.
+        assert generation(h) == 1 and len(batches(h)) == 1
 
         # The channel is not poisoned: the next call in the same epoch works.
+        decode_a_different_call(h)
         next_call_id, _ = await expose_function_call(h)
         assert next_call_id != call_id
         admitted = await answer(h, next_call_id)
         assert error_codes(admitted) == []
-        assert generation(h) == 1
-        assert batches(h)[-1] == {"generation": 1, "token_ids": [42]}
+        # The notice took generation 1, so this result follows it.
+        assert generation(h) == 2
+        assert batches(h)[-1] == {"generation": 2, "token_ids": [42]}
 
 
 @pytest.mark.asyncio
@@ -853,7 +862,8 @@ async def test_a_result_that_arrives_at_the_deadline_is_refused_without_the_time
         assert h.scheduler.pending_delays() == []
         h.scheduler.fire_all()
         assert error_codes(await h.settle()) == []
-        assert generation(h) == 0
+        # One notice for the timeout, and nothing from the refused result.
+        assert generation(h) == 1 and len(batches(h)) == 1
 
 
 @pytest.mark.asyncio
@@ -876,7 +886,8 @@ async def test_a_result_that_misses_its_deadline_while_the_append_tail_waits_is_
         assert errors(refused)[0].param == "item.call_id"
         assert "tool_result_timeout_s" in errors(refused)[0].message
         assert h.runner.tool_calls.record(call_id).state is ToolCallState.TIMED_OUT
-        assert generation(h) == 0 and batches(h) == []
+        # The only queued batch is the session's notice; the result was refused.
+        assert generation(h) == 1 and len(batches(h)) == 1
 
 
 @pytest.mark.asyncio
@@ -902,10 +913,10 @@ async def test_a_result_that_misses_its_deadline_while_the_plugin_renders_it_is_
         assert error_codes(refused) == ["invalid_function_call_output", "tool_result_timeout"]
         assert errors(refused)[0].param == "item.call_id"
         assert h.runner.tool_calls.record(call_id).state is ToolCallState.TIMED_OUT
-        # Nothing was committed: no item for the client, no queued batch, and no
-        # continuation into the next stage frame.
+        # The result was not committed: no item for the client, no continuation
+        # into the next stage frame, and the only batch is the session's notice.
         assert "conversation.item.created" not in types(refused)
-        assert generation(h) == 0 and batches(h) == []
+        assert generation(h) == 1 and len(batches(h)) == 1
         assert len(h.port.submissions) == submissions_before
 
 

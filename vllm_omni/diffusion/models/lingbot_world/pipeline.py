@@ -9,7 +9,7 @@ import math
 import os
 from collections import OrderedDict
 from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -69,9 +69,12 @@ from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import load_transformer_config, retrieve_latents
 from vllm_omni.diffusion.offloader.config import (
+    TEXT_ENCODER_COMPONENT,
     OffloadStrategy,
+    resolve_offload,
     resolve_offload_strategy,
 )
+from vllm_omni.diffusion.offloader.sequential_backend import sequential_offload_component
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -657,6 +660,18 @@ class LingBotWorldCausalDMDPipeline(
         if isinstance(first_block_limit, bool) or not isinstance(first_block_limit, int) or first_block_limit <= 0:
             raise ValueError("model_config.lingbot_first_block_kv_cpu_limit_bytes must be a positive integer.")
         self._first_block_kv_cpu_limit_bytes = first_block_limit if share_first_block else 0
+        worldkv_value = model_config.get("worldkv")
+        if worldkv_value is not None:
+            if not od_config.enforce_eager or reuse_last_step_kv or share_first_block:
+                raise ValueError("worldkv requires eager clean commits without first-block sharing")
+            # _validate_parallel_config already rejects pipeline, ring, CFG and VAE parallelism.
+            tensor_parallel_size = getattr(parallel_config, "tensor_parallel_size", 1)
+            ulysses_degree = getattr(parallel_config, "ulysses_degree", 1)
+            if tensor_parallel_size != 1 or ulysses_degree != 1:
+                raise ValueError(
+                    "worldkv currently requires single-rank attention, got "
+                    f"tensor_parallel_size={tensor_parallel_size}, ulysses_degree={ulysses_degree}."
+                )
         self.device = get_local_device()
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         model = od_config.model
@@ -713,6 +728,19 @@ class LingBotWorldCausalDMDPipeline(
             quant_config=getattr(od_config, "quantization_config", None),
             prefix="transformer",
         )
+
+        from vllm_omni.experimental.ar_diffusion.worldkv import WorldKVConfig
+
+        native = self.transformer.config
+        self._worldkv_config = WorldKVConfig.parse(
+            worldkv_value,
+            window_frames=(
+                int(native.local_attn_size) if native.local_attn_size != -1 else int(native.sliding_window_num_frames)
+            ),
+            sink_frames=int(native.sink_size),
+            chunk_frames=int(native.num_frames_per_block),
+        )
+        self.transformer.worldkv_config = self._worldkv_config
 
         scheduler_config = _load_json(model, "scheduler/scheduler_config.json", local_files_only)
         _validate_scheduler_config(scheduler_config)
@@ -826,6 +854,20 @@ class LingBotWorldCausalDMDPipeline(
             * int(self.transformer.config.attention_head_dim)
             * element_size
         )
+        memory_config = getattr(self, "_worldkv_config", None)
+        memory_bytes = 0
+        if memory_config is not None:
+            memory_bytes = memory_config.reservation_bytes(
+                int(self.transformer.config.num_layers),
+                tokens_per_frame,
+                int(self.transformer.blocks[0].self_attn.num_sp_heads),
+                int(self.transformer.config.attention_head_dim),
+                element_size,
+                chunk_frames=condition_latent_frames,
+            )
+            # Policy memory owns history; the legacy pool retains only its
+            # minimum geometry and never receives duplicate self-KV writes.
+            sink_frames, recent_window_frames = 0, 1
         return ARDiffusionKVCacheSpec(
             num_layers=int(self.transformer.config.num_layers),
             num_kv_heads=int(self.transformer.blocks[0].self_attn.num_sp_heads),
@@ -846,7 +888,8 @@ class LingBotWorldCausalDMDPipeline(
                 ),
             ),
             model_owned_state_bytes_per_session=(
-                condition_bytes_per_session
+                memory_bytes
+                + condition_bytes_per_session
                 + camera_bytes_per_session
                 + 2 * self._condition_encoder_cache_bytes()  # Committed and in-flight histories.
                 + self._streaming_decode_bytes_per_session()
@@ -1432,9 +1475,17 @@ class LingBotWorldCausalDMDPipeline(
         layers = scope.lookup(identity)
         if layers is None:
             ticket = scope.begin_build(identity)
-            projected_text = self.transformer.text_embedding(prompt_embeds)
+            # These projections bypass transformer.forward and its offload
+            # hook. Keep weights resident until the lazy K/V iterator finishes.
+            component = (
+                sequential_offload_component(self.transformer)
+                if resolve_offload_strategy(self.od_config) is OffloadStrategy.MODEL_LEVEL
+                else nullcontext()
+            )
+            with component:
+                projected_text = self.transformer.text_embedding(prompt_embeds)
 
-            scope.publish(ticket, _project_text_layer_kv(self.transformer.blocks, projected_text))
+                scope.publish(ticket, _project_text_layer_kv(self.transformer.blocks, projected_text))
             layers = scope.lookup(identity)
             assert layers is not None
         return [
@@ -1495,6 +1546,7 @@ class LingBotWorldCausalDMDPipeline(
         schedule: tuple[tuple[float, float], ...],
         generator: torch.Generator,
         progress_bar: TqdmProgressBar[Any],
+        camera_pose: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self._dmd_blocks.generate_block(
             condition=condition,
@@ -1506,6 +1558,7 @@ class LingBotWorldCausalDMDPipeline(
             schedule=schedule,
             generator=generator,
             progress_bar=progress_bar,
+            camera_pose=camera_pose,
         )
 
     def _session_text_caches(
@@ -1573,7 +1626,16 @@ class LingBotWorldCausalDMDPipeline(
         )
         input_ids = text_inputs.input_ids.to(self.device)
         attention_mask = text_inputs.attention_mask.to(self.device)
-        prompt_embeds = self.text_encoder(input_ids, attention_mask).last_hidden_state
+        offload = resolve_offload(getattr(self, "od_config", None))
+        encoder_context: AbstractContextManager[None] = nullcontext()
+        if offload.strategy is OffloadStrategy.MODEL_LEVEL and offload.offloads(TEXT_ENCODER_COMPONENT):
+            from vllm_omni.diffusion.offloader.sequential_backend import sequential_offload_component
+
+            # Release selected text weights before VAE conditioning/DiT work,
+            # including failed encodes; cache hits never restage the encoder.
+            encoder_context = sequential_offload_component(self.text_encoder)
+        with encoder_context:
+            prompt_embeds = self.text_encoder(input_ids, attention_mask).last_hidden_state
         prompt_embeds = prompt_embeds.to(device=self.device, dtype=dtype)
         prompt_embeds = prompt_embeds * attention_mask.unsqueeze(-1).to(dtype=prompt_embeds.dtype)
         self._prompt_embeds_cache[key] = prompt_embeds
@@ -1700,6 +1762,16 @@ class LingBotWorldCausalDMDPipeline(
                 max_sequence_length=inputs.max_sequence_length,
                 session_state=session_state,
             )
+        retrieval_poses = None
+        memory_config = getattr(self, "_worldkv_config", None)
+        if memory_config is not None and memory_config.retrieval_frames:
+            trajectory = inputs.camera_trajectory
+            if inputs.camera_actions is None:
+                trajectory = CameraTrajectory(
+                    poses=trajectory.poses[: inputs.num_frames], intrinsics=trajectory.intrinsics[: inputs.num_frames]
+                )
+                trajectory = interpolate_camera_trajectory(trajectory, inputs.num_latent_frames)
+            retrieval_poses = trajectory.poses
         generated_blocks: list[torch.Tensor] = []
         total_steps = (inputs.num_latent_frames // block_frames) * len(LINGBOT_DMD_TIMESTEPS)
         first_start_frame = tick.chunk_index * block_frames if tick is not None else 0
@@ -1725,6 +1797,11 @@ class LingBotWorldCausalDMDPipeline(
                         schedule=schedule,
                         generator=inputs.generator,
                         progress_bar=progress_bar,
+                        **(
+                            {"camera_pose": retrieval_poses[local_start_frame + block_frames // 2]}
+                            if retrieval_poses is not None
+                            else {}
+                        ),
                     )
                 )
         generated_latents = torch.cat(generated_blocks, dim=2)
@@ -2092,6 +2169,7 @@ class LingBotWorldCausalDMDPipeline(
                 initial_pitch=float(extra.get("camera_pitch", 0.0)),
             )
             extra["camera_pitch"] = camera_pitch
+            retrieval_pose = action_trajectory.poses[block_frames // 2]
             media_frames = self._chunk_media_frame_count(state, block_frames=block_frames)
             chunk_inputs = replace(
                 inputs,
@@ -2113,6 +2191,7 @@ class LingBotWorldCausalDMDPipeline(
             ):
                 raise ValueError("Cannot use mid-generation camera interaction together with camera_embedding_cache; ")
             trajectory = extra["camera_trajectory_cache"]
+            retrieval_pose = trajectory.poses[start_frame + block_frames // 2]
             camera = extra["camera_embedding_cache"][:, :, start_frame:stop_frame]
             camera_tail = CameraTrajectory(
                 poses=trajectory.poses[stop_frame - 1 : stop_frame].clone(),
@@ -2135,6 +2214,7 @@ class LingBotWorldCausalDMDPipeline(
                     "camera interaction must produce exactly one pose per latent frame; "
                     f"got {int(absolute_poses.shape[0])}, expected {num_latent_frames}."
                 )
+            retrieval_pose = absolute_poses[block_frames // 2]
             action_trajectory = camera_trajectory_from_absolute_pose(
                 absolute_poses,
                 width=inputs.width,
@@ -2165,6 +2245,7 @@ class LingBotWorldCausalDMDPipeline(
             raise ValueError("LingBot World requires the runner-provided torch.Generator.")
         extra["condition"] = condition
         extra["camera"] = camera
+        extra["retrieval_pose"] = retrieval_pose
         # One camera-modulation cache per block: the four probes and the
         # commit below are separate scheduler steps, so the block runner
         # cannot open the reuse window around them the way generate_block
@@ -2238,6 +2319,7 @@ class LingBotWorldCausalDMDPipeline(
             timestep_value=float(schedule[step_in_chunk][0]),
             step_index=step_in_chunk,
             camera_cache=extra["camera_cache"],
+            camera_pose=extra.get("retrieval_pose"),
         )
 
     def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
@@ -2281,6 +2363,7 @@ class LingBotWorldCausalDMDPipeline(
             ar=self._ar_block_context(extra["ar_cross_attention"]),
             start_frame=int(extra["start_frame"]),
             camera_cache=extra.pop("camera_cache"),
+            camera_pose=extra.get("retrieval_pose"),
         )
         completed_chunk_index = state.chunk_index
         inputs: _LingBotRequestInputs = extra["inputs"]
