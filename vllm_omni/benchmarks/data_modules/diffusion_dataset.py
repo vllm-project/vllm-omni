@@ -49,11 +49,14 @@ def _build_overrides(args: Namespace) -> dict[str, Any]:
 
 
 def _resize(items: list[dict[str, Any]], num_prompts: int) -> list[dict[str, Any]]:
-    """Repeat or truncate *items* to exactly *num_prompts* entries."""
+    """Repeat or truncate *items* to exactly *num_prompts* entries.
+
+    Callers guarantee ``num_prompts > 0``: ``load_diffusion_samples``
+    skips resizing for a zero count (which means "use all items"), and
+    the random loader maps an unset/zero count to its default first.
+    """
     if not items:
         raise ValueError("No diffusion prompts available")
-    if num_prompts <= 0:
-        return items
     if len(items) < num_prompts:
         factor = (num_prompts // len(items)) + 1
         items = items * factor
@@ -74,8 +77,10 @@ def _load_vbench_prompts(args: Namespace) -> list[dict[str, Any]]:
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(resp.text)
             except Exception as exc:
-                logger.warning("Failed to download VBench prompts: %s", exc)
-                return [{"prompt": "A cat sitting on a bench"}] * 50
+                raise RuntimeError(
+                    f"Failed to download VBench prompts from {VBENCH_T2V_PROMPT_URL}: {exc}. "
+                    "Download the file manually and pass it via --dataset-path."
+                ) from exc
 
     prompts: list[dict[str, Any]] = []
     with open(path, encoding="utf-8") as f:
@@ -87,7 +92,11 @@ def _load_vbench_prompts(args: Namespace) -> list[dict[str, Any]]:
 
 
 def _load_random_prompts(args: Namespace) -> list[dict[str, Any]]:
-    """Generate synthetic prompts, optionally using weighted resolution profiles."""
+    """Generate synthetic prompts, optionally using weighted resolution profiles.
+
+    An unset or zero ``num_prompts`` is coerced to the default of 10,
+    unlike the custom/vbench loaders where zero means "use all items".
+    """
     num_prompts = getattr(args, "num_prompts", 10) or 10
     config_str = getattr(args, "random_request_config", None)
 
@@ -142,9 +151,16 @@ _DATASET_LOADERS = {
 def load_diffusion_samples(args: Namespace) -> list[SampleRequest]:
     """Load diffusion benchmark prompts and return ``SampleRequest`` objects.
 
-    Dispatches by ``args.diffusion_dataset`` (default: ``"random"``).
+    Dispatches by ``args.diffusion_dataset`` (default: ``"random"``),
+    falling back to an explicit ``args.dataset_name`` when it names a
+    diffusion loader, so ``--dataset-name custom`` works without the
+    dedicated ``--diffusion-dataset`` flag.
     """
-    dataset_name = getattr(args, "diffusion_dataset", "random") or "random"
+    dataset_name = getattr(args, "diffusion_dataset", None)
+    if not dataset_name:
+        dataset_name = getattr(args, "dataset_name", None)
+        if dataset_name not in _DATASET_LOADERS:
+            dataset_name = "random"
     loader = _DATASET_LOADERS.get(dataset_name)
     if loader is None:
         raise ValueError(f"Unknown diffusion dataset: {dataset_name!r}. Choose from {sorted(_DATASET_LOADERS)}")

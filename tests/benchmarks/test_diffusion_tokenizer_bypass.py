@@ -25,8 +25,10 @@ pytestmark = [
 
 
 def test_diffusion_backends_are_registered():
-    """Every _DIFFUSION_BACKENDS entry must exist in ASYNC_REQUEST_FUNCS."""
-    for backend in _DIFFUSION_BACKENDS:
+    """Every diffusion dispatch key (endpoint paths and backend aliases)
+    must exist in ASYNC_REQUEST_FUNCS, or benchmark dispatch fails with
+    'Unknown backend' at request time."""
+    for backend in sorted(_DIFFUSION_ENDPOINTS | _DIFFUSION_BACKENDS):
         assert backend in ASYNC_REQUEST_FUNCS, f"{backend!r} not registered in patch.py"
 
 
@@ -254,3 +256,6 @@ def test_main_tokenizer_less_diffusion_run_reaches_sampling(tmp_path):
     # sampled requests from the dataset on the way.
     assert captured["tokenizer"] is None
     assert len(captured["input_requests"]) == 2
+    # Content check: the custom JSONL prompts must be what reaches the
+    # benchmark, not synthetic random filler.
+    assert captured["input_requests"][0].prompt == "a cat sitting on a mat"
