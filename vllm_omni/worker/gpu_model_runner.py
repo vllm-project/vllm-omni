@@ -367,13 +367,31 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         )
 
     @torch.inference_mode()
+    def profile_encoder_cudagraph_memory(self) -> int:
+        """Measure encoder graphs before allocating the language model KV cache."""
+        from vllm_omni.worker.encoder_cudagraph import measure_single_replay_encoder_memory
+
+        # Models without the single-replay opt-in keep vLLM's own manager, which
+        # profile_cudagraph_memory already captures. Only the opt-in path needs
+        # this separate reserve on NPU, where KV is allocated before capture.
+        if not getattr(self.get_model(), "encoder_cudagraph_single_replay", False):
+            return 0
+        return measure_single_replay_encoder_memory(
+            self.vllm_config,
+            self.device,
+            self.dtype,
+            self.get_model(),
+            supports_mm_inputs=self.supports_mm_inputs,
+        )
+
+    @torch.inference_mode()
     def _create_encoder_cudagraph_manager(self):
         raw_model = self.get_model()
         if not getattr(raw_model, "encoder_cudagraph_single_replay", False):
             return super()._create_encoder_cudagraph_manager()
         from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
 
-        from vllm_omni.worker.encoder_cudagraph import SingleReplayEncoderCudaGraphManager
+        from vllm_omni.worker.encoder_cudagraph import create_single_replay_encoder_manager
 
         if not (
             self.compilation_config.cudagraph_mm_encoder
@@ -381,9 +399,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             and supports_encoder_cudagraph(raw_model)
         ):
             return None
-        return SingleReplayEncoderCudaGraphManager(
-            vllm_config=self.vllm_config, device=self.device, dtype=self.dtype, model=raw_model
-        )
+        return create_single_replay_encoder_manager(self.vllm_config, self.device, self.dtype, raw_model)
 
     def _maybe_attach_attention_metadata_extensions(
         self,
@@ -2443,12 +2459,12 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                     # __class__ cell inside this nested function. `narrow.context`
                     # is None once a narrow step was restored (fused graph
                     # declined); only a live step owns the one-query buffers.
-                    active = narrow is not None and narrow.context is not None
+                    live = narrow if narrow is not None and narrow.context is not None else None
                     return super(OmniGPUModelRunner, self)._model_forward(
-                        input_ids=None if active else input_ids,
-                        positions=narrow.positions if active else positions,
+                        input_ids=None if live is not None else input_ids,
+                        positions=live.positions if live is not None else positions,
                         intermediate_tensors=intermediate_tensors,
-                        inputs_embeds=narrow.inputs_embeds if active else inputs_embeds,
+                        inputs_embeds=live.inputs_embeds if live is not None else inputs_embeds,
                         **model_kwargs,
                         **model_kwargs_extra,
                     )
@@ -2467,7 +2483,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                     frames=frames,
                     model_kwargs=model_kwargs,
                     model_kwargs_extra=model_kwargs_extra,
-                    narrow=narrow,
+                    narrow=cast(Any, narrow),
                 )
             finally:
                 if narrow is not None:
