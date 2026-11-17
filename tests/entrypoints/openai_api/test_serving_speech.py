@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hashlib
 import io
+import itertools
 import json
 import logging
 import os
@@ -262,6 +263,80 @@ async def test_initial_burst_flushes_short_stream_at_eof(monkeypatch):
     assert len(output) == 3
     assert output[0].startswith(b"RIFF"), "the pending header must flush at end-of-stream too"
     assert all(len(c) > 44 for c in output[1:])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_value", ["", "abc", "inf", "1e309"])
+async def test_initial_burst_invalid_value_degrades_to_off(monkeypatch, bad_value):
+    """Malformed and non-finite values must degrade to pass-through instead
+    of raising: "" / "abc" hit ValueError in float(), while "inf" / "1e309"
+    raise OverflowError inside int() — none of them may escape the parse,
+    which sits ABOVE the generator's try/finally (an escaping exception
+    would skip record_stream_abort and the engine-iterator aclose)."""
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_INITIAL_BURST", bad_value)
+    serving = _burst_serving()
+    state = {"generated": 0}
+
+    async def results():
+        for _ in range(3):
+            state["generated"] += 1
+            yield SimpleNamespace(multimodal_output={"model_outputs": torch.zeros(320), "sr": 24000})
+
+    chunks = serving._generate_audio_chunks(results(), f"burst-bad-{bad_value}", response_format="pcm")
+    first = await anext(chunks)
+    assert state["generated"] == 1, f"burst value {bad_value!r} must degrade to pass-through (off), got a held release"
+    assert len(first) == 640
+    rest = [c async for c in chunks]
+    assert [len(c) for c in rest] == [640, 640]
+
+
+@pytest.mark.asyncio
+async def test_initial_burst_continuity_timeline_follows_delivery(monkeypatch, mocker):
+    """The continuity timeline must be stamped at the YIELD sites (delivery
+    cadence), not at the generation sites: with burst=3 the first three
+    chunks leave together at the release, so arrivals[0..2] share one stamp
+    and arrivals[3] is the independent pass-through delivery — this is what
+    makes the reserve visible to audio_underrun_s / audio_continuity_ok."""
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_INITIAL_BURST", "3")
+    serving = _burst_serving()
+    # Deterministic clock: every perf_counter() call advances by 1 so the
+    # relative ordering of generation stamps vs delivery stamps is readable
+    # in the captured arrivals.
+    counter = itertools.count(start=100)
+    monkeypatch.setattr("vllm_omni.entrypoints.openai.serving_speech.time.perf_counter", lambda: next(counter))
+    # Keep the TTFP observation silent (it is generation-side and already
+    # covered elsewhere); we only care about the continuity timeline here.
+    serving._observe_speech_audio_ttfp = lambda **kwargs: (0, 0, True)
+
+    captured = {}
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_speech.observe_audio_streaming_finalize",
+        side_effect=lambda *args, **kwargs: captured.update(kwargs),
+    )
+    state = {"generated": 0}
+
+    async def results():
+        for _ in range(4):  # 3 held + released together, 4th pass-through
+            state["generated"] += 1
+            yield SimpleNamespace(multimodal_output={"model_outputs": torch.zeros(320), "sr": 24000})
+
+    chunks = serving._generate_audio_chunks(results(), "burst-timeline", response_format="pcm")
+    output = [c async for c in chunks]
+    assert len(output) == 4
+
+    arrivals = captured["chunk_arrival_times_s"]
+    sizes = captured["chunk_bytes"]
+    assert len(arrivals) == 4 and len(sizes) == 4
+    # Chunks 1-3 were HELD until the release: their delivery stamps share the
+    # release moment (three consecutive counter ticks), NOT their generation
+    # moments (three ticks earlier).
+    assert arrivals[0] == arrivals[1] == arrivals[2], (
+        f"held chunks must share the release delivery stamp, got {arrivals[:3]}"
+    )
+    assert arrivals[3] > arrivals[0], (
+        f"the pass-through chunk 4 must be delivered later than the release, got {arrivals}"
+    )
+    assert all(size == 640 for size in sizes)
 
 
 class TestAudioMixin:

@@ -1893,11 +1893,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # first byte.
         # Resolve with a safe fallback: a malformed value (deployment-template
         # leftovers like an empty string) must not fail every streaming speech
-        # request — warn and degrade to off instead. NaN/inf are also caught
-        # by int(); float strings like "2.5" clamp to 2.
+        # request — warn and degrade to off instead. Non-finite values are
+        # rejected the same way ("inf"/"1e309" raise OverflowError inside
+        # int(); "nan" passes int() but is meaningless as a count); float
+        # strings like "2.5" clamp to 2. The fallback matters because this
+        # parse sits ABOVE the generator's try/finally: an escaping exception
+        # would skip record_stream_abort and the engine-iterator aclose().
         try:
-            burst_n = max(1, int(float(os.environ.get("VLLM_OMNI_SPEECH_INITIAL_BURST", "1"))))
-        except (TypeError, ValueError):
+            burst_value = float(os.environ.get("VLLM_OMNI_SPEECH_INITIAL_BURST", "1"))
+            if not math.isfinite(burst_value):
+                raise ValueError("non-finite burst value")
+            burst_n = max(1, int(burst_value))
+        except (TypeError, ValueError, OverflowError):
             logger.warning(
                 "Invalid VLLM_OMNI_SPEECH_INITIAL_BURST=%r; disabling initial burst buffering (1).",
                 os.environ.get("VLLM_OMNI_SPEECH_INITIAL_BURST", ""),
@@ -1930,6 +1937,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 mod_metrics.inc_speech_stream_aborted(reason)
 
         def record_audio_chunk(audio_bytes: bytes, chunk_np: np.ndarray, result: Any) -> None:
+            """Generation-side observation: TTFP and first-audio bookkeeping.
+
+            Deliberately runs at the GENERATION site (before the burst hold):
+            the docs row promises TTFP stays generation-side, so the metric
+            keeps measuring when the model produced its first chunk regardless
+            of the delivery reserve.
+            """
             nonlocal first_audio_chunk_s, first_audio_packet_ts, ttfp_observed
             nonlocal audio_stage_id, audio_replica_id, audio_channels
             if not audio_bytes:
@@ -1945,6 +1959,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     request_arrival_ts=request_arrival_ts,
                     first_packet_ts=first_audio_packet_ts,
                 )
+
+        def record_client_delivery(audio_bytes: bytes) -> None:
+            """Client-side continuity timeline: stamped at the YIELD site.
+
+            `audio_chunk_arrivals_s`/`audio_chunk_bytes` feed
+            compute_continuity_stats, which simulates a player consuming the
+            stream — so the stamps must reflect when chunks actually LEAVE for
+            the client, not when the model generated them. With burst>1 the
+            held chunks leave together at the release, and that cadence (the
+            reserve this flag exists to add) must be visible to the metrics.
+            Called immediately before every audio yield site: burst release,
+            pass-through, end-of-stream flush, resampler tail.
+            """
             audio_chunk_arrivals_s.append(max(time.perf_counter() - stream_start_s, 0.0))
             audio_chunk_bytes.append(len(audio_bytes))
 
@@ -2059,6 +2086,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                                 yield pending_wav_header
                                 pending_wav_header = None
                             for held, held_sr in burst_buf:
+                                record_client_delivery(held)
                                 if include_sample_rate:
                                     yield held, held_sr
                                 else:
@@ -2068,6 +2096,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         continue
                     if wav_header is not None:
                         yield wav_header
+                    record_client_delivery(audio_bytes)
                     if include_sample_rate:
                         yield audio_bytes, output_sample_rate
                     else:
@@ -2083,6 +2112,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     yield pending_wav_header
                     pending_wav_header = None
                 for held, held_sr in burst_buf:
+                    record_client_delivery(held)
                     if include_sample_rate:
                         yield held, held_sr
                     else:
@@ -2119,6 +2149,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         audio_format.update(_encoded_audio_format(audio_response, output_sample_rate, final_chunk))
                     if wav_header is not None:
                         yield wav_header
+                    record_client_delivery(audio_bytes)
                     if include_sample_rate:
                         yield audio_bytes, output_sample_rate
                     else:
