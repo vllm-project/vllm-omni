@@ -3,9 +3,6 @@
 """YuE2's worker-side sampler follows retained engine outputs on recompute."""
 
 import pytest
-
-pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
-
 import torch
 from vllm.sampling_params import SamplingParams
 
@@ -163,8 +160,6 @@ def test_accepted_draw_still_reaches_frame_limit(model) -> None:
     model._reconcile_history(state, 3)
     assert len(state.history) == 3
     assert state.finish_ready and state.truncated
-
-
 
 
 @pytest.mark.parametrize("frames", [200, 250, 9000])
