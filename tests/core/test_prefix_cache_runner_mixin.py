@@ -349,6 +349,7 @@ def test_shared_runner_shutdown_releases_connectors_and_cache_before_upstream():
     namespace = {"PrefixCacheRunnerMixin": PrefixCacheRunnerMixin, "Base": Base}
     exec(compile(module, "<shared runner shutdown>", "exec"), namespace)
     runner = namespace["OmniGPUModelRunner"]()
+    runner._omni_connector_initialized = True
     runner.shutdown_omni_connectors = lambda: order.append("connectors")
     runner.omni_prefix_cache = SimpleNamespace(shutdown=lambda: order.append("cache"))
     runner._prefix_cache_group_view = SimpleNamespace()
