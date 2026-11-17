@@ -385,7 +385,7 @@ def _validate_seed_tts(
         )
     n = int(result.get("seed_tts_content_evaluated", 0) or 0)
     if n <= 0:
-        errs.append("seed_tts_content_evaluated is 0 (enable --seed-tts-wer-eval and check PCM capture).")
+        errs.append("seed_tts_content_evaluated is 0 (enable --wer-eval and check PCM capture).")
     mean_wer = result.get("seed_tts_content_error_mean")
     if n > 0 and max_mean_wer is not None and mean_wer is None:
         errs.append(
@@ -483,7 +483,7 @@ def seed_tts_eval_env(ns: argparse.Namespace) -> dict[str, str]:
     WER is always on for this path. SIM and UTMOS turn on when their floor is
     set and the parent process has not already chosen an explicit value.
     """
-    env: dict[str, str] = {"SEED_TTS_WER_EVAL": "1"}
+    env: dict[str, str] = {"WER_EVAL": "1"}
     if ns.seed_tts_eval_device:
         env["SEED_TTS_EVAL_DEVICE"] = ns.seed_tts_eval_device
     if ns.min_seed_tts_mean_sim is not None and not os.environ.get("SEED_TTS_SIM_EVAL", "").strip():
@@ -696,7 +696,7 @@ def run_daily_omni(ns: argparse.Namespace, vllm: str) -> Path:
     if pack_mode:
         argv.extend(["--daily-omni-pack-mode", pack_mode])
     if ns.daily_omni_save_eval_items:
-        argv.append("--daily-omni-save-eval-items")
+        argv.append("--save-eval-items")
     print("\n$", vllm, *argv, "\n", flush=True)
     _omni_acc_bench_core().run_vllm_bench_subprocess(vllm, argv)
     out = Path(ns.result_dir) / result_filename
@@ -757,7 +757,7 @@ def run_seed_tts(ns: argparse.Namespace, vllm: str) -> Path:
         )
         + _omni_acc_bench_core().seed_tts_bench_argv(locale=ns.seed_tts_locale)
         + [
-            "--seed-tts-wer-eval",
+            "--wer-eval",
             "--extra-body",
             json.dumps(extra, ensure_ascii=False, separators=(",", ":")),
         ]
@@ -765,7 +765,7 @@ def run_seed_tts(ns: argparse.Namespace, vllm: str) -> Path:
     if ns.seed_tts_turns_per_session > 1:
         argv.extend(["--seed-tts-turns-per-session", str(ns.seed_tts_turns_per_session)])
     if ns.seed_tts_wer_save_items:
-        argv.append("--seed-tts-wer-save-items")
+        argv.append("--save-eval-items")
     if ns.seed_tts_file_ref_audio:
         argv.append("--seed-tts-file-ref-audio")
     if getattr(ns, "omni_fail_fast_on_timeout", False):

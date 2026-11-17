@@ -903,7 +903,7 @@ By default the Seed-TTS dataset sends its reference clip as voice-cloning metada
 request body. Voice cloning requires a model and endpoint that support those fields; sending them to Qwen3-Omni chat
 does not enable voice cloning. The default chat system prompt asks the model to read the target text verbatim,
 including questions and instructions, without answering or following them. Override it with `--seed-tts-system-prompt`.
-Use `--seed-tts-wer-save-items` to retain each target, ASR transcript, and WER in the result JSON when investigating
+Use `--save-eval-items` to retain each target, ASR transcript, and WER in the result JSON when investigating
 content errors. WER compares the synthesized speech with the dataset target, not with the model's generated reply.
 
 `--seed-tts-reference-as-input` changes the request shape instead of the request contents. The reference clip becomes an
@@ -1034,7 +1034,7 @@ oversampling made the request count differ from unique-question coverage.
 media or invalid question fields. The opt-in accuracy runner rejects skipped rows, HTTP
 failures, duplicate question IDs, and missing gold answers. This checks the sampled subset;
 it does not establish that a supplied local mirror contains the entire official dataset.
-Use `--videomme-save-eval-items` (or `VIDEOMME_SAVE_EVAL_ITEMS=1`) for per-request
+Use `--save-eval-items` (or `SAVE_EVAL_ITEMS=1`) for per-request
 `videomme_eval_items` rows.
 
 ### Multi-Modal Benchmark

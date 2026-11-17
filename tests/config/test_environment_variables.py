@@ -109,6 +109,13 @@ def _resolve_environment_name(expression: ast.expr, constants: dict[str, str]) -
     return value or None
 
 
+# Wrapper positions below -1 encode a vararg forward: the helper forwards
+# its ``*args``, and ``-(position + 1)`` is the number of regular positional
+# parameters before the vararg, so call-site arguments from that offset on
+# are potential environment keys.
+_VARARG_OFFSET = 1
+
+
 def _environment_wrapper_parameters(
     tree: ast.Module,
     os_names: set[str],
@@ -121,11 +128,27 @@ def _environment_wrapper_parameters(
         positional = [*function.args.posonlyargs, *function.args.args]
         parameter_indexes: dict[str, int | None] = {parameter.arg: index for index, parameter in enumerate(positional)}
         parameter_indexes.update({parameter.arg: None for parameter in function.args.kwonlyargs})
+        if function.args.vararg is not None:
+            parameter_indexes[function.args.vararg.arg] = -(len(positional) + _VARARG_OFFSET)
+        # A comprehension target iterating a parameter aliases that parameter
+        # (e.g. the ``v`` in ``any(os.environ.get(v, ...) for v in names)``).
+        loop_aliases: dict[str, tuple[str, int | None]] = {}
+        for node in ast.walk(function):
+            if (
+                isinstance(node, ast.comprehension)
+                and isinstance(node.iter, ast.Name)
+                and node.iter.id in parameter_indexes
+                and isinstance(node.target, ast.Name)
+            ):
+                loop_aliases[node.target.id] = (node.iter.id, parameter_indexes[node.iter.id])
         forwarded: set[tuple[str, int | None]] = set()
         for node in ast.walk(function):
             for expression in _environment_key_expressions(node, os_names, getenv_names, environ_names):
-                if isinstance(expression, ast.Name) and expression.id in parameter_indexes:
-                    forwarded.add((expression.id, parameter_indexes[expression.id]))
+                if isinstance(expression, ast.Name):
+                    if expression.id in parameter_indexes:
+                        forwarded.add((expression.id, parameter_indexes[expression.id]))
+                    elif expression.id in loop_aliases:
+                        forwarded.add(loop_aliases[expression.id])
         if forwarded:
             wrappers[function.name] = forwarded
     return wrappers
@@ -146,14 +169,21 @@ def _environment_accesses(path: Path) -> set[str]:
 
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             for parameter_name, position in wrappers.get(node.func.id, set()):
-                argument = node.args[position] if position is not None and position < len(node.args) else None
-                if argument is None:
-                    argument = next(
-                        (keyword.value for keyword in node.keywords if keyword.arg == parameter_name),
-                        None,
-                    )
-                if argument is not None and (name := _resolve_environment_name(argument, constants)):
-                    names.add(name)
+                if position is not None and position < 0:
+                    # The helper forwards its vararg; only the arguments from
+                    # the vararg offset on are potential environment keys.
+                    arguments = list(node.args[-position - _VARARG_OFFSET :])
+                else:
+                    argument = node.args[position] if position is not None and position < len(node.args) else None
+                    if argument is None:
+                        argument = next(
+                            (keyword.value for keyword in node.keywords if keyword.arg == parameter_name),
+                            None,
+                        )
+                    arguments = [argument] if argument is not None else []
+                for argument in arguments:
+                    if name := _resolve_environment_name(argument, constants):
+                        names.add(name)
 
     return names
 
@@ -223,6 +253,7 @@ def test_environment_scanner_covers_indirection_aliases_membership_and_casing():
         "model_executor/models/mimo_audio/mimo_audio.py": {"model_stage"},
         "model_executor/models/moss_tts/modeling_moss_tts_local_depth.py": {"VLLM_OMNI_MOSS_LOCAL_SHORT_ATTN"},
         "distributed/ray_utils/utils.py": {"RAY_RAYLET_PID"},
+        "benchmarks/patch/patch.py": {"WER_EVAL", "SAVE_EVAL_ITEMS"},
     }
     for relative_path, expected in expected_by_path.items():
         assert expected <= _environment_accesses(_PACKAGE_ROOT / relative_path)

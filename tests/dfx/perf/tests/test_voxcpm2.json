@@ -91,7 +91,7 @@
           4
         ],
         "seed_tts_locale": "en",
-        "seed_tts_wer_eval": true,
+        "wer_eval": true,
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "H100": {
@@ -212,7 +212,7 @@
         "extra_body": {
           "voice": "default"
         },
-        "seed_tts_wer_eval": true,
+        "wer_eval": true,
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "H100": {

@@ -61,7 +61,7 @@ steps:
         artifact_paths:
           - tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json
         commands:
-          - export SEED_TTS_WER_EVAL=1
+          - export WER_EVAL=1
           - export SEED_TTS_SIM_EVAL=1
           - export SEED_TTS_UTMOS_EVAL=1
           - export SEED_TTS_EVAL_DEVICE=cuda:1
@@ -74,7 +74,7 @@ steps:
         artifact_paths:
           - tests/e2e/accuracy/minicpmo_4_5/results/*.json
         commands:
-          - export SEED_TTS_WER_EVAL=1
+          - export WER_EVAL=1
           - export SEED_TTS_SIM_EVAL=1
           - export SEED_TTS_UTMOS_EVAL=1
           - export SEED_TTS_EVAL_DEVICE=cuda:1

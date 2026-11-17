@@ -262,18 +262,25 @@ def test_compute_videomme_accuracy_metrics_saves_eval_items() -> None:
 
 
 @pytest.mark.parametrize(
-    "argv",
-    [["--save-eval-items"], ["--videomme-save-eval-items"]],
-    ids=["generic-flag", "videomme-deprecated-alias"],
+    ("argv", "expects_warning"),
+    [
+        (["--save-eval-items"], False),
+        (["--videomme-save-eval-items"], True),
+        (["--daily-omni-save-eval-items"], True),
+        (["--seed-tts-wer-save-items"], True),
+    ],
+    ids=["generic-flag", "videomme-alias", "daily-omni-alias", "seed-tts-alias"],
 )
 def test_save_eval_items_cli_sets_env(
     monkeypatch: pytest.MonkeyPatch,
     argv: list[str],
+    expects_warning: bool,
 ) -> None:
     from argparse import ArgumentParser
 
     from vllm_omni.benchmarks import serve
     from vllm_omni.entrypoints.cli.benchmark.cli_args import (
+        add_daily_omni_cli_args,
         add_eval_output_cli_args,
         add_videomme_cli_args,
     )
@@ -285,14 +292,16 @@ def test_save_eval_items_cli_sets_env(
         seen["save_eval_items"] = getattr(args, "save_eval_items", None)
         return {"ok": "1"}
 
-    monkeypatch.delenv("SAVE_EVAL_ITEMS", raising=False)
+    # Seed a value so teardown removes the variable serve.main writes.
+    monkeypatch.setenv("SAVE_EVAL_ITEMS", "0")
     monkeypatch.setattr(serve, "main_async", fake_main_async)
 
     parser = ArgumentParser()
     add_videomme_cli_args(parser)
+    add_daily_omni_cli_args(parser)
     add_eval_output_cli_args(parser)
-    if argv == ["--videomme-save-eval-items"]:
-        with pytest.warns(FutureWarning, match="videomme-save-eval-items is deprecated"):
+    if expects_warning:
+        with pytest.warns(FutureWarning, match="deprecated"):
             args = parser.parse_args(argv)
     else:
         args = parser.parse_args(argv)
@@ -309,6 +318,98 @@ def test_save_eval_items_cli_sets_env(
     assert serve.main(args) == {"ok": "1"}
     assert seen["env"] == "1"
     assert seen["save_eval_items"] is True
+
+
+@pytest.mark.parametrize(
+    ("argv", "expects_warning"),
+    [
+        (["--wer-eval"], False),
+        (["--seed-tts-wer-eval"], True),
+    ],
+    ids=["generic-flag", "seed-tts-deprecated-alias"],
+)
+def test_wer_eval_cli_sets_env(
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+    expects_warning: bool,
+) -> None:
+    """The WER half of the rename: ``--wer-eval`` must set ``WER_EVAL`` in serve.main."""
+    from argparse import ArgumentParser
+
+    from vllm_omni.benchmarks import serve
+    from vllm_omni.entrypoints.cli.benchmark.cli_args import add_eval_output_cli_args
+
+    seen: dict[str, str | None] = {}
+
+    async def fake_main_async(args: Namespace) -> dict[str, str]:
+        seen["env"] = os.environ.get("WER_EVAL")
+        return {"ok": "1"}
+
+    # Seed a value so teardown removes the variable serve.main writes.
+    monkeypatch.setenv("WER_EVAL", "0")
+    monkeypatch.setattr(serve, "main_async", fake_main_async)
+
+    parser = ArgumentParser()
+    add_eval_output_cli_args(parser)
+    if expects_warning:
+        with pytest.warns(FutureWarning, match="deprecated"):
+            args = parser.parse_args(argv)
+    else:
+        args = parser.parse_args(argv)
+    assert args.wer_eval is True
+
+    args.save_eval_items = False
+    args.omni_request_timeout_s = None
+    args.endpoint = None
+    args.backend = "openai-chat-omni"
+    args.explicit_keys = frozenset()
+    args.extra_body = None
+    args.print_stage = False
+    args.dataset_name = "seed-tts"
+    assert serve.main(args) == {"ok": "1"}
+    assert seen["env"] == "1"
+
+
+def test_deprecated_eval_output_aliases_are_hidden_from_help() -> None:
+    """The deprecated aliases stay suppressed from ``--help``: the docs are
+    the only user-facing discovery path for them by design."""
+    from argparse import ArgumentParser
+
+    from vllm_omni.entrypoints.cli.benchmark.cli_args import (
+        add_daily_omni_cli_args,
+        add_eval_output_cli_args,
+        add_videomme_cli_args,
+    )
+
+    parser = ArgumentParser()
+    add_videomme_cli_args(parser)
+    add_daily_omni_cli_args(parser)
+    add_eval_output_cli_args(parser)
+    help_text = parser.format_help()
+    for legacy_flag in (
+        "--videomme-save-eval-items",
+        "--daily-omni-save-eval-items",
+        "--seed-tts-wer-eval",
+        "--seed-tts-wer-save-items",
+    ):
+        assert legacy_flag not in help_text
+
+
+def test_deprecated_eval_output_aliases_are_removed_by_v0_34() -> None:
+    """The deprecated aliases announce removal after v0.34; fail once the
+    version reaches it so the cleanup cannot be missed at the release boundary."""
+    from vllm_omni.version import __version__
+
+    if __version__ == "dev":
+        pytest.skip("version metadata unavailable; cannot check the removal horizon")
+    release = tuple(int(part) for part in __version__.split("+")[0].split(".dev")[0].split(".")[:2])
+    if release >= (0, 34):
+        pytest.fail(
+            "v0.34 reached: remove the _DeprecatedStoreTrue aliases "
+            "(--videomme-save-eval-items, --daily-omni-save-eval-items, "
+            "--seed-tts-wer-eval, --seed-tts-wer-save-items in cli_args.py) and "
+            "the _env_flag legacy-name fallbacks in patch.py, then drop this guard"
+        )
 
 
 def test_eval_output_dataset_lists_are_valid_choices() -> None:

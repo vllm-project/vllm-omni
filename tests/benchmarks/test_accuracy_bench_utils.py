@@ -413,7 +413,7 @@ def test_seed_tts_eval_env_enables_only_configured_floors(monkeypatch: pytest.Mo
 
     env = seed_tts_eval_env(ns)
 
-    assert env["SEED_TTS_WER_EVAL"] == "1"
+    assert env["WER_EVAL"] == "1"
     assert env["SEED_TTS_SIM_EVAL"] == "1"
     assert env["SEED_TTS_EVAL_DEVICE"] == "cuda:1"
     assert "SEED_TTS_UTMOS_EVAL" not in env

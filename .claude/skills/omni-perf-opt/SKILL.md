@@ -93,7 +93,7 @@ Every optimization needs correctness evidence on the same workload, including
 
 - Text: thinker greedy output unchanged, or accuracy (Daily-Omni, Video-MME)
   within baseline run-to-run variance.
-- Speech: Seed-TTS WER (`--seed-tts-wer-eval`) within variance; for
+- Speech: Seed-TTS WER (`--wer-eval`) within variance; for
   bitwise-claimed changes, identical codec ids and waveform for a fixed seed.
 - Streaming: same duration, no truncation or repetition, and
   `audio_continuity_ok_rate` not worse.
