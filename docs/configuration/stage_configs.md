@@ -335,9 +335,27 @@ The Qwen3-TTS and Qwen3-Omni XPU profiles select V2; final-release XPU
 hardware validation remains pending. Retained V1 profiles identify unavailable
 workflows and preserve explicit configuration errors. They do not provide a V1
 fallback.
-V1-only Drama and LFM3 real-weight serving tests are retired, and Drama jobs are
-removed from CUDA Weekly and AMD CI. The Merge matrix also excludes VibeVoice.
-These exclusions do not count as passing V2 model tests.
+Drama 3 / Fish-Omni serving and both LFM3-Omni speech and text-only profiles
+are unavailable. Their retired serving E2E tests covered speech generation,
+voice cloning, streaming, concurrency and request validation across those
+workflows. Retained Fish AR and LFM3-Omni component tests are not complete V2
+serving replacements; LFM3-Audio uses a different checkpoint and profile.
+Drama jobs are removed from CUDA Weekly and AMD CI. The Merge matrix also
+excludes VibeVoice. These exclusions do not count as passing V2 model tests.
+
+Retiring V1 dispatch also reduces the following Weekly CI coverage:
+
+| Retired selection | Retained V2 CI selection | Remaining coverage limit |
+| --- | --- | --- |
+| Audex offline TTS, S2T and TTA on CUDA L4 and AMD MI325 | H100 selects Audex offline S2S and online TTA/TTS. | No effective V2 CI owner is established for the three offline files. Their L4/MI325 markers exclude them from the H100 aggregate. |
+| CUDA L4 Higgs V2/V3, IndexTTS2, and Ming/GLM online serving | AMD MI325 selects the corresponding offline/online files. H100 selects only the dedicated Higgs V3 full-response case. | These selections do not replace the retired L4 scenarios. |
+| CUDA L4 CosyVoice3 offline inference | AMD MI325 selects the same offline expansion file. H100 selects CosyVoice3 online expansion. | Online coverage and another hardware backend do not replace L4 offline coverage. |
+
+The existing Ming and GLM **offline L4** cases already use the default V2
+runner and remain selected. These are CI source selections, not new passing
+results or qualification of every model/platform combination. Retained test
+source or another backend's CI lane does not establish support for a retired
+workflow.
 
 MRv2 native downstream receivers accept turn-based requests. A pipeline that
 sets `supports_duplex_mrv2` also accepts duplex sessions on those stages;
