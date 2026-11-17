@@ -1236,7 +1236,7 @@ steps:
       - label: "MiniMax-H3 I2VA Ref2VA Accuracy"
         agent_pool: mi300_4
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: diffusion_minimax_h3_accuracy
         env:
@@ -1244,48 +1244,21 @@ steps:
         artifact_paths:
           - artifacts/rocm-minimax-h3-i2va/**/*
         commands:
-          - export ROCM_MINIMAX_H3_I2VA_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minimax-h3-i2va"
-          - mkdir -p "$$ROCM_MINIMAX_H3_I2VA_ARTIFACT_DIR"
           - |
-            nodes=(
-              "tests/e2e/accuracy/minimax_h3/test_minimax_h3_i2va_ref2va_similarity.py::test_minimax_h3_i2va_matches_official_reference"
-              "tests/e2e/accuracy/minimax_h3/test_minimax_h3_i2va_ref2va_similarity.py::test_minimax_h3_ref2va_matches_official_reference"
-            )
-            pytest --collect-only -q "$${nodes[@]}" \
-              -m "full_model and diffusion and rocm and MI325 and cards_4" --run-level full_model \
-              > "$$ROCM_MINIMAX_H3_I2VA_ARTIFACT_DIR/collection.txt"
-            count=$$(awk '/::/ { n++ } END { print n + 0 }' \
-              "$$ROCM_MINIMAX_H3_I2VA_ARTIFACT_DIR/collection.txt")
-            if [[ "$$count" != "$${#nodes[@]}" ]]; then
-              echo "Expected exactly $${#nodes[@]} MiniMax-H3 I2VA/Ref2VA nodes, found $$count." >&2
-              cat "$$ROCM_MINIMAX_H3_I2VA_ARTIFACT_DIR/collection.txt" >&2
-              exit 5
+            if bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh \
+              4 2 165m rocm-minimax-h3-i2va \
+              tests/e2e/accuracy/minimax_h3/test_minimax_h3_i2va_ref2va_similarity.py::test_minimax_h3_i2va_matches_official_reference \
+              tests/e2e/accuracy/minimax_h3/test_minimax_h3_i2va_ref2va_similarity.py::test_minimax_h3_ref2va_matches_official_reference \
+              -m "full_model and diffusion and rocm and MI325 and cards_4"; then
+              status=0
+            else
+              status=$$?
             fi
-            for node in "$${nodes[@]}"; do
-              if ! grep -Fq "$$node" "$$ROCM_MINIMAX_H3_I2VA_ARTIFACT_DIR/collection.txt"; then
-                echo "MiniMax-H3 accuracy node was not collected: $$node" >&2
-                cat "$$ROCM_MINIMAX_H3_I2VA_ARTIFACT_DIR/collection.txt" >&2
-                exit 5
-              fi
-            done
-          - |
-            set +e
-            nodes=(
-              "tests/e2e/accuracy/minimax_h3/test_minimax_h3_i2va_ref2va_similarity.py::test_minimax_h3_i2va_matches_official_reference"
-              "tests/e2e/accuracy/minimax_h3/test_minimax_h3_i2va_ref2va_similarity.py::test_minimax_h3_ref2va_matches_official_reference"
-            )
-            timeout --signal=TERM --kill-after=2m 165m \
-              pytest -s -v "$${nodes[@]}" \
-              -m "full_model and diffusion and rocm and MI325 and cards_4" --run-level full_model \
-              --junitxml="$$ROCM_MINIMAX_H3_I2VA_ARTIFACT_DIR/pytest.xml" \
-              2>&1 | tee "$$ROCM_MINIMAX_H3_I2VA_ARTIFACT_DIR/pytest.log"
-            status=$${PIPESTATUS[0]}
-            set -e
             if [[ -d tests/e2e/accuracy/artifacts ]]; then
-              mkdir -p "$$ROCM_MINIMAX_H3_I2VA_ARTIFACT_DIR/accuracy"
-              cp -a tests/e2e/accuracy/artifacts/. "$$ROCM_MINIMAX_H3_I2VA_ARTIFACT_DIR/accuracy/"
+              artifact_dir="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minimax-h3-i2va"
+              mkdir -p "$$artifact_dir/accuracy"
+              cp -a tests/e2e/accuracy/artifacts/. "$$artifact_dir/accuracy/"
             fi
-
             exit "$$status"
 
   - group: ":full_moon: Qwen-Image 2.1 Accuracy MI300 Nightly"
