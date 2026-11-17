@@ -19,13 +19,14 @@ skips q/k, RoPE, masks and softmax (about two thirds of the kernels).
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 
 import torch
 import torch.nn as nn
 from torch.cuda import CUDAGraph
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader import DefaultModelLoader
+from vllm.model_executor.model_loader import DefaultModelLoader, get_model_loader
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
 from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Config
@@ -49,7 +50,16 @@ class Qwen3TTSFirstFrameDecoder(nn.Module):
 
     def load(self, vllm_config: VllmConfig) -> set[str]:
         """Load decoder weights exactly as Code2Wav does; returns the loaded parameter names."""
-        loader = DefaultModelLoader(vllm_config.load_config)
+        loader = get_model_loader(vllm_config.load_config)
+        # Subfolder assets require the DefaultModelLoader iterator protocol.
+        # Registered subclasses (including unified checkpoints) keep their
+        # iterator; unrelated outer-model formats retain the native fallback.
+        # Even an outer dummy loader needs real native speech-tokenizer assets
+        # here. Drop its incompatible format/options only for this subfolder.
+        if not isinstance(loader, DefaultModelLoader):
+            loader = DefaultModelLoader(
+                replace(vllm_config.load_config, load_format="auto", model_loader_extra_config={})
+            )
         source = DefaultModelLoader.Source(
             model_or_path=self.model_path,
             revision=vllm_config.model_config.revision,

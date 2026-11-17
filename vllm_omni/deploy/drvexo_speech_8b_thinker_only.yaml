@@ -1,0 +1,24 @@
+# DRVEXO-speech-8b stage-0 smoke deployment.
+# This intentionally excludes Talker/Code2Wav until the speech bridge has
+# trained weights.  It validates text and precomputed-ASR-feature -> text.
+pipeline: drvexo_speech_8b_thinker_only
+distributed_executor_backend: mp
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    gpu_memory_utilization: 0.25
+    kv_cache_memory_bytes: 2147483648
+    enable_mm_embeds: true
+    limit_mm_per_prompt: {audio: 1}
+    enforce_eager: true
+    async_scheduling: false
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 128

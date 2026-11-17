@@ -18,11 +18,11 @@ from vllm_omni.outputs import OmniRequestOutput
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def output(audio, *, sr=1000, tokens=3, finished=True, reason="stop"):
+def output(audio, *, sr=1000, tokens=3, finished=True, reason="stop", entry_stage_id=0):
     return OmniRequestOutput(
         finished=finished,
         _multimodal_output={"audio": audio, "sr": sr},
-        metrics={"stage_metrics": {"0": {"num_tokens_out": tokens, "finish_reason": reason}}},
+        metrics={"stage_metrics": {str(entry_stage_id): {"num_tokens_out": tokens, "finish_reason": reason}}},
     )
 
 
@@ -31,7 +31,9 @@ def generate(engine, **kwargs):
         engine,
         prompts=kwargs.pop("prompts", [{"part": 0}, {"part": 1}]),
         request_id="speech-test",
-        sampling_params_list=[SamplingParams(seed=42, max_tokens=1500)],
+        sampling_params_list=[
+            SamplingParams(seed=42, max_tokens=1500) for _ in range(kwargs.get("entry_stage_id", 0) + 1)
+        ],
         silence_ms=2,
         extract_audio=OmniOpenAIServingSpeech._extract_audio_output,
         **kwargs,
@@ -39,7 +41,8 @@ def generate(engine, **kwargs):
 
 
 @pytest.mark.asyncio
-async def test_segments_emit_one_complete_waveform_and_sum_usage():
+@pytest.mark.parametrize("entry_stage_id", [0, 1])
+async def test_segments_emit_one_complete_waveform_and_sum_usage(entry_stage_id):
     calls = []
     parameters = []
 
@@ -47,40 +50,46 @@ async def test_segments_emit_one_complete_waveform_and_sum_usage():
         part = kwargs["prompt"]["part"]
         calls.append((part, "start"))
         assert kwargs["request_id"] == f"speech-test-segment-{part}"
-        params = kwargs["sampling_params_list"][0]
+        assert kwargs["entry_stage_id"] == entry_stage_id
+        params = kwargs["sampling_params_list"][entry_stage_id]
         assert params.seed == 42 and params.max_tokens == 1500
         parameters.append(params)
         params.seed = 99
         wave = torch.tensor([part + 1.0, part + 1.0])
-        yield output(wave[:1], tokens=2, finished=False)
-        yield output([wave[:1], wave], tokens=part + 3)
+        yield output(wave[:1], tokens=2, finished=False, entry_stage_id=entry_stage_id)
+        result = output([wave[:1], wave], tokens=part + 3, entry_stage_id=entry_stage_id)
+        if entry_stage_id != 0:
+            result.metrics["stage_metrics"]["0"] = {"num_tokens_out": 0, "finish_reason": "length"}
+        yield result
         calls.append((part, "done"))
 
     engine = Mock(spec=AsyncOmni, generate=engine_generate, abort=AsyncMock())
-    results = [result async for result in generate(engine)]
+    results = [result async for result in generate(engine, entry_stage_id=entry_stage_id)]
     assert calls == [(0, "start"), (0, "done"), (1, "start"), (1, "done")]
     assert parameters[0] is not parameters[1]
     assert len(results) == 1
     result = results[0]
     assert result.request_id == "speech-test" and result.finished
     assert result.multimodal_output["audio"].tolist() == [1, 1, 0, 0, 2, 2]
-    counter = SpeechOutputTokenCounter()
+    assert result.metrics["stage_metrics"] == {str(entry_stage_id): {"num_tokens_out": 7}}
+    counter = SpeechOutputTokenCounter(entry_stage_id=entry_stage_id)
     counter.observe(result)
     assert counter.total() == 7
     engine.abort.assert_not_awaited()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("entry_stage_id", [0, 1])
 @pytest.mark.parametrize("fail_at", [0, 1])
 @pytest.mark.parametrize("failure", ["exception", "empty", "length", "unfinished", "nan", "rate"])
-async def test_segment_failure_does_not_return_partial_audio(failure, fail_at):
+async def test_segment_failure_does_not_return_partial_audio(failure, fail_at, entry_stage_id):
     calls = []
 
     async def engine_generate(**kwargs):
         part = kwargs["prompt"]["part"]
         calls.append(part)
         if part != fail_at:
-            yield output(torch.ones(2))
+            yield output(torch.ones(2), entry_stage_id=entry_stage_id)
             return
         if failure == "exception":
             raise RuntimeError("engine failed")
@@ -89,11 +98,12 @@ async def test_segment_failure_does_not_return_partial_audio(failure, fail_at):
             finished=failure != "unfinished",
             reason="length" if failure == "length" else "stop",
             sr=None if failure == "rate" else 1000,
+            entry_stage_id=entry_stage_id,
         )
 
     engine = Mock(spec=AsyncOmni, generate=engine_generate, abort=AsyncMock())
     with pytest.raises(RuntimeError if failure == "exception" else TTSGenerationError):
-        async for _ in generate(engine, prompts=[{"part": i} for i in range(3)]):
+        async for _ in generate(engine, prompts=[{"part": i} for i in range(3)], entry_stage_id=entry_stage_id):
             pytest.fail("A failed request must not return a partial waveform")
     assert calls == list(range(fail_at + 1))
     engine.abort.assert_awaited_once_with(f"speech-test-segment-{fail_at}")

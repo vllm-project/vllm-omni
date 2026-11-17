@@ -1,0 +1,23 @@
+pipeline: drvexo_speech_qwen35_4b_thinker_only
+async_chunk: false
+stages:
+  - stage_id: 0
+    load_format: drvexo_unified
+    devices: '0'
+    dtype: bfloat16
+    max_model_len: 8192
+    max_num_batched_tokens: 2048
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.2
+    kv_cache_memory_bytes: 1073741824
+    enforce_eager: true
+    enable_prefix_caching: false
+    enable_chunked_prefill: true
+    async_scheduling: false
+    limit_mm_per_prompt:
+      image: 1
+      audio: 1
+      video: 0
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 128

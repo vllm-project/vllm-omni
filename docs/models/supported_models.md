@@ -19,6 +19,8 @@ th {
 
 | Architecture | Models | Example HF Models | NVIDIA GPU | AMD GPU | Ascend NPU | Intel GPU | Recipe |
 | -------------- | -------- | ------------------- | ------------ | --------- | ----- | ----------- | -------- |
+| `DRVEXOSpeech8BForConditionalGeneration` | DRVEXO Speech 8B | Complete local unified checkpoint | ✅︎ | | | | [GB10 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/DRVEXO/DRVEXO-Speech-8B-GB10.md) |
+| `DRVEXOSpeechQwen35ForConditionalGeneration` | DRVEXO 4B Unified (experimental) | [`DRVEXO-LLM/drvexo-4b-unified`](https://huggingface.co/DRVEXO-LLM/drvexo-4b-unified) | GB10 smoke tested | | | | [Integration guide](drvexo_unified_4b.md) |
 | `Lfm3AudioForConditionalGeneration` | LFM3-Audio-2B | `LiquidAI/LFM3-Audio-2B` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LiquidAI/LFM3-Audio-2B.md) |
 | `Lfm3OmniForConditionalGeneration` | LFM3-Omni-2B | `LiquidAI/LFM3-Omni-2B` | ✅︎ | | ✅︎ | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LiquidAI/LFM3-Omni-2B.md) |
 | `Qwen3OmniMoeForConditionalGeneration` | Qwen3-Omni | `Qwen/Qwen3-Omni-30B-A3B-Instruct` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen3-Omni.md) |
