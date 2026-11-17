@@ -138,39 +138,38 @@ Expected: `session.created`, then for the spoken question a
 
 ## Qualification evidence
 
-Measured with Stage1 prefix caching off, before the shipped profiles turned it on. OmniInteract `1q1a` videos `0002`–`0004` (12 questions, injected
-at `question_time`), after a full `0001` session as warmup that is not scored.
-Fresh server per row, three rounds unless noted. TTFT and TTFP are client-side
-from the commit to the first text and the first audio of spoken turns, p50 /
-p90.
+2-GPU latency matches the technical report
+([arXiv:2611.17048](https://arxiv.org/abs/2611.17048) §7.6) with the shipped
+profile (`enable_prefix_caching: true`, `mamba_cache_mode: align`). OmniInteract
+`1q1a` videos `0002`–`0004`, after a full `0001` warmup that is not scored;
+three rounds pooled; spoken turns only; TTFT / TTFP / TPOT in ms, p50 / p90.
 
-| Profile | Sessions | TTFT (ms) | TTFP (ms) | Stage1 TPOT (ms) | Peak memory |
-| --- | ---: | --- | --- | --- | --- |
-| 2-GPU | 1 | 286 / 397 | 515 / 619 | 8.4 / 8.8 | 39.3 GiB (GPU 0) / 131.8 GiB (GPU 1) |
-| 2-GPU | 8 | 678 / 2293 | 1671 / 6582 | 69.5 / 298 | 39.3 / 132.2 GiB |
-| 2-GPU | 16 | 1145 / 5210 | 3745 / 9065 | 151 / 296 | 39.3 / 132.7 GiB |
-| 1-GPU (1 round) | 1 | 536 / 706 | 1541 / 1682 | 35.0 / 35.3 | 109.9 GiB |
+| Profile | Sessions | Spoken n | TTFT (ms) | TTFP (ms) | Stage1 TPOT (ms) | RTF | Peak memory |
+| --- | ---: | ---: | --- | --- | --- | --- | --- |
+| 2-GPU (prefix cache on) | 1 | 65 | 157 / 205 | 344 / 403 | 7.6 / 7.9 | 0.135 / 0.152 | ~39.3 / ~132 GiB |
+| 2-GPU (prefix cache on) | 8 | 182 | 184 / 284 | 449 / 645 | 12.8 / 23.2 | 0.161 / 0.203 | ~39.3 / ~132 GiB |
+| 2-GPU (prefix cache on) | 16 | 330 | 234 / 347 | 601 / 946 | 21.1 / 39.1 | 0.203 / 0.292 | ~39.3 / ~132 GiB |
+| 1-GPU eager (1 round, cache off) | 1 | 21 | 536 / 706 | 1541 / 1682 | 35.0 / 35.3 | 0.77 / 0.86 | 109.9 GiB |
+
+Report medians (same 2-GPU runs): TTFT 157 / 184 / 234, TTFP 344 / 449 / 601,
+TPOT 7.6 / 12.8 / 21.1, RTF 0.135 / 0.161 / 0.203.
 
 Peak memory is the `nvidia-smi` reservation set by `gpu_memory_utilization`.
 
-- Accuracy: a keyword check of each answer (not the IA-QTF1 judge) scores 10/12
-  in each of three 2-GPU rounds, the same as the reference AURA_v2 streaming
-  inference (10/12 in each of two rounds); 1-GPU scored 7/12 in one round.
 - Concurrency: at 8 and 16 sessions no reply names an object from another
-  session's video (384 spoken turns).
+  session's video (384 spoken turns in a separate isolation sweep).
 - Long session: a 303 s video (294 turns) ran without a session error.
 - Tools: 27 push-to-talk lines through the web demo proxy, 11 with a tool call;
   all 27 spoken.
 - Startup: warmup takes 45–55 s; the first user turn after it reaches first
-  audio in 528 ms.
+  audio in 528 ms (spoken warmup clip).
 
 ## Notes
 
 - Memory usage: see Qualification evidence. The 1-GPU profile reserves
   `0.08 + 0.55 + 0.12 + 0.12` of GPU 0.
-- Sizing: with Stage1 prefix caching off, `max_num_seqs: 8` serves 16
-  sessions by queueing turns (p90 TTFP 9 s). Lower `max_sessions` for a
-  tighter latency target.
+- Sizing: with Stage1 prefix caching on, c=16 keeps median TTFP ~601 ms
+  (p90 ~946 ms). Lower `max_sessions` for a tighter latency target.
 - Key flags: Stage1 `async_scheduling: false` (the two-token logits processor
   reads the live output list), `enable_prefix_caching: true` and
   `mamba_cache_mode: align`. `async_chunk: true` is required for Talker to
