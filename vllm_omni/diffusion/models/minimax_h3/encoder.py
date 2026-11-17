@@ -1291,7 +1291,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             raise RuntimeError(f"MiniMax H3 text encoder weights not loaded: {len(missing)} params: {missing}")
         return loaded
 
-    def enable_block_offload(self, root: str | Path, *, num_slots: int = 6) -> Qwen3VLBlockOffloader:
+    def enable_block_offload(self, root: str | Path, *, num_slots: int = 3) -> Qwen3VLBlockOffloader:
         offloader = Qwen3VLBlockOffloader(self, root, num_slots=num_slots)
         self.text_model.block_offloader = offloader
         return offloader

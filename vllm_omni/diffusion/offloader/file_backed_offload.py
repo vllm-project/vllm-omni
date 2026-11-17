@@ -280,3 +280,7 @@ class FileBackedBlockOffloader:
             for handle in self.handles.values():
                 handle.close()
             self.handles.clear()
+            # Return idle pinned buffers before the next model stage allocates.
+            empty_host_cache = getattr(torch._C, "_host_emptyCache", None)
+            if callable(empty_host_cache):
+                empty_host_cache()
