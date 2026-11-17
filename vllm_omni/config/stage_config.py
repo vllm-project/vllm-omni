@@ -47,6 +47,18 @@ _TOPOLOGY_OWNED_ENGINE_FIELDS = frozenset(
     }
 )
 
+SKIP_STREAMING_UPDATES_ATTR = "_omni_skip_streaming_updates"
+
+
+def skip_on_streaming_updates(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Mark a ``prompt_transform_func`` to run only when a request is first submitted.
+
+    The engine then does not call it on streaming-input updates, which carry
+    the later chunks of a request that already passed the transform.
+    """
+    setattr(func, SKIP_STREAMING_UPDATES_ATTR, True)
+    return func
+
 
 def _normalize_stage_backend_fields(stage: StageDeployConfig) -> None:
     """Normalize promoted backends and enforce their precedence over extras."""
@@ -395,7 +407,8 @@ class StagePipelineConfig:
     supports_duplex_mrv2: bool = False
     # Rewrites the Stage-0 view of a raw prompt before vLLM input processing.
     # The callable receives ``(prompt, sampling_params_list)``; downstream
-    # stages continue to receive the original prompt.
+    # stages continue to receive the original prompt. It also runs on
+    # streaming-input updates unless marked with ``skip_on_streaming_updates``.
     prompt_transform_func: str | None = None
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
@@ -686,6 +699,10 @@ class StageDeployConfig:
     dlo_host_registration_limit_gib: float | None = None
     # Diffusion-specific debug and observability knobs.
     enable_diffusion_pipeline_profiler: bool | None = None
+    # Mixed-resolution batch packing (MixFusion) server-level defaults.
+    enable_mixfusion: bool | None = None
+    mixfusion_min_chunk_tokens: int | None = None
+    mixfusion_max_chunks: int | None = None
 
     # Modality/service constraints consumed outside the core engine config.
     max_generated_image_size: int | None = None
@@ -742,6 +759,9 @@ class DuplexSessionRuntimeConfig:
     history_ms_per_token: float | None = None
     history_calibration_timeout_ms: int = 1000
     history_audio_max_bytes_per_session: int = 8 * 1024 * 1024
+    # Server-only model configuration. Models validate their own options;
+    # client session.update cannot select code or change these limits.
+    model_custom_options: dict[str, object] = field(default_factory=dict)
     # Startup warmup, before real ``/v1/realtime`` clients are admitted.
     # Audio-primary models run this many silent frames; 0 disables that path.
     # Video-required models (AURA) still run one short non-silent audio chunk
@@ -759,6 +779,8 @@ class DuplexSessionRuntimeConfig:
     collect_stats: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.model_custom_options, dict):
+            raise ValueError("duplex_session.model_custom_options must be a mapping")
         if not isinstance(self.collect_stats, bool):
             raise ValueError("duplex_session.collect_stats must be a boolean")
         if self.replica_policy not in ("legacy", "least_sessions"):
@@ -1062,7 +1084,7 @@ def _merge_platforms(
     base: dict[str, Any] | None,
     overlay: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """Deep-merge two ``platforms:`` blocks per-platform, per-stage_id."""
+    """Merge platform blocks by stage ID and named connector definition."""
     if not base and not overlay:
         return None
     base = base or {}
@@ -1073,6 +1095,9 @@ def _merge_platforms(
         op = overlay.get(plat) or {}
         merged_plat = {**bp, **{k: v for k, v in op.items() if k != "stages"}}
         merged_plat["stages"] = _merge_stage_lists(bp.get("stages"), op.get("stages"))
+        connectors = _merge_connectors(bp.get("connectors"), op.get("connectors"))
+        if connectors is not None:
+            merged_plat["connectors"] = connectors
         merged[plat] = merged_plat
     return merged
 
@@ -1206,6 +1231,8 @@ def _apply_platform_overrides(
         device_name = current_omni_platform.device_name
         platform = device_name.lower() if device_name is not None else None
     platform_section = (deploy.platforms or {}).get(platform) if platform is not None else None
+    if platform_section is not None and "connectors" in platform_section:
+        deploy.connectors = _merge_connectors(deploy.connectors, platform_section["connectors"])
     if platform_section is not None and "cuda_mps" in platform_section:
         cuda_mps = platform_section["cuda_mps"]
         if not isinstance(cuda_mps, bool):
@@ -1256,7 +1283,7 @@ def _apply_platform_overrides(
                 if key in _DEEP_MERGE_KEYS and isinstance(val, dict):
                     base_val = getattr(base, key, None)
                     if isinstance(base_val, dict):
-                        setattr(base, key, {**base_val, **val})
+                        setattr(base, key, _get_recursively_merged_dict(base_val, val))
                         continue
                 setattr(base, key, val)
             else:
