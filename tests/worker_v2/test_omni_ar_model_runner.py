@@ -1422,3 +1422,133 @@ def test_stream_history_allocates_only_for_scheduled_requests():
     torch.testing.assert_close(history.embeds[:1], embeds)
     state.finish_audio({"request"})
     assert not state._talker_inputs
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("final_stage_id", [0, 1, None])
+def test_final_stage_request_does_not_emit_downstream_payload(monkeypatch, final_stage_id):
+    needs_history, include_hidden, engine_output_type = False, False, "latent"
+    # Native prompt-logprob preparation otherwise pins memory using CUDA.
+    monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    input_batch = SimpleNamespace(req_ids=["req"], num_reqs=1, seq_lens=torch.tensor([3]))
+    input_batch.idx_mapping, input_batch.query_start_loc = torch.tensor([0]), torch.tensor([0, 1])
+    input_batch.idx_mapping_np = np.array([0])
+    input_batch.num_computed_prefill_tokens_np = np.array([0])
+    input_batch.num_scheduled_tokens = np.array([3])
+    input_batch.prefill_len_np = np.array([3])
+    input_batch.query_start_loc_np = np.array([0, 3])
+    state = SimpleNamespace(input_batch=input_batch, hidden_states=torch.zeros(1, 2))
+    state.finished_req_ids, state.ec_connector_output = {"finished"}, None
+    runner.execute_model_state = state
+    runner._kv_extracted_req_ids = runner._last_aux_output = runner._last_multimodal_outputs = None
+    runner.is_last_pp_rank, runner.pp_handler, runner.check_ep_fault = True, None, False
+    runner.aux_output_connector = None
+    runner.model_config = SimpleNamespace(
+        async_chunk=True, stage_id=0, stage_connector_config={"extra": {"role": "sender"}}
+    )
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(engine_output_type=engine_output_type), kv_transfer_config=None
+    )
+    text_hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+    multimodal_outputs = {"codes": {"audio": torch.ones(3, 1)}}
+    runner.model_state = SimpleNamespace(
+        postprocess_model_output=MagicMock(return_value=(text_hidden, multimodal_outputs)),
+        run_postprocess=MagicMock(),
+    )
+    runner.model_state.intermediate_buffer = SimpleNamespace(
+        buffers={0: {"global_request_id": "global-req", "omni_final_stage_id": final_stage_id}}
+    )
+    runner.req_states = SimpleNamespace(req_id_to_index={"req": 0})
+    runner.req_states.all_token_ids = SimpleNamespace(gpu=torch.tensor([[1]]))
+    runner.req_states.num_computed_tokens = SimpleNamespace(gpu=torch.tensor([0]))
+    runner.req_states.prompt_len = SimpleNamespace(np=np.array([3]), gpu=torch.tensor([3]))
+    runner.main_stream = runner.output_copy_stream = MagicMock()
+    runner.eplb = runner._finalize_native_data_plane_output = runner._reserve_native_data_plane_outputs = MagicMock()
+    sampler_out = (SimpleNamespace(sampled_token_ids=torch.tensor([[2]])), MagicMock(), MagicMock())
+    sampling_active = False
+
+    @contextmanager
+    def sampling_context(*, req_ids, num_output_tokens):
+        nonlocal sampling_active
+        assert needs_history and req_ids == ["req"]
+        sampling_active = True
+        yield
+        sampling_active = False
+
+    # Exercise the deferred structured-output branch in one existing matrix
+    # case without doubling the full orchestration parametrization.
+    requires_multimodal_postprocess = not needs_history and include_hidden is None and engine_output_type == "text"
+    runner.model = SimpleNamespace(
+        compute_logits=lambda hidden: hidden,
+        logitsprocs_need_output_token_ids=needs_history,
+        postprocess_requires_multimodal_outputs=requires_multimodal_postprocess,
+    )
+    if include_hidden is not None:
+        runner.model.omni_pooler_payload_include_hidden = include_hidden
+    runner.model.mrv2_sampling_context = sampling_context
+    runner.model.mm_outputs_fresh_per_step = True
+    runner.sampler = None
+    runner.speculator = None
+    runner.num_speculative_steps = 0
+    runner.sample = MagicMock(return_value=sampler_out)
+    runner.sample.side_effect = lambda *_: sampler_out if sampling_active is needs_history else pytest.fail()
+    logprobs_mock = MagicMock(side_effect=lambda *_: pytest.fail("inside ctx") if sampling_active else {})
+    runner.prompt_logprobs_worker = PromptLogprobsWorker(1, torch.device("cpu"), logprobs_mode="raw_logits")
+    runner.prompt_logprobs_worker.add_request(
+        "req", 0, SamplingParams(prompt_logprob_token_ids=np.array([[1, 0], [1, 0]]))
+    )
+    runner.prompt_logprobs_worker.compute_prompt_logprobs = logprobs_mock
+    runner.postprocess_sampled, connector_output = MagicMock(), object()
+
+    def post_forward(finished_req_ids):
+        runner.postprocess_sampled.assert_called_once()  # postprocess precedes kv_connector.post_forward
+        assert finished_req_ids == {"finished"}
+        return connector_output
+
+    runner.kv_connector = SimpleNamespace(post_forward=MagicMock(side_effect=post_forward))
+    mock_out = SimpleNamespace(copy_event=None)
+    monkeypatch.setattr(omni_ar_model_runner, "OmniAsyncOutput", MagicMock(return_value=mock_out))
+
+    runner.sample_tokens(None)
+    kwargs = omni_ar_model_runner.OmniAsyncOutput.call_args.kwargs
+    kwargs.pop("sampler_output")
+    kwargs.pop("num_sampled_tokens")
+    kwargs["finalize_output"] = None
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda stream: None)
+    output = _async_output(**kwargs).get_output()
+    if final_stage_id == 0:
+        assert output.inter_stage_outputs is None
+    else:
+        assert output.inter_stage_outputs[0]["codes.audio"].shape == (3, 1)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("marker,expected", [(0, True), (1, True), (2, False), (None, False), ("bad", False)])
+def test_final_stage_snapshot_is_conservative(marker, expected):
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    runner.model_config = SimpleNamespace(stage_id=1)
+    info = {"omni_final_stage_id": marker}
+    runner.model_state = SimpleNamespace(intermediate_buffer=SimpleNamespace(buffers=[info]))
+    runner.req_states = SimpleNamespace(req_id_to_index={"known": 0})
+    snapshot = runner._final_stage_request_ids(["known", "missing"])
+    assert snapshot == (frozenset({"known"}) if expected else frozenset())
+    info["omni_final_stage_id"] = 3
+    assert snapshot == (frozenset({"known"}) if expected else frozenset())
+
+
+@pytest.mark.cpu
+def test_final_stage_filter_keeps_client_audio_and_other_requests():
+    inter, client = OmniARModelRunner._build_async_chunk_outputs_from_mm(
+        {"codes": {"audio": torch.tensor([[1], [2]])}, "audio": torch.tensor([[3.0], [4.0]])},
+        np.array([0, 1, 2]),
+        np.array([1, 1]),
+        2,
+        2,
+        req_ids=["final", "downstream"],
+        final_stage_req_ids=frozenset({"final"}),
+    )
+    assert inter[0] is None
+    assert inter[1]["codes.audio"].tolist() == [[2]]
+    assert client[0]["audio"].tolist() == [[3.0]]
+    assert client[1]["audio"].tolist() == [[4.0]]

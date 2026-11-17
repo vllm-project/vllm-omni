@@ -400,6 +400,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             multimodal_outputs=multimodal_outputs if need_pooler else None,
             input_batch=input_batch if need_pooler else None,
             async_chunk=async_chunk,
+            final_stage_req_ids=self._final_stage_request_ids(input_batch.req_ids) if async_chunk else frozenset(),
             engine_output_type=engine_output_type,
             # Connector senders drop the orchestrator pooler. Stage 0 still
             # partitions latent off the client channel and publishes it once
@@ -620,6 +621,26 @@ class OmniARModelRunner(OmniGPUModelRunner):
             pooler.append(flatten_payload(payload))
         return pooler
 
+    def _final_stage_request_ids(self, req_ids: list[str]) -> frozenset[str]:
+        """Snapshot requests without a downstream consumer before state cleanup."""
+        buffers = getattr(getattr(self.model_state, "intermediate_buffer", None), "buffers", {})
+        final_req_ids = set()
+        for req_id in req_ids:
+            req_index = self.req_states.req_id_to_index.get(req_id)
+            if req_index is None:
+                continue
+            try:
+                info = buffers[req_index]
+                if not isinstance(info, dict):
+                    continue
+                final_stage = info.get("omni_final_stage_id")
+                if final_stage is not None and int(final_stage) <= getattr(self.model_config, "stage_id", 0):
+                    final_req_ids.add(req_id)
+            except (KeyError, IndexError, TypeError, ValueError):
+                # Missing or malformed metadata must not discard a payload.
+                continue
+        return frozenset(final_req_ids)
+
     @staticmethod
     def _build_async_chunk_outputs_from_mm(
         mm_outputs: dict[str, Any],
@@ -630,6 +651,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         padded_total_tokens: int | None = None,
         req_ids: list[str] | None = None,
         engine_output_type: str = "audio",
+        final_stage_req_ids: frozenset[str] = frozenset(),
     ) -> tuple[list[dict[str, Any] | None] | None, list[dict[str, Any] | None] | None]:
         """Build async-chunk payloads without materializing hidden on CPU."""
         if not mm_outputs:
@@ -665,7 +687,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
                 for key, value in payload_mm.items()
             }
             inter_stage, client_mm = partition_flat_payload(flatten_payload(payload))
-            inter_stage_list.append(inter_stage or None)
+            inter_stage_list.append(None if req_id in final_stage_req_ids else inter_stage or None)
             client_mm_list.append(client_mm or None)
 
         return (
@@ -950,6 +972,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         multimodal_outputs: dict | None = None,
         input_batch: Any | None = None,
         async_chunk: bool = False,
+        final_stage_req_ids: frozenset[str] = frozenset(),
         engine_output_type: str = "audio",
         partition_async_payload: bool | None = None,
         finalize_output: Any | None = None,
@@ -967,6 +990,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         self.pending_aux_output = pending_aux_output
         self.copy_event = copy_event if copy_event is not None else torch.cuda.Event(blocking=True)
         self._async_chunk = bool(async_chunk)
+        self._final_stage_req_ids = frozenset(final_stage_req_ids)
         self._engine_output_type = engine_output_type
         # None preserves the historical split whenever async_chunk is on.
         # Callers that keep an orchestrator bridge pass False.
@@ -1202,6 +1226,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                     self._padded_total_tokens,
                     self._req_ids,
                     self._engine_output_type,
+                    self._final_stage_req_ids,
                 )
             if self._streaming_audio is not None:
                 pooler_inter, pooler_client = None, self._streaming_audio.get_output()
