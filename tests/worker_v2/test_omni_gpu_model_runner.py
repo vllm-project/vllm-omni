@@ -10,10 +10,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from vllm import SamplingParams
+from vllm.compilation.cuda_graph import CUDAGraphEntry, CUDAGraphWrapper
+from vllm.config import SchedulerConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import ForwardContext, override_forward_context
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor, CudaGraphManager
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
@@ -71,6 +73,51 @@ def _make_runner():
     runner.req_states = SimpleNamespace(req_id_to_index={"r1": 0, "r2": 1})
     runner.execute_model_state = None
     return runner
+
+
+@pytest.mark.parametrize("backbone_mode", [CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE, CUDAGraphMode.NONE])
+@pytest.mark.parametrize("num_reqs,bucket", [(1, 1), (3, 4), (4, 4)])
+def test_mtp_graph_replay_is_independent_of_backbone_mode(mocker, backbone_mode, num_reqs, bucket):
+    runner = _make_runner()
+    runner.scheduler_config = SchedulerConfig(max_model_len=16, is_encoder_decoder=False, max_num_seqs=4)
+    runner.model_state = mocker.Mock(spec=OmniModelState)
+    runner.model_state._get_mtp_capture_sizes.return_value = [4, 1]
+    manager = runner.cudagraph_manager = object.__new__(CudaGraphManager)
+    manager._graphs_captured = True
+    manager._candidates = {
+        (size, 0): [BatchExecutionDescriptor(backbone_mode, size, size, 1)]
+        for size in (1, 4)
+        if backbone_mode != CUDAGraphMode.NONE
+    }
+
+    # MTP capture forces FULL even when the backbone dispatches PIECEWISE/NONE.
+    captured = runner._dispatch_mtp_batch_descriptor(bucket)
+    replay = mocker.Mock()
+    output = torch.ones(bucket, 2)
+    wrapper = object.__new__(CUDAGraphWrapper)
+    wrapper.runtime_mode = CUDAGraphMode.FULL
+    wrapper.runnable = mocker.Mock(side_effect=AssertionError("MTP graph was bypassed"))
+    wrapper.is_debugging_mode = False
+    wrapper.concrete_cudagraph_entries = {
+        captured: CUDAGraphEntry(batch_descriptor=captured, cudagraph=replay, output=output)
+    }
+    dispatched = runner._dispatch_mtp_batch_descriptor(num_reqs)
+    context = ForwardContext({}, {}, {}, cudagraph_runtime_mode=dispatched.cg_mode, batch_descriptor=dispatched)
+    with override_forward_context(context):
+        assert wrapper() is output
+    replay.replay.assert_called_once_with()
+    wrapper.runnable.assert_not_called()
+    assert dispatched.num_tokens == dispatched.num_reqs == bucket
+
+
+@pytest.mark.parametrize("capture_sizes,num_reqs", [([], 1), ([8], 3), ([8, 4, 1], 5)])
+def test_mtp_dispatch_without_supported_bucket_stays_eager(mocker, capture_sizes, num_reqs):
+    runner = _make_runner()
+    runner.scheduler_config = SchedulerConfig(max_model_len=16, is_encoder_decoder=False, max_num_seqs=4)
+    runner.model_state = mocker.Mock(spec=OmniModelState)
+    runner.model_state._get_mtp_capture_sizes.return_value = capture_sizes
+    desc = runner._dispatch_mtp_batch_descriptor(num_reqs)
+    assert desc == BatchExecutionDescriptor(CUDAGraphMode.NONE, num_reqs, num_reqs)
 
 
 @pytest.mark.parametrize("hook_fails", [False, True])

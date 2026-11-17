@@ -615,7 +615,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         torch.accelerator.synchronize()
         return max(free_before - torch.accelerator.get_memory_info()[0], 0)
 
-    def _dispatch_mtp_batch_descriptor(self, num_mtp_reqs: int) -> Any:
+    def _dispatch_mtp_batch_descriptor(self, num_mtp_reqs: int) -> BatchExecutionDescriptor:
         capture_sizes = self.model_state._get_mtp_capture_sizes()
         captured_bucket = next(
             (size for size in sorted(capture_sizes) if num_mtp_reqs <= size <= self.scheduler_config.max_num_seqs),
@@ -627,11 +627,14 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                 num_tokens=num_mtp_reqs,
                 num_reqs=num_mtp_reqs,
             )
-        return self.cudagraph_manager.dispatch(
-            captured_bucket,
-            captured_bucket,
-            1,
-            0,
+        # MTP owns a FULL graph wrapper and capture buckets independently of
+        # the backbone. Its replay must use the same mode as capture even when
+        # the backbone excludes FULL graphs for structured outputs.
+        return BatchExecutionDescriptor(
+            cg_mode=CUDAGraphMode.FULL,
+            num_tokens=captured_bucket,
+            num_reqs=captured_bucket,
+            uniform_token_count=1,
         )
 
     def _make_dummy_input_batch(
