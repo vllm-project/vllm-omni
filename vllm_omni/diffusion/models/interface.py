@@ -85,6 +85,18 @@ def supports_chunked_vae_decode(vae: object) -> TypeGuard[SupportsChunkedVAEDeco
 
 
 @runtime_checkable
+class SupportsPreparedDenoiseInputs(Protocol):
+    """Optional request-scoped preparation for step-execution pipelines.
+
+    The runtime calls this after encoding and layout finalization. The result
+    belongs to the request; models may optionally bind it to a batch view.
+    """
+
+    def prepare_denoise_inputs(self, state: StepRequestState) -> object:
+        ...
+
+
+@runtime_checkable
 class SupportsStepExecution(Protocol):
     """State-driven step-level execution protocol for diffusion pipelines.
 

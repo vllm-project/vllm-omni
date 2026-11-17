@@ -130,7 +130,7 @@ class MiniMaxH3DenoiseBranch:
                 "max_seqlen_q": text_len,
             },
         }
-        self.prepared_rope = PreparedDenoiseInputs[torch.Tensor]()
+        self.prepared_rope = PreparedDenoiseInputs[object]()
         self._uses_prepared_rope = False
         # Where the video segment sits in the packed sequence. Resolved to plain
         # ints here so the attention layers never sync on it per step.
@@ -182,6 +182,11 @@ class MiniMaxH3DenoiseBranch:
             lambda: prepare(self.static_kwargs["img_position_ids"], seq_len=self.seq_len)
         )
         self._uses_prepared_rope = True
+
+    def bind_prepared_rope(self, prepared: PreparedDenoiseInputs[object]) -> None:
+        """Attach the request-owned result selected by the current batch view."""
+        self.prepared_rope = prepared
+        self._uses_prepared_rope = prepared.bind() is not None
 
     def release_prepared_inputs(self) -> None:
         self.prepared_rope.release()
