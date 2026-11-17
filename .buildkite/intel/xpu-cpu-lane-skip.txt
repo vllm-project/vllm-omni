@@ -1,6 +1,7 @@
 # Files excluded from the Intel device-agnostic lane (cpu-marked tests run with
 # current_platform == xpu, no card). Measured 2026-11-14 on one B60 host:
-# 29235 passed / 333 failed across these 50 files / 229 skipped in 16m33s.
+# 29235 passed / 333 failed across the 50 files listed then (51 now) / 229
+# skipped in 16m33s.
 #
 # Two causes, both tracked in VLLMZ-3554:
 #   * the case resolves a real checkpoint, which the Intel agents' HF cache

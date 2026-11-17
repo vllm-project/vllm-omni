@@ -69,7 +69,7 @@ def test_launch_row_chunks_is_npu_only(device_type, expected_grids_and_offsets):
 @pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires Ascend NPU")
 @pytest.mark.parametrize(
     "device",
-    [pytest.param("npu", marks=hardware_marks(res={"npu": "A3", "xpu": "B60"}, num_cards=1))],
+    [pytest.param("npu", marks=hardware_marks(res={"npu": "A3"}, num_cards=1))],
 )
 def test_modulation_wrappers_match_reference_above_grid_limit(device):
     rows = 69888
