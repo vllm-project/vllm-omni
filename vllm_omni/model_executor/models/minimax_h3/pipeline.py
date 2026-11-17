@@ -29,6 +29,7 @@ MINIMAX_H3_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             requires_multimodal_data=True,
             model_arch="MiniMaxH3Encoder",
+            supports_native_mrv2_data_plane=True,
             engine_output_type="latent",
             prompt_transform_func=f"{_PROCESSOR}.prepare_encoder_prompt",
             custom_process_next_stage_input_func=f"{_PROCESSOR}.encoder2diffusion_full_payload",
