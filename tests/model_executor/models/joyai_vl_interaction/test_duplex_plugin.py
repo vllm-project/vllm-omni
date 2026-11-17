@@ -1845,6 +1845,40 @@ async def test_camera_commit_after_done_starts_on_final_playback_ack(early_ack):
 
 
 @pytest.mark.asyncio
+async def test_coalesced_camera_commits_keep_memory_and_input_byte_limit():
+    h = await open_joyai(modalities=("text",))
+    try:
+        request_id = await observe(h)
+        colors = ["blue", "green", "yellow", "orange", "purple"]
+        frames = [frame(color) for color in colors]
+        budget = sum(map(len, frames))
+        h.manager.runtime_config = DuplexSessionRuntimeConfig(max_pending_input_bytes_per_session=budget)
+        for image in frames:
+            await h.run(AppendAudio(video_frames=(image,)))
+            await h.run(Commit(final=True, create_response=True))
+        assert len(h.port.submissions) == 1
+        assert h.session.pending_input_bytes == budget
+        events = await h.run(AppendAudio(video_frames=(frame("white"),)))
+        assert any(getattr(event, "code", None) == "input_backpressure" for event in events)
+        assert h.session.pending_input_bytes == budget
+
+        await h.deliver_and_settle(
+            tts_output(request_id, text="</silence>", finished=True), stage_id=0, segment_finished=True
+        )
+        assert len(h.port.submissions) == 2
+        memory = h.runner.model_state.visual_memory
+        assert memory.next_id == 6
+        assert [entry.image.getpixel((0, 0)) for entry in memory.pending] == [
+            Image.new("RGB", (1, 1), color).getpixel((0, 0)) for color in ["red", *colors]
+        ]
+        assert h.session.pending_input_bytes == 0
+        await h.run(CloseSession())
+        assert h.session.pending_input_bytes == 0
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_new_camera_commit_supersedes_queued_promotion():
     h = await open_joyai()
     try:
@@ -1861,6 +1895,15 @@ async def test_new_camera_commit_supersedes_queued_promotion():
         assert len(h.port.submissions) == 2
         latest = h.port.submissions[-1]
         assert latest.prompt["multi_modal_data"]["image"][-1].getpixel((0, 0)) == (0, 128, 0)
+        # C replaces B's queued response, but both committed frames belong in
+        # visual memory. Otherwise a busy session silently forgets B's scene.
+        memory = h.runner.model_state.visual_memory
+        assert memory.next_id == 3
+        assert [entry.image.getpixel((0, 0)) for entry in memory.pending] == [
+            (255, 0, 0),
+            (0, 0, 255),
+            (0, 128, 0),
+        ]
         assert not any(abort for _, abort in h.port.cleanups)
         # A's silent terminal frees its own async-chunk prewarm; nothing else may be aborted.
         assert h.port.aborts == [[request_id]]

@@ -98,7 +98,7 @@ def _activation_edges(
                 if block + 1 < plan.schedule.num_blocks:
                     next_step, next_block = step, block + 1
                 elif step + 1 < plan.schedule.num_denoise_steps or (
-                    chunk == 0 and plan.schedule.chunks > 1 and step < plan.schedule.num_denoise_steps
+                    chunk == 0 and step < plan.schedule.num_denoise_steps and plan.schedule.same_step_has_sink
                 ):
                     next_step, next_block = step + 1, 0
                 else:
@@ -291,6 +291,8 @@ class SupportsNoisyPPKV(Protocol):
     ) -> None: ...
 
     def set_inflight(self, inflight: Sequence[Inflight]) -> None: ...
+
+    def finish_request(self, owner: str) -> None: ...
 
     def end_request(self, req: str, *, retain: Collection[Cell] | None = None) -> None: ...
 
@@ -659,7 +661,7 @@ def run_cell_pipeline(
                     member_schedule = schedules[req]
                     keep_clean_input = (
                         member_schedule.ordering is Ordering.SAME_STEP
-                        and member_schedule.chunks > 1
+                        and member_schedule.same_step_has_sink
                         and rank_of_block(member_schedule.num_denoise_steps, 0, member_schedule) == spec.rank
                         and cell == (0, member_schedule.num_denoise_steps - 1, member_schedule.num_blocks - 1)
                     )
@@ -737,7 +739,7 @@ def run_cell_pipeline(
                 if local + 1 < item.plan.num_slots:
                     still.append(item)
                 else:
-                    kv.end_request(item.req)
+                    kv.finish_request(item.req)
                     pending_hidden.pop(item.req, None)
             ctx.inflight = still
             kv.set_inflight(tuple(ctx.inflight))

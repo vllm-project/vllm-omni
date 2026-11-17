@@ -282,7 +282,7 @@ def test_h3_turbo_allows_distributed_layerwise_offload(monkeypatch):
     torch.nn.Module.__init__(pipeline)
     pipeline.partition = "fl2va"
     pipeline._turbo_lora_specs = {}
-    pipeline._native_lora_adapter_ids = set()
+    pipeline._native_distilled_lora_adapter_ids = set()
     pipeline._lora_sigma_schedules = {}
     pipeline.od_config = SimpleNamespace(
         enable_cpu_offload=False,
@@ -333,7 +333,7 @@ def test_h3_turbo_offload_compatibility_follows_dit_selection(
     torch.nn.Module.__init__(pipeline)
     pipeline.partition = "fl2va"
     pipeline._turbo_lora_specs = {}
-    pipeline._native_lora_adapter_ids = set()
+    pipeline._native_distilled_lora_adapter_ids = set()
     pipeline._lora_sigma_schedules = {}
     pipeline.od_config = SimpleNamespace(
         diffusion_offload_config={"mode": mode, "components": components},
@@ -490,9 +490,10 @@ def test_only_an_active_recognized_turbo_adapter_restricts_ref2va(monkeypatch):
     pipeline.partition = "combined"
     pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
     pipeline._turbo_lora_specs = {}
-    pipeline._native_lora_adapter_ids = set()
+    pipeline._native_distilled_lora_adapter_ids = set()
     pipeline._lora_sigma_schedules = {}
     request = _request("generic-peft")
+    pipeline.transformer = torch.nn.Module()
 
     def load():
         return pipeline._load_diffusion_lora_adapter(
@@ -582,3 +583,22 @@ def test_h3_turbo_accepts_four_steps_for_four_nfe():
         ),
         _spec(),
     )
+
+
+@pytest.mark.parametrize("turbo_scale", [0.0, 0.7, 1.0])
+def test_h3_finds_turbo_in_composition(turbo_scale):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+    spec = _spec()
+    pipeline._turbo_lora_specs = {2: spec}
+    pipeline._native_distilled_lora_adapter_ids = set()
+    first = _request("swap")
+    first.lora_int_id = 1
+    turbo = _request("turbo")
+    turbo.lora_int_id = 2
+    sampling = SimpleNamespace(lora_request=[first, turbo], lora_scale=[1.0, turbo_scale])
+    assert pipeline._active_turbo_spec(sampling) is (spec if turbo_scale else None)
+    sampling.lora_request.reverse()
+    sampling.lora_scale.reverse()
+    assert pipeline._active_turbo_spec(sampling) is (spec if turbo_scale else None)

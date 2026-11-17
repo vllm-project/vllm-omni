@@ -12,6 +12,11 @@ import numpy as np
 
 from vllm_omni.engine.duplex.contracts import duplex_resource_request_belongs_to_session
 from vllm_omni.engine.duplex.plugin import DefaultDuplexModelSessionState, DuplexDataPlane, DuplexDataPlaneContext
+from vllm_omni.engine.duplex.visual_memory import (
+    EncodedVisualImage,
+    VisualMemory,
+    VisualMemorySource,
+)
 from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import Action, ParsedAction, parse_action
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.delegation import (
     DELEGATION_TOOL_NAME,
@@ -21,10 +26,7 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.input import Jo
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import (
     RECENT_MESSAGES,
     SUMMARY_CHUNK_MESSAGES,
-    EncodedVisualImage,
     JoyAISummaryMemory,
-    JoyAIVisualMemory,
-    VisualMemorySource,
 )
 
 
@@ -66,7 +68,7 @@ class JoyAISessionState(DefaultDuplexModelSessionState):
     conversation_images: tuple[str, ...] = ()
     last_response_text: str = ""
     memory: JoyAISummaryMemory = field(default_factory=JoyAISummaryMemory)
-    visual_memory: JoyAIVisualMemory = field(default_factory=JoyAIVisualMemory)
+    visual_memory: VisualMemory = field(default_factory=VisualMemory)
     visual_source: VisualMemorySource | None = None
     observations: list[WorkingObservation] = field(default_factory=list)
     queries: list[QueryReference] = field(default_factory=list)
