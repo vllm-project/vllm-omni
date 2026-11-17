@@ -115,7 +115,8 @@ XPU_TEST_BUDGET="${XPU_TEST_BUDGET:-60m}"
 # pr    = the no-card XPU-dispatch stage, every core_model case on one and on
 #         two cards, and the omni models. Needs tiny-random/Qwen-Image (30MB),
 #         riverclouds/qwen_image_random (9.9GB), Qwen2.5-Omni-3B (12GB) and
-#         Qwen2.5-Omni-7B (21GB) in the mounted HF cache.
+#         Qwen2.5-Omni-7B (21GB); the container downloads any that are not
+#         in the mounted HF cache yet.
 # broad = also advanced_model on one card (Qwen3-TTS, Z-Image, Wan2.1, Voxtral,
 #         ~13m) and on two (11 sleep/wake cases, which additionally need
 #         BAGEL-7B-MoT).
@@ -191,26 +192,40 @@ time timeout -k 30 "${XPU_TEST_BUDGET}" docker run \
     ignore=(--ignore tests/e2e/offline_inference/test_cosyvoice3_expansion.py)
 
 
-    # The GPU stages load these from the mounted cache. Resolving them up front
-    # turns "LocalEntryNotFoundError six minutes into the omni stage" into one
-    # clear message naming what the agent is missing.
+    # The GPU stages load these from the mounted cache. Fetch what is missing
+    # up front: a fresh agent fills its cache on the first run (about 43 GB,
+    # kept on the host for later builds), and a download that fails stops the
+    # job here with the repo named, not six minutes into the omni stage.
+    # huggingface_hub locks per file, so two agents sharing one cache can
+    # fetch the same repo at once.
     if [ "${run_1card}" = 1 ]; then
         python - <<PY || exit 1
+import time
 from huggingface_hub import snapshot_download
 
 needed = ["tiny-random/Qwen-Image", "riverclouds/qwen_image_random",
           "Qwen/Qwen2.5-Omni-3B", "Qwen/Qwen2.5-Omni-7B"]
-missing = []
+failed = []
 for repo in needed:
     try:
         snapshot_download(repo, local_files_only=True)
+        continue
+    except Exception:
+        pass
+    print(f"checkpoint preflight: downloading {repo}", flush=True)
+    start = time.monotonic()
+    try:
+        snapshot_download(repo)
     except Exception as exc:
-        missing.append(f"{repo}: {type(exc).__name__}")
-if missing:
+        failed.append(f"{repo}: {type(exc).__name__}: {exc}")
+        continue
+    print(f"checkpoint preflight: {repo} done in "
+          f"{time.monotonic() - start:.0f}s", flush=True)
+if failed:
     raise SystemExit(
-        "these checkpoints are not in the mounted HF cache:\n  "
-        + "\n  ".join(missing)
-        + "\nSeed them on the agent cache that HF_CACHE points at."
+        "these checkpoints are neither in the mounted HF cache nor "
+        "downloadable (HF_HUB_OFFLINE set, or no network/HF_TOKEN):\n  "
+        + "\n  ".join(failed)
     )
 print("checkpoint preflight ok:", ", ".join(needed))
 PY
