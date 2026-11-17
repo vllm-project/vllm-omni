@@ -305,20 +305,17 @@ class _AudioVAEDeterminismContext(AbstractContextManager):
         return False
 
 
-class _VideoVAEPartProxy(nn.Module):
-    """Residency proxy for one half of the split video VAE.
+class _VAEPartProxy(nn.Module):
+    """Residency proxy for one half of a split video or audio VAE.
 
-    The pipeline's ``_component_on_device`` drives whatever object it is
-    given through ``load_to_device``/``offload_to_cpu``. The checkpoint's
-    ViT decoder holds ~9GB of FP32 weights while the CNN encoder holds
-    ~0.7GB, and each is used by exactly one direction, so routing those
-    calls per half keeps the decoder off the device while reference videos
-    encode and the encoder off while latents decode. ``object.__setattr__``
+    The pipeline's ``_component_on_device`` drives the selected half through
+    ``load_to_device``/``offload_to_cpu``. Routing per half keeps unused
+    decoder weights on the host during reference encoding. ``object.__setattr__``
     keeps the back-reference out of the module registry (registering the
     adapter as a submodule would recurse through ``parameters()``).
     """
 
-    def __init__(self, vae: MiniMaxH3VideoVAE, part: str) -> None:
+    def __init__(self, vae: MiniMaxH3VideoVAE | MiniMaxH3AudioVAE, part: str) -> None:
         super().__init__()
         object.__setattr__(self, "_vae", vae)
         object.__setattr__(self, "_part", part)
@@ -333,7 +330,7 @@ class _VideoVAEPartProxy(nn.Module):
         self._vae.set_omni_component_cache(cache)
 
     @property
-    def sequential_offload_target(self) -> MiniMaxH3VideoVAE:
+    def sequential_offload_target(self) -> MiniMaxH3VideoVAE | MiniMaxH3AudioVAE:
         """The module model-level CPU offload actually hooks.
 
         ``enable_omni_model_cpu_offload`` registers the sequential hook on the
@@ -346,6 +343,14 @@ class _VideoVAEPartProxy(nn.Module):
         residency is the whole point.
         """
         return self._vae
+
+
+class _VideoVAEPartProxy(_VAEPartProxy):
+    """Video encoder/decoder residency with the shared proxy lifecycle."""
+
+
+class _AudioVAEPartProxy(_VAEPartProxy):
+    """Audio encoder/decoder residency with the shared proxy lifecycle."""
 
 
 class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
@@ -1391,37 +1396,100 @@ class MiniMaxH3AudioVAE(nn.Module):
         # encoding and waveform decoding.
         initial_device = load_device or device
         self.remote.eval().to(device=initial_device, dtype=torch.float32)
-        self._stager = None
-        if initial_device.type == "cpu" and device.type not in ("cpu", "meta"):
-            self._stager = PinnedModuleStager(
-                self.remote,
-                device,
-                pin_memory=True,
-            )
         self.model = self.remote.model
+        self._stager = None
+        self._encoder_stager = None
+        self._decoder_stager = None
+        self.encoder_component = _AudioVAEPartProxy(self, "encoder")
+        if initial_device.type == "cpu" and device.type not in ("cpu", "meta"):
+            self._build_residency_stagers(device)
         self.sample_rate = int(self.config_dict["sample_rate"])
 
+    def _build_residency_stagers(self, device: torch.device) -> None:
+        """Partition the native waveform encoder from every remaining module.
+
+        Encoding touches encoder, optional pre_block and mean_proj. Keep all
+        other children in the second group, including the unused logs_proj.
+        Partial adapters and checkpoints with root state retain whole staging.
+        """
+        encoder_names = {"encoder", "pre_block", "mean_proj"}
+        children = dict(self.model.named_children())
+        roots = (self.remote, self.model)
+        root_state = any(list(root.parameters(recurse=False)) or list(root.buffers(recurse=False)) for root in roots)
+        if (
+            all(isinstance(children.get(name), nn.Module) for name in ("encoder", "mean_proj", "decoder"))
+            and set(dict(self.remote.named_children())) == {"model"}
+            and not root_state
+        ):
+            encoder = [module for name, module in children.items() if name in encoder_names]
+            decoder = [module for name, module in children.items() if name not in encoder_names]
+            storage = [
+                {
+                    tensor.untyped_storage().data_ptr()
+                    for module in modules
+                    for tensor in (*module.parameters(), *module.buffers())
+                }
+                for modules in (encoder, decoder)
+            ]
+            if not storage[0].intersection(storage[1]):
+                self._encoder_stager = PinnedModuleStager(encoder, device, pin_memory=True)
+                self._decoder_stager = PinnedModuleStager(decoder, device, pin_memory=True)
+                return
+        self._stager = PinnedModuleStager(self.remote, device, pin_memory=True)
+
+    def _part_stager(self, part: str) -> PinnedModuleStager | None:
+        if part == "encoder":
+            return self._encoder_stager
+        if part == "decoder":
+            return self._decoder_stager
+        raise ValueError(f"unknown audio VAE part {part!r}")
+
+    def _load_part_to_device(self, part: str) -> None:
+        stager = self._part_stager(part) or self._stager
+        if stager is not None:
+            stager.load()
+        else:
+            self.remote.to(self._device_target)
+
+    def _offload_part_to_cpu(self, part: str) -> None:
+        stager = self._part_stager(part) or self._stager
+        if stager is not None:
+            stager.offload()
+        else:
+            self.remote.to("cpu")
+            self._release_component_cache()
+
+    def _release_component_cache(self) -> None:
+        cache = getattr(self, "_omni_component_cache", None)
+        if cache is None:
+            torch.accelerator.empty_cache()
+        else:
+            cache.release_if_needed()
+
     def load_to_device(self) -> None:
-        if self._stager is not None:
+        if self._encoder_stager is not None:
+            self._encoder_stager.load()
+            self._decoder_stager.load()
+        elif self._stager is not None:
             self._stager.load()
         else:
             self.remote.to(self._device_target)
 
     def set_omni_component_cache(self, cache: BoundedAllocatorCache | None) -> None:
         self._omni_component_cache = cache
-        if self._stager is not None:
-            self._stager.set_cache_retention(cache)
+        for stager in (self._encoder_stager, self._decoder_stager, self._stager):
+            if stager is not None:
+                stager.set_cache_retention(cache)
 
     def offload_to_cpu(self) -> None:
-        if self._stager is not None:
+        if self._encoder_stager is not None:
+            self._encoder_stager.offload()
+            self._decoder_stager.offload()
+        elif self._stager is not None:
             self._stager.offload()
         else:
             self.remote.to("cpu")
-            cache = getattr(self, "_omni_component_cache", None)
-            if cache is None:
-                torch.accelerator.empty_cache()
-            else:
-                cache.release_if_needed()
+            self._release_component_cache()
 
     @torch.inference_mode()
     def encode_waveform(

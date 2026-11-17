@@ -663,3 +663,11 @@ logs. A successful HTTP response alone does not prove the cache was used.
 - [Cache-DiT guide](../../docs/user_guide/diffusion/cache_acceleration/cache_dit.md)
 - [Supported models](../../docs/models/supported_models.md)
 - [Video API](../../docs/serving/videos_api.md)
+
+### Reference-audio encoder residency
+
+The full pipeline stages only the native Audio VAE encoder, optional
+attention projection and mean projection during reference encoding in the
+manual component-offload path. Resident and model-level sequential-offload
+placement retain their existing behavior; encoder-only stage adapters and
+unrecognized checkpoint layouts keep their existing whole-component scope.

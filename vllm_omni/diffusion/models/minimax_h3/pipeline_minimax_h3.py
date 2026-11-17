@@ -8,7 +8,7 @@ import json
 import math
 import os
 import weakref
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import fields, replace
@@ -213,7 +213,7 @@ from .vae import (
     MiniMaxH3AudioVAE,
     MiniMaxH3VideoVAE,
     _load_component_config,
-    _VideoVAEPartProxy,
+    _VAEPartProxy,
     vae_compile_allowed,
 )
 from .vdnh3 import VDNCheckpoint
@@ -1861,7 +1861,7 @@ class MiniMaxH3Pipeline(
             # has no half-residency benefit anyway. The check is a type check, not
             # getattr: Mock components auto-create any attribute, which would
             # unwrap them to a child mock and break scope tracking.
-            if isinstance(component, _VideoVAEPartProxy):
+            if isinstance(component, _VAEPartProxy):
                 component = component.sequential_offload_target
             with sequential_offload_component(component):
                 yield
@@ -3051,6 +3051,13 @@ class MiniMaxH3Pipeline(
             tensors[name] = _broadcast_tensor(source, dtype=dtype, device=self.device) if dtype is not None else None
         return MiniMaxH3EncoderMediaConditioning(**metadata, **tensors)
 
+    @contextmanager
+    def _audio_encoding_component_on_device(self, component: nn.Module) -> Iterator[None]:
+        if component is self.audio_vae:
+            component = self.audio_vae.encoder_component
+        with self._component_on_device(component):
+            yield
+
     def _encode_local_media(self, media: MiniMaxH3EncoderMediaInput | None) -> MiniMaxH3EncoderMediaConditioning:
         group, rank, world_size = _dit_rank_world()
         distributed_video = self.video_vae.is_distributed_enabled()
@@ -3066,7 +3073,7 @@ class MiniMaxH3Pipeline(
                     video_vae=self.video_vae,
                     audio_vae=self.audio_vae,
                     emit_conditioning=rank == 0,
-                    component_scope=self._component_on_device,
+                    component_scope=self._audio_encoding_component_on_device,
                 )
         except ValueError as exc:
             error = OmniClientError(str(exc))
@@ -3934,7 +3941,7 @@ class MiniMaxH3Pipeline(
         if cached is not None and cached[0] == key:
             return cached[1]
         samples = round(num_frames / MINIMAX_H3_FPS * MINIMAX_H3_AUDIO_SAMPLE_RATE)
-        with self._component_on_device(self.audio_vae):
+        with self._component_on_device(self.audio_vae.encoder_component):
             rows, encoded_t = self.audio_vae.encode_waveform(torch.zeros(2, samples), MINIMAX_H3_AUDIO_SAMPLE_RATE)
         if encoded_t != audio_t:
             raise RuntimeError(f"encoded silence has {encoded_t} audio latents, the canvas {audio_t}")
