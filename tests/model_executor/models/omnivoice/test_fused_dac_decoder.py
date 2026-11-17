@@ -100,9 +100,9 @@ def _random_rvq_fc2(device: str, seed: int = 0):
     from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_decoder import HiggsAudioRVQ
 
     torch.manual_seed(seed)
-    quantizer = HiggsAudioRVQ(
-        num_quantizers=NUM_QUANTIZERS, codebook_size=1024, codebook_dim=64, hidden_size=1024
-    ).to(device=device, dtype=torch.float32)
+    quantizer = HiggsAudioRVQ(num_quantizers=NUM_QUANTIZERS, codebook_size=1024, codebook_dim=64, hidden_size=1024).to(
+        device=device, dtype=torch.float32
+    )
     fc2 = torch.nn.Linear(1024, 256).to(device=device, dtype=torch.float32)
     return quantizer, fc2
 
@@ -226,7 +226,7 @@ def test_load_weights_builds_fused_bit_exact_decoder(tmp_path):
 
     stock = _stock_decoder("cpu").to(device)
     stock.load_state_dict(
-        {k[len("acoustic_decoder."):]: v for k, v in sd.items() if k.startswith("acoustic_decoder.")},
+        {k[len("acoustic_decoder.") :]: v for k, v in sd.items() if k.startswith("acoustic_decoder.")},
         strict=True,
     )
     ref = _wrap(decoder.quantizer, decoder.fc2, stock)
