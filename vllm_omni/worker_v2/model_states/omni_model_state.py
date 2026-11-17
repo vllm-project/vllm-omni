@@ -16,7 +16,7 @@ from __future__ import annotations
 import inspect
 import threading
 import types
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
 from typing import Any, cast
 
@@ -35,6 +35,7 @@ from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_omni.model_executor.models.interfaces import requires_request_sample_eligibility
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
 from vllm_omni.utils.device_copy import index_to_device
 from vllm_omni.worker_v2.model_states.intermediate_buffer import (
@@ -894,6 +895,43 @@ class OmniModelState(DefaultModelState):
         if self._has_mtp:
             self._mtp_state.record_inputs(input_batch, embeds)
 
+    @staticmethod
+    def _sample_keep_mask(input_batch: InputBatch) -> np.ndarray:
+        """Rows whose sample is kept this step: decode or a finishing prefill chunk.
+
+        Official ``InputBatch`` sets ``is_prefilling_np`` to
+        ``num_computed_prefill_tokens_np < prefill_len_np``. Under that invariant
+        and non-negative scheduled counts, this mask equals
+        ``computed + scheduled >= prefill_len_np``. The OR is still the shared
+        rule so eligibility cannot drop a decode-flagged row that
+        ``publish_sampled_embeddings`` would keep, even if a caller sets the
+        phase flag independently of the counts. This is a runner-wide keep mask,
+        not a MiniMax-H3-only prefill contract. Those arrays are already in
+        batch order, and ``prefill_len_np`` includes codec tokens replayed after
+        preemption. Missing arrays raise ``AttributeError``; a short array
+        raises ``ValueError`` rather than defaulting a slot or reading another
+        request's counts.
+        """
+        num_reqs = input_batch.num_reqs
+        computed = np.asarray(input_batch.num_computed_prefill_tokens_np[:num_reqs])
+        scheduled = np.asarray(input_batch.num_scheduled_tokens[:num_reqs])
+        prefill_len = np.asarray(input_batch.prefill_len_np[:num_reqs])
+        is_prefilling = np.asarray(input_batch.is_prefilling_np[:num_reqs], dtype=np.bool_)
+        if not (
+            computed.shape[0] == num_reqs
+            and scheduled.shape[0] == num_reqs
+            and prefill_len.shape[0] == num_reqs
+            and is_prefilling.shape[0] == num_reqs
+        ):
+            raise ValueError(
+                "sample keep mask requires batch-ordered arrays of length "
+                f"num_reqs={num_reqs}: computed={computed.shape[0]} "
+                f"scheduled={scheduled.shape[0]} prefill_len={prefill_len.shape[0]} "
+                f"is_prefilling={is_prefilling.shape[0]}"
+            )
+        finishing = computed + scheduled >= prefill_len
+        return ~is_prefilling | finishing
+
     def publish_sampled_embeddings(
         self, input_batch: InputBatch, sampled_token_ids: torch.Tensor
     ) -> tuple[dict[str, Any], torch.cuda.Event] | None:
@@ -913,10 +951,7 @@ class OmniModelState(DefaultModelState):
             return None
         if sampled_token_ids.reshape(num_reqs, -1).shape[1] != 1:
             return None  # speculative steps sample several tokens per row
-        computed = input_batch.num_computed_prefill_tokens_np[:num_reqs]
-        scheduled = np.asarray(input_batch.num_scheduled_tokens[:num_reqs])
-        finishing = computed + scheduled >= input_batch.prefill_len_np[:num_reqs]
-        kept = ~input_batch.is_prefilling_np[:num_reqs] | finishing
+        kept = self._sample_keep_mask(input_batch)
         rows = np.flatnonzero(kept).tolist()
         device = sampled_token_ids.device
         # Preserve the empty per-row prefill marker even when every request
@@ -936,11 +971,18 @@ class OmniModelState(DefaultModelState):
     # Post-forward: per-request postprocess
     # ------------------------------------------------------------------
 
-    def run_postprocess(self, hidden_states: torch.Tensor, input_batch: InputBatch) -> None:
+    def run_postprocess(
+        self,
+        hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+        multimodal_outputs: Any | None = None,
+    ) -> None:
         """Per-request postprocess after model forward.
 
         Extracts per-request updates from hidden_states and writes them
         back to the intermediate buffer (e.g. ``last_talker_hidden``).
+        Models that declare ``postprocess_requires_multimodal_outputs`` also
+        receive the current step's structured output.
         """
         if not self.has_postprocess:
             return
@@ -1015,9 +1057,53 @@ class OmniModelState(DefaultModelState):
             n_tok = int(input_batch.num_scheduled_tokens[i])
             h_slice = hidden_states[start : start + n_tok]
             info = {key: value for key, value in buf.items() if isinstance(key, str) and key != "hidden_states"}
+            if getattr(self.model, "postprocess_requires_multimodal_outputs", False):
+                info["multimodal_outputs"] = multimodal_outputs
+                # Structured outputs preserve the current batch row.  Passing
+                # that row explicitly keeps model feedback aligned even when
+                # an earlier request has no live buffer or is a warmup row.
+                info["_omni_batch_row"] = i
             updates = self.model.postprocess(h_slice, **info)
             if updates:
                 self.intermediate_buffer.update(req_idx, updates, gpu_keys)
+
+    def _request_sample_eligible(
+        self,
+        input_batch: InputBatch,
+        buffer_list: Sequence[Any],
+    ) -> list[bool]:
+        """Per-request sample eligibility for models that opt into the runner contract.
+
+        Warmup dummy requests are never eligible: they do not pass through
+        stage input processors, so request metadata such as the MiniMax H3
+        encoder payload is absent. That warmup filter is applied only here,
+        after the shared keep mask.
+
+        Real requests reuse ``_sample_keep_mask``: the same
+        ``~is_prefilling_np | finishing`` rule as ``publish_sampled_embeddings``.
+        Those arrays are already in batch order, and ``prefill_len_np`` includes
+        codec tokens replayed after preemption. On a well-formed official
+        ``InputBatch``, this agrees with the V1
+        ``num_computed + scheduled >= num_tokens`` rule without a second
+        ``idx_mapping_np`` / ``RequestState`` lookup. Missing arrays or a
+        buffer/batch length mismatch fail loudly rather than defaulting a
+        slot to eligible or silently reading another request's counts.
+        """
+        num_reqs = input_batch.num_reqs
+        if len(buffer_list) != num_reqs:
+            raise ValueError(
+                "request sample eligibility requires one gathered buffer per batch "
+                f"row: num_buffers={len(buffer_list)} num_reqs={num_reqs}"
+            )
+        kept = self._sample_keep_mask(input_batch)
+        eligible: list[bool] = []
+        for batch_idx, info in enumerate(buffer_list):
+            req_id = info.get("req_id") if isinstance(info, Mapping) else None
+            if isinstance(req_id, str) and is_warmup_request(req_id):
+                eligible.append(False)
+                continue
+            eligible.append(bool(kept[batch_idx]))
+        return eligible
 
     # ------------------------------------------------------------------
     # Output post-processing
@@ -1059,6 +1145,18 @@ class OmniModelState(DefaultModelState):
                     "model_intermediate_buffer": buffer_list,
                     "request_token_spans": self._request_token_spans(input_batch),
                 }
+                if requires_request_sample_eligibility(self.model):
+                    make_output_kwargs["request_sample_eligible"] = self._request_sample_eligible(
+                        input_batch, buffer_list
+                    )
+                logits_index = input_batch.logits_indices
+                if getattr(self.model, "postprocess_requires_multimodal_outputs", False):
+                    if logits_index.shape[0] != input_batch.num_reqs:
+                        raise RuntimeError(
+                            "Structured per-request postprocess requires exactly one logits row per request: "
+                            f"num_logits={logits_index.shape[0]} num_reqs={input_batch.num_reqs}"
+                        )
+                make_output_kwargs["logits_index"] = logits_index
                 make_output_kwargs["runtime_additional_information"] = buffer_list
                 model_output = self.model.make_omni_output(model_output, **make_output_kwargs)
 

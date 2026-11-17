@@ -40,13 +40,14 @@ def test_cpu_fallback_does_not_mutate_shared_model_or_config():
 
 
 @pytest.mark.cpu
-def test_facade_rejects_non_torch_speaker():
+def test_facade_preserves_non_torch_speaker():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import MiniCPMO45Token2wav
 
     facade = MiniCPMO45Token2wav.__new__(MiniCPMO45Token2wav)
     facade._core = SimpleNamespace(_spk_model=object())
-    with pytest.raises(ValueError, match="CUDA Torch speaker"):
-        facade.enable_speaker_cuda_graph(_config())
+    speaker = facade._core._spk_model
+    assert facade.enable_speaker_cuda_graph(_config()) is False
+    assert facade._core._spk_model is speaker
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)

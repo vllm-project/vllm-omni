@@ -168,30 +168,86 @@ def _legacy_loop(host: _Host) -> None:
             host._wait_for_next_payload(generation)
 
 
-def _burst(loop) -> tuple[int, int, int]:
-    connector = _Connector()
-    host = _host(connector)
+_BURST_ROUNDS = 12
+_BURST_TIMEOUT_S = 60.0
+
+
+class _BurstConnector(_Connector):
+    """Each round lands in one wakeup while the receive loop is parked.
+
+    Poll counts then follow from the loop alone: how much a wakeup has
+    queued, and how often the short poll timeout fires, would otherwise
+    depend on thread timing and machine load.
+    """
+
+    def __init__(self, stop: threading.Event) -> None:
+        super().__init__()
+        self._stop = stop
+        self.parked = False
+
+    def put_round(self, items: dict[str, Any]) -> None:
+        with self._store_lock:
+            self._store.update(items)
+        with self._wake:
+            self.parked = False
+            self._signaled = True
+            self._wake.notify_all()
+
+    def wait_until_parked(self, deadline: float) -> None:
+        with self._wake:
+            while not self.parked:
+                assert time.perf_counter() < deadline, "receive loop never parked"
+                self._wake.wait(timeout=0.01)
+
+    def wait_for_change(self, generation: int, *, timeout: float) -> bool:
+        with self._wake:
+            while self._generation == generation and not self._signaled and not self._stop.is_set():
+                self.parked = True
+                self._wake.notify_all()
+                self._wake.wait(timeout=0.01)
+            self.parked = False
+            if self._generation != generation:
+                return True
+            if not self._signaled:
+                return False
+            self._signaled = False
+            self._generation += 1
+            return True
+
+
+def _burst(loop) -> tuple[int, float, int]:
+    """Deliver ``_BURST_ROUNDS`` rounds of one chunk per queued request."""
     stop = threading.Event()
+    connector = _BurstConnector(stop)
+    host = _host(connector)
 
     def produce() -> None:
-        chunk = [0] * _N_REQS
-        while not stop.is_set():
-            for req_idx in range(_QUEUED):
-                connector.put("0", "1", f"r{req_idx}_0_{chunk[req_idx]}", {"embed": {"decode": [chunk[req_idx]]}})
-                chunk[req_idx] += 1
-            time.sleep(0.002)
+        for round_idx in range(_BURST_ROUNDS):
+            connector.wait_until_parked(deadline)
+            if stop.is_set():
+                return
+            connector.put_round(
+                {f"0_1_r{req_idx}_0_{round_idx}": {"embed": {"decode": [round_idx]}} for req_idx in range(_QUEUED)}
+            )
 
     host._recv_thread = threading.Thread(target=loop, args=(host,), daemon=True)
-    host._recv_thread.start()
-    producer = threading.Thread(target=produce, daemon=True)
-    producer.start()
     iters = 0
-    deadline = time.perf_counter() + 0.2
+    start = time.perf_counter()
+    deadline = start + _BURST_TIMEOUT_S
+    producer = threading.Thread(target=produce, daemon=True)
+    host._recv_thread.start()
+    producer.start()
+    expected = _BURST_ROUNDS * _QUEUED
     try:
-        while time.perf_counter() < deadline:
-            iters += 1
+        rows = 0
+        while rows < expected:
+            assert time.perf_counter() < deadline, f"only {rows}/{expected} chunks in {_BURST_TIMEOUT_S}s"
+            for _ in range(1000):
+                iters += 1
+            rows = _rows(host)
+        connector.wait_until_parked(deadline)
         gets = connector.gets
-        return gets, iters, _rows(host)
+        return gets, iters / (time.perf_counter() - start), rows
     finally:
         stop.set()
         producer.join(timeout=1)
@@ -300,14 +356,16 @@ def test_registered_request_that_missed_is_polled_again_during_a_burst():
 
 
 def test_burst_receive_yields_the_model_thread():
-    legacy_gets, legacy_iters, legacy_rows = _burst(_legacy_loop)
-    drain_gets, drain_iters, drain_rows = _burst(_Host._recv_loop)
+    legacy_gets, legacy_rate, legacy_rows = _burst(_legacy_loop)
+    drain_gets, drain_rate, drain_rows = _burst(_Host._recv_loop)
     print(
         f"burst: gets {legacy_gets} -> {drain_gets}, "
-        f"model-thread iters {legacy_iters} -> {drain_iters}, "
+        f"model-thread iters/s {legacy_rate:.0f} -> {drain_rate:.0f}, "
         f"chunks {legacy_rows} -> {drain_rows}"
     )
-    assert legacy_rows > 0 and drain_rows > 0
-    # Poll count is the stable signal. The iteration count shows the model
-    # thread got more of the GIL, but it moves with machine load.
+    assert legacy_rows == drain_rows == _BURST_ROUNDS * _QUEUED
+    # Each round: the legacy loop rescans all 32 requests to find nothing left
+    # (32 + 32 gets); the drain rescans only the 8 that returned a chunk.
+    # The iteration rate shows the model thread got more of the GIL, but it
+    # moves with machine load.
     assert drain_gets < legacy_gets * 0.85

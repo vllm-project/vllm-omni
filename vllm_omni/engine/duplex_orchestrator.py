@@ -13,20 +13,24 @@ and applies the session-owned policy.
 from __future__ import annotations
 
 import time as _time
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
+from vllm.inputs import split_enc_dec_input
 from vllm.logger import init_logger
-from vllm.v1.engine import FinishReason
+from vllm.renderers.inputs.preprocess import parse_model_prompt
+from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.v1.engine import EngineCoreRequest, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.core.sched.duplex_stage_work import PERF_CHUNK_KEY, stage_work_rows
+from vllm_omni.core.sched.duplex_stage_work import stage_work_rows
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreRequest
 from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
+    DuplexInputCapacity,
     DuplexOutputContext,
     DuplexRequestIdentity,
     DuplexStagePort,
@@ -36,10 +40,11 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_is_auxiliary_request,
 )
 from vllm_omni.engine.duplex.messages import DuplexSessionError
-from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, validate_duplex_replica_policy
+from vllm_omni.engine.duplex.plugin import DuplexInputCapacityError, DuplexModelPlugin, validate_duplex_replica_policy
 from vllm_omni.engine.duplex.replica_placement import DuplexReplicaPlacement
 from vllm_omni.engine.duplex.session.engine_session import DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
+from vllm_omni.engine.duplex.session.perf_ledger import with_perf_chunk
 from vllm_omni.engine.messages import EngineQueueMessage, OutputMessage
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
@@ -306,15 +311,9 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         chunk = req_state.stage_output_chunks.get(src_stage_id)
         if chunk is None:
             return
-        for next_input in next_inputs:
-            buffer = next_input.get("model_intermediate_buffer") if isinstance(next_input, dict) else None
-            duplex = buffer.get("duplex") if isinstance(buffer, dict) else None
-            if isinstance(buffer, dict) and isinstance(duplex, dict):
-                # Copy both levels: the stage-input processor may share them with bridge state.
-                next_input["model_intermediate_buffer"] = {
-                    **buffer,
-                    "duplex": {**duplex, PERF_CHUNK_KEY: list(chunk)},
-                }
+        for index, next_input in enumerate(next_inputs):
+            if isinstance(next_input, dict):
+                next_inputs[index] = with_perf_chunk(next_input, chunk)
 
     async def _report_duplex_session_request_error(
         self,
@@ -322,19 +321,19 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         replica_id: int | None,
         eco: OmniEngineCoreOutput,
         req_state: OrchestratorRequestState,
-    ) -> None:
+    ) -> bool:
         if not req_state.session_owned or getattr(eco, "finish_reason", None) != FinishReason.ERROR:
-            return
+            return False
         # Segment boundaries do not terminate a resumable request. Context
         # overflow emits a separate terminal ERROR with is_segment_finished=False.
         if getattr(eco, "is_segment_finished", False):
-            return
+            return False
         reason = getattr(eco, "stop_reason", None)
         error = reason if isinstance(reason, str) and reason else "duplex session request failed"
         # Duplex sessions receive session events, not the ordinary request queue's
         # ErrorMessage. Close a resident session before another append can recreate
         # its finished stage request without the model's voice/persona prefill.
-        await self._handle_forward_failure(req_state.request_id, stage_id, req_state, RuntimeError(error))
+        return await self._handle_forward_failure(req_state.request_id, stage_id, req_state, RuntimeError(error))
 
     async def _handle_forward_failure(
         self,
@@ -571,6 +570,50 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             kwargs["replica_id"] = replica_id
         return await super()._build_next_stage_request(req_id, next_stage_id, next_input, params, **kwargs)
 
+    def _process_stage_inputs_in_worker(
+        self, stage_id: int, *, validate_input_tokens: Callable[[int], None] | None = None, **kwargs: Any
+    ) -> EngineCoreRequest:
+        """Own duplex renderer adaptation inside the shared, joined worker.
+
+        Render once before backend length admission, preserving exact recoverable
+        capacity errors and reusing the engine input's multimodal features.
+        """
+        if validate_input_tokens is None:
+            return super()._process_stage_inputs_in_worker(stage_id, **kwargs)
+        processor = self._get_stage_input_processor(stage_id)
+        prompt = kwargs["prompt"]
+        if isinstance(prompt, dict) and "type" in prompt:
+            engine_input = prompt
+        else:
+            parsed = parse_model_prompt(processor.model_config, prompt)
+            params = processor.renderer.default_cmpl_tok_params.with_kwargs(**(kwargs.get("tokenization_kwargs") or {}))
+            # The renderer's early length check would hide our
+            # recoverable error (and can truncate counting at cap+1).
+            # Change only this request; the callback checks the full
+            # expanded count before normal backend validation.
+            params = replace(params, max_total_tokens=None)
+            (engine_input,) = processor.renderer.render_cmpl([parsed], params)
+        _, decoder = split_enc_dec_input(engine_input)
+        validate_input_tokens(
+            length_from_prompt_token_ids_or_embeds(decoder.get("prompt_token_ids"), decoder.get("prompt_embeds"))
+        )
+        return processor.process_inputs(**{**kwargs, "prompt": engine_input})
+
+    @staticmethod
+    def _input_capacity_validator(capacity: DuplexInputCapacity) -> Callable[[int], None]:
+        """Enforce model-supplied limits on already expanded engine input."""
+
+        def validate(input_tokens: int) -> None:
+            if input_tokens + capacity.reserved_output_tokens > capacity.max_context_tokens:
+                raise DuplexInputCapacityError(
+                    f"History context needs {input_tokens} input tokens and "
+                    f"{capacity.reserved_output_tokens} reserved output tokens; "
+                    f"the context limit is {capacity.max_context_tokens}. "
+                    "Delete source items or select an explicit history policy."
+                )
+
+        return validate
+
     async def submit(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult:
         context = submission.context
         input_guard = nullcontext() if submission.resumable else self._stage_input_submission(context.stage_id)
@@ -591,6 +634,10 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                     model_config=self.stage_pools[context.stage_id].stage_vllm_config.model_config,
                     resumable=True,
                 )
+                if submission.input_capacity is not None:
+                    self._input_capacity_validator(submission.input_capacity)(
+                        length_from_prompt_token_ids_or_embeds(request.prompt_token_ids, request.prompt_embeds)
+                    )
             else:
                 # Keep raw Stage0 prompt (additional_information / multi_modal_data) for
                 # stage input processors via process_engine_inputs. Resumable requests
@@ -599,12 +646,18 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 request_state.prompt = dict(submission.prompt)
                 # Use the ordinary multimodal input processor for turn-model plugins.
                 # Its CPU preprocessing runs off the session/orchestrator event loop.
+                validation = (
+                    {}
+                    if submission.input_capacity is None
+                    else {"validate_input_tokens": self._input_capacity_validator(submission.input_capacity)}
+                )
                 request = await self._build_next_stage_request(
                     context.request_id,
                     context.stage_id,
                     dict(submission.prompt),
                     context.stage_sampling_params,
                     resumable=False,
+                    **validation,
                 )
                 if self.request_states.get(context.request_id) is not request_state:
                     raise RuntimeError("duplex request cancelled during input preprocessing")

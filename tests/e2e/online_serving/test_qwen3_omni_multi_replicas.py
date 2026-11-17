@@ -11,8 +11,15 @@ import pytest
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
-from tests.helpers.runtime import OmniResponse, OmniServerParams, dummy_messages_from_mix_data
+from tests.helpers.runtime import (
+    QWEN3_OMNI_COLD_INIT_TIMEOUT_S,
+    QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S,
+    OmniResponse,
+    OmniServerParams,
+    dummy_messages_from_mix_data,
+)
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.platforms import current_omni_platform
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
@@ -26,6 +33,8 @@ test_params = [
         model=MODEL,
         stage_config_path=MULTI_REPLICA_DEPLOY,
         server_args=["--disable-log-stats"],
+        stage_init_timeout=(QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S if current_omni_platform.is_rocm() else None),
+        init_timeout=QWEN3_OMNI_COLD_INIT_TIMEOUT_S if current_omni_platform.is_rocm() else None,
     )
 ]
 

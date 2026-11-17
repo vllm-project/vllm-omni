@@ -89,7 +89,7 @@ def _assert_valid_audio(audio: torch.Tensor, sr: int) -> None:
     assert torch.any(audio != 0).item()
 
 
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 def test_basic_english(omni_runner: OmniRunner) -> None:
     """English TTS: text + ref_audio, no emotion conditioning."""
     req = _build_request("Hello, this is a voice synthesis test.", REF_AUDIO)

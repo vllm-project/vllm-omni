@@ -101,6 +101,7 @@ def collect(omni, request_prompts) -> dict[str, dict]:
         entry = by_request.setdefault(out.request_id, {})
         if out.final_output_type == "text":
             entry["text"] = out.outputs[0].text
+            entry["token_ids"] = list(out.outputs[0].token_ids)
             if getattr(out, "prompt", None):
                 prompt_of[out.request_id] = out.prompt
         elif out.final_output_type == "audio":
