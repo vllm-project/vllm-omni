@@ -589,7 +589,7 @@ class OrchestratorBase:
             self._membership.install_membership_handlers(
                 output_queue=self.output_async_queue,
                 cleanup_callback=cleanup_member_requests,
-                replica_removed_callback=self._remove_stage_replica_metrics,
+                replica_removed_callback=self._handle_replica_removed,
                 replica_added_callback=self._publish_replica_post_warmup_memory,
             )
             membership_watcher = self._membership.start()
@@ -1755,6 +1755,19 @@ class OrchestratorBase:
         engine_idx = self._stage_replica_to_engine_idx.get((stage_id, replica_id))
         if self._stat_logger is not None and engine_idx is not None:
             self._stat_logger.remove_stage_post_warmup_memory(engine_idx=engine_idx)
+
+    async def _handle_replica_removed(self, stage_id: int, replica_id: int) -> None:
+        """Membership detach: drop stats, then let the stage owner react.
+
+        The owner seam runs before ``MembershipController`` cleans up the requests
+        the removed address was routing, so a session-based owner can close its
+        sessions with a typed error instead of letting them time out.
+        """
+        self._remove_stage_replica_metrics(stage_id, replica_id)
+        await self._on_replica_removed(stage_id, replica_id)
+
+    async def _on_replica_removed(self, stage_id: int, replica_id: int) -> None:
+        """Seam for stage owners after a replica detaches; the base does nothing."""
 
     def _sync_engines_waiting_counter(self) -> None:
         """Aggregate per-replica waiting into the counter shared with the

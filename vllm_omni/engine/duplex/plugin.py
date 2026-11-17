@@ -1125,14 +1125,13 @@ def validate_duplex_plugin_sampling(plugin: DuplexModelPlugin, *, sampling_defau
 def validate_duplex_replica_policy(
     plugin: DuplexModelPlugin,
     runtime_config: DuplexSessionRuntimeConfig,
-    *,
-    distributed: bool,
 ) -> None:
-    """Validate replica policy before workers start and against the actual stage pools."""
+    """Validate plugin sharing capability before workers start.
+
+    DuplexReplicaPlacement validates group topology against the actual pools.
+    """
     if runtime_config.replica_policy == "legacy":
         return
-    if distributed:
-        raise ValueError("duplex_session.replica_policy=least_sessions does not support distributed hub/LB mode")
     cap = runtime_config.max_sessions_per_replica
     assert cap is not None
     # This capability depends on the requested capacity for some plugins; the

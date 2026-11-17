@@ -44,7 +44,6 @@ from vllm_omni.engine.duplex.plugin import (
     DuplexInputCapacityError,
     DuplexModelPlugin,
     PartialStageForward,
-    validate_duplex_replica_policy,
 )
 from vllm_omni.engine.duplex.replica_placement import DuplexReplicaPlacement
 from vllm_omni.engine.duplex.session.engine_session import DuplexFenceMismatchError
@@ -112,14 +111,11 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         self.replica_placement: DuplexReplicaPlacement | None = None
         admission_limit = None
         if duplex_session_config.replica_policy == "least_sessions":
-            if self._membership is not None or any(
-                pool.is_distributed or pool._lb is not None for pool in self.stage_pools
-            ):
-                validate_duplex_replica_policy(plugin, duplex_session_config, distributed=True)
+            stage_replica_counts = [pool.num_replicas for pool in self.stage_pools]
             cap = duplex_session_config.max_sessions_per_replica
             assert cap is not None
             self.replica_placement = DuplexReplicaPlacement(
-                stage_replica_counts=[pool.num_replicas for pool in self.stage_pools],
+                stage_replica_counts=stage_replica_counts,
                 max_sessions_per_replica=cap,
                 replica_groups=duplex_session_config.replica_groups,
                 frontend_count=frontend_count,
@@ -177,6 +173,22 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             raise StageUnavailableError(f"stage {stage_id}: pinned duplex replica {replica_id} is unavailable")
         return replica_id
 
+    async def _retire_replica(self, stage_id: int, replica_id: int, reason: str) -> None:
+        """Mark a replica unavailable, stop dispatch to it, and fail its sessions.
+
+        Shared by the in-process engine-death path and the membership-detach path so
+        both reach the same placement/eviction/session-failure sequence.
+        """
+        if self.replica_placement is None:
+            return
+        affected = self.replica_placement.mark_unavailable(stage_id, replica_id)
+        pool = self.stage_pools[stage_id]
+        if 0 <= replica_id < pool.num_replicas and pool.clients[replica_id] is not None:
+            # Prevent dispatch before any cleanup await. Preserve request bindings
+            # so the generic failure path can still attribute ordinary requests.
+            pool.evict_replica(replica_id)
+        await self.session_manager.fail_sessions(affected, reason=reason)
+
     async def _handle_dead_replica(
         self,
         stage_id: int,
@@ -185,15 +197,20 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         *,
         failed_request_id: str | None = None,
     ) -> None:
-        if self.replica_placement is not None:
-            affected = self.replica_placement.mark_unavailable(stage_id, replica_id)
-            # Prevent dispatch before any cleanup await. Preserve request bindings
-            # so the generic failure path can still attribute ordinary requests.
-            self.stage_pools[stage_id].evict_replica(replica_id)
-            await self.session_manager.fail_sessions(
-                affected, reason=f"Stage-{stage_id} replica-{replica_id} is unavailable: {error}"
-            )
+        await self._retire_replica(
+            stage_id,
+            replica_id,
+            f"Stage-{stage_id} replica-{replica_id} is unavailable: {error}",
+        )
         await super()._handle_dead_replica(stage_id, replica_id, error, failed_request_id=failed_request_id)
+
+    async def _on_replica_removed(self, stage_id: int, replica_id: int) -> None:
+        """A replica left the pool (hub-reported detach), not necessarily an engine death."""
+        await self._retire_replica(
+            stage_id,
+            replica_id,
+            f"Stage-{stage_id} replica-{replica_id} left the pool",
+        )
 
     def _on_stage_submitted(
         self,
