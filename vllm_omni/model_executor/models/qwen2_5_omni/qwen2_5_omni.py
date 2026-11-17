@@ -1013,7 +1013,9 @@ class Qwen2_5OmniForConditionalGeneration(
             self.token2wav_config.dit_config.mel_dim,
         )
         total_mel = int(codec.shape[1] * factor)
-        steps = 10
+        # ODE grid points from the stage's dit_num_steps override (nested
+        # under token2wav_config in hf_overrides); 10 = released recipe.
+        steps = getattr(self.token2wav, "dit_num_steps", 10)
 
         # Prepare initial noise for the whole sequence
         y_all = torch.randn((1, total_mel, mel_dim), dtype=ref_mel.dtype, device=token2wav_dev)
