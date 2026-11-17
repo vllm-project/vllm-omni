@@ -964,6 +964,21 @@ class QwenImage21SequencePrepare(nn.Module):
         )
 
 
+def _qwen_image21_rope_text_mask(
+    text_mask: torch.Tensor | None, device: torch.device, sp_active: bool
+) -> torch.Tensor | None:
+    if text_mask is None:
+        return None
+    if sp_active or device.type != "cuda":
+        if not bool(text_mask.all()):
+            raise ValueError(
+                "Qwen-Image-2.1 mixed-length text padding requires CUDA without sequence parallelism "
+                "for per-request image RoPE."
+            )
+        return None
+    return text_mask
+
+
 class QwenImage21Transformer2DModel(CachedTransformer):
     r"""
     The single-stream Transformer used by Qwen-Image 2.1, ported to vllm-omni parallel layers.
@@ -1353,11 +1368,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             )
             geometry = self._geometry_for_request(kv_cache, img_mask, signature)
         self.sequence_prepare._request_geometry = geometry
-        per_request_mask = (
-            encoder_hidden_states_mask
-            if hidden_states.device.type == "cuda" and not sp_active and batch_size > 1
-            else None
-        )
+        per_request_mask = _qwen_image21_rope_text_mask(encoder_hidden_states_mask, hidden_states.device, sp_active)
         prefix_hidden_states, target_hidden_states, prefix_freqs, target_freqs = self.sequence_prepare(
             hidden_states,
             txt_hidden_states,
