@@ -86,7 +86,7 @@ _ACTIVE_HWR_REGISTRATIONS_LOCK = threading.Lock()
 # XCCL and NCCL reject E8M0 scales as a collective element type. E8M0 is one
 # byte wide and bit-preserving under a uint8 reinterpretation, so collect the
 # underlying byte storage and view the output back as E8M0.
-_BYTE_VIEW_ALLGATHER_DTYPES = {dtype for dtype in (getattr(torch, "float8_e8m0fnu", None),) if dtype is not None}
+_BYTE_VIEW_ALLGATHER_DTYPES = frozenset({torch.float8_e8m0fnu})
 
 
 def _all_gather_into_tensor(

@@ -486,20 +486,30 @@ class TestDistributedLayerwiseOffloadHook:
         rank1_hook = make_hook(rank1_block, 1)
         rank0_hook.initialize_hook(current_block)
         rank1_hook.initialize_hook(OnlineMxfp8Block())
+        # dp_size > 1 uses the chunk-manifest path.
+        assert rank0_hook.manifest is not None
         rank0_hook.gpu_shard_buffers = [
             {dtype: torch.empty_like(shard) for dtype, shard in rank0_hook.cpu_shards.items()} for _ in range(2)
         ]
 
+        source_dtypes = []
+        original_all_gather = dist_backend_module._all_gather_into_tensor
+
+        def recording_all_gather(output, input_tensor, group):
+            # Record the dtype before the helper applies its uint8 byte view,
+            # so the fake can route to the correct rank-1 shard even when a
+            # block later carries a real uint8 dtype group.
+            source_dtypes.append(input_tensor.dtype)
+            original_all_gather(output, input_tensor, group)
+
+        monkeypatch.setattr(dist_backend_module, "_all_gather_into_tensor", recording_all_gather)
         collective_dtypes = []
 
         def fake_allgather(output, local_shard, *, group):
             del group
             collective_dtypes.append(local_shard.dtype)
             local_bytes = local_shard.view(torch.uint8)
-            if local_shard.dtype == torch.uint8:
-                remote_bytes = rank1_hook.cpu_shards[torch.float8_e8m0fnu].view(torch.uint8)
-            else:
-                remote_bytes = rank1_hook.cpu_shards[local_shard.dtype].view(torch.uint8)
+            remote_bytes = rank1_hook.cpu_shards[source_dtypes.pop(0)].view(torch.uint8)
             shard_size = local_bytes.numel()
             output_bytes = output.view(torch.uint8)
             output_bytes[:shard_size].copy_(local_bytes)
