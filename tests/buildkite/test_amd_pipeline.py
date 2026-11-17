@@ -1007,10 +1007,26 @@ def test_tiny_diffusion_multigpu_nightly_uses_native_rocm_collection(
 
     assert step["agent_pool"] == agent_pool
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == ("Blocking" if agent_pool == "mi300_2" else "NonBlocking")
     assert step["timeout_in_minutes"] == 50
     assert step["artifact_paths"] == [artifacts]
     assert "retry" not in step
+
+    if agent_pool == "mi300_2":
+        assert step["env"]["ROCM_DIFFUSION_RUN_LEVEL"] == "core_model"
+        assert len(step["commands"]) == 1
+        assert split(step["commands"][0]) == [
+            "bash",
+            ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh",
+            "2",
+            str(expected_count),
+            "40m",
+            "rocm-tiny-diffusion-2gpu",
+            TINY_DIFFUSION_PATH,
+            "-m",
+            markers,
+        ]
+        return
 
     commands = step["commands"]
     collect_commands = [command for command in commands if AMD_COLLECTION_GUARD.name in command]
