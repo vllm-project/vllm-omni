@@ -1191,6 +1191,9 @@ with its `continuation_errors` entry; `retry_continuation` retries only that
 follow-up. Continuations reserve awaiting-response state before the send can
 yield, so lifecycle events observed during the write remain authoritative.
 Only results delivered before a follow-up begins are covered by that request.
+An acknowledged hard playback truncate retires the targeted playback gate when
+generation ends, including when the ACK precedes terminal metadata. Late ACKs
+cannot reopen a retired gate; the early-stop marker is removed at response end.
 A successful write is not proof of server acceptance, and the runner never sends
 playback ACKs on behalf of the application.
 

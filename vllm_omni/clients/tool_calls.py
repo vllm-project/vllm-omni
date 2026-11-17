@@ -52,6 +52,7 @@ class DuplexToolRunner:
         self.continuation_errors: dict[str, DuplexClientError] = {}
         self._active_responses: set[str] = set()
         self._playback: dict[str, tuple[float, float]] = {}
+        self._hard_stops: set[str] = set()
         self._ready = asyncio.Event()
         self._ready.set()
         self._continuation_lock = asyncio.Lock()
@@ -86,17 +87,21 @@ class DuplexToolRunner:
             self._active_responses.discard(response_id)
             response = event.raw.get("response", {})
             metadata = response.get("metadata", {}) if isinstance(response, dict) else {}
-            if isinstance(response, dict) and response.get("status") in {"cancelled", "failed"}:
+            if response_id in self._hard_stops or (
+                isinstance(response, dict) and response.get("status") in {"cancelled", "failed"}
+            ):
                 self._playback.pop(response_id, None)
             else:
                 self._note_playback(response_id, metadata)
+            self._hard_stops.discard(response_id)
         elif event.type == "playback.acknowledged":
             details = event.raw.get("event", {})
             item_id = details.get("item_id") if isinstance(details, dict) else None
             rid = details.get("response_id") if isinstance(details, dict) else None
             if not rid and isinstance(item_id, str) and item_id.startswith("item_"):
                 rid = item_id[5:]
-            if isinstance(rid, str):
+            # ACKs cannot recreate playback debt for a retired response.
+            if isinstance(rid, str) and (rid in self._active_responses or rid in self._playback):
                 self._note_playback(rid, details)
         elif event.type == "output_audio_buffer.cleared" and response_id:
             self._playback.pop(response_id, None)
@@ -166,6 +171,13 @@ class DuplexToolRunner:
 
     def _note_playback(self, response_id: str, details: object) -> None:
         if self._client.session_info.get("playback_commit_policy") != "ack_only" or not isinstance(details, dict):
+            return
+        if details.get("truncate") is True:
+            self._playback.pop(response_id, None)
+            if response_id in self._active_responses:
+                self._hard_stops.add(response_id)
+            return
+        if response_id in self._hard_stops:
             return
         playback = details.get("playback")
         if isinstance(playback, dict):

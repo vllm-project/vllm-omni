@@ -1002,6 +1002,9 @@ await `runner.retry_result(call_id)` in an application task while `run()` keeps
 consuming events. The handler is not executed again. Transport success does not
 acknowledge server acceptance. Follow-ups wait for generation and, with
 `ack_only`, playback acknowledgements. Playback ACKs remain the application's job.
+An acknowledged hard truncate (`truncate=true`) releases that response's playback
+gate once generation ends, without requiring another full ACK. Later stale ACKs
+cannot restore its playback debt.
 
 If the result write succeeds but its required `response.create` write fails,
 `runner.pending_continuations` retains the call ID and

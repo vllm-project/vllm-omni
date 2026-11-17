@@ -587,3 +587,64 @@ async def test_settlement_discards_a_failed_continuation(monkeypatch):
             await runner.retry_continuation("call_a")
         assert sent(sock, "response.create") == []
         sock.feed(SESSION_CLOSED)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("truncate_before_done", [False, True])
+async def test_hard_truncate_releases_playback_without_another_ack(truncate_before_done):
+    sock = FakeSocket()
+    created = session_with("client_response_create")
+    created["session"]["playback_commit_policy"] = "ack_only"
+    sock.feed(created)
+    client, _ = make_client(sock)
+
+    async def handler(arguments):
+        return "25C"
+
+    async with client:
+        runner = DuplexToolRunner(client, {"get_weather": handler})
+        runner.handle_event(wrap_event({"type": "response.created", "response": {"id": "resp_1"}}))
+        runner.handle_event(wrap_event(call_event()))
+        await settle()
+        done = wrap_event(
+            {
+                "type": "response.done",
+                "response": {"id": "resp_1", "metadata": {"playback": {"sent_ms": 1000, "committed_ms": 0}}},
+            }
+        )
+        truncated = wrap_event(
+            {
+                "type": "playback.acknowledged",
+                "event": {
+                    "item_id": "item_resp_1",
+                    "truncate": True,
+                    "playback": {"sent_ms": 1000, "committed_ms": 200},
+                },
+            }
+        )
+        runner.handle_event(truncated if truncate_before_done else done)
+        await settle()
+        assert sent(sock, "response.create") == []
+        runner.handle_event(done if truncate_before_done else truncated)
+        await settle()
+        assert len(sent(sock, "response.create")) == 1
+        assert len(sent(sock, "conversation.item.create")) == 1
+        # A stale ACK for the stopped response must not restore its debt while
+        # the next response completes and another tool needs continuation.
+        runner.handle_event(wrap_event({"type": "response.created", "response": {"id": "followup"}}))
+        runner.handle_event(
+            wrap_event(
+                {
+                    "type": "playback.acknowledged",
+                    "event": {
+                        "item_id": "item_resp_1",
+                        "playback": {"sent_ms": 1000, "committed_ms": 200},
+                    },
+                }
+            )
+        )
+        runner.handle_event(wrap_event({"type": "response.done", "response": {"id": "followup"}}))
+        runner.handle_event(wrap_event(call_event("call_b")))
+        await settle()
+        assert len(sent(sock, "response.create")) == 2
+        sock.feed(SESSION_CLOSED)
