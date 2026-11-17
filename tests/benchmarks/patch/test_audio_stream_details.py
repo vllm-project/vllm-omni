@@ -191,24 +191,27 @@ def test_benchmark_exports_audio_details_in_request_order(monkeypatch: pytest.Mo
         assert "audio_stream_details" not in result
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("fails", [False, True])
-def test_cli_scopes_audio_details_to_one_run(monkeypatch: pytest.MonkeyPatch, enabled: bool, fails: bool) -> None:
+async def test_serving_scopes_audio_details_to_one_run(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool, fails: bool
+) -> None:
     async def run(args: Namespace) -> dict[str, bool]:
         assert patch.CAPTURE_AUDIO_STREAM_DETAILS.get() is enabled
         if fails:
             raise RuntimeError("benchmark failed")
         return {"ok": True}
 
-    monkeypatch.setattr(serve, "main_async", run)
+    monkeypatch.setattr(serve, "vllm_main_async", run)
     token = patch.CAPTURE_AUDIO_STREAM_DETAILS.set(not enabled)
     try:
         args = Namespace(backend="openai-audio-speech", save_detailed=enabled)
         if fails:
             with pytest.raises(RuntimeError, match="benchmark failed"):
-                serve.main(args)
+                await serve.main_async(args)
         else:
-            assert serve.main(args) == {"ok": True}
+            assert await serve.main_async(args) == {"ok": True}
         assert patch.CAPTURE_AUDIO_STREAM_DETAILS.get() is not enabled
     finally:
         patch.CAPTURE_AUDIO_STREAM_DETAILS.reset(token)
