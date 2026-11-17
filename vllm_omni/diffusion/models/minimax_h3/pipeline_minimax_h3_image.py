@@ -51,6 +51,7 @@ from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComp
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.offloader import OffloadPlan
 from vllm_omni.diffusion.offloader.config import TEXT_ENCODER_COMPONENT
+from vllm_omni.diffusion.prepared_denoise import prepared_denoise_scope
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError
@@ -701,8 +702,9 @@ class MiniMaxH3ImagePipeline(
         sigmas = minimax_h3_image_run_sigmas(self.pdd_sigmas)
         sigma_values = torch.tensor(sigmas, dtype=torch.float32, device=self.device)
         deltas = sigma_values[:-1] - sigma_values[1:]
-        branch.prepare_rope_table(self.transformer)
-        try:
+        with prepared_denoise_scope() as prepared:
+            prepared.prepare(lambda: branch.build_rope_table(self.transformer))
+            branch.bind_prepared_rope(prepared)
             with self.progress_bar(total=num_steps) as progress_bar:
                 for step in range(num_steps):
                     check_request_cancellation()
@@ -722,8 +724,6 @@ class MiniMaxH3ImagePipeline(
                     velocity, _ = self.transformer(pdd_step=step, **kwargs)
                     _euler_target_step(video_rows, velocity, n_cond, deltas[step])
                     progress_bar.update()
-        finally:
-            branch.release_prepared_inputs()
         return video_rows[n_cond:]
 
     # no_grad, not inference_mode: the runner selects no_grad for layerwise

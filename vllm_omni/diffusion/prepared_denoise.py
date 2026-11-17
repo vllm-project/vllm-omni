@@ -4,7 +4,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Generic, TypeVar, cast
 
@@ -43,3 +44,17 @@ class PreparedDenoiseInputs(Generic[T]):
 
     def release(self) -> None:
         self.invalidate()
+
+
+@contextmanager
+def prepared_denoise_scope() -> Iterator[PreparedDenoiseInputs[object]]:
+    """Own prepared inputs across a request-mode denoise loop.
+
+    Enter after encoding and layout finalization. The same store used by step
+    execution is released on success, cancellation, or any exception.
+    """
+    prepared = PreparedDenoiseInputs[object]()
+    try:
+        yield prepared
+    finally:
+        prepared.release()

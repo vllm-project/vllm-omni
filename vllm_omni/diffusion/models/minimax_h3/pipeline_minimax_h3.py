@@ -4218,10 +4218,7 @@ class MiniMaxH3Pipeline(
             return None
         branch = state.extra[_STEP_BRANCH]
         transformer = state.extra[_STEP_TRANSFORMER]
-        prepare = getattr(transformer, "prepare_rope_table", None)
-        if not callable(prepare):
-            return None
-        return prepare(branch.static_kwargs["img_position_ids"], seq_len=branch.seq_len)
+        return branch.build_rope_table(transformer)
 
     def bind_prepared_denoise_inputs(self, input_batch: InputBatch) -> None:
         """Attach each request's table in current batch order."""

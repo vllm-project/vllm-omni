@@ -35,6 +35,17 @@ def test_prepared_denoise_inputs_publish_only_complete_generations():
         prepared.bind()
 
 
+def test_request_mode_prepared_scope_releases_after_failure():
+    from vllm_omni.diffusion.prepared_denoise import prepared_denoise_scope
+
+    with pytest.raises(ValueError, match="denoise failed"):
+        with prepared_denoise_scope() as prepared:
+            prepared.prepare(object)
+            raise ValueError("denoise failed")
+    with pytest.raises(RuntimeError, match="stale"):
+        prepared.bind()
+
+
 def test_grouped_qkv_checkpoint_reorder():
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         _reorder_grouped_qkv_to_qkv,
