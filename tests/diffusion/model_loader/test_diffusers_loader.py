@@ -2540,3 +2540,25 @@ def test_hsdp_checkpoint_plan_honors_remap_and_rejects_missing(tmp_path, checkpo
     else:
         assert result.plan is None
         assert "no checkpoint binding" in result.fallback_reason
+
+
+@pytest.mark.parametrize("integrated", [True, False])
+def test_safetensors_tensors_are_cloned_only_on_integrated_gpus(tmp_path, monkeypatch, integrated):
+    """Integrated GPUs get a private copy of each tensor instead of a view into the checkpoint mmap."""
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+        quantization_config=None,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    weight = torch.zeros(2)
+    monkeypatch.setattr(loader, "_prepare_weights", lambda *_args, **_kwargs: (tmp_path, ["model.safetensors"], True))
+    monkeypatch.setattr(loader_module, "safetensors_weights_iterator", lambda *_args: iter([("weight", weight)]))
+    monkeypatch.setattr(loader_module, "_device_shares_host_memory", lambda: integrated)
+    source = DiffusersPipelineLoader.ComponentSource(model_or_path=str(tmp_path), subfolder=None, revision=None)
+
+    [(name, loaded)] = list(loader._get_weights_iterator(source))
+
+    assert name == "weight"
+    assert torch.equal(loaded, weight)
+    assert (loaded is not weight) is integrated
