@@ -693,7 +693,6 @@ class MiniMaxH3ImagePipeline(
         tags = packed["token_tags"].clone()
         tags[packed["text_pos"].view(-1)] = text_tags
         branch = MiniMaxH3DenoiseBranch(packed=packed, text_embeddings=hidden, token_tags=tags, device=self.device)
-        branch.prepare_rope_table(self.transformer)
         n_cond = int(anchors.shape[0])
         _require_reference_prefix(packed["update_mask"], n_cond)
         anchors = anchors.to(self.device)
@@ -702,25 +701,29 @@ class MiniMaxH3ImagePipeline(
         sigmas = minimax_h3_image_run_sigmas(self.pdd_sigmas)
         sigma_values = torch.tensor(sigmas, dtype=torch.float32, device=self.device)
         deltas = sigma_values[:-1] - sigma_values[1:]
-        with self.progress_bar(total=num_steps) as progress_bar:
-            for step in range(num_steps):
-                check_request_cancellation()
-                t = 1.0 - sigmas[step]
-                kwargs = branch.forward_kwargs(
-                    video_rows=video_rows,
-                    audio_rows=audio_rows,
-                    t_video=t,
-                    t_audio=t,
-                    imgvid_cond_timestep=MINIMAX_H3_IMGVID_COND_TIMESTEP,
-                    audio_ref_cond_timestep=1.0,
-                )
-                # Only the target rows are read back below, and the update
-                # writes only them, so the anchor rows need neither re-copying
-                # nor a zeroed velocity.
-                kwargs["skip_mask_out_condition"] = True
-                velocity, _ = self.transformer(pdd_step=step, **kwargs)
-                _euler_target_step(video_rows, velocity, n_cond, deltas[step])
-                progress_bar.update()
+        branch.prepare_rope_table(self.transformer)
+        try:
+            with self.progress_bar(total=num_steps) as progress_bar:
+                for step in range(num_steps):
+                    check_request_cancellation()
+                    t = 1.0 - sigmas[step]
+                    kwargs = branch.forward_kwargs(
+                        video_rows=video_rows,
+                        audio_rows=audio_rows,
+                        t_video=t,
+                        t_audio=t,
+                        imgvid_cond_timestep=MINIMAX_H3_IMGVID_COND_TIMESTEP,
+                        audio_ref_cond_timestep=1.0,
+                    )
+                    # Only the target rows are read back below, and the update
+                    # writes only them, so the anchor rows need neither re-copying
+                    # nor a zeroed velocity.
+                    kwargs["skip_mask_out_condition"] = True
+                    velocity, _ = self.transformer(pdd_step=step, **kwargs)
+                    _euler_target_step(video_rows, velocity, n_cond, deltas[step])
+                    progress_bar.update()
+        finally:
+            branch.release_prepared_inputs()
         return video_rows[n_cond:]
 
     # no_grad, not inference_mode: the runner selects no_grad for layerwise

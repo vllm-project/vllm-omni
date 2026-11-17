@@ -8,6 +8,33 @@ import torch.nn as nn
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
+def test_prepared_denoise_inputs_publish_only_complete_generations():
+    from vllm_omni.diffusion.prepared_denoise import PreparedDenoiseInputs
+
+    prepared = PreparedDenoiseInputs[object]()
+    first = object()
+    assert prepared.prepare(lambda: first) is first
+    assert prepared.prepare(lambda: pytest.fail("unchanged generation was rebuilt")) is first
+
+    prepared.invalidate()
+    with pytest.raises(RuntimeError, match="stale"):
+        prepared.bind()
+
+    def fail_prepare() -> object:
+        raise ValueError("preparation failed")
+
+    with pytest.raises(ValueError, match="preparation failed"):
+        prepared.prepare(fail_prepare)
+    with pytest.raises(RuntimeError, match="stale"):
+        prepared.bind()
+
+    second = object()
+    assert prepared.prepare(lambda: second) is second
+    prepared.release()
+    with pytest.raises(RuntimeError, match="stale"):
+        prepared.bind()
+
+
 def test_grouped_qkv_checkpoint_reorder():
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         _reorder_grouped_qkv_to_qkv,
@@ -223,6 +250,8 @@ def test_denoise_branch_prepares_rope_table_once_per_npu_run(monkeypatch: pytest
 
     assert model.prepare_calls == 1
     assert model.forward_calls == 2
+    with pytest.raises(RuntimeError, match="stale"):
+        branch.prepared_rope.bind()
 
 
 def test_denoise_branch_keeps_rope_construction_on_the_reference_path_off_npu(

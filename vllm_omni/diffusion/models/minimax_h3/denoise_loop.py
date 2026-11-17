@@ -23,6 +23,7 @@ from vllm_omni.diffusion.forward_context import (
     set_forward_context_denoise_timestep,
     set_forward_context_denoise_total_steps,
 )
+from vllm_omni.diffusion.prepared_denoise import PreparedDenoiseInputs
 from vllm_omni.diffusion.sampler import SamplingState, sampler_object
 from vllm_omni.platforms import current_omni_platform
 
@@ -129,6 +130,8 @@ class MiniMaxH3DenoiseBranch:
                 "max_seqlen_q": text_len,
             },
         }
+        self.prepared_rope = PreparedDenoiseInputs[torch.Tensor]()
+        self._uses_prepared_rope = False
         # Where the video segment sits in the packed sequence. Resolved to plain
         # ints here so the attention layers never sync on it per step.
         raw_spans = packed.get("video_spans")
@@ -169,17 +172,20 @@ class MiniMaxH3DenoiseBranch:
         """Materialize the branch-local DiT RoPE table once per denoise run.
 
         ``img_position_ids`` is immutable for this branch while latents and
-        timesteps change every scheduler step. Keeping the table in
-        ``static_kwargs`` makes every model call reuse the exact same BF16
-        tensor without extending its lifetime beyond this request branch.
+        timesteps change every scheduler step. The branch owns the prepared
+        result; forward kwargs bind it for each model call.
         """
         prepare = getattr(model, "prepare_rope_table", None)
         if not callable(prepare):
             return
-        self.static_kwargs["rope_table"] = prepare(
-            self.static_kwargs["img_position_ids"],
-            seq_len=self.seq_len,
+        self.prepared_rope.prepare(
+            lambda: prepare(self.static_kwargs["img_position_ids"], seq_len=self.seq_len)
         )
+        self._uses_prepared_rope = True
+
+    def release_prepared_inputs(self) -> None:
+        self.prepared_rope.release()
+        self._uses_prepared_rope = False
 
     def forward_kwargs(
         self,
@@ -210,6 +216,7 @@ class MiniMaxH3DenoiseBranch:
         unique_timesteps, inverse_indices = torch.unique(timesteps, sorted=True, return_inverse=True)
         return {
             **self.static_kwargs,
+            **({"rope_table": self.prepared_rope.bind()} if self._uses_prepared_rope else {}),
             "x": x,
             "audio_x": audio_x,
             "unique_timesteps": unique_timesteps,
@@ -351,8 +358,6 @@ def minimax_h3_denoise_loop(
     # Keep CUDA/CPU on the reference path: its accuracy CI compares the
     # generated video against the official artifact. The table reuse is an
     # Ascend-specific performance optimization and must not alter that path.
-    if current_omni_platform.is_npu():
-        positive.prepare_rope_table(model)
     video_rows, audio_rows = minimax_h3_prepare_denoise_rows(
         positive=positive,
         initial_video_rows=initial_video_rows,
@@ -408,6 +413,8 @@ def minimax_h3_denoise_loop(
         check_request_cancellation()
         return step_profiler(states[0].step_index) if step_profiler is not None else nullcontext()
 
+    if current_omni_platform.is_npu():
+        positive.prepare_rope_table(model)
     try:
         with torch.inference_mode():
             sampler_object(sampler).sample(
@@ -418,6 +425,7 @@ def minimax_h3_denoise_loop(
             )
     finally:
         minimax_h3_publish_denoise_progress(None, None, None)
+        positive.release_prepared_inputs()
         if reference_kv_state is not None:
             positive.static_kwargs.pop("reference_kv_state", None)
             reference_kv_state.close()
