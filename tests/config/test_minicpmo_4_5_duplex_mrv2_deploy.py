@@ -37,7 +37,7 @@ def test_duplex_mrv2_cuda_profile(monkeypatch) -> None:
     assert stages[1].yaml_engine_args["async_scheduling"] is False
     assert stages[2].yaml_engine_args.get("async_scheduling") is not False
     # Retain the base profile capacity and Talker KV budget.
-    assert [s.yaml_engine_args["max_num_seqs"] for s in stages] == [16, 16, 8]
+    assert [s.yaml_engine_args["max_num_seqs"] for s in stages] == [16, 16, 16]
     assert stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 4 * 1024**3
 
 
@@ -78,7 +78,10 @@ def test_reference_optimizations_are_cuda_only(monkeypatch, deploy_name, platfor
             "token2wav_s3_cuda_graph",
             "cfm_drop_upstream_att_buffer",
         ):
-            assert extra.get(flag, False) is (platform == "cuda")
+            # Disabled on every platform pending a root-cause fix for the
+            # seed-tts illegal-memory-access crash (see minicpmo_4_5.yaml).
+            assert extra.get(flag, False) is False
+        assert extra.get("token2wav_spk_cpu_reference", False) is (platform == "cuda")
         # CUDA overrides retain the shared NPU option and chunk geometry.
         assert extra["cfm_npu_cross_reference_batching"] is True
         assert extra["codec_chunk_frames"] == 25

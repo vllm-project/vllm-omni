@@ -1634,7 +1634,7 @@ class TestDeployConfigLoading:
             # K-step books its span with the synchronous runner contract.
             assert stages[1].yaml_engine_args["async_scheduling"] is False
             # CUDA Code2Wav uses two replicas with eight slots each.
-            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [16, 16, 8]
+            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [16, 16, 16]
 
     @pytest.mark.parametrize(
         ("filename", "stage0_devices", "stage1_devices", "stage2_devices", "stage1_replicas"),

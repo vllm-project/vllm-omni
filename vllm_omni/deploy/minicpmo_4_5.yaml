@@ -181,16 +181,16 @@ platforms:
       connector_of_shared_memory:
         extra:
           # Seed-TTS tuning; retain shared connector options on every platform.
-          hift_graph_continuation_frames: [3, 43]
+          # The exact-shape graph / FP16 / drop-buffer toggles from #10331 are
+          # disabled for now: nightly build 20013 (2026-11-17) died with a CUDA
+          # illegal-memory-access in Code2Wav on stage 2 during the seed-tts
+          # accuracy run (186 of 1088 prompts lost), while nightly build 19773
+          # (2026-11-15, before #10331) completed the same run cleanly with
+          # these paths off. hift_graph_continuation_frames also falls back to
+          # the shared [3, 34] default below. Re-enable each toggle separately
+          # once the faulting kernel is identified (CUDA_LAUNCH_BLOCKING=1).
           hift_graph_capture_batch_sizes: [1, 2, 4, 8, 16]
-          token2wav_spk_cpu_reference: false
-          token2wav_spk_cuda_graph: true
-          token2wav_s3_cuda_graph: true
-          ref_setup_batch_size: 4
-          token2wav_float16: true
-          # BatchedToken2Wav owns its caches; omit unused upstream chunk buffers
-          # before device placement, saving about 1.04 GiB per FP16 replica.
-          cfm_drop_upstream_att_buffer: true
+          token2wav_spk_cpu_reference: true
     # Private MPS for colocated CUDA stages. NPU does not read this block.
     # A missing or failing nvidia-cuda-mps-control daemon, parallel stage
     # init, or a stage that is not one numeric GPU disables MPS and continues. Set false
@@ -235,11 +235,6 @@ platforms:
         async_scheduling: false
         default_sampling_params:
           stop_token_ids: [1]
-      - stage_id: 2
-        num_replicas: 2
-        devices: "0,0"
-        gpu_memory_utilization: 0.15
-        max_num_seqs: 8
 
   npu:
     # All three stages use MRv2.
