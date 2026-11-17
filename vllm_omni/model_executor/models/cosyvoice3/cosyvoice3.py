@@ -554,6 +554,7 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
         self.feat_extractor = comps["feat_extractor"]
         self.campplus_session = comps["campplus_session"]
         self.campplus_trt = comps["campplus_trt"]
+        self._s3_checkpoint = comps["s3_checkpoint"]
         self._cached_model_dir = model_dir
         self._speaker_cache = get_speaker_cache()
 
@@ -604,7 +605,9 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
                 providers=_campplus_onnx_providers(),
             )
 
+        s3_checkpoint = os.path.join(model_dir, config.speech_tokenizer_path)
         return {
+            "s3_checkpoint": s3_checkpoint if os.path.isfile(s3_checkpoint) else "speech_tokenizer_v3_25hz",
             "tokenizer": tokenizer,
             "feat_extractor": feat_extractor,
             "campplus_session": campplus_session,
@@ -616,22 +619,19 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
         """Whether to use the TensorRT campplus speaker-embedding path (default on)."""
         return _cosyvoice3_trt_enabled()
 
-    # Class-level cached s3tokenizer model — loaded once per process on first
-    # call to ``_extract_speech_token_via_s3`` and shared across all
-    # processor instances.
-    _s3_model = None
+    # Load each speech tokenizer once per process, using the model snapshot when available.
+    _s3_models: dict[str, tuple] = {}
+    _s3_batchers: dict[str, _SpeechTokenBatcher] = {}
 
     @classmethod
-    def _ensure_s3_model(cls):
-        if cls._s3_model is not None:
-            return cls._s3_model
+    def _ensure_s3_model(cls, checkpoint: str):
         with _REFERENCE_CONDITIONERS_LOCK:
-            if cls._s3_model is None:
-                cls._s3_model = cls._load_s3_model()
-        return cls._s3_model
+            if checkpoint not in cls._s3_models:
+                cls._s3_models[checkpoint] = cls._load_s3_model(checkpoint)
+            return cls._s3_models[checkpoint]
 
-    @classmethod
-    def _load_s3_model(cls):
+    @staticmethod
+    def _load_s3_model(checkpoint: str):
         # s3tokenizer is imported lazily (kept off the module top level) so
         # callers that don't use the CosyVoice3 talker need not install it.
         try:
@@ -642,21 +642,17 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
                 "package; install it with `pip install s3tokenizer`."
             ) from e
 
-        model = _s3.load_model("speech_tokenizer_v3_25hz")
+        model = _s3.load_model(checkpoint)
         device = current_omni_platform.get_torch_device()
         model = model.to(device).eval()
         return (model, _s3, device)
 
-    _s3_batcher: "_SpeechTokenBatcher | None" = None
-
     @classmethod
-    def _ensure_s3_batcher(cls) -> "_SpeechTokenBatcher":
-        if cls._s3_batcher is None:
-            model, s3, device = cls._ensure_s3_model()
-            with _REFERENCE_CONDITIONERS_LOCK:
-                if cls._s3_batcher is None:
-                    cls._s3_batcher = _SpeechTokenBatcher(model, s3, device)
-        return cls._s3_batcher
+    def _ensure_s3_batcher(cls, checkpoint: str, model, s3, device) -> _SpeechTokenBatcher:
+        with _REFERENCE_CONDITIONERS_LOCK:
+            if checkpoint not in cls._s3_batchers:
+                cls._s3_batchers[checkpoint] = _SpeechTokenBatcher(model, s3, device)
+            return cls._s3_batchers[checkpoint]
 
     def _extract_speech_token_via_s3(self, audio, return_device):
         """Drop-in replacement for ``extract_speech_token`` that uses the
@@ -664,7 +660,7 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
         ``(speech_token[1, T], speech_token_len[1])`` int32 tensors as the
         ONNX path so the rest of ``_call_hf_processor`` is unchanged.
         """
-        model, _s3, dev = self._ensure_s3_model()
+        model, _s3, dev = self._ensure_s3_model(self._s3_checkpoint)
 
         # audio is a (waveform_ndarray, sr) tuple; resample to 16 kHz mono float32.
         wav, sr = audio
@@ -678,7 +674,7 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
 
         mel = _s3.log_mel_spectrogram(audio_t)
         if torch.device(dev).type == "cuda":
-            codes = self._ensure_s3_batcher().tokens(mel)
+            codes = self._ensure_s3_batcher(self._s3_checkpoint, model, _s3, dev).tokens(mel)
         else:
             mels_p, mels_lens = _s3.padding([mel])
             with torch.inference_mode():

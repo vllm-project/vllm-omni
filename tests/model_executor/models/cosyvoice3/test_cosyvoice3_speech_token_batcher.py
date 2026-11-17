@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Batched reference speech-token extraction returns each caller its own tokens."""
 
+import sys
 import threading
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -28,6 +30,32 @@ def _s3(calls):
         return codes, lens
 
     return SimpleNamespace(padding=padding), SimpleNamespace(quantize=quantize)
+
+
+@pytest.mark.parametrize("bundled_checkpoint", [True, False])
+def test_speech_tokenizer_uses_model_snapshot_when_available(tmp_path, monkeypatch, bundled_checkpoint):
+    from vllm_omni.model_executor.models.cosyvoice3 import cosyvoice3
+    from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
+
+    config = CosyVoice3Config()
+    checkpoint = tmp_path / config.speech_tokenizer_path
+    if bundled_checkpoint:
+        checkpoint.touch()
+
+    load_model = Mock()
+    monkeypatch.setitem(sys.modules, "s3tokenizer", SimpleNamespace(load_model=load_model))
+    monkeypatch.setattr(cosyvoice3, "get_qwen_tokenizer", Mock())
+    monkeypatch.setattr(cosyvoice3.onnxruntime, "InferenceSession", Mock())
+    monkeypatch.setattr(cosyvoice3.current_omni_platform, "get_torch_device", lambda: "cpu")
+    monkeypatch.setenv("COSYVOICE3_TRT", "0")
+    processor_cls = cosyvoice3.CosyVoice3MultiModalProcessor
+    monkeypatch.setattr(processor_cls, "_s3_models", {})
+    processor = object.__new__(processor_cls)
+    processor._ensure_cached_runtime_components(str(tmp_path), config)
+
+    model = processor._ensure_s3_model(processor._s3_checkpoint)
+    assert processor._ensure_s3_model(processor._s3_checkpoint) is model
+    load_model.assert_called_once_with(str(checkpoint) if bundled_checkpoint else "speech_tokenizer_v3_25hz")
 
 
 def test_speech_token_batcher_returns_each_rows_tokens_under_concurrency():
