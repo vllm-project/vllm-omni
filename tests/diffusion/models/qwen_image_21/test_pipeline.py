@@ -11,11 +11,13 @@ import pytest
 import torch
 from torch import nn
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import (
     QwenImage21Pipeline,
+    _with_quantization_config,
     get_qwen_image_21_post_process_func,
 )
+from vllm_omni.quantization import build_quant_config
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -405,3 +407,34 @@ def test_postprocess_envelope_normalizes_non_dict_metadata(postprocess):
     result = postprocess({"payload": {"image": torch.rand(1, 4, 16, 16)}, "metadata": "bogus"})
 
     assert result["metadata"] == {}
+
+
+def test_encoder_quant_config_survives_a_pre_quantized_transformer():
+    """dataclasses.replace reruns __post_init__, which would put the transformer's FP8 checkpoint config back."""
+    checkpoint = TransformerConfig.from_dict(
+        {"quantization_config": {"quant_method": "fp8", "is_checkpoint_fp8_serialized": True}}
+    )
+    od_config = OmniDiffusionConfig(model="test-model", tf_model_config=checkpoint)
+    encoder_quant_config = build_quant_config("fp8")
+
+    encoder_od_config = _with_quantization_config(od_config, encoder_quant_config)
+
+    assert encoder_od_config.quantization_config is encoder_quant_config
+    assert od_config.quantization_config is checkpoint.quant_config
+
+
+def test_load_weights_skips_the_text_encoder_lm_head():
+    """The pipeline replaces the unused lm_head with Identity, so checkpoint keys for it are dropped."""
+    pipeline = QwenImage21Pipeline.__new__(QwenImage21Pipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.text_encoder = nn.Module()
+    pipeline.text_encoder.proj = nn.Linear(2, 2, bias=False)
+    pipeline.text_encoder.lm_head = nn.Identity()
+    weight = torch.ones(2, 2)
+
+    loaded = pipeline.load_weights(
+        [("text_encoder.proj.weight", weight), ("text_encoder.lm_head.weight", torch.ones(8, 2))]
+    )
+
+    assert "text_encoder.proj.weight" in loaded
+    assert torch.equal(pipeline.text_encoder.proj.weight, weight)
