@@ -87,7 +87,7 @@ def _sweep_count(params: dict) -> int:
     return len(request_rate) + len(concurrency)
 
 
-def test_qwen3_omni_burnin_jobs_are_nonblocking_nightly_only() -> None:
+def test_qwen3_omni_correctness_blocks_while_perf_stays_nonblocking() -> None:
     nightly = _pipeline_steps(NIGHTLY_PIPELINE)
     for label, expected in JOB_SPECS.items():
         step = nightly[label]
@@ -97,7 +97,7 @@ def test_qwen3_omni_burnin_jobs_are_nonblocking_nightly_only() -> None:
         assert step["agent_pool"] == expected["pool"]
         assert step["depends_on"] == "amd-build"
         assert step["mirror_hardwares"] == ["amdproduction"]
-        assert step["grade"] == "NonBlocking"
+        assert step["grade"] == ("Blocking" if expected["config"] is None else "NonBlocking")
         assert step["timeout_in_minutes"] == expected["timeout"]
         assert step["source_file_dependencies"] == expected["source_group"]
         assert step["artifact_paths"] == [artifact]

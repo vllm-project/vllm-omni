@@ -1667,6 +1667,7 @@ def run_headless(args: TrackingNamespace) -> None:
         engine_args_dict=engine_args_dict,
         headless=True,
         watermark_config=args.watermark_config,
+        local_replica_count=omni_dp_size_local,
     )
     parallel_config = vllm_config.parallel_config
 
