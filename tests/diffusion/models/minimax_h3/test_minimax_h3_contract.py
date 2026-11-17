@@ -2393,7 +2393,7 @@ def test_model_offload_uses_hooked_text_encoder_call():
     actual = pipeline._encode_text_hidden(input_ids, vision_kwargs)
 
     assert actual is expected
-    pipeline.text_encoder.assert_called_once_with(input_ids, **vision_kwargs)
+    pipeline.text_encoder.assert_called_once_with(input_ids, **vision_kwargs, return_on_device=True)
     pipeline.text_encoder.load_to_device.assert_not_called()
 
 
