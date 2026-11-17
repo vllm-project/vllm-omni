@@ -1300,7 +1300,14 @@ def test_end_response_omits_serving_time_to_first_output_from_stage_table(
 def test_end_response_omits_engine_core_phase_split_from_stage_table(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    phase_fields = ("vllm_queued_ms", "vllm_prefill_ms", "vllm_decode_ms", "vllm_num_preemptions")
+    phase_fields = (
+        "vllm_queued_ms",
+        "vllm_prefill_ms",
+        "vllm_decode_ms",
+        "vllm_num_preemptions",
+        "vllm_input_wait_ms",
+        "vllm_ready_queued_ms",
+    )
     original = OrchestratorAggregator.build_and_log_summary
     captured: list[tuple[OrchestratorAggregator, dict[str, object]]] = []
 
@@ -1318,6 +1325,8 @@ def test_end_response_omits_engine_core_phase_split_from_stage_table(
         stats.vllm_prefill_ms = 20.0
         stats.vllm_decode_ms = 300.0
         stats.vllm_num_preemptions = 0
+        stats.vllm_input_wait_ms = 1.0
+        stats.vllm_ready_queued_ms = 0.5
         session.observe_stage_request_stats(stage_id, stats)
     session.end_response()
 

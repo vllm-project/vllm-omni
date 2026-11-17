@@ -77,6 +77,13 @@ class StageRequestStats:
     vllm_prefill_ms: float | None = None
     vllm_decode_ms: float | None = None
     vllm_num_preemptions: int | None = None
+    # vllm_queued_ms split at the time the stage's input gate first saw the
+    # request's input ready (async-chunk receivers and full-payload-input
+    # stages after stage 0): queued -> input ready -> scheduled. When both are
+    # set they add up to vllm_queued_ms. None on a stage without an input gate,
+    # or when the input-ready time was not observed.
+    vllm_input_wait_ms: float | None = None
+    vllm_ready_queued_ms: float | None = None
 
     @property
     def rx_mbps(self) -> float:
@@ -153,6 +160,8 @@ DUPLEX_STAGE_TABLE_EXCLUDE = frozenset(
         defs.VLLM_PREFILL_MS,
         defs.VLLM_DECODE_MS,
         defs.VLLM_NUM_PREEMPTIONS,
+        defs.VLLM_INPUT_WAIT_MS,
+        defs.VLLM_READY_QUEUED_MS,
     }
 )
 # StageRequestStats fields of the engine-core phase split.
@@ -161,6 +170,8 @@ _PHASE_SPLIT_FIELDS = (
     defs.VLLM_PREFILL_MS,
     defs.VLLM_DECODE_MS,
     defs.VLLM_NUM_PREEMPTIONS,
+    defs.VLLM_INPUT_WAIT_MS,
+    defs.VLLM_READY_QUEUED_MS,
 )
 TRANSFER_EXCLUDE = {"from_stage", "to_stage", "request_id", "used_shm"}
 E2E_EXCLUDE = {"request_id"}

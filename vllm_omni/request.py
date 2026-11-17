@@ -66,6 +66,12 @@ class OmniRequest(Request):
         self.model_intermediate_buffer: dict | None = model_intermediate_buffer
         # Sender's connector address, or the payload itself for run requests.
         self.payload_sender_info: PayloadSenderInfo | None = payload_sender_info
+        # First step that saw this downstream-stage request's input ready
+        # (OmniSchedulerMixin._stamp_input_ready); cleared once it went out
+        # with the first SCHEDULED event.
+        self.omni_input_ready_ts: float | None = None
+        # Set when the request is stamped, so it is stamped at most once.
+        self.omni_input_ready_stamped: bool = False
 
     @staticmethod
     def _maybe_decode_prompt_embeds(
