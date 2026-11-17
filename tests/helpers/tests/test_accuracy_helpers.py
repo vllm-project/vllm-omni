@@ -15,6 +15,24 @@ from tests.e2e.accuracy import helpers
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.mark.parametrize("ftfy_installed", [False, True])
+def test_wan_i2v_reference_preserves_prompt_punctuation(monkeypatch, ftfy_installed):
+    from tests.e2e.accuracy.wan22_i2v import run_wan22_i2v_diffusers_cp as runner
+
+    monkeypatch.setattr(
+        runner.wan_i2v_module,
+        "ftfy",
+        SimpleNamespace(fix_text=lambda text: text.replace("，", ",")),
+        raising=False,
+    )
+    if not ftfy_installed:
+        monkeypatch.delattr(runner.wan_i2v_module, "ftfy")
+
+    runner._align_wan_prompt_cleaning()
+
+    assert runner.wan_i2v_module.prompt_clean("  色调艳丽，过曝\n静态  ") == "色调艳丽，过曝 静态"
+
+
 @pytest.mark.parametrize(
     ("device_name", "device_architecture", "profile"),
     [
