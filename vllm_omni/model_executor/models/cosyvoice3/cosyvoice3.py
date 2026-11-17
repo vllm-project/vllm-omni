@@ -852,6 +852,17 @@ class CosyVoice3Model(
     _sampling_eps = 1e-5
 
     @property
+    def mrv2_forward_returns_tensor(self) -> bool:
+        """Declare the Talker's base MRv2 output contract.
+
+        The Talker returns hidden states directly. When DSpark requests target
+        layers, upstream MRv2 owns the resulting ``(hidden, aux)`` tuple via
+        ``use_aux_hidden_state_outputs``. Code2Wav returns ``OmniOutput`` and
+        still needs the structured-output capture path.
+        """
+        return self.model_stage == "cosyvoice3_talker"
+
+    @property
     def requires_request_ids(self) -> bool:
         """Key streaming caches by the same IDs used for runner cleanup."""
         return self.model_stage == "cosyvoice3_code2wav"

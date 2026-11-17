@@ -112,6 +112,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     _kstep_frames: int = 0
     _last_aux_output: Any
     _last_multimodal_outputs: dict[str, Any] | None
+    _model_returns_tuple: bool
     _model_has_structured_output: bool
     # FULL-graph aux-output contract (see _configure_cudagraph_output_contract).
     _full_graph_aux_outputs = False
@@ -119,6 +120,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
 
     def _configure_cudagraph_output_contract(self) -> None:
         """Select the CUDA graph output contract declared by the model."""
+        self._model_returns_tuple = bool(getattr(self.model, "_returns_tuple", False))
         self._model_has_structured_output = _needs_capture_tensor_unwrap(self.model)
         # FULL replay returns what capture stored: the hidden states and, for a
         # declared tuple model, its auxiliary pytree flattened to leaves.
@@ -126,6 +128,18 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         self._aux_output_spec = None
         self._exclude_full_graph = (self._model_has_structured_output and not self._full_graph_aux_outputs) or hasattr(
             self.model, "_last_captured_layers"
+        )
+
+    def _aux_hidden_state_contract_conflicts(self) -> bool:
+        """Whether a target-hidden-layer drafter conflicts with the model output.
+
+        ``_returns_tuple`` declares a model-owned auxiliary tuple. The
+        drafter-owned ``(hidden, aux layers)`` tuple is managed separately by
+        upstream MRv2 and must remain available to speculative decoding.
+        """
+        return bool(
+            self.use_aux_hidden_state_outputs
+            and (self._model_returns_tuple or hasattr(self.model, "_last_captured_layers"))
         )
 
     def _split_fullgraph_output(self, replayed: Any) -> tuple[Any, Any]:
@@ -413,9 +427,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         self._last_aux_output = None
         self._last_multimodal_outputs = None
         self._configure_cudagraph_output_contract()
-        if self.use_aux_hidden_state_outputs and (
-            self._model_has_structured_output or hasattr(self.model, "_last_captured_layers")
-        ):
+        if self._aux_hidden_state_contract_conflicts():
             # Both would use the forward's tuple output slot.
             raise NotImplementedError(
                 f"{type(self.model).__name__} returns its own auxiliary output; a drafter that "
@@ -602,7 +614,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         torch.accelerator.synchronize()
         return max(free_before - torch.accelerator.get_memory_info()[0], 0)
 
-    def _dispatch_mtp_batch_descriptor(self, num_mtp_reqs: int) -> Any:
+    def _dispatch_mtp_batch_descriptor(self, num_mtp_reqs: int) -> BatchExecutionDescriptor:
         capture_sizes = self.model_state._get_mtp_capture_sizes()
         captured_bucket = next(
             (size for size in sorted(capture_sizes) if num_mtp_reqs <= size <= self.scheduler_config.max_num_seqs),
@@ -614,11 +626,14 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                 num_tokens=num_mtp_reqs,
                 num_reqs=num_mtp_reqs,
             )
-        return self.cudagraph_manager.dispatch(
-            captured_bucket,
-            captured_bucket,
-            1,
-            0,
+        # MTP owns a FULL graph wrapper and capture buckets independently of
+        # the backbone. Its replay must use the same mode as capture even when
+        # the backbone excludes FULL graphs for structured outputs.
+        return BatchExecutionDescriptor(
+            cg_mode=CUDAGraphMode.FULL,
+            num_tokens=captured_bucket,
+            num_reqs=captured_bucket,
+            uniform_token_count=1,
         )
 
     def _make_dummy_input_batch(
