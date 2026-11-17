@@ -62,6 +62,7 @@ from vllm_omni.entrypoints.openai.serving_speech import (
     OmniOpenAIServingSpeech,
     _audio_duration_seconds,
     _audio_format_headers,
+    _coerce_sample_rate,
     _create_wav_header,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.base import (
@@ -1551,7 +1552,8 @@ class TestTTSMethods:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("failure", [None, "empty", "nan", "rate"])
-    async def test_segmented_request_encodes_all_audio_once(self, speech_server, mocker, failure):
+    @pytest.mark.parametrize("entry_stage_id", [0, 1])
+    async def test_segmented_request_encodes_all_audio_once(self, speech_server, mocker, failure, entry_stage_id):
         from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import IndexTTS25Adapter
 
         server = speech_server
@@ -1559,6 +1561,8 @@ class TestTTSMethods:
         adapter = IndexTTS25Adapter(SpeechServingContext(server=server))
         mocker.patch.object(server, "_get_tts_adapter", return_value=adapter)
         mocker.patch.object(adapter, "validate", return_value=None)
+        mocker.patch.object(adapter, "entry_stage_id", entry_stage_id)
+        mocker.patch.object(adapter, "apply_sampling_overrides", side_effect=lambda params, *_: params)
         mocker.patch.object(
             adapter,
             "build",
@@ -1571,7 +1575,7 @@ class TestTTSMethods:
                 )
             ),
         )
-        server.engine_client.default_sampling_params_list = []
+        server.engine_client.default_sampling_params_list = [SamplingParams(seed=7) for _ in range(3)]
         server.engine_client.abort = mocker.AsyncMock()
         calls = []
 
@@ -1580,6 +1584,10 @@ class TestTTSMethods:
             part = kwargs["prompt"]["part"]
             assert kwargs["prompt"]["cache_salt"] == f"tenant:segment-{part}"
             assert kwargs["watermarking"] is False
+            assert kwargs.get("entry_stage_id", 0) == entry_stage_id
+            assert [p.seed for p in kwargs["sampling_params_list"]] == [
+                42 if stage == entry_stage_id else 7 for stage in range(3)
+            ]
             wave = torch.full((4,), float(part))
             sr = 22050
             if part == 1:
@@ -1591,7 +1599,7 @@ class TestTTSMethods:
                     sr = 24000
             yield OmniRequestOutput(
                 _multimodal_output={"audio": wave, "sr": sr},
-                metrics={"stage_metrics": {"0": {"num_tokens_out": 3}}},
+                metrics={"stage_metrics": {str(entry_stage_id): {"num_tokens_out": 3}}},
             )
 
         server.engine_client.generate = engine_generate
@@ -4118,6 +4126,7 @@ def _build_streaming_speech_app(
     mocker: MockerFixture,
     chunk: torch.Tensor | None = None,
     sample_rate: int | None = None,
+    sparse_first: bool = False,
 ) -> FastAPI:
     """Speech app whose mock engine yields one intermediate then one final chunk.
 
@@ -4129,10 +4138,17 @@ def _build_streaming_speech_app(
     if chunk is None:
         chunk = torch.sin(torch.linspace(0, 440 * 2 * torch.pi, 24000))
 
-    def _make_output(finished: bool) -> OmniRequestOutput:
-        mm_output: dict = {"audio": chunk}
-        if sample_rate is not None:
-            mm_output["sr"] = torch.tensor(sample_rate)
+    def _make_output(
+        finished: bool,
+        *,
+        output_chunk: torch.Tensor = chunk,
+        output_sample_rate: int | torch.Tensor | None = sample_rate,
+    ) -> OmniRequestOutput:
+        mm_output: dict = {"audio": output_chunk}
+        if output_sample_rate is not None:
+            mm_output["sr"] = (
+                output_sample_rate if isinstance(output_sample_rate, torch.Tensor) else torch.tensor(output_sample_rate)
+            )
 
         class MockCompletionOutput:
             def __init__(self, index: int = 0):
@@ -4163,7 +4179,14 @@ def _build_streaming_speech_app(
         )
 
     async def mock_generate_streaming(*args, **kwargs):
-        yield _make_output(finished=False)
+        if sparse_first:
+            yield _make_output(
+                finished=False,
+                output_chunk=torch.empty(0),
+                output_sample_rate=torch.empty(0),
+            )
+        else:
+            yield _make_output(finished=False)
         yield _make_output(finished=True)
 
     mock_engine_client.generate = mocker.MagicMock(side_effect=mock_generate_streaming)
@@ -4232,6 +4255,21 @@ class TestStreamingResponse:
         client = TestClient(streaming_app)
         response = client.post("/v1/audio/speech", json={"input": "Hello", "stream": True, "response_format": "pcm"})
         self._assert_sse_audio_response(response)
+
+    def test_streaming_ignores_empty_sparse_sample_rate_before_audio(self, mocker: MockerFixture):
+        """An empty sparse step must not become the stream's first audio chunk."""
+        app = _build_streaming_speech_app(mocker, sample_rate=22050, sparse_first=True)
+        response = TestClient(app).post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream": True, "response_format": "wav"},
+        )
+
+        self._assert_sse_audio_response(response, response_format="wav")
+        assert "event: speech.audio.error" not in response.text
+
+    def test_sparse_sample_rate_uses_last_nonempty_value(self):
+        """A trailing empty carrier must not hide an earlier request's rate."""
+        assert _coerce_sample_rate([torch.tensor(22050), torch.empty(0)]) == 22050
 
     def test_stream_format_audio_streaming(self, streaming_app):
         """stream_format=audio without stream=True returns raw audio/pcm chunks."""

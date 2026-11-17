@@ -28,6 +28,7 @@ async def generate_speech_segments(
     extract_audio: Callable[[OmniRequestOutput], tuple[dict | None, str | None]],
     arrival_time: float | None = None,
     watermarking: bool | None = None,
+    entry_stage_id: int = 0,
 ) -> AsyncIterator[OmniRequestOutput]:
     """Yield one logical result after every segment has finished successfully.
 
@@ -35,7 +36,9 @@ async def generate_speech_segments(
     parameters (including the seed). Sum per-segment codec usage; intermediate
     cumulative snapshots must not duplicate either audio or token counts.
     The caller encodes the concatenated mono waveform once, in the requested
-    response format. Streaming and timestamp aggregation are not supported.
+    response format. Every segment uses the adapter's entry stage for dispatch,
+    token-limit validation and aggregate usage. Streaming and timestamp
+    aggregation are not supported.
     """
     if not prompts or silence_ms < 0:
         raise ValueError("Segmented speech requires prompts and a nonnegative silence interval")
@@ -47,7 +50,7 @@ async def generate_speech_segments(
         complete = False
         audio_output = None
         audio_key = None
-        counter = SpeechOutputTokenCounter()
+        counter = SpeechOutputTokenCounter(entry_stage_id=entry_stage_id)
         generator = engine_client.generate(
             prompt=prompt,
             request_id=segment_id,
@@ -57,6 +60,7 @@ async def generate_speech_segments(
             output_modalities=["audio"],
             arrival_time=arrival_time,
             watermarking=watermarking,
+            entry_stage_id=entry_stage_id,
         )
         try:
             finished = False
@@ -111,5 +115,5 @@ async def generate_speech_segments(
         final_output_type="audio",
         _multimodal_output={"audio": torch.cat(pieces), "sr": sample_rate},
         # These are aggregate usage counts, not the last segment's timing data.
-        metrics={"stage_metrics": {"0": {"num_tokens_out": output_tokens}}},
+        metrics={"stage_metrics": {str(entry_stage_id): {"num_tokens_out": output_tokens}}},
     )
