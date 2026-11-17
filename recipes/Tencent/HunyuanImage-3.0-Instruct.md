@@ -471,20 +471,19 @@ thresholds are `SSIM >= 0.20` and `PSNR >= 10.0`.
 - The benchmark table is an online HTTP concurrency-16 result; do not compare
   it directly with loaded-once request-level benchmarks.
 
-## Ascend NPU: AR-only PIECEWISE graphs with ModelSlim MXFP8
+## Ascend NPU: AR-only PIECEWISE graphs
 
 This opt-in configuration serves the AR text stage. It does not start DiT or
 produce images. The generic deploy YAML keeps its eager defaults.
 
 ### Checkpoint and graph boundaries
 
-Use a ModelSlim HunyuanImage3 checkpoint with `quant_model_description.json`
-and `W8A8_MXFP8` entries. The AR loader aliases fused `gate_and_up_proj`
-metadata to runtime `gate_up_proj` names, preserves the checkpoint up/gate
-ordering during weight and scale loading, and enables quantized routers when
-using the Ascend quantizer. Other router quantization backends retain their
-previous behavior. QKV scale reshaping preserves the scale tensor's compressed
-input dimension.
+Checkpoint loading must already work in eager mode before enabling graphs.
+This change does not modify quantization metadata, router quantization or QKV
+scale loading. The historical ModelSlim MXFP8 measurements below required
+separate local checkpoint-compatibility patches, which are not included here.
+The MXFP8 command therefore requires those external prerequisites; it is not
+validation of standalone MXFP8 support in this PR.
 
 Hunyuan AR bypasses the fixed-capacity decode attention override. In the
 validated PIECEWISE mode, attention runs outside captured regions while
@@ -533,7 +532,8 @@ Measured on eight Ascend950DT NPUs, TP=8, with the same pre-quantized checkpoint
 in both modes: driver 25.6.1.b023, CANN 9.2.1, PyTorch 2.10.0,
 torch-npu 2.10.0.post7, vLLM 0.33.0, and Transformers 5.19.0. The original
 measurement used vLLM-Omni `a72de0985bdc15c2b4fd9690fc895f0bb46ce2c7` plus the
-ModelSlim/runner adaptations in this change. These results have not been
+runner adaptation plus separate local ModelSlim compatibility patches. Only the
+runner adaptation is included in this change. These results have not been
 remeasured on the current upstream base.
 
 Each case used two sequential warmups and eight measured requests. The custom benchmark client used a fixed Chinese city-description prompt and
@@ -559,5 +559,5 @@ All 16 measured PIECEWISE texts exactly matched the corresponding eager texts,
 and logs confirmed ACL graph replay. This is a small, single-prompt performance
 and text-parity check, not a general accuracy evaluation, BF16-versus-MXFP8
 comparison, or validation of image input, DiT, FULL graphs, or other hardware.
-The table compares configurations with the same weight-loading adaptations;
-it does not attribute speedup to the metadata or router changes individually.
+The table compares configurations with the same external weight-loading
+adaptations; it does not validate this PR alone against that MXFP8 checkpoint.

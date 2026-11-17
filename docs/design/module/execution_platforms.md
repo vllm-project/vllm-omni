@@ -109,5 +109,5 @@ Hunyuan AR selects the standard Ascend attention backend and capture entrypoint
 rather than installing the fixed-capacity decode override. Its opt-in validated
 configuration uses PIECEWISE regions with attention outside the graph; generic
 deploy defaults remain eager. FULL graph capture is not an output-correctness
-guarantee. See the [Hunyuan recipe](../../../recipes/Tencent/HunyuanImage-3.0-Instruct.md#ascend-npu-ar-only-piecewise-graphs-with-modelslim-mxfp8)
+guarantee. See the [Hunyuan recipe](../../../recipes/Tencent/HunyuanImage-3.0-Instruct.md#ascend-npu-ar-only-piecewise-graphs)
 for the checkpoint, capture sizes, workload, and validation limits.

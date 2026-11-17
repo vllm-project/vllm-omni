@@ -116,8 +116,7 @@ class HunyuanModel(HunYuanModel):
         num_attention_heads = self.config.num_attention_heads
         num_kv_heads = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
         num_key_value_groups = num_attention_heads // num_kv_heads
-        # MXFP8 scales retain QKV row layout with a compressed input dimension.
-        hidden_size = qkv.shape[-1]
+        hidden_size = self.config.hidden_size
 
         if hasattr(self.config, "head_dim"):
             attention_head_dim = self.config.head_dim
@@ -1271,14 +1270,12 @@ class HunyuanImage3SparseMoeBlock(HunYuanSparseMoeBlock):
         self.physical_expert_start = self.ep_rank * self.n_local_physical_experts
         self.physical_expert_end = self.physical_expert_start + self.n_local_physical_experts
 
-        # Unquantized routers retain the HF FP32 behavior.
-        # ModelSlim checkpoints may quantize the router as well as the experts.
-        router_quant_config = quant_config if quant_config is not None and quant_config.get_name() == "ascend" else None
+        # FP32 router gate (HF: ``wg = nn.Linear(..., dtype=torch.float32)``).
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
             bias=False,
-            quant_config=router_quant_config,
+            quant_config=None,
             params_dtype=torch.float32,
             prefix=f"{prefix}.gate",
         )
@@ -1325,10 +1322,11 @@ class HunyuanImage3SparseMoeBlock(HunYuanSparseMoeBlock):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # Dynamic MXFP8 quantization consumes the model floating-point dtype.
-        # Unquantized routers keep the HF FP32 input and matmul behavior.
-        router_input = hidden_states if hasattr(self.gate, "weight_scale") else hidden_states.float()
-        router_logits, _ = self.gate(router_input)
+        # FP32 router (HF: `with torch.autocast('cuda', enabled=False): ...`
+        # plus `if self.wg.weight.dtype == torch.float32: hidden_states.float()`).
+        # ``self.gate.weight`` is fp32 (params_dtype=torch.float32), so the
+        # ReplicatedLinear matmul runs in fp32 once we cast the input.
+        router_logits, _ = self.gate(hidden_states.float())
 
         # softmax + topk + clamp-divide renormalization, all in fp32 — matches
         # ``HunyuanTopKGate.easy_topk`` exactly.
@@ -1480,18 +1478,6 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
-
-        # ModelSlim uses fused up,gate checkpoint tensors. Metadata aliases
-        # select the quantizer; load_weights performs the gate/up reordering.
-        if quant_config is not None and quant_config.get_name() == "ascend":
-            description = quant_config.quant_description
-            for key, value in list(description.items()):
-                alias = key.replace(".gate_and_up_proj.", ".gate_up_proj.")
-                alias = alias.replace(".mlp.gate.wg.", ".mlp.gate.")
-                if alias != key:
-                    if alias in description and description[alias] != value:
-                        raise ValueError(f"Conflicting Hunyuan quantization metadata: {alias}")
-                    description[alias] = value
 
         # Use mRoPE to preserve 2D positional encoding for image tokens.
         if isinstance(config.rope_parameters, dict):

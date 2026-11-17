@@ -370,13 +370,11 @@ class HunYuanSparseMoeBlock(nn.Module):
         self.n_redundant_experts = eplb_config.num_redundant_experts
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
         self.n_local_physical_experts = self.n_physical_experts // self.ep_size
-        # ModelSlim checkpoints may quantize the router as well as the experts.
-        router_quant_config = quant_config if quant_config is not None and quant_config.get_name() == "ascend" else None
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
             bias=False,
-            quant_config=router_quant_config,
+            quant_config=None,
             prefix=f"{prefix}.gate",
         )
         if config.use_mixed_mlp_moe > 0:
