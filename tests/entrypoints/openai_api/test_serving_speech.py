@@ -61,7 +61,6 @@ from vllm_omni.entrypoints.openai.serving_speech import (
     OmniOpenAIServingSpeech,
     _audio_duration_seconds,
     _audio_format_headers,
-    _coerce_sample_rate,
     _create_wav_header,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.base import (
@@ -99,6 +98,7 @@ from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
 )
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
+from vllm_omni.sample_rate import coerce_sample_rate
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -267,7 +267,9 @@ def create_mock_audio_output_for_test(
         def __init__(self, request_id: str, audio_tensor: torch.Tensor):
             self.request_id = request_id
             self.outputs = [MockCompletionOutput(index=0)]
-            self.multimodal_output = {"audio": audio_tensor}
+            # The mock model declares its rate (24 kHz for the 24000-sample
+            # fixture below), as every audio-emitting model now must.
+            self.multimodal_output = {"audio": audio_tensor, "sr": torch.tensor(24000, dtype=torch.int32)}
             self.finished = True
             self.prompt_token_ids = None
             self.encoder_prompt_token_ids = None
@@ -4120,13 +4122,14 @@ class TestStreamingProtocolValidation:
 def _build_streaming_speech_app(
     mocker: MockerFixture,
     chunk: torch.Tensor | None = None,
-    sample_rate: int | None = None,
+    sample_rate: int = 24000,
     sparse_first: bool = False,
 ) -> FastAPI:
     """Speech app whose mock engine yields one intermediate then one final chunk.
 
-    ``sample_rate`` is reported as the model's ``sr`` when given; omitted, the
-    serving layer's 24 kHz default applies (as for most TTS models).
+    The mock model declares its rate as ``sr`` (24 kHz unless overridden) —
+    audio-emitting models always advertise it, and the serving layer no
+    longer substitutes a default when it is missing.
     """
     mock_engine_client = mocker.MagicMock()
     mock_engine_client.errored = False
@@ -4262,9 +4265,9 @@ class TestStreamingResponse:
         self._assert_sse_audio_response(response, response_format="wav")
         assert "event: speech.audio.error" not in response.text
 
-    def test_sparse_sample_rate_uses_last_nonempty_value(self):
+    def test_sparse_sample_rate_ignores_empty_carriers(self):
         """A trailing empty carrier must not hide an earlier request's rate."""
-        assert _coerce_sample_rate([torch.tensor(22050), torch.empty(0)]) == 22050
+        assert coerce_sample_rate([torch.tensor(22050), torch.empty(0)]) == 22050
 
     def test_stream_format_audio_streaming(self, streaming_app):
         """stream_format=audio without stream=True returns raw audio/pcm chunks."""
@@ -4496,7 +4499,10 @@ class TestSpeechAudioFormatMetadata:
     _STEREO = torch.stack([_MONO.repeat(2) * 0.5, -_MONO.repeat(2) * 0.25])
 
     _CASES = [
-        pytest.param(None, None, 24000, 1, id="default-24k-mono"),
+        # Builder-default chunk; the mock model declares the 24 kHz rate
+        # (models always advertise it — the serving layer no longer
+        # substitutes a default when the payload omits it).
+        pytest.param(None, 24000, 24000, 1, id="default-24k-mono"),
         pytest.param(_MONO, 24000, 24000, 1, id="explicit-24k-mono"),
         pytest.param(_STEREO, 48000, 48000, 2, id="48k-stereo"),
     ]
@@ -4528,8 +4534,9 @@ class TestSpeechAudioFormatMetadata:
         # The body stays the model-native interleaved s16le stream, byte for byte.
         assert response.content == self._expected_pcm(chunk)
 
-    # WAV streaming requires the model to report ``sr`` on its first chunk.
-    @pytest.mark.parametrize(("chunk", "model_sr", "rate", "channels"), _CASES[1:])
+    # Streaming requires the model to report ``sr`` on its first chunk
+    # (every audio-emitting model does).
+    @pytest.mark.parametrize(("chunk", "model_sr", "rate", "channels"), _CASES)
     def test_raw_wav_stream_header_matches_metadata(self, mocker: MockerFixture, chunk, model_sr, rate, channels):
         app = _build_streaming_speech_app(mocker, chunk=chunk, sample_rate=model_sr)
         response = TestClient(app).post(
