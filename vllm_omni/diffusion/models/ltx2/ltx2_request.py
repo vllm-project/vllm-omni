@@ -13,6 +13,7 @@ from typing import Any, Literal
 import torch
 
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.request import resolve_video_num_frames
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from .ltx2_guidance import LTXGuidanceSpec, LTXModalityGuidance
@@ -626,7 +627,11 @@ class LTXRequestMixin:
 
         height = sampling.height or height or self.pipeline_recipe.height
         width = sampling.width or width or self.pipeline_recipe.width
-        num_frames = sampling.num_frames or num_frames or self.pipeline_recipe.num_frames
+        num_frames = resolve_video_num_frames(
+            sampling.num_frames,
+            default_num_frames=num_frames or self.pipeline_recipe.num_frames,
+            is_dummy_run=req.is_dummy_run(),
+        )
         frame_rate = sampling.resolved_frame_rate or frame_rate or self.pipeline_recipe.frame_rate
         num_inference_steps = (
             sampling.num_inference_steps or num_inference_steps or self.pipeline_recipe.num_inference_steps

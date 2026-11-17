@@ -368,10 +368,23 @@ class TestLTXDiffusionDecoder:
             ("2.3", {}, False),
         ],
     )
-    def test_ltx25_diffusion_decoder_is_default_with_conv_vae_opt_in(self, model_version, extras, expected):
-        from vllm_omni.diffusion.models.ltx2.ltx2_components import _ltx2_use_diffusion_decoder
+    def test_ltx25_diffusion_decoder_is_default_with_conv_vae_opt_in(
+        self, model_version, extras, expected, monkeypatch
+    ):
+        from vllm_omni.diffusion.models.ltx2 import ltx2_components
 
-        assert _ltx2_use_diffusion_decoder(SimpleNamespace(extras=extras), model_version) is expected
+        monkeypatch.setattr(ltx2_components.current_omni_platform, "is_cuda", lambda: True)
+        assert ltx2_components._ltx2_use_diffusion_decoder(SimpleNamespace(extras=extras), model_version) is expected
+
+    def test_ltx25_omitted_conv_vae_extra_uses_conv_vae_off_cuda(self, monkeypatch):
+        from vllm_omni.diffusion.models.ltx2 import ltx2_components
+
+        monkeypatch.setattr(ltx2_components.current_omni_platform, "is_cuda", lambda: False)
+        assert ltx2_components._ltx2_use_diffusion_decoder(SimpleNamespace(extras={}), "2.5") is False
+        assert (
+            ltx2_components._ltx2_use_diffusion_decoder(SimpleNamespace(extras={"ltx2_use_conv_vae": False}), "2.5")
+            is True
+        )
 
     def test_conv_vae_opt_in_rejects_non_boolean_model_extra(self):
         from vllm_omni.diffusion.models.ltx2.ltx2_components import _ltx2_use_diffusion_decoder

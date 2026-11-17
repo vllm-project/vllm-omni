@@ -35,6 +35,7 @@ from vllm_omni.diffusion.offloader.config import (
 )
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
 if TYPE_CHECKING:
@@ -87,11 +88,17 @@ _LTX2_DIFFUSION_DECODER_SUBFOLDER = "diffusion_decoder"
 
 
 def _ltx2_use_diffusion_decoder(od_config: Any, model_version: str) -> bool:
-    """Select DiffVAE by default for LTX-2.5, with an explicit ConvVAE opt-in."""
+    """Use DiffVAE for LTX-2.5 on CUDA. ConvVAE elsewhere unless the extra sets it."""
     extras = getattr(od_config, "extras", {}) or {}
     use_conv_vae = extras.get(_LTX2_CONV_VAE_EXTRA, False)
     if not isinstance(use_conv_vae, bool):
         raise TypeError(f"{_LTX2_CONV_VAE_EXTRA} must be a bool, got {type(use_conv_vae)!r}")
+    if model_version == "2.5" and _LTX2_CONV_VAE_EXTRA not in extras and not current_omni_platform.is_cuda():
+        logger.warning(
+            "LTX-2.5 DiffVAE requires CUDA natten; falling back to ConvVAE on %s.",
+            current_omni_platform.device_type,
+        )
+        return False
     return model_version == "2.5" and not use_conv_vae
 
 
