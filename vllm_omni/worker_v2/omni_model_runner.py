@@ -79,7 +79,12 @@ def _runner_assisted_batch_descriptor(
 
 
 def _needs_capture_tensor_unwrap(model: Any) -> bool:
-    return bool(getattr(model, "_returns_tuple", False))
+    if getattr(model, "_returns_tuple", False):
+        return True
+    # Some models build multimodal outputs from the live batch after replay.
+    return bool(getattr(model, "have_multimodal_outputs", False)) and (
+        getattr(model, "mrv2_forward_returns_tensor", False) is not True
+    )
 
 
 def _supports_full_graph_aux_outputs(model: Any) -> bool:
@@ -108,19 +113,33 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     _last_aux_output: Any
     _last_multimodal_outputs: dict[str, Any] | None
     _model_returns_tuple: bool
+    _model_has_structured_output: bool
     # FULL-graph aux-output contract (see _configure_cudagraph_output_contract).
     _full_graph_aux_outputs = False
     _aux_output_spec: Any = None
 
     def _configure_cudagraph_output_contract(self) -> None:
         """Select the CUDA graph output contract declared by the model."""
-        self._model_returns_tuple = _needs_capture_tensor_unwrap(self.model)
+        self._model_returns_tuple = bool(getattr(self.model, "_returns_tuple", False))
+        self._model_has_structured_output = _needs_capture_tensor_unwrap(self.model)
         # FULL replay returns what capture stored: the hidden states and, for a
         # declared tuple model, its auxiliary pytree flattened to leaves.
         self._full_graph_aux_outputs = _supports_full_graph_aux_outputs(self.model)
         self._aux_output_spec = None
-        self._exclude_full_graph = (self._model_returns_tuple and not self._full_graph_aux_outputs) or hasattr(
+        self._exclude_full_graph = (self._model_has_structured_output and not self._full_graph_aux_outputs) or hasattr(
             self.model, "_last_captured_layers"
+        )
+
+    def _aux_hidden_state_contract_conflicts(self) -> bool:
+        """Whether a target-hidden-layer drafter conflicts with the model output.
+
+        ``_returns_tuple`` declares a model-owned auxiliary tuple. The
+        drafter-owned ``(hidden, aux layers)`` tuple is managed separately by
+        upstream MRv2 and must remain available to speculative decoding.
+        """
+        return bool(
+            self.use_aux_hidden_state_outputs
+            and (self._model_returns_tuple or hasattr(self.model, "_last_captured_layers"))
         )
 
     def _split_fullgraph_output(self, replayed: Any) -> tuple[Any, Any]:
@@ -408,9 +427,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         self._last_aux_output = None
         self._last_multimodal_outputs = None
         self._configure_cudagraph_output_contract()
-        if self.use_aux_hidden_state_outputs and (
-            self._model_returns_tuple or hasattr(self.model, "_last_captured_layers")
-        ):
+        if self._aux_hidden_state_contract_conflicts():
             # Both would use the forward's tuple output slot.
             raise NotImplementedError(
                 f"{type(self.model).__name__} returns its own auxiliary output; a drafter that "
@@ -525,23 +542,24 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     def capture_model(self, *, profile_only: bool = False) -> int:
         """Handle CUDA graph capture for Omni models.
 
-        Tuple-returning models use PIECEWISE graphs; FULL replay requires
-        a tensor output.
+        Structured-output models use PIECEWISE graphs; FULL replay requires a
+        tensor output unless the model declares the auxiliary-output contract.
 
         For PIECEWISE capture, the warmup pass runs with
         ``CUDAGraphMode.NONE`` which hits ``torch.empty_like(hidden_states)``
-        in the cudagraph framework.  If the model returns a tuple, that call
-        crashes.  We temporarily wrap the model's forward to extract only the
-        tensor part during capture, then restore the original forward.
+        in the cudagraph framework. If the model returns a tuple or
+        ``OmniOutput``, that call crashes. We temporarily wrap the model's
+        forward to extract only the tensor part during capture, then restore
+        the original forward.
         """
         if self._exclude_full_graph:
             self._exclude_unsupported_full_graphs()
 
-        # Wrap model forward during capture so tuple returns don't crash
-        # torch.empty_like() in the PIECEWISE warmup pass. A model with the
-        # FULL aux-output contract instead hands the graph manager its leaves,
-        # which it keeps in persistent buffers and returns on replay.
-        if self._model_returns_tuple:
+        # Wrap model forward during capture so structured returns don't crash
+        # torch.empty_like() in the PIECEWISE warmup pass. A model with the FULL
+        # aux-output contract instead hands the graph manager its leaves, which
+        # it keeps in persistent buffers and returns on replay.
+        if self._model_has_structured_output:
             original_forward = self.model.forward
             aux_outputs = self._full_graph_aux_outputs
 

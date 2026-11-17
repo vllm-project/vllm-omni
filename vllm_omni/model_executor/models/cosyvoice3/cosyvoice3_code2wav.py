@@ -573,8 +573,9 @@ class CosyVoice3Code2Wav(nn.Module):
 
         Build each prompt/continuation contiguously before right padding. Padding
         the prompt and continuation separately would insert a gap in conditioning.
-        The default keeps exact-length CPU-F0 HiFT. The opt-in profile (GPUs with
-        FA2/FA3) uses packed Flow, batched HiFT, and FP64 GPU F0.
+        The default keeps exact-length per-request HiFT. The opt-in packed
+        profile uses packed Flow and batched HiFT. Both paths use GPU FP32 F0
+        on CUDA by default; COSYVOICE3_F0_ON_CPU=1 selects CPU F0.
         """
         if not items:
             return []
