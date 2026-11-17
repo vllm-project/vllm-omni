@@ -89,7 +89,7 @@ public rendering of its error fields belong to `error_contracts.md`.
 
 ## Current audio decoding compatibility
 
-Omni retains soundfile-first automatic audio decoding when using vLLM 0.33.
+Omni retains soundfile-first automatic audio decoding when using vLLM 0.34.
 Decoder rounding can affect BF16 model inputs and generated responses.
 Missing soundfile dependencies and unsupported formats fall back to upstream
 decoders; explicit backend selections keep upstream behavior. Encoded-size,
@@ -99,8 +99,8 @@ and recognized-format corruption errors propagate. Tests in
 
 ## Temporary video decoding compatibility
 
-With vLLM 0.33.0 and 0.34.0rc3, Omni reuses one OpenCV capture for metadata and frame
-extraction within each synchronous video decode. The upstream decoder still
+With vLLM 0.33.0, 0.34.0rc3 and 0.34.0, Omni reuses one OpenCV capture for
+metadata and frame extraction within each synchronous video decode. The upstream decoder still
 owns frame counting, sampling, recovery, and output metadata. The reuse context
 is reset on completion or error and is isolated between concurrent calls.
 Standalone metadata reads open their own capture.

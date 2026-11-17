@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from vllm.multimodal.video_decoders.base import VideoSourceMetadata, VideoTargetMetadata
     from vllm.multimodal.video_decoders.opencv import OpenCVVideoBackendMixin
 
-_AFFECTED_VLLM_VERSIONS = frozenset({"0.33.0", "0.34.0rc3"})
+_AFFECTED_VLLM_VERSIONS = frozenset({"0.33.0", "0.34.0rc3", "0.34.0"})
 
 
 def apply_opencv_capture_reuse_patch() -> None:

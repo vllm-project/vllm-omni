@@ -656,7 +656,7 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/depl
 ## Qwen3-TTS with Model Runner V2
 
 Qwen3-TTS selects Model Runner V2 by default on CUDA and NPU. With vLLM
-0.34.0rc3, V2 is the only supported model runner; overrides that select V1 on
+0.34.0, V2 is the only supported model runner; overrides that select V1 on
 XPU, ROCm and MUSA are rejected. MRV2 remains experimental for this model.
 On NPU, the V2 Talker uses `FULL_AND_PIECEWISE`; Code2Wav retains
 `PIECEWISE`. These settings do not establish hardware qualification.

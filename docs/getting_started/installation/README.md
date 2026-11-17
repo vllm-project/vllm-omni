@@ -1,11 +1,13 @@
 # Installation
 
 !!! important
-    This source checkout targets vLLM 0.34.0rc3 at `9950ce36a2e1f4307e99bb4972202c1618b4787e`, with CUDA 13.0 and PyTorch 2.14.0. Full CI and ROCm/XPU runtime validation remain pending. CUDA Dockerfiles retain the published 0.33.0 bootstrap image and verify the frozen candidate wheel; ROCm builds the same candidate commit from source on its 0.33.0 bootstrap base. The published Omni 0.32.0 wheel instructions below retain their matching vLLM 0.32.0 dependency.
+    This source checkout targets the official [vLLM 0.34.0 release](https://github.com/vllm-project/vllm/releases/tag/v0.34.0), at commit `62d4bc3c7e33b1b6c906e233e6af2d3506c482ca`. CUDA uses PyTorch 2.14.0 and CUDA 13.0; ROCm and XPU retain their upstream platform runtimes. The CUDA, ROCm and XPU Dockerfiles use published upstream 0.34.0 images. Published Omni wheel instructions below retain the vLLM dependency matching that Omni release.
 
-The CUDA Dockerfiles rebuild LMCache 0.5.6 against Torch 2.14 because the base's
-Torch 2.13 extension fails to import. They retain its CUDA architecture coverage
-and check dependency consistency. Release-container validation remains pending.
+    CI results obtained with vLLM 0.34.0rc3 do not qualify the final 0.34.0 artifacts. Final-release model validation and ROCm/XPU runtime qualification remain pending.
+
+The CUDA Dockerfiles rebuild LMCache 0.5.6 against the selected Torch 2.14
+runtime to preserve the extension's native ABI. They retain its CUDA architecture
+coverage and check dependency consistency. Release-container validation remains pending.
 
 vLLM-Omni supports the following hardware platforms:
 
@@ -18,7 +20,7 @@ vLLM-Omni supports the following hardware platforms:
 
 ## Source development and demo dependencies
 
-For this 0.33 source checkout, the `[dev]` and `[demo]` extras need a temporary
+For this 0.34 source checkout, the `[dev]` and `[demo]` extras need a temporary
 Gradio source backport to satisfy vLLM's Pillow 13 requirement. From the repository
 root, after installing the matching vLLM runtime for your platform. The builder
 requires Git and uv 0.11.8 or newer:

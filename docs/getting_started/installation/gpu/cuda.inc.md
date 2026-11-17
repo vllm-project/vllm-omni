@@ -9,10 +9,10 @@
 # --8<-- [start:set-up-using-python]
 
 vLLM-Omni depends on the matching major/minor release of vLLM. This source
-checkout targets vLLM 0.34.0rc3 at commit
-`9950ce36a2e1f4307e99bb4972202c1618b4787e` on `releases/v0.34.0` (tagged `v0.34.0rc3`).
+checkout targets the official [vLLM 0.34.0 release](https://github.com/vllm-project/vllm/releases/tag/v0.34.0)
+at commit `62d4bc3c7e33b1b6c906e233e6af2d3506c482ca` (tagged `v0.34.0`).
 The combined Python metadata range for this checkout and vLLM is
-`>=3.11,<3.14`. The candidate CUDA wheel uses PyTorch 2.14.0 and CUDA 13.0
+`>=3.11,<3.14`. The release CUDA wheel uses PyTorch 2.14.0 and CUDA 13.0
 (`cu130`); the current validation environment uses Python 3.12.
 The pre-built Omni wheel instructions below install
 the published 0.32.0 release with its matching vLLM dependency.
@@ -54,20 +54,17 @@ uv pip install 'vllm-omni[demo]==0.32.0'
 
 #### Installation of vLLM
 
-If you do not need to modify source code of vLLM, install the candidate
-0.34.0rc3 wheel directly from the frozen commit:
+If you do not need to modify vLLM, install the official 0.34.0 release:
 
 ```bash
-uv pip install --torch-backend=cu130 \
-  "vllm @ https://wheels.vllm.ai/9950ce36a2e1f4307e99bb4972202c1618b4787e/vllm-0.34.0rc3-cp38-abi3-manylinux_2_28_x86_64.whl"
+uv pip install vllm==0.34.0 --torch-backend=cu130
 ```
 
-This command selects the Linux x86_64 CUDA 13.0 wheel and matching PyTorch
-backend. It requires a CUDA 13 compatible driver. For another architecture,
-CUDA variant or an existing incompatible PyTorch installation, build vLLM
-from source instead. The candidate commit-index wheel is available; native model
-and full CI validation remain pending. Install
-Omni from this source checkout.
+The release provides Linux x86_64 and aarch64 CUDA 13.0 wheels with matching
+PyTorch dependencies. A CUDA 13 compatible driver is required. For another
+CUDA variant or an existing incompatible PyTorch installation, follow the
+[vLLM 0.34 CUDA installation instructions](https://github.com/vllm-project/vllm/blob/v0.34.0/docs/getting_started/installation/gpu.cuda.inc.md).
+Install Omni from this source checkout.
 
 #### Installation of vLLM-Omni
 
@@ -133,14 +130,14 @@ If you want to check, modify or debug with source code of vLLM, install the libr
 ```bash
 git clone https://github.com/vllm-project/vllm.git
 cd vllm
-git checkout 9950ce36a2e1f4307e99bb4972202c1618b4787e
+git checkout v0.34.0
 ```
 
 Set up environment variables to get pre-built wheels. If there are internet problems, just download the whl file manually. And set `VLLM_PRECOMPILED_WHEEL_LOCATION` as your local absolute path of whl file.
 
 ```bash
-# CUDA 13.0 candidate wheel for the exact source commit on x86_64
-export VLLM_PRECOMPILED_WHEEL_LOCATION=https://wheels.vllm.ai/9950ce36a2e1f4307e99bb4972202c1618b4787e/vllm-0.34.0rc3-cp38-abi3-manylinux_2_28_x86_64.whl
+# Official CUDA 13.0 release wheel matching the source tag on x86_64
+export VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.34.0/vllm-0.34.0-cp38-abi3-manylinux_2_28_x86_64.whl
 ```
 
 Install vllm with command below (If you have no existing PyTorch).
@@ -202,18 +199,18 @@ docker run --runtime nvidia --gpus 2 \
 
 #### Build docker image
 
-The production Dockerfile bootstraps from the published
-`vllm/vllm-openai:v0.33.0` CUDA 13 image and verifies the frozen
-vLLM 0.34.0rc3 wheel with its matching dependencies:
+The production Dockerfile uses the published
+`vllm/vllm-openai:v0.34.0` CUDA 13 image with the official vLLM 0.34.0 runtime
+and its matching dependencies:
 
 ```bash
 DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.cuda -t vllm-omni-cuda .
 ```
 
-Both CUDA Dockerfiles pin the same bootstrap image by digest and install the
-candidate wheel. The telemetry repair validates that exact base before removing
-its unused incompatible exporter; retained exporters and LMCache remain pinned
-in the normal dependency solve. Full CI validation remains pending:
+Both CUDA Dockerfiles pin the same release image by digest and verify the
+installed vLLM version and source revision. LMCache remains pinned and is rebuilt
+against Torch 2.14; the normal dependency solve checks package consistency.
+The final release images still need model validation:
 
 ```bash
 DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.ci -t vllm-omni-cuda-ci .

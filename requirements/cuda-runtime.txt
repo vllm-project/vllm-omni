@@ -1,4 +1,4 @@
-# Native 9950ce36 CUDA selection for dependencies shared with vLLM-Omni.
+# Native v0.34.0 (62d4bc3c) CUDA selection for dependencies shared with vLLM-Omni.
 # Exact versions: requirements/test/cuda.txt and its kv_connectors_cuda.txt
 # extension. These locks target Python 3.12 / CUDA; common.txt remains portable.
 # Only LMCache's two metadata upper bounds use cuda-telemetry-overrides.txt.

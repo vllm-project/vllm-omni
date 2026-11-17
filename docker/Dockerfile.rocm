@@ -1,6 +1,5 @@
-# Use the published v0.33.0 base, then build the frozen v0.34.0rc3 source
-# below. This combination still requires Omni runtime qualification.
-ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.33.0
+# Use the published v0.34.0 runtime; Omni ROCm qualification is separate.
+ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.34.0@sha256:3cb773d23f063afa86291ef75773cdd486154ddea94c213300f4ed7cc42b7af1
 
 # Keep the dependency-heavy portion independent from the source tree. The
 # registry cache is keyed on these inputs, while the final source copy can be
@@ -8,12 +7,11 @@ ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.33.0
 FROM ${BASE_IMAGE} AS deps
 
 # NOTE: REMINDER to vLLM-Omni rebase maintainer
-# Build from the exact release-branch source until a matching prebuilt ROCm image is available.
-# Set USE_NIGHTLY_BUILD=0 only with a BASE_IMAGE that already contains the
-# target runtime. CUDA CI and the source commit are checked together in
-# tests/buildkite/test_rocm_dockerfile.py.
-ARG USE_NIGHTLY_BUILD=1
-ARG VLLM_VERSION_OR_COMMIT_HASH=9950ce36a2e1f4307e99bb4972202c1618b4787e
+# Set USE_NIGHTLY_BUILD=1 only to rebuild the exact release source instead
+# of using the matching published ROCm runtime. CUDA CI and the source commit
+# are checked together in tests/buildkite/test_rocm_dockerfile.py.
+ARG USE_NIGHTLY_BUILD=0
+ARG VLLM_VERSION_OR_COMMIT_HASH=62d4bc3c7e33b1b6c906e233e6af2d3506c482ca
 ARG ARG_PYTORCH_ROCM_ARCH
 ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
 

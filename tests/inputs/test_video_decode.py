@@ -136,7 +136,7 @@ def test_video_workaround_is_retired_when_upstream_reuses_capture(video_bytes, n
 
 @pytest.mark.parametrize(
     "version",
-    ["0.32.0", "0.33.1", "0.34.0rc0", "0.34.0rc2", "0.34.0rc4", "0.34.0", "0.33.0.post1", "0.33.0.dev1", "dev"],
+    ["0.32.0", "0.33.1", "0.34.0rc0", "0.34.0rc2", "0.34.0rc4", "0.34.1", "0.33.0.post1", "0.33.0.dev1", "dev"],
 )
 def test_video_workaround_leaves_other_versions_untouched(version, native_decoder, monkeypatch):
     _restore_native(monkeypatch, native_decoder)

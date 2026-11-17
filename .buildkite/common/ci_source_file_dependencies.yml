@@ -719,7 +719,6 @@ source_file_dependencies:
     - docker/Dockerfile.ci
     - docker/Dockerfile.ci.dockerignore
     - requirements/cuda.txt
-    - requirements/cuda-bootstrap.txt
     - requirements/cuda-runtime.txt
     - requirements/cuda-telemetry-overrides.txt
     - requirements/cudnn-runtime.txt

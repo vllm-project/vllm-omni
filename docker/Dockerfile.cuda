@@ -1,14 +1,13 @@
-ARG BASE_IMAGE=vllm/vllm-openai:v0.33.0@sha256:d825baf9ce4b1b6bfc5ecc7b79880c7e6748c65a72d697ce3d47607aafa84c6e
+ARG BASE_IMAGE=vllm/vllm-openai:v0.34.0@sha256:20fdb089454afbb324efa4110a2c025ff7b27cc1a086e07aa580b18df8ad1ce1
 FROM ${BASE_IMAGE}
-ARG BASE_IMAGE
 # The base's optional EFA NCCL override conflicts with Torch 2.14 metadata.
 # Use the official wheel's declared NCCL dependency for the Omni runtime.
 ENV UV_OVERRIDE=""
 
-# Verify the candidate runtime using the same frozen wheel as CUDA CI,
-# bootstrapped from the pinned v0.33.0 base image.
-ARG VLLM_PRECOMPILED_WHEEL_COMMIT=9950ce36a2e1f4307e99bb4972202c1618b4787e
-ARG VLLM_VERSION=0.34.0rc3
+# Verify the official release runtime against the same source and package
+# identity as CUDA CI.
+ARG VLLM_PRECOMPILED_WHEEL_COMMIT=62d4bc3c7e33b1b6c906e233e6af2d3506c482ca
+ARG VLLM_VERSION=0.34.0
 ARG COMMON_WORKDIR=/app
 
 WORKDIR ${COMMON_WORKDIR}
@@ -23,18 +22,15 @@ RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
 
 # Step 2: Copy vllm-omni code and install
 COPY . ${COMMON_WORKDIR}/vllm-omni
-# Apply the same guarded old bootstrap and target telemetry contract as CUDA CI.
-RUN python3 vllm-omni/tools/prepare_ci_telemetry.py "${BASE_IMAGE}" && \
-    uv pip uninstall --python "$(python3 -c 'import sys; print(sys.executable)')" opentelemetry-exporter-otlp-common
 RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir \
     -r requirements/cuda-runtime.txt --override requirements/cuda-telemetry-overrides.txt \
     "nvidia-nccl-cu13==2.30.7" \
-    "vllm @ https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT}/vllm-${VLLM_VERSION}-cp38-abi3-manylinux_2_28_$(uname -m).whl" \
+    "vllm==${VLLM_VERSION}" \
     "."
 
-# The published final base still ships an LMCache wheel with the Torch 2.13
-# CUDA ABI. Rebuild the same release against Torch 2.14, retaining every
-# published CUDA architecture.
+# Rebuild LMCache against the selected Torch ABI instead of relying on a
+# precompiled connector wheel with the same Python package version. Retain
+# every published CUDA architecture.
 RUN uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" \
     -r ${COMMON_WORKDIR}/vllm-omni/requirements/cuda-runtime.txt \
     --override ${COMMON_WORKDIR}/vllm-omni/requirements/cuda-telemetry-overrides.txt \

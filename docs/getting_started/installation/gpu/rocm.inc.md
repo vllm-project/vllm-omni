@@ -11,9 +11,9 @@
 For ROCm, vLLM-Omni currently recommends the setup steps through Docker Images.
 
 vLLM-Omni depends on the matching major/minor release of vLLM. This source
-checkout targets vLLM 0.34.0rc3. The Dockerfile retains the frozen source build
-on the published 0.33.0 base image. The published upstream 0.33.0 ROCm
-image and this source-build path still require Omni runtime validation.
+checkout targets the official vLLM 0.34.0 release. The Dockerfile uses the
+published `vllm/vllm-openai-rocm:v0.34.0` base image by default. This runtime
+still requires Omni model validation on ROCm.
 The pre-built Omni wheel instructions below retain the published 0.30.0
 release with its matching vLLM dependency.
 
@@ -53,7 +53,7 @@ uv pip install onnxruntime-rocm
 
 #### Installation of vLLM
 
-Build vLLM from the frozen 0.34.0rc3 source commit using upstream's matching
+Build vLLM from the official 0.34.0 source tag using upstream's matching
 ROCm/PyTorch requirements, or use the Docker source build below. The older
 0.32.0 ROCm wheel does not provide the 0.34 APIs used by this checkout.
 ROCm runtime validation remains pending.
@@ -89,7 +89,7 @@ If you want to check, modify or debug with source code of vLLM, install the libr
 ```bash
 git clone https://github.com/vllm-project/vllm.git
 cd vllm
-git checkout 9950ce36a2e1f4307e99bb4972202c1618b4787e
+git checkout v0.34.0
 python3 -m pip install -r requirements/rocm.txt
 python3 setup.py develop
 ```
@@ -100,11 +100,13 @@ python3 setup.py develop
 
 #### Build docker image
 
-The Dockerfile starts from `vllm/vllm-openai-rocm:v0.33.0` and defaults to
-`USE_NIGHTLY_BUILD=1` with source commit `9950ce36a2e1f4307e99bb4972202c1618b4787e`. Its development dependency
-install builds the hash-pinned temporary Gradio source backport and installs
-the resulting local wheel with the normal resolver. ROCm runtime validation
-remains pending.
+The Dockerfile starts from the published `vllm/vllm-openai-rocm:v0.34.0`
+image, pinned by digest, and defaults to `USE_NIGHTLY_BUILD=0` to retain its
+release runtime. For an optional source rebuild, `USE_NIGHTLY_BUILD=1` selects
+release commit `62d4bc3c7e33b1b6c906e233e6af2d3506c482ca` by default.
+Its development dependency install builds the hash-pinned temporary Gradio
+source backport and installs the resulting local wheel with the normal resolver.
+ROCm model validation remains pending.
 
 ```bash
 DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm .
@@ -115,7 +117,7 @@ To select the upstream ROCm base explicitly, pass `BASE_IMAGE`:
 ```bash
 DOCKER_BUILDKIT=1 docker build \
   -f docker/Dockerfile.rocm \
-  --build-arg BASE_IMAGE=vllm/vllm-openai-rocm:v0.33.0 \
+  --build-arg BASE_IMAGE=vllm/vllm-openai-rocm:v0.34.0 \
   -t vllm-omni-rocm .
 ```
 

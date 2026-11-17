@@ -1,13 +1,8 @@
-# Install the v0.34.0rc3 candidate package from its frozen commit index.
-# Bootstrap dependencies from the last published release image (v0.33.0,
-# digest-pinned below) until the matching v0.34.0 image is published, and
-# verify the selected runtime from its exact frozen wheel below.
-ARG VLLM_PRECOMPILED_WHEEL_COMMIT=9950ce36a2e1f4307e99bb4972202c1618b4787e
-ARG VLLM_VERSION=0.34.0rc3
+# Use the official v0.34.0 release image and verify its package identity.
+ARG VLLM_PRECOMPILED_WHEEL_COMMIT=62d4bc3c7e33b1b6c906e233e6af2d3506c482ca
+ARG VLLM_VERSION=0.34.0
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai
-# The bootstrap digest selects the image bytes independently of the target
-# wheel above. Retain the published v0.33.0 base for this candidate runtime.
-ARG VLLM_BASE_TAG=v0.33.0@sha256:d825baf9ce4b1b6bfc5ecc7b79880c7e6748c65a72d697ce3d47607aafa84c6e
+ARG VLLM_BASE_TAG=v0.34.0@sha256:20fdb089454afbb324efa4110a2c025ff7b27cc1a086e07aa580b18df8ad1ce1
 
 # We use registry-based layer caching for the dependencies,
 # where the tag is determined based on the hash of the contents
@@ -15,8 +10,6 @@ ARG VLLM_BASE_TAG=v0.33.0@sha256:d825baf9ce4b1b6bfc5ecc7b79880c7e6748c65a72d697c
 # everything except the actual project dir, since that should not
 # change much across branches.
 FROM ${VLLM_BASE_IMAGE}:${VLLM_BASE_TAG} AS deps
-ARG VLLM_BASE_IMAGE
-ARG VLLM_BASE_TAG
 # The base overrides Torch's NCCL dependency for its optional EFA build.
 # Resolve the official wheel's declared dependencies for the Omni runtime.
 ENV UV_OVERRIDE=""
@@ -56,18 +49,13 @@ ENV VLLM_OMNI_VERSION_OVERRIDE=0.0.0
 # Do NOT use a non-editable install here — that copies an empty stub into
 # site-packages and breaks ``import vllm_omni.entrypoints``.
 RUN python3 tools/build_gradio_pillow13.py --output-dir /tmp/gradio-pillow13
-# Validate the old base before removing its unused common exporter. Target
-# telemetry pins and the two native LMCache metadata exceptions are separate.
-RUN python3 tools/prepare_ci_telemetry.py "${VLLM_BASE_IMAGE}:${VLLM_BASE_TAG}" && \
-    uv pip uninstall --system opentelemetry-exporter-otlp-common
 RUN uv pip install --system -r requirements/cuda-runtime.txt --override requirements/cuda-telemetry-overrides.txt \
     "nvidia-nccl-cu13==2.30.7" \
     /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl \
-    "vllm @ https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT}/vllm-${VLLM_VERSION}-cp38-abi3-manylinux_2_28_$(uname -m).whl" \
+    "vllm==${VLLM_VERSION}" \
     -e ".[dev]"
-# The final base's LMCache wheel was compiled against Torch 2.13. Its CUDA
-# extension references a c10 symbol removed in Torch 2.14. Follow LMCache's
-# source workflow so the unchanged release is compiled against this runtime.
+# Rebuild LMCache against the selected Torch ABI instead of relying on a
+# precompiled connector wheel with the same Python package version.
 RUN uv pip install --system -r requirements/cuda-runtime.txt --override requirements/cuda-telemetry-overrides.txt \
     ninja "packaging>=24.2" "setuptools>=77.0.3,<81.0.0" \
     "setuptools_scm>=8" "grpcio==1.78.0" "grpcio-tools==1.78.0" wheel
