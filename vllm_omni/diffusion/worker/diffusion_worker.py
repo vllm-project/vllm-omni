@@ -2349,8 +2349,10 @@ class WorkerProc:
         if sharing_registry is not None and not sharing_registry.register(rank):
             return  # Parent sealed the sharing group before this worker started.
 
-        # Arm before initialization; no parent remains to escalate cleanup.
-        set_death_signal(signal.SIGKILL, expected_parent_pid=parent_pid)
+        # Register first, then catch a parent that exited before registration.
+        set_death_signal(signal.SIGKILL)
+        if sys.platform == "linux" and parent_pid is not None and os.getppid() != parent_pid:
+            os.kill(os.getpid(), signal.SIGKILL)
 
         from vllm_omni.plugins import load_omni_general_plugins
 

@@ -351,42 +351,17 @@ def terminate_alive_proc(proc, timeout=5):
             proc.kill()
 
 
-def set_death_signal(sig: int, *, expected_parent_pid: int | None = None) -> None:
-    """Arm Linux parent-death signaling; self-signal if the parent is gone.
-
-    Pass the PID captured before spawn to detect an already-exited parent.
-    Non-Linux is a no-op; registration failures are logged.
-    """
+def set_death_signal(sig: int) -> None:
+    """Best-effort parent-death signal for Linux subprocesses."""
     try:
         import ctypes
         import platform
 
         if platform.system() != "Linux":
             return
-
-        parent = os.getppid() if expected_parent_pid is None else expected_parent_pid
-        if os.getppid() != parent:
-            os.kill(os.getpid(), sig)
-            return
-
-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        rc = libc.prctl(1, sig)  # PR_SET_PDEATHSIG
-        if rc != 0:
-            logger.warning(
-                "prctl(PR_SET_PDEATHSIG, %s) failed: rc=%s errno=%s",
-                sig,
-                rc,
-                ctypes.get_errno(),
-            )
-            if os.getppid() != parent:
-                os.kill(os.getpid(), sig)
-            return
-
-        # Catch parent death during registration.
-        if os.getppid() != parent:
-            os.kill(os.getpid(), sig)
+        ctypes.CDLL("libc.so.6").prctl(1, sig)
     except Exception:
-        logger.exception("Failed to set parent death signal")
+        pass
 
 
 def patch_generation_config_if_needed(model_config: Any) -> None:
