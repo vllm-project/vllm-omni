@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import msgspec
 import pytest
+from huggingface_hub import ResolvedRevision
 from vllm.config import VllmConfig
 from vllm.v1.engine.exceptions import EngineDeadError
 
@@ -152,6 +153,59 @@ def test_resolved_plan_uses_total_memory_ratio_and_checks_physical_free(host, mo
     )
     assert all(b.kv_cache_bytes == 128 for b in resolved.budgets)
     nvml.nvmlShutdown.assert_called_once()
+
+
+def _prepare_hf_plan(host, mocker, dit_revision: str | None = None):
+    provider = host.stages[0].replicas[0]
+    consumer = host.stages[1].replicas[0]
+    for replica in (provider, consumer):
+        replica.stage_cfg.model_config.model = "example/HunyuanImage-3.0-Instruct"
+        replica.stage_cfg.model_config.revision = None
+        replica.stage_cfg.model_config.dtype = "bfloat16"
+        replica.stage_cfg.model_config.moe_backend = "triton"
+    provider.stage_cfg.model_config.hf_config = SimpleNamespace(_commit_hash="a" * 40)
+    consumer.stage_cfg.model_config.revision = dit_revision
+    consumer.stage_cfg.diffusion_config.revision = dit_revision
+    provider.stage_vllm_config.cache_config.kv_cache_memory_bytes = 128
+    consumer.stage_cfg.cache_config.kv_cache_memory_bytes = 64
+    nvml = mocker.Mock()
+    nvml.nvmlDeviceGetMemoryInfo.return_value = SimpleNamespace(free=1024, total=2048)
+    mocker.patch("vllm.utils.import_utils.import_pynvml", return_value=nvml)
+    return provider, consumer, WeightSharingConfig(0, 1, gpu_memory_utilization=0.75)
+
+
+def test_resolved_plan_inherits_unset_dit_revision_from_ar_commit(host, mocker):
+    provider, consumer, config = _prepare_hf_plan(host, mocker)
+    resolved = module.resolve_sharing_plan(host.runtime, config, list(host.stages.values()))
+    assert resolved.model_id == "example/HunyuanImage-3.0-Instruct"
+    assert resolved.checkpoint_revision == "a" * 40
+    assert provider.stage_vllm_config.model_config.revision == "a" * 40
+    assert consumer.stage_cfg.model_config.revision == "a" * 40
+    assert consumer.stage_cfg.diffusion_config.revision == "a" * 40
+
+
+def test_resolved_plan_falls_back_to_ar_resolved_revision(host, mocker):
+    provider, consumer, config = _prepare_hf_plan(host, mocker)
+    provider.stage_cfg.model_config.hf_config = SimpleNamespace(_commit_hash=None)
+    provider.stage_cfg.model_config.revision = ResolvedRevision("a" * 40)
+    resolved = module.resolve_sharing_plan(host.runtime, config, list(host.stages.values()))
+    assert resolved.checkpoint_revision == "a" * 40
+    assert consumer.stage_cfg.diffusion_config.revision == "a" * 40
+
+
+def test_resolved_plan_accepts_equivalent_dit_revision(host, mocker):
+    _, _, config = _prepare_hf_plan(host, mocker, dit_revision="main")
+    requested = mocker.patch.object(module, "resolve_revision", return_value=SimpleNamespace(resolved="a" * 40))
+    resolved = module.resolve_sharing_plan(host.runtime, config, list(host.stages.values()))
+    requested.assert_called_once_with("example/HunyuanImage-3.0-Instruct", "main")
+    assert resolved.checkpoint_revision == "a" * 40
+
+
+def test_resolved_plan_rejects_conflicting_dit_revision(host, mocker):
+    _, _, config = _prepare_hf_plan(host, mocker, dit_revision="refs/pr/1")
+    mocker.patch.object(module, "resolve_revision", return_value=SimpleNamespace(resolved="b" * 40))
+    with pytest.raises(ValueError, match="same model and checkpoint revision"):
+        module.resolve_sharing_plan(host.runtime, config, list(host.stages.values()))
 
 
 def test_diffusion_rpc_unwraps_all_rank_metadata(host, mocker):
