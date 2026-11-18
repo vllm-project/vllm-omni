@@ -128,11 +128,13 @@ Thinker prefix caching is disabled, so the two caches do not cooperate. The
 [design document](../design/feature/mooncake_kv_hs_cache.md) describes the
 request lifecycle and the deferred two-level mode.
 
-The adapter targets vLLM `0.33.0` at source revision
+The original adapter integration used vLLM `0.33.0` at source revision
 `4ba787ec9959e566d3b587a796dff07673324da5` and Mooncake `0.3.12.post1`.
-Its metadata and worker lookup integration must be rechecked before upgrading
-vLLM. CPU regression tests and native host-memory Store tests do not validate
-GPU transfers or the complete serving pipeline.
+This source checkout requires vLLM `0.34.0`; use the matching runtime from the
+[installation guide](../getting_started/installation/README.md). Revalidate the
+metadata and worker lookup integration when upgrading vLLM. CPU regression tests
+and native host-memory Store tests do not validate GPU transfers or the complete
+serving pipeline.
 
 ### Configuration
 
