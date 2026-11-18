@@ -28,6 +28,7 @@ from vllm_omni.diffusion.attention.capabilities import (
     ParallelStrategy,
     SupportStatus,
 )
+from vllm_omni.diffusion.attention.ops import sol_attn as sol_ops
 from vllm_omni.diffusion.data import (
     AttentionConfig,
     AttentionSpec,
@@ -475,7 +476,7 @@ def bsa_kernels(monkeypatch, kernel):
     module = types.ModuleType("sol_attn.triton_ref.preprocess")
     monkeypatch.setattr(module, "prepare", prepare, raising=False)
     monkeypatch.setitem(sys.modules, "sol_attn.triton_ref.preprocess", module)
-    monkeypatch.setattr(sol_module, "resolve_block_sparse_provider", resolve)
+    monkeypatch.setattr(sol_ops, "resolve_block_sparse_provider", resolve)
 
     def exact(query, key, value, indices, counts, sizes, scale):
         blocks = key.shape[1] // 64
@@ -654,7 +655,7 @@ def test_bsa_missing_provider_fails_even_with_dense_guards(monkeypatch):
     def missing(*args):
         raise ImportError("missing BSA provider")
 
-    monkeypatch.setattr(sol_module, "resolve_block_sparse_provider", missing)
+    monkeypatch.setattr(sol_ops, "resolve_block_sparse_provider", missing)
     with pytest.raises(ImportError, match="missing BSA provider"):
         make_impl(provider="cudnn", dense_steps=10)
 
@@ -687,7 +688,7 @@ def test_bsa_threshold_routing_keeps_neighbors_and_both_sink_axes():
     centroids[:, 5, 0, 0] = 1
     threshold = torch.zeros(1, 6, 2)
     sizes = torch.full((6,), 64, dtype=torch.int32)
-    actual = sol_module._sol_bsa_block_map(query, centroids, threshold, sizes, 0.125, 127, 2)
+    actual = sol_ops._sol_bsa_block_map(query, centroids, threshold, sizes, 0.125, 127, 2)
     positions = torch.arange(6)
     expected = ((positions[:, None] - positions[None, :]).abs() <= 1)[None, None].repeat(1, 2, 1, 1)
     expected[:, 0, :, 5] = True
@@ -783,7 +784,7 @@ def test_text_audio_runs_bsa_for_all_fifty_steps(bsa_kernels, monkeypatch, layer
     def unexpected_dense(*args):
         pytest.fail("Explicit all-step/all-layer profile must not invoke a dense guard")
 
-    monkeypatch.setattr(sol_module, "_sol_bsa_attention_op", record_bsa)
+    monkeypatch.setattr(sol_ops, "sol_bsa_attention", record_bsa)
     monkeypatch.setattr(impl.dense_attention, "forward_cuda", unexpected_dense)
     config = OmniDiffusionConfig()
     for step in range(50):

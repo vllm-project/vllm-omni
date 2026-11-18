@@ -33,21 +33,12 @@ last_reviewed: 2026-07-16
 Diffusion model integration owns pipeline contracts, registration, checkpoint
 loading, adapters, shared layers, and model-specific processing.
 
-MiniMax-H3's token refiner declares a model-owned inherited backend policy:
-global or category SOL selections use dense SDPA there, while an exact
-per-role user choice takes precedence. The main DiT retains role `self`.
-Shared attention selection applies this policy to both the baseline and
-startup schedule profiles; the model does not rewrite the global config.
-
-MiniMax-H3 owns the packed text/audio positions used by SOL-BSA's
-`text_audio` protection policy. `MiniMaxH3DenoiseBranch` validates their bounds
-and constructs one block64 `TextAudioBlockMask` per request branch, outside the
-denoising loop. The transformer and attention blocks pass it unchanged to
-`AttentionMetadata`, including its global coordinates under pure Ulysses.
-The mask includes reference and target audio but does not blanket-protect visual
-references. Single-request step execution reuses the same branch metadata;
-multi-request and compact unequal-Q/KV SOL execution remain rejected. Dense and
-other sparse backends ignore this optional metadata.
+MiniMax-H3 keeps its token refiner dense for inherited SOL selections and builds
+one global block64 `TextAudioBlockMask` per request branch from packed text and
+reference/target audio positions. The mask is reused across denoising steps and
+pure Ulysses; visual references are not protected as a whole. See
+[attention backend selection](../../feature/attention_backend_selection.md)
+for selection and metadata contracts.
 
 ## Candidate invariants
 

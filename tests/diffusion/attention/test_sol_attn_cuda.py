@@ -431,7 +431,7 @@ def test_real_sol_h3_simple_selection_and_forward(tmp_path, selection):
 
 @hardware_test(res={"cuda": ["L4", "H100", "B200", "RTX5090"]}, num_cards=1)
 def test_real_sol_wan_transformer_forward(tmp_path, monkeypatch):
-    import vllm_omni.diffusion.attention.backends.sol_attn as sol_module
+    from vllm_omni.diffusion.attention.ops import sol_attn as sol_ops
     from vllm_omni.diffusion.distributed.parallel_state import (
         destroy_distributed_env,
         init_distributed_environment,
@@ -498,13 +498,13 @@ def test_real_sol_wan_transformer_forward(tmp_path, monkeypatch):
         text = torch.randn(1, 16, 32, device="cuda", dtype=torch.bfloat16, generator=generator)
         timestep = torch.tensor([500.0], device="cuda", dtype=torch.bfloat16)
         calls = []
-        original_op = sol_module._sol_attention_op
+        original_op = sol_ops.sol_attention
 
         def record_sparse(*args):
             calls.append(args[0].shape)
             return original_op(*args)
 
-        monkeypatch.setattr(sol_module, "_sol_attention_op", record_sparse)
+        monkeypatch.setattr(sol_ops, "sol_attention", record_sparse)
         outputs = {}
         for backend, model in models.items():
             assert all(block.attn2.attn.attn_backend.get_name() == "SDPA" for block in model.blocks)

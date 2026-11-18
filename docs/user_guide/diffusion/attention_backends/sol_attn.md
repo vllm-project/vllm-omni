@@ -38,35 +38,25 @@ No JSON or model-specific attention settings are required.
 - **Ref2VA:** replace `/FL2VA` with `/Ref2VA` and `--task-type fl2va` with
   `--task-type ref2va`; set request `extra_params.task` to `ref2va`.
 
-Provision sufficient model memory; GPU selection and parallelism are configured
-separately.
-
-Submit requests through the
-[MiniMax-H3 online video API](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md#http-api-examples).
+For memory requirements, parallelism, and HTTP requests, see the
+[MiniMax-H3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md).
 
 ## Advanced settings
 
-Only use `--diffusion-attention-config` when overriding defaults. Like
-[TRTLLM attention](trtllm.md#quick-start), it accepts JSON or
-[dotted flags](../attention_backends.md#configuration). For example, replace
-the quick-start backend flag with:
+To override defaults, replace the quick-start backend flag with:
 
 ```bash
 --diffusion-attention-config '{"default":{"backend":"SOL_ATTN","sol_attn":{"thresh_type":"exact","tau":1.5}}}'
 ```
-
-The usual tuning options are:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `tau` | `1.0` | Controls sparsity. Higher values generally compute fewer blocks exactly; check output quality. |
 | `thresh_type` | `diag` | Threshold estimator: `diag` or `exact`. Neither changes precision or makes attention dense. |
 
-Leave these at their defaults unless comparing output quality and latency.
-More aggressive sparsity does not guarantee a faster end-to-end request.
-
 ## Validation limits
 
 Full-model video/audio quality, HTTP serving, and speedup for the default
-profile remain unvalidated. Compare against a matching dense baseline before
-deployment. Full-model compilation and HSDP compatibility are not guaranteed.
+profile remain unvalidated. More sparsity does not guarantee a faster request;
+compare against a matching dense baseline before deployment. Full-model
+compilation and HSDP compatibility are not guaranteed.

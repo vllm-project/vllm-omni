@@ -78,11 +78,9 @@ Roles are declared by each diffusion model. Common categories are `self` and
 3. `default`.
 4. Platform default.
 
-Models may declare policies for inherited category/global selections. For
-example, H3 keeps its text refiner dense when SOL is selected globally, without
-requiring user-supplied role names. An exact `per_role` entry overrides that
-model policy; the startup log reports the effective selection. Backend options
-are replaced as a complete spec rather than merged across different backends.
+Model policies may replace inherited category/global selections, including
+their backend options. Exact `per_role` settings take precedence; startup logs
+report the effective backend.
 
 ```bash
 # Dotted flags

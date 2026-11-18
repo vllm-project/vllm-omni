@@ -363,14 +363,10 @@ steady-state latency. H3 is CFG-distilled, so `--cfg-parallel-size` must remain
 
 ### Attention Backends
 
-`SOL_ATTN` is an optional, training-free BF16 sparse attention backend.
-Selecting it defaults to cuDNN SOL-BSA with block64 text/audio protection and
-no dense step/layer guards; the cuDNN provider requires SM90 or newer.
-For installation and the T2VA, FL2VA, and Ref2VA serve command, see
-[online serving](../../docs/user_guide/diffusion/attention_backends/sol_attn.md#quick-start).
-Use `--diffusion-attention-backend SOL_ATTN`; H3 automatically keeps the token
-refiner dense, without per-role JSON. This opt-in does not
-change the platform default below and still needs full-model quality and latency validation.
+For optional training-free sparse attention, use
+`--diffusion-attention-backend SOL_ATTN`. The default cuDNN provider requires
+SM90+. See the [SOL guide](../../docs/user_guide/diffusion/attention_backends/sol_attn.md)
+for installation, online serving, tuning, and validation limits.
 
 On supported datacenter Blackwell systems, MiniMax H3 defaults to dense BF16
 `TRTLLM_ATTN`; no attention backend flag is required. To select it explicitly,

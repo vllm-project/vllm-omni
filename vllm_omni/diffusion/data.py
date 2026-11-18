@@ -2387,24 +2387,12 @@ class BlockSparseSpec:
 
 @dataclass
 class SolAttnSpec:
-    """User-facing controls for the Sol-Attn sparse attention backend.
+    """SOL routing and execution settings; no VSA-trained weights are required.
 
-    ``tau`` scales the routing threshold (higher selects fewer exact KV
-    blocks). ``thresh_type`` selects a diagonal-covariance (``diag``) or
-    full-covariance (``exact``) threshold estimator, not attention precision.
-    ``prefix_sink`` derives a protected prefix from model-owned
-    video layout; ``sink_tokens``/``sink_start`` add an explicit range. Sink
-    rows are exact as K/V and queries; the native provider recomputes those
-    queries densely, while BSA protects complete sink tiles. ``dense_steps``
-    keeps the first N denoise steps dense, ``dense_layers`` exempts individual
-    DiT blocks, and ``kv_splits`` sets the number of KV splits used by the kernel.
-    ``provider`` defaults to cuDNN BF16 block-sparse execution with SOL
-    routing and a normalization-weighted centroid residual, not VSA gates.
-    The default ``sink_mode=text_audio`` requires producer-owned block64
-    metadata; it overrides ``prefix_sink`` and cannot add an explicit sink
-    range. All steps/layers use SOL unless dense guards are explicitly set.
-    Native fused SOL remains available with ``provider=native`` and
-    ``sink_mode=prefix``; ``provider=triton`` selects the other BSA provider.
+    ``tau`` controls sparsity; ``thresh_type`` selects the threshold estimator,
+    not attention precision. The default cuDNN path protects text/audio tiles
+    on both Q and KV axes using model-owned metadata. Native fused execution
+    requires ``sink_mode=prefix`` instead. Dense guards are opt-in.
     """
 
     tau: float = 1.0
