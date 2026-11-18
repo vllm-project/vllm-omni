@@ -97,9 +97,8 @@ def validate_voice_clone_request(info: Mapping[str, Any]) -> None:
             fix = _TRANSPORTABLE_FORMS.get(key, "a top-level tensor or plain Python lists")
             raise ValueError(_NOT_TRANSPORTABLE.format(field="additional_information", key=key, fix=fix))
     ref_audio = info.get("ref_audio")
-    has_ref_audio = isinstance(ref_audio, list) and bool(ref_audio) and ref_audio[0] is not None
-    if has_ref_audio and isinstance(ref_audio[0], str):
-        has_ref_audio = _is_text(ref_audio[0])
+    first_ref = ref_audio[0] if isinstance(ref_audio, list) and ref_audio else None
+    has_ref_audio = _is_text(first_ref) if isinstance(first_ref, str) else first_ref is not None
     prompt = Qwen3TTSPromptEmbedsBuilder._voice_clone_prompt_dict(info.get("voice_clone_prompt"))
     speaker = info.get("speaker")
     if not has_ref_audio and prompt is None and isinstance(speaker, list) and speaker and _is_text(speaker[0]):
@@ -118,15 +117,10 @@ def validate_voice_clone_request(info: Mapping[str, Any]) -> None:
     if not (has_ref_audio or has_cached_ref or (has_spk and (xvec or has_ref_code))):
         raise ValueError(_MISSING_REFERENCE)
 
-    if xvec:
-        return
-    if any(_is_token_ids(v) for v in (info.get(PRECOMPUTED_REF_IDS_KEY), info.get("ref_ids"))):
-        return
-    if any(_is_token_ids(prompt.get(k)) for k in ("ref_ids", "ref_id")):
-        return
-    if _is_text(first_value(info.get("ref_text"))) or _is_text(first_value(prompt.get("ref_text"))):
-        return
-    raise ValueError(_MISSING_TRANSCRIPT)
+    ids = (info.get(PRECOMPUTED_REF_IDS_KEY), info.get("ref_ids"), prompt.get("ref_ids"), prompt.get("ref_id"))
+    texts = (info.get("ref_text"), prompt.get("ref_text"))
+    if not (xvec or any(map(_is_token_ids, ids)) or any(_is_text(first_value(t)) for t in texts)):
+        raise ValueError(_MISSING_TRANSCRIPT)
 
 
 def _overlay(base: Mapping[str, Any], top: Mapping[str, Any]) -> dict[str, Any]:
@@ -164,14 +158,37 @@ def check_voice_clone_prompt(prompt: Any, sampling_params_list: Sequence[Any]) -
     return prompt
 
 
+# A valid Base first chunk for each reference form that a plain update's buffer may be laid over.
+_SPK = {"voice_clone_prompt": [{"ref_spk_embedding": [0.0]}]}
+_FIRST_CHUNKS = tuple(
+    {"task_type": ["Base"], **reference}
+    for reference in (
+        {"ref_audio": ["ref.wav"], "ref_text": ["ref"]},
+        {"ref_audio": ["ref.wav"], "x_vector_only_mode": [True]},
+        {"ref_audio": ["ref.wav"], "ref_ids": [list(range(8))]},
+        {"ref_audio": ["ref.wav"], PRECOMPUTED_REF_IDS_KEY: [list(range(8))]},
+        {**_SPK, "x_vector_only_mode": [True]},
+        {**_SPK, "codes": {PRECOMPUTED_REF_CODE_KEY: [[[0] * 16]]}, "ref_text": ["ref"]},
+        {REF_AUDIO_CACHE_KEY: ["ref"], "ref_text": ["ref"]},
+    )
+)
+
+
 def check_tts_update(prompt: Any, sampling_params_list: Sequence[Any]) -> Any:
-    """Stage-0 update transform: the text check, then a full voice-clone check for updates that replace the prompt."""
+    """Stage-0 update transform: the text check, then the voice-clone check of a replacement prompt,
+    or of a plain update's buffer laid over each valid Base first chunk (the caller cannot see the
+    real one), as Model Runner V2 does: re-sending a usable reference passes, clearing one fails."""
     check_text_update(prompt, sampling_params_list)
     for item in prompt if isinstance(prompt, list) else (prompt,):
-        if isinstance(item, dict) and streaming_update_replaces_prompt(
-            (item.get("model_intermediate_buffer"), item.get("additional_information"))
-        ):
+        if not isinstance(item, dict):
+            continue
+        buffer = item.get("model_intermediate_buffer")
+        if streaming_update_replaces_prompt((buffer, item.get("additional_information"))):
             check_voice_clone_prompt(item, sampling_params_list)
+        elif isinstance(buffer, dict) and buffer:
+            for first in _FIRST_CHUNKS:
+                view = {"additional_information": first, "model_intermediate_buffer": buffer}
+                check_voice_clone_prompt(view, sampling_params_list)
     return prompt
 
 

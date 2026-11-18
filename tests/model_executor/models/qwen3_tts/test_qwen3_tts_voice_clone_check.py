@@ -3,6 +3,7 @@
 """Frontend rejection of unusable Qwen3-TTS Base requests (#3707, #3708)."""
 
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -17,7 +18,7 @@ from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
 from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import _ref_audio_wire_waveform
 from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_FUSED_PIPELINE, QWEN3_TTS_PIPELINE
-from vllm_omni.model_executor.models.qwen3_tts.prompt_checks import _overlay, check_voice_clone_prompt
+from vllm_omni.model_executor.models.qwen3_tts.prompt_checks import _overlay, check_tts_update, check_voice_clone_prompt
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     PRECOMPUTED_REF_CODE_KEY,
     PRECOMPUTED_REF_IDS_KEY,
@@ -303,6 +304,30 @@ def test_accepted_base_prompts_reach_the_engine_intact(prompt):
         object.__new__(Qwen3TTSPromptEmbedsBuilder).normalize_ref_audio(ref_audio[0])
 
 
+def _mrv2_view(info, buffer):
+    # The Talker's view after the real engine-core round trip and Model Runner V2's add_request.
+    received = _ipc_request(info, buffer)
+    mrv2 = OmniIntermediateBuffer(1)
+    new_req = SimpleNamespace(
+        req_id="r",
+        prompt_embeds=None,
+        additional_information=received.additional_information,
+        model_intermediate_buffer=received.model_intermediate_buffer,
+        mm_features=None,
+        sampling_params=None,
+    )
+    mrv2.add_request(0, new_req)
+    return received, {k: v for k, v in mrv2.buffers[0].items() if k != "req_id"}
+
+
+def _passes(info):
+    try:
+        check_voice_clone_prompt({"additional_information": info}, [])
+        return True
+    except ValueError:
+        return False
+
+
 _BUFFERS = {
     "drops-ref-audio": {"ref_audio": None},
     "blanks-ref-text": {"ref_text": [""]},
@@ -336,25 +361,10 @@ def test_buffer_check_matches_the_mrv2_talker_view(info, buffer):
         accepted = True
     except ValueError:
         accepted = False
-    received = _ipc_request(info, buffer)
-    mrv2 = OmniIntermediateBuffer(1)
-    new_req = SimpleNamespace(
-        req_id="r",
-        prompt_embeds=None,
-        additional_information=received.additional_information,
-        model_intermediate_buffer=received.model_intermediate_buffer,
-        mm_features=None,
-        sampling_params=None,
-    )
-    mrv2.add_request(0, new_req)
-    talker_info = {k: v for k, v in mrv2.buffers[0].items() if k != "req_id"}
+    received, talker_info = _mrv2_view(info, buffer)
     received_info = deserialize_additional_information(received.additional_information)
     assert _same(_overlay(received_info, received.model_intermediate_buffer), talker_info)
-    try:
-        check_voice_clone_prompt({"additional_information": talker_info}, [])
-        served = True
-    except ValueError:
-        served = False
+    served = _passes(talker_info)
     # A buffer tensor arrives as a raw buffer list, so the value the caller meant is lost even when
     # the view still has another reference: always rejected.
     values = [v for section in buffer.values() for v in (section.values() if isinstance(section, dict) else [section])]
@@ -420,3 +430,71 @@ def test_engine_rejects_before_input_processing(mocker: MockerFixture, prompt, m
             message_type=message_type,
         )
     assert engine.input_processor.process_inputs.called is (error is RuntimeError)
+
+
+_FIRST_CHUNKS: dict[str, dict[str, Any]] = {
+    "icl": {"ref_audio": AUDIO, "ref_text": TEXT},
+    "xvec": {"ref_audio": AUDIO, "x_vector_only_mode": [True]},
+    "xvec-embedding": {"voice_clone_prompt": VCP_SPK, "x_vector_only_mode": [True]},
+    "icl-precomputed-ref-code": {
+        "codes": {PRECOMPUTED_REF_CODE_KEY: CODE},
+        "voice_clone_prompt": VCP_SPK,
+        "ref_text": TEXT,
+    },
+    "icl-cached-artifacts": {**CACHED, "ref_text": TEXT},
+    "icl-ref-ids": {"ref_audio": AUDIO, "ref_ids": [IDS.tolist()[0]]},
+    "icl-precomputed-ref-ids": {"ref_audio": AUDIO, PRECOMPUTED_REF_IDS_KEY: IDS},
+}
+_UPDATE_BUFFERS = {
+    **_BUFFERS,
+    "empty-ref-audio": {"ref_audio": []},
+    "blank-ref-audio": {"ref_audio": ["  "]},
+    "array-ref-audio": {"ref_audio": [np.zeros(1024, dtype=np.float32)]},
+    "turns-off-xvec-with-ref-text": {"x_vector_only_mode": [False], "ref_text": TEXT},
+    "resends-reference": {"ref_audio": AUDIO, "ref_text": TEXT},
+    "turns-on-xvec": {"x_vector_only_mode": [True]},
+    "drops-cached-artifacts": {REF_AUDIO_CACHE_KEY: None},
+    "drops-ref-ids": {"ref_ids": None},
+    "drops-precomputed-ref-ids": {PRECOMPUTED_REF_IDS_KEY: None},
+    "resends-embedding-reference": {"voice_clone_prompt": VCP_SPK, "x_vector_only_mode": [True]},
+    "next-text": {"text": ["Next words."]},
+    # Needs the first chunk's task, which the caller cannot see: left to a follow-up.
+    "only-sets-base-task": {"task_type": ["Base"]},
+}
+_UPDATE_REJECTS = {
+    "drops-ref-audio": NO_REF,
+    "empty-ref-audio": NO_REF,
+    "blank-ref-audio": NO_REF,
+    "blanks-ref-text": NO_TEXT,
+    "turns-off-xvec": NO_TEXT,
+    "replaces-vcp": NO_TEXT,
+    # Over an embedding-only voice, in-context mode also needs a reference code.
+    "turns-off-xvec-with-ref-text": NO_REF,
+    "drops-cached-artifacts": NO_REF,
+    "drops-ref-ids": NO_TEXT,
+    "drops-precomputed-ref-ids": NO_TEXT,
+    "array-ref-audio": NOT_INTACT,
+    "tensor-ref-code": NOT_INTACT,
+    "tensor-ref-ids": NOT_INTACT,
+}
+
+
+@pytest.mark.parametrize("name", list(_UPDATE_BUFFERS))
+def test_plain_update_buffer_must_not_break_a_base_request(name):
+    # A plain update keeps the first chunk's additional_information and Model Runner V2 lays the
+    # buffer over it, so the update may re-send a usable reference but not clear one.
+    update = {"prompt_token_ids": [0], "model_intermediate_buffer": _UPDATE_BUFFERS[name]}
+    if name in _UPDATE_REJECTS:
+        with pytest.raises(ValueError, match=_UPDATE_REJECTS[name]):
+            check_tts_update(update, [])
+    else:
+        assert check_tts_update(update, []) is update
+
+
+@pytest.mark.parametrize("name", [name for name in _UPDATE_BUFFERS if name not in _UPDATE_REJECTS])
+@pytest.mark.parametrize("first", list(_FIRST_CHUNKS))
+def test_accepted_plain_update_keeps_a_base_request_servable(first, name):
+    # The Talker's view of a valid first chunk with an accepted update buffer still passes.
+    info = _base(**_FIRST_CHUNKS[first])["additional_information"]
+    buffer = _UPDATE_BUFFERS[name]
+    assert _passes(_mrv2_view(info, buffer)[1])
