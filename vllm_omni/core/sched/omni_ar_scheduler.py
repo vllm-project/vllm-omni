@@ -939,8 +939,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             roles = getattr(self, pair_registry, {}).get(pair_id) or {}
             members = [self.requests.get(rid) for rid in roles.values()]
             if any(
-                member is not None and request_is_seeded(getattr(member, "sampling_params", None))
-                for member in members
+                member is not None and request_is_seeded(getattr(member, "sampling_params", None)) for member in members
             ):
                 return True
         return False
@@ -989,6 +988,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         solo_queue = None
         solo_group = 1
         drain_kv = False
+        unit_origins: list[tuple[object, str]] = []
         if seeded_solo:
             # Upstream drains KV-holding requests first: their blocks are already
             # allocated, so they can finish and release memory for the requests
@@ -1003,9 +1003,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # still need a block, and solo-admitting it would hide a holder that
             # could have made progress (P2 on #9937).
             drain_unit = [
-                holder
-                for holder in self._runnable_kv_holders(seeded=False)
-                if not self._paired_with_seeded(holder)
+                holder for holder in self._runnable_kv_holders(seeded=False) if not self._paired_with_seeded(holder)
             ]
             promoted = None
             if drain_unit:
@@ -1017,12 +1015,28 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if promoted is not None:
                 solo_queue, solo_request = promoted
                 unit = self._isolation_unit(solo_request)
-                queue_requests = self.waiting if solo_queue == "waiting" else self.kv_holding_waiting
-                present = {request.request_id for request in queue_requests}
-                if unit is None or any(request.request_id not in present for request in unit):
+                if unit is not None:
+                    # A CFG unit can straddle the two queues: the companion may
+                    # already hold KV blocks while the seeded branch still waits.
+                    # Gather both members so the unit is admitted together.
+                    for member in unit:
+                        origin = next(
+                            (
+                                name
+                                for name, queue in (("waiting", self.waiting), ("kv_holding", self.kv_holding_waiting))
+                                if any(request.request_id == member.request_id for request in queue)
+                            ),
+                            None,
+                        )
+                        if origin is None:
+                            unit = None
+                            break
+                        unit_origins.append((member, origin))
+                if unit is None:
                     # Cannot isolate this unit safely; admit nothing instead of
                     # splitting it across a solo step.
                     seeded_defer, solo_queue, unit = True, None, None
+                    unit_origins.clear()
                 else:
                     solo_group = len(unit)
 
@@ -1051,8 +1065,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # the cap: the queue is pre-built by `OmniCFGARScheduler` and a
                 # cap wide enough for a pair would otherwise admit an unrelated
                 # request that sits between its branches (#9937).
-                promoted_queue = self.waiting if solo_queue == "waiting" else self.kv_holding_waiting
-                promoted_queue.remove_requests(unit)
+                for member, origin in unit_origins:
+                    origin_queue = self.waiting if origin == "waiting" else self.kv_holding_waiting
+                    origin_queue.remove_requests([member])
                 restricted = create_request_queue(self.policy)
                 for request in unit:
                     restricted.add_request(request)
@@ -1089,10 +1104,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.max_num_active_reqs = original_max_num_active_reqs
             if original_wait_queues is not None:
                 original_waiting, original_kv_holding = original_wait_queues
-                if self.waiting is not original_waiting:
-                    original_waiting.prepend_requests(self.waiting)
-                if self.kv_holding_waiting is not original_kv_holding:
-                    original_kv_holding.prepend_requests(self.kv_holding_waiting)
+                if unit_origins:
+                    # Put leftovers back where they came from: a gathered unit
+                    # can contain members from both queues.
+                    origins_by_member = {id(member): origin for member, origin in unit_origins}
+                    for leftover in (*self.waiting, *self.kv_holding_waiting):
+                        origin = origins_by_member.get(id(leftover))
+                        target = original_kv_holding if origin == "kv_holding" else original_waiting
+                        target.prepend_requests([leftover])
+                else:
+                    if self.waiting is not original_waiting:
+                        original_waiting.prepend_requests(self.waiting)
+                    if self.kv_holding_waiting is not original_kv_holding:
+                        original_kv_holding.prepend_requests(self.kv_holding_waiting)
                 self.waiting, self.kv_holding_waiting = original_wait_queues
             self._restore_omni_wait_queues()
 

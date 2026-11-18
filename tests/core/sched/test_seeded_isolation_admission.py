@@ -503,3 +503,18 @@ def test_standalone_holder_still_drains_before_a_paired_unit(monkeypatch) -> Non
     # Only the standalone unseeded holder drains; the pair stays queued.
     assert seen["kv_ids"] == ["loose"]
     assert seen["limit"] == 8
+
+
+def test_unit_split_across_queues_is_gathered_not_deferred(monkeypatch) -> None:
+    """A companion holding KV blocks must not make the seeded branch defer forever."""
+    cond = _StubRequest("cond", seed=7)
+    uncond = _StubRequest("uncond")
+    scheduler = _make_scheduler(parked=0, waiting=[cond], kv_holding=[uncond])
+    _audex_pair(scheduler, cond, uncond)
+
+    seen = _run_schedule(scheduler, monkeypatch)
+
+    # Both members are gathered into the promoted queue and admitted together.
+    assert seen["limit"] == 2
+    assert seen["waiting_ids"] == ["cond", "uncond"]
+    assert seen["kv_len"] == 0
