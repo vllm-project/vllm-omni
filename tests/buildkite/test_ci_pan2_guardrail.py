@@ -54,5 +54,7 @@ def test_ci_image_hashes_the_pinned_guardrail_requirements() -> None:
     assert "requirements/*.txt" in IMAGE_SCRIPT.read_text(encoding="utf-8")
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
     install_at = dockerfile.index("requirements/ci-pan2-guardrail.txt")
-    check_at = dockerfile.index("uv pip check --system", install_at)
+    # The strict runtime checker runs uv pip check and permits only the two
+    # native LMCache metadata bounds; every other dependency error still fails.
+    check_at = dockerfile.index("python3 tools/prepare_ci_telemetry.py --check-runtime", install_at)
     assert check_at > install_at

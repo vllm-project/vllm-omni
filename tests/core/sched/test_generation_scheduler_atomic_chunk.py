@@ -185,7 +185,6 @@ def _make_scheduler(
     )
     sched.use_v2_model_runner = native
     sched.async_scheduling = False
-    sched.prev_step_scheduled_req_ids = set()
     sched._last_stats_time = time.monotonic()  # make_stats() short-circuits
     sched.finish_calls = []
     sched.finish_calls_unresolved = []
@@ -315,7 +314,8 @@ def _make_runner_output():
         kv_connector_output=None,
         ec_connector_output=None,
         cudagraph_stats=None,
-        req_id_to_index={},
+        # req_id_to_index was dropped upstream; the pin derives it from req_ids.
+        req_ids=[],
     )
 
 

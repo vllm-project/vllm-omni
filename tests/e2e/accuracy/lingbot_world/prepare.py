@@ -30,8 +30,10 @@ def verify_inference_runtime(platform: str) -> dict:
     names = ("vllm", "torch") + (("torch-npu", "vllm-ascend") if platform == "npu" else ())
     packages = {name: importlib.metadata.version(name) for name in names}
     version = Version(packages["vllm"])
-    if version.base_version != "0.33.0" or version.is_prerelease or version.is_devrelease:
-        raise RegressionError("LingBot comparison requires the supported vLLM 0.33.0 runtime")
+    # NPU capture keeps the unchanged vLLM-Ascend 0.33.0 image.
+    expected_vllm = "0.34.0" if platform == "cuda" else "0.33.0"
+    if version.base_version != expected_vllm or version.is_prerelease or version.is_devrelease:
+        raise RegressionError(f"LingBot {platform} capture requires released vLLM {expected_vllm}")
     if platform not in ("cuda", "npu"):
         raise RegressionError(f"Unsupported platform: {platform}")
     if platform == "cuda" and Version(packages["torch"]).base_version != "2.14.0":

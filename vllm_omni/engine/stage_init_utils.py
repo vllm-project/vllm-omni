@@ -947,6 +947,7 @@ def compute_replica_layout(
     stage_configs: Sequence[Any],
     *,
     allow_zero: bool = False,
+    local_replica_counts: Mapping[int, int] | None = None,
 ) -> tuple[list[int], dict[int, list[str | None]]]:
     """Compute per-stage replica counts and device assignments.
 
@@ -957,6 +958,9 @@ def compute_replica_layout(
             single-stage / head-distributed mode for non-self stages that
             will be filled dynamically by remote registrations); when False
             (default), the count is clamped to at least 1.
+        local_replica_counts: optional stage-index overrides for the number of
+            replicas using this host's device pool. Cluster totals are preserved;
+            remote slots receive no local device assignment.
 
     Returns:
         replicas_per_stage: num_replicas per logical stage.
@@ -978,7 +982,15 @@ def compute_replica_layout(
     replica_devices_map: dict[int, list[str | None]] = {}
     for stage_id, stage_cfg in enumerate(stage_configs):
         num_replicas = replicas_per_stage[stage_id]
+        local_replicas = (
+            local_replica_counts.get(stage_id, num_replicas) if local_replica_counts is not None else num_replicas
+        )
+        if not 0 <= local_replicas <= num_replicas:
+            raise ValueError(f"Stage {stage_id}: local replica count {local_replicas} must be in [0, {num_replicas}]")
         if num_replicas <= 1:
+            continue
+        if local_replicas == 0:
+            replica_devices_map[stage_id] = [None] * num_replicas
             continue
         runtime_cfg = getattr(stage_cfg, "runtime_config", getattr(stage_cfg, "runtime", {}))
         devices_str = (
@@ -987,10 +999,10 @@ def compute_replica_layout(
         devices_per_replica = get_stage_devices_per_replica(stage_cfg)
         replica_devices_map[stage_id] = split_devices_for_replicas(
             devices_str,
-            num_replicas,
+            local_replicas,
             devices_per_replica,
             stage_id,
-        )
+        ) + [None] * (num_replicas - local_replicas)
         logger.info(
             "[stage_init] Stage %s: %d replicas, devices_per_replica=%d, devices split: %s",
             stage_id,
@@ -1488,7 +1500,9 @@ def _count_stage_devices(devices: Any) -> int | None:
     return len(values) or None
 
 
-def _check_stage_device_layout(stage_config: Any, engine_args_dict: dict[str, Any]) -> None:
+def _check_stage_device_layout(
+    stage_config: Any, engine_args_dict: dict[str, Any], *, local_replica_count: int | None = None
+) -> None:
     """Fail early when a stage's world size cannot fit its assigned ``devices``.
 
     Re-runs :func:`check_device_layout` (normally only reached on the
@@ -1499,13 +1513,17 @@ def _check_stage_device_layout(stage_config: Any, engine_args_dict: dict[str, An
     """
     from vllm_omni.config.composable_parallel import StrategyApplyError, check_device_layout
 
+    if local_replica_count == 0:
+        return
     runtime = getattr(stage_config, "runtime_config", getattr(stage_config, "runtime", None))
     devices = _get_attr_or_item(runtime, "devices", None) if runtime is not None else None
     if devices is None:
         # No explicit placement -> vLLM assigns devices itself; nothing to check.
         return
 
-    num_replicas = _get_attr_or_item(runtime, "num_replicas", 1) if runtime is not None else 1
+    num_replicas = local_replica_count
+    if num_replicas is None:
+        num_replicas = _get_attr_or_item(runtime, "num_replicas", 1) if runtime is not None else 1
     stage_id = getattr(stage_config, "stage_id", "?")
     tp_size, local_dp_size, pp_size = _get_local_llm_parallel_sizes(stage_config, engine_args_dict)
     if local_dp_size == 0:
@@ -1556,8 +1574,12 @@ def build_vllm_config(
     api_process_count: int = 1,
     api_process_rank: int = 0,
     watermark_config: WatermarkConfig | None = None,
+    local_replica_count: int | None = None,
 ) -> tuple[Any, type]:
     """Build engine args, then create VllmConfig and executor_class.
+
+    ``local_replica_count`` scopes device validation to this host without
+    changing the stage's cluster-wide replica count.
 
     Returns:
         (vllm_config, executor_class)
@@ -1609,7 +1631,7 @@ def build_vllm_config(
     # the mismatch used to surface only as an opaque worker-side assertion
     # ("DP adjusted local rank N is out of bounds for M devices."). Re-run the
     # same check here, before workers spawn, to fail early with a clear message.
-    _check_stage_device_layout(stage_config, filtered_engine_args_dict)
+    _check_stage_device_layout(stage_config, filtered_engine_args_dict, local_replica_count=local_replica_count)
 
     # Multi-stage pipelines (qwen3_tts code2wav, etc.) set max_model_len
     # larger than HF max_position_embeddings by design. vLLM's validator
