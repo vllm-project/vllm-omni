@@ -48,6 +48,7 @@ def test_post_sample_keeps_request_slot_and_token_rows_aligned():
     assert args["input_ids"].tolist() == [7, 9]
     assert torch.equal(args["hidden_states"], hidden[[0, 4]])
     assert output["codes"]["audio"][:, 0].tolist() == [11, 0, 0, 0, 22]
+    assert output["meta"]["codec_frame_valid"].tolist() == [True, False, False, False, True]
 
 
 def test_post_sample_rejects_multi_token_rows():

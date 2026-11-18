@@ -92,9 +92,22 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
     reason; PersonaPlex does not need pipeline parallelism.
     """
 
+    # forward returns only temporal hidden states; the model-state builds
+    # multimodal outputs after replay, so MRv2 can capture the full backbone.
+    mrv2_forward_returns_tensor = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         self.vllm_config = vllm_config
+        model_config = vllm_config.model_config
+        if bool(getattr(model_config, "use_v2_model_runner", False)) and (
+            getattr(model_config, "session_mode", "turn") != "duplex"
+            or not bool(getattr(model_config, "async_chunk", False))
+        ):
+            raise ValueError(
+                "PersonaPlex Stage 0 Model Runner V2 requires session_mode='duplex' "
+                "and async_chunk=True; turn-mode codec handoff is not supported."
+            )
         config: PersonaPlexConfig = vllm_config.model_config.hf_config  # type: ignore[assignment]
         self.config = config
         self.temporal_config = config.temporal_config
@@ -164,6 +177,9 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
     def create_mrv2_model_state(self, vllm_config, encoder_cache, device):
         from .model_state import PersonaPlexModelState
 
+        # The state owns fresh token-major outputs, filled after sampling.
+        # Retain them directly instead of snapshotting zero placeholders.
+        self.mm_outputs_fresh_per_step = True
         return PersonaPlexModelState(vllm_config, self, encoder_cache, device)
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:

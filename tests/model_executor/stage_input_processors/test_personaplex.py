@@ -154,3 +154,23 @@ def test_async_chunk_does_not_buffer_invalid_mrv2_placeholder() -> None:
         request,
     )
     assert manager.request_payload["r"]["personaplex_frames"] == []
+
+
+@pytest.mark.parametrize("last_valid", [False, True])
+def test_async_chunk_uses_only_last_row_validity(last_valid: bool) -> None:
+    manager = SimpleNamespace(
+        request_payload={}, connector=SimpleNamespace(config={"extra": {"codec_chunk_frames": 1}})
+    )
+    request = SimpleNamespace(request_id="r", external_req_id="r", resumable=True)
+    codes = torch.arange(24, dtype=torch.long).reshape(3, 8)
+    talker2code2wav_async_chunk(
+        manager,
+        {"codes": {"audio": codes}, "meta": {"codec_frame_valid": torch.tensor([False, False, last_valid])}},
+        request,
+    )
+    frames = manager.request_payload["r"]["personaplex_frames"]
+    if last_valid:
+        assert len(frames) == 1
+        assert torch.equal(frames[0], codes[-1])
+    else:
+        assert frames == []
