@@ -8,9 +8,9 @@
 - Mode: Online serving with the OpenAI-compatible `/v1/audio/speech` API, or offline with `Omni`
 - Maintainer: Community
 
-## Historical integration
+## Model
 
-This recipe records the earlier `fishaudio/drama-3` integration. Drama 3 is a
+Drama 3 is a
 35B-total / 3B-active MoE text backbone (Qwen3.5 MoE: hybrid gated-delta-net
 and full attention, block-FP8 routed experts) with a codebook tower that
 decodes 10 codebooks per frame. It outputs 44.1 kHz mono audio through the
