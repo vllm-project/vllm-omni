@@ -19,7 +19,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.mark.parametrize("wrapped", [False, True])
 @pytest.mark.parametrize("rows", [0, 4, 8, 9, 30])
 @pytest.mark.parametrize("offset", [0, -16, 1016])
-def test_native_full_payload_preserves_legacy_dedelay_and_tail(rows, offset, wrapped):
+def test_native_full_payload_preserves_valid_dedelayed_prefix(rows, offset, wrapped):
     audio = torch.arange(rows * 8).reshape(rows, 8) + offset
     payload = {"codes": {"audio": audio}}
     if wrapped:
@@ -28,15 +28,18 @@ def test_native_full_payload_preserves_legacy_dedelay_and_tail(rows, offset, wra
     legacy = talker2code2wav([out])[0]["prompt_token_ids"]
     native = talker2code2wav_full_payload(None, {"codes.audio": audio}, None)
     assert native["codes"]["audio"].tolist() == legacy
-    # Independent expected layout: book q reads delayed rows q + frame.
-    frames = max(rows - 7, 0) if rows >= 8 else 0
-    kept = frames - 1 if frames >= 2 else frames
-    expected = []
-    for q in range(8):
-        for frame in range(kept):
-            value = (q + frame) * 8 + q + offset
-            expected.append(value if 0 <= value < 1024 else 0)
+    # Book q reads delayed row q + frame. Keep every complete valid frame
+    # before the first special/pad; zero-filling invalid codes or blindly
+    # trimming the last frame would synthesize audio or discard real audio.
+    valid_frames = []
+    for frame in range(max(rows - 7, 0)):
+        values = [(q + frame) * 8 + q + offset for q in range(8)]
+        if any(value < 0 or value >= 1024 for value in values):
+            break
+        valid_frames.append(values)
+    expected = [values[q] for q in range(8) for values in valid_frames]
     assert legacy == expected
+    assert all(0 <= value < 1024 for value in legacy)
     assert native["meta"]["finished"]
     assert talker2code2wav_token_only([out])[0]["prompt_token_ids"] == legacy
 

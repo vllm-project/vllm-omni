@@ -755,7 +755,10 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         for i, info in enumerate(infos):
             if not isinstance(info, dict):
                 continue
-            request_id = info.get("request_id")
+            meta = info.get("meta")
+            if info.get("request_id") is None and (not isinstance(meta, dict) or meta.get("request_id") is None):
+                continue
+            request_id = require_request_id(info, "talker")
             session = self._sessions.get(str(request_id)) if request_id is not None else None
             if not session or not session.get("use_native"):
                 continue
