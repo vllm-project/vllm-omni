@@ -364,8 +364,9 @@ steady-state latency. H3 is CFG-distilled, so `--cfg-parallel-size` must remain
 ### Attention Backends
 
 For optional training-free sparse attention, use
-`--diffusion-attention-backend SOL_ATTN`. The default cuDNN provider requires
-SM90+. See the [SOL guide](../../docs/user_guide/diffusion/attention_backends/sol_attn.md)
+`--diffusion-attention-backend SOL_ATTN`. This calls the upstream Sol-Attn kernel
+directly on SM80+; no provider flag is needed.
+See the [SOL guide](../../docs/user_guide/diffusion/attention_backends/sol_attn.md)
 for installation, online serving, tuning, and validation limits.
 
 On supported datacenter Blackwell systems, MiniMax H3 defaults to dense BF16
