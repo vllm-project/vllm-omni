@@ -8,6 +8,19 @@ import torch
 from torch import nn
 
 
+def normalize_shift(value: float | str, *, name: str, error_cls: type[Exception]) -> float:
+    """Convert a shift while preserving the caller's error classification."""
+    if isinstance(value, bool):
+        raise error_cls(f"{name} must be a positive finite number, got {value!r}.")
+    try:
+        shift = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise error_cls(f"{name} must be a positive finite number, got {value!r}.") from exc
+    if not math.isfinite(shift) or shift <= 0:
+        raise error_cls(f"{name} must be a positive finite number, got {value!r}.")
+    return shift
+
+
 def safe_linalg_solve(matrix: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
     try:
         return torch.linalg.solve(matrix, rhs)
