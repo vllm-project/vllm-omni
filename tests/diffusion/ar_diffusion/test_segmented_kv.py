@@ -66,6 +66,31 @@ def append(state, lengths, offset=0, retain=None):
     return handles
 
 
+def test_pending_archive_views_require_all_layers_and_exclude_transient_conditioning():
+    cache = make_cache()
+    state = make_state(cache).segmented("main")
+    with pytest.raises(RuntimeError, match="Stage every"):
+        state.pending_layer_views()
+    state.prepare_layer_views(4, 3)
+    handles = state.begin_commit((2, 2))
+    for layer in range(cache.num_layers):
+        state.assemble(layer, rows(3, -20), rows(3, 20), rows(4, layer), -rows(4, layer))
+        if layer == 0:
+            with pytest.raises(RuntimeError, match="Stage every"):
+                state.pending_layer_views()
+        state.stage(layer)
+    views = state.pending_layer_views()
+    assert len(views) == cache.num_layers
+    for layer, (key, value) in enumerate(views):
+        assert key.shape == value.shape == (4, 2, 4)
+        torch.testing.assert_close(key, rows(4, layer))
+        torch.testing.assert_close(value, -rows(4, layer))
+    state.commit(retain=handles)
+    with pytest.raises(RuntimeError, match="Stage every"):
+        state.pending_layer_views()
+    state.close()
+
+
 @pytest.mark.parametrize("lengths", [(1, 1), (15, 3), (17, 5)])
 def test_ragged_pages_match_dense_attention_without_padding(lengths):
     cache = make_cache()

@@ -144,7 +144,7 @@ def _build_bitsandbytes(**kw: Any) -> QuantizationConfig:
 
 
 def _build_mxfp8(**kw: Any) -> QuantizationConfig:
-    """Lazy import for W8A8 MXFP8 diffusion config (NPU only)."""
+    """Lazy import for the platform-dispatched W8A8 MXFP8 diffusion config."""
     from .mxfp8_config import DiffusionMXFP8Config
 
     return DiffusionMXFP8Config(**kw)

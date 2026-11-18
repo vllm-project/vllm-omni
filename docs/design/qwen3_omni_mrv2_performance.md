@@ -48,6 +48,23 @@ releases each chunk slot. CUDA retains its asynchronous output path. This
 adaptation alone does not establish a performance or audio-quality gain.
 The duplex profile remains on MRv1.
 
+Non-streaming NPU Code2Wav uses longer windows: 300 codec frames for the
+first chunk and 325 for subsequent chunks including left context. It caps
+each decoder batch at 8 rows and captures both windows for row counts 1–8
+(or fewer when the stage's `max_num_seqs` is smaller). Larger batches are
+split in row order before temporal chunking. The same limit applies with
+`enforce_eager: true` and to uncaptured tail windows. This bounds decoder
+activation pressure while preserving each request's existing chunk trimming;
+it does not cap memory for model weights or accumulated output waveforms.
+Changing the decoder batch shape can change BF16 numerical results, so this
+split does not promise bitwise equality with an unsplit batch. Audio-quality
+acceptance requires representative speech inputs in addition to shape and
+trimming regressions.
+The limit is separate from request concurrency and does not change the
+streaming graph plan. Talker and Code2Wav share a device in the default NPU
+deployment, so graph-count limits alone do not provide a memory budget for
+these longer non-streaming windows (#10090).
+
 ## Ascend prefix cache
 
 The default Thinker prefix cache is enabled on CUDA for V1 and V2. NPU keeps

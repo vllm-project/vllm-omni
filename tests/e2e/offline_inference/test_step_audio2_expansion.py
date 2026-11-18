@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E expansion tests for Step-Audio2 offline inference (nightly CI).
 
@@ -69,7 +69,7 @@ def _assert_non_empty_text_output(outputs: list[OmniRequestOutput]) -> None:
     assert len(text_content.strip()) > 0
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", TEST_PARAMS, indirect=True)
 def test_audio_to_text_and_audio(omni_runner: OmniRunner) -> None:
     """Test processing audio input and generating text + audio output."""
@@ -87,7 +87,7 @@ def test_audio_to_text_and_audio(omni_runner: OmniRunner) -> None:
             assert audio_tensor.numel() > 0
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", TEST_PARAMS, indirect=True)
 def test_text_only_input(omni_runner: OmniRunner) -> None:
     """Test processing text-only input (no audio)."""

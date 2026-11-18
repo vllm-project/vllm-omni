@@ -139,6 +139,14 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         self._has_lmcache = False
 
     def shutdown(self) -> None:
+        # Connector teardown reads fields populated by init_omni_connectors().
+        # Some runner tests and failed-construction paths reach shutdown before
+        # that initializer completes, so honor its explicit readiness marker.
+        if getattr(self, "_omni_connector_initialized", False):
+            shutdown_connectors = getattr(self, "shutdown_omni_connectors", None)
+            if callable(shutdown_connectors):
+                shutdown_connectors()
+
         # Also inherited by OmniNPUModelRunner. GPU AR stops the cache
         # earlier in its teardown; the shared helper is idempotent.
         self._shutdown_omni_prefix_cache()
@@ -2410,7 +2418,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         # positions per request runs K codec frames here, one replay each, using
         # the same loop the NPU runner uses. Everything else -- prefill, a mixed
         # step, another stage -- falls through to the ordinary single forward.
-        from vllm_omni.platforms.npu.worker import talker_multiframe
+        from vllm_omni.worker import talker_multiframe
 
         frames = talker_multiframe.applies(self.model, model_kwargs_extra)
         if frames <= 1 and talker_multiframe.is_multi_token_decode(self.model, model_kwargs_extra):

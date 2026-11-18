@@ -21,6 +21,8 @@ class SchedulingMetadataUpdate:
     prompt_token_ids: tuple[int, ...] | None = None
     resize_prompt_to: int | None = None
     input_terminal: bool = False
+    # Native MRv2 receive: the producing step's duplex chunk id from payload meta.
+    duplex_perf_chunk: tuple[int, int] | None = None
 
 
 @dataclass
@@ -77,6 +79,8 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
 
     multimodal_outputs: list[dict[str, object]] | None = None
     inter_stage_outputs: list[dict[str, Any] | None] | None = None
+    # MRv2-only tags frozen before asynchronous output materialization.
+    _duplex_perf_chunks: dict[str, tuple[int, int]] | None = None
     # IDs of requests whose KV cache has been extracted from GPU/NPU to CPU.
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None

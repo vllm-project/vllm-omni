@@ -1312,7 +1312,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--context-previous-max-tokens", type=int, default=500)
     parser.add_argument(
         "--tail-silence-s",
-        type=int,
+        type=float,
         default=0,
         help="Additional silent seconds holding the last frame to allow the final answer to finish.",
     )

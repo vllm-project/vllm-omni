@@ -117,12 +117,6 @@ indextts2 = [
     "WeTextProcessing; sys_platform == 'linux'",
 ]
 
-# Kokoro-82M grapheme-to-phoneme frontend (English + espeak-ng languages).
-# Japanese / Mandarin voices additionally need misaki[ja] / misaki[zh].
-kokoro = [
-    "misaki[en]>=0.9.4",
-]
-
 # Local-test-only extras
 local = [
     "FlagEmbedding",
@@ -207,6 +201,7 @@ include = ["vllm_omni*"]
 "vllm_omni" = [
     "_version.py",
     "py.typed",
+    "benchmarks/realtime_video/*.json",
     "deploy/*.md",
     "deploy/*.yaml",
     "diffusion/models/hy_nomas/camera_trajectories.json",
@@ -341,6 +336,7 @@ markers = [
     "B200: [hardware-resource] [cuda] Tests that require B200 GPU",
     "RTX5090: [hardware-resource] [cuda] Tests that require an RTX 5090 GPU (SM120, compute capability 12.0)",
     "MI325: [hardware-resource] [rocm] Tests that require MI325 GPU (AMD/ROCm)",
+    "MI300: [hardware-resource] [rocm] Tests that require MI300 GPU (AMD/ROCm)",
     "B60: [hardware-resource] [xpu] Tests that require Intel Arc Pro B60 XPU",
     "B70: [hardware-resource] [xpu] Tests that require Intel Arc Pro B70 XPU",
     "S5000: [hardware-resource] [musa] Tests that require S5000 GPU (Moore Threads/MUSA)",
