@@ -31,7 +31,7 @@ from vllm_omni.model_executor.models.glm_image.pipeline import GLM_IMAGE_PIPELIN
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-@pytest.fixture(scope="function", autouse=True)
+@pytest.fixture(scope="module")
 def _init_distributed():
     """Initialize the minimal distributed environment required by
     ReplicatedLinear (tensor-parallel group must exist)."""
@@ -50,9 +50,11 @@ def _init_distributed():
         local_rank=0,
         distributed_init_method="env://",
     )
-    initialize_model_parallel()
-    yield
-    cleanup_dist_env_and_memory()
+    try:
+        initialize_model_parallel()
+        yield
+    finally:
+        cleanup_dist_env_and_memory()
 
 
 @pytest.fixture(scope="function", autouse=True)
@@ -172,6 +174,7 @@ class TestValidateGlmImageTpConstraints:
             )
 
 
+@pytest.mark.usefixtures("_init_distributed")
 class TestGlmImageAdaLayerNormZeroQuantization:
     """Test GlmImageAdaLayerNormZero with quantization config."""
 
@@ -220,6 +223,7 @@ class TestGlmImageAdaLayerNormZeroQuantization:
         assert len(result) == 10  # Should return 10 chunks
 
 
+@pytest.mark.usefixtures("_init_distributed")
 class TestGlmImageAdaLayerNormContinuousQuantization:
     """Test GlmImageAdaLayerNormContinuous with quantization config."""
 
@@ -266,6 +270,7 @@ class TestGlmImageAdaLayerNormContinuousQuantization:
         assert result.shape == (batch_size, seq_len, 2560)
 
 
+@pytest.mark.usefixtures("_init_distributed")
 class TestGlmImageAttentionQuantization:
     """Test GlmImageAttention with quantization config."""
 
@@ -298,6 +303,7 @@ class TestGlmImageAttentionQuantization:
         assert attn.to_qkv.quant_config is None
 
 
+@pytest.mark.usefixtures("_init_distributed")
 class TestColumnParallelModulesQuantization:
     """Test ColumnParallelGELU and ColumnParallelSiLU with quantization config."""
 
@@ -336,6 +342,7 @@ class TestColumnParallelModulesQuantization:
         assert layer.proj.quant_config is mock_quant_config
 
 
+@pytest.mark.usefixtures("_init_distributed")
 class TestGlmImageFeedForwardQuantization:
     """Test GlmImageFeedForward with quantization config."""
 
@@ -388,6 +395,7 @@ class TestGlmImageFeedForwardQuantization:
         assert isinstance(ff.net[0], ColumnParallelSiLU)
 
 
+@pytest.mark.usefixtures("_init_distributed")
 class TestGlmImageTransformerBlockQuantization:
     """Test GlmImageTransformerBlock with quantization config."""
 
@@ -568,6 +576,7 @@ class TestGlmImageRotaryPosEmbed:
         assert torch.allclose(sin1, sin2)
 
 
+@pytest.mark.usefixtures("_init_distributed")
 class TestGlmImageTransformer2DModelQuantization:
     """Test GlmImageTransformer2DModel with quantization config."""
 
