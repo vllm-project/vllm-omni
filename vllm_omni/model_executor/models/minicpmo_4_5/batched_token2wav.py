@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import math
+import os
 import time
 from collections import OrderedDict
 from collections.abc import Mapping
@@ -18,7 +19,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
-
 from vllm_omni.utils.device_copy import index_to_device
 
 from .code2wav_stats import Code2WavSolveStats
@@ -368,6 +368,7 @@ class BatchedToken2Wav(nn.Module):
         chunk_encoder_graph_config: Mapping[str, Any] | None = None,
         bfloat16_attention_cache: bool = False,
         setup_cache_size: int = 1,
+        setup_host_cache_size: int = 0,
         cfm_tf32: bool = False,
         encoder_graph_config: Mapping[str, Any] | None = None,
         cfm_float16: bool = False,
@@ -414,9 +415,14 @@ class BatchedToken2Wav(nn.Module):
         chunk_frames = int(connector.get("codec_chunk_frames", 25) or 25)
         initial_frames = int(connector.get("initial_codec_chunk_frames", 0) or 0)
         token_widths = {left_context + chunk_frames}
+        token_widths.update(left_context + int(frames) for frames in encoder_cfg.get("extra_codec_chunk_frames", ()))
         if initial_frames:
             token_widths.add(left_context + initial_frames)
         self._chunk_encoder_token_widths = tuple(sorted(width for width in token_widths if width > 0))
+        self._precapture_encoder_tails = bool(encoder_cfg.get("precapture_tails", False))
+        self._tail_encoder_graph: FlowEncoderGraphs | None = None
+        self._c8_mixed_tail_checks: dict[tuple, int] = {}
+        self._c8_mixed_tail_replays = 0
         self._chunk_encoder_graph = (
             FlowEncoderGraphs(
                 functools.partial(self._encode_chunk_eager, last_chunk=False),
@@ -646,6 +652,10 @@ class BatchedToken2Wav(nn.Module):
         self._timestep_freqs: dict[tuple[Any, ...], torch.Tensor] = {}
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
         self._setup_cache_size = setup_cache_size
+        self._setup_host_cache_size = int(setup_host_cache_size)
+        if self._setup_host_cache_size < 0 or (self._setup_host_cache_size and setup_cache_size == 0):
+            raise ValueError("Host setup cache needs a nonnegative budget and at least one device slot")
+        self._setup_host_cache = OrderedDict()
         self._setup_cache: OrderedDict[tuple[tuple[str, str], int], BatchedToken2WavState] = OrderedDict()
 
     def _sync_solve_timing(self, device: torch.device) -> None:
@@ -792,6 +802,9 @@ class BatchedToken2Wav(nn.Module):
         for setup_key in list(self._setup_cache):
             if setup_key[0] == prompt_key:
                 self._setup_cache.pop(setup_key)
+        for setup_key in list(self._setup_host_cache):
+            if setup_key[0] == prompt_key:
+                self._setup_host_cache.pop(setup_key)
 
     @staticmethod
     def _repeat_prompt(features: PromptFeatures, batch_size: int) -> tuple[torch.Tensor, ...]:
@@ -981,15 +994,23 @@ class BatchedToken2Wav(nn.Module):
         return graphs
 
     def _graph_encode(
-        self, tokens: torch.Tensor, states: list[BatchedToken2WavState], copy: bool = False
+        self, tokens: torch.Tensor, states: list[BatchedToken2WavState], copy: bool = False, *, last_chunk: bool = False
     ) -> tuple[torch.Tensor, ...] | None:
-        """A continuation chunk's encoder outputs from its graph: views rewritten by the next replay, or copies."""
-        if self._encoder_graphs is None or self.flow.training or torch.is_grad_enabled():
+        """Encoder outputs from the matching arena, valid until its next replay."""
+        if last_chunk:
+            graphs = getattr(self, "_tail_encoder_graph", None)
+            if len(states) != 1:
+                return None
+        else:
+            graphs = self._encoder_graphs
+        if graphs is None or self.flow.training or torch.is_grad_enabled():
             return None
         flows = [state.flow_cache for state in states]
-        outputs = self._encoder_graphs.run(
+        outputs = graphs.run(
             tokens, [flow["conformer_cnn_cache"] for flow in flows], [flow["conformer_att_cache"] for flow in flows]
         )
+        if last_chunk and outputs is not None and (graphs.replays in (1, 4) or graphs.replays % 32 == 0):
+            logger.info("Flow encoder startup tail graph replays=%d", graphs.replays)
         return tuple(value.clone() for value in outputs) if outputs is not None and copy else outputs
 
     @torch.inference_mode()
@@ -1067,16 +1088,42 @@ class BatchedToken2Wav(nn.Module):
             (*att.shape[:3], max(key[2] for key in keys), att.shape[4]), dtype=att.dtype, device=att.device
         )
         self._ensure_relpos_pe(probe, probe_att)
+        layouts = {
+            "cnn_shape": tuple(cnn.shape[1:]),
+            "att_layout": (int(att.shape[0]), int(att.shape[2]), int(att.shape[4])),
+            "hidden_dim": int(self.flow.encoder_proj.out_features),
+            "dtype": att.dtype,
+            "device": att.device,
+            "cnn_dtype": cnn.dtype,
+        }
         with self._autocast(att.device):
-            captured = graph.capture(
-                keys,
-                cnn_shape=tuple(cnn.shape[1:]),
-                att_layout=(int(att.shape[0]), int(att.shape[2]), int(att.shape[4])),
-                hidden_dim=int(self.flow.encoder_proj.out_features),
-                dtype=att.dtype,
-                device=att.device,
-                cnn_dtype=cnn.dtype,
-            )
+            captured = graph.capture(keys, **layouts)
+            if att.device.type == "npu" and self._precapture_encoder_tails:
+                # Finalization zero-pads right context in the real encoder and
+                # emits all supplied token frames. Keep tail shapes and storage
+                # distinct from the continuation arena.
+                tails = FlowEncoderGraphs(
+                    functools.partial(self._encode_chunk_eager, last_chunk=True),
+                    upsample=graph.upsample,
+                    held_tensors=self._encoder_position_tables,
+                    terminal=True,
+                )
+                self._tail_encoder_graph = tails
+                steady = int(features.mels.shape[1]) + _CACHE_TRIM_SUFFIX
+                initial = int(att.shape[3])
+                first_full = min(initial + graph.output_frames(max(widths)), steady)
+                tail_keys = [
+                    (1, width, history)
+                    for history in sorted({first_full, steady})
+                    for width in range(1, max(widths) + 1)
+                ]
+                tail_count = tails.capture(tail_keys, **layouts)
+                logger.info(
+                    "Flow encoder precaptured %d exact NPU tail graphs (history %s, buffers %.1f MiB)",
+                    tail_count,
+                    sorted({first_full, steady}),
+                    tails.storage_bytes() / 2**20,
+                )
         if captured:
             graph.capture_on_request = graph.capture_after_precapture
             self._encoder_graphs = graph
@@ -2056,7 +2103,20 @@ class BatchedToken2Wav(nn.Module):
 
     def has_cached_setup(self, features: PromptFeatures) -> bool:
         """Whether :meth:`setup_batch` would hit its cache now; read-only."""
-        return self._setup_cache_key(features) in self._setup_cache
+        key = self._setup_cache_key(features)
+        return key in self._setup_cache or key in self._setup_host_cache
+
+    @staticmethod
+    def _copy_setup_state(state: BatchedToken2WavState, device: torch.device) -> BatchedToken2WavState:
+        def copy(tensors):
+            output = {}
+            for k, v in tensors.items():
+                dst = torch.empty_like(v, device=device, pin_memory=device.type == "cpu")
+                dst.copy_(v, non_blocking=True)
+                output[k] = dst
+            return output
+
+        return BatchedToken2WavState(copy(state.flow_cache), copy(state.hift_cache))
 
     def setup_batch(self, features: PromptFeatures, batch_size: int) -> list[BatchedToken2WavState]:
         """Initial states for ``batch_size`` requests sharing one prompt.
@@ -2074,10 +2134,36 @@ class BatchedToken2Wav(nn.Module):
         # after padding has already been chosen for these initial states.
         cache_key = self._setup_cache_key(features)
         state = self._setup_cache.get(cache_key)
+        if os.getenv("MINICPMO_C8_PROMPT_CACHE_BUDGET_FILE") is not None:
+            requests = getattr(self, "_c8_setup_lookups", 0) + 1
+            hits = getattr(self, "_c8_setup_hits", 0) + (state is not None)
+            self._c8_setup_lookups, self._c8_setup_hits = requests, hits
+            if requests % 32 == 0:
+                logger.info(
+                    "[c8-reference-cache] lookups=%d hits=%d entries=%d capacity=%d",
+                    requests,
+                    hits,
+                    len(self._setup_cache),
+                    self._setup_cache_size,
+                )
         if state is not None:
             self._setup_cache.move_to_end(cache_key)
         else:
-            (state,) = self._create_initial_states(features, 1)
+            host_entry = self._setup_host_cache.get(cache_key)
+            if host_entry is not None:
+                self._setup_host_cache.move_to_end(cache_key)
+                host_state, ready, device = host_entry
+                torch.npu.current_stream(device).wait_event(ready)
+                state = self._copy_setup_state(host_state, device)
+            else:
+                (state,) = self._create_initial_states(features, 1)
+                device = features.mels.device
+                if self._setup_host_cache_size and device.type == "npu":
+                    pinned = self._copy_setup_state(state, torch.device("cpu"))
+                    ready = torch.npu.current_stream(device).record_event()
+                    self._setup_host_cache[cache_key] = (pinned, ready, device)
+                    while len(self._setup_host_cache) > self._setup_host_cache_size:
+                        self._setup_host_cache.popitem(last=False)
             if self._setup_cache_size > 0:
                 self._setup_cache[cache_key] = state
                 while len(self._setup_cache) > self._setup_cache_size:
@@ -2239,7 +2325,11 @@ class BatchedToken2Wav(nn.Module):
             )
             # Replay must use the same autocast context as startup capture.
             # A captured encoder graph stacks the conformer caches into its own inputs.
-            graphed = None if last_chunk or flush_encoder else self._graph_encode(tokens, states)
+            graphed = (
+                self._graph_encode(tokens, states, last_chunk=True)
+                if last_chunk or flush_encoder
+                else self._graph_encode(tokens, states)
+            )
             flow_cache = self._stack_flow_cache(states, include_conformer=graphed is None)
             # A graph's shared results are read below and copied per row by _split_flow_cache.
             hidden, conformer_cnn, conformer_att = graphed or self._encode_chunk(
@@ -2399,6 +2489,14 @@ class BatchedToken2Wav(nn.Module):
             )
             encoder_groups.setdefault(key, []).append(row)
 
+        mode = "baseline"
+        mode_file = os.getenv("MINICPMO_C8_MIXED_TAIL_GRAPH_FILE")
+        if mode_file and tokens[0].device.type == "npu" and batch_size > 1:
+            try:
+                with open(mode_file, encoding="utf-8") as stream:
+                    mode = stream.read().strip()
+            except OSError:
+                pass
         hidden_rows: list[torch.Tensor | None] = [None] * batch_size
         conformer_cnn_rows: list[torch.Tensor | None] = [None] * batch_size
         conformer_att_rows: list[torch.Tensor | None] = [None] * batch_size
@@ -2416,18 +2514,45 @@ class BatchedToken2Wav(nn.Module):
                     },
                 )
                 # With several groups the next replay rewrites the shared graph results, so they are copied.
-                graphed = (
-                    None if last_chunk else self._graph_encode(group_tokens, group_states, len(encoder_groups) > 1)
-                )
+                copy_outputs = len(encoder_groups) > 1
+                graphed = None
+                key = None
+                if not last_chunk:
+                    graphed = self._graph_encode(group_tokens, group_states, copy_outputs)
+                elif len(rows) == 1 and mode in ("shadow", "active"):
+                    flow = group_states[0].flow_cache
+                    att = flow["conformer_att_cache"]
+                    cnn = flow["conformer_cnn_cache"]
+                    key = (int(group_tokens.shape[1]), att.shape, cnn.shape, att.dtype, cnn.dtype)
+                    if mode == "active" and self._c8_mixed_tail_checks.get(key) == 2:
+                        graphed = self._graph_encode(group_tokens, group_states, copy_outputs, last_chunk=True)
+                        if graphed is not None:
+                            self._c8_mixed_tail_replays += 1
+                            n = self._c8_mixed_tail_replays
+                            if n in (1, 32, 96, 192) or n % 256 == 0:
+                                logger.info("[c8-mixed-tail-graph] active replays=%d", n)
                 # The encoder reads only the conformer caches.
-                group_cache = {} if graphed else self._stack_flow_cache(group_states)
-                hidden, conformer_cnn, conformer_att = graphed or self._encode_chunk(
-                    group_tokens,
-                    last_chunk=last_chunk,
-                    cnn_cache=group_cache["conformer_cnn_cache"],
-                    att_cache=group_cache["conformer_att_cache"],
-                    precaptured_checked=True,
-                )
+                if graphed is None:
+                    group_cache = self._stack_flow_cache(group_states)
+                    graphed = self._encode_chunk(
+                        group_tokens,
+                        last_chunk=last_chunk,
+                        cnn_cache=group_cache["conformer_cnn_cache"],
+                        att_cache=group_cache["conformer_att_cache"],
+                        precaptured_checked=True,
+                    )
+                    if mode == "shadow" and key is not None:
+                        matches = self._c8_mixed_tail_checks.get(key, 0)
+                        if 0 <= matches < 2:
+                            test = self._graph_encode(group_tokens, group_states, copy_outputs, last_chunk=True)
+                            if test is not None:
+                                exact = all(torch.equal(a, b) for a, b in zip(test, graphed, strict=True))
+                                self._c8_mixed_tail_checks[key] = matches + 1 if exact else -1
+                                if not exact or matches == 1:
+                                    logger.info(
+                                        "[c8-mixed-tail-graph] %s shape=%s", "qualified" if exact else "mismatch", key
+                                    )
+                hidden, conformer_cnn, conformer_att = graphed
             for group_row, row in enumerate(rows):
                 hidden_rows[row] = hidden[group_row : group_row + 1]
                 conformer_cnn_rows[row] = conformer_cnn[group_row : group_row + 1]

@@ -13,6 +13,7 @@ the same step.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -22,14 +23,14 @@ from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.worker.gpu import model_runner as gpu_runner
 from vllm_ascend.worker.v2 import model_runner as ascend_runner
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
-
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import (
     MINICPMO_TALKER_FRAMES_MAX,
     talker_kstep_frames,
 )
 from vllm_omni.worker_v2.ngram_adapter import scheduler_ngram_factory, use_scheduler_ngram
-from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.v2.input_batch import AscendInputBuffers
@@ -253,6 +254,17 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         # the stock backend, so arm the install only for MiniCPM-o stages.
         cfg = kwargs.get("vllm_config") or (args[0] if args else None)
         architectures = getattr(getattr(cfg, "model_config", None), "architectures", None) or []
+        excluded_op = os.environ.get("MINICPMO_TALKER_STATIC_EXCLUDED_OP")
+        if excluded_op and getattr(getattr(cfg, "model_config", None), "model_stage", None) == "tts":
+            from vllm_ascend.compilation import compiler_interface
+
+            set_blacklist = compiler_interface._set_static_kernel_blacklist
+
+            def set_talker_blacklist(blacklist):
+                set_blacklist([*blacklist, excluded_op])
+                logger.info("MiniCPM-o Talker static kernel keeps %s on the default path", excluded_op)
+
+            compiler_interface._set_static_kernel_blacklist = set_talker_blacklist
         if (
             any("MiniCPMO45" in str(a) for a in architectures)
             and os.environ.get("VLLM_OMNI_STATIC_SHAPE_V2", "1") == "1"
@@ -301,8 +313,32 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
             return
         return super()._dummy_sampler_run(hidden_states)
 
+    def _dummy_run(self, num_tokens: int, *args: Any, **kwargs: Any):
+        was_profile = getattr(self, "_omni_kstep_dummy_profile", False)
+        self._omni_kstep_dummy_profile = bool(kwargs.get("is_profile", False))
+        try:
+            return super()._dummy_run(num_tokens, *args, **kwargs)
+        finally:
+            self._omni_kstep_dummy_profile = was_profile
+
     def _call_model(self, model_inputs, *, input_batch, batch_desc):
+        mode_path = os.getenv("MINICPMO_NPU_TALKER_FUSED_MODE_FILE")
+        if mode_path and self.model_config.model_stage == "llm" and input_batch.has_prefill:
+            if "MiniCPMO45" in str(self.model_config.architectures):
+                from vllm_omni.platforms.npu.worker.prefill_graph import run_prefill
+
+                output = run_prefill(self, mode_path, model_inputs, input_batch, batch_desc, thinker=True)
+                if output is not None:
+                    return output
         if self._kstep_active():
+            mode_path = os.getenv("MINICPMO_NPU_TALKER_FUSED_MODE_FILE")
+            if mode_path and input_batch.has_prefill:
+                from vllm_omni.platforms.npu.worker.prefill_graph import run_prefill
+
+                output = run_prefill(self, mode_path, model_inputs, input_batch, batch_desc)
+                if output is not None:
+                    self._kstep_ran_last = False
+                    return output
             kstep_output = self._run_kstep_frames(model_inputs, input_batch)
             if kstep_output is not None:
                 return kstep_output
@@ -313,31 +349,49 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         if not self._kstep_active() or getattr(self, "cudagraph_manager", None) is None:
             return None
 
+        from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
+        from vllm_ascend.compilation.updatable_graph import UpdatableGraph
+
+        manager = self.cudagraph_manager
+        graph = manager.graphs.get(batch_desc)
+        static_replay = (
+            isinstance(graph, UpdatableGraph)
+            and not graph.tasks
+            and not graph.provider_sizes
+            and getattr(self.model_state, "device_metadata", None) is None
+            and not callable(getattr(self.model_state, "prepare_engram", None))
+        )
+        if static_replay:
+            logger.info_once("MiniCPM-o MRv2 Talker static graph replays without an update stream")
+
         def run_model():
-            replayed = self.cudagraph_manager.run_fullgraph(batch_desc)
+            # Preserve vLLM's offload barrier and output buffer handling. A
+            # static graph has no attention parameters for Ascend to refresh.
+            replayed = (
+                ModelCudaGraphManager.run_fullgraph(manager, batch_desc)
+                if static_replay
+                else manager.run_fullgraph(batch_desc)
+            )
             if self.use_aux_hidden_state_outputs:
                 replayed, _draft_aux = replayed
             hidden, _aux = self._split_fullgraph_output(replayed)
             return hidden
 
+        mode_path = os.getenv("MINICPMO_NPU_TALKER_FUSED_MODE_FILE")
+        if mode_path and static_replay:
+            from vllm_omni.platforms.npu.worker.talker_fused_decode import run_fused_step
+
+            return run_fused_step(self, mode_path, batch_desc, model_inputs, input_batch, run_model)
         return self._run_kstep_frames(model_inputs, input_batch, run_model=run_model)
 
     def _run_kstep_frames(self, model_inputs, input_batch, run_model=None):
-        """Replay the talker K-step frame loop on the MRv2 runner.
+        """Replay one codec frame for each booked query position.
 
-        The shared ``talker_multiframe.run`` owns the per-frame codec feedback: each
-        frame writes the previously sampled codec embedding into the persistent
-        inputs_embeds row, re-runs the K-row forward, samples one codec frame
-        from that row's hidden state, and finally merges the K frame outputs.
-        Re-running the K-row forward each frame rewrites the KV slots in place;
-        the causal mask means row k only reads rows 0..k, which all carry their
-        real codec embeddings by then. This keeps one host step per K frames
-        without touching the Ascend attention metadata layout.
-
-        ``run_model`` defaults to the eager single forward; passing the graph
-        replay turns the loop into per-frame replays of the K-row decode graph.
-        """
+        Each replay feeds the prior sampled codec into the persistent input
+        row. The causal mask isolates later rows, while replay rewrites the
+        booked KV slots. run_model may be eager or a graph replay."""
         from vllm_omni.model_executor.models.output_templates import OmniOutput
+
         from vllm_omni.worker import talker_multiframe as multiframe
 
         cfg = getattr(self, "vllm_config", None)
@@ -369,6 +423,11 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
             self._kstep_ran_last = False
             return None
         if not uniform or len(infos) != len(spans):
+            if not uniform and getattr(self, "_omni_kstep_dummy_profile", False):
+                # Memory profiling distributes its token budget across dummy
+                # requests. Uneven spans still need a full-sized forward.
+                self._kstep_ran_last = False
+                return None
             # K-step-armed decode step the frame loop cannot run. Falling back
             # to a single forward would sample one frame from the last row of
             # each span and report one stop row for K booked positions,
@@ -395,6 +454,7 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         # One replay per booked row. A width below the configured K would leave
         # rows unsampled; a width above it would write past the request's span.
         frames = width
+        using_full_graph = run_model is not None
         if run_model is None:
 
             def run_model():
@@ -432,6 +492,11 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         # (preprocess/make_omni_output/take_batch_stop_logits/merge_frame_outputs)
         # live on the inner talker, which the wrapper only partially forwards.
         codec_model = getattr(self.model, "talker", self.model)
+        frame_forward = None
+        if using_full_graph and os.getenv("MINICPMO_NPU_TALKER_NARROW_C8_MODE_FILE") is not None:
+            from vllm_omni.platforms.npu.worker.talker_batched_decode import prepare
+
+            frame_forward = prepare(self, codec_model, model_inputs, input_batch, width)
         out = multiframe.run(
             model=codec_model,
             run_model=run_model,
@@ -442,6 +507,7 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
             model_kwargs=model_kwargs,
             model_kwargs_extra=model_kwargs_extra,
             narrow=None,
+            frame_forward=frame_forward,
         )
         # Arm the per-step K-step state only after a successful frame loop:
         # drafts and postprocess now follow the frame-loop semantics until

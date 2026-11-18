@@ -3,6 +3,7 @@
 
 import functools
 import itertools
+import os
 import time
 import weakref
 from collections import Counter
@@ -16,7 +17,6 @@ import torch.nn.functional as F
 from torch.cuda import CUDAGraph
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 
 logger = init_logger(__name__)
@@ -737,11 +737,29 @@ def _resized_frame_view(cache: torch.Tensor, frames: int) -> torch.Tensor | None
     return cache.as_strided((*cache.shape[:-2], frames, width), cache.stride())
 
 
-def _copy_frame_segments(dst: torch.Tensor, src: torch.Tensor, segments: list[tuple[int, int]]) -> None:
-    """Write ``src[..., start:start + length, :]`` segments back to back into ``dst``'s frame axis."""
+def _copy_frame_segments(
+    dst: torch.Tensor, src: torch.Tensor, segments: list[tuple[int, int]], *, max_copy_bytes: int | None = None
+) -> None:
+    """Write attention history in frame order; limit temporary copy size on the secondary NPU."""
+    if max_copy_bytes is None:
+        tight_npu = (
+            dst.device.type == "npu"
+            and os.getenv("MINICPMO_C8_SECONDARY_VOCODER_TIGHT_MEMORY") == "1"
+            and os.getenv("VLLM_OMNI_REPLICA_ID") == "1"
+        )
+        max_copy_bytes = 64 * 2**20 if tight_npu else 0
     position = 0
     for start, length in segments:
-        dst[..., position : position + length, :].copy_(src[..., start : start + length, :])
+        target = dst[..., position : position + length, :]
+        source = src[..., start : start + length, :]
+        if max_copy_bytes and source.numel() * source.element_size() > max_copy_bytes and source.shape[0] > 1:
+            # The first dimension is the CFM step. Split the D2D copy without changing the solver.
+            bytes_per_step = source[0].numel() * source.element_size()
+            slab = max(1, max_copy_bytes // max(1, bytes_per_step))
+            for row in range(0, int(source.shape[0]), slab):
+                target[row : row + slab].copy_(source[row : row + slab])
+        else:
+            target.copy_(source)
         position += length
 
 

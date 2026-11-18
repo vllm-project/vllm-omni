@@ -42,7 +42,6 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequest, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
-
 from vllm_omni.core.sched.omni_scheduling_coordinator import uses_native_mrv2_data_plane
 from vllm_omni.data_entry_keys import (
     ASYNC_CHUNK_PREWARM_NS,
@@ -54,12 +53,6 @@ from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import PER_SAMPLE_KV_COUNT_KEY
 from vllm_omni.distributed.weight_sharing.runtime import SharingRuntime
-from vllm_omni.engine import (
-    AdditionalInformationEntry,
-    AdditionalInformationPayload,
-    OmniEngineCoreRequest,
-    PayloadSenderInfo,
-)
 from vllm_omni.engine.async_engine_utils import apply_omni_final_stage_metadata, scope_stage_replica_mm_uuids
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.errors import NativeKVHandoffError
@@ -86,7 +79,6 @@ from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_k
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.shared_request_queue import SharedRequestQueue
 from vllm_omni.engine.stage_client import DiffusionSubmitKwargs
-from vllm_omni.engine.stage_pool import StagePool, StageRequestMetrics, StageUnavailableError
 from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError
 from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
 from vllm_omni.metrics import definitions as metric_defs
@@ -96,9 +88,18 @@ from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
 from vllm_omni.outputs import OmniRequestOutput, StagePostWarmupMemoryStats
 from vllm_omni.tracing import RequestTrace
 
+from vllm_omni.engine import (
+    AdditionalInformationEntry,
+    AdditionalInformationPayload,
+    OmniEngineCoreRequest,
+    PayloadSenderInfo,
+)
+from vllm_omni.engine.stage_pool import StagePool, StageRequestMetrics, StageUnavailableError
+
 if TYPE_CHECKING:
-    from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
     from vllm_omni.engine.stage_client import StagePoolClient
+
+    from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
 
 logger = init_logger(__name__)
 
@@ -3726,6 +3727,8 @@ class OrchestratorBase:
                 except StageUnavailableError:
                     await self._fail_request_dead_stage(request_id, route_stage_id)
                     return False
+            if next_stage_id == 2 and pinned_replica_id is None and not req_state.session_owned:
+                pinned_replica_id = next_pool.select_experimental_code2wav_replica(request_id)
             route_kwargs: dict[str, Any] = {} if pinned_replica_id is None else {"pinned_replica_id": pinned_replica_id}
             stamp_downstream_stage_submit(
                 req_state,

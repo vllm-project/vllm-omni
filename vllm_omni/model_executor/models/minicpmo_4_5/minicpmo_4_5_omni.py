@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -47,8 +48,9 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
-from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
+
+from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm.v1.sample.metadata import SamplingMetadata
@@ -74,6 +76,9 @@ def _duplex_row_outputs(request_infos: list[Any]) -> dict[str, Any]:
         prompt_rows.append(list(prompt_token_ids) if isinstance(prompt_token_ids, list) else None)
     if any(row is not None for row in prompt_rows):
         outputs["duplex_prompt_token_ids"] = prompt_rows
+        outputs["duplex_explicit_reply"] = [
+            torch.tensor([int(info.get("duplex_explicit_reply") is True)], dtype=torch.long) for info in duplex_rows
+        ]
 
     special_rows = [
         info if isinstance(info := duplex_info.get("special_token_ids"), dict) else {} for duplex_info in duplex_rows
@@ -584,6 +589,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 return input_ids, embeds, {"duplex": {"prefill_success": False, "reason": str(exc)}}
             result = helper._stage_prefill_embeddings_only(state, audio_waveform, **prefill_kwargs)
         update_result = dict(result)
+        update_result["duplex_explicit_reply"] = (
+            prefill_kwargs["final"] and payload.get("_native_explicit_reply") is True
+        )
         if result.get("stage0_window_replaced") is True:
             window = duplex.get("stage0_window", {})
             logger.info(
@@ -1117,6 +1125,24 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if spec is None:
                 return duplex_sampler, None
 
+            if current_omni_platform.is_npu() and spec.method == "dspark":
+                if self.vllm_config.scheduler_config.async_scheduling:
+                    raise ValueError("MiniCPM-o MRv2 duplex DSpark requires synchronous Thinker scheduling")
+                if os.environ.get("MINICPMO_NPU_DSPARK_NATIVE_GATHER") == "1":
+                    from vllm.v1.worker.gpu.spec_decode import rejection_sampler as rejection_module
+
+                    def gather_draft_sampled(
+                        input_ids, positions, logits_indices, expanded_idx_mapping, expanded_local_pos, prefill_len
+                    ):
+                        rows = logits_indices.long()
+                        ids = input_ids.index_select(0, rows)
+                        pos = positions.index_select(0, rows)
+                        prefill = prefill_len.index_select(0, expanded_idx_mapping.long())
+                        placeholders = (expanded_local_pos > 0) & (pos - expanded_local_pos < prefill)
+                        return ids.masked_fill(placeholders, -1), pos
+
+                    rejection_module.gather_draft_sampled = gather_draft_sampled
+                    logger.info("MiniCPM-o MRv2 DSpark uses the native NPU draft gather")
             from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 
             return duplex_sampler, RejectionSampler(sampler, spec, sampler.req_states.draft_tokens.device)
@@ -1675,12 +1701,21 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             sampled == listen_id
             and 0 <= tts_bos_id
             and state is not None
-            and not getattr(state, "current_turn_ended", True)
             and not force_listen
             and not (
                 isinstance(payload, dict)
                 and payload.get("open_assistant_turn") is True
                 and getattr(state, "pending_speech_response_open", False)
+            )
+            and (
+                not getattr(state, "current_turn_ended", True)
+                or (
+                    getattr(state, "pending_speech_context", False)
+                    and (
+                        getattr(state, "idle_reply_due", False)
+                        or (isinstance(payload, dict) and payload.get("_native_explicit_reply") is True)
+                    )
+                )
             )
         ):
             return int(tts_bos_id)
@@ -1725,6 +1760,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         listen_id = token_ids.get("listen_token_id", -1)
         tts_bos_id = token_ids.get("tts_bos_token_id", -1)
         turn_eos_id = token_ids.get("turn_eos_token_id", -1)
+        if not force_listen and getattr(state, "idle_reply_due", False):
+            logger.info("MiniCPM-o duplex post-idle reply decision session=%s token=%d", state.session_id, sampled)
+            state.idle_reply_due = False
         if sampled in self._minicpmo45_chunk_terminator_token_ids(token_ids):
             state.pending_terminator_token = int(sampled)
             state.last_terminator_token = int(sampled)
@@ -1738,6 +1776,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 with suppress(Exception):
                     state.pending_speech_response_open = False
             return
+        state.speech_after_idle = False
         if sampled == turn_eos_id:
             # Official streaming_generate feeds <|turn_eos|> like text (its
             # hidden state conditions the Talker) and keeps sampling until a

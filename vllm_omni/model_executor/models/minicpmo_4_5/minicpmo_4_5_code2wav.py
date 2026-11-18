@@ -22,7 +22,6 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.utils.device_copy import to_device_nonblocking
 
@@ -483,6 +482,8 @@ class MiniCPMO45Code2Wav(nn.Module):
             "max_graphs": int(extra.get("code2wav_encoder_max_graphs", 8)),
             "capture_after": int(extra.get("code2wav_encoder_capture_after", 2)),
             "capture_after_precapture": read_bool_flag(extra, "code2wav_encoder_capture_after_precapture", False),
+            "precapture_tails": read_bool_flag(extra, "code2wav_encoder_tail_precapture", False),
+            "extra_codec_chunk_frames": tuple(extra.get("code2wav_encoder_extra_codec_chunk_frames") or ()),
             "rows": [row for row in encoder_rows if not max_num_seqs or row <= int(max_num_seqs)],
         }
         self._cfm_graph_config = {
@@ -606,7 +607,15 @@ class MiniCPMO45Code2Wav(nn.Module):
             extra = connector.get("extra", connector)
         else:
             extra = getattr(connector, "extra", None)
-        return dict(extra) if isinstance(extra, Mapping) else {}
+        result = dict(extra) if isinstance(extra, Mapping) else {}
+        if os.getenv("MINICPMO_C8_SECONDARY_VOCODER_HOST_CACHE") == "1" and os.getenv("VLLM_OMNI_REPLICA_ID") == "1":
+            result["token2wav_setup_cache_size"] = 4
+            result["token2wav_setup_host_cache_size"] = 64
+            if os.getenv("MINICPMO_C8_SECONDARY_VOCODER_TIGHT_MEMORY") == "1":
+                result["token2wav_setup_cache_size"] = 2
+                result["micro_batch_size"] = 2
+                logger.info("[c8-vocoder-tight] setup_device=2 setup_host=64 cfm_micro_batch=2")
+        return result
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return torch.zeros((input_ids.numel(), 1), device=input_ids.device, dtype=torch.float32)
@@ -732,6 +741,39 @@ class MiniCPMO45Code2Wav(nn.Module):
             self._request_prompt_keys[item.state_id] = cache_key
             self._runtime_prompts.move_to_end(cache_key)
         self._trim_runtime_prompts()
+
+    def _update_c8_prompt_cache_budget(self) -> None:
+        marker = os.getenv("MINICPMO_C8_PROMPT_CACHE_BUDGET_FILE")
+        if marker is None or self.backend is None:
+            return
+        try:
+            mode = Path(marker).read_text().strip()
+        except FileNotFoundError:
+            return
+        if mode not in ("baseline", "capacity64", "fresh64"):
+            return
+        if getattr(self, "_c8_prompt_cache_mode", None) == mode:
+            return
+        self._c8_prompt_cache_mode = mode
+        setup = self.backend._setup_cache
+        if mode == "fresh64":
+            setup.clear()
+            self.backend._setup_host_cache.clear()
+            for key, entry in list(self._runtime_prompts.items()):
+                if not entry.owners and not entry.pins:
+                    self._evict_runtime_prompt(key, entry)
+        budget = 1 if mode == "baseline" else 64
+        self._runtime_prompt_cache_size = 4 if mode == "baseline" else 64
+        self._setup_cache_size = self.backend._setup_cache_size = budget
+        while len(setup) > budget:
+            setup.popitem(last=False)
+        self._trim_runtime_prompts()
+        logger.info(
+            "[c8-reference-cache] mode=%s setup_entries=%d runtime_entries=%d",
+            mode,
+            len(setup),
+            len(self._runtime_prompts),
+        )
 
     def _trim_runtime_prompts(self) -> None:
         """Evict least-recent unowned references, never request-owned or prefetch-pinned state."""
@@ -1195,6 +1237,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
+        self._update_c8_prompt_cache_budget()
         details = {"batch_size": len(runtime_additional_information or ())}
         with self._watchdog.watch("forward/start", details), _stage_matmul_policy(self._tf32_mode):
             return self._forward_impl(
@@ -1574,6 +1617,19 @@ class MiniCPMO45Code2Wav(nn.Module):
                 self._states.pop(request_id, None)
             else:
                 self._states[request_id] = state
+        if os.getenv("MINICPMO_RSI_NATIVE_AUDIO_TRACE"):
+            for item, output in zip(items, outputs, strict=True):
+                if item.duplex_turn_id >= 0:
+                    logger.info(
+                        "RSI_NATIVE_PCM request=%s turn=%s chunk=%d frames=%d samples=%d tail=%s segment=%s",
+                        item.request_id,
+                        item.duplex_turn_id,
+                        item.chunk_seq,
+                        int(item.tokens.numel()),
+                        int(output.numel()),
+                        item.last_chunk,
+                        item.tts_is_last_chunk,
+                    )
         sample_rate_tensor = torch.as_tensor(sample_rate, dtype=torch.int32)
         return OmniOutput(
             text_hidden_states=None,
@@ -1827,6 +1883,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
             MiniCPMO45Token2wav as Token2wav,
         )
+
         from vllm_omni.platforms import current_omni_platform
 
         extra = self._extra_config()
@@ -1960,6 +2017,13 @@ class MiniCPMO45Code2Wav(nn.Module):
         if read_bool_flag(extra, "token2wav_s3_cuda_graph", False):
             if token2wav.enable_s3_cuda_graph(self.vllm_config):
                 logger.info("MiniCPM-o Code2Wav: exact-shape S3 CUDA graphs enabled")
+        if int(extra.get("token2wav_setup_host_cache_size", 0)):
+            logger.info(
+                "[c8-vocoder-replica] host references=%d device references=%d replica=%s",
+                int(extra["token2wav_setup_host_cache_size"]),
+                self._setup_cache_size,
+                os.getenv("VLLM_OMNI_REPLICA_ID", "0"),
+            )
         self.backend = BatchedToken2Wav(
             token2wav,
             trt_stepper=trt_stepper,
@@ -1969,6 +2033,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             chunk_encoder_graph_config=self._chunk_encoder_graph_config,
             bfloat16_attention_cache=read_bool_flag(extra, "code2wav_bfloat16_attention_cache", False),
             setup_cache_size=self._setup_cache_size,
+            setup_host_cache_size=int(extra.get("token2wav_setup_host_cache_size", 0)),
             cfm_tf32=tf32_mode != "off",
             encoder_graph_config=self._encoder_graph_config,
             cfm_float16=read_bool_flag(extra, "cfm_float16", False),
@@ -2116,6 +2181,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                     for attr in (
                         "_encoder_graphs",
                         "_chunk_encoder_graph",
+                        "_tail_encoder_graph",
                         "hift_graph_wrapper",
                         "_cfm_graph_wrapper",
                         "_whole_euler_graph_wrapper",

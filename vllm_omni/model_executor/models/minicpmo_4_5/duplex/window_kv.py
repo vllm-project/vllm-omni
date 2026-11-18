@@ -104,7 +104,6 @@ from typing import Any
 import torch
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowSpec
 from vllm.v1.kv_cache_spec_registry import register_kv_cache_spec
-
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
     ChunkWindowManager,
     ChunkWindowSpec,
@@ -672,6 +671,21 @@ class MiniCPMO45DuplexSchedulerHelper:
         duplex_mgr = cls.find_duplex_window_manager(scheduler)
         if duplex_mgr is None:
             return None
+
+        coordinator = scheduler.kv_cache_manager.coordinator
+        managers = coordinator.single_type_managers
+        # The in-place path compacts one table and uses standard RoPE frequencies.
+        # Leave all tables untouched when the scheduler must rebuild the retained prompt.
+        if len(managers) != 1:
+            return None
+        for config in (
+            getattr(model_config, "hf_text_config", None),
+            getattr(model_config, "hf_config", None),
+        ):
+            for field in ("rope_parameters", "rope_scaling"):
+                rope = getattr(config, field, None)
+                if isinstance(rope, dict) and rope.get("rope_type", rope.get("type", "default")) != "default":
+                    return None
 
         # Free and compact blocks via explicit request-local sink boundary on KV manager.
         # Rejection before state mutation: if compaction returns 0, no state is changed.

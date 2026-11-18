@@ -19,7 +19,6 @@ import numpy as np
 from numpy.typing import NDArray
 from vllm.logger import init_logger
 from vllm.multimodal.image import open_image
-
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
 
 if TYPE_CHECKING:
@@ -97,6 +96,9 @@ class _MiniCPMO45Stage0SessionState:
     pending_terminator_token: int | None = None
     last_terminator_token: int | None = None
     pending_speech_context: bool = False
+    quiet_audio_units: int = 0
+    speech_after_idle: bool = False
+    idle_reply_due: bool = False
     pending_speech_append_identity: tuple[int | None, int] | None = None
     pending_speech_response_open: bool = False
     generated_tokens: list[int] = field(default_factory=list)
@@ -612,6 +614,18 @@ class MiniCPMO45Stage0DuplexRuntime:
         ):
             state.pending_speech_context = True
             state.pending_speech_append_identity = append_identity
+        if is_speech:
+            # The audio front end bounds its streaming history at 30 seconds.
+            # Allow one reply at the end of the first voiced turn after that gap.
+            state.speech_after_idle |= state.quiet_audio_units >= 30 and state.current_turn_ended
+            state.quiet_audio_units = 0
+            state.idle_reply_due = False
+        elif not num_frames:
+            state.quiet_audio_units += units_built
+            state.idle_reply_due |= state.speech_after_idle
+            state.speech_after_idle = False
+        else:
+            state.quiet_audio_units = 0
         if append_identity is not None:
             state.prepared_append_identity = append_identity
             state.prepared_inputs_embeds = inputs_embeds
@@ -1044,7 +1058,6 @@ class MiniCPMO45Stage0DuplexRuntime:
     @staticmethod
     def _batched_audio_chunk(request: _MiniCPMO45AudioEncodeRequest) -> Any | None:  # Any: StreamingAudioChunk
         import torch
-
         from vllm_omni.model_executor.models.minicpmo_4_5.streaming_audio_encoder import (
             StreamingAudioChunk,
             StreamingAudioKVCache,
@@ -1076,7 +1089,6 @@ class MiniCPMO45Stage0DuplexRuntime:
     def _audio_feature_to_device(self, batch_feature: Any) -> Any:  # Any: transformers BatchFeature
         """Move one unit's log-mel features to the encoder without a host sync; integer lengths stay on the host."""
         import torch
-
         from vllm_omni.utils.device_copy import to_device_nonblocking
 
         data = getattr(batch_feature, "data", None)
