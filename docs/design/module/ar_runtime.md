@@ -32,6 +32,78 @@ last_reviewed: 2026-07-16
 The AR runtime extends vLLM scheduling and worker execution for omni-stage
 inputs and outputs while preserving vLLM scheduling and cache semantics.
 
+The experimental Mooncake KV/HS backend uses the existing MRv2 external-load
+state transitions for Qwen3-Omni turn requests and duplex utterances, which
+are also ordinary requests. Its connector must withhold
+successful receive completion until both GPU KV and request-local CPU captures
+are ready. For a cancelled or failed load, it reports completion once the
+native KV copy drains, so a CPU-only HS read never holds destination GPU
+blocks. Its prefix lookup is asynchronous: a slow Store delays only requests
+waiting for that lookup, and a lookup past its deadline is a miss.
+A failed receive uses the explicitly configured `recompute` policy;
+the upstream `fail` default still terminates requests for other configurations.
+Restored captures are merged before output publication and consumed once per
+request attempt. External loads do not populate the worker's local prefix-cache
+slots, so local prefix caching remains disabled with this backend. See
+[KV offload configuration](../../configuration/kv_offload.md#mooncake-kv-and-hidden-state-caching-experimental)
+for configuration, scope, and validation limits, and the
+[Mooncake KV/HS cache design](../feature/mooncake_kv_hs_cache.md) for its
+lifecycle and the deferred two-level mode.
+
+MRv2 preserves the auxiliary output tree when capturing PIECEWISE CUDA graphs,
+because their replay returns that tree directly to model postprocessing.
+FULL captures and their NONE-mode warmup flatten auxiliary tensors into the
+native graph buffers; FULL replay restores the tree before postprocessing.
+Both paths therefore publish the same named hidden-state fields to prefix
+caching and downstream stages.
+
+Models such as Qwen3-TTS whose `forward()` returns a tensor and whose
+`make_omni_output()` builds the multimodal payload afterward declare
+`mrv2_forward_returns_tensor = True`. Their multimodal-output capability does
+not require excluding FULL capture.
+
+Request-batched MTP uses its own FULL graph wrapper. Capture and replay select
+the same FULL descriptor from the MTP capture sizes, bounded by
+`max_num_seqs`, independently of the backbone's graph mode. A backbone that
+uses PIECEWISE graphs must not make the MTP wrapper bypass its captured graph.
+This does not enable graphs for an eager or graph-unsafe MTP implementation;
+requests without a supported capture bucket retain eager execution.
+
+After applying sampled output, the AR scheduler publishes only completed KV
+blocks to upstream prefix caching, including on its plain-decode path. Async
+placeholders and speculative steps use `num_computed_tokens - num_in_flight_tokens`
+as the materialized frontier. Stale output and requests that were not running
+before the update do not publish blocks. Publication precedes stop cleanup so
+the last completed blocks remain reusable after a request finishes.
+
+For Bagel image editing, the vLLM 0.33 prefix-range helper receives shallow
+`image` views of the custom `img2img` features so both VAE and ViT embedding
+spans retain bidirectional attention. The original features keep their modality,
+encoder data, cache identifiers and placeholder masks. Upstream still computes
+the ranges and applies sliding-window and padding rules. This adapter is installed
+from `vllm_omni.patch` for both upstream runner implementations; it is unnecessary
+with vLLM versions that build the ranges inline.
+
+MOSS Local's fused and separate depth-attention paths share an explicitly
+rounded initial weighted value and the same FMA accumulation order. This
+preserves bitwise parity when the compiler inlines attention into sampling,
+including SM89 code generation affected by LLVM SLP reduction reordering.
+
+## Qwen3-Omni Talker sampling
+
+The MRv2 Talker adapter follows the selected vLLM sampler's dispatch contract,
+including its `has_topp_only_rows` predicate. Seeded rows pass that predicate to
+top-k/top-p masking before drawing from their request-local V1 generators.
+Unseeded and greedy rows keep upstream sampling. When mixed rows have already
+been masked, their upstream call disables repeated masking and fused sampling.
+
+Custom samplers register their selected JIT kernels while the runner's startup
+registry is active. The Talker's seeded V1 stream uses native top-k/top-p
+masking even when unseeded sampling selects FlashInfer, so it registers those
+native kernels explicitly. AR workers also warm the existing fused-MoE prefill
+batch sizes on both runner implementations before CUDA graph capture and JIT
+monitoring. These startup passes leave EPLB load recording disabled.
+
 ## Full-payload input scheduling
 
 For a downstream, non-async stage with `requires_full_payload_input`,

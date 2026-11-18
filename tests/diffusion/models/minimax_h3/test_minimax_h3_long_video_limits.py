@@ -135,7 +135,7 @@ def test_external_encoder_cannot_bypass_continuation_edit_validation(kind):
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.od_config = SimpleNamespace(step_execution=False)
+    pipeline.od_config = SimpleNamespace(additional_config={}, step_execution=False)
     conditioning = SimpleNamespace(
         task="ref2va",
         num_frames=481,
@@ -152,7 +152,7 @@ def test_external_encoder_cannot_bypass_full_duration_limit():
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.od_config = SimpleNamespace(step_execution=False)
+    pipeline.od_config = SimpleNamespace(additional_config={}, step_execution=False)
     sampling = OmniDiffusionSamplingParams(extra_args={"long_video": True, "long_video_mode": "full"})
     with pytest.raises(OmniClientError, match="30-second request limit"):
         pipeline._prepare_encoder_conditioning_inputs(SimpleNamespace(task="ref2va", num_frames=7213), sampling)

@@ -165,6 +165,8 @@ class MRv2PrefixCacheMixin(PrefixCacheRunnerMixin, _RunnerBase):
         replay or trim) is discarded at once, so misses keep the plain
         output path.
         """
+        from vllm.distributed.parallel_state import get_tp_group
+
         cache, view = self.omni_prefix_cache, self._prefix_cache_group_view
         if cache is None or view is None:
             return None
@@ -182,12 +184,26 @@ class MRv2PrefixCacheMixin(PrefixCacheRunnerMixin, _RunnerBase):
             return None
         rewrite_ids = cache.step_rewrite_req_ids(step_id)
         emits_payloads = getattr(self.vllm_config.model_config, "engine_output_type", "text") != "text"
-        if not rewrite_ids or not emits_payloads or self._model_mm_outputs_written_in_sample():
-            cache.discard_step(step_id)
-            return None
-        batch_req_ids = input_batch.req_ids[: input_batch.num_reqs]
-        rows = tuple((row, req_id) for row, req_id in enumerate(batch_req_ids) if req_id in rewrite_ids)
-        return PrefixCacheRewrite(cache, step_id, rows)
+        if rewrite_ids and emits_payloads and not self._model_mm_outputs_written_in_sample():
+            from vllm.v1.executor.abstract import Executor
+            from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+
+            # MP (including Ray V2) consumes only TP0's async output unless a
+            # KV/EC connector aggregates all ranks. UniProc/external launcher
+            # and the legacy Ray wrapper materialize each worker's output.
+            if (
+                get_tp_group().is_first_rank
+                or getattr(self.vllm_config, "kv_transfer_config", None) is not None
+                or getattr(self.vllm_config, "ec_transfer_config", None) is not None
+                or not issubclass(Executor.get_class(self.vllm_config), MultiprocExecutor)
+            ):
+                batch_req_ids = input_batch.req_ids[: input_batch.num_reqs]
+                rows = tuple((row, req_id) for row, req_id in enumerate(batch_req_ids) if req_id in rewrite_ids)
+                return PrefixCacheRewrite(cache, step_id, rows)
+        # Drop only the read-side context; write-task holders keep the staging
+        # slot alive until the cache writes complete.
+        cache.discard_step(step_id)
+        return None
 
     @staticmethod
     def _prefix_cache_output_finalizer(

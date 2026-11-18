@@ -359,6 +359,9 @@ class Flux2Pipeline(
 
     _callback_tensor_inputs = ["latents", "prompt_embeds"]
 
+    # Both CFG branches share latents and timestep; prompts are padded to a
+    # fixed length and the position ids are batched like the latents.
+    supports_cfg_batching = True
     support_image_input = True
 
     def __init__(

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import Literal
 
 import torch
@@ -125,7 +126,7 @@ class Cosmos3MixedPrecisionRuntime:
             )
             return
 
-        wrapped_count = 0
+        wrapped_counts: Counter[str] = Counter()
         for path, component in components.items():
             for local_name, layer in component.named_modules():
                 if not isinstance(layer, LinearBase):
@@ -142,10 +143,16 @@ class Cosmos3MixedPrecisionRuntime:
                     module_name,
                     path,
                 )
-                wrapped_count += 1
+                wrapped_counts[strategy.format_name] += 1
 
-        if not wrapped_count:
+        if not wrapped_counts:
             raise ValueError("Cosmos3 mixed precision found no compatible FP8 or NVFP4 ModelOpt linears")
+
+        logger.info(
+            "Cosmos3 mixed precision wrapped linears: fp8=%d, nvfp4=%d",
+            wrapped_counts["fp8"],
+            wrapped_counts["nvfp4"],
+        )
 
     def use_high_precision(self, path: PrecisionPath) -> bool:
         return self.config.reasoner == "a16" if path == "reasoner" else self._generation_high_precision

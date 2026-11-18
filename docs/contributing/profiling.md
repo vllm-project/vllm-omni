@@ -87,7 +87,7 @@ Supported fields:
 | `warmup_iterations` | Torch-profiler warmup iterations. |
 | `active_iterations` | Torch-profiler active iterations. |
 
-For detailed explanations of the fields, please refer to upstream vLLM implementation [vllm/config/profiler.py](https://github.com/vllm-project/vllm/blob/v0.20.1/vllm/config/profiler.py)
+For detailed explanations of the fields, please refer to upstream vLLM implementation [vllm/config/profiler.py](https://github.com/vllm-project/vllm/blob/v0.33.0/vllm/config/profiler.py)
 
 ### Minimal configurations by output
 
