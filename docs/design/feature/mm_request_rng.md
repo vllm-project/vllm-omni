@@ -29,9 +29,8 @@ the worker reads the seed directly. No additional request wire field is needed.
 
 The model declares `SupportsMMRequestRNG`, supplies a shape/dtype/device draw plan
 and implements skipped draws. The runner owns device-local generators/checkpoints,
-separate from AR token sampling. MRv1 builds a plan on first encoding; MRv2 records
-the compact plan at request admission before upstream releases consumed encoder
-inputs, including CPU metadata. Neither retains pixels for replay. The runner attaches
+separate from AR token sampling. MRv2 records the compact plan at request admission before upstream releases consumed encoder
+inputs, including CPU metadata. The plan retains no pixels for replay. The runner attaches
 `(request_handle, mm_index)` to a shallow item copy, associating scheduled items by
 request ID and contextual identifier through upstream filtering and reordering.
 
@@ -43,17 +42,18 @@ Preemption retains state; completion/abort/shutdown release it. Reused request I
 get new handles; live updates must preserve references, seed and draw plan.
 All-prefix hits need no generator until encoding becomes necessary.
 
-In vLLM 0.33, `encoder_input_updates` releases only worker-side feature data;
+In vLLM 0.34, `encoder_input_updates` releases only worker-side feature data;
 EngineCore retains the original inputs. On resumption, the scheduler rebuilds
 `NewRequestData` from those originals. Hunyuan's M-RoPE prefix stripping removes
 covered pixels but retains seed/grid metadata, so re-admission can rebuild and
 validate the complete plan even after the worker released every image input.
 
-GPU MRv1/MRv2 and NPU MRv1 `load_model` bind the same provider. MRv2 tags temporary
+GPU MRv2 `load_model` binds the provider. MRv2 tags temporary
 input copies around its native encoder call and retains plans across preemption;
 only completion, abort and shutdown discard them. Hunyuan AR is unsupported on
 NPU MRv2, with or without a seed: its model state lacks Ascend attention metadata,
-and the NPU runner rejects it at startup. Use `model_runner: v1` on NPU.
+and the NPU runner rejects it at startup. vLLM 0.34 removed ModelRunner V1,
+so there is no V1 fallback for this stage.
 Execution is serialized eager encoding; encoder CUDA graph capture is outside scope.
 Seed zero enables request sampling.
 Seedless AR (no effective `vae_generator_seed`) intentionally retains global-RNG
@@ -91,9 +91,9 @@ including released input payloads, cache hits, preemption, retries and request-I
 They exercise upstream input-release generation and re-admission of independent
 request copies after partial/all image consumption, with and without prefix hits.
 Mixed-request CPU/CUDA cases also check nonempty prompt embedding assembly.
-CPU load-hook tests replace hardware dependencies. The NPU dispatch test uses the
-real Ascend runner and a weight-free Hunyuan VAE on CPU to verify tagging and replay;
-it requires Ascend dependencies and is included in NPU CI. It is not NPU inference evidence.
+CPU load-hook tests replace hardware initialization and verify provider binding
+through the current MRv2 runner. The retired V1 GPU/NPU hooks and their tests
+were removed when merging the upstream ModelRunner V1 removal.
 Real random-weight VAE tests use smaller CPU widths/images and the
 [complete official encoder config](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct/blob/2ec2c78bee7d4b94157341fba86c4c2c7b1858b2/config.json)
 on CUDA at 1024x1024, 768x1024 and 1024x768 with native 384-pixel spatial tiling.
@@ -101,7 +101,6 @@ They check posterior specs, samples and RNG state; CUDA request tests also cover
 No pretrained quality, distributed TP, NPU hardware or AR-to-DiT E2E claim is made.
 
 ```bash
-python -m pytest tests/inputs/test_mm_rng.py tests/model_executor/models/test_hunyuan_request_rng.py tests/worker/test_mm_request_rng_wiring.py tests/worker_v2/test_shared_stage_contracts.py tests/worker_v2/test_mm_request_rng.py -m 'core_model and cpu' -q
-python -m pytest tests/platforms/npu/test_mm_request_rng.py -m 'core_model and npu and A3' --run-level=core_model -q
+python -m pytest tests/inputs/test_mm_rng.py tests/model_executor/models/test_hunyuan_request_rng.py tests/worker_v2/test_shared_stage_contracts.py tests/worker_v2/test_mm_request_rng.py -m 'core_model and cpu' -q
 python -m pytest tests/model_executor/models/test_hunyuan_request_rng.py tests/worker_v2/test_mm_request_rng.py -m 'core_model and cuda and L4' --run-level=core_model -q
 ```

@@ -2,23 +2,33 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MRv2 request lifecycle and real encoder dispatch with weight-free Hunyuan."""
 
+import multiprocessing
+import uuid
+from contextlib import closing
 from copy import copy
 from dataclasses import replace
 
 import numpy as np
 import pytest
 import torch
+from vllm.config import SchedulerConfig, VllmConfig
+from vllm.config.multimodal import MultiModalConfig
 from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+from vllm.multimodal.cache.lru import LruKeyReplicatedReceiverCache
+from vllm.multimodal.cache.shm import ShmObjectStoreReceiverCache, ShmObjectStoreSenderCache
+from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
-from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.model_runner import DraftTokensHandler, GPUModelRunner
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.states import RequestState
+from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 from tests.model_executor.models import test_hunyuan_request_rng as hunyuan_rng
+from vllm_omni.core.sched.output import OmniNewRequestData
 from vllm_omni.model_executor.mm_request_rng import MM_RNG_ITEM_KEY
 from vllm_omni.worker_v2 import omni_model_runner, staged_writes
 
@@ -29,6 +39,8 @@ make_request = hunyuan_rng.make_request
 
 @pytest.fixture
 def v2(runner, mocker):
+    if runner.device.type == "cpu":
+        mocker.patch("vllm.v1.worker.gpu.mm.encoder_runner.PIN_MEMORY", False)
     model = runner.model
     model._mm_rng_provider = None
     model._timestep_token_id = -1
@@ -41,7 +53,8 @@ def v2(runner, mocker):
     result.jit_warmup_registry = JitWarmupRegistry(None)
     result.supports_mm_inputs = True
     result._omni_data_plane = result.sampler = result.pooling_runner = result.pp_handler = None
-    result.adaptive_verification = result.prompt_logprobs_worker = None
+    result.adaptive_verification = result.prompt_logprobs_worker = result.speculator = None
+    result.draft_tokens_handler = mocker.Mock(spec=DraftTokensHandler)
     result.is_last_pp_rank = False
     result.block_tables = mocker.Mock()
     result.lora_state = mocker.Mock()
@@ -96,23 +109,26 @@ def encode(v2, scheduled):
     [
         hunyuan_rng.runner_case("cpu", torch.float32),
         hunyuan_rng.runner_case("cuda", torch.float32),
+        hunyuan_rng.runner_case("cuda", torch.float16),
+        hunyuan_rng.runner_case("cuda", torch.bfloat16),
     ],
     indirect=True,
 )
-def test_mrv2_replays_released_prefix_and_mixed_requests(v2, make_request, mocker):
+@pytest.mark.parametrize("seed_b", [0, 42, 123])
+def test_mrv2_replays_released_prefix_and_mixed_requests(v2, make_request, mocker, seed_b):
     refs = hunyuan_rng.images()
-    a, b = make_request("A", [*refs, refs[0]], 42), make_request("B", refs[:1], 0)
+    a, b = make_request("A", [*refs, refs[0]], 42), make_request("B", refs[:1], seed_b)
     covered = a.mm_features[0].mm_position
     a.num_computed_tokens = covered.offset + covered.length
     admit(v2, a, b)
     provider = v2.model._mm_rng_provider
     assert provider is not None and not provider.streams
-    # vLLM 0.33 releases already consumed encoder inputs, including CPU fields.
+    # vLLM 0.34 releases already consumed encoder inputs, including CPU fields.
     update = hunyuan_rng.schedule()
     update.encoder_input_updates = {"A": {0: None}}
     v2._apply_encoder_input_updates(update)
     expected_a, state_a = hunyuan_rng.reference(v2, [*refs, refs[0]], 42)
-    expected_b, _ = hunyuan_rng.reference(v2, refs[:1], 0)
+    expected_b, _ = hunyuan_rng.reference(v2, refs[:1], seed_b)
     counts = np.array([len(a.prompt_token_ids) - a.num_computed_tokens, len(b.prompt_token_ids)])
     batch = mocker.Mock(
         spec=InputBatch,
@@ -160,7 +176,7 @@ def test_mrv2_readmits_after_input_release_and_preemption(v2, make_request, cons
     provider = v2.model._mm_rng_provider
     handle, plan = provider.handles["A"], v2._mm_rng_state.plans["A"]
 
-    # Pins vLLM 0.33 behavior: _get_encoder_input_updates reads only the four
+    # Pins vLLM 0.34 behavior: _get_encoder_input_updates reads only the four
     # attributes set below. Revisit this stub on upstream scheduler changes.
     scheduler = object.__new__(Scheduler)
     scheduler.use_v2_model_runner, scheduler.is_encoder_decoder = True, False
@@ -273,3 +289,138 @@ def test_mrv2_failed_encode_restores_inputs_for_retry(v2, make_request, mocker):
     v2.model.patch_embed = original
     expected, _ = hunyuan_rng.reference(v2, hunyuan_rng.images(), 0)
     hunyuan_rng.assert_latents(encode(v2, {"A": [1]}), [expected[1]])
+
+
+@pytest.mark.cpu
+def test_real_scheduler_cache_subset_and_duplicate_images(v2, make_request):
+    refs = hunyuan_rng.images()
+    cache = EncoderCacheManager(128)
+    sched = object.__new__(Scheduler)
+    sched.encoder_cache_manager = cache
+    sched.is_encoder_decoder = False
+    sched.scheduler_config = SchedulerConfig(max_model_len=128, is_multimodal_model=True, is_encoder_decoder=False)
+    sched.ec_connector = None
+    warm = make_request("warm", refs[:1])
+    admit(v2, warm)
+    encode(v2, {"warm": [0]})
+    cache.allocate(warm, 0)
+    req = make_request("A", [refs[0], refs[0], refs[1]])
+    indices, _, _, _, duplicates = sched._try_schedule_encoder_inputs(req, 0, req.num_prompt_tokens, 128)
+    assert indices == [1, 2]
+    assert duplicates == []  # Same image at two stream positions has distinct identity.
+    admit(v2, req)
+    expected, _ = hunyuan_rng.reference(v2, [refs[0], refs[0], refs[1]], 42)
+    hunyuan_rng.assert_latents(encode(v2, {"A": indices}), expected[1:])
+    assert not torch.equal(expected[0], expected[1])
+
+
+@pytest.mark.cpu
+def test_lru_restores_seed_before_scheduler(v2, make_request, mocker):
+    config = mocker.Mock()
+    config.get_multimodal_config.return_value = MultiModalConfig(mm_processor_cache_gb=0.01)
+    receiver = LruKeyReplicatedReceiverCache(config)
+    receiver.get_and_update_features(make_request("warm", hunyuan_rng.images(), 123).mm_features)
+    req = make_request("A", hunyuan_rng.images(), 123)
+    req.mm_features = [replace(feature, data=None) for feature in req.mm_features]
+    # EngineCore resolves processor-cache hits before scheduler prefix stripping.
+    req.mm_features = receiver.get_and_update_features(req.mm_features)
+    req.num_computed_tokens = req.mm_features[2].mm_position.offset
+    admit(v2, req)
+    expected, _ = hunyuan_rng.reference(v2, hunyuan_rng.images(), 123)
+    hunyuan_rng.assert_latents(encode(v2, {"A": [2]}), expected[2:])
+
+
+@pytest.mark.cpu
+def test_shm_worker_resolution_of_cached_predecessor(v2, monkeypatch, mocker, make_request):
+    monkeypatch.setattr("vllm.envs.VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME", f"hunyuan-rng-{uuid.uuid4().hex}")
+    mm_config = MultiModalConfig(
+        mm_processor_cache_type="shm", mm_processor_cache_gb=0.01, mm_shm_cache_max_object_size_mb=1
+    )
+    config = mocker.Mock(spec=VllmConfig)
+    config.parallel_config = mocker.Mock(world_size=1)
+    config.model_config = mocker.Mock()
+    config.model_config.get_multimodal_config.return_value = mm_config
+    with closing(ShmObjectStoreSenderCache(config)) as sender:
+        receiver = ShmObjectStoreReceiverCache(config, multiprocessing.Lock())
+        with closing(receiver._shm_cache):
+            req = make_request("A", hunyuan_rng.images())
+            handles = []
+            for feature in req.mm_features:
+                address, _ = sender.get_and_update_item((feature.data, []), feature.mm_hash)
+                handles.append(replace(feature, data=address))
+            req.mm_features = handles
+            req.num_computed_tokens = handles[1].mm_position.offset
+            data = OmniNewRequestData.from_base(
+                NewRequestData.from_request(req, ([],), req.all_token_ids, uses_mrope=True), req
+            )
+            assert data.mm_features[0].data is handles[0].data
+            assert "address" in data.mm_features[0].data
+            output = hunyuan_rng.schedule({"A": [2]}, new=[data])
+            wrapper = object.__new__(WorkerWrapperBase)
+            wrapper.mm_receiver_cache = receiver
+            wrapper._apply_mm_cache(output)
+            v2.add_requests(output)
+            expected, _ = hunyuan_rng.reference(v2, hunyuan_rng.images(), 42)
+            hunyuan_rng.assert_latents(encode(v2, output.scheduled_encoder_inputs), [expected[2]])
+            # UUID-only sender reuse: no original image data is provided.
+            cached, _ = sender.get_and_update_item(None, handles[0].mm_hash)
+            assert "address" in cached
+            restored = receiver.get_and_update_features([replace(handles[0], data=cached)])[0]
+            assert torch.equal(restored.data["vae_token_grid_hw"].data, torch.tensor([2, 2]))
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("change", ["seed_removed", "seed_added", "reference", "preceding_shape"])
+def test_live_request_update_rejects_changes_to_cached_plan(v2, make_request, change):
+    req = make_request("A", hunyuan_rng.images(), None if change == "seed_added" else 42)
+    admit(v2, req)
+    encode(v2, {"A": [0]})
+    updated = make_request("A", hunyuan_rng.images(), None if change == "seed_removed" else 42)
+    if change == "reference":
+        updated.mm_features[0] = replace(updated.mm_features[0], identifier="different-reference")
+    elif change == "preceding_shape":
+        # Even unchanged IDs cannot authorize changed predecessor draw geometry.
+        elem = updated.mm_features[0].data["vae_token_grid_hw"]
+        updated.mm_features[0].data["vae_token_grid_hw"] = replace(elem, data=torch.tensor([4, 4]))
+    with pytest.raises(ValueError, match="Multimodal RNG"):
+        admit(v2, updated)
+
+
+@pytest.mark.cpu
+def test_seedless_and_seeded_groups_keep_global_rng_behavior(v2, make_request):
+    refs = hunyuan_rng.images()[:1]
+    admit(v2, make_request("A", refs, 42), make_request("B", refs, None))
+    torch.manual_seed(314)
+    before = torch.get_rng_state()
+    single = encode(v2, {"B": [0]})[0]
+    after = torch.get_rng_state()
+    v2.encoder_cache.reset_encoder_cache()
+    torch.set_rng_state(before)
+    mixed = encode(v2, {"A": [0], "B": [0]})[1]
+    assert torch.equal(single, mixed)
+    assert torch.equal(torch.get_rng_state(), after)
+    assert "B" not in v2._mm_rng_state.provider.handles
+
+
+@pytest.mark.cpu
+def test_inconsistent_image_seeds_are_rejected_at_admission(v2, make_request):
+    req = make_request("A", hunyuan_rng.images())
+    seed = req.mm_features[1].data["vae_generator_seed"]
+    req.mm_features[1].data["vae_generator_seed"] = replace(seed, data=torch.tensor(0))
+    with pytest.raises(ValueError, match="seed does not match"):
+        admit(v2, req)
+
+
+@pytest.mark.cpu
+def test_request_plan_is_built_once_per_admission(v2, make_request, mocker):
+    refs = [hunyuan_rng.images()[0]] * 8
+    build_plan = mocker.spy(v2.model, "get_mm_rng_specs")
+    admit(v2, make_request("A", refs))
+    expected, _ = hunyuan_rng.reference(v2, refs, 42)
+    for indices in (list(range(8)), list(reversed(range(8))), [7]):
+        v2.encoder_cache.reset_encoder_cache()
+        hunyuan_rng.assert_latents(encode(v2, {"A": indices}), [expected[i] for i in indices])
+    assert build_plan.call_count == 1
+    v2.finish_requests(hunyuan_rng.schedule(finished=["A"]))
+    admit(v2, make_request("A", refs))
+    assert build_plan.call_count == 2

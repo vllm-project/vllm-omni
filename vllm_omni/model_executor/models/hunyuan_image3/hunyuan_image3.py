@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+from __future__ import annotations
+
 import gc
 import hashlib
 import math
@@ -87,8 +89,6 @@ from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import get_tokenizer
 from vllm.utils.tensor_schema import TensorSchema
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
 from vllm_omni.model_executor.mm_request_rng import MM_RNG_ITEM_KEY, RandomDrawSpec, RequestRNGProvider
@@ -101,6 +101,10 @@ from vllm_omni.model_executor.models.hunyuan_image3._hunyuan_v1_vendored import 
 )
 from vllm_omni.model_executor.models.hunyuan_image3.autoencoder_kl_3d import AutoencoderKLConv3D
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import LightProjector, Siglip2VisionTransformer
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
+    from vllm.v1.sample.sampler import Sampler
 
 if TYPE_CHECKING:
     from vllm_omni.distributed.weight_sharing.adapters import WeightSharingAdapter
@@ -2188,6 +2192,8 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         sampling_metadata: SamplingMetadata,
         per_req_extra_args: Sequence[Mapping[str, Any] | None] | None = None,
     ) -> SamplerOutput | None:
+        from vllm.v1.sample.sampler import Sampler
+
         if logits is None or logits.numel() == 0:
             return None
 
@@ -2340,7 +2346,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         return loaded_params
 
     @staticmethod
-    def get_weight_sharing_adapter() -> "WeightSharingAdapter":
+    def get_weight_sharing_adapter() -> WeightSharingAdapter:
         """Return the model-specific shared-weight operations used by the runner."""
         from vllm_omni.distributed.weight_sharing.adapters import hunyuan_image3
 

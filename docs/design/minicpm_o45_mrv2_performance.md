@@ -1,15 +1,13 @@
 # MiniCPM-o 4.5 MRv2 profiles
 
-The default `minicpmo_4_5.yaml` selects MRv2 for the CUDA Thinker and Code2Wav.
-The CUDA Talker stays on MRv1 for multi-frame decode, and other platforms
-retain MRv1. All three stages keep `async_chunk: true`.
-The ordinary and explicit MRv2 turn profiles enable Thinker prefix caching on
-CUDA. Both V1 and MRv2 restore cached Thinker outputs for the Talker. MRv2 uses
-the shared stage-output prefix cache to restore `latent`, `latent_input_ids`
-and `latent_positions` together before publishing the llm2tts payload. Changing
-the CUDA runner to V1 preserves the enabled cache. NPU, ROCm, XPU and MUSA keep
-their existing disabled overrides; duplex profiles also keep caching disabled
-because their mutable KV window cannot reuse prefix blocks.
+The default `minicpmo_4_5.yaml` selects MRv2 for all three CUDA stages
+and FlashAttention for the Talker. All three duplex stages keep
+`async_chunk: true`. CUDA turn serving sends the completed Thinker payload
+to the Talker. Turn profiles inherit Thinker ngram speculation and disabled
+prefix caching. Both V1 and MRv2 can restore cached Thinker outputs when an
+overlay disables speculation and enables caching. MRv2 restores `latent`,
+`latent_input_ids` and `latent_positions` together. Duplex profiles keep
+caching disabled for their mutable KV window.
 
 The MRv2 output-cache opt-in requires an explicit `session_mode: turn` on
 the Thinker model config. A missing mode does not advertise output-cache
@@ -26,11 +24,6 @@ control on device. Code2Wav reuses mainline Whole-Euler Flow graphs and shared
 prompt state. The previous experimental block compilation, tiled attention,
 channels-last and merged-CFM implementations are removed.
 
-`minicpmo_4_5_turn_mrv2_h200.yaml` selects Talker capacity 16 and 4 GiB KV;
-the generic MRv2 profile selects capacity 8 and 2 GiB KV. These configurations
-require new end-to-end performance measurements after the mainline integration.
-Previously reported numbers do not describe this revised codec backend.
-
 ## Turn prefix-cache memory
 
 The persistent stage-output cache is a pageable CPU mirror, not a second
@@ -38,7 +31,7 @@ GPU KV pool. `stage_prefix_cache_config` takes its `num_blocks` from the
 Thinker KV configuration. `PrefixBlockPool` allocates one tensor per cached
 key, shaped `[num_blocks, block_size, width]`; recycled KV slots overwrite
 the corresponding output rows. There is no independent output-cache block
-budget or deploy knob, including in the H200 profile.
+budget or deploy knob.
 
 The Thinker caches hidden states and `latent` separately, plus
 `latent_input_ids` and `latent_positions`. Mirror tensor storage is therefore
@@ -54,23 +47,17 @@ MRv2 uses depth at least `max(4, 2 * max_concurrent_batches + 1)`.
 `PrefixCacheConfig.gpu_staging_bytes` defaults to 512 MiB for device rows
 awaiting a host copy. Budget pressure flushes pending copies; it is not a
 hard peak-memory bound, since one reservation can exceed it when no tasks
-remain pending. This is distinct from the H200 profile's 4 GiB Talker KV
-reservation. Neither value proves that model weights, graph caches and
-concurrent buffers fit together. No H200 peak-memory measurement with the
-enabled output cache is available here; validate host RAM and device peaks
-on the target workload, or disable stage-0 prefix caching in the CUDA overlay.
+remain pending. The Talker reserves its own 4 GiB CUDA KV cache.
 
 ## Runner and codec behavior
 
-The generic MRv2 profile and the opt-in native V1 duplex H200 profile enable
+The CUDA turn profile and the opt-in duplex H200 profile enable
 ordinary TF32 for CFM DiT GEMMs within Code2Wav forward/capture only
 (`torch.backends.cuda.matmul.allow_tf32` on dense QKV/MLP, Triton
 `input_precision="tf32"` on tiled attention). This is not compensated TF32x3.
 The previous process matmul policy is restored afterwards. cuDNN's TF32 policy
 is independent. HiFT stays IEEE FP32. TF32 changes rounding.
-Duplex defaults to an MRv2 Thinker and Code2Wav on CUDA through
-`minicpmo_4_5.yaml`, with the multi-frame Talker on V1. Other platforms keep V1. Turn results
-do not establish duplex performance or interruption correctness.
+The CUDA duplex profile uses MRv2 on all three stages.
 
 The shared Code2Wav backend defaults to the fused CFM body on both CUDA and
 NPU, subject to architecture and attention-cache eligibility. CUDA accepts
@@ -117,12 +104,23 @@ rounding and requires speech-quality and service validation; it is off by
 default and does not reduce the number of flow steps.
 
 `token2wav_spk_cuda_graph: true` opts the CUDA Torch CAM++ backend into
-exact-shape graph replay. It requires the Torch speaker backend and rejects
-CPU/NPU or TensorRT speaker configurations. Up to four feature shapes are
+exact-shape graph replay. CPU/NPU or TensorRT speaker configurations keep their
+selected backend and skip this option. Up to four feature shapes are
 captured without padding; additional shapes use the existing eager forward.
 Autocast or a changed precision policy also uses the eager path. Each replay
-returns an owned embedding. This option is off by default and does not expand
-the reference-audio cache or batch reference extraction.
+returns an owned embedding. The backend option is off by default; the shipped
+CUDA deployment enables it. It does not expand the reference-audio cache or
+batch reference extraction.
+
+`token2wav_s3_cuda_graph: true` opts CUDA Code2Wav into exact-shape replay
+of the S3 reference tokenizer. Non-CUDA tokenizers skip this option. CUDA replay
+requires the S3 `AudioEncoderV2` and keeps
+the pinned `s3tokenizer==0.3.0` encoder and quantizer without reimplementing
+their arithmetic. Up to two repeated shapes are
+captured; additional shapes run eagerly. Long references retain the library's
+sliding-window path. Replay owns its returned codes and lengths, and a changed
+precision policy uses the original eager encoder. The backend option is off by
+default; the shipped CUDA deployment enables it.
 
 ## Turn-mode conditioning transport
 
@@ -148,7 +146,7 @@ accepted tokens reach `llm2tts`, so the Talker still receives one Thinker row
 per committed token. Example overlay:
 
 ```yaml
-base_config: minicpmo_4_5_turn_mrv2.yaml
+base_config: minicpmo_4_5_turn.yaml
 stages:
   - stage_id: 0
     speculative_config:
@@ -164,6 +162,29 @@ Validation covers CUDA turn sessions with greedy text and speech output.
 Duplex sessions keep their own sampler and are not covered, and platforms
 whose profiles fall back to V1 (NPU, XPU, ROCm, MUSA) do not run this path.
 Greedy text can differ from decoding without drafts at near-tied tokens.
+
+The default single-card and two-card Ascend profiles use synchronous MRv2
+with seven Ngram draft tokens for greedy Thinker requests. The scheduler
+drafts from committed token history and the NPU verifies the drafts. When
+a Thinker decode batch includes non-greedy sampling, MRv2 scheduler Ngram
+skips drafts for that step so sampled requests use the ordinary sampler.
+Native duplex batches use ordinary decoding on both runners so the duplex
+sampler receives one logit row per request. Ascend's `ngram_gpu` proposer uses MRv1
+and the same native duplex guard. Use `ngram` for MRv2.
+
+The CUDA profile also enables Thinker Ngram. In a duplex deployment, ordinary
+chat requests retain the stock rejection sampler alongside the duplex sampler;
+verification is required for both CUDA worker drafts and Ascend scheduler
+drafts. On every platform, a batch containing native duplex requests drops
+its drafts before the scheduler accounts for the scheduled tokens.
+
+To disable Thinker Ngram, set `speculative_config: null` for stage 0 under
+`platforms.npu.stages` in a deploy overlay. Use `async_scheduling: true` there
+to restore asynchronous scheduling for ordinary decoding.
+
+The Ascend `minicpmo_4_5_npu_2card.yaml` profile colocates Thinker and
+Talker and gives Code2Wav its own NPU. The `minicpmo_4_5_2gpu.yaml`
+profile gives Thinker its own device and colocates Talker and Code2Wav.
 
 ## Thinker prefix cache with drafts
 
@@ -189,15 +210,18 @@ drafter that reads Talker layers. Draft codes are verified against the
 Talker's own sampling: each row's 16-code repetition window includes the
 drafts before it, and codec EOS decisions (empty condition, length cap)
 apply per row. Only rows of accepted codes reach Code2Wav. The CUDA platform
-block sets stage 1's `speculative_config`, and platform blocks override stage
-fields, so the draft goes there:
+block selects the draft method. Set the DSpark config there and clear the
+inherited K-step control stop ID. The pipeline supplies the codec EOS.
 
 ```yaml
-base_config: minicpmo_4_5_turn_mrv2.yaml
+base_config: minicpmo_4_5_turn.yaml
 platforms:
   cuda:
     stages:
       - stage_id: 1
+        async_scheduling: true
+        default_sampling_params:
+          stop_token_ids: []
         speculative_config:
           method: dspark
           model: <DSpark draft trained on the MiniCPM-o 4.5 Talker>
@@ -216,6 +240,25 @@ draft. vLLM's `Qwen3DSparkModel` also reads `markov_rank` and the
 confidence-head fields from the top level of the draft config. Talker drafters
 cover turn sessions only; duplex sessions and the K-step Talker reject them at
 load.
+
+### CUDA MRv2 Talker K-step
+
+Use `minicpmo_4_5_turn.yaml` for CUDA turn serving. It inherits FlashAttention,
+synchronous scheduling, seven continuation drafts and the control stop ID from
+`minicpmo_4_5.yaml`. The MRv2 Talker uses one FlashAttention query per codec
+frame, advances the position and KV slot, and re-embeds the confirmed codec.
+For a single-frame control, override CUDA stage 1 with
+`speculative_config: null` and `default_sampling_params.stop_token_ids: []`.
+
+Mixed prefill and decode steps use the single-frame codec path. A K-step batch
+replays a CUDA graph when its sampling settings are supported, and falls back
+to the same per-frame attention view for other settings. The connector receives
+only valid codec frames, including the final short batch at EOS.
+
+The profile enables CUDA MPS for the colocated stages. CUDA Graphs are captured
+on demand for the batch sizes seen by the Talker. To prewarm a newly started
+C16 replica, send several request waves at different concurrency levels before
+measuring steady-state RTF.
 
 ## Code2Wav batching across reference audio
 
@@ -237,6 +280,8 @@ checkpoint's `campplus.onnx`. On CUDA, reference preparation follows the
 stage's matmul policy (`token2wav_allow_tf32`, enabled by default); cuDNN's
 convolution TF32 policy is independent. FP32 tensors therefore do not imply
 strict FP32 arithmetic.
+On other Torch accelerators, enable this path with
+`token2wav_device_spk: true` in connector `extra`.
 The CUDA path does not require TensorRT. Set `token2wav_device_spk: false`
 in connector `extra` to use CPU ONNX Runtime for accuracy triage; explicitly
 enabling `token2wav_trt` retains its TensorRT speaker embedding path.
@@ -253,9 +298,9 @@ or reference normalization policy.
 
 ## Full-duplex MRv2
 
-`minicpmo_4_5.yaml` selects MRv2 for the CUDA Thinker and Code2Wav; the Talker
-keeps V1 for multi-frame decode, and non-CUDA platforms keep V1. The Thinker has no async producer: as on V1, the orchestrator hands
-each finished segment to `llm2tts`.
+`minicpmo_4_5.yaml` selects MRv2 for the CUDA Thinker, Talker and Code2Wav.
+The Thinker has no async producer, so the orchestrator hands each finished
+segment to `llm2tts`.
 The Talker reuses the streaming prompt recipe (full attention extends its KV
 prefix until capacity; sliding recompute rebuilds the previous condition,
 confirmed codec ids and current condition) and keeps the 16-frame codec
@@ -549,3 +594,55 @@ Local pre-commit and `git diff --check` passed. No NPU/ROCm hardware, CUDA C32,
 or full repository suite was run for this retention change. Higher retention
 keeps more idle reference features and temporary WAVs; active/pinned ownership
 and the CFM setup-cache capacity are unchanged.
+
+## Seed-TTS experimental optimization bundle
+
+`vllm_omni/deploy/minicpmo_4_5.yaml` reproduces the latest
+CUDA development configuration: Thinker ngram speculation, 16-frame Talker
+K-step, two Code2Wav replicas on one GPU, grouped reference setup of four,
+HiFT continuation shapes 3/43, speaker/S3 graph replay, and Flow FP16.
+The existing turn deployment inherits these defaults. Connector tuning is scoped
+to `platforms.cuda.connectors` in the existing YAML; other platforms retain their
+shared defaults, including FP32 Flow for NPU cross-reference CFM batching.
+Speaker replay also checks the selected backend, so CPU ONNX Runtime and
+TensorRT overrides remain usable. The development runs used private CUDA MPS
+on one L20X; the CUDA tuning is not qualified for other platforms.
+
+The CUDA deployment sets `cfm_drop_upstream_att_buffer: true` to remove the
+unused upstream CFM/DiT chunk attention buffers before device placement.
+`BatchedToken2Wav` manages its request and graph caches separately. The core
+loader retains its default of `false` for callers using upstream streaming.
+
+The runtime bundle includes:
+
+- Nonblocking transfer of the retained codec history window to the Talker device.
+- A CUDA single-row FP32 sampler that retains exponential noise generation and
+  division, and fuses argmax with probability validation. Invalid probabilities
+  still feed an asynchronous device assertion. CPU, unsupported layouts/dtypes
+  and widths outside 1–8192 retain native multinomial. Seeded token and generator
+  parity is tested for both eager execution and CUDA graph replay. With Triton
+  available, this helper serves per-row CUDA K-step sampling, including V1 and
+  mixed greedy/stochastic batches. The default all-stochastic CUDA MRv2 K-step
+  path uses upstream batched exponential noise and returns before this helper.
+  Default-deployment throughput measurements therefore do not isolate or
+  establish a benefit from the single-row helper.
+- `ref_setup_batch_size` (backend default 1; deployment default 4): group equal-shaped reference features for
+  encoder/CFM setup, preserve voice order, separate output state ownership and
+  bounded setup-cache retention.
+- `token2wav_ref_cpu_prefetch_workers` (default 0): experimental CPU-only
+  reference extraction with at most 32 pending futures. Before materializing a
+  WAV, CPU submission shares the idle-prefetch pin limit of
+  `max(1, runtime_prompt_cache_size)` requests. A rejected submission releases
+  its pin and leaves reference preparation to chunk 0. GPU completion stays on
+  the caller thread. Eviction cancels queued work or waits for an active reader
+  before unlinking its WAV. Non-FP32 default dtype bypasses background work.
+  Four workers regressed the C16 screen, so the default profile
+  leaves this option disabled. Worker threads live for the backend lifetime.
+
+Historical development evidence and rejected variants are recorded in
+[InferRSI #435](https://github.com/InferMatrixLab/InferRSI/pull/435).
+The rebased whole-PR comparison and its measured revisions are recorded in
+[PR #10331](https://github.com/vllm-project/vllm-omni/pull/10331).
+Those results include code and deployment changes; they do not attribute gains
+to each component. Formal quality non-inferiority and independent-engine
+acceptance remain unestablished.

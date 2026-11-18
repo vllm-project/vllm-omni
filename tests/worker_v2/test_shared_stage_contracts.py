@@ -89,14 +89,15 @@ def test_logits_vocab_is_adopted_before_parent_sampler_initialization(monkeypatc
     assert upstream.init_model_state is original_initializer
 
 
-def test_load_model_binds_request_rng_model(monkeypatch, mocker):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_load_model_binds_request_rng_model(monkeypatch, mocker, enabled):
     import vllm.v1.worker.gpu.model_runner as upstream
     from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 
     from vllm_omni.worker_v2 import omni_model_runner as module
 
     class RequestRNGModel(torch.nn.Module):
-        supports_mm_request_rng = True
+        supports_mm_request_rng = enabled
 
     runner = object.__new__(module.OmniGPUModelRunner)
     runner.jit_warmup_registry = JitWarmupRegistry(None)
@@ -116,6 +117,10 @@ def test_load_model_binds_request_rng_model(monkeypatch, mocker):
     monkeypatch.setattr(upstream.GPUModelRunner, "load_model", load)
     runner.load_model()
     assert runner.model is model and runner.model_state is model_state
-    model.bind_mm_rng_provider.assert_called_once_with(runner._mm_rng_state.provider)
+    if enabled:
+        model.bind_mm_rng_provider.assert_called_once_with(runner._mm_rng_state.provider)
+    else:
+        assert runner._mm_rng_state is None
+        model.bind_mm_rng_provider.assert_not_called()
     model.advance_mm_rng.assert_not_called()
     assert upstream.init_model_state is original_initializer
