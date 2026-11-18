@@ -794,6 +794,9 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
     """
 
     have_multimodal_outputs: bool = True
+    # forward() returns plain backbone hidden states; make_omni_output() builds
+    # multimodal outputs after replay, keeping MRv2 FULL CUDA graphs enabled (#10435).
+    mrv2_forward_returns_tensor: bool = True
     has_preprocess: bool = True
     has_postprocess: bool = True
     # Intermediate prefill chunks reach make_omni_output but must not produce
