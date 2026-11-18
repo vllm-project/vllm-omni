@@ -26,7 +26,9 @@ import inspect
 from types import SimpleNamespace
 
 import pytest
+import torch
 
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.duo.model_runner import DuoModelRunner
 from vllm_omni.diffusion.models.duo.pipeline import DuoPipeline
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
@@ -47,16 +49,60 @@ def test_prepare_batch_inputs_accepts_use_mixfusion():
     assert list(override.parameters)[:4] == list(base.parameters)[:4]
 
 
-def test_stepwise_loop_publishes_intermediate_step_output():
-    # `post_step_output` is the only producer of `latent_ready`; it must be
-    # reachable from the shared stepwise loop, not merely defined.
-    source = inspect.getsource(DiffusionModelRunner._execute_stepwise_core)
-    assert "post_step_output" in source, (
-        "the stepwise loop must call pipeline.post_step_output, otherwise nothing ever "
-        "emits the latent_ready frame Realization's codec handoff depends on"
+def test_stepwise_loop_publishes_intermediate_step_output(monkeypatch):
+    # `post_step_output` is the only producer of `latent_ready`. Assert on the
+    # output the runner actually returns: a snapshot taken on a non-terminal
+    # step has to survive into the batch, otherwise nothing ever emits the frame
+    # Realization's codec handoff depends on.
+    #
+    # The batch indexes outputs by request id, so a second entry for the same
+    # request in one step would be discarded -- the earlier revision appended
+    # the snapshot as its own entry and lost it that way.
+    from tests.diffusion.test_diffusion_step_pipeline import (
+        _make_cached_scheduler_output,
+        _make_runner,
+        _make_scheduler_output,
+        _make_step_request,
+        _noop_forward_context,
+        model_runner_module,
     )
-    # It must run after the sampling update and before the decode gate.
-    assert source.index("step_scheduler") < source.index("post_step_output") < source.index("should_decode")
+
+    class _SnapshotPipeline(type(_make_runner().pipeline)):
+        """Publishes an owned snapshot once, on the first step."""
+
+        def __init__(self):
+            super().__init__()
+            self.post_step_calls = 0
+
+        def post_step_output(self, state):
+            self.post_step_calls += 1
+            if state.step_index != 1:
+                return None
+            return DiffusionOutput(
+                output={"payload": {"video_latent": torch.zeros(2), "audio_latent": torch.zeros(2)}},
+                finished=False,
+            )
+
+    runner = _make_runner()
+    runner.pipeline = _SnapshotPipeline()
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+    first = DiffusionModelRunner.execute_stepwise(
+        runner, _make_scheduler_output(_make_step_request(), step_id=0)
+    ).get_request_output("req-1")
+    assert runner.pipeline.post_step_calls == 1
+    assert first.finished is False
+    assert first.result is not None, (
+        "the intermediate snapshot must reach the batch; the non-terminal entry "
+        "has to carry it because a second entry for the same request is dropped"
+    )
+    assert set(first.result.output["payload"]) == {"video_latent", "audio_latent"}
+
+    # A step without a snapshot keeps the default one-final-output contract.
+    second = DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1)).get_request_output(
+        "req-1"
+    )
+    assert second.result is not None and second.finished is True
 
 
 def test_codec_completion_covers_every_codec_mode():

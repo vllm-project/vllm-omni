@@ -1684,21 +1684,18 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             # to hand finished latents to the codec ahead of the
                             # clean commit. Returning None keeps the default
                             # one-final-output contract.
+                            #
+                            # The batch carries at most one output per request
+                            # per step -- ``BatchRunnerOutput`` indexes by
+                            # request id -- so the snapshot has to ride on this
+                            # step's single output. Appending it as its own
+                            # entry would be overwritten by the entry below.
                             step_output = getattr(pipeline, "post_step_output", None)
-                            if step_output is not None:
-                                step_result = step_output(req)
-                                if step_result is not None:
-                                    step_result = self._prepare_output_for_transport(step_result, req.sampling)
-                                    self._attach_stepwise_metadata(req, step_result)
-                                    self._maybe_send_stage_payload([req], [step_result])  # type: ignore[list-item]
-                                    runner_output_list.append(
-                                        RunnerOutput(
-                                            request_id=req.request_id,
-                                            step_index=req.step_index,
-                                            finished=False,
-                                            result=step_result,
-                                        )
-                                    )
+                            step_result = step_output(req) if step_output is not None else None
+                            if step_result is not None:
+                                step_result = self._prepare_output_for_transport(step_result, req.sampling)
+                                self._attach_stepwise_metadata(req, step_result)
+                                self._maybe_send_stage_payload([req], [step_result])  # type: ignore[list-item]
                             if self.od_config.streaming_output:
                                 should_decode = req.chunk_denoise_completed or req.request_denoise_completed
                             else:
@@ -1736,6 +1733,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                 if self.od_config.streaming_output
                                 else req.denoise_completed
                             )
+                            # A step with no decoded media still has to deliver the
+                            # pipeline's intermediate snapshot, so it rides this
+                            # entry. When both exist the terminal decode wins and
+                            # the snapshot was already sent above.
+                            if result is None:
+                                result = step_result
                             if finished and result is not None:
                                 self._maybe_send_stage_payload([req], [result])  # type: ignore[list-item]
                             runner_output_list.append(

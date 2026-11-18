@@ -483,3 +483,35 @@ def test_formatter_routes_segmentation_payload_to_multimodal_output(
     # Structured payloads are not images: they travel under their own key.
     assert result.images == []
     assert result.multimodal_output[key] is segmentation
+
+
+def test_formatter_keeps_both_packed_latents_of_an_av_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Realization publishes `{video_latent, audio_latent}` as one packed AV
+    # snapshot and the codec handoff reads both keys. The formatter used to keep
+    # only the ones it recognised, so the audio half was silently dropped and a
+    # downstream stage would receive half a snapshot.
+    monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    payload = {
+        "video_latent": torch.zeros(1, 1280, 96),
+        "audio_latent": torch.zeros(1, 58, 32),
+    }
+    postprocess_output = normalize_diffusion_postprocess_output(
+        {"payload": payload, "metadata": {"phase": "latent_ready"}}
+    )
+
+    [result] = format_diffusion_outputs(
+        request=_request("prompt-0"),
+        od_config=_config(),
+        diffusion_output=DiffusionOutput(output=None, finished=False),
+        output_data=payload,
+        postprocess_output=postprocess_output,
+    )
+
+    assert set(payload) <= set(result.multimodal_output), (
+        "both packed latents must survive formatting; dropping one hands the "
+        f"codec half a snapshot (got {sorted(result.multimodal_output)})"
+    )
+    assert result.multimodal_output["audio_latent"] is payload["audio_latent"]
+    assert result.multimodal_output["video_latent"] is payload["video_latent"]

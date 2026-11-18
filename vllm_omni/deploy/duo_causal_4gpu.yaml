@@ -25,7 +25,13 @@ stages:
   devices: '0,1,2,3'
   dtype: bfloat16
   step_execution: true
-  streaming_output: false
+  # The Realization stage hands its finished latents to the codec on the
+  # `latent_ready` frame, ahead of the separate clean commit. That frame is a
+  # non-terminal one, and a non-streaming diffusion stage keeps only the final
+  # output, so leaving this false silently reduces the stage to a single
+  # `clean_committed` result and drops the handoff. The online duplex presets
+  # (duo_dmd.yaml, duo_tp8_shared.yaml) set it the same way.
+  streaming_output: true
   diffusion_model_runner_cls: vllm_omni.diffusion.models.duo.model_runner.DuoModelRunner
   # Stage-deploy parallelism is declared flat here, but on the path this preset
   # is launched with (`Omni(model=..., deploy_config_path=..., model_class_name=

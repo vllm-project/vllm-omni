@@ -92,7 +92,20 @@ def _metadata_from_legacy_payload(payload: dict[str, DiffusionPayloadValue]) -> 
 
 
 # Structured (non-media) payloads travel in ``multimodal_output`` under their own key.
-STRUCTURED_PAYLOAD_KEYS = frozenset({"actions", "trajectory", "segmentation", "video_segmentation", "video_depth"})
+# ``video_latent``/``audio_latent`` are the packed AV latents a downstream stage
+# consumes (Duo's Realization -> codec handoff reads both); keeping only one of
+# them would silently hand over half a snapshot.
+STRUCTURED_PAYLOAD_KEYS = frozenset(
+    {
+        "actions",
+        "trajectory",
+        "segmentation",
+        "video_segmentation",
+        "video_depth",
+        "video_latent",
+        "audio_latent",
+    }
+)
 
 
 def _infer_primary_payload_key(payload: DiffusionPayload) -> str | None:
