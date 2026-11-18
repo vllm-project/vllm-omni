@@ -17,6 +17,7 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from vllm.config import LoadConfig
 
+from tests.diffusion.models.hy_nomas import conftest as hy_nomas_conftest
 from tests.diffusion.models.hy_nomas.test_native_runtime import _small_transformer
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig, resolve_model_class_name
 from vllm_omni.diffusion.executor.uniproc_executor import UniProcDiffusionExecutor
@@ -43,6 +44,51 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_extras import get_extra_body_params, get_video_generation_defaults
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+def test_single_rank_parallel_uses_file_rendezvous(monkeypatch, mocker):
+    get_file_store_init_method = mocker.patch.object(
+        hy_nomas_conftest,
+        "get_file_store_init_method",
+        return_value="file:///tmp/hy-nomas-rendezvous",
+    )
+    init_distributed_environment = mocker.patch.object(hy_nomas_conftest, "init_distributed_environment")
+    initialize_model_parallel = mocker.patch.object(hy_nomas_conftest, "initialize_model_parallel")
+    cleanup_dist_env_and_memory = mocker.patch.object(hy_nomas_conftest, "cleanup_dist_env_and_memory")
+
+    fixture = hy_nomas_conftest.single_rank_parallel.__wrapped__(monkeypatch)
+    next(fixture)
+    try:
+        get_file_store_init_method.assert_called_once_with()
+        init_distributed_environment.assert_called_once_with(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method="file:///tmp/hy-nomas-rendezvous",
+            backend="gloo",
+        )
+        initialize_model_parallel.assert_called_once_with(backend="gloo")
+    finally:
+        fixture.close()
+    cleanup_dist_env_and_memory.assert_called_once_with()
+
+
+def test_single_rank_parallel_cleans_up_after_initialization_failure(monkeypatch, mocker):
+    mocker.patch.object(hy_nomas_conftest, "get_file_store_init_method", return_value="file:///tmp/hy-nomas-failure")
+    mocker.patch.object(hy_nomas_conftest, "init_distributed_environment")
+    initialize_model_parallel = mocker.patch.object(
+        hy_nomas_conftest,
+        "initialize_model_parallel",
+        side_effect=RuntimeError("injected initialization failure"),
+    )
+    cleanup_dist_env_and_memory = mocker.patch.object(hy_nomas_conftest, "cleanup_dist_env_and_memory")
+
+    fixture = hy_nomas_conftest.single_rank_parallel.__wrapped__(monkeypatch)
+    with pytest.raises(RuntimeError, match="injected initialization failure"):
+        next(fixture)
+
+    initialize_model_parallel.assert_called_once_with(backend="gloo")
+    cleanup_dist_env_and_memory.assert_called_once_with()
 
 
 TRANSFORMER_CONFIG = {
@@ -172,7 +218,13 @@ def test_public_defaults(architecture):
 
 
 @pytest.mark.parametrize("text_encoder_override", [None, "local-text-encoder"])
-def test_pipeline_loads_diffusers_components(checkpoint, monkeypatch, text_encoder_override):
+@pytest.mark.parametrize(
+    ("decoder_parallel_mode", "sp_size"),
+    [("none", 1), ("window", 2)],
+)
+def test_pipeline_loads_diffusers_components(
+    checkpoint, monkeypatch, mocker, text_encoder_override, decoder_parallel_mode, sp_size
+):
     download = Mock(return_value=str(checkpoint))
     transformer = nn.Linear(2, 2, bias=False)
     transformer.patch_size = (1, 1, 1)
@@ -183,6 +235,11 @@ def test_pipeline_loads_diffusers_components(checkpoint, monkeypatch, text_encod
     text_encoder = nn.Linear(2, 2)
     vae = nn.Linear(2, 2)
     vae.spatial_compression_ratio = 32
+    vae.configure_distributed_decode = mocker.Mock()
+    group = object()
+    if decoder_parallel_mode == "window":
+        monkeypatch.setattr(pipeline_hy_nomas, "get_sp_group", lambda: SimpleNamespace(ulysses_group=group))
+        monkeypatch.setattr(pipeline_hy_nomas.dist, "get_global_rank", lambda process_group, rank: 0)
     load_text = Mock(return_value=text_encoder)
     monkeypatch.setattr(pipeline_hy_nomas, "TextEncoder", load_text)
     monkeypatch.setattr(pipeline_hy_nomas, "build_transformer", Mock(return_value=transformer))
@@ -216,11 +273,19 @@ def test_pipeline_loads_diffusers_components(checkpoint, monkeypatch, text_encod
         revision="test-revision",
         dtype=torch.bfloat16,
         distributed_executor_backend="mp",
-        custom_pipeline_args={} if text_encoder_override is None else {"text_encoder": text_encoder_override},
+        parallel_config=DiffusionParallelConfig(ulysses_degree=sp_size),
+        custom_pipeline_args={
+            "decoder_parallel_mode": decoder_parallel_mode,
+            **({} if text_encoder_override is None else {"text_encoder": text_encoder_override}),
+        },
     )
     pipeline = HyNomasPipeline(od_config=config)
     assert pipeline.od_config is config
     assert pipeline.transformer is transformer and pipeline.text_encoder is text_encoder and pipeline.vae is vae
+    if decoder_parallel_mode == "window":
+        vae.configure_distributed_decode.assert_called_once_with(group, output_rank=0)
+    else:
+        vae.configure_distributed_decode.assert_not_called()
     assert [(source.subfolder, source.prefix) for source in pipeline.weights_sources] == [
         ("transformer", "transformer."),
         ("decoder", "vae."),
@@ -380,6 +445,7 @@ def test_decode_chunk_matches_legacy_quantization():
     )
     pipeline._component_context = lambda module: nullcontext()
     pipeline.sp_size = 1
+    pipeline.decoder_parallel_mode = "none"
     pipeline.device = torch.device("cpu")
 
     video = pipeline._decode_chunk(session, torch.zeros(1), pixel_frames=2, finish=False)
@@ -596,6 +662,8 @@ def test_module_offload_rejects_unsupported_components(components, mocker):
         ({"quantization_config": "int8"}, "unquantized"),
         ({"lora_path": "adapter"}, "LoRA"),
         ({"custom_pipeline_args": {"arbitrary": True}}, "custom_pipeline_args"),
+        ({"custom_pipeline_args": {"decoder_parallel_mode": "unknown"}}, "decoder_parallel_mode"),
+        ({"custom_pipeline_args": {"decoder_parallel_mode": "window"}}, "requires more than one Ulysses rank"),
         ({"custom_pipeline_args": {"decoder_backend": "reference"}}, "Unsupported Hy-Nomas custom_pipeline_args"),
         ({"custom_pipeline_args": {"decoder_backend": "native"}}, "Unsupported Hy-Nomas custom_pipeline_args"),
         ({"enable_layerwise_offload": True}, "layer offload"),
@@ -635,6 +703,33 @@ def test_supported_ulysses_config(sp_size):
             dtype=torch.bfloat16,
         )
     )
+
+
+@pytest.mark.parametrize("sp_size", [2, 4, 8, 16])
+def test_window_decoder_accepts_supported_sp(sp_size):
+    validate_config(
+        OmniDiffusionConfig(
+            distributed_executor_backend="mp",
+            parallel_config=DiffusionParallelConfig(ulysses_degree=sp_size),
+            dtype=torch.bfloat16,
+            custom_pipeline_args={"decoder_parallel_mode": "window"},
+        )
+    )
+
+
+@pytest.mark.parametrize("sp_size", [2, 4, 8, 16])
+def test_window_decoder_reserves_gather_memory(pipeline, sp_size):
+    from tests.diffusion.models.hy_nomas.test_pixelumm_parallel import make_decoder
+
+    pipeline.vae = make_decoder()
+    pipeline.sp_size = sp_size
+    pipeline.heads_num = 2 * sp_size
+    pipeline.hidden_size = 8 * sp_size
+    baseline = pipeline.ar_diffusion_kv_cache_spec().model_owned_state_bytes_per_session
+    pipeline.decoder_parallel_mode = "window"
+    candidate = pipeline.ar_diffusion_kv_cache_spec().model_owned_state_bytes_per_session
+    tile_bytes = 3 * 4 * pipeline.vae.temporal_window_latents * pipeline.ar_config.height * pipeline.ar_config.width * 2
+    assert candidate - baseline == (sp_size + 1) * tile_bytes
 
 
 class CustomUniExecutor(UniProcDiffusionExecutor):
