@@ -41,17 +41,25 @@ def _fresh_once_loggers():
         getattr(vllm_logger, name).cache_clear()
 
 
-def _fake_memory_profiling(*, non_torch: int, torch_peak: int):
+def _fake_memory_profiling(
+    *, non_torch: int, torch_peak: int, persistent_buffers: int = 0, reserved_unallocated: int = 0
+):
     """A stand-in for ``vllm.utils.mem_utils.memory_profiling`` context manager."""
 
     @contextmanager
     def _mp(snapshot, weights_memory):  # noqa: ARG001 - signature parity only
-        # total_consumed mirrors upstream vllm.utils.mem_utils.MemoryProfilingResult
-        # (added by upstream 58b2012aa2) and is read by OmniGPUWorkerBase.
+        # Buffers allocated before profile_run are resident but absent from
+        # both model_memory_usage and the profiling-window peak increase.
+        # Reserved-but-unallocated allocator memory (e.g. graph pools captured
+        # at load) shows up only in the device-level consumption.
+        consumed = weights_memory + persistent_buffers + non_torch + reserved_unallocated
         yield SimpleNamespace(
+            before_profile=SimpleNamespace(torch_allocated=weights_memory + persistent_buffers),
             non_torch_increase=non_torch,
             torch_peak_increase=torch_peak,
-            total_consumed=torch_peak + non_torch,
+            total_consumed=consumed,
+            transient_peak_headroom=torch_peak,
+            non_kv_cache_memory=consumed + torch_peak,
         )
 
     return _mp
@@ -108,7 +116,53 @@ def test_determine_available_memory_populates_total_consumed(monkeypatch):
 
     OmniGPUWorkerBase.determine_available_memory(worker)
 
-    assert worker.total_consumed == 3 * GIB
+    assert worker.total_consumed == 11 * GIB
+
+
+def test_determine_available_memory_reserves_preprofile_runtime_buffers(monkeypatch):
+    """MRv2's resident buffers must not be handed to the KV allocator."""
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    monkeypatch.setattr(
+        base,
+        "memory_profiling",
+        _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB, persistent_buffers=3 * GIB),
+    )
+
+    assert worker.determine_available_memory() == 14 * GIB
+    assert worker.total_consumed == 14 * GIB
+
+
+def test_determine_available_memory_ignores_reserved_unallocated_memory(monkeypatch):
+    """Co-located stage budgets are tuned without allocator slack such as load-time graph pools."""
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    monkeypatch.setattr(
+        base,
+        "memory_profiling",
+        _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB, reserved_unallocated=7 * GIB),
+    )
+
+    assert worker.determine_available_memory() == 17 * GIB
+    assert worker.total_consumed == 18 * GIB
+
+
+def test_determine_available_memory_does_not_count_retained_peak_twice(monkeypatch):
+    """Persistent allocations made during profiling are already in consumption."""
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+
+    @contextmanager
+    def profile_memory(snapshot, weights_memory):
+        yield SimpleNamespace(
+            before_profile=SimpleNamespace(torch_allocated=10 * GIB),
+            non_torch_increase=1 * GIB,
+            torch_peak_increase=5 * GIB,
+            total_consumed=14 * GIB,
+            transient_peak_headroom=2 * GIB,
+            non_kv_cache_memory=16 * GIB,
+        )
+
+    monkeypatch.setattr(base, "memory_profiling", profile_memory)
+    assert worker.determine_available_memory() == 14 * GIB
+    assert worker.peak_activation_memory == 2 * GIB
 
 
 def test_determine_available_memory_clamps_to_zero(monkeypatch):
@@ -151,7 +205,7 @@ def test_determine_available_memory_reserves_cudagraph_memory(monkeypatch, apply
         assert worker.cudagraph_memory_estimate == (4 if apply_estimate else 0) * GIB
         # Warmup adds the actual graph memory separately when suggesting a KV budget.
         assert worker.peak_activation_memory == 2 * GIB
-        assert worker.total_consumed == 3 * GIB
+        assert worker.total_consumed == 11 * GIB
     # With the reserve off there is no extra capture pass at all.
     assert calls == ["profile-enter", "model", "profile-exit", *(["graphs"] if apply_estimate else [])] * 2
 
@@ -291,8 +345,98 @@ def test_no_graph_capture_says_nothing_about_the_reserve(monkeypatch, caplog):
     assert "CUDA graph" not in "\n".join(record.getMessage() for record in caplog.records)
 
 
+def _fake_device_memory(monkeypatch, free_values):
+    """Device free memory read before and after a capture."""
+    frees = iter(free_values)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda *args, **kwargs: (next(frees), 40 * GIB))
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.FULL, CUDAGraphMode.NONE])
+def test_auxiliary_graphs_are_measured_released_and_reserved(monkeypatch, caplog, mode):
+    """Model-owned graphs are captured once while profiling, measured, and
+    released before the KV cache is sized; warmup captures them for real. The
+    hook owns its graphs whatever the runner's cudagraph mode is."""
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    worker.vllm_config.compilation_config.cudagraph_mode = mode
+    calls = []
+    worker.model_runner.profile_run = lambda: calls.append("model")
+
+    def profile_graphs():
+        calls.append("graphs")
+        return 4 * GIB
+
+    worker.model_runner.profile_cudagraph_memory = profile_graphs
+    worker.model_runner.model = SimpleNamespace(
+        capture_auxiliary_graphs=lambda: calls.append("auxiliary"),
+        release_auxiliary_graphs=lambda: calls.append("release"),
+    )
+    monkeypatch.setattr(base, "current_omni_platform", SimpleNamespace(is_cuda_alike=lambda: True))
+    monkeypatch.setenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1")
+    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB))
+    _fake_device_memory(monkeypatch, [20 * GIB, 18 * GIB, 20 * GIB])
+
+    with caplog.at_level("INFO", logger=base.logger.name):
+        out = worker.determine_available_memory()
+
+    graphs = 4 * GIB if mode == CUDAGraphMode.FULL else 0
+    assert out == 30 * GIB - 13 * GIB - graphs - 2 * GIB
+    assert calls == ["model", *(["graphs"] if graphs else []), "auxiliary", "release"]
+    # capture_model() reports only the runner's graphs, so the estimate it is
+    # compared with leaves the auxiliary pool out; the persistent total keeps it.
+    assert worker.cudagraph_memory_estimate == graphs
+    assert worker.total_consumed == 11 * GIB + 2 * GIB
+    reserved = "\n".join(record.getMessage() for record in caplog.records)
+    assert f"Reserved {base.format_gib(graphs + 2 * GIB)} GiB for CUDA graphs" in reserved
+    assert f"({base.format_gib(0)} GiB still held after release)" in reserved
+
+
+def test_disabling_the_reserve_leaves_auxiliary_graphs_to_warmup(monkeypatch):
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    worker.vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+    worker.model_runner.profile_cudagraph_memory = lambda: pytest.fail("the reserve is disabled")
+    worker.model_runner.model = SimpleNamespace(
+        capture_auxiliary_graphs=lambda: pytest.fail("warmup captures these when the reserve is off")
+    )
+    monkeypatch.setattr(base, "current_omni_platform", SimpleNamespace(is_cuda_alike=lambda: True))
+    monkeypatch.setenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "0")
+    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB))
+
+    assert worker.determine_available_memory() == 17 * GIB
+
+
 @pytest.mark.parametrize(
-    "runner_path", ["gpu_ar_model_runner.GPUARModelRunner", "gpu_generation_model_runner.GPUGenerationModelRunner"]
+    "hooks",
+    [{}, {"capture_auxiliary_graphs": lambda: pytest.fail("cannot be released, so warmup captures it only")}],
+)
+def test_auxiliary_graphs_that_cannot_be_released_are_not_measured(monkeypatch, hooks):
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    worker.model_runner.model = SimpleNamespace(**hooks)
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda *args, **kwargs: pytest.fail("nothing to measure"))
+
+    assert worker._profile_auxiliary_graph_memory() == 0
+
+
+def test_auxiliary_graphs_are_released_when_capture_fails(monkeypatch):
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    released = []
+
+    def capture():
+        raise RuntimeError("capture failed")
+
+    worker.model_runner.model = SimpleNamespace(
+        capture_auxiliary_graphs=capture, release_auxiliary_graphs=lambda: released.append(True)
+    )
+    _fake_device_memory(monkeypatch, [20 * GIB])
+
+    with pytest.raises(RuntimeError, match="capture failed"):
+        worker._profile_auxiliary_graph_memory()
+    assert released == [True]
+
+
+@pytest.mark.parametrize(
+    "runner_path", ["omni_ar_model_runner.OmniARModelRunner", "omni_generation_model_runner.OmniGenerationModelRunner"]
 )
 def test_the_upstream_graph_profiler_is_callable_with_no_arguments(runner_path):
     """`determine_available_memory` calls this inherited method at startup on
@@ -303,7 +447,7 @@ def test_the_upstream_graph_profiler_is_callable_with_no_arguments(runner_path):
     import inspect
 
     module_name, class_name = runner_path.split(".")
-    runner_cls = getattr(importlib.import_module(f"vllm_omni.worker.{module_name}"), class_name)
+    runner_cls = getattr(importlib.import_module(f"vllm_omni.worker_v2.{module_name}"), class_name)
 
     signature = inspect.signature(runner_cls.profile_cudagraph_memory)
     required = [
@@ -384,7 +528,7 @@ def test_memory_pool_context_disabled_returns_nullcontext():
 
 
 def test_memory_pool_context_enabled_uses_cumem_pool_with_tag(monkeypatch):
-    import vllm.device_allocator.cumem as cumem_mod
+    import vllm.device_allocator as allocator_mod
 
     worker = object.__new__(OmniGPUWorkerBase)
     worker.rank = 0
@@ -394,15 +538,11 @@ def test_memory_pool_context_enabled_uses_cumem_pool_with_tag(monkeypatch):
     recorded = {}
 
     class FakeAllocator:
-        @classmethod
-        def get_instance(cls):
-            return cls()
-
         def use_memory_pool(self, tag):
             recorded["tag"] = tag
             return "POOL_CTX"
 
-    monkeypatch.setattr(cumem_mod, "CuMemAllocator", FakeAllocator)
+    monkeypatch.setattr(allocator_mod, "get_mem_allocator_instance", FakeAllocator)
 
     ctx = OmniGPUWorkerBase._maybe_get_memory_pool_context(worker, "weights")
 
@@ -423,10 +563,10 @@ def _fake_platform():
 
 @pytest.mark.parametrize(
     ("level", "expected_tags"),
-    [(1, ("weights",)), (2, tuple())],
+    [(1, ("weights", "runtime", "cudagraph")), (2, ("runtime", "cudagraph"))],
 )
 def test_sleep_offload_tags_by_level(monkeypatch, level, expected_tags):
-    import vllm.device_allocator.cumem as cumem_mod
+    import vllm.device_allocator as allocator_mod
 
     worker = object.__new__(OmniGPUWorkerBase)
     worker.rank = 0
@@ -441,19 +581,44 @@ def test_sleep_offload_tags_by_level(monkeypatch, level, expected_tags):
     monkeypatch.setattr(base, "current_omni_platform", platform)
 
     calls = {}
+    # Runtime pointer layouts and captured inputs are initialized once. Wake
+    # remaps their storage; it cannot reconstruct discarded allocation bytes.
+    memory = {
+        "weights": torch.tensor([11, 13]),
+        "runtime": torch.tensor([0x1000, 0x2000]),
+        "cudagraph": torch.tensor([7, 9]),
+        "kv_cache": torch.tensor([23, 29]),
+    }
+    original = {tag: value.clone() for tag, value in memory.items()}
 
     class FakeAllocator:
-        @classmethod
-        def get_instance(cls):
-            return cls()
+        def __init__(self):
+            self.backup = {}
 
         def sleep(self, offload_tags):
             order.append("allocator_sleep")
             calls["offload_tags"] = offload_tags
+            self.backup = {tag: value.clone() for tag, value in memory.items() if tag in offload_tags}
+            for value in memory.values():
+                value.zero_()
 
-    monkeypatch.setattr(cumem_mod, "CuMemAllocator", FakeAllocator)
+        def wake_up(self, tags):
+            for tag, value in memory.items():
+                if tags is None or tag in tags or tag not in {"weights", "kv_cache"}:
+                    if tag in self.backup:
+                        value.copy_(self.backup[tag])
+
+    allocator = FakeAllocator()
+
+    monkeypatch.setattr(allocator_mod, "get_mem_allocator_instance", lambda: allocator)
 
     assert OmniGPUWorkerBase.sleep(worker, level=level) is True
+    assert OmniGPUWorkerBase.wake_up(worker, tags=["weights"]) is True
+    for tag in ("runtime", "cudagraph"):
+        torch.testing.assert_close(memory[tag], original[tag], rtol=0, atol=0)
+    expected_weights = original["weights"] if level == 1 else torch.zeros_like(original["weights"])
+    torch.testing.assert_close(memory["weights"], expected_weights, rtol=0, atol=0)
+    assert not torch.any(memory["kv_cache"])
     assert calls["offload_tags"] == expected_tags
     assert order[0] == "sync"
     assert "allocator_sleep" in order
@@ -462,7 +627,7 @@ def test_sleep_offload_tags_by_level(monkeypatch, level, expected_tags):
 
 
 def test_wake_up_forwards_tags_to_allocator(monkeypatch):
-    import vllm.device_allocator.cumem as cumem_mod
+    import vllm.device_allocator as allocator_mod
 
     worker = object.__new__(OmniGPUWorkerBase)
     worker.rank = 0
@@ -471,14 +636,10 @@ def test_wake_up_forwards_tags_to_allocator(monkeypatch):
     calls = {}
 
     class FakeAllocator:
-        @classmethod
-        def get_instance(cls):
-            return cls()
-
         def wake_up(self, tags):
             calls["tags"] = tags
 
-    monkeypatch.setattr(cumem_mod, "CuMemAllocator", FakeAllocator)
+    monkeypatch.setattr(allocator_mod, "get_mem_allocator_instance", FakeAllocator)
 
     assert OmniGPUWorkerBase.wake_up(worker, tags=["weights"]) is True
     assert calls["tags"] == ["weights"]
@@ -504,3 +665,67 @@ def test_cuda_profiler_is_wired_for_omni_worker(monkeypatch):
 
     assert isinstance(worker.profiler, FakeCudaProfiler)
     assert worker.profiler.profiler_config.profiler == "cuda"
+
+
+@pytest.mark.parametrize(
+    "module_name, class_name",
+    [
+        ("vllm_omni.platforms.xpu.worker.xpu_ar_worker", "XPUARWorker"),
+        ("vllm_omni.platforms.xpu.worker.xpu_generation_worker", "XPUGenerationWorker"),
+    ],
+)
+def test_xpu_workers_reuse_omni_gpu_worker_base(module_name, class_name):
+    module = pytest.importorskip(module_name)
+    worker_cls = getattr(module, class_name)
+
+    mro = worker_cls.__mro__
+    assert mro.index(OmniGPUWorkerBase) < mro.index(module.XPUWorker)
+    for method in ("_maybe_get_memory_pool_context", "sleep", "wake_up", "handle_sleep_task", "handle_wake_task"):
+        assert getattr(worker_cls, method) is getattr(OmniGPUWorkerBase, method)
+
+
+@pytest.mark.parametrize(
+    "module_name, class_name, v2_runner",
+    [
+        ("vllm_omni.platforms.xpu.worker.xpu_ar_worker", "XPUARWorker", "XPUOmniARModelRunner"),
+        ("vllm_omni.platforms.xpu.worker.xpu_generation_worker", "XPUGenerationWorker", "XPUOmniGenerationModelRunner"),
+    ],
+)
+def test_xpu_workers_always_build_the_v2_runner(monkeypatch, module_name, class_name, v2_runner):
+    # vLLM 0.34 removed Model Runner V1: the XPU workers have no runner choice.
+    module = pytest.importorskip(module_name)
+    worker_cls = getattr(module, class_name)
+    v2_module = pytest.importorskip("vllm_omni.platforms.xpu.worker.xpu_omni_v2_model_runner")
+    assert worker_cls.model_runner_cls is getattr(v2_module, v2_runner)
+    assert worker_cls.use_v2_model_runner is True
+
+    built = []
+
+    def fake_runner(vllm_config, device):
+        built.append((vllm_config, device))
+        return "v2"
+
+    monkeypatch.setattr(worker_cls, "model_runner_cls", staticmethod(fake_runner))
+    worker = worker_cls.__new__(worker_cls)
+    worker.vllm_config, worker.device = object(), "xpu:0"
+
+    assert worker._make_model_runner() == "v2"
+    assert built == [(worker.vllm_config, worker.device)]
+
+
+def test_xpu_generation_worker_warmup_skips_kv_cache_and_sampler_warmup(monkeypatch):
+    # Mirrors GPUGenerationWorker: a V2 generation stage has no KV cache or
+    # sampler, so it only profiles and captures the auxiliary graphs.
+    module = pytest.importorskip("vllm_omni.platforms.xpu.worker.xpu_generation_worker")
+    worker_cls = module.XPUGenerationWorker
+    calls = []
+    parent = next(cls for cls in worker_cls.__mro__[1:] if "compile_or_warm_up_model" in vars(cls))
+    monkeypatch.setattr(parent, "compile_or_warm_up_model", lambda _self: calls.append("super"))
+    worker = worker_cls.__new__(worker_cls)
+    worker.model_runner = SimpleNamespace(profile_run=lambda: calls.append("profile_run"))
+    worker._capture_auxiliary_graphs = lambda: calls.append("capture_auxiliary_graphs")
+
+    times = worker.compile_or_warm_up_model()
+
+    assert calls == ["profile_run", "capture_auxiliary_graphs"]
+    assert times.encoder == 0.0 and times.language_model >= 0.0

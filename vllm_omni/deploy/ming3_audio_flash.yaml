@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# Ming-3.0-audio-flash: audio understanding plus optional speech output.
+#
+# Concurrent serving on 2x H200 with CUDA Model Runner V2. The TP=2 Thinker
+# shares GPU 1 with the batched Talker; both stages schedule up to 32 requests.
+# Use the ASR or thinker-only profiles when speech output is not needed.
+pipeline: bailing_moe_v3_audio
+async_chunk: true
+trust_remote_code: false
+distributed_executor_backend: mp
+dtype: bfloat16
+enable_prefix_caching: false
+enable_chunked_prefill: true
+
+stages:
+  - stage_id: 0
+    limit_mm_per_prompt:
+      audio: 20
+    devices: "0,1"
+    tensor_parallel_size: 2
+    enable_expert_parallel: false
+    disable_custom_all_reduce: true
+    max_num_seqs: 32
+    max_model_len: 131072
+    max_num_batched_tokens: 2048
+    # Leave KV-cache headroom for the full 128K context after graph profiling.
+    gpu_memory_utilization: 0.89
+    enforce_eager: false
+    model_runner: v2
+    async_scheduling: true
+    enable_prefix_caching: false
+    enable_chunked_prefill: true
+    engine_extras:
+      mamba_cache_mode: none
+    compilation_config:
+      cudagraph_mode: FULL_AND_PIECEWISE
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 96, 128, 192, 256, 384, 512, 768, 1024]
+    # Batch arrivals under load to reduce prefill steps, at the cost of up to
+    # 100 ms of extra first-token latency. Set min_batch to 0 to disable.
+    additional_config:
+      ar_prefill_admission_min_batch: 8
+      ar_prefill_admission_max_wait_ms: 100
+      ar_prefill_admission_min_running: 4
+    default_sampling_params:
+      temperature: 0.6
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      detokenize: true
+      ignore_eos: false
+
+  - stage_id: 1
+    devices: "1"
+    max_num_seqs: 32
+    max_num_batched_tokens: 8192
+    gpu_memory_utilization: 0.10
+    enforce_eager: false
+    model_runner: v2
+    enable_prefix_caching: false
+    compilation_config:
+      mode: 0
+      cudagraph_mode: NONE
+    engine_extras:
+      hf_overrides:
+        enable_llm_cuda_graph: true
+        # Compile the batched flow/layer work before graph capture.
+        compile_flow: true
+        low_latency_streaming: true
+        normalize_text: true
+        tn_mode: upstream
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 1
+
+# Native CUDA Bailing/KDA kernels are required.
+platforms: {}

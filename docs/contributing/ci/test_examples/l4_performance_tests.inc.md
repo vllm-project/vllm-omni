@@ -4,10 +4,9 @@ When you want to add L4-level ***performance test*** cases, add entries to JSON 
 
 | Model type | Runner | Example JSON files |
 | ---------- | ------ | ------------------ |
-| Omni (nightly) | `run_benchmark.py` | `test_qwen3_omni_no_async_chunk.json`, `test_qwen3_omni_async_chunk.json` (`full_model` without `slow` in `mark`) |
-| Omni (weekly) | `run_benchmark.py` | `test_qwen3_omni_async_chunk.json` (CUDA only), `test_qwen3_omni_vllm_text.json`, `test_qwen3_omni_multi_replicas.json` (`slow` in `mark`; **Perf Test** in `test-weekly.yml`) |
+| Omni (nightly) | `run_benchmark.py` | `test_qwen3_omni_no_async_chunk.json`, `test_qwen3_omni_async_chunk.json` (`full_model` in `mark`) |
 | TTS | `run_benchmark.py` | `test_tts.json`, `test_voxcpm2.json`, `test_higgs_audio_v3.json` |
-| Diffusion (`/v1/chat/completions`) | `run_diffusion_benchmark.py` | `test_qwen_image_vllm_omni.json`, `test_bagel_vllm_omni.json`, … |
+| Diffusion (`/v1/chat/completions`) | `run_diffusion_benchmark.py` | `test_bagel_vllm_omni.json`, … |
 | Diffusion (`/v1/images/generations`, `/v1/images/edits`, `/v1/videos`) | `run_benchmark.py` | `test_wan22_i2v_vllm_omni.json`, `test_cosmos3_vllm_omni.json`, `test_lingbot_video_vllm_omni.json`, … |
 
 #### How runners pick cases
@@ -21,7 +20,7 @@ Diffusion-script cases are detected by `is_diffusion_perf_config()`: presence of
 
 #### Running perf cases
 
-Pass **`--test-config-file`** to load one JSON file, or omit it for the bulk scan above. In either mode, pytest **`-m`** filters each case using its JSON `mark`. A single file can contain nightly, weekly, and platform-specific case objects. For example, the nightly object in `test_qwen3_omni_async_chunk.json` declares both H100 and A3, while its `slow` weekly object is CUDA-only; there is no NPU weekly counterpart. Use `-m "H100 and full_model and not slow"`, `-m "H100 and full_model and slow"`, or `-m "npu"` to select the intended schedule and platform.
+Pass **`--test-config-file`** to load one JSON file, or omit it for the bulk scan above. In either mode, pytest **`-m`** filters each case using its JSON `mark`. A single file can contain nightly and platform-specific case objects. For example, the object in `test_qwen3_omni_async_chunk.json` declares H100, B200, A3, and MI325. Use `-m "H100 and full_model"` or `-m "npu"` to select the intended platform.
 
 ```JSON
 {
@@ -58,35 +57,6 @@ Pass **`--test-config-file`** to load one JSON file, or omit it for the bulk sca
 ```
 
 #### Parameter Explanation
-
-##### Qwen3-Omni multi-replica audio baseline recalibration
-
-`test_qwen3_omni_multi_replicas.json` explicitly selects `speaker: "ethan"`
-for all four audio-output workloads. Earlier runs omitted the speaker and
-used Chelsie before the default-voice correction in #8568. Their audio TTFP
-and RTF baselines are not comparable with the fixed Ethan workloads.
-
-The affected H100 `mean_audio_ttfp_ms` and `mean_audio_rtf` baselines are
-temporarily absent pending recalibration; measurements continue to be saved,
-but these metrics have no baseline regression comparison during this period.
-The Thinker TPOT baseline remains in place. Text-only and A3 configurations
-retain their existing baselines.
-
-CI maintainers should restore the audio baselines after the sender snapshot
-optimization associated with #8794 is merged. Run the fixed Ethan workloads
-multiple times on H100, including the concurrency sweep `[8, 16, 24, 32]`
-and the three multimodal-input workloads. Record the tested commit, deployment
-configuration, speaker, request counts, input/output lengths, and the
-variation in latency and audio duration. Review the high-concurrency TTFP
-tail separately before choosing thresholds: changing the voice does not
-resolve sender backlog. Keep restored baseline arrays aligned with the sweep.
-
-```bash
-export BENCHMARK_DIR=tests/dfx/perf/results
-pytest -sv tests/dfx/perf/scripts/run_benchmark.py \
-  --test-config-file tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json \
-  -m "H100 and slow"
-```
 
 ##### Overview
 
@@ -172,6 +142,13 @@ Examples:
 - Omni/TTS and OpenAI generation endpoints (`/v1/images/*`, `/v1/videos`): `result_{test_name}_{optional_hw}_{dataset}_....json` under `BENCHMARK_DIR`
 - Remaining diffusion (`run_diffusion_benchmark.py`): one aggregate `diffusion_result_{config_stem}_{optional_hw}_{timestamp}.json` per source JSON file
 
+DFX cases with `duplex_eval_accuracy_config` keep intermediate judge inputs in a
+per-test temporary directory under `duplex_eval_response_root`. Pytest teardown
+removes that directory after evaluation, including failed tests and interrupts;
+performance and accuracy summary JSON files remain available. This also applies
+when running the DFX case locally. Direct `vllm bench serve --omni` runs retain
+their normal output behavior.
+
 #### Local commands
 
 ```bash
@@ -187,10 +164,7 @@ pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
   -m "H100 and B200 and cards_2"
 pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
   --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json \
-  -m "H100 and full_model and not slow"
-pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
-  --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json \
-  -m "H100 and full_model and slow"
+  -m "H100 and full_model"
 pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
   --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json \
   -m "npu"
@@ -241,17 +215,30 @@ You can add any benchmark running parameters you need here. For all optional par
 
 1. Change the --xxx-xx-xx running parameters to xxx_xx_xx format and fill them as keys in the JSON file.
 2. For boolean variables in the running parameters, modify them to forms such as ignore_eos: true/false and fill them into the JSON file.
-3. Optionally add a `baseline` object (see **Baseline thresholds** below). If you omit `baseline` or leave it empty, the performance test still runs but does not assert metric thresholds from this field.
+3. Optionally add a `baseline` object. With `--assert-baseline`, each metric in the bucket for the machine that ran the case must stay within 10% of that baseline in the worse direction: throughput and QPS fail when they drop below 90% of the baseline, and latency, memory, and real-time factor fail when they rise above 110%. Missing or unmatched hardware logs a warning and skips baseline validation without failing the case. Use `--require-baseline` to enforce the same comparison and also fail for missing hardware calibration; it implies checking without requiring `--assert-baseline`. CUDA and NPU perf jobs pass `--assert-baseline` except for the Qwen3-Omni NPU exception described below. The five AMD Qwen3-Omni/TTS, Voxtral and MiniCPM nightly perf jobs use `--require-baseline` with provisional MI300 baselines and remain nonblocking during qualification.
 4. Set `"name"` on each `benchmark_params` entry for stable pytest ids and readable result keys.
 5. Image/video generation cases (`/v1/images/generations`, `/v1/images/edits`, `/v1/videos`) use this same schema: set `endpoint` to the API path, put width/height/steps/frames in `extra_body`, use `dataset_name: random` for text-only inputs or `random-mm` when the request needs a synthetic image/video. Do not set `server_type` or `task`, and do not use `random-request-config` or kebab-case diffusion client fields.
 6. The qps and concurrency modes are recommended to be mutually exclusive. For detailed explanations, see the table below:
 
-| Parameter       | Type          | Required | Example/Values       | Description                          |
-| --------------- | ------------- | -------- | -------------------- | ------------------------------------ |
-| name            | string        | No       | `"1024x1024_steps4"` | Stable suffix for pytest param id    |
-| num_prompts     | int / array   | Yes      | 10, [10, 20, 30]     | Number of requests (scalar or sweep) |
-| request_rate    | float / array | No       | 0.5, [0.5, 1, inf]   | Queries per second (QPS mode)        |
-| max_concurrency | int / array   | No       | 1, [1, 2, 3]         | Max in-flight requests               |
-| baseline        | object        | No       | see below            | Optional hardware-nested thresholds  |
+CUDA/NPU ready performance jobs and the MiniCPM-o 4.5 A3 two-card nightly
+job currently have no configured baseline, so the flag only enables the check
+entry point and those cases skip threshold validation until baselines are added.
+The two Qwen3-Omni NPU nightly performance jobs intentionally omit
+`--assert-baseline` while the known performance issue
+[#10055](https://github.com/vllm-project/vllm-omni/issues/10055) is evaluated.
 
-`num_prompts`, `request_rate`, and `max_concurrency` accept scalars or arrays; single values expand to match sweep length. QPS and concurrency modes are mutually exclusive. `baseline` top-level keys must be hardware pytest markers from `pyproject.toml`; metric names and values are free-form (scalars or sweep-aligned lists). Omit `baseline` to run without threshold assertions.
+AMD calibration uses the recorded runtime label `MI300`, even though existing
+selection expressions contain the `MI325` pytest marker. An actual MI325 device
+does not inherit MI300 thresholds. See the
+[AMD performance qualification notes](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/amd/performance-qualification.md)
+for calibration provenance, historical failures and native validation criteria.
+
+| Parameter       | Type          | Required | Example/Values       | Description                                                         |
+| --------------- | ------------- | -------- | -------------------- | ------------------------------------------------------------------- |
+| name            | string        | No       | `"1024x1024_steps4"` | Stable suffix for pytest param id                                   |
+| num_prompts     | int / array   | Yes      | 10, [10, 20, 30]     | Number of requests (scalar or sweep)                                |
+| request_rate    | float / array | No       | 0.5, [0.5, 1, inf]   | Queries per second (QPS mode)                                       |
+| max_concurrency | int / array   | No       | 1, [1, 2, 3]         | Max in-flight requests                                              |
+| baseline        | object        | No       | see below            | Hardware-nested reference; `--assert-baseline` applies the 10% gate |
+
+`num_prompts`, `request_rate`, and `max_concurrency` accept scalars or arrays; single values expand to match sweep length. QPS and concurrency modes are mutually exclusive. `baseline` top-level keys must be hardware pytest markers from `pyproject.toml`; metric names and values are free-form (scalars or sweep-aligned lists). Omit `baseline` to run without threshold assertions. Pass `--assert-baseline` to enforce the 10% regression gate described above.

@@ -31,9 +31,11 @@ from vllm.config import CacheConfig
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_qk_norm_rope import fused_qk_rmsnorm_rope_gate
+from vllm.platforms import current_platform
 
 from vllm_omni.model_executor.models.fish_omni.configuration_fish_omni import FishOmniAudioDecoderConfig
 from vllm_omni.model_executor.models.fish_omni.kernels import (
+    eager_qk_rmsnorm_rope_gate,
     gemma_rms_norm,
     gemma_rms_norm_table,
     sigmoid_gate,
@@ -186,7 +188,8 @@ class TowerLayer(nn.Module):
             normed = gemma_rms_norm(mixed, self.input_layernorm.weight, eps)
         qkv = self.qkv_proj(normed)
         q_gate, k, v = qkv.split([2 * self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k, gate = fused_qk_rmsnorm_rope_gate(
+        qk_rope = eager_qk_rmsnorm_rope_gate if current_platform.device_type == "npu" else fused_qk_rmsnorm_rope_gate
+        q, k, gate = qk_rope(
             q_gate,
             k,
             self.q_norm.weight,

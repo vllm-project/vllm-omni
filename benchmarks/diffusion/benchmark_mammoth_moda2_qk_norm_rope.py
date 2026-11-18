@@ -21,6 +21,7 @@ from collections.abc import Callable
 
 import torch
 
+from tests.diffusion.models.mammoth_moda2.helpers import initialize_block_weights
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     _fused_cuda_supported,
     fused_qk_norm_rope,
@@ -162,6 +163,7 @@ def _run_attention(seq: int, warmup: int, iters: int, *, fused_first: bool = Fal
         .to(device="cuda", dtype=torch.bfloat16)
         .eval()
     )
+    initialize_block_weights(block)
     block.attn.norm_q.weight.normal_(1.0, 0.2)
     block.attn.norm_k.weight.normal_(1.0, 0.2)
     hidden = torch.randn(2, seq, 2520, device="cuda", dtype=torch.bfloat16)

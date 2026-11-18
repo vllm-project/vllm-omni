@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+"""Shared text and modality benchmark aggregation, printing and JSON projections."""
+
+import math
 import warnings
 from collections import defaultdict
 from collections.abc import Sequence
@@ -19,6 +22,23 @@ _PERCENTILE_ROWS_TYPE = list[tuple[float, float]] | None
 _STAGE_DURATION_MAP_TYPE = dict[str, float] | None
 _FLOAT_LIST_TYPE = list[float]
 _INT_LIST_TYPE = list[int]
+VALID_GOODPUT_METRICS = ("ttft", "tpot", "e2el", defs.AUDIO_TTFP)
+
+
+def validate_goodput_config(goodput_config_dict: dict[str, float]) -> None:
+    """Validate request-level goodput SLO names and values."""
+    for slo_name, slo_val in goodput_config_dict.items():
+        if slo_name not in VALID_GOODPUT_METRICS:
+            raise ValueError(
+                f"Invalid metric name found, {slo_name}: {slo_val}. "
+                "The service level objective name should be one of "
+                f"{list(VALID_GOODPUT_METRICS)}. "
+            )
+        if slo_val < 0:
+            raise ValueError(
+                f"Invalid value found, {slo_name}: {slo_val}. The service level objective value should be non-negative."
+            )
+
 
 _MULTIMODAL_BENCHMARK_FIELDS = [
     ("num_ttft_samples", int, field(default=0)),
@@ -61,6 +81,22 @@ _MULTIMODAL_BENCHMARK_FIELDS = [
     (defs.MEDIAN_VIDEO_RTF, float, field(default=0.0)),
     (defs.STD_VIDEO_RTF, float, field(default=0.0)),
     (defs.PERCENTILES_VIDEO_RTF, _PERCENTILE_ROWS_TYPE, field(default=None)),
+    ("num_video_ttfc_samples", int, field(default=0)),
+    ("num_video_fps_samples", int, field(default=0)),
+    ("num_video_steady_interval_samples", int, field(default=0)),
+    (defs.MEAN_VIDEO_TTFC_MS, float, field(default=0.0)),
+    (defs.MEDIAN_VIDEO_TTFC_MS, float, field(default=0.0)),
+    (defs.STD_VIDEO_TTFC_MS, float, field(default=0.0)),
+    (defs.PERCENTILES_VIDEO_TTFC_MS, _PERCENTILE_ROWS_TYPE, field(default=None)),
+    (defs.MIN_VIDEO_FPS, float, field(default=0.0)),
+    (defs.MEAN_VIDEO_FPS, float, field(default=0.0)),
+    (defs.MEDIAN_VIDEO_FPS, float, field(default=0.0)),
+    (defs.STD_VIDEO_FPS, float, field(default=0.0)),
+    (defs.PERCENTILES_VIDEO_FPS, _PERCENTILE_ROWS_TYPE, field(default=None)),
+    (defs.MEAN_VIDEO_STEADY_INTERVAL_MS, float, field(default=0.0)),
+    (defs.MEDIAN_VIDEO_STEADY_INTERVAL_MS, float, field(default=0.0)),
+    (defs.STD_VIDEO_STEADY_INTERVAL_MS, float, field(default=0.0)),
+    (defs.PERCENTILES_VIDEO_STEADY_INTERVAL_MS, _PERCENTILE_ROWS_TYPE, field(default=None)),
     (defs.MEAN_VIDEO_GENERATION_MS, float, field(default=0.0)),
     (defs.MEDIAN_VIDEO_GENERATION_MS, float, field(default=0.0)),
     (defs.STD_VIDEO_GENERATION_MS, float, field(default=0.0)),
@@ -186,8 +222,35 @@ def has_metric_samples(metrics: object, metric_name: str) -> bool:
         "itl": "num_itl_samples",
         defs.AUDIO_TTFP: "num_audio_ttfp_samples",
         defs.AUDIO_RTF: "num_audio_rtf_samples",
+        defs.VIDEO_TTFC: "num_video_ttfc_samples",
+        defs.VIDEO_FPS: "num_video_fps_samples",
+        defs.VIDEO_STEADY_INTERVAL: "num_video_steady_interval_samples",
     }.get(metric_name)
     return sample_count_attr is None or getattr(metrics, sample_count_attr, 0) > 0
+
+
+def metric_result_fields(metrics: object, metric_name: str) -> dict[str, float]:
+    """Project one shared aggregate to JSON names, units and selected percentiles.
+
+    The aggregate already contains the requested percentile population. Missing
+    samples produce no fields; callers select which metric sections to include.
+    """
+    if not has_metric_samples(metrics, metric_name):
+        return {}
+    if metric_name in (defs.AUDIO_DURATION, defs.AUDIO_UNDERRUN):
+        suffix = "_s"
+    elif metric_name in (defs.AUDIO_RTF, defs.VIDEO_RTF, defs.VIDEO_FPS):
+        suffix = ""
+    else:
+        suffix = "_ms"
+    result = {
+        f"{summary}_{metric_name}{suffix}": float(getattr(metrics, f"{summary}_{metric_name}{suffix}", 0.0))
+        for summary in ("mean", "median")
+    }
+    for percentile, value in getattr(metrics, f"percentiles_{metric_name}{suffix}", None) or []:
+        label = str(int(percentile)) if int(percentile) == percentile else str(percentile)
+        result[f"p{label}_{metric_name}{suffix}"] = float(value)
+    return result
 
 
 def print_metrics(
@@ -485,6 +548,9 @@ def process_one_metric(
         defs.AUDIO_RTF: "Real Time Factor",
         defs.AUDIO_DURATION: "Audio Duration",
         defs.AUDIO_UNDERRUN: "Streaming Audio Underrun",
+        defs.VIDEO_TTFC: "Video Time to First Chunk",
+        defs.VIDEO_FPS: "Video Generation FPS",
+        defs.VIDEO_STEADY_INTERVAL: "Steady Video Chunk Interval",
     }
 
     header = metric_header_map.get(metric_attribute_name, metric_attribute_name)
@@ -498,9 +564,9 @@ def process_one_metric(
     if is_audio_duration_or_underrun:
         suffix = "_s"
         unit_suffix = " (s)"
-    elif is_audio_rtf:
+    elif is_audio_rtf or metric_attribute_name in (defs.VIDEO_RTF, defs.VIDEO_FPS):
         suffix = ""
-        unit_suffix = ""
+        unit_suffix = " (frames/s)" if metric_attribute_name == defs.VIDEO_FPS else ""
     field_names = _AGGREGATE_PERCENTILE_FIELD_NAMES.get(metric_attribute_name)
     mean_attr_name = field_names[0] if field_names else f"mean_{metric_attribute_name}{suffix}"
     mean_value = getattr(metrics, mean_attr_name, 0.0)
@@ -882,6 +948,7 @@ def calculate_metrics(
     request_rate,
     benchmark_duration,
     print_stage: bool = False,
+    duplex_metric_aggregation: str = "session",
 ) -> tuple[MultiModalsBenchmarkMetrics, list[int]]:
     """Calculate the metrics for the benchmark.
 
@@ -896,6 +963,8 @@ def calculate_metrics(
     Returns:
         A tuple of the benchmark metrics and the actual output lengths.
     """
+    validate_goodput_config(goodput_config_dict)
+
     actual_output_lens: list[int] = []
     total_input = 0
     completed = 0
@@ -917,6 +986,9 @@ def calculate_metrics(
     total_image_pixels = 0
     video_durations: list[float] = []
     video_rtfs: list[float] = []
+    video_ttfcs: list[float] = []
+    video_fps_samples: list[float] = []
+    video_steady_intervals: list[float] = []
     total_video_frames = 0
     video_generation_times_ms: list[float] = []
     peak_memories_mb: list[float] = []
@@ -981,17 +1053,52 @@ def calculate_metrics(
             itls += outputs[i].itl
             session_metrics = getattr(outputs[i], "duplex_session_metrics", None)
             ttft_measured = not isinstance(session_metrics, dict) or session_metrics.get("ttft_ms") is not None
-            audio_ttfp_measured = not isinstance(session_metrics, dict) or session_metrics.get("ttfp_ms") is not None
-            audio_rtf_measured = not isinstance(session_metrics, dict) or session_metrics.get("rtf") is not None
-            if ttft_measured:
-                ttfts.append(outputs[i].ttft)
-            if audio_ttfp_measured:
-                audio_ttfps.append(getattr(outputs[i], defs.AUDIO_TTFP, 0.0))
-            if audio_rtf_measured:
-                audio_rtfs.append(getattr(outputs[i], defs.AUDIO_RTF, 0.0))
+            audio_ttfp_value = float(getattr(outputs[i], defs.AUDIO_TTFP, 0.0) or 0.0)
+            # Duplex records an explicit ttfp_ms presence bit. Other backends reuse
+            # audio_ttfp == 0.0 as "first packet not observed"; that sentinel must
+            # not satisfy an audio_ttfp SLO.
+            if isinstance(session_metrics, dict):
+                audio_ttfp_measured = session_metrics.get("ttfp_ms") is not None
+            else:
+                audio_ttfp_measured = audio_ttfp_value > 0
+            audio_duration_value = float(getattr(outputs[i], defs.AUDIO_DURATION, 0.0) or 0.0)
+            if isinstance(session_metrics, dict):
+                audio_rtf_measured = session_metrics.get("rtf") is not None
+            else:
+                # A request that produced no audio has no RTF sample. Counting the
+                # 0.0 placeholder pulls the mean and percentiles down in mixed
+                # text+audio runs, where text requests would otherwise all read
+                # as perfectly real-time synthesis.
+                audio_rtf_measured = audio_duration_value > 0
+            if duplex_metric_aggregation == "response" and isinstance(session_metrics, dict):
+                # Pool responses rather than giving short and long sessions equal weight.
+                # Goodput below remains request/session based.
+                # Duplex rows use None for missing timings; a measured zero is
+                # valid here, unlike the legacy audio_ttfp == 0.0 sentinel.
+                for row in getattr(outputs[i], "duplex_request_metrics", None) or []:
+                    for field, samples, scale in (
+                        ("ttft_ms", ttfts, 0.001),
+                        ("ttfp_ms", audio_ttfps, 0.001),
+                        ("rtf", audio_rtfs, 1.0),
+                    ):
+                        value = row.get(field)
+                        if (
+                            isinstance(value, (int, float))
+                            and not isinstance(value, bool)
+                            and math.isfinite(value)
+                            and value >= 0
+                        ):
+                            samples.append(value * scale)
+            else:
+                if ttft_measured:
+                    ttfts.append(outputs[i].ttft)
+                if audio_ttfp_measured:
+                    audio_ttfps.append(audio_ttfp_value)
+                if audio_rtf_measured:
+                    audio_rtfs.append(getattr(outputs[i], defs.AUDIO_RTF, 0.0))
             goodput_ttfts.append(outputs[i].ttft if ttft_measured else None)
-            goodput_audio_ttfps.append(getattr(outputs[i], defs.AUDIO_TTFP, 0.0) if audio_ttfp_measured else None)
-            audio_duration.append(getattr(outputs[i], defs.AUDIO_DURATION, 0.0))
+            goodput_audio_ttfps.append(audio_ttfp_value if audio_ttfp_measured else None)
+            audio_duration.append(audio_duration_value)
             audio_frames.append(getattr(outputs[i], defs.AUDIO_FRAMES, 0))
             image_count = int(getattr(outputs[i], defs.IMAGE_COUNT, 0) or 0)
             total_images += image_count
@@ -1009,6 +1116,13 @@ def calculate_metrics(
             video_rtf = float(getattr(outputs[i], defs.VIDEO_RTF, 0.0) or 0.0)
             if video_rtf > 0:
                 video_rtfs.append(video_rtf)
+            video_ttfc = getattr(outputs[i], defs.VIDEO_TTFC, None)
+            if video_ttfc is not None:
+                video_ttfcs.append(float(video_ttfc))
+            video_fps = getattr(outputs[i], defs.VIDEO_FPS, None)
+            if video_fps is not None:
+                video_fps_samples.append(float(video_fps))
+            video_steady_intervals.extend(getattr(outputs[i], defs.VIDEO_STEADY_INTERVALS, ()))
             video_generation_time_ms = float(getattr(outputs[i], defs.VIDEO_GENERATION_TIME_MS, 0.0) or 0.0)
             if video_generation_time_ms > 0:
                 video_generation_times_ms.append(video_generation_time_ms)
@@ -1030,9 +1144,9 @@ def calculate_metrics(
         if "ttft" in goodput_config_dict:
             valid_metrics.append(goodput_ttfts)
             slo_values.append(goodput_config_dict["ttft"] / MILLISECONDS_TO_SECONDS_CONVERSION)
-        if "audio_ttft" in goodput_config_dict:
+        if defs.AUDIO_TTFP in goodput_config_dict:
             valid_metrics.append(goodput_audio_ttfps)
-            slo_values.append(goodput_config_dict["audio_ttft"] / MILLISECONDS_TO_SECONDS_CONVERSION)
+            slo_values.append(goodput_config_dict[defs.AUDIO_TTFP] / MILLISECONDS_TO_SECONDS_CONVERSION)
         if "tpot" in goodput_config_dict:
             valid_metrics.append(all_tpots)
             slo_values.append(goodput_config_dict["tpot"] / MILLISECONDS_TO_SECONDS_CONVERSION)
@@ -1219,6 +1333,26 @@ def calculate_metrics(
             defs.STD_VIDEO_RTF: np.std(video_rtfs or 0),
             defs.MEDIAN_VIDEO_RTF: np.median(video_rtfs or 0),
             defs.PERCENTILES_VIDEO_RTF: [(p, np.percentile(video_rtfs or 0, p)) for p in selected_percentiles],
+            "num_video_ttfc_samples": len(video_ttfcs),
+            "num_video_fps_samples": len(video_fps_samples),
+            "num_video_steady_interval_samples": len(video_steady_intervals),
+            defs.MEAN_VIDEO_TTFC_MS: np.mean(video_ttfcs or 0) * 1000,
+            defs.MEDIAN_VIDEO_TTFC_MS: np.median(video_ttfcs or 0) * 1000,
+            defs.STD_VIDEO_TTFC_MS: np.std(video_ttfcs or 0) * 1000,
+            defs.PERCENTILES_VIDEO_TTFC_MS: [
+                (p, np.percentile(video_ttfcs or 0, p) * 1000) for p in selected_percentiles
+            ],
+            defs.MIN_VIDEO_FPS: min(video_fps_samples, default=0.0),
+            defs.MEAN_VIDEO_FPS: np.mean(video_fps_samples or 0),
+            defs.MEDIAN_VIDEO_FPS: np.median(video_fps_samples or 0),
+            defs.STD_VIDEO_FPS: np.std(video_fps_samples or 0),
+            defs.PERCENTILES_VIDEO_FPS: [(p, np.percentile(video_fps_samples or 0, p)) for p in selected_percentiles],
+            defs.MEAN_VIDEO_STEADY_INTERVAL_MS: np.mean(video_steady_intervals or 0) * 1000,
+            defs.MEDIAN_VIDEO_STEADY_INTERVAL_MS: np.median(video_steady_intervals or 0) * 1000,
+            defs.STD_VIDEO_STEADY_INTERVAL_MS: np.std(video_steady_intervals or 0) * 1000,
+            defs.PERCENTILES_VIDEO_STEADY_INTERVAL_MS: [
+                (p, np.percentile(video_steady_intervals or 0, p) * 1000) for p in selected_percentiles
+            ],
             defs.MEAN_VIDEO_GENERATION_MS: np.mean(video_generation_times_ms or 0),
             defs.STD_VIDEO_GENERATION_MS: np.std(video_generation_times_ms or 0),
             defs.MEDIAN_VIDEO_GENERATION_MS: np.median(video_generation_times_ms or 0),

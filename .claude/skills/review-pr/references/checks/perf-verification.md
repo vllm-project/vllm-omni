@@ -47,6 +47,10 @@ switch on plus each further claim.
 Every optimization needs correctness or quality evidence. A faster result on a
 different workload, precision, seed, or topology is not a valid comparison.
 
+For diffusion accuracy evidence, use the reference-alignment and calibration
+contract in [diffusion-accuracy-test](../../../diffusion-accuracy-test/SKILL.md)
+to assess the claimed comparison scope and threshold evidence.
+
 ## E2e stage-attribution table
 
 For an end-to-end latency claim, request the stage-attribution table the

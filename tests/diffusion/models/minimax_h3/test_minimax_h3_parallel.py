@@ -441,8 +441,9 @@ def test_sp_output_boundary_preserves_logits_and_minimizes_gather(
             return torch.cat((tensor, self.remote_rows), dim=0)
 
     class _FinalLayer(nn.Module):
-        def forward(self, hidden, *, t_emb, inverse_indices):
+        def forward(self, hidden, *, t_emb, inverse_indices, pdd_step=None):
             del t_emb
+            assert pdd_step is None
             inverse = inverse_indices.to(torch.float32).unsqueeze(-1)
             return (
                 hidden[:, :2].to(torch.float32) + inverse,

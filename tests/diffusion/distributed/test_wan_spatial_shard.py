@@ -834,3 +834,40 @@ def test_spatial_shard_decode_matches_reference(split_dim: str):
     assert mean_abs_diff <= _SPATIAL_SHARD_TOLERANCE, (
         f"spatial_shard_{split_dim} mean_abs_diff {mean_abs_diff} exceeds {_SPATIAL_SHARD_TOLERANCE}"
     )
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("mode", "auto_tiling"),
+    [("tile", True), ("spatial_shard_height", False), ("spatial_shard_width", False)],
+)
+def test_registry_auto_enables_vae_tiling_only_for_tile_mode(monkeypatch, mocker, mode, auto_tiling):
+    """Spatial-shard decode is full-frame, so loading must not force VAE tiling on it."""
+    from torch import nn
+
+    from vllm_omni.diffusion import registry
+    from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+    from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeExecutor
+
+    vae = DistributedAutoencoderKLWan(base_dim=8, z_dim=4, dim_mult=[1, 2], num_res_blocks=1, attn_scales=[]).eval()
+    vae.distributed_executor = mocker.Mock(spec=DistributedVaeExecutor)
+
+    class Pipeline(nn.Module):
+        def __init__(self, od_config):
+            super().__init__()
+            self.vae = vae
+
+    monkeypatch.setattr(registry.DiffusionModelRegistry, "_try_load_model_cls", lambda _: Pipeline)
+    config = OmniDiffusionConfig(
+        model_class_name="test_wan_vae_tiling",
+        parallel_config=DiffusionParallelConfig(
+            tensor_parallel_size=2, vae_patch_parallel_size=2, vae_parallel_mode=mode
+        ),
+        vae_use_tiling=False,
+        vae_fast_path="off",
+    )
+    model = registry.initialize_model(config)
+    assert config.vae_use_tiling is auto_tiling
+    assert model.vae.use_tiling is auto_tiling
+    vae.distributed_executor.set_parallel_size.assert_called_once_with(2, mode=mode)

@@ -13,14 +13,13 @@ from vllm_omni.diffusion.layers.ops import fused_qk_norm_rope
 ```
 
 The canonical module is `rope/qk_norm_rope.py`. It owns the kernels, eager
-reference, backend predicates, dispatch, and the schema/fake implementation for
-`torch.ops.vllm_omni.fused_qk_norm_rope`. The old
-`vllm_omni.diffusion.layers.fused_qk_norm_rope` module re-exports the same public
-function; it does not register or wrap another operation. Internal implementation
-tests must patch the canonical module, not the compatibility module.
-The legacy module also preserves `fused_qk_norm_rope_min_tokens` and the private
-`_fused_cuda_supported` alias used by the merged Boogu integration. Their
-implementation remains canonical; this migration adds no public support query.
+references, backend predicates, dispatch, and both torch registrations:
+`fused_qk_norm_rope` and `fused_joint_qkv_norm_rope`. The joint operation
+normalizes and rotates Q/K from two streams and gathers their V rows into the
+same combined sequence. The old
+`vllm_omni.diffusion.layers.fused_qk_norm_rope` module re-exports the original
+public names and the private helpers used by existing callers and tests.
+Tests that patch implementation helpers target the canonical module.
 
 | Contract | Supported behavior |
 | --- | --- |
@@ -37,7 +36,7 @@ implementation remains canonical; this migration adds no public support query.
 | Invalid inputs | Existing public validation raises; runtime failures are not caught by a new fallback |
 
 The public package consumer is MiniMax-H3's `MiniMaxH3Attention` in
-`diffusion/models/minimax_h3/minimax_h3_transformer.py`. This migration changes
+`diffusion/models/minimax_h3/minimax_h3_blocks.py`. This migration changes
 its import only. H3's weights, table preparation, and no-table normalization
 path remain model-owned. The CUDA torch registration and direct NPU/eager
 dispatch are preserved.
@@ -68,7 +67,7 @@ The five categories follow
 | Layout | Q/K strides are passed to the kernel (non-contiguous supported); weights and the table are made contiguous by the public entry |
 | Rounding, half-split kernel | Normalized values rounded to BF16, rotation in FP32 |
 | Rounding, half-split eager reference | Historical x-dtype arithmetic |
-| Rounding, interleaved (kernel and reference) | FP32 rotation of the BF16-rounded normalized value; fused vs eager within one operand ulp (≈28% of Q/K elements differ by exactly one BF16 ulp) |
+| Rounding, interleaved (kernel and reference) | FP32 rotation of the BF16-rounded normalized value; `cuda_rms_norm=True` preserves the vLLM CUDA RMSNorm reduction order for BF16 128/128 |
 | Tolerances | CUDA `atol=0.0625, rtol=0.02`; NPU `atol=rtol=0.02` (own suite, not CUDA's) |
 | Mutation/aliasing | Outputs are new tensors; inputs are not mutated |
 
@@ -84,9 +83,9 @@ The five categories follow
   fallback and the unit-test golden.
 - Compile/graph modes: `torch.compile` fullgraph and CUDA-graph replay
   supported via the registered op and its fake implementation.
-- Build/resource recovery: the NPU path has no silent eager fallback — a
-  missing MindIE-SD falls back to `npu_rotary_mul`, not to eager; without
-  CUDA + Triton, the eager reference serves.
+- The NPU path calls `torch_npu.npu_rms_norm` and
+  `torch_npu.npu_rotary_mul` directly. The eager reference serves inputs outside
+  the supported accelerated variants.
 - Execution-error handling: changes to error handling require separate
   justification and path/state tests.
 - Relocation preserves behavior: the canonical module is AST-identical to the
@@ -107,12 +106,11 @@ The five categories follow
 
 ### 4. Public API
 
-- Keyword-only `head_dim/rotary_dim/interleaved`; `interleaved` is a
-  model-passed variant choice, not an operator decision.
-- Support query only when a caller needs it: `can_use_fused_qk_norm_rope`
-  lands with #7422; #7417 adds no public support query.
-- Optional dependencies stay lazy (`import torch_npu` inside the function,
-  `find_spec("mindiesd")` probe; no eager fallback when MindIE-SD is missing).
+- Keyword-only `head_dim`, `rotary_dim`, `interleaved`, and `cuda_rms_norm`.
+  Callers choose the pairing and RMSNorm variant.
+- The existing `fused_qk_norm_rope_available` remains accessible through the
+  legacy module. The package-level support query is tracked in #7422.
+- The NPU implementation imports `torch_npu` when the NPU path runs.
 - Single torch registration owner in the canonical module; the legacy module
   re-exports only.
 - Metadata recording stays separate from per-call dispatch: contract,
@@ -127,6 +125,10 @@ The five categories follow
 | --- | --- | --- |
 | MiniMax-H3 | `layers.ops` (import-only change in #7417) | norm weights, table preparation, no-table normalization path; `interleaved=False` |
 | Boogu-Image | legacy imports; public-surface adoption in #7422 | packed `[cos\|sin]` table materialization; token gate policy (`B*S >= 2048` default, env-overridable, permanent through #7422's public-surface migration); model-owned fallback chain; `interleaved=True` |
+
+Qwen-Image and HunyuanVideo 1.5 use the legacy imports for the joint operation
+and table packing. Flux.3, MammothModa2, Pan2, and Z-Image also import QK/RoPE
+helpers through that path. LongCat-Image uses its token-gate helper.
 
 ## Qualification status (RFC #7382)
 
@@ -147,8 +149,8 @@ current owners.
   and registered fake output metadata.
 - `tests/diffusion/layers/test_fused_qk_norm_rope.py`: existing CUDA BF16 reference
   comparison (`atol=0.0625`, `rtol=0.02`), fullgraph compilation with input
-  preservation, and CUDA Graph replay after updating input buffers. The merged
-  interleaved/general-geometry tests and token-gate tests are retained.
+  preservation, and CUDA Graph replay after updating input buffers. The suite
+  covers the joint operation, table packing, token gate, and large offsets.
 - `tests/diffusion/layers/test_fused_qk_norm_rope_npu.py`: CPU tests of the Ascend
   adapters and real-device dispatch/reference coverage (`atol=rtol=0.02`).
 

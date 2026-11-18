@@ -17,6 +17,8 @@ from typing import Any
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.data_entry_keys import ASYNC_CHUNK_PREWARM_NS
 from vllm_omni.engine.duplex.contracts import DuplexFence, DuplexStageRequestContext, DuplexStageSubmission
@@ -26,8 +28,13 @@ from vllm_omni.engine.orchestrator import (
     Orchestrator,
     OrchestratorRequestState,
     _attach_async_chunk_prewarm_payload,
+    build_engine_core_request_from_tokens,
 )
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.plugin import JoyAIDuplexPlugin
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
+from vllm_omni.model_executor.models.nemotron_voicechat.duplex.plugin import NemotronVoiceChatDuplexPlugin
+from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import code2wav_prewarm_payload
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -61,7 +68,15 @@ class _FakePool:
     def live_replica_ids(self) -> list[int]:
         return [0]
 
-    async def submit_initial(self, request_id, _req_state, request, prompt_text=None, expected_replica_id=None):
+    async def submit_initial(
+        self,
+        request_id,
+        _req_state,
+        request,
+        prompt_text=None,
+        expected_replica_id=None,
+        requested_replica_id=None,
+    ):
         self.submitted.append(request)
         return 0
 
@@ -73,6 +88,9 @@ class _FakePool:
 
     def get_bound_client(self, request_id):
         return self.stage_client
+
+    def get_payload_sender_info(self, request_id):
+        return None
 
 
 def _orchestrator(payload_func: Any = None, cls: type[Orchestrator] = Orchestrator) -> Orchestrator:
@@ -206,7 +224,71 @@ async def test_prewarm_submits_plain_placeholder(case: dict[str, Any], expected_
     assert payload_func.call_count == expected_calls
     (placeholder,) = orchestrator.stage_pools[2].submitted
     assert _entry_keys(placeholder) == _PLAIN_KEYS
-    assert placeholder.resumable is stage0_kwargs.get("resumable", streaming)
+    entry_request = _stage0(**stage0_kwargs)
+    assert placeholder.resumable is bool(getattr(entry_request, "resumable", streaming))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("plugin_cls", "joyai_stage_id", "async_chunk", "entry_resumable", "session_owned", "persistent_stages"),
+    [
+        pytest.param(Qwen3OmniDuplexPlugin, None, True, False, True, (), id="qwen-per-utterance"),
+        pytest.param(JoyAIDuplexPlugin, 0, True, False, True, (1, 2), id="joyai-sentence-tts"),
+        pytest.param(JoyAIDuplexPlugin, 1, True, False, True, (2, 3), id="joyai-asr-sentence-tts"),
+        pytest.param(JoyAIDuplexPlugin, 0, False, False, True, (), id="joyai-one-shot"),
+        pytest.param(NemotronVoiceChatDuplexPlugin, None, True, True, True, (1, 2), id="nemotron-streaming"),
+        pytest.param(MiniCPMO45DuplexPlugin, None, True, True, True, (1, 2), id="minicpm-streaming"),
+        pytest.param(JoyAIDuplexPlugin, 0, True, False, False, (), id="non-session-turn"),
+    ],
+)
+async def test_prewarmed_native_stop_keeps_only_required_downstream_requests_open(
+    plugin_cls, joyai_stage_id, async_chunk, entry_resumable, session_owned, persistent_stages
+) -> None:
+    plugin = plugin_cls(lambda *args, **kwargs: "")
+    stage_count = 4 if joyai_stage_id == 1 else 3
+    if isinstance(plugin, JoyAIDuplexPlugin):
+        roles = ["asr", "joyvl", "talker", "code2wav"] if joyai_stage_id == 1 else ["joyvl", "talker", "code2wav"]
+        plugin.configure_pipeline(
+            SimpleNamespace(stages=[SimpleNamespace(stage_id=i, model_stage=role) for i, role in enumerate(roles)])
+        )
+    plugin.configure_async_chunk(enabled=async_chunk)
+    assert plugin.capabilities(max_sessions=1).supports_core_resumable_request is entry_resumable
+    orchestrator = _orchestrator(cls=DuplexOrchestrator)
+    orchestrator.plugin = plugin
+    orchestrator.replica_placement = None
+    if stage_count == 4:
+        orchestrator.stage_pools.append(_FakePool("receiver"))
+    params = [SamplingParams(max_tokens=8, temperature=0, stop_token_ids=[7]) for _ in range(stage_count)]
+    entry_request = build_engine_core_request_from_tokens(
+        "req", {"prompt_token_ids": list(_TOKENS)}, params[0], resumable=entry_resumable
+    )
+    state = OrchestratorRequestState(
+        request_id="req",
+        prompt=_prompt(None),
+        sampling_params_list=params,
+        final_stage_id=stage_count - 1,
+        session_owned=session_owned,
+    )
+
+    assert await orchestrator._prewarm_async_chunk_stages("req", entry_request, state)
+
+    for stage_id in range(1, stage_count):
+        (placeholder,) = orchestrator.stage_pools[stage_id].submitted
+        persistent = stage_id in persistent_stages
+        assert placeholder.resumable is persistent
+        request = Request.from_engine_core_request(placeholder, block_hasher=None)
+        request.status = RequestStatus.RUNNING
+        request.num_computed_tokens = request.num_prompt_tokens + 1
+        scheduler = object.__new__(Scheduler)
+        scheduler.max_model_len = 64
+        scheduler.num_waiting_for_streaming_input = 0
+        _, stopped = Scheduler._update_request_with_output(scheduler, request, [7])
+        assert stopped
+        assert Scheduler._handle_stopped_request(scheduler, request) is (not persistent)
+        assert request.status == (
+            RequestStatus.WAITING_FOR_STREAMING_REQ if persistent else RequestStatus.FINISHED_STOPPED
+        )
+        assert scheduler.num_waiting_for_streaming_input == int(persistent)
 
 
 @pytest.mark.asyncio
@@ -245,6 +327,7 @@ async def test_add_request_attaches_payload_once_and_streaming_update_does_not(m
 @pytest.mark.asyncio
 async def test_duplex_session_submit_does_not_request_payload(mocker) -> None:
     orchestrator = _orchestrator(cls=DuplexOrchestrator)
+    orchestrator.replica_placement = None
     prewarm = mocker.AsyncMock(return_value=True)
     orchestrator._prewarm_async_chunk_stages = prewarm  # type: ignore[method-assign]
     sampling_params = tuple(_sampling_params())

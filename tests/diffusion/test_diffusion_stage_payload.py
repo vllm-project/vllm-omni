@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -60,7 +61,12 @@ class _FakeKVTransferManager:
 def _make_runner(connector, *, payload_keys=("text_encoder_output",), optional_keys=(), recv_stages=("0", "1")):
     runner = object.__new__(DiffusionModelRunner)
     runner.od_config = SimpleNamespace(
-        stage_input_payload_keys=payload_keys, stage_input_optional_payload_keys=optional_keys, stage_id=1
+        kv_transfer_config=None,
+        cfg_kv_collect_func=None,
+        stage_input_payload_keys=payload_keys,
+        stage_input_optional_payload_keys=optional_keys,
+        stage_id=1,
+        diffusion_attention_schedule=None,
     )
     runner.device = torch.device("cpu")
     runner._local_rank = 0
@@ -72,7 +78,9 @@ def _make_runner(connector, *, payload_keys=("text_encoder_output",), optional_k
 
 def _make_sender(connector, *, payload_keys=("prompt_embeds",), send_stages=("0", "1")):
     runner = object.__new__(DiffusionModelRunner)
-    runner.od_config = SimpleNamespace(stage_output_payload_keys=payload_keys, stage_id=0)
+    runner.od_config = SimpleNamespace(
+        kv_transfer_config=None, cfg_kv_collect_func=None, stage_output_payload_keys=payload_keys, stage_id=0
+    )
     runner.device = torch.device("cpu")
     runner.pipeline = None
     runner.kv_transfer_manager = _FakeKVTransferManager(connector, send_stages=send_stages)
@@ -90,6 +98,7 @@ def _make_request(prompt, *, request_id="req-7", kv_sender_info=None, payload_se
         request_id=request_id,
         kv_sender_info=kv_sender_info,
         payload_sender_info=payload_sender_info,
+        mixfusion_info=None,
     )
 
 
@@ -591,6 +600,7 @@ def test_native_kv_runner_keeps_synchronous_payload_transport(monkeypatch):
     connector = _FakeConnector(_conditioning())
     manager = _FakeKVTransferManager(connector)
     config = SimpleNamespace(
+        cfg_kv_collect_func=None,
         stage_input_payload_keys=("text_encoder_output",),
         stage_input_optional_payload_keys=(),
         stage_id=1,
@@ -619,7 +629,7 @@ def test_step_mode_receives_payload_before_kv_and_reuses_cached_state():
     runner = _make_runner(connector)
     runner.state_cache = {}
     request = _make_request({"prompt": "a cat"})
-    request.sampling_params = SimpleNamespace()
+    request.sampling_params = SimpleNamespace(attention_schedule=None, attention_sigma_schedule=None)
     kv_calls = []
 
     def receive_kv(state_request, **kwargs):
@@ -627,9 +637,13 @@ def test_step_mode_receives_payload_before_kv_and_reuses_cached_state():
         kv_calls.append(state_request.request_id)
 
     runner.kv_transfer_manager.receive_multi_kv_cache_distributed = receive_kv
-    scheduled = SimpleNamespace(
-        scheduled_new_reqs=[SimpleNamespace(request_id=request.request_id, req=request, diffusion_kv_metadata=None)],
-        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    scheduled = DiffusionSchedulerOutput(
+        step_id=0,
+        scheduled_new_reqs=[NewRequestData(request_id=request.request_id, req=request)],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        finished_req_ids=set(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
     )
     states, new_ids = runner._update_states(scheduled)
     assert new_ids == [request.request_id]
@@ -637,8 +651,14 @@ def test_step_mode_receives_payload_before_kv_and_reuses_cached_state():
     assert len(connector.calls) == 1
     assert kv_calls == [request.request_id]
 
-    scheduled.scheduled_new_reqs = []
-    scheduled.scheduled_cached_reqs.request_ids = [request.request_id]
+    scheduled = DiffusionSchedulerOutput(
+        step_id=1,
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData(request_ids=[request.request_id]),
+        finished_req_ids=set(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
+    )
     cached_states, new_ids = runner._update_states(scheduled)
     assert cached_states == states
     assert new_ids == []

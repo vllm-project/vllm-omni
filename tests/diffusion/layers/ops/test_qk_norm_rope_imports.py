@@ -25,6 +25,7 @@ def test_import_order_preserves_operation_identity(legacy_first: bool) -> None:
         names = [legacy, public] if {legacy_first!r} else [public, legacy]
         first = importlib.import_module(names[0])
         registered = torch.ops.vllm_omni.fused_qk_norm_rope.default
+        registered_joint = torch.ops.vllm_omni.fused_joint_qkv_norm_rope.default
         second = importlib.import_module(names[1])
         canonical = importlib.import_module(
             "vllm_omni.diffusion.layers.ops.rope.qk_norm_rope"
@@ -33,10 +34,13 @@ def test_import_order_preserves_operation_identity(legacy_first: bool) -> None:
         assert first.fused_qk_norm_rope is canonical.fused_qk_norm_rope
         assert first.fused_qk_norm_rope.__module__ == canonical.__name__
         assert registered is torch.ops.vllm_omni.fused_qk_norm_rope.default
+        assert registered_joint is torch.ops.vllm_omni.fused_joint_qkv_norm_rope.default
         assert canonical._fused_qk_norm_rope_impl.__module__ == canonical.__name__
         assert canonical._fused_qk_norm_rope_fake.__module__ == canonical.__name__
         compat = importlib.import_module(legacy)
-        assert compat.fused_qk_norm_rope_min_tokens is canonical.fused_qk_norm_rope_min_tokens
+        assert compat.__all__ == canonical.__all__
+        for name in canonical.__all__:
+            assert getattr(compat, name) is getattr(canonical, name)
         assert compat._fused_cuda_supported is canonical._fused_cuda_supported
     """)
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)

@@ -24,19 +24,35 @@ from typing import Any
 
 import numpy as np
 import torch
+import vllm.v1.worker.gpu.buffer_utils as buffer_utils
 from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_uva_available
-from vllm.v1.worker.gpu import buffer_utils
 from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+from vllm_omni.worker_v2.warmup import is_warmup_request
 
 logger = init_logger(__name__)
 
 _MASK64 = (1 << 64) - 1
+
+
+def _broadcast_tp_tensor(tensor: torch.Tensor) -> None:
+    """Copy ``tensor`` from tensor-parallel rank 0 when that group exists."""
+    from vllm.distributed.parallel_state import (
+        get_tensor_model_parallel_world_size,
+        get_tp_group,
+        model_parallel_is_initialized,
+    )
+
+    if not model_parallel_is_initialized():
+        return
+    if get_tensor_model_parallel_world_size() <= 1:
+        return
+    get_tp_group().broadcast(tensor, src=0)
 
 
 def _frame_seed(seed: int, frame: int) -> int:
@@ -148,7 +164,7 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
         req_id = str(new_req_data.req_id)
         prompt_ids = list(new_req_data.prompt_token_ids or [])
         token_ids = list(new_req_data.prefill_token_ids or prompt_ids)
-        if req_id.startswith("_warmup_"):
+        if is_warmup_request(req_id):
             # Warmup requests: text rows with zero codes.
             rows = torch.zeros((len(prompt_ids), self.frame_width), dtype=torch.int64)
             rows[:, 0] = torch.tensor(prompt_ids, dtype=torch.int64)
@@ -223,7 +239,11 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
             event = torch.cuda.Event()
             event.record()
         else:
-            host_history, host_count = history.clone(), count.clone()
+            # Native NPU tensors are not CUDA tensors. Blocking host copies
+            # complete before the slot can be reused; copy=True also keeps CPU
+            # snapshots independent of the original slot storage.
+            host_history = history.to(device="cpu", non_blocking=False, copy=True)
+            host_count = count.to(device="cpu", non_blocking=False, copy=True)
         self._suspended[req_id] = _SuspendedRequest(host_history, host_count, event)
 
     def on_requests_finished(self, req_ids: set[str]) -> None:
@@ -260,6 +280,28 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
     # ------------------------------------------------------------------
     # Step inputs
     # ------------------------------------------------------------------
+
+    def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
+        model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
+        # Dummy runs skip run_preprocess, retaining the last step's buffers.
+        # vLLM 0.34's new extensible-KV sizing warmup can leave full-budget
+        # mixed prefill/decode rows immediately before CUDA graph capture.
+        # The compiled forward gathers hidden states by sample_rows, so a
+        # prefill row can exceed a later dummy run's num_tokens and trip the
+        # gather's bounds assert. Stage this dummy size's pure decode layout;
+        # the next real step rewrites every buffer before the model runs.
+        buffers = self.buffers
+        num_samples = min(num_tokens, self.max_num_seqs)
+        rows = torch.arange(num_tokens, device=self.device)
+        sampling = rows < min(num_reqs, num_samples)
+        buffers.token_slots[:num_tokens].fill_(buffers.dummy_slot)
+        buffers.token_from_slot[:num_tokens].fill_(True)
+        buffers.sample_token_rows[:num_tokens].copy_(sampling)
+        buffers.token_sample_index[:num_tokens].copy_(torch.where(sampling, rows, torch.zeros_like(rows)))
+        buffers.sample_rows[:num_samples].copy_(rows[:num_samples])
+        buffers.sample_valid[:num_samples].copy_(rows[:num_samples] < num_reqs)
+        buffers.sample_slots[:num_samples].fill_(buffers.dummy_slot)
+        return model_inputs
 
     def run_preprocess(self, input_batch, model_inputs, req_states=None, mtp_batch_descriptor_dispatcher=None):
         self._flush_slot_writes()
@@ -308,16 +350,18 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
         batch row) that samples frame ``frames[row]`` draws from that frame's seed."""
         noise = self.buffers.noise
         noise.uniform_()
-        if not self._seeds:
-            return
-        for row, req_id in enumerate(req_ids):
-            seed = self._seeds.get(req_id)
-            if seed is None or not sampling[row]:
-                continue
-            if self._seed_generator is None:
-                self._seed_generator = torch.Generator(device=noise.device)
-            self._seed_generator.manual_seed(_frame_seed(seed, int(frames[row])))
-            noise[row].uniform_(generator=self._seed_generator)
+        if self._seeds:
+            for row, req_id in enumerate(req_ids):
+                seed = self._seeds.get(req_id)
+                if seed is None or not sampling[row]:
+                    continue
+                if self._seed_generator is None:
+                    self._seed_generator = torch.Generator(device=noise.device)
+                self._seed_generator.manual_seed(_frame_seed(seed, int(frames[row])))
+                noise[row].uniform_(generator=self._seed_generator)
+        # Each tensor-parallel rank samples inside the forward. Device RNG is
+        # not shared, so rank 0's noise is the one every rank uses.
+        _broadcast_tp_tensor(noise)
 
     def run_postprocess(self, hidden_states, input_batch) -> None:
         self.model.num_sample_rows = None
@@ -403,4 +447,13 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
         return hidden, _FrameRowsSnapshot(frames, valid, partitioned=self._partitioned)
 
 
-__all__ = ["FishOmniModelState"]
+def create_fish_omni_model_state(vllm_config, model, encoder_cache, device):
+    """CUDA keeps the upstream hybrid state; NPU builds Ascend attention metadata."""
+    if getattr(device, "type", None) == "npu":
+        from vllm_omni.platforms.npu.models.fish_omni_model_state import NPUFishOmniModelState
+
+        return NPUFishOmniModelState(vllm_config, model, encoder_cache, device)
+    return FishOmniModelState(vllm_config, model, encoder_cache, device)
+
+
+__all__ = ["FishOmniModelState", "create_fish_omni_model_state"]

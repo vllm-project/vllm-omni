@@ -71,6 +71,21 @@ The executor is model-agnostic and accepts three function parameters:
 
 - (Optional) Broadcast final result to all ranks
 
+Packing copies decoded tiles into independent communication storage. The executor
+releases the original tile references after packing and the packed send buffer
+after gathering. Only rank 0 allocates receive buffers; other ranks send their
+packed tiles without retaining copies of other ranks' tiles. Gathered storage
+remains live through merging because unpacked tiles are views into it.
+HCCL retains explicit all-gather with guarded receive allocation: TorchNPU's
+gather adapter can otherwise allocate hidden receive buffers outside the
+executor's allocation-error agreement.
+
+Wan tile decoding copies each temporal chunk into a preallocated output and
+releases the chunk before decoding the next one. Raw values and patch layout are
+preserved: blending still precedes unpatchification and clamping. Causal feature
+caches remain live between temporal chunks and are cleared when a tile finishes,
+including on failure, before packing, gathering, and merging.
+
 This design separates:
 
 - Distributed execution logic

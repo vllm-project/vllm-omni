@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_codec_frame_rate, load_supported_speakers
+from vllm_omni.model_extras import get_extra_body_params
 
 logger = init_logger(__name__)
 
@@ -188,6 +189,10 @@ class PreparedRequest:
     tts_params: dict[str, Any] = field(default_factory=dict)
     model_type: str = "generic"
     output_policy: OutputPolicy = field(default_factory=OutputPolicy)
+    #: Additional complete prompts, executed in order after ``prompt``. Only
+    #: non-streaming audio without word timestamps supports this path.
+    additional_prompts: list[dict[str, Any]] = field(default_factory=list)
+    segment_silence_ms: int = 200
 
 
 @dataclass
@@ -206,6 +211,25 @@ class SpeechServingContext:
     server: Any
     engine_client: Any | None = None
     diffusion_engine: Any | None = None
+
+
+@dataclass(frozen=True)
+class TextCommitmentCapabilities:
+    """Adapter contract for raw-text commitment through the WebSocket path.
+
+    These describe supported behavior, not a promise that the current server
+    deployment enables optional features such as the forced aligner. A future
+    stateful adapter must use a handler that implements its lifecycle contract.
+    """
+
+    #: Versioned key resolved by the streaming text frontend factory registry.
+    profile: str
+    languages: frozenset[str]
+    independent_segments: bool
+    preserves_cross_segment_context: bool
+    streaming_audio: bool
+    word_timestamps: bool
+    retry_failed_segments: bool
 
 
 @dataclass(frozen=True)
@@ -246,8 +270,20 @@ class TTSModelAdapter(ABC):
     backend: ClassVar[str] = "ar"
     #: Whether streaming entrypoints must retain terminal metrics for validation.
     validates_generation: ClassVar[bool] = False
+    #: Whether to report a ``length`` finish of the AR entry stage (stopped at
+    #: ``max_new_tokens`` or the context window before end-of-speech) as
+    #: truncated audio: ``X-Audio-Truncated`` on non-streaming responses and
+    #: ``truncated`` on the SSE ``speech.audio.done`` event. Enable it only
+    #: after checking that this model's entry stage emits the speech itself, so
+    #: that a ``length`` finish means the audio was cut off. A
+    #: ``validate_generation`` error takes precedence: rejected audio is never
+    #: returned with the flag.
+    reports_length_truncation: ClassVar[bool] = False
     #: Whether the model consumes ``request.speed`` in its native parameters.
     native_speed_control: ClassVar[bool] = False
+    #: None disables commitment. Opt-in adapters describe their complete
+    #: commitment contract so the handler can validate every requested feature.
+    text_commitment: ClassVar[TextCommitmentCapabilities | None] = None
     #: Whether ``request.ref_audio_codes`` (pre-computed reference codes) is
     #: accepted; other adapters get a 4xx instead of silently dropping it.
     supports_reference_codes: ClassVar[bool] = False
@@ -423,19 +459,13 @@ class DiffusionTTSAdapter(TTSModelAdapter):
 
     backend: ClassVar[str] = "diffusion"
 
-    #: Backing diffusion pipeline class (for EXTRA_BODY_PARAMS lookup).
-    pipeline_cls: ClassVar[type | None] = None
-
     @classmethod
     def extra_body_params(cls) -> frozenset[str]:
-        """Fallback-safe access to the pipeline's declared body params.
-
-        Returns the pipeline's ``EXTRA_BODY_PARAMS`` if the #3572 contract is
-        present, else an empty frozenset (the adapter then uses its own inline
-        parameter logic).
-        """
-        params = getattr(cls.pipeline_cls, "EXTRA_BODY_PARAMS", None)
-        return frozenset(params) if params is not None else frozenset()
+        """Return body parameters declared for this adapter's model arches."""
+        params: set[str] = set()
+        for model_arch in cls.model_archs:
+            params.update(get_extra_body_params(model_arch))
+        return frozenset(params)
 
 
 # Re-exported here to avoid import cycles at call sites.
