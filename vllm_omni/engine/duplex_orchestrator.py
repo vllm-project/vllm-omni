@@ -86,6 +86,12 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
     keeps ``Orchestrator`` free of duplex code.
     """
 
+    # Class-level defaults so any path that runs before ``__init__`` (or a test
+    # that builds the object via ``object.__new__``) still sees the fork
+    # bookkeeping instead of an AttributeError.
+    _fork_parents: set[str] = set()
+    _fork_children: dict[str, set[str]] = {}
+
     def __init__(
         self,
         # Any: ``*args`` / ``**kwargs`` are forwarded verbatim to ``OrchestratorBase.__init__``.
@@ -99,6 +105,17 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
     ) -> None:
         super().__init__(*args, **kwargs)
         self.plugin = plugin
+        #: Parents that forked at least one independently scheduled child
+        #: (Duo's H50 handoff). The parent owns the Intent-side KV the next
+        #: block reads, so it must outlive every child and every block: the
+        #: set is sticky until abort or session teardown. Without it a
+        #: finished block retires its own parent and the next
+        #: ``fork_stage_request`` has nothing to fork from.
+        self._fork_parents: set[str] = set()
+        #: parent request id -> child request ids it forked. Used to cascade an
+        #: abort to in-flight children, which would otherwise stay registered
+        #: against a session that is already being torn down.
+        self._fork_children: dict[str, set[str]] = {}
         self.duplex_session_config = duplex_session_config
         self.replica_placement: DuplexReplicaPlacement | None = None
         admission_limit = None
@@ -397,6 +414,31 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 )
                 cleanup_ids.extend(stale_request_ids)
             cleanup_ids = list(dict.fromkeys(cleanup_ids))
+        # ``request_states`` is the only place ``fork_stage_request`` finds a
+        # parent, so every decision about keeping one alive has to be taken
+        # before ``super()`` pops it. Filtering afterwards cannot work.
+        child_to_parent = {child: parent for parent, kids in self._fork_children.items() for child in kids}
+        if abort or release_owners:
+            # Teardown ends the whole family. Cascade to the children that are
+            # still streaming; they are registered against the session being
+            # closed and would otherwise outlive it.
+            for request_id in list(cleanup_ids):
+                for child_id in self._fork_children.get(request_id, ()):
+                    if child_id not in cleanup_ids:
+                        cleanup_ids.append(child_id)
+        else:
+            # A forked parent owns the Intent-side KV that the next block reads,
+            # so a retiring child must not clean it. Hold every forking parent
+            # out of the batch: the parent lives until its session ends, not
+            held = [rid for rid in cleanup_ids if rid in self._fork_parents]
+            if held:
+                cleanup_ids = [rid for rid in cleanup_ids if rid not in self._fork_parents]
+                logger.debug(
+                    "[DuplexOrchestrator] keeping forked parent(s) %s alive while children retire",
+                    held,
+                )
+                if not cleanup_ids:
+                    return []
         try:
             outputs = await super()._cleanup_request_ids(
                 cleanup_ids, abort=abort, release_owners=release_owners, trace_error=trace_error
@@ -407,17 +449,18 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             raise
         if closing_session_ids:
             self.session_manager.finalize_closed_sessions(closing_session_ids)
-        # A forked child must not retire its parent: the parent owns the Intent-side
-        # KV that the next block reads, so it stays registered until the session or
-        # an abort ends it. `fork_stage_request` sets `parent_request_id` on children.
-        retiring_parents = (
-            set() if abort else {getattr(s, "parent_request_id", None) for s in self.request_states.values()}
-        )
         for request_id in cleanup_ids:
-            if request_id in retiring_parents:
-                logger.debug("[DuplexOrchestrator] keeping forked parent %s registered", request_id)
-                continue
             self.session_manager.unregister_request(request_id)
+            parent_id = child_to_parent.get(request_id)
+            if parent_id is not None:
+                children = self._fork_children.get(parent_id)
+                if children is not None:
+                    children.discard(request_id)
+                    if not children:
+                        self._fork_children.pop(parent_id, None)
+            # Only a parent that is itself gone stops protecting the family.
+            self._fork_parents.discard(request_id)
+            self._fork_children.pop(request_id, None)
         return outputs
 
     # ------------------------------------------------------------------ #
@@ -570,7 +613,16 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         generation and sampling params, so it cannot outlive or outvote the
         session it belongs to.
         """
-        parent = cast(DuplexOrchestratorRequestState, self.request_states[parent_request_id])
+        parent = self.request_states.get(parent_request_id)
+        if parent is None:
+            # Cleanup now keeps a forking parent alive until its session ends,
+            # so reaching this means the session was torn down (or the parent
+            # was never registered). Fail with the reason instead of a bare
+            # KeyError from the dict lookup.
+            raise RuntimeError(
+                f"cannot fork {request_id} from {parent_request_id}: parent request is no longer registered"
+            )
+        parent = cast(DuplexOrchestratorRequestState, parent)
         bridge = parent.streaming.bridge_states["duplex"]
         context = DuplexStageRequestContext(
             request_id=request_id,
@@ -586,6 +638,11 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         self.ensure_request(context)
         child = cast(DuplexOrchestratorRequestState, self.request_states[request_id])
         child.parent_request_id = parent_request_id
+        # Record the edge in both directions. The parent must outlive every
+        # child it forked, and an abort of the parent must reach the children
+        # that are still streaming.
+        self._fork_parents.add(parent_request_id)
+        self._fork_children.setdefault(parent_request_id, set()).add(request_id)
         runner = cast("DuplexSessionRunner", self.session_manager.runner_for_request_id(request_id))
         runner.session.reserve_stage_request(stage_id, request_id, fence=context.fence)
         return child
@@ -747,8 +804,13 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         await self._cleanup_request_ids(request_ids, abort=abort)
 
     async def abort_requests(self, request_ids: list[str]) -> None:
-        if request_ids:
-            await self._abort_request_ids(list(dict.fromkeys(request_ids)))
+        if not request_ids:
+            return
+        # Route through ``_cleanup_request_ids`` so an aborted parent takes its
+        # still-streaming forked children with it. Calling ``_abort_request_ids``
+        # directly would leave those children registered against a session that
+        # is about to disappear.
+        await self._cleanup_request_ids(list(dict.fromkeys(request_ids)), abort=True)
 
 
 __all__ = ["DuplexOrchestrator", "DuplexOrchestratorRequestState"]

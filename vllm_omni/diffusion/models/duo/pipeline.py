@@ -61,6 +61,65 @@ class _Session:
     history_blocks: int = 36
 
 
+_WEIGHT_INDEX_FILES = ("model.safetensors.index.json", "diffusion_pytorch_model.safetensors.index.json")
+
+
+def _has_weights(directory: Path) -> bool:
+    """Whether `directory` looks like a self-contained sharded checkpoint."""
+    if not directory.is_dir():
+        return False
+    if any((directory / name).is_file() for name in _WEIGHT_INDEX_FILES):
+        return True
+    return any(directory.glob("*.safetensors")) and (directory / "config.json").is_file()
+
+
+def _resolve_weights_subfolder(root: Path) -> str | None:
+    """Find the directory that holds the DiT shards, whatever the bundle layout.
+
+    The released Duo variants disagree on where the Realization weights live:
+    `Duo-*-causal-base` nests them under `realization/backbone/` (with a
+    `transformer/` subdirectory), while the quantized release puts them directly
+    at `realization/`. Probing for the shards keeps one loader for all of them
+    instead of hardcoding a single release's layout.
+    """
+    if _has_weights(root):
+        return None
+    for candidate in ("transformer", "backbone"):
+        if _has_weights(root / candidate):
+            return candidate
+    raise ValueError(
+        f"Realization checkpoint at {root} has no loadable DiT shards: expected a safetensors "
+        f"index or *.safetensors plus config.json at the root or under one of "
+        f"{', '.join(('transformer', 'backbone'))}"
+    )
+
+
+def _manifest_adapter_modules(manifest_path: Path) -> list[str] | None:
+    """Read the trained-projection list from any released ``complete.json`` far.
+
+    The released variants disagree on the manifest key: causal-base records its
+    LoRA under ``models.student``, the DMD release under ``models.generator``,
+    and the quantized release ships a merged full model under
+    ``models.realization`` (``mode: full``, so there is nothing to list). Probe
+    the three instead of assuming the causal-base key, and return ``None`` when
+    the manifest genuinely declares no adapter so the loader keeps working from
+    the file itself.
+    """
+    release = json.loads(manifest_path.read_text(encoding="utf-8"))
+    models = release.get("models") or {}
+    for key in ("student", "generator", "realization"):
+        entry = models.get(key)
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("mode") == "full":
+            # A merged checkpoint has no separate adapter to apply.
+            return None
+        modules = (entry.get("lora") or {}).get("modules")
+        if modules:
+            return modules
+    return None
+
+
 class DuoPipeline(nn.Module):
     dummy_run_num_frames = 0
     supports_step_execution = True
@@ -152,7 +211,7 @@ class DuoPipeline(nn.Module):
                     "Merged Realization checkpoint cannot apply an adapter, merge, or online FP8 conversion again"
                 )
         root = Path(od_config.model)
-        subfolder = None if root.name == "transformer" else "transformer"
+        subfolder = _resolve_weights_subfolder(root)
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=str(root),
@@ -228,21 +287,20 @@ class DuoPipeline(nn.Module):
         if adapter_format == "torchtitan_split_qkv":
             from .checkpoint import load_training_adapter
 
-            # The release manifest lists exactly which projections the adapter
-            # trained; pass it so the loader cross-checks the file against it
-            # instead of demanding LoRA for every 2D weight in the tree.
+            # The release manifest lists which projections the adapter trained;
+            # pass it so the loader cross-checks the file against it instead of
+            # demanding LoRA for every 2D weight in the tree.
             manifest_modules = self.options.get("adapter_manifest_modules")
             manifest_path = self.options.get("adapter_manifest_path")
             if manifest_modules is None and manifest_path:
-                from pathlib import Path
-
-                release = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-                manifest_modules = (release.get("models", {}).get("student", {}).get("lora") or {}).get("modules")
+                manifest_modules = _manifest_adapter_modules(Path(manifest_path))
             identity = load_training_adapter(
                 self.transformer,
                 adapter,
-                rank=self.options.get("rank", 128),
-                alpha=self.options.get("alpha", 128),
+                # Left as the caller's intent: None means "accept what the file
+                # declares", which is what lets another rank/alpha variant load.
+                rank=self.options.get("rank"),
+                alpha=self.options.get("alpha"),
                 role_embedding=self.options.get("role_embedding", False),
                 target_modules=self.options.get("adapter_modules"),
                 manifest_modules=manifest_modules,

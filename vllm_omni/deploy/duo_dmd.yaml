@@ -45,7 +45,9 @@ stages:
     architectures:
     - DuoIntentForConditionalGeneration
     text_config:
-      vocab_size: 151685
+      # Released intent_adapter/tokenizer.json has 151643 base entries plus 38
+      # added tokens (max id 151680); intent.py rejects a mismatch.
+      vocab_size: 151681
     duo_forbidden_token_ids:
     - 151643
     - 151644
@@ -82,6 +84,10 @@ stages:
   step_execution: true
   streaming_output: true
   diffusion_model_runner_cls: vllm_omni.diffusion.models.duo.model_runner.DuoModelRunner
+  # Realization TP. This nested block resolves into the diffusion parallel
+  # config, but on the `Omni(...)` launch path the resolved stage still came up
+  # at tensor_parallel_size=1; pass TP to `Omni(...)` explicitly as well (see
+  # duo_causal_4gpu.yaml for the measured evidence).
   parallel_config:
     tensor_parallel_size: 4
     sequence_parallel_size: 1
@@ -124,6 +130,7 @@ stages:
   step_execution: false
   streaming_output: false
   diffusion_model_runner_cls: vllm_omni.diffusion.models.duo.model_runner.DuoModelRunner
+  # Codec TP, same caveat as the Realization stage above.
   parallel_config:
     tensor_parallel_size: 2
     sequence_parallel_size: 1

@@ -69,19 +69,20 @@ Realization stage loads `adapter_path` (a `.safetensors` with
 upstream's `apps/duo/duo_dcp.py` before a deploy config can start. The loader
 does not read `complete.json`; nothing is auto-detected from it.
 
-What the released bundle is missing, verified against the live download rather
-than assumed from `complete.json`:
+What the released bundle is still missing, verified against the live download
+rather than assumed from `complete.json`:
 
-- `realization/dcp/.metadata` is absent (the Hub tree lists only
-  `__0_0.distcp`, and the file 404s), although `complete.json` records it with a
-  sha256 and a size. A `.distcp` payload without its metadata index cannot be
-  read by `torch.distributed.checkpoint`, so the Realization adapter cannot be
-  exported from this release at all.
-- `codec/video_vae/` and `codec/audio_vae/` ship weights only: no `config.json`
-  and no modeling code anywhere in the repository. `vae_bridge.load_codec`
-  requires `config.json` with `auto_map.AutoModel`, so the codec stage cannot
-  construct as published. The weights themselves are intact and match the
-  manifest hashes (video `5f0c2e16…`, audio `52c59e67…`).
+- `realization/dcp/.metadata` **is** published now (206259 B, sha256
+  `e0a1e880…`, matching the hash in `complete.json`), together with
+  `realization/dcp/__0_0.distcp` (2.78 GB, 635 `models.student.*` tensors,
+  rank-128 / alpha-128). An earlier revision of this port was written before
+  that upload and recorded the DCP as unreadable; that is no longer true, and
+  the export path below works against the current release.
+- `codec/video_vae/` and `codec/audio_vae/` still ship weights only: no
+  `config.json` and no modeling code anywhere in the repository.
+  `vae_bridge.load_codec` requires `config.json` with `auto_map.AutoModel`, so
+  the codec stage cannot construct as published. The weights themselves are
+  intact and match the manifest hashes (video `5f0c2e16…`, audio `52c59e67…`).
 
 The Intent stage is unaffected: `intent/` carries the full Qwen3-VL weights
 (64 layers, 66.7 GB over 14 shards) plus the 515-tensor adapter, which is what

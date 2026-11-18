@@ -73,12 +73,18 @@ class SplitQKVRealizationLoRALinear(nn.Module):
 
 @torch.no_grad()
 def load_training_adapter(
-    model, path, *, rank=128, alpha=128, role_embedding=False, target_modules=None, manifest_modules=None
+    model, path, *, rank=None, alpha=None, role_embedding=False, target_modules=None, manifest_modules=None
 ):
+    """Apply a released causal-student LoRA to a fully loaded Realization base.
+
+    ``rank``, ``alpha`` and ``role_embedding`` default to what the adapter file
+    declares in its own metadata; passing them explicitly only asserts the
+    caller's expectation and fails when the file disagrees. A future Duo
+    checkpoint with a different rank, or with ``role_embedding=True`` for
+    dual-role conditioning, therefore loads without editing this function.
+    """
     if not getattr(model, "_realization_base_loaded", False) or getattr(model, "_realization_adapter_loaded", False):
         raise ValueError("Training adapter requires complete base and cannot be stacked")
-    if rank != 128 or alpha != 128 or role_embedding is not False:
-        raise ValueError("Exported causal student requires rank/alpha128 and no role embedding")
     all_linears = {
         n: m for n, m in model.named_modules() if hasattr(m, "weight") and m.weight.ndim == 2 and n != "role_embeddings"
     }
@@ -124,33 +130,24 @@ def load_training_adapter(
                     "Adapter inventory disagrees with the release manifest: "
                     f"missing={sorted(declared - covered)[:5]}, extra={sorted(covered - declared)[:5]}"
                 )
-        if (
-            meta.get("layout") != "diffusers_split_qkv"
-            or meta.get("rank") != "128"
-            or meta.get("alpha") != "128"
-            or meta.get("role_embedding") != "false"
+        layout, file_rank, file_alpha, file_role = _adapter_identity(meta)
+        # Validate the file's own declaration, then check any caller expectation
+        # against it. Reading the values from the file is what lets a future
+        # rank/alpha/role_embedding checkpoint load unchanged.
+        for label, given, declared in (
+            ("rank", rank, file_rank),
+            ("alpha", alpha, file_alpha),
+            ("role_embedding", role_embedding, file_role),
         ):
-            raise ValueError("Missing explicit exported student layout/rank/role identity")
+            if given is not None and given != declared:
+                raise ValueError(f"Adapter declares {label}={declared!r} but the caller requires {given!r}")
         if keys != expected:
             raise ValueError(
                 "Training adapter inventory mismatch: "
                 f"missing={sorted(expected - keys)}, extra={sorted(keys - expected)}"
             )
-    replacements = {}
-    with safe_open(str(path), framework="pt", device="cpu") as source:
-        if (
-            meta.get("layout") != "diffusers_split_qkv"
-            or meta.get("rank") != "128"
-            or meta.get("alpha") != "128"
-            or meta.get("role_embedding") != "false"
-        ):
-            raise ValueError("Missing explicit exported student layout/rank/role identity")
-        if set(source.keys()) != expected:
-            raise ValueError(
-                "Training adapter inventory mismatch: "
-                f"missing={sorted(expected - set(source.keys()))}, "
-                f"extra={sorted(set(source.keys()) - expected)}"
-            )
+        identity = {"layout": layout, "rank": file_rank, "alpha": file_alpha, "role_embedding": file_role}
+        scale_base = file_alpha / file_rank
         for name, module in modules.items():
             rows, cols = logical_weight_shape(module)
             targets = _targets(name)
@@ -159,7 +156,7 @@ def load_training_adapter(
                 a = source.get_tensor(target + ".lora_A.default.weight")
                 b = source.get_tensor(target + ".lora_B.default.weight")
                 wanted_rows = rows // len(targets)
-                if a.shape != (rank, cols) or b.shape != (wanted_rows, rank):
+                if a.shape != (file_rank, cols) or b.shape != (wanted_rows, file_rank):
                     raise ValueError("Training adapter geometry mismatch: " + target)
                 if (
                     a.dtype != torch.float32
@@ -174,9 +171,9 @@ def load_training_adapter(
                     b = torch.cat((gate, value), dim=0).contiguous()
                 pairs.append((a, b))
             replacements[name] = (
-                SplitQKVRealizationLoRALinear(module, pairs, alpha / rank)
+                SplitQKVRealizationLoRALinear(module, pairs, scale_base)
                 if len(pairs) == 3
-                else FixedRealizationLoRALinear(module, *pairs[0], alpha / rank)
+                else FixedRealizationLoRALinear(module, *pairs[0], scale_base)
             )
         role = source.get_tensor("role_embeddings.weight")
         if (
@@ -188,7 +185,7 @@ def load_training_adapter(
     for name, replacement in replacements.items():
         model.set_submodule(name, replacement)
     model.role_embeddings.weight.copy_(role.to(model.role_embeddings.weight.device))
-    model.role_embedding_enabled = False
+    model.role_embedding_enabled = file_role
     model._realization_adapter_loaded = True
     return dict(
         path=str(Path(path).resolve()),
@@ -196,10 +193,41 @@ def load_training_adapter(
         tensor_count=len(expected),
         projections=len(modules),
         target_modules=target_modules,
-        rank=rank,
-        alpha=alpha,
+        **identity,
+        scale=scale_base,
         qkv_layout="independent_logical_q_k_v",
-        role_embedding=False,
         checkpoint_id=meta.get("checkpoint_id"),
         decfg_inference=False,
     )
+
+
+def _adapter_identity(meta: dict[str, str]) -> tuple[str, int, int, bool]:
+    """Read the adapter's own layout/rank/alpha/role declaration.
+
+    A missing or unparseable field is an error: silently assuming the released
+    causal-base values would mis-scale a differently shaped checkpoint instead
+    of refusing it.
+    """
+    layout = meta.get("layout")
+    if layout != "diffusers_split_qkv":
+        raise ValueError(f"Unsupported exported student layout: {layout!r}")
+    try:
+        rank = int(meta["rank"])
+        alpha = int(meta["alpha"])
+        role = _parse_bool(meta["role_embedding"])
+    except (KeyError, ValueError) as exc:
+        raise ValueError(f"Missing explicit exported student rank/alpha/role identity: {exc}") from exc
+    if rank <= 0 or alpha <= 0:
+        raise ValueError(f"Exported student rank/alpha must be positive, got rank={rank} alpha={alpha}")
+    return layout, rank, alpha, role
+
+
+def _parse_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("true", "1"):
+        return True
+    if text in ("false", "0"):
+        return False
+    raise ValueError(f"Not a boolean: {value!r}")

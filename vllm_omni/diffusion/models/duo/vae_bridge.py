@@ -12,11 +12,43 @@ from vllm_omni.diffusion.models.minimax_h3.vae import (
     _load_remote_component,
 )
 
+_CODEC_LAYOUTS = (
+    # Released `inclusionAI/duo-v1` layout. Probed first because it is what a
+    # public `--model <bundle>` actually contains.
+    ("codec", "{kind}_vae"),
+    # Internal Realization checkpoint layout.
+    ("FL2VA", "{kind}_vae"),
+    # Component directory passed directly.
+    (None, "{kind}_vae"),
+)
+
+
+def _codec_candidates(kind, root) -> list[Path]:
+    root = Path(root)
+    return [
+        root / parent / pattern.format(kind=kind) if parent else root / pattern.format(kind=kind)
+        for parent, pattern in _CODEC_LAYOUTS
+    ]
+
+
+def resolve_codec_dir(kind, root) -> Path:
+    """Locate a codec component across the layouts the releases actually use.
+
+    The public ``duo-v1`` bundles keep the VAEs under ``codec/{video,audio}_vae``
+    while the internal Realization checkpoint uses ``FL2VA/{kind}_vae``. Probing
+    both keeps one loader for either bundle instead of hardcoding one layout.
+    """
+    candidates = _codec_candidates(kind, root)
+    for component in candidates:
+        if component.is_dir():
+            return component
+    raise FileNotFoundError(f"No {kind} VAE directory under {root}; tried: " + ", ".join(str(p) for p in candidates))
+
 
 def load_codec(kind, root, *, trust_remote_code):
     # Use the official loader without its FP16/uint8 whole-video transforms:
     # duplex uses BF16 temporal decoding and owns the 17-frame output clock.
-    path = str(Path(root) / "FL2VA" / f"{kind}_vae")
+    path = str(resolve_codec_dir(kind, root))
     config = _load_component_config(path)
     model = _load_remote_component(path, config, trust_remote_code=trust_remote_code).model
     for name in ("latents_mean", "latents_std"):

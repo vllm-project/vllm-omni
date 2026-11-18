@@ -14,13 +14,18 @@ state, both done here instead of being hidden in the loader:
    entry naming DuoPipeline. Do not add ``model_type``: it makes
    ``AutoConfig`` reject the directory before the diffusion loader reads
    ``architectures``.
-2. ``realization/complete.json`` records ``"mode": "lora"`` with no staged
-   adapter file: the adapter is folded into the backbone, so the loader must be
-   told ``backbone_includes_adapter``.
+2. The trained student LoRA is **not** in the backbone. ``realization/``
+   declares ``storage.format: dcp`` and the adapter lives in
+   ``realization/dcp/__0_0.distcp`` (2.78 GB, rank 128). It is exported to a
+   safetensors adapter with upstream's ``apps/duo/duo_dcp.py`` and passed via
+   ``adapter_path`` with ``adapter_format="torchtitan_split_qkv"``. Do **not**
+   set ``backbone_includes_adapter``: that tells the pipeline the adapter is
+   already folded in and would silently run an untrained projection path.
 
-Duo stage options have to ride on the engine args, because a deploy YAML's
-``model_config`` block is silently dropped (``StageDeployConfig`` has no such
-field).
+Duo stage options ride on the engine args, e.g. ``model_config={"duo": {...}}``.
+A ``model_config:`` block in a deploy YAML is not a ``StageDeployConfig`` field,
+so it would land in ``engine_extras`` rather than the stage model config.
+
 
 Usage::
 
@@ -55,7 +60,12 @@ DUO_OPTIONS = {
     "fp8_gemm": False,
     "joint_execution": False,
     "prefix_capacity": 0,
-    "backbone_includes_adapter": True,
+    # The trained causal-base LoRA is exported from realization/dcp/ and applied
+    # on top of the frozen backbone; the backbone itself is unadapted.
+    "adapter_format": "torchtitan_split_qkv",
+    "rank": 128,
+    "alpha": 128,
+    "role_embedding": False,
 }
 
 
@@ -87,6 +97,20 @@ def main() -> int:
     ap.add_argument("--model", required=True, help="bundle root (contains realization/backbone)")
     ap.add_argument("--deploy-config", default="vllm_omni/deploy/duo_causal_4gpu.yaml")
     ap.add_argument(
+        "--adapter",
+        required=True,
+        help=(
+            "safetensors adapter exported from realization/dcp/ (upstream "
+            "apps/duo/duo_dcp.py, layout=diffusers_split_qkv, rank=alpha=128)"
+        ),
+    )
+    ap.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=4,
+        help="Realization TP; pass explicitly, the deploy config value alone did not take effect",
+    )
+    ap.add_argument(
         "--steps",
         type=int,
         default=50,
@@ -97,19 +121,31 @@ def main() -> int:
     root = Path(args.model)
     backbone = root / "realization" / "backbone"
     ensure_backbone_config(backbone)
+    adapter = Path(args.adapter)
+    if not adapter.is_file():
+        raise SystemExit(f"adapter not found: {adapter}")
+    options = dict(DUO_OPTIONS)
+    options["adapter_path"] = str(adapter)
+    options["adapter_manifest_path"] = str(root / "realization" / "complete.json")
 
     from vllm_omni.entrypoints.omni import Omni
 
     print(f"deploy={args.deploy_config}")
     print(f"model={backbone}")
+    print(f"adapter={adapter}")
     engine = Omni(
         model=str(backbone),
         deploy_config_path=args.deploy_config,
         model_class_name=BACKBONE_ARCH,
-        # An engine-args field for a single-stage diffusion deploy.
+        # Pass TP explicitly. Measured on 4xA100 with the released causal-base
+        # bundle: with only the deploy config's `tensor_parallel_size: 4` the
+        # engine resolved one stage at TP=1 and put all 66 GB on device 0
+        # (OOM on the first denoise step); with this argument the four workers
+        # report 16.6 GiB each.
+        tensor_parallel_size=args.tensor_parallel_size,
         step_execution=True,
         # Duo stage options, see the module docstring.
-        model_config={"duo": DUO_OPTIONS},
+        model_config={"duo": options},
         disable_log_stats=True,
     )
     print("engine constructed")

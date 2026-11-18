@@ -27,15 +27,20 @@ stages:
   step_execution: true
   streaming_output: false
   diffusion_model_runner_cls: vllm_omni.diffusion.models.duo.model_runner.DuoModelRunner
-  # Stage-deploy parallelism fields are top-level members of StageDeployConfig.
-  # A nested `parallel_config:` block is silently dropped, which leaves the whole
-  # 66 GB backbone on one card and OOMs the first denoise step.
+  # Stage-deploy parallelism is declared flat here, but on the path this preset
+  # is launched with (`Omni(model=..., deploy_config_path=..., model_class_name=
+  # ..., step_execution=...)`) the value below alone did not take effect: the
+  # engine resolved a single stage with tensor_parallel_size=1 and put the whole
+  # 66 GB backbone on device 0. Passing `tensor_parallel_size=4` to `Omni(...)`
+  # made the four workers report 16.6 GiB each. Until that resolution is fixed,
+  # pass TP explicitly AND keep it here.
   tensor_parallel_size: 4
   gpu_memory_utilization: 0.9
   default_sampling_params:
     num_inference_steps: 50
     seed: 42
   max_num_seqs: 1
-# Stage options live on the engine args (see examples/offline_inference/duo),
-# because StageDeployConfig has no model_config field: a `model_config` block in
-# a deploy YAML is silently dropped.
+# Duo stage options (`duo`, `duo_codec`) ride on the engine args, e.g.
+# `model_config={"duo": {...}}` from examples/offline_inference/duo. A
+# `model_config:` block in a deploy YAML is not a StageDeployConfig field, so it
+# would land in `engine_extras` instead of the stage model config.
