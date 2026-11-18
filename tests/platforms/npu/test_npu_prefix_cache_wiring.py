@@ -1,26 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""NPU prefix-cache wiring: save_outputs -> sid -> materialize on CPU.
+"""Eager prefix-cache save/materialize behavior used by Ascend backends.
 
-The NPU runner consumes the prefix cache in eager mode (no CUDA streams) and
-hands the step id across execute_model()/sample_tokens() as the LAST field of
-its positionally-packed ``ExecuteModelState``. Neither path runs in CUDA CI,
-so a hit-read change can silently break them (`vllm_ascend` imports keep the
-runner modules out of reach of a plain unit test).
-
-Two layers of protection, both pure CPU:
-
-1. AST characterization of the ``ExecuteModelState`` field order in the NPU
-   and GPU runners — the pack/unpack sites pass fields positionally, so a
-   reorder or drop of ``prefix_cache_step_id`` corrupts the sid without any
-   import-time error.
-2. The eager-mode facade contract the NPU runner relies on: controller
-   auto-selects eager when CUDA is unavailable, and save -> materialize
-   returns byte-identical rows for both the miss and the hit-merge paths.
+The facade runs without CUDA streams and preserves byte-identical rows for
+misses and hit merges. V1 runner-specific tuple wiring is retired.
 """
 
-import ast
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -32,52 +17,11 @@ from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-_NPU_RUNNER = _REPO_ROOT / "vllm_omni/platforms/npu/worker/npu_ar_model_runner.py"
-_GPU_RUNNER = _REPO_ROOT / "vllm_omni/worker/gpu_ar_model_runner.py"
 
 NUM_BLOCKS = 16
 BLOCK_SIZE = 4
 HIDDEN = 8
 DTYPE = torch.float32
-
-
-def _named_tuple_fields(path: Path, class_name: str) -> list[str]:
-    tree = ast.parse(path.read_text())
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef) and node.name == class_name:
-            return [
-                stmt.target.id
-                for stmt in node.body
-                if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
-            ]
-    raise AssertionError(f"{class_name} not found in {path}")
-
-
-def test_execute_model_state_keeps_prefix_cache_sid_last():
-    """Both runners pack ExecuteModelState positionally: the sid must stay
-    the LAST field, and the NPU field order is pinned exactly — a reorder
-    passes import and every CUDA test, then ships the wrong value as the
-    sid on hardware."""
-    npu_fields = _named_tuple_fields(_NPU_RUNNER, "ExecuteModelState")
-    assert npu_fields == [
-        "scheduler_output",
-        "logits",
-        "spec_decode_metadata",
-        "spec_decode_common_attn_metadata",
-        "hidden_states",
-        "sample_hidden_states",
-        "aux_hidden_states",
-        "attn_metadata",
-        "positions",
-        "ec_connector_output",
-        "cudagraph_stats",
-        "batch_desc",
-        "multimodal_outputs",
-        "prefix_cache_step_id",
-    ]
-    gpu_fields = _named_tuple_fields(_GPU_RUNNER, "ExecuteModelState")
-    assert gpu_fields[-1] == "prefix_cache_step_id"
 
 
 class _FakeView:
@@ -146,7 +90,7 @@ def _expected_rows(slots: torch.Tensor) -> torch.Tensor:
 def _make_npu_mode_manager(monkeypatch) -> tuple[OmniPrefixCacheManager, _FakeView]:
     # The NPU condition: no CUDA -> the controller must auto-select eager
     # (submit() completes copy+scatter synchronously), exactly how
-    # npu_model_runner builds the manager with the default eager=None.
+    # Ascend backends build the manager with the default eager=None.
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     view = _FakeView()
     config = PrefixCacheConfig(num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE)

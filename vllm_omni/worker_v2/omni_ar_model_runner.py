@@ -43,6 +43,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import partition_flat_payload
 from vllm_omni.worker.sparse_audio import resolve_sparse_mm_routing
+from vllm_omni.worker_v2.mooncake_capture import snapshot_mooncake_output
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 from vllm_omni.worker_v2.omni_sampler import sample_with_output
 from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot, pack_output_snapshot
@@ -191,9 +192,15 @@ class OmniARModelRunner(OmniGPUModelRunner):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> Any:
+        flush_pending_metadata = getattr(self.model, "flush_pending_metadata", None)
+        if callable(flush_pending_metadata):
+            # Capture and unsuccessful forwards can leave unassigned metadata.
+            # Discard it without clearing metadata already bound to live requests.
+            flush_pending_metadata(())
         if not dummy_run:
             self._handle_kv_transfer_pre(scheduler_output)
-        return super().execute_model(
+        previous_state = self.execute_model_state if not dummy_run else None
+        output = super().execute_model(
             scheduler_output,
             intermediate_tensors,
             dummy_run=dummy_run,
@@ -203,6 +210,13 @@ class OmniARModelRunner(OmniGPUModelRunner):
             valid_dummy_state_slots=valid_dummy_state_slots,
             randomize_inputs=randomize_inputs,
         )
+        state = self.execute_model_state
+        if not dummy_run and state is not None and state is not previous_state:
+            # Preserve model-owned RoPE metadata in the actual forward order
+            # before the next step exports the finished requests' KV caches.
+            if callable(flush_pending_metadata):
+                flush_pending_metadata(state.input_batch.req_ids)
+        return output
 
     # ------------------------------------------------------------------
     # sample_tokens: OmniOutput handling + pooler_output + async D2H
@@ -275,6 +289,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             # above creates the current feedback frame.
             self.model_state.run_postprocess(text_hidden, input_batch, multimodal_outputs)
         prefix_cache_rewrite = self._prefix_cache_save_mrv2(input_batch, text_hidden, multimodal_outputs)
+        mooncake_rewrite = snapshot_mooncake_output(self, input_batch)
         if bool(getattr(self.model_config, "async_chunk", False)) and multimodal_outputs:
             multimodal_outputs = self._retain_multimodal_outputs(multimodal_outputs)
             snapshot_slot = self._last_multimodal_snapshot_slot
@@ -359,7 +374,6 @@ class OmniARModelRunner(OmniGPUModelRunner):
         # --- Build base output ---
         model_runner_output = OmniModelRunnerOutput(
             req_ids=input_batch.req_ids,
-            req_id_to_index={rid: i for i, rid in enumerate(input_batch.req_ids)},
             sampled_token_ids=None,  # type: ignore[arg-type]
             prompt_logprobs_dict=prompt_logprobs_dict,
             prompt_token_id_logprobs_dict=prompt_token_id_logprobs_dict,
@@ -379,6 +393,15 @@ class OmniARModelRunner(OmniGPUModelRunner):
         materialize_native = self._uses_native_output_materializer()
         get_request_errors = getattr(self.model_state, "get_request_errors", None)
         async_chunk = bool(getattr(self.model_config, "async_chunk", False))
+        finalize_output = self._prefix_cache_output_finalizer(
+            prefix_cache_rewrite,
+            None if materialize_native else self._finalize_native_data_plane_output,
+            mergeable=sampling_output.finalize_multimodal is None and streaming_audio is None,
+        )
+        if mooncake_rewrite is not None:
+            if sampling_output.finalize_multimodal is not None or streaming_audio is not None:
+                raise ValueError("Mooncake Thinker captures cannot use model-owned output materialization")
+            finalize_output = mooncake_rewrite.finalize(finalize_output)
         async_output = OmniAsyncOutput(
             model_runner_output=model_runner_output,
             sampler_output=sampler_output,
@@ -394,11 +417,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             # partitions latent off the client channel and publishes it once
             # through pooling_output for llm2tts.
             partition_async_payload=async_chunk and stage_sends_async_output(self.model_config),
-            finalize_output=self._prefix_cache_output_finalizer(
-                prefix_cache_rewrite,
-                None if materialize_native else self._finalize_native_data_plane_output,
-                mergeable=sampling_output.finalize_multimodal is None and streaming_audio is None,
-            ),
+            finalize_output=finalize_output,
             finalize_multimodal=sampling_output.finalize_multimodal,
             check_ep_fault=self.check_ep_fault,
             pending_aux_output=pending_aux_output,
@@ -434,7 +453,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         model_runner_output.kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.ec_connector_output = ec_connector_output
 
-        self._reserve_native_data_plane_outputs(list(model_runner_output.req_ids))
+        self._reserve_native_data_plane_outputs(model_runner_output)
         if materialize_native:
             return self._materialize_native_output(async_output)
         return async_output

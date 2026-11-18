@@ -119,7 +119,7 @@ def generate(request: dict, output: Path, repeats: int) -> None:
                 fresh_vision = type(vision)(vision.config)
             else:
                 fresh_vision = type(vision)(vision.dim, vision.theta)
-            fresh_text = type(text)(text.config, device=device)
+            fresh_text = type(text)(text.config)
         for target, source in ((vision, fresh_vision), (text, fresh_text)):
             for name, value in source.named_buffers():
                 buffer = target.get_buffer(name)

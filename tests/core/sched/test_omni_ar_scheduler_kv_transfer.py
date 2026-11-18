@@ -148,7 +148,6 @@ def _run_finished_save_step(mocker, request, *, inter_stage_outputs=None):
 
     model_runner_output = OmniModelRunnerOutput(
         req_ids=[request.request_id],
-        req_id_to_index={request.request_id: 0},
         sampled_token_ids=[[42]],
         logprobs=None,
         prompt_logprobs_dict={},
