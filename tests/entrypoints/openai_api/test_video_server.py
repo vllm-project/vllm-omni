@@ -2735,6 +2735,22 @@ def test_invalid_seconds_returns_422(test_client):
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize("flow_shift", ["nan", "inf", "-inf", "0", "-2"])
+def test_invalid_flow_shift_returns_422(test_client, flow_shift: str):
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "bad flow shift", "flow_shift": flow_shift},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "flow_shift"]
+
+
+@pytest.mark.parametrize("flow_shift", [float("nan"), float("inf"), float("-inf"), 0.0, -2.0])
+def test_video_request_rejects_invalid_flow_shift(flow_shift: float):
+    with pytest.raises(ValueError, match="flow_shift"):
+        VideoGenerationRequest(prompt="test", flow_shift=flow_shift)
+
+
 def test_negative_prompt_and_seed_pass_through(test_client, mocker: MockerFixture):
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
