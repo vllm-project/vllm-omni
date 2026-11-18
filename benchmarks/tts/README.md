@@ -122,6 +122,21 @@ This captures the failure mode where `RTF_p50 < 1` (server keeps up in
 aggregate) but per-stream chunk arrival is bursty enough that listeners
 still hear gaps - common at high concurrency on streaming TTS pipelines.
 
+Add `--save-detailed --save-result` to retain `audio_stream_details` in the
+benchmark JSON. Entries follow request order and record PCM sample rate,
+channels, sample width, relative arrival times, read byte counts, and response
+EOF time. The EOF time is null when the stream did not finish. Uncaptured
+requests have null entries; use the corresponding errors to interpret failures.
+These are client HTTP read boundaries, which can split or merge server audio
+chunks. They do not measure codec execution intervals.
+
+For every `openai-audio-speech` run, including without `--save-detailed`, an
+HTTP 200 response with no PCM bytes or an incomplete final PCM frame is a
+failed request. It is excluded from `completed` and successful-request metrics;
+the error includes the response Content-Type. Valid PCM responses are unchanged.
+The DFX runner requires `completed` to equal the requested count, so these
+failures also fail that gate; no performance thresholds are relaxed.
+
 #### Add WER / SIM / UTMOS to any of the above
 
 Append `--seed-tts-wer-eval` (and optionally `SEED_TTS_EVAL_DEVICE=cuda:0`

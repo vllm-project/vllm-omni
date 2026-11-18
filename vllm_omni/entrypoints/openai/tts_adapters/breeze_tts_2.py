@@ -32,6 +32,7 @@ class BreezeTTS2Adapter(ARTTSAdapter):
     model_archs = frozenset({"BreezeForConditionalGeneration"})
     detect_priority = 9
     supported_output_sample_rates = frozenset({24000})
+    reports_length_truncation = True
 
     def __init__(self, ctx: SpeechServingContext) -> None:
         super().__init__(ctx)

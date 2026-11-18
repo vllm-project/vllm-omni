@@ -58,7 +58,8 @@ def _run(spec_decode_tokens: dict) -> tuple[list, dict[str, _Request], SimpleNam
         num_nans_in_logits=None,
         kv_connector_output=None,
         cudagraph_stats=None,
-        req_id_to_index={request.request_id: i for i, request in enumerate(requests)},
+        # req_id_to_index was dropped upstream; the pin derives it from req_ids.
+        req_ids=[request.request_id for request in requests],
         routed_experts=None,
     )
     outputs = OmniARScheduler.update_from_output(scheduler, scheduler_output, model_runner_output)

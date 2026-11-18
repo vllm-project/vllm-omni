@@ -196,6 +196,36 @@ def _parse_serve_args(argv: list[str]) -> TrackingNamespace:
     return parser.parse_args(argv)
 
 
+def test_video_output_warmup_cli_options() -> None:
+    argv = ["serve", "fake-model", "--omni"]
+    args = _parse_serve_args(argv)
+    assert args.video_output_warmup is None
+    args = _parse_serve_args([*argv, "--video-output-warmup", "warmup.json", "--video-output-warmup-timeout", "90"])
+    assert args.video_output_warmup == "warmup.json"
+    assert args.video_output_warmup_timeout == 90
+    normalized = normalize_and_validate_diffusion_engine_ingress_kwargs(
+        {"video_output_warmup": args.video_output_warmup, "video_output_warmup_timeout": 90}, stage_id=0
+    )
+    assert "video_output_warmup" not in normalized
+    assert "video_output_warmup_timeout" not in normalized
+
+
+@pytest.mark.parametrize("api_server_count", [1, 2])
+def test_websocket_compression_is_an_opt_in_frontend_option(api_server_count: int) -> None:
+    argv = ["serve", "fake-model", "--omni", "--api-server-count", str(api_server_count)]
+    args = _parse_serve_args(argv)
+    assert args.disable_websocket_compression is False
+    assert "disable_websocket_compression" not in args.get_explicit_kwargs_dict()
+
+    args = _parse_serve_args([*argv, "--disable-websocket-compression"])
+    explicit = args.get_explicit_kwargs_dict()
+    assert explicit["disable_websocket_compression"] is True
+    normalized = normalize_and_validate_diffusion_engine_ingress_kwargs(
+        {"disable_websocket_compression": explicit["disable_websocket_compression"]}, stage_id=0
+    )
+    assert "disable_websocket_compression" not in normalized
+
+
 @pytest.mark.parametrize(
     "flags",
     [
@@ -1173,19 +1203,25 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
     engine_manager.shutdown.assert_called_once_with()
 
 
-def test_run_headless_llm_launches_one_manager_per_omni_dp_size_local(mocker: MockerFixture) -> None:
+@pytest.mark.parametrize("devices", [None, "0,1"], ids=["inherited", "local-pool"])
+def test_run_headless_llm_launches_one_manager_per_omni_dp_size_local(
+    mocker: MockerFixture, devices: str | None
+) -> None:
     """``--omni-dp-size-local=N`` must spawn N managers, each with its own
     master-assigned replica_id, and join all of them before returning."""
+    from vllm_omni.config.omni_config import OmniStageRuntimeConfig
     from vllm_omni.engine.stage_engine_startup import StageRegistrationResponse
 
     stage_cfg = _make_stage_cfg(0, stage_type="llm")
+    stage_cfg.runtime = OmniStageRuntimeConfig(devices=devices, num_replicas=3)
+    stage_cfg.final_output_type = None
     parallel_config = SimpleNamespace(
         data_parallel_size_local=1,
         data_parallel_rank=0,
         data_parallel_rank_local=0,
         node_rank_within_dp=0,
     )
-    vllm_config = SimpleNamespace(parallel_config=parallel_config, needs_dp_coordinator=False)
+    vllm_config = SimpleNamespace(parallel_config=parallel_config, needs_dp_coordinator=False, quant_config=None)
     manager_a = mocker.Mock()
     manager_b = mocker.Mock()
 
@@ -1201,10 +1237,13 @@ def test_run_headless_llm_launches_one_manager_per_omni_dp_size_local(mocker: Mo
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.get_stage_connector_spec", return_value={})
     mocker.patch("vllm_omni.engine.stage_init_utils.build_engine_args_dict", return_value={})
+    # Keep build_vllm_config real: two local devices must be validated against
+    # the local count, while the stage retains its three cluster-wide slots.
     mocker.patch(
-        "vllm_omni.engine.stage_init_utils.build_vllm_config",
-        return_value=(vllm_config, object),
+        "vllm_omni.engine.stage_init_utils.OmniEngineArgs.create_engine_config",
+        return_value=vllm_config,
     )
+    mocker.patch("vllm_omni.engine.stage_init_utils.Executor.get_class", return_value=object)
     mocker.patch(
         "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
         side_effect=[
@@ -1229,6 +1268,7 @@ def test_run_headless_llm_launches_one_manager_per_omni_dp_size_local(mocker: Mo
     assert mock_manager_cls.call_count == 2
     assigned_ids = [call.kwargs["omni_replica_base_id"] for call in mock_manager_cls.call_args_list]
     assert assigned_ids == [0, 1]
+    assert stage_cfg.runtime.num_replicas == 3
 
     # Multi-replica path joins the monitor threads instead of calling
     # ``monitor_engine_liveness`` synchronously on the main thread, but every
