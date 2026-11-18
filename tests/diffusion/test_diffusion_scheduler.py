@@ -2278,7 +2278,7 @@ class TestStepScheduler:
     def test_drr_aged_head_reserves_remaining_budget_gap(self) -> None:
         scheduler = StepScheduler()
         scheduler.initialize(
-            SimpleNamespace(
+            _scheduler_config(
                 max_num_seqs=8,
                 diffusion_batching_config={
                     "policy": "compute_budget",
@@ -2337,7 +2337,7 @@ class TestStepScheduler:
     def test_drr_aged_admission_respects_explicit_max_num_seqs_count_cap(self) -> None:
         scheduler = StepScheduler()
         scheduler.initialize(
-            SimpleNamespace(
+            _scheduler_config(
                 max_num_seqs=2,
                 diffusion_batching_config={
                     "policy": "compute_budget",
@@ -2379,7 +2379,7 @@ class TestStepScheduler:
     def test_drr_young_head_is_skipped_to_fill_budget(self) -> None:
         scheduler = StepScheduler()
         scheduler.initialize(
-            SimpleNamespace(
+            _scheduler_config(
                 max_num_seqs=8,
                 diffusion_batching_config={
                     "policy": "compute_budget",
@@ -2439,7 +2439,7 @@ class TestStepScheduler:
     def test_drr_aging_promotes_waiting_request_over_new_arrivals(self) -> None:
         scheduler = StepScheduler()
         scheduler.initialize(
-            SimpleNamespace(
+            _scheduler_config(
                 max_num_seqs=1,
                 diffusion_batching_config={
                     "policy": "compute_budget",
@@ -2494,7 +2494,7 @@ class TestStepScheduler:
         on main, even when a later, costlier request would win the DRR score.
         """
         scheduler = StepScheduler()
-        scheduler.initialize(SimpleNamespace(max_num_seqs=1))
+        scheduler.initialize(_scheduler_config(max_num_seqs=1))
 
         req_first = scheduler.add_request(_make_step_request("first"))
         first = scheduler.schedule()
@@ -2535,7 +2535,7 @@ class TestStepScheduler:
         """max_num_seqs > 1 pins the budget: 128 slots of 512x512 = 131072 units."""
         scheduler = StepScheduler()
         scheduler.initialize(
-            SimpleNamespace(
+            _scheduler_config(
                 max_num_seqs=128,
                 diffusion_batching_config={
                     "policy": "compute_budget",
@@ -2572,7 +2572,7 @@ class TestStepScheduler:
         """max_num_seqs=1 (unset) must not pin the batch to one request."""
         scheduler = StepScheduler()
         scheduler.initialize(
-            SimpleNamespace(
+            _scheduler_config(
                 max_num_seqs=1,
                 diffusion_batching_config={
                     "policy": "compute_budget",
@@ -2602,44 +2602,10 @@ class TestStepScheduler:
         assert sched_output.num_running_reqs == 10
         assert sched_output.num_waiting_reqs == 2
 
-    def test_compute_budget_batching_respects_max_num_seqs_hard_cap(self) -> None:
-        scheduler = StepScheduler()
-        scheduler.initialize(
-            SimpleNamespace(
-                max_num_seqs=4,
-                diffusion_batching_config={
-                    "policy": "compute_budget",
-                },
-            )
-        )
-
-        req_ids = [
-            scheduler.add_request(
-                _make_step_request(
-                    f"req-{i}",
-                    sampling_params=OmniDiffusionSamplingParams(
-                        height=512,
-                        width=512,
-                        num_inference_steps=4,
-                    ),
-                )
-            )
-            for i in range(8)
-        ]
-
-        sched_output = scheduler.schedule()
-
-        # Explicit max_num_seqs=4 -> budget 4 * 1024 = 4096 units, which also
-        # caps the 8 * 512x512 requests at 4 (compute_unit_budget=10240 is
-        # ignored, otherwise all 8 would fit).
-        assert _new_ids(sched_output) == req_ids[:4]
-        assert sched_output.num_running_reqs == 4
-        assert sched_output.num_waiting_reqs == 4
-
     def test_profile_batching_policy_ramps_batch_size(self) -> None:
         scheduler = StepScheduler()
         scheduler.initialize(
-            SimpleNamespace(
+            _scheduler_config(
                 max_num_seqs=4,
                 diffusion_batching_config={
                     "policy": "profile",
@@ -2655,6 +2621,38 @@ class TestStepScheduler:
         assert _new_ids(sched_output) == req_ids[:2]
         assert sched_output.num_running_reqs == 2
         assert sched_output.num_waiting_reqs == 2
+
+    def test_step_batch_rejects_different_sampling_key(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(_scheduler_config(max_num_seqs=3))
+
+        req_a = scheduler.add_request(_make_step_request("a"))
+        req_b = scheduler.add_request(
+            _make_step_request(
+                "b",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=768,
+                    num_inference_steps=4,
+                ),
+            )
+        )
+        scheduler.add_request(_make_step_request("c"))
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [req_a]
+        assert sched_output.num_running_reqs == 1
+        assert sched_output.num_waiting_reqs == 2
+
+        scheduler.update_from_output(
+            sched_output,
+            _make_step_output(req_a, step_index=4, finished=True),
+        )
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == [req_b]
+        assert second.num_running_reqs == 1
+        assert second.num_waiting_reqs == 1
 
     def test_step_batch_rejects_different_quality_levels(self) -> None:
         scheduler = StepScheduler()
@@ -2958,7 +2956,7 @@ class TestBatchingPolicyResolution:
         scheduler = StepScheduler()
         config = DiffusionBatchingConfig() if policy is None else DiffusionBatchingConfig(policy=policy)
         scheduler.initialize(
-            SimpleNamespace(
+            _scheduler_config(
                 enable_mixfusion=enable_mixfusion,
                 diffusion_batching_config=config,
             )
