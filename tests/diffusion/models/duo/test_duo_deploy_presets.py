@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Duo deploy presets must reach the runtime config they appear to configure.
 
 Two failures motivated this test, and neither is visible by reading the YAML:

@@ -43,31 +43,3 @@ class RowProjection(nn.Module):
         if self.bias is not None:
             result.add_(self.bias)
         return result.to(x.dtype).reshape(*x.shape[:-1], self.weight.shape[0])
-
-
-def _column(linear, rank, size, gated=False):
-    def shard(value):
-        if gated:
-            return (
-                value.reshape(2, value.shape[0] // 2, *value.shape[1:])
-                .chunk(size, dim=1)[rank]
-                .flatten(0, 1)
-                .contiguous()
-            )
-        return value.chunk(size, dim=0)[rank].contiguous().clone()
-
-    linear.weight = nn.Parameter(shard(linear.weight), requires_grad=False)
-    if linear.bias is not None:
-        linear.bias = nn.Parameter(shard(linear.bias), requires_grad=False)
-    linear.out_features = linear.weight.shape[0]
-
-
-def shard_decoder(model, group, rank, size=2):
-    for block in model.decoder.transformer_blocks:
-        attention = block.attn
-        _column(attention.to_qkv, rank, size)
-        attention.to_out = RowProjection(attention.to_out, group, rank, size)
-        attention.heads //= size
-        attention.attn_inner_dim //= size
-        _column(block.ff.w1, rank, size, gated=True)
-        block.ff.w2 = RowProjection(block.ff.w2, group, rank, size)

@@ -162,9 +162,6 @@ class DuoCodecPipeline(nn.Module):
         self.video = load_codec("video", root, trust_remote_code=od_config.trust_remote_code).to(device)
         if self.options.get("codec_mode") == "duo_5_17":
             cache_bf16_decoder_weights(self.video)
-        self._streaming_video = None
-        if self.options.get("decode_backend", "native") == "solarx":
-            self.max_sessions = 1
         self.sessions, self.retired = {}, {}
         self._video_graph = None
         self._audio_graph = None
@@ -185,27 +182,6 @@ class DuoCodecPipeline(nn.Module):
 
                 video_group, tensor_group, tensor_rank = tile_tensor_groups(self._tile_group, tensor_size)
             set_tile_group(self.video, video_group)
-
-        if self.options.get("decode_backend", "native") == "solarx":
-            from .streaming_video import make_streaming_runtime
-
-            if tensor_size > 1:
-                from .tile_tp import shard_decoder
-
-                self.video.decoder.to(dtype=torch.bfloat16)
-                self.video.post_quant_conv.to(dtype=torch.bfloat16)
-                shard_decoder(self.video, tensor_group, tensor_rank, tensor_size)
-            self._streaming_video = make_streaming_runtime(
-                self.video, video_group, use_graph=self.options.get("use_cuda_graph", True)
-            )
-            height, width = self.options["height"], self.options["width"]
-            with torch.inference_mode():
-                for h, w in dict.fromkeys(((height, width), (width, height))):
-                    self._streaming_video.reset()
-                    z = torch.zeros((1, 24, 1, h // 16, w // 16), device=device)
-                    for _ in range(13):
-                        self._streaming_video.push(z)
-            self._streaming_video.reset()
 
         if self._tile_group is not None and self._tile_group.rank_in_group != 0:
             self._vae_modules = ["video"]
@@ -448,10 +424,6 @@ class DuoCodecPipeline(nn.Module):
             raise
 
     def _new_video_decoder(self, block=0):
-        if self._streaming_video is not None:
-            from .streaming_video import DuoStreamingVideoDecoder
-
-            return DuoStreamingVideoDecoder(self.video, runtime=self._streaming_video, block=block)
         from .exact_video import DuoExactVideoDecoder
 
         decoder = DuoExactVideoDecoder(
@@ -464,7 +436,6 @@ class DuoCodecPipeline(nn.Module):
 
     def _decode_exact_block(self, c):
         started = time.perf_counter_ns()
-        captures_before = self._streaming_video.capture_count if self._streaming_video is not None else 0
         now = time.monotonic()
         for sid, live in tuple(self.sessions.items()):
             if now - live.touched > self.idle_seconds:
@@ -544,22 +515,12 @@ class DuoCodecPipeline(nn.Module):
                     codec_mode="duo_5_17",
                     buffered=not packets,
                     video_input_latents=5,
-                    decode_backend=self.options.get("decode_backend", "native"),
                     video_lookahead_latents=2 if session.exact_decoder.next_block_lookahead else 0,
                     codec_started_ns=started,
                     codec_finished_ns=time.perf_counter_ns(),
-                    video_graph_captures_total=self._streaming_video.capture_count
-                    if self._streaming_video is not None
-                    else 0,
-                    video_graph_captures_in_block=(self._streaming_video.capture_count - captures_before)
-                    if self._streaming_video is not None
-                    else 0,
                     dispatch_ns=c.dispatch_ns,
                     tile_parallel_size=self.od_config.parallel_config.tensor_parallel_size,
                     tile_tensor_parallel_size=self.options.get("tile_tensor_parallel_size", 1),
-                    spatial_tiles=len(self._streaming_video._plan["tiles"])
-                    if self._streaming_video is not None
-                    else None,
                 )
                 if c.final:
                     if session.pending_audio:

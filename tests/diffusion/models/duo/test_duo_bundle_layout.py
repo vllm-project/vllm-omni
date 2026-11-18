@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Duo must locate bundle components across the released layouts.
 
 The released Duo variants disagree on where their components live: the
