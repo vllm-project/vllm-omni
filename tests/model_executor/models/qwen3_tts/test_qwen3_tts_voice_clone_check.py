@@ -377,8 +377,28 @@ def test_pipelines_check_voice_clone_at_stage0(pipeline):
         (_base(), "add_request", ValueError),
         (_base(ref_audio=AUDIO, ref_text=TEXT), "add_request", RuntimeError),
         ({"prompt_token_ids": [0]}, "streaming_update", RuntimeError),
-        # Updates carry later chunks of a request already checked on submission.
+        # Plain updates carry later chunks of a request already checked on submission.
         (_base(), "streaming_update", RuntimeError),
+        # ... but still may not blank its text,
+        (_buffered(_base(), text=["  "]), "streaming_update", ValueError),
+        # and an update that replaces the prompt is checked like a new request.
+        (_base(meta={"replace_streaming_prompt": True}), "streaming_update", ValueError),
+        (_buffered(_base(), meta={"replace_streaming_prompt": True}), "streaming_update", ValueError),
+        (
+            _base(ref_audio=AUDIO, ref_text=TEXT, meta={"replace_streaming_prompt": True}),
+            "streaming_update",
+            RuntimeError,
+        ),
+    ],
+    ids=[
+        "invalid-request",
+        "valid-request",
+        "end-of-stream-update",
+        "plain-update",
+        "plain-update-blanks-text",
+        "replace-update-without-reference",
+        "buffer-replace-update-without-reference",
+        "replace-update-with-reference",
     ],
 )
 def test_engine_rejects_before_input_processing(mocker: MockerFixture, prompt, message_type, error):

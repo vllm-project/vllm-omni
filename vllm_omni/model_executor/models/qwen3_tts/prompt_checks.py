@@ -16,6 +16,7 @@ import numpy as np
 import torch
 
 from vllm_omni.config.stage_config import on_streaming_updates
+from vllm_omni.core.sched.utils import streaming_update_replaces_prompt
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     PRECOMPUTED_REF_CODE_KEY,
     PRECOMPUTED_REF_IDS_KEY,
@@ -163,7 +164,18 @@ def check_voice_clone_prompt(prompt: Any, sampling_params_list: Sequence[Any]) -
     return prompt
 
 
-@on_streaming_updates(check_text_update)
+def check_tts_update(prompt: Any, sampling_params_list: Sequence[Any]) -> Any:
+    """Stage-0 update transform: the text check, then a full voice-clone check for updates that replace the prompt."""
+    check_text_update(prompt, sampling_params_list)
+    for item in prompt if isinstance(prompt, list) else (prompt,):
+        if isinstance(item, dict) and streaming_update_replaces_prompt(
+            (item.get("model_intermediate_buffer"), item.get("additional_information"))
+        ):
+            check_voice_clone_prompt(item, sampling_params_list)
+    return prompt
+
+
+@on_streaming_updates(check_tts_update)
 def check_tts_prompt(prompt: Any, sampling_params_list: Sequence[Any]) -> Any:
     """Stage-0 ``prompt_transform_func`` of both Qwen3-TTS pipelines: text, then voice clone."""
     check_text_prompt(prompt, sampling_params_list)
