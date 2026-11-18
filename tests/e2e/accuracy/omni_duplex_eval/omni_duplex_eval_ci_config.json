@@ -90,6 +90,11 @@
     ]
   },
   "baseline": {
+    "MI300": {
+      "min_rtd_mean_content_score": 1.8,
+      "min_rtd_mean_temporal_score": 1.2,
+      "min_pr_mean_all_success": 0.2222222222222222
+    },
     "H100": {
       "min_rtd_mean_content_score": 1.8,
       "min_rtd_mean_temporal_score": 1.4,

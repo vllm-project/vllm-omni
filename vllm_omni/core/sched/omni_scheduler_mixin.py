@@ -491,7 +491,9 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         """Replace a downstream stage's placeholder with its next payload."""
         self._reset_streaming_session_replacement_state(session)
         session._output_token_ids.clear()
-        session._all_token_ids.clear()
+        # _all_token_ids is a TokenBuffer (array) since vLLM 0.34; it has no
+        # .clear(), so empty it with the del-slice idiom the pin uses.
+        del session._all_token_ids[:]
         new_prompt = update.prompt_token_ids or ()
         session._all_token_ids.extend(new_prompt)
         session.num_computed_tokens = 0

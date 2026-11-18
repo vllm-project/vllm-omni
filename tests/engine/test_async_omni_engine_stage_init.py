@@ -215,7 +215,9 @@ def test_build_vllm_config_forwards_text_watermark_config(
     )
     forwarded: list[dict[str, object] | None] = []
 
-    with pytest.raises(_StopAfterEngineArgsError):
+    expected_error = _StopAfterEngineArgsError if use_v2_model_runner else ValueError
+    expected_match = None if use_v2_model_runner else "Model Runner V1 is not supported"
+    with pytest.raises(expected_error, match=expected_match):
         # start to build the vLLM config and ensure the Omni watermark config is properly parsed
         build_vllm_config(
             stage,
@@ -224,7 +226,7 @@ def test_build_vllm_config_forwards_text_watermark_config(
             watermark_config=WatermarkConfig({"text": {"key": 1234, "algorithm": "gumbel"}}),
         )
 
-    assert forwarded == [expected]
+    assert forwarded == ([expected] if use_v2_model_runner else [])
 
 
 def test_orchestrator_startup_timeout_warns_how_to_raise_limits(monkeypatch):

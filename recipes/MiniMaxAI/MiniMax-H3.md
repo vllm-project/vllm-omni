@@ -622,16 +622,16 @@ Select the device with `HIP_VISIBLE_DEVICES` (not `CUDA_VISIBLE_DEVICES`), drop 
 CUDA-only `FLASHINFER_DISABLE_VERSION_CHECK`, and install without the `[fa4]` extra
 (FA4 is CUDA-only). The VAE uses AITER GroupNorm on ROCm.
 
-For this source checkout, build the frozen vLLM 0.33.0 ROCm runtime from
-source using the repository Dockerfile, from the Omni repository root:
+For this source checkout, build the image with the matching vLLM 0.34.0
+ROCm runtime from the Omni repository root:
 
 ```bash
-docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm:v033-source .
+docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm:v034-source .
 ```
 
 See the [ROCm installation guide](../../docs/getting_started/installation/gpu/rocm.inc.md)
 for source/runtime details. Container and native H3 validation on ROCm remain
-pending for this checkout; an older ROCm wheel cannot provide its 0.33 APIs.
+pending for this checkout; an older ROCm wheel cannot provide its 0.34 APIs.
 
 Historical prebuilt image: `vllm/vllm-omni-rocm:minimax-h3`. That image bundles TorchCodec (for image+audio Ref2VA) and `ffmpeg` (for
 video-reference Ref2VA).
