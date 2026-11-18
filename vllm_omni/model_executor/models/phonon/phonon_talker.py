@@ -144,6 +144,7 @@ class PhononTalkerForConditionalGeneration(nn.Module):
     has_preprocess = True
     has_postprocess = True
     have_multimodal_outputs = True
+    mrv2_forward_returns_tensor = True
     gpu_resident_buffer_keys = set()
 
     def __init__(self, *, vllm_config, prefix=""):
