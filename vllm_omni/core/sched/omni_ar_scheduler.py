@@ -919,6 +919,32 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             and request_is_seeded(getattr(request, "sampling_params", None)) == seeded
         ]
 
+    def _paired_with_seeded(self, request: object) -> bool:
+        """Whether ``request`` is the companion of a seeded CFG request.
+
+        Draining such a companion alone would split the pair: the pairing
+        wrapper deregisters it and the conditioned branch runs unguided
+        (review on #9937). The registries are the common pairing one
+        (``_cfg_req_to_pair`` / ``_cfg_pairs``) and the CFG scheduler's own
+        (``_request_pairs`` / ``_pairs``).
+        """
+        request_id = getattr(request, "request_id", None)
+        for request_registry, pair_registry in (
+            ("_cfg_req_to_pair", "_cfg_pairs"),
+            ("_request_pairs", "_pairs"),
+        ):
+            pair_id = getattr(self, request_registry, {}).get(request_id)
+            if pair_id is None:
+                continue
+            roles = getattr(self, pair_registry, {}).get(pair_id) or {}
+            members = [self.requests.get(rid) for rid in roles.values()]
+            if any(
+                member is not None and request_is_seeded(getattr(member, "sampling_params", None))
+                for member in members
+            ):
+                return True
+        return False
+
     def _isolation_unit(self, request: object) -> list[object] | None:
         """Requests that must be admitted together with the isolated request.
 
@@ -976,7 +1002,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # first - even when a seeded holder is queued. A seeded holder may
             # still need a block, and solo-admitting it would hide a holder that
             # could have made progress (P2 on #9937).
-            drain_unit = self._runnable_kv_holders(seeded=False)
+            drain_unit = [
+                holder
+                for holder in self._runnable_kv_holders(seeded=False)
+                if not self._paired_with_seeded(holder)
+            ]
             promoted = None
             if drain_unit:
                 drain_kv = True

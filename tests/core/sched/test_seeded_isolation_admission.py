@@ -110,12 +110,21 @@ def _make_scheduler(
 
 def _run_schedule(scheduler: OmniARScheduler, monkeypatch: pytest.MonkeyPatch) -> dict:
     """Run ``OmniARScheduler.schedule`` with the upstream admission condition."""
-    seen: dict = {"limit": None, "admitted": None, "waiting_len": None, "kv_len": None}
+    seen: dict = {
+        "limit": None,
+        "admitted": None,
+        "waiting_len": None,
+        "kv_len": None,
+        "waiting_ids": None,
+        "kv_ids": None,
+    }
 
     def upstream_schedule(_self, _throttle_prefills: bool = False):
         seen["limit"] = scheduler.max_num_active_reqs
         seen["waiting_len"] = len(scheduler.waiting)
         seen["kv_len"] = len(scheduler.kv_holding_waiting)
+        seen["waiting_ids"] = [request.request_id for request in scheduler.waiting]
+        seen["kv_ids"] = [request.request_id for request in scheduler.kv_holding_waiting]
         # The ``not len(scheduler.waiting)`` guard is a test-only divergence: the
         # real upstream breaks out of its admission loop when the queue is empty,
         # while this stub has to return before popping. Keep it when editing.
@@ -459,3 +468,38 @@ def test_solo_step_admits_a_common_cfg_pair_together(monkeypatch) -> None:
     assert seen["limit"] == 2
     assert seen["waiting_len"] == 2
     assert seen["admitted"] == "cond"
+
+
+def _audex_pair(scheduler, cond, uncond):
+    scheduler._cfg_pairs = {"pair": {"cond": cond.request_id, "uncond": uncond.request_id}}
+    scheduler._cfg_req_to_pair = {cond.request_id: "pair", uncond.request_id: "pair"}
+    scheduler.requests = {cond.request_id: cond, uncond.request_id: uncond}
+
+
+def test_paired_companion_is_not_drained_alone(monkeypatch) -> None:
+    """A CFG companion must not drain without its seeded partner."""
+    cond = _StubRequest("cond", seed=7)
+    uncond = _StubRequest("uncond")
+    scheduler = _make_scheduler(parked=0, waiting=[], kv_holding=[uncond, cond])
+    _audex_pair(scheduler, cond, uncond)
+
+    seen = _run_schedule(scheduler, monkeypatch)
+
+    # The unit is restricted together from the holder queue, not drained apart.
+    assert seen["limit"] == 2
+    assert seen["waiting_len"] == 0
+    assert seen["kv_ids"] == ["cond", "uncond"]
+
+
+def test_standalone_holder_still_drains_before_a_paired_unit(monkeypatch) -> None:
+    loose = _StubRequest("loose")
+    cond = _StubRequest("cond", seed=7)
+    uncond = _StubRequest("uncond")
+    scheduler = _make_scheduler(parked=0, waiting=[], kv_holding=[loose, uncond, cond])
+    _audex_pair(scheduler, cond, uncond)
+
+    seen = _run_schedule(scheduler, monkeypatch)
+
+    # Only the standalone unseeded holder drains; the pair stays queued.
+    assert seen["kv_ids"] == ["loose"]
+    assert seen["limit"] == 8
