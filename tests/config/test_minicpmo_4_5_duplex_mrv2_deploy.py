@@ -5,6 +5,7 @@
 import pytest
 
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.stage_config import (
     _apply_platform_overrides,
     load_deploy_config,
@@ -18,15 +19,15 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 _DEPLOY = "minicpmo_4_5.yaml"
 
 
-def _resolve_cuda_stages(monkeypatch):
-    # Resolve CUDA overrides even when this test runs on a non-CUDA host.
-    monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
-    config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform="cuda")
+def _resolve_stages(monkeypatch, platform: str):
+    # Resolve platform overrides even when this test runs on a different host.
+    monkeypatch.setattr(current_omni_platform, "device_name", platform)
+    config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform=platform)
     return config, merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
 
 
 def test_duplex_mrv2_cuda_profile(monkeypatch) -> None:
-    config, stages = _resolve_cuda_stages(monkeypatch)
+    config, stages = _resolve_stages(monkeypatch, "cuda")
     assert config.session_mode == "duplex"
     assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True, True]
     assert stages[1].yaml_engine_args["attention_backend"] == "FLASH_ATTN"
@@ -41,8 +42,23 @@ def test_duplex_mrv2_cuda_profile(monkeypatch) -> None:
     assert stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 4 * 1024**3
 
 
-@pytest.mark.parametrize("platform", ["xpu", "rocm", "musa"])
-def test_duplex_mrv2_profile_keeps_non_cuda_on_v1(monkeypatch, platform) -> None:
+def test_duplex_mrv2_rocm_profile_preserves_shared_contract(monkeypatch) -> None:
+    config, stages = _resolve_stages(monkeypatch, "rocm")
+    assert config.model_runner == "v2"
+    assert config.session_mode == "duplex"
+    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True, True]
+    assert [s.yaml_engine_args["async_chunk"] for s in stages] == [True, True, True]
+    assert [s.devices for s in stages] == ["0", "0", "0"]
+    assert stages[2].yaml_engine_args["enforce_eager"] is True
+    assert stages[2].input_sources == [1]
+
+    structured = VllmOmniConfig.from_pipeline_config(MINICPMO_4_5_PIPELINE, user_deploy_config=config)
+    assert [s.model_config.use_v2_model_runner for s in structured.stage_configs] == [True, True, True]
+    assert structured.stage_by_id(2).model_config.enforce_eager is True
+
+
+@pytest.mark.parametrize("platform", ["xpu", "musa"])
+def test_duplex_mrv2_profile_keeps_deferred_platforms_on_v1(monkeypatch, platform) -> None:
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
     config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform=platform)
     assert config.model_runner == "v1"
