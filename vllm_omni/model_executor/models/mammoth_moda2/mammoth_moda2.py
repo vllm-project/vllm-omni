@@ -84,7 +84,7 @@ def _enable_moe_routing_cudagraph_specialize(vllm_config: VllmConfig) -> None:
     ``object.__setattr__(..., False)`` before model load is still honored as
     an opt-out for tests / tooling; ``CompilationConfig`` forbids this key in
     deploy YAML / ``--compilation-config`` JSON, so user-facing remediation is
-    V1 ``MammothGPUARModelRunner`` or a cudagraph mode without FULL.
+    a cudagraph mode without FULL.
     """
     compilation_config = getattr(vllm_config, "compilation_config", None)
     if compilation_config is None:

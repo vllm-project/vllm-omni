@@ -101,7 +101,6 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":
         return cls(
             req_ids=[],
-            req_id_to_index={},
             sampled_token_ids=[],
             logprobs=None,
             prompt_logprobs_dict={},
