@@ -939,9 +939,8 @@ for the execution path and configuration overrides.
 
 ## MiniMax-Music3 with Model Runner V2
 
-`minimax_music3.yaml` and `minimax_music3_2gpu.yaml` run both stages on MRV2 on
-CUDA. Other platforms still select V1 and cannot start these profiles on
-vLLM 0.34. The MRV2 model state passes the batch rows, counts and per-request
+`minimax_music3.yaml` and `minimax_music3_2gpu.yaml` inherit the vLLM 0.34 MRV2
+default for both stages. The serving validation for these profiles used CUDA. The MRV2 model state passes the batch rows, counts and per-request
 arguments to the talker for CFG pairing, frame feedback and seeded sampling.
 Stage 0 uses `async_scheduling: false` so the two members of a CFG pair
 are sampled in the same engine step.

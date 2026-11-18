@@ -3357,9 +3357,9 @@ class TestPlatformOverrides:
     ):
         deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
         deploy = _apply_platform_overrides(deploy, platform=platform)
-        # MOSS realtime inherits V2 on every platform; other profiles retain
+        # MOSS realtime and Music3 inherit V2 on every platform; other profiles retain
         # their explicit platform overrides.
-        all_platforms_mrv2 = filename == "moss_tts_realtime.yaml"
+        all_platforms_mrv2 = filename in ("moss_tts_realtime.yaml", "minimax_music3.yaml", "minimax_music3_2gpu.yaml")
         npu_full_mrv2 = platform == "npu" and filename in (
             "qwen3_tts.yaml",
             "minicpmo_4_5.yaml",

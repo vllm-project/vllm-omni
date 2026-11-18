@@ -103,8 +103,8 @@ response shorter than the cap is the model finishing rather than a truncation.
   which sit outside any KV budget.
 - **Key flags:** none required. Guidance, the solver step count and the window
   geometry are fixed by the checkpoint and are not request parameters.
-- **Model runner:** both stages use MRV2 on CUDA. The shipped non-CUDA
-  selections require the retired V1 runner. For the CUDA stage-1 batch budget, see
+- **Model runner:** both stages use the vLLM 0.34 MRV2 default. For the tested CUDA
+  configuration and stage-1 batch budget, see
   [MiniMax-Music3 with Model Runner V2](../../docs/configuration/stage_configs.md#minimax-music3-with-model-runner-v2).
 - **Streaming:** `stream: true` returns SSE events and `stream_format: "audio"`
   returns raw audio bytes, one window at a time with the default

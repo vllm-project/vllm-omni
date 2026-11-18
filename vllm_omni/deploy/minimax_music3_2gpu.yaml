@@ -6,9 +6,8 @@
 # weights, and the flow-matching solver no longer competes with AR decode for
 # SMs. Everything else (window geometry, CFG contract, sampling defaults)
 # matches minimax_music3.yaml, so the two files stay behaviorally identical.
-# Both stages use V2 on CUDA. Other platforms still select the retired V1 runner.
+# Both stages inherit the vLLM 0.34 Model Runner V2 default.
 pipeline: minimax_music3
-model_runner: v1
 async_chunk: true
 
 # The repo-root config.json reports model_type=minimax_music3, which upstream
@@ -101,7 +100,3 @@ stages:
       temperature: 0.0
       max_tokens: 4096
       seed: 0
-
-platforms:
-  cuda:
-    model_runner: v2

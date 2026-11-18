@@ -10,10 +10,8 @@
 # sampling extra args reach the model's forward) and is also how the CFG
 # scheduler patches learn this stage is paired.
 #
-# The CUDA override selects V2 for both stages. The V1 default marks
-# the remaining platforms as unsupported on vLLM 0.34.
+# Both stages inherit the vLLM 0.34 Model Runner V2 default.
 pipeline: minimax_music3
-model_runner: v1
 async_chunk: true
 
 # The repo-root config.json reports model_type=minimax_music3, which upstream
@@ -138,8 +136,6 @@ stages:
       seed: 0
 
 platforms:
-  cuda:
-    model_runner: v2
   xpu:
     stages:
       - stage_id: 0
@@ -150,7 +146,7 @@ platforms:
       - stage_id: 1
         # Acoustic decoder on the second card.
         max_num_seqs: 2
-        # Legacy XPU budget. This profile requires a V2 port on vLLM 0.34.
+        # Two maximum-size V2 windows fit in this step (2 x 1608 tokens).
         max_num_batched_tokens: 4096
         gpu_memory_utilization: 0.9
         devices: "1"
