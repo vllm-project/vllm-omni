@@ -72,7 +72,7 @@ def test_voxcpm2_platform_keeps_user_runtime_overlay(tmp_path, platform):
     )
     deploy = _apply_platform_overrides(load_deploy_config(path), platform=platform)
     runtime = deploy.stages[0].engine_extras["hf_overrides"]["voxcpm2_runtime_config"]
-    assert deploy.model_runner == ("v2" if platform in {"cuda", "npu"} else "v1")
+    assert deploy.model_runner == "v2"
     assert runtime["cfg_value"] == 2.5
     assert runtime["startup_lora_path"] == "/tmp/custom-adapter"
     assert runtime.get("enable_incremental_vae", False) is (platform == "cuda")
