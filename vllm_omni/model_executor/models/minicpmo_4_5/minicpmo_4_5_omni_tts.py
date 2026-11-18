@@ -77,12 +77,6 @@ from vllm_omni.utils.seeded_exponential import fill_exponential_rows, fill_expon
 from vllm_omni.worker_v2.omni_sampler import OmniSampler
 from vllm_omni.worker_v2.warmup import is_warmup_request
 
-from vllm_omni.model_executor.models.minicpmo_4_5 import (
-    MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
-    MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
-)
-from vllm_omni.platforms import current_omni_platform
-
 if TYPE_CHECKING:
     from vllm.v1.sample.sampler import Sampler
 
