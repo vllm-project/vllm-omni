@@ -75,7 +75,7 @@ class _Estimator(nn.Module):
 
 def _run(body, estimator: nn.Module) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if body is blocks_forward_chunk_fused_npu:
-        prepare_estimator(estimator, fused_qkv_norm=True)
+        prepare_estimator(estimator)
     torch.manual_seed(1)
     rows, frames, cached = 4, 6, 5
     attn = estimator.blocks[0].attn

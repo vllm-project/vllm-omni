@@ -52,14 +52,11 @@ def _same_view(a: torch.Tensor, b: torch.Tensor) -> bool:
     )
 
 
-def prepare_estimator(estimator: nn.Module, *, pack_convs: bool = False, fused_qkv_norm: bool) -> None:
+def prepare_estimator(estimator: nn.Module, *, pack_convs: bool = False) -> None:
     """Establish weight storage before either eager-body or fused-body capture."""
     pack_convs = pack_convs and supports_fused_body(estimator)
     for block in getattr(estimator, "blocks", ()):
         attn = getattr(block, "attn", None)
-        if attn is not None:
-            # Per-model policy, established before any eager warmup or capture.
-            attn._npu_fused_qkv_norm = fused_qkv_norm
         if attn is not None and not attn.training and supports_packed_qkv(attn):
             if attn.to_q.weight.device.type == "npu" and attn.to_q.weight.dtype == torch.float32:
                 packed_qkv(attn)
@@ -284,22 +281,14 @@ def attention_npu(attn, hidden, att_cache, attn_mask, kv, slots=None):
     if logical_cache > cached:
         behind_keys[:, :, cached:].zero_()
         behind_values[:, :, cached:].zero_()
-    if attn._npu_fused_qkv_norm:
-        query = qkv_head_layer_norm(
-            qkv,
-            kv,
-            num_heads=int(attn.num_heads),
-            head_dim=int(attn.head_dim),
-            q_norm=attn.q_norm,
-            k_norm=attn.k_norm,
-        )
-    else:
-        packed = qkv.view(batch, frames, 3, int(attn.num_heads), int(attn.head_dim))
-        query = attn.q_norm(packed[:, :, 0].transpose(1, 2))
-        current_keys = attn.k_norm(packed[:, :, 1].transpose(1, 2))
-        current_values = packed[:, :, 2].transpose(1, 2)
-        keys[:, :, :frames].copy_(current_keys)
-        values[:, :, :frames].copy_(current_values)
+    query = qkv_head_layer_norm(
+        qkv,
+        kv,
+        num_heads=int(attn.num_heads),
+        head_dim=int(attn.head_dim),
+        q_norm=attn.q_norm,
+        k_norm=attn.k_norm,
+    )
     mask = _expand_attn_mask_for_npu(attn_mask, frames, capacity)
     if mask is not None and int(mask.shape[-1]) != capacity:
         tail = capacity - int(mask.shape[-1])

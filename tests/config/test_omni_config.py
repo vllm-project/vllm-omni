@@ -823,7 +823,6 @@ def test_minicpmo_npu_additional_config_reaches_engine_args(monkeypatch, deploy_
     stage = _from_pipeline_key("minicpmo_4_5", deploy_config_path=deploy_name).stage_by_id(2)
     expected: dict[str, object] = {"code2wav_enable_npu_graph": True, "code2wav_max_npu_graphs": 32}
     if deploy_name == "minicpmo_4_5":
-        expected["code2wav_fused_qkv_norm"] = True
         # Single-card deploy: batch sizes round up to a capture bucket so the
         # bounded pool can reuse captures across nearby batch sizes.
         expected["cfm_graph_batch_buckets"] = [1, 2, 4, 8]

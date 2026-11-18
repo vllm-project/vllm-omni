@@ -151,7 +151,7 @@ def test_original_and_packed_graphs_share_stable_weights():
     decoder = pytest.importorskip("cosyvoice2.flow.decoder_dit")
     prepare_code2wav_graph_runtime()
     attn = decoder.Attention(32, 2, 16, qkv_bias=True, qk_norm=True).npu().eval()
-    prepare_estimator(SimpleNamespace(blocks=[SimpleNamespace(attn=attn)]), fused_qkv_norm=True)
+    prepare_estimator(SimpleNamespace(blocks=[SimpleNamespace(attn=attn)]))
     pointers = [p.weight.data_ptr() for p in (attn.to_q, attn.to_k, attn.to_v)]
     x = torch.randn(2, 6, 32, device="npu")
     kv = torch.empty(2, 2, 2, 6, 16, device="npu")
@@ -225,9 +225,9 @@ def test_convolution_graph_storage_survives_fused_body_warmup():
     )
     conv = estimator.blocks[0].conv.block[1]
     original_pointer = conv.weight.data_ptr()
-    prepare_estimator(estimator, fused_qkv_norm=True)
+    prepare_estimator(estimator)
     assert conv.weight.data_ptr() == original_pointer
-    prepare_estimator(estimator, pack_convs=True, fused_qkv_norm=True)
+    prepare_estimator(estimator, pack_convs=True)
     pointer = conv.weight.data_ptr()
     x = torch.randn(2, conv.in_channels, 12, device="npu")
     for _ in range(3):
@@ -317,7 +317,6 @@ def test_fused_qkv_attention_npu_graph_preserves_cache_and_mask(monkeypatch, ali
         mask[1, -3:, :3] = False  # Per-query masks leave other valid keys.
 
     with npu_token2wav_sdpa_context(require_math=True):
-        monkeypatch.setattr(attn, "_npu_fused_qkv_norm", True, raising=False)
         minicpmo_fused.attention_npu(attn, x, cache, mask, kv)
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
@@ -328,9 +327,11 @@ def test_fused_qkv_attention_npu_graph_preserves_cache_and_mask(monkeypatch, ali
             if cache is not None and not alias:
                 cache.normal_()
             expected_kv = kv.clone()
-            monkeypatch.setattr(attn, "_npu_fused_qkv_norm", False)
-            expected = minicpmo_fused.attention_npu(attn, x, cache, mask, expected_kv)
-            monkeypatch.setattr(attn, "_npu_fused_qkv_norm", True)
+            from vllm_omni.model_executor.models.minicpmo_4_5.ops import fused_qkv_layer_norm
+
+            with monkeypatch.context() as native:
+                native.setattr(fused_qkv_layer_norm, "_use_npu_triton", lambda *a, **kw: False)
+                expected = minicpmo_fused.attention_npu(attn, x, cache, mask, expected_kv)
             graph.replay()
             torch.npu.synchronize()
             torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)

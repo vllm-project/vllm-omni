@@ -431,22 +431,8 @@ without Triton retain the native operator path. CUDA launch behavior is unchange
 History copies, masked cache-gap clearing, attention masks and attention itself
 retain their existing semantics.
 
-The NPU stage-2 `additional_config.code2wav_fused_qkv_norm` boolean defaults to
-`true`; set it to `false` to use the previous attention preparation path.
-The deployment YAML explicitly shows this default as a configuration example;
-omitting the key also enables fusion. The stage-config reader resolves the
-default once; downstream setup requires the resolved value explicitly.
-The setting belongs to each estimator instance and is applied before graph
-capture. Restart the server between settings so captured graphs are rebuilt.
-
-```yaml
-platforms:
-  npu:
-    stages:
-      - stage_id: 2
-        additional_config:
-          code2wav_fused_qkv_norm: true
-```
+Eligible NPU inputs automatically use the shared fused kernel; unsupported
+inputs use its native fallback. No deployment switch is required.
 
 NPU compilation, graph replay, numerical parity and service performance must be
 validated on the target stack; implementation alone does not establish a speedup.

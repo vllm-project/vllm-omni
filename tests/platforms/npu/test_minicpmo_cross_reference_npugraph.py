@@ -39,7 +39,6 @@ def test_equal_history_cross_reference_graph_matches_independent_solves(batch, c
     backend = BatchedToken2Wav(
         token2wav,
         cfm_graph_config={
-            "npu_fused_qkv_norm": True,
             "enabled": True,
             "fused_body": True,
             "capture_frames": capture_width,
@@ -144,9 +143,7 @@ def test_shared_prompt_input_is_not_overwritten(monkeypatch):
     token2wav = _Token2Wav(estimator)
     token2wav.flow.decoder.rand_noise = torch.randn(1, 2, 256, device="npu")
     token2wav.flow.decoder.inference_cfg_rate = 0.7
-    backend = BatchedToken2Wav(
-        token2wav, cfm_graph_config={"npu_fused_qkv_norm": True, "enabled": True, "fused_body": True}
-    )
+    backend = BatchedToken2Wav(token2wav, cfm_graph_config={"enabled": True, "fused_body": True})
     arena = backend._whole_euler_graph_wrapper.arena
     cache = torch.randn(backend.n_timesteps, arena.depth, 2, 2, arena.heads, 4, arena.head_dim, device="npu")
     saved = cache.clone()

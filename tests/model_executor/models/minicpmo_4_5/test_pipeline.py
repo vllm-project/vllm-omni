@@ -275,7 +275,6 @@ class TestDeployTopology:
             "code2wav_max_npu_graphs": 32,
         }
         if filename == "minicpmo_4_5.yaml":
-            expected_graph_config["code2wav_fused_qkv_norm"] = True
             expected_graph_config["cfm_graph_batch_buckets"] = [1, 2, 4, 8]
         assert stages[2].yaml_engine_args["additional_config"] == expected_graph_config
 
