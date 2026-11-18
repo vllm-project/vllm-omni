@@ -1,12 +1,12 @@
 # Sol-Attn
 
-`SOL_ATTN` is an opt-in, training-free sparse attention backend. Selecting it
-uses **cuDNN SOL-BSA, block64 text/audio protection, `diag`, `tau=1`, and no
-dense step/layer guards**. It does not change the platform's default backend.
+`SOL_ATTN` is an opt-in, training-free sparse attention backend. By default, H3
+uses it throughout denoising while keeping text/audio blocks exact. Selecting it does
+not change the checkpoint, sampling steps, precision, or platform defaults.
 
-The algorithm combines exact selected blocks with an approximation of omitted
-blocks, merged using their softmax normalization. It is not VSA and does not
-require VSA-trained weights.
+Sol-Attn is by **Haopeng Li et al.** ([paper](https://arxiv.org/abs/2607.24027),
+[upstream implementation](https://github.com/NVlabs/Sana/tree/f4035e0a976d828ed41c7b0b799e9712b47cd60d/techniques/sparse_backends)).
+This backend integrates their algorithm; it does not require VSA-trained weights.
 
 ## Requirements
 
@@ -17,11 +17,9 @@ pip install 'git+https://github.com/NVlabs/Sana.git@f4035e0a976d828ed41c7b0b799e
 pip install 'nvidia-cudnn-frontend>=1.31.0'
 ```
 
-The default cuDNN provider requires SM90 or newer, BF16 Q/K/V, head dimension
-128, and noncausal self-attention with equal Q/KV heads. Supported execution is
-one real sequence, locally or with pure Ulysses. Structural suffix padding is
-excluded; multiple packed documents, arbitrary masks, Ring, AllGather-KV,
-quantized KV, and compact unequal-Q/KV attention are rejected.
+The default cuDNN backend requires SM90 or newer and BF16 self-attention with
+head dimension 128 and equal Q/KV heads. It supports one sequence at a time,
+locally or with pure Ulysses; Ring, AllGather-KV, and quantized KV are unsupported.
 
 ## Quick start
 
@@ -34,23 +32,17 @@ vllm serve /path/to/MiniMax-H3/FL2VA --omni \
   --diffusion-attention-backend SOL_ATTN
 ```
 
-No JSON or internal role names are required. H3 applies SOL to its main DiT
-and automatically keeps the text token refiner on dense `TORCH_SDPA`.
+No JSON or model-specific attention settings are required.
 
 - **T2VA / FL2VA:** set request `extra_params.task` to `t2va` or `fl2va`.
 - **Ref2VA:** replace `/FL2VA` with `/Ref2VA` and `--task-type fl2va` with
   `--task-type ref2va`; set request `extra_params.task` to `ref2va`.
-- Set request `num_inference_steps=50` for a 50-step run. Attention selection
-  does not change the sampler, step count, checkpoint, or precision.
-- GPU selection and parallelism remain deployment choices. Without parallelism
-  options this uses one GPU; provide sufficient model memory in either case.
+
+Provision sufficient model memory; GPU selection and parallelism are configured
+separately.
 
 Submit requests through the
 [MiniMax-H3 online video API](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md#http-api-examples).
-
-The startup log identifies both selections: `SOL_ATTN` for role `self`, and
-`SDPA` for `minimax_h3.token_refiner` with
-`model override SOL_ATTN -> TORCH_SDPA` in the resolution source.
 
 ## Advanced settings
 
@@ -63,81 +55,18 @@ the quick-start backend flag with:
 --diffusion-attention-config '{"default":{"backend":"SOL_ATTN","sol_attn":{"thresh_type":"exact","tau":1.5}}}'
 ```
 
-Unspecified SOL options retain their defaults; the H3 refiner still stays
-dense automatically. `exact` changes the threshold estimator, not attention
-precision or equivalence to dense attention. Higher `tau` generally selects
-fewer exact blocks; validate quality and latency for the actual workload.
-
-### Configuration keys
-
-Optional overrides go in `AttentionSpec.sol_attn`:
+The usual tuning options are:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `provider` | `cudnn` | BF16 SOL-BSA; `triton` selects the other BSA provider, `native` the upstream fused kernel. |
-| `sink_mode` | `text_audio` | Model-owned text/audio block64 protection; `prefix` selects the legacy prefix/range policy. |
-| `tau` | `1.0` | Nonnegative threshold multiplier; higher values generally select fewer exact blocks. |
-| `thresh_type` | `diag` | `diag` ignores cross-dimension covariance; `exact` includes it. Neither changes precision or means dense attention. |
-| `dense_steps` | `0` | First N denoising steps stay dense; positive values also guard missing step metadata. |
-| `dense_layers` | `[]` | Layer indices/ranges kept dense; nonempty selectors also guard unidentified layers. |
-| `prefix_sink` | `true` | In `prefix` mode, derive the protected prefix from model-owned video layout. Ignored by `text_audio`. |
-| `sink_tokens` | `0` | Additional protected range in `prefix` mode; BSA rounds outward to whole blocks. |
-| `sink_start` | `0` | Range offset in `prefix` mode; `null` places the range at the valid-token suffix. |
-| `kv_splits` | `auto` | BSA resolves to one; native uses four on SM90 with CuTe and at least 65,536 valid tokens, otherwise one. |
+| `tau` | `1.0` | Controls sparsity. Higher values generally compute fewer blocks exactly; check output quality. |
+| `thresh_type` | `diag` | Threshold estimator: `diag` or `exact`. Neither changes precision or makes attention dense. |
 
-### Per-role overrides
-
-An exact `per_role` entry takes precedence over the model's automatic policy.
-For example, select cuDNN dense attention for the H3 refiner instead of SDPA:
-
-```bash
---diffusion-attention-config '{"default":{"backend":"SOL_ATTN"},"per_role":{"minimax_h3.token_refiner":{"backend":"CUDNN_ATTN"}}}'
-```
-
-H3's main DiT role is `self`, not `minimax_h3.main`. A per-role spec replaces
-the entire inherited spec; SOL options do not leak into a dense backend.
-Explicit selections still require compatible hardware and metadata. The
-automatic refiner policy applies independently to startup schedule profiles
-and does not change other models or non-SOL selections.
-
-### Protection policy
-
-The default adopts the
-[upstream Sol-H3 Ref2VA policy](https://github.com/NVlabs/Sana/blob/cf67a3acad7511acb85053e56a05e5dd24c82ba0/models/minimax_h3/Sol-H3/h3_runtime/engine.py#L302)
-for T2VA, FL2VA, and Ref2VA. Upstream uses different guards for its other tasks;
-this integration deliberately uses one text/audio policy across H3 tasks.
-It does not import the upstream LoRA, quantized transport, or reduced-step profile.
-
-H3 builds one block64 mask per request branch from actual packed text/audio
-positions, including reference and target audio. Marked blocks stay exact on
-both Q and KV axes. Visual reference blocks remain eligible for sparse routing,
-except mixed boundary blocks containing text/audio. Neighboring and
-route-selected blocks also stay exact; disabling dense guards does not make
-every block approximate. Pure Ulysses retains the global mask coordinates.
-
-Missing or stale text/audio metadata fails explicitly. Other models must
-publish compatible metadata or explicitly select `sink_mode="prefix"`; there
-is no silent fallback to prefix protection or dense attention.
-
-### Alternative providers
-
-`text_audio` requires a BSA provider and rejects explicit sink ranges. The
-`triton` provider requires `vllm-omni[vsa]` for its shared kernel, SM80+, and
-standard head-dimension scaling; it still executes SOL, not the VSA algorithm.
-
-To use the native fused kernel, explicitly set
-`"sol_attn":{"provider":"native","sink_mode":"prefix"}`. It supports SM80+
-and the upstream architecture-specific runtimes. Prefix mode conservatively
-protects everything before the target video, including Ref2VA visual references;
-native execution recomputes protected query rows densely. Set dense guards
-explicitly if desired. Models with cross-attention must select SOL only for
-compatible self-attention roles.
+Leave these at their defaults unless comparing output quality and latency.
+More aggressive sparsity does not guarantee a faster end-to-end request.
 
 ## Validation limits
 
-The SOL-BSA implementation currently uses a chunked PyTorch residual, not a
-fused residual kernel; routing metadata grows quadratically with block count.
-Kernel and attention-forward checks do not establish full-model video/audio
-quality, HTTP-serving validation, or a speedup for this default profile.
-Validate against a matching dense baseline before deployment. Full-model
-compilation and outer HSDP boundaries are outside the backend's guarantee.
+Full-model video/audio quality, HTTP serving, and speedup for the default
+profile remain unvalidated. Compare against a matching dense baseline before
+deployment. Full-model compilation and HSDP compatibility are not guaranteed.
