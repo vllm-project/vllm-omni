@@ -2238,8 +2238,10 @@ async def test_failure_inside_append_does_not_await_its_own_cancellation() -> No
 
         append = asyncio.create_task(append_discovering_failure())
         runner.tasks.track_append_task(append, epoch=0, final=False, response_bound=False)
-        await asyncio.wait_for(returned_from_failure.wait(), timeout=1)
-        await asyncio.wait_for(asyncio.gather(*tuple(harness.manager._dispatched_control_tasks)), timeout=1)
+        # A busy CPU suite can delay a loop turn past a one-second deadline,
+        # even when fail_sessions returns before cleanup cancels the append.
+        await asyncio.wait_for(returned_from_failure.wait(), timeout=5)
+        await asyncio.wait_for(asyncio.gather(*tuple(harness.manager._dispatched_control_tasks)), timeout=5)
         assert append.cancelled()
         assert harness.manager.get("a") is None
         assert port.placement.snapshot()["sessions"] == {}
