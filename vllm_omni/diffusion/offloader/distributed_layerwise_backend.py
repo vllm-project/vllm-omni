@@ -83,6 +83,23 @@ logger = init_logger(__name__)
 _ACTIVE_HWR_REGISTRATIONS: list[tuple[HostRegistration, HostWeightLease]] = []
 _ACTIVE_HWR_REGISTRATIONS_LOCK = threading.Lock()
 
+# XCCL and NCCL reject E8M0 scales as a collective element type. E8M0 is one
+# byte wide and bit-preserving under a uint8 reinterpretation, so collect the
+# underlying byte storage and view the output back as E8M0.
+_BYTE_VIEW_ALLGATHER_DTYPES = frozenset({torch.float8_e8m0fnu})
+
+
+def _all_gather_shard(
+    output: torch.Tensor,
+    input_tensor: torch.Tensor,
+    group: torch.distributed.ProcessGroup | None,
+) -> None:
+    """All-gather a shard, using byte storage for unsupported dtypes."""
+    if input_tensor.dtype in _BYTE_VIEW_ALLGATHER_DTYPES:
+        output = output.view(torch.uint8)
+        input_tensor = input_tensor.view(torch.uint8)
+    torch.distributed.all_gather_into_tensor(output, input_tensor, group=group)
+
 
 def _retain_active_hwr_registration(
     registration: HostRegistration,
@@ -347,10 +364,15 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             offset = offsets.get(dtype, 0)
             transform = (tensor_transforms or {}).get(id(target))
             runtime_source = transform(source) if callable(transform) else source
-            if runtime_source.dtype != dtype or runtime_source.shape != source.shape:
+            # Rank-local staging is sized from the recorded ``numel``/``shape``
+            # of the transformed tensor and re-validated at pack time, so a
+            # model-declared runtime layout may legitimately be smaller than the
+            # checkpoint tensor; ``_shard_and_pin`` accepts the same transforms.
+            # Only dtype must hold, because sources are bucketed by dtype.
+            if runtime_source.dtype != dtype:
                 raise ValueError(
-                    "mmap weight transform changed tensor metadata for "
-                    f"{name!r}: expected dtype={dtype}, shape={tuple(source.shape)}, "
+                    "mmap weight transform changed tensor dtype for "
+                    f"{name!r}: expected dtype={dtype}, "
                     f"got dtype={runtime_source.dtype}, shape={tuple(runtime_source.shape)}"
                 )
             stride = runtime_source.stride()
@@ -657,10 +679,10 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 with current_omni_platform.stream(self.comm_stream):
                     for dtype, local_shard in gpu_shards.items():
                         gw = gpu_weights[dtype][: self._ag_output_sizes[dtype]]
-                        torch.distributed.all_gather_into_tensor(
+                        _all_gather_shard(
                             gw,
                             local_shard,
-                            group=self.dp_group,
+                            self.dp_group,
                         )
                     evt.record(self.comm_stream)
             else:
@@ -687,10 +709,10 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                             full_out = gpu_weights[dtype_manifest.dtype][
                                 chunk.full_offset : chunk.full_offset + chunk.padded_numel
                             ]
-                            torch.distributed.all_gather_into_tensor(
+                            _all_gather_shard(
                                 full_out,
                                 local_input,
-                                group=self.dp_group,
+                                self.dp_group,
                             )
                             self._ag_done_events[input_slot].record(self.comm_stream)
                         self._chunk_reuse_events[input_slot] = self._ag_done_events[input_slot]

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Waveform ownership across graph replays and asynchronous output copies."""
 
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -24,7 +25,7 @@ class CausalCodec(nn.Module):
         self.channels = channels
         self.config = SimpleNamespace(codebook_size=1024)
 
-    def initialize_decoder_state_pool(self, capacity, scratch):
+    def initialize_decoder_state_pool(self, capacity, scratch, *, chunk_frames=0, packed=False):
         self.state = torch.zeros(capacity + scratch, device=self.weight.device)
 
     def reset_decoder_state_slots(self, slots):
@@ -84,6 +85,39 @@ def make_decoder(*, v2=True, channels=2, device="cpu", model_type="moss_tts_loca
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize("codec_version", [1, 2])
+@pytest.mark.parametrize("device_type", ["cpu", "cuda"])
+def test_loading_codec_releases_encoder_and_preserves_decode(monkeypatch, mocker, codec_version, device_type):
+    from tests.model_executor.models.moss_tts.test_audio_tokenizer_v1_streaming import _make_codec
+    from tests.model_executor.models.moss_tts.test_codec_ring_headroom import tiny_codec
+    from vllm_omni.model_executor.models.moss_tts import modeling_moss_tts_codec as codec_module
+
+    codec = _make_codec() if codec_version == 1 else tiny_codec()
+    codes = torch.tensor([[[1, 2, 3]], [[3, 2, 1]]])
+    expected = codec.batch_decode([codes[:, 0]], num_quantizers=2).audio
+    encoder_ref = weakref.ref(codec.encoder)
+    expected_parameters = {f"_codec.{name}" for name, _ in codec.named_parameters() if not name.startswith("encoder.")}
+    decoder = make_decoder(streaming=False)
+    decoder.vllm_config.device_config = SimpleNamespace(device=mocker.Mock(spec=torch.device, type=device_type))
+    decoder.vllm_config.load_config = object()
+    decoder.vllm_config.model_config.enforce_eager = True
+    monkeypatch.setattr(codec_module, "load_codec", lambda *args, **kwargs: (codec.config, codec))
+    empty_cache = mocker.patch.object(codec_module.current_omni_platform, "empty_cache", create=True)
+
+    loaded = decoder.load_weights(iter(()))
+
+    if device_type == "cpu":
+        empty_cache.assert_not_called()
+    else:
+        empty_cache.assert_called_once_with()
+    assert encoder_ref() is None
+    assert loaded == expected_parameters
+    assert codec.encoder is None
+    actual = decoder._codec.batch_decode([codes[:, 0]], num_quantizers=2).audio
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize("ramp,frames", [(None, [1, 15]), ([1, 4, 8, 15], [1, 4, 8, 15]), ([1, 4, 4, 15], [1, 4, 15])])
 def test_ramp_chunks_are_captured_at_exact_frame_counts(ramp, frames):
     config = SimpleNamespace(
@@ -119,9 +153,22 @@ def test_ramp_chunks_are_captured_at_exact_frame_counts(ramp, frames):
 def test_gpu_output_requires_local_streaming_mrv2_and_cuda(v2, streaming, model_type):
     decoder = make_decoder(v2=v2, streaming=streaming, model_type=model_type)
     assert decoder._gpu_stream_output == (v2 and streaming and model_type == "moss_tts_local")
+    assert decoder._stream_ring_headroom == (model_type == "moss_tts_local")
     session = decoder._ensure_stream_session()
     slot = session.acquire()
     assert session.step({slot: torch.ones(2, 3)})[slot].device.type == "cpu"
+
+
+@pytest.mark.cpu
+def test_whole_sequence_v2_does_not_use_v1_graph_api(mocker):
+    from tests.model_executor.models.moss_tts.test_codec_ring_headroom import tiny_codec
+
+    decoder = make_decoder(streaming=False)
+    decoder.vllm_config.model_config.enforce_eager = False
+    decoder._codec = tiny_codec()
+    legacy_graph = mocker.patch.object(decoder, "_enable_non_streaming_decoder_cudagraph")
+    decoder._configure_decoder_cudagraph(torch.device("cpu"))
+    legacy_graph.assert_not_called()
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)

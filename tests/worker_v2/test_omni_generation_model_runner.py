@@ -288,7 +288,7 @@ def test_sample_tokens_cpu_sync_owns_outputs_and_runs_connector_last():
     result = OmniGenerationModelRunner.sample_tokens(runner)
     assert isinstance(result, OmniModelRunnerOutput)
     # Reserve precedes finalize; connector runs after token state is applied.
-    runner._reserve_native_data_plane_outputs.assert_called_once_with(["req-0"])
+    runner._reserve_native_data_plane_outputs.assert_called_once_with(result)
     runner.kv_connector.post_forward.assert_called_once_with({"finished"})
     waveform.fill_(-1)
     assert torch.equal(result.multimodal_outputs[0]["codes.audio"], torch.arange(4, dtype=torch.float32))
@@ -436,6 +436,7 @@ def test_prewarm_runs_after_finish_and_only_on_consecutive_idle_steps(cached):
     from vllm_omni.core.sched.output import OmniRequestPrewarm, OmniSchedulerOutput
 
     runner = object.__new__(OmniGenerationModelRunner)
+    runner.encoder_cache = None
     runner._prev_step_idle = False
     runner._failed_optional_model_hooks = set()
     events = []

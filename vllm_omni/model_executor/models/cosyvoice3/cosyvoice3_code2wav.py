@@ -33,11 +33,13 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
 )
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreLookaheadLayer
 from vllm_omni.model_executor.models.cosyvoice3.runtime import (
+    compile_cosyvoice3_padded_dit,
     cosyvoice3_batch_flow_debug,
     cosyvoice3_batch_flow_profile,
     cosyvoice3_full_response_enabled,
     cosyvoice3_packed_inference_enabled,
     cosyvoice3_packed_streaming_enabled,
+    cosyvoice3_stage1_npu_graph_enabled,
 )
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 
@@ -97,9 +99,13 @@ class CosyVoice3Code2Wav(nn.Module):
     # the tensors and copy to host without taking another device snapshot.
     owns_generation_output_storage = True
 
-    def __init__(self, config: CosyVoice3Config):
+    def __init__(self, config: CosyVoice3Config, *, enable_npu_graphs: bool = False):
         super().__init__()
         self.config = config
+        # Keep existing NPU deployments unchanged unless the adapter is
+        # explicitly requested. Runtime-wide NPU settings are applied only
+        # after load_weights confirms that this stage is placed on NPU.
+        self._enable_npu_graphs = enable_npu_graphs and cosyvoice3_stage1_npu_graph_enabled()
 
         # Build flow matching components
         pre_lookahead_layer = PreLookaheadLayer(**config.flow["pre_lookahead_layer"])
@@ -774,6 +780,14 @@ class CosyVoice3Code2Wav(nn.Module):
         if f0_folded == 0:
             logger.warning("HiFT F0 predictor had no weight-norm layers to fold; check config drift")
         self.hift.eval()
+        # Some lightweight loaders construct this module with ``__new__`` and
+        # attach only the components needed by ``load_weights``. Treat a
+        # missing graph flag as disabled, matching the adapter's opt-in
+        # contract and preserving those compatibility paths.
+        if getattr(self, "_enable_npu_graphs", False) and device.type == "npu":
+            from vllm_omni.platforms.npu.models.cosyvoice3_graph import enable_cosyvoice3_graphs
+
+            enable_cosyvoice3_graphs(self.flow_model.decoder, self.hift)
         if device.type == "cuda" and cosyvoice3_packed_streaming_enabled():
             if os.getenv("COSYVOICE3_CACHED_ISTFT", "0") == "1":
                 self.hift.enable_cached_istft()
@@ -782,3 +796,6 @@ class CosyVoice3Code2Wav(nn.Module):
                 self.hift.enable_decode_graphs()
                 logger.info("CosyVoice3 streaming HiFT: decode CUDA graphs enabled")
         logger.info(f"Loaded hift weights from {hift_path}")
+        if self.config.cosyvoice3_compile_dit:
+            compile_cosyvoice3_padded_dit(self.flow_model.decoder.estimator, device)
+            logger.info("CosyVoice3 padded DiT compilation configured; first-use compilation occurs during warmup")
