@@ -23,11 +23,20 @@ from vllm_omni.diffusion.models.longcat_video.pipeline_longcat_video_avatar impo
     _infer_asset_root_from_path,
     _prepare_multi_speaker_audio_arrays,
     _resolve_num_segments,
+    _resolve_use_distill,
     get_longcat_video_avatar_post_process_func,
     prepare_longcat_video_avatar_model_for_omni,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+@pytest.mark.parametrize("loaded_use_distill", [True, False])
+def test_longcat_video_avatar_rejects_request_distill_change(loaded_use_distill: bool):
+    with pytest.raises(ValueError, match="load-time setting"):
+        _resolve_use_distill({"use_distill": not loaded_use_distill}, loaded_use_distill)
+    assert _resolve_use_distill({"use_distill": loaded_use_distill}, loaded_use_distill) == loaded_use_distill
+    assert _resolve_use_distill({}, loaded_use_distill) == loaded_use_distill
 
 
 @pytest.mark.parametrize(

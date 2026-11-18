@@ -5,11 +5,24 @@ from __future__ import annotations
 
 import pytest
 
-from examples.offline_inference.speech_to_video.speech_to_video import validate_media_inputs
+from examples.offline_inference.speech_to_video.speech_to_video import resolve_prompt, validate_media_inputs
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _JSON_CASE = {"input_json": "multi_example_1.json"}
+
+
+@pytest.mark.parametrize(
+    ("model_type", "prompt", "expected"),
+    [
+        ("wan-s2v", None, "A person speaking naturally"),
+        ("longcat-video-avatar", None, ""),
+        ("wan-s2v", "", ""),
+        ("longcat-video-avatar", "Custom prompt", "Custom prompt"),
+    ],
+)
+def test_resolve_prompt_preserves_model_defaults(model_type: str, prompt: str | None, expected: str) -> None:
+    assert resolve_prompt(model_type, prompt) == expected
 
 
 @pytest.mark.parametrize(

@@ -64,6 +64,12 @@ def validate_media_inputs(
             raise ValueError("--image is required for LongCat Avatar AI2V.")
 
 
+def resolve_prompt(model_type: str, prompt: str | None) -> str:
+    if prompt is not None:
+        return prompt
+    return "" if model_type == "longcat-video-avatar" else "A person speaking naturally"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate a talking-head video from a reference image and audio (Wan2.2 S2V)."
@@ -92,14 +98,16 @@ def parse_args() -> argparse.Namespace:
         "--extra-body",
         type=str,
         default=None,
-        help="[longcat-video-avatar] JSON dict of model-specific extra params (declared in "
-        "vllm_omni/model_extras/), merged into sampling extra_args. "
+        help="[longcat-video-avatar] JSON dict of model-specific params. "
+        "Load-time keys go into additional_config; "
+        "other keys go into sampling extra_args. "
         'Example: \'{"stage": "ai2v", "num_segments": "auto"}\'.',
     )
     parser.add_argument(
         "--prompt",
-        default="",
-        help="Text prompt describing the scene (defaults to the input_json prompt when available).",
+        default=None,
+        help="Text prompt describing the scene (Wan default: 'A person speaking naturally'; "
+        "LongCat Avatar uses the input_json prompt when available).",
     )
     parser.add_argument(
         "--negative-prompt",
@@ -280,6 +288,7 @@ def main():
     fps = args.fps if args.fps is not None else (25 if is_longcat_avatar else 16)
     extra_body = json.loads(args.extra_body) if args.extra_body else {}
     validate_media_inputs(args.model_type, image=args.image, audio=args.audio, extra_body=extra_body)
+    prompt_text = resolve_prompt(args.model_type, args.prompt)
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
 
@@ -390,7 +399,7 @@ def main():
             multi_modal_data["audio"] = args.audio
         if image is not None:
             multi_modal_data["image"] = image
-        prompt = {"prompt": args.prompt, "multi_modal_data": multi_modal_data}
+        prompt = {"prompt": prompt_text, "multi_modal_data": multi_modal_data}
         if args.negative_prompt is not None:
             prompt["negative_prompt"] = args.negative_prompt
         sampling_params = OmniDiffusionSamplingParams(
@@ -403,7 +412,7 @@ def main():
         )
     else:
         prompt = {
-            "prompt": args.prompt,
+            "prompt": prompt_text,
             "negative_prompt": args.negative_prompt,
             "multi_modal_data": {
                 "image": image,

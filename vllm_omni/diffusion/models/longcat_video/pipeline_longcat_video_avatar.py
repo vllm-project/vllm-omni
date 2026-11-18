@@ -447,6 +447,13 @@ def _as_bool(value: Any, default: bool) -> bool:
     return bool(value)
 
 
+def _resolve_use_distill(extra_args: dict[str, Any], loaded_use_distill: bool) -> bool:
+    requested = extra_args.get("use_distill")
+    if requested is not None and _as_bool(requested, loaded_use_distill) != loaded_use_distill:
+        raise ValueError("use_distill is a load-time setting; set it in additional_config before loading the model.")
+    return loaded_use_distill
+
+
 def _video_tensor_to_pil_frames(video: Any) -> list[Image.Image]:
     if isinstance(video, torch.Tensor):
         array = video.detach().cpu().numpy()
@@ -1840,7 +1847,7 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
         num_frames = _adjust_num_frames(int(extra.get("num_frames") or req.sampling_params.num_frames or 93))
         save_fps = int(extra.get("save_fps") or req.sampling_params.fps or self.save_fps)
         num_cond_frames = int(extra.get("num_cond_frames") or 13)
-        use_distill = _as_bool(extra.get("use_distill"), self.use_distill)
+        use_distill = _resolve_use_distill(extra, self.use_distill)
         steps = int(extra.get("num_inference_steps") or req.sampling_params.num_inference_steps or 50)
         text_guidance_scale = float(extra.get("text_guidance_scale") or req.sampling_params.guidance_scale or 4.0)
         audio_guidance_scale = float(extra.get("audio_guidance_scale") or req.sampling_params.guidance_scale_2 or 4.0)

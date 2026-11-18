@@ -28,7 +28,6 @@ LONGCAT_VIDEO_AVATAR_EXTRA_BODY_PARAMS = frozenset(
         "save_fps",
         "stage",
         "text_guidance_scale",
-        "use_distill",
         "use_kv_cache",
     }
 )
