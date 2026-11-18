@@ -1,10 +1,10 @@
 # Common dependencies for all platforms
-opentelemetry-api>=1.28.0
-# Use the 5.16+ Transformers APIs shared with vLLM v0.33.0. The release runtime
-# uses the 5.16+ model and tokenizer APIs; the former <5.15 cap conflicts.
+opentelemetry-api>=1.45.1
+# Match the vLLM 0.34 release range; CUDA selects its exact tested version
+# in cuda-runtime.txt.
 # MOSS-TTS-Nano's list/set weight-loading compatibility is handled by
 # transformers_keys_to_ignore_compat in model_executor/models/utils.py.
-transformers >= 5.16.1, < 5.20.0
+transformers >= 5.16.1, < 5.23.0
 av>=14.0.0
 # typing_extensions.Concatenate accepts a trailing `...` on 3.10 only from
 # 4.13 (older 4.12.x re-export typing.Concatenate, which rejects it). The
@@ -12,20 +12,20 @@ av>=14.0.0
 # floor instead of relying on the version vLLM/torch pull transitively.
 typing_extensions>=4.13
 omegaconf>=2.3.0
-diffusers==0.40.0
+diffusers==0.42.0
 # Hub kernels, including LTX-2.5 NATTEN. 0.16+ resolves torch-stable-abi*
 # FA3 builds on torch 2.13 / cu130; keep in sync with transformers above.
 kernels==0.16.1
 safetensors>=0.8.0
-accelerate==1.12.0
-soundfile>=0.13.1
+accelerate==1.13.0
+soundfile>=0.12.1
 # Breeze reference conditioning must use the released codec's soxr resampling.
 soxr>=0.5.0.post1
 cache-dit==1.5.0
 tqdm>=4.66.0
 torchsde>=0.2.6
 openai-whisper>=20250625
-imageio[ffmpeg]>=2.37.2
+imageio[ffmpeg]>=2.37.0
 x-transformers>=2.12.2
 einops>=0.8.1
 prettytable>=3.8.0
