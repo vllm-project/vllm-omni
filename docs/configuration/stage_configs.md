@@ -940,15 +940,14 @@ for the execution path and configuration overrides.
 ## MiniMax-Music3 with Model Runner V2
 
 `minimax_music3.yaml` and `minimax_music3_2gpu.yaml` run both stages on MRV2 on
-CUDA and on V1 on other platforms. To run V1 on CUDA, set `model_runner: v1`
-under `platforms.cuda` in a copy of either file. The talker keeps one
-implementation of its CFG pairing, frame feedback and seeded frame draw for
-both runners; on MRV2 a model state feeds it the batch's rows, counts and
-per-request extra args. Stage 0 keeps `async_scheduling: false` on both runners,
-because both members of a CFG pair must be sampled in the same engine step.
+CUDA. Other platforms still select V1 and cannot start these profiles on
+vLLM 0.34. The MRV2 model state passes the batch rows, counts and per-request
+arguments to the talker for CFG pairing, frame feedback and seeded sampling.
+Stage 0 uses `async_scheduling: false` so the two members of a CFG pair
+are sampled in the same engine step.
 
-On MRV2 each window reaches stage 1 as its codes, 200 frames x 8 codebooks =
-1600 prompt tokens, where V1 sends one placeholder token. A song's last window
+Each window reaches stage 1 as its codes, 200 frames x 8 codebooks =
+1600 prompt tokens. A song's last window
 can be one frame longer: 201 frames, 1608 tokens. A window is never split, so
 in your own config keep stage 1's `max_num_batched_tokens` at least
 `max_num_seqs` x 1608 on MRV2. With less, a few requests take every step and

@@ -10,9 +10,8 @@
 # sampling extra args reach the model's forward) and is also how the CFG
 # scheduler patches learn this stage is paired.
 #
-# Runner selection: both stages run Model Runner V2 on CUDA (the
-# `platforms.cuda` entry below) and V1 everywhere else. Set
-# `model_runner: v1` under `platforms.cuda` in a copy of this file to opt out.
+# The CUDA override selects V2 for both stages. The V1 default marks
+# the remaining platforms as unsupported on vLLM 0.34.
 pipeline: minimax_music3
 model_runner: v1
 async_chunk: true
@@ -121,10 +120,8 @@ stages:
     # input batch, which breaks when chunk arrival staggers requests.
     async_scheduling: false
     enable_prefix_caching: false
-    # V1: one placeholder prompt token per arriving window, so a six-minute
-    # song (90 windows) needs a tiny context. V2: each window's codes replace
-    # the prompt (200 frames x 8 codebooks = 1600 tokens), so the context only
-    # has to hold one window.
+    # Each V2 window replaces the stage-1 prompt (200 frames x 8 codebooks
+    # = 1600 tokens), so the context only needs to hold one window.
     max_model_len: 4096
     # On V2 one step should fit a window for every request: a window is 1600
     # tokens and a song's last window at most 1608, so 8 x 1608 = 12864.
@@ -153,8 +150,7 @@ platforms:
       - stage_id: 1
         # Acoustic decoder on the second card.
         max_num_seqs: 2
-        # V1 here: one placeholder token per window, so the old budget is
-        # plenty, and it stays within max_num_seqs x max_model_len.
+        # Legacy XPU budget. This profile requires a V2 port on vLLM 0.34.
         max_num_batched_tokens: 4096
         gpu_memory_utilization: 0.9
         devices: "1"
