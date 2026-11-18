@@ -21,7 +21,7 @@ logger = init_logger(__name__)
 def _is_minicpmo_v2_thinker(config: VllmConfig) -> bool:
     model = config.model_config
     return (
-        getattr(model, "use_v2_model_runner", False)
+        getattr(model, "use_v2_model_runner", True)
         and getattr(model, "model_stage", None) == "llm"
         and "MiniCPMO45OmniForConditionalGeneration" in (model.architectures or ())
     )

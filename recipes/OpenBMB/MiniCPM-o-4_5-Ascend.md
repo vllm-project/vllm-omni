@@ -10,6 +10,19 @@ It is an explicit deployment profile; it does not change the default recipe.
 
 ## Dependencies
 
+The qualified vLLM 0.33 reproduction snapshot is commit `676a1a42f` on
+`repro/minicpmo-ascend-v033`. Check out that snapshot before following the
+version-pinned commands below. Upstream main subsequently moved to vLLM 0.34
+and removed MRv1; the rebased PR retains that upstream change. Functional
+results from the 0.33 snapshot do not qualify the current main-based source
+with the older dependency set. The new main-based integration needs a separate
+compatible-environment functional run; no performance/quality rerun is implied.
+
+```bash
+git fetch origin repro/minicpmo-ascend-v033
+git switch --detach 676a1a42f
+```
+
 The functional reproduction uses the following source revisions and packages.
 Use the unmodified upstream repositories, not an experiment worktree or an
 Ascend source overlay. Older versions without the standardized shared KV
