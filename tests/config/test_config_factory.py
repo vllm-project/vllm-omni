@@ -3753,6 +3753,40 @@ class TestAuraOmniDeploy:
         assert talker_sampling["max_tokens"] == 1024
         assert talker_sampling["stop_token_ids"] == [2150]
 
+    @pytest.mark.parametrize("deploy_name", ["aura_omni_v2.yaml", "aura_omni_v2_2gpu.yaml"])
+    def test_aura_omni_v2_deploy_selects_mrv2_on_cuda(self, deploy_name):
+        pipeline = resolve_pipeline_config("aura_omni")
+        assert [stage.supports_native_mrv2_data_plane for stage in pipeline.stages] == [
+            True,
+            True,
+            True,
+            True,
+        ]
+        assert [stage.supports_duplex_mrv2 for stage in pipeline.stages] == [
+            False,
+            True,
+            True,
+            True,
+        ]
+        assert pipeline.stages[2].recompute_preemption == "fail"
+
+        deploy = _apply_platform_overrides(
+            load_deploy_config(Path(get_deploy_config_path(deploy_name))),
+            platform="cuda",
+        )
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        assert deploy.model_runner == "v2"
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [
+            True,
+            True,
+            True,
+            True,
+        ]
+        assert all(stage.yaml_engine_args["supports_native_mrv2_data_plane"] for stage in stages)
+        assert stages[1].yaml_engine_args["logits_processors"] == [
+            "vllm_omni.model_executor.models.aura_omni.two_token_logits:AuraTwoTokenLogitsProcessor"
+        ]
+
 
 class TestDeployCliOverrideFlow:
     """Test deploy-YAML baselines overridden by CLI runtime overrides."""

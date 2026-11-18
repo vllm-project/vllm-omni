@@ -23,7 +23,11 @@ Stage1 stop ids in the deploy config, not by a separate pipeline.
 
 Deploy profiles: `vllm_omni/deploy/aura_omni_v2.yaml` (one GPU, eager, one
 session) and `vllm_omni/deploy/aura_omni_v2_2gpu.yaml` (Stage1 on its own GPU,
-CUDA graphs, up to 16 sessions).
+CUDA graphs, up to 16 sessions). All four stages select Model Runner V2
+(`AuraTwoTokenLogitsProcessor` on Stage1). Stage0 and Stage1 set
+`async_chunk: false` so the orchestrator-fed ASR→AURA path does not park in
+`WAITING_FOR_CHUNK`; Stage2→3 keep deploy-level `async_chunk: true` for codec
+handoff.
 
 ## Supported scope
 

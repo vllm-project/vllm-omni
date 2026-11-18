@@ -9,6 +9,8 @@
 #
 # Served on /v1/realtime?duplex=1 only.
 pipeline: aura_omni
+# All four stages on Model Runner V2 (upstream drops V1).
+model_runner: v2
 # Qwen3-TTS Stage2 -> Stage3 codec handoff needs async_chunk; without it the
 # Talker runs but no audio reaches Stage3 or the client.
 async_chunk: true
@@ -33,6 +35,8 @@ connectors:
 
 stages:
   - stage_id: 0
+    # Entry ASR is orchestrator-fed with audio; avoid chunk-wait on MRV2.
+    async_chunk: false
     # 1: the next turn may queue behind an in-flight ASR request.
     max_num_seqs: 1
     gpu_memory_utilization: 0.08
@@ -51,6 +55,8 @@ stages:
       max_tokens: 256
 
   - stage_id: 1
+    # Orchestrator feeds Stage1 via asr2aura; do not park WAITING_FOR_CHUNK.
+    async_chunk: false
     max_num_seqs: 1
     gpu_memory_utilization: 0.55
     enforce_eager: true
@@ -134,3 +140,7 @@ stages:
       max_tokens: 16384
       seed: 42
       repetition_penalty: 1.0
+
+platforms:
+  cuda:
+    model_runner: v2
