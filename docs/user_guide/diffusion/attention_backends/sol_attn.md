@@ -10,20 +10,23 @@ This backend integrates their algorithm; it does not require VSA-trained weights
 
 ## Requirements
 
-Install the pinned Sol-Attn package with arbitrary exact-block protection:
+Install the pinned Sol-Attn package with arbitrary exact-block protection
+and automatic SM103 dispatch:
 
 ```bash
-pip install 'git+https://github.com/lishunyang12/Sana.git@088897e0c6a9cb970f00b43ab2177c3be7336b36#subdirectory=techniques/sparse_backends'
+pip install 'git+https://github.com/lishunyang12/Sana.git@d9ef6321230cff13398cfc86aa107f97f093e925#subdirectory=techniques/sparse_backends'
 ```
 
-This pin contains the generic `exact_block_mask` extension on top of upstream
+This pin contains the generic `exact_block_mask` extension and SM103 dispatch
+on top of upstream
 `f4035e0a`; it is a feature branch pending
 [upstream review](https://github.com/NVlabs/Sana/pull/593). Older releases with
 only a contiguous KV sink cannot preserve H3's disjoint text/audio Q/KV protection
 and fail dependency preflight.
 
-The upstream package selects its CuTe kernel on SM90/SM100/SM120 when the
+The upstream package selects its CuTe kernel on SM90/SM100/SM103/SM120 when the
 CuTe DSL runtime is available, and its Triton implementation otherwise (SM80+).
+SM103 (B300/GB300) uses the upstream SM100 kernel family automatically.
 Omni calls that implementation directly; no `provider` or `native` flag is used,
 and no cuDNN BSA adapter is involved. Attention requires BF16 self-attention with
 head dimension 128 and equal Q/KV heads. It supports one sequence at a time,

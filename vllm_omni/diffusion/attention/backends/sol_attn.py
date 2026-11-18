@@ -51,7 +51,7 @@ class SolAttnBackend(AttentionBackend):
         except ImportError as error:
             raise ImportError(
                 "SOL_ATTN requires the upstream sol_attn package. Install it with "
-                "`pip install 'git+https://github.com/lishunyang12/Sana.git@088897e0c6a9cb970f00b43ab2177c3be7336b36"
+                "`pip install 'git+https://github.com/lishunyang12/Sana.git@d9ef6321230cff13398cfc86aa107f97f093e925"
                 "#subdirectory=techniques/sparse_backends'`."
             ) from error
         if not callable(sol_attn):
