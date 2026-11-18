@@ -902,6 +902,12 @@ class MossRealtimeReferenceEncoder(MossReferenceEncoder):
         return wav  # the realtime codec takes the clip at the working rate
 
     def _encode_prepared(self, prepared: list[torch.Tensor], graphs: Any = None) -> list[torch.Tensor]:
+        param = next(self._processor.parameters(), None) if isinstance(self._processor, torch.nn.Module) else None
+        if param is not None:
+            # The standalone realtime codec does not move batch_encode inputs
+            # to its own device. Reference clips are prepared on CPU, so place
+            # them with the codec before its first projection.
+            prepared = [wav.to(param.device) for wav in prepared]
         with torch.no_grad():
             encoded = self._processor.batch_encode([wav.squeeze(0) for wav in prepared], num_quantizers=self._n_vq)
         return [

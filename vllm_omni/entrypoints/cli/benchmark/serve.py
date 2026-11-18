@@ -44,4 +44,8 @@ class OmniBenchmarkServingSubcommand(OmniBenchmarkSubcommandBase):
         from vllm_omni.benchmarks.serve import main
 
         preprocess_serve_args(args)
-        main(args)
+        result = main(args)
+        if args.backend == "realtime-video":
+            report = result["realtime_video_evaluation"] if args.realtime_video_evaluate else result["realtime_video"]
+            if not report["passed"]:
+                raise RuntimeError(f"Realtime video benchmark failed: {report['errors']}")

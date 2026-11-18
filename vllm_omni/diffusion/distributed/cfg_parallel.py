@@ -38,8 +38,12 @@ def _get_cfg_world_size_or_one() -> int:
 
 
 def _wrap(pred: torch.Tensor | tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
-    """Normalize prediction to tuple form."""
-    return pred if isinstance(pred, tuple) else (pred,)
+    """Normalize prediction to tuple form.
+
+    A list (MixFusion's per-request packed output) passes through unchanged so
+    ``combine_cfg_noise`` can combine it request by request.
+    """
+    return pred if isinstance(pred, (tuple, list)) else (pred,)
 
 
 def _unwrap(pred: tuple[torch.Tensor, ...]) -> torch.Tensor | tuple[torch.Tensor, ...]:
@@ -357,18 +361,20 @@ class CFGParallelMixin(metaclass=ABCMeta):
 
     def combine_cfg_noise(
         self,
-        positive_noise_pred: torch.Tensor | tuple[torch.Tensor, ...],
-        negative_noise_pred: torch.Tensor | tuple[torch.Tensor, ...],
+        positive_noise_pred: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
+        negative_noise_pred: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
         true_cfg_scale: float,
         cfg_normalize: bool = False,
         kwargs: dict[str, Any] | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    ) -> torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...]:
         """
         Combine conditional and unconditional noise predictions with CFG.
 
-        Accepts both plain tensors (backward-compatible, used by LTX2 etc.)
-        and tuples (multi-output models). Default implementation applies the
-        standard CFG formula to every element.
+        Accepts plain tensors (backward-compatible, used by LTX2 etc.), tuples
+        (multi-output models) and lists (packed batches, one prediction per
+        request). Default implementation applies the standard CFG formula to
+        every element and returns the inputs' container type: packed batches
+        must stay a list because the runner indexes them by request.
 
         Multi-output models can override this to apply different logic per element.
 
@@ -381,8 +387,8 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 return (video_combined, audio_pos)  # audio: positive only, no CFG
 
         Args:
-            positive_noise_pred: Positive/conditional prediction(s) — Tensor or tuple
-            negative_noise_pred: Negative/unconditional prediction(s) — Tensor or tuple
+            positive_noise_pred: Positive/conditional prediction(s) — Tensor, list or tuple
+            negative_noise_pred: Negative/unconditional prediction(s) — Tensor, list or tuple
             true_cfg_scale: CFG scale factor
             cfg_normalize: Whether to normalize the combined prediction (default: False)
             kwargs: Optional extra context for custom combine implementations.
@@ -390,6 +396,12 @@ class CFGParallelMixin(metaclass=ABCMeta):
         Returns:
             Combined noise prediction(s) — same type as inputs
         """
+        if isinstance(positive_noise_pred, list):
+            # Packed MixFusion batch: one prediction per request.
+            return [
+                self.combine_cfg_noise(p, n, true_cfg_scale, cfg_normalize, kwargs)
+                for p, n in zip(positive_noise_pred, negative_noise_pred, strict=True)
+            ]
         pos_t = _wrap(positive_noise_pred)
         neg_t = _wrap(negative_noise_pred)
 
@@ -596,7 +608,8 @@ class CFGParallelMixin(metaclass=ABCMeta):
             instead of final noise tensors wrapped in a tuple.
         """
         result = self.transformer(*args, **kwargs)
-        return result if isinstance(result, IntermediateTensors) else result[0]
+        # A MixFusion packed forward returns one tensor per request as a list.
+        return result if isinstance(result, (IntermediateTensors, list)) else result[0]
 
     def diffuse(
         self,

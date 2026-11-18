@@ -28,6 +28,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.data_entry_keys import returns_stage_payload
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import PER_SAMPLE_KV_COUNT_KEY
 from vllm_omni.distributed.omni_coordinator import (
     ReplicaInfo,
     ReplicaList,
@@ -35,7 +36,7 @@ from vllm_omni.distributed.omni_coordinator import (
     RoundRobinBalancer,
 )
 from vllm_omni.distributed.weight_sharing.runtime import SharingRuntime
-from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
+from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEngineCoreRequest
 from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
@@ -2458,6 +2459,64 @@ async def test_stage_pool_requested_replica_down_race_does_not_fallback() -> Non
     assert all(not client.add_request_calls for client in clients)
 
 
+def test_stage_pool_pinned_binding_accepts_a_replica_the_hub_reports_up() -> None:
+    pool, clients, _ = _distributed_routing_pool()
+
+    assert pool.bind_request_to_replica("pinned", 1) == 1
+    assert pool.get_bound_replica_id("pinned") == 1
+    assert all(not client.add_request_calls for client in clients)
+
+
+def test_stage_pool_pinned_binding_rejects_a_replica_the_hub_reports_down() -> None:
+    pool, _, _ = _distributed_routing_pool((ReplicaStatus.UP, ReplicaStatus.DOWN))
+
+    with pytest.raises(StageUnavailableError, match="pinned replica 1 is unavailable"):
+        pool.bind_request_to_replica("pinned", 1)
+
+    assert pool.get_bound_replica_id("pinned") is None
+
+
+@pytest.mark.asyncio
+async def test_distributed_pin_down_after_binding_does_not_fallback() -> None:
+    pool, clients, hub = _distributed_routing_pool()
+    assert pool.bind_request_to_replica("pinned", 1) == 1
+    hub.replicas[1].status = ReplicaStatus.DOWN
+    pool.invalidate_addr("tcp://replica-1")
+
+    with pytest.raises(OmniClientError, match="replica_id 1 does not exist or is not available"):
+        pool.preselect_replica_id("pinned")
+
+    state = OrchestratorRequestState(request_id="pinned", sampling_params_list=[_sampling_params()], final_stage_id=0)
+    request = FakePromptRequest(request_id="pinned", prompt_token_ids=[1])
+    with pytest.raises(StageUnavailableError, match="pinned replica 1 is unavailable"):
+        await pool.submit_initial("pinned", state, request, pinned_replica_id=1)
+
+    assert all(not client.add_request_calls for client in clients)
+
+
+def test_invalidate_addr_returns_pinned_requests_too() -> None:
+    pool, _, _ = _distributed_routing_pool()
+    assert pool.bind_request_to_replica("pinned", 1) == 1
+
+    # Pins share the distributed affinity ledger with explicit routes.
+    assert pool.invalidate_addr("tcp://replica-1") == ["pinned"]
+
+    assert pool.get_bound_replica_id("pinned") is None
+    pool.release_binding("pinned")
+    assert pool.get_bound_replica_id("pinned") is None
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_pinned_submit_in_distributed_mode_uses_that_replica() -> None:
+    pool, clients, _ = _distributed_routing_pool()
+    state = OrchestratorRequestState(request_id="pinned", sampling_params_list=[_sampling_params()], final_stage_id=0)
+    request = FakePromptRequest(request_id="pinned", prompt_token_ids=[1])
+
+    assert await pool.submit_initial("pinned", state, request, pinned_replica_id=1) == 1
+    assert len(clients[1].add_request_calls) == 1
+    assert not clients[0].add_request_calls
+
+
 @pytest.mark.asyncio
 async def test_explicit_run_request_detached_before_admission_returns_client_error() -> None:
     pool, clients, hub = _distributed_routing_pool()
@@ -2794,17 +2853,6 @@ async def test_stage_pool_pinned_submit_rejects_mismatched_cache_replica(monkeyp
     assert pool.get_bound_replica_id("pinned") is None
     assert not processor.add_request_calls
     assert all(not client.add_request_calls for client in clients)
-
-
-@pytest.mark.parametrize("distributed_hook", ["_hub", "_lb"])
-def test_stage_pool_pinned_binding_rejects_distributed_mode(distributed_hook: str) -> None:
-    pool = StagePool(0, [FakeStageClient(), FakeStageClient()])
-    setattr(pool, distributed_hook, object())
-
-    with pytest.raises(StageUnavailableError, match="only supported for local stage pools"):
-        pool.bind_request_to_replica("pinned", 1)
-
-    assert pool.get_bound_replica_id("pinned") is None
 
 
 @pytest.mark.asyncio
@@ -4388,7 +4436,8 @@ async def test_interaction_backlog_is_bounded_without_blocking_dispatch() -> Non
         )
     error = errors.get_nowait()
     assert error.request_id == "video"
-    assert error.event_id == "64"
+    # Request-scoped, not event-scoped, so the overloaded stream still ends.
+    assert error.event_id is None
     assert error.fatal is False
     assert error.error == "Too many pending interactions"
 
@@ -4484,6 +4533,28 @@ async def test_stage_pool_fans_out_parallel_samples(n: int) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("per_sample_kv", "expected"),
+    [(True, ["req-sample0", "req-sample1", "req-sample2"]), (False, ["req", "req", "req"])],
+)
+async def test_stage_pool_gives_each_sample_its_own_global_id(per_sample_kv: bool, expected: list[str]) -> None:
+    client = FakeStageClient()
+    stage_config = SimpleNamespace(model_config=SimpleNamespace(omni_kv_config={"per_sample_kv": per_sample_kv}))
+    pool = StagePool(0, client, output_processor=FakeOutputProcessor(), stage_vllm_config=stage_config)
+    parent_info = serialize_additional_information({"global_request_id": ["req"], "omni_final_stage_id": 1})
+    request = OmniEngineCoreRequest.from_request(_parallel_sample_request(3), additional_information=parent_info)
+    state = OrchestratorRequestState(request_id="req", sampling_params_list=[request.sampling_params], final_stage_id=1)
+
+    await pool.submit_initial("req", state, request)
+
+    # The AR runner sends each sample's KV under the sample's global request id.
+    sent = [deserialize_additional_information(args[0].additional_information) for args in client.add_request_calls]
+    assert [info["global_request_id"] for info in sent] == [[sample_id] for sample_id in expected]
+    assert all(info["omni_final_stage_id"] == 1 for info in sent)
+    assert deserialize_additional_information(request.additional_information)["global_request_id"] == ["req"]
+
+
+@pytest.mark.asyncio
 async def test_stage_pool_aborts_parent_when_a_sample_fails_to_submit(mocker) -> None:
     class FailingSecondSendClient(FakeStageClient):
         async def add_request_async(self, *args, **kwargs) -> None:
@@ -4572,6 +4643,8 @@ async def test_failed_parallel_sample_fails_its_parent_once(cache_miss: bool) ->
         (1, ["llm", "llm"], 1, False, True),
         (2, ["llm", "llm"], 1, False, False),
         (2, ["llm", "diffusion"], 1, False, False),
+        (2, ["llm", "per-sample-kv diffusion"], 1, False, True),
+        (2, ["llm", "per-sample-kv llm"], 1, False, False),
         (1, ["llm"], 0, True, True),
         (2, ["llm"], 0, True, False),
     ],
@@ -4579,7 +4652,12 @@ async def test_failed_parallel_sample_fails_its_parent_once(cache_miss: bool) ->
 async def test_add_request_rejects_parallel_samples_beyond_the_entry_stage(
     mocker, n: int, stages: list[str], final_stage_id: int, resumable: bool, accepted: bool
 ) -> None:
-    pools = [StagePool(index, FakeStageClient(stage_type=kind)) for index, kind in enumerate(stages)]
+    # "per-sample-kv <type>": the entry stage sends one KV per sample to that stage.
+    pools = [StagePool(index, FakeStageClient(stage_type=kind.split()[-1])) for index, kind in enumerate(stages)]
+    if any(kind.startswith("per-sample-kv") for kind in stages):
+        pools[0]._stage_vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(omni_kv_config={"per_sample_kv": True})
+        )
     orchestrator = Orchestrator(
         request_async_queue=asyncio.Queue(),
         output_async_queue=asyncio.Queue(),
@@ -4614,6 +4692,172 @@ async def test_add_request_rejects_parallel_samples_beyond_the_entry_stage(
         expected = "not supported for streaming (resumable) input" if resumable else "n > 1 is supported only"
         assert expected in fail.await_args.args[2]
         assert "req" not in orchestrator.request_states
+
+
+@pytest.mark.parametrize(("async_chunk", "feeds"), [(False, True), (True, False)])
+def test_per_sample_kv_is_not_used_with_async_chunk(async_chunk: bool, feeds: bool) -> None:
+    pools = [StagePool(0, FakeStageClient(stage_type="llm")), StagePool(1, FakeStageClient(stage_type="diffusion"))]
+    pools[0]._stage_vllm_config = SimpleNamespace(model_config=SimpleNamespace(omni_kv_config={"per_sample_kv": True}))
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=pools,
+    )
+    # Async-chunk prewarm submits the diffusion stage before the sample count is set.
+    orchestrator.async_chunk = async_chunk
+    assert orchestrator._feeds_per_sample_kv_stage(0, 1) is feeds
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("n", "accepted"), [(6, True), (7, False)])
+async def test_add_request_bounds_per_sample_n_by_max_num_seqs(mocker, n: int, accepted: bool) -> None:
+    # The diffusion stage holds every sample's KV prefix at once.
+    pools = [StagePool(0, FakeStageClient(stage_type="llm")), StagePool(1, FakeStageClient(stage_type="diffusion"))]
+    pools[0]._stage_vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(omni_kv_config={"per_sample_kv": True}),
+        scheduler_config=SimpleNamespace(max_num_seqs=6),
+    )
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=pools,
+    )
+    fail = mocker.patch.object(orchestrator, "_fail_request_client_error", new_callable=mocker.AsyncMock)
+    dispatch = mocker.patch.object(pools[0], "submit_initial", new_callable=mocker.AsyncMock, return_value=0)
+
+    await orchestrator._handle_add_request(
+        StageSubmissionMessage(
+            type="add_request",
+            request_id="req",
+            prompt=SimpleNamespace(sampling_params=SamplingParams(n=n), resumable=False),
+            original_prompt={},
+            output_prompt_text=None,
+            sampling_params_list=[SamplingParams(n=n), OmniDiffusionSamplingParams()],
+            final_stage_id=1,
+            preprocess_ms=0,
+            request_timestamp=0,
+            enqueue_ts=0,
+        )
+    )
+
+    if accepted:
+        fail.assert_not_awaited()
+        dispatch.assert_awaited_once()
+    else:
+        dispatch.assert_not_awaited()
+        assert "n=7 exceeds stage 0's max_num_seqs=6" in fail.await_args.args[2]
+
+
+@pytest.mark.asyncio
+async def test_add_request_drops_a_client_per_sample_kv_count(mocker) -> None:
+    pools = [StagePool(0, FakeStageClient(stage_type="llm")), StagePool(1, FakeStageClient(stage_type="diffusion"))]
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=pools,
+    )
+    dispatch = mocker.patch.object(pools[0], "submit_initial", new_callable=mocker.AsyncMock, return_value=0)
+    request = _parallel_sample_request(1)
+    client_params = OmniDiffusionSamplingParams(extra_args={PER_SAMPLE_KV_COUNT_KEY: 4, "user": 1})
+
+    await orchestrator._handle_add_request(
+        StageSubmissionMessage(
+            type="add_request",
+            request_id="req",
+            prompt=request,
+            original_prompt={},
+            output_prompt_text=None,
+            sampling_params_list=[request.sampling_params, client_params],
+            final_stage_id=1,
+            preprocess_ms=0,
+            request_timestamp=0,
+            enqueue_ts=0,
+        )
+    )
+
+    dispatch.assert_awaited_once()
+    assert orchestrator.request_states["req"].sampling_params_list[1].extra_args == {"user": 1}
+
+
+@pytest.mark.parametrize(("n", "per_sample_kv", "count"), [(3, True, 3), (1, True, None), (3, False, None)])
+def test_diffusion_params_carry_the_sample_count(n: int, per_sample_kv: bool, count: int | None) -> None:
+    pools = [StagePool(0, FakeStageClient(stage_type="llm")), StagePool(1, FakeStageClient(stage_type="diffusion"))]
+    pools[0]._stage_vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(omni_kv_config={"per_sample_kv": per_sample_kv})
+    )
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=pools,
+    )
+    params = OmniDiffusionSamplingParams(extra_args={PER_SAMPLE_KV_COUNT_KEY: 9})  # a client-supplied count
+    state = OrchestratorRequestState(request_id="req", sampling_params_list=[SamplingParams(n=n), params])
+
+    sent = orchestrator._diffusion_params_for_samples(state, 0, params)
+
+    assert sent.extra_args.get(PER_SAMPLE_KV_COUNT_KEY) == count
+    assert params.extra_args == {PER_SAMPLE_KV_COUNT_KEY: 9}  # the request's params are not mutated
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resumable", "model_type", "method", "accepted"),
+    [
+        (True, "qwen3_omni_moe", "dflash", False),
+        (False, "qwen3_omni_moe", "dflash", True),
+        (True, "qwen3_omni_moe", None, True),
+        (True, "qwen3_omni_moe", "mtp", True),
+        (True, "other_model", "dflash", True),
+    ],
+)
+async def test_add_request_rejects_qwen3_omni_dflash_resumable_input(
+    mocker, resumable: bool, model_type: str, method: str | None, accepted: bool
+) -> None:
+    pool = StagePool(
+        0,
+        FakeStageClient(),
+        stage_vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type)),
+            speculative_config=SimpleNamespace(use_dflash=lambda: method == "dflash") if method else None,
+        ),
+    )
+    output_queue: asyncio.Queue = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=output_queue,
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[pool],
+    )
+    dispatch = mocker.patch.object(pool, "submit_initial", new_callable=mocker.AsyncMock, return_value=0)
+    await orchestrator._handle_add_request(
+        StageSubmissionMessage(
+            type="add_request",
+            request_id="req",
+            prompt=SimpleNamespace(sampling_params=SamplingParams(), resumable=resumable),
+            original_prompt={},
+            output_prompt_text=None,
+            sampling_params_list=[SamplingParams()],
+            final_stage_id=0,
+            preprocess_ms=0,
+            request_timestamp=0,
+            enqueue_ts=0,
+        )
+    )
+    if accepted:
+        dispatch.assert_awaited_once()
+        assert output_queue.empty()
+    else:
+        dispatch.assert_not_awaited()
+        error = output_queue.get_nowait()
+        assert isinstance(error, ErrorMessage)
+        assert error.status_code == 400 and error.fatal is False
+        assert "streaming (resumable) input is not supported with Qwen3-Omni DFlash" in error.error
+        assert "req" not in orchestrator.request_states
+        assert pool.get_bound_replica_id("req") is None
 
 
 @pytest.mark.asyncio
