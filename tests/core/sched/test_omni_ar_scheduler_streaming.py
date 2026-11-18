@@ -47,6 +47,7 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
 from tests.helpers.duplex_scheduler import (
     DUPLEX_MAX_MODEL_LEN,
     append_duplex_frame,
+    duplex_append,
     join_duplex_sessions,
     make_engine_duplex_scheduler,
 )
@@ -1865,6 +1866,44 @@ def test_queued_streaming_update_that_overflows_does_not_return_to_admission() -
     # update_from_output frees every request reported as finished; freeing here
     # as well deleted it from self.requests twice (KeyError in _free_blocks).
     sched._free_request.assert_not_called()
+
+
+def test_queued_overflow_releases_carry_snapshot(tmp_path: Path) -> None:
+    sched = make_engine_duplex_scheduler(tmp_path, max_model_len=64, sliding_window=64)
+    request_id = "duplex-s.cw.e.1.r.stage0"
+
+    sched.add_request(duplex_append(request_id, 40))
+    running_step = sched.schedule()
+    assert running_step.num_scheduled_tokens == {request_id: 40}
+    request = sched.requests[request_id]
+
+    # A later append arrives while the first step is in flight. The stop path
+    # applies this append, snapshots the window, and rejects the 80-token prompt.
+    sched.add_request(duplex_append(request_id, 40))
+    assert len(request.streaming_queue) == 1
+    outputs = sched.update_from_output(
+        running_step,
+        ModelRunnerOutput(
+            req_ids=[request_id],
+            sampled_token_ids=[[3]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    assert request_id not in sched.requests
+    [terminal] = [
+        out
+        for batch in outputs.values()
+        for out in batch.outputs
+        if out.request_id == request_id and out.finish_reason == FinishReason.ERROR
+    ]
+    assert str(terminal.stop_reason).startswith("context_length_exceeded:")
+
+    cleanup_step = sched.schedule()
+
+    assert cleanup_step.finished_req_ids == {request_id}
+    assert not sched._minicpmo45_carry.snapshot_ids
 
 
 def test_queued_streaming_update_that_fits_still_resumes_the_session() -> None:

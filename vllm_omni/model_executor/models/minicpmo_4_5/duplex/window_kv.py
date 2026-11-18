@@ -901,6 +901,8 @@ class MiniCPMO45DuplexSchedulerHelper:
         now = time.monotonic()
         ops = carry.outbox
         windows = carry.windows
+        # A queued append can overflow and finish before its snapshot is committed.
+        carry.snapshot_ids.difference_update(scheduler_output.finished_req_ids)
         for request_id in sorted(scheduler_output.finished_req_ids, key=_stage0_order):
             session_id = duplex_stage0_session_id(request_id)
             if session_id is None:
