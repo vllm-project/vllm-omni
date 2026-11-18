@@ -258,3 +258,19 @@ passing factory tests alone does not establish production support.
 - Method implementations own platform-specific capability checks and kernels.
 - User-facing support claims require model, hardware, numerical, and memory
   validation in addition to configuration-level tests.
+
+## AutoRound input rotation
+
+AutoRound NVFP4 checkpoint activation metadata is validated through the upstream
+INC checkpoint parser before method selection. `OmniINCConfig` delegates native
+NVFP4 dispatch to vLLM instead of constructing a separate compressed-tensors
+method. A configured input transform must run before activation quantization;
+excluded unquantized layers retain their original inputs. The upstream method
+marks transformed layers as requiring unquantized input so producer fusion
+cannot bypass the transform.
+
+For MXFP methods whose native GEMMs accept only 2-D inputs, Omni retains its
+shape adaptation inside the upstream transform wrapper. Adding a transform
+must not bypass diffusion `(B, S, K)` handling. NVFP4 uses the upstream kernel's
+native output-shape handling. This integration does not change the Attention
+backend or the model's QKV fusion layout.

@@ -41,19 +41,19 @@ def test_build_quant_config_autoround(data_type, group_size, packing_format):
 
 @pytest.mark.parametrize(
     ("data_type", "group_size", "scheme_name"),
-    [("mx_fp", 32, "INCMxfp4LinearMethod"), ("nv_fp", 16, "CompressedTensorsW4A4Fp4")],
+    [("mx_fp", 32, "INCMxfp4LinearMethod"), ("nv_fp", 16, "INCNvFp4LinearMethod")],
     ids=["mxfp4", "nvfp4"],
 )
 @pytest.mark.parametrize("excluded", [False, True])
-def test_inc_fp4_linear_method(mocker, data_type, group_size, scheme_name, excluded):
+@pytest.mark.parametrize("rotation", [False, True])
+def test_inc_fp4_linear_method(mocker, data_type, group_size, scheme_name, excluded, rotation):
     from torch.nn import LayerNorm
     from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
-    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
-        CompressedTensorsLinearMethod,
-    )
     from vllm.model_executor.layers.quantization.inc.inc_linear import INCLinearMethod
+    from vllm.model_executor.layers.quantization.inc.transform.linear import INCLinearTransformMethod
 
     from vllm_omni.quantization import build_quant_config
+    from vllm_omni.quantization.inc_config import _MXFlattenedLinearMethod
 
     # Keep config parsing and method selection real; avoid device kernel initialization.
     mxfp4_kernel = mocker.patch(
@@ -63,6 +63,7 @@ def test_inc_fp4_linear_method(mocker, data_type, group_size, scheme_name, exclu
         "vllm.model_executor.layers.quantization.compressed_tensors.schemes."
         "compressed_tensors_w4a4_nvfp4.init_nvfp4_linear_kernel"
     )
+    mocker.patch("vllm.platforms.current_platform.is_cuda", return_value=True)
     config = build_quant_config(
         "auto-round",
         bits=4,
@@ -70,16 +71,24 @@ def test_inc_fp4_linear_method(mocker, data_type, group_size, scheme_name, exclu
         data_type=data_type,
         packing_format="auto_round:llm_compressor",
         extra_config={"proj": {"bits": 16}} if excluded else None,
+        rotation_config=dict(backend="transform", block_size=group_size, hadamard_type="hadamard")
+        if rotation
+        else None,
     )
     layer = mocker.Mock(spec=LinearBase)
     method = config.get_quant_method(layer, "proj")
+    if rotation and not excluded:
+        assert isinstance(method, INCLinearTransformMethod)
+        assert config.rotation_config["block_size"] == group_size
+        method = method.quant_method
+        if data_type == "mx_fp":
+            assert isinstance(method, _MXFlattenedLinearMethod)
     if excluded:
         assert isinstance(method, UnquantizedLinearMethod)
         mxfp4_kernel.assert_not_called()
         nvfp4_kernel.assert_not_called()
     elif data_type == "nv_fp":
-        assert isinstance(method, CompressedTensorsLinearMethod)
-        assert type(layer.scheme).__name__ == scheme_name
+        assert type(method).__name__ == scheme_name
     else:
         assert isinstance(method, INCLinearMethod)
         assert type(method.scheme).__name__ == scheme_name
@@ -254,3 +263,18 @@ def test_mxfp_flattened_finalize_skips_repeated_destructive_repack():
     method.process_weights_after_loading(layer)
 
     assert layer._already_called_process_weights_after_loading is True
+
+
+def test_autoround_nvfp4_rejects_incompatible_activation_metadata():
+    """The public Omni factory must validate checkpoint activation precision."""
+    from vllm_omni.quantization import build_quant_config
+
+    with pytest.raises(AssertionError, match="act_bits"):
+        build_quant_config(
+            "auto-round",
+            bits=4,
+            group_size=16,
+            data_type="nv_fp",
+            packing_format="auto_round:llm_compressor",
+            act_bits=8,
+        )

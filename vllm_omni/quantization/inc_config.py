@@ -105,28 +105,18 @@ class OmniINCConfig(INCConfig):
 
     def get_quant_method(self, layer, prefix: str):
         """Get quantization methods for AutoRound checkpoints."""
-        if self.data_type == "nv_fp":
-            from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
-            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
-                CompressedTensorsLinearMethod,
-            )
-            from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
-                CompressedTensorsW4A4Fp4,
-            )
-
-            layer_config = self.config_parser.resolve(layer, prefix)
-            if isinstance(layer, LinearBase):
-                if not layer_config.quantized:
-                    return UnquantizedLinearMethod()
-                scheme = CompressedTensorsW4A4Fp4()
-                layer.scheme = scheme
-                return CompressedTensorsLinearMethod(self)
-            return None
-
         # AutoRound MXFP8/MXFP4: vLLM's method, wrapped for diffusion's 3-D activations.
         method = super().get_quant_method(layer, prefix)
-        if self.is_mxfp and isinstance(method, INCLinearMethod):
-            return _MXFlattenedLinearMethod(method.scheme)
+        if self.is_mxfp:
+            if isinstance(method, INCLinearMethod):
+                return _MXFlattenedLinearMethod(method.scheme)
+            if self.rotation_config is not None:
+                from vllm.model_executor.layers.quantization.inc.transform.linear import (
+                    INCLinearTransformMethod,
+                )
+
+                if isinstance(method, INCLinearTransformMethod) and isinstance(method.quant_method, INCLinearMethod):
+                    method.quant_method = _MXFlattenedLinearMethod(method.quant_method.scheme)
         return method
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
