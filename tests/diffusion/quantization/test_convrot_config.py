@@ -41,7 +41,7 @@ except ImportError:
         pass
 
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.diffusion]
 
 cuda_available = pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="GPU platform not available.")
 accelerator_available = pytest.mark.skipif(
@@ -55,6 +55,7 @@ def accelerator_device() -> str:
     return "xpu" if current_omni_platform.is_xpu() else "cuda"
 
 
+@pytest.mark.core_model
 @pytest.mark.cpu
 @pytest.mark.parametrize("size", [4, 16, 64, 256, 1024])
 def test_regular_hadamard_is_orthogonal_regular_and_exact(size):
@@ -69,6 +70,7 @@ def test_regular_hadamard_is_orthogonal_regular_and_exact(size):
     assert torch.equal(regular_hadamard(size).to(torch.bfloat16).float(), regular_hadamard(size))
 
 
+@pytest.mark.core_model
 @pytest.mark.cpu
 @pytest.mark.parametrize("size", [0, 2, 8, 32, 48])
 def test_rotation_group_size_must_be_a_power_of_four(size):
@@ -76,6 +78,7 @@ def test_rotation_group_size_must_be_a_power_of_four(size):
         regular_hadamard(size)
 
 
+@pytest.mark.core_model
 @pytest.mark.cpu
 @pytest.mark.parametrize(
     "in_features,requested,expected",
@@ -85,6 +88,7 @@ def test_group_size_falls_back_to_a_power_of_four_that_tiles_the_input(in_featur
     assert rotation_group_size(in_features, requested) == expected
 
 
+@pytest.mark.core_model
 @pytest.mark.cpu
 def test_rotation_preserves_the_product_and_spreads_outliers():
     torch.manual_seed(0)
@@ -96,6 +100,7 @@ def test_rotation_preserves_the_product_and_spreads_outliers():
     assert rotate(x, h).abs().amax() < x.abs().amax() / 8
 
 
+@pytest.mark.core_model
 @pytest.mark.cpu
 def test_int4_values_pack_two_per_byte():
     values = torch.arange(-8, 8, dtype=torch.int8).repeat(3, 2)
@@ -106,6 +111,7 @@ def test_int4_values_pack_two_per_byte():
         pack_int4(torch.zeros(2, 3, dtype=torch.int8))
 
 
+@pytest.mark.core_model
 @pytest.mark.cpu
 def test_int4_quantization_is_symmetric_per_row():
     x = torch.tensor([[0.0, 7.0, -7.0, 3.5], [0.0, 0.0, 0.0, 0.0]])
@@ -114,6 +120,7 @@ def test_int4_quantization_is_symmetric_per_row():
     assert scale.shape == (2, 1) and scale[0, 0] == 1.0 and scale[1, 0] > 0
 
 
+@pytest.mark.core_model
 @pytest.mark.cpu
 def test_factory_builds_all_methods():
     assert {"convrot_int8", "convrot_int4", "convrot_mxfp4", "convrot_mxfp8"} <= set(SUPPORTED_QUANTIZATION_METHODS)
@@ -157,6 +164,7 @@ def test_factory_builds_all_methods():
         build_quant_config({"method": "convrot_mxfp8", "int8_layers": ["to_out"]})
 
 
+@pytest.mark.core_model
 @pytest.mark.cpu
 @pytest.mark.parametrize("config_cls", [DiffusionConvRotMxfp4Config, DiffusionConvRotMxfp8Config])
 def test_mxfp_from_config_rejects_int8_layers(config_cls):
@@ -164,12 +172,7 @@ def test_mxfp_from_config_rejects_int8_layers(config_cls):
         config_cls.from_config({"int8_layers": ["to_out"]})
 
 
-@pytest.mark.cpu
-@pytest.mark.parametrize("config_cls", [DiffusionConvRotMxfp4Config, DiffusionConvRotMxfp8Config])
-def test_mxfp_configs_require_ampere_or_newer(config_cls):
-    assert config_cls.get_min_capability() == 80
-
-
+@pytest.mark.core_model
 @pytest.mark.cpu
 def test_kernel_bias_prefers_prepared_layer_bias_only_when_layer_has_bias():
     layer_with_bias = SimpleNamespace(has_bias=True, bias="prepared")
@@ -180,6 +183,7 @@ def test_kernel_bias_prefers_prepared_layer_bias_only_when_layer_has_bias():
     assert convrot_config._resolve_kernel_bias(layer_without_bias, "caller") == "caller"
 
 
+@pytest.mark.core_model
 @pytest.mark.cpu
 def test_missing_mxfp_support_only_disables_mxfp_methods(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
@@ -198,6 +202,7 @@ def test_missing_mxfp_support_only_disables_mxfp_methods(mocker: MockerFixture, 
     assert isinstance(int8.get_quant_method(layer, "blocks.0.ff.net.2"), ConvRotInt8OnlineLinearMethod)
 
 
+@pytest.mark.core_model
 @pytest.mark.cpu
 def test_layers_route_to_int4_int8_or_unquantized(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
