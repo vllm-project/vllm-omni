@@ -646,7 +646,12 @@ def initialize_model(
                 od_config.model_class_name,
             )
         # Only tile mode distributes the tiled path's tiles; spatial_shard_* decodes the full frame.
-        if vae_pp_size > 1 and is_distributed_vae and vae_mode == "tile" and not od_config.vae_use_tiling:
+        if vae_mode == "crop" and vae_pp_size > 1 and is_distributed_vae:
+            from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
+
+            if not isinstance(model.vae, DistributedAutoencoderKLWan):
+                raise ValueError(f"vae_parallel_mode='crop' supports Wan VAEs only, got {type(model.vae).__name__}")
+        if vae_pp_size > 1 and is_distributed_vae and vae_mode in ("tile", "crop") and not od_config.vae_use_tiling:
             logger.info(
                 "vae_patch_parallel_size=%d in tile mode requires vae_use_tiling; automatically enabling it.",
                 vae_pp_size,

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any, ClassVar, cast
@@ -525,6 +526,72 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
         )
         return tiletask_list, grid_spec
 
+    @staticmethod
+    def _crop_grid(height: int, width: int, ranks: int, halo: int) -> tuple[int, int]:
+        """Rank grid (rows, cols) whose largest halo-padded crop is smallest (2 x 4 for 90 x 160 on 8)."""
+        best = None
+        for rows in range(1, ranks + 1):
+            if ranks % rows:
+                continue
+            cols = ranks // rows
+            if rows > height or cols > width:
+                continue
+            crop_h = -(-height // rows) + 2 * halo
+            crop_w = -(-width // cols) + 2 * halo
+            key = (crop_h * crop_w, abs(crop_h - crop_w))
+            if best is None or key < best[0]:
+                best = (key, (rows, cols))
+        return best[1] if best is not None else (1, 1)
+
+    def crop_split(self, z: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
+        """One latent crop per rank on a 2D rank grid, each widened by a ``halo``-latent margin.
+
+        Unlike ``tile_split`` (fixed 256-pixel tiles with a quarter overlap, about twice the
+        frame area in total and uneven per rank), every rank decodes one crop of about
+        1/N of the frame plus the margin, which is trimmed again in ``crop_merge`` (no blending).
+        """
+        _, _, num_frames, height, width = z.shape
+        halo = int(os.environ.get("VLLM_OMNI_WAN_VAE_CROP_HALO", "2"))
+        ranks = min(int(self.distributed_executor.parallel_size), int(self.distributed_executor.world_size))
+        rows, cols = self._crop_grid(height, width, ranks, halo)
+        row_bounds = [round(i * height / rows) for i in range(rows + 1)]
+        col_bounds = [round(j * width / cols) for j in range(cols + 1)]
+        tasks: list[TileTask] = []
+        offsets = {}
+        for i in range(rows):
+            h0, h1 = max(0, row_bounds[i] - halo), min(height, row_bounds[i + 1] + halo)
+            for j in range(cols):
+                w0, w1 = max(0, col_bounds[j] - halo), min(width, col_bounds[j + 1] + halo)
+                frames = [z[:, :, k : k + 1, h0:h1, w0:w1] for k in range(num_frames)]
+                offsets[(i, j)] = (
+                    row_bounds[i] - h0,
+                    row_bounds[i + 1] - h0,
+                    col_bounds[j] - w0,
+                    col_bounds[j + 1] - w0,
+                )
+                tasks.append(TileTask(len(tasks), (i, j), frames, workload=(h1 - h0) * (w1 - w0)))
+        grid_spec = GridSpec(
+            split_dims=(3, 4),
+            grid_shape=(rows, cols),
+            tile_spec={"offsets": offsets, "ratio": self.spatial_compression_ratio},
+            output_dtype=self.dtype,
+        )
+        return tasks, grid_spec
+
+    def crop_merge(self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid_spec: GridSpec) -> torch.Tensor:
+        """Trim each decoded crop's margin and concatenate the grid."""
+        rows, cols = grid_spec.grid_shape
+        ratio = grid_spec.tile_spec["ratio"]
+        self.clear_cache()
+        out_rows = []
+        for i in range(rows):
+            parts = []
+            for j in range(cols):
+                a, b, c, d = grid_spec.tile_spec["offsets"][(i, j)]
+                parts.append(coord_tensor_map[(i, j)][:, :, :, a * ratio : b * ratio, c * ratio : d * ratio])
+            out_rows.append(torch.cat(parts, dim=-1))
+        return torch.clamp(torch.cat(out_rows, dim=3), min=-1.0, max=1.0)
+
     def tile_exec(self, task: TileTask) -> torch.Tensor:
         """Decode one tile, retaining raw values and patch layout for blending."""
         self.clear_cache()
@@ -793,12 +860,13 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
         return self._tile_parallel_decode(z, return_dict=return_dict)
 
     def _tile_parallel_decode(self, z: torch.Tensor, return_dict: bool = True):
-        logger.debug("Decode running with distributed executor")
-        result = self.distributed_executor.execute(
-            z,
-            DistributedOperator(split=self.tile_split, exec=self.tile_exec, merge=self.tile_merge),
-            broadcast_result=False,
-        )
+        if self.distributed_executor.parallel_mode == "crop" and self.config.patch_size is None and z.ndim == 5:
+            logger.debug("Decode running with distributed executor (crop)")
+            operator = DistributedOperator(split=self.crop_split, exec=self.tile_exec, merge=self.crop_merge)
+        else:
+            logger.debug("Decode running with distributed executor")
+            operator = DistributedOperator(split=self.tile_split, exec=self.tile_exec, merge=self.tile_merge)
+        result = self.distributed_executor.execute(z, operator, broadcast_result=False)
         if not return_dict:
             return (result,)
 

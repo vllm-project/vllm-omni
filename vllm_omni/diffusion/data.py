@@ -354,6 +354,9 @@ class DiffusionParallelConfig:
 
     - "tile": Patch/tile parallel decode (default). Each rank decodes a subset
       of spatial tiles and the results are stitched on rank 0.
+    - "crop": Wan VAEs only. One spatial crop per rank on a 2D rank grid, widened by a
+      small latent margin (VLLM_OMNI_WAN_VAE_CROP_HALO, default 2) that is trimmed again;
+      no tile overlap or blending, so each rank decodes about 1/N of the frame.
     - "batch": Decode complete images on different ranks, preserving their
       batch order. Requires AutoencoderKL/Flux2 and DP/PP/CFG sizes of 1.
     - "spatial_shard_height": Spatially-sharded decode that splits decoder
@@ -404,8 +407,9 @@ class DiffusionParallelConfig:
         assert self.allgather_degree > 0, "AllGather degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
-        assert self.vae_parallel_mode in {"tile", "batch", "spatial_shard_height", "spatial_shard_width"}, (
-            "vae_parallel_mode must be one of {'tile', 'batch', 'spatial_shard_height', 'spatial_shard_width'}, "
+        assert self.vae_parallel_mode in {"tile", "crop", "batch", "spatial_shard_height", "spatial_shard_width"}, (
+            "vae_parallel_mode must be one of "
+            "{'tile', 'crop', 'batch', 'spatial_shard_height', 'spatial_shard_width'}, "
             f"but got {self.vae_parallel_mode!r}."
         )
         if self.vae_parallel_mode == "batch" and (

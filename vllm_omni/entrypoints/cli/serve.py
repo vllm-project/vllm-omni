@@ -1256,9 +1256,10 @@ class OmniServeCommand(CLISubcommand):
             "--vae-parallel-mode",
             type=str,
             default="tile",
-            choices=["tile", "batch", "spatial_shard_height", "spatial_shard_width"],
+            choices=["tile", "crop", "batch", "spatial_shard_height", "spatial_shard_width"],
             help="VAE parallel decode strategy for diffusion models. "
             "'tile' (default) uses patch/tile parallel decode; "
+            "'crop' (Wan VAEs) decodes one margin-padded crop per rank on a 2D rank grid; "
             "'batch' distributes complete images for AutoencoderKL/Flux2 with DP/PP/CFG sizes of 1; "
             "'spatial_shard_height'/'spatial_shard_width' use spatially-sharded decode that splits "
             "decoder feature maps along height/width and exchanges halo regions. The "
