@@ -82,7 +82,7 @@ def release_denoise_graphs_after_denoise(od_config: Any, runner: GraphedForward 
     """
     if runner is None or not runner.num_graphs:
         return
-    if not getattr(od_config, "diffusion_graph_release_after_denoise", False):
+    if not od_config.diffusion_graph_release_after_denoise:
         return
     logger.debug("%s: releasing %d captured denoise graph(s) before decode", runner.name, runner.num_graphs)
     runner.clear()
@@ -108,21 +108,21 @@ def _step_dependent_attention(od_config: Any) -> str | None:
     Attention layers read the step index or timestep off the forward context, not
     off the step's arguments, so a replay would keep the capture step's choice.
     """
-    kv_cache_dtype = getattr(od_config, "diffusion_kv_cache_dtype", None)
-    skip_steps = getattr(od_config, "diffusion_kv_cache_skip_step_indices", None)
+    kv_cache_dtype = od_config.diffusion_kv_cache_dtype
+    skip_steps = od_config.diffusion_kv_cache_skip_step_indices
     if kv_cache_dtype not in (None, "auto", "float") and skip_steps:
         return "diffusion_kv_cache_skip_steps makes KV quantization depend on the step index"
     # Checked even with an empty default: requests can bring their own ranges.
-    if getattr(od_config, "diffusion_attention_schedule", None) is not None:
+    if od_config.diffusion_attention_schedule is not None:
         return "diffusion_attention_schedule selects the attention profile by step index"
-    attention_config = getattr(od_config, "diffusion_attention_config", None)
+    attention_config = od_config.diffusion_attention_config
     if attention_config is not None:
         specs = [attention_config.default, *attention_config.per_role.values()]
         for spec in specs:
-            quant = getattr(spec, "quant", None)
+            quant = spec.quant if spec is not None else None
             if quant is not None and quant.precision is not None and skip_steps:
                 return "diffusion_kv_cache_skip_steps makes quant.precision depend on the step index"
-            skip_softmax = getattr(spec, "skip_softmax", None)
+            skip_softmax = spec.skip_softmax if spec is not None else None
             if skip_softmax is not None and skip_softmax.disabled_until_timestep > 0:
                 return "TRTLLM_ATTN skip_softmax.disabled_until_timestep makes attention depend on the timestep"
     return None
@@ -133,9 +133,9 @@ def _refusal(od_config: Any) -> str | None:
     # manager, which imports this module.
     from vllm_omni.diffusion.offloader.config import offload_enabled
 
-    if getattr(od_config, "enforce_eager", False):
+    if od_config.enforce_eager:
         return "enforce_eager=True"
-    kv_mode = DiffusionKVCacheMode(getattr(od_config, "diffusion_kv_mode", None) or DiffusionKVCacheMode.DENSE_LEGACY)
+    kv_mode = DiffusionKVCacheMode(od_config.diffusion_kv_mode or DiffusionKVCacheMode.DENSE_LEGACY)
     if kv_mode is not DiffusionKVCacheMode.DENSE_LEGACY:
         # The attention layers take the paged KV adapter (block tables, slot
         # mapping) from the forward context, not from the step's arguments, so
@@ -143,17 +143,17 @@ def _refusal(od_config: Any) -> str | None:
         return f"diffusion_kv_mode={kv_mode.value!r} reads per-request paged KV state outside the step arguments"
     if (step_dependent := _step_dependent_attention(od_config)) is not None:
         return step_dependent
-    cache_backend = getattr(od_config, "cache_backend", None) or "none"
+    cache_backend = od_config.cache_backend or "none"
     if cache_backend != "none":
         return f"cache_backend={cache_backend!r} decides per step whether the transformer runs at all"
     if offload_enabled(od_config):
         # Every strategy (model-level, layerwise, distributed layerwise) and the
         # diffusion_offload_config API: hooks move or all-gather the weights.
         return "CPU offload moves the weights that a captured graph reads"
-    parallel_config = getattr(od_config, "parallel_config", None)
-    if getattr(parallel_config, "pipeline_parallel_size", 1) > 1:
+    parallel_config = od_config.parallel_config
+    if parallel_config.pipeline_parallel_size > 1:
         return "pipeline parallelism hands intermediate tensors between stages"
-    if getattr(parallel_config, "data_parallel_size", 1) > 1:
+    if parallel_config.data_parallel_size > 1:
         # Replicas serve different requests, so one can capture a new shape while
         # another replays; the world-group capture agreement would then pair with
         # another replica's next collective and hang.
@@ -198,7 +198,7 @@ def build_denoise_graph_runner(
     """
     from vllm_omni.diffusion.distributed.utils import get_local_device
 
-    requested = bool(getattr(od_config, "diffusion_use_graph", False))
+    requested = bool(od_config.diffusion_use_graph)
     # Stated either way: a silent None is indistinguishable from "engaged and did not pay".
     logger.info("%s: diffusion_use_graph=%s", name, requested)
     if not requested:
@@ -211,7 +211,7 @@ def build_denoise_graph_runner(
         return None
     device = get_local_device()
     graph_cls = current_omni_platform.get_graphed_forward_cls()
-    release = bool(getattr(od_config, "diffusion_graph_release_after_denoise", False))
+    release = bool(od_config.diffusion_graph_release_after_denoise)
     runner = graph_cls(
         _StepForward(fn),
         device=device,
@@ -239,7 +239,7 @@ def warn_if_denoise_graph_unsupported(od_config: Any, pipeline: Any) -> None:
     Pipelines opt in by assigning ``self._denoise_graph_runner`` (``None`` when refused, which
     :func:`build_denoise_graph_runner` already reports); anything else would ignore the flag silently.
     """
-    if getattr(od_config, "diffusion_use_graph", False) and not hasattr(pipeline, "_denoise_graph_runner"):
+    if od_config.diffusion_use_graph and not hasattr(pipeline, "_denoise_graph_runner"):
         logger.warning(
             "diffusion_use_graph=True is ignored: %s does not support denoise graphs; running eager.",
             type(pipeline).__name__,
