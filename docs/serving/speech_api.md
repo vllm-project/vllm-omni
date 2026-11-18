@@ -201,8 +201,9 @@ responses and `truncated` on the SSE `speech.audio.done` event:
 - absent: the model does not report truncation, or the server did not record
   why generation stopped. This does not mean the audio is complete.
 
-Models that report it today: Qwen3-TTS, Breeze-TTS-2, Fish Audio Drama 3 and
-YuE2 (YuE2 on non-streaming responses only, from its own metadata). Qwen3-TTS
+Models that report it today: Qwen3-TTS, Breeze-TTS-2, Fish Audio Drama 3,
+CosyVoice3, Voxtral TTS and YuE2 (YuE2 on non-streaming responses only, from
+its own metadata). Qwen3-TTS
 rejects some truncated generations with an error instead (Base task requests,
 and requests whose budget the server sizes from the text), so those never
 return audio.
