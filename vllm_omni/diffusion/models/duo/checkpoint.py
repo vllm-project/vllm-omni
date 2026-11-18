@@ -204,8 +204,8 @@ def load_training_adapter(
 def _adapter_identity(meta: dict[str, str]) -> tuple[str, int, int, bool]:
     """Read the adapter's own layout/rank/alpha/role declaration.
 
-    A missing or unparseable field is an error: silently assuming the released
-    causal-base values would mis-scale a differently shaped checkpoint instead
+    A missing or unparsable field is an error: silently assuming the released
+    causal-base values would rescale a differently shaped checkpoint instead
     of refusing it.
     """
     layout = meta.get("layout")
