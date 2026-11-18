@@ -302,6 +302,52 @@ steps:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline --test-config-file tests/dfx/perf/tests/test_qwen_image_21_vllm_omni.json -m "H100 and B200 and cards_4"
 
+      - label: ":full_moon: Diffusion X2I(&A&T) · MiniMax-H3-Image · Diffusers Accuracy Calibration"
+        key: nightly-diffusion-minimax-h3-image-diffusers-accuracy
+        source_file_dependencies: diffusion_minimax_h3_image_diffusers_accuracy
+        mirror_hardwares: h100_1
+        timeout_in_minutes: 180
+        artifact_paths:
+          - tests/e2e/accuracy/artifacts/minimax_h3_image/**/*
+        commands:
+          - >-
+            bash -c 'source tests/e2e/accuracy/minimax_h3_image/setup_reference.sh &&
+            exec pytest -sv tests/e2e/accuracy/minimax_h3_image/test_diffusers_similarity.py
+            -m "full_model and cuda and H100 and cards_1" --run-level full_model'
+
+      - label: ":full_moon: Diffusion X2I(&A&T) · MiniMax-H3-Image · Perf · 1-GPU"
+        source_file_dependencies: diffusion_minimax_h3_image_perf
+        key: nightly-diffusion-x2iat-performance-minimax-h3-image-1gpu
+        mirror_hardwares: h100_1
+        timeout_in_minutes: 180
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_minimax_h3_image_vllm_omni.json -m "full_model and diffusion and cuda and H100 and cards_1" --run-level full_model
+
+      - label: ":full_moon: Diffusion X2I(&A&T) · MiniMax-H3-Image · Perf · 2-GPU"
+        source_file_dependencies: diffusion_minimax_h3_image_perf
+        key: nightly-diffusion-x2iat-performance-minimax-h3-image-2gpu
+        mirror_hardwares: h100_2
+        timeout_in_minutes: 180
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_minimax_h3_image_vllm_omni.json -m "full_model and diffusion and cuda and H100 and cards_2" --run-level full_model
+
+      - label: ":full_moon: Diffusion X2I(&A&T) · MiniMax-H3-Image · Perf · 4-GPU"
+        source_file_dependencies: diffusion_minimax_h3_image_perf
+        key: nightly-diffusion-x2iat-performance-minimax-h3-image-4gpu
+        mirror_hardwares: h100_4
+        timeout_in_minutes: 180
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_minimax_h3_image_vllm_omni.json -m "full_model and diffusion and cuda and H100 and cards_4" --run-level full_model
+
   - group: ":card_index_dividers: Diffusion X2V Model Test"
     key: nightly-diffusion-x2v-group
     depends_on: upload-nightly-pipeline

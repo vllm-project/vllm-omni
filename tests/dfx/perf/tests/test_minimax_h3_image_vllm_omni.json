@@ -1,0 +1,479 @@
+[
+  {
+    "test_name": "test_minimax_h3_image_single_gpu_dlo",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "MiniMax-H3-Image H100 measurement: single_gpu_dlo; 2048x2048 generation and editing.",
+    "server_params": {
+      "model": "MiniMaxAI/MiniMax-H3-Image",
+      "serve_args": {
+        "num-gpus": 1,
+        "diffusion-offload-config": {
+          "mode": "layer",
+          "components": [
+            "dit",
+            "text_encoder"
+          ]
+        }
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "t2i_2048x2048_steps6",
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/generations",
+        "num_prompts": 10,
+        "num_warmups": 2,
+        "max_concurrency": 1,
+        "random_input_len": 32,
+        "random_output_len": 1,
+        "random_range_ratio": 0.0,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "size": "2048x2048",
+          "num_inference_steps": 6,
+          "guidance_scale": 1,
+          "seed": 42,
+          "generator_device": "cpu"
+        }
+      },
+      {
+        "name": "edit_2048x2048_steps6",
+        "dataset_name": "random-mm",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/edits",
+        "num_prompts": 10,
+        "num_warmups": 2,
+        "max_concurrency": 1,
+        "random_input_len": 32,
+        "random_output_len": 1,
+        "random_range_ratio": 0.0,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "size": "2048x2048",
+          "num_inference_steps": 6,
+          "guidance_scale": 1,
+          "seed": 42,
+          "generator_device": "cpu"
+        },
+        "random_mm_base_items_per_request": 1,
+        "random_mm_num_mm_items_range_ratio": 0,
+        "random_mm_limit_mm_per_prompt": {
+          "image": 1
+        },
+        "random_mm_bucket_config": {
+          "(1024, 1024, 1)": 1.0
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_minimax_h3_image_tp2",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 2
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "MiniMax-H3-Image H100 measurement: tp2; 2048x2048 generation and editing.",
+    "server_params": {
+      "model": "MiniMaxAI/MiniMax-H3-Image",
+      "serve_args": {
+        "num-gpus": 2,
+        "tensor-parallel-size": 2,
+        "usp": 1,
+        "text-encoder-tp-size": 2
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "t2i_2048x2048_steps6",
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/generations",
+        "num_prompts": 10,
+        "num_warmups": 2,
+        "max_concurrency": 1,
+        "random_input_len": 32,
+        "random_output_len": 1,
+        "random_range_ratio": 0.0,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "size": "2048x2048",
+          "num_inference_steps": 6,
+          "guidance_scale": 1,
+          "seed": 42,
+          "generator_device": "cpu"
+        }
+      },
+      {
+        "name": "edit_2048x2048_steps6",
+        "dataset_name": "random-mm",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/edits",
+        "num_prompts": 10,
+        "num_warmups": 2,
+        "max_concurrency": 1,
+        "random_input_len": 32,
+        "random_output_len": 1,
+        "random_range_ratio": 0.0,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "size": "2048x2048",
+          "num_inference_steps": 6,
+          "guidance_scale": 1,
+          "seed": 42,
+          "generator_device": "cpu"
+        },
+        "random_mm_base_items_per_request": 1,
+        "random_mm_num_mm_items_range_ratio": 0,
+        "random_mm_limit_mm_per_prompt": {
+          "image": 1
+        },
+        "random_mm_bucket_config": {
+          "(1024, 1024, 1)": 1.0
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_minimax_h3_image_tp4",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 4
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "MiniMax-H3-Image H100 measurement: tp4; 2048x2048 generation and editing.",
+    "server_params": {
+      "model": "MiniMaxAI/MiniMax-H3-Image",
+      "serve_args": {
+        "num-gpus": 4,
+        "tensor-parallel-size": 4,
+        "usp": 1,
+        "text-encoder-tp-size": 4
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "t2i_2048x2048_steps6",
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/generations",
+        "num_prompts": 10,
+        "num_warmups": 2,
+        "max_concurrency": 1,
+        "random_input_len": 32,
+        "random_output_len": 1,
+        "random_range_ratio": 0.0,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "size": "2048x2048",
+          "num_inference_steps": 6,
+          "guidance_scale": 1,
+          "seed": 42,
+          "generator_device": "cpu"
+        }
+      },
+      {
+        "name": "edit_2048x2048_steps6",
+        "dataset_name": "random-mm",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/edits",
+        "num_prompts": 10,
+        "num_warmups": 2,
+        "max_concurrency": 1,
+        "random_input_len": 32,
+        "random_output_len": 1,
+        "random_range_ratio": 0.0,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "size": "2048x2048",
+          "num_inference_steps": 6,
+          "guidance_scale": 1,
+          "seed": 42,
+          "generator_device": "cpu"
+        },
+        "random_mm_base_items_per_request": 1,
+        "random_mm_num_mm_items_range_ratio": 0,
+        "random_mm_limit_mm_per_prompt": {
+          "image": 1
+        },
+        "random_mm_bucket_config": {
+          "(1024, 1024, 1)": 1.0
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_minimax_h3_image_a3_1card_sp2_dlo",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "npu": "A3"
+          },
+          "num_cards": 2
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "MiniMax-H3-Image A3 measurement: a3_1card_sp2_dlo; 2048x2048 generation and editing.",
+    "server_params": {
+      "model": "MiniMaxAI/MiniMax-H3-Image",
+      "serve_args": {
+        "num-gpus": 2,
+        "enforce-eager": true,
+        "usp": 2,
+        "text-encoder-tp-size": 2,
+        "diffusion-offload-config": {
+          "mode": "layer",
+          "components": [
+            "dit"
+          ],
+          "layer_options": {
+            "dit": {
+              "weight_transfer": "allgather"
+            }
+          }
+        }
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "t2i_2048x2048_steps6",
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/generations",
+        "num_prompts": 10,
+        "num_warmups": 2,
+        "max_concurrency": 1,
+        "random_input_len": 32,
+        "random_output_len": 1,
+        "random_range_ratio": 0.0,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "size": "2048x2048",
+          "num_inference_steps": 6,
+          "guidance_scale": 1,
+          "seed": 42,
+          "generator_device": "cpu"
+        }
+      },
+      {
+        "name": "edit_2048x2048_steps6",
+        "dataset_name": "random-mm",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/edits",
+        "num_prompts": 10,
+        "num_warmups": 2,
+        "max_concurrency": 1,
+        "random_input_len": 32,
+        "random_output_len": 1,
+        "random_range_ratio": 0.0,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "size": "2048x2048",
+          "num_inference_steps": 6,
+          "guidance_scale": 1,
+          "seed": 42,
+          "generator_device": "cpu"
+        },
+        "random_mm_base_items_per_request": 1,
+        "random_mm_num_mm_items_range_ratio": 0,
+        "random_mm_limit_mm_per_prompt": {
+          "image": 1
+        },
+        "random_mm_bucket_config": {
+          "(1024, 1024, 1)": 1.0
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_minimax_h3_image_a3_2card_sp4_dlo",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "npu": "A3"
+          },
+          "num_cards": 4
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "MiniMax-H3-Image A3 measurement: a3_2card_sp4_dlo; 2048x2048 generation and editing.",
+    "server_params": {
+      "model": "MiniMaxAI/MiniMax-H3-Image",
+      "serve_args": {
+        "num-gpus": 4,
+        "enforce-eager": true,
+        "usp": 4,
+        "text-encoder-tp-size": 4,
+        "diffusion-offload-config": {
+          "mode": "layer",
+          "components": [
+            "dit"
+          ],
+          "layer_options": {
+            "dit": {
+              "weight_transfer": "allgather"
+            }
+          }
+        }
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "t2i_2048x2048_steps6",
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/generations",
+        "num_prompts": 10,
+        "num_warmups": 2,
+        "max_concurrency": 1,
+        "random_input_len": 32,
+        "random_output_len": 1,
+        "random_range_ratio": 0.0,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "size": "2048x2048",
+          "num_inference_steps": 6,
+          "guidance_scale": 1,
+          "seed": 42,
+          "generator_device": "cpu"
+        }
+      },
+      {
+        "name": "edit_2048x2048_steps6",
+        "dataset_name": "random-mm",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/edits",
+        "num_prompts": 10,
+        "num_warmups": 2,
+        "max_concurrency": 1,
+        "random_input_len": 32,
+        "random_output_len": 1,
+        "random_range_ratio": 0.0,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "size": "2048x2048",
+          "num_inference_steps": 6,
+          "guidance_scale": 1,
+          "seed": 42,
+          "generator_device": "cpu"
+        },
+        "random_mm_base_items_per_request": 1,
+        "random_mm_num_mm_items_range_ratio": 0,
+        "random_mm_limit_mm_per_prompt": {
+          "image": 1
+        },
+        "random_mm_bucket_config": {
+          "(1024, 1024, 1)": 1.0
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_minimax_h3_image_a3_4card_tp8",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "npu": "A3"
+          },
+          "num_cards": 8
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "MiniMax-H3-Image A3 measurement: a3_4card_tp8; 2048x2048 generation and editing.",
+    "server_params": {
+      "model": "MiniMaxAI/MiniMax-H3-Image",
+      "serve_args": {
+        "num-gpus": 8,
+        "enforce-eager": true,
+        "tensor-parallel-size": 8,
+        "usp": 1,
+        "text-encoder-tp-size": 8
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "t2i_2048x2048_steps6",
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/generations",
+        "num_prompts": 10,
+        "num_warmups": 2,
+        "max_concurrency": 1,
+        "random_input_len": 32,
+        "random_output_len": 1,
+        "random_range_ratio": 0.0,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "size": "2048x2048",
+          "num_inference_steps": 6,
+          "guidance_scale": 1,
+          "seed": 42,
+          "generator_device": "cpu"
+        }
+      },
+      {
+        "name": "edit_2048x2048_steps6",
+        "dataset_name": "random-mm",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/edits",
+        "num_prompts": 10,
+        "num_warmups": 2,
+        "max_concurrency": 1,
+        "random_input_len": 32,
+        "random_output_len": 1,
+        "random_range_ratio": 0.0,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "size": "2048x2048",
+          "num_inference_steps": 6,
+          "guidance_scale": 1,
+          "seed": 42,
+          "generator_device": "cpu"
+        },
+        "random_mm_base_items_per_request": 1,
+        "random_mm_num_mm_items_range_ratio": 0,
+        "random_mm_limit_mm_per_prompt": {
+          "image": 1
+        },
+        "random_mm_bucket_config": {
+          "(1024, 1024, 1)": 1.0
+        }
+      }
+    ]
+  }
+]

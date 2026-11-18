@@ -507,3 +507,37 @@ def test_reference_limit_matches_model_metadata():
     assert h3i.MINIMAX_H3_IMAGE_MAX_REFERENCES == 16
     metadata = get_diffusion_model_metadata("MiniMaxH3ImagePipeline")
     assert metadata.max_multimodal_image_inputs == h3i.MINIMAX_H3_IMAGE_MAX_REFERENCES
+
+
+@pytest.mark.parametrize("count", [1, 16, 17])
+def test_request_reference_limit_and_order(count):
+    from PIL import Image
+
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    pipe = h3i.MiniMaxH3ImagePipeline.__new__(h3i.MiniMaxH3ImagePipeline)
+    torch.nn.Module.__init__(pipe)
+    pipe.num_steps = 6
+    pipe.supported_tasks = {"t2i", "edit"}
+    pipe.min_generation_area = 2048 * 2048
+    images = [Image.new("RGB", (32, 32), (i, 0, 0)) for i in range(count)]
+    request = DiffusionRequestBatch(
+        requests=[
+            OmniDiffusionRequest(
+                prompt={"prompt": "Combine the reference images.", "multi_modal_data": {"image": images}},
+                sampling_params=OmniDiffusionSamplingParams(seed=42, generator_device="cpu"),
+                request_id="reference-limit",
+            )
+        ]
+    )
+    if count > 16:
+        with pytest.raises(OmniClientError, match="at most 16"):
+            pipe._parse_request(request)
+    else:
+        parsed = pipe._parse_request(request)
+        assert len(parsed["references"]) == count
+        assert [image.getpixel((0, 0))[0] for image in parsed["references"]] == list(range(count))
+        assert parsed["steps"] == 6
+        assert parsed["canvas"] == (2048, 2048)

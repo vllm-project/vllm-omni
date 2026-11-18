@@ -332,6 +332,75 @@ steps:
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
+      - label: ":full_moon: Diffusion X2I(&A&T) · MiniMax-H3-Image · Diffusers Accuracy Calibration · A3"
+        key: nightly-diffusion-minimax-h3-image-diffusers-accuracy-a3
+        source_file_dependencies: [diffusion_minimax_h3_image_diffusers_accuracy, ci_npu]
+        mirror_hardwares: a3_npu_2
+        timeout_in_minutes: 180
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_TOKEN: "${HF_TOKEN}"
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          HCCL_NPU_SOCKET_PORT_RANGE: auto
+        artifact_paths:
+          - tests/e2e/accuracy/artifacts/minimax_h3_image/**/*
+        commands:
+          - >-
+            bash -c 'source tests/e2e/accuracy/minimax_h3_image/setup_reference.sh &&
+            exec pytest -sv tests/e2e/accuracy/minimax_h3_image/test_diffusers_similarity.py
+            -m "full_model and npu and A3 and cards_1" --run-level full_model'
+
+      - label: ":full_moon: Diffusion X2I(&A&T) · MiniMax-H3-Image · Perf · A3 1-card (2 dies)"
+        source_file_dependencies: [diffusion_minimax_h3_image_perf, ci_npu]
+        key: nightly-diffusion-x2iat-performance-minimax-h3-image-a3-1card
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          HCCL_NPU_SOCKET_PORT_RANGE: auto
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_minimax_h3_image_vllm_omni.json -m "full_model and diffusion and npu and A3 and cards_2" --run-level full_model
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            exit $$EXIT
+      - label: ":full_moon: Diffusion X2I(&A&T) · MiniMax-H3-Image · Perf · A3 2-card (4 dies)"
+        source_file_dependencies: [diffusion_minimax_h3_image_perf, ci_npu]
+        key: nightly-diffusion-x2iat-performance-minimax-h3-image-a3-2card
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_4
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          HCCL_NPU_SOCKET_PORT_RANGE: auto
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_minimax_h3_image_vllm_omni.json -m "full_model and diffusion and npu and A3 and cards_4" --run-level full_model
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            exit $$EXIT
+      - label: ":full_moon: Diffusion X2I(&A&T) · MiniMax-H3-Image · Perf · A3 4-card (8 dies)"
+        source_file_dependencies: [diffusion_minimax_h3_image_perf, ci_npu]
+        key: nightly-diffusion-x2iat-performance-minimax-h3-image-a3-4card
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_8
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          HCCL_NPU_SOCKET_PORT_RANGE: auto
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_minimax_h3_image_vllm_omni.json -m "full_model and diffusion and npu and A3 and cards_8" --run-level full_model
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            exit $$EXIT
   - group: ":card_index_dividers: Diffusion X2V Model Test"
     key: nightly-diffusion-x2v-group
     depends_on: upload-nightly-pipeline
