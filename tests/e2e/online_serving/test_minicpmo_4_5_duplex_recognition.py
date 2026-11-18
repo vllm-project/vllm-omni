@@ -39,9 +39,9 @@ def test_duplex_long_video_scene_recognition(omni_server, tmp_path: Path, monkey
     # Only replace file decoding with frozen bytes. The demo drives the real
     # WebSocket server, streaming/pacing, playback ACKs, commit and drain.
     monkeypatch.setattr(demo, "_resolve_duplex_av_inputs", lambda **kwargs: (str(wav), frames, [None] * len(frames)))
-    output = repo / "tests/e2e/online_serving/results/minicpmo_duplex_recognition" / uuid.uuid4().hex
+    attempts_root = repo / "tests/e2e/online_serving/results/minicpmo_duplex_recognition" / uuid.uuid4().hex
     args = argparse.Namespace(
-        output_dir=str(output),
+        output_dir=str(attempts_root / "attempt_0"),
         input_wav=str(wav),
         input_video=None,
         video_fps=1,
@@ -84,14 +84,27 @@ def test_duplex_long_video_scene_recognition(omni_server, tmp_path: Path, monkey
         require_audio=True,
     )
     for attempt in range(2):
+        # Each attempt streams into its own directory, so a green retry
+        # keeps the first-pass event trace and verdict instead of
+        # overwriting a coverage regression away.
+        attempt_dir = attempts_root / f"attempt_{attempt}"
+        args.output_dir = str(attempt_dir)
         result = asyncio.run(demo.run_demo(args))
-        events = [json.loads(line) for line in (output / "events.jsonl").read_text().splitlines()]
+        events = [json.loads(line) for line in (attempt_dir / "events.jsonl").read_text().splitlines()]
         report = evaluate_session(result["transcript"], events, manifest["scenes"])
         report["fixture_archive_sha256"] = manifest["archive_sha256"]
         report["reference_audio_sha256"] = manifest["reference_audio_sha256"]
         report["scope"] = "12 scene descriptions plus response completion; not all-question accuracy or token parity"
         report["post_commit"] = result["post_commit"]
-        (output / "recognition.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        report["attempt"] = attempt
+        if attempt > 0:
+            report["retry_reason"] = (
+                "coverage-only failure on the previous attempt (see the "
+                "attempt_0 recognition.json for the retained first pass)"
+            )
+        (attempt_dir / "recognition.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         assert result["ok"], result
         assert result["video_frames_sent"] == 180, result
         assert result["post_commit"]["input_had_residual_model_unit"] is True, result
@@ -106,3 +119,35 @@ def test_duplex_long_video_scene_recognition(omni_server, tmp_path: Path, monkey
             warnings.warn(f"duplex scene coverage failed once, retrying: {report}")
             continue
         assert report["passed"], report
+    # A coverage-only failure followed by a pass must retain both traces:
+    # the first pass keeps its events.jsonl plus a failing recognition.json,
+    # and the retry's directory holds the passing verdict.
+    if report["passed"] and report["attempt"] > 0:
+        first_pass = json.loads((attempts_root / "attempt_0" / "recognition.json").read_text(encoding="utf-8"))
+        assert (attempts_root / "attempt_0" / "events.jsonl").exists()
+        assert first_pass["passed"] is False and not first_pass["protocol_errors"], first_pass
+
+
+def test_replay_tail_window_bounds() -> None:
+    """A tiny positive duration must skip the replay instead of slicing [-0:]."""
+    repo = Path(__file__).resolve().parents[3]
+    spec = importlib.util.spec_from_file_location(
+        "minicpmo_recognition_demo_window",
+        repo / "examples/online_serving/minicpmo/realtime_duplex_demo.py",
+    )
+    assert spec is not None and spec.loader is not None
+    demo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(demo)
+    window = demo._replay_tail_window
+    # 180 s of audio plus 1 fps video, 15 s tail: exactly one scene window.
+    assert window(2_880_000, 180, 15.0, 16_000) == (240_000, 15)
+    # A window longer than the input clamps to the full input.
+    assert window(128_000, 10, 15.0, 16_000) == (128_000, 10)
+    # 0.3 s rounds to zero frames while audio rounds to 4800 samples:
+    # video_frames[-0:] would keep every frame, so the replay is skipped
+    # rather than pairing a short audio tail with the entire video.
+    assert window(2_880_000, 180, 0.3, 16_000) is None
+    # Without video, the audio tail alone is still a valid window.
+    assert window(2_880_000, 0, 0.3, 16_000) == (4_800, 0)
+    # Durations shorter than one audio sample are skipped as well.
+    assert window(2_880_000, 0, 1e-5, 16_000) is None
