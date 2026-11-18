@@ -203,7 +203,7 @@ def test_npu_gather_reads_only_the_blocks_the_kernel_sees(monkeypatch, use_host_
         return (torch.zeros_like(q),)
 
     provider = ModuleType("torch_npu")
-    provider.npu_fusion_attention = attention
+    monkeypatch.setattr(provider, "npu_fusion_attention", attention, raising=False)
     monkeypatch.setitem(sys.modules, "torch_npu", provider)
     monkeypatch.setattr(torch.Tensor, "index_select", spy)
 
@@ -238,7 +238,7 @@ def test_npu_fused_kernel_gets_tnd_lengths_as_python_ints(monkeypatch, use_host_
         return (torch.zeros_like(q),)
 
     provider = ModuleType("torch_npu")
-    provider.npu_fusion_attention = attention
+    monkeypatch.setattr(provider, "npu_fusion_attention", attention, raising=False)
     monkeypatch.setitem(sys.modules, "torch_npu", provider)
 
     kwargs = dict(
