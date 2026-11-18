@@ -2,13 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
+import logging
+import math
 import os
 import subprocess
 import threading
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 import pytest
 
@@ -17,6 +19,145 @@ from tests.helpers.hardware import get_runtime_resource_label as get_runtime_res
 from tests.helpers.mark import get_hardware_mark_list, hardware_marks
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import modify_stage_config
+
+BASELINE_REGRESSION_TOLERANCE = 0.10
+
+# Substrings, not a closed metric list. ``throughput_qps`` matches the higher
+# group only; ``mean_audio_rtf`` and ``peak_memory_mb_mean`` match the lower group.
+_LOWER_IS_BETTER_TOKENS = ("latency", "ttft", "tpot", "itl", "e2el", "ttfp", "ttfc", "interval", "rtf", "memory")
+_HIGHER_IS_BETTER_TOKENS = ("throughput", "qps", "fps")
+
+
+def metric_lower_is_better(name: str) -> bool:
+    """Return whether a smaller measured value is the better one."""
+    key = name.lower().replace("-", "_")
+    lower = any(token in key for token in _LOWER_IS_BETTER_TOKENS)
+    higher = any(token in key for token in _HIGHER_IS_BETTER_TOKENS)
+    if lower and higher:
+        raise ValueError(f"baseline metric {name!r} matches both a higher-is-better token and a lower-is-better token")
+    if lower:
+        return True
+    if higher:
+        return False
+    raise ValueError(
+        f"baseline metric {name!r} has no regression direction; "
+        "use a latency/memory/rtf-style name or a throughput/qps-style name"
+    )
+
+
+def _is_finite_number(value: object) -> TypeGuard[int | float]:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _worse_ratio(measured: float, baseline: float, *, lower_is_better: bool) -> float:
+    """Fraction by which ``measured`` is worse than ``baseline``.
+
+    Zero baseline has no percentage scale: any move in the bad direction is
+    treated as an unbounded regression, and a value that is not worse passes.
+    """
+    if baseline == 0:
+        bad = measured > 0 if lower_is_better else measured < 0
+        return math.inf if bad else 0.0
+    if lower_is_better:
+        return (measured - baseline) / baseline
+    return (baseline - measured) / baseline
+
+
+def _regressed(worse_ratio: float, tolerance: float) -> bool:
+    # Only regressions strictly beyond tolerance fail; allow float noise at the boundary.
+    if worse_ratio <= tolerance:
+        return False
+    return not math.isclose(worse_ratio, tolerance, rel_tol=1e-9, abs_tol=1e-12)
+
+
+def assert_baseline_within_tolerance(
+    measured: Mapping[str, Any],
+    baseline: Mapping[str, Any] | None,
+    hardware: str | None,
+    *,
+    tolerance: float = BASELINE_REGRESSION_TOLERANCE,
+    required: bool = False,
+) -> None:
+    """Fail when any metric in the current hardware bucket is more than ``tolerance`` worse.
+
+    ``baseline`` is the sweep-resolved hardware-nested map
+    (``{"H100": {"request_throughput": 1.2}}``). Missing or empty baselines
+    and missing or unmatched hardware log a warning and skip comparison,
+    unless ``required=True`` requests a failure instead.
+    """
+    baseline_hardware = hardware
+    # Ascend runtime labels use the A2 resource bucket when no exact bucket exists.
+    if isinstance(baseline, dict) and hardware in ("910B", "910B4") and hardware not in baseline and "A2" in baseline:
+        baseline_hardware = "A2"
+    if (
+        not isinstance(baseline, dict)
+        or not baseline
+        or not isinstance(baseline_hardware, str)
+        or not baseline_hardware
+        or baseline_hardware not in baseline
+    ):
+        available = list(baseline) if isinstance(baseline, dict) else []
+        message = f"No matching baseline for hardware {hardware!r}; available hardware: {available}"
+        if required:
+            raise AssertionError(message)
+        logging.getLogger(__name__).warning("[baseline-check] SKIP: %s", message)
+        print(f"[baseline-check] WARNING SKIP: {message}", flush=True)
+        return
+    bucket = baseline[baseline_hardware]
+    if not isinstance(bucket, dict) or not bucket:
+        raise AssertionError(f"baseline[{baseline_hardware!r}] must be a non-empty metric map, got {bucket!r}")
+
+    print(
+        f"[baseline-check] START hardware={hardware} baseline_hardware={baseline_hardware} "
+        f"tolerance={tolerance:.0%} metrics={len(bucket)}",
+        flush=True,
+    )
+    failures: list[str] = []
+    for name, expected in bucket.items():
+        if isinstance(expected, (list, tuple)):
+            failures.append(f"{name}: baseline is still a sweep list; resolve the sweep step before comparing")
+            continue
+        if not _is_finite_number(expected):
+            failures.append(f"{name}: baseline {expected!r} is not a finite number")
+            continue
+        if expected < 0:
+            failures.append(f"{name}: negative baseline {expected} is not supported")
+            continue
+        actual = measured.get(name)
+        if not _is_finite_number(actual):
+            failures.append(f"{name}: measured value {actual!r} is not a finite number")
+            continue
+        if actual < 0:
+            failures.append(f"{name}: negative measured value {actual} is not supported")
+            continue
+        try:
+            lower_is_better = metric_lower_is_better(str(name))
+        except ValueError as exc:
+            failures.append(str(exc))
+            continue
+        ratio = _worse_ratio(float(actual), float(expected), lower_is_better=lower_is_better)
+        regressed = _regressed(ratio, tolerance)
+        print(
+            f"[baseline-check] {'FAIL' if regressed else 'PASS'} {name}: "
+            f"measured={actual} baseline={expected} regression={ratio:.2%} tolerance={tolerance:.0%}",
+            flush=True,
+        )
+        if not regressed:
+            continue
+        if lower_is_better:
+            limit = float(expected) * (1 + tolerance)
+            direction = "above"
+        else:
+            limit = float(expected) * (1 - tolerance)
+            direction = "below"
+        failures.append(
+            f"{name}: measured {actual} is more than {tolerance:.0%} {direction} "
+            f"baseline {expected} on {hardware} (limit {limit})"
+        )
+    if failures:
+        logging.getLogger(__name__).error("[baseline-check] FAIL hardware=%s: %s", hardware, "; ".join(failures))
+        raise AssertionError("performance baseline regression:\n" + "\n".join(failures))
+    print(f"[baseline-check] PASS hardware={hardware}: all {len(bucket)} metrics passed", flush=True)
 
 
 def _named_pytest_marks(names: list[str]) -> list[pytest.MarkDecorator]:
@@ -851,11 +992,28 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help=("Path to benchmark config JSON. Example: --test-config-file tests/dfx/perf/tests/test_tts.json"),
     )
     parser.addoption(
+        "--require-duplex-eval-score-floors",
+        action="store_true",
+        default=False,
+        help="Fail Omni-DuplexEval accuracy cases without score floors for the runtime hardware (default: off).",
+    )
+    parser.addoption(
         "--assert-baseline",
         action="store_true",
         default=False,
         help=(
-            "When set, omni/diffusion perf runners compare metrics against the baseline block in the JSON config "
-            "(default: off)."
+            "Fail a perf case when a metric is more than 10% worse than the baseline for this hardware. "
+            "Throughput and QPS fail when they fall below 90% of the baseline. "
+            "Latency, memory, and real-time factor fail when they rise above 110% of the baseline. "
+            "Missing or unmatched hardware logs a warning and skips baseline validation (default: off)."
+        ),
+    )
+    parser.addoption(
+        "--require-baseline",
+        action="store_true",
+        default=False,
+        help=(
+            "Enforce the same 10% performance tolerance as --assert-baseline, "
+            "and fail when the runtime hardware has no matching baseline (default: off)."
         ),
     )
