@@ -21,7 +21,11 @@ import torch
 from PIL import Image
 
 from vllm_omni.diffusion.models.bagel.image_transforms import resize_for_vae, resize_for_vit, to_tensor
-from vllm_omni.model_executor.models.bagel.bagel import OmniBagelProcessingInfo, OmniBagelProcessor
+from vllm_omni.model_executor.models.bagel.bagel import (
+    OmniBagelDataParser,
+    OmniBagelProcessingInfo,
+    OmniBagelProcessor,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -97,3 +101,33 @@ def test_token_counts_match_the_processed_pixels(size):
 
     assert tuple(out["pixel_values"][0].shape[1:]) == (vae_h, vae_w)
     assert tuple(out["vit_pixel_values"][0].shape[1:]) == (vit_h, vit_w)
+
+
+@pytest.mark.parametrize("modality", ["image", "img2img"])
+@pytest.mark.parametrize("channels_first", [False, True], ids=["HWC", "CHW"])
+@pytest.mark.parametrize("tensor", [False, True], ids=["numpy", "torch"])
+@pytest.mark.parametrize("dtype", ["uint8", "float_unit", "float_byte"])
+def test_non_pil_images_preserve_pixels(modality, channels_first, tensor, dtype):
+    # Non-integer float values exercise conversion of the [0, 1] range.
+    pixels = np.empty((32, 48, 3), dtype=np.float32)
+    pixels[:] = [0.25, 0.5, 0.75]
+    expected = (pixels * 255).astype(np.uint8)
+    if dtype == "uint8":
+        pixels = expected
+    elif dtype == "float_byte":
+        pixels = expected.astype(np.float32)
+    if channels_first:
+        pixels = pixels.transpose(2, 0, 1)
+    if tensor:
+        # Torch pixels are supported by the HF processor directly. The public
+        # vLLM image parser reserves torch tensors for precomputed embeddings.
+        images = [torch.from_numpy(pixels.copy())]
+    else:
+        items = OmniBagelDataParser().parse_mm_data({modality: pixels})[modality]
+        assert (items.get_image_size(0).width, items.get_image_size(0).height) == (48, 32)
+        data = items.get_processor_data()
+        images = data["images" if modality == "image" else "pixel_values_img2img"]
+    actual = _processor()(images=images, is_img2img=modality == "img2img", **GEOMETRY)
+    reference = _processor()(images=[Image.fromarray(expected)], is_img2img=modality == "img2img", **GEOMETRY)
+    for key in reference:
+        torch.testing.assert_close(actual[key][0], reference[key][0], rtol=0, atol=0)

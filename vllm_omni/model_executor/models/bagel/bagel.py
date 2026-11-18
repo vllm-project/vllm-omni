@@ -6,11 +6,10 @@ from dataclasses import replace
 from math import isqrt
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn as nn
-from PIL import Image
 from transformers import BatchFeature
+from transformers.image_transforms import to_pil_image
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.inputs import ModalityData, MultiModalDataDict
@@ -96,7 +95,7 @@ class OmniBagelProcessor(BagelProcessor):
             images = [images]
         vae_images = [
             resize_for_vae(
-                image if isinstance(image, Image.Image) else Image.fromarray(np.asarray(image)),
+                to_pil_image(image),
                 max_size=vae_max_size,
                 stride=vae_stride,
             )
@@ -493,10 +492,8 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         self.latent_pos_embed = PositionEmbedding(self.max_latent_size, hidden_size)
         self.time_embedder = TimestepEmbedder(hidden_size)
 
-        self._pending_img2img_info: list[tuple[int, int, int, int]] = []
         self._ropes_pending: list[dict[str, Any]] = []
         self._ropes_metadata: dict[str, dict[str, Any]] = {}
-        self._last_img2img_info: tuple[int, int, int, int] | None = None
 
         from transformers import AutoTokenizer
 
@@ -570,8 +567,6 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         """Clear stale state accumulated during warmup/profiling runs."""
         self._ropes_pending.clear()
         self._ropes_metadata.clear()
-        self._pending_img2img_info.clear()
-        self._last_img2img_info = None
         self._vae_token_mask = None
 
     def get_kv_transfer_metadata(
@@ -705,9 +700,6 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         p = self.latent_patch_size
         timestep = 0
 
-        if self._ropes_pending:
-            self._ropes_pending.clear()
-
         results = []
 
         for vae_pv, vit_pv in zip(vae_pixel_values, vit_pixel_values):
@@ -740,12 +732,6 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             combined = torch.cat([se, vae_embeds, ee, se, vit_emb.to(vae_embeds.dtype), ee], dim=0)
             results.append(combined)
 
-            num_vae = h * w + 2  # +2 for start/end markers
-            num_vit = vit_emb.shape[0] + 2
-            info = (num_vae, num_vit, int(H), int(W))
-            self._pending_img2img_info.append(info)
-            self._last_img2img_info = info
-
         return tuple(results)
 
     def forward(
@@ -754,40 +740,24 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         positions: torch.Tensor,
         intermediate_tensors=None,
         inputs_embeds: torch.Tensor | None = None,
+        *,
+        img2img_layouts: Sequence[tuple[int, int, int, int] | None] = (),
         **kwargs: object,
     ) -> torch.Tensor:
-        use_mot = False
-        seq_len = inputs_embeds.shape[0] if inputs_embeds is not None else positions.shape[0]
-
-        if self._pending_img2img_info:
-            positions = self._adjust_positions_for_img2img(positions, input_ids, kwargs.get("seq_token_counts"))
-            use_mot = True
-
-        elif self._last_img2img_info is not None:
-            info = self._last_img2img_info
-            num_vae, num_vit, _, _ = info
-            num_img2img = num_vae + 1 + num_vit
-
-            if seq_len >= num_img2img and self._has_img2img_placeholder(input_ids):
-                self._pending_img2img_info = [info]
-                positions = self._adjust_positions_for_img2img(positions, input_ids, kwargs.get("seq_token_counts"))
-                use_mot = True
-            else:
-                rope = positions[seq_len - 1] + 1
-                self._ropes_pending.append({"ropes": [rope]})
-
-        if use_mot:
-            return self._mot_forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
+        if any(layout is not None for layout in img2img_layouts):
+            positions = self._adjust_positions_for_img2img(
+                positions, input_ids, kwargs["seq_token_counts"], img2img_layouts
+            )
+            if self._has_vae_tokens:
+                return self._mot_forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
         return super().forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
-
-    def _has_img2img_placeholder(self, input_ids: torch.Tensor | None) -> bool:
-        return input_ids is not None and bool((input_ids == self._img2img_token_id).any())
 
     def _adjust_positions_for_img2img(
         self,
         positions: torch.Tensor,
-        input_ids: torch.Tensor | None = None,
-        seq_token_counts: Sequence[int] | None = None,
+        input_ids: torch.Tensor | None,
+        seq_token_counts: Sequence[int],
+        layouts: Sequence[tuple[int, int, int, int] | None],
     ) -> torch.Tensor:
         """Rewrite position IDs for img2img.
 
@@ -802,44 +772,20 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
 
         When M=0 (standard img2img) this reduces to VAE->0, ViT->1, text->2..
         """
-        info_list = self._pending_img2img_info
-        self._pending_img2img_info = []
-
-        if not info_list:
-            self._vae_token_mask = None
-            self._has_vae_tokens = False
-            self._has_non_vae_tokens = True
-            return positions
-
         boundaries = [0]
-        # Copy positions to the host once: indexing the CUDA tensor element by
-        # element in the loop below would sync the device on every iteration.
-        if seq_token_counts is not None:
-            for count in seq_token_counts:
-                boundaries.append(boundaries[-1] + int(count))
-        else:
-            pos_list = positions.tolist()
-            for i in range(1, len(pos_list)):
-                if pos_list[i] < pos_list[i - 1]:
-                    boundaries.append(i)
-            boundaries.append(len(pos_list))
+        for count in seq_token_counts:
+            boundaries.append(boundaries[-1] + int(count))
 
         num_requests = len(boundaries) - 1
         new_positions = positions.clone()
         vae_mask = torch.zeros(len(positions), dtype=torch.bool, device=positions.device)
 
-        img2img_idx = 0
         for req_idx in range(num_requests):
             start = boundaries[req_idx]
             end = boundaries[req_idx + 1]
             req_len = end - start
 
-            if img2img_idx < len(info_list):
-                cur_info = info_list[img2img_idx]
-            elif self._last_img2img_info is not None:
-                cur_info = self._last_img2img_info
-            else:
-                cur_info = None
+            cur_info = layouts[req_idx]
 
             if cur_info is not None:
                 num_vae, num_vit, img_H, img_W = cur_info
@@ -886,7 +832,6 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                             "prefill_position_count": req_len,
                         }
                     )
-                    img2img_idx += 1
                     continue
 
             rope = int(new_positions[end - 1].item()) + 1

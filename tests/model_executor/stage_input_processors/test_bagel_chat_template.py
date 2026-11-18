@@ -110,3 +110,16 @@ def test_two_stage_pipelines_declare_the_template():
     assert BAGEL_PIPELINE.chat_template is BAGEL_CHAT_TEMPLATE
     assert BAGEL_THINK_PIPELINE.chat_template is BAGEL_CHAT_TEMPLATE
     assert BAGEL_SINGLE_STAGE_PIPELINE.chat_template is None
+
+
+@pytest.mark.parametrize("has_image", [False, True])
+@pytest.mark.parametrize("prompt", [QUESTION, f"{BOS}{QUESTION}{EOS}", ""])
+def test_offline_prompt_builder_matches_online_template(has_image, prompt):
+    from vllm_omni.model_extras import build_x_to_text_prompt
+
+    parts = [_text(prompt)]
+    if has_image:
+        parts.insert(0, {"type": "image"})
+    offline, stop_ids = build_x_to_text_prompt("bagel", "ByteDance-Seed/BAGEL-7B-MoT", prompt, has_image)
+    assert offline == {"prompt": _render([_user(*parts)]), "modalities": ["text"]}
+    assert stop_ids is None
