@@ -137,6 +137,7 @@ class MiniMaxMusic3TalkerForConditionalGeneration(nn.Module):
     # Sampling, feedback and window emission are all model-owned.
     prefer_model_sampler: bool = True
     have_multimodal_outputs: bool = True
+    mrv2_forward_returns_tensor = True
     has_postprocess: bool = True
     skips_model_sampler_output_token_history: bool = True
     postprocess_uses_hidden_states: bool = False
