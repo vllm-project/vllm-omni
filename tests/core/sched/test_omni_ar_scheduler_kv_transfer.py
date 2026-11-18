@@ -174,9 +174,11 @@ def test_finish_saves_async_only_with_downstream_consumer(mocker, final_stage_id
     assert adapter.save_async.called is expect_save
 
 
-def test_stage_zero_final_skips_inter_stage_output(mocker):
+@pytest.mark.parametrize("force_kv_transfer", [False, True], ids=["stage-zero-final", "cfg-companion"])
+def test_stage_zero_final_skips_inter_stage_output(mocker, force_kv_transfer):
+    # Runners drop these rows; a payload here is contradictory metadata and must stay loud.
     warn = mocker.patch("vllm_omni.core.sched.omni_ar_scheduler.logger.warning")
-    request = _make_chunk_request(0)
+    request = _make_chunk_request(0, force_kv_transfer=force_kv_transfer)
     adapter = _run_finished_save_step(mocker, request, inter_stage_outputs=[{"codes": 1}])
 
     adapter.save_async.assert_not_called()

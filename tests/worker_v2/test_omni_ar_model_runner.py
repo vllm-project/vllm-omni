@@ -11,14 +11,26 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import torch
+from vllm.config import VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxRequestOutput
 from vllm.sampling_params import SamplingParams
+from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.worker.gpu.eplb_utils import EPLBController
+from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.model_runner import ExecuteModelState
 from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
+from vllm.v1.worker.gpu.states import RequestState
 
 import vllm_omni.worker_v2.omni_ar_model_runner as omni_ar_model_runner
-from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot
+from vllm_omni.config.model import OmniModelConfig
+from vllm_omni.core.sched.output import OmniNewRequestData
+from vllm_omni.engine.async_engine_utils import apply_omni_final_stage_metadata
+from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot
+from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
+from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner, OmniAsyncOutput
+from vllm_omni.worker_v2.omni_data_plane import OmniRunnerDataPlane
 from vllm_omni.worker_v2.output_snapshot import pack_output_snapshot
 
 pytestmark = [pytest.mark.core_model]
@@ -422,6 +434,8 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
         assert kwargs["text_hidden"] is None
     # The output-only policy must never remove the hidden states used to sample.
     assert runner.sample.call_args.args[0] is text_hidden
+    # Async-chunk only: a non-chunk step never masks its payload rows.
+    assert kwargs["downstream_payload_rows"] is None
     built = kwargs["model_runner_output"]
     assert built.kv_connector_output is connector_output
     torch.testing.assert_close(built.prompt_token_id_logprobs_dict["req"], torch.tensor([[2.0, 1.0], [4.0, 3.0]]))
@@ -1598,3 +1612,258 @@ def test_stream_history_allocates_only_for_scheduled_requests():
     torch.testing.assert_close(history.embeds[:1], embeds)
     state.finish_audio({"request"})
     assert not state._talker_inputs
+
+
+def _final_stage_payload(final_stage_id: int | None, *, force_kv_transfer: bool = False):
+    """Encode the routing marker exactly as the orchestrator sends it."""
+    if final_stage_id is None:
+        return None
+    request = EngineCoreRequest(
+        request_id="req",
+        prompt_token_ids=[1],
+        mm_features=None,
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+    tagged = apply_omni_final_stage_metadata(request, final_stage_id, force_kv_transfer=force_kv_transfer)
+    return tagged.additional_information
+
+
+def _routing_config(mocker, *, stage_id: int, engine_output_type: str | None, client_keys: tuple | None):
+    vllm_config = mocker.Mock(spec=VllmConfig)
+    vllm_config.model_config = mocker.Mock(spec=OmniModelConfig)
+    vllm_config.model_config.stage_id = stage_id
+    vllm_config.model_config.engine_output_type = engine_output_type
+    model = mocker.Mock(spec=torch.nn.Module)
+    if client_keys is not None:
+        model.omni_client_multimodal_output_keys = client_keys
+    return vllm_config, model
+
+
+def _routing_runner(mocker, payloads, *, stage_id=0, engine_output_type="latent", client_keys=None, data_plane=None):
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    runner._omni_data_plane = data_plane
+    runner.vllm_config, runner.model = _routing_config(
+        mocker, stage_id=stage_id, engine_output_type=engine_output_type, client_keys=client_keys
+    )
+    req_ids = list(payloads)
+    # Batch rows map to non-consecutive request-state slots.
+    slots = [5, 2, 7, 0][: len(req_ids)]
+    buffer = OmniIntermediateBuffer(8)
+    for slot, (req_id, payload) in zip(slots, payloads.items()):
+        data = mocker.Mock(spec=OmniNewRequestData)
+        data.req_id, data.prompt_embeds, data.additional_information = req_id, None, payload
+        data.model_intermediate_buffer, data.mm_features, data.sampling_params = None, [], None
+        buffer.add_request(slot, data)
+    runner.model_state = mocker.Mock(spec=OmniModelState)
+    runner.model_state.intermediate_buffer = buffer
+    batch = mocker.Mock(spec=InputBatch)
+    batch.req_ids, batch.num_reqs, batch.idx_mapping_np = req_ids, len(req_ids), np.array(slots)
+    return runner, batch
+
+
+_COMPANION_BATCH = {
+    "cond": _final_stage_payload(1),
+    "cond-uncond": _final_stage_payload(0, force_kv_transfer=True),
+    "unmarked": None,
+}
+
+
+@pytest.mark.parametrize(
+    ("payloads", "stage_id", "engine_output_type", "client_keys", "expected"),
+    [
+        pytest.param(_COMPANION_BATCH, 0, "latent", None, (True, False, True), id="cfg-companion"),
+        pytest.param({"a": _final_stage_payload(1), "b": _final_stage_payload(2)}, 0, "latent", None, None, id="all"),
+        pytest.param({"a": None, "b": None}, 0, "latent", None, None, id="no-marker-keeps-payload"),
+        pytest.param(
+            {"a": _final_stage_payload(1), "b": _final_stage_payload(2)}, 1, "latent", None, (False, True), id="stage-1"
+        ),
+        pytest.param(_COMPANION_BATCH, 0, "latent", ("audio",), None, id="client-keys-keep-all"),
+        pytest.param({"a": _final_stage_payload(0)}, 0, "audio", None, None, id="audio-terminal-keeps-all"),
+        pytest.param(
+            {"a": _final_stage_payload(0), "b": _final_stage_payload(0)}, 0, "Audio", None, None, id="audio-all-final"
+        ),
+        pytest.param(
+            {"a": _final_stage_payload(1), "b": _final_stage_payload(0)},
+            0,
+            "audio",
+            None,
+            (True, False),
+            id="audio-mixed",
+        ),
+    ],
+)
+@pytest.mark.cpu
+def test_downstream_payload_rows_from_engine_metadata(
+    mocker, payloads, stage_id, engine_output_type, client_keys, expected
+) -> None:
+    runner, batch = _routing_runner(
+        mocker, payloads, stage_id=stage_id, engine_output_type=engine_output_type, client_keys=client_keys
+    )
+    assert runner._downstream_payload_rows(batch) == expected
+
+
+@pytest.mark.parametrize(
+    ("marker", "stage_id", "expected"),
+    [
+        pytest.param(1, 0, True, id="later-stage"),
+        pytest.param(0, 0, False, id="stage-final"),
+        pytest.param(0, 1, False, id="earlier-stage"),
+        pytest.param("1", 0, True, id="str-later"),
+        pytest.param("0", 0, False, id="str-final"),
+        pytest.param(0.5, 0, False, id="float-truncates"),
+        pytest.param(True, 0, True, id="bool-as-int"),
+        pytest.param(None, 0, True, id="none-keeps"),
+        pytest.param("final", 0, True, id="non-numeric-keeps"),
+        pytest.param([0], 0, True, id="list-keeps"),
+    ],
+)
+@pytest.mark.cpu
+def test_final_stage_marker_coercion(marker, stage_id, expected) -> None:
+    """A malformed marker keeps the payload, so the scheduler guard still sees lost metadata."""
+    assert omni_ar_model_runner._row_needs_downstream_payload({"omni_final_stage_id": marker}, stage_id) is expected
+
+
+@pytest.mark.parametrize("info", [{}, None, [("omni_final_stage_id", 0)]], ids=["missing", "none", "non-dict"])
+@pytest.mark.cpu
+def test_missing_final_stage_marker_keeps_payload(info) -> None:
+    assert omni_ar_model_runner._row_needs_downstream_payload(info, 0) is True
+
+
+@pytest.mark.cpu
+def test_native_data_plane_keeps_stage_final_payloads(mocker) -> None:
+    """The native MRv2 data plane routes its own payloads: the runner produces no row mask."""
+    runner, batch = _routing_runner(mocker, _COMPANION_BATCH, data_plane=mocker.Mock(spec=OmniRunnerDataPlane))
+    assert runner._downstream_payload_rows(batch) is None
+
+
+@pytest.mark.parametrize(
+    ("connector_role", "engine_output_type", "native_plane", "expected"),
+    [
+        pytest.param("sender", "latent", False, (True, False, True), id="partitioned"),
+        pytest.param("receiver", "latent", False, None, id="partition-off"),
+        pytest.param("sender", "text", False, None, id="text-output"),
+        pytest.param("sender", "latent", True, None, id="native-plane"),
+    ],
+)
+@pytest.mark.cpu
+def test_sample_tokens_wires_stage_final_mask(
+    monkeypatch, mocker, connector_role, engine_output_type, native_plane, expected
+) -> None:
+    """An async-chunk connector sender passes the stage-final row mask snapshot to its async output."""
+    monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
+    data_plane = mocker.Mock(spec=OmniRunnerDataPlane) if native_plane else None
+    runner, batch = _routing_runner(
+        mocker, _COMPANION_BATCH, engine_output_type=engine_output_type, data_plane=data_plane
+    )
+    batch.idx_mapping, batch.query_start_loc = torch.from_numpy(batch.idx_mapping_np), torch.tensor([0, 1, 2, 3])
+    model_config = runner.vllm_config.model_config
+    model_config.async_chunk = True
+    model_config.stage_connector_config = {"extra": {"role": connector_role}}
+    runner.model_config = model_config
+    runner.vllm_config.kv_transfer_config = None
+    runner.model.compute_logits = lambda hidden: hidden
+    hidden = torch.arange(6.0).reshape(3, 2)
+    multimodal_outputs = {"latent": hidden.clone()}
+    runner.model_state.postprocess_model_output = mocker.Mock(return_value=(hidden, multimodal_outputs))
+    for hook in ("post_sample", "publish_sampled_embeddings", "prepare_streaming_audio_output", "get_request_errors"):
+        setattr(runner.model_state, hook, None)
+    runner.execute_model_state = ExecuteModelState(
+        input_batch=batch,
+        attn_metadata=None,
+        slot_mappings_by_layer=None,
+        hidden_states=hidden,
+        aux_hidden_states=None,
+        dp_sync_state=None,
+        finished_req_ids=set(),
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        num_spec_tokens_to_schedule=0,
+    )
+    runner._kv_extracted_req_ids = runner._last_aux_output = runner._last_multimodal_outputs = None
+    runner._last_multimodal_snapshot_slot = None
+    runner.aux_output_connector = runner.pp_handler = runner.speculator = runner.sampler = None
+    runner.omni_prefix_cache = runner._prefix_cache_group_view = None
+    runner.num_speculative_steps, runner.check_ep_fault = 0, False
+    runner._retain_multimodal_outputs = lambda outputs: outputs
+    sampled = SamplerOutput(torch.ones(3, 1, dtype=torch.long), None, None, torch.ones(3), torch.zeros(3))
+    runner.sample = mocker.Mock(return_value=(sampled, torch.ones(3), torch.zeros(3)))
+    runner.req_states = mocker.Mock(spec=RequestState)
+    runner.req_states.all_token_ids = runner.req_states.num_computed_tokens = mocker.Mock(spec=["gpu"])
+    runner.req_states.prompt_len = mocker.Mock(spec=["np", "gpu"])
+    runner.prompt_logprobs_worker = mocker.Mock(spec=PromptLogprobsWorker)
+    runner.prompt_logprobs_worker.compute_prompt_logprobs.return_value = {}
+    runner.prompt_logprobs_worker.compute_prompt_token_id_logprobs.return_value = {}
+    runner.main_stream = runner.output_copy_stream = mocker.Mock(spec=torch.cuda.Stream)
+    runner.postprocess_sampled = mocker.Mock()
+    runner.kv_connector = mocker.Mock(spec=["post_forward"])
+    runner.eplb = mocker.Mock(spec=EPLBController)
+    runner._reserve_native_data_plane_outputs = mocker.Mock()
+    runner._materialize_native_output = mocker.Mock(side_effect=lambda output: output)
+    async_output = mocker.Mock(spec=OmniAsyncOutput)
+    async_output.copy_event = None
+    build = mocker.patch.object(omni_ar_model_runner, "OmniAsyncOutput", return_value=async_output)
+
+    assert runner.sample_tokens(None) is async_output
+    kwargs = build.call_args.kwargs
+    assert kwargs["partition_async_payload"] is (connector_role == "sender")
+    assert kwargs["downstream_payload_rows"] == expected
+
+
+@pytest.mark.parametrize("snapshot", [False, True], ids=["mm-builder", "request-output-snapshot"])
+@pytest.mark.cpu
+def test_async_chunk_drops_connector_payload_for_stage_final_rows(monkeypatch, mocker, snapshot) -> None:
+    """A stage-final row (CFG companion) has no connector consumer; its client output stays."""
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    batch = mocker.Mock(spec=InputBatch)
+    batch.query_start_loc_np, batch.num_scheduled_tokens = np.array([0, 1, 2, 3]), np.array([1, 1, 1])
+    batch.num_reqs, batch.num_tokens_after_padding = 3, 3
+    latent, audio = torch.arange(6.0).reshape(3, 2), torch.arange(12.0).reshape(3, 4)
+    snapshots = []
+
+    def finalize(_mm, _num_sampled):
+        snapshots.append(
+            RequestOutputSnapshot(
+                inter_stage=[{"latent": latent[i : i + 1]} for i in range(3)],
+                client=[{"audio": audio[i : i + 1]} for i in range(3)],
+            )
+        )
+        return snapshots[-1]
+
+    def run(rows, *, partition=True):
+        return _async_output(
+            req_ids=["cond", "cond-uncond", "other"],
+            sampler_output=SamplerOutput(
+                torch.ones(3, 1, dtype=torch.long), None, None, torch.ones(3, dtype=torch.long), torch.zeros(3)
+            ),
+            num_sampled_tokens=torch.ones(3, dtype=torch.long),
+            multimodal_outputs={"latent": latent.clone(), "audio": audio.clone()},
+            input_batch=batch,
+            async_chunk=True,
+            partition_async_payload=partition,
+            finalize_multimodal=finalize if snapshot else None,
+            downstream_payload_rows=rows,
+        ).get_output()
+
+    unmasked, masked = run(None), run((True, False, True))
+    assert unmasked.inter_stage_outputs[1] is not None
+    assert masked.pooler_output is None
+    assert masked.inter_stage_outputs[1] is None
+    for i in (0, 2):
+        assert masked.inter_stage_outputs[i].keys() == unmasked.inter_stage_outputs[i].keys() == {"latent"}
+        assert torch.equal(masked.inter_stage_outputs[i]["latent"], unmasked.inter_stage_outputs[i]["latent"])
+    # The client channel, including the companion's row, is unchanged.
+    for got, ref in zip(masked.multimodal_outputs, unmasked.multimodal_outputs, strict=True):
+        assert got.keys() == ref.keys() == {"audio"} and torch.equal(got["audio"], ref["audio"])
+    if snapshot:
+        # The model-owned snapshot is not edited in place.
+        assert all(payload is not None for payload in snapshots[-1].inter_stage)
+    assert run((False, False, False)).inter_stage_outputs is None
+    # Without connector partitioning the payload is the orchestrator bridge: no mask.
+    bridge = run((True, False, True), partition=False)
+    assert bridge.pooler_output is bridge.inter_stage_outputs
+    assert torch.equal(bridge.inter_stage_outputs[1]["latent"], latent[1:2])

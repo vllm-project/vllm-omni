@@ -29,6 +29,7 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.worker.gpu.eplb_utils import step_eplb_after
+from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import get_drafter_hidden_states
 from vllm.v1.worker.workspace import use_workspace_lane
@@ -145,6 +146,22 @@ def _guard_graph_replay_for_pooler_copy(
     """Keep static graph outputs alive until non-snapshotted D2H completes."""
     if need_pooler and not async_chunk:
         main_stream.wait_event(copy_event)
+
+
+def _row_needs_downstream_payload(info: object, stage_id: int) -> bool:
+    """Whether a request row has a consumer for its connector payload.
+
+    ``apply_omni_final_stage_metadata`` tags each request with
+    ``omni_final_stage_id``. A row that ends at this stage (e.g. a CFG
+    companion) has none; the scheduler refuses to send such payloads and
+    warns "Skipping inter-stage chunk". A missing or malformed marker keeps it.
+    """
+    if not isinstance(info, dict):
+        return True
+    try:
+        return int(info["omni_final_stage_id"]) > stage_id
+    except (KeyError, TypeError, ValueError):
+        return True
 
 
 class OmniARModelRunner(OmniGPUModelRunner):
@@ -393,6 +410,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         materialize_native = self._uses_native_output_materializer()
         get_request_errors = getattr(self.model_state, "get_request_errors", None)
         async_chunk = bool(getattr(self.model_config, "async_chunk", False))
+        partition_async_payload = async_chunk and stage_sends_async_output(self.model_config)
         finalize_output = self._prefix_cache_output_finalizer(
             prefix_cache_rewrite,
             None if materialize_native else self._finalize_native_data_plane_output,
@@ -416,7 +434,11 @@ class OmniARModelRunner(OmniGPUModelRunner):
             # Connector senders drop the orchestrator pooler. Stage 0 still
             # partitions latent off the client channel and publishes it once
             # through pooling_output for llm2tts.
-            partition_async_payload=async_chunk and stage_sends_async_output(self.model_config),
+            partition_async_payload=partition_async_payload,
+            # Snapshot now: request slots can be reused before get_output().
+            downstream_payload_rows=(
+                self._downstream_payload_rows(input_batch) if need_pooler and partition_async_payload else None
+            ),
             finalize_output=finalize_output,
             finalize_multimodal=sampling_output.finalize_multimodal,
             check_ep_fault=self.check_ep_fault,
@@ -457,6 +479,31 @@ class OmniARModelRunner(OmniGPUModelRunner):
         if materialize_native:
             return self._materialize_native_output(async_output)
         return async_output
+
+    def _downstream_payload_rows(self, input_batch: InputBatch) -> tuple[bool, ...] | None:
+        """Per-row mask for connector payloads that the scheduler sends.
+
+        Returns None when every row keeps its payload. The native data plane
+        routes its own payloads. Models that declare client output keys, and
+        audio stages whose rows all end here, keep every row (as V1 did).
+        """
+        if getattr(self, "_omni_data_plane", None) is not None:
+            return None
+        if getattr(getattr(self, "model", None), "omni_client_multimodal_output_keys", ()):
+            return None
+        model_config = self.vllm_config.model_config
+        stage_id = getattr(model_config, "stage_id", 0)
+        buffers = self.model_state.intermediate_buffer.buffers
+        rows = tuple(
+            _row_needs_downstream_payload(buffers[input_batch.idx_mapping_np[i]], stage_id)
+            for i in range(input_batch.num_reqs)
+        )
+        if all(rows):
+            return None
+        # Kept from the V1 rule: an audio stage whose rows all end here keeps its payload.
+        if not any(rows) and (model_config.engine_output_type or "").lower() == "audio":
+            return None
+        return rows
 
     def _propose_draft_tokens(
         self,
@@ -964,6 +1011,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         async_chunk: bool = False,
         engine_output_type: str = "audio",
         partition_async_payload: bool | None = None,
+        downstream_payload_rows: tuple[bool, ...] | None = None,
         finalize_output: Any | None = None,
         finalize_multimodal: Any | None = None,
         check_ep_fault: bool = False,
@@ -985,6 +1033,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         self._partition_async_payload = (
             self._async_chunk if partition_async_payload is None else bool(partition_async_payload)
         )
+        self._downstream_payload_rows = downstream_payload_rows
         self._finalize_output = finalize_output
         self._finalize_multimodal = finalize_multimodal
         self._has_fault: torch.Tensor | None = None
@@ -1226,6 +1275,13 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 def copy_payload(payload: dict[str, Any]) -> dict[str, torch.Tensor]:
                     return _ensure_tensor_values(_async_copy_mm_value(payload))
 
+            if pooler_inter is not None and self._partition_async_payload and self._downstream_payload_rows:
+                # Stage-final rows have no connector consumer; their client output stays.
+                pooler_inter = [
+                    p if keep else None for p, keep in zip(pooler_inter, self._downstream_payload_rows, strict=True)
+                ]
+                if all(p is None for p in pooler_inter):
+                    pooler_inter = None
             # Connector senders publish through inter_stage_outputs only.
             # An orchestrator bridge such as llm2tts reads pooling_output.
             # Copying that payload onto multimodal_output as well makes the
