@@ -21,6 +21,7 @@ import traceback
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -76,6 +77,7 @@ from vllm_omni.diffusion.ipc import (
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, LoRABackend
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.request_streaming import request_chunk_transport
 from vllm_omni.diffusion.sched.interface import (
     DiffusionSchedulerOutput,
     KVPrefetchJob,
@@ -113,6 +115,31 @@ _ASYNC_OUTPUT_DRAIN_TIMEOUT_S = 10.0
 # Worker entry points that release device memory. Background D2H/SHM packing
 # still reads model output tensors, so it must finish before these run.
 _MEMORY_RELEASING_METHODS = frozenset({"sleep", "handle_sleep_task"})
+_REQUEST_CHUNK_EXECUTE_METHODS = frozenset({"execute_model", "execute_model_batch"})
+
+
+@dataclass
+class _AsyncOutputJob:
+    """One background D2H/SHM pack.
+
+    Final outputs stay ``OUTPUT_READY``. ``CHUNK_READY`` jobs are intermediate
+    media and must not send ``COMPUTE_DONE``.
+    """
+
+    output: Any
+    async_output_id: str
+    gpu_event: Any = None
+    kind: AsyncOutputKind = AsyncOutputKind.OUTPUT_READY
+    request_id: str | None = None
+    chunk_index: int | None = None
+
+
+def _coerce_async_output_job(item: Any) -> _AsyncOutputJob:
+    """Accept the historical ``(output, async_output_id, gpu_event)`` tuple."""
+    if isinstance(item, _AsyncOutputJob):
+        return item
+    output, async_output_id, gpu_event = item
+    return _AsyncOutputJob(output=output, async_output_id=async_output_id, gpu_event=gpu_event)
 
 
 def _cleanup_after_execution_error(exc: Exception) -> None:
@@ -459,7 +486,7 @@ class DiffusionWorker:
         # Worker-side cache of (lora_request, lora_scale) per scheduled
         # request id. Used by step mode to recover LoRA identity for cached
         # requests, which only carry their request_id in subsequent ticks.
-        self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
+        self._step_lora_state: dict[str, tuple[LoRARequest | list[LoRARequest] | None, float | list[float]]] = {}
         self._shutdown_complete = False
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.weight_transfer_engine: WeightTransferEngine | None = None
@@ -1202,7 +1229,7 @@ class DiffusionWorker:
 
         if self.lora_manager is not None:
             try:
-                self.lora_manager.set_request_adapter(
+                self.lora_manager.set_request_adapters(
                     request.sampling_params.lora_request, request.sampling_params.lora_scale
                 )
             except Exception as exc:
@@ -1237,7 +1264,7 @@ class DiffusionWorker:
         if self.lora_manager is not None and scheduler_output.scheduled_new_reqs:
             sp = scheduler_output.scheduled_new_reqs[0].req.sampling_params
             try:
-                self.lora_manager.set_request_adapter(sp.lora_request, sp.lora_scale)
+                self.lora_manager.set_request_adapters(sp.lora_request, sp.lora_scale)
             except Exception as exc:
                 if sp.lora_request is not None:
                     raise
@@ -1315,8 +1342,8 @@ class DiffusionWorker:
         if self.lora_manager is None:
             return
 
-        lora_request: LoRARequest | None = None
-        lora_scale = 1.0
+        lora_request: LoRARequest | list[LoRARequest] | None = None
+        lora_scale: float | list[float] = 1.0
         for request_id in scheduler_output.scheduled_request_ids:
             entry = self._step_lora_state.get(request_id)
             if entry is not None:
@@ -1324,7 +1351,7 @@ class DiffusionWorker:
                 break
 
         try:
-            self.lora_manager.set_request_adapter(lora_request, lora_scale)
+            self.lora_manager.set_request_adapters(lora_request, lora_scale)
         except Exception as exc:
             if lora_request is not None:
                 raise
@@ -1769,6 +1796,10 @@ class WorkerProc:
         self._async_output_thread: threading.Thread | None = None
         self._async_output_done = threading.Condition()
         self._async_output_pending = 0
+        # CHUNK_READY packs share ``_async_output_pending`` so drain waits for
+        # them, and use this counter so COMPUTE_DONE is enqueued only after
+        # those packs are already on ``result_mq``.
+        self._chunk_output_pending = 0
         # MessageQueue.acquire_write() is single-writer: it reads current_idx,
         # writes that block, then advances the index. The async output thread
         # enqueues OUTPUT_READY while the main loop enqueues COMPUTE_DONE, so
@@ -1821,6 +1852,8 @@ class WorkerProc:
             return
 
         # Async path: enqueue compute_done immediately, bg thread does D2H+SHM.
+        # CHUNK_READY packs already queued for this forward must hit result_mq
+        # first so the result pump delivers them before the RPC future resolves.
         if not self.od_config.step_execution and isinstance(output, (DiffusionOutput, BatchRunnerOutput)):
             async_output_id = WorkerProc._generate_async_output_id()
             gpu_event = current_omni_platform.record_device_event()
@@ -1869,39 +1902,136 @@ class WorkerProc:
             item = output_queue.get()
             if item is None:
                 break
-            output, async_output_id, gpu_event = item
+            job = _coerce_async_output_job(item)
             try:
                 # Cross-stream ordering: wait for default stream to finish
                 # writing the output tensors before the side stream reads.
-                if gpu_event is not None:
-                    d2h_stream.wait_event(gpu_event)
-                pack_diffusion_output_shm(output, d2h_stream=d2h_stream, **transport_options)
+                if job.gpu_event is not None:
+                    d2h_stream.wait_event(job.gpu_event)
+                pack_diffusion_output_shm(job.output, d2h_stream=d2h_stream, **transport_options)
                 d2h_stream.synchronize()
+                if (
+                    job.output is not None
+                    and hasattr(job.output, "async_output_id")
+                    and getattr(job.output, "async_output_id", None) is None
+                ):
+                    job.output.async_output_id = job.async_output_id
 
-                self._enqueue_result(
-                    AsyncDiffusionOutput(
-                        kind=AsyncOutputKind.OUTPUT_READY,
-                        async_output_id=async_output_id,
-                        output=output,
-                    )
-                )
+                self._enqueue_result(self._async_output_message(job))
             except Exception:
                 logger.exception(
                     "Async output packing failed for id '%s'; sending error",
-                    async_output_id,
+                    job.async_output_id,
                 )
                 self._enqueue_result(
-                    AsyncDiffusionOutput(
-                        kind=AsyncOutputKind.OUTPUT_READY,
-                        async_output_id=async_output_id,
+                    self._async_output_message(
+                        job,
+                        output=None,
                         error="Background D2H/SHM packing failed",
                     )
                 )
             finally:
                 with self._async_output_done:
-                    # Clamped: only items enqueued by _return_result are counted.
+                    # Clamped: only items enqueued by _return_result / emit_chunk are counted.
                     self._async_output_pending = max(0, self._async_output_pending - 1)
+                    if job.kind == AsyncOutputKind.CHUNK_READY:
+                        self._chunk_output_pending = max(0, getattr(self, "_chunk_output_pending", 0) - 1)
                     self._async_output_done.notify_all()
+
+    @staticmethod
+    def _async_output_message(
+        job: _AsyncOutputJob,
+        *,
+        output: Any | None = None,
+        error: str | None = None,
+    ) -> AsyncDiffusionOutput:
+        """Build the result-queue envelope for one packed async output."""
+        if output is None and error is None:
+            output = job.output
+        message = AsyncDiffusionOutput(
+            kind=job.kind,
+            async_output_id=job.async_output_id,
+            output=output,
+            error=error,
+        )
+        if job.kind == AsyncOutputKind.CHUNK_READY:
+            message.request_id = job.request_id
+            message.chunk_index = job.chunk_index
+        return message
+
+    def _wait_chunk_outputs(self, timeout: float | None = None) -> bool:
+        """Block until CHUNK_READY packs from this forward are on ``result_mq``."""
+        if timeout is None:
+            timeout = _ASYNC_OUTPUT_DRAIN_TIMEOUT_S
+        with self._async_output_done:
+            if getattr(self, "_chunk_output_pending", 0) == 0:
+                return True
+            return bool(
+                self._async_output_done.wait_for(
+                    lambda: getattr(self, "_chunk_output_pending", 0) == 0,
+                    timeout=timeout,
+                )
+            )
+
+    def _make_emit_chunk(self, request_id: str) -> Callable[[DiffusionOutput], None]:
+        """Return the media-rank emitter. It never sends ``COMPUTE_DONE``."""
+
+        def emit_chunk(output: DiffusionOutput) -> None:
+            if not isinstance(output, DiffusionOutput):
+                raise TypeError(f"emit_chunk expected DiffusionOutput, got {type(output).__name__}")
+            if output.finished:
+                raise ValueError("request chunk emit requires DiffusionOutput.finished=False")
+            if self._async_output_queue is None:
+                raise RuntimeError("request chunk emit requires the async output queue")
+            async_output_id = WorkerProc._generate_async_output_id()
+            output.async_output_id = async_output_id
+            gpu_event = current_omni_platform.record_device_event()
+            with self._async_output_done:
+                self._async_output_pending += 1
+                self._chunk_output_pending = getattr(self, "_chunk_output_pending", 0) + 1
+            self._async_output_queue.put(
+                _AsyncOutputJob(
+                    output=output,
+                    async_output_id=async_output_id,
+                    gpu_event=gpu_event,
+                    kind=AsyncOutputKind.CHUNK_READY,
+                    request_id=request_id,
+                    chunk_index=output.chunk_index,
+                )
+            )
+
+        return emit_chunk
+
+    @contextmanager
+    def _request_chunk_transport(self, method: str, should_reply: bool) -> Iterator[None]:
+        """Close emits and drain chunks before either success or error RPC return."""
+        if method not in _REQUEST_CHUNK_EXECUTE_METHODS or self.od_config.step_execution:
+            yield
+            return
+        factory = self._make_emit_chunk if should_reply and self.result_mq is not None else None
+        forward_error: BaseException | None = None
+        try:
+            with request_chunk_transport(factory):
+                yield
+        except BaseException as exc:
+            forward_error = exc
+            raise
+        finally:
+            if not self._wait_chunk_outputs():
+                # Returning an error while old chunks remain queued would allow
+                # the same request id to be reused before its output retires.
+                # Stop this Worker; the failure monitor tears down the group.
+                pending = int(getattr(self, "_chunk_output_pending", 0) or 0)
+                logger.error(
+                    "Worker %s: request CHUNK_READY drain timed out with %s pack(s) still "
+                    "pending (method=%s); shutting down Worker to avoid request-id reuse. "
+                    "forward_error=%r",
+                    self.gpu_id,
+                    pending,
+                    method,
+                    forward_error,
+                )
+                raise SystemExit("Request chunk outputs did not drain; refusing to reuse the Worker") from forward_error
 
     def drain_async_outputs(self, timeout: float | None = None) -> bool:
         """Block until background D2H/SHM packing has no work left.
@@ -2029,8 +2159,8 @@ class WorkerProc:
                 raise TimeoutError("Diffusion async outputs did not drain before pause")
             if method in _MEMORY_RELEASING_METHODS:
                 self.drain_async_outputs()
-            # Use execute_method from WorkerWrapperBase for consistent method resolution
-            result = self.worker.execute_method(method, *args, **kwargs)
+            with self._request_chunk_transport(method, should_reply):
+                result = self.worker.execute_method(method, *args, **kwargs)
         except Exception as e:
             logger.error(f"Error executing RPC: {e}", exc_info=True)
             status.update(

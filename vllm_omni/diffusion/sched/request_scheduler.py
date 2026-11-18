@@ -20,6 +20,7 @@ from vllm_omni.diffusion.sched.interface import (
     SchedulerRequestState,
     _AdmissionWaitDecision,
 )
+from vllm_omni.lora.utils import build_lora_batch_key
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import AttentionScheduleConfig
@@ -36,7 +37,7 @@ _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(
     "attention_sigma_schedule",
     "condition_key",
     "flow_shift",
-    "lora_int_id",
+    "lora_key",
     "sample_solver",
 }
 
@@ -76,7 +77,7 @@ def build_request_batch_sampling_params_key(
     key_kwargs["sample_solver"] = _normalize_explicit_sample_solver(extra_args.get("sample_solver"))
     key_kwargs["flow_shift"] = _normalize_explicit_flow_shift(extra_args.get("flow_shift"))
     key_kwargs["condition_key"] = getattr(request, "batch_compatibility_key", None)
-    key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
+    key_kwargs["lora_key"] = build_lora_batch_key(lora_request, getattr(sampling, "lora_scale", None))
     key_kwargs["attention_schedule"] = resolve_request_attention_schedule(sampling, attention_schedule_config)
     key_kwargs["attention_schedule_explicit"] = sampling.attention_schedule is not None
     key_kwargs["attention_sigma_schedule"] = resolve_request_attention_sigma_schedule(
@@ -146,9 +147,7 @@ class RequestScheduler(BaseScheduler):
         """
         if not request_batch_key_allowed(request, self.od_config, supported=self._mixfusion_supported):
             return None
-        return build_request_batch_sampling_params_key(
-            request, getattr(self.od_config, "diffusion_attention_schedule", None)
-        )
+        return build_request_batch_sampling_params_key(request, self.od_config.diffusion_attention_schedule)
 
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: BaseRunnerOutput) -> set[str]:
         scheduled_request_ids = sched_output.scheduled_request_ids

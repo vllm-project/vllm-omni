@@ -388,6 +388,29 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable vLLM-Omni mode for multi-modal and diffusion models",
         )
+        omni_config_group.add_argument(
+            "--disable-websocket-compression",
+            action="store_true",
+            default=False,
+            help="Disable per-message deflate for all WebSocket routes on this server. "
+            "Useful for already-compressed video streams, including browser clients.",
+        )
+        omni_config_group.add_argument(
+            "--video-output-warmup",
+            type=str,
+            default=None,
+            metavar="REQUEST_JSON",
+            help="Run a streaming video session.start JSON file before HTTP startup. "
+            "Requires explicit num_frames and no playback pacing. Disabled when omitted.",
+        )
+        omni_config_group.add_argument(
+            "--video-output-warmup-timeout",
+            type=float,
+            default=180.0,
+            metavar="SECONDS",
+            help="Generation/encoding deadline for --video-output-warmup (default: 180 seconds). "
+            "A failure or timeout aborts server startup.",
+        )
         serve_parser.maybe_override_argument(
             omni_config_group,
             "--watermark-config",
@@ -1643,6 +1666,7 @@ def run_headless(args: TrackingNamespace) -> None:
         engine_args_dict=engine_args_dict,
         headless=True,
         watermark_config=args.watermark_config,
+        local_replica_count=omni_dp_size_local,
     )
     parallel_config = vllm_config.parallel_config
 
