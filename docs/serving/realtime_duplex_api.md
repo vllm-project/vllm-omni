@@ -526,8 +526,9 @@ and graph mode. The example inherits the duplex profile. For a turn-mode
 comparison, point `base_config` at `minicpmo_4_5_turn.yaml` in the same deploy
 directory instead; the overlay above does not change the turn-mode profile,
 while editing the shared `minicpmo_4_5.yaml` affects both serving modes.
-The turn profile also turns on stage-0 prefix caching on CUDA, which the duplex
-profile keeps off; keep that setting the same across the backends you compare.
+On CUDA both shipped profiles disable stage-0 prefix caching and use the
+same seven-token n-gram lookahead. Keep the resolved prefix-cache and
+speculative decoding settings fixed when comparing attention backends.
 
 For a quality comparison, keep the source and model revisions, reference audio,
 input audio/video, frame rate, pacing, window settings, sampling parameters,
