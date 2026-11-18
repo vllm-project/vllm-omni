@@ -176,13 +176,15 @@ def test_mrv2_mixed_batch_touches_only_enabled_rows() -> None:
     logits[:, respond] = 2.0
     logits[:, 3] = 9.0
     ctx = SimpleNamespace(expanded_idx_mapping=torch.tensor([0, 1, 2], dtype=torch.int32))
+    # apply() edits in place and returns the same tensor, so snapshot the input first.
+    before = logits.clone()
     out = proc.apply(logits, ctx)  # type: ignore[arg-type]
     # Row 0: first step, enabled -> only the control pair survives.
     assert out[0, 3] == float("-inf")
     assert out[0, silent] == 1.5
     assert out[0, respond] == 2.0
-    # Row 1: not streaming -> untouched.
-    assert torch.equal(out[1], logits[1])
+    # Row 1: not streaming -> untouched, compared against the pre-apply snapshot.
+    assert torch.equal(out[1], before[1])
     # Row 2: body step, enabled -> control pair masked, body kept.
     assert out[2, silent] == float("-inf")
     assert out[2, respond] == float("-inf")
