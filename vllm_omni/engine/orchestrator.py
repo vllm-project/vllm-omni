@@ -27,6 +27,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, cast
 
 import janus
+import numpy as np
 import torch
 from opentelemetry.trace import Tracer
 from vllm.config import ModelConfig
@@ -99,7 +100,7 @@ from vllm_omni.outputs import OmniRequestOutput, StagePostWarmupMemoryStats
 from vllm_omni.tracing import RequestTrace
 
 if TYPE_CHECKING:
-    from vllm_omni.engine import OmniEngineCoreOutput
+    from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
     from vllm_omni.engine.stage_client import StagePoolClient
 
 logger = init_logger(__name__)
@@ -196,6 +197,13 @@ def build_engine_core_request_from_tokens(
 
     prompt_token_ids = prompt.get("prompt_token_ids")
     prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
+    # vLLM 0.34 types EngineCoreRequest.prompt_token_ids as a 32-bit int
+    # ``np.ndarray`` at runtime (TokenBuffer asserts itemsize == 4); coerce
+    # list prompts so /v1/run stage inputs round-trip through
+    # ``msgspec.convert`` symmetrically (a decoded plain list fails the
+    # ndarray field check).
+    if isinstance(prompt_token_ids, list):
+        prompt_token_ids = np.asarray(prompt_token_ids, dtype=np.int32)
 
     sampling_params = None
     pooling_params = None
@@ -325,9 +333,14 @@ class OrchestratorRequestState:
     # Per-request pipeline timing accumulator (milliseconds)
     pipeline_timings: dict[str, float] = field(default_factory=dict)
     # A session-owned request's lifetime belongs to a session (duplex), not to
-    # its own ``finished`` flag: no synthetic terminal, no client emission of
-    # stage-0 segment ends, no terminal re-forward, no cleanup on finish.
+    # its own ``finished`` flag: no synthetic terminal on the client queue, no
+    # client emission of stage-0 segment ends, no terminal re-forward, no
+    # cleanup on finish. A swallowed final-stage request-end is routed through
+    # intercept instead of ``output_async_queue``.
     session_owned: bool = False
+    # Final-stage processed output kept ``finished=True`` through intercept.
+    # Session raw-terminal fallback must not emit a second empty done.
+    routed_final_finished: bool = False
     # Duplex sentence TTS already submitted this output. Do not also run the
     # legacy full-text handoff for the same stage result.
     skip_legacy_stage_forward: bool = False
@@ -587,7 +600,7 @@ class OrchestratorBase:
             self._membership.install_membership_handlers(
                 output_queue=self.output_async_queue,
                 cleanup_callback=cleanup_member_requests,
-                replica_removed_callback=self._remove_stage_replica_metrics,
+                replica_removed_callback=self._handle_replica_removed,
                 replica_added_callback=self._publish_replica_post_warmup_memory,
             )
             membership_watcher = self._membership.start()
@@ -1186,6 +1199,7 @@ class OrchestratorBase:
             processed = [
                 output for output in processed if getattr(output, "request_id", None) not in reported_session_errors
             ]
+        self._stamp_poll_segment_finished(stage_id, raw_outputs, processed)
 
         if self._stat_logger is not None and (raw_outputs.scheduler_stats is not None or iteration_stats is not None):
             self._stat_logger.record(
@@ -1689,6 +1703,7 @@ class OrchestratorBase:
                     stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
 
             await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
+            self._note_routed_stage_output(stage_id, output, req_state)
 
     async def _handle_stage_error(
         self,
@@ -1751,6 +1766,19 @@ class OrchestratorBase:
         engine_idx = self._stage_replica_to_engine_idx.get((stage_id, replica_id))
         if self._stat_logger is not None and engine_idx is not None:
             self._stat_logger.remove_stage_post_warmup_memory(engine_idx=engine_idx)
+
+    async def _handle_replica_removed(self, stage_id: int, replica_id: int) -> None:
+        """Membership detach: drop stats, then let the stage owner react.
+
+        The owner seam runs before ``MembershipController`` cleans up the requests
+        the removed address was routing, so a session-based owner can close its
+        sessions with a typed error instead of letting them time out.
+        """
+        self._remove_stage_replica_metrics(stage_id, replica_id)
+        await self._on_replica_removed(stage_id, replica_id)
+
+    async def _on_replica_removed(self, stage_id: int, replica_id: int) -> None:
+        """Seam for stage owners after a replica detaches; the base does nothing."""
 
     def _sync_engines_waiting_counter(self) -> None:
         """Aggregate per-replica waiting into the counter shared with the
@@ -2120,6 +2148,25 @@ class OrchestratorBase:
             self._shared_requests.finish(cleanup_ids, aborted=abort or trace_error is not None)
         return abort_outputs
 
+    def _stamp_poll_segment_finished(
+        self, stage_id: int, raw_outputs: OmniEngineCoreOutputs, processed: list[RequestOutput]
+    ) -> None:
+        """Bind this poll's ``is_segment_finished`` onto processed outputs.
+
+        Duplex intercept must not read a leftover ``streaming.segments[stage].finished``
+        from an earlier sentence park. Turn-based requests do not need this.
+        """
+        del stage_id, raw_outputs, processed
+
+    def _note_routed_stage_output(
+        self,
+        stage_id: int,
+        output: object,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        """Record that a processed output was routed; no-op outside duplex."""
+        del stage_id, output, req_state
+
     async def _apply_raw_terminal_stage_finish(
         self,
         stage_id: int,
@@ -2213,6 +2260,17 @@ class OrchestratorBase:
         )
         return True
 
+    async def _finish_session_owned_raw_terminal(
+        self,
+        stage_id: int,
+        replica_id: int,
+        request_id: str,
+        req_state: OrchestratorRequestState,
+        pool: StagePool,
+    ) -> None:
+        """Route a swallowed duplex request-end through intercept; no-op outside duplex."""
+        del stage_id, replica_id, request_id, req_state, pool
+
     async def _finish_raw_terminal_requests(
         self,
         stage_id: int,
@@ -2224,7 +2282,10 @@ class OrchestratorBase:
 
         for request_id in request_ids:
             req_state = self.request_states.get(request_id)
-            if req_state is None or req_state.session_owned:
+            if req_state is None:
+                continue
+            if req_state.session_owned:
+                await self._finish_session_owned_raw_terminal(stage_id, replica_id, request_id, req_state, pool)
                 continue
             if req_state.trace is not None:
                 req_state.trace.finish_stage(stage_id)
@@ -2293,16 +2354,6 @@ class OrchestratorBase:
                     *self._cfg_tracker.cleanup_parent(request_id),
                 ]
             )
-
-    def _diffusion_params_for_samples(self, req_state: OrchestratorRequestState, src_stage_id: int, params: Any) -> Any:
-        """Tell the diffusion stage how many per-sample KV caches to receive."""
-        params = _without_per_sample_kv_count(params)
-        n = getattr(req_state.sampling_params_list[src_stage_id], "n", 1) or 1
-        if n <= 1 or not self.stage_pools[src_stage_id].per_sample_kv:
-            return params
-        params = copy.copy(params)
-        params.extra_args = {**(params.extra_args or {}), PER_SAMPLE_KV_COUNT_KEY: n}
-        return params
 
     def _maybe_clone_diffusion_params_for_cfg(self, request_id: str, params: Any) -> Any:
         """Attach CFG companion ids to diffusion sampling params when needed."""
@@ -3190,7 +3241,7 @@ class OrchestratorBase:
                 already_submitted=already_submitted,
                 t_submit_start=_t_submit_start,
                 submit_kwargs=submit_kwargs,
-                params_override=self._diffusion_params_for_samples(
+                params_override=cast(Orchestrator, self)._diffusion_params_for_samples(
                     req_state, src_stage_id, self._maybe_clone_diffusion_params_for_cfg(req_id, params)
                 ),
                 pinned_replica_id=pinned_replica_id,
@@ -3515,6 +3566,13 @@ class OrchestratorBase:
             )
         )
 
+    def _prewarm_downstream_resumable(
+        self, stage_id: int, entry_request: Any, req_state: OrchestratorRequestState
+    ) -> bool:
+        """Keep the entry request's streaming lifetime on downstream stages."""
+        del stage_id
+        return bool(getattr(entry_request, "resumable", req_state.streaming.enabled))
+
     async def _prewarm_async_chunk_stages(
         self,
         request_id: str,
@@ -3653,7 +3711,7 @@ class OrchestratorBase:
                 base_input["prompt_token_ids"] = [0] * next_prompt_len
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
-                downstream_resumable = bool(getattr(entry_request, "resumable", req_state.streaming.enabled))
+                downstream_resumable = self._prewarm_downstream_resumable(next_stage_id, entry_request, req_state)
                 # Session-owned and resumable requests keep their downstream
                 # request across turns, so they stay on the chunk-0 path.
                 if attach_prewarm_payload and not req_state.session_owned and not downstream_resumable:
@@ -4103,7 +4161,7 @@ class Orchestrator(OrchestratorBase):
                     request_id,
                     stage_id,
                     f"streaming (resumable) input is not supported: stage {mrv2_stage_id} runs on "
-                    "model_runner v2, which supports turn-based requests only; use model_runner: v1 "
+                    "model_runner v2, which supports turn-based requests only; select a V2 duplex profile "
                     "for that stage",
                 )
                 return

@@ -26,10 +26,16 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer, set_request_perf_chunk
 from vllm_omni.core.sched.fast_allocate import install_decode_allocate_fast_path
-from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.core.sched.omni_scheduler_mixin import (
+    OmniSchedulerMixin,
+    _request_finishes_on_next_stop,
+)
 from vllm_omni.core.sched.output import OmniChunkCommit
 from vllm_omni.core.sched.utils import (
     free_kv_blocks_in_physical_order,
+)
+from vllm_omni.core.sched.utils import (
+    streaming_update_replaces_prompt as _streaming_update_replaces_prompt,
 )
 from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
@@ -45,6 +51,50 @@ class _ChunkSaveKwargs(TypedDict, total=False):
     duplex_perf_chunk: tuple[int, int]
     segment_generation: int | None
     force_request_finished: bool
+
+
+def _segment_generation_of(request: Request) -> int | None:
+    """Scheduler segment identity for this poll, if the request carries one."""
+    raw = getattr(request, "_omni_segment_generation", None)
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None
+    return raw
+
+
+def _enqueue_last_sentence_chunk(
+    scheduler: OmniSchedulerMixin,
+    request: Request,
+    inter_stage_output: dict[str, Any] | None,
+    scheduler_output: SchedulerOutput,
+    req_id: str,
+    *,
+    is_segment_finished: bool,
+    new_token_ids: list[int],
+    confirmed_num_computed_tokens: int | None,
+) -> None:
+    """Enqueue the last-sentence vocoder chunk before ``_free_request``.
+
+    Saving after free drops that chunk; Code2Wav then parks on the last
+    segment until the client times out. Immediate ``save_async``, not
+    ``batch_saves``: the batch flush runs after the caller loop.
+    """
+    adapter = scheduler.chunk_transfer_adapter
+    if adapter is None:
+        return
+    save_kwargs: _ChunkSaveKwargs = {
+        "new_token_ids": new_token_ids,
+        "confirmed_num_computed_tokens": confirmed_num_computed_tokens,
+        "force_request_finished": True,
+    }
+    perf_chunk = OmniSchedulerMixin._duplex_step_chunk(scheduler, scheduler_output, req_id)
+    if isinstance(perf_chunk, tuple):
+        save_kwargs["duplex_perf_chunk"] = perf_chunk
+    adapter.save_async(
+        inter_stage_output,
+        request,
+        is_segment_finished,
+        **save_kwargs,
+    )
 
 
 def _should_emit_engine_output(
@@ -986,6 +1036,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             and not requires_token_updates
             else None
         )
+        # The worker's output order follows its batch, not num_scheduled_tokens.
+        # ModelRunnerOutput.req_id_to_index was dropped upstream; derive the
+        # row index from req_ids like the pin's scheduler does.
+        req_indices = {req_id: i for i, req_id in enumerate(model_runner_output.req_ids)}
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             if num_tokens_scheduled <= 0:
                 # A zero-token schedule entry used to die on the bare assert
@@ -1035,7 +1089,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # request is aborted while the model is executing it (e.g.,
                 # in pipeline parallelism or async scheduling).
                 continue
-            req_index = model_runner_output.req_id_to_index[req_id]
+            req_index = req_indices[req_id]
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
 
             stale_async_tokens = int(getattr(request, "async_tokens_to_discard", 0) or 0)
@@ -1210,7 +1264,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             stopped = sampling_validation_failed
             is_segment_finished = False
+            output_segment_generation = _segment_generation_of(request)
             finished = False
+            finish_on_next_stop = False
+            enqueued_finish_on_next_stop = False
             new_token_ids = generated_token_ids
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
@@ -1300,6 +1357,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             num_generation_tokens = _num_generation_tokens(request)
             processor_request = request
             if stopped:
+                # Last sentence: this 2150 is the Code2Wav request terminal.
+                # Mixin copies the stamp onto the parked session; also read the
+                # last sentence's additional_information in case that copy
+                # missed the wire shape. Only this stamp may force a request
+                # finish — a bare 2150 is still a segment park for other models.
+                finish_on_next_stop = _request_finishes_on_next_stop(request)
+                if finish_on_next_stop:
+                    request.resumable = False
                 if (
                     request.resumable
                     and self.chunk_transfer_adapter is not None
@@ -1317,11 +1382,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
                 finish_reason = request.get_finished_reason()
+                # Capture before ``_handle_stopped_request``: a queued
+                # StreamingUpdate in the same step bumps generation, and this
+                # park's eco must keep the generation that just stopped.
+                output_segment_generation = _segment_generation_of(request)
                 if self.chunk_transfer_adapter is not None:
-                    try:
-                        boundary_generation = int(getattr(request, "_omni_segment_generation", 0) or 0)
-                    except (TypeError, ValueError):
-                        boundary_generation = 0
+                    boundary_generation = 0 if output_segment_generation is None else output_segment_generation
                 finished = self._handle_stopped_request(request)
                 is_segment_finished = not finished
                 if finished:
@@ -1369,6 +1435,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     request.spec_token_ids = []
                     request._output_token_ids.clear()
                 if finished:
+                    # Last-sentence terminal: enqueue the vocoder chunk *before*
+                    # ``_free_request``. Saving after free drops that chunk
+                    # (#6670); Code2Wav then parks on the last segment until the
+                    # client times out. Immediate ``save_async``, not
+                    # ``batch_saves``: the batch flush runs after this loop.
+                    if finish_on_next_stop and self.chunk_transfer_adapter is not None and not omits_chunk_transfer:
+                        _enqueue_last_sentence_chunk(
+                            self,
+                            request,
+                            inter_stage_output,
+                            scheduler_output,
+                            req_id,
+                            is_segment_finished=is_segment_finished,
+                            new_token_ids=new_token_ids,
+                            confirmed_num_computed_tokens=confirmed_num_computed_tokens,
+                        )
+                        enqueued_finish_on_next_stop = True
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
@@ -1436,6 +1519,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     routed_experts=routed_experts,
                     num_nans_in_logits=request.num_nans_in_logits,
                     is_segment_finished=is_segment_finished,
+                    segment_generation=output_segment_generation,
                     new_prompt_len_snapshot=self._new_prompt_len_snapshot.get(req_id),
                     num_generation_tokens=num_generation_tokens,
                 )
@@ -1464,6 +1548,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if (
                 self.chunk_transfer_adapter is not None
                 and not omits_chunk_transfer
+                and not enqueued_finish_on_next_stop
                 and (
                     inter_stage_output is not None
                     or (new_token_ids and requires_token_updates)
@@ -1755,13 +1840,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         session.mm_features.extend(update.mm_features)
                 self._finish_streaming_session_update(session, update)
                 return
-        replace_streaming_prompt = any(
-            isinstance(info, dict)
-            and isinstance(info.get("meta"), dict)
-            and info["meta"].get("replace_streaming_prompt") is True
-            for info in update_infos
-        )
-        if replace_streaming_prompt:
+        if _streaming_update_replaces_prompt(update_infos):
             self._release_replaced_streaming_prompt_cache(session)
             self._replace_streaming_session(session, update)
             return

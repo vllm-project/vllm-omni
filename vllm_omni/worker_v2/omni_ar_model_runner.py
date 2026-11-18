@@ -193,9 +193,15 @@ class OmniARModelRunner(OmniGPUModelRunner):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> Any:
+        flush_pending_metadata = getattr(self.model, "flush_pending_metadata", None)
+        if callable(flush_pending_metadata):
+            # Capture and unsuccessful forwards can leave unassigned metadata.
+            # Discard it without clearing metadata already bound to live requests.
+            flush_pending_metadata(())
         if not dummy_run:
             self._handle_kv_transfer_pre(scheduler_output)
-        return super().execute_model(
+        previous_state = self.execute_model_state if not dummy_run else None
+        output = super().execute_model(
             scheduler_output,
             intermediate_tensors,
             dummy_run=dummy_run,
@@ -205,6 +211,13 @@ class OmniARModelRunner(OmniGPUModelRunner):
             valid_dummy_state_slots=valid_dummy_state_slots,
             randomize_inputs=randomize_inputs,
         )
+        state = self.execute_model_state
+        if not dummy_run and state is not None and state is not previous_state:
+            # Preserve model-owned RoPE metadata in the actual forward order
+            # before the next step exports the finished requests' KV caches.
+            if callable(flush_pending_metadata):
+                flush_pending_metadata(state.input_batch.req_ids)
+        return output
 
     # ------------------------------------------------------------------
     # sample_tokens: OmniOutput handling + pooler_output + async D2H
@@ -398,7 +411,6 @@ class OmniARModelRunner(OmniGPUModelRunner):
         # --- Build base output ---
         model_runner_output = OmniModelRunnerOutput(
             req_ids=input_batch.req_ids,
-            req_id_to_index={rid: i for i, rid in enumerate(input_batch.req_ids)},
             sampled_token_ids=None,  # type: ignore[arg-type]
             prompt_logprobs_dict=prompt_logprobs_dict,
             prompt_token_id_logprobs_dict=prompt_token_id_logprobs_dict,
@@ -479,7 +491,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         model_runner_output.kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.ec_connector_output = ec_connector_output
 
-        self._reserve_native_data_plane_outputs(list(model_runner_output.req_ids))
+        self._reserve_native_data_plane_outputs(model_runner_output)
         if materialize_native:
             return self._materialize_native_output(async_output)
         return async_output

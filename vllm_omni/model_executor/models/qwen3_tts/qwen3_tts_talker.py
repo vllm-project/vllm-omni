@@ -183,6 +183,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
     # that it never writes again, so the runner stores them without copying.
     preprocess_prefill_updates_owned = True
 
+    # forward returns backbone tensors; make_omni_output packages audio afterward.
+    mrv2_forward_returns_tensor = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         from vllm_omni.platforms import current_omni_platform
@@ -397,7 +400,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             torch.zeros(1, int(self.talker_config.hidden_size), dtype=model_dtype),
             persistent=False,
         )
-        self._embedding_dtype = torch.bfloat16
+        self._embedding_dtype = model_dtype
 
         tokenizer_config = Qwen3TTSTokenizerV2Config.from_pretrained(
             self.model_path,
@@ -446,6 +449,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             speaker_cache=self._speaker_cache,
             ref_audio_artifact_cache_max_entries=_ref_audio_artifact_cache_capacity(vllm_config),
         )
+        self._prompt_builder._embedding_dtype = model_dtype
         self._load_custom_voice_profiles()
 
     # -------------------- custom voice profiles --------------------

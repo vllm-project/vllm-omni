@@ -81,6 +81,8 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
 
     multimodal_outputs: list[dict[str, object]] | None = None
     inter_stage_outputs: list[dict[str, Any] | None] | None = None
+    # MRv2-only tags frozen before asynchronous output materialization.
+    _duplex_perf_chunks: dict[str, tuple[int, int]] | None = None
     # IDs of requests whose KV cache has been extracted from GPU/NPU to CPU.
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None
@@ -101,7 +103,6 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":
         return cls(
             req_ids=[],
-            req_id_to_index={},
             sampled_token_ids=[],
             logprobs=None,
             prompt_logprobs_dict={},

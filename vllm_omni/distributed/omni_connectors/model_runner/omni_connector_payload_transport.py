@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 from vllm.distributed.parallel_state import get_tp_group
 
-from vllm_omni.data_entry_keys import OmniPayload, returns_stage_payload
+from vllm_omni.data_entry_keys import OmniPayload, OmniPayloadStruct, returns_stage_payload, to_dict
 from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime import (
     _OmniConnectorRuntimeMixin,
     logger,
@@ -1804,6 +1804,14 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         emitted = 0
         completions: list[Any] = []
         for request, payload in entries:
+            # Read only the tag frozen with this output, not a request buffer
+            # that may already describe the next chunk. Builders can reuse
+            # payloads, so keep request-specific metadata off shared objects.
+            perf_chunk = getattr(request, "_omni_duplex_perf_chunk", None)
+            if perf_chunk is not None:
+                if isinstance(payload, OmniPayloadStruct):
+                    payload = to_dict(payload)
+                payload = {**payload, "meta": {**(payload.get("meta") or {}), "duplex_perf_chunk": list(perf_chunk)}}
             enqueued, completion = self._enqueue_chunk_payload(request, payload, wait_for_delivery=wait_for_delivery)
             if enqueued:
                 emitted += 1

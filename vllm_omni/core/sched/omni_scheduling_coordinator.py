@@ -344,7 +344,8 @@ class OmniSchedulingCoordinator:
                     new_prompt = [0] * next_len
                     request.prompt_token_ids = new_prompt
                     request.num_prompt_tokens = next_len
-                    request._all_token_ids.clear()
+                    # TokenBuffer (array) has no .clear(); del-slice like the pin.
+                    del request._all_token_ids[:]
                     request._all_token_ids.extend(new_prompt)
                     request._output_token_ids.clear()
                     request.num_computed_tokens = 0
@@ -353,7 +354,8 @@ class OmniSchedulingCoordinator:
             prompt_token_ids = list(update.prompt_token_ids)
             request.prompt_token_ids = prompt_token_ids
             request.num_prompt_tokens = len(prompt_token_ids)
-            request._all_token_ids.clear()
+            # TokenBuffer (array) has no .clear(); del-slice like the pin.
+            del request._all_token_ids[:]
             request._all_token_ids.extend(prompt_token_ids)
             request._output_token_ids.clear()
             request.num_computed_tokens = 0
@@ -437,6 +439,7 @@ class OmniSchedulingCoordinator:
                         OmniChunkRecvHandle(
                             request_id=request.request_id,
                             external_req_id=request.external_req_id,
+                            payload_sender_info=getattr(request, "payload_sender_info", None),
                         )
                     )
                     request.status = RequestStatus.WAITING_FOR_CHUNK
