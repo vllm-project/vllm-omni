@@ -14,7 +14,7 @@ meta:
 
 model:
   model_id: "fishaudio/s2-pro"
-  min_vllm_version: "0.19.0"
+  min_vllm_version: "0.34.0"
   architecture: dense
   parameter_count: "4.6B"
   active_parameters: "4.6B"
@@ -71,7 +71,7 @@ guide: |
   - **Hardware**: a single CUDA GPU. Reference run: 1x A800 80 GB — the model
     loads at ~48.3 GiB and peaks ~48.9 GiB during inference. A two-GPU profile
     (`fish_qwen3_omni_2gpu.yaml`) is available for higher concurrency.
-  - **vLLM-Omni** targeting vLLM >= 0.19.
+  - **vLLM-Omni** targeting vLLM 0.34.0.
   - The DAC codec is included in vLLM-Omni.
 
   ## Installation
