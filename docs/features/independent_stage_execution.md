@@ -142,6 +142,8 @@ if __name__ == "__main__":
     main()
 ```
 
+Run MiniMax H3 text encoder by using Independent Stage Execution: [independent_stage_execution.md](independent_stage_execution.md)
+
 ## Limitations
 
 This feature is early in its development and currently has the following gaps.

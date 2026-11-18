@@ -84,3 +84,26 @@ MINIMAX_H3_DECODE_PIPELINE = PipelineConfig(
         ),
     ),
 )
+
+MINIMAX_H3_S0_ONLY_PIPELINE = PipelineConfig(
+    model_type="minimax_h3_s0_only",
+    stage_cli_aliases={"text_encoder_tp_size": (0, "tensor_parallel_size")},
+    model_arch="MiniMaxH3Encoder",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="text_encoder",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            model_arch="MiniMaxH3Encoder",
+            engine_output_type="latent",
+            prompt_transform_func=f"{_PROCESSOR}.prepare_encoder_prompt",
+            sampling_constraints={"max_tokens": 1, "temperature": 0.0, "detokenize": False},
+            model_path_resolver=f"{_CHECKPOINT}.resolve_minimax_h3_model_root",
+            final_output=True,
+            final_output_type="latent",
+        ),
+    ),
+)

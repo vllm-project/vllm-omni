@@ -21,19 +21,25 @@ from vllm_omni.model_executor.models.minimax_h3.encoder_processing import prepar
 from vllm_omni.model_executor.models.minimax_h3.timeline_guides import MINIMAX_H3_TIMELINE_GUIDES_KEY
 
 
+
 def _diffusion_sampling_params(sampling_params_list: Sequence[Any]) -> Any:
     diffusion_params = [
         sampling_params
         for sampling_params in sampling_params_list
         if isinstance(sampling_params, OmniDiffusionSamplingParams)
     ]
-    if len(diffusion_params) != 1:
-        raise RuntimeError(
-            "MiniMax H3 encoding requires exactly one OmniDiffusionSamplingParams stage parameter, "
-            f"got {len(diffusion_params)}"
-        )
-    return diffusion_params[0]
-
+    if len(diffusion_params) == 1:
+        return diffusion_params[0]
+    if not diffusion_params:
+        # /v1/run at encoder-only stage: stage 0 params built by LLM type;
+        # encoder consumes only extra_args and optional fps/num_frames/height/width.
+        fallback = [p for p in sampling_params_list if getattr(p, "extra_args", None)]
+        if len(fallback) == 1:
+            return fallback[0]
+    raise RuntimeError(
+        "MiniMax H3 encoding requires exactly one OmniDiffusionSamplingParams stage parameter, "
+        f"got {len(diffusion_params)}"
+    )
 
 def prepare_encoder_prompt(
     prompt: Any,
