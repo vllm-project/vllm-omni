@@ -324,7 +324,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
-            num_common_prefix_blocks=num_common_prefix_blocks,
+            # vLLM 0.34 removed num_common_prefix_blocks and ec_manager_metadata
+            # from SchedulerOutput; the parameter stays for callers, and the
+            # encoder-cache manager no longer publishes per-step metadata.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             # Preemptions accumulated since the previous step; cleared by
@@ -333,10 +335,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             # Upstream drains the manager-side list every step (unbounded growth
             # otherwise) and applies _skip_zero_block_ids before zeroing.
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
-            ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
         )
+        del num_common_prefix_blocks
 
         # KVTransfer: package metadata
         if self.connector is not None:
@@ -354,6 +356,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         scheduler_output.kv_connector_block_state = None
 
         return scheduler_output
+
+    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        self._enforce_kstep_span_uniformity(scheduler_output)
+        super()._update_after_schedule(scheduler_output)
 
     def _is_done_receiving_chunks(self, request_id: str) -> bool:
         if self.chunk_transfer_adapter is not None:
@@ -405,7 +411,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             request.status = RequestStatus.WAITING
             self._enqueue_waiting_request(request)
             return False
-        return super()._handle_stopped_request(request)
+        finished = super()._handle_stopped_request(request)
+        if not finished:
+            # The pin no longer enqueues inside the base stop handler.
+            self._enqueue_waiting_request(request)
+        return finished
 
     def _requeue_completed_native_chunks(self) -> None:
         """Return completed native generation chunks to the admission queue.
@@ -708,11 +718,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self._postprocess_omni_schedule_output(res)
                 return self._wrap_omni_scheduler_output(res)
 
-        # Compute common prefix blocks (aligned with v1)
+        # Compute common prefix blocks (aligned with v1). vLLM 0.34 removed
+        # KVCacheManager.get_num_common_prefix_blocks and the SchedulerOutput
+        # field, so the fast path keeps the placeholder the builder drops.
         num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
-        if self.running:
-            any_request = self.running[0]
-            num_common_prefix_blocks = self.kv_cache_manager.get_num_common_prefix_blocks(any_request.request_id)
 
         # Assemble the current SchedulerOutput contract.
         if self.use_v2_model_runner:
@@ -733,7 +742,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # No running/resumed reqs scheduled in our fast path
         cached_reqs_data = self._make_cached_request_data(
             running_reqs=scheduled_running_reqs,
-            resumed_reqs=[],
             num_scheduled_tokens=num_scheduled_tokens,
             spec_decode_tokens=scheduled_spec_decode_tokens,
             req_to_new_blocks=req_to_new_blocks,
@@ -741,9 +749,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         cached_reqs_data = OmniCachedRequestData(
             req_ids=cached_reqs_data.req_ids,
-            resumed_req_ids=cached_reqs_data.resumed_req_ids,
             new_token_ids=cached_reqs_data.new_token_ids,
-            all_token_ids=cached_reqs_data.all_token_ids,
             new_block_ids=cached_reqs_data.new_block_ids,
             num_computed_tokens=cached_reqs_data.num_computed_tokens,
             num_output_tokens=cached_reqs_data.num_output_tokens,
@@ -752,10 +758,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         )
 
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-
-        # Record request ids scheduled in this step for the next update.
-        self.prev_step_scheduled_req_ids.clear()
-        self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
         scheduler_output = self._build_generation_scheduler_output(
             new_reqs_data,
@@ -877,6 +879,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         ):
             self.processed_step_seq += 1
             self._drain_deferred_frees()
+            # HiSparse async loads must wait for the same completed-step fence.
+            if getattr(self, "defer_async_loads", False):
+                self._drain_deferred_loads()
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -909,6 +914,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # the below loop can be a performance bottleneck. We should do our best
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
+        # The worker's output order follows its batch, not num_scheduled_tokens.
+        # ModelRunnerOutput.req_id_to_index was dropped upstream; derive the
+        # row index from req_ids like the pin's scheduler does.
+        req_indices = {req_id: i for i, req_id in enumerate(model_runner_output.req_ids)}
         stopped_preempted_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
@@ -947,7 +956,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # this output must not be appended or emitted.
                 continue
 
-            req_index = model_runner_output.req_id_to_index[req_id]
+            req_index = req_indices[req_id]
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
 
             scheduled_spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
@@ -1012,21 +1021,24 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 request.num_computed_tokens -= num_tokens_scheduled
             elif self.chunk_transfer_adapter is not None and getattr(self, "_supports_pending_generation", False):
                 self.chunk_transfer_adapter.mark_chunk_consumed(req_id)
+            async_chunk_transport = self._async_chunk_transport_enabled()
+            input_terminal = (
+                self._input_execution_is_terminal(request.request_id, scheduler_output)
+                if async_chunk_transport
+                else False
+            )
             if (
                 request.status == RequestStatus.FINISHED_ERROR
                 or request.status == RequestStatus.FINISHED_STOPPED
                 or (
-                    not self._async_chunk_transport_enabled()
+                    not async_chunk_transport
                     and not generation_pending
                     and request.num_computed_tokens >= request.num_prompt_tokens
                 )
                 or (
-                    self._async_chunk_transport_enabled()
+                    async_chunk_transport
                     and not generation_pending
-                    and self._input_execution_is_terminal(
-                        request.request_id,
-                        scheduler_output,
-                    )
+                    and input_terminal
                     and request.num_computed_tokens >= len(request.prompt_token_ids)
                 )
             ):
@@ -1035,6 +1047,13 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Optional: set a stop_reason for front-end clarity
                 # (does not affect protocol)
                 stopped = True
+                if self._native_data_plane is True and input_terminal:
+                    # V1 ChunkTransferAdapter recv sets resumable=False on
+                    # meta.finished. MRv2 native only stamps input_terminal;
+                    # a session-owned Code2Wav would otherwise park this stop
+                    # as WAITING_FOR_STREAMING_REQ and the client never sees
+                    # response.done.
+                    request.resumable = False
 
             # Validate grammar before terminal cleanup and finish-reason capture.
             if OmniSchedulerMixin._reject_invalid_grammar_tokens(self, request, new_token_ids):
@@ -1118,6 +1137,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             if request in stopped_running_reqs or request.is_finished():
                 continue
             request.status = RequestStatus.FINISHED_STOPPED
+            if self._native_data_plane is True:
+                # Native pending_finish is the empty last codec window after
+                # upstream meta.finished. Same V1 recv contract as above.
+                request.resumable = False
             finish_reason = request.get_finished_reason()
             finished = self._handle_stopped_request(request)
             is_segment_finished = not finished

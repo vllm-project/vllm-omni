@@ -255,7 +255,7 @@ def print_comparison_table(all_runs: list[list[dict]], labels: list[str]) -> Non
         # Improvement column (2-run comparison only)
         if len(all_runs) == 2:
             print(f"\n### Improvement ({labels[0]} vs {labels[1]})\n")
-            print("| Metric | Concurrency | Change |")
+            print("| Metric | Concurrency | Improvement |")
             print("| --- | --- | --- |")
             for metric, key, _ in perf_metrics:
                 for c in concurrencies:
@@ -268,7 +268,8 @@ def print_comparison_table(all_runs: list[list[dict]], labels: list[str]) -> Non
                     v0 = _get(conc_map0.get(c, {}), key)
                     v1 = _get(conc_map1.get(c, {}), key)
                     if not math.isnan(v0) and not math.isnan(v1) and v1 > 0:
-                        pct = (v1 - v0) / v1 * 100
+                        delta = v0 - v1 if key == "audio_throughput" else v1 - v0
+                        pct = delta / v1 * 100
                         print(f"| {metric} | {c} | {pct:+.1f}% |")
 
 

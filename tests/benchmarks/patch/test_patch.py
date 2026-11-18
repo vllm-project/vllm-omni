@@ -10,6 +10,7 @@ import base64
 import json
 import time
 from argparse import Namespace
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,7 @@ from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SeedTTSSampleRequest,
     SeedTTSTextSampleRequest,
+    SeedTTSTurn,
 )
 from vllm_omni.benchmarks.patch import patch
 from vllm_omni.benchmarks.patch.patch import (
@@ -351,6 +353,92 @@ def test_stage0_token_timings_use_weighted_tpot_when_itls_are_incomplete():
     assert output.itl == []
     assert output.tpot_measured is True
     assert (output.text_latency - output.ttft) / 4 == pytest.approx(0.02)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("aggregation", ["session", "response"])
+@pytest.mark.parametrize("save_metrics", [False, True])
+async def test_grouped_seed_tts_response_percentiles_without_save_flag(monkeypatch, mocker, aggregation, save_metrics):
+    from vllm.benchmarks.serve import TaskType
+
+    from vllm_omni.benchmarks.metrics.metrics import calculate_metrics
+
+    monkeypatch.setattr(patch, "_DUPLEX_METRIC_AGGREGATION", aggregation)
+    latencies = iter([100.0, 300.0, 800.0])
+    probe_type = patch._RealtimeTTSProbe
+
+    @asynccontextmanager
+    async def fake_probe(_url):
+        events = EventCollector()
+        latency = next(latencies)
+
+        async def stream_silence(**_kwargs):
+            now = time.monotonic()
+            events.add({"type": "response.created", "response": {"id": "r"}}, received_at_s=now)
+            events.add(
+                {"type": "response.output_audio_transcript.delta", "response_id": "r", "delta": "hello"},
+                received_at_s=now + latency / 1000,
+            )
+            events.add(
+                {
+                    "type": "response.output_audio.delta",
+                    "response_id": "r",
+                    "delta": base64.b64encode(b"\x00\x00" * 2400).decode(),
+                    "sample_rate_hz": 24_000,
+                    "metadata": {"audio_duration_ms": 100},
+                },
+                received_at_s=now + (latency + 100) / 1000,
+            )
+            events.add(
+                {
+                    "type": "response.done",
+                    "response": {"id": "r"},
+                    "response_request_metrics": {"ttft_ms": latency, "ttfp_ms": latency + 100},
+                },
+                received_at_s=now + 1,
+            )
+            return 1.0
+
+        probe = probe_type(_url)
+        probe.events = events
+        monkeypatch.setattr(probe, "configure", mocker.AsyncMock())
+        monkeypatch.setattr(probe, "stream_silence", stream_silence)
+        monkeypatch.setattr(probe, "acknowledge_playback", mocker.AsyncMock())
+        monkeypatch.setattr(probe, "turn_session_stats", mocker.AsyncMock(return_value={}))
+        monkeypatch.setattr(probe, "close_session", mocker.AsyncMock())
+        yield probe
+
+    monkeypatch.setattr(patch, "_RealtimeTTSProbe", fake_probe)
+    outputs = []
+    for size in (2, 1):
+        request = _seed_tts_request_func_input()
+        request.extra_body = {"save_duplex_request_metrics": True} if save_metrics else {}
+        request.seed_tts_turns = tuple(
+            SeedTTSTurn(utterance_id=str(index), target_text="hello") for index in range(size)
+        )
+        output = await async_request_openai_realtime_duplex(request, session=None)
+        assert output.success, output.error
+        assert bool(getattr(output, "duplex_request_metrics", None)) == (save_metrics or aggregation == "response")
+        outputs.append(output)
+
+    metrics, _ = calculate_metrics(
+        input_requests=[],
+        outputs=outputs,
+        dur_s=1.0,
+        tokenizer=None,
+        selected_percentiles=[50.0, 95.0],
+        duplex_metric_aggregation=aggregation,
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=[],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=1.0,
+    )
+    count, p50, p95 = (3, 300.0, 750.0) if aggregation == "response" else (2, 500.0, 770.0)
+    assert (metrics.num_ttft_samples, metrics.num_audio_ttfp_samples, metrics.num_audio_rtf_samples) == (count,) * 3
+    assert dict(metrics.percentiles_ttft_ms) == pytest.approx({50: p50, 95: p95})
+    assert dict(metrics.percentiles_audio_ttfp_ms) == pytest.approx({50: p50 + 100, 95: p95 + 100})
 
 
 def test_stage0_zero_itls_fall_back_to_positive_tpot():
@@ -2384,6 +2472,70 @@ async def test_benchmark_preserves_stage_metrics_request_order_and_missing_snaps
     )
     assert completion_order.index(1) < completion_order.index(0)
     assert result["request_stage_metrics"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("endpoint_type", "speech_extra"),
+    [("openai-chat-omni", None), ("openai-chat-omni", {"ref_audio": "x"}), ("openai-audio-speech", {"ref_audio": "x"})],
+)
+async def test_benchmark_warmups_do_not_seed_prefix_cache(monkeypatch, endpoint_type, speech_extra):
+    """The ready check and each warmup carry a private cache_salt; measured requests and dataset fields are unchanged."""
+    sent = []
+
+    async def request_func(request_func_input, session, pbar=None):
+        sent.append((request_func_input.request_id, request_func_input.extra_body or {}))
+        return MixRequestFuncOutput(
+            success=True, prompt_len=1, output_tokens=1, ttft=0.01, text_latency=0.1, latency=0.1
+        )
+
+    monkeypatch.setitem(patch.ASYNC_REQUEST_FUNCS, endpoint_type, request_func)
+    extra_body = {"return_stage_metrics": True}
+    await patch.benchmark(
+        task_type=patch.TaskType.GENERATION,
+        endpoint_type=endpoint_type,
+        api_url="http://unused/v1/unused",
+        base_url="http://unused",
+        model_id="test-model",
+        model_name="test-model",
+        tokenizer=None,
+        input_requests=[
+            SeedTTSSampleRequest(
+                prompt="hello",
+                prompt_len=1,
+                expected_output_len=1,
+                request_id=str(i),
+                seed_tts_speech_extra=speech_extra,
+            )
+            for i in range(2)
+        ],
+        logprobs=None,
+        request_rate=float("inf"),
+        burstiness=1.0,
+        disable_tqdm=True,
+        num_warmups=3,
+        profile=False,
+        selected_percentile_metrics=[],
+        selected_percentiles=[],
+        ignore_eos=True,
+        goodput_config_dict={},
+        max_concurrency=2,
+        lora_modules=None,
+        extra_headers=None,
+        extra_body=extra_body,
+        ready_check_timeout_sec=5,
+    )
+    assert extra_body == {"return_stage_metrics": True}
+    warmup_salts = [body.get("cache_salt") for request_id, body in sent if not request_id]
+    measured = [body for request_id, body in sent if request_id]
+    assert len(warmup_salts) == 4 and len(measured) == 2
+    assert all("cache_salt" not in body for body in measured)
+    if speech_extra:
+        assert all(body["ref_audio"] == "x" for _, body in sent)
+    if endpoint_type in patch.CACHE_SALT_BACKENDS:
+        assert all(warmup_salts) and len(set(warmup_salts)) == 4
+    else:
+        assert warmup_salts == [None] * 4
 
 
 @pytest.mark.parametrize("snapshot", [None, {}, "not-a-dict"])

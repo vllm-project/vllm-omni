@@ -639,7 +639,13 @@ def test_generate_cancel_bounds_cleanup_abort(monkeypatch):
         await asyncio.sleep(0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=1.0)
+            # Harness bound only - it guards against a wedged cleanup, while the
+            # semantic bound is the monkeypatched ABORT_TIMEOUT_S=0.05 asserted
+            # via seen_timeouts below. CI scheduling stalls (CPU throttling, GC
+            # pauses) can delay the cleanup chain for ~1s before the inner bound
+            # arms (issue #10165), so keep generous headroom here instead of
+            # matching the inner bound's magnitude.
+            await asyncio.wait_for(task, timeout=5.0)
         assert seen_timeouts
         assert seen_timeouts[-1] == 0.05
         assert omni.request_states == {}
@@ -905,11 +911,15 @@ def test_run_entry_stage_yields_at_entry_stage():
         delta_params = SamplingParams(output_kind=RequestOutputKind.DELTA)
 
         response = await omni.run_entry_stage(
-            {"prompt": "hi"}, [delta_params, SamplingParams()], request_id="entry-call"
+            {"prompt": "hi"},
+            [delta_params, SamplingParams()],
+            request_id="entry-call",
+            requested_replica_id=1,
         )
 
         assert isinstance(response, NextStageInputMessage)
         assert re.fullmatch(r"entry-call-[0-9a-f]{8}-0", submitted["request_id"])
+        assert submitted["requested_replica_id"] == 1
         assert (submitted["final_stage_id"], submitted["yield_stage_id"]) == (1, 0)
         assert all(params.output_kind == RequestOutputKind.FINAL_ONLY for params in submitted["sampling_params_list"])
         assert omni.request_states == {}
@@ -941,12 +951,17 @@ def test_run_downstream_stage_resubmits_and_returns_finished_output():
 
         omni.engine.add_next_stage_input_async = fake_add_next_stage_input_async
 
-        response = await omni.run_downstream_stage(stage_input, request_id="downstream-call")
+        response = await omni.run_downstream_stage(
+            stage_input,
+            request_id="downstream-call",
+            requested_replica_id=0,
+        )
 
         assert isinstance(response, OutputMessage)
         assert response.finished is True
         assert re.fullmatch(rf"downstream-call-[0-9a-f]{{8}}-{next_stage_id}", submitted[0].request_id)
         assert response.request_id == submitted[0].request_id
+        assert submitted[0].requested_replica_id == 0
         assert omni.request_states == {}
 
     asyncio.run(run())

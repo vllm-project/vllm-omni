@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from vllm.benchmarks.serve import main_async
+from vllm.benchmarks.serve import main_async as vllm_main_async
 
 # Import patch to register daily-omni dataset and omni backends
 # This monkey-patches vllm.benchmarks.datasets.get_samples before it's used
@@ -19,7 +19,9 @@ from vllm.benchmarks.serve import main_async
 import vllm_omni.benchmarks.patch.patch  # noqa: F401
 from vllm_omni.benchmarks.omniinteract import omniinteract_output_lock
 from vllm_omni.benchmarks.patch.patch import (
+    CAPTURE_AUDIO_STREAM_DETAILS,
     maybe_enable_stage_metrics,
+    set_duplex_metric_aggregation,
     set_fail_fast_on_timeout,
     set_print_stage,
     set_request_timeout_s,
@@ -72,7 +74,14 @@ def _validate_fail_fast_on_timeout(args: argparse.Namespace) -> None:
         )
 
 
-def main(args: argparse.Namespace) -> dict[str, Any]:
+async def main_async(args: argparse.Namespace) -> dict[str, Any]:
+    """Run the common serving lifecycle from async protocol/CI callers too."""
+    if getattr(args, "realtime_video_evaluate", None):
+        # Saved outputs are scored after the generation server has released its
+        # devices; no server discovery, tokenizer or benchmark traffic is needed.
+        from vllm_omni.benchmarks.realtime_video.eval import evaluate_from_args
+
+        return await asyncio.to_thread(evaluate_from_args, args)
     if getattr(args, "seed_tts_wer_eval", False):
         os.environ["SEED_TTS_WER_EVAL"] = "1"
     if getattr(args, "seed_tts_wer_save_items", False):
@@ -88,6 +97,7 @@ def main(args: argparse.Namespace) -> dict[str, Any]:
     _validate_fail_fast_on_timeout(args)
     set_fail_fast_on_timeout(getattr(args, "omni_fail_fast_on_timeout", False))
     set_print_stage(getattr(args, "print_stage", False))
+    set_duplex_metric_aggregation(getattr(args, "duplex_metric_aggregation", "session"))
     args.extra_body = maybe_enable_stage_metrics(
         getattr(args, "extra_body", None),
         enabled=should_request_stage_metrics(args),
@@ -97,5 +107,13 @@ def main(args: argparse.Namespace) -> dict[str, Any]:
         if getattr(args, "dataset_name", None) == "omniinteract"
         else contextlib.nullcontext()
     )
-    with lock:
-        return asyncio.run(main_async(args))
+    token = CAPTURE_AUDIO_STREAM_DETAILS.set(bool(getattr(args, "save_detailed", False)))
+    try:
+        with lock:
+            return await vllm_main_async(args)
+    finally:
+        CAPTURE_AUDIO_STREAM_DETAILS.reset(token)
+
+
+def main(args: argparse.Namespace) -> dict[str, Any]:
+    return asyncio.run(main_async(args))

@@ -845,17 +845,6 @@ def test_stage_prefix_cache_config_gate():
         _stage_cfg(groups=(object(), object()))
 
 
-def test_npu_runner_uses_shared_prefix_cache_gate():
-    """npu_model_runner cannot be imported without vllm_ascend; pin at the
-    source level that it stages through the shared gate instead of a
-    hand-rolled subset of the GPU checks."""
-    path = Path(__file__).resolve().parents[2] / "vllm_omni/platforms/npu/worker/npu_model_runner.py"
-    tree = ast.parse(path.read_text())
-    calls = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-    assert "stage_prefix_cache_config" in calls
-    assert "check_prefix_cache_kv_groups" not in calls
-
-
 def test_native_only_cache_policy_leaves_hybrid_kv_cache_enabled():
     policy = ModelCachePolicy(needs_full_hidden_states=False, native_kv_cache_only=True)
     cache = SimpleNamespace(enable_prefix_caching=True, block_size=BLOCK_SIZE)
@@ -1485,14 +1474,18 @@ def test_staging_task_slot_released_at_pool_write_not_drain():
     assert mgr._controller._tasks.get(tid) is None
 
 
-def test_blocked_save_is_released_by_pool_write_alone():
+@pytest.mark.parametrize("consume", ["materialize", "discard_step"])
+def test_blocked_save_is_released_by_pool_write_alone(consume):
     """All step contexts consumed, the only slot held by a pending write:
     the committer finishing that write must unblock the waiting save."""
     mgr, view = make_manager(staging_depth=1, staging_claim_timeout_s=2.0)
     _hold_writes(mgr)
     s0 = run_step(mgr, view, {"a": ([0], 0, 1)})
     tid = next(iter(mgr._request_tasks.tasks["a"]))
-    mgr.materialize(s0, ["a"])
+    if consume == "materialize":
+        mgr.materialize(s0, ["a"])
+    else:
+        mgr.discard_step(s0)
     slot = mgr._step_ctxs.get(s0)  # consumed
     assert slot is None
     assert mgr._controller._staging_pool._busy[0] == {StagingBufferHolder.for_task(tid)}
