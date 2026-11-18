@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
@@ -27,7 +30,10 @@ LONGCAT_NEXT_THINKER_ONLY_PIPELINE = PipelineConfig(
             # "latent" thinkers get their codes payload without a decoder stage.
             engine_output_type="latent",
             sampling_constraints={"detokenize": True},
-            prompt_expand_func=f"{_PROC}.expand_longcat_cfg_prompts",
+            # No prompt_expand_func: CFG twin expansion only runs on
+            # multi-stage pipelines (async_omni_engine gates it on
+            # final_stage_id > 0), and this understanding-only pipeline has
+            # no generation stage to decode a visual twin.
         ),
     ),
 )

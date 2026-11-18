@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """vLLM multimodal processor for LongCat-Next.
 
 The checkpoint's own ``__call__`` only accepts file paths embedded in the

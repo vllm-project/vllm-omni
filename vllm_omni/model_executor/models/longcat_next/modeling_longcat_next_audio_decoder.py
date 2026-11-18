@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """LongCat-Next audio decoder stage (audio codes -> 24 kHz waveform).
 
 Runs the checkpoint's remote-code LongcatNextAudioTokenizer decode path (VQ

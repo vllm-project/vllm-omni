@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """LongCat-Next thinker stage — native vLLM port.
 
 The 74B MoE+MLA backbone runs on vLLM's native FlashNgramModel, so TP, paged
@@ -32,7 +35,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
-from vllm.model_executor.models.longcat_flash import FlashConfig
+from vllm.model_executor.models.longcat_flash import LongcatFlashConfig as FlashConfig
 from vllm.model_executor.models.longcat_flash_ngram import FlashNgramModel, NgramEmbedding
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,

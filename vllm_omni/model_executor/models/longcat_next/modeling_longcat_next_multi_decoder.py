@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """LongCat-Next combined decoder stage: audio codes -> waveform, OR visual
 codes -> RGB image, from one process.
 

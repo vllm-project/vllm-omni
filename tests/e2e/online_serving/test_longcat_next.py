@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 E2E online-serving smoke test for LongCat-Next.
@@ -20,13 +20,15 @@ decided, rather than guessing at an ``extra_body`` shape here.
 
 import os
 
+# Must be set before tests.helpers.runtime imports vllm, which reads it at
+# import time when it resolves the worker process launch method.
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
 import pytest
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
 from tests.helpers.stage_config import get_deploy_config_path
-
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 MODEL = "meituan-longcat/LongCat-Next"
 _DEPLOY = get_deploy_config_path("longcat_next_4gpu_80gb_multi_decoder.yaml")
@@ -60,5 +62,9 @@ def test_text_only(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "messages": messages,
         "stream": False,
+        # Text in, text out: without this the shared client defaults to
+        # ["text", "audio"] and assert_omni_response requires audio output,
+        # which a text-only request can never produce.
+        "modalities": ["text"],
     }
     openai_client.send_omni_request(request_config)

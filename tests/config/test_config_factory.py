@@ -2349,8 +2349,10 @@ stages:
         assert s0.model_stage == "thinker"
         assert s0.yaml_engine_args["model_arch"] == "LongcatNextForCausalLM"
         assert s0.yaml_engine_args["engine_output_type"] == "latent"
-        # visual-CFG twin expansion must survive the deploy merge
-        assert s0.yaml_extras["prompt_expand_func"].endswith("expand_longcat_cfg_prompts")
+        # Single-stage pipeline: no CFG twin expansion (prompt expansion only
+        # runs on multi-stage pipelines), so no prompt_expand_func may leak in
+        # from the multi-decoder pipeline's stage 0.
+        assert "prompt_expand_func" not in s0.yaml_extras
         assert s0.yaml_extras["default_sampling_params"]["detokenize"] is True
 
     def test_longcat_next_multi_decoder_deploy_merges_two_stages(self):

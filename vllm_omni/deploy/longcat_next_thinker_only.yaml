@@ -11,9 +11,8 @@ enable_prefix_caching: false
 
 stages:
   - stage_id: 0
-    # >= 2 so a request's visual-CFG twin decodes in the same step as its
-    # parent (the model combines both streams' logits per step). With
-    # max_num_seqs=1 the twin decodes separately and CFG silently no-ops.
+    # Understanding-only: several concurrent requests share each decode
+    # step, so batched serving needs headroom beyond a single sequence.
     max_num_seqs: 2
     tensor_parallel_size: 4
     devices: "0,1,2,3"

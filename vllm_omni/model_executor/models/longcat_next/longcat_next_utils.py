@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Shared helpers for the LongCat-Next stages.
 
 Token-id layout: text + special tokens occupy [0, 131125); visual codes
@@ -125,10 +128,16 @@ def load_weight_subtree(
     prefix: str,
     *,
     dtype: torch.dtype | None = None,
-    strict: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Load only the ``prefix``-scoped tensors from a sharded checkpoint, so
-    a decoder stage never materialises the full backbone in memory."""
+    a decoder stage never materialises the full backbone in memory.
+
+    Raises when the snapshot has no keys -- or not ALL keys -- under
+    ``prefix``: a partially-covered subtree would leave the remaining
+    parameters randomly initialized while the decoder still reports success,
+    yielding silent garbage audio/images. Unexpected (extra) checkpoint keys
+    stay a warning: they do not corrupt the loaded subtree.
+    """
     from safetensors import safe_open
 
     index_path = os.path.join(model_path, "model.safetensors.index.json")
@@ -154,9 +163,13 @@ def load_weight_subtree(
                     tensor = tensor.to(dtype)
                 state_dict[key[len(dotted) :]] = tensor
 
-    missing, unexpected = module.load_state_dict(state_dict, strict=strict)
+    missing, unexpected = module.load_state_dict(state_dict, strict=False)
     if missing:
-        logger.warning("load_weight_subtree(%s): %d missing keys (e.g. %s)", prefix, len(missing), missing[:3])
+        raise RuntimeError(
+            f"load_weight_subtree({prefix}): {len(missing)} module parameters have no "
+            f"checkpoint entry (e.g. {sorted(missing)[:3]}) -- the decoder would run "
+            "on randomly initialized tensors; the snapshot is stale or partial"
+        )
     if unexpected:
         logger.warning("load_weight_subtree(%s): %d unexpected keys (e.g. %s)", prefix, len(unexpected), unexpected[:3])
     return list(missing), list(unexpected)

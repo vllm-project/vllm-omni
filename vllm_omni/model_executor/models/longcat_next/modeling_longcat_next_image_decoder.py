@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """LongCat-Next image decoder stage (visual codes -> RGB image).
 
 Runs the checkpoint's remote-code LongcatNextVisualTokenizer decode path

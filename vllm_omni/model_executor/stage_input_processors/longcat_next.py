@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Stage input processors bridging LongCat-Next thinker -> decoders.
 
 Neither visual (image) nor audio (speech) generation goes through the
