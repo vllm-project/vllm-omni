@@ -3,6 +3,7 @@
 """Exercise upstream Mooncake completion accounting without device/network I/O."""
 
 import asyncio
+from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -19,11 +20,28 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 @pytest.fixture
-def producer(monkeypatch):
+def mooncake_clock(monkeypatch):
+    # Freeze only Mooncake's deadline clock, not asyncio or the shared time
+    # module. Slow CI scheduling must not expire a live fanout ticket.
+    clock = Mock(return_value=1000.0)
+    monkeypatch.setattr(mc, "time", SimpleNamespace(perf_counter=clock, monotonic=mc.time.monotonic))
+    return clock
+
+
+@pytest.fixture
+def producer(monkeypatch, mooncake_clock):
     worker = object.__new__(mc.MooncakeConnectorWorker)
     worker.shutdown = Mock()  # No hardware constructor, sockets or listener thread.
     worker.is_kv_consumer = False
     worker.tp_rank, worker.tp_size = 0, 1
+    # vLLM 0.34 lease bookkeeping read by record_send_reqs / heartbeats;
+    # None = lease disabled, so send deadlines fall back to the
+    # monkeypatched VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT below.
+    worker._kv_lease_duration = None
+    worker._lease_reqs = {}
+    worker._last_heartbeat_time = 0.0
+    # vLLM 0.34 fetch_finished_sending_reqs parks expired tickets here.
+    worker._expired_transfer_ids = OrderedDict()
     worker.transfer_topo = SimpleNamespace(
         handshake_target_ranks=lambda size: list(range(size)),
         total_num_kv_heads=1,
@@ -169,7 +187,7 @@ async def test_mixed_tickets_and_empty_block_notifications(producer, empty, rank
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["row_count", "transport"])
-async def test_failed_rank_does_not_report_source_complete(producer, failure):
+async def test_failed_rank_does_not_report_source_complete(producer, mooncake_clock, failure):
     worker = producer.connector_worker
     install_mooncake_cfg_fanout(producer)
     ticket = await register(worker, "request")
@@ -182,9 +200,25 @@ async def test_failed_rank_does_not_report_source_complete(producer, failure):
     assert worker.reqs_need_send["request"] is ticket
     assert not await worker.fetch_finished_sending_reqs()
     # Preserve upstream timeout cleanup after all in-flight writes have stopped.
-    ticket.expire_time = 0
+    mooncake_clock.return_value = ticket.expire_time + 1
     assert await worker.fetch_finished_sending_reqs() == {"request"}
     assert not worker.reqs_need_send
+
+
+@pytest.mark.asyncio
+async def test_expired_ticket_waits_for_in_flight_writes(producer, mooncake_clock):
+    worker = producer.connector_worker
+    install_mooncake_cfg_fanout(producer)
+    ticket = await register(worker, "request")
+    assert not await worker.fetch_finished_sending_reqs()
+    ticket.sending = 1
+    mooncake_clock.return_value = ticket.expire_time + 1
+    assert not await worker.fetch_finished_sending_reqs()
+    assert worker.reqs_need_send["request"] is ticket
+    ticket.sending = 0
+    assert await worker.fetch_finished_sending_reqs() == {"request"}
+    assert not worker.reqs_need_send
+    assert not await worker.fetch_finished_sending_reqs()
 
 
 def test_worker_installs_adapter_after_native_initialization(producer, monkeypatch):

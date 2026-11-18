@@ -13,13 +13,14 @@ monolithic conftest. Defer imports until fixtures run so session fixtures in
 from __future__ import annotations
 
 import threading
-from collections.abc import Generator
+from collections.abc import AsyncGenerator, Generator
 from typing import TYPE_CHECKING, Any
 
 import pytest
+import pytest_asyncio
 
 if TYPE_CHECKING:
-    from tests.helpers.runtime import OmniRunner, OmniServer
+    from tests.helpers.runtime import AsyncOmniRunner, OmniRunner, OmniServer
 
 omni_fixture_lock = threading.Lock()
 
@@ -125,6 +126,53 @@ def omni_runner(request: pytest.FixtureRequest, run_level: str) -> Generator[Omn
     from tests.helpers.runtime import iter_omni_runner
 
     yield from iter_omni_runner(request, run_level, omni_fixture_lock)
+
+
+@pytest_asyncio.fixture(scope="function", loop_scope="function")
+async def async_omni_runner_function(
+    request: pytest.FixtureRequest,
+    run_level: str,
+) -> AsyncGenerator[AsyncOmniRunner, None]:
+    """Function-scoped in-process :class:`~tests.helpers.runtime.AsyncOmniRunner` (cf. :func:`omni_runner_function`).
+
+    The default for live ``AsyncOmni`` tests. Parametrize with
+    :class:`~tests.helpers.runtime.AsyncOmniParams` and ``indirect=True``. One
+    engine per test keeps the engine on that test's event loop: pytest-asyncio
+    defaults to a function-scoped loop, and an engine reused across loops hangs
+    on its second ``generate()``.
+
+    An async fixture, so the engine is built and shut down on the test's running
+    loop: ``AsyncOmni.shutdown()`` cancels the output-handler task, which
+    belongs to that loop. A sync fixture is torn down after the loop has stopped.
+    """
+    from tests.helpers.runtime import iter_async_omni
+
+    runners = iter_async_omni(request, run_level, omni_fixture_lock)
+    try:
+        yield next(runners)
+        next(runners, None)
+    finally:
+        runners.close()
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def async_omni_runner(request: pytest.FixtureRequest, run_level: str) -> AsyncGenerator[AsyncOmniRunner, None]:
+    """Module-scoped :class:`~tests.helpers.runtime.AsyncOmniRunner` (cf. :func:`omni_runner`).
+
+    Only for modules whose every consumer is marked
+    ``@pytest.mark.asyncio(loop_scope="module")`` with the same params: the
+    engine binds to the first event loop that awaits it. Prefer
+    :func:`async_omni_runner_function` otherwise. Built and shut down on the
+    module loop.
+    """
+    from tests.helpers.runtime import iter_async_omni
+
+    runners = iter_async_omni(request, run_level, omni_fixture_lock)
+    try:
+        yield next(runners)
+        next(runners, None)
+    finally:
+        runners.close()
 
 
 @pytest.fixture

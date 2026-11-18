@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import math
 
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_rope_utils import rope_config_validation
 
 
 class VoxCPM2Config(PretrainedConfig):
@@ -123,25 +122,26 @@ class VoxCPM2Config(PretrainedConfig):
         # -- RoPE scaling (longrope) --
         raw_rope = lm.get("rope_scaling", rope_scaling)
         if raw_rope is not None:
-            self.rope_scaling = dict(raw_rope)
+            self.rope_parameters: dict | None = dict(raw_rope)
             # HF expects "rope_type" not "type"
-            if "type" in self.rope_scaling:
-                self.rope_scaling["rope_type"] = self.rope_scaling.pop("type")
+            if "type" in self.rope_parameters:
+                self.rope_parameters["rope_type"] = self.rope_parameters.pop("type")
             # longrope requires "factor" (used by HF validation)
-            if "factor" not in self.rope_scaling:
-                self.rope_scaling["factor"] = 1.0
-            rope_config_validation(self)
+            if "factor" not in self.rope_parameters:
+                self.rope_parameters["factor"] = 1.0
+            self.standardize_rope_params()
+            self.validate_rope()
 
             # vllm's MiniCPMAttention reads config.rope_parameters (a dict
             # with rope_type, theta, scaling factors, etc.).  HF transformers
             # only auto-computes this for known model_types; for custom
             # types we must build it manually.
             if not getattr(self, "rope_parameters", None):
-                rp = dict(self.rope_scaling)
+                rp = dict(self.rope_parameters)
                 rp["rope_theta"] = self.rope_theta
                 self.rope_parameters = rp
         else:
-            self.rope_scaling = None
+            self.rope_parameters = None
 
     def get_text_config(self, **kwargs):
         """Return self as the text config — LM attributes are top-level."""

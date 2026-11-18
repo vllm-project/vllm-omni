@@ -7,24 +7,26 @@ Unit tests for DiffusionWorker class.
 This module tests the DiffusionWorker implementation:
 - sleep: Putting worker into sleep mode (levels 1 and 2)
 - wake_up: Waking worker from sleep mode
+- shutdown: Releasing collective resources before process groups
 """
 
 import pytest
 import torch
 from pytest_mock import MockerFixture
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.gpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 def patch_cumem_allocator(mocker: MockerFixture):
-    mock_allocator_class = mocker.Mock()
+    mock_allocator = mocker.Mock()
     mocker.patch(
-        "vllm_omni.diffusion.worker.diffusion_worker._get_cumem_allocator_class",
-        return_value=mock_allocator_class,
+        "vllm_omni.diffusion.worker.diffusion_worker._get_mem_allocator_instance",
+        return_value=mock_allocator,
     )
-    return mock_allocator_class
+    return mock_allocator
 
 
 @pytest.fixture
@@ -44,6 +46,7 @@ def mock_od_config(mocker: MockerFixture):
 def mock_gpu_worker(mocker: MockerFixture, mock_od_config):
     """Create a DiffusionWorker with mocked initialization."""
     mocker.patch.object(DiffusionWorker, "init_device")
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.synchronize")
     mocker.patch.object(DiffusionWorker, "load_model")
     worker = DiffusionWorker(local_rank=0, rank=0, od_config=mock_od_config)
     # Mock the model_runner with pipeline
@@ -55,6 +58,7 @@ def mock_gpu_worker(mocker: MockerFixture, mock_od_config):
     return worker
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 class TestDiffusionWorkerSleep:
     """Test DiffusionWorker.sleep method."""
 
@@ -63,15 +67,13 @@ class TestDiffusionWorkerSleep:
         """
         Unified interception of Allocators, and provision of default security values.
         """
-        self.mock_allocator_class = patch_cumem_allocator(mocker)
-        self.mock_allocator = mocker.Mock()
-        self.mock_allocator_class.get_instance.return_value = self.mock_allocator
+        self.mock_allocator = patch_cumem_allocator(mocker)
         self.mock_allocator.get_current_usage.return_value = 4 * 1024**3
         self.mock_allocator.sleep = mocker.Mock()
 
     def test_sleep_level_1(self, mocker: MockerFixture, mock_gpu_worker):
         """Test sleep mode level 1 (offload weights only)."""
-        mock_allocator_class = patch_cumem_allocator(mocker)
+        mock_allocator = patch_cumem_allocator(mocker)
         mock_platform = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform")
         mock_platform.get_free_memory.side_effect = [10 * 1024**3, 12 * 1024**3]
         mock_platform.get_device_total_memory.return_value = 80 * 1024**3
@@ -87,8 +89,6 @@ class TestDiffusionWorkerSleep:
         ]
 
         # Setup allocator mock
-        mock_allocator = mocker.Mock()
-        mock_allocator_class.get_instance = mocker.Mock(return_value=mock_allocator)
         mock_allocator.sleep = mocker.Mock()
         mock_allocator.get_current_usage.return_value = initial_usage
 
@@ -103,7 +103,7 @@ class TestDiffusionWorkerSleep:
 
     def test_sleep_level_2(self, mocker: MockerFixture, mock_gpu_worker):
         """Test sleep mode level 2 (offload all, save buffers)."""
-        mock_allocator_class = patch_cumem_allocator(mocker)
+        mock_allocator = patch_cumem_allocator(mocker)
         mock_platform = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform")
         mock_platform.get_free_memory.side_effect = [5 * 1024**3, 10 * 1024**3]
         mock_platform.get_device_total_memory.return_value = 80 * 1024**3
@@ -117,8 +117,6 @@ class TestDiffusionWorkerSleep:
         ]
 
         # Setup allocator mock
-        mock_allocator = mocker.Mock()
-        mock_allocator_class.get_instance = mocker.Mock(return_value=mock_allocator)
         mock_allocator.sleep = mocker.Mock()
         mock_allocator.get_current_usage.return_value = initial_usage
 
@@ -161,7 +159,7 @@ class TestDiffusionWorkerSleep:
 
     def test_sleep_memory_freed_validation(self, mocker: MockerFixture, mock_gpu_worker):
         """Test that sleep validates memory was actually freed."""
-        mock_allocator_class = patch_cumem_allocator(mocker)
+        mock_allocator = patch_cumem_allocator(mocker)
         mock_platform = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform")
         mock_platform.get_free_memory.return_value = 10 * 1024**3
         mock_platform.get_device_total_memory.return_value = 80 * 1024**3
@@ -174,8 +172,6 @@ class TestDiffusionWorkerSleep:
             3 * 1024**3,  # After sleep: 3GB used (negative freed)
         ]
 
-        mock_allocator = mocker.Mock()
-        mock_allocator_class.get_instance = mocker.Mock(return_value=mock_allocator)
         mock_allocator.sleep = mocker.Mock()
         mock_allocator.get_current_usage.return_value = initial_usage
 
@@ -186,7 +182,7 @@ class TestDiffusionWorkerSleep:
     def test_sleep_falls_back_to_device_memory_when_nvml_unavailable(self, mocker: MockerFixture, mock_gpu_worker):
         """Test sleep uses device-scoped fallback when NVML is unavailable."""
 
-        mock_allocator_class = patch_cumem_allocator(mocker)
+        mock_allocator = patch_cumem_allocator(mocker)
         mock_platform = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform")
         mock_get_process_memory = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_process_gpu_memory")
         mock_get_process_memory.side_effect = [None, None]
@@ -196,8 +192,6 @@ class TestDiffusionWorkerSleep:
         ]
         mock_platform.get_device_total_memory.return_value = 8 * 1024**3
 
-        mock_allocator = mocker.Mock()
-        mock_allocator_class.get_instance = mocker.Mock(return_value=mock_allocator)
         mock_allocator.sleep = mocker.Mock()
         mock_allocator.get_current_usage.return_value = 2 * 1024**3
 
@@ -207,16 +201,15 @@ class TestDiffusionWorkerSleep:
         assert bool(result) is True
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 class TestDiffusionWorkerWakeUp:
     """Test DiffusionWorker.wake_up method."""
 
     def test_wake_up_without_buffers(self, mocker: MockerFixture, mock_gpu_worker):
         """Test wake_up without saved buffers (level 1 sleep)."""
-        mock_allocator_class = patch_cumem_allocator(mocker)
+        mock_allocator = patch_cumem_allocator(mocker)
 
         # Setup allocator mock
-        mock_allocator = mocker.Mock()
-        mock_allocator_class.get_instance = mocker.Mock(return_value=mock_allocator)
         mock_allocator.wake_up = mocker.Mock()
         mock_allocator.get_current_usage.return_value = 10 * 1024**3
 
@@ -232,11 +225,9 @@ class TestDiffusionWorkerWakeUp:
 
     def test_wake_up_with_buffers(self, mocker: MockerFixture, mock_gpu_worker):
         """Test wake_up with saved buffers (level 2 sleep)."""
-        mock_allocator_class = patch_cumem_allocator(mocker)
+        mock_allocator = patch_cumem_allocator(mocker)
 
         # Setup allocator mock
-        mock_allocator = mocker.Mock()
-        mock_allocator_class.get_instance = mocker.Mock(return_value=mock_allocator)
         mock_allocator.wake_up = mocker.Mock()
         mock_allocator.get_current_usage.return_value = 10 * 1024**3
 
@@ -277,11 +268,9 @@ class TestDiffusionWorkerWakeUp:
 
     def test_wake_up_partial_buffer_restore(self, mocker: MockerFixture, mock_gpu_worker):
         """Test wake_up only restores buffers that were saved."""
-        mock_allocator_class = patch_cumem_allocator(mocker)
+        mock_allocator = patch_cumem_allocator(mocker)
 
         # Setup allocator mock
-        mock_allocator = mocker.Mock()
-        mock_allocator_class.get_instance = mocker.Mock(return_value=mock_allocator)
         mock_allocator.wake_up = mocker.Mock()
         mock_allocator.get_current_usage.return_value = 10 * 1024**3
 
@@ -315,6 +304,36 @@ class TestDiffusionWorkerWakeUp:
         assert result is True
 
 
+@pytest.mark.cpu
+class TestDiffusionWorkerShutdown:
+    def test_releases_collective_resources_before_process_groups(self, mocker: MockerFixture):
+        worker = DiffusionWorker.__new__(DiffusionWorker)
+        worker.model_runner = None
+        events = []
+        mocker.patch(
+            "vllm_omni.diffusion.distributed.a2a_permute.clear_a2a_permute_workspaces",
+            side_effect=lambda: events.append("workspace"),
+        )
+        mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env",
+            side_effect=lambda: events.append("process_groups"),
+        )
+        worker.shutdown()
+        assert events == ["workspace", "process_groups"]
+
+    def test_destroys_process_groups_after_transport_cleanup_error(self, mocker: MockerFixture):
+        worker = DiffusionWorker.__new__(DiffusionWorker)
+        worker.model_runner = None
+        mocker.patch(
+            "vllm_omni.diffusion.distributed.a2a_permute.clear_a2a_permute_workspaces",
+            side_effect=RuntimeError("collective cleanup failed"),
+        )
+        destroy = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env")
+        worker.shutdown()
+        destroy.assert_called_once_with()
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 class TestDiffusionWorkerInitLoraManager:
     """Test DiffusionWorker.init_lora_manager method."""
 
@@ -351,3 +370,22 @@ class TestDiffusionWorkerInitLoraManager:
 
         pipeline.load_lora_weights.assert_called_once_with("/path/to/lora.safetensors")
         assert pipeline.lora_is_fused is True
+
+    def test_fixed_adapter_manager_initialization_is_idempotent(self, mocker, mock_gpu_worker):
+        from vllm_omni.diffusion.lora.manager import LoRABackend
+
+        worker = mock_gpu_worker
+        pipeline = worker.model_runner.pipeline
+        pipeline.lora_is_fused = False
+        pipeline.diffusion_lora_fixed_adapter = True
+        worker.od_config.lora_backend = LoRABackend.DISTILL
+        factory = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.DiffusionLoRAManager")
+        factory.return_value.pipeline = pipeline
+
+        worker.init_lora_manager()
+        worker.init_lora_manager()
+
+        factory.assert_called_once()
+        pipeline.load_lora_weights.assert_not_called()
+        factory.return_value.close.assert_not_called()
+        assert worker.lora_manager is factory.return_value

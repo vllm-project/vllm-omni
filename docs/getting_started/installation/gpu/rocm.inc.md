@@ -11,8 +11,11 @@
 For ROCm, vLLM-Omni currently recommends the setup steps through Docker Images.
 
 vLLM-Omni depends on the matching major/minor release of vLLM. This source
-checkout targets vLLM 0.31.0. The pre-built Omni wheel instructions below install
-the published 0.30.0 release with its matching vLLM dependency.
+checkout targets the official vLLM 0.34.0 release. The Dockerfile uses the
+published `vllm/vllm-openai-rocm:v0.34.0` base image by default. This runtime
+still requires Omni model validation on ROCm.
+The pre-built Omni wheel instructions below retain the published 0.30.0
+release with its matching vLLM dependency.
 
 The Dockerfile's `BASE_IMAGE` pin applies only to Docker builds. The
 `vllm-omni` package does not install vLLM as a dependency, so non-Docker source
@@ -50,14 +53,10 @@ uv pip install onnxruntime-rocm
 
 #### Installation of vLLM
 
-If you do not need to modify source code of vLLM, install the final 0.31.0
-release wheel for ROCm 7.2.3:
-
-```bash
-uv pip install vllm==0.31.0+rocm723 --extra-index-url https://wheels.vllm.ai/rocm/0.31.0/rocm723
-```
-
-The pre-built 0.31.0 vLLM wheel targets ROCm 7.2.3. If you need a different ROCm stack or want to reuse an existing PyTorch installation, build vLLM from source instead.
+Build vLLM from the official 0.34.0 source tag using upstream's matching
+ROCm/PyTorch requirements, or use the Docker source build below. The older
+0.32.0 ROCm wheel does not provide the 0.34 APIs used by this checkout.
+ROCm runtime validation remains pending.
 
 #### Installation of vLLM-Omni
 
@@ -71,13 +70,26 @@ VLLM_OMNI_TARGET_DEVICE=rocm uv pip install -e .
 uv pip install -e . --no-build-isolation
 ```
 
+For source development or Gradio demos, include the temporary Gradio backport
+in the normal install while retaining the ROCm target:
+
+```bash
+python tools/build_gradio_pillow13.py --output-dir /tmp/gradio-pillow13
+VLLM_OMNI_TARGET_DEVICE=rocm uv pip install --no-build-isolation -e '.[dev,demo]' \
+  /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl
+uv pip check
+```
+
+See the [source dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
+for provenance and qualification limits. ROCm runtime acceptance remains pending.
+
 <details><summary>(Optional) Installation of vLLM from source</summary>
 If you want to check, modify or debug with source code of vLLM, install the library from source with the following instructions:
 
 ```bash
 git clone https://github.com/vllm-project/vllm.git
 cd vllm
-git checkout v0.31.0
+git checkout v0.34.0
 python3 -m pip install -r requirements/rocm.txt
 python3 setup.py develop
 ```
@@ -88,12 +100,13 @@ python3 setup.py develop
 
 #### Build docker image
 
-The source build defaults to the published upstream base image
-`vllm/vllm-openai-rocm:v0.31.0`, aligned with this source checkout.
-Older or custom bases must provide the vLLM APIs checked by the Dockerfile's
-image-build canary. This upstream base is distinct from the prebuilt
-`vllm/vllm-omni-rocm` images discussed below; their published-tag availability
-is tracked in [#7405](https://github.com/vllm-project/vllm-omni/issues/7405).
+The Dockerfile starts from the published `vllm/vllm-openai-rocm:v0.34.0`
+image, pinned by digest, and defaults to `USE_NIGHTLY_BUILD=0` to retain its
+release runtime. For an optional source rebuild, `USE_NIGHTLY_BUILD=1` selects
+release commit `62d4bc3c7e33b1b6c906e233e6af2d3506c482ca` by default.
+Its development dependency install builds the hash-pinned temporary Gradio
+source backport and installs the resulting local wheel with the normal resolver.
+ROCm model validation remains pending.
 
 ```bash
 DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm .
@@ -104,7 +117,7 @@ To select the upstream ROCm base explicitly, pass `BASE_IMAGE`:
 ```bash
 DOCKER_BUILDKIT=1 docker build \
   -f docker/Dockerfile.rocm \
-  --build-arg BASE_IMAGE=vllm/vllm-openai-rocm:v0.31.0 \
+  --build-arg BASE_IMAGE=vllm/vllm-openai-rocm:v0.34.0 \
   -t vllm-omni-rocm .
 ```
 

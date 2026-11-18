@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """vLLM-native PersonaPlex Helium temporal transformer.
 
 The module maps the Moshi temporal LM backbone onto vLLM's Llama-style decoder
@@ -9,7 +9,7 @@ embeddings or depformer; PersonaPlex feeds temporal `inputs_embeds` directly.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from itertools import islice
 
 import torch
@@ -25,27 +25,22 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
-    is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
-    maybe_prefix,
 )
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowSpec
 
 from vllm_omni.model_executor.models.personaplex.configuration_helium import (
     HeliumConfig,
 )
 
-__all__ = ["HeliumForCausalLM", "HeliumModel"]
+__all__ = ["HeliumModel"]
 
 
 class HeliumRMSNorm(RMSNorm):
@@ -109,6 +104,85 @@ class HeliumMLP(nn.Module):
         x = self.act_fn(x)
         x, _ = self.down_proj(x)
         return x
+
+
+def moshi_attention_window(context: int) -> int:
+    """How many keys, counting its own, a Moshi streaming query attends to.
+
+    Moshi's ``RingKVCache`` holds ``context`` cells but labels the oldest as the
+    next write position, so once it wraps a query attends to the last
+    ``context - 1`` keys (``personaplex_temporal._ringkv_positions`` keeps the
+    same convention). vLLM's sliding window counts the query too, so this is
+    the window that matches Moshi at every position.
+    """
+    return context - 1
+
+
+def check_rope_covers_context(max_model_len: int, max_position_embeddings: int) -> None:
+    """Refuse a context that would read RoPE past Helium's table.
+
+    vllm-omni lets an explicit max_model_len exceed the config's
+    max_position_embeddings (it sets VLLM_ALLOW_LONG_MAX_MODEL_LEN), and vLLM
+    then only warns. Helium's rotary table has one row per position, so a
+    sequence that grows past it would index out of range mid-call.
+    """
+    if max_model_len > max_position_embeddings:
+        raise ValueError(
+            f"max_model_len {max_model_len} exceeds Helium's RoPE table of {max_position_embeddings} "
+            "positions; raise max_position_embeddings with it (PersonaPlex Stage 0: "
+            "hf_overrides.temporal_config.max_position_embeddings)."
+        )
+
+
+def check_window_bounds_kv_cache(max_model_len: int, context: int, kv_cache_spec: KVCacheSpec | None) -> None:
+    """Refuse a context past Helium's window unless the layer's KV cache is windowed.
+
+    A call longer than the window relies on the attention layer resolving to
+    a ``SlidingWindowSpec``: only then does the KV manager free the pages
+    behind the window. With any other spec a long call keeps every page until
+    the pool runs out, so fail at startup instead.
+    """
+    if max_model_len <= context:
+        return
+    window = moshi_attention_window(context)
+    if isinstance(kv_cache_spec, SlidingWindowSpec) and kv_cache_spec.sliding_window == window:
+        return
+    resolved = type(kv_cache_spec).__name__
+    if isinstance(kv_cache_spec, SlidingWindowSpec):
+        resolved += f"(sliding_window={kv_cache_spec.sliding_window})"
+    raise ValueError(
+        f"max_model_len {max_model_len} runs past Helium's {context}-frame window, which needs a "
+        f"SlidingWindowSpec of {window} keys so the KV behind the window is freed, but the attention "
+        f"backend resolved {resolved}. Use a backend with sliding-window support, or keep "
+        f"max_model_len within {context}."
+    )
+
+
+def check_window_bounds_kv_caches(
+    max_model_len: int,
+    context: int,
+    kv_cache_specs: Iterable[KVCacheSpec | None],
+    *,
+    num_layers: int,
+) -> None:
+    """Check the resolved KV spec of every attention layer on this rank.
+
+    ``kv_cache_specs`` is only consumed when the context exceeds the window.
+    A rank that holds layers but yields no spec was not checked at all, so it
+    is refused too; a rank with no layers (an empty pipeline-parallel slice)
+    holds no Helium KV and has nothing to check.
+    """
+    if max_model_len <= context:
+        return
+    checked = 0
+    for kv_cache_spec in kv_cache_specs:
+        check_window_bounds_kv_cache(max_model_len, context, kv_cache_spec)
+        checked += 1
+    if checked == 0 and num_layers > 0:
+        raise ValueError(
+            f"max_model_len {max_model_len} runs past Helium's {context}-frame window, but none of this "
+            f"rank's {num_layers} layers exposed an attention layer whose KV cache spec could be checked."
+        )
 
 
 def _get_helium_rope(config: HeliumConfig):
@@ -185,7 +259,7 @@ class HeliumAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             cache_config=cache_config,
             quant_config=quant_config,
-            per_layer_sliding_window=config.sliding_window,
+            per_layer_sliding_window=moshi_attention_window(config.sliding_window),
             prefix=f"{prefix}.attn",
             attn_type=attn_type,
         )
@@ -313,6 +387,7 @@ class HeliumModel(nn.Module):
         # Helium backbone from its temporal sub-config while the engine's top-level
         # hf_config is the composite PersonaPlexConfig. Defaults to the engine's.
         config = config or vllm_config.model_config.hf_config
+        check_rope_covers_context(vllm_config.model_config.max_model_len, config.max_position_embeddings)
         self.config = config
         self.quant_config = vllm_config.quant_config
         self.vocab_size = config.vocab_size
@@ -321,6 +396,12 @@ class HeliumModel(nn.Module):
             config.num_hidden_layers,
             lambda prefix: layer_type(vllm_config=vllm_config, prefix=prefix, config=config),
             prefix=f"{prefix}.layers",
+        )
+        check_window_bounds_kv_caches(
+            vllm_config.model_config.max_model_len,
+            config.sliding_window,
+            (module.get_kv_cache_spec(vllm_config) for module in self.modules() if isinstance(module, Attention)),
+            num_layers=self.end_layer - self.start_layer,
         )
         if get_pp_group().is_last_rank:
             self.norm = HeliumRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -375,174 +456,3 @@ class HeliumModel(nn.Module):
             batch, seq_len = unflatten_shape
             hidden_states = hidden_states.reshape(batch, seq_len, -1)
         return hidden_states
-
-
-class HeliumForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
-    packed_modules_mapping = {
-        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-        "gate_up_proj": ["gate_proj", "up_proj"],
-    }
-    embedding_modules = {
-        "lm_head": "output_embeddings",
-    }
-
-    def __init__(
-        self,
-        *,
-        vllm_config: VllmConfig,
-        prefix: str = "",
-        layer_type: type[nn.Module] = HeliumDecoderLayer,
-    ) -> None:
-        super().__init__()
-        config = vllm_config.model_config.hf_config
-        self.config = config
-        self.quant_config = vllm_config.quant_config
-        self.model = HeliumModel(
-            vllm_config=vllm_config,
-            prefix=maybe_prefix(prefix, "model"),
-            layer_type=layer_type,
-        )
-        if get_pp_group().is_last_rank:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=self.quant_config,
-                prefix=maybe_prefix(prefix, "lm_head"),
-            )
-        else:
-            self.lm_head = PPMissingLayer()
-        self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
-
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.embed_input_ids(input_ids)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
-        return self.model(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-        )
-
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        if hidden_states.dim() == 3:
-            batch, seq_len, hidden = hidden_states.shape
-            flat_hidden = hidden_states.reshape(batch * seq_len, hidden)
-            logits = self.logits_processor(self.lm_head, flat_hidden)
-            if logits is None:
-                return None
-            return logits.reshape(batch, seq_len, -1)
-        return self.logits_processor(self.lm_head, hidden_states)
-
-    def load_weights(
-        self,
-        weights: Iterable[tuple[str, torch.Tensor]] | Mapping[str, torch.Tensor],
-    ) -> set[str]:
-        if isinstance(weights, Mapping):
-            weights = weights.items()
-
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded_params: set[str] = set()
-
-        for name, loaded_weight in weights:
-            mapped = self._load_moshi_weight(name, loaded_weight, params_dict)
-            loaded_params.update(mapped)
-
-        return loaded_params
-
-    def _load_moshi_weight(
-        self,
-        name: str,
-        loaded_weight: torch.Tensor,
-        params_dict: dict[str, nn.Parameter],
-    ) -> set[str]:
-        if name == "out_norm.alpha":
-            return self._load_direct(
-                "model.norm.weight",
-                loaded_weight.squeeze(),
-                params_dict,
-            )
-        if name == "text_linear.weight":
-            return self._load_direct("lm_head.weight", loaded_weight, params_dict)
-
-        prefix = "transformer.layers."
-        if not name.startswith(prefix):
-            return set()
-
-        rest = name.removeprefix(prefix)
-        layer_index, _, suffix = rest.partition(".")
-        if not layer_index.isdigit() or not suffix:
-            return set()
-
-        base = f"model.layers.{layer_index}"
-        if suffix == "self_attn.in_proj_weight":
-            q_weight, k_weight, v_weight = loaded_weight.chunk(3, dim=0)
-            param_name = f"{base}.self_attn.qkv_proj.weight"
-            self._load_shard(param_name, q_weight, "q", params_dict)
-            self._load_shard(param_name, k_weight, "k", params_dict)
-            self._load_shard(param_name, v_weight, "v", params_dict)
-            return {param_name}
-        if suffix == "self_attn.out_proj.weight":
-            return self._load_direct(
-                f"{base}.self_attn.o_proj.weight",
-                loaded_weight,
-                params_dict,
-            )
-        if suffix == "gating.linear_in.weight":
-            gate_weight, up_weight = loaded_weight.chunk(2, dim=0)
-            param_name = f"{base}.mlp.gate_up_proj.weight"
-            self._load_shard(param_name, gate_weight, 0, params_dict)
-            self._load_shard(param_name, up_weight, 1, params_dict)
-            return {param_name}
-        if suffix == "gating.linear_out.weight":
-            return self._load_direct(
-                f"{base}.mlp.down_proj.weight",
-                loaded_weight,
-                params_dict,
-            )
-        if suffix == "norm1.alpha":
-            return self._load_direct(
-                f"{base}.input_layernorm.weight",
-                loaded_weight.squeeze(),
-                params_dict,
-            )
-        if suffix == "norm2.alpha":
-            return self._load_direct(
-                f"{base}.post_attention_layernorm.weight",
-                loaded_weight.squeeze(),
-                params_dict,
-            )
-        return set()
-
-    def _load_direct(
-        self,
-        name: str,
-        loaded_weight: torch.Tensor,
-        params_dict: dict[str, nn.Parameter],
-    ) -> set[str]:
-        if name not in params_dict or is_pp_missing_parameter(name, self):
-            return set()
-        param = params_dict[name]
-        weight_loader = getattr(param, "weight_loader", default_weight_loader)
-        weight_loader(param, loaded_weight)
-        return {name}
-
-    def _load_shard(
-        self,
-        name: str,
-        loaded_weight: torch.Tensor,
-        shard_id: str | int,
-        params_dict: dict[str, nn.Parameter],
-    ) -> None:
-        if name not in params_dict or is_pp_missing_parameter(name, self):
-            return
-        param = params_dict[name]
-        weight_loader = param.weight_loader
-        weight_loader(param, loaded_weight, shard_id)

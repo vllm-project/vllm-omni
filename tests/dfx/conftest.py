@@ -2,20 +2,162 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
+import logging
+import math
 import os
-import re
 import subprocess
 import threading
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 import pytest
 
+from tests.helpers.hardware import _safe_filename_token, hardware_json_value
+from tests.helpers.hardware import get_runtime_resource_label as get_runtime_resource_label
 from tests.helpers.mark import get_hardware_mark_list, hardware_marks
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import modify_stage_config
-from vllm_omni.platforms import current_omni_platform
+
+BASELINE_REGRESSION_TOLERANCE = 0.10
+
+# Substrings, not a closed metric list. ``throughput_qps`` matches the higher
+# group only; ``mean_audio_rtf`` and ``peak_memory_mb_mean`` match the lower group.
+_LOWER_IS_BETTER_TOKENS = ("latency", "ttft", "tpot", "itl", "e2el", "ttfp", "ttfc", "interval", "rtf", "memory")
+_HIGHER_IS_BETTER_TOKENS = ("throughput", "qps", "fps")
+
+
+def metric_lower_is_better(name: str) -> bool:
+    """Return whether a smaller measured value is the better one."""
+    key = name.lower().replace("-", "_")
+    lower = any(token in key for token in _LOWER_IS_BETTER_TOKENS)
+    higher = any(token in key for token in _HIGHER_IS_BETTER_TOKENS)
+    if lower and higher:
+        raise ValueError(f"baseline metric {name!r} matches both a higher-is-better token and a lower-is-better token")
+    if lower:
+        return True
+    if higher:
+        return False
+    raise ValueError(
+        f"baseline metric {name!r} has no regression direction; "
+        "use a latency/memory/rtf-style name or a throughput/qps-style name"
+    )
+
+
+def _is_finite_number(value: object) -> TypeGuard[int | float]:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _worse_ratio(measured: float, baseline: float, *, lower_is_better: bool) -> float:
+    """Fraction by which ``measured`` is worse than ``baseline``.
+
+    Zero baseline has no percentage scale: any move in the bad direction is
+    treated as an unbounded regression, and a value that is not worse passes.
+    """
+    if baseline == 0:
+        bad = measured > 0 if lower_is_better else measured < 0
+        return math.inf if bad else 0.0
+    if lower_is_better:
+        return (measured - baseline) / baseline
+    return (baseline - measured) / baseline
+
+
+def _regressed(worse_ratio: float, tolerance: float) -> bool:
+    # Only regressions strictly beyond tolerance fail; allow float noise at the boundary.
+    if worse_ratio <= tolerance:
+        return False
+    return not math.isclose(worse_ratio, tolerance, rel_tol=1e-9, abs_tol=1e-12)
+
+
+def assert_baseline_within_tolerance(
+    measured: Mapping[str, Any],
+    baseline: Mapping[str, Any] | None,
+    hardware: str | None,
+    *,
+    tolerance: float = BASELINE_REGRESSION_TOLERANCE,
+    required: bool = False,
+) -> None:
+    """Fail when any metric in the current hardware bucket is more than ``tolerance`` worse.
+
+    ``baseline`` is the sweep-resolved hardware-nested map
+    (``{"H100": {"request_throughput": 1.2}}``). Missing or empty baselines
+    and missing or unmatched hardware log a warning and skip comparison,
+    unless ``required=True`` requests a failure instead.
+    """
+    baseline_hardware = hardware
+    # Ascend runtime labels use the A2 resource bucket when no exact bucket exists.
+    if isinstance(baseline, dict) and hardware in ("910B", "910B4") and hardware not in baseline and "A2" in baseline:
+        baseline_hardware = "A2"
+    if (
+        not isinstance(baseline, dict)
+        or not baseline
+        or not isinstance(baseline_hardware, str)
+        or not baseline_hardware
+        or baseline_hardware not in baseline
+    ):
+        available = list(baseline) if isinstance(baseline, dict) else []
+        message = f"No matching baseline for hardware {hardware!r}; available hardware: {available}"
+        if required:
+            raise AssertionError(message)
+        logging.getLogger(__name__).warning("[baseline-check] SKIP: %s", message)
+        print(f"[baseline-check] WARNING SKIP: {message}", flush=True)
+        return
+    bucket = baseline[baseline_hardware]
+    if not isinstance(bucket, dict) or not bucket:
+        raise AssertionError(f"baseline[{baseline_hardware!r}] must be a non-empty metric map, got {bucket!r}")
+
+    print(
+        f"[baseline-check] START hardware={hardware} baseline_hardware={baseline_hardware} "
+        f"tolerance={tolerance:.0%} metrics={len(bucket)}",
+        flush=True,
+    )
+    failures: list[str] = []
+    for name, expected in bucket.items():
+        if isinstance(expected, (list, tuple)):
+            failures.append(f"{name}: baseline is still a sweep list; resolve the sweep step before comparing")
+            continue
+        if not _is_finite_number(expected):
+            failures.append(f"{name}: baseline {expected!r} is not a finite number")
+            continue
+        if expected < 0:
+            failures.append(f"{name}: negative baseline {expected} is not supported")
+            continue
+        actual = measured.get(name)
+        if not _is_finite_number(actual):
+            failures.append(f"{name}: measured value {actual!r} is not a finite number")
+            continue
+        if actual < 0:
+            failures.append(f"{name}: negative measured value {actual} is not supported")
+            continue
+        try:
+            lower_is_better = metric_lower_is_better(str(name))
+        except ValueError as exc:
+            failures.append(str(exc))
+            continue
+        ratio = _worse_ratio(float(actual), float(expected), lower_is_better=lower_is_better)
+        regressed = _regressed(ratio, tolerance)
+        print(
+            f"[baseline-check] {'FAIL' if regressed else 'PASS'} {name}: "
+            f"measured={actual} baseline={expected} regression={ratio:.2%} tolerance={tolerance:.0%}",
+            flush=True,
+        )
+        if not regressed:
+            continue
+        if lower_is_better:
+            limit = float(expected) * (1 + tolerance)
+            direction = "above"
+        else:
+            limit = float(expected) * (1 - tolerance)
+            direction = "below"
+        failures.append(
+            f"{name}: measured {actual} is more than {tolerance:.0%} {direction} "
+            f"baseline {expected} on {hardware} (limit {limit})"
+        )
+    if failures:
+        logging.getLogger(__name__).error("[baseline-check] FAIL hardware=%s: %s", hardware, "; ".join(failures))
+        raise AssertionError("performance baseline regression:\n" + "\n".join(failures))
+    print(f"[baseline-check] PASS hardware={hardware}: all {len(bucket)} metrics passed", flush=True)
 
 
 def _named_pytest_marks(names: list[str]) -> list[pytest.MarkDecorator]:
@@ -275,6 +417,25 @@ def _create_unique_server_params(
         serve_flat = _build_serve_args(server_params.get("serve_args"))
         raw_extra = tuple(server_params.get("extra_cli_args") or ())
         extra_cli_args = tuple(serve_flat) + raw_extra
+        # Apply the existing update/delete mechanism to explicit deploy paths too.
+        # The generated config is temporary; the source deploy stays unchanged.
+        if not stage_config_name and ("update" in server_params or "delete" in server_params):
+            args = list(extra_cli_args)
+            # Match argparse: the last deploy flag wins over earlier defaults.
+            for index in range(len(args) - 1, -1, -1):
+                arg = args[index]
+                if arg == "--deploy-config" and index + 1 < len(args):
+                    args[index + 1] = modify_stage(
+                        args[index + 1], server_params.get("update"), server_params.get("delete")
+                    )
+                    break
+                if arg.startswith("--deploy-config="):
+                    path = modify_stage(arg.split("=", 1)[1], server_params.get("update"), server_params.get("delete"))
+                    args[index] = f"--deploy-config={path}"
+                    break
+            else:
+                raise ValueError("server_params.update/delete requires stage_config_name or --deploy-config")
+            extra_cli_args = tuple(args)
         use_omni = bool(server_params.get("use_omni", True))
 
         server_param = (
@@ -292,17 +453,6 @@ def _create_unique_server_params(
     return unique_params
 
 
-def configs_with_platform_stage_configs(configs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Resolve stage config for XPU vs CUDA/ROCm."""
-    out: list[dict[str, Any]] = []
-    for config in configs:
-        config_copy = json.loads(json.dumps(config))
-        if current_omni_platform.is_xpu():
-            config_copy["server_params"]["stage_config_name"] = "xpu/qwen3_omni_ci.yaml"
-        out.append(config_copy)
-    return out
-
-
 def extract_server_args_by_test_name(configs: list[dict[str, Any]]) -> dict[str, list[str] | None]:
     mapping: dict[str, list[str] | None] = {}
     for cfg in configs:
@@ -316,15 +466,17 @@ def extract_server_args_by_test_name(configs: list[dict[str, Any]]) -> dict[str,
 def create_reliability_omni_server_params(
     configs: list[dict[str, Any]], stage_configs_dir: Path
 ) -> list[OmniServerParams]:
-    adjusted_configs = configs_with_platform_stage_configs(configs)
-    unique_params = _create_unique_server_params(adjusted_configs, stage_configs_dir)
-    server_args_by_name = extract_server_args_by_test_name(adjusted_configs)
+    unique_params = _create_unique_server_params(configs, stage_configs_dir)
+    server_args_by_name = extract_server_args_by_test_name(configs)
+    runtime_params_by_name = {str(cfg.get("test_name")): cfg.get("server_params") or {} for cfg in configs}
     return [
         OmniServerParams(
             model=model,
             stage_config_path=stage_config_path,
             server_args=server_args_by_name.get(test_name),
             use_omni=use_omni,
+            init_timeout=runtime_params_by_name[test_name].get("init_timeout"),
+            stage_init_timeout=runtime_params_by_name[test_name].get("stage_init_timeout"),
         )
         for test_name, model, stage_config_path, _stage_overrides_json, _extra_cli_args, use_omni in unique_params
     ]
@@ -336,20 +488,16 @@ def supports_video_generation(model_name: str) -> bool:
 
 
 def parse_stage_devices(stage_config_path: str) -> str:
-    text = Path(stage_config_path).read_text(encoding="utf-8")
-    raw_devices: list[str] = re.findall(r"^\s*devices:\s*\"?([0-9,\s]+)\"?\s*$", text, flags=re.MULTILINE)
-    devices: set[int] = set()
-    for item in raw_devices:
-        for token in item.split(","):
-            token = token.strip()
-            if token:
-                devices.add(int(token))
-    if not devices:
-        raise ValueError(f"No runtime.devices found in stage config: {stage_config_path}")
-    return ",".join(str(x) for x in sorted(devices))
+    """Devices for the runtime platform, ignoring other ``platforms:`` blocks."""
+    from tests.dfx.reliability.helpers import stage_config_device_spec
+    from vllm_omni.platforms import current_omni_platform
+
+    device_name = current_omni_platform.device_name
+    platform = device_name.lower() if isinstance(device_name, str) and device_name.strip() else None
+    return stage_config_device_spec(stage_config_path, platform)
 
 
-def resolve_oom_device_spec(config: dict[str, Any], stage_config_path: str | None) -> str:
+def resolve_oom_device_spec(config: Mapping[str, Any], stage_config_path: str | None) -> str:
     explicit = config.get("device")
     if explicit is not None:
         return str(explicit)
@@ -407,16 +555,6 @@ def create_benchmark_indices(
 OMNI_RESULT_TEMPLATE_PATH = Path(__file__).resolve().parent / "perf" / "scripts" / "result_omni_template.json"
 
 
-def _safe_filename_token(value: Any | None, *, default: str = "na") -> str:
-    """Make a single path segment safe for result filenames on common filesystems."""
-    if value is None:
-        return default
-    s = str(value).strip()
-    for bad in ("/", "\\", ":", "*", "?", '"', "<", ">", "|"):
-        s = s.replace(bad, "_")
-    return s if s else default
-
-
 def _benchmark_param_id_suffix(param: dict[str, Any], *, idx: int) -> str:
     """Derive a readable pytest id suffix from one ``benchmark_params`` entry."""
     name = param.get("name")
@@ -452,87 +590,10 @@ def _unique_benchmark_param_id_suffixes(params_list: list[dict[str, Any]]) -> li
     return unique
 
 
-# Device marketing-name tokens for ``get_runtime_resource_label`` only.
-# Longer / more specific tokens must appear before shorter substrings
-# (e.g. ``H200`` before ``H20``, ``910B4`` before ``910``).
-_RUNTIME_DEVICE_ALIASES: tuple[str, ...] = (
-    "H100",
-    "H800",
-    "H200",
-    "H20",
-    "B200",
-    "GB200",
-    "L40S",
-    "L40",
-    "L4",
-    "A100",
-    "A800",
-    "A10G",
-    "A10",
-    "A30",
-    "MI325",
-    "MI300",
-    "MI250",
-    "B60",
-    "S5000",
-    "910B4",
-    "910B",
-    "910",
-    "310P",
-    "A2",
-    "A3",
-)
-_RUNTIME_RESOURCE_LABEL: str | None = None
-
-
-def _normalize_runtime_device_label(raw: str) -> str:
-    """Map a platform device name to a short filename-safe resource token."""
-    if not raw or not str(raw).strip():
-        return "na"
-    upper = str(raw).upper()
-    for token in _RUNTIME_DEVICE_ALIASES:
-        if token.upper() in upper:
-            return _safe_filename_token(token)
-    compact = re.sub(r"[^a-zA-Z0-9]+", "", str(raw))
-    for prefix in ("NVIDIA", "AMD", "ASCEND", "HUAWEI"):
-        if compact.upper().startswith(prefix):
-            compact = compact[len(prefix) :]
-            break
-    return _safe_filename_token(compact[:48]) if compact else "na"
-
-
-def _read_runtime_device_name(*, device_id: int = 0) -> str | None:
-    """Device name from the active Omni platform."""
-    if current_omni_platform.device_count() <= device_id:
-        return None
-    get_name = getattr(current_omni_platform, "get_device_name", None)
-    if not callable(get_name):
-        return None
-    raw = get_name(device_id)
-    if isinstance(raw, str) and raw.strip():
-        return raw.strip()
-    return None
-
-
-def get_runtime_resource_label(*, device_id: int = 0, refresh: bool = False) -> str:
-    """Return a filename-safe hardware label detected on the running machine."""
-    global _RUNTIME_RESOURCE_LABEL
-    if not refresh and _RUNTIME_RESOURCE_LABEL is not None:
-        return _RUNTIME_RESOURCE_LABEL
-    raw = _read_runtime_device_name(device_id=device_id)
-    label = _normalize_runtime_device_label(raw) if raw else "na"
-    if not refresh:
-        _RUNTIME_RESOURCE_LABEL = label
-    return label
-
+# ``get_runtime_resource_label`` and ``hardware_json_value`` live in
+# ``tests.helpers.hardware`` and are re-exported above.
 
 _FILENAME_OMIT_RESOURCE_LABELS = frozenset({"H100"})
-
-
-def hardware_json_value(resource_label: str | None) -> str:
-    """Hardware token stored in perf result JSON (empty when unknown)."""
-    token = _safe_filename_token(resource_label)
-    return "" if token == "na" else token
 
 
 def resource_label_for_filename(resource_label: str | None) -> str:
@@ -553,7 +614,7 @@ def is_hardware_nested_baseline(baseline: dict[str, Any]) -> bool:
       (``[hardware-resource]`` markers from ``pyproject.toml``).
 
     Metric names under each hardware bucket are unconstrained.
-    Runtime device aliases (:data:`_RUNTIME_DEVICE_ALIASES`) are unrelated.
+    Runtime device aliases (:data:`tests.helpers.hardware._RUNTIME_DEVICE_ALIASES`) are unrelated.
     """
     if not baseline:
         return False
@@ -647,6 +708,78 @@ def resolve_baseline_for_sweep(
     }
 
 
+def _cli_argument(args: list[str], name: str, default: str = "") -> str:
+    return args[args.index(name) + 1] if name in args else default
+
+
+def _cli_int_argument(args: list[str], name: str) -> int | None:
+    if name not in args:
+        return None
+    return int(args[args.index(name) + 1])
+
+
+def _write_omniinteract_accuracy_result(
+    result: dict[str, Any],
+    *,
+    args: list[str],
+    test_name: str,
+    dataset_name: str,
+    num_prompt: int,
+    returncode: int,
+    started_at: datetime,
+    current_dt: str,
+    benchmark_params_name: str | None,
+    accuracy_baseline: dict[str, Any] | None,
+) -> Path:
+    from tests.e2e.accuracy.helpers import (
+        _OMNIINTERACT_DATASET,
+        _acc_result_filename,
+        flatten_omniinteract_accuracy_metrics,
+        omniinteract_accuracy_result_dir,
+        write_dfx_accuracy_result,
+    )
+
+    model_id = result.get("model_id") or _cli_argument(args, "--model")
+    subset = _cli_argument(args, "--omniinteract-subsets") or None
+    suite = f"{_OMNIINTERACT_DATASET}_{subset}" if subset else _OMNIINTERACT_DATASET
+    accuracy_path = omniinteract_accuracy_result_dir() / _acc_result_filename(
+        str(model_id),
+        suite,
+        when=started_at,
+    )
+    omni = result.get("omniinteract")
+    accuracy = omni.get("accuracy") if isinstance(omni, dict) else None
+    if not isinstance(accuracy, dict):
+        accuracy = {"status": "failed", "error": "benchmark did not produce an accuracy result"}
+    else:
+        accuracy = flatten_omniinteract_accuracy_metrics(accuracy)
+    generation: dict[str, Any] = {
+        "completed": result.get("completed", 0),
+        "failed": result.get("failed", 0),
+    }
+    if isinstance(omni, dict):
+        generation.update({key: value for key, value in omni.items() if key != "accuracy"})
+    write_dfx_accuracy_result(
+        accuracy_path,
+        test_name=test_name,
+        name=subset or benchmark_params_name,
+        model_id=str(model_id),
+        dataset=_OMNIINTERACT_DATASET,
+        dataset_path=_cli_argument(args, "--dataset-path", dataset_name),
+        date=str(result.get("date") or current_dt),
+        hardware=str(result["Hardware"]),
+        baseline=accuracy_baseline or {},
+        branch=str(result["branch"]),
+        num_prompts=num_prompt,
+        max_concurrency=_cli_int_argument(args, "--max-concurrency"),
+        benchmark_exit_code=returncode,
+        generation=generation,
+        accuracy=accuracy,
+    )
+    print(f"Accuracy result saved to {accuracy_path}")
+    return accuracy_path
+
+
 def run_benchmark(
     args: list[str],
     test_name: str,
@@ -661,6 +794,7 @@ def run_benchmark(
     resource_label: str | None = None,
     num_warmups: int = 2,
     benchmark_params_name: str | None = None,
+    accuracy_baseline: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run one ``vllm bench serve --omni`` iteration and return parsed metrics.
 
@@ -675,7 +809,8 @@ def run_benchmark(
     under one ``test_name`` stay distinguishable (e.g. Wan USP2 832x480 vs
     1280x720).
     """
-    current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+    started_at = datetime.now()
+    current_dt = started_at.strftime("%Y%m%d-%H%M%S")
     ri = _safe_filename_token(random_input_len)
     ro = _safe_filename_token(random_output_len)
     hw = resource_label_for_filename(resource_label)
@@ -698,6 +833,10 @@ def run_benchmark(
         ]
     )
     result_filename = "_".join(name_parts) + ".json"
+    result_dir = os.environ.get("BENCHMARK_DIR", "tests/dfx/perf/results")
+    result_path = os.path.join(result_dir, result_filename)
+    # A failed CLI invocation must never reuse an earlier run's result.
+    Path(result_path).unlink(missing_ok=True)
     if "--result-filename" in args:
         print(f"The result file will be overwritten by {result_filename}")
     command = (
@@ -708,7 +847,7 @@ def run_benchmark(
             str(num_warmups),
             "--save-result",
             "--result-dir",
-            os.environ.get("BENCHMARK_DIR", "tests"),
+            result_dir,
             "--result-filename",
             result_filename,
         ]
@@ -733,7 +872,7 @@ def run_benchmark(
     stderr_thread.start()
     stdout_thread.join()
     stderr_thread.join()
-    process.wait()
+    returncode = process.wait()
 
     if "--result-dir" in command:
         index = command.index("--result-dir")
@@ -767,11 +906,80 @@ def run_benchmark(
     if random_output_len is not None:
         result["random_output_len"] = random_output_len
     result["Hardware"] = hardware_json_value(resource_label)
+    result["branch"] = os.environ.get("BUILDKITE_BRANCH", "")
     result["test_name"] = test_name
     if benchmark_params_name:
         result["name"] = benchmark_params_name
+    # Accuracy is published only in ``result_acc_*.json`` below; the perf result
+    # must not carry a second copy of it. ``result`` keeps it in memory so the
+    # caller's IA-QTF1 floor assertions still see it.
+    persisted = result
+    if isinstance(omniinteract_summary := result.get("omniinteract"), dict) and "accuracy" in omniinteract_summary:
+        persisted = {
+            **result,
+            "omniinteract": {key: value for key, value in omniinteract_summary.items() if key != "accuracy"},
+        }
     with open(result_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+        json.dump(persisted, f, ensure_ascii=False, indent=2)
+    if dataset_name == "omni-duplex-eval" and "--duplex-eval-evaluate" in args and accuracy_baseline is not None:
+        from tests.e2e.accuracy.helpers import (
+            _DUPLEX_EVAL_DEFAULT_ACC_DIR,
+            _acc_result_filename,
+            dfx_accuracy_result_dir,
+            write_dfx_accuracy_result,
+        )
+
+        # Intentional parallel of _write_omniinteract_accuracy_result: no flatten; NPU exit stays after the write.
+        model_id = result.get("model_id") or _cli_argument(args, "--model")
+        dataset = "omni_duplex_eval"
+        accuracy_dir = dfx_accuracy_result_dir(_DUPLEX_EVAL_DEFAULT_ACC_DIR)
+        accuracy_path = accuracy_dir / _acc_result_filename(str(model_id), dataset, when=started_at)
+        # Persist before quality assertions, including partial or failed judging.
+        duplex = result.get("omni_duplex_eval")
+        accuracy = duplex.get("accuracy") if isinstance(duplex, dict) else None
+        if not isinstance(accuracy, dict):
+            accuracy = {"status": "failed", "error": "benchmark did not produce an accuracy result"}
+        write_dfx_accuracy_result(
+            accuracy_path,
+            test_name=test_name,
+            name=benchmark_params_name,
+            model_id=str(model_id),
+            dataset=dataset,
+            dataset_path=_cli_argument(args, "--dataset-path", dataset_name),
+            date=str(result.get("date") or current_dt),
+            hardware=str(result["Hardware"]),
+            baseline=accuracy_baseline or {},
+            branch=str(result["branch"]),
+            num_prompts=num_prompt,
+            max_concurrency=_cli_int_argument(args, "--max-concurrency"),
+            benchmark_exit_code=returncode,
+            generation={
+                "completed": result.get("completed", 0),
+                "failed": result.get("failed", 0),
+                **({k: v for k, v in duplex.items() if k != "accuracy"} if isinstance(duplex, dict) else {}),
+            },
+            accuracy=accuracy,
+        )
+        print(f"Accuracy result saved to {accuracy_path}")
+        from vllm_omni.platforms import current_omni_platform
+
+        # Preserve the accuracy job's torch_npu shutdown exception while
+        # requiring complete artifacts and scores in the caller's assertions.
+        allowed_exit_codes = (0, -6) if current_omni_platform.is_npu() else (0,)
+        assert returncode in allowed_exit_codes, f"benchmark exited with unexpected code {returncode}"
+    if dataset_name == "omniinteract" and "--omniinteract-evaluate" in args:
+        _write_omniinteract_accuracy_result(
+            result,
+            args=args,
+            test_name=test_name,
+            dataset_name=dataset_name,
+            num_prompt=num_prompt,
+            returncode=returncode,
+            started_at=started_at,
+            current_dt=current_dt,
+            benchmark_params_name=benchmark_params_name,
+            accuracy_baseline=accuracy_baseline,
+        )
     return result
 
 
@@ -784,11 +992,28 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help=("Path to benchmark config JSON. Example: --test-config-file tests/dfx/perf/tests/test_tts.json"),
     )
     parser.addoption(
+        "--require-duplex-eval-score-floors",
+        action="store_true",
+        default=False,
+        help="Fail Omni-DuplexEval accuracy cases without score floors for the runtime hardware (default: off).",
+    )
+    parser.addoption(
         "--assert-baseline",
         action="store_true",
         default=False,
         help=(
-            "When set, omni/diffusion perf runners compare metrics against the baseline block in the JSON config "
-            "(default: off)."
+            "Fail a perf case when a metric is more than 10% worse than the baseline for this hardware. "
+            "Throughput and QPS fail when they fall below 90% of the baseline. "
+            "Latency, memory, and real-time factor fail when they rise above 110% of the baseline. "
+            "Missing or unmatched hardware logs a warning and skips baseline validation (default: off)."
+        ),
+    )
+    parser.addoption(
+        "--require-baseline",
+        action="store_true",
+        default=False,
+        help=(
+            "Enforce the same 10% performance tolerance as --assert-baseline, "
+            "and fail when the runtime hardware has no matching baseline (default: off)."
         ),
     )

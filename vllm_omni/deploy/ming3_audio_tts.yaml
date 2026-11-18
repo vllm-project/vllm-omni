@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# Ming3 text-to-speech: up to 64 requests share the Talker and AudioVAE batch.
+pipeline: ming3_audio_tts
+async_chunk: false
+trust_remote_code: false
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.4
+    enforce_eager: false
+    max_num_batched_tokens: 2304
+    devices: "0"
+    compilation_config:
+      mode: 0
+      cudagraph_mode: NONE
+    engine_extras:
+      hf_overrides:
+        low_latency_streaming: true
+        compile_flow: true
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 1
+
+platforms: {}

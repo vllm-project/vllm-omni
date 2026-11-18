@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# Single-stage Ref2VA: text TP8, DiT USP8, resident video/audio VAEs.
+# Parameters from the 8x Ascend 910B1 (64 GiB/device) experiment.
+# Use the existing serving container's Ascend runtime environment.
+# vllm serve "$MODEL" --omni --config recipes/MiniMaxAI/minimax-h3-ref2va-8-rank-resident.yaml
+
+host: "127.0.0.1"
+port: 19100
+trust-remote-code: true
+task-type: ref2va
+num-gpus: 8
+usp: 8
+ring: 1
+text-encoder-tp-size: 8
+vae-parallel-mode: tile
+vae-use-tiling: true
+vae-patch-parallel-size: 8
+enable-distributed-layerwise-offload: true
+diffusion-attention-backend: FLASH_ATTN
+
+# The CLI accepts this argument as JSON. Selecting only these two components
+# keeps video/audio VAEs resident and preserves rank-local text weight transfer.
+diffusion-offload-config: >-
+  {"mode":"layer","components":["dit","text_encoder"],"layer_options":{"dit":{"weight_transfer":"allgather"},"text_encoder":{"weight_transfer":"rank-local"}}}

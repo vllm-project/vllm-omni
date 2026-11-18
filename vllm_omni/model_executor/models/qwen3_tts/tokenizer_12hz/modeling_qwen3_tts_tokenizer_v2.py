@@ -19,7 +19,7 @@
 import copy
 import inspect
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -40,6 +40,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import ModelOutput, auto_docstring, logging
 from transformers.utils.deprecation import deprecate_kwarg
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
 from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
 
@@ -83,7 +84,7 @@ class Qwen3TTSTokenizerV2EncoderOutput(ModelOutput):
 class Qwen3TTSTokenizerV2DecoderOutput(ModelOutput):
     r"""
     audio_values (`List[torch.FloatTensor]`):
-        Decoded audio values, obtained using the decoder part of Qwen3TTSTokenizerV1.
+        Decoded audio values, obtained using the decoder part of Qwen3TTSTokenizerV2.
         Each tensor has shape (segment_length_i).
     """
 
@@ -353,6 +354,7 @@ class Qwen3TTSTokenizerV2DecoderAttention(nn.Module):
         attention_mask: torch.Tensor | None,
         past_key_values: Cache | None = None,
         cache_position: torch.LongTensor | None = None,
+        force_eager_attention: bool = False,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
@@ -371,7 +373,7 @@ class Qwen3TTSTokenizerV2DecoderAttention(nn.Module):
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
+        if not force_eager_attention and self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
@@ -915,6 +917,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         self.post_init()
 
         # CUDA Graph support
+        self._npu_incremental = None
         self._cudagraph_enabled = False
         self._cudagraph_wrapper = None
 
@@ -1010,6 +1013,12 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
 
         self._time_major_stack = TimeMajorConvStack(self)
         logger.info("Qwen3-TTS decoder: time-major (GEMM) conv stack enabled")
+
+    def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True):
+        if self._npu_incremental is not None:
+            self._npu_incremental.close()
+            self._npu_incremental = None
+        return super()._apply(fn, recurse=recurse)
 
     def _conv_decode(self, hidden: torch.Tensor) -> torch.Tensor:
         """Pre-transformer output ``[B, T, latent]`` -> unclamped waveform ``[B, 1, T * total_upsample]``."""
@@ -1667,6 +1676,9 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
                 max_batch_size=max_batch_size,
             )
 
+        if caches is not None and self._npu_incremental is not None:
+            return self._npu_incremental.decode_requests(codes, lengths, caches)
+
         if caches is not None:
             prefix_length = int(getattr(self.config, "sliding_window", 0) or 0)
             initial_codec_chunk_frames = int(getattr(self, "_initial_codec_chunk_frames", 1))
@@ -1743,14 +1755,28 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
 
 class Qwen3TTSTokenizerV2Encoder(MimiModel):
     def __init__(self, config: MimiConfig):
+        config = copy.deepcopy(config)
+        config.decoder_config = None
         super().__init__(config)
-        self.config = config
+        if not hasattr(self.encoder, "encoder_seanet"):
+            # Flat Mimi constructs the unused decoder unconditionally.
+            self.decoder = None
+            self.decoder_transformer = None
+            self.upsample = None
 
-        self.upsample = None
-        self.decoder_transformer = None
-        self.decoder = None
-
-        self.post_init()
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # Speech checkpoints retain Mimi's flat names; Transformers 5.22
+        # groups the SEANet, transformer and downsample under the encoder.
+        mapper = None
+        if hasattr(self.encoder, "encoder_seanet"):
+            mapper = WeightsMapper(
+                orig_to_new_prefix={
+                    "encoder.layers.": "encoder.encoder_seanet.layers.",
+                    "encoder_transformer.": "encoder.encoder_transformer.",
+                    "downsample.": "encoder.downsample.",
+                }
+            )
+        return AutoWeightsLoader(self).load_weights(weights, mapper=mapper)
 
 
 @auto_docstring

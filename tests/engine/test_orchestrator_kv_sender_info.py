@@ -33,6 +33,9 @@ class _DummySenderStage:
     def get_kv_sender_info(self):
         return self._sender_info
 
+    def get_payload_sender_info(self):
+        return None
+
 
 class _DummyDiffusionStage:
     stage_type = "diffusion"
@@ -507,7 +510,7 @@ def test_prewarm_submits_bound_payload_endpoint_for_concurrent_replicas():
     orchestrator = object.__new__(Orchestrator)
     endpoints = {"a": {"host": "10.0.0.2", "zmq_port": 52099}, "b": {"host": "10.0.0.3", "zmq_port": 54147}}
     source = SimpleNamespace(
-        get_bound_client=lambda key: SimpleNamespace(get_payload_sender_info=lambda: endpoints[key]),
+        get_payload_sender_info=lambda key: endpoints[key],
         get_bound_replica_id=lambda key: {"a": 2, "b": 4}[key],
     )
     submitted = {}

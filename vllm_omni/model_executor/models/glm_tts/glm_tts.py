@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -46,8 +46,6 @@ from vllm.multimodal.processing import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.inputs.mm_processor import OmniDummyInputsBuilder, OmniMultiModalProcessor
 from vllm_omni.model_executor.models.common.nucleus_ras_sampling import ras_sample_one as _ras_sample_one
@@ -64,18 +62,13 @@ from .voice_clone import (
     load_voice_clone_frontend,
 )
 
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
+
 logger = init_logger(__name__)
 
-_GLM_TTS_DEFAULT_REPO_ID = "zai-org/GLM-TTS"
 _GLM_TTS_TOKENIZER_SUBDIR = "vq32k-phoneme-tokenizer"
 _GLM_TTS_MAX_PROMPT_SPEECH_TOKENS = 1024
-
-
-def _req_float(param: torch.Tensor | None, req_idx: int, default: float) -> float:
-    if param is None or param.numel() == 0:
-        return default
-    index = min(req_idx, int(param.numel()) - 1)
-    return float(param.reshape(-1)[index].item())
 
 
 def _tensor_param_values(
@@ -1130,6 +1123,8 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
         per-request nucleus+repetition-aware sampling; otherwise falls back
         to standard vLLM sampling.
         """
+        from vllm.v1.sample.sampler import Sampler
+
         if logits is None or logits.numel() == 0:
             return None
         if self.model_stage != "glm_tts":

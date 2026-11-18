@@ -78,9 +78,9 @@ the boundary affected by the in-flight stage client/process refactor in
 [#5441](https://github.com/vllm-project/vllm-omni/pull/5441). Names and
 responsibilities proposed only by that PR are not current contracts.
 
-The orchestration loop also has an opt-in event-driven mode
-(`VLLM_OMNI_EVENT_DRIVEN_ORCH=1`, default off except for Qwen3-TTS) proposed in
-[#5221](https://github.com/vllm-project/vllm-omni/pull/5221). It changes poll
+The orchestration loop is event-driven by default, as proposed in
+[#5221](https://github.com/vllm-project/vllm-omni/pull/5221);
+`VLLM_OMNI_EVENT_DRIVEN_ORCH=0` selects the legacy 1 ms poll loop. The mode changes poll
 cadence only: the routing, ordering, and terminal-state contracts below hold
 identically on both loops.
 
@@ -94,6 +94,25 @@ It does not own stage placement, replica selection, stage-process startup,
 payload schemas, public protocol rendering, connector transport, or semantic
 error classification. Those responsibilities belong to the stage runtime,
 I/O, entrypoint, connector, and error contracts.
+
+## Stage-0 multimodal preprocessing caches
+
+One frontend can route requests to multiple stage-0 replicas, each with its
+own receiver cache. OpenAI chat requests pass through the frontend renderer
+before replica selection, so a frontend cache hit must still supply tensors
+to a replica that has never received that media or has evicted it.
+
+During stage-0 input-processor construction, replicated deployments select
+the renderer's upstream processor-only cache instead of its LRU or SHM sender
+cache. Distributed frontends select this policy at startup even with zero or
+one initial replica, allowing later joins without switching a live cache.
+Preprocessing results remain reusable; frontend tensor storage and tensor
+transfer per request increase. Local single-replica deployments and disabled
+or already processor-only caches retain their existing behavior. Renderer
+resource cleanup remains owned by upstream vLLM.
+
+`tests/engine/test_stage0_multimodal_cache.py` exercises startup selection,
+repeated media across independent receivers, eviction, and late joins.
 
 ## Candidate invariants
 
@@ -136,6 +155,13 @@ is request-terminal. Output-processor abort state is committed only after the
 physical EngineCore abort succeeds.
 Changes that cross into stage runtime or public error behavior require review
 from that contract's owners.
+
+Multimodal cache-miss feedback invalidates only the reported hashes in the
+owning sender cache before request error delivery. Downstream caches are
+updated under the preprocessing lock; stage 0 feedback crosses to the frontend
+and is applied while draining outputs, including cancelled requests. Ordinary
+request failures retain retryable classification; duplex session termination
+keeps its existing semantics.
 
 ## Promotion gate
 

@@ -7,25 +7,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.worker.gpu_generation_model_runner import _HostCopyBatch
+from tests.helpers.mark import hardware_marks
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_host_copy_batch_preserves_noncontiguous_outputs_on_current_stream():
-    stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream):
-        source = torch.arange(24, device="cuda", dtype=torch.float32).reshape(4, 6)
-        copies = _HostCopyBatch(pin_memory=True)
-        first = copies.copy(source.t())
-        second = copies.copy(source + 10)
-        copies.wait()
-        assert first.is_contiguous() and first.is_pinned()
-        assert torch.equal(first, torch.arange(24, dtype=torch.float32).reshape(4, 6).t())
-        assert torch.equal(second, torch.arange(24, dtype=torch.float32).reshape(4, 6) + 10)
-        copies.wait()  # no outstanding copies
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

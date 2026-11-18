@@ -26,8 +26,9 @@ _FP8_MAX = float(torch.finfo(_FP8).max)
 
 
 def fp8_supported(device: torch.device) -> bool:
-    """FP8 GEMMs through ``torch._scaled_mm`` are validated on Ada and Hopper GPUs."""
-    if device.type != "cuda" or not torch.cuda.is_available():
+    """FP8 GEMMs through ``torch._scaled_mm`` are validated on NVIDIA Ada and Hopper GPUs."""
+    # ROCm also uses the CUDA namespace, but this E4M3 GEMM path is NVIDIA-only.
+    if device.type != "cuda" or torch.version.hip is not None or not torch.cuda.is_available():
         return False
     return (8, 9) <= torch.cuda.get_device_capability(device) < (10, 0)
 

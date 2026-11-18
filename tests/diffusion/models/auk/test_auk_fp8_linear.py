@@ -10,6 +10,7 @@ out-of-range activations, and the denoise step eager and under its CUDA graph.
 
 import pytest
 import torch
+from pytest_mock import MockerFixture
 from torch import nn
 from vllm.utils.torch_utils import set_default_torch_dtype
 
@@ -22,7 +23,7 @@ pytestmark = [pytest.mark.core_model]
 
 _needs_fp8 = pytest.mark.skipif(
     not (torch.cuda.is_available() and fp8_supported(torch.device("cuda"))),
-    reason="FP8 GEMMs need an Ada or Hopper CUDA device",
+    reason="FP8 GEMMs need an NVIDIA Ada or Hopper CUDA device",
 )
 
 
@@ -51,6 +52,47 @@ def _relative_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
 @pytest.mark.cpu
 def test_fp8_is_unsupported_off_cuda() -> None:
     assert not fp8_supported(torch.device("cpu"))
+
+
+@pytest.mark.cpu
+def test_fp8_is_unsupported_on_hip(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture) -> None:
+    monkeypatch.setattr(torch.version, "hip", "6.4.0")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    get_capability = mocker.Mock(return_value=(9, 0))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", get_capability)
+
+    assert not fp8_supported(torch.device("cuda"))
+    get_capability.assert_not_called()
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("capability", "supported"),
+    [((8, 0), False), ((8, 9), True), ((9, 0), True), ((10, 0), False)],
+    ids=["ampere", "ada", "hopper", "blackwell"],
+)
+def test_fp8_support_matches_validated_nvidia_capabilities(
+    monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, capability: tuple[int, int], supported: bool
+) -> None:
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    get_capability = mocker.Mock(return_value=capability)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", get_capability)
+    device = torch.device("cuda")
+
+    assert fp8_supported(device) is supported
+    get_capability.assert_called_once_with(device)
+
+
+@pytest.mark.cpu
+def test_fp8_is_unsupported_without_a_cuda_device(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture) -> None:
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    get_capability = mocker.Mock()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", get_capability)
+
+    assert not fp8_supported(torch.device("cuda"))
+    get_capability.assert_not_called()
 
 
 @pytest.mark.cpu

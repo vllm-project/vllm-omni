@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """F0 folding and joint C4/C5 loading regressions with the existing CPU F0 policy."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
 from torch.nn.utils import parametrize
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core import hifigan
 
 pytestmark = [
@@ -23,11 +26,20 @@ def fixed_seed():
         yield
 
 
+def _select_weight_norm_api(api, monkeypatch):
+    if api == "legacy":
+        monkeypatch.setattr(hifigan, "weight_norm", nn.utils.weight_norm)
+    return api
+
+
 @pytest.fixture(params=["parametrized", "legacy"])
 def weight_norm_api(request, monkeypatch):
-    if request.param == "legacy":
-        monkeypatch.setattr(hifigan, "weight_norm", nn.utils.weight_norm)
-    return request.param
+    return _select_weight_norm_api(request.param, monkeypatch)
+
+
+@pytest.fixture
+def checkpoint_weight_norm_api(request, monkeypatch):
+    return _select_weight_norm_api(request.param, monkeypatch)
 
 
 @pytest.fixture(
@@ -40,7 +52,7 @@ def fold_context(request):
 @pytest.fixture(
     params=[
         pytest.param("cpu", marks=pytest.mark.cpu),
-        pytest.param("cuda", marks=pytest.mark.cuda),
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)),
     ]
 )
 def runtime(request):
@@ -88,6 +100,7 @@ def _make_loader():
     # Real load_weights and vocoder; only the unrelated Flow is reduced.
     model = CosyVoice3Code2Wav.__new__(CosyVoice3Code2Wav)
     nn.Module.__init__(model)
+    model.config = SimpleNamespace(cosyvoice3_compile_dit=False)
     model.flow_model = nn.Linear(2, 2)
     model.hift = _make_hift().train()
     model._hift_window_len = 64
@@ -174,17 +187,17 @@ def test_f0_fold_leaves_generator_norms_unchanged(weight_norm_api):
 
 
 @pytest.mark.parametrize(
-    "weight_norm_api,legacy_checkpoint",
+    "checkpoint_weight_norm_api,legacy_checkpoint",
     [("parametrized", False), ("parametrized", True), ("legacy", True)],
-    indirect=["weight_norm_api"],
+    indirect=["checkpoint_weight_norm_api"],
 )
 def test_load_folds_loaded_generator_and_f0_weights(
-    tmp_path, weight_norm_api, legacy_checkpoint, runtime, fold_context
+    tmp_path, checkpoint_weight_norm_api, legacy_checkpoint, runtime, fold_context
 ):
     device = runtime
     model = _make_loader()
     assert model.hift.training and model.hift.f0_predictor.training and model.flow_model.training
-    assert hasattr(model.hift.f0_predictor.condnet[0], "weight_g") == (weight_norm_api == "legacy")
+    assert hasattr(model.hift.f0_predictor.condnet[0], "weight_g") == (checkpoint_weight_norm_api == "legacy")
     state = _write_checkpoint(model, tmp_path, legacy_checkpoint)
     # Do not forward the loader instance before loading. A separate unfolded
     # reference refreshes legacy cached weights from the changed checkpoint.

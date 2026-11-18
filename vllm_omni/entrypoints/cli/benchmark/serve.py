@@ -26,7 +26,7 @@ class OmniBenchmarkServingSubcommand(OmniBenchmarkSubcommandBase):
     """The `serve` subcommand for vllm bench."""
 
     name = "serve"
-    help = "Benchmark online serving. Supports Daily-Omni, OmniInteract, and Seed-TTS datasets."
+    help = "Benchmark online serving. Supports Daily-Omni, OmniInteract, Omni-DuplexEval, and Seed-TTS datasets."
 
     @classmethod
     def add_cli_args(cls, parser: argparse.ArgumentParser) -> None:
@@ -44,4 +44,8 @@ class OmniBenchmarkServingSubcommand(OmniBenchmarkSubcommandBase):
         from vllm_omni.benchmarks.serve import main
 
         preprocess_serve_args(args)
-        main(args)
+        result = main(args)
+        if args.backend == "realtime-video":
+            report = result["realtime_video_evaluation"] if args.realtime_video_evaluate else result["realtime_video"]
+            if not report["passed"]:
+                raise RuntimeError(f"Realtime video benchmark failed: {report['errors']}")

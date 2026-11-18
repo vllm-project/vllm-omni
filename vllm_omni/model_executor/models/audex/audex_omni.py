@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # Adapted from nvidia/Nemotron-Labs-Audex-2B (Apache-2.0):
 #   inference_scripts_vllm/audioqa_scripts/audex_2b_vllm/modeling_audex_vllm.py
@@ -126,6 +126,11 @@ class NemotronDenseAudexForConditionalGeneration(
     SupportsPP,
 ):
     _LM_ARCHITECTURE = "NemotronDenseForCausalLM"
+
+    def mrv2_custom_sampler(self, sampler):
+        from vllm_omni.model_executor.models.audex.cfg import AudexCFGSampler
+
+        return AudexCFGSampler(sampler), None
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:

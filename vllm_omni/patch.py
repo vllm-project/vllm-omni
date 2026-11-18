@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# mypy: disable-error-code="attr-defined"
 
 import importlib
 import logging
@@ -10,7 +11,6 @@ from functools import cached_property
 import torch
 from aenum import extend_enum
 from vllm.config import ModelConfig as _OriginalModelConfig
-from vllm.config import VllmConfig as _OriginalVllmConfig
 from vllm.inputs import TokensPrompt as _OriginalTokensPrompt
 from vllm.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding as _OriginalMRotaryEmbedding,
@@ -24,28 +24,20 @@ from vllm.v1.request import StreamingUpdate as _OriginalStreamingUpdate
 
 import vllm_omni.logger  # noqa: F401
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEngineCoreRequest
+from vllm_omni.inputs.audio import apply_soundfile_first_audio_decode_patch
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.inputs.video import apply_opencv_capture_reuse_patch
 from vllm_omni.model_executor.layers.rotary_embedding import OmniMRotaryEmbedding
 from vllm_omni.request import OmniRequest, OmniStreamingUpdate
+from vllm_omni.utils.mm_prefix import apply_img2img_mm_prefix_patch
 
 _PATCH_LOGGER = logging.getLogger("vllm_omni.patch")
 
-# Omni's deploy config selects a runner per stage. vLLM 0.31's config property
-# otherwise defaults to v2 independently of the runner selected by our workers,
-# making shared consumers such as InputProcessor choose the wrong API.
-_runner_property = _OriginalVllmConfig.use_v2_model_runner
-if not getattr(_runner_property.fget, "_omni_stage_runner", False):
-
-    def _patched_use_v2_model_runner(self, _upstream=_runner_property.fget):
-        # Lazy import keeps the package's patch/config initialization acyclic.
-        from vllm_omni.config.model import OmniModelConfig
-
-        if isinstance(self.model_config, OmniModelConfig):
-            return self.model_config.use_v2_model_runner
-        return _upstream(self)
-
-    _patched_use_v2_model_runner._omni_stage_runner = True
-    _OriginalVllmConfig.use_v2_model_runner = property(_patched_use_v2_model_runner)
+# Decoder rounding is visible to audio encoders and can change mixed-media
+# answers. Preserve Omni's existing default while retaining explicit choices.
+apply_soundfile_first_audio_decode_patch()
+apply_opencv_capture_reuse_patch()
+apply_img2img_mm_prefix_patch()
 
 # =============================================================================
 # Patch ModelConfig.is_mm_prefix_lm to support omni-specific models
@@ -316,7 +308,7 @@ if _legacy_nvfp4_linear_method is not None:
 
     # Sentinel so a later reload of this module recovers the genuine upstream
     # method above instead of wrapping this wrapper (see reload-idempotency note).
-    _patched_nvfp4_pwal._vllm_omni_wrapped_pwal = _original_nvfp4_pwal
+    setattr(_patched_nvfp4_pwal, "_vllm_omni_wrapped_pwal", _original_nvfp4_pwal)
 
     if not _already_patched_upstream:
         _OriginalModelOptNvFp4LinearMethod.process_weights_after_loading = _patched_nvfp4_pwal
@@ -379,19 +371,19 @@ for module_name, module in list(sys.modules.items()):
     if "vllm" not in module_name:
         continue
     if hasattr(module, "EngineCoreOutput") and module.EngineCoreOutput == _OriginalEngineCoreOutput:
-        module.EngineCoreOutput = OmniEngineCoreOutput
+        setattr(module, "EngineCoreOutput", OmniEngineCoreOutput)
     if hasattr(module, "EngineCoreOutputs") and module.EngineCoreOutputs == _OriginalEngineCoreOutputs:
-        module.EngineCoreOutputs = OmniEngineCoreOutputs
+        setattr(module, "EngineCoreOutputs", OmniEngineCoreOutputs)
     if hasattr(module, "TokensPrompt") and module.TokensPrompt == _OriginalTokensPrompt:
-        module.TokensPrompt = OmniTokensPrompt
+        setattr(module, "TokensPrompt", OmniTokensPrompt)
     if hasattr(module, "MRotaryEmbedding") and module.MRotaryEmbedding == _OriginalMRotaryEmbedding:
-        module.MRotaryEmbedding = OmniMRotaryEmbedding
+        setattr(module, "MRotaryEmbedding", OmniMRotaryEmbedding)
     if hasattr(module, "Request") and module.Request == _OriginalRequest:
-        module.Request = OmniRequest
+        setattr(module, "Request", OmniRequest)
     if hasattr(module, "StreamingUpdate") and module.StreamingUpdate == _OriginalStreamingUpdate:
-        module.StreamingUpdate = OmniStreamingUpdate
+        setattr(module, "StreamingUpdate", OmniStreamingUpdate)
     if hasattr(module, "EngineCoreRequest") and module.EngineCoreRequest == _OriginalEngineCoreRequest:
-        module.EngineCoreRequest = OmniEngineCoreRequest
+        setattr(module, "EngineCoreRequest", OmniEngineCoreRequest)
 
 
 # Patch: add qwen3_omni_moe to vllm's chat template fallback registry.
@@ -480,7 +472,7 @@ def _patch_flashinfer_fp8_scaled_mm_output_shape():
             out = out.view(*output_shape)
         return out
 
-    _patched_apply_scaled_mm._omni_output_shape_patched = True
+    setattr(_patched_apply_scaled_mm, "_omni_output_shape_patched", True)
     FlashInferFP8ScaledMMLinearKernel.apply_scaled_mm = _patched_apply_scaled_mm
 
 
@@ -578,7 +570,7 @@ def _patch_inductor_factorable_divisibility():
             return True
         return _provably_factorable_multiple(numerator, denominator)
 
-    statically_known_multiple_of._vllm_omni_factorable_divisibility = True
+    setattr(statically_known_multiple_of, "_vllm_omni_factorable_divisibility", True)
     SizeVarAllocator.statically_known_multiple_of = statically_known_multiple_of
     _PATCH_LOGGER.info("inductor factorable-divisibility patch: installed.")
 
@@ -587,70 +579,179 @@ _patch_inductor_factorable_divisibility()
 
 
 # =============================================================================
-# Patch CuMemAllocator._python_free_callback to fix CUDA double-free on shutdown
+# Patch CuMemAllocator free path so releasing a MemPool frees all its memory
 # =============================================================================
-# WHY: CuMemAllocator._python_free_callback guards the asleep-entry double-free
-# skip with ``if data.is_asleep and current_platform.is_rocm():`` — only ROCm
-# gets the safe empty-handle return.  On CUDA, the callback falls through and
-# returns the original handle, causing cuMemRelease on already-freed memory
-# (CUDA_ERROR_INVALID_VALUE) during EngineCore subprocess atexit cleanup.
+# WHY: Inline diffusion engines release their CuMem ``MemPool`` in-process at
+# shutdown, and torch then raw-frees every cached block through the C
+# extension's ``my_free``, which calls ``_python_free_callback`` for a handle
+# to unmap. Two kinds of block have no usable handle there (#8016):
 #
-# This happens because ``sleep()`` calls ``unmap_and_release()`` on ALL
-# platforms, then sets ``is_asleep = True``.  When the atexit handler
-# (``_shutdown_singleton`` -> ``release_pools()`` -> GC) triggers the free
-# callback, the asleep entries must return an empty chunk list so the C
-# extension skips ``cuMemRelease`` — exactly the same logic already used by
-# the ROCm guard.
+# * Blocks swept by ``use_memory_pool()`` on exit: it pops idle segments from
+#   ``pointer_to_data`` and unmaps them, but torch's MemPool still caches them
+#   and frees them again later, so the upstream callback raises ``KeyError``.
+# * Asleep blocks: ``sleep()`` already unmapped them. Upstream only guards
+#   ROCm, whose ``my_free`` accepts an empty chunk list; on CUDA ``my_free``
+#   parses the handle as ``KKKK`` and always unmaps.
 #
-# The fix removes the ``current_platform.is_rocm()`` condition so the guard
-# applies to CUDA (and any future platform that implements cumem).
+# On CUDA any failure in ``my_free`` returns without unmapping and leaves a
+# Python exception and a sticky CUDA error behind, so every later free in the
+# same ``emptyCache`` pops its entry but never releases the physical memory.
+# One stale block thus leaked the whole transformer (~4 GiB) on shutdown.
 #
-# FRAGILITY: Relies on ``_python_free_callback`` being a regular method
-# (not a slot or C extension).  If CuMemAllocator is rewritten in C/Cython,
-# this monkey-patch will silently become a no-op.
+# FIX: remember handles swept by ``use_memory_pool()``; when torch frees a
+# swept or asleep block, re-back it with fresh physical memory on CUDA so
+# ``my_free`` can unmap, release, and free the address normally (ROCm keeps
+# its empty-chunk-list path).
+#
+# FRAGILITY: Relies on ``_python_free_callback`` being a regular method and on
+# ``use_memory_pool()`` resolving ``unmap_and_release`` from the module globals.
+def _cumem_platform_is_rocm() -> bool:
+    from vllm.platforms import current_platform
+
+    return current_platform.is_rocm()
+
+
+def release_cumem_allocations_for_shutdown(allocator) -> int:
+    """Retire every allocation still tracked by an inline worker.
+
+    ``CuMemAllocator.release_pools()`` only drops the Python MemPool and
+    pluggable-allocator wrappers. Tensors retained outside the model runner
+    can therefore keep entries in ``pointer_to_data`` after an inline engine
+    shuts down, which prevents the next sleep-enabled engine from starting in
+    the same process.
+
+    The caller must first stop worker activity and synchronize the device.
+    Mapped allocations are unmapped here; already-asleep allocations were
+    unmapped by ``sleep()``. Both are removed from the live-usage registry and
+    retained as swept handles so the later MemPool/tensor free callback can
+    finish releasing their virtual addresses safely.
+    """
+    from vllm.device_allocator import cumem as cumem_module
+
+    # Since the v0.34 pin, sleep backups are mmap'd + cudaHostRegister'd by
+    # create_cpu_backup() and must be unregistered (release_cpu_backup, the
+    # pin's own release-then-null order) before the last reference is dropped;
+    # a stale registration poisons later host mappings in this process.
+    release_backup = getattr(cumem_module, "release_cpu_backup", None)
+    if release_backup is None:
+        _PATCH_LOGGER.debug("[cumem-cuda] release_cpu_backup unavailable; backup drop keeps legacy semantics")
+
+    swept_handles = allocator.__dict__.setdefault("_omni_swept_handles", {})
+    retired_bytes = 0
+    for ptr, data in list(allocator.pointer_to_data.items()):
+        if not data.is_asleep:
+            # Keep the entry visible until the physical unmap succeeds. If it
+            # fails, get_current_usage() must continue to report the leak.
+            cumem_module.unmap_and_release(data.handle)
+        if data.cpu_backup_tensor is not None and release_backup is not None:
+            release_backup(data.cpu_backup_tensor)
+        data.cpu_backup_tensor = None
+        removed = allocator.pointer_to_data.pop(ptr, None)
+        if removed is not data:
+            raise RuntimeError(f"CuMem allocation {ptr} changed during shutdown")
+        swept_handles[ptr] = data.handle
+        retired_bytes += data.handle[1]
+    return retired_bytes
+
+
 def _patch_cumem_free_callback_cuda() -> None:
     try:
-        from vllm.device_allocator.cumem import CuMemAllocator
+        from vllm.device_allocator import cumem as cumem_module
+        from vllm.device_allocator.cumem import CuMemAllocator, cumem_available
+
+        if not cumem_available:
+            return
     except ImportError:
         _PATCH_LOGGER.debug("[cumem-cuda] CuMemAllocator not available; skipping patch")
         return
 
-    _original_free_callback = CuMemAllocator._python_free_callback
-
-    if getattr(_original_free_callback, "_omni_cumem_cuda_patched", False):
+    if getattr(CuMemAllocator._python_free_callback, "_omni_cumem_cuda_patched", False):
         return
 
-    # The upstream bug: `_python_free_callback` only skips the double-free
-    # for ROCm (line ~206).  We wrap the method to extend the guard to all
-    # platforms.
+    original_unmap_and_release = cumem_module.unmap_and_release
+
+    # v0.34-pin backups are cudaHostRegister'd; unregister them exactly like
+    # the pin's own _python_free_callback does (release, then null) instead of
+    # dropping the last reference to a still-registered mmap.
+    release_backup = getattr(cumem_module, "release_cpu_backup", None)
+    if release_backup is None:
+        _PATCH_LOGGER.debug("[cumem-cuda] release_cpu_backup unavailable; backup drop keeps legacy semantics")
+
+    def _tracking_unmap_and_release(allocation_handle) -> None:
+        original_unmap_and_release(allocation_handle)
+        allocator = CuMemAllocator.instance
+        # sleep()/discard() keep their entries; only the use_memory_pool()
+        # sweep unmaps a block that is no longer tracked.
+        if allocator is not None and allocation_handle[2] not in allocator.pointer_to_data:
+            allocator.__dict__.setdefault("_omni_swept_handles", {})[allocation_handle[2]] = allocation_handle
+
+    def _releasable_handle(allocation_handle) -> tuple:
+        """Return a handle for a block whose physical memory is already released."""
+        if _cumem_platform_is_rocm():
+            device, size, d_mem, _ = allocation_handle
+            return (device, size, d_mem, [])
+        cumem_module.create_and_map(allocation_handle)
+        return allocation_handle
+
+    def _patched_free_callback(self, ptr: int) -> tuple:
+        data = self.pointer_to_data.pop(ptr, None)
+        if data is None:
+            swept = self.__dict__.get("_omni_swept_handles", {}).pop(ptr, None)
+            if swept is None:
+                raise KeyError(ptr)
+            return _releasable_handle(swept)
+        if data.cpu_backup_tensor is not None:
+            if release_backup is not None:
+                release_backup(data.cpu_backup_tensor)
+            data.cpu_backup_tensor = None
+        if data.is_asleep:
+            return _releasable_handle(data.handle)
+        # Drain pending kernels before the C extension's cuMemUnmap.
+        torch.accelerator.synchronize(data.handle[0])
+        return data.handle
+
+    setattr(_patched_free_callback, "_omni_cumem_cuda_patched", True)
+    CuMemAllocator._python_free_callback = _patched_free_callback
+    cumem_module.unmap_and_release = _tracking_unmap_and_release
+    _PATCH_LOGGER.info("[cumem-cuda] CuMemAllocator free path patched: swept and asleep blocks are released safely.")
+
+
+def _patch_xpumem_free_callback_xpu() -> None:
+    try:
+        from vllm.device_allocator.xpumem import XpuMemAllocator, xpumem_available
+    except ImportError:
+        _PATCH_LOGGER.debug("[xpumem] XpuMemAllocator not available; skipping patch")
+        return
+
+    if not xpumem_available:
+        return
+
+    if getattr(XpuMemAllocator._python_free_callback, "_omni_xpumem_xpu_patched", False):
+        return
+
     def _patched_free_callback(self, ptr: int) -> tuple:
         data = self.pointer_to_data.pop(ptr)
         if data.cpu_backup_tensor is not None:
             data.cpu_backup_tensor = None
         if data.is_asleep:
-            # sleep() already called unmap_and_release() on this allocation.
-            # Return an empty chunk list so the C extension skips
-            # cuMemRelease, avoiding a double-free.  Same logic as the
-            # existing ROCm guard, but applied to all platforms.
             device, size, d_mem, _ = data.handle
-            result = (device, size, d_mem, [])
+            result: tuple = (device, size, d_mem, [])
             _PATCH_LOGGER.debug(
-                "[cumem-cuda] Free callback: asleep entry %s -> empty handle",
+                "[xpumem] Free callback: asleep entry %s -> empty handle",
                 ptr,
             )
             return result
-        # Drain pending kernels before the C extension's cuMemUnmap.
+        # Drain pending kernels before the C extension unmaps.
         torch.accelerator.synchronize(data.handle[0])
         return data.handle
 
-    _patched_free_callback._omni_cumem_cuda_patched = True
-    CuMemAllocator._python_free_callback = _patched_free_callback
-    _PATCH_LOGGER.info(
-        "[cumem-cuda] CuMemAllocator._python_free_callback patched: asleep guard extended to all platforms."
-    )
+    setattr(_patched_free_callback, "_omni_xpumem_xpu_patched", True)
+    XpuMemAllocator._python_free_callback = _patched_free_callback
+    _PATCH_LOGGER.info("[xpumem] XpuMemAllocator._python_free_callback patched: asleep guard enabled for XPU.")
 
 
 _patch_cumem_free_callback_cuda()
+_patch_xpumem_free_callback_xpu()
 
 
 def _patch_batched_seeded_random_sample() -> None:
@@ -725,3 +826,64 @@ def _patch_mrv2_stop_token_capacity() -> None:
 
 
 _patch_mrv2_stop_token_capacity()
+
+
+def _patch_ascend_ngram() -> None:
+    # Runner selection happens here. Both speculator factory bindings are
+    # handled in platforms/npu/worker/npu_omni_v2_model_runner.py.
+    from vllm_omni.worker_v2.ngram_adapter import allow_ascend_scheduler_ngram
+
+    allow_ascend_scheduler_ngram()
+
+
+_patch_ascend_ngram()
+
+
+def _patch_weak_ref_tensors_dict_payloads() -> None:
+    """Let cudagraph weak-ref traversal pass through Omni payload dicts.
+
+    vLLM 0.34's ``weak_ref_tensors`` recurses into nested containers and
+    raises ``ValueError`` on plain dicts (and Nones). Omni stage models return
+    ``OmniOutput`` NamedTuples whose ``multimodal_outputs`` field is a dict of
+    tensors; CUDAGraphWrapper weak-references exactly that output at capture
+    and replay (vllm/compilation/cuda_graph.py), so a dict payload would kill
+    every graphed stage step. Baseline applied the storage-alias primitive per
+    tuple element, which passed dicts through untouched. The patch adds a dict
+    branch (recursing over values) — every non-dict input keeps the original
+    code path, and dicts previously raised, so no upstream caller can regress.
+    Bound names are rebound in the two modules that from-import the helper.
+    """
+    from vllm.utils import torch_utils
+
+    original = torch_utils.weak_ref_tensors
+    if getattr(original, "_omni_dict_payloads", False):
+        return
+
+    def weak_ref_tensors_with_dicts(tensors):
+        # Baseline dispatched the storage-alias primitive per tuple element,
+        # so dicts and Nones (OmniOutput's optional fields) passed through
+        # untouched — the primitive returns non-tensors as-is. vLLM 0.34
+        # recurses containers instead and raises on both.
+        if isinstance(tensors, dict):
+            return tensors
+        if tensors is None:
+            return None
+        return original(tensors)
+
+    weak_ref_tensors_with_dicts._omni_dict_payloads = True  # type: ignore[attr-defined]
+    weak_ref_tensors_with_dicts.__wrapped__ = original  # type: ignore[attr-defined]
+    torch_utils.weak_ref_tensors = weak_ref_tensors_with_dicts
+    # Rebind early from-imports so the production cudagraph path sees the patch.
+    for module_name in (
+        "vllm.compilation.cuda_graph",
+        "vllm.compilation.breakable_cudagraph",
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        if getattr(module, "weak_ref_tensors", None) is original:
+            module.weak_ref_tensors = weak_ref_tensors_with_dicts
+
+
+_patch_weak_ref_tensors_dict_payloads()

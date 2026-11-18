@@ -43,12 +43,20 @@ TRANSFORM = {
 
 def test_delta_factors_apply_the_vdn_solve_rule():
     torch.manual_seed(0)
-    k = torch.nn.functional.normalize(torch.randn(3, 2, 6, 4, dtype=torch.float64), dim=-1)
+    if torch.version.hip is not None and not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required for the LAPACK-free solve-rule path")
+    device = torch.device("cuda" if torch.version.hip is not None else "cpu")
+    k = torch.nn.functional.normalize(torch.randn(3, 2, 6, 4, dtype=torch.float64, device=device), dim=-1)
     A = k.transpose(-1, -2) @ k
-    B, state = torch.randn(3, 2, 4, 4, dtype=torch.float64), torch.randn(3, 2, 4, 4, dtype=torch.float64)
-    alpha = torch.rand(3, 2, 4, dtype=torch.float64)
+    B, state = (
+        torch.randn(3, 2, 4, 4, dtype=torch.float64, device=device),
+        torch.randn(3, 2, 4, 4, dtype=torch.float64, device=device),
+    )
+    alpha = torch.rand(3, 2, 4, dtype=torch.float64, device=device)
     transition, injection = _delta_factors(A, B, alpha)
-    expected = (state * alpha.unsqueeze(-2) + B) @ torch.linalg.inv(torch.eye(4, dtype=torch.float64) + A)
+    expected = (state * alpha.unsqueeze(-2) + B) @ torch.linalg.inv(
+        torch.eye(4, dtype=torch.float64, device=device) + A
+    )
     torch.testing.assert_close(state @ transition + injection, expected)
 
 

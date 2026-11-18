@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.models.omnivoice import pipeline_omnivoice
 from vllm_omni.diffusion.models.omnivoice.pipeline_omnivoice import (
     OmniVoicePipeline,
     _PreparedOmniVoiceRequest,
@@ -19,6 +20,31 @@ from vllm_omni.model_executor.models.omnivoice.omnivoice_generator import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize(
+    "sampling_params",
+    [
+        OmniDiffusionSamplingParams(seed=42),
+        OmniDiffusionSamplingParams(extra_args={"seed": 42}),
+    ],
+)
+def test_prepare_request_input_honors_both_seed_entrypoints(monkeypatch, sampling_params) -> None:
+    """Keep typed and legacy seed inputs working during the migration."""
+    pipeline = object.__new__(OmniVoicePipeline)
+    pipeline.duration_estimator = SimpleNamespace(estimate_duration=lambda *args: 1)
+    pipeline.tokenizer = SimpleNamespace(encode=lambda text: SimpleNamespace(ids=[1]))
+    pipeline.device = torch.device("cpu")
+    pipeline.config = SimpleNamespace(
+        num_audio_codebook=1, audio_mask_id=0, audio_chunk_duration=15.0, audio_chunk_threshold=30.0, frame_rate=25
+    )
+    pipeline._estimate_target_len = lambda *args: 1
+    monkeypatch.setattr(pipeline_omnivoice, "_tokenize_with_nonverbal_tags", lambda text, tokenizer: [2])
+
+    prepared = pipeline._prepare_request_input("Hello", sampling_params)
+
+    assert isinstance(prepared, _PreparedOmniVoiceRequest)
+    assert prepared.seed == 42
 
 
 def test_sdpa_fallback_mask_preserves_packed_sequence_boundaries() -> None:
@@ -86,7 +112,8 @@ def test_request_batch_prepare_error_does_not_skip_valid_request() -> None:
         _prepare_request_input=prepare_request,
         _collate_request_inputs=collate_requests,
         generator=generate_tokens,
-        decoder=lambda tokens: tokens.float(),
+        device=torch.device("cpu"),
+        _decode_chunk=lambda prepared, tokens: (DiffusionOutput(output=tokens.float()), None),
         num_step=32,
         guidance_scale=7.0,
         t_shift=1.0,
@@ -134,7 +161,8 @@ def test_request_batch_honors_explicit_sampling_overrides() -> None:
         _prepare_request_input=lambda prompt, extra: prepared,
         _collate_request_inputs=lambda requests: (prepared.input_ids, prepared.audio_mask, [prepared.cond_len]),
         generator=generate_tokens,
-        decoder=lambda tokens: tokens.float(),
+        device=torch.device("cpu"),
+        _decode_chunk=lambda prepared, tokens: (DiffusionOutput(output=tokens.float()), None),
         num_step=32,
         guidance_scale=2.0,
         t_shift=1.0,
@@ -201,7 +229,8 @@ def test_request_batch_prepare_error_preserves_surrounding_output_indices() -> N
         _prepare_request_input=prepare_request,
         _collate_request_inputs=collate_requests,
         generator=generate_tokens,
-        decoder=lambda tokens: tokens.float(),
+        device=torch.device("cpu"),
+        _decode_chunk=lambda prepared, tokens: (DiffusionOutput(output=tokens.float()), None),
         num_step=32,
         guidance_scale=2.0,
         t_shift=1.0,

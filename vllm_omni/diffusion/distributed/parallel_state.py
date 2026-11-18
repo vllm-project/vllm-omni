@@ -30,6 +30,7 @@ If you only need to use the distributed environment without model parallelism,
 """
 
 import inspect
+import sys
 from math import prod
 
 import torch
@@ -62,6 +63,7 @@ _CFG: GroupCoordinator | None = None
 _DP: GroupCoordinator | None = None
 _FS: GroupCoordinator | None = None  # Fully Sharded (HSDP shard dimension)
 _HSDP_REPLICATE: GroupCoordinator | None = None  # HSDP replica dimension
+_TEXT_ENCODER_TP: GroupCoordinator | None = None  # generic HF text-encoder TP
 
 # Rank-layout metadata for expert parallelism. This is not a process group;
 # it is reused by platform-specific runtimes that must build companion groups
@@ -221,9 +223,9 @@ class RankGenerator:
 
     def get_mask(self, order: str, token: str):
         ordered_token = order.split("-")
-        token = token.split("-")
+        tokens = token.split("-")
         mask = [False] * len(ordered_token)
-        for t in token:
+        for t in tokens:
             mask[ordered_token.index(t)] = True
         return mask
 
@@ -381,6 +383,50 @@ def is_dp_last_group():
 # * SET
 
 
+def get_text_encoder_tp_group(tp_size: int) -> GroupCoordinator:
+    """Return the text-encoder tensor-parallel group, creating it on first use.
+
+    The groups tile each data-parallel replica into consecutive blocks of
+    ``tp_size`` ranks (``[0..n-1], [n..2n-1], ...``), so every rank belongs to
+    exactly one group and gets the full encoder output without a broadcast.
+    Groups never span replicas: different DP replicas encode different
+    requests, and a shared all-reduce would mix their activations.  Creation
+    is a collective: every world rank must call this with the same ``tp_size``.
+    """
+    global _TEXT_ENCODER_TP
+    if _TEXT_ENCODER_TP is not None:
+        if _TEXT_ENCODER_TP.world_size != tp_size:
+            raise ValueError(
+                f"text encoder TP group already initialized with size {_TEXT_ENCODER_TP.world_size}, got {tp_size}"
+            )
+        return _TEXT_ENCODER_TP
+    world = get_world_group()
+    dp_size = _DP.world_size if _DP is not None else 1
+    replica_size = world.world_size // dp_size
+    if tp_size < 1 or replica_size % tp_size != 0:
+        raise ValueError(
+            f"text_encoder_tp_size ({tp_size}) must evenly divide the ranks of one data-parallel replica "
+            f"({replica_size} = world size {world.world_size} / data_parallel_size {dp_size})"
+        )
+    # DP is the outermost rank dimension ("tp-sp-pp-cfg-dp"), so replica r owns
+    # world ranks [r * replica_size, (r + 1) * replica_size) and tiles of a
+    # divisor of replica_size stay inside one replica.  Check that layout.
+    if _DP is not None and dp_size > 1:
+        expected_dp_ranks = world.ranks[world.rank_in_group % replica_size :: replica_size]
+        if list(_DP.ranks) != expected_dp_ranks:
+            raise RuntimeError(
+                f"text encoder TP expects DP-outermost rank layout; DP group {_DP.ranks} != {expected_dp_ranks}"
+            )
+    group_ranks = [world.ranks[i : i + tp_size] for i in range(0, world.world_size, tp_size)]
+    _TEXT_ENCODER_TP = init_model_parallel_group(
+        group_ranks=group_ranks,
+        local_rank=world.local_rank,
+        backend=torch.distributed.get_backend(world.device_group),
+        parallel_mode="tensor",
+    )
+    return _TEXT_ENCODER_TP
+
+
 def init_world_group(ranks: list[int], local_rank: int, backend: str) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=[ranks],
@@ -523,6 +569,87 @@ def init_vllm_model_parallel_group(
     )
 
 
+def build_ulysses_allgather_rank_groups(
+    sp_group_ranks: list[list[int]],
+    sp_ulysses_degree: int,
+    sp_allgather_degree: int,
+) -> tuple[list[list[int]], list[list[int]]]:
+    """Rank lists of every Ulysses / AllGather-KV group in the composed topology.
+
+    Pure function (no ``torch.distributed``). Position ``p`` inside one SP
+    group maps to ``ulysses_rank = p % U`` and ``allgather_rank = p // U``::
+
+        SP group [0 1 2 3] (U=2, A=2):  Ulysses [0 1] [2 3]   AllGather [0 2] [1 3]
+
+    This is the layout invariant of the composed topology, chosen to match the
+    flat contiguous sharding of ``sp_shard`` (position ``p`` owns chunk ``p``):
+    a contiguous Ulysses group jointly holds one contiguous region, so its
+    all-to-all reproduces that region in order, and the stride-U AllGather
+    group holds regions in ``allgather_rank`` order, so the K/V all-gather
+    rebuilds the global sequence. Any other layout permutes the sequence.
+
+    Returns:
+        ``(ulysses_groups, allgather_groups)`` in a deterministic order, so
+        every rank issues the same ``new_group`` sequence.
+    """
+    ulysses_groups: list[list[int]] = []
+    allgather_groups: list[list[int]] = []
+    for group_ranks in sp_group_ranks:
+        if len(group_ranks) != sp_ulysses_degree * sp_allgather_degree:
+            raise ValueError(
+                f"Invalid sp_group_ranks entry: expected size "
+                f"{sp_ulysses_degree * sp_allgather_degree}, got {len(group_ranks)}."
+            )
+        # Ulysses groups: contiguous regions of U ranks. One region per
+        # AllGather rank, so region index == allgather_rank.
+        for region in range(sp_allgather_degree):
+            ulysses_groups.append(list(group_ranks[region * sp_ulysses_degree : (region + 1) * sp_ulysses_degree]))
+        # AllGather-KV groups: stride-U, so index inside the group == allgather_rank.
+        for ulysses_rank in range(sp_ulysses_degree):
+            allgather_groups.append(list(group_ranks[ulysses_rank::sp_ulysses_degree]))
+    return ulysses_groups, allgather_groups
+
+
+def _set_ulysses_allgather_pg(
+    sp_ulysses_degree: int,
+    sp_allgather_degree: int,
+    rank: int,
+    world_size: int,
+    sp_group_ranks: list[list[int]] | None,
+) -> tuple[torch.distributed.ProcessGroup, torch.distributed.ProcessGroup, torch.distributed.ProcessGroup]:
+    """Build the orthogonal process groups of the Ulysses x AllGather-KV topology.
+
+    See ``build_ulysses_allgather_rank_groups`` for the rank-layout invariant.
+    ``ring_degree == 1`` is required, so every rank's Ring group is a singleton.
+    """
+    sp_size = sp_ulysses_degree * sp_allgather_degree
+    if sp_group_ranks is None:
+        sp_group_ranks = [list(range(offset, offset + sp_size)) for offset in range(0, world_size, sp_size)]
+    if len(sp_group_ranks) * sp_size != world_size or any(len(ranks) != sp_size for ranks in sp_group_ranks):
+        raise ValueError(f"Invalid sp_group_ranks: expected {world_size // sp_size} groups of size {sp_size}.")
+
+    ulysses_pg = ring_pg = allgather_pg = None
+    ulysses_groups, allgather_groups = build_ulysses_allgather_rank_groups(
+        sp_group_ranks,
+        sp_ulysses_degree,
+        sp_allgather_degree,
+    )
+    for ranks in ulysses_groups:
+        group = torch.distributed.new_group(ranks)
+        if rank in ranks:
+            ulysses_pg = group
+    for ranks in allgather_groups:
+        group = torch.distributed.new_group(ranks)
+        if rank in ranks:
+            allgather_pg = group
+    for singleton_rank in range(world_size):
+        group = torch.distributed.new_group([singleton_rank])
+        if rank == singleton_rank:
+            ring_pg = group
+    assert ulysses_pg is not None and ring_pg is not None and allgather_pg is not None
+    return ulysses_pg, ring_pg, allgather_pg
+
+
 # adapted from https://github.com/feifeibear/long-context-attention/blob/main/yunchang/globals.py
 def set_seq_parallel_pg(
     sp_ulysses_degree: int,
@@ -536,7 +663,8 @@ def set_seq_parallel_pg(
     """
     Initialize Ulysses, Ring, and AllGather-KV process groups.
 
-    AllGather-KV is mutually exclusive with Ulysses and Ring.
+    AllGather-KV may be composed with Ulysses (the orthogonal
+    Ulysses x AllGather-KV topology), but not with Ring.
 
     Args:
         sp_ulysses_degree: Size of each Ulysses subgroup.
@@ -546,19 +674,22 @@ def set_seq_parallel_pg(
         use_ulysses_low: If True, Ulysses groups are contiguous chunks and Ring
             groups are strided within each SP group. If False, the opposite.
         sp_group_ranks: Optional explicit SP groups. Each entry must be a list
-            of length sp_ulysses_degree * sp_ring_degree. When provided, groups
-            are built from these ranks instead of auto-generated contiguous
-            ranges.
+            of length sp_ulysses_degree * sp_ring_degree * sp_allgather_degree.
+            When provided, groups are built from these ranks instead of
+            auto-generated contiguous ranges.
 
     Returns:
         ulysses_pg (torch.distributed.ProcessGroup): The Ulysses process group
             for this rank.
         ring_pg (torch.distributed.ProcessGroup): The Ring process group for
             this rank.
+        allgather_pg (torch.distributed.ProcessGroup): The AllGather-KV process
+            group for this rank.
 
     Raises:
-        ValueError: If sp_group_ranks length does not match world_size or any
-            entry has the wrong size.
+        ValueError: If sp_group_ranks length does not match world_size, any
+            entry has the wrong size, or an unsupported degree combination is
+            requested.
         AssertionError: If world_size is not divisible by sp_size.
 
     Behavior:
@@ -569,8 +700,26 @@ def set_seq_parallel_pg(
           slice using offsets of size sp_size.
     """
     if sp_allgather_degree > 1:
-        if sp_ulysses_degree > 1 or sp_ring_degree > 1:
-            raise ValueError("AllGather-KV is mutually exclusive with Ulysses and Ring")
+        if sp_ring_degree > 1:
+            raise ValueError(
+                "AllGather-KV cannot be composed with Ring: the supported two-dimensional "
+                "topology is Ulysses x AllGather-KV (ulysses_degree > 1 with ring_degree == 1). "
+                f"Got ulysses_degree={sp_ulysses_degree}, ring_degree={sp_ring_degree}, "
+                f"allgather_degree={sp_allgather_degree}."
+            )
+        if sp_ulysses_degree > 1:
+            logger.info(
+                "Building orthogonal Ulysses x AllGather-KV process groups "
+                f"(ulysses={sp_ulysses_degree}, allgather={sp_allgather_degree})."
+            )
+            return _set_ulysses_allgather_pg(
+                sp_ulysses_degree=sp_ulysses_degree,
+                sp_allgather_degree=sp_allgather_degree,
+                rank=rank,
+                world_size=world_size,
+                sp_group_ranks=sp_group_ranks,
+            )
+
         sp_size = sp_allgather_degree
         if sp_group_ranks is None:
             sp_group_ranks = [list(range(offset, offset + sp_size)) for offset in range(0, world_size, sp_size)]
@@ -726,12 +875,13 @@ def _initialize_model_parallel(
         data_parallel_size: number of data parallelism groups.
         cfg_parallel_size: number of GPUs used for Classifier Free Guidance (CFG) parallelism.
         sequence_parallel_size: number of GPUs used for sequence parallelism.
-            Uses allgather_degree when AllGather-KV is enabled, otherwise
-            ulysses_degree * ring_degree.
+            Equals ``ulysses_degree * ring_degree * allgather_degree``.
         ulysses_degree: number of GPUs used for ulysses sequence parallelism.
         ring_degree: number of GPUs used for ring sequence parallelism.
         allgather_degree: number of GPUs used for AllGather-KV sequence parallelism
-            (causal=False only). Mutually exclusive with ulysses/ring in v1.
+            (causal=False only). May be composed with ulysses_degree as the
+            orthogonal Ulysses x AllGather-KV topology; cannot be combined with
+            ring_degree > 1.
         tensor_parallel_size: number of GPUs used for tensor parallelism.
         pipeline_parallel_size: number of GPUs used for pipeline parallelism.
         fully_shard_degree: number of GPUs used for the HSDP shard dimension.
@@ -771,15 +921,16 @@ def _initialize_model_parallel(
     world_size: int = torch.distributed.get_world_size()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
 
-    if allgather_degree > 1:
-        if ulysses_degree != 1 or ring_degree != 1:
-            raise ValueError(
-                "AllGather-KV (allgather_degree>1) is mutually exclusive with Ulysses/Ring in v1. "
-                f"Got ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, "
-                f"allgather_degree={allgather_degree}."
-            )
+    if allgather_degree > 1 and ring_degree > 1:
+        raise ValueError(
+            "AllGather-KV (allgather_degree>1) cannot be composed with Ring (ring_degree>1). "
+            "The supported two-dimensional topology is Ulysses x AllGather-KV "
+            "(ulysses_degree > 1 with ring_degree == 1). "
+            f"Got ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, "
+            f"allgather_degree={allgather_degree}."
+        )
 
-    expected_sequence_parallel_size = allgather_degree if allgather_degree > 1 else ring_degree * ulysses_degree
+    expected_sequence_parallel_size = ring_degree * ulysses_degree * allgather_degree
     if sequence_parallel_size is None:
         sequence_parallel_size = expected_sequence_parallel_size
         logger.info("sequence_parallel_size is not provided, using %d", sequence_parallel_size)
@@ -856,7 +1007,7 @@ def _initialize_model_parallel(
     )
     global _PP
     assert _PP is None, "pipeline model parallel group is already initialized"
-    _PP = init_model_parallel_group(
+    _PP = init_model_parallel_group(  # type: ignore[assignment]
         group_ranks=get_rank_groups("pp"),
         local_rank=get_world_group().local_rank,
         backend=backend,
@@ -874,7 +1025,7 @@ def _initialize_model_parallel(
         world_size=world_size,
         sp_group_ranks=sp_group_ranks,
     )
-    _SP = init_model_parallel_group(
+    _SP = init_model_parallel_group(  # type: ignore[assignment]
         group_ranks=sp_group_ranks,
         local_rank=get_world_group().local_rank,
         backend=backend,
@@ -1019,7 +1170,14 @@ def initialize_model_parallel(
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
-    global _DP, _CFG, _SP, _PP, _FS, _HSDP_REPLICATE, _EXPERT_PARALLEL_GROUP_RANKS
+    global _DP, _CFG, _SP, _PP, _FS, _HSDP_REPLICATE, _TEXT_ENCODER_TP, _EXPERT_PARALLEL_GROUP_RANKS
+
+    # The optional fused transport owns collective symmetric allocations.
+    # Release them while all process groups are still alive, without importing
+    # NPU build dependencies for other backends.
+    a2a_permute = sys.modules.get("vllm_omni.diffusion.distributed.a2a_permute")
+    if a2a_permute is not None:
+        a2a_permute.clear_a2a_permute_workspaces()
 
     if vllm_parallel_state._DP and vllm_parallel_state._DP is not _DP:
         vllm_parallel_state._DP.destroy()
@@ -1036,6 +1194,10 @@ def destroy_model_parallel():
     if _HSDP_REPLICATE:
         _HSDP_REPLICATE.destroy()
     _HSDP_REPLICATE = None
+
+    if _TEXT_ENCODER_TP:
+        _TEXT_ENCODER_TP.destroy()
+    _TEXT_ENCODER_TP = None
 
     if _CFG:
         _CFG.destroy()
