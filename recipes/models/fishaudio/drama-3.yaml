@@ -18,7 +18,7 @@ meta:
 
 model:
   model_id: "fishaudio/drama-3"
-  min_vllm_version: "0.31.0"
+  min_vllm_version: "0.34.0"
   architecture: moe
   parameter_count: "35B"
   active_parameters: "3B"
@@ -82,7 +82,7 @@ guide: |
 
   - **Hardware**: a single CUDA GPU with at least 48 GB. Reference run:
     1x H100 80 GB (stage-0 weights 36.9 GiB).
-  - **vLLM-Omni** with Drama 3 support, on vLLM >= 0.31.
+  - **vLLM-Omni** with Drama 3 support, on vLLM 0.34.0.
 
   ## Installation
 
