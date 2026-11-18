@@ -15,6 +15,7 @@ import regex as re
 import soundfile as sf
 from vllm.logger import init_logger
 
+from vllm_omni.engine.duplex.sentence_tts import consume_growing_text
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.aura_omni.control_tokens import (
     QWEN_NEWLINE_ID,
@@ -441,18 +442,13 @@ def next_duplex_sentence_chunk(state: dict[str, Any], raw_text: str, *, finished
     if is_effectively_silent(text) and already == 0:
         return None
 
-    emitted_prefix = str(state.get("emitted_prefix", ""))
     pending = str(state.get("pending", ""))
-    if text.startswith(emitted_prefix):
-        new_tail = text[len(emitted_prefix) :]
-    else:
-        new_tail = text
+    delta = consume_growing_text(str(state.get("emitted_prefix", "")), text)
+    if delta.restarted:
         pending = ""
-        emitted_prefix = ""
-    if new_tail:
-        pending = pending + new_tail
-        emitted_prefix = text
-        state["emitted_prefix"] = emitted_prefix
+    if delta.tail:
+        pending = pending + delta.tail
+        state["emitted_prefix"] = delta.seen
 
     if not finished:
         state["pending"] = pending

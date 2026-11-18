@@ -350,7 +350,7 @@ def test_empty_score_directory(tmp_path):
     ],
 )
 @pytest.mark.parametrize("accuracy_dir_override", [False, True])
-@pytest.mark.parametrize("resource_label", ["H100", "H800", "A3"])
+@pytest.mark.parametrize("resource_label", ["H100", "H800", "A3", "MI300"])
 @pytest.mark.parametrize("benchmark_params_name", [None, "rtd-pr-c8"])
 def test_dfx_writes_both_artifacts_before_quality_gate(
     tmp_path,

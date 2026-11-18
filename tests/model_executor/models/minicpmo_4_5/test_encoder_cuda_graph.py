@@ -39,6 +39,38 @@ def test_cpu_and_grad_paths_remain_eager():
     assert not graph._seen
 
 
+@pytest.mark.cpu
+@pytest.mark.parametrize("gc_enabled", [False, True])
+@pytest.mark.parametrize("capture_fails", [False, True])
+def test_capture_defers_gc_and_restores_its_previous_state(mocker, monkeypatch, gc_enabled, capture_fails):
+    monkeypatch.setenv("VLLM_ENABLE_CUDAGRAPH_GC", "0")
+    module = "vllm_omni.model_executor.models.minicpmo_4_5.encoder_cuda_graph"
+    manager = mocker.patch(f"{module}.EncoderCudaGraphManager").return_value
+    for name in ("current_stream", "graph_pool_handle", "Stream", "stream"):
+        mocker.patch(f"{module}.torch.cuda.{name}")
+
+    def capture(*, graph_pool):
+        # Finalizers must not free CUDA resources during stream capture.
+        assert not gc.isenabled()
+        if capture_fails:
+            raise RuntimeError("capture failed")
+
+    manager.capture.side_effect = capture
+    graph = _make_graph(torch.sin)
+    value = torch.ones(2, 3)
+    was_enabled = gc.isenabled()
+    try:
+        (gc.enable if gc_enabled else gc.disable)()
+        if capture_fails:
+            with pytest.raises(RuntimeError, match="capture failed"):
+                graph._capture((value,), value.shape)
+        else:
+            assert graph._capture((value,), value.shape) is manager
+        assert gc.isenabled() == gc_enabled
+    finally:
+        (gc.enable if was_enabled else gc.disable)()
+
+
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
