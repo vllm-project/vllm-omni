@@ -19,7 +19,6 @@ stages:
     max_num_seqs: 4
     async_scheduling: false
     enable_chunked_prefill: false
-    worker_cls: vllm_omni.model_executor.models.yue2.runtime.Yue2Worker
     # Reserve synthesis headroom: NAR K/V, acoustic graph buffers and VAE
     # activations are allocated beyond the engine budget. The earlier 4090
     # memory measurement predates async/compiled synthesis; 0.70 is a starting

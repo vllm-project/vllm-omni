@@ -34,7 +34,7 @@ def use_scheduler_ngram(config: VllmConfig) -> bool:
     assert spec is not None
     if spec.method == "ngram_gpu":
         raise ValueError(
-            "MiniCPM-o stage 0 speculative_config.method=ngram_gpu on Ascend requires model_runner: v1. "
+            "MiniCPM-o stage 0 speculative_config.method=ngram_gpu is unsupported on Ascend MRv2. "
             "Use method: ngram for MRv2."
         )
 

@@ -45,9 +45,9 @@ def test_duplex_mrv2_cuda_profile(monkeypatch) -> None:
 def test_duplex_mrv2_profile_keeps_non_cuda_on_v1(monkeypatch, platform) -> None:
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
     config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform=platform)
-    stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
-    # The non-CUDA, non-NPU platforms still resolve to the v1 data plane.
-    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [False, False, False]
+    assert config.model_runner == "v1"
+    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
+        merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
 
 
 def test_duplex_mrv2_profile_npu_full_mrv2(monkeypatch) -> None:

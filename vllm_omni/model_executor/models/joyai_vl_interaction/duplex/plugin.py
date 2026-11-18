@@ -161,6 +161,14 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         """
         self._async_chunk_streaming = bool(enabled)
 
+    def resumable_downstream_stage_ids(self, *, stage_count: int) -> frozenset[int]:
+        """Sentence TTS reuses Talker and Code2Wav across each turn's sentences."""
+        if not self._async_chunk_streaming:
+            return frozenset()
+        return frozenset(
+            stage_id for stage_id in (self.joyai_stage_id + 1, self.audio_stage_id) if stage_id < stage_count
+        )
+
     def draining_stage_ids(self, *, stage_count: int) -> frozenset[int]:
         """Talker and Code2Wav keep running after JoyAI has finished the action."""
         if not self._async_chunk_streaming:

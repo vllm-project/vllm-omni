@@ -116,6 +116,9 @@ EXCLUDED_MODELS = [
     "OmniVoice",
     "Cosmos3OmniDiffusersPipeline",
     "Cosmos3OmniPipeline",
+    # Causal AR bimanual sim model requiring action/camera assets and
+    # persistent AR state; covered by tests/diffusion/models/cosmos3_nano_sim_bimanual.
+    "Cosmos3NanoSimBimanualPipeline",
     "DiffusersAdapterPipeline",
     "HiDreamO1ImagePipeline",
     "DreamZeroPipeline",
