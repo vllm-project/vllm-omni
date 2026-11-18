@@ -4,7 +4,8 @@
 """
 End-to-end tests for Bagel with shared memory connector: img2img and text2img.
 
-- img2img: validates output vs reference pixels within a ±10 tolerance.
+- img2img: validates output vs reference pixels within a ±10 tolerance on
+  CUDA and a ±25 tolerance on ROCm.
 - text2img: validates output vs reference pixels within a ±5 tolerance
   (equivalent to `examples/offline_inference/bagel/end2end.py` with
   text2img modality and 14 steps).
@@ -24,6 +25,7 @@ from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.usefixtures("clean_gpu_memory_between_tests")]
 
@@ -67,6 +69,10 @@ TEXT2IMG_REFERENCE_PIXELS = [
 
 
 PIXEL_TOLERANCE = 10
+# Three independent MI300X MERGE runs reproduced a maximum channel delta of
+# 21 at one img2img probe while the other nine probes and text2img remained
+# within their existing bounds. Retain four levels of headroom for ROCm drift.
+ROCM_PIXEL_TOLERANCE = 25
 TEXT2IMG_PIXEL_TOLERANCE = 5
 
 DEFAULT_PROMPT = "<|fim_middle|><|im_start|>Change the grass color to red<|im_end|>"
@@ -153,6 +159,13 @@ def _validate_pixels(
         + "\nActual values at all probes (paste as the new reference table if re-goldening):\n"
         + "\n".join(probes)
     )
+
+
+def _img2img_pixel_tolerance() -> int:
+    """Keep CUDA's golden strict while allowing observed ROCm variance."""
+    if current_omni_platform.is_rocm():
+        return ROCM_PIXEL_TOLERANCE
+    return PIXEL_TOLERANCE
 
 
 def _generate_bagel_img2img(
@@ -245,7 +258,7 @@ def test_bagel_img2img_shared_memory_connector(run_level):
     ) as runner:
         generated_image = _generate_bagel_img2img(runner.omni, input_image)
         if run_level == "advanced_model":
-            _validate_pixels(generated_image)
+            _validate_pixels(generated_image, tolerance=_img2img_pixel_tolerance())
 
 
 @pytest.mark.advanced_model

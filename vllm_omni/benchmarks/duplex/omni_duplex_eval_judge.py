@@ -82,6 +82,8 @@ class DuplexJudge:
         return self.chat(
             content,
             system="You are a careful evaluator for real-time multimodal systems.",
+            # Official Omni-DuplexEval temporal judging requests 800 completion tokens.
+            max_tokens=800,
             followup=followup,
         )
 

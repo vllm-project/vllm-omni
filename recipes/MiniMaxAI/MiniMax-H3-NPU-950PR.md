@@ -116,6 +116,58 @@ vllm serve "${MODEL}" \
 The recommended lossy configuration uses a **start=8 / end=12** dense-fallback
 window; see below for more aggressive settings.
 
+### Ref2VA on a 950PR that reports ~86 GB HBM
+
+The sections above match a 128 GB part. On a 950PR whose `npu-smi` reports
+86016 MB, `--usp 4` does not shard the DiT: Ulysses shards the sequence, and
+each card holds a full copy of the weights. The Ref2VA DiT is about 62 GB in
+bf16, and `vllm serve` with `--usp 4` and no quantization raises
+`torch.OutOfMemoryError` after about 79 GiB is already allocated. Tensor
+parallel 4 in bf16 uses about 15.5 GB per card. USP4 plus MXFP8 uses about
+31 GB per card and fits.
+
+For Ref2VA on that device, keep the environment variables and server flags
+of the recommended lossy configuration, switch `--task-type` to `ref2va`,
+and narrow the dense window with the flags below. `skip_layers` keeps those
+DiT blocks dense on every step. The first request is a warmup; exclude it
+from steady-state measurements. Measured at 1344x768, 24 fps, 50 steps,
+vLLM-Omni 0.32.0, MindIE-SD 3.2.0.
+
+| Point | `start_step` | `end_step` | `skip_layers` | 5 s diffuse |
+| --- | ---: | ---: | --- | ---: |
+| Speed | 4 | 4 | `0-1,48-49` | 312.5 s |
+| Sharper | 6 | 6 | `0-2,47-49` | 354.2 s |
+
+```bash
+  --task-type ref2va \
+  --diffusion-attention-config '{"default":{"backend":"RAINFUSION_ATTN","block_sparse":{"sparsity":0.8,"precision":"mix","start_step":4,"end_step":4,"skip_layers":"0-1,48-49"}}}' \
+  --diffusion-quantization-config '{"transformer":{"method":"mxfp8"}}'
+```
+
+A 15 s run of the speed point took 1836 s; that run has no quality comparison.
+
+Quality against the dense USP4+MXFP8 run of the same prompt
+(Laplacian-variance ratio): 0.81 for the speed point, 0.91 for the sharper
+point. When frames look soft, move toward the sharper row before lowering
+`sparsity`.
+
+#### RainFusion plus Cache-DiT
+
+Same USP4 + MXFP8 stack, with a shorter dense tail and Cache-DiT. Across
+five repeats on vLLM-Omni 0.32.0, the 5 s diffuse median is 166.17 s
+(wall-clock median 181.5 s), with 31 of 50 denoise steps cached. The same
+configuration passed at seeds 2202 (165.1 s) and 2303 (165.9 s). Quality
+versus the dense run: 0.924 sharpness / 0.950 flicker / 0.984 luma.
+
+```bash
+  --task-type ref2va \
+  --diffusion-attention-config '{"default":{"backend":"RAINFUSION_ATTN","block_sparse":{"sparsity":0.8,"precision":"mix","start_step":4,"end_step":2,"skip_layers":"0-2,47-49"}}}' \
+  --diffusion-quantization-config '{"transformer":{"method":"mxfp8"}}' \
+  --cache-backend cache_dit \
+  --enable-cache-dit-summary \
+  --cache-config '{"Fn_compute_blocks":2,"Bn_compute_blocks":1,"max_warmup_steps":4,"residual_diff_threshold":0.07,"max_continuous_cached_steps":3,"enable_taylorseer":true,"taylorseer_order":1}'
+```
+
 ### Optional optimizations
 
 The following sections list only the **increment or replacement** relative to
@@ -208,6 +260,8 @@ general throughput guarantee.
   DLO; if your workload never approaches the maximum duration, dropping
   `--enable-distributed-layerwise-offload` may improve latency at the risk of
   OOM on longer durations.
+- On a 950PR with ~86 GB HBM, USP4 bf16 does not fit; see the
+  "Ref2VA on a 950PR that reports ~86 GB HBM" section above.
 
 ## Additional resources
 
