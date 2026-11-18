@@ -23,6 +23,16 @@ vLLM-Omni supports end-to-end serving for speech-generating models, including bo
 
 The optimizations described in this post apply to both models. We present results for each side by side.
 
+### Platform scope
+
+The shipped `qwen3_omni_moe.yaml` and `qwen3_tts.yaml` profiles select Model
+Runner V2 on ROCm after the vLLM 0.34 removal of V1. Their ROCm Code2Wav stages
+remain eager because the decoder convolutions are not safe inside the outer
+graph capture. That runner migration preserves the multi-stage and async-chunk
+contracts, but it does not extend this post's CUDA Graph, cuDNN, Triton,
+first-frame or NVIDIA performance claims to ROCm. ROCm performance and audio
+quality require separate hardware qualification.
+
 ### vLLM-Omni vs HF Transformers
 
 Compared with **HF Transformers** (offline, single request), vLLM-Omni with the full optimization stack delivers dramatically lower latency and higher efficiency for both models.
