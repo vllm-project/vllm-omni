@@ -845,9 +845,10 @@ def test_capture_streams_are_not_reused_by_torch_pool():
     assert wrapper.stats["capacity"] == 6
 
 
-def _leave_stale_graphs_in_a_cycle():
-    # Mimics an earlier test whose wrapper stays reachable only through a
-    # reference cycle, so its CUDA graphs are freed by cyclic GC, not refcount.
+def _stale_graphs_in_a_cycle():
+    # Mimics an earlier test's wrapper: once the caller drops its reference,
+    # only a reference cycle keeps it and its CUDA graphs alive, so they are
+    # freed by cyclic GC, not by refcount.
     weight = torch.randn(64, 64, device="cuda")
     stale = FlowEncoderGraphs(lambda x, **kw: ((x @ weight).sin(),) * 3, max_graphs=2)
     for size in (4, 6):
@@ -856,7 +857,7 @@ def _leave_stale_graphs_in_a_cycle():
             stale(x, last_chunk=False, cnn_cache=None, att_cache=None)
     torch.accelerator.synchronize()
     stale.cycle = stale
-    return weakref.ref(stale), [weakref.ref(entry[0]) for entry in stale.exact_graphs.values()]
+    return stale, [weakref.ref(entry[0]) for entry in stale.exact_graphs.values()]
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
@@ -865,18 +866,23 @@ def _leave_stale_graphs_in_a_cycle():
 @torch.inference_mode()
 def test_capture_survives_a_cyclic_gc_of_a_stale_graph():
     # Regression for an order-dependent CI failure: a GC cycle landing inside
-    # capture reset a stale CUDAGraph and invalidated the capture.
+    # capture reset a stale CUDAGraph and invalidated the capture. The stale
+    # wrapper's strong reference is held across the capture guard's entry
+    # collect and dropped only once the stream is capturing, so the collect
+    # runs on graphs that are alive during the capture: the same-run case,
+    # unlike the between-test cleanup of #10481.
     was_enabled = gc.isenabled()
     gc.disable()
     try:
-        stale, stale_graphs = _leave_stale_graphs_in_a_cycle()
-        assert stale() is not None
+        stale, stale_graphs = _stale_graphs_in_a_cycle()
         assert stale_graphs and all(ref() is not None for ref in stale_graphs)
         collected: list[int] = []
         weight = torch.randn(32, 32, device="cuda")
 
         def forward(x, **kw):
+            nonlocal stale
             if torch.cuda.is_current_stream_capturing() and not collected:
+                stale = None  # only the reference cycle is left
                 collected.append(gc.collect())
             y = (x @ weight).sin()
             return y, y + 1, y + 2
@@ -889,7 +895,8 @@ def test_capture_survives_a_cyclic_gc_of_a_stale_graph():
         torch.accelerator.synchronize()
         assert collected, "no GC ran during capture"
         assert wrapper.stats["captures"] == 2
-        assert stale() is None
+        # The guard unfreezes and collects on exit; the cycle is gone by then.
+        assert all(ref() is None for ref in stale_graphs)
     finally:
         if was_enabled:
             gc.enable()
