@@ -62,7 +62,7 @@
     ]
   },
   {
-    "test_name": "test_qwen3_omni_datasets_cuda_async_prefix",
+    "test_name": "test_qwen3_omni_datasets_cuda_async_daily",
     "mark": [
       {
         "hardware_marks": {
@@ -120,7 +120,53 @@
           "configuration": "async-prefix",
           "accuracy": true
         }
+      }
+    ]
+  },
+  {
+    "test_name": "test_qwen3_omni_datasets_cuda_async_seed",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": [
+              "H100",
+              "B200"
+            ]
+          },
+          "num_cards": 2
+        }
       },
+      "full_model",
+      "omni"
+    ],
+    "server_params": {
+      "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+      "extra_cli_args": [
+        "--deploy-config",
+        "vllm_omni/deploy/qwen3_omni_moe.yaml",
+        "--stage-init-timeout",
+        "1200",
+        "--init-timeout",
+        "1800"
+      ],
+      "update": {
+        "model_runner": "v2",
+        "async_chunk": true,
+        "stages": {
+          "0": {
+            "enable_prefix_caching": true
+          },
+          "1": {
+            "enable_prefix_caching": false
+          },
+          "2": {
+            "enable_prefix_caching": false
+          }
+        }
+      }
+    },
+    "benchmark_params": [
       {
         "name": "async-prefix-seed-tts-c1",
         "dataset_name": "seed-tts",

@@ -55,6 +55,16 @@ def test_json_matrix_matches_scenario_v2(platform):
     assert all(c.count == nightly.DATASETS[c.dataset]["count"] for c in cases)
 
 
+def test_dataset_server_groups_do_not_share_a_failed_media_engine():
+    configs = json.loads((ROOT / "tests/dfx/perf/tests/test_qwen3_omni_datasets.json").read_text())
+    assert len({cfg["test_name"] for cfg in configs}) == len(configs)
+    # DFX's active server key includes test_name. Distinct dataset groups force
+    # a new engine, while Seed's concurrency sweep keeps one server lifetime.
+    assert all(len({p["dataset_name"] for p in cfg["benchmark_params"]}) == 1 for cfg in configs)
+    seed = next(cfg for cfg in configs if cfg["test_name"] == "test_qwen3_omni_datasets_cuda_async_seed")
+    assert len(seed["benchmark_params"]) == 4
+
+
 def test_coverage_rejects_partial_success_even_with_high_accuracy():
     result = {"request_count": 1197, "completed": 1000, "successful_audio_requests": 1000, "daily_omni_accuracy": 0.70}
     errors = validation.coverage_errors(result, 1197, require_audio=True)

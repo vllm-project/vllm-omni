@@ -31,6 +31,8 @@ after request measurement. NPU reserves a third device for the evaluators.
 Production deploy YAMLs are not changed; JSON applies temporary test overrides.
 Benchmark servers allow 1200 seconds per stage and 1800 seconds for overall
 initialization, covering cold compilation before requests are measured.
+Daily-Omni and Seed-TTS use separate server groups. A failed media engine therefore
+does not get reused for Seed's concurrency sweep; Seed tiers share one lifetime.
 
 The full-duplex JSON configurations use the same shared runner. CUDA covers
 Omni-DuplexEval `PR_correction` (120 selected IDs, c8) and OmniInteract
