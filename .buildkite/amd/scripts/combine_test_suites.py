@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -14,6 +15,10 @@ from typing import Any
 import yaml
 
 SUITE_GROUPS = frozenset({"READY_TESTS", "MERGE_TESTS", "NIGHTLY_TESTS", "WEEKLY_TESTS"})
+
+
+def _step_key(step: dict[str, Any]) -> str:
+    return json.dumps(step, sort_keys=True, default=str)
 
 
 def _parse_suite_spec(suite_spec: str) -> tuple[str, Path]:
@@ -65,7 +70,7 @@ def combine_test_suites(suite_specs: Sequence[str]) -> dict[str, Any]:
         raise ValueError("At least one AMD test suite spec is required")
 
     combined: dict[str, Any] = {"env": {}, "steps": []}
-    prior_steps: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
     seen_groups: set[str] = set()
 
     for suite_spec in suite_specs:
@@ -89,8 +94,14 @@ def combine_test_suites(suite_specs: Sequence[str]) -> dict[str, Any]:
             combined["env"][name] = value
 
         suite_steps = _flatten_steps(suite, input_path)
-        retained_steps = [step for step in suite_steps if step not in prior_steps]
-        duplicate_steps = [step for step in suite_steps if step in prior_steps]
+        retained_steps = []
+        duplicate_steps = []
+        for step in suite_steps:
+            key = _step_key(step)
+            if key in seen_keys:
+                duplicate_steps.append(step)
+            else:
+                retained_steps.append(step)
         if duplicate_steps:
             duplicate_jobs = sum(step.get("parallelism", 1) for step in duplicate_steps)
             print(
@@ -100,7 +111,7 @@ def combine_test_suites(suite_specs: Sequence[str]) -> dict[str, Any]:
 
         if retained_steps:
             combined["steps"].append({"group": group_name, "steps": retained_steps})
-        prior_steps.extend(suite_steps)
+        seen_keys.update(_step_key(step) for step in suite_steps)
 
     return combined
 
