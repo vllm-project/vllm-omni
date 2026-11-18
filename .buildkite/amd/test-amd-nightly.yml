@@ -497,6 +497,40 @@ steps:
 
   - group: ":full_moon: HunyuanVideo-1.5 MI300 Nightly"
     steps:
+      - label: "HunyuanVideo-1.5 CacheDiT Layerwise Offload"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 90
+        source_file_dependencies: diffusion_hunyuan_video_features
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-hunyuanvideo15-cachedit-offload/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 1 70m rocm-hunyuanvideo15-cachedit-offload
+            'tests/e2e/online_serving/test_hunyuan_video_15_expansion.py::test_hunyuan_video_15_t2v_features[single_card_cachedit_layerwise]'
+            -m "full_model and diffusion and rocm and MI325 and cards_1"
+
+      - label: "HunyuanVideo-1.5 CacheDiT TP2 VAE2"
+        agent_pool: mi300_2
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 90
+        source_file_dependencies: diffusion_hunyuan_video_features
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-hunyuanvideo15-cachedit-tp2-vae2/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 1 70m rocm-hunyuanvideo15-cachedit-tp2-vae2
+            'tests/e2e/online_serving/test_hunyuan_video_15_expansion.py::test_hunyuan_video_15_t2v_features[parallel_cachedit_tp2_vae2]'
+            -m "full_model and diffusion and rocm and MI325 and cards_2"
+
       - label: "HunyuanVideo-1.5 Default T2V Smoke"
         agent_pool: mi300_1
         mirror_hardwares: [amdproduction]

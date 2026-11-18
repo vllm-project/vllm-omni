@@ -1640,6 +1640,21 @@ source_file_dependencies:
     - *hunyuan_video
     - tests/e2e/online_serving/test_hunyuan_video_15_expansion.py
 
+  diffusion_hunyuan_video_features:
+    - *hunyuan_video
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
+    - tests/e2e/online_serving/test_hunyuan_video_15_expansion.py
+    - tests/helpers/mark.py
+    - tests/helpers/runtime.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/deploy/hunyuan_video_15.yaml
+    - vllm_omni/diffusion/cache/
+    - vllm_omni/diffusion/offloader/
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/diffusion/worker/
+    - vllm_omni/diffusion/data.py
+
   diffusion_hunyuan_video_accuracy:
     - *hunyuan_video
     - tests/e2e/accuracy/hunyuanvideo15_t2v/

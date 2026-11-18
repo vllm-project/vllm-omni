@@ -391,3 +391,27 @@ def test_unknown_dependency_key_fails_closed() -> None:
             ["README.md"],
             pipeline_path=AMD_NIGHTLY_PIPELINE,
         )
+
+
+@pytest.mark.parametrize(
+    "changed_file",
+    (
+        "tests/e2e/online_serving/test_hunyuan_video_15_expansion.py",
+        "vllm_omni/diffusion/cache/cachedit/backend.py",
+        "vllm_omni/diffusion/offloader/layerwise_backend.py",
+        "vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_hunyuan_video_15.py",
+        ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh",
+        ".buildkite/amd/scripts/assert-pytest-collection.sh",
+    ),
+)
+def test_hunyuan_feature_changes_keep_both_nightly_topologies(changed_file: str) -> None:
+    filtered = FILTER.filter_amd_nightly_suite(
+        _load_pipeline(AMD_NIGHTLY_PIPELINE),
+        [changed_file],
+        pipeline_path=AMD_NIGHTLY_PIPELINE,
+    )
+
+    assert {
+        "HunyuanVideo-1.5 CacheDiT Layerwise Offload",
+        "HunyuanVideo-1.5 CacheDiT TP2 VAE2",
+    } <= _labels(filtered)

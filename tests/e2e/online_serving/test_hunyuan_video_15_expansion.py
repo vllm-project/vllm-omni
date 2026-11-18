@@ -7,8 +7,8 @@ for HunyuanVideo-1.5-T2V (480p).
 Coverage:
 - Default single-card deployment (H100, B200, MI325, or Ascend A2) — ``full_model``
 - CPU offloading (1 H100 or Ascend A2) — ``core_model`` + ``advanced_model``
-- CacheDiT + Layerwise CPU offloading (1 H100, B200, or Ascend A2) — ``full_model``
-- CacheDiT + TP=2 + VAE patch parallel=2 (2 H100s, B200s, or Ascend A2s) — ``full_model``
+- CacheDiT + Layerwise CPU offloading (1 H100, B200, MI325, or Ascend A2) — ``full_model``
+- CacheDiT + TP=2 + VAE patch parallel=2 (2 H100s, B200s, MI325s, or Ascend A2s) — ``full_model``
 
 HunyuanVideo-1.5 is a high-priority model. The CPU-offload row runs in the existing
 CUDA PR (L2) and merge (L3) lanes. The shared default and CacheDiT / parallel rows
@@ -79,7 +79,7 @@ def _get_diffusion_feature_cases(model: str):
             ),
             id="single_card_cachedit_layerwise",
             marks=[
-                *hardware_marks(res={"cuda": ["H100", "B200"], "npu": "A2"}),
+                *hardware_marks(res={"cuda": ["H100", "B200"], "npu": "A2", "rocm": "MI325"}),
                 pytest.mark.full_model,
             ],
         ),
@@ -99,7 +99,7 @@ def _get_diffusion_feature_cases(model: str):
             ),
             id="parallel_cachedit_tp2_vae2",
             marks=[
-                *hardware_marks(res={"cuda": ["H100", "B200"], "npu": "A2"}, num_cards=2),
+                *hardware_marks(res={"cuda": ["H100", "B200"], "npu": "A2", "rocm": "MI325"}, num_cards=2),
                 pytest.mark.full_model,
             ],
         ),
