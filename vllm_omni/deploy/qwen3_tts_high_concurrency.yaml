@@ -117,17 +117,22 @@ stages:
 
 platforms:
   npu:
+    # Inherit the current base qwen3_tts.yaml NPU runner and graph settings
+    # (model_runner v2, stage 0 FULL_AND_PIECEWISE, stage 1 PIECEWISE).
+    # Full decode graphs on NPU require Model Runner V2; the Talker rejects
+    # the V1 combination before loading weights.
+    # Stage 1 also sets enforce_eager: false because this profile's CUDA-tuned
+    # stage definition defaults to eager, unlike the base recipe.
+    # #7993 previously showed that forcing eager on NPU broke the 100 ms
+    # streaming SLO, but those v0.29.0rc1 measurements do not stand in for
+    # results of this current runner/graph combination.
+    model_runner: v2
     stages:
-      # Graphs on, aligned with the base qwen3_tts.yaml NPU override. Forcing
-      # eager on NPU halved throughput and broke the 100 ms streaming SLO at
-      # concurrency 8+ on 910B4 (#7993): as shipped RTF 1.079 with 733/782
-      # samples over SLO; with graphs enabled RTF 0.604 with 0 violations.
-      # Stage 0 inherits the graph-enabled default from its own definition;
-      # stage 1 overrides this file's CUDA-tuned eager setting.
       - stage_id: 0
         enforce_eager: false
         compilation_config:
-          cudagraph_mode: PIECEWISE
+          # Full decode graphs require Model Runner V2 on NPU.
+          cudagraph_mode: FULL_AND_PIECEWISE
       - stage_id: 1
         enforce_eager: false
         compilation_config:

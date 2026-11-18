@@ -247,21 +247,50 @@ def test_single_stage_pcm_requires_reset_capability_declaration(single_stage_tts
 
 
 def test_qwen3_tts_high_concurrency_npu_enables_graphs():
-    """The NPU override must not force eager on either stage (#7993).
+    """High-concurrency NPU override inherits the current base runner/graphs.
 
-    Forcing eager on NPU halved throughput and broke the 100 ms streaming
-    SLO at concurrency 8+ (910B4: RTF 1.079 as shipped with 733/782 samples
-    over SLO, vs RTF 0.604 with none once graphs were enabled). The NPU
-    override aligns with the base qwen3_tts.yaml recipe instead; stage 1's
-    CUDA-tuned eager default in its own definition stays untouched.
+    After applying the NPU overlay, this profile must resolve to the same
+    runner and cudagraph modes as qwen3_tts.yaml (model_runner v2, stage 0
+    FULL_AND_PIECEWISE, stage 1 PIECEWISE) and must still disable stage 1's
+    CUDA-tuned eager default. High-concurrency knobs such as max_num_seqs
+    stay on this profile. The CUDA path remains V1. #7993's v0.29.0rc1
+    measurements are not treated as results for this runner/graph combination.
     """
     from tests.helpers.stage_config import get_deploy_config_path
     from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config
 
-    deploy = load_deploy_config(get_deploy_config_path("qwen3_tts_high_concurrency.yaml"))
-    deploy = _apply_platform_overrides(deploy, platform="npu")
+    def _load(name: str, platform: str):
+        return _apply_platform_overrides(load_deploy_config(get_deploy_config_path(name)), platform=platform)
+
+    base = _load("qwen3_tts.yaml", "npu")
+    deploy = _load("qwen3_tts_high_concurrency.yaml", "npu")
+    cuda = _load("qwen3_tts_high_concurrency.yaml", "cuda")
+
+    assert deploy.model_runner == base.model_runner == "v2"
+    assert cuda.model_runner == "v1"
+
+    base_by_id = {stage.stage_id: stage for stage in base.stages}
     by_id = {stage.stage_id: stage for stage in deploy.stages}
-    for stage_id in (0, 1):
+    cuda_by_id = {stage.stage_id: stage for stage in cuda.stages}
+    expected_modes = {0: "FULL_AND_PIECEWISE", 1: "PIECEWISE"}
+    for stage_id, expected_mode in expected_modes.items():
         stage = by_id[stage_id]
+        base_stage = base_by_id[stage_id]
         assert stage.enforce_eager is False, f"stage {stage_id} must keep graphs enabled on NPU"
-        assert (stage.compilation_config or {}).get("cudagraph_mode") == "PIECEWISE"
+        assert (stage.compilation_config or {}).get("cudagraph_mode") == expected_mode
+        assert (stage.compilation_config or {}).get("cudagraph_mode") == (
+            (base_stage.compilation_config or {}).get("cudagraph_mode")
+        )
+
+    # Profile-specific concurrency knobs must survive the inherited overlay.
+    assert by_id[0].max_num_seqs == 64
+    assert by_id[1].max_num_seqs == 10
+    assert by_id[0].devices == "0"
+    assert by_id[1].devices == "1"
+    extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+    assert extra["code_predictor_prefix_graphs"] is True
+
+    # CUDA path of this profile is unchanged: stage 1 stays eager, no NPU graph overlay.
+    assert cuda_by_id[1].enforce_eager is True
+    assert (cuda_by_id[0].compilation_config or {}).get("cudagraph_mode") != "FULL_AND_PIECEWISE"
+    assert (cuda_by_id[1].compilation_config or {}).get("cudagraph_mode") is None
