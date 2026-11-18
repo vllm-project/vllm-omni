@@ -201,6 +201,9 @@ class DuplexCapabilities:
             "function_call_output_continuation": self.function_call_output_continuation,
             "max_tools": self.max_tools,
             "clears_function_call_block_on_user_commit": self.clears_function_call_block_on_user_commit,
+            "supports_image_input": self.supports_image_input,
+            "supports_text_only_turn": self.supports_text_only_turn,
+            "requires_model_runner_kv": self.requires_model_runner_kv,
             "requires_native_stage_role": self.requires_native_stage_role,
             "implementation_level": (
                 "model_native_duplex" if self.supports_model_native_turn_policy else "turn_based_duplex"
