@@ -44,6 +44,13 @@ REALTIME_ERROR_TYPES_BY_CODE: dict[str, str] = {
     "unsupported_native_response_options": "invalid_request_error",
     "runtime_touch_failed": "server_error",
     "session_stats_disabled": "invalid_request_error",
+    # Action capture: admission, validation, retention, retrieval.
+    "action_capture_unsupported": "invalid_request_error",
+    "action_capture_invalid": "server_error",
+    "action_capture_retention_overflow": "rate_limit_error",
+    "action_capture_not_retained": "invalid_request_error",
+    "action_capture_update_conflict": "invalid_request_error",
+    "invalid_seed": "invalid_request_error",
     "engine_error": "server_error",
     "input_backpressure": "rate_limit_error",
     "output_backpressure": "rate_limit_error",
@@ -82,6 +89,7 @@ REALTIME_ERROR_TYPES_BY_CODE: dict[str, str] = {
     "tool_call_registration_failed": "server_error",
     "tool_call_settlement_failed": "server_error",
     "tool_result_retirement_failed": "server_error",
+    "weight_sync_sessions_open": "invalid_request_error",
     "server_vad_unavailable": "server_error",
     "semantic_vad_unavailable": "server_error",
 }

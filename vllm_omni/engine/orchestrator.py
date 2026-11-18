@@ -358,6 +358,9 @@ class StreamingSegmentState:
     # processed RequestOutput used by the routing layer.
     token_ids: list[int] = field(default_factory=list)
     output_metadata: dict[str, Any] = field(default_factory=dict)
+    # Serialized per-unit capture payload; also populated on the terminal
+    # poll so the response's final unit is never lost.
+    capture_payload: bytes | None = None
 
 
 @dataclass
@@ -1143,10 +1146,18 @@ class OrchestratorBase:
             # Only streaming requests maintain the per-stage segment snapshot.
             if req_state.streaming.enabled:
                 raw_mm = self._completion_multimodal_output(eco, None)
+                # Recover the terminal poll's own payload: the snapshot below
+                # stores empty fields there, which would lose the final unit.
+                capture_payload = getattr(eco, "action_capture_payload", None)
                 req_state.streaming.segments[stage_id] = StreamingSegmentState(
                     finished=segment_finished,
                     token_ids=(self._coerce_int_list(getattr(eco, "new_token_ids", None)) if segment_finished else []),
                     output_metadata=(dict(raw_mm) if segment_finished and isinstance(raw_mm, dict) else {}),
+                    capture_payload=(
+                        bytes(capture_payload)
+                        if capture_payload is not None and (segment_finished or bool(getattr(eco, "finished", False)))
+                        else None
+                    ),
                 )
                 req_state.streaming.new_prompt_len_snapshot = getattr(
                     eco,

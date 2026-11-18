@@ -785,12 +785,17 @@ class DuplexSessionRuntimeConfig:
     # ``session.stats.get`` (RFC #8325). Off: nothing is recorded or attached.
     # Single-host only: stage and API timestamps share one CLOCK_MONOTONIC.
     collect_stats: bool = False
+    # Deployment veto on per-session action capture; the opt-in is the
+    # per-session knob, so the gate defaults to true.
+    allow_action_capture: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_custom_options, dict):
             raise ValueError("duplex_session.model_custom_options must be a mapping")
         if not isinstance(self.collect_stats, bool):
             raise ValueError("duplex_session.collect_stats must be a boolean")
+        if not isinstance(self.allow_action_capture, bool):
+            raise ValueError("duplex_session.allow_action_capture must be a boolean")
         if self.replica_policy not in ("legacy", "least_sessions"):
             raise ValueError("duplex_session.replica_policy must be 'legacy' or 'least_sessions'")
         if self.max_sessions_per_replica is not None and (

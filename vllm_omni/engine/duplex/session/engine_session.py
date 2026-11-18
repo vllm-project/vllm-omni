@@ -40,6 +40,7 @@ from vllm_omni.engine.duplex.config import (
 )
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.events import TurnEvent
+from vllm_omni.engine.duplex.session.action_ledger import ActionLedgerError, SessionActionLedger
 from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLedger
 from vllm_omni.engine.duplex.session.context_view import DuplexHistoryView
 from vllm_omni.engine.duplex.session.context_view import render_history_view as render_context_view
@@ -264,6 +265,17 @@ class DuplexEngineSession:
     #: Server-side stage work and audio by turn and chunk (RFC #8325); None when
     #: the deployment does not collect session stats.
     perf: SessionPerfLedger | None = field(default=None, repr=False)
+    # Per-session capture ledger; a mid-session turn-on creates it lazily.
+    actions: SessionActionLedger | None = field(default=None, repr=False)
+    # Responses begun in this session (monotone); mixed into the capture seed.
+    capture_response_count: int = field(default=0)
+    # One-shot seal status for the next epoch advance (default: interruption).
+    capture_epoch_cause: str | None = field(default=None)
+    # Deferred capture failure: state methods cannot await the close path,
+    # so the next delivery fails the session with it and its code below.
+    capture_pending_error: str | None = field(default=None)
+    # The typed code of the pending capture failure.
+    capture_pending_error_code: str | None = field(default=None)
 
     def __post_init__(self) -> None:
         if self.accepted_fence is None:
@@ -1152,6 +1164,14 @@ class DuplexEngineSession:
             self.perf.bind_response(
                 epoch=self.epoch, turn_id=self._response.active_response_turn_id, response_id=response_id
             )
+        if self.actions is not None:
+            self.capture_response_count += 1
+            try:
+                self.actions.bind_response(
+                    response_id, epoch=self.epoch, turn_id=self._response.active_response_turn_id
+                )
+            except ActionLedgerError as exc:
+                self._defer_capture_failure(exc)
         return response_id
 
     def _clear_response_metrics(self) -> None:
@@ -1661,6 +1681,13 @@ class DuplexEngineSession:
         response_id = self._response.active_response_id
         if self.perf is not None and response_id is not None:
             self.perf.end_response(response_id)
+        if self.actions is not None and response_id is not None:
+            # the response boundary seals the record set; the
+            # completeness of its ingest accounting was enforced per delivery.
+            try:
+                self.actions.seal_active_response(response_id)
+            except ActionLedgerError as exc:
+                self._defer_capture_failure(exc)
         response_input_commit_seq = self._response.active_response_input_commit_seq
         if response_input_commit_seq is None:
             response_input_commit_seq = self.input_commit_seq
@@ -2109,10 +2136,31 @@ class DuplexEngineSession:
             return None
         return self._playback.by_response.get(item_id.removeprefix("item_"))
 
+    def _defer_capture_failure(self, exc: ActionLedgerError) -> None:
+        """Record a capture-ledger failure for the runner to fail the session with."""
+        if self.capture_pending_error is None:
+            self.capture_pending_error = str(exc)
+            self.capture_pending_error_code = exc.code
+
     def barge_in(self) -> int:
         self._log_response_aggregator()
         if self.perf is not None:
             self.perf.cancel_epoch(self.epoch)
+        if self.actions is not None:
+            # Seal before the epoch bump — stale-epoch outputs are dropped below.
+            cause = self.capture_epoch_cause
+            self.capture_epoch_cause = None
+            try:
+                if cause is not None:
+                    (
+                        self.actions.seal_for_cancel()
+                        if cause == "truncated_cancel"
+                        else self.actions.seal_for_interruption()
+                    )
+                else:
+                    self.actions.seal_for_interruption()
+            except ActionLedgerError as exc:
+                self._defer_capture_failure(exc)
         self.epoch += 1
         self.sync_fence()
         self._response.assistant_text_buffer.clear()
@@ -2138,6 +2186,12 @@ class DuplexEngineSession:
         self._log_response_aggregator()
         if self.perf is not None:
             self.perf.close_all()
+        if self.actions is not None:
+            # Close bypasses the retention guard: the terminal cache drains all.
+            try:
+                self.actions.seal_for_close()
+            except ActionLedgerError as exc:
+                self._defer_capture_failure(exc)
         self.state = DuplexSessionState.CLOSED
         self.release_buffered_input_bytes()
         self._input.queued_input_bytes = 0

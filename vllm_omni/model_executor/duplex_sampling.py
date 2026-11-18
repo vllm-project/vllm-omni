@@ -26,6 +26,10 @@ class DuplexSamplingRow:
     temperature: float | None = None
     top_k: int | None = None
     top_p: float | None = None
+    # The duplex envelope's epoch stamp (framework-owned fence epoch).
+    epoch: int | None = None
+    #: The engine's capture envelope, present only when the session has capture on.
+    action_capture: dict[str, object] | None = None
 
 
 def _host_value(values: Any, row_idx: int, cast: type) -> Any:
@@ -36,6 +40,22 @@ def _host_value(values: Any, row_idx: int, cast: type) -> Any:
         return cast(values[row_idx])
     except (IndexError, TypeError, ValueError):
         return None
+
+
+def _epoch_value(duplex: dict[str, Any]) -> int | None:
+    """The envelope's fence epoch, when the framework stamped one."""
+    epoch = duplex.get("epoch")
+    if isinstance(epoch, int) and not isinstance(epoch, bool):
+        return epoch
+    return None
+
+
+def _action_capture_value(duplex: dict[str, Any]) -> dict[str, Any] | None:
+    """The engine's capture envelope; None when capture is off."""
+    capture = duplex.get("action_capture")
+    if isinstance(capture, dict) and capture.get("enabled") is True:
+        return dict(capture)
+    return None
 
 
 class DuplexSamplingHelper:
@@ -115,6 +135,8 @@ class DuplexSamplingHelper:
                     temperature=_host_value(temperature_cpu, row_idx, float),
                     top_k=_host_value(top_k_cpu, row_idx, int),
                     top_p=_host_value(top_p_cpu, row_idx, float),
+                    epoch=_epoch_value(duplex),
+                    action_capture=_action_capture_value(duplex),
                 )
             )
         return tuple(rows)

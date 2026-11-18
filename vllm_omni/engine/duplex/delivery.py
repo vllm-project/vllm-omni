@@ -29,6 +29,7 @@ from vllm_omni.engine.duplex.events import (
     DuplexEvent,
     ErrorEvent,
     ResponseDone,
+    SessionActionRecords,
     SessionClosed,
     SessionUpdated,
 )
@@ -45,6 +46,13 @@ def _is_retained_update_outcome(event: DuplexEvent, event_id: str | None) -> boo
     if isinstance(event, SessionUpdated):
         return True
     return isinstance(event, ErrorEvent) and bool(event_id) and event.related_event_id == event_id
+
+
+def _is_capture_reply(event: DuplexEvent, event_id: str) -> bool:
+    """Whether ``event`` answers the armed ``session.action_records.get``."""
+    if isinstance(event, SessionActionRecords):
+        return event.request_event_id == event_id
+    return isinstance(event, ErrorEvent) and event.related_event_id == event_id
 
 
 class DuplexOutputOverflowError(RuntimeError):
@@ -99,6 +107,9 @@ class DuplexOutputBuffer:
         self._retention_event_id: str | None = None
         self._retention_sealed = False
         self._retained: list[tuple[int, DuplexEvent]] = []
+        # One outstanding ``session.action_records.get`` keeps its reply until consumed.
+        self._capture_reply_event_id: str | None = None
+        self._retained_capture_reply: DuplexEvent | None = None
         # Latest accepted session payload, with a monotonic generation. Reader
         # and pump both apply "latest if newer" so a later update is not
         # overwritten when an earlier session.updated is finally dequeued.
@@ -155,7 +166,7 @@ class DuplexOutputBuffer:
             else:
                 self._bytes += size
             observe_waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]] = []
-            if isinstance(event, SessionUpdated | ErrorEvent):
+            if isinstance(event, SessionUpdated | ErrorEvent | SessionActionRecords):
                 self._observation_seq += 1
                 if isinstance(event, SessionUpdated):
                     self._accepted_session_seq += 1
@@ -170,6 +181,13 @@ class DuplexOutputBuffer:
                     # this list: it outlives the outbox budget until disarm.
                     self._retained.append((self._observation_seq, event))
                     self._retention_sealed = True
+                if (
+                    self._capture_reply_event_id is not None
+                    and isinstance(event, SessionActionRecords | ErrorEvent)
+                    and _is_capture_reply(event, self._capture_reply_event_id)
+                ):
+                    # One point-in-time reply; the events stream is unaffected.
+                    self._retained_capture_reply = event
                 observe_waiters = self._observe_waiters
                 self._observe_waiters = []
             waiter = self._waiter
@@ -251,6 +269,24 @@ class DuplexOutputBuffer:
         """The settling event for the outstanding update, if it has arrived."""
         with self._lock:
             return tuple(event for observed_seq, event in self._retained if observed_seq > seq)
+
+    def arm_capture_retention(self, event_id: str) -> None:
+        """Keep the next capture reply answering ``event_id``."""
+        with self._lock:
+            self._capture_reply_event_id = event_id
+            self._retained_capture_reply = None
+
+    def disarm_capture_retention(self) -> DuplexEvent | None:
+        """Drop the armed capture request; returns the retained reply, if any."""
+        with self._lock:
+            self._capture_reply_event_id = None
+            reply, self._retained_capture_reply = self._retained_capture_reply, None
+            return reply
+
+    def capture_reply_arrived(self) -> bool:
+        """Whether the armed request's reply has been retained."""
+        with self._lock:
+            return self._retained_capture_reply is not None
 
     async def wait_for_observation(self, seen: int) -> bool:
         """Wait until a newer control event is enqueued.

@@ -54,6 +54,7 @@ from vllm_omni.engine.duplex.plugin import (
     settle_response_runtime,
 )
 from vllm_omni.engine.duplex.session import helpers
+from vllm_omni.engine.duplex.session.action_ledger import ActionLedgerError
 from vllm_omni.engine.duplex.session.context import CommittedInputContinuation, DuplexSessionContext, StageOutput
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
@@ -67,6 +68,7 @@ from vllm_omni.engine.duplex.session.tool_calls import (
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.duplex import attach_duplex_output_decision
+from vllm_omni.protocol.duplex.action_records import ORIGIN_CLIENT, ORIGIN_ENGINE, ActionPayloadError
 
 if TYPE_CHECKING:
     from vllm.outputs import RequestOutput
@@ -166,6 +168,39 @@ class SilenceContinuationScheduler(Protocol):
         expected_epoch: int | None,
         expected_model_turn_id: int | None,
     ) -> bool: ...
+
+
+def _capture_input_modality(payload: object) -> str:
+    """The capture ledger's input modality for one appended unit."""
+    if not isinstance(payload, Mapping):
+        return "audio"
+    if str(payload.get("type", "")) == "text" or payload.get("text") is not None:
+        return "text"
+    if payload.get("video_frames"):
+        return "vision"
+    return "audio"
+
+
+def _with_action_capture_envelope(
+    prompt: dict[str, object], *, seed: int | None, response_index: int
+) -> dict[str, object]:
+    """Stamp ``duplex.action_capture`` on the append envelope (enabled flag,
+    seed, response index); mirrors ``with_perf_chunk`` for envelope-less prompts."""
+    buffer = prompt.get("model_intermediate_buffer")
+    if buffer is None:
+        buffer = {}
+    if not isinstance(buffer, Mapping):
+        return prompt
+    duplex = buffer.get("duplex")
+    if duplex is None:
+        duplex = {}
+    if not isinstance(duplex, Mapping):
+        return prompt
+    entry = {"enabled": True, "seed": int(seed) if seed is not None else None, "response_index": int(response_index)}
+    return {
+        **prompt,
+        "model_intermediate_buffer": {**buffer, "duplex": {**duplex, "action_capture": entry}},
+    }
 
 
 class ModelChannel:
@@ -339,6 +374,11 @@ class ModelChannel:
     ) -> dict[str, object] | None:
         """Submit one planned append to the stage port and bind the resulting stage request."""
         session = self._ctx.session
+        # read and drop the engine-injected marker before the
+        # plugin plans the append; it is ledger bookkeeping, not a model hint.
+        engine_unit = isinstance(payload, Mapping) and bool(payload.get("engine_injected_unit"))
+        if engine_unit and isinstance(payload, dict):
+            payload.pop("engine_injected_unit", None)
         # Session stats: the chunk's in-engine interval starts when its append is taken up.
         accepted_ns = session.perf.now_ns() if session.perf is not None else 0
         if self._ctx.stage_port.stage_count == 0:
@@ -494,6 +534,18 @@ class ModelChannel:
                     submitted_ns=accepted_ns,
                 )
                 prompt = with_perf_chunk(prompt, perf_chunk)
+            if session.actions is not None and session.config.action_capture:
+                session.actions.note_input_unit(
+                    fence.epoch,
+                    reservation.update.seq,
+                    modality=("silence" if engine_unit else _capture_input_modality(payload)),
+                    origin=(ORIGIN_ENGINE if engine_unit else ORIGIN_CLIENT),
+                )
+                prompt = _with_action_capture_envelope(
+                    prompt,
+                    seed=session.config.seed,
+                    response_index=session.capture_response_count,
+                )
             try:
                 runtime_patch = self._ctx.plugin.runtime_patch_for_submitted_prompt(prompt)
                 submission = DuplexStageSubmission(
@@ -506,6 +558,11 @@ class ModelChannel:
                 if remaining_transcription_input is not None:
                     self._input_transcriptions[request_id] = remaining_transcription_input
                 submission_result = await self._ctx.stage_port.submit(submission)
+                # the session now holds appended data; the
+                # weight-sync fence refuses updates until it closes.
+                note_appended = getattr(self._ctx.manager, "note_session_appended", None)
+                if callable(note_appended):
+                    note_appended(session.session_id)
             except BaseException:
                 if perf is not None and perf_chunk is not None:
                     perf.drop_chunk(perf_chunk)
@@ -786,6 +843,41 @@ class ModelChannel:
                 # A chunk's turn cannot be final before its outputs are handled.
                 perf.mark_handled(item.context.perf_chunks)
 
+    async def _ingest_action_capture(self, item: StageOutput, expected_epoch: int) -> None:
+        """Ingest one delivery's capture payload; absent or invalid payloads close the session."""
+        session = self._ctx.session
+        actions = session.actions
+        if actions is None or not session.config.action_capture:
+            return
+        if item.stage_id not in self._ctx.plugin.action_capture_stage_ids():
+            return
+        payload = item.context.segment_capture_payload
+        if payload is None:
+            await self._fail_action_capture(
+                f"capture delivery without payload: stage={item.stage_id} request={item.request_id}"
+            )
+            return
+        try:
+            actions.ingest(
+                payload,
+                epoch=expected_epoch,
+                turn_id=item.context.identity.fence.turn_id,
+                response_id=session.active_response_id,
+                stage_id=item.stage_id,
+                input_modality="",
+            )
+        except (ActionLedgerError, ActionPayloadError) as exc:
+            await self._fail_action_capture(str(exc))
+
+    async def _fail_action_capture(self, message: str, *, code: str | None = None) -> None:
+        error_code = code if code is not None else "action_capture_invalid"
+        logger.error("duplex action capture failed session=%s: %s", self._ctx.session.session_id, message)
+        self._out.emit_error(error_code, f"Action capture failed: {message}", retryable=False)
+        try:
+            await self._close_from_runtime("action_capture_invalid")
+        except Exception:
+            logger.exception("closing the session after an action-capture failure failed")
+
     async def _on_stage_output_item(self, item: StageOutput) -> CommittedInputContinuation | None:
         session = self._ctx.session
         if session.state == DuplexSessionState.CLOSED or self._ctx.run.closing:
@@ -799,6 +891,16 @@ class ModelChannel:
         session.touch_lease(DuplexLeaseActivity.MODEL_OUTPUT)
         if self._ctx.plugin.data_plane.is_terminal(item.request_id):
             return None
+        pending_capture_error = session.capture_pending_error
+        if pending_capture_error is not None:
+            session.capture_pending_error = None
+            pending_code = session.capture_pending_error_code
+            session.capture_pending_error_code = None
+            await self._fail_action_capture(pending_capture_error, code=pending_code)
+            return None
+        # Ingest runs after the epoch/lease guards, so stale-epoch outputs
+        # drop exactly like their segments.
+        await self._ingest_action_capture(item, expected_epoch)
         if self._out.auto_responds():
             active_request_id = session.active_request_id
             if active_request_id is not None and active_request_id != item.request_id:
@@ -1955,6 +2057,9 @@ class ModelChannel:
                 )
             return
         payload = self.silence_unit_payload()
+        # Engine bookkeeping for the origin annotation; stripped before the
+        # plugin sees the payload.
+        payload["engine_injected_unit"] = True
         if auto_response and count + 1 == continuation_limit:
             payload["force_listen"] = True
         payload["duplex_turn_id"] = payload_turn_id_value

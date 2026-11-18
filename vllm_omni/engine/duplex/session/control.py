@@ -413,6 +413,22 @@ class SessionControl:
             session.replace_config(candidate_config)
             session.replace_runtime_config(candidate_runtime_config)
             runtime_adopted = True
+            if previous_config.action_capture and not candidate_config.action_capture and session.actions is not None:
+                # Turning capture off seals the in-flight scope as truncated.
+                session.actions.seal_for_close()
+            elif candidate_config.action_capture and session.actions is None:
+                # Refused mid-response: the scope was not captured from its
+                # start, and re-keying a half-captured scope breaks completeness.
+                if session.active_response_id is not None:
+                    self._out.emit_error(
+                        "action_capture_update_conflict",
+                        "session.update cannot turn action_capture on while a response is active",
+                        event_id=realtime_event_id,
+                    )
+                    return
+                from vllm_omni.engine.duplex.session.action_ledger import SessionActionLedger
+
+                session.actions = SessionActionLedger(session_id=session.session_id)
             try:
                 session.touch_lease(DuplexLeaseActivity.SIGNAL)
             except Exception:

@@ -275,6 +275,35 @@ class SessionStats(RealtimeEvent):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class SessionActionRecords(RealtimeEvent):
+    """Captured action records of one scope (reply to ``session.action_records.get``).
+
+    vLLM-Omni-only event. The payload is the wire form of one
+    ``DuplexActionRecordSet``; a point-in-time answer, never replayed on resume.
+    """
+
+    wire_type = "session.action.records"
+    optional_wire_fields = frozenset({"response_id"})
+
+    # The ``event_id`` of the ``session.action_records.get`` this answers.
+    request_event_id: str | None = None
+    # The scope this set sealed (None for a listening scope).
+    response_id: str | None = None  # type: ignore[assignment]
+    records: Mapping[str, object] = field(default_factory=dict)
+
+    def _wire_fields(self) -> dict[str, object]:
+        data: dict[str, object] = {
+            "session_id": self.session_id,
+            "records": wire_value(self.records),
+        }
+        if self.request_event_id is not None:
+            data["request_event_id"] = self.request_event_id
+        if self.response_id is not None:
+            data["response_id"] = self.response_id
+        return data
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class TurnEvent(RealtimeEvent):
     """Turn-state transition (``turn.event``)."""
 
@@ -432,6 +461,7 @@ __all__ = [
     "SessionResumed",
     "SessionResyncRequired",
     "SessionStats",
+    "SessionActionRecords",
     "Speak",
     "TurnEvent",
     # Bases and helpers shared with the Tier 1 surface.

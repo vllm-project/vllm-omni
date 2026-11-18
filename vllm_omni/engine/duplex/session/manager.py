@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import threading
 import time
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, replace
@@ -29,7 +30,7 @@ from opentelemetry import trace
 from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.commands import AppendAudio, Commit, DuplexCommand
-from vllm_omni.engine.duplex.config import apply_session_stats_capability
+from vllm_omni.engine.duplex.config import apply_action_capture_capability, apply_session_stats_capability
 from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
     DuplexStagePort,
@@ -50,6 +51,7 @@ from vllm_omni.engine.duplex.events import (
 )
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
+    CollectActionRecordsMessage,
     DuplexControlResultMessage,
     DuplexSessionCommandMessage,
     DuplexSessionError,
@@ -64,12 +66,14 @@ from vllm_omni.engine.duplex.plugin import (
     validate_duplex_plugin_sampling,
     validate_session_tools,
 )
+from vllm_omni.engine.duplex.session.action_ledger import SessionActionLedger
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity, DuplexLeaseConfig, DuplexLeaseState
 from vllm_omni.engine.duplex.session.perf_ledger import SessionPerfLedger
 from vllm_omni.engine.duplex.turn_detection import SileroVADBackendProvider, SmartTurnBackendProvider
 from vllm_omni.engine.duplex.vad_batcher import TurnDetectionBatcher
 from vllm_omni.inputs.data import disable_watermarking
+from vllm_omni.protocol.duplex.action_records import DuplexActionRecordSet
 from vllm_omni.tracing import SessionTrace
 
 if TYPE_CHECKING:
@@ -81,6 +85,9 @@ if TYPE_CHECKING:
     from vllm_omni.engine.messages import EngineQueueMessage, OutputQueueWriter
 
 logger = init_logger(__name__)
+
+# How long sealed action records of a closed session stay collectable.
+TERMINAL_ACTION_RECORDS_TTL_S = 300.0
 
 
 @dataclass(frozen=True)
@@ -186,6 +193,14 @@ class DuplexSessionManager:
         self._request_cleanups_in_progress: set[tuple[str, int]] = set()
         #: Sessions retained for cleanup retry after their runner is gone.
         self._session_snapshots: dict[str, DuplexEngineSession] = {}
+        # sealed action-record sets of closed sessions, held
+        # for a bounded collection deadline; retrieval after close reads this.
+        self._terminal_action_records: dict[str, tuple[float, list[DuplexActionRecordSet]]] = {}
+        self._terminal_action_records_lock = threading.Lock()
+        # open sessions that appended data. The weight-sync
+        # fence reads this cross-thread; the set itself is lock-guarded.
+        self._appended_session_ids: set[str] = set()
+        self._appended_sessions_lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
     # Views                                                              #
@@ -290,6 +305,8 @@ class DuplexSessionManager:
             await self.resume(message)
         elif isinstance(message, TouchDuplexSessionMessage):
             await self.touch(message)
+        elif isinstance(message, CollectActionRecordsMessage):
+            await self.collect_terminal_records(message)
         elif isinstance(message, DuplexSessionCommandMessage):
             self._dispatch_command(message)
         else:
@@ -628,8 +645,18 @@ class DuplexSessionManager:
                 raise DuplexRuntimeConfigError(str(exc)) from exc
             collect_stats = bool(getattr(self.runtime_config, "collect_stats", False))
             capabilities = apply_session_stats_capability(
-                self.plugin.capabilities(max_sessions=max_sessions), collect_stats
+                apply_action_capture_capability(
+                    self.plugin.capabilities(max_sessions=max_sessions),
+                    bool(getattr(self.runtime_config, "allow_action_capture", True)),
+                ),
+                collect_stats,
             )
+            if config.action_capture and not capabilities.supports_action_capture:
+                raise DuplexRuntimeConfigError(
+                    "This duplex model/deployment does not support action capture "
+                    "(duplex_session.allow_action_capture / supports_action_capture)",
+                    code="action_capture_unsupported",
+                )
             validate_session_tools(capabilities, config.extra_body)
             session = DuplexEngineSession(
                 session_id=session_id,
@@ -641,6 +668,7 @@ class DuplexSessionManager:
                 num_stages=self.stage_port.stage_count,
                 log_stats=self.log_stats,
                 perf=self._session_perf_ledger() if collect_stats else None,
+                actions=SessionActionLedger(session_id=session_id) if config.action_capture else None,
             )
             # Validates the plugin's sampling policy for this runtime config before admission.
             self.sampling_params_for(session)
@@ -854,6 +882,9 @@ class DuplexSessionManager:
         except Exception:
             logger.exception("duplex runner %s failed for session %s", kind, session.session_id)
         session.close()
+        self.forget_session(session.session_id)
+        # Stash sealed sets before the session becomes unreachable.
+        self._stash_terminal_action_records(session)
         try:
             await self._finalize_pending_cleanup(pending, session)
         finally:
@@ -865,6 +896,73 @@ class DuplexSessionManager:
                     SessionExpired(reason=reason) if kind == "expired" else SessionClosed(reason=reason)
                 )
                 self.emit(session, [terminal])
+
+    def note_session_appended(self, session_id: str) -> None:
+        """Record that a session submitted input (its KV now depends on weights)."""
+        with self._appended_sessions_lock:
+            self._appended_session_ids.add(session_id)
+
+    def forget_session(self, session_id: str) -> None:
+        """Drop a closed session from the appended-sessions fence."""
+        with self._appended_sessions_lock:
+            self._appended_session_ids.discard(session_id)
+
+    def open_sessions_with_appended_data(self) -> list[str]:
+        """Open duplex sessions that appended data (weight-sync fence, )."""
+        with self._appended_sessions_lock:
+            return [sid for sid in self._appended_session_ids if sid in self.runners]
+
+    def _stash_terminal_action_records(self, session: DuplexEngineSession) -> None:
+        actions = session.actions
+        if actions is None:
+            return
+        sets = actions.take_terminal_sets()
+        if not sets:
+            return
+        with self._terminal_action_records_lock:
+            self._terminal_action_records[session.session_id] = (self._clock() + TERMINAL_ACTION_RECORDS_TTL_S, sets)
+
+    def take_terminal_action_records(
+        self, session_id: str, response_id: str | None = None
+    ) -> DuplexActionRecordSet | None:
+        """Post-close retrieval from the terminal cache; None when absent/expired.
+
+        ``response_id=None`` takes the most recently sealed set. The caller
+        (the engine surface) reports absence loudly instead of silently.
+        """
+        with self._terminal_action_records_lock:
+            entry = self._terminal_action_records.get(session_id)
+            if entry is None:
+                return None
+            deadline, sets = entry
+            if self._clock() > deadline:
+                self._terminal_action_records.pop(session_id, None)
+                logger.error("duplex terminal action records for session %s expired uncollected", session_id)
+                return None
+            if not sets:
+                self._terminal_action_records.pop(session_id, None)
+                return None
+            if response_id is None:
+                set_ = sets.pop()
+            else:
+                match = next((s for s in sets if s.response_id == response_id), None)
+                if match is None:
+                    return None
+                sets.remove(match)
+                set_ = match
+            if not sets:
+                self._terminal_action_records.pop(session_id, None)
+            return set_
+
+    def _evict_expired_terminal_action_records(self) -> None:
+        """Drop past-deadline terminal records loudly (called by the reaper)."""
+        now = self._clock()
+        with self._terminal_action_records_lock:
+            expired = [sid for sid, (deadline, _) in self._terminal_action_records.items() if now > deadline]
+            for sid in expired:
+                self._terminal_action_records.pop(sid, None)
+        for sid in expired:
+            logger.error("duplex terminal action records for session %s expired uncollected", sid)
 
     async def _finalize_pending_cleanup(
         self,
@@ -937,6 +1035,35 @@ class DuplexSessionManager:
     # Lease expiry / reaper                                              #
     # ------------------------------------------------------------------ #
 
+    async def collect_terminal_records(self, message: CollectActionRecordsMessage) -> None:
+        """Answer post-close ``collect_action_records`` from the terminal cache."""
+        try:
+            set_ = self.take_terminal_action_records(message.session_id, message.response_id)
+            if set_ is None:
+                raise DuplexSessionError(
+                    "no retained action records for session "
+                    f"{message.session_id}" + (f" response {message.response_id}" if message.response_id else ""),
+                    code="action_capture_not_retained",
+                    session_id=message.session_id,
+                )
+            error_code, error_message, error_retryable = None, None, False
+        except DuplexSessionError as exc:
+            set_, error_code, error_message, error_retryable = None, *self._control_error(exc)
+        except Exception as exc:
+            logger.exception("collect_action_records failed: %s", exc)
+            set_, (error_code, error_message, error_retryable) = None, self._control_error(exc)
+        result = DuplexControlResultMessage(
+            control_id=message.control_id,
+            operation="collect_action_records",
+            session_id=message.session_id,
+            ok=set_ is not None,
+            error_code=error_code,
+            error_message=error_message,
+            error_retryable=error_retryable,
+            action_records=set_.to_wire() if set_ is not None else None,
+        )
+        await self._result_sink.put(result)
+
     async def reaper_loop(self, shutdown_event: asyncio.Event) -> None:
         interval = float(self.runtime_config.reaper_interval_s)
         while not shutdown_event.is_set():
@@ -953,6 +1080,8 @@ class DuplexSessionManager:
     async def reap_expired(self, now: float | None = None) -> int:
         completed = 0
         effective_now = self._clock() if now is None else now
+        # past-deadline terminal action records are dropped loudly.
+        self._evict_expired_terminal_action_records()
         # Retry request cleanups recorded by the orchestrator error paths.
         for key, request_cleanup in list(self._pending_request_cleanups.items()):
             if key in self._request_cleanups_in_progress:

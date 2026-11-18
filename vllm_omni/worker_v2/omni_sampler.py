@@ -34,6 +34,8 @@ class OmniSamplingOutput:
     owns_multimodal_outputs: bool = False
     # Invoked on CPU-owned snapshots after D2H, with effective per-request counts.
     finalize_multimodal: Callable[[dict[str, Any], list[int]], dict[str, Any] | RequestOutputSnapshot] | None = None
+    # Per-request capture payloads; never ``multimodal_outputs`` (non-None replaces).
+    action_capture: dict[str, Any] | None = None
 
 
 class OmniSampler:

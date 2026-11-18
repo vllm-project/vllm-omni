@@ -903,6 +903,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         mm_outputs = getattr(model_runner_output, "multimodal_outputs", None)
+        capture_outputs = getattr(model_runner_output, "action_capture_payloads", None)
         inter_stage_outputs = getattr(model_runner_output, "inter_stage_outputs", None)
         # Token-only processors need sampled IDs even without a tensor payload.
         processor = getattr(getattr(self, "chunk_transfer_adapter", None), "custom_process_next_stage_input_func", None)
@@ -1243,6 +1244,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             new_token_ids = generated_token_ids
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
+            capture_output = capture_outputs[req_index] if capture_outputs else None
             inter_stage_output = inter_stage_outputs[req_index] if inter_stage_outputs else None
             if sampling_validation_failed:
                 pooler_output = mm_output = inter_stage_output = None
@@ -1477,6 +1479,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     prompt_token_id_logprobs=prompt_token_id_logprobs,
                     pooling_output=pooling_output_payload,
                     multimodal_output=mm_output,
+                    action_capture_payload=capture_output,
                     stop_reason=request.stop_reason,
                     prefill_stats=prefill_stats,
                     kv_transfer_params=kv_transfer_params,

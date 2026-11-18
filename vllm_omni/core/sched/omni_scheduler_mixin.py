@@ -1036,6 +1036,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         segment_generation: int | None = None,
         new_prompt_len_snapshot: int | None = None,
         num_generation_tokens: int | None = None,
+        action_capture_payload: bytes | None = None,
         error: Any = None,
     ) -> OmniEngineCoreOutput:
         """Build the common request-output envelope used by LLM schedulers."""
@@ -1070,6 +1071,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             segment_generation=segment_generation,
             new_prompt_len_snapshot=new_prompt_len_snapshot,
             num_generation_tokens=num_generation_tokens,
+            action_capture_payload=action_capture_payload,
             error=error,
         )
 
