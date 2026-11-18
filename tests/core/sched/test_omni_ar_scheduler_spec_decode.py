@@ -28,7 +28,7 @@ def _runner_output(sampled_token_ids: list[list[int]]) -> SimpleNamespace:
         num_nans_in_logits=None,
         kv_connector_output=None,
         cudagraph_stats=None,
-        req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+        req_ids=req_ids,
         routed_experts=None,
     )
 
@@ -44,7 +44,12 @@ def test_spec_decode_bookkeeping_keeps_per_request_accepted_counts() -> None:
     scheduler = _make_scheduler_stub(requests)
     _bind_request_lifecycle(scheduler, update_request=lambda _request, token_ids: (token_ids, False))
     stats = []
-    scheduler.make_spec_decoding_stats = lambda _stats, **kwargs: (stats.append(kwargs), _stats)[1]
+
+    def record_stats(current_stats, **kwargs):
+        stats.append(kwargs)
+        return current_stats
+
+    scheduler.make_spec_decoding_stats = record_stats
 
     scheduler_output = SimpleNamespace(
         num_scheduled_tokens={"r0": 4, "r1": 2},
