@@ -36,6 +36,7 @@ from vllm.outputs import CompletionOutput
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.config.stage_config import StagePipelineConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.request_scheduler import RequestScheduler
 from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
@@ -1410,6 +1411,7 @@ class TestSpeechAPI:
         # Regression: StepScheduler.add_request() used to receive
         # num_inference_steps=None and fail while converting it to int.
         scheduler = StepScheduler()
+        scheduler.od_config = SimpleNamespace(diffusion_attention_schedule=None)
         scheduler.add_request(
             OmniDiffusionRequest(
                 prompt="Hello",
@@ -1451,7 +1453,7 @@ class TestSpeechAPI:
             assert response.status_code == 200
 
         scheduler = RequestScheduler()
-        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+        scheduler.initialize(OmniDiffusionConfig(max_num_seqs=2, diffusion_attention_schedule=None))
         for index, sampling_params in enumerate(passed_sampling_params):
             scheduler.add_request(
                 OmniDiffusionRequest(
