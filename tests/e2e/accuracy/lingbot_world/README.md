@@ -73,6 +73,9 @@ videos from the semantic
 tests. Server/cleanup failures remain failures. Generation hardware, source,
 model and workload are separate from the CUDA evaluator hardware.
 
+CUDA capture requires released vLLM 0.34.0 and Torch 2.14.0. NPU capture keeps
+its existing vLLM-Ascend 0.33.0 image and is not qualified for vLLM 0.34.0.
+
 CUDA generation uses two H100 GPUs with Ulysses/SP=2. NPU uses the existing
 four-device A2 configuration, followed by the same scorers on a CUDA worker.
 Evaluator dependencies, source revisions and weight checksums remain pinned.

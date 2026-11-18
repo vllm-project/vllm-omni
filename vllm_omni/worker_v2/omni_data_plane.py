@@ -327,6 +327,10 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
     def reserve_outputs(self, req_ids: list[str]) -> None:
         """Keep request state alive until deferred runner outputs are consumed."""
         self._raise_output_error()
+        # Native TP executors materialize async output on the replying leader
+        # only. A peer rank never completes a deferred publication hold.
+        if not self.is_data_transfer_rank():
+            return
         with self._native_output_lock:
             for req_id in dict.fromkeys(req_ids):
                 if req_id in self._native_requests:

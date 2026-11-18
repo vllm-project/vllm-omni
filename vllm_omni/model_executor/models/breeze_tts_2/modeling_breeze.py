@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Breeze-TTS-2: T5Gemma2 prompt encoding, paged Qwen3, and RVQ decoding."""
 
+from __future__ import annotations
+
 from collections.abc import Iterable
-from typing import Any, TypedDict, cast
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 import torch
 import torch.nn.functional as F
@@ -13,7 +15,6 @@ from vllm.config import VllmConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.sequence import IntermediateTensors
-from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_omni.config.model import OmniModelConfig
@@ -28,6 +29,9 @@ from vllm_omni.model_executor.models.breeze_tts_2.text_encoder_graph import (
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker_v2.warmup import is_warmup_request
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 
 class BreezeSampling(TypedDict):

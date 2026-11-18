@@ -173,6 +173,14 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             raise StageUnavailableError(f"stage {stage_id}: pinned duplex replica {replica_id} is unavailable")
         return replica_id
 
+    def _prewarm_downstream_resumable(
+        self, stage_id: int, entry_request: Any, req_state: OrchestratorRequestState
+    ) -> bool:
+        return super()._prewarm_downstream_resumable(stage_id, entry_request, req_state) or (
+            req_state.session_owned
+            and stage_id in self.plugin.resumable_downstream_stage_ids(stage_count=len(self.stage_pools))
+        )
+
     async def _retire_replica(self, stage_id: int, replica_id: int, reason: str) -> None:
         """Mark a replica unavailable, stop dispatch to it, and fail its sessions.
 
