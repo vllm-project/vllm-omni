@@ -1041,7 +1041,6 @@ class WholeEulerExecutionArena:
         # Attention storage is ``(n_t, depth, 2, 2 * B, heads, frames, head_dim)``:
         # dim 2 is the K/V half, so each half is fully contiguous for the op.
         self.head_dim = int(block0.attn.head_dim)
-        self.att_width = 2 * self.head_dim
 
         # Static staging buffers, shared by every graph that stages the same shape.
         self._buffers: dict[tuple, torch.Tensor] = {}

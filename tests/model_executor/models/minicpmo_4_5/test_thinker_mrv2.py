@@ -50,7 +50,7 @@ def test_cuda_turn_inherits_mrv2_talker_kstep(monkeypatch):
     assert talker.yaml_runtime["cuda_mps"] is True
 
 
-def _model(mocker, *, v2=True, session="turn", async_chunk=False, speculative_config=None):
+def _model(mocker, *, session="turn", async_chunk=False, speculative_config=None):
     thinker = torch.nn.Module()
     thinker.make_empty_intermediate_tensors = lambda: None
     mocker.patch.object(omni, "init_vllm_registered_model", return_value=thinker)
@@ -60,7 +60,6 @@ def _model(mocker, *, v2=True, session="turn", async_chunk=False, speculative_co
             hf_config=SimpleNamespace(),
             multimodal_config=None,
             model_stage="llm",
-            use_v2_model_runner=v2,
             session_mode=session,
             async_chunk=async_chunk,
         ),
@@ -382,7 +381,7 @@ def test_mrv2_cancel_before_first_prefill_completes_frees_session(mocker):
 
 
 def test_mrv2_duplex_thinker_batches_prefill_appends(mocker):
-    """MRv2 hands its prefill rows to the V1 cross-session ``preprocess_batch``."""
+    """MRv2 hands its prefill rows to the cross-session ``preprocess_batch``."""
     model = _model(mocker, session="duplex")
     batch = mocker.patch.object(model, "preprocess_batch")
     infos = [
@@ -400,15 +399,14 @@ def test_mrv2_duplex_thinker_batches_prefill_appends(mocker):
     batch.assert_not_called()
 
 
-@pytest.mark.parametrize("v2,session,keeps", [(True, "duplex", True), (True, "turn", False), (False, "duplex", False)])
-def test_only_the_mrv2_duplex_thinker_keeps_native_multimodal_inputs(mocker, v2, session, keeps):
-    # Chat requests with media share the duplex Thinker; turn MRv2 has no preprocess and V1 encodes first.
-    assert _model(mocker, v2=v2, session=session).preprocess_keeps_mm_inputs is keeps
+@pytest.mark.parametrize("session,keeps", [("duplex", True), ("turn", False)])
+def test_only_the_mrv2_duplex_thinker_keeps_native_multimodal_inputs(mocker, session, keeps):
+    # Chat requests with media share the duplex Thinker; turn MRv2 has no preprocess.
+    assert _model(mocker, session=session).preprocess_keeps_mm_inputs is keeps
 
 
-@pytest.mark.parametrize("v2,session", [(True, "turn"), (False, "duplex")])
-def test_mrv2_batch_preprocess_hook_is_duplex_mrv2_only(mocker, v2, session):
-    assert not hasattr(_model(mocker, v2=v2, session=session), "preprocess_batch_mrv2")
+def test_mrv2_batch_preprocess_hook_is_duplex_mrv2_only(mocker):
+    assert not hasattr(_model(mocker, session="turn"), "preprocess_batch_mrv2")
 
 
 def test_mrv2_thinker_returns_drafter_layers_with_hidden_states(mocker):
@@ -484,7 +482,6 @@ def test_mrv2_native_drafter_output_survives_runner_load_and_capture(mocker, mon
     else:
         talker = object.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
         torch.nn.Module.__init__(talker)
-        talker._use_v2_model_runner = True
         talker._k_step_frames = 0
         talker._deferred_cleanup_ids = set()
         talker.vllm_config = model.vllm_config
@@ -526,13 +523,6 @@ def test_mrv2_native_drafter_output_survives_runner_load_and_capture(mocker, mon
     assert runner.capture_model() == 0
     assert captured[0][0] is hidden and captured[0][1] is decoder.aux
     assert runner.use_aux_hidden_state_outputs is True
-
-
-def test_v1_thinker_refuses_drafter_layers(mocker):
-    model = _model(mocker, v2=False)
-    with pytest.raises(NotImplementedError, match="model_runner: v2"):
-        model.set_aux_hidden_state_layers((1, 9, 17))
-    assert model._returns_aux_hidden_states is False
 
 
 def test_talker_stage_hands_drafter_hooks_to_the_talker(mocker):

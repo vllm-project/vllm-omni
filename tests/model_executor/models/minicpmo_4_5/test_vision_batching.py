@@ -99,6 +99,7 @@ class _FakeVisionModel:
         self.config = _VisionConfig(vision_batch_size=vision_batch_size)
         self.vpm = _FakeVisionEncoder()
         self.resampler = _FakeResampler()
+        self.vision_packed_encode = False
 
 
 class _FakeAudioModel:

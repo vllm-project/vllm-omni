@@ -32,7 +32,6 @@ def _talker(session_mode, k_step_frames):
         speculative_config=SimpleNamespace(num_speculative_tokens=7),
     )
     talker._k_step_frames = k_step_frames
-    talker._use_v2_model_runner = True
     return talker
 
 
