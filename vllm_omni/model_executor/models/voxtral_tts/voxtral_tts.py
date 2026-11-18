@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from __future__ import annotations
+
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from functools import cached_property
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import regex as re
 import torch
@@ -17,8 +20,6 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -31,6 +32,9 @@ from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts_audio_generation im
     VoxtralTTSProcessingInfo,
 )
 from vllm_omni.transformers_utils.repo_utils import hf_api
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 logger = init_logger(__name__)
 
@@ -172,7 +176,7 @@ class VoxtralTTSForConditionalGeneration(
 
     # -------------------- CUDA Graph for acoustic transformer --------------------
 
-    def get_language_model(self) -> "nn.Module":
+    def get_language_model(self) -> nn.Module:
         """Return the language model for upstream MoE detection."""
         if hasattr(self.model, "get_language_model"):
             return self.model.get_language_model()
@@ -210,6 +214,8 @@ class VoxtralTTSForConditionalGeneration(
     # -------------------- Device utilities --------------------
     @cached_property
     def sampler(self):
+        from vllm.v1.sample.sampler import Sampler
+
         if hasattr(self.model, "sampler"):
             return self.model.sampler
         return Sampler()

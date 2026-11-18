@@ -48,6 +48,30 @@ def test_terminal_without_new_frames_does_not_replay_last_chunk(frames):
     assert terminal is not None and terminal.meta.finished.item()
     assert terminal.codes.audio.numel() == 0
     assert emitted == frames
+    assert terminal.meta.joyai_finish_on_next_stop is None
+
+
+def test_empty_finished_preserves_finish_on_next_stop_stamp():
+    from vllm_omni.data_entry_keys import JOYAI_FINISH_ON_NEXT_STOP_KEY
+
+    tm = _tm(initial_chunk_frames=1)
+    payload = _call(tm, "r", n_frames=1)
+    assert payload is not None
+    tm.put_req_chunk["r"] += 1
+    request = _req("r", finished=True)
+    setattr(request, f"_{JOYAI_FINISH_ON_NEXT_STOP_KEY}", True)
+    terminal = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        multimodal_output={"codes": {"audio": torch.zeros((0,))}},
+        request=request,
+        is_finished=True,
+    )
+    assert terminal is not None and terminal.codes.audio.numel() == 0
+    assert terminal.meta.joyai_finish_on_next_stop is True
+
+    empty = _call(_tm(initial_chunk_frames=1), "q", n_frames=0, finished=True)
+    assert empty is not None and empty.codes.audio.numel() == 0
+    assert empty.meta.joyai_finish_on_next_stop is None
 
 
 def test_repeated_nonterminal_callback_does_not_republish_boundary():
