@@ -194,6 +194,109 @@ async def test_omni_run_server_worker_forwards_client_config(
     provider.shutdown()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cli_options, request_headers, expected_status, expected_origin",
+    [
+        pytest.param([], {}, 400, None, id="default"),
+        pytest.param(
+            ["--allowed-origins", '["http://localhost:8000"]'],
+            {},
+            200,
+            "http://localhost:8000",
+            id="allowed-origin",
+        ),
+        pytest.param(
+            ["--allowed-origins", '["http://localhost:8000"]'],
+            {"Origin": "http://localhost:8001"},
+            400,
+            None,
+            id="unlisted-origin",
+        ),
+        pytest.param(
+            ["--allowed-origins", '["http://localhost:8000"]', "--allowed-methods", '["GET"]'],
+            {"Access-Control-Request-Method": "DELETE"},
+            400,
+            "http://localhost:8000",
+            id="disallowed-method",
+        ),
+        pytest.param(
+            ["--allowed-origins", '["http://localhost:8000"]', "--allowed-headers", '["Content-Type"]'],
+            {"Access-Control-Request-Headers": "x-unlisted-header"},
+            400,
+            "http://localhost:8000",
+            id="disallowed-header",
+        ),
+        pytest.param(
+            ["--allowed-origins", '["http://localhost:8000"]', "--allow-credentials"],
+            {},
+            200,
+            "http://localhost:8000",
+            id="credentials",
+        ),
+    ],
+)
+async def test_omni_worker_preserves_cli_cors_policy(
+    mocker, cli_options, request_headers, expected_status, expected_origin
+):
+    """Exercise real CLI -> upstream app -> Omni routes, without a model.
+
+    Catch dropped CORS options, permissive defaults, and middleware lost when
+    Omni replaces upstream routes. CORS controls browser access, not whether
+    an ordinary HTTP request executes.
+    """
+    import httpx
+
+    from vllm_omni.entrypoints.cli.serve import OmniServeCommand
+    from vllm_omni.utils.tracking_parser import TrackingArgumentParser
+
+    parser = TrackingArgumentParser()
+    OmniServeCommand().subparser_init(parser.add_subparsers(dest="command"))
+    args = parser.parse_args(["serve", "dummy", "--omni", *cli_options])
+
+    @asynccontextmanager
+    async def fake_engine(*_args, **_kwargs):
+        yield _FakeEngineClient(vllm_config=_FakeVllmConfig(_FakeParallelConfig(_api_process_rank=0)))
+
+    mocker.patch.object(api_server, "build_async_omni", fake_engine)
+    mocker.patch.object(api_server, "omni_init_app_state", new_callable=mocker.AsyncMock)
+    mocker.patch.object(api_server.STORAGE_MANAGER, "start", new_callable=mocker.AsyncMock)
+
+    async def exercise_http(app, **_kwargs):
+        headers = {
+            "Origin": "http://localhost:8000",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "authorization",
+            **request_headers,
+        }
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://server") as client:
+            # CORS controls browser access; it does not reject ordinary HTTP requests.
+            response = await client.get("/v1/models", headers={"Origin": headers["Origin"]})
+            assert response.status_code == 200
+            assert response.json() == {"object": "list", "data": []}
+            assert response.headers.get("access-control-allow-origin") == expected_origin
+            assert response.headers.get("access-control-allow-credentials") == (
+                "true" if "--allow-credentials" in cli_options else None
+            )
+
+            preflight = await client.options("/v1/models", headers=headers)
+            assert preflight.status_code == expected_status
+            assert preflight.headers.get("access-control-allow-origin") == expected_origin
+        return asyncio.create_task(asyncio.sleep(0))
+
+    listener = mocker.patch.object(api_server, "serve_http", side_effect=exercise_http)
+    sock = _FakeSocket()
+    root_logger = logging.getLogger()
+    original_level = root_logger.level
+    try:
+        await api_server.omni_run_server_worker("127.0.0.1:8091", sock, args)
+    finally:
+        # Building the real app imports SageMaker standards, which changes root logging.
+        root_logger.setLevel(original_level)
+    listener.assert_awaited_once()
+    assert sock.closed
+
+
 # FastAPI/Starlette auto-adds HEAD on every GET route. Including HEAD here
 # would invent ("HEAD", path) entries for every GET and fail the current census.
 # TODO: extend this set and the expected census if @router.head / @router.options appear.

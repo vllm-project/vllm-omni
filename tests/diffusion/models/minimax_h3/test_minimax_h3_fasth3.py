@@ -457,6 +457,7 @@ def test_a_vsa_variant_accepts_pure_ulysses_and_refuses_ring(tmp_path):
     od_config = SimpleNamespace(
         diffusion_attention_backend="FASTVIDEO_VSA",
         parallel_config=SimpleNamespace(sequence_parallel_size=8, ulysses_degree=8, ring_degree=1),
+        diffusion_attention_schedule=None,
     )
     fusion = _load(sparse.parent)
     fusion.check_serving_contract(partition="fl2va", od_config=od_config, video_shift=12.0, audio_shift=3.0)
@@ -472,6 +473,7 @@ def test_a_vsa_variant_accepts_normalized_attention_config(tmp_path, cpu_vsa_wor
     od_config = SimpleNamespace(
         diffusion_attention_config=SimpleNamespace(default=AttentionSpec(backend="FASTVIDEO_VSA")),
         parallel_config=SimpleNamespace(sequence_parallel_size=1),
+        diffusion_attention_schedule=None,
     )
     _load(sparse.parent).check_serving_contract(
         partition="fl2va", od_config=od_config, video_shift=12.0, audio_shift=3.0
@@ -503,6 +505,7 @@ def test_a_vsa_variant_reads_the_backend_the_dit_will_actually_resolve(tmp_path,
             per_role={"self": AttentionSpec(backend="FASTVIDEO_VSA")},
         ),
         parallel_config=SimpleNamespace(sequence_parallel_size=1),
+        diffusion_attention_schedule=None,
     )
     fusion.check_serving_contract(od_config=sparse_dit, **contract)
 

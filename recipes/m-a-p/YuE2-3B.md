@@ -2,6 +2,10 @@
 
 > Text-to-music: style + lyrics (optionally an ABC score) in, a 48 kHz stereo song out
 
+YuE2 requires Model Runner V1, which this vLLM 0.34 branch removes. Its deploy
+profile is rejected; the commands below require a model-owner migration to
+Model Runner V2 before they can run on this branch.
+
 ## Summary
 
 - Vendor: m-a-p (Multimodal Art Projection)
