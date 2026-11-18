@@ -1,0 +1,65 @@
+[
+    {
+        "test_name": "test_cosmos3_t2v_stability",
+        "description": "Cosmos3-Nano T2V stability 24h: CFG parallel=2 + HSDP=2 + VAE patch parallel=2 + VAE tiling, no guardrails; resolution sampled from ranges per batch",
+        "mark": [
+            {
+                "hardware_marks": {
+                    "res": {
+                        "cuda": "H800"
+                    },
+                    "num_cards": 2
+                }
+            },
+            "local_model",
+            "diffusion"
+        ],
+        "server_params": {
+            "model": "nvidia/Cosmos3-Nano",
+            "serve_args": {
+                "cfg-parallel-size": 2,
+                "use-hsdp": true,
+                "hsdp-shard-size": 2,
+                "vae-patch-parallel-size": 2,
+                "vae-use-tiling": true,
+                "model-class-name": "Cosmos3OmniDiffusersPipeline",
+                "no-guardrails": true,
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "dataset": "random",
+                "task": "t2v",
+                "backend": "v1/videos",
+                "width": [
+                    1024,
+                    1280
+                ],
+                "height": [
+                    720,
+                    1024
+                ],
+                "num_frames": 189,
+                "fps": 24,
+                "num_inference_steps": 4,
+                "enable_negative_prompt": true,
+                "duration_sec": 86400,
+                "max_concurrency": 1,
+                "num_prompts_per_batch": 50,
+                "seed": 42,
+                "random_request_config": [
+                    {
+                        "prompt": "Cinematic drone shot pushing through misty mountain ridges at sunrise, golden light catching the clouds, slow and smooth.",
+                        "weight": 1
+                    }
+                ],
+                "extra_body": {
+                    "guidance_scale": 5.5,
+                    "flow_shift": 9.0,
+                    "max_sequence_length": 4096
+                }
+            }
+        ]
+    }
+]

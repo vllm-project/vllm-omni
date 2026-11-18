@@ -30,10 +30,19 @@ from vllm.v1.engine import EngineCoreRequestType, FinishReason
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
+from vllm_omni.core.sched.output import OmniNewRequestData
+from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
 from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
+from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import has_tts_text_conditioning
 from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2code2wav_async_chunk
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
+)
+from tests.helpers.duplex_scheduler import (
+    DUPLEX_MAX_MODEL_LEN,
+    append_duplex_frame,
+    join_duplex_sessions,
+    make_engine_duplex_scheduler,
 )
 from tests.helpers.omni_scheduler import bind_omits_transfer_helpers
 
@@ -51,12 +60,17 @@ def _make_scheduler(*, stage_id: int = 0, session_mode: str = "turn") -> OmniARS
     )
     sched.num_waiting_for_streaming_input = 0
     sched.log_stats = False
+    # Upstream Scheduler.__init__ resolves hash_block_size = block_size (16 by
+    # default); the super()._update_request_as_session call at the pinned
+    # target truncates session.block_hashes with it.
+    sched.hash_block_size = 16
     sched.chunk_transfer_adapter = None
     sched.kv_holding_waiting = set()
     sched.deferred_waiting = set()
     sched._free_request_blocks = MagicMock()
     sched.encoder_cache_manager = MagicMock()
     sched._inflight_prefills = set()
+    sched._outputs_awaiting_stage_payload = {}
     return sched
 
 
@@ -118,16 +132,25 @@ def _make_talker_adapter(
     *,
     max_model_len: int = 100,
     recompute_on_capacity: bool = True,
+    receives_chunks: bool = False,
+    segment_finished_requests: set[str] | None = None,
+    requests_num_chunks_sent: dict[str, int] | None = None,
+    replaced_streaming_prompt_ids: set[str] | None = None,
+    requests_with_ready_chunks: set[str] | None = None,
 ) -> OmniChunkTransferAdapter:
     adapter = OmniChunkTransferAdapter.__new__(OmniChunkTransferAdapter)
-    adapter.receives_chunks = False
+    adapter.receives_chunks = receives_chunks
     adapter._max_model_len = max_model_len
     adapter._streaming_prompt_previous_chunks = 1
     adapter._streaming_prompt_recompute_on_capacity = recompute_on_capacity
     adapter._streaming_condition_lengths = {}
     adapter._streaming_condition_seqs = {}
-    adapter.segment_finished_requests = set()
-    adapter.requests_num_chunks_sent = {}
+    adapter.segment_finished_requests = set() if segment_finished_requests is None else segment_finished_requests
+    adapter.requests_num_chunks_sent = {} if requests_num_chunks_sent is None else requests_num_chunks_sent
+    if replaced_streaming_prompt_ids is not None:
+        adapter.replaced_streaming_prompt_ids = replaced_streaming_prompt_ids
+    if requests_with_ready_chunks is not None:
+        adapter.requests_with_ready_chunks = requests_with_ready_chunks
     return adapter
 
 
@@ -160,6 +183,7 @@ def _run_resumable_segment_stop(
     inter_stage_output=None,
 ):
     sched = MagicMock()
+    sched.grammar_compile_error_reqs = {}
     sched._hold_payloadless_outputs = False
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
@@ -299,7 +323,11 @@ def test_resumable_segment_boundary_keeps_pre_transition_send_watermark() -> Non
     )
 
 
-@pytest.mark.parametrize("processor", [None, talker2code2wav_async_chunk], ids=["no_opt_in", "cosyvoice3"])
+@pytest.mark.parametrize(
+    "processor",
+    [None, talker2code2wav_async_chunk, SimpleNamespace(_requires_full_token_history=True)],
+    ids=["no_opt_in", "cosyvoice3", "full_token_history"],
+)
 @pytest.mark.parametrize("new_token_ids", [[], [42]], ids=["no_tokens", "sampled_token"])
 @pytest.mark.parametrize("omit_chunk_transfer", [False, True], ids=["downstream", "stage0_final"])
 def test_running_decode_step_without_inter_stage_payload_does_not_raise(
@@ -316,6 +344,7 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise(
     session.additional_information = {"omni_final_stage_id": 0} if omit_chunk_transfer else None
 
     sched = mocker.MagicMock()
+    sched.grammar_compile_error_reqs = {}
     sched._hold_payloadless_outputs = False
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
@@ -410,6 +439,7 @@ def test_stale_async_frame_is_dropped_before_output_processing() -> None:
     num_output_placeholders = session.num_output_placeholders
 
     sched = MagicMock()
+    sched.grammar_compile_error_reqs = {}
     sched._hold_payloadless_outputs = False
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
@@ -577,6 +607,62 @@ def test_stage0_streaming_update_keeps_all_computed_tokens_without_placeholder()
     assert sched._new_prompt_len_snapshot[session.request_id] == 2
 
 
+def test_stage0_plain_streaming_update_keeps_the_first_chunk_text() -> None:
+    # Qwen3-TTS skips its stage-0 text check on streaming updates, so a plain
+    # stage-0 extension must keep the first chunk's additional_information:
+    # the re-admitted request carries it to the Talker's preprocess.
+    sched = _make_scheduler(stage_id=0)
+    session = _make_request()
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    first_chunk_info = serialize_additional_information({"task_type": ["CustomVoice"], "text": ["Hello there."]})
+    session.additional_information = first_chunk_info
+    update = _make_update([10, 20])
+    update.additional_information = serialize_additional_information({"task_type": ["CustomVoice"], "text": ["   "]})
+
+    sched._update_request_as_session(session, update)
+
+    assert session.status == RequestStatus.WAITING
+    assert session.additional_information is first_chunk_info
+    readmitted = OmniNewRequestData.from_request(session, block_ids=([],))
+    info = deserialize_additional_information(readmitted.additional_information)
+    assert info["text"] == ["Hello there."]
+    assert has_tts_text_conditioning(info, allow_blank_text=False)
+
+
+def test_stage0_streaming_update_keeps_full_hash_block() -> None:
+    """A fully computed length that is a multiple of hash_block_size must keep that block.
+
+    The pin deletes ``block_hashes[keep_end // hash_block_size:]`` with
+    ``keep_end = num_tokens - 1``. Clamping the computed frontier to
+    ``num_tokens - 1`` before that delete drops hash 0 when the length is 16.
+    """
+    sched = _make_scheduler(stage_id=0)
+    # Request stores this list. Compare against a copy so the extension
+    # inside _update_request_as_session does not rewrite the expected prefix.
+    prompt = list(range(16))
+    expected_prefix = list(prompt)
+    session = Request(
+        request_id="req-ar-hash-block",
+        prompt_token_ids=prompt,
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+        arrival_time=100.0,
+        block_hasher=None,
+    )
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.num_computed_tokens = 16
+    session.block_hashes.append("h0")
+
+    sched._update_request_as_session(session, _make_update([10, 20]))
+
+    assert session.prompt_token_ids[:16] == expected_prefix
+    assert list(session._all_token_ids[:16]) == expected_prefix
+    assert session.prompt_token_ids[-2:] == [10, 20]
+    assert list(session._all_token_ids[-2:]) == [10, 20]
+    assert session.block_hashes[0] == "h0"
+    assert session.num_computed_tokens >= 16
+
+
 def test_stage0_basic_window_rebuilds_below_low_watermark() -> None:
     sched = _make_scheduler(stage_id=0)
     session = _make_request()
@@ -642,9 +728,10 @@ def test_stage0_context_window_compacts_dropped_speech() -> None:
     assert getattr(session, "_minicpmo45_window_previous_len") == 3
 
 
+@pytest.mark.parametrize("mode", ["off", "basic"])
 @pytest.mark.parametrize("cleared_outputs", [False, True])
 @pytest.mark.parametrize("in_flight", [0, 1])
-def test_stage0_window_uses_confirmed_span_and_terminator(cleared_outputs, in_flight) -> None:
+def test_stage0_window_uses_confirmed_span_and_terminator(cleared_outputs, in_flight, mode) -> None:
     sched = _make_scheduler(stage_id=0)
     session = _make_request()
     session.prompt_token_ids = [0] * 9
@@ -657,15 +744,19 @@ def test_stage0_window_uses_confirmed_span_and_terminator(cleared_outputs, in_fl
     if cleared_outputs:
         # A stop without a queued append clears this before the next update.
         session._output_token_ids.clear()
-    update = _make_minicpm_window_update(seq=2, mode="basic")
+    update = _make_minicpm_window_update(seq=2, mode=mode)
 
     sched._update_request_as_session(session, update)
 
     plan = update.model_intermediate_buffer["duplex"]["stage0_window"]
     assert plan["completed_token_ids"] == [40]
     assert plan["completed_terminator_token_id"] == 99
-    assert plan["replacement_prompt_len"] == 9
-    assert plan["dropped_tokens"] == 9
+    if mode == "off":
+        assert "replace" not in plan
+        assert session.prompt_token_ids[:10] == [0] * 9 + [40]
+    else:
+        assert plan["replacement_prompt_len"] == 9
+        assert plan["dropped_tokens"] == 9
 
 
 def test_stage0_window_rebuild_that_overflows_max_model_len_finishes_the_session() -> None:
@@ -796,12 +887,94 @@ def test_stage0_window_open_start_falls_back_to_the_context_reserve_when_unset()
     assert plan["replacement_prompt_len"] == 22
 
 
+def _joyai_sentence_payload(*, replace: bool) -> object:
+    """Wire shape ``joyai_action_to_tts`` actually sends after serialize_payload."""
+    from vllm_omni.data_entry_keys import serialize_payload
+
+    info: dict[str, object] = {
+        "task_type": ["CustomVoice"],
+        "language": ["Auto"],
+        "speaker": ["Vivian"],
+        "instruct": [""],
+        "text": ["此诚危急存亡之秋也。"],
+    }
+    if replace:
+        info["meta"] = {
+            "replace_streaming_prompt": True,
+            "replace_runtime_additional_information": True,
+            "talker_prefill_offset": 0,
+            "talker_text_offset": 0,
+        }
+        info["embed"] = {"prefill": []}
+        info["hidden_states"] = {"trailing_text": []}
+    return serialize_payload(info)
+
+
+def _parked_talker_after_first_sentence() -> Request:
+    """Talker after sentence-1 2150: prompt zeros plus leftover codec KV."""
+    session = _make_request()
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.prompt_token_ids = [0] * 40
+    session._all_token_ids.clear()
+    session._all_token_ids.extend(session.prompt_token_ids)
+    session._output_token_ids.clear()
+    session.append_output_token_ids([100, 101, 2150])
+    session.num_prompt_tokens = 40
+    session.num_computed_tokens = 43
+    return session
+
+
+def test_serialized_joyai_meta_is_a_replace_flag() -> None:
+    from vllm_omni.core.sched.utils import streaming_update_replaces_prompt as _streaming_update_replaces_prompt
+
+    payload = _joyai_sentence_payload(replace=True)
+    assert _streaming_update_replaces_prompt((None, payload)) is True
+    assert _streaming_update_replaces_prompt((None, _joyai_sentence_payload(replace=False))) is False
+    assert _streaming_update_replaces_prompt(({"meta.replace_streaming_prompt": True}, None)) is True
+
+
+def test_joyai_serialized_payload_replaces_talker_codec_instead_of_appending() -> None:
+    """Sentence 2 must not keep sentence 1's 2150 in the Talker prompt.
+
+    The production wire has no nested dict ``meta``: only a flattened
+    AdditionalInformationPayload. The old isinstance(dict) check missed it.
+    """
+    sched = _make_scheduler(stage_id=1)
+    sched.chunk_transfer_adapter = _make_talker_adapter()
+    session = _parked_talker_after_first_sentence()
+    update = _make_update([0] * 44)
+    update.additional_information = _joyai_sentence_payload(replace=True)
+    update.model_intermediate_buffer = None
+
+    sched._update_request_as_session(session, update)
+
+    assert list(session.prompt_token_ids) == [0] * 44
+    assert list(session._all_token_ids) == [0] * 44
+    assert 2150 not in session.prompt_token_ids
+    assert 100 not in session._all_token_ids
+    assert session.num_computed_tokens == 0
+    assert session.num_prompt_tokens == 44
+    sched._free_request_blocks.assert_called_once_with(session)
+
+
+def test_talker_update_without_replace_flag_keeps_old_codec() -> None:
+    """Control: streaming-input append is unchanged when the flag is absent."""
+    sched = _make_scheduler(stage_id=1)
+    sched.chunk_transfer_adapter = _make_talker_adapter()
+    session = _parked_talker_after_first_sentence()
+    update = _make_update([0] * 44)
+    update.additional_information = _joyai_sentence_payload(replace=False)
+    update.model_intermediate_buffer = None
+
+    sched._update_request_as_session(session, update)
+
+    assert 2150 in session.prompt_token_ids or 100 in session.prompt_token_ids or 101 in session.prompt_token_ids
+    sched._free_request_blocks.assert_not_called()
+
+
 def test_explicit_streaming_payload_replaces_placeholder_prompt() -> None:
     sched = _make_scheduler(stage_id=1)
-    sched.chunk_transfer_adapter = SimpleNamespace(
-        receives_chunks=False,
-        segment_finished_requests=set(),
-    )
+    sched.chunk_transfer_adapter = _make_talker_adapter()
     session = _make_request()
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
     update = _make_update([10, 20])
@@ -830,9 +1003,7 @@ def test_explicit_streaming_payload_replaces_placeholder_prompt() -> None:
 def test_explicit_model_intermediate_prompt_replacement_releases_cache_and_watermark() -> None:
     sched = _make_scheduler(stage_id=1)
     session = _make_request()
-    sched.chunk_transfer_adapter = SimpleNamespace(
-        receives_chunks=False,
-        segment_finished_requests=set(),
+    sched.chunk_transfer_adapter = _make_talker_adapter(
         requests_num_chunks_sent={session.external_req_id: 59},
     )
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
@@ -1162,7 +1333,7 @@ def test_ready_async_chunk_prompt_replacement_releases_stale_kv_once() -> None:
     session.spec_token_ids = [-1, -1]
     sched.requests = {session.request_id: session}
     sched._inflight_prefills.add(session)
-    sched.chunk_transfer_adapter = SimpleNamespace(
+    sched.chunk_transfer_adapter = _make_talker_adapter(
         replaced_streaming_prompt_ids={session.request_id},
         requests_with_ready_chunks={session.request_id},
         requests_num_chunks_sent={session.external_req_id: 4090},
@@ -1202,7 +1373,7 @@ def test_chunk_segment_cleanup_keeps_requeued_resumable_receiver() -> None:
     sched.kv_holding_waiting = queue(session)
     sched.deferred_waiting = set()
     sched.num_waiting_for_streaming_input = 1
-    sched.chunk_transfer_adapter = SimpleNamespace(
+    sched.chunk_transfer_adapter = _make_talker_adapter(
         receives_chunks=True,
         segment_finished_requests={session.request_id},
     )
@@ -1235,7 +1406,7 @@ def test_chunk_segment_cleanup_keeps_explicit_update_stage_parked(
     sched = OmniARScheduler.__new__(OmniARScheduler)
     sched.vllm_config = SimpleNamespace(model_config=SimpleNamespace(session_mode=session_mode))
     sched.num_waiting_for_streaming_input = 1
-    sched.chunk_transfer_adapter = SimpleNamespace(
+    sched.chunk_transfer_adapter = _make_talker_adapter(
         receives_chunks=receives_chunks,
         segment_finished_requests={session.request_id},
     )
@@ -1396,6 +1567,8 @@ def test_overflow_guard_survives_eager_abort_until_fifo_cleanup(mocker, fifo_pub
     other.status = RequestStatus.RUNNING
     sched.running.append(other)
     engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    # EngineCore.__init__ sets this; __new__ skips it. False is the unpaused default.
+    engine.reject_new_requests = False
     engine.scheduler = sched
     engine.engines_running = False
     engine.batch_queue = None
@@ -1665,6 +1838,61 @@ def test_context_overflow_emits_an_error_output_with_the_reason() -> None:
 
     sched._emit_streaming_context_overflow_outputs(outputs)
     assert len(outputs[2]) == 1
+
+
+def test_duplex_session_samples_its_last_frame_at_max_model_len_then_fails_cleanly(tmp_path) -> None:
+    """A PersonaPlex-shaped session (one placeholder per 80 ms frame, one
+    greedy token per frame) through the real scheduler and KV manager: the last
+    frame it may run is the one whose sample lands exactly on max_model_len;
+    the next append fails only that session, with an explicit error, and a
+    concurrent session keeps running on the same engine."""
+    sched = make_engine_duplex_scheduler(tmp_path)
+    # "long" joins ten frames short of the context; "short" is a later caller.
+    join_duplex_sessions(sched, {"long": DUPLEX_MAX_MODEL_LEN - 10, "short": 100})
+
+    last_sample = None
+    for _ in range(20):
+        sampled_at, outputs = append_duplex_frame(sched)
+        if "long" in sampled_at:
+            last_sample = sampled_at["long"]
+        if "long" not in sched.requests:
+            break
+    else:
+        pytest.fail("the long session never reached max_model_len")
+
+    # Prompt 2999 samples position 3000: the last one the worker can book.
+    assert last_sample == DUPLEX_MAX_MODEL_LEN - 1
+    error = outputs["long"]
+    assert error.finish_reason == FinishReason.ERROR
+    assert error.stop_reason.startswith(OmniARScheduler.STREAMING_CONTEXT_OVERFLOW_STOP_REASON)
+    assert f"grow to {DUPLEX_MAX_MODEL_LEN} tokens" in error.stop_reason
+    assert f"max_model_len {DUPLEX_MAX_MODEL_LEN}" in error.stop_reason
+
+    # The other session was in the same step and keeps running afterwards.
+    assert "short" in sampled_at
+    for _ in range(3):
+        sampled_at, _ = append_duplex_frame(sched)
+        assert set(sampled_at) == {"short"}
+
+
+def test_duplex_session_without_the_sample_reserve_crashes_on_the_exact_fill(tmp_path, monkeypatch) -> None:
+    """Root cause of ``Sampled token IDs exceed the max model length. Total
+    number of tokens: 3001 > max_model_len: 3000`` on builds before the
+    streaming overflow guard: nothing stopped the append whose prompt fills
+    max_model_len exactly, and the token that frame samples is position 3001.
+    The guard therefore has to reserve the sampled token, not only the prompt
+    (the test above)."""
+    monkeypatch.setattr(OmniARScheduler, "_streaming_update_overflows", lambda *_args, **_kwargs: False)
+    sched = make_engine_duplex_scheduler(tmp_path)
+    join_duplex_sessions(sched, {"long": DUPLEX_MAX_MODEL_LEN - 10})
+
+    for _ in range(9):
+        append_duplex_frame(sched)
+    assert sched.requests["long"].num_prompt_tokens == DUPLEX_MAX_MODEL_LEN - 1
+
+    with pytest.raises(AssertionError, match=r"Total number of tokens: 3001 > max_model_len: 3000"):
+        append_duplex_frame(sched)
+    assert sched.requests["long"].num_prompt_tokens == DUPLEX_MAX_MODEL_LEN
 
 
 @pytest.mark.parametrize("native", [True, False])

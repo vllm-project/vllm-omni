@@ -598,13 +598,13 @@ nightly/weekly Accuracy wiring. Retain this skill's test mechanics where needed.
 **When the user explicitly asks for L4 perf (or full L4 including perf):**
 
 1. **Do not** put throughput/latency assertions inside `test_*_expansion.py` — perf uses the **dfx benchmark harness**, not `omni_server` e2e fixtures.
-2. Add or extend a **JSON config** under `tests/dfx/perf/tests/` (mirror in-tree names: `test_qwen_image_vllm_omni.json`, `test_cosmos3_vllm_omni.json`, `test_qwen3_omni_async_chunk.json`).
+2. Add or extend a **JSON config** under `tests/dfx/perf/tests/` (mirror in-tree names: `test_bagel_vllm_omni.json`, `test_cosmos3_vllm_omni.json`, `test_qwen3_omni_async_chunk.json`).
 3. Each JSON **case**: `test_name`, optional **`mark`** (`hardware_marks` required when present; `marks`: `full_model` + `omni`/`tts`/`diffusion`), `server_params` (`model`, `serve_args` or `stage_config_name`), `benchmark_params[]` with **`name`** and explicit **`baseline`** (`throughput_qps`, `latency_mean`, `peak_memory_mb_mean`, …). Diffusion cases also set `server_type` (e.g. `"vllm-omni"`) and usually `benchmark_endpoint`.
 4. Run locally via the matching script (model type → runner):
 
 | Model type | Runner script | Example config |
 |------------|---------------|----------------|
-| **Diffusion X2I/X2V** | `tests/dfx/perf/scripts/run_diffusion_benchmark.py` | `tests/dfx/perf/tests/test_qwen_image_vllm_omni.json` |
+| **Diffusion X2I/X2V** | `tests/dfx/perf/scripts/run_diffusion_benchmark.py` | `tests/dfx/perf/tests/test_bagel_vllm_omni.json` |
 | **TTS** | `tests/dfx/perf/scripts/run_benchmark.py` | `tests/dfx/perf/tests/test_tts.json` (shared) or `test_{slug}.json` (dedicated; use when the model must not join the shared nightly matrix before integration — e.g. `test_voxcpm2.json`, `test_coqui_tts.json`) |
 | **Omni** | `tests/dfx/perf/scripts/run_benchmark.py` | `test_qwen3_omni_no_async_chunk.json`, `test_qwen3_omni_async_chunk.json`, `test_qwen3_omni_vllm_text.json`, `test_qwen3_omni_multi_replicas.json` |
 
@@ -850,7 +850,7 @@ Full templates live in [references/test-routing.md](references/test-routing.md).
 | **Diffusion X2I L2 online** | `pytest -s -v e2e/online_serving/test_qwen_image.py -m "core_model and diffusion" --run-level=core_model` |
 | **Diffusion X2V L2 online** | `pytest -s -v e2e/online_serving/test_wan22_t2v.py -m "core_model and diffusion" --run-level=core_model` |
 | **Diffusion X2I L4 nightly** | `pytest -s -v e2e/online_serving/test_qwen_image_expansion.py -m "full_model and diffusion and H100" --run-level=full_model` |
-| **Diffusion X2I L4 perf (nightly)** | `pytest -s -v dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file dfx/perf/tests/test_qwen_image_vllm_omni.json` |
+| **Diffusion X2I L4 perf (nightly)** | `pytest -s -v dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file dfx/perf/tests/test_bagel_vllm_omni.json` |
 | **Diffusion X2V L4 nightly** | `pytest -s -v e2e/online_serving/test_wan22_expansion.py -m "full_model and cuda" --run-level=full_model` |
 | **Invalid param (weekly H100)** | `pytest -s -v dfx/reliability/invalid_param_test/ -m "slow and H100"` |
 | **Invalid param (weekly L4)** | `pytest -s -v dfx/reliability/invalid_param_test/ -m "slow and L4"` |

@@ -7,6 +7,7 @@ Audio and motion modules use standard nn.Linear (no TP needed).
 """
 
 import math
+import os
 from collections.abc import Iterable
 from copy import deepcopy
 
@@ -28,6 +29,8 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
@@ -86,7 +89,16 @@ def torch_dfs(model, parent_name="root"):
 class WanS2VSelfAttention(nn.Module):
     """S2V self-attention using vllm-omni ops (QKVParallelLinear + Attention)."""
 
-    def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True, eps=1e-6):
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        window_size=(-1, -1),
+        qk_norm=True,
+        eps=1e-6,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
         if dim % num_heads != 0:
             raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
         super().__init__()
@@ -102,7 +114,8 @@ class WanS2VSelfAttention(nn.Module):
             head_size=self.head_dim,
             total_num_heads=num_heads,
             bias=True,
-            quant_config=None,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_qkv" if prefix else "to_qkv",
         )
 
         self.num_heads = self.to_qkv.num_heads
@@ -120,15 +133,19 @@ class WanS2VSelfAttention(nn.Module):
             bias=True,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_out" if prefix else "to_out",
         )
 
-        # Unified attention layer
+        # Unified attention layer. The prefix carries the block index, which is what
+        # SAGE_ATTN_FORCE_SDPA_BLOCKS matches against.
         self.attn = Attention(
             num_heads=self.num_heads,
             head_size=self.head_dim,
             num_kv_heads=self.num_kv_heads,
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
+            prefix=prefix,
         )
 
         self.rotary_embedding = RotaryEmbeddingWanS2V()
@@ -170,7 +187,16 @@ class WanS2VSelfAttention(nn.Module):
 class WanS2VCrossAttention(nn.Module):
     """S2V cross-attention using vllm-omni ops (ColumnParallelLinear + Attention)."""
 
-    def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True, eps=1e-6):
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        window_size=(-1, -1),
+        qk_norm=True,
+        eps=1e-6,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
         if dim % num_heads != 0:
             raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
         super().__init__()
@@ -180,9 +206,33 @@ class WanS2VCrossAttention(nn.Module):
         self.inner_dim = num_heads * self.head_dim
 
         # Separate Q/K/V projections for cross-attention
-        self.to_q = ColumnParallelLinear(dim, self.inner_dim, bias=True, gather_output=False, return_bias=False)
-        self.to_k = ColumnParallelLinear(dim, self.inner_dim, bias=True, gather_output=False, return_bias=False)
-        self.to_v = ColumnParallelLinear(dim, self.inner_dim, bias=True, gather_output=False, return_bias=False)
+        self.to_q = ColumnParallelLinear(
+            dim,
+            self.inner_dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_q" if prefix else "to_q",
+        )
+        self.to_k = ColumnParallelLinear(
+            dim,
+            self.inner_dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_k" if prefix else "to_k",
+        )
+        self.to_v = ColumnParallelLinear(
+            dim,
+            self.inner_dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_v" if prefix else "to_v",
+        )
 
         tp_size = get_tensor_model_parallel_world_size()
         self.num_heads = num_heads // tp_size
@@ -193,7 +243,15 @@ class WanS2VCrossAttention(nn.Module):
         self.norm_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
 
         # Output projection
-        self.to_out = RowParallelLinear(self.inner_dim, dim, bias=True, input_is_parallel=True, return_bias=False)
+        self.to_out = RowParallelLinear(
+            self.inner_dim,
+            dim,
+            bias=True,
+            input_is_parallel=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_out" if prefix else "to_out",
+        )
 
         # Unified attention layer
         self.attn = Attention(
@@ -202,7 +260,12 @@ class WanS2VCrossAttention(nn.Module):
             num_kv_heads=self.num_heads,
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
+            prefix=prefix,
+            role="cross",
             skip_sequence_parallel=True,
+            # Same opt-out as Wan2.2 T2V cross-attn: short text sequences, no win from
+            # runtime Q/K/V quantization.
+            disable_kv_quant=True,
         )
 
     def forward(self, x, context, context_lens=None):
@@ -228,23 +291,41 @@ class WanS2VTransformerBlock(nn.Module):
     modulation is applied to each segment.
     """
 
-    def __init__(self, dim, ffn_dim, num_heads, window_size=(-1, -1), qk_norm=True, cross_attn_norm=False, eps=1e-6):
+    def __init__(
+        self,
+        dim,
+        ffn_dim,
+        num_heads,
+        window_size=(-1, -1),
+        qk_norm=True,
+        cross_attn_norm=False,
+        eps=1e-6,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
         self.num_heads = num_heads
 
+        def sub(name):
+            return f"{prefix}.{name}" if prefix else name
+
         # Self-attention (TP-enabled)
         self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.self_attn = WanS2VSelfAttention(dim, num_heads, window_size, qk_norm, eps)
+        self.self_attn = WanS2VSelfAttention(
+            dim, num_heads, window_size, qk_norm, eps, quant_config=quant_config, prefix=sub("self_attn")
+        )
 
         # Cross-attention (TP-enabled)
         self.norm3 = FP32LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
-        self.cross_attn = WanS2VCrossAttention(dim, num_heads, (-1, -1), qk_norm, eps)
+        self.cross_attn = WanS2VCrossAttention(
+            dim, num_heads, (-1, -1), qk_norm, eps, quant_config=quant_config, prefix=sub("cross_attn")
+        )
 
         # FFN (TP-enabled, reused from wan2_2_transformer.py)
         self.norm2 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.ffn = WanFeedForward(dim=dim, inner_dim=ffn_dim, dim_out=dim)
+        self.ffn = WanFeedForward(dim=dim, inner_dim=ffn_dim, dim_out=dim, quant_config=quant_config, prefix=sub("ffn"))
 
         # 6-way scale-shift modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
@@ -477,6 +558,38 @@ class AudioCrossAttention(WanS2VCrossAttention):
     pass
 
 
+def _quantize_audio_injector(quant_config: QuantizationConfig | None) -> bool:
+    """Whether the audio injector cross-attentions take the DiT's quant config (opt-in, default off).
+
+    VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR=1 quantizes the injector's q/k/v/out GEMMs with the DiT's method.
+    Pre-quantized checkpoints carry no injector scales, so this is only meant for online quantization.
+    """
+    return quant_config is not None and os.environ.get("VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR") == "1"
+
+
+class WanS2VAudioInjectLayer(nn.Module):
+    """One audio injection: AdaIN/LayerNorm over the noisy tokens, then cross-attention to the frame audio tokens.
+
+    Holds no parameters (the norm and the cross-attention are passed in, so checkpoint names stay under
+    ``audio_injector``); it exists so that regional compilation (``_repeated_blocks``) fuses the norm, the
+    casts and the scale/shift with the projections instead of running them eagerly.
+    """
+
+    def forward(self, x, audio_emb, norm, injector, temb, num_frames):
+        h = rearrange(x, "b (t n) c -> (b t) n c", t=num_frames)
+        h = norm(h, temb=temb) if temb is not None else norm(h)
+        # Back to the hidden-state dtype: the fp32 global audio embedding makes diffusers AdaLayerNorm (and the audio
+        # tokens) fp32, which turned the whole injection into fp32 passes. Upstream Wan2.2 S2V runs it under bf16
+        # autocast, and quantized GEMMs need a 16-bit activation.
+        h, audio_emb = h.to(x.dtype), audio_emb.to(x.dtype)
+        out = injector(
+            x=h,
+            context=audio_emb,
+            context_lens=torch.ones(h.shape[0], dtype=torch.long, device=h.device) * audio_emb.shape[1],
+        )
+        return rearrange(out, "(b t) n c -> b (t n) c", t=num_frames).to(x.dtype)
+
+
 class AudioInjector_WAN(nn.Module):
     def __init__(
         self,
@@ -489,6 +602,7 @@ class AudioInjector_WAN(nn.Module):
         enable_adain=False,
         adain_dim=2048,
         need_adain_ont=False,
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
         if inject_layer is None:
@@ -504,7 +618,18 @@ class AudioInjector_WAN(nn.Module):
                         audio_injector_id += 1
 
         self.injector = nn.ModuleList(
-            [AudioCrossAttention(dim=dim, num_heads=num_heads, qk_norm=True) for _ in range(audio_injector_id)]
+            [
+                AudioCrossAttention(
+                    dim=dim,
+                    num_heads=num_heads,
+                    qk_norm=True,
+                    quant_config=quant_config,
+                    # Module path for the quant method (ignored_layers); unquantized keeps the old empty prefix,
+                    # which the attention backends also read for a layer index.
+                    prefix=f"audio_injector.injector.{i}" if quant_config is not None else "",
+                )
+                for i in range(audio_injector_id)
+            ]
         )
         self.injector_pre_norm_feat = nn.ModuleList(
             [nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6) for _ in range(audio_injector_id)]
@@ -1105,8 +1230,13 @@ class WanS2VTransformer3DModel(nn.Module):
     - Attention layer for attention computation
     """
 
-    _repeated_blocks = ["WanS2VTransformerBlock"]
+    # WanS2VAudioInjectLayer: the audio injection after the audio_inject_layers blocks. Outside the block region it
+    # ran as ~30 eager fp32 kernels over every noisy token per injection (+1.5 s/step at 1280x720x81, 12 layers).
+    _repeated_blocks = ["WanS2VTransformerBlock", "WanS2VAudioInjectLayer"]
     _layerwise_offload_blocks_attrs = ["blocks"]
+    packed_modules_mapping = {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+    }
 
     @staticmethod
     def _is_transformer_block(name, mod):
@@ -1158,6 +1288,8 @@ class WanS2VTransformer3DModel(nn.Module):
         qk_norm=True,
         cross_attn_norm=True,
         eps=1e-6,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
         *args,
         **kwargs,
     ):
@@ -1188,11 +1320,29 @@ class WanS2VTransformer3DModel(nn.Module):
         self.patch_embedding = nn.Conv3d(in_dim, dim, kernel_size=patch_size, stride=patch_size)
         self.condition_embedder = WanS2VConditionEmbedder(dim, freq_dim, text_dim, text_len)
 
-        # Transformer blocks (TP-enabled)
+        # The registry binds packed_modules_mapping to the pipeline class, not to this
+        # transformer, and the config may have been rebuilt from checkpoint metadata.
+        # Bind it here so ignored_layers on to_q/to_k/to_v also cover the fused to_qkv.
+        if quant_config is not None:
+            configure_quant_config(quant_config, type(self))
+
+        # Transformer blocks (TP-enabled). Only these are quantized: the audio injector,
+        # motioner and embedders keep BF16 weights, as T2V's embedders do.
+        blocks_prefix = f"{prefix}.blocks" if prefix else "blocks"
         self.blocks = nn.ModuleList(
             [
-                WanS2VTransformerBlock(dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps)
-                for _ in range(num_layers)
+                WanS2VTransformerBlock(
+                    dim,
+                    ffn_dim,
+                    num_heads,
+                    window_size,
+                    qk_norm,
+                    cross_attn_norm,
+                    eps,
+                    quant_config=quant_config,
+                    prefix=f"{blocks_prefix}.{i}",
+                )
+                for i in range(num_layers)
             ]
         )
 
@@ -1227,6 +1377,12 @@ class WanS2VTransformer3DModel(nn.Module):
         )
 
         all_modules, all_modules_names = torch_dfs(self.blocks, parent_name="root.transformer_blocks")
+        quantize_injector = _quantize_audio_injector(quant_config)
+        if quantize_injector:
+            # A quantized injector stays out of the compiled regions: on XPU (Arc Pro B70, TP4) online MXFP8
+            # GEMMs inside the compiled WanS2VAudioInjectLayer region lose the device on the first step, while
+            # the same injector run eagerly is fine.
+            self._repeated_blocks = ["WanS2VTransformerBlock"]
         self.audio_injector = AudioInjector_WAN(
             all_modules,
             all_modules_names,
@@ -1237,8 +1393,11 @@ class WanS2VTransformer3DModel(nn.Module):
             enable_adain=enable_adain,
             adain_dim=dim,
             need_adain_ont=adain_mode != "attn_norm",
+            quant_config=quant_config if quantize_injector else None,
         )
         self.adain_mode = adain_mode
+        # Parameter-free; listed in _repeated_blocks so regional compile covers the audio injection too.
+        self.audio_inject_layer = WanS2VAudioInjectLayer()
 
         self.trainable_cond_mask = nn.Embedding(3, dim)
 
@@ -1456,26 +1615,19 @@ class WanS2VTransformer3DModel(nn.Module):
             audio_emb = self.merged_audio_emb
             num_frames = audio_emb.shape[1]
 
-            input_hidden_states = hidden_states[:, : self.original_seq_len]
-            input_hidden_states = rearrange(input_hidden_states, "b (t n) c -> (b t) n c", t=num_frames)
-
             if self.enable_adain and self.adain_mode == "attn_norm":
-                audio_emb_global = rearrange(self.audio_emb_global, "b t n c -> (b t) n c")
-                adain_hidden_states = self.audio_injector.injector_adain_layers[audio_attn_id](
-                    input_hidden_states, temb=audio_emb_global[:, 0]
-                )
-                attn_hidden_states = adain_hidden_states
+                norm = self.audio_injector.injector_adain_layers[audio_attn_id]
+                temb = rearrange(self.audio_emb_global, "b t n c -> (b t) n c")[:, 0]
             else:
-                attn_hidden_states = self.audio_injector.injector_pre_norm_feat[audio_attn_id](input_hidden_states)
-
-            attn_audio_emb = rearrange(audio_emb, "b t n c -> (b t) n c")
-            residual_out = self.audio_injector.injector[audio_attn_id](
-                x=attn_hidden_states,
-                context=attn_audio_emb,
-                context_lens=torch.ones(attn_hidden_states.shape[0], dtype=torch.long, device=attn_hidden_states.device)
-                * attn_audio_emb.shape[1],
+                norm, temb = self.audio_injector.injector_pre_norm_feat[audio_attn_id], None
+            residual_out = self.audio_inject_layer(
+                hidden_states[:, : self.original_seq_len],
+                rearrange(audio_emb, "b t n c -> (b t) n c"),
+                norm,
+                self.audio_injector.injector[audio_attn_id],
+                temb,
+                num_frames,
             )
-            residual_out = rearrange(residual_out, "(b t) n c -> b (t n) c", t=num_frames)
             hidden_states[:, : self.original_seq_len].add_(residual_out)
 
             if sp_active:
@@ -1802,8 +1954,14 @@ class WanS2VTransformer3DModel(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def create_s2v_transformer_from_config(config: dict) -> WanS2VTransformer3DModel:
-    """Create WanS2VTransformer3DModel from a config dict (diffusers format)."""
+def create_s2v_transformer_from_config(
+    config: dict, quant_config: QuantizationConfig | None = None
+) -> WanS2VTransformer3DModel:
+    """Create WanS2VTransformer3DModel from a config dict (diffusers format).
+
+    ``quant_config`` must already be resolved for this transformer (see
+    ``resolve_wan_transformer_quant_config``); None builds BF16 layers.
+    """
     kwargs = {}
 
     # Map config keys to constructor parameters
@@ -1846,5 +2004,7 @@ def create_s2v_transformer_from_config(config: dict) -> WanS2VTransformer3DModel
             if config_key in ("patch_size", "window_size") and isinstance(value, list):
                 value = tuple(value)
             kwargs[param_name] = value
+    if quant_config is not None:
+        kwargs["quant_config"] = quant_config
 
     return WanS2VTransformer3DModel(**kwargs)

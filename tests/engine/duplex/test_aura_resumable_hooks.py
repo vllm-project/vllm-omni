@@ -369,6 +369,7 @@ def test_draining_empty_eos_completes_owning_response_before_shortcut() -> None:
             session=session,
             plugin=SimpleNamespace(data_plane=_Plane()),
             stage_port=port,
+            history_calibration=None,
             model_state=SimpleNamespace(clear_continuation=lambda: None),
             services=SimpleNamespace(spawn=lambda *_a, **_k: None),
             run=DuplexRunState(),
@@ -461,6 +462,7 @@ def test_draining_completion_drops_finished_response_books_only() -> None:
             session=session,
             plugin=SimpleNamespace(data_plane=_Plane()),
             stage_port=_Port(),
+            history_calibration=None,
             model_state=SimpleNamespace(clear_continuation=lambda: None),
             services=SimpleNamespace(spawn=lambda *_a, **_k: None),
             run=DuplexRunState(),
@@ -529,6 +531,7 @@ def test_stale_continue_does_not_close_the_new_response() -> None:
     channel = ModelChannel(
         SimpleNamespace(
             session=session,
+            history_calibration=None,
             plugin=SimpleNamespace(data_plane=SimpleNamespace()),
             stage_port=SimpleNamespace(),
             model_state=SimpleNamespace(clear_continuation=lambda: cleared.append(True)),
@@ -618,6 +621,7 @@ def test_silent_listen_with_continuation_releases_ephemeral_request() -> None:
     channel = ModelChannel(
         SimpleNamespace(
             session=session,
+            history_calibration=None,
             plugin=SimpleNamespace(data_plane=_Plane()),
             stage_port=port,
             model_state=SimpleNamespace(
@@ -771,6 +775,7 @@ def test_fast_tool_result_does_not_end_a_live_non_resumable_request() -> None:
             session=session,
             plugin=SimpleNamespace(data_plane=_Plane()),
             stage_port=SimpleNamespace(),
+            history_calibration=None,
             model_state=SimpleNamespace(clear_continuation=lambda: cleared.append(True)),
             services=SimpleNamespace(spawn=lambda *_a, **_k: None),
             run=SimpleNamespace(closing=False, stream_request_id="req-live"),

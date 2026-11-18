@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any, Literal, TypeAlias, TypedDict
+from typing import Any, Literal, TypeAlias, TypedDict, TypeGuard
 
 import numpy as np
 import PIL.Image
@@ -124,6 +124,7 @@ def _validate_video_metadata(metadata: DiffusionMetadataMapping | None) -> None:
     _check_optional_positive_number(metadata, "fps", group="video")
     _check_optional_int(metadata, "video_fps_multiplier", group="video", min_value=1)
     _check_optional_shape(metadata, "shape", group="video")
+    _check_optional_shape(metadata, "frame_counts", group="video")
 
 
 def _validate_audio_metadata(metadata: DiffusionMetadataMapping | None) -> None:
@@ -215,6 +216,15 @@ def _check_optional_non_empty_str(metadata: DiffusionMetadataMapping, key: str, 
         raise TypeError(f"Diffusion metadata field '{group}.{key}' must be str.")
     if not value:
         raise ValueError(f"Diffusion metadata field '{group}.{key}' must be non-empty.")
+
+
+def valid_frame_counts(value: object, expected_len: int) -> TypeGuard[DiffusionShape]:
+    """Whether an optional frame-count hint matches the encoded video outputs."""
+    return (
+        isinstance(value, (list, tuple))
+        and len(value) == expected_len
+        and all(type(count) is int and count > 0 for count in value)
+    )
 
 
 def _check_optional_shape(metadata: DiffusionMetadataMapping, key: str, *, group: str) -> None:

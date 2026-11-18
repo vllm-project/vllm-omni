@@ -122,7 +122,6 @@ def _native_adapter(num_rows: int = 1):
             max_num_batched_tokens=32 * num_rows,
             max_num_blocks_per_group=[2],
             device=device,
-            kernel_block_sizes=kernel_block_sizes,
         )
 
     for row in range(num_rows):

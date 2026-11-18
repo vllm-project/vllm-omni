@@ -555,19 +555,16 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         """
         device = last_h.device
         n_vq = self.n_vq
+        # _initial_state/_advance_state keep these counters as Python ints.
+        # Callers must not store device tensors here: int(tensor) would sync.
         audio_lengths = int(state.get("audio_lengths", 0))
         delayed_lengths = int(state.get("delayed_lengths", -1))
 
-        idx = torch.arange(n_vq, device=device)
-        pre_mask = idx < audio_lengths
-        if delayed_lengths == -1:
-            post_mask = torch.ones(n_vq, dtype=torch.bool, device=device)
-        else:
-            post_mask = idx > (delayed_lengths - 1)
-        sampling_mask = pre_mask & post_mask
-
         codes = torch.full((n_vq,), self.audio_pad_code, dtype=torch.long, device=device)
-        if not bool(sampling_mask.any()):
+        # Both mask bounds are CPU state already; avoid CUDA any/nonzero syncs.
+        active_start = max(0, delayed_lengths)
+        active_end = min(n_vq, audio_lengths)
+        if active_start >= active_end:
             return codes
 
         audio_top_k = 25
@@ -580,8 +577,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
             all_logits[:, -1] = float("-inf")  # invalid sentinel
             all_logits[:, self.audio_pad_code] = float("-inf")
 
-            active_idx = sampling_mask.nonzero(as_tuple=True)[0]  # (n_active,)
-            active_logits = all_logits[active_idx]  # (n_active, V+1)
+            active_logits = all_logits[active_start:active_end]  # (n_active, V+1)
             active_logits = active_logits / max(audio_temp, 1e-6)
             if audio_top_k > 0 and audio_top_k < active_logits.shape[-1]:
                 top_vals, _ = torch.topk(active_logits, audio_top_k, dim=-1)
@@ -592,13 +588,11 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
                     active_logits,
                 )
             probs = torch.softmax(active_logits, dim=-1)
-            codes[active_idx] = torch.multinomial(probs, num_samples=1).squeeze(-1).long()
+            codes[active_start:active_end] = torch.multinomial(probs, num_samples=1).squeeze(-1).long()
             return codes
 
         # Fallback: per-head loop (used before load_weights() completes).
-        for i in range(n_vq):
-            if not bool(sampling_mask[i]):
-                continue
+        for i in range(active_start, active_end):
             head = self.audio_heads[i]
             logits = head(last_h).reshape(-1)  # (V,)
             logits[..., -1] = float("-inf")
@@ -800,6 +794,9 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
     """
 
     have_multimodal_outputs: bool = True
+    # forward() returns plain backbone hidden states; make_omni_output() builds
+    # multimodal outputs after replay, keeping MRv2 FULL CUDA graphs enabled (#10435).
+    mrv2_forward_returns_tensor: bool = True
     has_preprocess: bool = True
     has_postprocess: bool = True
     # Intermediate prefill chunks reach make_omni_output but must not produce
@@ -1089,6 +1086,7 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                     "MOSS-TTS make_omni_output requires request_token_spans "
                     f"for {len(info_dicts)} request infos, got {0 if spans is None else len(spans)}"
                 )
+            sampling_params = kwargs.get("request_sampling_params")
             for i, info in enumerate(info_dicts):
                 if not isinstance(info, dict):
                     continue
@@ -1099,9 +1097,27 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                 if row_start >= row_end:
                     continue
 
-                state = info.get("audio_state", {}) or {}
+                state = info["audio_state"]
                 if state.get("is_stopping"):
                     continue  # already stopped — no more audio frames
+
+                generator = state.get("local_generator")
+                if generator is None:
+                    seed = info.get("seed")
+                    if isinstance(seed, (list, tuple)):
+                        seed = seed[0] if seed else None
+                    params = (
+                        sampling_params[i]
+                        if sampling_params is not None and i < len(sampling_params)
+                        else info.get("sampling_params")
+                    )
+                    if seed is None:
+                        seed = get_tts_local_seed(params)
+                    if seed is None:
+                        seed = getattr(params, "seed", None)
+                    if seed is not None:
+                        generator = torch.Generator(device=hidden.device).manual_seed(int(seed))
+                        state["local_generator"] = generator
 
                 last_h = hidden[row_end - 1].unsqueeze(0)  # (1, H)
                 # Sampling parameters mirror upstream ``MossTTSRealtimeInference.generate``:
@@ -1124,6 +1140,7 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                     do_sample=True,
                     repetition_penalty=1.1,
                     history_per_codebook=hist_per_cb,
+                    generators=[generator],
                 ).squeeze(0)  # (n_vq,)
                 if int(state.get("step", 0)) < 5 or int(state.get("step", 0)) % 50 == 0:
                     logger.debug(
@@ -1720,14 +1737,15 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
     get_mtp_seed = staticmethod(get_tts_local_seed)
 
     def create_mrv2_model_state(self, vllm_config, encoder_cache, device):
-        from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+        # MRV2 always uses Local's dedicated request-slot state. Continuation
+        # controls primary-token sampling, so Local owns its MTP schedule.
+        from .local_model_state import MossLocalModelState
 
-        state_cls = OmniModelState
-        if getattr(self.config, "mrv2_gpu_slot_state", False):
-            from .local_model_state import MossLocalModelState
+        if current_omni_platform.is_npu():
+            from vllm_omni.platforms.npu.models.moss_tts_local_model_state import NPUMossLocalModelState
 
-            state_cls = MossLocalModelState
-        return state_cls(vllm_config, self, encoder_cache, device)
+            return NPUMossLocalModelState(vllm_config, self, encoder_cache, device)
+        return MossLocalModelState(vllm_config, self, encoder_cache, device)
 
     @property
     def mtp_output_key(self) -> tuple[str, str]:
@@ -1883,10 +1901,12 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         # First audio is part of the MRV2 streaming slot-state path. Load it
         # here so its weights and graphs count toward model memory profiling.
         model_config = self.vllm_config.model_config
+        # The decoder's Triton kernels and torch.cuda graphs have no NPU path;
+        # without it Stage1 delivers the first chunk as well.
         if (
             model_config.use_v2_model_runner
             and model_config.async_chunk
-            and getattr(self.config, "mrv2_gpu_slot_state", False)
+            and not current_omni_platform.is_npu()
             and supports_in_process_first_audio(self.vllm_config)
         ):
             from .first_frame_decoder import MossFirstFrameDecoder

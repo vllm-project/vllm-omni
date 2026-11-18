@@ -114,6 +114,7 @@ class _Cache:
             SimpleNamespace(key=torch.zeros(shape), value=torch.zeros(shape)) for _ in range(num_layers)
         ]
         self.cross_attention = [None] * num_layers
+        self.worldkv = None
 
 
 class _StubCrossAttention(nn.Module):
@@ -1023,15 +1024,36 @@ def test_forward_propagates_pipeline_profiler_stage_durations() -> None:
     assert output.stage_durations == pipeline.stage_durations
 
 
-def test_pipeline_weight_loader_preserves_component_parameter_prefixes() -> None:
+@pytest.mark.parametrize("leased_post_attention", [False, True])
+def test_pipeline_weight_loader_preserves_component_parameter_prefixes(
+    monkeypatch: pytest.MonkeyPatch, leased_post_attention: bool
+) -> None:
+    from vllm_omni.diffusion.models.lingbot_world import leased_post_attention as leased_module
+
     module = _load_pipeline_module()
     pipeline = _pipeline(module)
+    pipeline._lingbot_leased_post_attention = leased_post_attention
+    encoded = _counting_text_encoder(pipeline)
+    pipeline.encode_prompt("move through the room", max_sequence_length=512, dtype=torch.float32)
+    installs: list[tuple[nn.Module, bool]] = []
+
+    def install(transformer: nn.Module, *, enabled: bool) -> None:
+        assert pipeline.transformer.loaded_weights == [("blocks.0.weight", weight)]
+        assert pipeline._conditioning_projection_revision == 1
+        assert not pipeline._prompt_embeds_cache
+        installs.append((transformer, enabled))
+
+    monkeypatch.setattr(leased_module, "install", install)
     weight = torch.randn(2, 2)
 
     loaded = pipeline.load_weights([("transformer.blocks.0.weight", weight)])
 
     assert loaded == {"transformer.blocks.0.weight"}
     assert pipeline.transformer.loaded_weights == [("blocks.0.weight", weight)]
+    assert pipeline._conditioning_projection_revision == 1
+    assert installs == ([(pipeline.transformer, True)] if leased_post_attention else [])
+    pipeline.encode_prompt("move through the room", max_sequence_length=512, dtype=torch.float32)
+    assert encoded == ["move through the room", "move through the room"]
 
 
 def test_request_requires_runner_provided_generator() -> None:
@@ -3392,3 +3414,55 @@ def test_uint8_frames_match_the_pil_conversion_byte_for_byte() -> None:
     assert frames.dtype == np.uint8 and frames.shape == (5, 8, 8, 3)
     assert frames.flags["C_CONTIGUOUS"]
     np.testing.assert_array_equal(frames, expected)
+
+
+@pytest.mark.parametrize("fail", [None, "text", "key", "value"])
+def test_ar_text_projection_activates_offloaded_transformer(monkeypatch, fail):
+    from contextlib import contextmanager
+
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module, od_config=_od_config(enable_cpu_offload=True))
+    pipeline._ar_diffusion_kv_state = _FakeARState()
+    active = False
+    events = []
+
+    @contextmanager
+    def activate(transformer):
+        nonlocal active
+        assert transformer is pipeline.transformer
+        active = True
+        events.append("load")
+        try:
+            yield
+        finally:
+            active = False
+            events.append("release")
+
+    class Guard(nn.Module):
+        def __init__(self, stage):
+            super().__init__()
+            self.stage = stage
+
+        def forward(self, value):
+            assert active, "text projections ran outside the transformer offload context"
+            if fail == self.stage:
+                raise RuntimeError("projection failed")
+            return value
+
+    monkeypatch.setattr(module, "sequential_offload_component", activate, raising=False)
+    pipeline.transformer.text_embedding = Guard("text")
+    for block in pipeline.transformer.blocks:
+        block.cross_attn.k = Guard("key")
+        block.cross_attn.v = Guard("value")
+    embeds = torch.ones(1, 4, 8)
+    if fail:
+        with pytest.raises(RuntimeError, match="projection failed"):
+            pipeline._ar_text_caches(embeds, invalidate=False, condition_revision="prompt")
+        assert not active and events == ["load", "release"]
+        fail = None
+    caches = pipeline._ar_text_caches(embeds, invalidate=False, condition_revision="prompt")
+    assert not active and len(caches) == 2
+    torch.testing.assert_close(caches[0].key, embeds.unflatten(2, (2, 4)))
+    count = len(events)
+    pipeline._ar_text_caches(embeds, invalidate=False, condition_revision="prompt")
+    assert len(events) == count  # Cache hit must not reload transformer weights.

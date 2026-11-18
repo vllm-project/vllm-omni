@@ -1,0 +1,250 @@
+{
+  "id": "215d0ace-e989-4b7f-a67c-150501bd0879",
+  "revision": 0,
+  "last_node_id": 4,
+  "last_link_id": 2,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadVideo",
+      "pos": [
+        0,
+        0
+      ],
+      "size": [
+        360,
+        330
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "file",
+          "type": "COMBO",
+          "link": null,
+          "widget": {
+            "name": "file"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadVideo"
+      },
+      "widgets_values": [
+        "seedvr2-input.mp4"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "VLLMOmniRestoreVideo",
+      "pos": [
+        420,
+        0
+      ],
+      "size": [
+        360,
+        330
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 1
+        },
+        {
+          "name": "url",
+          "type": "STRING",
+          "link": null,
+          "widget": {
+            "name": "url"
+          }
+        },
+        {
+          "name": "model",
+          "type": "STRING",
+          "link": null,
+          "widget": {
+            "name": "model"
+          }
+        },
+        {
+          "name": "width",
+          "type": "INT",
+          "link": null,
+          "widget": {
+            "name": "width"
+          }
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "link": null,
+          "widget": {
+            "name": "height"
+          }
+        },
+        {
+          "name": "seed",
+          "type": "INT",
+          "link": null,
+          "widget": {
+            "name": "seed"
+          }
+        },
+        {
+          "name": "timeout_seconds",
+          "type": "INT",
+          "link": null,
+          "widget": {
+            "name": "timeout_seconds"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": [
+            2
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniRestoreVideo"
+      },
+      "widgets_values": [
+        "http://localhost:8098/v1",
+        "seedvr2",
+        224,
+        128,
+        7723,
+        "fixed",
+        1800
+      ]
+    },
+    {
+      "id": 3,
+      "type": "SaveVideo",
+      "pos": [
+        840,
+        0
+      ],
+      "size": [
+        360,
+        330
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 2
+        },
+        {
+          "name": "filename_prefix",
+          "type": "STRING",
+          "link": null,
+          "widget": {
+            "name": "filename_prefix"
+          }
+        },
+        {
+          "name": "format",
+          "type": "COMFY_DYNAMICCOMBO_V3",
+          "link": null,
+          "widget": {
+            "name": "format"
+          }
+        },
+        {
+          "name": "codec",
+          "type": "COMFY_DYNAMICCOMBO_V3",
+          "link": null,
+          "widget": {
+            "name": "codec"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": null,
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "video/SeedVR2-restored",
+        "mp4",
+        "h264"
+      ]
+    },
+    {
+      "id": 4,
+      "type": "MarkdownNote",
+      "pos": [
+        0,
+        -260
+      ],
+      "size": [
+        700,
+        210
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "MarkdownNote"
+      },
+      "widgets_values": [
+        "Upload a short CFR video in Load Video. Start a separate vLLM-Omni SeedVR2 service with --served-model-name seedvr2, then set its /v1 URL. Width and height are explicit output dimensions divisible by 16. Source FPS, frame count and first mono/stereo audio track are retained; audio is AAC re-encoded. Whole-clip API only: server admission limits apply. See docs/seedvr2-restoration.md."
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "VIDEO"
+    ],
+    [
+      2,
+      2,
+      0,
+      3,
+      0,
+      "VIDEO"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "workflowRendererVersion": "LG"
+  },
+  "version": 0.4
+}

@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import PurePath
 from typing import TYPE_CHECKING
 
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import (
@@ -115,6 +115,15 @@ class PersonaPlexDuplexPlugin(DuplexModelPlugin):
         if not defaults:
             return defaults
         configured = list(defaults)
+        # The final (Code2Wav) request lives for the whole session. CUMULATIVE
+        # output makes the output processor re-concatenate every earlier
+        # waveform on each frame, so per-frame cost grows with session length.
+        # PersonaPlexDataPlaneSession.audio_output_is_delta relies on this.
+        final = configured[-1]
+        if len(configured) > 1 and isinstance(final, SamplingParams):
+            final = final.clone()
+            final.output_kind = RequestOutputKind.DELTA
+            configured[-1] = final
         stage0 = defaults[0]
         if isinstance(stage0, SamplingParams):
             # Greedy, one temporal token per frame: the native stepper takes

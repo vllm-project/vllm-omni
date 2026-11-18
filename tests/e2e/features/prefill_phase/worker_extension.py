@@ -23,7 +23,7 @@ class PhaseContractWorkerExtension:
         original_preprocess = runner.model.preprocess
         model_state = getattr(runner, "model_state", None)
         is_v2 = model_state is not None
-        original_mtp = model_state._run_batched_mtp if model_state is not None else runner._talker_mtp_forward
+        original_mtp = model_state.post_sample if model_state is not None else runner._talker_mtp_forward
 
         def preprocess(input_ids, input_embeds, **info):
             rid = info["req_id"] if is_v2 else info["request_id"]
@@ -61,20 +61,22 @@ class PhaseContractWorkerExtension:
             for rid in decode_req_ids:
                 self.phase_contract_codes.append(runner.model_intermediate_buffer[rid]["codes"]["audio"].tolist())
 
-        def v2_mtp(mtp_batches, input_ids, embeds, input_batch, gpu_keys, *args, **kwargs):
+        def v2_mtp(input_batch, hidden, sampled, outputs, *args, **kwargs):
             assert model_state is not None
-            for batch_index, _offset, _mtp_inputs in mtp_batches:
-                req_index = int(input_batch.idx_mapping_np[batch_index])
+            recorded = model_state._mtp_state.recorded
+            entries = recorded[1].entries if recorded is not None else []
+            for batch_index, req_index, _req_id, _prefill in entries:
                 computed = model_state._get_input_batch_num_computed(input_batch, req_index, batch_index)
                 prompt_len = model_state._get_req_state_value(runner.req_states.prompt_len, req_index)
-                assert computed is not None and prompt_len is not None and computed >= prompt_len, (
-                    "prefill row was routed through MTP"
+                scheduled = int(input_batch.num_scheduled_tokens[batch_index])
+                assert computed is not None and prompt_len is not None and computed + scheduled >= prompt_len, (
+                    "unfinished prefill row was routed through MTP"
                 )
-            original_mtp(mtp_batches, input_ids, embeds, input_batch, gpu_keys, *args, **kwargs)
-            for batch_index, _offset, _mtp_inputs in mtp_batches:
-                req_index = int(input_batch.idx_mapping_np[batch_index])
-                codes = model_state.intermediate_buffer.buffers[req_index]["codes"]["audio"]
-                self.phase_contract_codes.append(codes.tolist())
+            original_mtp(input_batch, hidden, sampled, outputs, *args, **kwargs)
+            for batch_index, _req_index, _req_id, _prefill in entries:
+                last = int(input_batch.query_start_loc_np[batch_index + 1]) - 1
+                if outputs["meta"]["codec_frame_valid"][last]:
+                    self.phase_contract_codes.append(outputs["codes"]["audio"][last : last + 1].tolist())
 
         runner.model.preprocess = preprocess
         if model_state is not None:
@@ -90,7 +92,7 @@ class PhaseContractWorkerExtension:
                 tail_embeddings.clear()
 
             model_state.run_preprocess = run_preprocess
-            model_state._run_batched_mtp = v2_mtp
+            model_state.post_sample = v2_mtp
         else:
             runner._talker_mtp_forward = legacy_mtp
         return True

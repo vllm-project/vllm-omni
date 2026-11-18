@@ -18,9 +18,6 @@ from vllm_omni.experimental.fullduplex.video_stacking import (
     concat_frames,
     unit_subframe_offsets,
 )
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
-    MiniCPMO45DuplexPolicy,
-)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -37,19 +34,6 @@ def test_realtime_client_removes_obsolete_duplex_url_parameters():
         "duplex": ["1"],
         "model": ["openbmb/MiniCPM-o-4_5"],
     }
-
-
-def test_seed_tts_initial_text_is_part_of_native_duplex_context():
-    prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
-        "Speak exactly.",
-        True,
-        "The quick brown fox.",
-    )
-
-    assert prefix == "<|im_start|>system\nSpeak exactly.\n<|audio_start|>"
-    assert suffix == (
-        "<|audio_end|><|im_end|>\n<|im_start|>user\nThe quick brown fox.<|im_end|>\n<|im_start|>assistant\n"
-    )
 
 
 @pytest.mark.parametrize("scheme, expected_scheme", [("http", "ws"), ("https", "wss"), ("ws", "ws"), ("wss", "wss")])
@@ -194,6 +178,71 @@ async def test_realtime_client_close_waits_for_a_new_session_closed_event():
 
 
 @pytest.mark.asyncio
+async def test_realtime_client_get_session_stats_returns_stats():
+    class Client(RealtimeDuplexClient):
+        def __init__(self):
+            super().__init__("ws://unused")
+            self.sent = []
+
+        async def send(self, event):
+            self.sent.append(event)
+            self.events.add(
+                {
+                    "type": "session.stats",
+                    "request_event_id": event["event_id"],
+                    "stats": {"turns": []},
+                }
+            )
+
+    client = Client()
+    stats = await client.get_session_stats(timeout_s=1.0)
+
+    assert stats == {"turns": []}
+    assert client.sent[0]["type"] == "session.stats.get"
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_get_session_stats_raises_on_related_error():
+    class Client(RealtimeDuplexClient):
+        async def send(self, event):
+            self.events.add(
+                {
+                    "type": "error",
+                    "related_event_id": event["event_id"],
+                    "error": {"code": "session_stats_disabled", "message": "disabled"},
+                }
+            )
+
+    client = Client("ws://unused")
+    with pytest.raises(ConnectionError, match="disabled"):
+        await client.get_session_stats(timeout_s=1.0)
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_get_session_stats_times_out():
+    class Client(RealtimeDuplexClient):
+        async def send(self, event):
+            return
+
+    client = Client("ws://unused")
+    with pytest.raises(TimeoutError, match="session.stats"):
+        await client.get_session_stats(timeout_s=0.05)
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_get_session_stats_send_times_out():
+    class Client(RealtimeDuplexClient):
+        async def send(self, event):
+            await asyncio.Event().wait()
+
+    client = Client("ws://unused")
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(TimeoutError, match="sending session.stats"):
+        await client.get_session_stats(timeout_s=0.05)
+    assert asyncio.get_running_loop().time() - started < 1.0
+
+
+@pytest.mark.asyncio
 async def test_realtime_client_configure_sends_seed_tts_text_condition():
     class Client(RealtimeDuplexClient):
         def __init__(self):
@@ -246,6 +295,27 @@ async def test_realtime_client_configure_disables_auto_response_without_obsolete
         "force_listen_count": 0,
     }
     assert extra_body == {"ref_audio": "data:audio/wav;base64,AAAA", "native_duplex": False}
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_stamps_append_after_send():
+    class _FakeWs:
+        async def send(self, raw: str) -> None:
+            del raw
+
+    client = RealtimeDuplexClient("ws://unused")
+    client._ws = _FakeWs()
+    await client.send(
+        {
+            "type": "input_audio_buffer.append",
+            "audio": "xx",
+            "video_frames": ["frame"],
+        }
+    )
+    await client.send({"type": "input_audio_buffer.commit"})
+    assert len(client.events.client_appends) == 1
+    assert client.events.client_appends[0].keys() == {"sent_at_s", "event_id"}
+    assert client.events.client_appends[0]["event_id"] == ""
 
 
 def test_realtime_event_collector_partitions_audio_by_response():

@@ -357,6 +357,14 @@ works. It guides representative task selection, independent references,
 threshold evidence, and the Accuracy CI lane. A functional-only request does
 not automatically require an accuracy workload.
 
+When the requested coverage includes a performance watch, use
+[diffusion-perf-test](../diffusion-perf-test/SKILL.md). It guides workload and
+deployment-row selection, the `run_benchmark.py` config schema and measurement
+contract, and the nightly/weekly Perf CI lane. A functional-only request does
+not automatically require a perf workload. For diagnosing or implementing an
+optimization (rather than adding coverage), use
+[diffusion-perf-opt](../diffusion-perf-opt/SKILL.md).
+
 **Follow the [vllm-omni-test skill](../vllm-omni-test/SKILL.md)** for markers, file naming, Buildkite wiring, and run commands. Also read [l4_functionality_tests.inc.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/test_examples/l4_functionality_tests.inc.md), [test_system_overview.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/test_system_overview.md), and [test_writing_guide.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/test_writing_guide.md).
 
 Classify the model's **CI priority** first:

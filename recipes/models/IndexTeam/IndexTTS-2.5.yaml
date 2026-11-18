@@ -1,0 +1,252 @@
+meta:
+  title: "IndexTTS-2.5"
+  slug: "indextts-2-5"
+  provider: "IndexTeam"
+  description: "Multilingual zero-shot voice-cloning TTS with native speed, emotion, and text-normalization controls, served through vLLM-Omni's OpenAI-compatible speech API."
+  date_added: 2026-08-10
+  date_updated: 2026-08-12
+  tasks:
+    - omni
+  related_recipes:
+    - Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+    - zai-org/GLM-TTS
+    - OpenMOSS-Team/MOSS-TTS
+
+model:
+  model_id: "IndexTeam/IndexTTS-2.5"
+  min_vllm_version: "0.27.0"
+  install:
+    pip:
+      command: 'uv pip install "vllm-omni[indextts2] @ git+https://github.com/vllm-project/vllm-omni.git"'
+      note: "IndexTTS-2.5 support is included in vLLM-Omni; see the upstream IndexTTS-2.5 recipe for deployment details."
+    docker: false
+  architecture: dense
+  parameter_count: "Undisclosed"
+  active_parameters: "Undisclosed"
+  context_length: 0
+  base_args:
+    - "--trust-remote-code"
+  base_env: {}
+
+omni:
+  port: 8092
+  tasks:
+    - id: t2a
+      label: "Text → Speech"
+      model_id: "IndexTeam/IndexTTS-2.5"
+      endpoint: "/v1/audio/speech"
+      description: "Multilingual voice cloning with native speed and emotion controls (22.05 kHz mono WAV)"
+      curl: |
+        curl -X POST http://localhost:8092/v1/audio/speech \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "IndexTeam/IndexTTS-2.5",
+            "input": "你好，这是 IndexTTS-2.5 语音合成测试。",
+            "voice": "demo_voice",
+            "speed": 1.0,
+            "response_format": "wav",
+            "extra_params": {
+              "lang": "zh",
+              "text_normalization": true
+            }
+          }' --output output.wav
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 96
+    description: "Native BF16 bundle using the standard two-stage single-GPU deploy profile; lower-memory configurations have not been characterized"
+
+compatible_strategies: []
+
+hardware_overrides: {}
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  IndexTTS-2.5 is a two-stage text-to-speech system: an autoregressive talker
+  produces semantic codes, then EnhancedCodec, S2Mel CFM/DiT, and BigVGAN
+  synthesize **22.05 kHz mono WAV** audio. The vLLM-Omni integration exposes
+  zero-shot voice cloning, reusable named voices, multilingual text processing,
+  text normalization, model-native speed control, and three emotion-conditioning
+  modes through `/v1/audio/speech`.
+
+  The model is available from
+  [IndexTeam/IndexTTS-2.5 on Hugging Face](https://huggingface.co/IndexTeam/IndexTTS-2.5).
+
+  ## Prerequisites
+
+  - Download access to [IndexTeam/IndexTTS-2.5 on Hugging Face](https://huggingface.co/IndexTeam/IndexTTS-2.5).
+    vLLM-Omni also accepts an already-downloaded native bundle and its nested
+    upstream `checkpoints/` layout.
+  - Use a CUDA GPU with enough memory for both stages. The standard deploy
+    config reserves up to `0.4` GPU-memory utilization per stage on one GPU;
+    lower-memory profiles have not been validated.
+  - Follow the merged
+    [vLLM-Omni IndexTTS-2.5 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/IndexTeam/IndexTTS-2_5.md)
+    for the upstream serving requirements.
+
+  ## Installation
+
+  ```bash
+  uv venv && source .venv/bin/activate
+  uv pip install "vllm-omni[indextts2] @ git+https://github.com/vllm-project/vllm-omni.git"
+  ```
+
+  ## Launch the server
+
+  IndexTTS-2.5's standard two-stage deploy config is selected automatically:
+
+  ```bash
+  vllm serve IndexTeam/IndexTTS-2.5 \
+    --omni \
+    --trust-remote-code \
+    --port 8092
+  ```
+
+  ## Quick start: upload and reuse a voice
+
+  Upload a reference recording once. The voice-storage API requires a consent
+  identifier:
+
+  ```bash
+  curl -X POST http://localhost:8092/v1/audio/voices \
+    -F "audio_sample=@/path/to/reference.wav" \
+    -F "consent=user-consent-id" \
+    -F "name=demo_voice" \
+    -F "speaker_description=IndexTTS-2.5 demo voice"
+  ```
+
+  Reuse that speaker by name:
+
+  ```bash
+  curl -X POST http://localhost:8092/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "IndexTeam/IndexTTS-2.5",
+      "input": "你好，这是复用已上传音色的语音合成测试。",
+      "voice": "demo_voice",
+      "response_format": "wav",
+      "extra_params": {"lang": "zh", "text_normalization": true}
+    }' --output named_voice.wav
+  ```
+
+  Use `ref_audio` instead of `voice` to clone directly from a URL, data URL, or
+  permitted `file://` URI. There are no built-in text-only preset speakers.
+
+  ## Language and text controls
+
+  IndexTTS-2.5 officially supports `zh` (Chinese), `en` (English), `ja`
+  (Japanese), `es` (Spanish), and `ar` (Arabic). Pass the corresponding code
+  through `extra_params.lang`. vLLM-Omni also provides `zhen` as an additional
+  Chinese-English mixed-text preprocessing mode; it is not a separate model
+  language. Text normalization is enabled by default:
+
+  ```json
+  {
+    "input": "Hello，欢迎使用 IndexTTS 二点五。",
+    "voice": "demo_voice",
+    "extra_params": {
+      "lang": "zhen",
+      "text_normalization": true
+    }
+  }
+  ```
+
+  Spanish and Arabic requests use `"lang": "es"` and `"lang": "ar"`,
+  respectively. Cantonese (`yue`) is not listed as an officially supported
+  IndexTTS-2.5 language.
+
+  For Japanese, write numbers, dates, and percentages as readable Japanese
+  text because the Japanese tokenizer does not automatically expand them.
+
+  ## Native speed control
+
+  `speed` accepts values from `0.5` to `2.0`. Values above `1.0` produce shorter,
+  faster speech. vLLM-Omni maps the public API convention to the model-native
+  `duration_factor = 1 / speed`, so the audio waveform is not post-resampled:
+
+  ```bash
+  curl -X POST http://localhost:8092/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "IndexTeam/IndexTTS-2.5",
+      "input": "这是使用模型原生语速控制的测试。",
+      "voice": "demo_voice",
+      "speed": 1.5,
+      "extra_params": {"lang": "zh"}
+    }' --output speed_1_5.wav
+  ```
+
+  ## Emotion control
+
+  IndexTTS-2.5 supports an eight-value emotion vector, an emotion description,
+  or a separate emotion-reference recording. `emo_alpha` controls conditioning
+  strength from `0` to `1`.
+
+  Explicit vector order: `happy`, `angry`, `sad`, `afraid`, `disgusted`,
+  `melancholic`, `surprised`, `calm`:
+
+  ```json
+  {
+    "input": "今天真是令人开心的一天！",
+    "voice": "demo_voice",
+    "extra_params": {
+      "lang": "zh",
+      "emo_vector": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      "emo_alpha": 0.8
+    }
+  }
+  ```
+
+  Infer emotion from text:
+
+  ```json
+  {
+    "input": "我们终于完成了这项工作！",
+    "voice": "demo_voice",
+    "extra_params": {
+      "lang": "zh",
+      "use_emo_text": true,
+      "emo_text": "开心、兴奋而且充满活力",
+      "emo_alpha": 0.8
+    }
+  }
+  ```
+
+  Transfer expression from another recording while preserving the uploaded
+  speaker identity:
+
+  ```json
+  {
+    "input": "请用情绪参考音频中的表达方式朗读这句话。",
+    "voice": "demo_voice",
+    "extra_params": {
+      "lang": "zh",
+      "emo_audio": "file:///path/to/emotion_reference.wav",
+      "emo_alpha": 0.8
+    }
+  }
+  ```
+
+  When several emotion sources are supplied, precedence is `use_emo_text` >
+  `emo_vector` > `emo_audio` > the speaker-reference emotion.
+
+  ## Validation notes
+
+  The integration has completed end-to-end generation with voice cloning and
+  Whisper-small transcript checks. In the fixed-seed Chinese validation,
+  `speed=1.0` produced 5.503 s and `speed=2.0` produced 2.752 s; both matched
+  the requested sentence. These measurements are functional evidence, not a
+  general throughput claim.
+
+  ## References
+
+  - [IndexTTS-2.5 model page](https://huggingface.co/IndexTeam/IndexTTS-2.5)
+  - [vLLM-Omni IndexTTS-2.5 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/IndexTeam/IndexTTS-2_5.md)
+  - [vLLM-Omni repository](https://github.com/vllm-project/vllm-omni)
