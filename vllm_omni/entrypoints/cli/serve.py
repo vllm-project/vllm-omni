@@ -1237,8 +1237,9 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             choices=[1, 8],
             default=None,
-            help="Experimental vision sequence parallelism for the diffusion text encoder. "
-            "MiniMax-H3 supports 1 (replicated, default) or 8 (requires --text-encoder-tp-size 8). "
+            help="Experimental vision sequence parallelism supported only by MiniMax-H3-family pipelines "
+            "using the Qwen3-VL encoder. Supports 1 (replicated, default) or 8 "
+            "(requires --text-encoder-tp-size 8). "
             "Reuses the encoder TP group without adding devices. "
             "Equivalent to setting DiffusionParallelConfig.text_encoder_vision_sp_size.",
         )
