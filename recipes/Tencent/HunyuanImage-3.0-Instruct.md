@@ -139,7 +139,7 @@ the same checkpoint, parallelism, and image settings.
 Start the DiT-only server with one of the following CLI-only configurations.
 These commands use explicit CLI flags for all parallelism and runtime settings.
 
-**TP=4 + FP8**
+##### TP=4 + FP8
 
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \
@@ -152,7 +152,7 @@ vllm serve tencent/HunyuanImage-3.0-Instruct \
   --enable-diffusion-pipeline-profiler
 ```
 
-**TP=2 + FP8 + SP=2**
+##### TP=2 + FP8 + SP=2
 
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \
@@ -166,7 +166,7 @@ vllm serve tencent/HunyuanImage-3.0-Instruct \
   --enable-diffusion-pipeline-profiler
 ```
 
-**TP=2 + FP8 + CFG=2**
+##### TP=2 + FP8 + CFG=2
 
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \
@@ -470,3 +470,94 @@ thresholds are `SSIM >= 0.20` and `PSNR >= 10.0`.
 - `--force-cutlass-fp8` keeps the FP8 dense layers on the CUTLASS FP8 path.
 - The benchmark table is an online HTTP concurrency-16 result; do not compare
   it directly with loaded-once request-level benchmarks.
+
+## Ascend NPU: AR-only PIECEWISE graphs
+
+This opt-in configuration serves the AR text stage. It does not start DiT or
+produce images. The generic deploy YAML keeps its eager defaults.
+
+### Checkpoint and graph boundaries
+
+Checkpoint loading must already work in eager mode before enabling graphs.
+This change does not modify quantization metadata, router quantization or QKV
+scale loading. The historical ModelSlim MXFP8 measurements below required
+separate local checkpoint-compatibility patches, which are not included here.
+The MXFP8 command therefore requires those external prerequisites; it is not
+validation of standalone MXFP8 support in this PR.
+
+Hunyuan AR bypasses the fixed-capacity decode attention override. In the
+validated PIECEWISE mode, attention runs outside captured regions while
+supported surrounding computation is captured. FULL and FULL_AND_PIECEWISE
+produced incorrect text in the tested environment and are not validated by this
+recipe. Successful capture or a 128-token usage count alone is insufficient:
+compare the generated text with eager output as well.
+
+### Start the service
+
+Run from the repository root. Prepare the model directory and eight available
+Ascend NPUs, then start:
+
+```bash
+export MODEL=/path/to/HunyuanImage-3.0-Instruct-Distil-W8A8F8-MXFP
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export NO_PROXY=localhost,127.0.0.1,::1
+
+vllm serve "$MODEL" \
+  --omni \
+  --deploy-config vllm_omni/deploy/hunyuan_image3_ar.yaml \
+  --quantization ascend \
+  --dtype bfloat16 \
+  --trust-remote-code \
+  --served-model-name hunyuanimage3-ar-mxfp8 \
+  --host 0.0.0.0 --port 8010 \
+  --max-model-len 8192 \
+  --stage-overrides '{"0":{"enforce_eager":false,"compilation_config":{"cudagraph_mode":"PIECEWISE","cudagraph_capture_sizes":[1,2,4,8,1280]}}}'
+```
+
+The model's tokenizer or deployment must provide an appropriate prompt format
+for the selected API. Prompt/chat-template configuration is outside this graph
+change; the command above does not install a default chat template.
+
+The 1280-token graph size covers the 1259-token benchmark prompt; choose capture
+sizes for other workloads separately. Prefix caching remains disabled and
+`max_num_seqs` remains 1, so multiple concurrent requests queue rather than form
+a multi-request execution batch.
+
+To compare against eager, restart with the same command and replace the stage
+override with `'{"0":{"enforce_eager":true}}'`.
+
+### Recorded hardware results
+
+Measured on eight Ascend950DT NPUs, TP=8, with the same pre-quantized checkpoint
+in both modes: driver 25.6.1.b023, CANN 9.2.1, PyTorch 2.10.0,
+torch-npu 2.10.0.post7, vLLM 0.33.0, and Transformers 5.19.0. The original
+measurement used vLLM-Omni `a72de0985bdc15c2b4fd9690fc895f0bb46ce2c7` plus the
+runner adaptation plus separate local ModelSlim compatibility patches. Only the
+runner adaptation is included in this change. These results have not been
+remeasured on the current upstream base.
+
+Each case used two sequential warmups and eight measured requests. The custom benchmark client used a fixed Chinese city-description prompt and
+a deployment-local Hunyuan system/chat template, which is not shipped by this
+change. Input was 1259 tokens including that system prompt; every output was
+128 tokens. Reproducing these historical measurements requires the same prompt
+format. The benchmark is not a community-standard benchmark.
+The client reused one HTTP connection pool and disabled environment proxies.
+TTFT ends at the first non-empty streamed text delta; E2E ends after the stream;
+TPOT uses first-to-last text-delta time divided by 127.
+
+| Metric | Eager | PIECEWISE |
+| --- | ---: | ---: |
+| C=1 mean TTFT | 70.71 ms | 41.80 ms |
+| C=1 mean TPOT | 59.90 ms/token | 13.18 ms/token |
+| C=1 mean E2E | 7.678 s | 1.717 s |
+| C=1 QPS | 0.1302 | 0.5825 |
+| C=4 mean TTFT | 17.165 s | 3.849 s |
+| C=4 mean E2E | 24.720 s | 5.510 s |
+| C=4 QPS | 0.1312 | 0.5893 |
+
+All 16 measured PIECEWISE texts exactly matched the corresponding eager texts,
+and logs confirmed ACL graph replay. This is a small, single-prompt performance
+and text-parity check, not a general accuracy evaluation, BF16-versus-MXFP8
+comparison, or validation of image input, DiT, FULL graphs, or other hardware.
+The table compares configurations with the same external weight-loading
+adaptations; it does not validate this PR alone against that MXFP8 checkpoint.
