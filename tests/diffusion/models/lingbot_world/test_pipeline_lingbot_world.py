@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import os
 import weakref
 from pathlib import Path
@@ -91,11 +92,6 @@ class _FakePretrained:
         self.to_calls = getattr(self, "to_calls", [])
         self.to_calls.append((args, kwargs))
         return self
-
-
-class _FakeScheduler:
-    def __init__(self, **kwargs):
-        self.config = SimpleNamespace(**kwargs)
 
 
 class _FakeTransformerFactory:
@@ -448,7 +444,6 @@ def _stub_pipeline_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
         "UMT5EncoderModel": _FakePretrained,
         "AutoWeightsLoader": _AutoWeightsLoader,
         "DistributedAutoencoderKLWan": _StubVAE,
-        "FlowUniPCMultistepScheduler": _FakeScheduler,
         "CausalLingBotWorldTransformer3DModel": _FakeTransformerFactory,
         "get_local_device": lambda: torch.device("cpu"),
         "prefetch_subfolders": prefetch_subfolders,
@@ -1537,41 +1532,41 @@ def test_fixed_dmd_transition_and_cache_commit_trace(reuse_last_step_kv: bool) -
 
     generator = torch.Generator(device="cpu").manual_seed(17)
     current = torch.randn((1, 16, 3, 2, 2), generator=generator)
-    warped_schedule = (
-        (1000.0, 1.0),
-        (937.5, 0.9375),
-        (2500.0 / 3.0, 5.0 / 6.0),
-        (625.0, 0.625),
-    )
-    for index, (_, sigma) in enumerate(warped_schedule):
-        x0 = current - sigma
-        if index + 1 < len(module.LINGBOT_DMD_TIMESTEPS):
-            next_sigma = warped_schedule[index + 1][1]
+    fixture = Path(__file__).with_name("fixtures") / "lingbot_world_official_dmd_schedule.json.fixture"
+    warped_schedule = json.loads(fixture.read_text())["schedules"]["5"]
+    for index, step in enumerate(warped_schedule):
+        sigma = step["x0_sigma_first_match"]
+        x0 = (current.double() - sigma).float()
+        if index + 1 < len(module.LINGBOT_DMD_TIMESTEP_INDICES):
+            next_sigma = warped_schedule[index + 1]["renoise_sigma_second_match"]
             noise = torch.randn(current.shape, generator=generator)
             current = (1.0 - next_sigma) * x0 + next_sigma * noise
         else:
             current = x0
     torch.testing.assert_close(result.output, current)
 
-    expected_timesteps = [timestep for timestep, _ in warped_schedule]
+    expected_timesteps = [step["timestep"] for step in warped_schedule]
     if not reuse_last_step_kv:
         expected_timesteps.append(0.0)
     torch.testing.assert_close(
-        torch.cat([call["timestep"] for call in transformer.calls]), torch.tensor(expected_timesteps)
+        torch.cat([call["timestep"] for call in transformer.calls]),
+        torch.tensor(expected_timesteps, dtype=torch.int64 if reuse_last_step_kv else torch.float32),
     )
     commit_flags = [False] * (len(expected_timesteps) - 1) + [True]
     assert [call["update_cache"] for call in transformer.calls] == commit_flags
     assert [call["start_frame"] for call in transformer.calls] == [0] * len(expected_timesteps)
     assert len({call["cache_id"] for call in transformer.calls}) == 1
-    committed_latent = result.output + warped_schedule[-1][1] if reuse_last_step_kv else result.output
+    committed_latent = (
+        result.output + warped_schedule[-1]["x0_sigma_first_match"] if reuse_last_step_kv else result.output
+    )
     torch.testing.assert_close(transformer.calls[-1]["hidden_states"][:, :16], committed_latent)
 
 
 @pytest.mark.parametrize(
     ("flow_shift", "expected_timesteps"),
     [
-        (5.0, (1000.0, 937.5, 2500.0 / 3.0, 625.0)),
-        (2.5, (1000.0, 15000.0 / 17.0, 5000.0 / 7.0, 5000.0 / 11.0)),
+        (5.0, (999.0, 937.0, 833.0, 624.0)),
+        (2.5, (999.0, 881.0, 713.0, 454.0)),
     ],
 )
 def test_request_flow_shift_warps_transformer_timesteps(flow_shift: float, expected_timesteps) -> None:
@@ -1587,7 +1582,7 @@ def test_request_flow_shift_warps_transformer_timesteps(flow_shift: float, expec
 
     torch.testing.assert_close(
         torch.cat([call["timestep"] for call in transformer.calls[:4]]),
-        torch.tensor(expected_timesteps),
+        torch.tensor(expected_timesteps, dtype=torch.int64),
     )
 
 
@@ -1604,7 +1599,7 @@ def test_request_tiny_positive_flow_shift_keeps_schedule_finite() -> None:
 
     timesteps = torch.cat([call["timestep"] for call in transformer.calls[:4]])
     assert torch.isfinite(timesteps).all()
-    assert timesteps[0].item() == 1000.0
+    assert timesteps[0].item() == 0.0
 
 
 def test_request_flow_shift_override_has_precedence_without_mutating_scheduler() -> None:
@@ -1753,7 +1748,7 @@ def test_multi_chunk_generation_uses_one_request_local_cache_and_decodes_accumul
     assert result.output.shape == (1, 3, 21, 16, 16)
     assert len(transformer.calls) == 10
     assert [call["start_frame"] for call in transformer.calls] == [0] * 5 + [3] * 5
-    expected_timesteps = torch.tensor([1000.0, 937.5, 2500.0 / 3.0, 625.0, 0.0] * 2)
+    expected_timesteps = torch.tensor([999.0, 937.0, 833.0, 624.0, 0.0] * 2)
     torch.testing.assert_close(
         torch.cat([call["timestep"] for call in transformer.calls]),
         expected_timesteps,
@@ -2600,7 +2595,7 @@ def test_stepwise_progress_metadata_and_commit_trace(reuse_last_step_kv: bool) -
 
 
 @pytest.mark.parametrize("num_chunks", [2, 12])
-def test_stepwise_matches_tick_transformer_trace_and_latents(num_chunks) -> None:
+def test_finite_stepwise_and_online_ticks_share_control_and_commit_trace(num_chunks) -> None:
     module = _load_pipeline_module()
     transformer = _RecordingTransformer()
     pipeline = _pipeline(module, transformer=transformer)
@@ -2640,10 +2635,12 @@ def test_stepwise_matches_tick_transformer_trace_and_latents(num_chunks) -> None
 
     assert [call["update_cache"] for call in transformer.calls] == [call["update_cache"] for call in tick_calls]
     assert [call["start_frame"] for call in transformer.calls] == [call["start_frame"] for call in tick_calls]
+    # Finite requests draw the full native C/T noise layout first. Ticks have
+    # no declared endpoint and retain online draws, so same-seed latents differ.
     for tick_latent, output in zip(tick_latents, stepwise_outputs, strict=True):
-        torch.testing.assert_close(output.output["payload"]["latents"], tick_latent)
+        assert not torch.equal(output.output["payload"]["latents"], tick_latent)
     for step_call, tick_call in zip(transformer.calls, tick_calls, strict=True):
-        torch.testing.assert_close(step_call["hidden_states"], tick_call["hidden_states"])
+        torch.testing.assert_close(step_call["hidden_states"][:, 16:], tick_call["hidden_states"][:, 16:])
         torch.testing.assert_close(step_call["camera_hidden_states"], tick_call["camera_hidden_states"])
     assert stepwise_state.extra["condition"].shape[2] == 3
     assert pipeline.vae.encode_inputs == []

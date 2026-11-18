@@ -56,7 +56,7 @@ from vllm_omni.diffusion.models.lingbot_world.camera import (
     load_camera_trajectory,
     resolve_trusted_action_directory,
 )
-from vllm_omni.diffusion.models.lingbot_world.dmd_block import ARBlockContext, LingBotDMDBlockRunner
+from vllm_omni.diffusion.models.lingbot_world.dmd_block import ARBlockContext, LingBotDMDBlockRunner, LingBotDMDStep
 from vllm_omni.diffusion.models.lingbot_world.transformer import (
     CameraModulationCache,
     CausalLingBotWorldTransformer3DModel,
@@ -121,7 +121,7 @@ if TYPE_CHECKING:
         ARDiffusionKVState,
     )
 
-LINGBOT_DMD_TIMESTEPS = (1000, 750, 500, 250)
+LINGBOT_DMD_TIMESTEP_INDICES = (0, 250, 500, 750)
 _CAMERA_SPATIAL_FOLD = 8
 _MAX_PIXEL_AREA = 480 * 832
 _MAX_SOURCE_IMAGE_PIXELS = 4096 * 4096
@@ -220,20 +220,29 @@ def _positive_finite_flow_shift(value: Any) -> float:
 def _build_shifted_flow_schedule(
     *,
     flow_shift: float,
-) -> tuple[tuple[float, float], ...]:
-    """Map checkpoint DMD labels to request-local warped timestep/sigma pairs."""
+) -> tuple[LingBotDMDStep, ...]:
+    """Select the causal-fast checkpoint's four native training-lattice steps.
 
-    # The checkpoint labels index the unshifted [1, ..., 1 / N] training
-    # lattice. Apply the request's flow shift before using the value both as
-    # the transformer timestep and the sampling sigma.
-    base_sigmas = torch.tensor(LINGBOT_DMD_TIMESTEPS, dtype=torch.float64) / 1000
-    shifted_numerators = flow_shift * base_sigmas
-    shifted_sigmas = shifted_numerators / ((1.0 - base_sigmas) + shifted_numerators)
-    warped_timesteps = shifted_sigmas * 1000
-    return tuple(
-        (float(timestep), float(sigma))
-        for timestep, sigma in zip(warped_timesteps.tolist(), shifted_sigmas.tolist(), strict=True)
-    )
+    The reference samples scheduler indices 0/250/500/750 after shifting a
+    1000-point lattice. Its integer timestep can occur more than once:
+    flow inversion selects the first match, while add_noise selects the
+    scheduler's second match. Keep those coefficients distinct.
+    """
+    scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=1000, shift=1.0)
+    scheduler.set_timesteps(1000, device="cpu", shift=flow_shift)
+    steps = []
+    for index in LINGBOT_DMD_TIMESTEP_INDICES:
+        timestep = scheduler.timesteps[index]
+        inversion_index = int((scheduler.timesteps - timestep).abs().argmin().item())
+        noise_index = scheduler.index_for_timestep(timestep)
+        steps.append(
+            LingBotDMDStep(
+                int(timestep.item()),
+                float(scheduler.sigmas[inversion_index].item()),
+                float(scheduler.sigmas[noise_index].item()),
+            )
+        )
+    return tuple(steps)
 
 
 def _validate_scheduler_config(config: dict[str, Any]) -> None:
@@ -1103,11 +1112,11 @@ class LingBotWorldCausalDMDPipeline(
 
         num_inference_steps = getattr(sampling, "num_inference_steps", None)
         if num_inference_steps is None:
-            num_inference_steps = len(LINGBOT_DMD_TIMESTEPS)
-        if num_inference_steps != len(LINGBOT_DMD_TIMESTEPS):
+            num_inference_steps = len(LINGBOT_DMD_TIMESTEP_INDICES)
+        if num_inference_steps != len(LINGBOT_DMD_TIMESTEP_INDICES):
             raise ValueError(
                 "num_inference_steps must be 4 for LingBot World causal DMD "
-                f"timesteps {list(LINGBOT_DMD_TIMESTEPS)}, got {num_inference_steps}."
+                f"scheduler indices {list(LINGBOT_DMD_TIMESTEP_INDICES)}, got {num_inference_steps}."
             )
 
         num_frames = getattr(sampling, "num_frames", None)
@@ -1543,9 +1552,10 @@ class LingBotWorldCausalDMDPipeline(
         cache: LingBotTransformerCache | None,
         ar_cross_attention: list[LingBotAttentionCache] | None,
         start_frame: int,
-        schedule: tuple[tuple[float, float], ...],
+        schedule: tuple[LingBotDMDStep, ...],
         generator: torch.Generator,
         progress_bar: TqdmProgressBar[Any],
+        initial_latents: torch.Tensor | None = None,
         camera_pose: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self._dmd_blocks.generate_block(
@@ -1558,6 +1568,7 @@ class LingBotWorldCausalDMDPipeline(
             schedule=schedule,
             generator=generator,
             progress_bar=progress_bar,
+            initial_latents=initial_latents,
             camera_pose=camera_pose,
         )
 
@@ -1772,8 +1783,21 @@ class LingBotWorldCausalDMDPipeline(
                 )
                 trajectory = interpolate_camera_trajectory(trajectory, inputs.num_latent_frames)
             retrieval_poses = trajectory.poses
+        # A finite rollout draws the native [C, T, H, W] noise before any
+        # per-block re-noising. Ticks have no declared rollout endpoint and
+        # deliberately retain their online, one-block-at-a-time RNG contract.
+        initial_noise = (
+            randn_tensor(
+                (1, self.transformer.config.out_channels, *condition.shape[2:]),
+                generator=inputs.generator,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            if tick is None
+            else None
+        )
         generated_blocks: list[torch.Tensor] = []
-        total_steps = (inputs.num_latent_frames // block_frames) * len(LINGBOT_DMD_TIMESTEPS)
+        total_steps = (inputs.num_latent_frames // block_frames) * len(LINGBOT_DMD_TIMESTEP_INDICES)
         first_start_frame = tick.chunk_index * block_frames if tick is not None else 0
         with self.progress_bar(total=total_steps) as progress_bar:
             # Phase 3: generate left-to-right in latent-frame blocks. The
@@ -1797,6 +1821,9 @@ class LingBotWorldCausalDMDPipeline(
                         schedule=schedule,
                         generator=inputs.generator,
                         progress_bar=progress_bar,
+                        initial_latents=(
+                            initial_noise[:, :, local_start_frame:stop_frame] if initial_noise is not None else None
+                        ),
                         **(
                             {"camera_pose": retrieval_poses[local_start_frame + block_frames // 2]}
                             if retrieval_poses is not None
@@ -1804,6 +1831,7 @@ class LingBotWorldCausalDMDPipeline(
                         ),
                     )
                 )
+        del initial_noise
         generated_latents = torch.cat(generated_blocks, dim=2)
         # The direct/offline cache is request-local and no longer needed once
         # all latent blocks have been generated. Release it before VAE decode
@@ -2116,9 +2144,22 @@ class LingBotWorldCausalDMDPipeline(
         state.step_index = 0
         state.step_in_chunk = 0
         state.total_chunks = total_chunks
-        state.chunk_num_steps = len(LINGBOT_DMD_TIMESTEPS)
+        state.chunk_num_steps = len(LINGBOT_DMD_TIMESTEP_INDICES)
         state.extra = {
             "inputs": inputs,
+            # Request-owned only: no future horizon is allocated for AR ticks.
+            "initial_noise": randn_tensor(
+                (
+                    1,
+                    self.transformer.config.out_channels,
+                    inputs.num_latent_frames,
+                    inputs.height // self.vae_scale_factor_spatial,
+                    inputs.width // self.vae_scale_factor_spatial,
+                ),
+                generator=inputs.generator,
+                device=self.device,
+                dtype=torch.float32,
+            ),
             "schedule": _build_shifted_flow_schedule(flow_shift=inputs.flow_shift),
             "dtype": dtype,
             "block_frames": block_frames,
@@ -2259,22 +2300,15 @@ class LingBotWorldCausalDMDPipeline(
             invalidate=False,
             condition_revision=(inputs.prompt, int(inputs.max_sequence_length), str(state.prompt_embeds.dtype)),
         )
-        state.latents = randn_tensor(
-            (
-                1,
-                self.transformer.config.out_channels,
-                condition.shape[2],
-                condition.shape[3],
-                condition.shape[4],
-            ),
-            generator=generator,
-            device=self.device,
-            dtype=torch.float32,
-        )
+        state.latents = extra["initial_noise"][:, :, start_frame:stop_frame]
+        if stop_frame == inputs.num_latent_frames:
+            # The final view survives only until its first denoise transition;
+            # neither the session nor completed request retains this buffer.
+            extra.pop("initial_noise")
         state.timesteps = torch.tensor(
-            [timestep for timestep, _ in extra["schedule"]],
+            [step.timestep for step in extra["schedule"]],
             device=self.device,
-            dtype=torch.float32,
+            dtype=torch.int64,
         )
         state.step_in_chunk = 0
         state.step_index = 0
@@ -2316,7 +2350,7 @@ class LingBotWorldCausalDMDPipeline(
             cache=None,
             ar=ar_context,
             start_frame=int(extra["start_frame"]),
-            timestep_value=float(schedule[step_in_chunk][0]),
+            timestep_value=schedule[step_in_chunk].timestep,
             step_index=step_in_chunk,
             camera_cache=extra["camera_cache"],
             camera_pose=extra.get("retrieval_pose"),
@@ -2333,11 +2367,11 @@ class LingBotWorldCausalDMDPipeline(
             raise ValueError("LingBot World requires the runner-provided torch.Generator.")
         schedule = extra["schedule"]
         step_in_chunk = state.step_in_chunk
-        next_sigma = schedule[step_in_chunk + 1][1] if step_in_chunk + 1 < len(schedule) else None
+        next_sigma = schedule[step_in_chunk + 1].noise_sigma if step_in_chunk + 1 < len(schedule) else None
         state.latents = self._dmd_blocks.apply_transition(
             latents,
             noise_pred,
-            schedule[step_in_chunk][1],
+            schedule[step_in_chunk].sigma,
             next_sigma=next_sigma,
             generator=generator,
         )

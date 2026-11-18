@@ -170,6 +170,29 @@ class _LingBotSPPrepare(nn.Module):
         return hidden_states, camera_hidden_states, timestep_projection, cosine, sine
 
 
+def _linear_fp32(layer: nn.Linear, value: torch.Tensor) -> torch.Tensor:
+    """Official FP32 subgraph, preserving the loaded checkpoint parameter values."""
+    with torch.autocast(value.device.type, enabled=False):
+        return F.linear(value.float(), layer.weight.float(), None if layer.bias is None else layer.bias.float())
+
+
+class _LingBotRotaryEmbedding(nn.Module):
+    """Official complex128 rotation on CUDA/CPU, with the existing rotary implementation on other devices."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.wan_rotary = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
+
+    def forward(self, value: torch.Tensor, cosine: torch.Tensor, sine: torch.Tensor) -> torch.Tensor:
+        if value.device.type not in ("cpu", "cuda"):
+            return self.wan_rotary(value, cosine, sine)
+        with torch.autocast(value.device.type, enabled=False):
+            pairs = value.double().unflatten(-1, (-1, 2)).contiguous()
+            frequencies = torch.complex(cosine.double(), sine.double())[None, :, None, :]
+            rotated = torch.view_as_real(torch.view_as_complex(pairs) * frequencies).flatten(-2)
+        return rotated.to(dtype=value.dtype)
+
+
 class LingBotSelfAttention(nn.Module):
     """Block-causal self-attention over retained history and one full chunk."""
 
@@ -221,7 +244,7 @@ class LingBotSelfAttention(nn.Module):
         )
         self.norm_q = _LingBotRMSNorm(self.tp_inner_dim, eps)
         self.norm_k = _LingBotRMSNorm(self.tp_inner_dim, eps)
-        self.rotary_embedding = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
+        self.rotary_embedding = _LingBotRotaryEmbedding()
         self.attn = Attention(
             num_heads=self.num_sp_heads,
             head_size=self.head_dim,
@@ -329,7 +352,7 @@ class LingBotSelfAttention(nn.Module):
     ) -> torch.Tensor:
         # Project logical [B, S, D] tokens into TP-local
         # [B, S, num_local_heads, head_dim].
-        qkv, _ = self.qkv(hidden_states)
+        qkv, _ = self.qkv(hidden_states.to(dtype=self.norm_q.weight.dtype))
         query, key, value = qkv.split((self.tp_inner_dim, self.tp_inner_dim, self.tp_inner_dim), dim=-1)
         query = self.norm_q(query)
         key = self.norm_k(key)
@@ -525,7 +548,7 @@ class LingBotCrossAttention(nn.Module):
         *,
         cache: LingBotAttentionCache | None,
     ) -> tuple[torch.Tensor, LingBotAttentionCache]:
-        query = self.norm_q(self.q(hidden_states))
+        query = self.norm_q(self.q(hidden_states.to(dtype=self.norm_q.weight.dtype)))
         query = query.unflatten(2, (self.num_local_heads, self.head_dim))
 
         # Text K/V is constant within a request and is projected once per layer.
@@ -672,10 +695,15 @@ class LingBotAttentionBlock(nn.Module):
         modulation = self.modulation.unsqueeze(1) + timestep_projection.float()
         shift_msa, scale_msa, gate_msa, shift_ffn, scale_ffn, gate_ffn = modulation.chunk(6, dim=2)
 
+        # The opt-in NPU graph implements BF16 residual boundaries. Its eager
+        # fallback must compute the same operations when a lease is unavailable.
+        use_leased_attention = hasattr(self, "_lingbot_leased_post_attention")
+        residual_dtype = hidden_states.dtype
         hidden_grid = hidden_states.unflatten(1, (num_frames, tokens_per_frame))
-        normalized = self.norm1(hidden_states.float()).unflatten(1, (num_frames, tokens_per_frame))
-        normalized = (normalized * (1 + scale_msa) + shift_msa).flatten(1, 2).to(hidden_states.dtype)
-        if hasattr(self, "_lingbot_leased_post_attention"):
+        norm_input = hidden_states.float() if use_leased_attention else hidden_states
+        normalized = self.norm1(norm_input).float().unflatten(1, (num_frames, tokens_per_frame))
+        normalized = (normalized * (1 + scale_msa) + shift_msa).flatten(1, 2).to(self.self_attn.norm_q.weight.dtype)
+        if use_leased_attention:
             from vllm_omni.diffusion.models.lingbot_world.leased_post_attention import acquire
 
             camera_scale, camera_shift = (
@@ -700,12 +728,16 @@ class LingBotAttentionBlock(nn.Module):
             )
             if lease is None:
                 hidden_grid = hidden_grid + attention_output.unflatten(1, (num_frames, tokens_per_frame)) * gate_msa
-                hidden_states = hidden_grid.flatten(1, 2).to(hidden_states.dtype)
+                hidden_states = hidden_grid.flatten(1, 2)
+                if use_leased_attention:
+                    hidden_states = hidden_states.to(residual_dtype)
                 if camera_scale is None:
                     camera_scale, camera_shift = (
                         self.camera_modulation(camera_hidden_states) if camera_modulation is None else camera_modulation
                     )
-                hidden_states = ((1 + camera_scale) * hidden_states + camera_shift).to(hidden_states.dtype)
+                hidden_states = (1 + camera_scale) * hidden_states + camera_shift
+                if use_leased_attention:
+                    hidden_states = hidden_states.to(residual_dtype)
                 cross_normalized = self.norm3(hidden_states)
             else:
                 _, hidden_states, cross_normalized = lease.consume()
@@ -714,10 +746,13 @@ class LingBotAttentionBlock(nn.Module):
             hidden_states = hidden_states + attention_output
 
         hidden_grid = hidden_states.unflatten(1, (num_frames, tokens_per_frame))
-        normalized = self.norm2(hidden_states.float()).unflatten(1, (num_frames, tokens_per_frame))
-        normalized = (normalized * (1 + scale_ffn) + shift_ffn).flatten(1, 2).to(hidden_states.dtype)
+        norm_input = hidden_states.float() if use_leased_attention else hidden_states
+        normalized = self.norm2(norm_input).float().unflatten(1, (num_frames, tokens_per_frame))
+        normalized = (normalized * (1 + scale_ffn) + shift_ffn).flatten(1, 2).to(self.self_attn.norm_q.weight.dtype)
         ffn_output = self.ffn(normalized).unflatten(1, (num_frames, tokens_per_frame))
-        hidden_states = (hidden_grid + ffn_output * gate_ffn).flatten(1, 2).to(hidden_states.dtype)
+        hidden_states = (hidden_grid + ffn_output * gate_ffn).flatten(1, 2)
+        if use_leased_attention:
+            hidden_states = hidden_states.to(residual_dtype)
         return hidden_states, cast(LingBotAttentionCache, cross_cache)
 
 
@@ -782,7 +817,7 @@ class _LingBotHead(nn.Module):
         num_frames = timestep_embedding.shape[1]
         modulation = self.modulation.unsqueeze(1) + timestep_embedding.unsqueeze(2).float()
         shift, scale = modulation.chunk(2, dim=2)
-        normalized = self.norm(hidden_states.float())
+        normalized = self.norm(hidden_states).float()
         if tokens_per_frame is None:
             normalized = normalized.unflatten(1, (num_frames, -1))
             normalized = (normalized * (1 + scale) + shift).flatten(1, 2)
@@ -794,8 +829,7 @@ class _LingBotHead(nn.Module):
             scale = scale.squeeze(2).index_select(1, frames)
             shift = shift.squeeze(2).index_select(1, frames)
             normalized = normalized * (1 + scale) + shift
-        normalized = normalized.to(hidden_states.dtype)
-        return self.head(normalized)
+        return _linear_fp32(self.head, normalized)
 
 
 def _sinusoidal_embedding(dim: int, timestep: torch.Tensor) -> torch.Tensor:
@@ -813,16 +847,17 @@ def _sinusoidal_embedding(dim: int, timestep: torch.Tensor) -> torch.Tensor:
 
 def _rope_axis(max_seq_len: int, dim: int, *, start: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
     if dim == 0:
-        empty = torch.empty(max_seq_len, 0, dtype=torch.float32)
+        empty = torch.empty(max_seq_len, 0, device="cpu", dtype=torch.float64)
         return empty, empty.clone()
     if dim % 2:
         raise ValueError(f"RoPE axis dimension must be even, got {dim}.")
     frequencies = 1.0 / torch.pow(
         10000,
-        torch.arange(0, dim, 2, dtype=torch.float64) / dim,
+        torch.arange(0, dim, 2, device="cpu", dtype=torch.float64) / dim,
     )
-    phase = torch.outer(torch.arange(start, start + max_seq_len, dtype=torch.float64), frequencies)
-    return phase.cos().float(), phase.sin().float()
+    phase = torch.outer(torch.arange(start, start + max_seq_len, device="cpu", dtype=torch.float64), frequencies)
+    frequencies = torch.polar(torch.ones_like(phase), phase)
+    return frequencies.real, frequencies.imag
 
 
 class CameraModulationCache:
@@ -997,8 +1032,11 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         height_dim = width_dim = 2 * (attention_head_dim // 6)
         for axis, axis_dim in (("temporal", temporal_dim), ("height", height_dim), ("width", width_dim)):
             cosine, sine = _rope_axis(rope_max_seq_len, axis_dim)
-            self.register_buffer(f"_rope_{axis}_cosine", cosine, persistent=False)
-            self.register_buffer(f"_rope_{axis}_sine", sine, persistent=False)
+            # Keep canonical CPU tables outside model dtype casts and the
+            # device allocator used for model weights.
+            setattr(self, f"_rope_{axis}_cosine", cosine)
+            setattr(self, f"_rope_{axis}_sine", sine)
+        self._rope_device_tables: tuple[torch.device, torch.dtype, tuple[torch.Tensor, ...]] | None = None
         # One static-address buffer per shape for the per-token timestep
         # projection; see _stage_timestep_projection.
         self._timestep_projection_buffers: dict[tuple[tuple[int, ...], torch.dtype, torch.device], torch.Tensor] = {}
@@ -1140,16 +1178,34 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if height > self.config.rope_max_seq_len or width > self.config.rope_max_seq_len:
             raise ValueError("Spatial RoPE positions exceed rope_max_seq_len.")
-        if start_frame + frames <= self._rope_temporal_cosine.shape[0]:
-            temporal_cosine = self._rope_temporal_cosine[start_frame : start_frame + frames]
-            temporal_sine = self._rope_temporal_sine[start_frame : start_frame + frames]
+        table_dtype = torch.float64 if device.type in ("cpu", "cuda") else dtype
+        cached_tables = self._rope_device_tables
+        if cached_tables is None or cached_tables[:2] != (device, table_dtype):
+            tables = (
+                self._rope_temporal_cosine,
+                self._rope_temporal_sine,
+                self._rope_height_cosine,
+                self._rope_height_sine,
+                self._rope_width_cosine,
+                self._rope_width_sine,
+            )
+            if table_dtype != torch.float64:
+                tables = tuple(table.float() for table in tables)
+            cached_tables = device, table_dtype, tuple(table.to(device=device, dtype=table_dtype) for table in tables)
+            self._rope_device_tables = cached_tables
+        temporal_cosine, temporal_sine, height_cosine, height_sine, width_cosine, width_sine = cached_tables[2]
+        if start_frame + frames <= temporal_cosine.shape[0]:
+            temporal_cosine = temporal_cosine[start_frame : start_frame + frames]
+            temporal_sine = temporal_sine[start_frame : start_frame + frames]
         else:
             # Keep absolute positions and checkpoint frequencies, computing only
             # this block instead of growing a table for the whole session.
-            temporal_dim = self._rope_temporal_cosine.shape[1] * 2
+            temporal_dim = temporal_cosine.shape[1] * 2
             temporal_cosine, temporal_sine = _rope_axis(frames, temporal_dim, start=start_frame)
-            temporal_cosine = temporal_cosine.to(self._rope_temporal_cosine)
-            temporal_sine = temporal_sine.to(self._rope_temporal_sine)
+            if table_dtype != torch.float64:
+                temporal_cosine, temporal_sine = temporal_cosine.float(), temporal_sine.float()
+            temporal_cosine = temporal_cosine.to(device=device, dtype=table_dtype)
+            temporal_sine = temporal_sine.to(device=device, dtype=table_dtype)
 
         def expand_axis(table: torch.Tensor, axis: str) -> torch.Tensor:
             if axis == "temporal":
@@ -1161,22 +1217,22 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         cosine = torch.cat(
             (
                 expand_axis(temporal_cosine, "temporal"),
-                expand_axis(self._rope_height_cosine, "height"),
-                expand_axis(self._rope_width_cosine, "width"),
+                expand_axis(height_cosine, "height"),
+                expand_axis(width_cosine, "width"),
             ),
             dim=-1,
         )
         sine = torch.cat(
             (
                 expand_axis(temporal_sine, "temporal"),
-                expand_axis(self._rope_height_sine, "height"),
-                expand_axis(self._rope_width_sine, "width"),
+                expand_axis(height_sine, "height"),
+                expand_axis(width_sine, "width"),
             ),
             dim=-1,
         )
         return (
-            cosine.reshape(frames * height * width, -1).to(device=device, dtype=dtype),
-            sine.reshape(frames * height * width, -1).to(device=device, dtype=dtype),
+            cosine.reshape(frames * height * width, -1).to(device=device, dtype=table_dtype),
+            sine.reshape(frames * height * width, -1).to(device=device, dtype=table_dtype),
         )
 
     def _validate_inputs(
@@ -1252,9 +1308,16 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         else:
             raise ValueError("timestep must be scalar, rank 1 [batch], or rank 2 [batch, frames].")
 
-        frequency_embedding = _sinusoidal_embedding(self.config.freq_dim, timestep.reshape(-1)).to(dtype=dtype)
-        timestep_embedding = self.time_embedding(frequency_embedding).unflatten(0, (batch_size, frames))
-        timestep_projection = self.time_projection(timestep_embedding).unflatten(2, (6, self.dim))
+        # The native checkpoint keeps sinusoid generation in FP64 and both
+        # time MLPs in FP32, even when the attention projections use BF16.
+        frequency_embedding = _sinusoidal_embedding(self.config.freq_dim, timestep.reshape(-1)).float()
+        with torch.autocast(timestep.device.type, enabled=False):
+            timestep_embedding = _linear_fp32(self.time_embedding[0], frequency_embedding)
+            timestep_embedding = self.time_embedding[1](timestep_embedding)
+            timestep_embedding = _linear_fp32(self.time_embedding[2], timestep_embedding)
+            timestep_embedding = timestep_embedding.unflatten(0, (batch_size, frames))
+            timestep_projection = _linear_fp32(self.time_projection[1], self.time_projection[0](timestep_embedding))
+            timestep_projection = timestep_projection.unflatten(2, (6, self.dim))
         return timestep_embedding, timestep_projection
 
     def _unpatchify(
@@ -1502,6 +1565,10 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             if name not in params:
                 raise KeyError(f"Unexpected LingBot model weight name: {checkpoint_name}")
             param = params[name]
+            if name.startswith(("time_embedding.", "time_projection.", "head.head.")):
+                # A later partial reload must still pass through native stage
+                # precision after the first load promoted these parameters.
+                loaded_weight = loaded_weight.to(dtype=self.patch_embedding.weight.dtype)
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             if shard_id is None:
                 weight_loader(param, loaded_weight)
@@ -1515,4 +1582,10 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             # model parameter they populated, matching Wan's loader contract.
             loaded.add(checkpoint_name)
             loaded.add(name)
+        # Match the native FP32 autocast islands without repeatedly materializing
+        # the large time-projection weight on every probe. Loading first retains
+        # exactly the checkpoint values selected by the stage's BF16 contract.
+        self.time_embedding.float()
+        self.time_projection.float()
+        self.head.head.float()
         return loaded
