@@ -3,6 +3,8 @@
 # Copyright 2025 The Qwen team.
 """Inference-only Qwen3-Omni-Moe unified model (thinker + talker + code2wav)."""
 
+from __future__ import annotations
+
 import asyncio
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from functools import cached_property
@@ -45,8 +47,6 @@ from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.transformers_utils.processor import cached_processor_from_config
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import Embeddings, HiddenStates, Ids, OmniPayload, OmniPayloadMeta
 from vllm_omni.metrics import definitions as defs
@@ -75,6 +75,9 @@ from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, 
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp, ramp_decode_windows
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import to_device_nonblocking
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 # Voice used when a request names no speaker. Matches the reference
 # ``Qwen3OmniMoeForConditionalGeneration.generate(speaker="Ethan")``; the
@@ -203,8 +206,8 @@ class Qwen3OmniMoeForConditionalGeneration(
     eager_frames_need_postprocess = False
 
     def create_omni_model_state(
-        self, vllm_config: VllmConfig, encoder_cache: "EncoderCache | None", device: torch.device
-    ) -> "OmniModelState":
+        self, vllm_config: VllmConfig, encoder_cache: EncoderCache | None, device: torch.device
+    ) -> OmniModelState:
         from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
         if current_omni_platform.is_npu() and self.model_stage in ("thinker", "talker"):
@@ -578,6 +581,8 @@ class Qwen3OmniMoeForConditionalGeneration(
     @cached_property
     def sampler(self):
         """Get sampler from active model."""
+        from vllm.v1.sample.sampler import Sampler
+
         if hasattr(self.model, "sampler"):
             return self.model.sampler
         return Sampler()

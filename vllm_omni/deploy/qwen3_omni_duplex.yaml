@@ -1,6 +1,6 @@
 # Concurrent input / interruptible VAD turns; not native streaming input KV.
-# The turn deploy defaults to model runner v2. Duplex stays on V1; use
-# qwen3_omni_duplex_mrv2.yaml for the V2 duplex path.
+# This historical V1 profile is unavailable with vLLM 0.34 and is rejected.
+# Use qwen3_omni_duplex_mrv2.yaml for the V2 duplex path.
 # Unconfigured history_policy uses full_history: all effective originals, with
 # capacity errors instead of clipping. Set model_custom_options.history_policy
 # to recent in a duplex_session overlay to restore the legacy bounded window.

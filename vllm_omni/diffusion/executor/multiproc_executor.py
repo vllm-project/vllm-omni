@@ -412,7 +412,7 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
                     worker_extension_cls,
                     custom_pipeline_args,
                 ),
-                kwargs={"sharing_registry": sharing_registry},
+                kwargs={"sharing_registry": sharing_registry, "parent_pid": os.getpid()},
                 name=f"DiffusionWorker-{i}",
                 daemon=True,
             )

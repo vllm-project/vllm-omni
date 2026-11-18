@@ -419,9 +419,14 @@ def test_shared_pools_are_isolated_by_encoder_and_replay_stream():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("gc_enabled", [True, False])
 @torch.inference_mode()
-def test_capture_does_not_collect_an_older_cuda_graph(monkeypatch, gc_enabled):
+def test_capture_does_not_collect_an_older_cuda_graph(gc_enabled):
     """A prior model's graph must be finalized outside a later capture."""
-    monkeypatch.setattr(torch.compiler.config, "force_cudagraph_gc", False)
+    # Assign and restore directly instead of monkeypatch.setattr: pytest's
+    # undo path deletes torch _config_module names (the mock.patch workaround
+    # hides them), which would fail every later torch.cuda.graph capture in
+    # this process with AttributeError.
+    previous_force_cudagraph_gc = torch.compiler.config.force_cudagraph_gc
+    torch.compiler.config.force_cudagraph_gc = False
     previous_threshold = gc.get_threshold()
     previously_enabled = gc.isenabled()
     in_capture = False
@@ -478,6 +483,7 @@ def test_capture_does_not_collect_an_older_cuda_graph(monkeypatch, gc_enabled):
         gc.collect()
         assert finalized_during_capture == [False]
     finally:
+        torch.compiler.config.force_cudagraph_gc = previous_force_cudagraph_gc
         gc.disable()
         gc.set_threshold(*previous_threshold)
         gc.collect()
