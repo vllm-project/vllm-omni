@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Tests for tests.helpers.voice_isolation request planning and first-window gating. No server or model."""
+"""Tests for voice isolation request planning, fail-fast controls, and first-window gating."""
 
+import json
 from pathlib import Path
+from threading import Barrier
 from types import SimpleNamespace
 
 import pytest
@@ -111,3 +113,65 @@ def test_partial_registration_fails_both_registered_batches_and_leaves_inline_ru
     assert generated == [("inline", 8)]
     assert suite.generated[mode, "inline", 8] == {"audio": []}
     assert request.param is params and not voice_dirs[0].exists()
+
+
+def test_no_async_control_sends_once_on_timeout_and_closes_client(monkeypatch) -> None:
+    import httpx
+    from openai import OpenAI
+
+    from tests.helpers import client, runtime
+
+    suite = _suite()
+    request = SimpleNamespace(param=runtime.OmniServerParams(model="m", server_args=["--no-async-chunk"]))
+    received = []
+    voice_dirs = []
+
+    def time_out(http_request):
+        received.append((http_request.url.path, json.loads(http_request.content), http_request.extensions["timeout"]))
+        raise httpx.ReadTimeout("speech stalled", request=http_request)
+
+    sdk = OpenAI(
+        api_key="EMPTY",
+        base_url="http://test/v1",
+        max_retries=2,
+        http_client=httpx.Client(transport=httpx.MockTransport(time_out)),
+    )
+
+    def server_fixture(request, run_level, lock):
+        voice_dir = Path(request.param.env_dict["SPEAKER_SAMPLES_DIR"])
+        voice_dirs.append(voice_dir)
+        try:
+            yield SimpleNamespace(host="127.0.0.1", port=1, model="m", log_stats=False)
+        finally:
+            assert sdk.is_closed()
+            assert voice_dir.exists()
+
+    monkeypatch.setattr(client, "OnlineOmniClient", lambda **kwargs: SimpleNamespace(client=sdk))
+    monkeypatch.setattr(runtime, "iter_omni_server", server_fixture)
+    monkeypatch.setattr(suite, "reference_audio_urls", lambda: {"a": "data:a", "b": "data:b", "c": "data:c"})
+    mode = suite.generate(request, "full_model", [("inline", 1)])
+
+    assert len(received) == 1
+    route, body, deadlines = received[0]
+    assert route == "/v1/audio/speech"
+    assert body["seed"] == 2000 and body["ref_audio"] == "data:a" and body["ref_text"] == "ref a"
+    assert deadlines["read"] == 600.0
+    assert suite.generated[mode, "inline", 1]["error"].startswith("APITimeoutError:")
+    assert sdk.is_closed() and not voice_dirs[0].exists()
+
+
+def test_inline_c8_keeps_concurrent_requests_and_response_order(monkeypatch) -> None:
+    suite = _suite()
+    concurrency = 8
+    barrier = Barrier(concurrency, timeout=5)
+
+    def send(client, model, req, urls, source):
+        assert source == "inline"
+        if req["idx"] < concurrency:
+            barrier.wait()
+        return str(req["seed"]).encode()
+
+    monkeypatch.setattr(suite, "_send", send)
+    run = suite._generate(None, "m", concurrency, {}, "inline")
+    assert run["requests"] == suite.plan_requests()
+    assert run["audio"] == [str(req["seed"]).encode() for req in run["requests"]]

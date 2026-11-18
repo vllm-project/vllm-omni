@@ -204,9 +204,13 @@ class VoiceIsolationSuite:
     def _generate(self, client, model: str, concurrency: int, urls: dict[str, str], source: str) -> dict[str, Any]:
         requests = self.plan_requests()
         t0 = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            futures = [pool.submit(self._send, client, model, r, urls, source) for r in requests]
-            audio = [f.result() for f in futures]
+        if concurrency == 1:
+            # Stop at the first failed control request without queueing later requests.
+            audio = [self._send(client, model, r, urls, source) for r in requests]
+        else:
+            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                futures = [pool.submit(self._send, client, model, r, urls, source) for r in requests]
+                audio = [f.result() for f in futures]
         return {"requests": requests, "audio": audio, "wall_s": time.perf_counter() - t0}
 
     def generate(self, request, run_level, plan: list[tuple[str, int]]) -> str:
@@ -233,6 +237,9 @@ class VoiceIsolationSuite:
                     host=server.host, port=server.port, api_key="EMPTY", run_level=run_level, log_stats=server.log_stats
                 )
                 with closing(client.client):
+                    if mode == "no_async_chunk":
+                        # The serial control reports the first failed attempt and can tear down its server.
+                        client.client.max_retries = 0
                     registration_error = None
                     if any(source == "registered" for source, _ in plan):
                         try:
