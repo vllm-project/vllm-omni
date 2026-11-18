@@ -110,6 +110,8 @@ _IT2I_INPUT = json.loads(get_asset_path(f"{ASSET_SUBDIR}/it2i.jsonl").read_text(
 PROMPT = _IT2I_INPUT["prompt"]
 TEST_IMAGE_URLS = _IT2I_INPUT["image_files"]
 SEED = 42
+IMAGE_WIDTH, IMAGE_HEIGHT = 1280, 720
+IMAGE_SIZE = f"{IMAGE_WIDTH}x{IMAGE_HEIGHT}"
 AR_TP_SIZE = len(AR_DEVICES.split(","))
 DIT_TP_SIZE = len(DIT_DEVICES.split(","))
 
@@ -254,16 +256,23 @@ def _run_offline(runner: OmniRunner, output_path: Path) -> tuple[Image.Image, st
     token_ids = result.token_ids
     system_prompt_type = result.system_prompt_type
 
-    ar_stop_token_ids = resolve_stop_token_ids(task="it2i", bot_task="think_recaption", tokenizer=tokenizer)
+    # Match online fixed-size generation: stop at </recaption> before AR predicts a ratio.
+    ar_stop_token_ids = resolve_stop_token_ids(
+        task="it2i", bot_task="think_recaption", tokenizer=tokenizer, image_size=IMAGE_SIZE
+    )
     params_list = list(runner.omni.default_sampling_params_list)
     for sp in params_list:
         if isinstance(sp, OmniDiffusionSamplingParams):
+            sp.width = IMAGE_WIDTH
+            sp.height = IMAGE_HEIGHT
             sp.num_inference_steps = NUM_INFERENCE_STEPS
             sp.guidance_scale = GUIDANCE_SCALE
             sp.seed = SEED
             sp.generator = torch.Generator(device=current_omni_platform.device_type or "cuda").manual_seed(SEED)
         elif hasattr(sp, "stop_token_ids"):
             sp.stop_token_ids = ar_stop_token_ids
+            sp.seed = SEED
+            sp.extra_args = {**(sp.extra_args or {}), "target_h": IMAGE_HEIGHT, "target_w": IMAGE_WIDTH}
 
     images = download_images(TEST_IMAGE_URLS)
     prompts: list[OmniPromptType] = [
@@ -272,6 +281,8 @@ def _run_offline(runner: OmniRunner, output_path: Path) -> tuple[Image.Image, st
             "prompt": PROMPT,
             "use_system_prompt": system_prompt_type,
             "modalities": ["image"],
+            "width": IMAGE_WIDTH,
+            "height": IMAGE_HEIGHT,
             "multi_modal_data": {"image": images},
         }
     ]
@@ -324,7 +335,7 @@ def _run_online(
                 "seed": SEED,
                 "sys_type": "en_unified",
                 "bot_task": bot_task,
-                "size": "1280x720",
+                "size": IMAGE_SIZE,
             },
             "files": [
                 ("image", (f"image_{i}.png", pil_to_png_bytes(img), "image/png")) for i, img in enumerate(images)
@@ -358,7 +369,7 @@ def _assert_accuracy(
     device_profile = resolve_device_profile(profiles=similarity_thresholds)
     thresholds = resolve_similarity_thresholds(similarity_thresholds, device_profile)
     with Image.open(ref_path) as ref:
-        assert ref.size == (1280, 720), "IT2I reference must be 1280x720"
+        assert ref.size == (IMAGE_WIDTH, IMAGE_HEIGHT), f"IT2I reference must be {IMAGE_SIZE}"
         reference_image = ref.convert("RGB")
     model_label = f"{MODEL_NAME} [{label}] vs reference"
     ssim, psnr = measure_image_similarity(

@@ -57,7 +57,18 @@
           4
         ],
         "percentile_metrics": "e2el",
-        "baseline": {},
+        "baseline": {
+          "H100": {
+            "mean_e2el_ms": [
+              1849.8335140175186,
+              5414.036436966853
+            ],
+            "request_throughput": [
+              0.5399214614406311,
+              0.7066488166455321
+            ]
+          }
+        },
         "dataset_name": "random",
         "tokenizer": "gpt2",
         "random_input_len": 8,

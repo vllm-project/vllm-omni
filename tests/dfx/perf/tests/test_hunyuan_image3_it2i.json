@@ -82,7 +82,18 @@
           16
         ],
         "percentile_metrics": "e2el",
-        "baseline": {},
+        "baseline": {
+          "H100": {
+            "mean_e2el_ms": [
+              8780.952811532188,
+              58151.52815403417
+            ],
+            "request_throughput": [
+              0.11382375941023119,
+              0.25474844114978445
+            ]
+          }
+        },
         "dataset_name": "custom_image",
         "dataset_path": "tests/assets/hunyuan_image3/perf_it2i.jsonl",
         "skip_tokenizer_init": true,
