@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import math
+import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -42,7 +43,11 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
-from vllm_omni.diffusion.forward_context import build_local_sp_padding_mask, get_forward_context
+from vllm_omni.diffusion.forward_context import (
+    build_local_sp_padding_mask,
+    get_forward_context,
+    is_forward_context_available,
+)
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.fused_add_norm_quant import (
     can_fuse_add_layernorm_quant,
@@ -770,7 +775,12 @@ class WanTransformerBlock(nn.Module):
         hidden_states_mask: torch.Tensor | None = None,
         vsa_dit_seq_shape: tuple[int, int, int] | None = None,
         preserve_vsa_all_blocks: bool = False,
-    ) -> torch.Tensor:
+        ffn_residual: tuple[torch.Tensor, torch.Tensor] | None = None,
+        defer_ffn_residual: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """``ffn_residual`` is the previous block's deferred ``(ff_output, c_gate)``; with
+        ``defer_ffn_residual`` this block returns ``(hidden_states, (ff_output, c_gate))``
+        instead of adding its own FFN residual, so the next block folds it into norm1."""
         if temb.ndim == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
             shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
@@ -790,7 +800,23 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention. norm1's modulated output goes straight into
         # attn1.to_qkv as its MXFP8 input where the kernels allow.
-        if self.attn1.to_gate_compress is None and can_fuse_layernorm_quant(
+        fused_norm1 = False
+        if ffn_residual is not None:
+            # hidden_states is the previous block's output, which the transformer loop owns:
+            # its pending FFN residual, norm1 and the QKV input quantization run as one kernel.
+            ff_prev, gate_prev = ffn_residual
+            if self.attn1.to_gate_compress is None and can_fuse_add_layernorm_quant(
+                self.attn1.to_qkv, hidden_states, gate_prev, scale_msa, shift_msa
+            ):
+                hidden_states, norm_hidden_states = fused_add_layernorm_quant(
+                    self.attn1.to_qkv, hidden_states, ff_prev, gate_prev, 1 + scale_msa, shift_msa, self.norm1.eps
+                )
+                fused_norm1 = True
+            else:
+                hidden_states = (hidden_states + ff_prev * gate_prev).type_as(hidden_states)
+        if fused_norm1:
+            pass
+        elif self.attn1.to_gate_compress is None and can_fuse_layernorm_quant(
             self.attn1.to_qkv, hidden_states, scale_msa, shift_msa
         ):
             norm_hidden_states = fused_layernorm_quant(
@@ -820,9 +846,11 @@ class WanTransformerBlock(nn.Module):
         if norm2 is not None and can_fuse_add_layernorm_quant(
             self.attn2.to_q, hidden_states, gate_msa, norm2.weight, norm2.bias
         ):
-            # hidden_states is the block input, which hooks may still hold.
+            # Without a deferred residual hidden_states is the block input, which hooks may
+            # still hold; with one it is already the loop-owned tensor norm1 updated in place.
+            residual = hidden_states if ffn_residual is not None else hidden_states.clone()
             hidden_states, norm_hidden_states = fused_add_layernorm_quant(
-                self.attn2.to_q, hidden_states.clone(), attn_output, gate_msa, norm2.weight, norm2.bias, norm2.eps
+                self.attn2.to_q, residual, attn_output, gate_msa, norm2.weight, norm2.bias, norm2.eps
             )
         else:
             hidden_states = (hidden_states + attn_output * gate_msa).type_as(hidden_states)
@@ -839,6 +867,8 @@ class WanTransformerBlock(nn.Module):
             hidden_states = hidden_states + attn_output
             norm_hidden_states = self.norm3(hidden_states, c_scale_msa, c_shift_msa).type_as(hidden_states)
         ff_output = self.ffn(norm_hidden_states)
+        if defer_ffn_residual:
+            return hidden_states, (ff_output, c_gate_msa)
         hidden_states = (hidden_states + ff_output * c_gate_msa).type_as(hidden_states)
 
         return hidden_states
@@ -1156,6 +1186,27 @@ class WanTransformer3DModel(nn.Module):
         """Return the dtype of the model parameters."""
         return next(self.parameters()).dtype
 
+    def _defer_ffn_residual(self) -> bool:
+        """Fold each block's FFN residual into the next block's norm1 kernel (XPU MXFP8 path).
+
+        Only for plain WanTransformerBlocks run as one stage with no cache backend: cache hooks
+        may keep block inputs, which the deferred path updates in place.
+        """
+        if os.environ.get("VLLM_OMNI_WAN_DEFER_FFN_RESIDUAL", "1").strip().lower() in ("0", "false", "off"):
+            return False
+        blocks = self.blocks[self.start_layer : self.end_layer]
+        if len(blocks) == 0 or self.start_layer != 0 or self.end_layer != len(self.blocks):
+            return False
+        if any(type(b) is not WanTransformerBlock for b in blocks):
+            return False
+        if not is_forward_context_available():
+            return False
+        cfg = get_forward_context().omni_diffusion_config
+        if cfg is None or getattr(cfg, "cache_backend", None) not in (None, "", "none"):
+            return False
+        first = blocks[0]
+        return first.attn1.to_gate_compress is None and isinstance(first.norm2, nn.LayerNorm)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1249,16 +1300,35 @@ class WanTransformer3DModel(nn.Module):
         # Preserve the post-patch (T, H, W) grid so VSA can partition
         # the flattened DiT sequence into spatiotemporal blocks.
         vsa_dit_seq_shape = (post_patch_num_frames, post_patch_height, post_patch_width)
-        for block in self.blocks[self.start_layer : self.end_layer]:
-            hidden_states = block(
-                hidden_states,
-                encoder_hidden_states,
-                timestep_proj,
-                rotary_emb,
-                hidden_states_mask,
-                vsa_dit_seq_shape,
-                self.preserve_vsa_all_blocks,
-            )
+        if self._defer_ffn_residual():
+            # Each block hands its FFN residual to the next block's norm1 kernel (see
+            # WanTransformerBlock.forward); the last one is added here.
+            pending = None
+            for block in self.blocks[self.start_layer : self.end_layer]:
+                hidden_states, pending = block(
+                    hidden_states,
+                    encoder_hidden_states,
+                    timestep_proj,
+                    rotary_emb,
+                    hidden_states_mask,
+                    vsa_dit_seq_shape,
+                    self.preserve_vsa_all_blocks,
+                    ffn_residual=pending,
+                    defer_ffn_residual=True,
+                )
+            ff_output, c_gate_msa = pending
+            hidden_states = (hidden_states + ff_output * c_gate_msa).type_as(hidden_states)
+        else:
+            for block in self.blocks[self.start_layer : self.end_layer]:
+                hidden_states = block(
+                    hidden_states,
+                    encoder_hidden_states,
+                    timestep_proj,
+                    rotary_emb,
+                    hidden_states_mask,
+                    vsa_dit_seq_shape,
+                    self.preserve_vsa_all_blocks,
+                )
 
         if not is_pipeline_last_stage():
             # Non-last PP stage: hand the token sequence to the caller via IntermediateTensors.
