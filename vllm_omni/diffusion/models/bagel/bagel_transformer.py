@@ -1409,7 +1409,7 @@ class Bagel(CFGParallelMixin, nn.Module):
             nn.init.constant_(self.llm2vae.weight, 0)
             nn.init.constant_(self.llm2vae.bias, 0)
 
-    def prepare_prompts(self, curr_kvlens, curr_rope, prompts, tokenizer, new_token_ids):
+    def prepare_prompts(self, curr_kvlens, curr_rope, prompts, tokenizer, new_token_ids, *, bos=True, eos=True):
         packed_text_ids = list()
         packed_text_position_ids = list()
         text_token_lens = list()
@@ -1417,7 +1417,10 @@ class Bagel(CFGParallelMixin, nn.Module):
         newlens, new_rope = list(), list()
         for prompt, curr_kvlen, curr_position_id in zip(prompts, curr_kvlens, curr_rope):
             text_ids = tokenizer.encode(prompt, add_special_tokens=False)
-            text_ids = [new_token_ids["bos_token_id"]] + text_ids + [new_token_ids["eos_token_id"]]
+            if bos:
+                text_ids = [new_token_ids["bos_token_id"]] + text_ids
+            if eos:
+                text_ids = text_ids + [new_token_ids["eos_token_id"]]
             text_token_lens.append(len(text_ids))
             packed_text_ids.extend(text_ids)
             packed_text_position_ids.extend(range(curr_position_id, curr_position_id + len(text_ids)))
@@ -1530,8 +1533,11 @@ class Bagel(CFGParallelMixin, nn.Module):
         packed_text_indexes: torch.LongTensor,
         packed_position_ids: torch.LongTensor,
         packed_seqlens: torch.IntTensor,
+        padded_latent: torch.Tensor | None = None,
     ):
-        padded_latent = vae_model.encode(padded_images)
+        # CFG branches share one sampled image latent but have separate caches.
+        if padded_latent is None:
+            padded_latent = vae_model.encode(padded_images)
 
         p = self.latent_patch_size
         packed_latent = list()
