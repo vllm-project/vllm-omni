@@ -648,20 +648,18 @@ def test_turn_deployment_rejects_explicit_duplex_without_falling_back_to_stt(fla
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "explicit_template, pipeline_template, tokenizer_template, tokenizer_error, expected",
+    "explicit_template, tokenizer_template, tokenizer_error, expected",
     [
-        ("explicit", "pipeline", None, False, "explicit"),
-        (None, "pipeline", "tokenizer", False, "pipeline"),
-        (None, None, "tokenizer", False, None),
-        (None, None, None, False, "model-json"),
-        (None, None, None, True, "model-json"),
+        ("explicit", None, False, "explicit"),
+        (None, "tokenizer", False, None),
+        (None, None, False, "model-json"),
+        (None, None, True, "model-json"),
     ],
 )
 async def test_shared_chat_template_resolution(
-    mocker, explicit_template, pipeline_template, tokenizer_template, tokenizer_error, expected
+    mocker, explicit_template, tokenizer_template, tokenizer_error, expected
 ):
     engine = _FakeDuplexOmni()
-    engine.engine = SimpleNamespace(pipeline_config=SimpleNamespace(chat_template=pipeline_template))
     tokenizer = mocker.patch.object(
         engine,
         "get_tokenizer",
@@ -672,5 +670,5 @@ async def test_shared_chat_template_resolution(
     model_template = mocker.patch.object(api_server, "_load_model_chat_template_json", return_value="model-json")
 
     assert await api_server._resolve_chat_template(engine, _minimal_args()) == expected
-    assert tokenizer.call_count == (0 if explicit_template is not None or pipeline_template is not None else 1)
+    assert tokenizer.call_count == (0 if explicit_template is not None else 1)
     assert model_template.call_count == (1 if expected == "model-json" else 0)
