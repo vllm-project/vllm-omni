@@ -1381,55 +1381,46 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
             "mi300_2",
             "slow and rocm and MI325 and cards_2",
             "tests/dfx/reliability/test_qwen3_omni.py",
-            "Blocking",
         ),
         "Reliability Test · qwen3-omni replicas": (
             "mi300_4",
             "slow and rocm and MI325 and cards_4",
             "tests/dfx/reliability/test_qwen3_omni_replica.py",
-            "Blocking",
         ),
         "Reliability Test · wan22": (
             "mi300_2",
             "slow and rocm and MI325 and cards_2",
             "tests/dfx/reliability/test_wan22.py",
-            "Blocking",
         ),
         "Reliability Test · hunyuan-image": (
             "mi300_4",
             "slow and rocm and MI325 and cards_4",
             "tests/dfx/reliability/test_hunyuan_image.py",
-            "Blocking",
         ),
         "Reliability Test · minicpmo-4.5": (
             "mi300_1",
             "slow and rocm and MI325 and cards_1",
             "tests/dfx/reliability/test_minicpmo_4_5.py",
-            "Blocking",
         ),
         "Reliability Test · minicpmo-4.5 replicas": (
             "mi300_4",
             "slow and rocm and MI325 and cards_3",
             "tests/dfx/reliability/test_minicpmo_4_5_replica.py",
-            "Blocking",
         ),
         "Reliability Test · Invalid parameters · MI300 · Single-GPU": (
             "mi300_1",
             "slow and rocm and MI325 and H100 and cards_1",
             "tests/dfx/reliability/invalid_param_test/",
-            "Blocking",
         ),
         "Reliability Test · Invalid parameters · MI300 · 2-GPU": (
             "mi300_2",
             "slow and rocm and MI325 and H100 and cards_2",
             "test_invalid_omni_chat.py",
-            "Blocking",
         ),
         "Reliability Test · Invalid parameters · Audio · MI300 · Single-GPU": (
             "mi300_1",
             "slow and rocm and MI325 and L4 and cards_1",
             "tests/dfx/reliability/invalid_param_test/",
-            "Blocking",
         ),
     }
 
@@ -1437,11 +1428,11 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
     assert "if" not in group
     assert [step["label"] for step in group["steps"]] == list(jobs)
     for step in group["steps"]:
-        pool, marker, filename, grade = jobs[step["label"]]
+        pool, marker, filename = jobs[step["label"]]
         command = "\n".join(step["commands"])
         assert "if" not in step
         assert step["agent_pool"] == pool
-        assert step["grade"] == grade
+        assert step["grade"] == "Blocking"
         assert step["depends_on"] == "amd-build"
         assert marker in command
         assert filename in command
