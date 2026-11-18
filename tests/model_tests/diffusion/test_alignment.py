@@ -116,6 +116,9 @@ EXCLUDED_MODELS = [
     "OmniVoice",
     "Cosmos3OmniDiffusersPipeline",
     "Cosmos3OmniPipeline",
+    # Tower-disaggregated Cosmos3 stages; need a two-stage deployment.
+    "Cosmos3ReasonerPipeline",
+    "Cosmos3GeneratorPipeline",
     "DiffusersAdapterPipeline",
     "HiDreamO1ImagePipeline",
     "DreamZeroPipeline",

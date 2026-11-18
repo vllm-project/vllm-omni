@@ -1784,3 +1784,18 @@ def test_shared_gen_stack_preserves_control_metadata_sharding_and_wrapped_output
     output = model._run_gen_layers(inputs, gather_output=False, **kwargs)
     torch.testing.assert_close(output, torch.full_like(inputs, 4 if already_sharded else 5))
     assert len(gathered) == 1
+
+
+@pytest.mark.parametrize("owned_towers", [("reasoner",), ("generator",)])
+def test_tower_split_transformer_builds_only_its_tower(owned_towers) -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+
+    model = Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(num_hidden_layers=2), dtype=torch.float32),
+        owned_towers=owned_towers,
+    )
+
+    is_reasoner = owned_towers == ("reasoner",)
+    assert len(model.language_model.layers) == (2 if is_reasoner else 0)
+    assert len(model.gen_layers) == (0 if is_reasoner else 2)
+    assert hasattr(model.language_model, "embed_tokens") == is_reasoner

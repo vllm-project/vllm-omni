@@ -1143,15 +1143,20 @@ class Cosmos3LanguageModel(nn.Module):
         quant_config: QuantizationConfig | None = None,
         release_completed_blocks_to_meta: bool = False,
         prefix: str = "",
+        rope_only: bool = False,
     ) -> None:
         super().__init__()
-        self.embed_tokens = _Cosmos3StagedEmbedding(vocab_size, hidden_size)
         self.rotary_emb = Qwen3VLTextRotaryEmbedding(
             head_dim=head_dim,
             rope_theta=rope_theta,
             mrope_section=mrope_section,
         )
         self.layers = nn.ModuleList()
+        if rope_only:
+            # A stage that does not own the UND tower still needs rotary_emb for
+            # the GEN frequencies, but none of the tower's weights.
+            return
+        self.embed_tokens = _Cosmos3StagedEmbedding(vocab_size, hidden_size)
         for i in range(num_hidden_layers):
             layer = Cosmos3UndDecoderLayer(
                 hidden_size=hidden_size,
@@ -1358,10 +1363,14 @@ class Cosmos3VFMTransformer(nn.Module):
         sound_gen: bool = False,
         sound_dim: int | None = None,
         sound_latent_fps: float | None = None,
+        owned_towers: tuple[str, ...] | None = None,
     ) -> None:
         super().__init__()
         model_config = od_config.tf_model_config
         self._validate_supported_config(model_config)
+        # A tower-split stage builds only the tower it runs; ``None`` builds both.
+        self.owns_reasoner = owned_towers is None or "reasoner" in owned_towers
+        self.owns_generator = owned_towers is None or "generator" in owned_towers
 
         self.hidden_size = int(_tf_config_get(model_config, "hidden_size", 4096))
         self.num_hidden_layers = int(_tf_config_get(model_config, "num_hidden_layers", 36))
@@ -1455,6 +1464,7 @@ class Cosmos3VFMTransformer(nn.Module):
                 release_completed_blocks_to_meta=release_completed_blocks_to_meta,
                 prefix="language_model",
                 **self._language_model_kwargs(),
+                **({} if self.owns_reasoner else {"rope_only": True}),
             )
 
             # Video projection layers are small; not worth quantizing.
@@ -1512,7 +1522,10 @@ class Cosmos3VFMTransformer(nn.Module):
                 prefix=prefix,
             )
 
-        if _pp_parallel_active():
+        if not self.owns_generator:
+            self.start_layer, self.end_layer = 0, 0
+            self.gen_layers = nn.ModuleList()
+        elif _pp_parallel_active():
             self.start_layer, self.end_layer, self.gen_layers = make_layers(
                 self.num_hidden_layers,
                 lambda prefix: build_gen_layer(int(prefix.split(".")[-1]), prefix),

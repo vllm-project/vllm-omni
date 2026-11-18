@@ -1,0 +1,29 @@
+# nvidia/Cosmos3-Super-Text2Image, one stage per Mixture-of-Transformers tower:
+#   stage 0 "reasoner"  (UND tower)        --per-layer text K/V-->
+#   stage 1 "generator" (GEN tower + VAE)  -> image
+# Each tower fits on one H200. T2I only.
+pipeline: cosmos3_omni_disagg
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.9
+    enforce_eager: true
+    parallel_config:
+      tensor_parallel_size: 1
+    engine_args:
+      model_config:
+        guardrails: false
+
+  - stage_id: 1
+    devices: "1"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.9
+    enforce_eager: true
+    parallel_config:
+      tensor_parallel_size: 1
+    engine_args:
+      model_config:
+        guardrails: false

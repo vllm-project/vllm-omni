@@ -33,6 +33,7 @@ from vllm.logger import init_logger
 from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
+from vllm_omni.diffusion.models.cosmos3_pipeline_config import COSMOS3_DISAGG_PIPELINE
 from vllm_omni.diffusion.models.mossimage_pipeline_config import MOSS_IMAGE_PIPELINE
 from vllm_omni.diffusion.models.physis.h3.pipeline_config import PHYSIS_H3_PIPELINE
 from vllm_omni.diffusion.models.physis.ltx.pipeline_config import PHYSIS_LTX_PIPELINE
@@ -179,6 +180,8 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     # so these entries are only reachable through a deploy yaml's ``pipeline:``
     # key (see deploy/cosmos3_policy_droid.yaml and deploy/cosmos3_omni.yaml).
     "cosmos3_omni_deploy": COSMOS3_OMNI_DEPLOY_PIPELINE,
+    # One stage per MoT tower (deploy/cosmos3_super_t2i_disagg.yaml).
+    "cosmos3_omni_disagg": COSMOS3_DISAGG_PIPELINE,
     "cosmos3_policy": COSMOS3_POLICY_PIPELINE,
     "cosyvoice3": resolve_cosyvoice3_pipeline,
     "covo_audio": COVO_AUDIO_PIPELINE,

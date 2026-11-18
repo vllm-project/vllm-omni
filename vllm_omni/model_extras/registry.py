@@ -393,6 +393,9 @@ for model_class_name in ("LTX2Pipeline", "LTX2TwoStagePipeline"):
     _EXTRA_SPECS[model_class_name]["transformer_config_subfolder_resolver"] = ltx_transformer_config_subfolder
 
 
+# Tower-disaggregated Cosmos3 stages accept the same `extra_body` params.
+_EXTRA_SPECS["Cosmos3ReasonerPipeline"] = _EXTRA_SPECS["Cosmos3OmniDiffusersPipeline"]
+_EXTRA_SPECS["Cosmos3GeneratorPipeline"] = _EXTRA_SPECS["Cosmos3OmniDiffusersPipeline"]
 # Alias: some code paths surface HunyuanImage3's pipeline class name rather than
 # the architecture name; point both at the same spec.
 _EXTRA_SPECS["HunyuanImage3Pipeline"] = _EXTRA_SPECS["HunyuanImage3ForCausalMM"]

@@ -41,6 +41,7 @@ from typing import Any, ClassVar
 import numpy as np
 import PIL.Image
 import torch
+from diffusers.configuration_utils import FrozenDict
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from torch import nn
@@ -1029,6 +1030,9 @@ class Cosmos3OmniDiffusersPipeline(
 
     support_image_input: ClassVar[bool] = True
     color_format: ClassVar[str] = "RGB"
+    # Tower-split stages (pipeline_cosmos3_disagg) build one MoT tower; ``None`` builds both.
+    cosmos3_owned_towers: ClassVar[tuple[str, ...] | None] = None
+    cosmos3_loads_vae: ClassVar[bool] = True
     _dit_modules: ClassVar[list[str]] = ["transformer.language_model", "transformer"]
     _encoder_modules: ClassVar[list[str]] = []
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -1114,20 +1118,28 @@ class Cosmos3OmniDiffusersPipeline(
         )
 
         # --- VAE ---
-        self.vae = DistributedAutoencoderKLWan.from_pretrained(
-            model_path,
-            subfolder="vae",
-            torch_dtype=self.dtype,
-            local_files_only=local_files_only,
-        ).to(self.device)
+        if self.cosmos3_loads_vae:
+            self.vae = DistributedAutoencoderKLWan.from_pretrained(
+                model_path,
+                subfolder="vae",
+                torch_dtype=self.dtype,
+                local_files_only=local_files_only,
+            ).to(self.device)
+            vae_config = self.vae.config
+        else:
+            # Only the latent scale factors are needed; skip the VAE weights.
+            self.vae = None
+            vae_config = FrozenDict(
+                DistributedAutoencoderKLWan.load_config(model_path, subfolder="vae", local_files_only=local_files_only)
+            )
 
-        if not hasattr(self.vae.config, "scale_factor_temporal"):
+        if not hasattr(vae_config, "scale_factor_temporal"):
             raise ValueError(
                 "Cosmos3 Diffusers VAE config must define scale_factor_temporal "
                 "so transformer mRoPE temporal positions can be computed correctly."
             )
-        self.vae_scale_factor_temporal = int(self.vae.config.scale_factor_temporal)
-        self.vae_scale_factor_spatial = getattr(self.vae.config, "scale_factor_spatial", 16)
+        self.vae_scale_factor_temporal = int(vae_config.scale_factor_temporal)
+        self.vae_scale_factor_spatial = getattr(vae_config, "scale_factor_spatial", 16)
 
         sound_gen = resolve_sound_gen(od_config)
         sound_dim = None
@@ -1146,6 +1158,7 @@ class Cosmos3OmniDiffusersPipeline(
             sound_gen=sound_gen,
             sound_dim=sound_dim,
             sound_latent_fps=sound_latent_fps,
+            owned_towers=self.cosmos3_owned_towers,
         )
         self.is_edge_model = transformer_cls is Cosmos3EdgeVFMTransformer
 
