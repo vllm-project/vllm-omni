@@ -1578,6 +1578,8 @@ class DuplexSessionRunner:
                 session.release_input_bytes(-pending_delta)
             if pcm_reservation is not None:
                 pcm_reservation.commit()
+            if payload["is_speech"]:
+                session.touch_lease(DuplexLeaseActivity.APPEND)
             # Fresh input for an ephemeral request is an explicit retry even
             # when the buffer waits until commit to start the append.
             if not session.capabilities.supports_core_resumable_request:

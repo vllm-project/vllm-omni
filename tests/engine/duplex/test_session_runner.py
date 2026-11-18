@@ -828,6 +828,31 @@ async def test_idle_expiry_emits_session_expired() -> None:
 
 
 @pytest.mark.asyncio
+async def test_buffered_speech_refreshes_idle_lease() -> None:
+    clock = {"now": 100.0}
+    h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(idle_ttl_s=2.0), clock=lambda: clock["now"])
+    try:
+        audio = append_audio(samples=1600)
+        for count, now in enumerate((101.0, 102.0), start=1):
+            clock["now"] = now
+            events = await h.run(audio)
+            assert "error" not in types(events)
+            assert h.runner.model_state.audio_buffer.pending_byte_count == count * len(audio.audio)
+            assert h.port.submissions == []
+            assert await h.manager.reap_expired() == 0
+
+        clock["now"] = 103.5
+        assert await h.manager.reap_expired() == 0
+        clock["now"] = 104.0
+        assert await h.manager.reap_expired() == 1
+        events = await h.settle()
+        assert types(events) == ["session.expired"]
+        assert events[0].reason == "idle_ttl_expired"
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_commands_for_a_closed_session_are_answered_with_unknown_session() -> None:
     h = await open_harness()
     await h.manager.handle(CloseDuplexSessionMessage(control_id="c-close", session_id=SESSION_ID, reason="bye"))
