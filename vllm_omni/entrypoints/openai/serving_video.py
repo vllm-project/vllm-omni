@@ -116,6 +116,14 @@ class LatentEditInput:
 
 
 @dataclass
+class TimelineGuideInput:
+    """Resolved timeline guides and the request-owned files they reference."""
+
+    guides: list[dict[str, Any]]
+    cleanup_paths: tuple[str, ...] = ()
+
+
+@dataclass
 class VideoGenerationArtifacts:
     """Normalized outputs and profiler metadata extracted from one request."""
 
@@ -263,6 +271,12 @@ class OmniOpenAIServingVideo:
         return any(item.supports_latent_mask_editing for item in metadata)
 
     @property
+    def supports_timeline_guides(self) -> bool:
+        """Return whether the configured diffusion model accepts timeline guides."""
+        _, metadata = self._resolve_diffusion_metadata()
+        return any(item.supports_timeline_guides for item in metadata)
+
+    @property
     def supported_control_upload_types(self) -> frozenset[str]:
         """Return multipart control types accepted by the active pipeline.
 
@@ -404,6 +418,9 @@ class OmniOpenAIServingVideo:
                     if value is not None
                 }
             )
+        guide_input = request._timeline_guide_input
+        if guide_input is not None:
+            multi_modal_data["timeline_guides"] = guide_input.guides
         if multi_modal_data:
             prompt["multi_modal_data"] = multi_modal_data
         if vp.width is not None and vp.height is not None:

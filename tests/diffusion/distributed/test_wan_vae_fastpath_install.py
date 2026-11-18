@@ -25,6 +25,7 @@ from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
     REPORT_ATTR,
     decode_frames,
     install_wan_vae_fastpath,
+    is_encoder_installed,
     is_installed,
     uninstall_wan_vae_fastpath,
 )
@@ -73,8 +74,15 @@ def _build_pair(config: dict, dtype: torch.dtype) -> tuple[AutoencoderKLWan, Aut
 @pytest.mark.parametrize("config_name", sorted(CONFIGS))
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("frames", [1, 3])
-def test_lossless_fallback_paths_are_bitwise_exact(config_name: str, dtype: torch.dtype, frames: int) -> None:
-    """Without CUDA every kernel declines, so this exercises the restructured PyTorch paths."""
+@pytest.mark.parametrize("latent_hw", [(6, 8), (1, 1)])
+def test_lossless_fallback_paths_are_bitwise_exact(
+    config_name: str, dtype: torch.dtype, frames: int, latent_hw: tuple[int, int]
+) -> None:
+    """Without CUDA every kernel declines, so this exercises the restructured PyTorch paths.
+
+    With 1x1 latents every contiguous activation also passes the channels-last
+    contiguity check, which must not change the layout the convolutions see.
+    """
     config = CONFIGS[config_name]
     reference, candidate = _build_pair(config, dtype)
     report = install_wan_vae_fastpath(candidate, level="lossless")
@@ -82,7 +90,7 @@ def test_lossless_fallback_paths_are_bitwise_exact(config_name: str, dtype: torc
     assert report.fused_silu_dtypes == ()
 
     torch.manual_seed(1)
-    latents = torch.randn(1, config["z_dim"], frames, 6, 8).to(dtype)
+    latents = torch.randn(1, config["z_dim"], frames, *latent_hw).to(dtype)
     with torch.no_grad():
         expected = reference.decode(latents, return_dict=False)[0]
         actual = candidate.decode(latents, return_dict=False)[0]
@@ -378,22 +386,28 @@ def test_installer_declines_forward_wrappers_it_would_bypass(target: str, level:
 
 @torch.no_grad()
 @pytest.mark.parametrize("pre_hook", [False, True])
-def test_installer_declines_convolution_hooks_it_would_bypass(pre_hook: bool) -> None:
-    _, vae = _build_pair(TINY_RESIDUAL, torch.float32)
-    conv = vae.decoder.conv_in
+def test_installer_keeps_hooks_on_convolutions_it_would_inline(pre_hook: bool) -> None:
+    reference, vae = _build_pair(TINY_RESIDUAL, torch.float32)
     calls = []
 
     def hook(*args):
         calls.append(True)
 
-    handle = conv.register_forward_pre_hook(hook) if pre_hook else conv.register_forward_hook(hook)
+    handles = [
+        conv.register_forward_pre_hook(hook) if pre_hook else conv.register_forward_hook(hook)
+        for conv in (reference.decoder.conv_in, vae.decoder.conv_in)
+    ]
     try:
-        report = install_wan_vae_fastpath(vae, level="channels_last")
-        assert not report.installed and "decoder.conv_in" in report.reason and "forward hooks" in report.reason
-        vae.decode(torch.randn(1, 4, 2, 6, 8))
-        assert calls
+        latents = torch.randn(1, 4, 2, 6, 8)
+        expected = reference.decode(latents).sample
+        reference_calls = len(calls)
+        calls.clear()
+        assert install_wan_vae_fastpath(vae).installed
+        assert torch.equal(vae.decode(latents).sample, expected)
+        assert len(calls) == reference_calls > 0
     finally:
-        handle.remove()
+        for handle in handles:
+            handle.remove()
 
 
 @torch.no_grad()
@@ -452,11 +466,11 @@ def test_installer_refuses_unsupported_targets() -> None:
 
 @pytest.mark.parametrize(("batch", "frames"), [(1, 1), (1, 2), (2, 1)])
 def test_resample_views_keep_channels_last_recognizable(batch: int, frames: int) -> None:
-    """Regression: ``reshape`` gives a size-1 batch dim a stride the layout heuristic rejects."""
+    """Regression (channels_last level): ``reshape`` gives a size-1 batch dim a stride the layout heuristic rejects."""
     import torch.nn.functional as F
 
     x = torch.randn(batch, 8, frames, 6, 10).contiguous(memory_format=torch.channels_last_3d)
-    merged = fastpath_forwards._merge_batch_and_frames(x)
+    merged = fastpath_forwards._merge_batch_and_frames(x, channels_last=True)
     reference = x.permute(0, 2, 1, 3, 4).reshape(batch * frames, 8, 6, 10)
     assert merged.data_ptr() == x.data_ptr()
     assert torch.equal(merged, reference)
@@ -464,7 +478,7 @@ def test_resample_views_keep_channels_last_recognizable(batch: int, frames: int)
     assert upsampled.stride(1) == 1, "nearest upsample must keep channels_last for the following Conv2d"
     assert torch.equal(upsampled, F.interpolate(reference.contiguous(), scale_factor=(2.0, 2.0), mode="nearest-exact"))
 
-    split = fastpath_forwards._split_batch_and_frames(upsampled, batch, frames)
+    split = fastpath_forwards._split_batch_and_frames(upsampled, batch, frames, channels_last=True)
     assert split.shape == (batch, 8, frames, 12, 20)
     assert split.data_ptr() == upsampled.data_ptr()
     assert split.is_contiguous(memory_format=torch.channels_last_3d)
@@ -472,8 +486,95 @@ def test_resample_views_keep_channels_last_recognizable(batch: int, frames: int)
 
     plain = torch.randn(batch, 8, frames, 6, 10)
     assert torch.equal(
-        fastpath_forwards._merge_batch_and_frames(plain), plain.permute(0, 2, 1, 3, 4).reshape(-1, 8, 6, 10)
+        fastpath_forwards._merge_batch_and_frames(plain, channels_last=True),
+        plain.permute(0, 2, 1, 3, 4).reshape(-1, 8, 6, 10),
     )
+
+
+@pytest.mark.parametrize(("batch", "frames"), [(1, 1), (1, 2), (2, 1)])
+@pytest.mark.parametrize(("height", "width"), [(6, 10), (1, 1)])
+@pytest.mark.parametrize("memory_format", [torch.contiguous_format, torch.channels_last_3d])
+def test_lossless_resample_views_keep_upstream_strides(
+    batch: int, frames: int, height: int, width: int, memory_format: torch.memory_format
+) -> None:
+    """The lossless level reproduces upstream's strides, which pick the next convolution's kernel.
+
+    Channels-last activations and 1x1 ones (whose contiguous strides also pass
+    ``is_contiguous(memory_format=torch.channels_last_3d)``) are not re-laid out.
+    """
+    x = torch.randn(batch, 8, frames, height, width).contiguous(memory_format=memory_format)
+    merged = fastpath_forwards._merge_batch_and_frames(x)
+    reference = x.permute(0, 2, 1, 3, 4).reshape(batch * frames, 8, height, width)
+    assert merged.stride() == reference.stride()
+    assert torch.equal(merged, reference)
+
+    conv_out = torch.randn(batch * frames, 8, 2 * height, 2 * width)
+    if memory_format == torch.channels_last_3d:
+        conv_out = conv_out.contiguous(memory_format=torch.channels_last)
+    split = fastpath_forwards._split_batch_and_frames(conv_out, batch, frames)
+    reference = conv_out.view(batch, frames, 8, 2 * height, 2 * width).permute(0, 2, 1, 3, 4)
+    assert split.data_ptr() == conv_out.data_ptr()
+    assert split.stride() == reference.stride()
+
+    time_conv_out = torch.randn(batch, 16, frames, height, width).contiguous(memory_format=memory_format)
+    interleaved = fastpath_forwards._interleave_time(time_conv_out, batch, 8, frames, height, width)
+    halves = time_conv_out.reshape(batch, 2, 8, frames, height, width)
+    reference = torch.stack((halves[:, 0], halves[:, 1]), 3).reshape(batch, 8, 2 * frames, height, width)
+    assert interleaved.stride() == reference.stride()
+    assert torch.equal(interleaved, reference)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("batch", [1, 2])
+def test_lossless_resample_matches_upstream_for_channels_last_input(dtype: torch.dtype, batch: int) -> None:
+    """A channels-last activation (e.g. from a channels-last latent) leaves the upsampler in upstream's layout.
+
+    With a single batch element, upstream's ``reshape`` gives the batch dimension
+    a stride that ATen does not treat as channels-last, so its ``Conv2d`` runs
+    NCHW; the CPU convolution is layout-sensitive too.
+    """
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanResample
+
+    torch.manual_seed(0)
+    resample = WanResample(16, mode="upsample3d", upsample_out_dim=16).eval().to(dtype)
+    expected_cache, actual_cache = [None], [None]
+    # The first chunk skips the time convolution ("Rep"); later chunks interleave it.
+    for _ in range(3):
+        x = torch.randn(batch, 16, 1, 6, 10).to(dtype).contiguous(memory_format=torch.channels_last_3d)
+        expected = WanResample.forward(resample, x, feat_cache=expected_cache, feat_idx=[0])
+        actual = fastpath_forwards.resample_forward(resample, x, actual_cache, [0])
+        assert actual.stride() == expected.stride()
+        assert torch.equal(actual, expected)
+
+
+def test_suggests_channels_last_matches_aten() -> None:
+    """The port picks the layout ATen's ``F.pad`` allocates, including for ambiguous strides."""
+    import torch.nn.functional as F
+
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath._utils import suggests_channels_last
+
+    candidates = []
+    for batch, height, width in [(1, 6, 10), (3, 6, 10), (1, 1, 1), (3, 1, 1), (1, 1, 5)]:
+        image = torch.randn(batch, 8, height, width)
+        video = torch.randn(batch, 8, 2, height, width)
+        frame = torch.randn(batch, 8, 1, height, width).contiguous(memory_format=torch.channels_last_3d)
+        channels_last_video = video.contiguous(memory_format=torch.channels_last_3d)
+        candidates += [
+            image,
+            image.contiguous(memory_format=torch.channels_last),
+            video,
+            channels_last_video,
+            channels_last_video[:, :, 1:],
+            video.permute(0, 2, 1, 3, 4).contiguous().permute(0, 2, 1, 3, 4),
+            frame,
+            # Upstream's merge of a single channels-last frame.
+            frame.permute(0, 2, 1, 3, 4).reshape(batch, 8, height, width),
+        ]
+    for x in candidates:
+        # Padding every spatial dimension makes the two output layouts distinguishable.
+        padded = F.pad(x, (1, 1) * (x.dim() - 2))
+        assert suggests_channels_last(x) == (padded.stride(1) == 1), (tuple(x.shape), x.stride())
 
 
 @torch.no_grad()
@@ -644,3 +745,37 @@ def test_registry_hook_skips_non_cuda_platform_and_non_wan_vaes(mocker) -> None:
     other = nn.Linear(2, 2)
     registry_module._apply_wan_vae_fastpath_if_enabled(_StubPipeline(other), SimpleNamespace(vae_fast_path="lossless"))
     assert not hasattr(other, REPORT_ATTR)
+
+
+@pytest.mark.parametrize("decode_level", ["off", "lossless", "channels_last"])
+@pytest.mark.parametrize("encode_level", ["off", "lossless", "channels_last"])
+def test_registry_encoder_decoder_settings_are_independent(mocker, decode_level, encode_level) -> None:
+    from tests.diffusion.distributed.test_wan_vae_encoder_fastpath import CONFIG
+
+    vae = AutoencoderKLWan(**CONFIG).eval()
+    platform = mocker.Mock()
+    platform.is_cuda.return_value = True
+    mocker.patch.object(registry_module, "current_omni_platform", platform)
+    registry_module._apply_wan_vae_fastpath_if_enabled(
+        _StubPipeline(vae), SimpleNamespace(vae_fast_path=decode_level, vae_encode_fast_path=encode_level)
+    )
+    assert is_installed(vae) == (decode_level != "off")
+    assert is_encoder_installed(vae) == (encode_level != "off")
+
+
+@pytest.mark.parametrize("failed_component", ["encoder", "decoder"])
+def test_registry_component_failure_does_not_disable_other_component(mocker, failed_component) -> None:
+    from tests.diffusion.distributed.test_wan_vae_encoder_fastpath import CONFIG
+    from vllm_omni.diffusion.distributed.autoencoders import wan_vae_fastpath
+
+    vae = AutoencoderKLWan(**CONFIG).eval()
+    platform = mocker.Mock()
+    platform.is_cuda.return_value = True
+    mocker.patch.object(registry_module, "current_omni_platform", platform)
+    install_name = "install_wan_vae_encoder_fastpath" if failed_component == "encoder" else "install_wan_vae_fastpath"
+    mocker.patch.object(wan_vae_fastpath, install_name, side_effect=RuntimeError("injected failure"))
+    registry_module._apply_wan_vae_fastpath_if_enabled(
+        _StubPipeline(vae), SimpleNamespace(vae_fast_path="lossless", vae_encode_fast_path="lossless")
+    )
+    assert is_encoder_installed(vae) == (failed_component != "encoder")
+    assert is_installed(vae) == (failed_component != "decoder")

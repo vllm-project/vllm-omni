@@ -12,7 +12,9 @@ import torch
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
+from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import async_tensor_h2d
+from vllm.v1.worker.gpu import buffer_utils
 from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
@@ -20,7 +22,7 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
-from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot
+from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
 logger = init_logger(__name__)
@@ -43,7 +45,9 @@ class _CodeRowsSnapshot(PackedOutputSnapshot):
     copy is a single D2H and the per-request views come from one ``split``.
     """
 
-    def __init__(self, codes: torch.Tensor, decode_rows: list[int], num_reqs: int, first_audio=None) -> None:
+    def __init__(
+        self, codes: torch.Tensor, decode_rows: list[int], num_reqs: int, first_audio=None, *, partitioned: bool = False
+    ) -> None:
         dict.__init__(self, {"codes": {"audio": self._rows(codes, decode_rows, num_reqs)}})
         self._first_audio = first_audio
         if first_audio is not None:
@@ -51,6 +55,7 @@ class _CodeRowsSnapshot(PackedOutputSnapshot):
         self._codes = codes
         self._decode_rows = decode_rows
         self._num_reqs = num_reqs
+        self._partitioned = partitioned
         self.producer_event = None
 
     @staticmethod
@@ -61,11 +66,40 @@ class _CodeRowsSnapshot(PackedOutputSnapshot):
         return outputs
 
     def copy_to_cpu(self, copy_tensor):
-        cpu = copy_tensor(self._codes)
-        payload = {"codes": {"audio": self._rows(cpu, self._decode_rows, self._num_reqs)}}
+        rows = self._rows(copy_tensor(self._codes), self._decode_rows, self._num_reqs)
+        first_audio = list(copy_tensor(self._first_audio).unbind()) if self._first_audio is not None else None
+        if self._partitioned:
+            payloads = [{"codes.audio": row} for row in rows]
+            if first_audio is not None:
+                for payload, flag in zip(payloads, first_audio, strict=True):
+                    payload["meta.first_audio"] = flag
+            return RequestOutputSnapshot(payloads)
+        payload = {"codes": {"audio": rows}}
         if self._first_audio is not None:
-            payload["meta"] = {"first_audio": list(copy_tensor(self._first_audio).unbind())}
+            payload["meta"] = {"first_audio": first_audio}
         return payload
+
+
+class _UvaIndexPools:
+    """One pinned device-mapped (UVA) index pool per index upload of a step.
+
+    A pool hands out its next slot on every call and rewrites it ``depth``
+    calls later, while earlier steps may still read it on the GPU. Each pool
+    is therefore used at most once per step, so a slot is reused only after
+    ``depth`` steps.
+    """
+
+    def __init__(self, capacity: int, depth: int) -> None:
+        def pool(shape):
+            return buffer_utils.UvaBufferPool(shape, torch.int64, depth)
+
+        self.reset = pool(capacity)
+        self.mtp = pool((capacity, 2))
+        self.eager_slots = pool(capacity)
+        self.eager_offsets = pool(capacity)
+        self.eager_mtp_slots = pool(capacity)
+        self.rows = pool(capacity)
+        self.keep = pool(capacity)
 
 
 class MossLocalModelState(OmniModelState):
@@ -82,6 +116,17 @@ class MossLocalModelState(OmniModelState):
             self._local_eager_mtp,
         )
         logger.info("MOSS Local MRV2 GPU slot state enabled: capacity=%d", self.scheduler_config.max_num_seqs)
+        # Per-step slot/offset indices go through pinned device-mapped (UVA)
+        # ring buffers read directly by fused copy kernels, instead of a pinned
+        # allocation + H2D upload and several eager gathers per step.
+        self._uva: _UvaIndexPools | None = None
+        self._pending_resets: list[int] = []
+        if device.type == "cuda" and is_uva_available():
+            # Round-robin depth: CPU may run a few steps ahead of the GPU.
+            depth = buffer_utils._DEFAULT_MAX_CONCURRENCY + 2
+            self._uva = _UvaIndexPools(self.scheduler_config.max_num_seqs, depth)
+            logger.info("MOSS Local MRV2 UVA slot-state indices enabled (depth=%d)", depth)
+        self._partitioned_rows = bool(getattr(getattr(vllm_config, "model_config", None), "async_chunk", False))
         self._early_first_audio = None
         decoder = getattr(model, "first_frame_decoder", None)
         if decoder is not None:
@@ -213,14 +258,36 @@ class MossLocalModelState(OmniModelState):
 
     def add_request(self, req_index, new_req_data):
         super().add_request(req_index, new_req_data)
-        self._hidden_pool[req_index].zero_()
-        self._codes_pool[req_index].fill_(self.model.audio_pad_token_id)
-        self._active_pool[req_index].fill_(True)
         self._active_host[req_index] = True
         self._eager_host[req_index] = False
         self._first_mtp_slots.discard(req_index)
+        if self._uva is not None:
+            # Applied by one fused kernel at the start of the next preprocess,
+            # before any read of this slot in stream order.
+            self._pending_resets.append(req_index)
+            return
+        self._hidden_pool[req_index].zero_()
+        self._codes_pool[req_index].fill_(self.model.audio_pad_token_id)
+        self._active_pool[req_index].fill_(True)
         self._keep_pool[req_index].fill_(False)
         self._eager_emb_pool[req_index].zero_()
+
+    def _flush_pending_resets(self, uva: _UvaIndexPools) -> None:
+        if not self._pending_resets:
+            return
+        from vllm_omni.model_executor.models.moss_tts.local_state_kernels import reset_slots
+
+        slots = uva.reset.copy_to_uva(np.asarray(self._pending_resets, dtype=np.int64))
+        self._pending_resets.clear()
+        reset_slots(
+            slots,
+            self._hidden_pool,
+            self._codes_pool,
+            self._active_pool,
+            self._keep_pool,
+            self._eager_emb_pool,
+            self.model.audio_pad_token_id,
+        )
 
     def remove_request(self, req_index_or_id):
         # Freeing is CPU bookkeeping. Reinitialization happens on admission,
@@ -234,9 +301,12 @@ class MossLocalModelState(OmniModelState):
             early.remove(request_id)
         super().remove_request(req_index_or_id)
 
-    def _select_rows(self, tensor, rows):
+    def _select_rows(self, tensor, rows, pool=None):
+        """Rows of ``tensor``; ``pool`` is the call site's own UVA index pool."""
         if rows == list(range(len(rows))):
             selected = tensor[: len(rows)]
+        elif pool is not None:
+            selected = tensor.index_select(0, pool.copy_to_uva(np.asarray(rows, dtype=np.int64)))
         else:
             indices = _metadata_to_device(np.asarray(rows, dtype=np.int64), tensor.device)
             selected = tensor.index_select(0, indices)
@@ -244,6 +314,8 @@ class MossLocalModelState(OmniModelState):
         return selected.long()
 
     def run_preprocess(self, input_batch, model_inputs, req_states=None, mtp_batch_descriptor_dispatcher=None):
+        if self._uva is not None:
+            self._flush_pending_resets(self._uva)
         input_ids = model_inputs.get("input_ids")
         if input_ids is None:
             input_ids = input_batch.input_ids
@@ -349,9 +421,11 @@ class MossLocalModelState(OmniModelState):
             self._local_eager_rows = eager_rows
             if eager_rows:
                 # Their frame was sampled after the previous forward.
-                slots = self._select_rows(input_batch.idx_mapping, eager_rows)
+                slots = self._select_rows(input_batch.idx_mapping, eager_rows, self._uva and self._uva.eager_slots)
                 offsets = self._mtp_offsets[: len(eager_rows)]
-                offsets.copy_(self._select_rows(input_batch.query_start_loc, eager_rows))
+                offsets.copy_(
+                    self._select_rows(input_batch.query_start_loc, eager_rows, self._uva and self._uva.eager_offsets)
+                )
                 embeds.index_copy_(
                     0, offsets, embeds.index_select(0, offsets) + self._eager_emb_pool.index_select(0, slots)
                 )
@@ -360,8 +434,8 @@ class MossLocalModelState(OmniModelState):
         elif decode_rows:
             cached = [row for row in decode_rows if int(input_batch.idx_mapping_np[row]) in self._first_mtp_slots]
             if cached:
-                slots = self._select_rows(input_batch.idx_mapping, cached)
-                offsets = self._select_rows(input_batch.query_start_loc, cached)
+                slots = self._select_rows(input_batch.idx_mapping, cached, self._uva and self._uva.eager_slots)
+                offsets = self._select_rows(input_batch.query_start_loc, cached, self._uva and self._uva.eager_offsets)
                 embeds.index_copy_(
                     0, offsets, embeds.index_select(0, offsets) + self._eager_emb_pool.index_select(0, slots)
                 )
@@ -373,16 +447,26 @@ class MossLocalModelState(OmniModelState):
 
     def _run_slot_mtp(self, batch, input_ids, embeds, rows, dispatcher):
         bsz = len(rows)
-        slots = self._select_rows(batch.idx_mapping, rows)
-        # Upstream query_start_loc is int32; index_copy_ requires int64.
         offsets = self._mtp_offsets[:bsz]
-        offsets.copy_(self._select_rows(batch.query_start_loc, rows))
         ids, emb = self._mtp_input_ids[:bsz], self._mtp_input_embeds[:bsz]
         hidden, step = self._mtp_hidden[:bsz], self._mtp_text_step[:bsz]
-        ids.copy_(input_ids.index_select(0, offsets))  # MRV2 token inputs are int32.
-        torch.index_select(embeds, 0, offsets, out=emb)
-        torch.index_select(self._hidden_pool, 0, slots, out=hidden)
-        step[:, 0].copy_(self._active_pool.index_select(0, slots))
+        uva_index = None
+        if self._uva is not None:
+            from vllm_omni.model_executor.models.moss_tts.local_state_kernels import gather_mtp
+
+            host = np.empty((bsz, 2), dtype=np.int64)
+            host[:, 0] = batch.idx_mapping_np[rows]
+            host[:, 1] = batch.query_start_loc_np[rows]
+            uva_index = self._uva.mtp.copy_to_uva(host)
+            gather_mtp(uva_index, input_ids, embeds, self._hidden_pool, self._active_pool, ids, emb, hidden, step)
+        else:
+            slots = self._select_rows(batch.idx_mapping, rows)
+            # Upstream query_start_loc is int32; index_copy_ requires int64.
+            offsets.copy_(self._select_rows(batch.query_start_loc, rows))
+            ids.copy_(input_ids.index_select(0, offsets))  # MRV2 token inputs are int32.
+            torch.index_select(embeds, 0, offsets, out=emb)
+            torch.index_select(self._hidden_pool, 0, slots, out=hidden)
+            step[:, 0].copy_(self._active_pool.index_select(0, slots))
 
         buffers = [self.intermediate_buffer.buffers[int(batch.idx_mapping_np[row])] for row in rows]
         req_ids = [str(buf["req_id"]) for buf in buffers]
@@ -409,6 +493,11 @@ class MossLocalModelState(OmniModelState):
         early = getattr(self, "_early_first_audio", None)
         if early is not None:
             early.after_mtp(req_ids, codes[:bsz], ids)
+        if uva_index is not None:
+            from vllm_omni.model_executor.models.moss_tts.local_state_kernels import scatter_mtp
+
+            scatter_mtp(uva_index, new_emb[:bsz], codes[:bsz], embeds, self._codes_pool)
+            return
         embeds.index_copy_(0, offsets, new_emb[:bsz])
         self._codes_pool.index_copy_(0, slots, codes[:bsz])
 
@@ -421,7 +510,7 @@ class MossLocalModelState(OmniModelState):
         text embedding. A decode row emits only if its previous frame did.
         """
         bsz = len(rows)
-        slots = self._select_rows(batch.idx_mapping, rows)
+        slots = self._select_rows(batch.idx_mapping, rows, self._uva and self._uva.eager_mtp_slots)
         ids, emb = self._mtp_input_ids[:bsz], self._mtp_input_embeds[:bsz]
         hidden, step = self._mtp_hidden[:bsz], self._mtp_text_step[:bsz]
         ids.zero_()  # the MTP does not read token ids
@@ -506,17 +595,22 @@ class MossLocalModelState(OmniModelState):
             return model_output, {}
         # This gather is an owned snapshot. Later slot writes cannot change
         # data already handed to the runner, even before its D2H completes.
-        slots = self._select_rows(input_batch.idx_mapping, self._decode_rows)
+        slots = self._select_rows(input_batch.idx_mapping, self._decode_rows, self._uva and self._uva.rows)
         codes = self._codes_pool.index_select(0, slots)
         keep = codes.ne(model.audio_pad_token_id).any(dim=-1)
         if self._decode_rows == list(range(input_batch.num_reqs)):
             model._batch_should_continue = keep
         else:
-            rows = _metadata_to_device(
-                np.asarray(self._decode_rows, dtype=np.int64),
-                codes.device,
-            )
+            if self._uva is not None:
+                rows = self._uva.keep.copy_to_uva(np.asarray(self._decode_rows, dtype=np.int64))
+            else:
+                rows = _metadata_to_device(
+                    np.asarray(self._decode_rows, dtype=np.int64),
+                    codes.device,
+                )
             model._batch_should_continue.index_copy_(0, rows, keep)
         early = getattr(self, "_early_first_audio", None)
         first_audio = early.take_flags(input_batch.req_ids, codes.device) if early is not None else None
-        return model_output, _CodeRowsSnapshot(codes, list(self._decode_rows), input_batch.num_reqs, first_audio)
+        return model_output, _CodeRowsSnapshot(
+            codes, list(self._decode_rows), input_batch.num_reqs, first_audio, partitioned=self._partitioned_rows
+        )

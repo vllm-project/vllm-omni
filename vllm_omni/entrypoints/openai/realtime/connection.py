@@ -16,6 +16,16 @@ import numpy as np
 import pybase64 as base64
 from fastapi import WebSocket, WebSocketDisconnect
 from openai.types import realtime as types
+from openai.types.chat import (
+    ChatCompletionContentPartImageParam,
+    ChatCompletionContentPartInputAudioParam,
+    ChatCompletionContentPartParam,
+    ChatCompletionContentPartTextParam,
+    ChatCompletionMessageParam,
+    ChatCompletionUserMessageParam,
+)
+from openai.types.chat.chat_completion_content_part_image_param import ImageURL
+from openai.types.chat.chat_completion_content_part_input_audio_param import InputAudio
 from pydantic import TypeAdapter
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
@@ -55,6 +65,9 @@ MAX_INPUT_AUDIO_BUFFER_BYTES = 64 * 1024 * 1024
 
 AUTO_TRUNCATION_TRIGGER_RATIO = 0.8
 AUTO_TRUNCATION_TARGET_RATIO = 0.5
+
+# OpenAI's error code for a cancel when no matching response is in progress.
+RESPONSE_CANCEL_NOT_ACTIVE = "response_cancel_not_active"
 
 
 def _is_prompt_limit_error(exc: VLLMValidationError) -> bool:
@@ -112,7 +125,6 @@ class OpenAIFullDuplexConnection:
             await self.ws.accept()
             logger.info("[realtime] connection opened, session_id=%s", self.session.session_id)
             await self._send_session_created()
-            await self._send_conversation_created()
 
             while self._connected:
                 try:
@@ -1275,7 +1287,7 @@ class OpenAIFullDuplexConnection:
         if active is None:
             await self._send_error(
                 "No response is in progress",
-                "invalid_request_error",
+                RESPONSE_CANCEL_NOT_ACTIVE,
                 event_id=event.event_id,
             )
             return
@@ -1283,7 +1295,7 @@ class OpenAIFullDuplexConnection:
         if response_id is not None and response_id != active.response_id:
             await self._send_error(
                 f"Response '{response_id}' is not in progress",
-                "invalid_request_error",
+                RESPONSE_CANCEL_NOT_ACTIVE,
                 event_id=event.event_id,
             )
             return
@@ -1335,16 +1347,16 @@ class OpenAIFullDuplexConnection:
         await self._send_conversation_item_added_and_done(item, prev_id)
 
     def _validate_input_item(self, item: types.ConversationItem) -> None:
-        for part in getattr(item, "content", None) or []:
-            part_type = getattr(part, "type", None)
-            if part_type == "input_image":
-                raise ValueError("Image input is not supported")
-            if part_type == "input_audio":
-                audio = getattr(part, "audio", None)
-                if audio:
-                    self._decode_pcm16(audio)
-            if part_type == "output_audio" and getattr(part, "audio", None):
-                raise ValueError("Client-provided assistant audio is not supported")
+        if isinstance(item, types.RealtimeConversationItemUserMessage):
+            for part in item.content:
+                if part.type == "input_image" and not part.image_url:
+                    raise ValueError("input_image requires an image_url")
+                if part.type == "input_audio" and part.audio:
+                    self._decode_pcm16(part.audio)
+        elif isinstance(item, types.RealtimeConversationItemAssistantMessage):
+            for part in item.content:
+                if part.type == "output_audio" and part.audio:
+                    raise ValueError("Client-provided assistant audio is not supported")
 
     # ------------------------------------------------------------------ #
     #  conversation.item.delete                                           #
@@ -1617,7 +1629,7 @@ class OpenAIFullDuplexConnection:
         s = self.session
         effective_instructions = instructions if instructions is not None else s.config.instructions
         effective_items = items if items is not None else s.items
-        messages: list[dict[str, Any]] = []
+        messages: list[ChatCompletionMessageParam] = []
         converted_tools = self._convert_tools(tools) if tools else None
 
         if effective_instructions:
@@ -1646,23 +1658,28 @@ class OpenAIFullDuplexConnection:
 
             role = getattr(item, "role", None)
             if role == "user":
-                content = []
+                content: list[ChatCompletionContentPartParam] = []
                 for part in item.content:
                     if part.type == "input_audio" and part.audio:
                         audio_bytes = self._decode_pcm16(part.audio, MAX_INPUT_AUDIO_BUFFER_BYTES)
                         content.append(
-                            {
-                                "type": "input_audio",
-                                "input_audio": {
-                                    "data": self._pcm16_wav_b64(audio_bytes),
-                                    "format": "wav",
-                                },
-                            }
+                            ChatCompletionContentPartInputAudioParam(
+                                type="input_audio",
+                                input_audio=InputAudio(
+                                    data=self._pcm16_wav_b64(audio_bytes),
+                                    format="wav",
+                                ),
+                            )
                         )
                     elif part.type == "input_text" and part.text:
-                        content.append({"type": "text", "text": part.text})
+                        content.append(ChatCompletionContentPartTextParam(type="text", text=part.text))
+                    elif part.type == "input_image" and part.image_url:
+                        image_url = ImageURL(url=part.image_url)
+                        if part.detail is not None:
+                            image_url["detail"] = part.detail
+                        content.append(ChatCompletionContentPartImageParam(type="image_url", image_url=image_url))
                 if content:
-                    messages.append({"role": "user", "content": content})
+                    messages.append(ChatCompletionUserMessageParam(role="user", content=content))
             elif role == "assistant":
                 text = self._assistant_item_text(item)
                 if text:
@@ -1851,18 +1868,6 @@ class OpenAIFullDuplexConnection:
                 event_id=_gen_id("evt"),
                 type="session.updated",
                 session=session_obj,  # type: ignore[arg-type]
-            )
-        )
-
-    async def _send_conversation_created(self) -> None:
-        await self._send_event(
-            types.ConversationCreatedEvent(
-                event_id=_gen_id("evt"),
-                type="conversation.created",
-                conversation={  # type: ignore[arg-type]
-                    "id": self.session.conversation_id,
-                    "object": "realtime.conversation",
-                },
             )
         )
 

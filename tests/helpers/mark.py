@@ -225,9 +225,12 @@ def _normalize_num_cards(res: dict[str, SkuSpec], num_cards: int | dict[str, int
     device_class = get_supported_platforms() - allowed
     for platform in res:
         if platform in device_class:
+            accelerators = ", ".join(sorted(allowed))
+            if platform == "cpu":
+                raise ValueError(f"{platform!r} is not a res dict key; use pytest.mark.cpu.")
             raise ValueError(
-                f"{platform!r} is not a res dict key; use pytest.mark.{platform} "
-                f"or an accelerator key ({', '.join(sorted(allowed))})."
+                f"{platform!r} is not a res dict key. It is auto-added for [gpu] platforms; "
+                f"use an accelerator key ({accelerators})."
             )
         if platform not in allowed:
             supported = ", ".join(sorted(allowed)) or "(none)"

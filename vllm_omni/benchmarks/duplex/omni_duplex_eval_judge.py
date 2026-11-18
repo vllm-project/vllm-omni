@@ -23,7 +23,7 @@ def _build_openai_url(base_url: str, api_path: str) -> str:
 
 
 class DuplexJudge:
-    def __init__(self, base_url: str, model: str, *, api_key: str = "EMPTY", timeout: int = 600) -> None:
+    def __init__(self, base_url: str, model: str, *, api_key: str = "EMPTY", timeout: float = 600.0) -> None:
         self.base_url, self.model, self.api_key, self.timeout = base_url, model, api_key, timeout
 
     def chat(self, content: Any, *, system: str | None = None, max_tokens: int = 1200) -> str:

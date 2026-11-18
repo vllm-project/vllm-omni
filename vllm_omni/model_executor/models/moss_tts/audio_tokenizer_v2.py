@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import math
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -200,6 +201,9 @@ class StreamingExecutionContext:
     state_slot_ids: torch.Tensor
     valid_rows: torch.Tensor
     attention_metadata: StreamingAttentionMetadata | None = None
+    # One transformer's ``rope_angles`` result, shared by its layers, whose
+    # per-slot offsets advance together.
+    rope_table: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def validate(self, *, batch_size: int, state_capacity: int, device: torch.device) -> None:
         if self.state_slot_ids.shape != (batch_size,):
@@ -356,6 +360,45 @@ def create_norm_fn(norm_type: str, dim: int, **kwargs) -> nn.Module:
 # =============================================================================
 
 
+def _rope_angles(
+    offset: torch.Tensor,
+    batch: int,
+    num_frames: int,
+    head_dim: int,
+    max_period: float,
+    time_before_heads: bool,
+    device: torch.device,
+    freqs_cache: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """fp32 rotation angles, (B, T, 1, D/2) or (B, 1, T, D/2)."""
+    if freqs_cache is None:
+        ds = torch.arange(head_dim // 2, device=device, dtype=torch.float32)
+        freqs_cache = torch.exp(ds * (-math.log(max_period) * 2 / head_dim))
+    ts = offset.float().view(-1, 1) + torch.arange(num_frames, device=device, dtype=torch.float32)
+    return freqs_cache * (ts.view(batch, -1, 1, 1) if time_before_heads else ts.view(batch, 1, -1, 1))
+
+
+@torch.library.custom_op("vllm_omni::moss_codec_rope_angles", mutates_args=())
+def rope_angles(
+    offset: torch.Tensor, num_frames: int, head_dim: int, max_period: float, freqs_cache: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(cos, sin)``, each (B, 1, T, D/2) fp32, as ``apply_rope`` computes them.
+
+    Opaque to Inductor on purpose: a materialized table is shared by many
+    layers instead of being recomputed inside every rotation kernel.
+    """
+    angles = _rope_angles(offset, offset.shape[0], num_frames, head_dim, max_period, False, offset.device, freqs_cache)
+    return torch.cos(angles), torch.sin(angles)
+
+
+@rope_angles.register_fake
+def _(
+    offset: torch.Tensor, num_frames: int, head_dim: int, max_period: float, freqs_cache: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    shape = (offset.shape[0], 1, num_frames, head_dim // 2)
+    return offset.new_empty(shape, dtype=torch.float32), offset.new_empty(shape, dtype=torch.float32)
+
+
 def apply_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -363,6 +406,7 @@ def apply_rope(
     max_period: float = 10_000,
     time_before_heads: bool = False,
     freqs_cache: torch.Tensor | None = None,
+    table: tuple[torch.Tensor, torch.Tensor] | None = None,
 ):
     """Apply rotary position embedding (GPT-J interleaved convention).
 
@@ -380,6 +424,13 @@ def apply_rope(
     returned tensors are **not** interchangeable between the two paths — callers
     must not mix NPU and non-NPU outputs.  Result is bf16-equivalent (max
     ``max_abs_diff <= 1 ULP``).  Falls back to the eager path on non-NPU.
+
+    When ``table`` is provided (precomputed by the parent ``Transformer.forward``
+    via ``rope_angles`` and shared across all layers within that block), the
+    per-layer cos/sin computation is skipped on both the NPU and the eager
+    path -- one computation per transformer block instead of one per layer
+    (~86 redundant dispatches removed for a 92-layer / 6-block decoder, ~15x
+    reduction per block on NPU).
     """
     if time_before_heads:
         B, T, H, D = q.shape
@@ -390,24 +441,17 @@ def apply_rope(
     if D <= 0 or (D % 2) != 0:
         raise ValueError(f"RoPE requires an even last dimension, got D={D}")
 
-    if freqs_cache is not None:
-        freqs = freqs_cache
-    else:
-        ds = torch.arange(D // 2, device=q.device, dtype=torch.float32)
-        freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
-    ts = offset.float().view(-1, 1) + torch.arange(T, device=q.device, dtype=torch.float32)
-
-    if time_before_heads:
-        ts = ts.view(B, -1, 1, 1)
-    else:
-        ts = ts.view(B, 1, -1, 1)
-
     # Fast path: npu_rotary_mul (fused rotation kernel) on NPU.
     if q.device.type == "npu":
         torch_npu = _get_torch_npu()
 
-        cos_d2 = torch.cos(freqs * ts)  # (..., 1, T, D//2)
-        sin_d2 = torch.sin(freqs * ts)
+        if table is not None:
+            # Precomputed by ``rope_angles`` for these offsets: same values.
+            cos_d2, sin_d2 = table
+        else:
+            angles = _rope_angles(offset, B, T, D, max_period, time_before_heads, q.device, freqs_cache)
+            cos_d2 = torch.cos(angles)  # (..., 1, T, D//2)
+            sin_d2 = torch.sin(angles)
         # neox cos/sin: cat([first_half, second_half]) -- each freq once per half.
         cos = torch.cat([cos_d2, cos_d2], dim=-1)  # (..., 1, T, D)
         sin = torch.cat([sin_d2, sin_d2], dim=-1)
@@ -432,8 +476,13 @@ def apply_rope(
     qr, qi = q[..., 0].float(), q[..., 1].float()
     kr, ki = k[..., 0].float(), k[..., 1].float()
 
-    rotr = torch.cos(freqs * ts)
-    roti = torch.sin(freqs * ts)
+    if table is not None:
+        # Precomputed by ``rope_angles`` for these offsets: same values.
+        rotr, roti = table
+    else:
+        angles = _rope_angles(offset, B, T, D, max_period, time_before_heads, q.device, freqs_cache)
+        rotr = torch.cos(angles)
+        roti = torch.sin(angles)
 
     qor = qr * rotr - qi * roti
     qoi = qr * roti + qi * rotr
@@ -472,10 +521,11 @@ class MossAudioTokenizerRotaryEmbedding(nn.Module):
         k: torch.Tensor,
         offset: torch.Tensor,
         time_before_heads: bool = False,
+        table: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         D = q.shape[-1]
         freqs = self._get_freqs(D, q.device)  # noqa: N806
-        return apply_rope(q, k, offset, self.max_period, time_before_heads, freqs_cache=freqs)
+        return apply_rope(q, k, offset, self.max_period, time_before_heads, freqs_cache=freqs, table=table)
 
 
 # =============================================================================
@@ -823,6 +873,8 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
 
         self._register_load_state_dict_pre_hook(self._load_hook, with_module=True)
 
+        self._cached_attn_bias: torch.Tensor | None = None
+
     @staticmethod
     def _load_hook(module, state_dict, prefix, *_):
         mappings = {
@@ -896,6 +948,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         key: torch.Tensor,
         value: torch.Tensor,
         execution_context: StreamingExecutionContext | None = None,
+        attn_bias: torch.Tensor | None = None,
     ):
         state = cast(MHAState | None, self._streaming_state)
         B, T = query.shape[:2]
@@ -923,7 +976,8 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         q, k, v = projected[0], projected[1], projected[2]
 
         if self.rope:
-            q, k = self.rope(q, k, offset, time_before_heads=False)
+            table = execution_context.rope_table if execution_context is not None else None
+            q, k = self.rope(q, k, offset, time_before_heads=False, table=table)
 
         slot_attention = getattr(self, "_slot_attention", None)
         slot_attention_rows = getattr(self, "_slot_attention_rows", None)
@@ -969,42 +1023,47 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
             )
         else:
             k, v, pos_k = self._complete_kv(k, v, execution_context)
-            pos_k = pos_k[:, None]
 
-            if metadata is not None:
-                attn_bias = metadata.attn_bias
-                streaming_attention = getattr(self, "_streaming_attention", None)
-            elif self.causal:
-                # Reuse cached arange(T) — keyed by (device, T) so that changing
-                # T never frees a previous allocation (CUDA graph safety: a
-                # captured graph bakes in the pointer, so storage must live as
-                # long as the module and all captured graphs).
-                cache_key = (q.device, T)
-                if cache_key not in self._arange_t_cache:
-                    self._arange_t_cache[cache_key] = torch.arange(T, device=q.device, dtype=torch.long)
-                pos_q = offset.view(-1, 1, 1) + self._arange_t_cache[cache_key].view(-1, 1)
-                delta = pos_q - pos_k
-                # Build mask directly in the convention needed by the active path.
-                # SDPA / streaming_attention use True=attend; npu_fusion_attention
-                # uses True=masked.  On NPU we construct the inverted mask directly
-                # (avoids a ~attn_bias allocation + kernel per layer per step).
-                is_npu = q.device.type == "npu" and q.dtype in (torch.float16, torch.bfloat16)
-                streaming_attention = getattr(self, "_streaming_attention", None)
-                use_npu_path = is_npu and streaming_attention is None
-                if use_npu_path:
-                    # NPU convention: True = masked (inverted)
-                    attn_bias = (pos_k < 0) | (delta < 0)
-                    if self.context is not None:
-                        attn_bias = attn_bias | (delta >= self.context)
-                    attn_bias = attn_bias[:, None]
+            if attn_bias is None:
+                pos_k = pos_k[:, None]
+                if metadata is not None:
+                    attn_bias = metadata.attn_bias
+                    streaming_attention = getattr(self, "_streaming_attention", None)
+                elif self.causal:
+                    # Reuse cached arange(T) — keyed by (device, T) so that changing
+                    # T never frees a previous allocation (CUDA graph safety: a
+                    # captured graph bakes in the pointer, so storage must live as
+                    # long as the module and all captured graphs).
+                    cache_key = (q.device, T)
+                    if cache_key not in self._arange_t_cache:
+                        self._arange_t_cache[cache_key] = torch.arange(T, device=q.device, dtype=torch.long)
+                    pos_q = offset.view(-1, 1, 1) + self._arange_t_cache[cache_key].view(-1, 1)
+                    delta = pos_q - pos_k
+                    # Build mask directly in the convention needed by the active path.
+                    # SDPA / streaming_attention use True=attend; npu_fusion_attention
+                    # uses True=masked.  On NPU we construct the inverted mask directly
+                    # (avoids a ~attn_bias allocation + kernel per layer per step).
+                    is_npu = q.device.type == "npu" and q.dtype in (torch.float16, torch.bfloat16)
+                    streaming_attention = getattr(self, "_streaming_attention", None)
+                    use_npu_path = is_npu and streaming_attention is None
+                    if use_npu_path:
+                        # NPU convention: True = masked (inverted)
+                        attn_bias = (pos_k < 0) | (delta < 0)
+                        if self.context is not None:
+                            attn_bias = attn_bias | (delta >= self.context)
+                        attn_bias = attn_bias[:, None]
+                    else:
+                        # SDPA / streaming_attention convention: True = attend
+                        attn_bias = (pos_k >= 0) & (delta >= 0)
+                        if self.context is not None:
+                            attn_bias = attn_bias & (delta < self.context)
+                        attn_bias = attn_bias[:, None]
                 else:
-                    # SDPA / streaming_attention convention: True = attend
-                    attn_bias = (pos_k >= 0) & (delta >= 0)
-                    if self.context is not None:
-                        attn_bias = attn_bias & (delta < self.context)
-                    attn_bias = attn_bias[:, None]
+                    attn_bias = None
+                    streaming_attention = getattr(self, "_streaming_attention", None)
+                    use_npu_path = False
+                self._cached_attn_bias = attn_bias
             else:
-                attn_bias = None
                 streaming_attention = getattr(self, "_streaming_attention", None)
                 use_npu_path = False
 
@@ -1177,24 +1236,30 @@ class MossAudioTokenizerTransformerLayer(StreamingModule):
                 update = apply_weights_per_step(self.gating, self.weights_per_step_schedule, x, offset)
             else:
                 update = self.gating(x)
+        if isinstance(self.layer_scale_2, MossAudioTokenizerLayerScale):
+            return torch.addcmul(x_orig.to(update.dtype), update, self.layer_scale_2.scale)
         return x_orig.to(update.dtype) + self.layer_scale_2(update)
 
     def _sa_block(
         self,
         x: torch.Tensor,
         execution_context: StreamingExecutionContext | None = None,
+        attn_bias: torch.Tensor | None = None,
     ):
         x_orig = x
         x = self.norm1(x)
-        update = self.self_attn(x, x, x, execution_context=execution_context)
+        update = self.self_attn(x, x, x, execution_context=execution_context, attn_bias=attn_bias)
+        if isinstance(self.layer_scale_1, MossAudioTokenizerLayerScale):
+            return torch.addcmul(x_orig.to(update.dtype), update, self.layer_scale_1.scale)
         return x_orig.to(update.dtype) + self.layer_scale_1(update)
 
     def forward(
         self,
         x: torch.Tensor,
         execution_context: StreamingExecutionContext | None = None,
+        attn_bias: torch.Tensor | None = None,
     ):
-        x = self._sa_block(x, execution_context)
+        x = self._sa_block(x, execution_context, attn_bias)
         x = self._ff_block(x, execution_context)
         state = self._streaming_state
         if state is not None and execution_context is None:
@@ -1252,7 +1317,7 @@ class MossAudioTokenizerTransformer(StreamingModule):
         self._kv_capacity = context if context is not None else 1024
         self._kv_context = context
         self._kv_causal = causal
-
+        self._head_dim = d_model // num_heads
         self.rope: MossAudioTokenizerRotaryEmbedding | None = None
         if positional_embedding in {"rope", "sin_rope"}:
             self.rope = MossAudioTokenizerRotaryEmbedding(max_period=max_period)
@@ -1272,6 +1337,8 @@ class MossAudioTokenizerTransformer(StreamingModule):
                     **kwargs,
                 )
             )
+
+        self._share_attn_bias: bool = True
 
     def _init_streaming_state(self, batch_size: int) -> TransformerState:
         device = next(self.parameters()).device
@@ -1325,8 +1392,27 @@ class MossAudioTokenizerTransformer(StreamingModule):
             pos_emb = create_sin_embedding(positions, C, max_period=self.max_period, dtype=x.dtype)
             x = x + self.positional_scale * pos_emb
 
-        for layer in self.layers:
-            x = layer(x, *args, execution_context=execution_context, **kwargs)
+        if self.rope is not None and execution_context is not None and getattr(self, "_shared_rope", False):
+            # Every layer's attention offset equals these offsets (one reset,
+            # one advance per call), so they share one rotation table.
+            table = rope_angles(
+                offsets, T, self._head_dim, float(self.rope.max_period), self.rope._get_freqs(self._head_dim, x.device)
+            )
+            execution_context = dataclasses.replace(execution_context, rope_table=table)
+
+        shared_attn_bias: torch.Tensor | None = None
+        try:
+            for i, layer in enumerate(self.layers):
+                if self._share_attn_bias and i == 0:
+                    x = layer(x, *args, attn_bias=None, execution_context=execution_context, **kwargs)
+                    shared_attn_bias = layer.self_attn._cached_attn_bias
+                elif self._share_attn_bias:
+                    x = layer(x, *args, attn_bias=shared_attn_bias, execution_context=execution_context, **kwargs)
+                else:
+                    x = layer(x, *args, attn_bias=None, execution_context=execution_context, **kwargs)
+        finally:
+            for layer in self.layers:
+                layer.self_attn._cached_attn_bias = None
 
         if state is not None:
             assert isinstance(state, TransformerState)

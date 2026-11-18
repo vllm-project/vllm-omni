@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import tempfile
 from contextlib import AbstractContextManager
 from types import SimpleNamespace
@@ -1231,3 +1233,28 @@ def test_ulysses_uaa_hybrid_ring_matches_baseline(
                 os.remove(path)
             except OSError:
                 pass
+
+
+def test_default_ulysses_import_does_not_require_optional_symmem_backend():
+    # Use a fresh interpreter: successful CUDA E2E cannot cover missing optional
+    # dependencies, and this test module already imported Ulysses above.
+    code = """
+import importlib.abc
+import sys
+
+blocked = {
+    "vllm_omni.diffusion.distributed.a2a_permute",
+    "vllm_omni.diffusion.distributed.qkv_a2a",
+}
+
+class WithoutOptionalBackend(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in blocked:
+            raise ImportError("optional symmetric-memory backend unavailable")
+
+sys.meta_path.insert(0, WithoutOptionalBackend())
+from vllm_omni.diffusion.attention.parallel.ulysses import UlyssesParallelAttention
+assert blocked.isdisjoint(sys.modules)
+"""
+    result = subprocess.run([sys.executable, "-c", code], text=True, capture_output=True, timeout=60)
+    assert result.returncode == 0, result.stderr

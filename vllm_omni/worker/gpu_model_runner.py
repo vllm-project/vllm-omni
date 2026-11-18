@@ -99,6 +99,12 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         # policy counterpart lives on PrefixCacheRunnerMixin.
         self._pooler_payload_include_hidden_flag = True
 
+    def shutdown(self) -> None:
+        # Also inherited by OmniNPUModelRunner. GPU AR stops the cache
+        # earlier in its teardown; the shared helper is idempotent.
+        self._shutdown_omni_prefix_cache()
+        super().shutdown()
+
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
         override_fn = self._sampled_token_ids_cpu_override
         if callable(override_fn):

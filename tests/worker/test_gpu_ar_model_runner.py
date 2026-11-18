@@ -250,7 +250,6 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     serving.model_config = SimpleNamespace(async_chunk=True)
     serving._tts_model_type = "higgs_audio_v3"
     serving._get_tts_adapter = lambda: Adapter()
-    serving._track_ref_audio_artifact_warmup = lambda *args, **kwargs: None
     serving._speech_output_policies = {}
 
     _, stage_sampling_params, _ = asyncio.run(serving._prepare_speech_generation(request, request_id="speech-test"))
@@ -1799,6 +1798,7 @@ class TestDownstreamPayloadMemoization:
 
     def _runner(self, stages):
         runner = object.__new__(GPUARModelRunner)
+        runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=0))
         runner._downstream_payload_cache = {}
         runner._request_final_stage_id = lambda rid: stages[rid]
         return runner

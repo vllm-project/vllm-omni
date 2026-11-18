@@ -6,9 +6,11 @@ import torch
 import torch.nn.functional as F
 from vllm.triton_utils import HAS_TRITON
 
+from tests.helpers.mark import hardware_marks
+
 pytestmark = [
     pytest.mark.core_model,
-    pytest.mark.cuda,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
     pytest.mark.diffusion,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
     pytest.mark.skipif(not HAS_TRITON, reason="Triton required"),

@@ -46,7 +46,7 @@ from vllm_omni.diffusion.sched.interface import (
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 from vllm_omni.diffusion.worker.input_batch import InputBatch
-from vllm_omni.diffusion.worker.utils import RunnerOutput, StepRequestState
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput, StepRequestState
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
@@ -1323,6 +1323,36 @@ class TestWorker:
         DiffusionWorker.execute_stepwise(worker, next_batch)
         assert "req-1" not in worker._step_lora_state
         assert worker._step_lora_state == {"req-2": (lora_request, 1.0)}
+
+    @pytest.mark.parametrize("error", [None, "decode failed"])
+    def test_terminal_output_retires_lora_state_without_another_wave(self, error):
+        terminal = RunnerOutput("done", finished=True, result=DiffusionOutput(error=error))
+        # A decoded chunk is not necessarily the final output of its request.
+        chunk = RunnerOutput("streaming", finished=False, result=DiffusionOutput(output=torch.ones(1)))
+        expected = BatchRunnerOutput.from_list([terminal, chunk])
+        worker = _make_step_worker(expected_output=expected)
+        scheduled = _make_batch_scheduler_output([_make_engine_request(rid) for rid in ("done", "streaming")])
+
+        output = worker.execute_stepwise(scheduled)
+
+        assert output is expected
+        assert worker._step_lora_state == {"streaming": (None, 1.0)}
+        assert torch.equal(chunk.result.output, torch.ones(1))
+
+    def test_runner_exception_retires_only_scheduled_lora_state(self):
+        worker = _make_step_worker()
+        worker._step_lora_state["unscheduled"] = (None, 0.5)
+
+        def fail(_):
+            raise RuntimeError("denoise failed")
+
+        worker.model_runner.execute_stepwise = fail
+        scheduled = _make_batch_scheduler_output([_make_engine_request(rid) for rid in ("first", "second")])
+
+        with pytest.raises(RuntimeError, match="denoise failed"):
+            worker.execute_stepwise(scheduled)
+
+        assert worker._step_lora_state == {"unscheduled": (None, 0.5)}
 
 
 @pytest.mark.cpu

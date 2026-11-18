@@ -41,9 +41,9 @@ class _VoxCPM2RuntimeConfig:
     delayed_audio_copy_use_events: bool = False
     coalesce_audio_d2h: bool = True
     enable_batched_vae_decode: bool = True
-    enable_batched_fsq_fusion: bool = False
+    enable_batched_fsq_fusion: bool = True
     batched_fsq_fusion_max_batch: int = 32
-    enable_batched_prefill_tail: bool = False
+    enable_batched_prefill_tail: bool = True
     enable_unified_decode_graph: bool = True
     unified_decode_graph_max_batch_size: int = 64
 

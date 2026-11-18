@@ -17,8 +17,9 @@ ordinary TF32 for CFM DiT GEMMs within Code2Wav forward/capture only
 `input_precision="tf32"` on tiled attention). This is not compensated TF32x3.
 The previous process matmul policy is restored afterwards. cuDNN's TF32 policy
 is independent. HiFT stays IEEE FP32. TF32 changes rounding.
-Duplex keeps the mainline V1 session path. Turn results do not establish duplex
-performance or interruption correctness.
+Duplex defaults to the V1 session path; `minicpmo_4_5_duplex_mrv2.yaml` is the
+opt-in CUDA overlay that runs all three duplex stages on MRv2. Turn results do
+not establish duplex performance or interruption correctness.
 
 The shared Code2Wav backend defaults to the existing fused CFM body on CUDA
 when TF32 is allowed, subject to architecture and FP32 attention-cache
@@ -50,3 +51,15 @@ Disabling TF32 with `token2wav_allow_tf32: false` or
 `cfm_fused_body: true` overrides that choice and may use TF32 attention.
 Slot pooling and row-offset merging remain opt-in. Fusion changes floating-point
 rounding and does not promise identical waveforms.
+
+## Full-duplex MRv2
+
+`minicpmo_4_5_duplex_mrv2.yaml` opts all three CUDA stages into MRv2 and
+otherwise inherits the default duplex profile; non-CUDA platforms keep V1.
+Stage 0 keeps `async_chunk: false` because the Thinker has no async producer:
+as on V1, the orchestrator hands each finished segment to `llm2tts`.
+The Talker reuses the streaming prompt recipe (full attention extends its KV
+prefix until capacity; sliding recompute rebuilds the previous condition,
+confirmed codec ids and current condition) and keeps the 16-frame codec
+penalty history across conditions. A segment flushes only on an EOS sampled
+in the current output, never on `turn_end` alone.

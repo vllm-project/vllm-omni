@@ -399,6 +399,13 @@ class StageRuntime:
         locked_devices: set[int] = set()
         launch: StageEngineLaunch | None = None
         exited_contexts = 0
+        # With several API servers every replica is spawned before the first
+        # handshake, and handshakes complete in launch order. A replica may
+        # then wait for every earlier replica to initialize before the
+        # front-end answers it, so its handshake wait covers all of them.
+        handshake_timeout_s = (
+            float(timeout) * sum(len(plan.replicas) for plan in stage_plans) if num_api_servers > 1 else None
+        )
 
         try:
             for plan in stage_plans:
@@ -441,6 +448,7 @@ class StageRuntime:
                         omni_parallel_stage_init=self._parallel_stage_init,
                         num_api_servers=num_api_servers,
                         watched_frontend_processes=watched_frontend_processes if num_api_servers > 1 else None,
+                        handshake_timeout_s=handshake_timeout_s,
                     )
                     # Environment overlays are process-global. Serialize spawn;
                     # parallel initialization waits for READY outside this lock.

@@ -1172,6 +1172,31 @@ def test_api_topology_resolved_from_launch(requested, config, expected):
     assert api_server._resolve_api_server_count(Namespace(api_server_count=requested), config) == expected
 
 
+@pytest.mark.parametrize(
+    "current,limit,expected", [(16, None, 4), (2, None, 2), (16, "8", 8), (2, "8", 2), (16, "0", 16)]
+)
+def test_api_server_torch_threads_are_capped(monkeypatch, current, limit, expected):
+    import torch
+
+    monkeypatch.delenv("VLLM_OMNI_API_SERVER_TORCH_THREADS", raising=False)
+    if limit is not None:
+        monkeypatch.setenv("VLLM_OMNI_API_SERVER_TORCH_THREADS", limit)
+    previous = torch.get_num_threads()
+    try:
+        torch.set_num_threads(current)
+        api_server._limit_api_server_torch_threads()
+        assert torch.get_num_threads() == expected
+    finally:
+        torch.set_num_threads(previous)
+
+
+@pytest.mark.parametrize("limit", ["-1", "invalid"])
+def test_api_server_rejects_invalid_torch_thread_limit(monkeypatch, limit):
+    monkeypatch.setenv("VLLM_OMNI_API_SERVER_TORCH_THREADS", limit)
+    with pytest.raises(ValueError, match="VLLM_OMNI_API_SERVER_TORCH_THREADS must be a non-negative integer"):
+        api_server._limit_api_server_torch_threads()
+
+
 @pytest.mark.parametrize("requested,config", [(2, None), (2, {}), (2, {"client_count": 1}), (2, {"client_count": "2"})])
 def test_api_topology_rejects_inconsistent_launch(requested, config):
     with pytest.raises(ValueError):

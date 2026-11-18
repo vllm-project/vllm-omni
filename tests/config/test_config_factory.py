@@ -2944,20 +2944,20 @@ class TestPlatformOverrides:
             assert talker_sampling["temperature"] > 0.0, "talker is expected to sample, not decode greedily"
             assert talker_sampling.get("seed") == 42, f"talker sampling lost its seed on {platform}"
 
-    def test_minicpmo_4_5_cuda_caps_talker_kv_cache(self):
+    @pytest.mark.parametrize("platform", ["cuda", "npu"])
+    def test_minicpmo_4_5_caps_talker_kv_cache(self, platform):
         pipeline = resolve_pipeline_config("minicpmo_4_5")
         assert isinstance(pipeline, PipelineConfig)
         deploy_path = Path(get_deploy_config_path("minicpmo_4_5.yaml"))
 
-        cuda = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
-        cuda_stages = merge_pipeline_deploy(pipeline, cuda)
-        assert cuda_stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 4 * 1024**3
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform)
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        # Both single-device profiles reserve headroom for colocated Code2Wav.
+        assert stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 4 * 1024**3
 
-        # The CUDA memory budget must not leak into the existing NPU profile.
-        npu = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
-        npu_stages = merge_pipeline_deploy(pipeline, npu)
-        assert "kv_cache_memory_bytes" not in npu_stages[1].yaml_engine_args
-
+    def test_minicpmo_4_5_cuda_replicas_use_automatic_talker_kv_cache(self):
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
         # Multi-GPU replica profiles place Talker on dedicated devices and
         # preserve their previous automatic KV-cache sizing.
         for filename in (

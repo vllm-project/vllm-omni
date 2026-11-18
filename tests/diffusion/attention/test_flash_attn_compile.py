@@ -25,7 +25,7 @@ from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfi
 from vllm_omni.diffusion.forward_context import ForwardContext
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 @pytest.fixture(autouse=True)

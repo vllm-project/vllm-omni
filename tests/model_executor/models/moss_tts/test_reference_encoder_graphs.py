@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.moss_tts.reference_encoder_graphs import (
     MossReferenceEncoderGraphs,
     _cached_reference_rope,
@@ -18,7 +19,7 @@ from vllm_omni.model_executor.models.moss_tts.reference_encoder_graphs import (
     install_windowed_attention,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 FRAME, N_VQ = 8, 3
 

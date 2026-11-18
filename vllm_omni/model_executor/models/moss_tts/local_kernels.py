@@ -28,37 +28,42 @@ def _attention(
     LOOKUP: tl.constexpr,
     BD: tl.constexpr,
     BS: tl.constexpr,
+    GROUP: tl.constexpr,
 ):
-    head, batch = tl.program_id(0), tl.program_id(1)
+    """Fused gather, KV insertion and attention for GROUP heads per program."""
+    batch, group = tl.program_id(0), tl.program_id(1)
+    h = group * GROUP + tl.arange(0, GROUP)
     d = tl.arange(0, BD)
+    dmask = (h[:, None] < HEADS) & (d[None, :] < D)
     row = tl.load(Tokens + batch) if LOOKUP else batch
-    offset = row * (3 * H) + head * D + d
-    q = tl.load(QKV + offset, d < D, 0).to(tl.float32)
-    k = tl.load(QKV + offset + H, d < D, 0).to(tl.float32)
-    v = tl.load(QKV + offset + 2 * H, d < D, 0).to(tl.float32)
-    base = (batch * HEADS + head) * CAPACITY * D
-    tl.store(K + base + POSITION * D + d, k, d < D)
-    tl.store(V + base + POSITION * D + d, v, d < D)
+    offset = row * (3 * H) + h[:, None] * D + d[None, :]
+    q = tl.load(QKV + offset, dmask, 0).to(tl.float32)
+    k = tl.load(QKV + offset + H, dmask, 0).to(tl.float32)
+    v = tl.load(QKV + offset + 2 * H, dmask, 0).to(tl.float32)
+    base = (batch * HEADS + h[:, None]) * CAPACITY * D + d[None, :]
+    tl.store(K + base + POSITION * D, k, dmask)
+    tl.store(V + base + POSITION * D, v, dmask)
     if POSITION == 0:
         result = v
     else:
         s = tl.arange(0, BS)
-        offsets = base + s[:, None] * D + d[None, :]
-        mask = (s[:, None] < POSITION) & (d[None, :] < D)
-        keys = tl.load(K + offsets, mask, 0).to(tl.float32)
-        values = tl.load(V + offsets, mask, 0).to(tl.float32)
-        # Never read the just-written slot or unwritten future slots.
-        keys = tl.where(s[:, None] == POSITION, k[None, :], keys)
-        values = tl.where(s[:, None] == POSITION, v[None, :], values)
-        scores = tl.sum(keys * q[None, :], axis=1) * (D**-0.5)
-        scores = tl.where(s <= POSITION, scores, -float("inf"))
-        probs = tl.exp(scores - tl.max(scores, axis=0))
-        probs = probs / tl.sum(probs, axis=0)
-        result = tl.sum(values * probs[:, None], axis=0)
-    tl.store(Out + batch * H + head * D + d, result, d < D)
+        scores = tl.full((GROUP, BS), -float("inf"), tl.float32)
+        for p in tl.static_range(POSITION):
+            kp = tl.load(K + base + p * D, dmask, 0).to(tl.float32)
+            sp = tl.sum(kp * q, axis=1) * (D**-0.5)
+            scores = tl.where(s[None, :] == p, sp[:, None], scores)
+        sp = tl.sum(k * q, axis=1) * (D**-0.5)
+        scores = tl.where(s[None, :] == POSITION, sp[:, None], scores)
+        probs = tl.exp(scores - tl.max(scores, axis=1)[:, None])
+        probs = probs / tl.sum(probs, axis=1)[:, None]
+        result = v * tl.sum(tl.where(s[None, :] == POSITION, probs, 0.0), axis=1)[:, None]
+        for p in tl.static_range(POSITION):
+            vp = tl.load(V + base + p * D, dmask, 0).to(tl.float32)
+            result += vp * tl.sum(tl.where(s[None, :] == p, probs, 0.0), axis=1)[:, None]
+    tl.store(Out + batch * H + h[:, None] * D + d[None, :], result, dmask)
     if LOOKUP:
-        residual = tl.load(Embedding + row * H + head * D + d, d < D, 0)
-        tl.store(Residual + batch * H + head * D + d, residual, d < D)
+        residual = tl.load(Embedding + row * H + h[:, None] * D + d[None, :], dmask, 0)
+        tl.store(Residual + batch * H + h[:, None] * D + d[None, :], residual, dmask)
 
 
 def lookup_attention(
@@ -69,13 +74,18 @@ def lookup_attention(
     *,
     tokens: torch.Tensor | None = None,
     embedding: torch.Tensor | None = None,
+    group: int = 8,
+    num_warps: int = 4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused gather, KV insertion, attention and optional residual gather."""
+    """Fused gather, KV insertion, attention and optional residual gather.
+
+    Each program handles ``group`` heads as (group, head_dim) tiles.
+    """
     batch, heads, capacity, dim = key.shape
     hidden = heads * dim
     out = torch.empty((batch, hidden), dtype=key.dtype, device=key.device)
     residual = torch.empty_like(out) if tokens is not None else out
-    _attention[(heads, batch)](
+    _attention[(batch, triton.cdiv(heads, group))](
         qkv,
         tokens,
         embedding,
@@ -91,8 +101,8 @@ def lookup_attention(
         tokens is not None,
         triton.next_power_of_2(dim),
         triton.next_power_of_2(position + 1),
-        num_warps=4,
-        enable_fp_fusion=False,
+        group,
+        num_warps=num_warps,
     )
     return out, residual
 

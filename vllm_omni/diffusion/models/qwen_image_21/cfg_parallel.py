@@ -26,6 +26,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.models.qwen_image_21.qwen_image_21_transformer import QwenImage21KVCache
 
 logger = logging.getLogger(__name__)
 
@@ -121,70 +122,73 @@ class QwenImage21CFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
         Returns:
             Denoised latents
         """
-        # Fresh cache for every generation: the pipeline is a singleton shared
-        # across requests, so cache state must never leak between them.
-        cache_enabled = getattr(self.transformer, "causal_condition", False)
-        kv_cache = [{} for _ in range(len(self.transformer.transformer_blocks))] if cache_enabled else None
-        self.scheduler.set_begin_index(0)
-        self.transformer.do_true_cfg = do_true_cfg
-        additional_transformer_kwargs = additional_transformer_kwargs or {}
+        try:
+            # Fresh cache for every generation: the pipeline is a singleton shared
+            # across requests, so cache state must never leak between them.
+            cache_enabled = getattr(self.transformer, "causal_condition", False)
+            kv_cache = QwenImage21KVCache({} for _ in self.transformer.transformer_blocks) if cache_enabled else None
+            self.scheduler.set_begin_index(0)
+            self.transformer.do_true_cfg = do_true_cfg
+            additional_transformer_kwargs = additional_transformer_kwargs or {}
 
-        with self.progress_bar(total=len(timesteps)) as pbar:
-            for i, t in enumerate(timesteps):
-                if self.interrupt:
-                    continue
-                self._current_timestep = t
+            with self.progress_bar(total=len(timesteps)) as pbar:
+                for i, t in enumerate(timesteps):
+                    if self.interrupt:
+                        continue
+                    self._current_timestep = t
 
-                # Broadcast timestep to match batch size
-                timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
+                    # Broadcast timestep to match batch size
+                    timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
 
-                # Condition image latents go in front of the noise latents.
-                latent_model_input = latents
-                if image_latents is not None:
-                    latent_model_input = torch.cat([image_latents, latents], dim=1)
+                    # Condition image latents go in front of the noise latents.
+                    latent_model_input = latents
+                    if image_latents is not None:
+                        latent_model_input = torch.cat([image_latents, latents], dim=1)
 
-                positive_kwargs = {
-                    "hidden_states": latent_model_input,
-                    "timestep": timestep / 1000,
-                    "encoder_hidden_states_mask": prompt_embeds_mask,
-                    "encoder_hidden_states": prompt_embeds,
-                    "img_shapes": img_shapes,
-                    "img_mask": img_mask,
-                    "attention_kwargs": attention_kwargs,
-                    "kv_cache": kv_cache,
-                    "cache_branch": "cond",
-                    **additional_transformer_kwargs,
-                }
-                if do_true_cfg:
-                    negative_kwargs = {
+                    positive_kwargs = {
                         "hidden_states": latent_model_input,
                         "timestep": timestep / 1000,
-                        "encoder_hidden_states_mask": negative_prompt_embeds_mask,
-                        "encoder_hidden_states": negative_prompt_embeds,
+                        "encoder_hidden_states_mask": prompt_embeds_mask,
+                        "encoder_hidden_states": prompt_embeds,
                         "img_shapes": img_shapes,
-                        "img_mask": negative_img_mask,
+                        "img_mask": img_mask,
                         "attention_kwargs": attention_kwargs,
                         "kv_cache": kv_cache,
-                        "cache_branch": "uncond",
+                        "cache_branch": "cond",
                         **additional_transformer_kwargs,
                     }
-                else:
-                    negative_kwargs = None
+                    if do_true_cfg:
+                        negative_kwargs = {
+                            "hidden_states": latent_model_input,
+                            "timestep": timestep / 1000,
+                            "encoder_hidden_states_mask": negative_prompt_embeds_mask,
+                            "encoder_hidden_states": negative_prompt_embeds,
+                            "img_shapes": img_shapes,
+                            "img_mask": negative_img_mask,
+                            "attention_kwargs": attention_kwargs,
+                            "kv_cache": kv_cache,
+                            "cache_branch": "uncond",
+                            **additional_transformer_kwargs,
+                        }
+                    else:
+                        negative_kwargs = None
 
-                # Prefill (first step) returns the full joint sequence and
-                # caches the prefix; decode steps return target tokens only.
-                # Slicing the target tail is correct for both.
-                noise_pred = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg,
-                    true_cfg_scale,
-                    positive_kwargs,
-                    negative_kwargs,
-                    cfg_normalize=False,
-                    output_slice=latents.size(1),
-                )
+                    # Prefill (first step) returns the full joint sequence and
+                    # caches the prefix; decode steps return target tokens only.
+                    # Slicing the target tail is correct for both.
+                    noise_pred = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg,
+                        true_cfg_scale,
+                        positive_kwargs,
+                        negative_kwargs,
+                        cfg_normalize=False,
+                        output_slice=latents.size(1),
+                    )
 
-                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                    latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
-                pbar.update()
+                    pbar.update()
 
-        return latents
+            return latents
+        finally:
+            self.transformer.release_request_geometry()

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Correctness tests for OmniVoice Triton kernels.
 
@@ -13,9 +13,11 @@ from __future__ import annotations
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
+
 pytestmark = [
     pytest.mark.core_model,
-    pytest.mark.cuda,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
 ]
 

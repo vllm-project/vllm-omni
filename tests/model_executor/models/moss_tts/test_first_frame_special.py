@@ -3,13 +3,14 @@
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import (
     MossAudioTokenizerMultiheadAttention,
     MossAudioTokenizerRotaryEmbedding,
 )
 from vllm_omni.model_executor.models.moss_tts.first_frame_special import EmptyHistoryAttention, StatelessFirstGraphs
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 
 @pytest.mark.parametrize("batch", [1, 3])

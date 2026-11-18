@@ -162,13 +162,11 @@ steps:
           - mkdir -p "$$PERSONAPLEX_TEMPORAL_ARTIFACT_DIR"
           - >-
             pytest --collect-only -q
-            tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py::test_temporal_streaming_step_matches_legacy_end_to_end
             tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py::test_mimi_streaming_step_matches_legacy_end_to_end
             2>&1 | tee "$$PERSONAPLEX_TEMPORAL_ARTIFACT_DIR/collection.txt"
           - >-
             timeout --signal=TERM --kill-after=2m 110m
             pytest -s -v -ra
-            tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py::test_temporal_streaming_step_matches_legacy_end_to_end
             tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py::test_mimi_streaming_step_matches_legacy_end_to_end
             --durations=50
             --junitxml="$$PERSONAPLEX_TEMPORAL_ARTIFACT_DIR/pytest.xml"

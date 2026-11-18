@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from tests.model_executor.models.moss_tts.test_local_model_state import _batch, _state
 from vllm_omni.model_executor.models.moss_tts.local_model_state import MossLocalModelState
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import MossTTSLocalTalkerForGeneration
@@ -106,7 +107,7 @@ def test_prefill_chunk_crosses_reference_end(batch_prefill, omit_trailing_pad):
     assert state.intermediate_buffer.buffers[0]["ref_offset"] == 6
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_pending_reference_uploads_survive_staging_reuse_and_overflow():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
@@ -131,7 +132,7 @@ def test_pending_reference_uploads_survive_staging_reuse_and_overflow():
         torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_batched_real_audio_embedding_matches_scalar_bfloat16_reduction():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")

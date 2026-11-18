@@ -126,7 +126,7 @@ def test_ref_audio_data_url_encodes_explicit_wav(tmp_path):
     assert demo._ref_audio_data_url(None) is None
 
 
-def test_realtime_duplex_demo_requires_ref_audio(monkeypatch):
+def test_realtime_duplex_demo_allows_the_server_default_ref_audio(monkeypatch):
     demo = _load_demo_module()
     monkeypatch.setattr(
         demo.sys,
@@ -138,8 +138,9 @@ def test_realtime_duplex_demo_requires_ref_audio(monkeypatch):
         ],
     )
 
-    with pytest.raises(SystemExit):
-        demo.parse_args()
+    args = demo.parse_args()
+
+    assert args.ref_audio is None
 
 
 def test_realtime_duplex_demo_accepts_explicit_ref_audio(monkeypatch):

@@ -154,9 +154,7 @@ def _apply_diffusion_parallel_runtime_overrides(
         ulysses_degree = parallel_config_dict.get("ulysses_degree") or 1
         ring_degree = parallel_config_dict.get("ring_degree") or 1
         allgather_degree = parallel_config_dict.get("allgather_degree") or 1
-        parallel_config_dict["sequence_parallel_size"] = (
-            allgather_degree if allgather_degree > 1 else ulysses_degree * ring_degree
-        )
+        parallel_config_dict["sequence_parallel_size"] = ulysses_degree * ring_degree * allgather_degree
 
     if parallel_config_dict is not None:
         engine_args["parallel_config"] = parallel_config_dict
@@ -200,6 +198,76 @@ class StageExecutionType(str, Enum):
     DIFFUSION = "diffusion"
 
 
+class DiffusionStageRole(str, Enum):
+    """Role of a diffusion stage within a (possibly disaggregated) pipeline.
+
+    ``execution_type`` answers *which engine* runs a stage; ``stage_role`` is an
+    orthogonal axis that answers *which slice of a diffusion model* the stage
+    runs. Splitting a single diffusion model across stages by role lets many
+    DiT-style models become disaggregatable through configuration alone, with no
+    per-model source changes:
+
+    - ``FULL``:    run the whole pipeline (encode + denoise + decode) in one
+                   stage. This is the default / single-stage behavior.
+    - ``ENCODE``:  run only the (text/image) encoder(s) and emit conditioning
+                   embeddings for a downstream stage.
+    - ``DENOISE``: run only the DiT denoise loop consuming upstream embeddings
+                   and emit latents for a downstream decode stage.
+    - ``DENOISE_DECODE``: run the DiT denoise loop and VAE decode together (the
+                          generation stage of E/G disaggregation).
+    - ``DECODE``:  run only the VAE decode on upstream latents (the trailing
+                   stage of a 3-way E/G/D split).
+    """
+
+    FULL = "full"
+    ENCODE = "encode"
+    DENOISE = "denoise"
+    DENOISE_DECODE = "denoise_decode"
+    DECODE = "decode"
+
+
+# Legacy ``model_stage`` strings -> ``DiffusionStageRole``. ``model_stage`` was
+# a free-form string ("text_encode"/"dit") before roles existed; keep the map so
+# older stage configs and deploy YAML keep working.
+_MODEL_STAGE_TO_ROLE: dict[str, DiffusionStageRole] = {
+    "text_encode": DiffusionStageRole.ENCODE,
+    "encode": DiffusionStageRole.ENCODE,
+    # Legacy single-stage configs (e.g. wan2_2_ti2v) use "dit" for the whole
+    # pipeline; disaggregated topologies set ``stage_role`` explicitly.
+    "dit": DiffusionStageRole.FULL,
+    "denoise": DiffusionStageRole.DENOISE,
+    "denoise_decode": DiffusionStageRole.DENOISE_DECODE,
+    "decode": DiffusionStageRole.DECODE,
+    "vae_decode": DiffusionStageRole.DECODE,
+    "diffusion": DiffusionStageRole.FULL,
+    "full": DiffusionStageRole.FULL,
+}
+
+
+def resolve_diffusion_stage_role(
+    stage_role: DiffusionStageRole | str | None,
+    model_stage: str | None = None,
+) -> DiffusionStageRole:
+    """Resolve the effective diffusion stage role.
+
+    Prefers an explicit ``stage_role`` and otherwise falls back to the legacy
+    free-form ``model_stage`` string. Unknown values resolve to ``FULL`` so a
+    plain single-stage diffusion model keeps running the whole pipeline.
+    """
+    if isinstance(stage_role, DiffusionStageRole):
+        return stage_role
+    if isinstance(stage_role, str) and stage_role:
+        try:
+            return DiffusionStageRole(stage_role)
+        except ValueError:
+            resolved = _MODEL_STAGE_TO_ROLE.get(stage_role)
+            if resolved is not None:
+                return resolved
+    if model_stage:
+        return _MODEL_STAGE_TO_ROLE.get(model_stage, DiffusionStageRole.FULL)
+    return DiffusionStageRole.FULL
+
+
 def _resolve_scheduler(
     execution_type: StageExecutionType,
     async_scheduling: bool = True,
@@ -234,6 +302,11 @@ class StagePipelineConfig:
     stage_id: int
     model_stage: str
     execution_type: StageExecutionType = StageExecutionType.LLM_AR
+    # Diffusion-only: which slice of a diffusion model this stage runs
+    # (encode / denoise / decode / full). Orthogonal to ``execution_type`` and
+    # only meaningful when ``execution_type == DIFFUSION``. ``None`` falls back
+    # to ``model_stage`` (legacy) and ultimately to ``FULL``.
+    stage_role: DiffusionStageRole | None = None
     input_sources: tuple[int, ...] = ()
     final_output: bool = False
     final_output_type: str | None = None
@@ -254,6 +327,7 @@ class StagePipelineConfig:
     async_chunk_process_next_stage_input_func: str | None = None
     sync_process_input_func: str | None = None
     supports_native_mrv2_data_plane: bool = False
+    supports_duplex_mrv2: bool = False
     # Rewrites the Stage-0 view of a raw prompt before vLLM input processing.
     # The callable receives ``(prompt, sampling_params_list)``; downstream
     # stages continue to receive the original prompt.
@@ -265,6 +339,7 @@ class StagePipelineConfig:
     # them is what enables the worker-side connector receive path, so an empty
     # tuple leaves existing deployments untouched.
     stage_input_payload_keys: tuple[str, ...] = ()
+    stage_input_optional_payload_keys: tuple[str, ...] = ()
     # Mirror of the above on the producing side: keys this stage hands to the
     # next stage over the connector. Only diffusion producers need this; AR
     # stages already send through ``send_full_payload_outputs``.
@@ -292,6 +367,10 @@ class StagePipelineConfig:
     # Whether the non-async path waits for a complete upstream payload from
     # the model-runner connector before scheduling this stage.
     requires_full_payload_input: bool = False
+    # Stage 0 only: a chat request carrying none of these input modalities
+    # skips this stage and enters at stage 1 (e.g. Qwen3-ASR runs only for
+    # requests with audio). Empty means every request runs it.
+    bypass_without_modalities: tuple[str, ...] = ()
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -498,6 +577,7 @@ class StageDeployConfig:
     vae_use_slicing: bool | None = None
     vae_use_tiling: bool | None = None
     vae_fast_path: str | None = None
+    vae_encode_fast_path: str | None = None
     boundary_ratio: float | None = None
     flow_shift: float | None = None
     diffusion_kv_cache_dtype: str | None = None
@@ -1014,9 +1094,11 @@ def validate_native_mrv2_session(deploy: DeployConfig, ps: StagePipelineConfig, 
 
     Streaming-session prompt replacement exists only in the V1 chunk adapter,
     so a stage that receives from an upstream stage on MRv2 supports
-    turn-based sessions only.
+    turn-based sessions only unless it explicitly declares supports_duplex_mrv2.
     """
     if stage_runner != "v2" or not ps.supports_native_mrv2_data_plane or not ps.input_sources:
+        return
+    if deploy.session_mode == "duplex" and ps.supports_duplex_mrv2:
         return
     if deploy.session_mode != "turn":
         raise ValueError(
@@ -1080,6 +1162,8 @@ def _build_engine_args(
     engine_args["inline_diffusion"] = ps.inline_diffusion
     if ps.stage_input_payload_keys:
         engine_args["stage_input_payload_keys"] = tuple(ps.stage_input_payload_keys)
+    if ps.stage_input_optional_payload_keys:
+        engine_args["stage_input_optional_payload_keys"] = tuple(ps.stage_input_optional_payload_keys)
     if ps.stage_output_payload_keys:
         engine_args["stage_output_payload_keys"] = tuple(ps.stage_output_payload_keys)
 
@@ -1298,6 +1382,7 @@ def merge_pipeline_deploy(
             StageConfig(
                 stage_id=ps.stage_id,
                 model_stage=ps.model_stage,
+                stage_role=ps.stage_role.value if ps.stage_role is not None else None,
                 session_mode=deploy.session_mode,
                 stage_type=stage_type,
                 input_sources=list(ps.input_sources),
@@ -1326,6 +1411,7 @@ class StageConfig:
 
     stage_id: int
     model_stage: str
+    stage_role: str | None = None
     session_mode: str = "turn"
     stage_type: StageType = StageType.LLM
     input_sources: list[int] = field(default_factory=list)
@@ -1350,6 +1436,11 @@ class StageConfig:
 
         # Overlay topology-level fields
         engine_args["model_stage"] = self.model_stage
+        # Diffusion disaggregation stage role (see DiffusionStageRole). Only
+        # surfaced when set so non-diffusion stages are unaffected; the payload
+        # key schema rides along in ``yaml_engine_args``.
+        if self.stage_role is not None:
+            engine_args["stage_role"] = self.stage_role
         if self.worker_type:
             engine_args["worker_type"] = self.worker_type
         if self.scheduler_cls:

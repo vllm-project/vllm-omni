@@ -1,41 +1,62 @@
 # Omni-DuplexEval CI Guard
 
 Nightly end-to-end scoring regression for [Hothan/Omni-DuplexEval]
-(RTD 6 subtasks + PR 3 subtasks), driven by `vllm bench omni-duplex-eval`
-(generate → evaluate → summarize).
+(RTD 6 subtasks + PR 3 subtasks), driven by `vllm bench serve --omni`
+with integrated generation, judging, and result saving.
 
 ## Files
 
 | File | Purpose |
 | ------ | --------- |
-| `test_omni_duplex_eval_ci.py` | Main pytest: hardcoded thresholds + 6 assertions |
+| `test_omni_duplex_eval_ci.py` | Main pytest: benchmark invocation, coverage checks, and score thresholds |
 | `test_omni_duplex_eval_ci_mock.py` | CPU mock integration tests (no GPU / model needed) |
 | `omni_duplex_eval_ci_config.json` | Dataset / revision / sample IDs / judge |
-| `conftest.py` | `judge_server` fixture (endpoint resolution only) |
+| `conftest.py` | `judge_server` fixture and model/judge device isolation |
 | `README.md` | This document |
 | `results/.gitignore` | Track empty results dir for Buildkite artifact upload |
 
 ## Run locally
 
-Judge server must be pre-started; this test never launches it:
+The test needs two devices: one for MiniCPM-o and one for the judge.
+It starts the judge unless `VLLM_DUPLEX_EVAL_JUDGE_URL` points to a healthy server:
 
 ```bash
-# CUDA (H100 / B200), or NPU (A3)
-VLLM_DUPLEX_EVAL_JUDGE_URL=http://127.0.0.1:8001 \
-  pytest -s -v tests/e2e/accuracy/omni_duplex_eval/ \
-    -m "full_model and cuda and (H100 or B200) and cards_1"
+# CUDA (H100 / B200); for NPU use "full_model and npu and A3 and cards_2".
+pytest -s -v tests/e2e/accuracy/omni_duplex_eval/test_omni_duplex_eval_ci.py \
+  -m "full_model and cuda and (H100 or B200) and cards_2" \
+  --run-level full_model --basetemp /tmp/omni_duplex_ci
 ```
 
 The `omni_server` fixture boots MiniCPM-o-4_5 with the community duplex
 params (`tests/e2e/online_serving/helpers/minicpmo_4_5_duplex.py`).
-`judge.base_url_env` (default `VLLM_DUPLEX_EVAL_JUDGE_URL`) overrides
-`judge.base_url` from the JSON config.
+The benchmark selects every configured sample ID with `--num-prompts 0`,
+`--disable-shuffle`, and `--max-concurrency 1`. Warmups and the benchmark's
+request-based readiness probe are disabled; the server fixture already waits
+for startup. Input replay uses the default real-time media clock and 1 FPS.
+The judge settings continue to come from the JSON config and `judge_server`.
 
 ## Results output
 
-After Phase 3 (summarize), the full `summarize_scores()` dict is persisted
-to `results/summary.json` (same pattern as PR#6817 perf tests) and printed
-to stdout:
+`bench serve --duplex-eval-evaluate --save-result` prints the performance and
+accuracy results and writes:
+
+- `results/bench-result.json`: full serving benchmark result, including
+  `omni_duplex_eval.accuracy`, publication errors, and
+  `published_with_unfinished_responses`.
+- `<response-root>/run-*/evaluation/evaluation_summary.json`: the accuracy
+  summary saved by the benchmark.
+
+The guard copies `bench-result.json`'s `omni_duplex_eval.accuracy` to
+`results/result_acc_{model}_{dataset}_{date}_{random_number}.json` for
+dashboard collection. Model and dataset use the basenames of their configured
+IDs or paths. The date is UTC in `YYYYMMDD-HHMMSS` format, followed by an
+eight-digit random number, for example:
+`result_acc_MiniCPM-o-4_5_Omni-DuplexEval_20261014-070221_48392107.json`.
+It does not run a second evaluation or summarization. Before each run, the
+guard removes the previous `bench-result.json` and `result_acc_*.json` files
+from its results directory so stale results cannot be uploaded as current
+results after an early CLI failure. The accuracy summary is saved before
+checking the results:
 
 - `results/` is tracked in git via `results/.gitignore` (empty dir, nothing
   committed inside).
@@ -45,8 +66,9 @@ to stdout:
 
 ## Judge server
 
-Judge is a pre-started, OpenAI-compatible endpoint (never launched by this
-test). It can run on a separate machine / GPU from the `omni_server`.
+The fixture starts an OpenAI-compatible judge on the first allocated device
+and the Omni server on the second. A healthy pre-started judge can be reused
+through `VLLM_DUPLEX_EVAL_JUDGE_URL`.
 
 Current judge: **Qwen2.5-VL-7B-Instruct** (`judge.model` in the JSON
 config). The 7B model is chosen for Phase A to run on a single GPU (≈16 GB
@@ -68,22 +90,25 @@ python -m vllm.entrypoints.openai.api_server \
 
 If the judge is started on a different host or the media temporary directory
 changes, adjust `--allowed-local-media-path` to match the path used by
-`vllm bench omni-duplex-eval evaluate` for materialized videos.
+`bench serve` for materialized videos. A remote judge must be able to read
+those paths when using the default `video_url` mode.
 
 ## CPU mock tests (no GPU / model / judge needed)
 
 `test_omni_duplex_eval_ci_mock.py` drives the *real*
 `test_omni_duplex_eval_ci()` guard on CPU by stubbing the heavy I/O:
 
-- `_run_cli` is replaced by an argv-recording spy (never executes).
+- `_run_cli` is replaced by an argv-recording spy that saves a synthetic
+  benchmark result (no model execution).
 - `resolve_ref_audio` is stubbed to a local path.
-- Fake score files are pre-written under `tmp_path/scores/<split>/` from
-  `sample_ids_per_split` (minus `exclude_ids`), so `summarize_scores()`
-  and the Phase-4 assertions run for real.
+- Fake score files are pre-written under a run's `evaluation/<split>/`
+  directory from `sample_ids_per_split` (minus `exclude_ids`), so the
+  summarizer and guard assertions run for real.
 
-It validates the CLI argument assembly (generate + evaluate), the
-score-file-count check, `protocol_pin`, the RTD/PR `by_task` keys, and
-all threshold comparisons — including the failure paths. Runs in CI on
+The tests parse the assembled command with the real `bench serve` parser,
+verify artifact persistence, and reject incomplete generation, publication,
+or judging even when the CLI exits successfully. They retain coverage of
+score files, protocol pins, and score thresholds. Runs in CI on
 every PR (`core_model` + `cpu` marks):
 
 ```bash
@@ -98,10 +123,10 @@ inferred from the split row order and must be re-verified once the dataset
 is reachable). `exclude_ids` has been removed.
 
 All `_MIN_*` thresholds are currently **0.0 (record mode)**: the nightly run
-produces real scores and persists `results/summary.json` without failing the
+produces real scores and persists `results/result_acc_*.json` without failing the
 gate. Tighten after the first nightly run:
 
-1. Record `summarize_scores()` output (mean content / temporal / success).
+1. Record the run's `results/result_acc_*.json` (mean content / temporal / success).
 2. Set `_MIN_*` thresholds = `mean - n * std` (start `n=2`) in
    `test_omni_duplex_eval_ci.py`. As a starting point, the paper's
    MiniCPM-o 4.5 scores (100-point scale) map to ≈1.15 content / ≈2.40
@@ -117,12 +142,16 @@ size before tightening.
 
 ## Assertions (in order)
 
-1. `protocol_pin == PROTOCOL_PIN` (track upstream protocol changes)
-2. `summary["samples"]` == number of selected IDs
-3. RTD `by_task` keys == 6 RTD subtasks
-4. PR `by_task` keys == 3 PR subtasks
-5. RTD mean content / temporal scores >= thresholds
-6. PR `mean_all_success` >= threshold
+1. All selected requests completed and were published, with no request or artifact errors.
+2. Evaluation completed for every selected sample, with no failed/skipped evaluations or errors.
+3. Config, individual scores, and summary match `PROTOCOL_PIN`.
+4. Score file count and split/ID set match the CI selection; summary sample count matches too.
+5. RTD `by_task` covers all 6 RTD subtasks, and PR covers all 3 PR subtasks.
+6. RTD mean content / temporal scores and PR `mean_all_success` meet the thresholds.
+
+Samples with unfinished responses remain eligible for scoring, following the
+benchmark's policy. Their count is recorded in `bench-result.json`; it is
+not an additional pass/fail threshold.
 
 ## Reference paper & scoring scale
 

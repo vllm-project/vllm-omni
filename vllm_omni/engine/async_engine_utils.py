@@ -1,7 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Stateless request and shutdown helpers for :mod:`async_omni_engine`."""
 
 from __future__ import annotations
 
+import asyncio
+import queue
 import threading
 from typing import Any
 
@@ -25,11 +30,143 @@ SHUTDOWN_ENQUEUE_TIMEOUT_S = 1.0
 SHUTDOWN_JOIN_TIMEOUT_S = 30.0
 _WEAK_SHUTDOWN_JOIN_TIMEOUT_S = 1.0
 _JANUS_SYNC_QUEUE_SHUTDOWN = getattr(janus, "SyncQueueShutDown", None)
+
+
+def _iter_multimodal_items(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def scope_stage_replica_mm_uuids(
+    prompt: Any,
+    *,
+    stage_id: int,
+    replica_id: int,
+    model_id: str,
+    mm_hasher_algorithm: str,
+) -> Any:
+    """Return ``prompt`` with its multimodal cache UUIDs scoped to one stage replica, as a
+    shallow copy (see ``AsyncOmniEngine._ensure_stage_replica_mm_uuids``)."""
+
+    if not isinstance(prompt, dict):
+        return prompt
+
+    mm_data = prompt.get("multi_modal_data")
+    if not isinstance(mm_data, dict) or not mm_data:
+        return prompt
+
+    from vllm.multimodal.hasher import MultiModalHasher
+
+    existing_uuids = prompt.get("multi_modal_uuids")
+    if not isinstance(existing_uuids, dict):
+        existing_uuids = {}
+
+    scoped_uuids: dict[str, list[str | None]] = dict(existing_uuids)
+    for modality, raw_items in mm_data.items():
+        items = _iter_multimodal_items(raw_items)
+        if not items:
+            continue
+
+        modality_existing = existing_uuids.get(modality)
+        if not isinstance(modality_existing, list):
+            modality_existing = [modality_existing] if modality_existing is not None else []
+
+        modality_uuids: list[str | None] = []
+        for idx, item in enumerate(items):
+            user_uuid = modality_existing[idx] if idx < len(modality_existing) else None
+            if user_uuid is not None:
+                base_uuid = str(user_uuid)
+            elif item is None:
+                base_uuid = None
+            else:
+                base_uuid = MultiModalHasher.hash_kwargs(
+                    mm_hasher_algorithm,
+                    model_id=model_id,
+                    **{modality: item},
+                )
+
+            if base_uuid is None:
+                modality_uuids.append(None)
+            else:
+                modality_uuids.append(f"stage{stage_id}:rep{replica_id}:{base_uuid}")
+
+        scoped_uuids[modality] = modality_uuids
+
+    if not scoped_uuids:
+        return prompt
+    scoped_prompt = dict(prompt)
+    scoped_prompt["multi_modal_uuids"] = scoped_uuids
+    return scoped_prompt
+
+
 _LEGACY_JANUS_QUEUE_CLOSED_MESSAGE = "Operation on the closed queue is forbidden"
 _RPC_RESULT_ROUTER_CLOSED_MESSAGES = {
     "RPC result router closed",
     "RPC result router is closed",
 }
+
+
+class OutputQueueSink:
+    """Hands orchestrator output to the serving event loop.
+
+    Messages go through the output queue's thread-safe sync side (which the
+    offline ``Omni`` entrypoint reads directly). A waiting serving loop gets
+    one ``call_soon_threadsafe`` wakeup per batch: puts made while a wakeup is
+    already scheduled, or while the loop is draining, add nothing, unlike the
+    janus async side (a task and a lock per put) or an executor hop per
+    message. The queue is unbounded, so ``put`` never blocks the orchestrator.
+    """
+
+    __slots__ = ("_sync_q", "_loop", "_ready", "_wake_scheduled")
+
+    def __init__(self, sync_q: janus.SyncQueue[EngineQueueMessage]) -> None:
+        self._sync_q = sync_q
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._ready: asyncio.Event | None = None
+        # Starts set: no serving loop waits until arm_wakeup() clears it.
+        self._wake_scheduled = True
+
+    def put_nowait(self, item: EngineQueueMessage) -> None:
+        self._sync_q.put_nowait(item)
+        if self._wake_scheduled:
+            return
+        self._wake_scheduled = True
+        loop, ready = self._loop, self._ready
+        if loop is not None and ready is not None:
+            try:
+                loop.call_soon_threadsafe(ready.set)
+            except RuntimeError:
+                pass  # serving loop already closed
+
+    async def put(self, item: EngineQueueMessage) -> None:
+        self.put_nowait(item)
+
+    def drain(self, max_messages: int) -> list[EngineQueueMessage]:
+        """Take up to ``max_messages`` queued messages without waiting."""
+        msgs: list[EngineQueueMessage] = []
+        while len(msgs) < max_messages:
+            try:
+                msgs.append(self._sync_q.get_nowait())
+            except queue.Empty:
+                break
+        return msgs
+
+    def arm_wakeup(self) -> asyncio.Event:
+        """Ask for a wakeup on the running loop at the next put.
+
+        Callers must drain once more after arming: a put that landed before
+        the flag was cleared does not wake the loop.
+        """
+        loop = asyncio.get_running_loop()
+        if self._ready is None or self._loop is not loop:
+            self._ready = asyncio.Event()
+            self._loop = loop
+        self._ready.clear()
+        self._wake_scheduled = False
+        return self._ready
 
 
 def is_janus_sync_queue_shutdown(exc: Exception) -> bool:
@@ -74,6 +211,9 @@ def upgrade_to_omni_request(
         raw_buffer = raw_prompt.get("model_intermediate_buffer")
         if isinstance(raw_info, dict):
             wire_payload = dict(raw_info)
+            # Deferred image/video stays on the original prompt for the orchestrator;
+            # keep it off the wire, where PIL images and video arrays cannot be serialized.
+            wire_payload.pop("deferred_multi_modal_data", None)
         if isinstance(raw_buffer, dict):
             model_intermediate_buffer = raw_buffer
         additional_information = serialize_additional_information(

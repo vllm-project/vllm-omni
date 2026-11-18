@@ -30,6 +30,13 @@ stages:
       code_predictor_kv_cache: true
       code_predictor_fused_sampling: true
       code_predictor_fused: true
+      # Serving-side runaway ceiling for requests without max_new_tokens:
+      # max(codec_budget_min_frames, codec_budget_frames_per_text_token *
+      # input text tokens) codec frames, capped by max_tokens below. Each
+      # key takes a number (all tasks) or a per-task mapping; a rate of 0
+      # disables the ceiling. Defaults:
+      # codec_budget_frames_per_text_token: {Base: 12, CustomVoice: 40, VoiceDesign: 40}
+      # codec_budget_min_frames: {Base: 192, CustomVoice: 400, VoiceDesign: 400}
     # Talker decode contexts are short (~100-700 tokens): FA3 split-KV plus
     # its combine kernel costs more than one pass per head.
     attention_config:

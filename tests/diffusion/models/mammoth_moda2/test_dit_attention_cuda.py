@@ -23,7 +23,6 @@ from .test_dit_attention import _reference_attention
 pytestmark = [
     pytest.mark.core_model,
     pytest.mark.advanced_model,
-    pytest.mark.cuda,
     *hardware_marks(res={"cuda": "L4"}, num_cards=1),
 ]
 

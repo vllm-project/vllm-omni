@@ -16,13 +16,14 @@ is resolved lazily inside each test and skips if unavailable.
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.layers import adalayernorm as adaln_mod
 from vllm_omni.diffusion.layers.adalayernorm import (
     _FAILED_ADALN_KEYS,
     AdaLayerNorm,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 # Unique channels + eps so the failed keys used here cannot collide with
 # other tests in the same session.

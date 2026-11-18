@@ -5,6 +5,7 @@ Encodes reference audio into VQ codes for use as prompt conditioning.
 
 from __future__ import annotations
 
+import math
 import os
 from functools import lru_cache
 
@@ -77,6 +78,18 @@ def _get_resample_kernel(
 
     # lru_cache requires hashable key parts; torch.device and torch.dtype are.
     return torchaudio.transforms.Resample(source_sr, target_sr).to(device=device, dtype=dtype)
+
+
+def reference_audio_samples(shape: tuple[int, ...] | torch.Size) -> int:
+    """Mono sample count that ``_prepare_reference_audio_tensor`` produces for
+    reference audio of this shape, before resampling."""
+    if len(shape) == 2:
+        channels_first = shape[0] <= 8 and shape[1] > shape[0]
+        channels_last = not channels_first and shape[-1] <= 8 and shape[0] > shape[-1]
+        return int(shape[0] if channels_last else shape[1])
+    if len(shape) > 2:
+        return int(shape[-1])
+    return math.prod(shape)
 
 
 def _prepare_reference_audio_tensor(

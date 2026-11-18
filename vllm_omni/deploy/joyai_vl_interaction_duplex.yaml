@@ -1,0 +1,5 @@
+# Text/video observations with the existing JoyAI -> Qwen3-TTS -> Code2Wav stages.
+base_config: joyai_vl_interaction.yaml
+session_mode: duplex
+duplex_session:
+  max_sessions: 1

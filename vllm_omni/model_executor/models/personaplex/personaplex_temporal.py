@@ -1,36 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Streaming Helium temporal transformer for PersonaPlex (moshi-free, plain torch).
+"""Ring-KV and RoPE primitives for PersonaPlex streaming transformers.
 
-Frame-clocked duplex needs a stateful per-frame forward: one 80 ms step consumes
-one summed frame embedding and returns the temporal hidden + text logits, with a
-sliding-window KV carried across the conversation. vLLM's engine path serves the
-offline/staged flavor of this model (``modeling_helium.HeliumForCausalLM``); this
-module is the REAL-TIME flavor: no engine context, a fixed-capacity ring KV, and
-static shapes so the whole step is CUDA-graphable.
+The Mimi codec's encoder/decoder transformers (``personaplex_mimi.py``) run as
+stateful per-frame steppers over a sliding context window. This module holds
+the pieces they share, mirroring the Moshi streaming transformer (MIT; the
+reference for the ``nvidia/personaplex-7b-v1`` checkpoint) op for op:
 
-Semantics mirror the Moshi streaming transformer exactly (MIT; the reference for
-the ``nvidia/personaplex-7b-v1`` checkpoint), op for op, so greedy decoding is
-bit-comparable against recorded reference outputs:
+- interleaved (non-neox) RoPE applied at the ABSOLUTE offset in fp32
+- a fixed-capacity ring KV whose position table drives the relative-position
+  causal mask with ``context``-window truncation
 
-- fp32 RMSNorm with ``alpha`` weights (norm1/norm2/out_norm)
-- fused in-proj attention, interleaved (non-neox) RoPE applied at the ABSOLUTE
-  offset in fp32, relative-position causal mask over a ring KV with
-  ``context``-window truncation
-- SiLU gating MLP with fused ``linear_in`` (gate/up) and ``linear_out``
-- ``transformer_out`` is the POST-``out_norm`` hidden; ``text_logits`` is
-  ``text_linear`` of that hidden
-
-Weights load directly from the moshi checkpoint's fused layout
-(``transformer.layers.{i}.self_attn.in_proj_weight`` etc.), keeping the exact
-computation order of the reference.
-
-Per-slot elastic recycle (concurrent serving) uses the same per-row
-``start_offset`` masking verified for the moshi-hosted path: writes stay uniform
-because every slot ticks in lockstep; ``reset_slot`` only moves that row's
-valid-window start. The LM-specific "+1 sacrifice tick" bump is the CALLER's
-job (see the fullduplex PersonaPlex stage0), matching the split introduced when
-the +1 was found to be wrong for codec streams.
+All shapes are static so a whole step is CUDA-graphable, and every row carries
+its own offset so batched duplex serving can recycle one slot (``reset_row``)
+while the others keep streaming.
 """
 
 from __future__ import annotations
@@ -38,10 +21,6 @@ from __future__ import annotations
 import math
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-from vllm_omni.model_executor.models.personaplex.personaplex_depformer import _rms_norm_f32
 
 
 def _rope_tables(offset: torch.Tensor, seq_len: int, head_dim: int, max_period: float = 10_000.0):
@@ -126,19 +105,11 @@ class _RingKV:
         self.end_offset.zero_()
         self.start_offset.zero_()
 
-    def reset_slot(self, b: int) -> None:
-        # Mask everything written so far for row b; the row's next write is its
-        # first visible entry. (LM sacrifice-tick +1 is applied by the caller.)
-        self.start_offset[b] = self.end_offset[b]
-
     def reset_row(self, b: int) -> None:
         # Restart row b at position 0. Every cached entry of the row sits at or
         # past the new end offset, so all of them are masked until overwritten.
         self.end_offset[b] = 0
         self.start_offset[b] = 0
-
-    def bump_slot_start(self, b: int) -> None:
-        self.start_offset[b] += 1
 
     def complete(
         self,
@@ -174,162 +145,3 @@ class _RingKV:
         below = positions < self.start_offset.view(-1, 1)  # [B, capacity]
         positions = torch.where(below, torch.full_like(positions, -1), positions)
         return self.cache[0], self.cache[1], positions
-
-
-def _normalize_temporal_active(active: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
-    if active.shape != reference.shape:
-        raise ValueError(f"active must have shape {tuple(reference.shape)}, got {tuple(active.shape)}")
-    return active.to(device=reference.device, dtype=torch.bool)
-
-
-class _TemporalLayer(nn.Module):
-    """One Helium decoder layer in the checkpoint's fused layout."""
-
-    def __init__(self, dim: int, num_heads: int, hidden: int) -> None:
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.in_proj_weight = nn.Parameter(torch.empty(3 * dim, dim))
-        self.out_proj_weight = nn.Parameter(torch.empty(dim, dim))
-        self.gating_in = nn.Parameter(torch.empty(2 * hidden, dim))
-        self.gating_out = nn.Parameter(torch.empty(dim, hidden))
-        self.norm1_alpha = nn.Parameter(torch.ones(1, 1, dim))
-        self.norm2_alpha = nn.Parameter(torch.ones(1, 1, dim))
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        kv: _RingKV,
-        offset: torch.Tensor,
-        context: int,
-        active: torch.Tensor,
-        rope: tuple[torch.Tensor, torch.Tensor],
-        ring: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
-        B, T, _ = x.shape
-        h = _rms_norm_f32(x, self.norm1_alpha, 1e-8)
-        qkv = F.linear(h, self.in_proj_weight)
-        # Layout mirrors moshi's einops "b t (p h d) -> p b h t d" exactly, so the
-        # downstream kernels see identical strides (bit-level replay agreement).
-        qkv = qkv.view(B, T, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        q, k = _apply_rope(q, k, *rope)
-
-        keys, values, pos_k = kv.complete(k, v, active, *ring)
-        pos_k = pos_k.view(pos_k.shape[0], 1, pos_k.shape[1])  # [B, 1, cap]
-        pos_q = offset.view(-1, 1, 1) + torch.arange(T, device=q.device, dtype=torch.long).view(1, -1, 1)
-        delta = pos_q - pos_k
-        attn_bias = (pos_k >= 0) & (delta >= 0) & (delta < context)
-        attn_bias = attn_bias.unsqueeze(1)  # [B, 1, T, cap]
-        attn = F.scaled_dot_product_attention(q, keys, values, attn_bias, dropout_p=0.0)
-        attn = attn.transpose(1, 2).reshape(B, T, self.dim)
-        x = x + F.linear(attn, self.out_proj_weight)
-
-        h = _rms_norm_f32(x, self.norm2_alpha, 1e-8)
-        a, b = F.linear(h, self.gating_in).chunk(2, dim=-1)
-        return x + F.linear(F.silu(a) * b, self.gating_out)
-
-
-class PersonaPlexTemporalStreaming(nn.Module):
-    """The 7B Helium temporal backbone as a stateful per-frame stepper.
-
-    ``step(frame_embedding [B, 1, dim]) -> (transformer_out [B, 1, dim],
-    text_logits [B, 1, 1, text_card])``, matching moshi's
-    ``LMModel.forward_embeddings`` contract so the existing native depformer and
-    input embeddings compose unchanged.
-    """
-
-    def __init__(
-        self,
-        dim: int = 4096,
-        num_layers: int = 32,
-        num_heads: int = 32,
-        hidden: int = 11264,
-        context: int = 3000,
-        text_card: int = 32000,
-        max_period: float = 10_000.0,
-    ) -> None:
-        super().__init__()
-        self.dim = dim
-        self.context = context
-        self.max_period = max_period
-        self.layers = nn.ModuleList([_TemporalLayer(dim, num_heads, hidden) for _ in range(num_layers)])
-        self.out_norm_alpha = nn.Parameter(torch.ones(1, 1, dim))
-        self.text_linear = nn.Parameter(torch.empty(text_card, dim))
-        self._kv: list[_RingKV] | None = None
-        self._offset: torch.Tensor | None = None
-
-    # -- streaming state ----------------------------------------------------
-
-    def streaming_init(self, batch_size: int) -> None:
-        p = next(self.parameters())
-        heads = self.layers[0].num_heads
-        head_dim = self.layers[0].head_dim
-        # Capacity = context window (the mask truncates at `context` anyway).
-        self._kv = [_RingKV(batch_size, heads, head_dim, self.context, p.device, p.dtype) for _ in self.layers]
-        self._offset = torch.zeros(batch_size, device=p.device, dtype=torch.long)
-
-    def reset_streaming(self) -> None:
-        assert self._kv is not None, "call streaming_init first"
-        for kv in self._kv:
-            kv.reset()
-        self._offset.zero_()
-
-    def reset_slot(self, b: int) -> None:
-        assert self._kv is not None
-        for kv in self._kv:
-            kv.reset_slot(b)
-
-    def bump_slot_start(self, b: int) -> None:
-        """LM sacrifice-tick semantics: mask the one spurious post-recycle write."""
-        assert self._kv is not None
-        for kv in self._kv:
-            kv.bump_slot_start(b)
-
-    # -- per-frame step -------------------------------------------------------
-
-    @torch.no_grad()
-    def step(
-        self,
-        frame_embedding: torch.Tensor,
-        active: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert self._kv is not None, "call streaming_init first"
-        active = _normalize_temporal_active(active, self._offset)
-        x = frame_embedding
-        T = x.shape[1]
-        # Offset-pure tables, identical for every layer: build once per step.
-        rope = _rope_tables(self._offset, T, self.layers[0].head_dim, self.max_period)
-        ring = _ringkv_positions(self._offset, T, self.context, active)
-        for layer, kv in zip(self.layers, self._kv):
-            x = layer(x, kv, self._offset, self.context, active, rope, ring)
-        self._offset.add_(x.shape[1] * active.to(self._offset.dtype))
-        out = _rms_norm_f32(x, self.out_norm_alpha, 1e-8)
-        text_logits = F.linear(out, self.text_linear)
-        return out, text_logits[:, None]
-
-    # -- weights --------------------------------------------------------------
-
-    def load_weights(self, state_dict: dict[str, torch.Tensor]) -> int:
-        """Load from the moshi checkpoint layout (fused, exact tensor reuse)."""
-        loaded = 0
-        with torch.no_grad():
-            for i, layer in enumerate(self.layers):
-                base = f"transformer.layers.{i}"
-                pairs = [
-                    (layer.in_proj_weight, f"{base}.self_attn.in_proj_weight"),
-                    (layer.out_proj_weight, f"{base}.self_attn.out_proj.weight"),
-                    (layer.gating_in, f"{base}.gating.linear_in.weight"),
-                    (layer.gating_out, f"{base}.gating.linear_out.weight"),
-                    (layer.norm1_alpha, f"{base}.norm1.alpha"),
-                    (layer.norm2_alpha, f"{base}.norm2.alpha"),
-                ]
-                for param, name in pairs:
-                    src = state_dict[name]
-                    param.data.copy_(src.reshape(param.shape).to(param.dtype))
-                    loaded += 1
-            self.out_norm_alpha.data.copy_(state_dict["out_norm.alpha"].reshape(self.out_norm_alpha.shape))
-            self.text_linear.data.copy_(state_dict["text_linear.weight"].to(self.text_linear.dtype))
-            loaded += 2
-        return loaded

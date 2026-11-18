@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import math
-import os
 import queue
 import time
 from collections import defaultdict
@@ -101,7 +100,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     self._generation_min_batch_size,
                     self._generation_max_wait_s * 1000,
                 )
-        self._first_chunk_express = os.environ.get("VLLM_OMNI_CODEC_FIRST_CHUNK_EXPRESS") == "1"
+        self._first_chunk_express = bool(extra.get("generation_first_chunk_express", False))
         self._last_step_express = False
         # Streams that already had a chunk scheduled; the rest await their first.
         self._chunk_started: set[str] = set()
@@ -109,7 +108,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # chunk's stream still holds at least this much unplayed audio, so a
         # loaded stage does not trade first packets for playback underruns.
         # Playback is assumed to start with a stream's first emitted audio.
-        self._express_min_slack_s = float(os.environ.get("VLLM_OMNI_CODEC_FIRST_CHUNK_EXPRESS_SLACK_S", "0") or 0)
+        self._express_min_slack_s = float(extra.get("generation_first_chunk_express_min_slack_s", 0.0))
         # request id -> [monotonic time of first emitted audio, emitted seconds]
         self._stream_audio: dict[str, list[float]] = {}
         self._express_skipped_for_slack = 0

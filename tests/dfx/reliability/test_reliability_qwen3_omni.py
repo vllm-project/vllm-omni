@@ -344,7 +344,7 @@ QWEN_PARAMS = create_reliability_omni_server_params(RELIABILITY_SCENARIOS, DEPLO
 
 
 @pytest.mark.slow
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
     omni_server_function,
@@ -415,7 +415,7 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
 
 
 @pytest.mark.slow
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_function, online_client_function) -> None:
     device_spec = resolve_oom_device_spec(
@@ -457,7 +457,7 @@ def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_functi
 
 
 @pytest.mark.slow
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_function, online_client_function) -> None:
     device_spec = resolve_oom_device_spec(
@@ -501,6 +501,7 @@ def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_funct
 
 @pytest.mark.slow
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize(
     "fault_injector",
     WORKER_SIGNAL_FAULT_PARAMS,
@@ -531,6 +532,7 @@ def test_reliability_fault_process_kill_request_failure(
 
 @pytest.mark.slow
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize(
     "fault_injector",
     WORKER_SIGNAL_FAULT_PARAMS,
@@ -647,6 +649,7 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
 @pytest.mark.slow
 @pytest.mark.skip(reason="issue#3683")
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize(
     "fault_injector",
     WORKER_SIGNAL_FAULT_PARAMS,
@@ -677,7 +680,7 @@ def test_reliability_fault_process_kill_worker_with_load_request_failure(
 
 
 @pytest.mark.slow
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize("signal_name", SERVE_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
@@ -701,7 +704,7 @@ def test_reliability_fault_process_kill_serve_root_no_load_fast_fail_and_cleanup
 
 
 @pytest.mark.slow
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize("signal_name", SERVE_WITH_LOAD_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
@@ -736,6 +739,7 @@ def test_reliability_fault_process_kill_serve_root_with_load_fast_fail_and_clean
 
 @pytest.mark.slow
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("signal_name", TREE_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_tree_no_load_fast_fail_and_cleanup(
@@ -763,6 +767,7 @@ def test_reliability_fault_process_kill_tree_no_load_fast_fail_and_cleanup(
 
 @pytest.mark.slow
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("signal_name", TREE_WITH_LOAD_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
@@ -804,7 +809,7 @@ def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
     "EngineCore still dies and is evicted (not respawned), so the engine does not "
     "recover after the hog stops. Out of scope for the #4285 fault-isolation fix."
 )
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
     omni_server_function,

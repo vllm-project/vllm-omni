@@ -20,11 +20,12 @@ import socket
 import time
 from argparse import Namespace
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from http import HTTPStatus
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
+import torch
 import uvloop
 import vllm.envs as envs
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
@@ -98,10 +99,10 @@ from vllm_omni.entrypoints.async_omni import ABORT_TIMEOUT_S, AsyncOmni
 from vllm_omni.entrypoints.duplex.openai import dispatch_realtime_websocket
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
 from vllm_omni.entrypoints.duplex.warmup import (
-    DUPLEX_WARMUP_CLIENT_WAIT_S,
     _warmup_duplex_realtime,
     lookup_duplex_plugin,
     startup_warmup_kind,
+    wait_for_duplex_warmup,
 )
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni
 from vllm_omni.entrypoints.openai import app_state as openai_app_state
@@ -189,7 +190,10 @@ from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, FileStorageHan
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type
 from vllm_omni.entrypoints.openai.video.generation.helpers import (
+    VIDEO_DELETE_TIMEOUT_S,
     VIDEO_SYNC_TIMEOUT_S,
+    _cleanup_timeline_guides,
+    _cleanup_video,
     _cleanup_video_references,
     _parse_video_form,
     _run_video_generation_job,
@@ -316,6 +320,29 @@ def run_omni_api_server_worker_proc(
     )
 
 
+def _limit_api_server_torch_threads() -> None:
+    """Limit the process-wide Torch pool at API worker startup.
+
+    The API process runs small host-side tensor ops per output (audio chunk
+    concatenation, copies) whose parallel regions leave the OpenMP workers
+    spinning; with the default one-thread-per-CPU pool that pinned 7-8 cores per
+    API server and starved co-located stage processes. A few threads keep media
+    preprocessing (image and video resize/normalize) close to full speed. A
+    lower thread count already in effect (e.g. from OMP_NUM_THREADS) is kept.
+    Inline diffusion stages share this pool. Set
+    VLLM_OMNI_API_SERVER_TORCH_THREADS to a higher cap or zero to disable it.
+    """
+    value = os.environ.get("VLLM_OMNI_API_SERVER_TORCH_THREADS", "4")
+    try:
+        limit = int(value)
+    except ValueError as exc:
+        raise ValueError("VLLM_OMNI_API_SERVER_TORCH_THREADS must be a non-negative integer") from exc
+    if limit < 0:
+        raise ValueError("VLLM_OMNI_API_SERVER_TORCH_THREADS must be a non-negative integer")
+    if limit:
+        torch.set_num_threads(min(limit, torch.get_num_threads()))
+
+
 async def omni_run_server_worker(
     listen_address: str,
     sock: socket.socket,
@@ -324,6 +351,7 @@ async def omni_run_server_worker(
     **uvicorn_kwargs: object,
 ) -> None:
     """Run a single API server worker."""
+    _limit_api_server_torch_threads()
     api_server_count = _resolve_api_server_count(args, client_config)
 
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
@@ -638,7 +666,10 @@ async def build_async_omni_from_stage_config(
         # This controls only the API-process WebSocket and is not an AsyncOmni option.
         kwargs.pop("robot_openpi_idle_timeout", None)
         model = kwargs.pop("model", None) or args.model
-        kwargs.setdefault("log_stats", not args.disable_log_stats)
+        if args.disable_log_stats:
+            kwargs["log_stats"] = False
+        else:
+            kwargs.setdefault("log_stats", True)
         if client_config is not None:
             kwargs["client_config"] = client_config
         if _should_serve_duplex(model, kwargs):
@@ -836,15 +867,17 @@ async def omni_init_app_state(
     # Get vllm_config from engine_client (following 0.14.0 pattern)
     vllm_config = await openai_app_state._get_vllm_config(engine_client)
 
-    # Detect if it's pure Diffusion mode (single stage and is Diffusion)
+    # Detect if it's Diffusion mode (every stage is a diffusion stage). This
+    # covers both single-stage diffusion and multi-stage diffusion pipelines
+    # such as the Wan Encode/Generation (EG) (text_encode + dit) disaggregation,
+    # which must use the diffusion serving path (no vllm_config) rather than the
+    # LLM/multi-stage path.
     is_pure_diffusion = False
     if hasattr(engine_client, "stage_configs") and engine_client.stage_configs:
         stage_configs = engine_client.stage_configs
-        if len(stage_configs) == 1:
-            stage_type = get_stage_type(stage_configs[0])
-            if stage_type == "diffusion":
-                is_pure_diffusion = True
-                logger.info("Detected pure diffusion mode (single diffusion stage)")
+        if all(get_stage_type(sc) == "diffusion" for sc in stage_configs):
+            is_pure_diffusion = True
+            logger.info("Detected diffusion mode (%d diffusion stage(s))", len(stage_configs))
 
     if args.served_model_name is not None:
         served_model_names = args.served_model_name
@@ -890,7 +923,6 @@ async def omni_init_app_state(
         )
 
         # audio related
-        state.openai_serving_speech = None
         state.openai_serving_audio_generate = OmniOpenAIServingAudioGenerate.for_diffusion(
             engine_client,
             state.openai_serving_models,
@@ -918,6 +950,7 @@ async def omni_init_app_state(
             speech_cache_config=speech_cache_config,
             allowed_local_media_path=getattr(args, "allowed_local_media_path", ""),
             allowed_media_domains=getattr(args, "allowed_media_domains", None),
+            request_logger=request_logger,
         )
         state.openai_serving_duplex = None
         state.openai_streaming_speech = None
@@ -1180,6 +1213,7 @@ async def omni_init_app_state(
         request_logger=request_logger,
         model_name=model_name,
         speech_cache_config=speech_cache_config,
+        api_server_shared_dir=getattr(args, "_omni_api_server_shared_dir", None),
         forced_aligner_enabled=build_forced_aligner_config(
             getattr(args, "forced_aligner", None),
             getattr(args, "forced_aligner_config", None),
@@ -1356,6 +1390,20 @@ async def create_batch_chat_completion(request: BatchChatCompletionRequest, raw_
 _remove_route_from_router(router, "/v1/audio/speech", {"POST"})
 
 
+def _unsupported_api_response(raw_request: Request, api_name: str) -> JSONResponse:
+    """404 for a route whose serving handler is not configured on this server."""
+    message = f"The model does not support {api_name}"
+    base_server = getattr(raw_request.app.state, "serving_tokenization", None)
+    if base_server is None:
+        raise HTTPException(status_code=HTTPStatus.NOT_FOUND.value, detail=message)
+    err = base_server.create_error_response(
+        message=message,
+        err_type="NotFoundError",
+        status_code=HTTPStatus.NOT_FOUND,
+    )
+    return _error_response_to_json_response(err, status_code=HTTPStatus.NOT_FOUND)
+
+
 @router.post(
     "/v1/audio/speech",
     dependencies=[Depends(validate_json_request)],
@@ -1385,18 +1433,7 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
     """
     handler = Omnispeech(raw_request)
     if handler is None:
-        base_server = getattr(raw_request.app.state, "serving_tokenization", None)
-        if base_server is None:
-            raise HTTPException(
-                status_code=HTTPStatus.NOT_FOUND.value,
-                detail="The model does not support Speech API",
-            )
-        err = base_server.create_error_response(
-            message="The model does not support Speech API",
-            err_type="NotFoundError",
-            status_code=HTTPStatus.NOT_FOUND,
-        )
-        return _error_response_to_json_response(err, status_code=HTTPStatus.NOT_FOUND)
+        return _unsupported_api_response(raw_request, "Speech API")
     try:
         result = await handler.create_speech(request, raw_request)
         if isinstance(result, ErrorResponse):
@@ -1423,18 +1460,7 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
 async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request):
     handler = Omnispeech(raw_request)
     if handler is None:
-        base_server = getattr(raw_request.app.state, "serving_tokenization", None)
-        if base_server is None:
-            raise HTTPException(
-                status_code=HTTPStatus.NOT_FOUND.value,
-                detail="The model does not support Speech API",
-            )
-        err = base_server.create_error_response(
-            message="The model does not support Speech API",
-            err_type="NotFoundError",
-            status_code=HTTPStatus.NOT_FOUND,
-        )
-        return _error_response_to_json_response(err, status_code=HTTPStatus.NOT_FOUND)
+        return _unsupported_api_response(raw_request, "Speech API")
     try:
         result = await handler.create_speech_batch(request)
         if isinstance(result, ErrorResponse):
@@ -1466,18 +1492,7 @@ async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request)
 async def create_audio_generate(request: OpenAICreateAudioGenerateRequest, raw_request: Request):
     handler = OmniAudioGenerate(raw_request)
     if handler is None:
-        base_server = getattr(raw_request.app.state, "serving_tokenization", None)
-        if base_server is None:
-            raise HTTPException(
-                status_code=HTTPStatus.NOT_FOUND.value,
-                detail="The model does not support Audio Generate API",
-            )
-        err = base_server.create_error_response(
-            message="The model does not support Audio Generate API",
-            err_type="NotFoundError",
-            status_code=HTTPStatus.NOT_FOUND,
-        )
-        return _error_response_to_json_response(err, status_code=HTTPStatus.NOT_FOUND)
+        return _unsupported_api_response(raw_request, "Audio Generate API")
     try:
         result = await handler.create_audio_generate(request, raw_request)
         if isinstance(result, ErrorResponse):
@@ -1785,7 +1800,7 @@ async def realtime_websocket(websocket: WebSocket):
     if use_duplex_realtime and duplex_handler is not None:
         if await _reject_multi_api_duplex(websocket):
             return
-        await _wait_for_duplex_warmup(websocket)
+        await wait_for_duplex_warmup(websocket)
         await duplex_handler.handle_realtime_session(websocket)
         return
 
@@ -1798,28 +1813,12 @@ async def realtime_websocket(websocket: WebSocket):
     await dispatch_realtime_websocket(websocket)
 
 
-async def _wait_for_duplex_warmup(websocket: WebSocket) -> None:
-    """Hold real clients until the startup duplex warmup finishes.
-
-    The warmup connection marks itself with ``vllm_omni_warmup=1`` and passes through.
-    """
-    warmup_done = getattr(websocket.app.state, "duplex_warmup_done", None)
-    if warmup_done is not None and not warmup_done.is_set() and websocket.query_params.get("vllm_omni_warmup") != "1":
-        try:
-            await asyncio.wait_for(warmup_done.wait(), timeout=DUPLEX_WARMUP_CLIENT_WAIT_S)
-        except (TimeoutError, asyncio.TimeoutError):
-            logger.warning(
-                "Duplex warmup still running after %d s; admitting the client anyway.",
-                DUPLEX_WARMUP_CLIENT_WAIT_S,
-            )
-
-
 @router.websocket("/v1/duplex")
 async def duplex_websocket(websocket: WebSocket):
     """Alias of ``/v1/realtime?duplex=1``: the same Realtime duplex session protocol."""
     if await _reject_multi_api_duplex(websocket):
         return
-    await _wait_for_duplex_warmup(websocket)
+    await wait_for_duplex_warmup(websocket)
     handler = getattr(websocket.app.state, "openai_serving_duplex", None)
     if handler is None:
         await websocket.accept()
@@ -2693,22 +2692,41 @@ async def create_video(
         control_path,
         latent_edit_input,
     ) = ctx
-    ref = video_response_from_request(effective_model_name, request)
-    await VIDEO_STORE.upsert(ref.id, ref)
-    task = asyncio.create_task(
-        _run_video_generation_job(
-            handler,
-            request,
-            ref.id,
-            reference_image,
-            reference_video,
-            reference_audio,
-            control_path,
-            app_state=raw_request.app.state,
-            latent_edit_input=latent_edit_input,
+
+    def _cleanup_request_resources() -> None:
+        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+        _cleanup_timeline_guides(request)
+
+    task: asyncio.Task[None] | None = None
+    ref = None
+    try:
+        ref = video_response_from_request(effective_model_name, request)
+        await VIDEO_STORE.upsert(ref.id, ref)
+        task = asyncio.create_task(
+            _run_video_generation_job(
+                handler,
+                request,
+                ref.id,
+                reference_image,
+                reference_video,
+                reference_audio,
+                control_path,
+                app_state=raw_request.app.state,
+                latent_edit_input=latent_edit_input,
+            )
         )
-    )
-    await VIDEO_TASKS.upsert(ref.id, task)
+        # A task cancelled before its first step never enters its finally block.
+        task.add_done_callback(lambda _: _cleanup_request_resources())
+        await VIDEO_TASKS.upsert(ref.id, task)
+    except BaseException:
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+        _cleanup_request_resources()
+        if ref is not None:
+            await VIDEO_STORE.pop(ref.id)
+        raise
     return ref
 
 
@@ -2790,6 +2808,7 @@ async def create_video_sync(
         ) from exc
     finally:
         _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+        _cleanup_timeline_guides(request)
     inference_time_s = time.perf_counter() - started_at
 
     return Response(
@@ -2908,12 +2927,13 @@ async def delete_video(video_id: str, raw_request: Request) -> VideoDeleteRespon
         if task is not None:
             task.cancel()
             try:
-                # Cancel cleanup may spend a full abort budget; +2s covers scheduling slack.
-                await asyncio.wait_for(task, timeout=VIDEO_ABORT_TIMEOUT_S + 2.0)
+                # Allow the abort budget while shielding artifact cleanup from a second cancellation.
+                await asyncio.wait_for(asyncio.shield(task), timeout=VIDEO_ABORT_TIMEOUT_S + VIDEO_DELETE_TIMEOUT_S)
             except asyncio.TimeoutError:
                 raise HTTPException(status_code=409, detail="Cancellation in progress. Please try again later.")
             except asyncio.CancelledError:
-                pass
+                if not task.cancelled():
+                    raise
 
         job = await VIDEO_STORE.get(video_id)
         if job is None:
@@ -2923,12 +2943,8 @@ async def delete_video(video_id: str, raw_request: Request) -> VideoDeleteRespon
             return VideoDeleteResponse(id=job.id, deleted=True)
 
     if job.status is VideoGenerationStatus.FAILED:
-        if job.file_name is not None:
-            try:
-                await STORAGE_MANAGER.delete(video_id)
-            except Exception:
-                logger.warning("Failed to delete stored artifact for failed video job %s", video_id, exc_info=True)
-
+        # Partial artifacts may exist before their descriptors are published.
+        await _cleanup_video(video_id)
         await VIDEO_STORE.pop(video_id)
         return VideoDeleteResponse(id=job.id, deleted=True)
 

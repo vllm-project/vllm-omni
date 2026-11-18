@@ -59,6 +59,35 @@ Pass **`--test-config-file`** to load one JSON file, or omit it for the bulk sca
 
 #### Parameter Explanation
 
+##### Qwen3-Omni multi-replica audio baseline recalibration
+
+`test_qwen3_omni_multi_replicas.json` explicitly selects `speaker: "ethan"`
+for all four audio-output workloads. Earlier runs omitted the speaker and
+used Chelsie before the default-voice correction in #8568. Their audio TTFP
+and RTF baselines are not comparable with the fixed Ethan workloads.
+
+The affected H100 `mean_audio_ttfp_ms` and `mean_audio_rtf` baselines are
+temporarily absent pending recalibration; measurements continue to be saved,
+but these metrics have no baseline regression comparison during this period.
+The Thinker TPOT baseline remains in place. Text-only and A3 configurations
+retain their existing baselines.
+
+CI maintainers should restore the audio baselines after the sender snapshot
+optimization associated with #8794 is merged. Run the fixed Ethan workloads
+multiple times on H100, including the concurrency sweep `[8, 16, 24, 32]`
+and the three multimodal-input workloads. Record the tested commit, deployment
+configuration, speaker, request counts, input/output lengths, and the
+variation in latency and audio duration. Review the high-concurrency TTFP
+tail separately before choosing thresholds: changing the voice does not
+resolve sender backlog. Keep restored baseline arrays aligned with the sweep.
+
+```bash
+export BENCHMARK_DIR=tests/dfx/perf/results
+pytest -sv tests/dfx/perf/scripts/run_benchmark.py \
+  --test-config-file tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json \
+  -m "H100 and slow"
+```
+
 ##### Overview
 
 | Field              | Required  | Description                                                                              |

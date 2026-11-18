@@ -1260,6 +1260,8 @@ def test_typed_stage_drives_video_capability_checks():
     assert minimax_handler.supports_mixed_reference_inputs
     assert minimax_handler.supports_latent_mask_editing
     assert get_diffusion_model_metadata("MiniMaxH3ModularPipeline").supports_latent_mask_editing
+    assert minimax_handler.supports_timeline_guides
+    assert get_diffusion_model_metadata("MiniMaxH3ModularPipeline").supports_timeline_guides
 
     cosmos_stage = StageConfigFactory.create_typed_default_diffusion(
         "cosmos3",
@@ -1272,6 +1274,7 @@ def test_typed_stage_drives_video_capability_checks():
     )
     assert cosmos_handler.supported_control_upload_types == frozenset({"edge", "blur", "depth", "seg", "wsm"})
     assert not cosmos_handler.supports_latent_mask_editing
+    assert not cosmos_handler.supports_timeline_guides
 
 
 @pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
@@ -1418,6 +1421,171 @@ def test_h3_latent_edit_rejects_mask_text_form_fields(test_client):
     )
 
     assert response.status_code == 422
+
+
+def _guide_files():
+    return [
+        ("guide_files", ("first.png", _make_test_image_bytes(), "image/png")),
+        ("guide_files", ("tail.mp4", b"guide-video", "video/mp4")),
+        ("guide_files", ("tone.flac", b"guide-audio", "audio/flac")),
+    ]
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+def test_h3_timeline_guides_reach_generation_and_are_cleaned(endpoint, test_client, mocker: MockerFixture):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    captured_bytes = {}
+    generate = engine.generate
+
+    async def capture_guides(prompt, request_id, sampling_params_list):
+        for index, guide in enumerate(prompt["multi_modal_data"]["timeline_guides"]):
+            for kind in ("video", "audio"):
+                if kind in guide:
+                    captured_bytes[(index, kind)] = Path(guide[kind]).read_bytes()
+        async for output in generate(prompt, request_id, sampling_params_list):
+            yield output
+
+    engine.generate = capture_guides
+    manifest = [
+        {"frame_index": 0, "image": {"upload_index": 0}},
+        {"frame_index": -22, "video": {"upload_index": 1}},
+        {"frame_index": 36, "image": {"upload_index": 0}, "audio": {"upload_index": 2}},
+    ]
+
+    response = test_client.post(
+        endpoint,
+        data={"prompt": "Follow the guides.", "timeline_guides": json.dumps(manifest)},
+        files=_guide_files(),
+    )
+
+    assert response.status_code == 200, response.text
+    if not endpoint.endswith("/sync"):
+        _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
+    guides = engine.captured_prompt["multi_modal_data"]["timeline_guides"]
+    assert [guide["frame_index"] for guide in guides] == [0, -22, 36]
+    assert isinstance(guides[0]["image"], Image.Image) and guides[0]["image"] is guides[2]["image"]
+    assert captured_bytes == {(1, "video"): b"guide-video", (2, "audio"): b"guide-audio"}
+    assert "timeline_guides" not in engine.captured_sampling_params_list[0].extra_args
+    paths = [Path(guides[1]["video"]), Path(guides[2]["audio"])]
+    _wait_until(lambda: not any(path.exists() for path in paths))
+
+
+def test_timeline_guides_are_rejected_for_models_without_capability(test_client):
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "guide", "timeline_guides": json.dumps([{"frame_index": 0, "image": {"upload_index": 0}}])},
+        files=_guide_files()[:1],
+    )
+
+    assert response.status_code == 400
+    assert "not supported" in response.json()["detail"].lower()
+
+
+@pytest.mark.parametrize(
+    ("manifest", "files", "message"),
+    [
+        (None, [0], "requires a timeline_guides manifest"),
+        ("not json", [0], "Invalid timeline_guides"),
+        ("[]", [], "must not be empty"),
+        ([{"frame_index": "0", "image": {"upload_index": 0}}], [0], "Invalid timeline_guides at 0.frame_index"),
+        ([{"frame_index": 0, "image": {"upload_index": 0}, "path": "/etc/passwd"}], [0], "Invalid timeline_guides"),
+        ([{"frame_index": 0}], [], "at least one of image, video, or audio"),
+        (
+            [{"frame_index": 0, "image": {"upload_index": 0}, "video": {"upload_index": 1}}],
+            [0, 1],
+            "both image and video",
+        ),
+        ([{"frame_index": 0, "image": {"upload_index": 1}}], [0], "only 1 were uploaded"),
+        ([{"frame_index": 0, "image": {"upload_index": 0}}], [0, 1], "are not referenced"),
+        (
+            [{"frame_index": 0, "image": {"upload_index": 0}}, {"frame_index": 1, "audio": {"upload_index": 0}}],
+            [0],
+            "both image and audio",
+        ),
+        ([{"frame_index": 0, "video": {"upload_index": 0}}], [2], "must be an MP4 or MOV file"),
+        ([{"frame_index": 0, "audio": {"upload_index": 0}}], [1], "must be a WAV, MP3, or FLAC file"),
+        ([{"frame_index": index, "audio": {"upload_index": 0}} for index in range(9)], [2], "at most 8 entries"),
+    ],
+)
+def test_h3_timeline_guide_manifest_validation(test_client, manifest, files, message):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    uploads = _guide_files()
+    data = {"prompt": "guide"}
+    if manifest is not None:
+        data["timeline_guides"] = manifest if isinstance(manifest, str) else json.dumps(manifest)
+
+    response = test_client.post("/v1/videos/sync", data=data, files=[uploads[index] for index in files] or None)
+
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+
+
+def test_h3_timeline_guide_persistence_failure_cleans_prior_uploads(test_client, monkeypatch):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    persisted: list[str] = []
+    original = video_generation_helpers._persist_uploaded_reference
+
+    async def persist_then_fail(upload, **kwargs):
+        if persisted:
+            raise HTTPException(status_code=400, detail="second upload rejected")
+        path = await original(upload, **kwargs)
+        persisted.append(path)
+        return path
+
+    monkeypatch.setattr(video_generation_helpers, "_persist_uploaded_reference", persist_then_fail)
+    manifest = [{"frame_index": 0, "video": {"upload_index": 0}, "audio": {"upload_index": 1}}]
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "guide", "timeline_guides": json.dumps(manifest)},
+        files=_guide_files()[1:],
+    )
+
+    assert response.status_code == 400
+    assert persisted and not Path(persisted[0]).exists()
+
+
+@pytest.mark.parametrize("failure", ["registration_error", "cancelled_before_start"])
+def test_create_video_cleans_timeline_guides_when_job_never_starts(test_client, monkeypatch, failure):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    persisted: list[str] = []
+    original_persist = video_generation_helpers._persist_uploaded_reference
+
+    async def recording_persist(upload, **kwargs):
+        path = await original_persist(upload, **kwargs)
+        persisted.append(path)
+        return path
+
+    monkeypatch.setattr(video_generation_helpers, "_persist_uploaded_reference", recording_persist)
+    original_upsert = api_server.VIDEO_TASKS.upsert
+
+    async def failing_upsert(video_id, task):
+        if failure == "registration_error":
+            raise RuntimeError("task registry unavailable")
+        # The job coroutine never starts, so its own finally block cannot clean up.
+        task.cancel()
+        await original_upsert(video_id, task)
+
+    monkeypatch.setattr(api_server.VIDEO_TASKS, "upsert", failing_upsert)
+    manifest = [{"frame_index": 0, "video": {"upload_index": 0}, "audio": {"upload_index": 1}}]
+    request_kwargs = {
+        "data": {"prompt": "guide", "timeline_guides": json.dumps(manifest)},
+        "files": _guide_files()[1:],
+    }
+
+    if failure == "registration_error":
+        with pytest.raises(RuntimeError, match="task registry unavailable"):
+            test_client.post("/v1/videos", **request_kwargs)
+    else:
+        assert test_client.post("/v1/videos", **request_kwargs).status_code == 200
+
+    assert len(persisted) == 2
+    _wait_until(lambda: not any(Path(path).exists() for path in persisted))
 
 
 def test_h3_latent_edit_masks_without_sources_are_forwarded_to_stage0(test_client, mocker: MockerFixture):
@@ -2700,6 +2868,99 @@ def test_delete_aborts_engine_request_before_cancelling_task(test_client):
     assert delete_resp.json()["deleted"] is True
     _wait_until(lambda: engine.aborted == [video_id])
     assert asyncio.run(api_server.VIDEO_STORE.get(video_id)) is None
+
+
+def test_create_video_rolls_back_job_when_task_registration_fails(test_client, monkeypatch):
+    handler = BlockingVideoHandler()
+    test_client.app.state.openai_serving_video = handler
+    cleanups = []
+    monkeypatch.setattr(api_server, "_cleanup_video_references", lambda *args: cleanups.append(args))
+
+    async def failing_upsert(video_id, task):
+        del video_id, task
+        raise RuntimeError("task registry unavailable")
+
+    monkeypatch.setattr(api_server.VIDEO_TASKS, "upsert", failing_upsert)
+
+    with pytest.raises(RuntimeError, match="task registry unavailable"):
+        test_client.post("/v1/videos", data={"prompt": "Roll back this video"})
+
+    assert cleanups
+    assert not handler.started.is_set()
+    assert asyncio.run(api_server.VIDEO_STORE.list_values()) == []
+
+
+def test_create_video_cleans_references_when_task_cancelled_before_start(test_client, monkeypatch):
+    handler = BlockingVideoHandler()
+    test_client.app.state.openai_serving_video = handler
+    cleanups = []
+    monkeypatch.setattr(api_server, "_cleanup_video_references", lambda *args: cleanups.append(args))
+    original_upsert = api_server.VIDEO_TASKS.upsert
+
+    async def cancelling_upsert(video_id, task):
+        # The job coroutine never starts, so its own finally block cannot clean up.
+        task.cancel()
+        await original_upsert(video_id, task)
+
+    monkeypatch.setattr(api_server.VIDEO_TASKS, "upsert", cancelling_upsert)
+
+    create_resp = test_client.post("/v1/videos", data={"prompt": "Cancel before start"})
+    assert create_resp.status_code == 200
+    _wait_until(lambda: len(cleanups) == 1)
+    assert not handler.started.is_set()
+
+
+def test_delete_failed_job_removes_unpublished_partial_artifact(test_client):
+    job = VideoResponse(model="test-model", prompt="Fail after partial save", status=VideoGenerationStatus.FAILED)
+    assert job.file_name is None
+    asyncio.run(api_server.VIDEO_STORE.upsert(job.id, job))
+    file_path = api_server.STORAGE_MANAGER.get_full_file_path(job.id)
+    Path(file_path).write_bytes(b"partial-video")
+
+    delete_resp = test_client.delete(f"/v1/videos/{job.id}")
+
+    assert delete_resp.status_code == 200
+    assert delete_resp.json()["deleted"] is True
+    assert not os.path.exists(file_path)
+    assert asyncio.run(api_server.VIDEO_STORE.get(job.id)) is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_delete_does_not_interrupt_job_cancellation_cleanup():
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleaned = asyncio.Event()
+
+    async def job() -> None:
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            cleaned.set()
+            raise
+
+    ref = VideoResponse(model="test-model", prompt="Slow cleanup", status=VideoGenerationStatus.IN_PROGRESS)
+    await api_server.VIDEO_STORE.upsert(ref.id, ref)
+    task = asyncio.create_task(job())
+    await asyncio.sleep(0)
+    await api_server.VIDEO_TASKS.upsert(ref.id, task)
+    raw_request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(openai_serving_video=BlockingVideoHandler()))
+    )
+
+    delete = asyncio.create_task(api_server.delete_video(ref.id, raw_request))
+    await asyncio.wait_for(cleanup_started.wait(), timeout=2.0)
+    # A client disconnect cancels DELETE; the job's own cleanup must still finish.
+    delete.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await delete
+    assert not task.done()
+
+    release_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cleaned.is_set()
 
 
 def test_video_response_file_extension_is_robust():

@@ -161,6 +161,9 @@ class OmniINCConfig(INCConfig):
         """
         omni = object.__new__(cls)
         omni.__dict__.update(inc.__dict__)
+        # The copied parser still references the original INCConfig. Rebuild it
+        # so layer resolution reads the upgraded config after prefix remapping.
+        omni.config_parser = type(inc.config_parser)(omni)
         return omni
 
     @classmethod
