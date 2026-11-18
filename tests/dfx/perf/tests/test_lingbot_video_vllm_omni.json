@@ -47,7 +47,7 @@
         "baseline": {
           "H100": {
             "request_throughput": 0.4985,
-            "mean_e2el_ms": 2005.6932,
+            "mean_e2el_ms": 2005.641,
             "mean_peak_memory_mb": 20744.0
           }
         }
