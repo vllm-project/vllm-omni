@@ -7,31 +7,9 @@ import pytest
 import torch
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
-from vllm_omni.worker_v2.omni_sampler import (
-    OmniSampler,
-    OmniSamplingOutput,
-    patch_resampled_token_insertion,
-    sample_with_output,
-)
+from vllm_omni.worker_v2.omni_sampler import OmniSampler, OmniSamplingOutput, sample_with_output
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-
-def test_resampled_insertion_uses_one_warp_for_launch_and_warmup(monkeypatch, mocker):
-    from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import _insert_resampled_kernel
-
-    run = mocker.Mock()
-    monkeypatch.setattr(_insert_resampled_kernel, "run", run)
-    patch_resampled_token_insertion()
-    patched = _insert_resampled_kernel.run
-    patch_resampled_token_insertion()
-    assert _insert_resampled_kernel.run is patched
-
-    _insert_resampled_kernel[(3,)]("inputs", PADDED_RESAMPLE_NUM_BLOCKS=256)
-    run.assert_called_once_with("inputs", grid=(3,), warmup=False, num_warps=1, PADDED_RESAMPLE_NUM_BLOCKS=256)
-    run.reset_mock()
-    _insert_resampled_kernel.warmup("inputs", grid=(2,), PADDED_RESAMPLE_NUM_BLOCKS=256)
-    run.assert_called_once_with("inputs", grid=(2,), warmup=True, num_warps=1, PADDED_RESAMPLE_NUM_BLOCKS=256)
 
 
 def _output():

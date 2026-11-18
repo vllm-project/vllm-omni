@@ -329,8 +329,8 @@ stages:
 - `vllm_omni/distributed/omni_connectors/connectors/shm_connector.py`: SharedMemoryConnector (transport-only put/get)
 - `vllm_omni/core/sched/omni_ar_scheduler.py`: AR scheduler with chunk_transfer_adapter
 - `vllm_omni/core/sched/omni_generation_scheduler.py`: Generation scheduler with same async chunk pattern
-- `vllm_omni/worker/gpu_model_runner.py`: Model runner with chunk handling
-- `vllm_omni/worker/gpu_generation_model_runner.py`: Generation model runner with batch output handling and ubatch_slices support
+- `vllm_omni/worker_v2/omni_model_runner.py`: V2 model runner with chunk handling
+- `vllm_omni/worker_v2/omni_generation_model_runner.py`: V2 generation runner with batch output handling
 - `vllm_omni/model_executor/models/qwen3_omni/qwen3_omni.py`: Model implementation with code2wav batching
 - `vllm_omni/model_executor/models/qwen3_omni/qwen3_omni_code2wav.py`: Code2wav decoder with batch support
 - `vllm_omni/engine/arg_utils.py`: Configuration definitions (async_chunk, worker_type)

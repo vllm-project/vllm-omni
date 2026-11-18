@@ -45,7 +45,7 @@ from vllm_omni.utils.mm_outputs import partition_flat_payload
 from vllm_omni.worker.sparse_audio import resolve_sparse_mm_routing
 from vllm_omni.worker_v2.mooncake_capture import snapshot_mooncake_output
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
-from vllm_omni.worker_v2.omni_sampler import patch_resampled_token_insertion, sample_with_output
+from vllm_omni.worker_v2.omni_sampler import sample_with_output
 from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot, pack_output_snapshot
 from vllm_omni.worker_v2.streaming_audio import StreamingAudioSnapshot
 from vllm_omni.worker_v2.warmup import is_warmup_request
@@ -162,8 +162,6 @@ class OmniARModelRunner(OmniGPUModelRunner):
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         super().load_model(*args, **kwargs)
-        if self.num_speculative_steps > 0 and self.is_last_pp_rank and self.device.type == "cuda":
-            patch_resampled_token_insertion()
         if (
             self.num_speculative_steps > 0
             and self.is_last_pp_rank
@@ -194,9 +192,15 @@ class OmniARModelRunner(OmniGPUModelRunner):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> Any:
+        flush_pending_metadata = getattr(self.model, "flush_pending_metadata", None)
+        if callable(flush_pending_metadata):
+            # Capture and unsuccessful forwards can leave unassigned metadata.
+            # Discard it without clearing metadata already bound to live requests.
+            flush_pending_metadata(())
         if not dummy_run:
             self._handle_kv_transfer_pre(scheduler_output)
-        return super().execute_model(
+        previous_state = self.execute_model_state if not dummy_run else None
+        output = super().execute_model(
             scheduler_output,
             intermediate_tensors,
             dummy_run=dummy_run,
@@ -206,6 +210,13 @@ class OmniARModelRunner(OmniGPUModelRunner):
             valid_dummy_state_slots=valid_dummy_state_slots,
             randomize_inputs=randomize_inputs,
         )
+        state = self.execute_model_state
+        if not dummy_run and state is not None and state is not previous_state:
+            # Preserve model-owned RoPE metadata in the actual forward order
+            # before the next step exports the finished requests' KV caches.
+            if callable(flush_pending_metadata):
+                flush_pending_metadata(state.input_batch.req_ids)
+        return output
 
     # ------------------------------------------------------------------
     # sample_tokens: OmniOutput handling + pooler_output + async D2H
@@ -363,7 +374,6 @@ class OmniARModelRunner(OmniGPUModelRunner):
         # --- Build base output ---
         model_runner_output = OmniModelRunnerOutput(
             req_ids=input_batch.req_ids,
-            req_id_to_index={rid: i for i, rid in enumerate(input_batch.req_ids)},
             sampled_token_ids=None,  # type: ignore[arg-type]
             prompt_logprobs_dict=prompt_logprobs_dict,
             prompt_token_id_logprobs_dict=prompt_token_id_logprobs_dict,

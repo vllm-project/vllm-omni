@@ -24,6 +24,183 @@ from vllm_omni.worker_v2.output_snapshot import pack_output_snapshot
 pytestmark = [pytest.mark.core_model]
 
 
+@pytest.mark.cpu
+def test_bagel_img2img_kv_transfer_preserves_compressed_rope(monkeypatch):
+    from vllm_omni.diffusion.models.bagel.bagel_transformer import Bagel, get_flattened_position_ids_extrapolate
+    from vllm_omni.diffusion.models.bagel.pipeline_bagel import BagelPipeline
+    from vllm_omni.distributed.omni_connectors.kv_transfer_manager import KVCacheTransferData, OmniKVTransferManager
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.model_executor.models.bagel.bagel import OmniBagelForConditionalGeneration
+    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+    model = object.__new__(OmniBagelForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model._pending_img2img_info = [(6, 4, 32, 32)] * 2
+    model._last_img2img_info = (6, 4, 32, 32)
+    model._ropes_pending, model._ropes_metadata = [], {}
+    model._img2img_token_id = 99
+    # Substitute only the attention kernels; keep Bagel's real position rewrite.
+    model._mot_forward = lambda *args, **kwargs: torch.zeros(29, 2)
+    req_ids = ["cfg_text", "cfg_img", "gen"]
+    lengths = [12, 3, 14]
+    positions = torch.cat([torch.arange(n) for n in lengths])
+    input_ids = torch.tensor([99] * 11 + [1] + [2] * 3 + [99] * 11 + [3] * 3)
+    runner = object.__new__(OmniARModelRunner)
+    runner.model, runner.execute_model_state = model, None
+    runner.kv_caches = [(torch.zeros(1, 32, 1, 2), torch.ones(1, 32, 1, 2))]
+    runner.cache_config = SimpleNamespace(block_size=32, cache_dtype="auto")
+    runner.req_states = SimpleNamespace(req_id_to_index={})
+    manager = object.__new__(OmniKVTransferManager)
+    received = {}
+
+    def transfer(*, finished_reqs, kv_caches, block_size, cache_dtype, request_id_resolver):
+        for req_id, data in finished_reqs.items():
+            payload = manager._extract_kv_cache(
+                req_id,
+                data["block_ids"],
+                data["seq_len"],
+                kv_caches,
+                block_size,
+                cache_dtype,
+                data.get("custom_metadata"),
+            )
+            received[req_id] = KVCacheTransferData.from_bytes(bytearray(payload.to_bytes()))
+        return list(finished_reqs)
+
+    monkeypatch.setattr(
+        runner, "_ensure_kv_transfer_manager", lambda: SimpleNamespace(handle_finished_requests_kv_transfer=transfer)
+    )
+
+    def forward(_runner, *_args, **_kwargs):
+        model(input_ids, positions, inputs_embeds=torch.zeros(29, 2))
+        runner.execute_model_state = SimpleNamespace(input_batch=SimpleNamespace(req_ids=req_ids))
+        return None
+
+    monkeypatch.setattr(OmniGPUModelRunner, "execute_model", forward)
+    runner.execute_model(SimpleNamespace(finished_requests_needing_kv_transfer={}))
+    # Transfer order differs from the forward order. Metadata must remain request-local.
+    finished = {rid: {"seq_len": n, "block_ids": [0]} for rid, n in zip(req_ids, lengths)}
+    runner._handle_kv_transfer_pre(
+        SimpleNamespace(finished_requests_needing_kv_transfer={rid: finished[rid] for rid in reversed(req_ids)})
+    )
+    assert model._ropes_pending == []
+
+    bagel = object.__new__(Bagel)
+    torch.nn.Module.__init__(bagel)
+    bagel.max_latent_size, bagel.latent_downsample = 64, 16
+    bagel.latent_channel, bagel.latent_patch_size = 16, 2
+    bagel.get_flattened_position_ids = get_flattened_position_ids_extrapolate
+    bagel.config = SimpleNamespace(llm_config=SimpleNamespace(num_hidden_layers=1))
+    pipeline = object.__new__(BagelPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.bagel, pipeline.device = bagel, torch.device("cpu")
+    pipeline.language_model = SimpleNamespace(vocab_size=100)
+    pipeline.new_token_ids = {"start_of_image": 1, "end_of_image": 2}
+    sampling = OmniDiffusionSamplingParams(height=32, width=32, seed=52, num_inference_steps=15)
+    sampling.past_key_values = SimpleNamespace(**received["gen"]["layer_blocks"])
+    sampling.kv_metadata = received["gen"]["metadata"]
+    for role in ("cfg_text", "cfg_img"):
+        setattr(sampling, role + "_past_key_values", SimpleNamespace(**received[role]["layer_blocks"]))
+        setattr(sampling, role + "_kv_metadata", received[role]["metadata"])
+    prepared = pipeline._forward_single({"prompt": "edit", "modalities": ["img2img"]}, sampling, prepare_only=True)
+    assert prepared["gen_context"]["ropes"] == [5]
+    assert prepared["cfg_text_context"]["ropes"] == [3]
+    assert prepared["cfg_img_context"]["ropes"] == [3]
+    assert prepared["generation_input"]["packed_position_ids"].tolist() == [5] * 6
+    assert prepared["cfg_text_packed_position_ids"].tolist() == [3] * 6
+    assert sampling.kv_metadata["image_shape"] == [32, 32]
+
+
+@pytest.mark.parametrize("step", ["dummy", "empty", "failed", "no_hook"])
+@pytest.mark.cpu
+def test_pending_metadata_only_flushes_after_a_real_successful_forward(monkeypatch, step):
+    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+    runner = object.__new__(OmniARModelRunner)
+    flush = MagicMock()
+    runner.model = SimpleNamespace(**({} if step == "no_hook" else {"flush_pending_metadata": flush}))
+    runner.execute_model_state = SimpleNamespace(input_batch=SimpleNamespace(req_ids=["previous"]))
+    monkeypatch.setattr(runner, "_handle_kv_transfer_pre", lambda _: None)
+    output = object()
+
+    def forward(_runner, *_args, **_kwargs):
+        if step == "failed":
+            raise RuntimeError("forward failed")
+        if step != "empty":
+            runner.execute_model_state = SimpleNamespace(input_batch=SimpleNamespace(req_ids=["current"]))
+        return output
+
+    monkeypatch.setattr(OmniGPUModelRunner, "execute_model", forward)
+    if step == "failed":
+        with pytest.raises(RuntimeError, match="forward failed"):
+            runner.execute_model(SimpleNamespace())
+    else:
+        assert runner.execute_model(SimpleNamespace(), dummy_run=step == "dummy") is output
+    if step == "no_hook":
+        flush.assert_not_called()
+    else:
+        flush.assert_called_once_with(())
+
+
+@pytest.mark.parametrize("step", ["dummy", "failed", "capture"])
+@pytest.mark.cpu
+def test_bagel_unassigned_metadata_does_not_leak_into_next_forward(monkeypatch, step):
+    from vllm_omni.model_executor.models.bagel.bagel import OmniBagelForConditionalGeneration
+    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+    model = object.__new__(OmniBagelForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    # Encoder profiling and earlier image requests leave this image geometry.
+    model._pending_img2img_info = []
+    model._last_img2img_info = (6, 4, 32, 32)
+    model._ropes_pending = []
+    live_metadata = {"ropes": [7], "image_shape": [32, 32]}
+    model._ropes_metadata = {"live": live_metadata}
+    model._img2img_token_id = 99
+    runner = object.__new__(OmniARModelRunner)
+    runner.model, runner.execute_model_state = model, None
+    monkeypatch.setattr(runner, "_handle_kv_transfer_pre", lambda _: None)
+    fail = step == "failed"
+
+    def attention(_input_ids, positions, *_args, **_kwargs):
+        if fail:
+            raise RuntimeError("attention failed after position metadata")
+        return torch.zeros(len(positions), 2)
+
+    model._mot_forward = attention
+
+    def parent_forward(_runner, scheduler_output, *_args, **_kwargs):
+        n = scheduler_output.tokens
+        # Keep the real Bagel forward, position rewrite and pending producer.
+        model(torch.full((n,), 99), torch.arange(n), inputs_embeds=torch.zeros(n, 2))
+        runner.execute_model_state = SimpleNamespace(input_batch=SimpleNamespace(req_ids=scheduler_output.req_ids))
+        return None
+
+    monkeypatch.setattr(OmniGPUModelRunner, "execute_model", parent_forward)
+    excluded = SimpleNamespace(tokens=12, req_ids=["excluded"])
+    if step == "capture":
+        # Native graph capture invokes the model directly, bypassing the runner.
+        model(torch.full((12,), 99), torch.arange(12), inputs_embeds=torch.zeros(12, 2))
+    elif step == "failed":
+        with pytest.raises(RuntimeError, match="attention failed after position metadata"):
+            runner.execute_model(excluded)
+    else:
+        runner.execute_model(excluded, dummy_run=True)
+    assert model._ropes_pending[0]["ropes"] == [3]
+    assert "excluded" not in model._ropes_metadata
+
+    fail = False
+    runner.execute_model(SimpleNamespace(tokens=14, req_ids=["real"]))
+    assert model.get_kv_transfer_metadata("real") == {
+        "ropes": [5],
+        "image_shape": [32, 32],
+        "prefill_position_count": 14,
+    }
+    assert model._ropes_pending == []
+    assert model._ropes_metadata["live"] is live_metadata
+    assert model._last_img2img_info == (6, 4, 32, 32)
+
+
 class _FakeStream:
     def wait_stream(self, _stream) -> None:
         pass
@@ -352,13 +529,9 @@ def test_sample_tokens_drafts_from_target_layers_after_postprocess(monkeypatch, 
         (7, True, None),
     ],
 )
-@pytest.mark.cpu
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_speculative_load_requires_verifier_only_on_final_rank(monkeypatch, steps, last_rank, has_verifier, device):
+def test_speculative_load_requires_verifier_only_on_final_rank(monkeypatch, steps, last_rank, has_verifier):
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
-    runner.device = torch.device(device)
     calls = []
-    patched = []
 
     def load(self, *args, **kwargs):
         calls.append((args, kwargs))
@@ -368,7 +541,6 @@ def test_speculative_load_requires_verifier_only_on_final_rank(monkeypatch, step
             self.rejection_sampler = object() if has_verifier else None
 
     monkeypatch.setattr(omni_ar_model_runner.OmniGPUModelRunner, "load_model", load)
-    monkeypatch.setattr(omni_ar_model_runner, "patch_resampled_token_insertion", lambda: patched.append(True))
     if steps and last_rank and has_verifier is None:
         # Missing base-runner state is an API-contract violation, not a disabled verifier.
         with pytest.raises(AttributeError, match="rejection_sampler"):
@@ -379,7 +551,6 @@ def test_speculative_load_requires_verifier_only_on_final_rank(monkeypatch, step
     else:
         runner.load_model(load_dummy_weights=True)
     assert calls == [((), {"load_dummy_weights": True})]
-    assert patched == ([True] if steps and last_rank and device == "cuda" else [])
 
 
 @pytest.mark.parametrize("scheduled", [0, 3, 7])
@@ -433,7 +604,6 @@ def test_async_output_preserves_fixed_token_scores_on_host(monkeypatch) -> None:
     scores = torch.tensor([[-0.5, -1.5], [-0.2, -2.2]])
     mro = omni_ar_model_runner.OmniModelRunnerOutput(
         req_ids=["req-0"],
-        req_id_to_index={"req-0": 0},
         sampled_token_ids=None,
         prompt_logprobs_dict={},
         prompt_token_id_logprobs_dict={"req-0": scores},
