@@ -919,7 +919,8 @@ def test_the_worker_restores_exactly_what_the_scheduler_hands_over(monkeypatch: 
         finishing = [s for s in sessions if s in running and rng.random() < 0.3]
         starting = [s for s in sessions if s not in running and s not in finishing and rng.random() < 0.3]
         never_ran = {s for s in starting if rng.random() < 0.2}
-        aborted, normal = [], []
+        aborted: list[str] = []
+        normal: list[str] = []
         for s in finishing:
             (aborted if rng.random() < 0.7 else normal).append(running[s].request_id)
         new_reqs = []

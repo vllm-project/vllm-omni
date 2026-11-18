@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from queue import Queue
 from threading import Event
 from types import SimpleNamespace
