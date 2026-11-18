@@ -502,8 +502,8 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         if not getattr(self.model_state, "uses_ascend_attn_metadata", False):
             raise NotImplementedError(
                 "NPU Model Runner V2 needs a model state that builds Ascend attention "
-                f"metadata; {type(self.model_state).__name__} does not. Keep this stage "
-                "on model_runner v1, or provide an NPU state (Drama 3 does)."
+                f"metadata; {type(self.model_state).__name__} does not. Provide "
+                "an NPU-compatible model state before enabling this stage."
             )
         logger.info(
             "NPU Model Runner V2 loaded %s with Ascend attention metadata.",
