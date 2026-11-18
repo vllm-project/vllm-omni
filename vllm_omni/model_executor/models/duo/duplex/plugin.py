@@ -661,14 +661,17 @@ class DuoDuplexPlugin(DuplexModelPlugin):
         return None
 
     def user_transcript(self, *, stage_id, output, prompt, finished):
+        # Release the ASR slot for this block before anything else. `alternating`
+        # /`serial` admission waits on `schedule.complete("asr", ...)`, and a
+        # finished ASR request with an empty transcript (`outputs` empty) returns
+        # below without producing text. Completing only on the text path left an
+        # empty transcript holding the slot and blocking every later block.
+        if stage_id == self.asr_stage_id and finished:
+            chunk = self.data_plane.states.get(output.request_id)
+            if chunk is not None and chunk.owner.schedule.mode != "free":
+                chunk.owner.schedule.complete("asr", chunk.next_block)
         if stage_id != self.asr_stage_id or not finished or not getattr(output, "outputs", None):
             return None
-        # Release the ASR slot for this block. `serial`/`alternating` admission
-        # waits on `schedule.complete("asr", ...)`; the only other producer was a
-        # plugin hook the engine never calls, which deadlocked those modes.
-        chunk = self.data_plane.states.get(output.request_id)
-        if chunk is not None and chunk.owner.schedule.mode != "free":
-            chunk.owner.schedule.complete("asr", chunk.next_block)
         from vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction import (
             _clean_qwen3_asr_transcript,
             _extract_completed_action_text,

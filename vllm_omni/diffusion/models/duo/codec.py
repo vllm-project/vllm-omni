@@ -169,18 +169,21 @@ class DuoCodecPipeline(nn.Module):
         self._tile_group = None
         self.video.stack_tiling = self.options.get("stack_tiling", False)
         video_group = None
-        tensor_group = None
-        tensor_rank = 0
+        # Tile tensor parallelism sharded the decoder weights, which only the
+        # removed SolarX backend did. Remapping tiles onto a subgroup without
+        # sharding the decoder would silently run each rank with the wrong
+        # weights, so the option is rejected instead of half-applied.
         tensor_size = self.options.get("tile_tensor_parallel_size", 1)
+        if tensor_size != 1:
+            raise ValueError(
+                "tile_tensor_parallel_size is no longer supported: the decoder sharding it "
+                "required belonged to the removed SolarX backend. Leave it at 1."
+            )
         if pc.tensor_parallel_size in (2, 4, 8):
             from vllm.distributed import get_tp_group
 
             self._tile_group = get_tp_group() if tile_group is None else tile_group
             video_group = self._tile_group
-            if tensor_size > 1:
-                from .tile_tp import tile_tensor_groups
-
-                video_group, tensor_group, tensor_rank = tile_tensor_groups(self._tile_group, tensor_size)
             set_tile_group(self.video, video_group)
 
         if self._tile_group is not None and self._tile_group.rank_in_group != 0:

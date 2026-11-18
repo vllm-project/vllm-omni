@@ -302,7 +302,7 @@ class DuoPipeline(nn.Module):
                 # declares", which is what lets another rank/alpha variant load.
                 rank=self.options.get("rank"),
                 alpha=self.options.get("alpha"),
-                role_embedding=self.options.get("role_embedding", False),
+                role_embedding=self.options.get("role_embedding"),
                 target_modules=self.options.get("adapter_modules"),
                 manifest_modules=manifest_modules,
             )

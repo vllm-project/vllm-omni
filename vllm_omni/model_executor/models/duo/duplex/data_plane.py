@@ -168,6 +168,12 @@ class DuoDataPlane(DuplexDataPlane):
                     pending.decoded = encode_av_chunk(payload, meta)
                     pending.codec_metadata = dict(meta)
                     trace("codec_complete", state)
+                    # `stream_4frame` (the default) and `old` land here, and they
+                    # need the same release as the delayed `duo_5_17` path above:
+                    # admission waits on `self.codec`, so omitting it hangs
+                    # `alternating`/`serial` after block 0.
+                    if owner.schedule.mode != "free":
+                        owner.schedule.complete("codec", state.next_block)
             else:
                 continue
             owner = getattr(state, "owner", None)

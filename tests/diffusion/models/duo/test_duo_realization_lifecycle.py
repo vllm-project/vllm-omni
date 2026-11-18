@@ -59,18 +59,38 @@ def test_stepwise_loop_publishes_intermediate_step_output():
     assert source.index("step_scheduler") < source.index("post_step_output") < source.index("should_decode")
 
 
-def test_scheduling_completions_live_on_active_paths():
-    # `DuoPhaseSchedule.admit` blocks on these counters; if their only producer
-    # is a hook the engine never calls, those modes deadlock.
-    from vllm_omni.model_executor.models.duo.duplex.data_plane import DuoDataPlane
+def test_codec_completion_covers_every_codec_mode():
+    # The first version of this fix only released the delayed `duo_5_17` branch;
+    # `stream_4frame` (the default) and `old` take the other branch and still
+    # hung `alternating`/`serial` after block 0. Assert both branches release.
+    from vllm_omni.model_executor.models.duo.duplex import data_plane
+
+    lines = inspect.getsource(data_plane.DuoDataPlane.project).splitlines()
+    # Count real calls, not comments that merely name the helper.
+    calls = [
+        i for i, line in enumerate(lines) if line.strip().startswith("owner.schedule.") and 'complete("codec"' in line
+    ]
+    # One release inside the delayed duo_5_17 branch and one in the default
+    # (stream_4frame / old) branch. The first version of this fix had only the
+    # former, so the default branch deadlocked serial modes after block 0.
+    assert calls, "the codec slot must be released"
+    assert len(calls) >= 2, (
+        "both the delayed duo_5_17 branch and the default (stream_4frame / old) branch "
+        f"must release the codec slot; found {len(calls)} call(s)"
+    )
+
+
+def test_asr_slot_is_released_before_the_empty_transcript_return():
+    # A finished ASR request with no `outputs` produces no transcript, so the
+    # completion must run before that early return; otherwise an empty utterance
+    # holds `asr_active` and blocks every later block in serial modes.
     from vllm_omni.model_executor.models.duo.duplex.plugin import DuoDuplexPlugin
 
-    assert 'complete("codec"' in inspect.getsource(DuoDataPlane), (
-        "codec completion must be emitted from the codec data plane"
-    )
-    assert 'complete("asr"' in inspect.getsource(DuoDuplexPlugin), "asr completion must be emitted from user_transcript"
-    # The dead hook itself must be gone, not merely shadowed.
-    assert not hasattr(DuoDuplexPlugin, "record_stage_timing")
+    source = inspect.getsource(DuoDuplexPlugin.user_transcript)
+    release = source.index('complete("asr"')
+    early_return = source.index("return None")
+    assert release < early_return, "the ASR slot must be released before the empty-transcript return"
+    assert "record_stage_timing" not in dir(DuoDuplexPlugin)
 
 
 def test_plugin_declares_no_unwired_hook_overrides():

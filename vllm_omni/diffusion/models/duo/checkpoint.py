@@ -73,7 +73,7 @@ class SplitQKVRealizationLoRALinear(nn.Module):
 
 @torch.no_grad()
 def load_training_adapter(
-    model, path, *, rank=None, alpha=None, role_embedding=False, target_modules=None, manifest_modules=None
+    model, path, *, rank=None, alpha=None, role_embedding=None, target_modules=None, manifest_modules=None
 ):
     """Apply a released causal-student LoRA to a fully loaded Realization base.
 
