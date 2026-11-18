@@ -35,10 +35,7 @@ stages:
   - stage_id: 0
     max_num_seqs: 64
     gpu_memory_utilization: 0.75
-    enforce_eager: false
-    # As in the other Fish Speech profiles: the Slow AR builds its prompt
-    # embeddings from the first prompt token, so a prefix-cache hit (a repeated
-    # request) would feed it the wrong rows.
+    enforce_eager: true
     enable_prefix_caching: false
     async_scheduling: false
     # vLLM scheduler requires max_num_batched_tokens >= max_model_len when
@@ -77,6 +74,6 @@ stages:
 
 platforms:
   cuda:
-    # Both stages run on Model Runner V2 on CUDA. Set model_runner: v1 here to
-    # opt out.
-    model_runner: v2
+    stages:
+      - stage_id: 0
+        enforce_eager: false

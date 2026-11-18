@@ -3332,22 +3332,6 @@ class TestPlatformOverrides:
             # Explicit null clears the inherited single-GPU 4 GiB CUDA cap.
             assert replica_stages[1].yaml_engine_args.get("kv_cache_memory_bytes") is None
 
-    @pytest.mark.parametrize(
-        "filename",
-        [
-            "fish_qwen3_omni.yaml",
-            "fish_qwen3_omni_2gpu.yaml",
-            "fish_qwen3_omni_high_concurrency_single_gpu.yaml",
-            "fish_qwen3_omni_high_concurrency_dual_gpu.yaml",
-        ],
-    )
-    def test_fish_speech_profiles_disable_prefix_caching(self, filename):
-        # The Slow AR rebuilds its prompt embeddings from the first prompt
-        # token, so a prefix-cache hit would feed it the wrong rows.
-        deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
-
-        assert [stage.engine_extras.get("enable_prefix_caching") for stage in deploy.stages] == [False, False]
-
     def test_fish_speech_npu_uses_ascend_kv_block_size(self):
         deploy_path = Path(get_deploy_config_path("fish_qwen3_omni.yaml"))
 
@@ -3356,24 +3340,29 @@ class TestPlatformOverrides:
         assert deploy.stages[0].engine_extras["block_size"] == 128
 
     @pytest.mark.parametrize(
-        "platform,runs_v2",
+        "filename,pipeline_key",
         [
-            ("cuda", [True, True]),
-            ("npu", [True, False]),
-            ("rocm", [True, False]),
-            ("musa", [True, False]),
-            ("xpu", [True, False]),
+            ("fish_omni.yaml", "fish_omni"),
+            ("fish_qwen3_omni.yaml", "fish_qwen3_omni"),
+            ("fish_qwen3_omni_2gpu.yaml", "fish_qwen3_omni"),
+            ("fish_qwen3_omni_high_concurrency_single_gpu.yaml", "fish_qwen3_omni"),
+            ("fish_qwen3_omni_high_concurrency_dual_gpu.yaml", "fish_qwen3_omni"),
         ],
     )
-    def test_fish_omni_dac_stage_runs_v2_on_cuda_only(self, platform, runs_v2):
-        deploy = load_deploy_config(Path(get_deploy_config_path("fish_omni.yaml")))
-        deploy = _apply_platform_overrides(deploy, platform=platform)
+    @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
+    def test_fish_profiles_resolve_both_stages_on_v2(self, monkeypatch, platform, filename, pipeline_key):
+        from vllm_omni.platforms import current_omni_platform
 
-        stages = merge_pipeline_deploy(resolve_pipeline_config("fish_omni"), deploy)
-
-        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == runs_v2
-        # The pipeline lets the DAC stage take the native data plane whenever it runs on V2.
-        assert stages[1].yaml_engine_args["supports_native_mrv2_data_plane"]
+        monkeypatch.setattr(current_omni_platform, "device_name", platform)
+        deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
+        stage0, dac = merge_pipeline_deploy(resolve_pipeline_config(pipeline_key), deploy)
+        assert stage0.yaml_engine_args["use_v2_model_runner"]
+        assert dac.yaml_engine_args["use_v2_model_runner"]
+        assert dac.yaml_engine_args["supports_native_mrv2_data_plane"]
+        if pipeline_key == "fish_qwen3_omni":
+            assert stage0.yaml_engine_args["enforce_eager"] is (platform != "cuda")
+            assert stage0.yaml_engine_args["supports_native_mrv2_data_plane"]
+            assert not stage0.yaml_engine_args["enable_prefix_caching"]
 
     @pytest.mark.parametrize(
         "filename,pipeline_key,cuda_default_runner,cuda_v1_stages",
@@ -3383,10 +3372,6 @@ class TestPlatformOverrides:
             ("moss_tts_nano.yaml", "moss_tts_nano", "v2", ()),
             ("moss_tts_realtime.yaml", "moss_tts_realtime", "v2", ()),
             ("minicpmo_4_5.yaml", "minicpmo_4_5", "v2", ()),
-            ("fish_qwen3_omni.yaml", "fish_qwen3_omni", "v2", ()),
-            ("fish_qwen3_omni_2gpu.yaml", "fish_qwen3_omni", "v2", ()),
-            ("fish_qwen3_omni_high_concurrency_single_gpu.yaml", "fish_qwen3_omni", "v2", ()),
-            ("fish_qwen3_omni_high_concurrency_dual_gpu.yaml", "fish_qwen3_omni", "v2", ()),
         ],
     )
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
