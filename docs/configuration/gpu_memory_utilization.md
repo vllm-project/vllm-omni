@@ -130,6 +130,31 @@ independently, while leaving headroom on each GPU. Devices that share a host mem
 pool must also account for their combined allocations and host memory use; separate
 device IDs do not make those budgets independent.
 
+#### Initializing stages that share a GPU in parallel
+
+Stages on the same GPU initialize one after another by default. On a GPU dedicated
+to the deployment, `vllm serve --omni --parallel-stage-init` (or
+`parallel_stage_init=True` in the Python API) overlaps them:
+
+- Before any stage starts, each GPU must fit the sum of `gpu_memory_utilization`
+  times its capacity, plus 2 GiB per stage that captures CUDA graphs, plus 1 GiB
+  external reserve and 1 GiB safety margin. Otherwise startup fails with
+  `StageAdmissionError`.
+- Each stage measures its KV cache budget under an exclusive device lock, over
+  that profiling window only, so memory its peers allocate before or after the
+  window is not charged to it. Neither is non-torch memory the stage itself
+  allocated before the window, such as kernel modules loaded by its first
+  kernel launches (about 0.2 GiB per stage for Qwen3-Omni). Like the CUDA
+  context, it sits outside the stage's `gpu_memory_utilization` share, so a
+  stage gets slightly more KV cache than when stages start one after another.
+- Startup log lines that read the device's free memory can include the peers'
+  memory: "Free memory on device ... on startup", the CUDA graph capture size
+  and the `--kv-cache-memory` suggestion. Start the stages one after another to
+  read them.
+- It is not supported with `--headless`, with Ray executors or across nodes,
+  and it disables NVIDIA MPS. Platforms whose workers size the KV cache their
+  own way log a warning; put their stages on separate GPUs.
+
 ### Step 4: Account for Tensor Parallelism
 
 When using `tensor_parallel_size > 1`, the model is split across multiple GPUs, so each GPU needs less memory.

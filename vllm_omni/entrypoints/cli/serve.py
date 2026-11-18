@@ -267,6 +267,10 @@ class OmniServeCommand(CLISubcommand):
             raise ValueError("--api-server-count must be >= 1 unless --headless is set")
         if args.headless and api_server_count is not None and api_server_count > 0:
             raise ValueError("--api-server-count cannot be used with --headless")
+        # A headless process launches one stage; overlapping same-GPU stage
+        # initialization is coordinated only inside one stage runtime.
+        if args.headless and getattr(args, "parallel_stage_init", False):
+            raise ValueError("--parallel-stage-init cannot be used with --headless")
         if api_server_count is not None and api_server_count > 1:
             distributed_args = (
                 "stage_id",
@@ -525,6 +529,15 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             default=600,
             help="The timeout for initializing the stages.",
+        )
+        omni_config_group.add_argument(
+            "--parallel-stage-init",
+            action="store_true",
+            default=False,
+            help=(
+                "Initialize stages that share a GPU concurrently instead of one after another, "
+                "on GPUs dedicated to this deployment. See docs/configuration/gpu_memory_utilization.md."
+            ),
         )
         omni_config_group.add_argument(
             "--log-stats",

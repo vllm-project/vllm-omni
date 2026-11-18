@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import logging
 import os
 import subprocess
 import threading
@@ -26,6 +27,7 @@ import types
 from pathlib import Path
 
 import pytest
+from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 from vllm_omni.engine.stage_admission import (
     ADMISSION_EXEMPT,
@@ -818,16 +820,34 @@ class _RecordingLocker:
             self.events.append("EX-exit")
 
 
+class _FakeWorker:
+    def __init__(self):
+        self.window = False
+
+    def profile_in_quiescent_window(self):
+        self.window = True
+
+
 class _FakeExecutor:
     instances: list[object] = []
 
     def __init__(self, vllm_config):
         self.vllm_config = vllm_config
         self.dam_calls = 0
+        # collective_rpc hands callables vLLM's worker wrapper, not the worker.
+        self.worker_wrapper = WorkerWrapperBase()
+        self.worker_wrapper.worker = _FakeWorker()
+        self.on_rpc = lambda: None
+        self.window_marked_at_profile = None
         _FakeExecutor.instances.append(self)
+
+    def collective_rpc(self, method, args=(), kwargs=None):
+        self.on_rpc()
+        return [method(self.worker_wrapper, *args, **(kwargs or {}))]
 
     def determine_available_memory(self):
         self.dam_calls += 1
+        self.window_marked_at_profile = self.worker_wrapper.worker.window
         return 123
 
     def initialize_from_config(self, kv_cache_configs):
@@ -854,6 +874,49 @@ def test_wrapper_phase_ordering():
         "SH-enter",
         "SH-exit",  # kernel warmup + CUDA-graph capture
     ]
+
+
+def test_wrapper_marks_the_profiling_window_inside_the_exclusive_lock():
+    """Workers measure non-torch memory over the locked window, not from their
+    init snapshots: co-located stages load and allocate between the two."""
+    locker = _RecordingLocker()
+    exec_ = wrap_executor_with_phase_locks(_FakeExecutor, locker)(vllm_config=object())
+    locker.events.clear()
+    seen: list[list[str]] = []
+    exec_.on_rpc = lambda: seen.append(list(locker.events))
+
+    assert exec_.determine_available_memory() == 123
+
+    assert seen == [["EX-enter"]], "the window must be marked while the exclusive lock is held"
+    assert exec_.window_marked_at_profile is True
+
+
+def test_wrapper_warns_when_workers_cannot_measure_the_locked_window(caplog):
+    """Platform workers without the hook keep their init-snapshot accounting."""
+    locker = _RecordingLocker()
+    exec_ = wrap_executor_with_phase_locks(_FakeExecutor, locker)(vllm_config=object())
+    exec_.worker_wrapper.worker = types.SimpleNamespace(window=False)
+
+    with caplog.at_level(logging.WARNING):
+        assert exec_.determine_available_memory() == 123
+
+    assert "cannot measure memory over the locked profiling window" in caplog.text
+
+
+def test_window_hook_reaches_the_worker_through_run_method():
+    """Executors run the callable on the worker wrapper through vLLM's
+    run_method; the hook must land on the wrapped worker. The hook is
+    module-level so multiprocess executors pickle it by reference."""
+    from vllm.v1.serial_utils import run_method
+
+    from vllm_omni.engine.stage_phase_lock import _profile_in_quiescent_window
+
+    worker = _FakeWorker()
+    wrapper = WorkerWrapperBase()
+    wrapper.worker = worker
+    assert run_method(wrapper, _profile_in_quiescent_window, (), {}) is True
+    assert worker.window is True
+    assert _profile_in_quiescent_window.__qualname__ == _profile_in_quiescent_window.__name__
 
 
 def test_wrapper_locks_warmup_and_capture_separately():
