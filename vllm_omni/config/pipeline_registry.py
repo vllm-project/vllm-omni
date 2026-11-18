@@ -180,8 +180,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     # so these entries are only reachable through a deploy yaml's ``pipeline:``
     # key (see deploy/cosmos3_policy_droid.yaml and deploy/cosmos3_omni.yaml).
     "cosmos3_omni_deploy": COSMOS3_OMNI_DEPLOY_PIPELINE,
-    # One stage per Mixture-of-Transformers tower; same opt-in rule as above
-    # (deploy/cosmos3_super_t2i_disagg.yaml).
+    # One stage per MoT tower (deploy/cosmos3_super_t2i_disagg.yaml).
     "cosmos3_omni_disagg": COSMOS3_DISAGG_PIPELINE,
     "cosmos3_policy": COSMOS3_POLICY_PIPELINE,
     "cosyvoice3": resolve_cosyvoice3_pipeline,

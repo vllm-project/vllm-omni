@@ -90,18 +90,3 @@ def test_model_without_vae_needs_no_groupnorm_patch(monkeypatch):
         lambda _: pytest.fail("Models without a VAE need no GroupNorm replacement"),
     )
     patch_groupnorm.apply_aiter_groupnorm(model, "OtherDiffusionModel")
-
-
-def test_a_stage_without_a_vae_is_left_alone(monkeypatch):
-    """Cosmos3's disaggregated reasoner never decodes, so its ``vae`` is ``None``."""
-    model = types.SimpleNamespace(vae=None)
-    monkeypatch.setattr(
-        patch_groupnorm,
-        "_replace_groupnorm_with_aiter",
-        lambda _: pytest.fail("there is no VAE to patch"),
-    )
-    warnings: list[str] = []
-    monkeypatch.setattr(patch_groupnorm.logger, "warning", lambda msg, *a, **k: warnings.append(msg))
-
-    patch_groupnorm.apply_aiter_groupnorm(model, "Cosmos3ReasonerPipeline")
-    assert warnings == []

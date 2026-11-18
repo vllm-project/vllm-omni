@@ -87,44 +87,13 @@ class Cosmos3MixedPrecisionRuntime:
         self._generation_high_precision = False
 
     def install(self, transformer: torch.nn.Module) -> None:
-        # A tower-disaggregated stage holds only one of the two towers, and the
-        # one it does not own is an empty ``ModuleList`` -- see
-        # ``Cosmos3VFMTransformer.owned_towers``. Scanning an unowned tower finds
-        # no linears, so ask the transformer which towers it actually holds
-        # rather than inferring emptiness from a miss. Co-located transformers
-        # (and the fakes in the unit tests) own both.
-        owns_generator = bool(getattr(transformer, "owns_generator", True))
-        owns_reasoner = bool(getattr(transformer, "owns_reasoner", True))
-
-        components: dict[PrecisionPath, torch.nn.Module] = {}
-        if owns_generator:
-            components["generation"] = transformer.gen_layers
+        components: dict[PrecisionPath, torch.nn.Module] = {
+            "generation": transformer.gen_layers,
+        }
         # Under pipeline parallelism the UND reasoner lives only on the first
         # stage; later stages hold a PPMissingLayer placeholder without layers.
-        if (
-            self.config.reasoner == "a16"
-            and owns_reasoner
-            and not isinstance(transformer.language_model, PPMissingLayer)
-        ):
+        if self.config.reasoner == "a16" and not isinstance(transformer.language_model, PPMissingLayer):
             components["reasoner"] = transformer.language_model.layers
-
-        if not components:
-            # Reasoner-only stage under ``reasoner="native"``: there is no
-            # denoising schedule to modulate here and the UND tower is asked to
-            # stay at checkpoint precision, so this runtime is a no-op and
-            # ``set_step`` never changes a dispatch. Returning is what keeps the
-            # unwrapped-linear guard below from failing the stage for having
-            # correctly found nothing to do. The generator stage still enforces
-            # that guard, so a genuinely unquantized checkpoint is still caught.
-            logger.debug(
-                "Cosmos3 mixed precision has no schedulable tower on this stage "
-                "(owns_generator=%s, owns_reasoner=%s, reasoner=%s); leaving all "
-                "linears on their checkpoint-native methods.",
-                owns_generator,
-                owns_reasoner,
-                self.config.reasoner,
-            )
-            return
 
         wrapped_counts: Counter[str] = Counter()
         for path, component in components.items():

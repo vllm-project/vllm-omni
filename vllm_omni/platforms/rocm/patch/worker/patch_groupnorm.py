@@ -36,8 +36,7 @@ def _replace_groupnorm_with_aiter(vae: nn.Module) -> bool:
 
 
 def apply_aiter_groupnorm(model: nn.Module, model_class_name: str | None) -> None:
-    # ``vae`` may be ``None`` on a stage that never decodes (Cosmos3's reasoner).
-    if getattr(model, "vae", None) is not None:
+    if hasattr(model, "vae"):
         # AITER GroupNorm does not preserve the PyTorch autocast behavior required
         # by Hunyuan Image 3.0. Keep PyTorch GroupNorm until the fix is released:
         # https://github.com/ROCm/aiter/issues/4780
