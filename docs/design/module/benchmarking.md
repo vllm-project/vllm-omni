@@ -47,6 +47,12 @@ outputs before using timings as performance evidence.
 Test workload parsing and metric calculations with deterministic fixtures. Do
 not compare materially different workloads or runtime settings.
 
+DFX's opt-in `--require-baseline` validates metrics with the same 10% regression
+tolerance as `--assert-baseline`, but fails when the measured hardware has no
+matching baseline. Existing `--assert-baseline` callers retain their warning and
+skip behavior for missing calibration. Baselines are selected by runtime device
+labels; a pytest selection marker does not establish physical hardware identity.
+
 ## LingBot performance and accuracy
 
 The packaged `realtime-video` backend uses the existing `vllm bench serve

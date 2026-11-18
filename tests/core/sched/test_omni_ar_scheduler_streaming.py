@@ -33,7 +33,13 @@ from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARS
 from vllm_omni.core.sched.output import OmniNewRequestData
 from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
 from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
-from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import has_tts_text_conditioning
+from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+    PRECOMPUTED_TEXT_IDS_KEY,
+    check_text_prompt,
+    check_text_update,
+    has_tts_text_conditioning,
+)
+from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
 from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2code2wav_async_chunk
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
@@ -608,9 +614,9 @@ def test_stage0_streaming_update_keeps_all_computed_tokens_without_placeholder()
 
 
 def test_stage0_plain_streaming_update_keeps_the_first_chunk_text() -> None:
-    # Qwen3-TTS skips its stage-0 text check on streaming updates, so a plain
-    # stage-0 extension must keep the first chunk's additional_information:
-    # the re-admitted request carries it to the Talker's preprocess.
+    # Qwen3-TTS's stage-0 update check ignores a plain update's
+    # additional_information, so a plain stage-0 extension must keep the first
+    # chunk's: the re-admitted request carries it to the Talker's preprocess.
     sched = _make_scheduler(stage_id=0)
     session = _make_request()
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
@@ -627,6 +633,88 @@ def test_stage0_plain_streaming_update_keeps_the_first_chunk_text() -> None:
     info = deserialize_additional_information(readmitted.additional_information)
     assert info["text"] == ["Hello there."]
     assert has_tts_text_conditioning(info, allow_blank_text=False)
+
+
+@pytest.mark.parametrize(
+    "replace_flag",
+    [{"meta": {"replace_streaming_prompt": True}}, {"meta.replace_streaming_prompt": True}],
+    ids=["nested", "wire-key"],
+)
+@pytest.mark.parametrize("text", [["Next sentence."], [""]], ids=["text", "blank-text"])
+def test_stage0_replace_flag_in_additional_information_replaces_the_prompt(replace_flag, text) -> None:
+    # The scheduler reads the replace flag from additional_information too, so
+    # such an update installs its own text. Qwen3-TTS's update check must then
+    # accept exactly the updates whose text the Talker can still use.
+    sched = _make_scheduler(stage_id=0)
+    session = _make_request()
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.additional_information = serialize_additional_information(
+        {"task_type": ["CustomVoice"], "text": ["Hello there."]}
+    )
+    update_prompt = {
+        "prompt_token_ids": [10, 20],
+        "additional_information": {"task_type": ["CustomVoice"], "text": text, **replace_flag},
+    }
+    try:
+        check_text_update(update_prompt, [])
+        accepted = True
+    except ValueError:
+        accepted = False
+    update = _make_update([10, 20])
+    update.additional_information = serialize_additional_information(update_prompt["additional_information"])
+    update.model_intermediate_buffer = None
+
+    sched._update_request_as_session(session, update)
+
+    assert session.additional_information is update.additional_information
+    assert list(session.prompt_token_ids) == [10, 20]
+    readmitted = OmniNewRequestData.from_request(session, block_ids=([],))
+    info = deserialize_additional_information(readmitted.additional_information)
+    assert info["text"] == text
+    assert accepted == has_tts_text_conditioning(info, allow_blank_text=False)
+
+
+_QWEN3_TTS_FIRST_CHUNKS = {
+    "info-text": ({"text": ["Hello."]}, None),
+    "info-text-ids": ({"text": [""], PRECOMPUTED_TEXT_IDS_KEY: [[1, 2, 3]]}, None),
+    "info-and-buffer-text": ({"text": ["Hello."]}, {"text": ["Hi."]}),
+    # A plain update drops this buffer, so the re-admitted request has no text.
+    "buffer-only-text": ({}, {"text": ["Hello."]}),
+}
+
+
+@pytest.mark.parametrize(("info", "buffer"), list(_QWEN3_TTS_FIRST_CHUNKS.values()), ids=list(_QWEN3_TTS_FIRST_CHUNKS))
+def test_qwen3_tts_stage0_check_accepts_only_text_a_plain_update_keeps(info, buffer) -> None:
+    # A text-less plain stage-0 update passes Qwen3-TTS's update check, and
+    # Model Runner V2 then re-admits the request from the session's payloads.
+    # The first-chunk check must accept exactly the text that survives that.
+    first_chunk = {
+        "prompt_token_ids": [1, 2, 3],
+        "additional_information": {"global_request_id": ["r"], "task_type": ["CustomVoice"], **info},
+        "model_intermediate_buffer": buffer,
+    }
+    update_prompt = {"prompt_token_ids": [10, 20], "additional_information": {"global_request_id": ["r"]}}
+    assert check_text_update(update_prompt, []) is update_prompt
+    try:
+        check_text_prompt(first_chunk, [])
+        accepted = True
+    except ValueError:
+        accepted = False
+
+    sched = _make_scheduler(stage_id=0)
+    session = _make_request()
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.additional_information = serialize_additional_information(first_chunk["additional_information"])
+    session.model_intermediate_buffer = buffer
+    update = _make_update([10, 20])
+    update.additional_information = serialize_additional_information(update_prompt["additional_information"])
+    update.model_intermediate_buffer = None
+    sched._update_request_as_session(session, update)
+    intermediate_buffer = OmniIntermediateBuffer(1)
+    intermediate_buffer.add_request(0, OmniNewRequestData.from_request(session, block_ids=([],)))
+    talker_info = intermediate_buffer.buffers[0]
+
+    assert accepted == has_tts_text_conditioning(talker_info, talker_info.get("hidden_states"))
 
 
 def test_stage0_streaming_update_keeps_full_hash_block() -> None:

@@ -883,6 +883,7 @@ def assert_result(
     num_prompts: int,
     *,
     check_baseline: bool = False,
+    require_baseline: bool = False,
     hardware: str | None = None,
 ) -> None:
     """Assert that the expected number of requests completed.
@@ -892,10 +893,12 @@ def assert_result(
     """
     completed = result.get("completed_requests", result.get("completed", 0))
     assert completed == num_prompts, f"Expected {num_prompts} completed requests, got {completed}"
-    if check_baseline:
+    if check_baseline or require_baseline:
         label = hardware if isinstance(hardware, str) and hardware else result.get("Hardware")
         baseline = result.get("baseline")
-        assert_baseline_within_tolerance(result, baseline if isinstance(baseline, dict) else None, label)
+        assert_baseline_within_tolerance(
+            result, baseline if isinstance(baseline, dict) else None, label, required=require_baseline
+        )
 
 
 def _default_benchmark_endpoint_for_task(task: str) -> str:
@@ -1069,5 +1072,6 @@ def test_diffusion_performance_benchmark(diffusion_server, benchmark_params, pyt
             result,
             sweep_run["num_prompts"],
             check_baseline=pytestconfig.getoption("assert_baseline"),
+            require_baseline=pytestconfig.getoption("require_baseline"),
             hardware=hardware_json_value(get_runtime_resource_label()),
         )

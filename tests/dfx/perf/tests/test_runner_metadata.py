@@ -778,7 +778,9 @@ def test_qwen3_duplex_c8_measures_and_judges_distinct_samples(monkeypatch, datas
     monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
     monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
     monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
-    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args, check_baseline=False: None)
+    monkeypatch.setattr(
+        run_benchmark, "assert_result", lambda *args, check_baseline=False, require_baseline=False: None
+    )
     run_benchmark.test_performance_benchmark(
         ServerEndpoint(), {"test_name": config["test_name"], "params": params}, pytestconfig=pytestconfig
     )
@@ -980,7 +982,9 @@ def test_dataset_judging_uses_launched_judge(monkeypatch, prefix, judge_url, pyt
 
     monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
     # The result contract is covered above; exercise actual CLI assembly here.
-    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args, check_baseline=False: None)
+    monkeypatch.setattr(
+        run_benchmark, "assert_result", lambda *args, check_baseline=False, require_baseline=False: None
+    )
     server = ServerEndpoint(judge_base_url=judge_url)
     case = {
         "test_name": "test_duplex",
@@ -996,7 +1000,7 @@ def test_dataset_judging_uses_launched_judge(monkeypatch, prefix, judge_url, pyt
         assert args[args.index(f"--{prefix.replace('_', '-')}-judge-base-url") + 1] == judge_url
 
 
-@pytest.mark.parametrize(("hardware", "enforce_score_floors"), [("H100", True), ("MI300", False)])
+@pytest.mark.parametrize(("hardware", "enforce_score_floors"), [("H100", True), ("MI300", True)])
 def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(
     monkeypatch, hardware, enforce_score_floors, pytestconfig
 ):
@@ -1042,7 +1046,9 @@ def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(
         return {"completed": 66}
 
     monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
-    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args, check_baseline=False: None)
+    monkeypatch.setattr(
+        run_benchmark, "assert_result", lambda *args, check_baseline=False, require_baseline=False: None
+    )
     run_benchmark.test_performance_benchmark(
         ServerEndpoint(model="openbmb/MiniCPM-o-4_5", judge_base_url="http://localhost:8001"),
         {"test_name": config["test_name"], "params": params},
@@ -1064,6 +1070,7 @@ def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(
     assert args.trust_remote_code
     assert args.duplex_eval_evaluate
     assert args.duplex_eval_judge_base_url == "http://localhost:8001"
+    assert "--duplex-eval-require-score-floors" not in call["args"]
     assert "--duplex-eval-accuracy-config" not in call["args"]
     assert "--duplex-eval-score-floor-hardware" not in call["args"]
     assert "--required-duplex-metrics" not in call["args"]
@@ -1073,7 +1080,7 @@ def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(
     assert call["accuracy_baseline"] == selected
 
 
-@pytest.mark.parametrize("device_env", ["CUDA_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES"])
+@pytest.mark.parametrize("device_env", ["CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES"])
 @pytest.mark.parametrize(("devices", "judge_index", "expected"), [("4,7", "1", "7"), ("4,7,3", "2", "3")])
 def test_judge_uses_allocated_device(monkeypatch, device_env, devices, judge_index, expected):
     from tests.dfx.perf.scripts import run_benchmark as runner
@@ -1085,6 +1092,7 @@ def test_judge_uses_allocated_device(monkeypatch, device_env, devices, judge_ind
 
     @contextmanager
     def server(model, args, **kwargs):
+        assert kwargs["wait_for_device_memory"] is False
         seen.append(kwargs["env_dict"])
 
         class Endpoint:
@@ -1405,7 +1413,9 @@ def test_omniinteract_ephemeral_artifacts_override_output_dir(tmp_path, monkeypa
         return {"completed": 4}
 
     monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
-    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args, check_baseline=False: None)
+    monkeypatch.setattr(
+        run_benchmark, "assert_result", lambda *args, check_baseline=False, require_baseline=False: None
+    )
     monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [])
     monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
     server = ServerEndpoint(judge_base_url="http://127.0.0.1:8001")
@@ -1443,7 +1453,9 @@ def test_omniinteract_persisted_artifacts_keep_configured_output_dir(tmp_path, m
         return {"completed": 4}
 
     monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
-    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args, check_baseline=False: None)
+    monkeypatch.setattr(
+        run_benchmark, "assert_result", lambda *args, check_baseline=False, require_baseline=False: None
+    )
     monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [])
     monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
     server = ServerEndpoint(judge_base_url="http://127.0.0.1:8001")
