@@ -5,7 +5,7 @@ import json
 import os
 import types
 from collections.abc import Mapping
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from typing import Any, get_args, get_origin
 
 from vllm.logger import init_logger
@@ -131,6 +131,19 @@ def prepare_stage_config_inputs(
     if resolved_kwargs.get("diffusion_streaming_output") and resolved_kwargs.get("streaming_output") is None:
         resolved_kwargs["streaming_output"] = True
     resolved_kwargs.pop("model_tag", None)
+
+    # ``--diffusion-batching-policy`` is sugar for the ``policy`` key of
+    # ``diffusion_batching_config``; no engine field carries it directly.
+    batching_policy = resolved_kwargs.pop("diffusion_batching_policy", None)
+    if batching_policy is not None:
+        batching_config = resolved_kwargs.get("diffusion_batching_config")
+        if isinstance(batching_config, Mapping):
+            batching_config = {**batching_config, "policy": batching_policy}
+        elif is_dataclass(batching_config) and not isinstance(batching_config, type):
+            batching_config = replace(batching_config, policy=batching_policy)
+        else:
+            batching_config = {"policy": batching_policy}
+        resolved_kwargs["diffusion_batching_config"] = batching_config
 
     resolved_kwargs = with_trust_remote_code_override(resolved_kwargs, trust_remote_code)
     deploy_config_path = resolved_kwargs.pop("deploy_config", None)
