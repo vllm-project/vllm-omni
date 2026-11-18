@@ -76,12 +76,14 @@ def assert_baseline_within_tolerance(
     hardware: str | None,
     *,
     tolerance: float = BASELINE_REGRESSION_TOLERANCE,
+    required: bool = False,
 ) -> None:
     """Fail when any metric in the current hardware bucket is more than ``tolerance`` worse.
 
     ``baseline`` is the sweep-resolved hardware-nested map
     (``{"H100": {"request_throughput": 1.2}}``). Missing or empty baselines
-    and missing or unmatched hardware log a warning and skip comparison.
+    and missing or unmatched hardware log a warning and skip comparison,
+    unless ``required=True`` requests a failure instead.
     """
     baseline_hardware = hardware
     # Ascend runtime labels use the A2 resource bucket when no exact bucket exists.
@@ -96,6 +98,8 @@ def assert_baseline_within_tolerance(
     ):
         available = list(baseline) if isinstance(baseline, dict) else []
         message = f"No matching baseline for hardware {hardware!r}; available hardware: {available}"
+        if required:
+            raise AssertionError(message)
         logging.getLogger(__name__).warning("[baseline-check] SKIP: %s", message)
         print(f"[baseline-check] WARNING SKIP: {message}", flush=True)
         return
@@ -1002,5 +1006,14 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "Throughput and QPS fail when they fall below 90% of the baseline. "
             "Latency, memory, and real-time factor fail when they rise above 110% of the baseline. "
             "Missing or unmatched hardware logs a warning and skips baseline validation (default: off)."
+        ),
+    )
+    parser.addoption(
+        "--require-baseline",
+        action="store_true",
+        default=False,
+        help=(
+            "Enforce the same 10% performance tolerance as --assert-baseline, "
+            "and fail when the runtime hardware has no matching baseline (default: off)."
         ),
     )
