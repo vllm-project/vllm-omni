@@ -37,7 +37,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from PIL import Image
 from torch import Tensor
-from torch.nn.init import _calculate_fan_in_and_fan_out, trunc_normal_
+from torch.nn.init import _calculate_fan_in_and_fan_out
 from transformers import AutoImageProcessor, PretrainedConfig
 from transformers.cache_utils import DynamicCache, EncoderDecoderCache
 from transformers.feature_extraction_utils import BatchFeature
@@ -879,37 +879,15 @@ def trunc_normal_tf_(
         tensor.mul_(std).add_(mean)
 
 
-def variance_scaling_(tensor, scale=1.0, mode="fan_in", distribution="normal"):
-    fan_in, fan_out = _calculate_fan_in_and_fan_out(tensor)
-    if mode == "fan_in":
-        denom = fan_in
-    elif mode == "fan_out":
-        denom = fan_out
-    elif mode == "fan_avg":
-        denom = (fan_in + fan_out) / 2
-
-    variance = scale / denom
-
-    if distribution == "truncated_normal":
-        # constant is stddev of standard normal truncated to (-2, 2)
-        trunc_normal_tf_(tensor, std=math.sqrt(variance) / 0.87962566103423978)
-    elif distribution == "normal":
-        with torch.no_grad():
-            tensor.normal_(std=math.sqrt(variance))
-    elif distribution == "uniform":
-        bound = math.sqrt(3 * variance)
-        with torch.no_grad():
-            tensor.uniform_(-bound, bound)
-    else:
-        raise ValueError(f"invalid distribution {distribution}")
-
-
 def lecun_normal_(tensor):
-    variance_scaling_(tensor, mode="fan_in", distribution="truncated_normal")
+    fan_in, _ = _calculate_fan_in_and_fan_out(tensor)
+    trunc_normal_tf_(tensor, std=math.sqrt(1.0 / fan_in) / 0.87962566103423978)
 
 
 def default_flax_embed_init(tensor):
-    variance_scaling_(tensor, mode="fan_in", distribution="normal")
+    fan_in, _ = _calculate_fan_in_and_fan_out(tensor)
+    with torch.no_grad():
+        tensor.normal_(std=math.sqrt(1.0 / fan_in))
 
 
 class SiglipVisionEmbeddings(nn.Module):
@@ -1879,14 +1857,12 @@ class Resampler(nn.Module):
         num_heads,
         kv_dim=None,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),
-        adaptive=False,
         max_size=(70, 70),
     ):
         super().__init__()
         self.num_queries = num_queries
         self.embed_dim = embed_dim
         self.num_heads = num_heads
-        self.adaptive = adaptive
         self.max_size = max_size
 
         self.query = nn.Parameter(torch.zeros(self.num_queries, embed_dim))
@@ -1917,15 +1893,6 @@ class Resampler(nn.Module):
         if max_h > self.max_size[0] or max_w > self.max_size[1]:
             self.max_size = [max(max_h, self.max_size[0]), max(max_w, self.max_size[1])]
             self._set_2d_pos_cache(self.max_size, device)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=0.02)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x, tgt_sizes=None):
         assert x.shape[0] == tgt_sizes.shape[0]
@@ -1974,11 +1941,6 @@ class Resampler(nn.Module):
 
     def _repeat(self, query, N: int):
         return query.unsqueeze(1).repeat(1, N, 1)
-
-    def supports_packed(self) -> bool:
-        attn = self.attn
-        plain = not attn.batch_first and attn._qkv_same_embed_dim and attn.in_proj_weight is not None
-        return plain and attn.bias_k is None and attn.bias_v is None and not attn.add_zero_attn
 
     def forward_packed(self, x: torch.Tensor, layouts: Sequence[tuple[int, int, int]]) -> torch.Tensor:
         """``forward`` without key padding for packed ``(tokens, kv_dim)`` features; returns ``(B, Q, D)``.
@@ -3601,7 +3563,6 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
                 embed_dim=embed_dim,  # LLM embedding dimension
                 num_heads=embed_dim // 128,  # Default from MiniCPM-o
                 kv_dim=vision_dim,  # Vision encoder dimension
-                adaptive=True,  # Enable adaptive resampling
             )
             self.resampler.attn_implementation = config.vision_config._attn_implementation
         else:
@@ -3632,7 +3593,6 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             self._encode_audio_transformer if current_omni_platform.is_npu() else self._encode_audio_features
         )
         self._audio_encoder_graph = make_encoder_graph(audio_forward, vllm_config)
-        self.mm_token_ids = set[int]()
         self.make_empty_intermediate_tensors = self.llm.make_empty_intermediate_tensors
 
     def get_language_model(self) -> torch.nn.Module:
@@ -3750,8 +3710,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         tgt_sizes = data["tgt_sizes"]
 
         vpm = self.vpm
-        packed = getattr(self, "vision_packed_encode", False) and hasattr(vpm, "forward_packed")
-        if packed and hasattr(self.resampler, "forward_packed") and self.resampler.supports_packed():
+        if self.vision_packed_encode:
             layouts = _packed_vision_layouts(pixel_values, tgt_sizes, vpm.embeddings.patch_size)
             if layouts is not None:
                 graph_encoder = None
@@ -4209,7 +4168,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         return multimodal_embeddings
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
-        """vLLM V1 encoder profiling calls this; the inherited Protocol stub returns None."""
+        """vLLM encoder profiling calls this; the inherited Protocol stub returns None."""
         return self.get_multimodal_embeddings(**kwargs)
 
     def get_input_embeddings(
@@ -4242,7 +4201,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         if intermediate_tensors is not None:
             inputs_embeds = None
 
-        # NOTE: In v1, inputs_embeds is always generated at model runner
+        # NOTE: inputs_embeds is generated by the model runner
         elif inputs_embeds is None:
             multimodal_embeddings = self.get_multimodal_embeddings(**kwargs)
             inputs_embeds = self.get_input_embeddings(input_ids, multimodal_embeddings)

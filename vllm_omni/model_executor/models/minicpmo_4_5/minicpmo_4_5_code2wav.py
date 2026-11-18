@@ -1614,8 +1614,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         By default only validates and enqueues; :meth:`run_idle_prefetch` does
         the work (plus setup with ``token2wav_ref_prefetch_setup``). Optional
         CPU workers materialize and pin references within the same pin budget.
-        A bad payload is logged and skipped, never raised. The V1 GPU, MRv2
-        GPU and NPU generation runners call this hook and
+        A bad payload is logged and skipped, never raised. The MRv2 GPU
+        and NPU generation runners call this hook and
         :meth:`run_idle_prefetch`; runners without these optional hooks prepare
         the reference inline at chunk 0.
         """
@@ -2001,12 +2001,9 @@ class MiniCPMO45Code2Wav(nn.Module):
 
         ``OmniGPUWorkerBase.compile_or_warm_up_model`` calls this right after the
         runner's own init work, i.e. weights loaded, profiling done, nothing
-        served yet. Runners that capture their own graphs (CUDA V1) already run a
-        dummy forward at that point, which fires the deferred sweep first and
-        leaves this a no-op; runners that do not (MRv2, NPU) would otherwise
-        defer the sweep to the first real request, where a C8 duplex replay
-        stalls every in-flight stream for ~1-2 s per graph while its first-wave
-        sessions time out.
+        served yet. If a dummy forward already fired the deferred sweep, this
+        is a no-op. Otherwise, warmup avoids deferring the sweep to the first
+        real request, which would stall every in-flight stream during capture.
 
         Capturing here rather than in ``load_weights`` also keeps the allocator
         layout the runner already uses: a sweep at weight-load time raises the
@@ -2014,8 +2011,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         at concurrency 8.
 
         ``cfm_graph_precapture_at_init`` can turn it off. It stays on by default
-        because this is where CUDA V1 already swept: the runner's own warmup has
-        run by now, so the capture reuses the allocator it warmed instead of
+        because the runner's own warmup has run by now, so capture reuses the
+        allocator it warmed instead of
         raising the reserved footprint the way a weight-load-time sweep does.
         """
         if self._extra_config().get("cfm_graph_precapture_after_load") is not None:

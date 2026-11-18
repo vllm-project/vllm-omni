@@ -6,7 +6,7 @@ three duplex stages keep `async_chunk: true`. CUDA turn serving sends the
 completed Thinker payload to the Talker. Turn profiles inherit Thinker ngram
 speculation and disabled prefix caching. XPU and MUSA retain the deferred V1
 default and are rejected by vLLM 0.34 rather than being implicitly qualified
-for V2. Both V1 and MRv2 can restore cached Thinker outputs when an
+for V2. MRv2 can restore cached Thinker outputs when an
 overlay disables speculation and enables caching. MRv2 restores `latent`,
 `latent_input_ids` and `latent_positions` together. Duplex profiles keep
 caching disabled for their mutable KV window.
@@ -15,10 +15,7 @@ The MRv2 output-cache opt-in requires an explicit `session_mode: turn` on
 the Thinker model config. A missing mode does not advertise output-cache
 support. The output cache refuses stage-0 speculative decoding, so an MRv2
 Thinker with a `speculative_config` reuses native KV only and keeps prefix
-caching on (see "Thinker prefix cache with drafts" below). A V1 Thinker with
-speculation, including n-gram, is still refused while the cache is enabled;
-such overlays must set stage 0 `enable_prefix_caching: false` under
-`platforms.cuda`.
+caching on (see "Thinker prefix cache with drafts" below).
 
 Turn mode uses the stage-level MRv2 contracts from #8184. Thinker emits live
 latent metadata outside graph replay; Talker keeps codec history and EOS
@@ -79,10 +76,6 @@ benefit. The required budget depends on the configured batch sizes, query
 widths and cache offsets; there is no universal minimum such as 30 graphs.
 Check the startup precapture budget warning when tuning `cfm_max_graphs` for
 memory-constrained deployments.
-
-The shared asynchronous output snapshot and batched Talker preprocessing also
-apply to V1 when async chunking/scheduling is enabled. Default V1 behavior must
-therefore be included in end-to-end regression validation.
 
 CFM graph execution defaults to the fused DiT body on CUDA (when TF32 is
 allowed or FP16 CFM is selected) and on NPU. NVIDIA SM80+ uses the existing
@@ -160,9 +153,9 @@ stages:
       num_speculative_tokens: 7
 ```
 
-vLLM 0.33 resolves a draft config with `architectures: ["DSparkDraftModel"]`
+vLLM 0.34 resolves a draft config with `architectures: ["DSparkDraftModel"]`
 and `model_type: qwen3` to `Qwen3DSparkModel`. Drafters that read Thinker
-layers require the Thinker on MRv2; the V1 Thinker rejects them at load.
+layers use the Thinker MRv2 auxiliary-hidden-state interface.
 Validation covers CUDA turn sessions with greedy text and speech output.
 Duplex sessions keep their own sampler and are not covered. NPU and ROCm use
 MRv2 but do not inherit this CUDA drafter configuration; XPU and MUSA retain
@@ -174,9 +167,8 @@ with seven Ngram draft tokens for greedy Thinker requests. The scheduler
 drafts from committed token history and the NPU verifies the drafts. When
 a Thinker decode batch includes non-greedy sampling, MRv2 scheduler Ngram
 skips drafts for that step so sampled requests use the ordinary sampler.
-Native duplex batches use ordinary decoding on both runners so the duplex
-sampler receives one logit row per request. Ascend's `ngram_gpu` proposer uses MRv1
-and the same native duplex guard. Use `ngram` for MRv2.
+Native duplex batches use ordinary decoding so the duplex sampler receives
+one logit row per request. Ascend profiles use the scheduler `ngram` proposer.
 
 The CUDA profile also enables Thinker Ngram. In a duplex deployment, ordinary
 chat requests retain the stock rejection sampler alongside the duplex sampler;
@@ -358,7 +350,7 @@ run-to-run variance, not a runner gap.
 
 ### Chunk-boundary probability precision
 
-The shared V1/MRv2 Thinker sampler draws the chunk boundary before applying
+The native duplex Thinker sampler draws the chunk boundary before applying
 text penalties and top-k/top-p filtering, as the released StreamDecoder does.
 Its probability must come from `softmax(logits)`. Computing it as
 `exp(logit_eos - logsumexp(logits))` materialized the intermediate reduction
@@ -550,7 +542,7 @@ overlay to disable that part.
 
 ## MRv2 Talker seeded sampling
 
-The MiniCPM-o MRv2 Talker uses V1's per-request exponential draws after
+The MiniCPM-o MRv2 Talker uses per-request seeded exponential draws after
 applying MRv2 logit processing. Its top-k/top-p adapter passes the actual
 logit vocabulary size to vLLM's sampling states and forwards the returned
 `has_topp_only_rows` predicate to native masking.
@@ -564,30 +556,8 @@ and are removed when requests finish. Batches requesting logprobs, sampling
 masks or trace replay keep the upstream sampler and its RNG semantics.
 
 Startup profiling also registers unseeded sampling slots before request ids
-exist. These slots initialize upstream sampling state without creating V1
+exist. These slots initialize upstream sampling state without creating per-request
 generators; seeded requests still require an admitted request id.
-
-## V1 Talker decode bookkeeping
-
-The CUDA V1 Talker uses the existing batch-preprocess row-fill hook for batches
-containing only one-token decode requests with initialized audio state. It
-checks the current request order, token offsets and prompt boundaries on every
-step; it does not cache metadata by batch size. New admissions, preemption
-resumes, mixed prefill/decode and K-step execution keep the generic path.
-The hook preserves condition metadata and updates only the live decode fields
-and the empty codec delta; the Talker still owns the sampled-id snapshot.
-
-For a full CUDA decode batch, codec ids, validity and completion flags stay
-batched until the runner's owned output snapshot has been copied. The output
-finalizer then restores per-request tensors and scalar completion flags.
-Mixed batches retain row-wise output. CPU placeholders are allocated only for
-rows without a device result. Snapshot ownership remains necessary even when
-all rows share one tensor: producer buffers may be overwritten on the next
-step.
-
-These shortcuts target V1. The default CUDA MRv2 Talker already skips identity
-decode preprocessing and emits device batches, so a V1 improvement alone does
-not establish a speedup for the default CUDA MRv2 deployment.
 
 ## Reference reuse across concurrent bursts
 
@@ -672,7 +642,7 @@ The runtime bundle includes:
   still feed an asynchronous device assertion. CPU, unsupported layouts/dtypes
   and widths outside 1–8192 retain native multinomial. Seeded token and generator
   parity is tested for both eager execution and CUDA graph replay. With Triton
-  available, this helper serves per-row CUDA K-step sampling, including V1 and
+  available, this helper serves per-row CUDA K-step sampling, including
   mixed greedy/stochastic batches. The default all-stochastic CUDA MRv2 K-step
   path uses upstream batched exponential noise and returns before this helper.
   Default-deployment throughput measurements therefore do not isolate or

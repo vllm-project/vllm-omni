@@ -16,9 +16,8 @@ different codec distribution than a single-frame deployment would.
 
 Order and defaults follow the engine's single-frame path so that enabling the
 multi-frame (K-step) decode does not change the sampling semantics:
-``vllm/v1/sample/sampler.py`` for the temperature/min-p/top-k/top-p order,
-``logits_processor/builtin.py`` for the censoring, bias and min-p processors and
-``model_executor/layers/utils.py`` for the penalties. Every added knob is a
+``vllm/v1/worker/gpu/sample/sampler.py`` for the logit pipeline and
+``vllm/v1/worker/gpu/sample/logits_processor.py`` for its processors. Every added knob is a
 no-op at its default value.
 """
 
@@ -37,7 +36,7 @@ logger = init_logger(__name__)
 
 VOCAB_SIZE = 6562
 HISTORY_WINDOW = 16
-# Same cutoff vLLM's V1 sampler uses to treat a row as greedy.
+# Temperature cutoff for treating a row as greedy.
 _SAMPLING_EPS = 1e-5
 
 # Engine steps 6a+7b run as one Triton kernel on NPU (adopted 2026-10-17 after a
@@ -245,7 +244,7 @@ def _sample_cuda(probabilities: torch.Tensor, generator: torch.Generator | None)
     return torch.multinomial(probabilities, 1, generator=generator).reshape(1)
 
 
-def draw_v1_codec_ids(
+def draw_seeded_codec_ids(
     processed_logits: torch.Tensor,
     *,
     top_k: torch.Tensor | None,
@@ -256,17 +255,16 @@ def draw_v1_codec_ids(
     has_topp_only_rows: bool = True,
     use_fp64_gumbel: bool = False,
 ) -> torch.Tensor:
-    """Return one codec id per row, matching V1 ``Sampler.sample``.
+    """Return one codec id per row using per-request seeded exponential draws.
 
-    MRv2 normally uses a different Triton Gumbel stream. Reuse V1's
-    exponential draws so a seed produces the same codec sequence.
+    MRv2 normally uses a different Triton Gumbel stream. Keep the model
+    exponential stream so a seed produces the same codec sequence.
 
     ``temperature`` is one value per row, on the same device as
     ``processed_logits``; ``host_temperature`` holds the same values on the
     host, so branch decisions never read the device. An all-greedy batch
     returns the argmax and does not touch ``generators``. A mixed batch draws
-    every row, then restores the argmax on greedy rows, which is the order V1
-    uses.
+    every row, then restores the argmax on greedy rows.
     """
     from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
@@ -280,8 +278,7 @@ def draw_v1_codec_ids(
             f"temperature rows {temperature.shape[0]}/{host_temperature.shape[0]} != logit rows {num_rows}"
         )
     host_greedy = host_temperature < _SAMPLING_EPS
-    # Skipping the draw on an all-greedy step keeps the generator aligned with
-    # V1, which returns before random_sample in that case.
+    # All-greedy steps must not advance the request generators.
     if host_greedy.all():
         return processed_logits.argmax(dim=-1)
     filtered = apply_top_k_top_p(processed_logits.clone(), top_k, top_p, has_topp_only_rows=has_topp_only_rows)
@@ -699,7 +696,7 @@ def _repetition_penalty_scaling(
     """Repetition penalty over the codec history window (engine step 6a).
 
     ``alpha = penalty ** frequency`` with the sign-dependent branch, matching the
-    model's single-frame ``_apply_batched_repetition_penalty``.
+    model's single-frame codec-window penalty.
     """
     positions = torch.arange(HISTORY_WINDOW, dtype=torch.int32, device=logits.device).reshape(1, -1)
     valid = positions < state.history_len.reshape(-1, 1)
@@ -1140,7 +1137,7 @@ def greedy_codec_sample(
 
     The engine's greedy branch returns the argmax after the censoring masks, the
     logit bias and the penalties, and skips temperature, min-p, top-k and top-p
-    entirely (``vllm/v1/sample/sampler.py:30-60``), so no top-k mask belongs on
+    entirely, so no top-k mask belongs on
     this path -- masking candidates below the argmax cannot change the argmax
     itself. Every other filter is the same one the random path uses.
 
