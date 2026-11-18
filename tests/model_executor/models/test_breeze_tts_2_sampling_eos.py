@@ -9,7 +9,6 @@ import yaml
 from vllm import SamplingParams
 from vllm.v1.core.sched.utils import check_stop
 from vllm.v1.request import Request, RequestStatus
-from vllm.v1.sample.logits_processor import BatchUpdate, MinTokensLogitsProcessor
 
 from vllm_omni.config.stage_config import merge_sampling_constraints
 from vllm_omni.model_executor.models.breeze_tts_2.pipeline import BREEZE_TTS_2_PIPELINE
@@ -54,6 +53,8 @@ def test_scheduler_stops_only_on_codec_eos(talker_sampling_params, codec_token, 
 
 @pytest.mark.parametrize("codec_token", [1, 2051])
 def test_first_step_keeps_codec_token_and_eos_logits(talker_sampling_params, codec_token, monkeypatch):
+    legacy = pytest.importorskip("vllm.v1.sample.logits_processor", reason="V1 masking implementation is retired")
+    BatchUpdate, MinTokensLogitsProcessor = legacy.BatchUpdate, legacy.MinTokensLogitsProcessor
     # vLLM's tensor helper uses a global flag rather than is_pin_memory,
     # and pinned allocations require a CUDA device even for this CPU test.
     monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
