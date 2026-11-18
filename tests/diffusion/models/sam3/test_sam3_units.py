@@ -30,6 +30,7 @@ IMAGE_SIZE = 112
 TINY_CONFIG = {
     "vision_config": {
         "backbone_config": {
+            "model_type": "sam3_vit_model",
             "hidden_size": 32,
             "intermediate_size": 64,
             "num_hidden_layers": 2,
