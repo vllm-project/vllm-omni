@@ -441,7 +441,9 @@ class TestStageGenExcludesQueueWait:
                 self._SUBMIT,
                 n_stages - 1,
             )
-            if replay_final:
+            # Replaying an earlier stage under the final id finalizes before
+            # later waits are folded, so only the real terminal output is replayed.
+            if replay_final and stage_id == n_stages - 1:
                 obj._process_single_result(
                     final_result,
                     n_stages - 1,
