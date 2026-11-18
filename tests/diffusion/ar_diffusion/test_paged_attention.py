@@ -172,6 +172,98 @@ def test_npu_host_lengths_custom_op_preserves_mutation_and_valid_lengths(monkeyp
     torch.testing.assert_close(output, query + keys + values)
 
 
+@pytest.mark.cpu
+@pytest.mark.parametrize("use_host_lengths", [True, False])
+def test_npu_gather_reads_only_the_blocks_the_kernel_sees(monkeypatch, use_host_lengths):
+    """The NPU path must not gather the padded KV capacity.
+
+    ``max_seq_len`` is the padded capacity of the request while the fused
+    kernel only reads ``kv_len`` tokens. Gathering the capacity would copy
+    every resident block of the pool into the packed buffer, on every layer.
+    """
+    torch.manual_seed(0)
+    query = torch.randn(3, N_HEADS, HEAD_DIM)
+    keys = torch.randn(16, 4, N_HEADS, HEAD_DIM)
+    values = torch.randn_like(keys)
+    table = torch.tensor([[5, 2, 7, 1, 3, 0, 4, 6] + [0] * 8], dtype=torch.int32)
+    # The first two blocks of the row hold the five visible KV tokens.
+    expected_k = keys[[5, 2]].flatten(0, 1)[:5]
+    expected_v = values[[5, 2]].flatten(0, 1)[:5]
+    gathered = []
+    original_index_select = torch.Tensor.index_select
+
+    def spy(self, dim, index):
+        if self is keys or self is values:
+            gathered.append(index.numel())
+        return original_index_select(self, dim, index)
+
+    def attention(q, k, v, **kwargs):
+        torch.testing.assert_close(k, expected_k)
+        torch.testing.assert_close(v, expected_v)
+        return (torch.zeros_like(q),)
+
+    provider = ModuleType("torch_npu")
+    provider.npu_fusion_attention = attention
+    monkeypatch.setitem(sys.modules, "torch_npu", provider)
+    monkeypatch.setattr(torch.Tensor, "index_select", spy)
+
+    kwargs = dict(
+        block_table=table,
+        query_start_loc=torch.tensor([0, 3], dtype=torch.int32),
+        seq_lens=torch.tensor([5], dtype=torch.int32),
+        max_query_len=3,
+        max_seq_len=64,
+        softmax_scale=HEAD_DIM**-0.5,
+    )
+    npu_lengths = (3, 5) if use_host_lengths else None
+    ar_diffusion_paged_attention(_MockNPUQuery(query), keys, values, **kwargs, npu_lengths=npu_lengths)
+
+    # ceil(kv_len / block_size) = ceil(5 / 4) blocks per cache, not the 16
+    # blocks the padded capacity would need.
+    assert gathered == [2, 2]
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("use_host_lengths", [True, False])
+def test_npu_fused_kernel_gets_tnd_lengths_as_python_ints(monkeypatch, use_host_lengths):
+    """The fused kernel takes python int lists, not device tensors."""
+    torch.manual_seed(0)
+    query = torch.randn(3, N_HEADS, HEAD_DIM)
+    keys = torch.randn(4, 4, N_HEADS, HEAD_DIM)
+    values = torch.randn_like(keys)
+    seen = []
+
+    def attention(q, k, v, **kwargs):
+        seen.append(kwargs)
+        return (torch.zeros_like(q),)
+
+    provider = ModuleType("torch_npu")
+    provider.npu_fusion_attention = attention
+    monkeypatch.setitem(sys.modules, "torch_npu", provider)
+
+    kwargs = dict(
+        block_table=torch.tensor([[0, 1, 2]], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 3], dtype=torch.int32),
+        seq_lens=torch.tensor([5], dtype=torch.int32),
+        max_query_len=3,
+        max_seq_len=12,
+        softmax_scale=HEAD_DIM**-0.5,
+    )
+    npu_lengths = (3, 5) if use_host_lengths else None
+    ar_diffusion_paged_attention(_MockNPUQuery(query), keys, values, **kwargs, npu_lengths=npu_lengths)
+
+    assert len(seen) == 1
+    call = seen[0]
+    assert call["input_layout"] == "TND"
+    assert call["head_num"] == N_HEADS
+    assert call["scale"] == HEAD_DIM**-0.5
+    assert call["keep_prob"] == 1.0
+    assert call["actual_seq_qlen"] == [3]
+    assert call["actual_seq_kvlen"] == [5]
+    assert all(type(length) is int for length in call["actual_seq_qlen"])
+    assert all(type(length) is int for length in call["actual_seq_kvlen"])
+
+
 def make_state(
     *,
     num_layers=1,
