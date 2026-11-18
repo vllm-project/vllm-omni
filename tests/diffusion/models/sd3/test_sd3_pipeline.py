@@ -7,6 +7,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.sd3.pipeline_sd3 import StableDiffusion3Pipeline
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
@@ -37,6 +38,7 @@ def _make_sd3_pipeline():
     pipeline.patch_size = 2
     pipeline.default_sample_size = 128
     pipeline.transformer = SimpleNamespace(in_channels=1)
+    pipeline.od_config = OmniDiffusionConfig(model="test", dtype=torch.float32)
     return pipeline
 
 
