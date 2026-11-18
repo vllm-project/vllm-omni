@@ -172,7 +172,7 @@ class DuoDataPlane(DuplexDataPlane):
                     # need the same release as the delayed `duo_5_17` path above:
                     # admission waits on `self.codec`, so omitting it hangs
                     # `alternating`/`serial` after block 0.
-                    if owner.schedule.mode != "free":
+                    if owner is not None and owner.schedule.mode != "free":
                         owner.schedule.complete("codec", state.next_block)
             else:
                 continue

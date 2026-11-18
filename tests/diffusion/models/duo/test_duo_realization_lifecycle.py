@@ -80,6 +80,48 @@ def test_codec_completion_covers_every_codec_mode():
     )
 
 
+def test_default_codec_mode_tolerates_a_chunk_without_an_owner(monkeypatch):
+    # `project()` treats a missing owner as valid on the publish path
+    # (`if owner is None: ready_ids = [output.request_id]`), so the release must
+    # not dereference it: a codec chunk arriving without a pipeline owner used to
+    # raise AttributeError here instead of simply skipping the release.
+    from vllm_omni.model_executor.models.duo.duplex import data_plane as dp
+
+    # The encode step needs real media; this test is about the release guard.
+    monkeypatch.setattr(dp, "encode_av_chunk", lambda payload, meta: {"packets": []})
+
+    plane = object.__new__(dp.DuoDataPlane)
+    plane.defer_clean = False
+    # `pending` mirrors the fields the codec branch touches; `codec_received`
+    # gates the duplicate-chunk check.
+    plane.requests = {
+        "c0": SimpleNamespace(
+            emitted=False,
+            decoded=None,
+            identity=None,
+            clean=False,
+            codec_received=False,
+            codec_metadata=None,
+        )
+    }
+    plane.states = {"c0": SimpleNamespace(owner=None, session_id="s", next_block=0, fence=0)}
+    plane.codec_stage_id = 2
+    plane.realization_stage_id = 1
+
+    output = SimpleNamespace(
+        request_id="c0",
+        stage_id=2,
+        multimodal_output={
+            "metadata": {"session_id": "s", "fence": 0, "block": 0, "codec_mode": "stream_4frame"},
+            "payload": {"packets": []},
+        },
+    )
+
+    # `project()` is a generator: it must be consumed, otherwise the body never
+    # runs and this test would pass regardless of the guard.
+    list(dp.DuoDataPlane.project(plane, {"data_plane_outputs": [output]}))
+
+
 def test_asr_slot_is_released_before_the_empty_transcript_return():
     # A finished ASR request with no `outputs` produces no transcript, so the
     # completion must run before that early return; otherwise an empty utterance
