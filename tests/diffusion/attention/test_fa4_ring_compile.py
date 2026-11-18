@@ -4,7 +4,6 @@
 """Real FA4/native-P2P regression tests; no vendor or collective mocks."""
 
 from datetime import timedelta
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,12 +12,10 @@ import torch.multiprocessing as mp
 from packaging.version import Version
 
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.ring.ring_globals import HAS_FA4
 from vllm_omni.diffusion.attention.backends.ring.ring_kernels import _fa4_ring_attention_op, flash_attn4_func_forward
 from vllm_omni.diffusion.attention.backends.ring.ring_selector import AttnType
 from vllm_omni.diffusion.attention.backends.ring_flash_attn import ring_flash_attn_forward
-from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -60,8 +57,23 @@ def _ring_worker(rank, rendezvous):
         groups = [dist.new_group([0, 1]), dist.new_group([2, 3])]
         with torch._dynamo.config.patch(enable_p2p_compilation=True), torch.inference_mode():
             for group in (groups[rank // 2], dist.group.WORLD):
-                runner = RingParallelAttention(SimpleNamespace(ring_group=group), "FLASH_ATTN", True)
-                compiled = torch.compile(runner.run_attention, fullgraph=True, dynamic=True)
+                # Exercise standalone FA4 directly; the strategy now prefers
+                # vLLM's bundled dispatcher, which bypasses this PR's op.
+                def forward(q, k, v, jk, jv, valid):
+                    return ring_flash_attn_forward(
+                        group,
+                        q,
+                        k,
+                        v,
+                        128**-0.5,
+                        causal=False,
+                        attn_type=AttnType.FA4,
+                        joint_tensor_key=jk,
+                        joint_tensor_value=jv,
+                        valid_kv_length=valid,
+                    )[0]
+
+                compiled = torch.compile(forward, fullgraph=True, dynamic=True)
                 # Isolate a 128-to-120 trim without a prefix, then cover GQA/prefix
                 # padding and replay the original unpadded shape.
                 cases = ((128, 4, 0, 0), (128, 4, 0, 8), (256, 2, 23, 7), (128, 4, 0, 0))
@@ -75,16 +87,10 @@ def _ring_worker(rank, rendezvous):
                     jk = torch.randn(1, prefix, kv_heads, 128, device="cuda", dtype=q.dtype) if prefix else None
                     jv = torch.randn_like(jk) if prefix else None
                     valid = seq * dist.get_world_size(group) - trim
-                    metadata = AttentionMetadata(
-                        joint_key=jk,
-                        joint_value=jv,
-                        joint_strategy="front",
-                        extra={"valid_kv_length": valid} if trim else {},
-                    )
                     inputs = (q, k, v, jk, jv) if prefix else (q, k, v)
                     before = tuple(t.clone() for t in inputs)
-                    eager = runner.run_attention(q, k, v, metadata)
-                    actual = compiled(q, k, v, metadata)
+                    eager = forward(q, k, v, jk, jv, valid if trim else None)
+                    actual = compiled(q, k, v, jk, jv, valid if trim else None)
                     gathered_k = [torch.empty_like(k) for _ in range(dist.get_world_size(group))]
                     gathered_v = [torch.empty_like(v) for _ in gathered_k]
                     dist.all_gather(gathered_k, k, group=group)

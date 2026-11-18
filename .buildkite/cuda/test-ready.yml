@@ -65,7 +65,7 @@ steps:
         commands:
           - uv pip install --system -e '.[fa4]'
           - python .buildkite/cuda/scripts/check_vllm_runtime.py
-          # Native P2P coverage skips until the CI image provides PyTorch 2.14+.
+          # The pinned vLLM CUDA runtime provides PyTorch 2.14 for native P2P coverage.
           - timeout 20m pytest -sv tests/diffusion/attention/test_fa4_ring_compile.py -m 'core_model and cuda and B200 and (cards_1 or cards_4)' --run-level "core_model" -rs
         mirror_hardwares: b200_4
 
