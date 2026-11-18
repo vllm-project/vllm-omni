@@ -47,17 +47,23 @@ _TOPOLOGY_OWNED_ENGINE_FIELDS = frozenset(
     }
 )
 
-SKIP_STREAMING_UPDATES_ATTR = "_omni_skip_streaming_updates"
+STREAMING_UPDATE_TRANSFORM_ATTR = "_omni_streaming_update_transform"
 
 
-def skip_on_streaming_updates(func: Callable[..., Any]) -> Callable[..., Any]:
-    """Mark a ``prompt_transform_func`` to run only when a request is first submitted.
+def on_streaming_updates(
+    transform: Callable[..., Any] | None,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Mark a ``prompt_transform_func`` to run ``transform`` on streaming-input updates instead.
 
-    The engine then does not call it on streaming-input updates, which carry
-    the later chunks of a request that already passed the transform.
+    Those updates carry the later chunks of a request that already passed the
+    transform. ``None`` skips them.
     """
-    setattr(func, SKIP_STREAMING_UPDATES_ATTR, True)
-    return func
+
+    def mark(func: Callable[..., Any]) -> Callable[..., Any]:
+        setattr(func, STREAMING_UPDATE_TRANSFORM_ATTR, transform)
+        return func
+
+    return mark
 
 
 def _normalize_stage_backend_fields(stage: StageDeployConfig) -> None:
@@ -408,7 +414,8 @@ class StagePipelineConfig:
     # Rewrites the Stage-0 view of a raw prompt before vLLM input processing.
     # The callable receives ``(prompt, sampling_params_list)``; downstream
     # stages continue to receive the original prompt. It also runs on
-    # streaming-input updates unless marked with ``skip_on_streaming_updates``.
+    # streaming-input updates unless ``on_streaming_updates`` names another
+    # transform (or none) for them.
     prompt_transform_func: str | None = None
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
