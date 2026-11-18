@@ -159,7 +159,7 @@ class _SpecConfig:
 
     def __init__(self, dynamic: bool) -> None:
         self._dynamic = dynamic
-        self.num_speculative_tokens_per_batch_size = None
+        self.num_speculative_tokens_per_batch_size: list[tuple[int, int, int]] | None = None
 
     def uses_dynamic_speculative_decoding(self) -> bool:
         return self._dynamic
