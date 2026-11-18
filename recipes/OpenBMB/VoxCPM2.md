@@ -24,6 +24,11 @@ gapless streaming via the bundled Gradio AudioWorklet demo.
 Because the model is only 2B params, a single 24 GB consumer GPU is
 sufficient — no tensor parallelism is required.
 
+For a version-pinned, bounded 16GB Linux baseline, see
+[VoxCPM2 on RTX 5060 Ti 16GB](VoxCPM2-RTX5060Ti-16GB.md). It compares 6 GiB
+and 2 GiB KV profiles with deployment commands, memory, latency and quality
+measurements, and their workload limits.
+
 ## References
 
 - Example guide (online):
@@ -105,16 +110,20 @@ non-empty residual state and fail at `aclnnCat`.
 
 ## GPU
 
-### 1 x RTX 4090 24GB (Single GPU, Minimum Recommended)
+### 1 x RTX 4090 24GB (Historical reference)
 
-VoxCPM2 (2B params in bfloat16) fits comfortably on a single 24 GB GPU.
-The bundled default config at
-[`vllm_omni/deploy/voxcpm2.yaml`](../../vllm_omni/deploy/voxcpm2.yaml)
-(`gpu_memory_utilization: 0.9`, `max_num_seqs: 4`, `enforce_eager: true`)
-loads cleanly on a 4090 with ~4.9 GiB for model weights, ~15.2 GiB for
-KV cache, and ~2 GiB for the talker's CUDA-Graph / CFM / VAE buffers,
-for a total resident footprint of about **22 GiB / 24 GiB** in steady
-state.
+The measurements in this section used the historical environment below,
+including vLLM 0.21.0 and the then-current deployment settings
+(`gpu_memory_utilization: 0.9`, `max_num_seqs: 4`, `enforce_eager: true`).
+They reported ~4.9 GiB for model weights, ~15.2 GiB for KV cache, and ~2 GiB
+for talker buffers, or about **22 GiB / 24 GiB** resident.
+
+These are not the memory requirements of the current bundled
+[`voxcpm2.yaml`](../../vllm_omni/deploy/voxcpm2.yaml), which sets an explicit
+6 GiB KV budget and `max_num_seqs: 8`. The
+[16GB recipe](VoxCPM2-RTX5060Ti-16GB.md) records measurements at a newer,
+pinned revision. Do not compare their throughput as an isolated hardware or
+configuration speedup.
 
 #### Environment
 
@@ -123,7 +132,7 @@ state.
 - Driver / runtime: NVIDIA driver 575.57.08, CUDA 12.9 runtime
 - torch: 2.11.0+cu128
 - vLLM: 0.21.0
-- vLLM-Omni: 0.20.1.dev (current `main`)
+- vLLM-Omni: 0.20.1.dev (historical run; commit not recorded)
 - Native VoxCPM2 source: `voxcpm` >= 2.0
 
 #### Command
@@ -306,7 +315,7 @@ steps themselves run at the same per-step rate as zero-shot.
 #### Notes
 
 - Prerequisites: `pip install voxcpm soundfile httpx ninja`. `ninja` must be on `PATH` because `flashinfer` JIT-compiles a top-k sampling kernel during the first profile pass (without it, startup dies with `FileNotFoundError: 'ninja'`).
-- Memory usage: ~4.9 GiB model weights + ~15.2 GiB KV cache ≈ 22 GiB / 24 GiB resident with the default `voxcpm2.yaml`. On a shared GPU, pass `--gpu-memory-utilization 0.75` (or lower) if startup fails the free-memory check.
+- Memory usage: the ~22 GiB figure belongs to the historical environment above. The current deploy pins KV to 6 GiB; lowering `gpu_memory_utilization` does not shrink an explicit KV budget. See the version-pinned [16GB measurements](VoxCPM2-RTX5060Ti-16GB.md) before choosing a profile.
 - Key flags: `--omni` is required. `--trust-remote-code` is not needed — the HF config registers under `model_type=voxcpm2`.
 - Output: 48 kHz mono. When streaming PCM to a player, use `-r 48000`.
 - Cold start: ~60 s server boot + ~25 s first-inference overhead (torch.compile + flashinfer JIT + the talker's own `_CapturedGraph` capture over CFM / AudioVAE — not vLLM engine CUDA graphs, which `enforce_eager: true` disables). Steady-state inference RTF is **~0.12** (~8× real-time on a single 4090; see T6 table for the per-call breakdown); online server requests run at ~RTF 0.5 wall-time (includes HTTP round-trip). Keep the server warm for interactive use.

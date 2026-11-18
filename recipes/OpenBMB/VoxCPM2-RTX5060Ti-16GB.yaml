@@ -1,0 +1,12 @@
+# Optional RTX 5060 Ti 16GB profile; see the paired recipe for versions and limits.
+# Cadence 2/1; legacy batched VAE disabled to avoid the conflict in #9971.
+base_config: ../../vllm_omni/deploy/voxcpm2.yaml
+stages:
+  - stage_id: 0
+    kv_cache_memory_bytes: 2147483648
+    engine_extras:
+      hf_overrides:
+        voxcpm2_runtime_config:
+          audio_emit_every: 1
+          vae_decode_every: 2
+          enable_batched_vae_decode: false

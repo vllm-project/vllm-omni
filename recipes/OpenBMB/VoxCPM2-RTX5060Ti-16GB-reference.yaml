@@ -1,0 +1,6 @@
+# 6 GiB reference for the paired 2 GiB profile.
+# Keep the runtime path and audio cadence identical when comparing KV budgets.
+base_config: VoxCPM2-RTX5060Ti-16GB.yaml
+stages:
+  - stage_id: 0
+    kv_cache_memory_bytes: 6442450944
