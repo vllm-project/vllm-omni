@@ -112,7 +112,8 @@ class StepRequestState:
     # ── Optional chunked streaming progress ──
     chunk_index: int = 0
     step_in_chunk: int = 0
-    total_chunks: int = 1
+    total_chunks: int | None = 1
+    stream_input_drained: bool = False
     chunk_num_steps: int | None = None
 
     # ── Optional interaction information in streaming output mode ──
@@ -183,6 +184,8 @@ class StepRequestState:
 
     @property
     def request_denoise_completed(self) -> bool:
+        if self.total_chunks is None:
+            return self.stream_input_drained
         if self.chunk_num_steps is None:
             return self.denoise_completed
         return self.chunk_index >= self.total_chunks

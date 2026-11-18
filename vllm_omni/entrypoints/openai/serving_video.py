@@ -309,6 +309,16 @@ class OmniOpenAIServingVideo:
         _, metadata = self._resolve_diffusion_metadata()
         return any(item.supports_proxy_video_input for item in metadata)
 
+    def live_proxy_canvas(self) -> tuple[int, int] | None:
+        od_config = self._resolve_diffusion_od_config()
+        if od_config is None or not od_config.streaming_output or not self.supports_proxy_video_input:
+            return None
+        from vllm_omni.diffusion.models.invoker_render.assets import InvokerRenderAssets
+
+        if od_config.model is None:
+            raise RuntimeError("Missing prepared Invoker-Render bundle for streaming")
+        return InvokerRenderAssets.read(od_config.model).proxy_size
+
     @property
     def supports_latent_mask_editing(self) -> bool:
         """Return whether the configured diffusion model accepts latent edits."""

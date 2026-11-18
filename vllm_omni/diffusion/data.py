@@ -2121,7 +2121,7 @@ class DiffusionOutput:
     # Streaming info (the defaults should make sense for non-streaming mode)
     finished: bool = True
     chunk_index: int = 0
-    total_chunks: int = 1
+    total_chunks: int | None = 1
     started_event_ids: list[str] = field(default_factory=list)
     active_event_ids: list[str] = field(default_factory=list)
     completed_event_ids: list[str] = field(default_factory=list)

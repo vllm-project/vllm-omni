@@ -49,6 +49,8 @@ from PIL import Image
 from pydantic import ValidationError
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.models.invoker_render.assets import FPS, PACKET_FRAMES, TAIL_FRAMES
+from vllm_omni.diffusion.models.invoker_render.proxy import BOOTSTRAP_KEY, PROXY_FRAME_LIMIT, PROXY_MODALITY
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.async_omni_base import ABORT_TIMEOUT_S
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
@@ -59,6 +61,7 @@ from vllm_omni.entrypoints.openai.stage_params import (
     resolve_diffusion_sampling_params,
 )
 from vllm_omni.entrypoints.openai.utils import is_video_generation_pipeline, parse_lora_requests
+from vllm_omni.entrypoints.openai.video.proxy_ingress import ProxyIngress
 from vllm_omni.entrypoints.openai.video_api_utils import (
     FragmentedMP4VideoEncoder,
     StreamingVideoFormat,
@@ -110,12 +113,14 @@ class OmniStreamingVideoOutputHandler:
         stage_configs: list[Any] | None = None,
         stall_timeout: float = _DEFAULT_STALL_TIMEOUT,
         start_timeout: float = _DEFAULT_START_TIMEOUT,
+        proxy_size: tuple[int, int] | None = None,
     ) -> None:
         self._engine_client = engine_client
         self._model_name = model_name
         self._stage_configs = stage_configs
         self._stall_timeout = stall_timeout
         self._start_timeout = start_timeout
+        self._proxy_size = proxy_size
 
     async def warmup(self, request_path: str, *, timeout: float = 180.0) -> None:
         """Drain a configured generation and its encoder before HTTP admission.
@@ -191,6 +196,15 @@ class OmniStreamingVideoOutputHandler:
                 return
             request, output_format = start
             pacing = request.streaming_pacing
+            proxy = ProxyIngress(self._proxy_size) if self._proxy_size is not None else None
+            if proxy is not None:
+                video_params = request.resolve_video_params()
+                if request.streaming_buffer_seconds is not None or video_params.num_frames is not None:
+                    await self._send_error(websocket, "Proxy sessions use source-driven pacing and finish at EOS")
+                    return
+                if video_params.fps not in (None, FPS):
+                    await self._send_error(websocket, "Proxy sessions use 24 FPS")
+                    return
             # Unpaced sessions keep the pre-backpressure unbounded sends.
             idle_timeout = pacing.idle_timeout_s if pacing is not None and pacing.enabled else None
             if request.streaming_buffer_seconds is not None:
@@ -212,6 +226,20 @@ class OmniStreamingVideoOutputHandler:
                         "request_id": request_id,
                         "format": output_format,
                         "config": request.model_dump(exclude_none=True),
+                        **(
+                            {
+                                "proxy": {
+                                    "width": proxy.size[0],
+                                    "height": proxy.size[1],
+                                    "fps": FPS,
+                                    "packet_frames": PACKET_FRAMES,
+                                    "tail_frames": TAIL_FRAMES,
+                                    "credit_frames": PROXY_FRAME_LIMIT,
+                                }
+                            }
+                            if proxy is not None
+                            else {}
+                        ),
                     },
                     send_lock,
                 ),
@@ -233,6 +261,7 @@ class OmniStreamingVideoOutputHandler:
                     progress=progress,
                     interaction_event_ids=interaction_event_ids,
                     track_playback=request.streaming_buffer_seconds is not None,
+                    proxy=proxy,
                 )
             )
             control_task = asyncio.create_task(
@@ -247,22 +276,32 @@ class OmniStreamingVideoOutputHandler:
                     request.streaming_buffer_seconds is not None,
                     stop_received_at=stop_received_at,
                     response_queue=response_queue,
+                    proxy=proxy,
                 )
             )
-            async for chunk, metadata in self._stream_video_bytes(request, request_id, output_format, progress):
-                if stop_event.is_set():
-                    stopped = True
-                    break
+            if proxy is not None:
+                await proxy.wait_for_bootstrap(stop_event, self._stall_timeout)
+                stream = self._stream_video_bytes(request, request_id, output_format, progress, proxy=proxy)
+            else:
+                stream = self._stream_video_bytes(request, request_id, output_format, progress)
+            async with aclosing(stream) as chunks:
+                async for chunk, metadata in chunks:
+                    if stop_event.is_set():
+                        stopped = True
+                        break
 
-                async def send_chunk() -> None:
-                    async with send_lock:
-                        metadata["transport_chunk_index"] = chunks_sent
-                        await websocket.send_json(metadata)
-                        await websocket.send_bytes(chunk)
+                    async def send_chunk() -> None:
+                        async with send_lock:
+                            metadata["transport_chunk_index"] = chunks_sent
+                            await websocket.send_json(metadata)
+                            await websocket.send_bytes(chunk)
 
-                await asyncio.wait_for(send_chunk(), timeout=idle_timeout)
-                chunks_sent += 1
-                progress.touch()
+                    await asyncio.wait_for(send_chunk(), timeout=idle_timeout)
+                    chunks_sent += 1
+                    progress.touch()
+                    if proxy is not None and "source_frames_consumed" in metadata:
+                        if proxy.sequence.consume(metadata["source_frames_consumed"]):
+                            response_queue.put_nowait(proxy.credit_message())
 
             if not stop_event.is_set():
 
@@ -463,6 +502,7 @@ class OmniStreamingVideoOutputHandler:
         *,
         stop_received_at: list[float],
         response_queue: asyncio.Queue[dict[str, Any]],
+        proxy: ProxyIngress | None = None,
     ) -> None:
         try:
             while not stop_event.is_set():
@@ -523,6 +563,37 @@ class OmniStreamingVideoOutputHandler:
                 if msg_type == "session.ping":
                     progress.touch()
                     response_queue.put_nowait({"type": "session.pong"})
+                    continue
+                if msg_type == "session.proxy.append" and proxy is not None:
+                    try:
+                        rgb = await asyncio.wait_for(websocket.receive_bytes(), timeout=self._start_timeout)
+                        packet = proxy.receive(msg, rgb)
+                    except (ValueError, OverflowError) as exc:
+                        await self._send_error(websocket, str(exc), send_lock=send_lock, response_queue=response_queue)
+                        continue
+                    except (asyncio.TimeoutError, WebSocketDisconnect, KeyError):
+                        stop_event.set()
+                        await self._abort_request(request_id)
+                        return
+                    if packet is not None:
+                        interaction_queue.put_nowait(
+                            {
+                                "event_id": f"proxy-{packet.input_seq}",
+                                "event": cast(
+                                    OmniInteractionEvent, {"multi_modal_data": {PROXY_MODALITY: packet.event()}}
+                                ),
+                            }
+                        )
+                    response_queue.put_nowait(proxy.credit_message())
+                    progress.touch()
+                    continue
+                if proxy is not None and msg_type in ("session.interaction", "session.playback"):
+                    await self._send_error(
+                        websocket,
+                        "Proxy sessions accept structural video controls",
+                        send_lock=send_lock,
+                        response_queue=response_queue,
+                    )
                     continue
                 if msg_type == "session.playback":
                     position = msg.get("position_seconds")
@@ -592,6 +663,7 @@ class OmniStreamingVideoOutputHandler:
         progress: _SessionProgress,
         interaction_event_ids: set[str],
         track_playback: bool,
+        proxy: ProxyIngress | None = None,
     ) -> None:
         """Deliver accepted interactions in ingress order without blocking the reader."""
 
@@ -609,12 +681,17 @@ class OmniStreamingVideoOutputHandler:
                 send_lock=send_lock,
                 response_queue=response_queue,
             )
+            if proxy is not None:
+                stop_event.set()
+                await self._abort_request(request_id)
 
         try:
             while True:
                 interaction = await interaction_queue.get()
                 try:
                     try:
+                        if proxy is not None:
+                            await proxy.engine_ready.wait()
                         if track_playback:
                             await self._engine_client.submit_interaction_async(
                                 request_id,
@@ -645,6 +722,10 @@ class OmniStreamingVideoOutputHandler:
                             send_lock=send_lock,
                             response_queue=response_queue,
                         )
+                        if proxy is not None:
+                            stop_event.set()
+                            await self._abort_request(request_id)
+                            return
                 finally:
                     interaction_queue.task_done()
 
@@ -905,9 +986,17 @@ class OmniStreamingVideoOutputHandler:
         request_id: str,
         output_format: StreamingVideoFormat,
         progress: _SessionProgress,
+        *,
+        proxy: ProxyIngress | None = None,
     ) -> AsyncGenerator[tuple[bytes, dict[str, Any]], None]:
         """Yield encoded video bytes from diffusion streaming outputs."""
         prompt, gen_params, vp = await self._build_prompt_and_sampling_params(request)
+        if proxy is not None:
+            media = prompt.get("multi_modal_data") or {}
+            prompt["multi_modal_data"] = {**media, BOOTSTRAP_KEY: proxy.initial}
+            proxy.initial = []
+            gen_params.fps = gen_params.frame_rate = FPS
+            vp.fps = FPS
         video_codec_options = {"preset": "ultrafast", "threads": "0", "tune": "zerolatency"}
         if isinstance(request.extra_params, dict) and "video_codec_options" in request.extra_params:
             video_codec_options = request.extra_params["video_codec_options"]
@@ -938,6 +1027,8 @@ class OmniStreamingVideoOutputHandler:
             async for result in self._iter_generation_outputs(prompt, gen_params, request_id, progress):
                 if result.error:
                     raise RuntimeError(str(result.error))
+                if proxy is not None:
+                    proxy.engine_ready.set()
                 encoded_chunks = await loop.run_in_executor(
                     executor, lambda: list(self._encode_generation_result(result, request_id, encoder))
                 )
@@ -1257,7 +1348,15 @@ class OmniStreamingVideoOutputHandler:
             **{key: stream_metadata[key] for key in ("pacing", "output_chunk_index") if key in stream_metadata},
             **{
                 key: stream_metadata[key]
-                for key in ("frame_start", "generated_raw_frames", "generated_frames", "withheld_frames")
+                for key in (
+                    "frame_start",
+                    "generated_raw_frames",
+                    "generated_frames",
+                    "withheld_frames",
+                    "source_frame_start",
+                    "source_frame_count",
+                    "source_frames_consumed",
+                )
                 if key in stream_metadata
             },
             **(

@@ -186,7 +186,7 @@ def format_diffusion_outputs(
 
 def _stream_metadata_from_diffusion_output(diffusion_output: DiffusionOutput) -> DiffusionMetadata | None:
     has_stream_data = (
-        diffusion_output.total_chunks > 1
+        diffusion_output.total_chunks != 1
         or not diffusion_output.finished
         or bool(diffusion_output.started_event_ids)
         or bool(diffusion_output.active_event_ids)

@@ -3,10 +3,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Mapping
+from collections import deque
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar
 
@@ -20,6 +21,8 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.interaction.mixin import InteractionMixin
+from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
 from vllm_omni.diffusion.models.minimax_h3.encoder import MiniMaxH3Qwen3VLEncoder
@@ -27,6 +30,7 @@ from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMax
 from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.utils import StepRequestState, StepWait
 from vllm_omni.errors import OmniClientError
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVBranchSpec,
@@ -39,6 +43,9 @@ from vllm_omni.model_executor.models.minimax_h3.preprocessing import minimax_h3_
 from .assets import FPS, PACKET_FRAMES, TAIL_FRAMES, VIDEO_SIZE, InvokerRenderAssets
 from .causal import CausalSession, InvokerRenderAttention, euler_step
 from .codec import CausalVideoDecoder, DecodeState, encode_rgb
+from .interaction import ProxyQueue
+from .proxy import BOOTSTRAP_KEY, PROXY_MODALITY
+from .schedule import Window
 
 
 def validate_proxy(rgb: np.ndarray, size: tuple[int, int]) -> np.ndarray:
@@ -82,19 +89,36 @@ def get_invoker_render_pre_process_func(od_config: OmniDiffusionConfig):
         if not isinstance(text, str) or text.strip() != assets.system_prompt:
             raise OmniClientError("Invoker-Render requires the frozen prompt from its artifact")
         data = prompt.get("multi_modal_data") or {}
+        if not isinstance(data, Mapping):
+            raise OmniClientError("Invoker-Render requires structured media inputs")
         image = data.get("image")
         if not isinstance(image, Image.Image) or image.size != VIDEO_SIZE:
             raise OmniClientError("Invoker-Render requires one 1344x768 reference image")
-        proxy = data.get("video")
-        if isinstance(proxy, list) and len(proxy) == 1:
-            proxy = proxy[0]
-        if isinstance(proxy, (str, Path)):
-            proxy = read_proxy_video(proxy, assets.proxy_size)
+        live = BOOTSTRAP_KEY in data
+        media_key = BOOTSTRAP_KEY if live else "video"
+        proxy = data.get(media_key)
+        if live:
+            if not od_config.streaming_output or not isinstance(proxy, list) or len(proxy) != 2:
+                raise OmniClientError(
+                    "Invoker-Render live requests require two bootstrap packets and the streaming profile"
+                )
+            queue = ProxyQueue(assets.proxy_size)
+            try:
+                for packet in proxy:
+                    queue.append(queue.packet(packet))
+            except (TypeError, ValueError) as exc:
+                raise OmniClientError(str(exc)) from exc
+            count = 1
         else:
-            proxy = validate_proxy(proxy, assets.proxy_size)
-        count = len(proxy)
-        if count < 2 * PACKET_FRAMES + TAIL_FRAMES or count % PACKET_FRAMES != TAIL_FRAMES:
-            raise OmniClientError("Invoker-Render requires 17*N+5 proxy frames and at least 39 frames")
+            if isinstance(proxy, list) and len(proxy) == 1:
+                proxy = proxy[0]
+            if isinstance(proxy, (str, Path)):
+                proxy = read_proxy_video(proxy, assets.proxy_size)
+            else:
+                proxy = validate_proxy(proxy, assets.proxy_size)
+            count = len(proxy)
+            if count < 2 * PACKET_FRAMES + TAIL_FRAMES or count % PACKET_FRAMES != TAIL_FRAMES:
+                raise OmniClientError("Invoker-Render requires 17*N+5 proxy frames and at least 39 frames")
         sampling = copy(request.sampling_params)
         extra = sampling.extra_args or {}
         if (
@@ -114,7 +138,7 @@ def get_invoker_render_pre_process_func(od_config: OmniDiffusionConfig):
             or sampling.enable_frame_interpolation
             or extra.get("flow_shift", 12) != 12
             or prompt.get("negative_prompt")
-            or set(data) != {"image", "video"}
+            or set(data) != {"image", media_key}
         ):
             raise OmniClientError("Invoker-Render uses fixed geometry, 24 FPS and four Euler steps with shift 12")
         sampling.width, sampling.height = VIDEO_SIZE
@@ -122,8 +146,9 @@ def get_invoker_render_pre_process_func(od_config: OmniDiffusionConfig):
         sampling.num_frames = count
         sampling.num_inference_steps = 4
         sampling.extra_args = {**extra, "session_id": request.request_id, "reset": True, "close_session": True}
-        request.prompt = {**prompt, "multi_modal_data": {"image": image.convert("RGB"), "video": proxy}}
+        request.prompt = {**prompt, "multi_modal_data": {"image": image.convert("RGB"), media_key: proxy}}
         request.sampling_params = sampling
+        request.use_step_execution = live
         return request
 
     return preprocess
@@ -134,11 +159,14 @@ class _Session:
     causal: CausalSession
     decoder: DecodeState
     delivered: int = 0
+    windows: deque[Window] = field(default_factory=deque)
+    active: Window | None = None
 
 
-class InvokerRenderPipeline(nn.Module):
+class InvokerRenderPipeline(nn.Module, InteractionMixin):
     support_image_input: ClassVar[bool] = True
     dummy_run_num_frames: ClassVar[int] = 0
+    supports_step_execution: ClassVar[bool] = True
 
     @staticmethod
     def reference_video_decode_spec(*, num_frames: int | None, extra_args: dict) -> ReferenceVideoDecodeSpec:
@@ -272,6 +300,101 @@ class InvokerRenderPipeline(nn.Module):
         video = self.decoder.decode(session.decoder, latents, eos=window.eos)
         session.delivered += len(video)
         return video
+
+    def prepare_encode(self, state: StepRequestState, **kwargs) -> StepRequestState:
+        if not isinstance(state.prompt, Mapping):
+            raise RuntimeError("Invoker-Render live request has no prepared proxy inputs")
+        data = state.prompt["multi_modal_data"]
+        session = self._start(data["image"], state.sampling.seed)
+        queue = ProxyQueue(self.assets.proxy_size)
+        for event in data[BOOTSTRAP_KEY]:
+            queue.append(queue.packet(event))
+        state.extra[PROXY_MODALITY] = queue
+        state.extra["invoker_session"] = session
+        state.total_chunks = None
+        state.chunk_num_steps = 4
+        state.timesteps = (1 - session.causal.sigmas[:-1]).float()
+        state.prompt = None
+        return state
+
+    def prepare_next_chunk(self, state: StepRequestState) -> None:
+        session: _Session = state.extra["invoker_session"]
+        queue: ProxyQueue = state.extra[PROXY_MODALITY]
+        while not session.windows and queue.pending:
+            packet = queue.take()
+            session.windows.extend(self._append(session, packet.as_frames(queue.size).copy(), eos=packet.eos))
+        if not session.windows:
+            session.active = None
+            return
+        session.active = session.windows.popleft()
+        state.latents = session.causal.prepare(self._cache(), session.active)
+        state.step_in_chunk = 0
+
+    def ar_diffusion_step_wait(self, state: StepRequestState) -> StepWait | None:
+        session: _Session = state.extra["invoker_session"]
+        return StepWait() if session.active is None else None
+
+    def ar_diffusion_resume_step(self, state: StepRequestState, reason: str) -> None:
+        if reason != "interaction":
+            raise RuntimeError("Invoker-Render proxy stream ended while waiting for input")
+        self.apply_interaction_at_chunk_boundary(state)
+        self.prepare_next_chunk(state)
+
+    def peek_chunk_media(self, state: StepRequestState) -> ChunkMediaSpec:
+        session: _Session = state.extra["invoker_session"]
+        window = session.active
+        if window is None:
+            raise ValueError("Invoker-Render has no ready proxy window")
+        count = sum(1 if index % 5 == 0 else 4 for index in range(window.start, window.stop))
+        return ChunkMediaSpec(num_media_frames=count, num_latent_frames=window.stop - window.start, fps=FPS)
+
+    def denoise_step(self, input_batch, *, states: Sequence[StepRequestState], **kwargs) -> torch.Tensor:
+        if len(states) != 1:
+            raise ValueError("Invoker-Render handles one stream per worker group")
+        state = states[0]
+        session: _Session = state.extra["invoker_session"]
+        if session.active is None or state.latents is None:
+            raise RuntimeError("Invoker-Render cannot denoise without a ready proxy window")
+        return session.causal.predict(self._cache(), session.active, state.latents, state.step_in_chunk)
+
+    def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs) -> None:
+        session: _Session = state.extra["invoker_session"]
+        step = state.step_in_chunk
+        assert state.latents is not None
+        state.latents = euler_step(
+            state.latents, noise_pred, session.causal.sigmas[step], session.causal.sigmas[step + 1]
+        )
+        state.step_in_chunk += 1
+        state.step_index += 1
+
+    def post_decode(self, state: StepRequestState, **kwargs) -> DiffusionOutput:
+        session: _Session = state.extra["invoker_session"]
+        queue: ProxyQueue = state.extra[PROXY_MODALITY]
+        window = session.active
+        assert window is not None and state.latents is not None
+        source_start = session.delivered
+        video = self._decode(session, window, state.latents)
+        chunk_index = state.chunk_index
+        state.chunk_index += 1
+        state.stream_input_drained = window.eos
+        if window.eos and session.delivered != queue.sequence.accepted:
+            raise RuntimeError("Invoker-Render EOS left proxy frames unaccounted for")
+        return DiffusionOutput(
+            output={
+                "payload": {"video": video},
+                "metadata": {
+                    "video": {"fps": FPS},
+                    "stream": {
+                        "source_frame_start": source_start,
+                        "source_frame_count": len(video),
+                        "source_frames_consumed": queue.sequence.consumed,
+                    },
+                },
+            },
+            chunk_index=chunk_index,
+            total_chunks=state.chunk_index if window.eos else None,
+            finished=window.eos,
+        )
 
     def forward(self, batch: DiffusionRequestBatch) -> DiffusionOutput:
         if batch.num_reqs != 1:
