@@ -229,6 +229,7 @@ steps:
         timeout_in_minutes: 300
         source_file_dependencies: [omni_qwen3_omni_perf, ci_rocm]
         env:
+          QWEN3_OMNI_REQUIRE_BASELINE: "1"
           QWEN3_OMNI_ARTIFACT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-no-async-chunk-perf"
           QWEN3_OMNI_CONFIG_FILE: tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json
           QWEN3_OMNI_EXPECTED_GPUS: "2"
@@ -250,6 +251,7 @@ steps:
         timeout_in_minutes: 180
         source_file_dependencies: [omni_qwen3_omni_perf, ci_rocm]
         env:
+          QWEN3_OMNI_REQUIRE_BASELINE: "1"
           QWEN3_OMNI_ARTIFACT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-async-chunk-perf"
           QWEN3_OMNI_CONFIG_FILE: tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
           QWEN3_OMNI_EXPECTED_GPUS: "2"
@@ -1375,7 +1377,7 @@ steps:
                 "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_voxtral_tts-default_voice_stress_seed-tts-text]"
               )
               timeout --signal=TERM --kill-after=2m 165m \
-                pytest -s -v -ra "$${nodes[@]}" \
+                pytest -s -v -ra "$${nodes[@]}" --require-baseline \
                 --test-config-file tests/dfx/perf/tests/test_tts.json \
                 --shard-id=0 --num-shards=1 \
                 -m "full_model and tts and rocm and MI325 and cards_1" --run-level full_model \
@@ -1487,7 +1489,7 @@ steps:
                 "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_voicedesign-voice_design_stress_seed-tts-design]"
               )
               timeout --signal=TERM --kill-after=2m 165m \
-                pytest -s -v -ra "$${nodes[@]}" \
+                pytest -s -v -ra "$${nodes[@]}" --require-baseline \
                 --test-config-file tests/dfx/perf/tests/test_tts.json \
                 --shard-id=0 --num-shards=1 \
                 -m "full_model and tts and rocm and MI325 and cards_2" --run-level full_model \
@@ -1713,7 +1715,7 @@ steps:
               set +e
               node="tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_minicpmo_4_5-seed-tts]"
               timeout --signal=TERM --kill-after=2m 165m \
-                pytest -s -v -ra "$$node" \
+                pytest -s -v -ra "$$node" --require-baseline \
                 --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json \
                 --shard-id=0 --num-shards=1 \
                 -m "full_model and omni and rocm and MI325 and cards_1" --run-level full_model \

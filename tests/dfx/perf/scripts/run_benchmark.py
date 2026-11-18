@@ -702,7 +702,7 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
             assert _is_finite_number(score) and 0 <= score <= 1, "Omni-DuplexEval correction score is invalid"
 
 
-def assert_result(result, params, num_prompt, *, check_baseline: bool = False) -> None:
+def assert_result(result, params, num_prompt, *, check_baseline: bool = False, require_baseline: bool = False) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
     if params.get("dataset_name") == "realtime-video":
         video = result.get("realtime_video")
@@ -746,12 +746,13 @@ def assert_result(result, params, num_prompt, *, check_baseline: bool = False) -
                     f"Missing or invalid P{percentile} {metric}"
                 )
     hardware = result.get("Hardware")
-    if check_baseline:
+    if check_baseline or require_baseline:
         baseline = result.get("baseline")
         assert_baseline_within_tolerance(
             result,
             baseline if isinstance(baseline, dict) else None,
             hardware if isinstance(hardware, str) else None,
+            required=require_baseline,
         )
     if params.get("duplex_performance_only"):
         return
@@ -959,7 +960,11 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
             assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
             try:
                 assert_result(
-                    result, assert_params, num_prompt, check_baseline=pytestconfig.getoption("assert_baseline")
+                    result,
+                    assert_params,
+                    num_prompt,
+                    check_baseline=pytestconfig.getoption("assert_baseline"),
+                    require_baseline=pytestconfig.getoption("require_baseline"),
                 )
             finally:
                 _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)
@@ -997,7 +1002,11 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
             assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
             try:
                 assert_result(
-                    result, assert_params, num_prompt, check_baseline=pytestconfig.getoption("assert_baseline")
+                    result,
+                    assert_params,
+                    num_prompt,
+                    check_baseline=pytestconfig.getoption("assert_baseline"),
+                    require_baseline=pytestconfig.getoption("require_baseline"),
                 )
             finally:
                 _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)

@@ -169,8 +169,8 @@ def test_qwen3_omni_perf_counts_and_existing_baselines_are_preserved() -> None:
         ],
     }
     expected_baseline_keys = {
-        "Qwen3-Omni No-Async-Chunk Perf": [{"A3", "H100"}] * 4,
-        "Qwen3-Omni Async-Chunk Perf": [{"A3", "H100"}] * 6,
+        "Qwen3-Omni No-Async-Chunk Perf": [{"A3", "H100", "MI300"}] * 4,
+        "Qwen3-Omni Async-Chunk Perf": [{"A3", "H100", "MI300"}] * 6,
     }
 
     for label, path in PERF_CONFIGS.items():
