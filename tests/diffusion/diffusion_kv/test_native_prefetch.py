@@ -163,6 +163,9 @@ def test_executor_submits_prefetch_after_current_rank_barrier():
 
 def _config():
     return SimpleNamespace(
+        stage_role=None,
+        model_stage=None,
+        omni_kv_config={},
         kv_transfer_config=KVTransferConfig(
             kv_connector="MooncakeConnector",
             kv_role="kv_consumer",
@@ -172,6 +175,7 @@ def _config():
         diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
         max_num_seqs=1,
         model_class_name="TestDiffusionPipeline",
+        diffusion_attention_schedule=None,
     )
 
 

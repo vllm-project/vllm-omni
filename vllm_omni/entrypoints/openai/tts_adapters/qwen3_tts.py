@@ -242,6 +242,9 @@ class Qwen3TTSAdapter(ARTTSAdapter):
 
     validates_generation = True
     supports_incremental_input = True
+    # Length finishes that validate_generation lets through (an explicit
+    # caller budget on non-Base tasks) still return audio; flag it.
+    reports_length_truncation = True
     stage_keys = frozenset({"qwen3_tts"})
     name = "qwen3_tts"
     text_commitment = TextCommitmentCapabilities(

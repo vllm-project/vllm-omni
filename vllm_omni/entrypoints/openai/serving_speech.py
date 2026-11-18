@@ -97,6 +97,8 @@ SPEECH_AUDIO_CHANNELS_HEADER = "X-Audio-Channels"
 # Raw audio bodies cannot carry metadata, so the duration of the returned audio
 # is stated in a response header for non-streaming requests.
 SPEECH_AUDIO_DURATION_HEADER = "X-Audio-Duration-Seconds"
+# Whether generation stopped at its token budget instead of at end-of-speech.
+SPEECH_AUDIO_TRUNCATED_HEADER = "X-Audio-Truncated"
 # Cached in place of the usage tokenizer after a failed load.
 _USAGE_TOKENIZER_UNAVAILABLE = object()
 
@@ -249,8 +251,10 @@ def _infer_audio_num_channels(audio: np.ndarray) -> int:
 def _audio_format_headers(
     audio_format: dict[str, int] | None,
     duration_s: float | None = None,
+    truncated: bool | None = None,
 ) -> dict[str, str]:
-    """Response headers describing the emitted audio's rate, channels and duration."""
+    """Response headers describing the emitted audio's rate, channels, duration
+    and, when the model reports it, whether it was truncated."""
     headers: dict[str, str] = {}
     exposed: list[str] = []
     if audio_format:
@@ -262,6 +266,10 @@ def _audio_format_headers(
         # really encoded to zero frames reports ``0.000``.
         headers[SPEECH_AUDIO_DURATION_HEADER] = f"{duration_s:.3f}"
         exposed.append(SPEECH_AUDIO_DURATION_HEADER)
+    if truncated is not None:
+        # ``None`` means the model does not report truncation: no header.
+        headers[SPEECH_AUDIO_TRUNCATED_HEADER] = "true" if truncated else "false"
+        exposed.append(SPEECH_AUDIO_TRUNCATED_HEADER)
     if not exposed:
         return {}
     # Without this, CORS hides these headers from cross-origin browser clients.
@@ -2235,6 +2243,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 # Streaming path: output_tokens = sum of stage-0 deltas.
                 usage = self._build_speech_usage(request, tts_params or {}, usage_acc.total())
                 done_payload["usage"] = usage.model_dump()
+            truncated = self._length_truncated(usage_acc)
+            if truncated is not None:
+                # Additive to the OpenAI schema, like ``duration``.
+                done_payload["truncated"] = truncated
             done = json.dumps(done_payload, separators=(",", ":"))
             yield f"event: speech.audio.done\ndata: {done}\n\n"
         except asyncio.CancelledError:
@@ -2283,6 +2295,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return None, None
         key = "audio" if "audio" in mm else ("model_outputs" if "model_outputs" in mm else None)
         return mm, key
+
+    def _length_truncated(self, usage_acc: SpeechOutputTokenCounter) -> bool | None:
+        """Whether stage 0 stopped at its token budget instead of end-of-speech.
+
+        ``None`` when the adapter does not report truncation or stage 0's
+        finish reason is unknown, so callers leave the signal out rather than
+        claim the audio is complete.
+        """
+        adapter = self._get_tts_adapter()
+        if adapter is None or not adapter.reports_length_truncation:
+            return None
+        finish_reason = usage_acc.stage0_finish_reason
+        if finish_reason is None:
+            return None
+        return finish_reason == "length"
 
     async def _prepare_speech_generation(
         self,
@@ -2617,6 +2644,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # meta.truncated) into ``collect`` for response headers.
         if collect is not None and (adapter := self._get_tts_adapter()) is not None:
             adapter.collect_response_metadata(audio_output, collect)
+            truncated = self._length_truncated(usage_acc)
+            if truncated is not None:
+                # Keep a flag the adapter set itself.
+                collect["audio_truncated"] = collect.get("audio_truncated", False) or truncated
 
         # A model can flag a per-request synthesis failure through the
         # adapter (e.g. YuE2's terminal NAR/VAE pass OOMing on one
@@ -3098,12 +3129,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         "(use the WebSocket streaming path for long transcripts)",
                         len(ts_json),
                     )
-            if collect.get("audio_truncated") is not None:
-                headers["X-Audio-Truncated"] = "true" if collect["audio_truncated"] else "false"
             headers.update(
                 _audio_format_headers(
                     collect.get("audio_format"),
                     collect.get("audio_duration_s"),
+                    collect.get("audio_truncated"),
                 )
             )
             return Response(content=audio_bytes, media_type=media_type, headers=headers)

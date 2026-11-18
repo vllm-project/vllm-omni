@@ -707,7 +707,7 @@ class StagePool:
         self.release_binding(request_id)
 
     def invalidate_addr(self, input_addr: str) -> list[str]:
-        """Drop affinity rows pointing at ``input_addr``; return affected request ids."""
+        """Return requests routed to ``input_addr``, dropping their affinity rows."""
         affected: list[str] = [rid for rid, addr in self._affinity.items() if addr == input_addr]
         for rid in affected:
             self._affinity.pop(rid, None)
@@ -716,24 +716,21 @@ class StagePool:
     # ---- Legacy (non-distributed) route binding ----
 
     def bind_request_to_replica(self, request_id: str, replica_id: int) -> int:
-        """Bind a real request to a required local replica, without selecting a fallback.
+        """Bind a real request to a required replica, without selecting a fallback.
 
         Call before input preprocessing or sender metadata construction, then
         pass the same pin to submission to recheck availability. Session
         reservations belong to the duplex placement owner, not this ledger.
+
+        Pins use the explicit-routing ledger and availability checks. Translate
+        routing errors for internal callers, which require a stage failure.
         """
-        if self._hub is not None or self._lb is not None:
-            raise StageUnavailableError("pinned replica routing is only supported for local stage pools")
-        if not self.is_replica_available(replica_id):
-            raise StageUnavailableError(f"stage {self.stage_id} pinned replica {replica_id} is unavailable")
-        bound = self.get_bound_replica_id(request_id)
-        if bound is not None and bound != replica_id:
+        try:
+            return self.bind_requested_replica(request_id, replica_id)
+        except OmniClientError as exc:
             raise StageUnavailableError(
-                f"stage {self.stage_id} request {request_id} is bound to replica {bound}, "
-                f"conflicting with pinned replica {replica_id}"
-            )
-        self._request_bindings[request_id] = replica_id
-        return replica_id
+                f"stage {self.stage_id} pinned replica {replica_id} is unavailable or conflicting: {exc}"
+            ) from exc
 
     def parallel_sample_parent_id(self, request_id: str) -> str | None:
         """The id of the n > 1 request whose sample (child request) is ``request_id``, else None."""

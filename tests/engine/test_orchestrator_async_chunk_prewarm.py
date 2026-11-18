@@ -217,7 +217,10 @@ async def test_prewarm_submits_plain_placeholder(case: dict[str, Any], expected_
     assert payload_func.call_count == expected_calls
     (placeholder,) = orchestrator.stage_pools[2].submitted
     assert _entry_keys(placeholder) == _PLAIN_KEYS
-    assert placeholder.resumable is stage0_kwargs.get("resumable", streaming)
+    entry_request = _stage0(**stage0_kwargs)
+    assert placeholder.resumable is bool(
+        getattr(entry_request, "resumable", streaming) or case.get("session_owned", False)
+    )
 
 
 @pytest.mark.asyncio
