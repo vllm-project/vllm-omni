@@ -213,6 +213,11 @@ class DuplexModelSessionState(ABC):
     committed_audio_consume_started: bool
     deferred_response_create: bool
     deferred_precreate_response: bool
+    # Response id of a response precreated by an explicit response.create
+    # (vs engine-owned auto responses). The model channel uses it to tag the
+    # response's first silence unit so the model can open the assistant turn
+    # even when the previous turn's turn-ended latch is still set.
+    explicit_response_create_id: str | None
     continuation_owner_id: str | None
     continuation_units: int
     pending_silence_task: asyncio.Task[bool] | None
@@ -270,6 +275,8 @@ class DefaultDuplexModelSessionState(DuplexModelSessionState):
     committed_audio_consume_started: bool = False
     deferred_response_create: bool = False
     deferred_precreate_response: bool = False
+    # See the field comment on DuplexModelSessionState above.
+    explicit_response_create_id: str | None = None
     continuation_owner_id: str | None = None
     continuation_units: int = 0
     pending_silence_task: asyncio.Task[bool] | None = None
@@ -751,6 +758,11 @@ class DuplexModelPlugin(ABC):
         del stage_id, segment_finished, output, context
         return False
 
+    def resumable_downstream_stage_ids(self, *, stage_count: int) -> frozenset[int]:
+        """Stages that keep a turn-commit request open across downstream segments."""
+        del stage_count
+        return frozenset()
+
     def draining_stage_ids(self, *, stage_count: int) -> frozenset[int]:
         """Output stages that may keep running after the next user turn starts.
 
@@ -1125,14 +1137,13 @@ def validate_duplex_plugin_sampling(plugin: DuplexModelPlugin, *, sampling_defau
 def validate_duplex_replica_policy(
     plugin: DuplexModelPlugin,
     runtime_config: DuplexSessionRuntimeConfig,
-    *,
-    distributed: bool,
 ) -> None:
-    """Validate replica policy before workers start and against the actual stage pools."""
+    """Validate plugin sharing capability before workers start.
+
+    DuplexReplicaPlacement validates group topology against the actual pools.
+    """
     if runtime_config.replica_policy == "legacy":
         return
-    if distributed:
-        raise ValueError("duplex_session.replica_policy=least_sessions does not support distributed hub/LB mode")
     cap = runtime_config.max_sessions_per_replica
     assert cap is not None
     # This capability depends on the requested capacity for some plugins; the

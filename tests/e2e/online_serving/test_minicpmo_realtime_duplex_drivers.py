@@ -2524,3 +2524,23 @@ def test_realtime_duplex_demo_writes_audio_per_response(tmp_path):
         with wave.open(str(tmp_path / f"response_{index:02d}.wav"), "rb") as wf:
             assert wf.getframerate() == 24000
             assert wf.readframes(wf.getnframes()) == expected
+
+
+def test_realtime_duplex_demo_replay_tail_window_bounds():
+    """A tiny positive duration must skip the replay instead of slicing [-0:]."""
+    demo = _load_example_demo_module()
+    window = demo._replay_tail_window
+    # 180 s of audio plus 1 fps video, 15 s tail: exactly one scene window.
+    assert window(2_880_000, 180, 15.0, 16_000, 1) == (240_000, 15)
+    # The video window scales with the caller's frame rate, not 1 s == 1 frame.
+    assert window(2_880_000, 360, 15.0, 16_000, 2) == (240_000, 30)
+    # A window longer than the input clamps to the full input.
+    assert window(128_000, 10, 15.0, 16_000, 1) == (128_000, 10)
+    # 0.3 s at 1 fps rounds to zero frames while audio rounds to 4800
+    # samples: video_frames[-0:] would keep every frame, so the replay is
+    # skipped rather than pairing a short audio tail with the entire video.
+    assert window(2_880_000, 180, 0.3, 16_000, 1) is None
+    # Without video, the audio tail alone is still a valid window.
+    assert window(2_880_000, 0, 0.3, 16_000, 1) == (4_800, 0)
+    # Durations shorter than one audio sample are skipped as well.
+    assert window(2_880_000, 0, 1e-5, 16_000, 1) is None

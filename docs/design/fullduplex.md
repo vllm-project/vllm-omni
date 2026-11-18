@@ -1055,8 +1055,9 @@ independent real-model verification.
 ## Session-aware replica placement
 
 The opt-in `duplex_session.replica_policy: least_sessions` policy places each
-session on a local replica group mapping every stage to a replica. The
-orchestrator owns a separate session reservation ledger; StagePool's request
+session on a replica group mapping every stage to a replica, including replicas
+attached from headless runtimes on other hosts. The orchestrator owns a separate
+session reservation ledger; StagePool's request
 bindings continue to describe submitted requests only. Admission reserves a
 group synchronously after taking the global admission slot. The group must
 have space under `max_sessions_per_replica` on every member replica. Replicas
@@ -1076,7 +1077,9 @@ replica.
 Replica failure marks the replica unavailable and closes every session in its
 reverse index, including idle sessions without an in-flight request. Other
 groups retain their reservations and can continue serving. This policy does
-not migrate model state or support coordinator/distributed deployments.
+not migrate model state. Distributed pins use StagePool's explicit-routing
+bindings and hub availability checks; detach notifications also close idle
+sessions. Session reservations remain separate from request bindings.
 Worker-local state capacity uses the per-replica cap, while `max_sessions`
 remains the global service cap. The default `legacy` policy preserves the
 existing routing, admission and worker capacity behavior. See the
@@ -1087,6 +1090,82 @@ With metrics enabled, `vllm_omni:duplex_reserved_sessions` reports reservations
 by model, stage and replica, and `vllm_omni:duplex_admission_rejected_total`
 counts global and replica capacity rejections. These collectors are created
 on first use by this policy and carry no session ID labels.
+
+### Multiple runtimes and hosts
+
+A runtime is one `vllm serve --omni` invocation. In a stage-based deployment,
+each stage-hosting runtime launches local replicas of one stage. One runtime is the head:
+it omits `--headless`, serves the API, and owns the master and session
+orchestration. Any stage runtime can take this role. The remaining runtimes
+use `--headless` and connect to the same `--omni-master-address` and
+`--omni-master-port`. A stage can span several runtimes, including runtimes on
+different hosts.
+
+For example, the declared stage totals `[1, 3, 1]` can be placed as follows:
+
+| Host | Stage | Local replicas | Role | Runtime arguments |
+| --- | --- | --- | --- | --- |
+| host0 | 0 | 1 | headless | `--stage-id 0 --omni-dp-size-local 1 --headless` |
+| host0 | 1 | 1 | head | `--stage-id 1 --omni-dp-size-local 1` |
+| host1 | 1 | 2 | headless | `--stage-id 1 --omni-dp-size-local 2 --headless` |
+| host0 | 2 | 1 | headless | `--stage-id 2 --omni-dp-size-local 1 --headless` |
+
+The head's `stages[].num_replicas` declares the cluster total for each stage;
+`--omni-dp-size-local` specifies the runtime's local share. For its own stage,
+the head resolves the total to `max(configured_total, local_count)`, preserving
+the existing CLI override when the configured count is smaller. The first
+`local_count` slots launch locally; the remaining slots attach remotely.
+Other stages attach remotely in their entirety. The existing unfiltered
+`single_stage_mode=True` path keeps all configured replicas local.
+The existing frontend-only head keeps all stage replicas remote.
+
+Device pools are split against the runtime's local replica count. For example,
+total `3`, local `2`, TP `1`, and `devices: "0,1"` assign GPUs 0/1 to the two
+local replicas; the third registration slot has no local device assignment.
+
+`DuplexReplicaPlacement` owns the startup group map and session reservations.
+Omitting `replica_groups` generates the Cartesian product of the stage replica
+slots, equivalent to a SQL `CROSS JOIN`, for both equal and unequal stage counts.
+The example above automatically gets three groups `{0: 0, 1: i, 2: 0}` for
+`i = 0, 1, 2`; `[2, 2]` gets all four pairs. The last stage's replica index
+changes fastest when assigning group IDs.
+Implicit paths are selected lazily from the least occupied replicas at each
+stage, preserving the same group IDs and round-robin tie-breaking without
+enumerating the product. Diagnostics record stage counts and the total group
+count instead of expanding every implicit path. Explicit groups restrict the paths
+instead of adding to the generated product. Each session reserves one path;
+replicas shared across paths retain one capacity counter. Stage 0 and stage 2
+each need a per-replica session cap of at
+least three to admit three sessions concurrently. Registration-assigned replica
+IDs identify replica slots, not durable host identities; explicit groups do
+not establish host affinity.
+
+StagePool owns dispatch and request bindings. A duplex pin reuses
+`bind_requested_replica`, including attachment and hub-UP validation, and uses
+the existing distributed address-affinity ledger. Internal routing errors are
+translated to stage failures. There is no second distributed pin ledger and no
+fallback to another replica after a required pin becomes unavailable.
+`MembershipController` invalidates the removed address and notifies the
+orchestrator. Duplex retirement marks the replica unavailable and closes every
+session reserved on it, including sessions with no active request. Generic
+request cleanup remains responsible for request bindings.
+
+Group topology is fixed for the head's lifetime. Later attachments do not add
+groups or recover closed sessions. This design adds neither elastic placement
+nor session migration or automatic restoration of an unavailable group.
+The distributed stage topology uses a single API frontend; the existing
+`--api-server-count > 1` launcher rejects distributed stage arguments. The
+local multi-frontend mode below is a separate deployment mode.
+
+The master address must be reachable from every runtime. Each cross-host
+pipeline edge also needs a connector with a suitable remote data plane;
+`SharedMemoryConnector` requires its sender and receiver to share a host.
+See [Disaggregated Inference](feature/disaggregated_inference.md) for transport
+configuration. Control-plane registration alone does not validate a connector's
+cross-host data path.
+
+For MiniCPM-o 4.5 on CUDA, keep the deploy profile's native MRv2 runner on all
+three stages when selecting `NixlConnector` for remote payload transfer.
 
 ### Multiple frontends
 
@@ -1100,7 +1179,11 @@ no central per-frame session dispatcher.
 Placement, rather than engine attachment, enforces exclusive ownership. Group
 `g` belongs to frontend `g % K`, and only that frontend may reserve its replicas
 or submit its session requests. Groups sharing a physical stage replica must
-have the same owner, and `K` must not exceed the group count. The global session
+have the same owner, and `K` must not exceed the group count. This validation
+also applies to automatically joined groups. Multi-stage joins usually share
+replicas across frontend owners, so those deployments must supply explicit
+groups with disjoint ownership, such as `[{0: 0, 1: 0}, {0: 1, 1: 1}]` for
+two stages with two replicas and two frontends. The global session
 budget is divided by floor/remainder across frontends and bounded by each
 frontend's owned replica capacity; budgets do not move between frontends.
 The reservation lifetime, strict stage pins and worker caps apply within each
@@ -1153,6 +1236,7 @@ message to `super()`:
 | `_on_stage_submitted(stage_id, request_id, replica_id, req_state)` | — | bind the forwarded stage request to the owning session |
 | `_intercept_stage_output(...) -> bool` | — | hand every session-owned output (Stage0 decision, Stage1 audio) plus its metric snapshot to `runner.on_stage_output`; `True` = do not forward |
 | `_handle_forward_failure(...) -> bool` | — | fail the owning session's response and close the session, keep the loop alive |
+| `_on_replica_removed(stage_id, replica_id)` | — | retire the detached replica and close its reserved sessions, including idle sessions |
 | `_cleanup_request_ids(ids, abort=, release_owners=)` | ignores `release_owners` | brackets `super()` with `close_sessions_for_request_ids` / `defer_request_cleanups` / `finalize_closed_sessions` |
 | `OrchestratorRequestState.session_owned` | never set | set by `ensure_request`: no synthetic terminal, no client emission, no terminal re-forward, no auto-cleanup on finish |
 

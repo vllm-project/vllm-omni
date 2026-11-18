@@ -75,9 +75,9 @@ We are keeping [issue #886](https://github.com/vllm-project/vllm-omni/issues/886
 # --8<-- [start:installation-main]
 
 You can also install vLLM-Omni from source if you want to use the latest features
-or bug fixes. This alignment checkout targets vLLM 0.33.0 and requires a
+or bug fixes. This alignment checkout targets vLLM 0.34.0 and requires a
 matching vLLM-Ascend runtime validated on your NPU. The v0.30.0 Ascend images
-above do not establish compatibility with this vLLM 0.33.0 checkout. Check
+above do not establish compatibility with this vLLM 0.34.0 checkout. Check
 [issue #886](https://github.com/vllm-project/vllm-omni/issues/886) for aligned
 versions and NPU validation before selecting a development image.
 
@@ -214,11 +214,11 @@ git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
 ```
 
-!!! warning "vLLM 0.33 alignment is not yet qualified on NPU"
+!!! warning "vLLM 0.34 alignment is not yet qualified on NPU"
     Both `docker/Dockerfile.npu` and `docker/Dockerfile.npu.ci` retain the
-    legacy `v0.32.0` Ascend runtime default. The commands below illustrate
-    hardware suffix selection; they do not produce a validated vLLM 0.33
-    image. Before building this checkout, obtain a matching vLLM 0.33.0 and
+    legacy `v0.33.0` Ascend runtime default. The commands below illustrate
+    hardware suffix selection; they do not produce a validated vLLM 0.34
+    image. Before building this checkout, obtain a matching vLLM 0.34.0 and
     vLLM-Ascend runtime, pass its verified image repository and tag through
     `VLLM_ASCEND_IMAGE` and `VLLM_ASCEND_VERSION`, and validate on your NPU.
     A final vLLM package alone does not establish vLLM-Ascend compatibility.

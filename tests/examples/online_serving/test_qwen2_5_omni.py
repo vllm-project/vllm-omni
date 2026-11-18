@@ -24,15 +24,20 @@ from tests.examples.helpers import (
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import convert_audio_file_to_text, cosine_similarity_text
 from tests.helpers.runtime import OmniServerParams
-from tests.helpers.stage_config import get_deploy_config_path
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 pytestmark = [pytest.mark.full_model, pytest.mark.example, pytest.mark.omni]
 
 models = ["Qwen/Qwen2.5-Omni-7B"]
 
-# Single CI deploy YAML; rocm/xpu deltas are picked automatically via the
-# platforms: section in vllm_omni/deploy/ci/qwen2_5_omni.yaml.
-stage_configs = [get_deploy_config_path("ci/qwen2_5_omni.yaml")]
+# This CUDA doc suite has four cards. Shard the Thinker across the two cards
+# separate from Talker (1) and Code2Wav (2) to retain its full 16K context.
+stage_configs = [
+    modify_stage_config(
+        get_deploy_config_path("ci/qwen2_5_omni.yaml"),
+        updates={"platforms.cuda.stages": [{"stage_id": 0, "tensor_parallel_size": 2, "devices": "0,3"}]},
+    )
+]
 
 example_dir = str(Path(__file__).parent.parent.parent.parent / "examples" / "online_serving")
 # Create parameter combinations for model and stage config

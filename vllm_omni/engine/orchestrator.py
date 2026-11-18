@@ -27,6 +27,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, cast
 
 import janus
+import numpy as np
 import torch
 from opentelemetry.trace import Tracer
 from vllm.config import ModelConfig
@@ -193,6 +194,13 @@ def build_engine_core_request_from_tokens(
 
     prompt_token_ids = prompt.get("prompt_token_ids")
     prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
+    # vLLM 0.34 types EngineCoreRequest.prompt_token_ids as a 32-bit int
+    # ``np.ndarray`` at runtime (TokenBuffer asserts itemsize == 4); coerce
+    # list prompts so /v1/run stage inputs round-trip through
+    # ``msgspec.convert`` symmetrically (a decoded plain list fails the
+    # ndarray field check).
+    if isinstance(prompt_token_ids, list):
+        prompt_token_ids = np.asarray(prompt_token_ids, dtype=np.int32)
 
     sampling_params = None
     pooling_params = None
@@ -589,7 +597,7 @@ class OrchestratorBase:
             self._membership.install_membership_handlers(
                 output_queue=self.output_async_queue,
                 cleanup_callback=cleanup_member_requests,
-                replica_removed_callback=self._remove_stage_replica_metrics,
+                replica_removed_callback=self._handle_replica_removed,
                 replica_added_callback=self._publish_replica_post_warmup_memory,
             )
             membership_watcher = self._membership.start()
@@ -1755,6 +1763,19 @@ class OrchestratorBase:
         engine_idx = self._stage_replica_to_engine_idx.get((stage_id, replica_id))
         if self._stat_logger is not None and engine_idx is not None:
             self._stat_logger.remove_stage_post_warmup_memory(engine_idx=engine_idx)
+
+    async def _handle_replica_removed(self, stage_id: int, replica_id: int) -> None:
+        """Membership detach: drop stats, then let the stage owner react.
+
+        The owner seam runs before ``MembershipController`` cleans up the requests
+        the removed address was routing, so a session-based owner can close its
+        sessions with a typed error instead of letting them time out.
+        """
+        self._remove_stage_replica_metrics(stage_id, replica_id)
+        await self._on_replica_removed(stage_id, replica_id)
+
+    async def _on_replica_removed(self, stage_id: int, replica_id: int) -> None:
+        """Seam for stage owners after a replica detaches; the base does nothing."""
 
     def _sync_engines_waiting_counter(self) -> None:
         """Aggregate per-replica waiting into the counter shared with the
@@ -3217,7 +3238,7 @@ class OrchestratorBase:
                 already_submitted=already_submitted,
                 t_submit_start=_t_submit_start,
                 submit_kwargs=submit_kwargs,
-                params_override=self._diffusion_params_for_samples(
+                params_override=cast(Orchestrator, self)._diffusion_params_for_samples(
                     req_state, src_stage_id, self._maybe_clone_diffusion_params_for_cfg(req_id, params)
                 ),
                 pinned_replica_id=pinned_replica_id,
@@ -3542,6 +3563,13 @@ class OrchestratorBase:
             )
         )
 
+    def _prewarm_downstream_resumable(
+        self, stage_id: int, entry_request: Any, req_state: OrchestratorRequestState
+    ) -> bool:
+        """Keep the entry request's streaming lifetime on downstream stages."""
+        del stage_id
+        return bool(getattr(entry_request, "resumable", req_state.streaming.enabled))
+
     async def _prewarm_async_chunk_stages(
         self,
         request_id: str,
@@ -3680,13 +3708,7 @@ class OrchestratorBase:
                 base_input["prompt_token_ids"] = [0] * next_prompt_len
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
-                # Turn-commit duplex (JoyAI/AURA) submits a non-resumable Stage0,
-                # but Code2Wav must stay parked across Talker 2150 so later
-                # sentences can reuse this prewarmed request. MiniCPM-style
-                # Stage0 is already resumable; turn-based HTTP is not session-owned.
-                downstream_resumable = bool(
-                    getattr(entry_request, "resumable", req_state.streaming.enabled) or req_state.session_owned
-                )
+                downstream_resumable = self._prewarm_downstream_resumable(next_stage_id, entry_request, req_state)
                 # Session-owned and resumable requests keep their downstream
                 # request across turns, so they stay on the chunk-0 path.
                 if attach_prewarm_payload and not req_state.session_owned and not downstream_resumable:
@@ -4107,7 +4129,7 @@ class Orchestrator(OrchestratorBase):
                     request_id,
                     stage_id,
                     f"streaming (resumable) input is not supported: stage {mrv2_stage_id} runs on "
-                    "model_runner v2, which supports turn-based requests only; use model_runner: v1 "
+                    "model_runner v2, which supports turn-based requests only; select a V2 duplex profile "
                     "for that stage",
                 )
                 return

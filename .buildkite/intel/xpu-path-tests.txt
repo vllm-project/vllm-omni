@@ -326,7 +326,6 @@ tests/model_tests/diffusion/test_case_filtering.py
 tests/platforms/npu/test_310p_patches.py
 tests/platforms/npu/test_310p_real_device.py
 tests/platforms/npu/test_a5_patches.py
-tests/platforms/npu/test_aux_output.py
 tests/platforms/npu/test_code2wav_graph_wrapper.py
 tests/platforms/npu/test_contiguous_kv_cache.py
 tests/platforms/npu/test_diffusion_attn_backend_selector.py
@@ -341,8 +340,6 @@ tests/platforms/npu/test_minicpmo_mrv2_kstep_gate.py
 tests/platforms/npu/test_moss_tts_codec_npugraph.py
 tests/platforms/npu/test_moss_tts_local_model_state.py
 tests/platforms/npu/test_moss_tts_reference_encoder_graphs.py
-tests/platforms/npu/test_npu_ar_input_buffer.py
-tests/platforms/npu/test_npu_generation_output_copy.py
 tests/platforms/npu/test_npu_generation_v2.py
 tests/platforms/npu/test_npu_omni_model_state_postprocess.py
 tests/platforms/npu/test_npu_v2_moe_comm_context.py

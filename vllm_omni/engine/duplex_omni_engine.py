@@ -99,7 +99,7 @@ class DuplexOmniEngine(AsyncOmniEngine):
         self.plugin = load_duplex_plugin(plugin_path, self._audio_encoder)
         self.plugin.configure_pipeline(pipeline_config)
         self.plugin.configure_server(self.duplex_session_config)
-        validate_duplex_replica_policy(self.plugin, self.duplex_session_config, distributed=self.single_stage_mode)
+        validate_duplex_replica_policy(self.plugin, self.duplex_session_config)
 
     # Any: signature of the ``OmniEngineBase._create_orchestrator`` seam it overrides.
     def _create_orchestrator(self, **orchestrator_kwargs: Any) -> OrchestratorBase:
