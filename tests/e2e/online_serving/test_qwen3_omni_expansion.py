@@ -496,7 +496,7 @@ def test_text_to_audio_long_output_001(omni_server, online_client) -> None:
 )
 def test_qwen3_omni_seed_tts_reads_questions_verbatim(omni_server, online_client, target: str) -> None:
     # These Seed-TTS targets produced long answers in nightly build #17816.
-    # Isolate the thinker's reading contract; the full benchmark below checks audio WER.
+    # Isolate the thinker's reading contract; the dataset benchmark checks audio WER separately.
     response = online_client.client.chat.completions.create(
         model=omni_server.model,
         messages=[

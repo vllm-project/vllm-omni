@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CPU contracts for the combined nightly, without loading model dependencies."""
+"""CPU contracts for Qwen3-Omni dataset benchmarks, without loading models."""
 
 from __future__ import annotations
 
@@ -93,6 +93,24 @@ def test_scoring_switches_are_scoped_and_restored(monkeypatch):
         assert nightly.os.environ["SEED_TTS_UTMOS_EVAL"] == "0"
     assert "SEED_TTS_WER_EVAL" not in nightly.os.environ
     assert nightly.os.environ["SEED_TTS_UTMOS_EVAL"] == "old"
+
+
+@pytest.mark.parametrize("indices", [[0, 0], [0, 1197], [0, True], [0], "0,647"])
+def test_daily_smoke_rejects_ambiguous_sample_selection(indices):
+    params = {
+        "dataset_name": "daily-omni",
+        "num_prompts": [2],
+        "max_concurrency": [8],
+        "qwen3_omni_workload": {
+            "platform": "cuda",
+            "configuration": "async-prefix",
+            "accuracy": True,
+            "smoke": True,
+            "smoke_indices": indices,
+        },
+    }
+    with pytest.raises(ValueError, match="matching Daily-Omni smoke subset"):
+        nightly.case_from_params(params)
 
 
 def test_source_rows_cannot_disappear_before_submission():

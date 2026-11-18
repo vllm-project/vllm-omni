@@ -1806,6 +1806,49 @@ def test_recorded_video_json_keeps_raw_metrics_hardware_and_recipe(tmp_path, mon
         assert saved[key] == record[key]
 
 
+@pytest.mark.parametrize("exit_code,write_result", [(0, True), (1, True), (1, False)])
+def test_result_transform_persists_failure_diagnostics(tmp_path, monkeypatch, exit_code, write_result):
+    """A failed CLI must still publish the callback's annotations for review."""
+    import io
+
+    from tests.dfx import conftest as dfx
+
+    class BenchmarkProcess:
+        def __init__(self, command, **kwargs):
+            self.stdout, self.stderr = io.StringIO(""), io.StringIO("")
+            if write_result:
+                path = (
+                    Path(command[command.index("--result-dir") + 1]) / command[command.index("--result-filename") + 1]
+                )
+                path.write_text(json.dumps({"completed": 1, "raw_marker": "retained"}))
+
+        def wait(self):
+            return exit_code
+
+    def annotate(result, returncode):
+        assert result["Hardware"] == "H200"
+        assert returncode == exit_code
+        return {
+            **result,
+            "benchmark_exit_code": returncode,
+            "validation_errors": ["incomplete workload"],
+            "qualification_scope": "smoke",
+        }
+
+    monkeypatch.setenv("BENCHMARK_DIR", str(tmp_path))
+    monkeypatch.setattr(dfx.subprocess, "Popen", BenchmarkProcess)
+    result = dfx.run_benchmark(
+        [], "test_dataset_callback", 1, "seed-tts", 4, resource_label="H200", result_transform=annotate
+    )
+    [saved_path] = tmp_path.glob("result_*.json")
+    saved = json.loads(saved_path.read_text())
+    assert saved == result
+    assert saved["validation_errors"] == ["incomplete workload"]
+    assert saved["benchmark_exit_code"] == exit_code
+    if write_result:
+        assert saved["raw_marker"] == "retained"
+
+
 def _response_performance_result(dataset_name):
     result = {"completed": 16, "duplex_metric_aggregation": "response"}
     if dataset_name == "omni-duplex-eval":
