@@ -399,6 +399,8 @@ _MULTISTAGE_APP_STATE_KEYS = {
     "online_renderer",
     "openai_serving_chat",
     "openai_serving_chat_batch",
+    "openai_serving_transcription",
+    "openai_serving_translation",
     "openai_serving_speech",
     "openai_serving_audio_generate",
     "openai_streaming_speech",
@@ -411,8 +413,10 @@ _MULTISTAGE_APP_STATE_KEYS = {
     "enable_server_load_tracking",
     "server_load_metrics",
 }
-# The OpenPI robot server is None unless the policy declares policy_server_config.
+# ASR handlers and the OpenPI robot server are None unless supported by the model.
 _MULTISTAGE_MUST_BE_NONE = {
+    "openai_serving_transcription",
+    "openai_serving_translation",
     "openai_serving_duplex",
     "openai_serving_realtime_robot",
     "rl_rollout_serving",
@@ -788,7 +792,10 @@ def test_should_enable_profiler_endpoints_matches_stage_config(stage_configs, ex
 
 
 @pytest.mark.asyncio
-async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_router(monkeypatch) -> None:
+@pytest.mark.parametrize("transcription_enabled", [False, True])
+async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_router(
+    monkeypatch, transcription_enabled
+) -> None:
     """Lock worker assembly: override, mount, storage, handlers, full census.
 
     Fails if assembly stops replacing upstream chat/batch/models/health/profiler,
@@ -797,6 +804,7 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
     handlers.
     """
     captured: dict[str, object] = {}
+    tasks = ("generate", "transcription") if transcription_enabled else ("generate",)
 
     def fake_build_openai_app(args, supported_tasks):
         app = FastAPI()
@@ -829,15 +837,27 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
         async def upstream_only():
             return {"owner": "upstream"}
 
+        if transcription_enabled:
+
+            @app.post("/v1/audio/transcriptions")
+            async def upstream_transcription():
+                return {"owner": "upstream"}
+
         captured["supported_tasks"] = supported_tasks
         return app
 
     @asynccontextmanager
     async def fake_build_async_omni(*_args, **_kwargs):
-        yield _FakeEngineClient(
+        engine = _FakeEngineClient(
             stage_configs=[{"engine_args": {"profiler_config": {"profiler": "torch"}}}],
             vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(_api_process_rank=0)),
         )
+
+        async def get_supported_tasks():
+            return tasks
+
+        monkeypatch.setattr(engine, "get_supported_tasks", get_supported_tasks)
+        yield engine
 
     async def fake_omni_init_app_state(engine_client, state, args):
         state.engine_client = engine_client
@@ -886,7 +906,7 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
     _assert_unique_route_entries(routes)
     manifest = _route_manifest(routes)
 
-    assert captured["supported_tasks"] == ("generate",)
+    assert captured["supported_tasks"] == tasks
     assert captured["storage_started"] is True
     assert captured["storage_stopped"] is True
     assert captured["restrictions"] == {}
@@ -908,6 +928,10 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
     assert _single_http_route(routes, "GET", "/health").endpoint is api_server.health
     assert _single_http_route(routes, "POST", "/start_profile").endpoint is api_server.start_profile
     assert _single_http_route(routes, "POST", "/stop_profile").endpoint is api_server.stop_profile
+    if transcription_enabled:
+        transcription_route = _single_http_route(routes, "POST", "/v1/audio/transcriptions")
+        expected = _single_http_route(api_server.transcription_router.routes, "POST", "/v1/audio/transcriptions")
+        assert transcription_route.endpoint is expected.endpoint
 
     # Assembled app includes Omni router HTTP/WS surface + profiler.
     for item in _EXPECTED_ROUTER_ROUTES:
@@ -1712,10 +1736,18 @@ async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch, tmp
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ming3", [False, True, "tts"])
-@pytest.mark.parametrize("supported_tasks", [("generate",), ("embed",)])
+@pytest.mark.parametrize(
+    ("supported_tasks", "has_asr_aligner"),
+    [
+        (("generate",), False),
+        (("embed",), False),
+        (("generate", "transcription"), False),
+        (("generate", "transcription"), True),
+    ],
+)
 @pytest.mark.parametrize("policy_server", [False, True])
 async def test_multistage_app_state_key_snapshot(
-    monkeypatch, mocker, tmp_path, supported_tasks, ming3, policy_server
+    monkeypatch, mocker, tmp_path, supported_tasks, has_asr_aligner, ming3, policy_server
 ) -> None:
     """Lock multi-stage ``app.state`` keys after init, including live vs None.
 
@@ -1733,6 +1765,7 @@ async def test_multistage_app_state_key_snapshot(
         ),
     )
     mocker.patch.object(engine, "get_supported_tasks", return_value=supported_tasks)
+    engine.engine.has_asr_aligner = has_asr_aligner
 
     class _FakeModels:
         def __init__(self, *args, **kwargs):
@@ -1781,7 +1814,7 @@ async def test_multistage_app_state_key_snapshot(
     monkeypatch.setattr(api_server, "ServingClassification", _FakeCtor)
     monkeypatch.setattr(api_server, "ServingScores", _FakeCtor)
     monkeypatch.setattr(api_server, "ServingTokenization", _FakeCtor)
-    monkeypatch.setattr(api_server, "OpenAIServingTranscription", _FakeCtor)
+    monkeypatch.setattr(api_server, "OmniOpenAIServingTranscription", _FakeCtor)
     monkeypatch.setattr(api_server, "OpenAIServingTranslation", _FakeCtor)
     monkeypatch.setattr(api_server, "AnthropicServingMessages", _FakeCtor)
     monkeypatch.setattr(api_server, "ServingTokens", _FakeCtor)
@@ -1802,7 +1835,9 @@ async def test_multistage_app_state_key_snapshot(
         )
 
     state = State()
-    await api_server.omni_init_app_state(engine, state, _minimal_args(log_error_stack=True))
+    # An aligner selected on the CLI can belong to TTS rather than ASR.
+    args = _minimal_args(log_error_stack=True, forced_aligner="/models/aligner")
+    await api_server.omni_init_app_state(engine, state, args)
     assert speech_kwargs["speech_cache_config"].resolve_max_bytes == 1024
     assert speech_kwargs["speech_cache_config"].resolve_max_entries == 2048
     assert speech_kwargs["speech_cache_config"].speaker_max_bytes == 8
@@ -1823,11 +1858,14 @@ async def test_multistage_app_state_key_snapshot(
         else {"openai_serving_chat", "openai_serving_chat_batch", "openai_streaming_video"}
     )
     robot = {"openai_serving_realtime_robot"} if policy_server else set()
+    transcription_services = (
+        {"openai_serving_transcription", "openai_serving_translation"} if "transcription" in supported_tasks else set()
+    )
     _assert_app_state_snapshot(
         state,
         expected_keys=_MULTISTAGE_APP_STATE_KEYS,
-        must_be_wired=(_MULTISTAGE_MUST_BE_WIRED | robot) - disabled,
-        must_be_none=(_MULTISTAGE_MUST_BE_NONE - robot) | disabled,
+        must_be_wired=(_MULTISTAGE_MUST_BE_WIRED | robot | transcription_services) - disabled,
+        must_be_none=(_MULTISTAGE_MUST_BE_NONE - robot - transcription_services) | disabled,
     )
     assert state.online_renderer.kwargs["log_error_stack"] is True
     assert state.online_renderer.warmup_calls == 1
@@ -1840,6 +1878,10 @@ async def test_multistage_app_state_key_snapshot(
         assert state.openai_serving_responses.args[2] is state.online_renderer
     else:
         assert state.openai_serving_responses is None
+    if "transcription" in supported_tasks:
+        assert state.openai_serving_transcription.args[0] is engine
+        assert state.openai_serving_transcription.kwargs["has_asr_aligner"] is has_asr_aligner
+        assert isinstance(state.openai_serving_translation.args[0], api_server.TextOnlyEngineClient)
 
 
 @pytest.mark.parametrize("count", [None, 0, -1, "2", True])

@@ -381,6 +381,9 @@ class StreamingInputState:
     # Synchronous stage-transition capability installed by the orchestrator
     # while the downstream input processor consumes upstream token output.
     source_token_decoder: Callable[..., str] | None = None
+    # The source model owns transcript cleanup; downstream bridges must not
+    # apply the target model's postprocessor to an upstream model's output.
+    source_model_config: Any | None = None
 
     def segment(self, stage_id: int | None) -> StreamingSegmentState:
         """Return ``stage_id``'s segment state, or a fresh empty one if unreported.
@@ -3291,6 +3294,9 @@ class OrchestratorBase:
             )[req_id] = req_state.pd_prefill_multimodal_output
 
         previous_decoder = req_state.streaming.source_token_decoder
+        previous_model_config = req_state.streaming.source_model_config
+        source_vllm_config = getattr(self.stage_pools[src_stage_id], "stage_vllm_config", None)
+        req_state.streaming.source_model_config = getattr(source_vllm_config, "model_config", None)
         source_processor = self.stage_pools[src_stage_id].output_processor
         tokenizer = getattr(source_processor, "tokenizer", None)
         decode = getattr(tokenizer, "decode", None)
@@ -3326,6 +3332,7 @@ class OrchestratorBase:
             return
         finally:
             req_state.streaming.source_token_decoder = previous_decoder
+            req_state.streaming.source_model_config = previous_model_config
 
         if not next_inputs:
             if not getattr(output, "finished", False):

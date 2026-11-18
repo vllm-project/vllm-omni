@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Typed runner contracts for models that plug into the omni worker loops.
+"""Typed model capabilities for Omni runners and stage processors.
 
 A model that a runner drives through a non-standard step (multi-frame decode
 in the Talker's case) has to answer a handful of attributes and methods. The
@@ -19,6 +19,8 @@ from typing import Any, Protocol, runtime_checkable
 __all__ = [
     "SupportsMRv2MultiFrameDecode",
     "SupportsMultiFrameDecode",
+    "TranscriptionLanguageMixin",
+    "get_transcription_language",
     "requires_request_sample_eligibility",
     "supports_multi_frame_decode",
 ]
@@ -129,3 +131,27 @@ def requires_request_sample_eligibility(model: Any) -> bool:
     verify).
     """
     return bool(getattr(model, "requires_request_sample_eligibility", False))
+
+
+class TranscriptionLanguageMixin:
+    """Optional language metadata for transcription models.
+
+    Models inherit this default and override it when their raw output carries
+    a language field. Request languages and separate language-detection passes
+    remain the caller's responsibility.
+    """
+
+    @classmethod
+    def get_transcription_language(cls, raw_text: str) -> str | None:
+        """Read a language code or English name without running inference.
+
+        Return None when no language is available, including incomplete
+        prefixes during streaming. The raw transcript must not be modified.
+        """
+        return None
+
+
+def get_transcription_language(model_cls: type[Any], raw_text: str) -> str | None:
+    """Use model-owned language parsing, including models without the mixin."""
+    getter = getattr(model_cls, "get_transcription_language", TranscriptionLanguageMixin.get_transcription_language)
+    return getter(raw_text)

@@ -1,0 +1,17 @@
+# Qwen3-ASR (0.6B or 1.7B), optionally followed by --forced-aligner.
+# The ASR and the default aligner each reserve 30% of GPU memory on device 0.
+model_runner: v1
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    dtype: bfloat16
+    gpu_memory_utilization: 0.30
+    max_model_len: 8192
+    max_num_seqs: 16
+    max_num_batched_tokens: 8192
+    trust_remote_code: true
+    enable_prefix_caching: false
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 4096

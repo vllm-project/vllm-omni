@@ -41,6 +41,11 @@ _OMNI_MODELS = {
         "Qwen2_5OmniToken2WavModel",
     ),
     "Qwen2ForCausalLM_old": ("qwen2_5_omni", "qwen2_old", "Qwen2ForCausalLM"),  # need to discuss
+    "Qwen3ASRForConditionalGeneration": (
+        "qwen3_asr",
+        "qwen3_asr",
+        "Qwen3ASRForConditionalGeneration",
+    ),
     # Qwen3 Omni MoE models
     "Qwen3OmniMoeForConditionalGeneration": (
         "qwen3_omni",

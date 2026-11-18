@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from dataclasses import replace
+
 import pytest
 from vllm.pooling_params import PoolingParams
 
@@ -10,6 +12,7 @@ from vllm_omni.config.pipeline_registry import OMNI_PIPELINES as _PIPELINE_REGIS
 from vllm_omni.config.stage_config import (
     DeployConfig,
     StageExecutionType,
+    StagePipelineConfig,
 )
 from vllm_omni.engine.stage_init_utils import (
     build_engine_args_dict_from_omni_stage_config,
@@ -130,3 +133,96 @@ def test_injected_aligner_survives_typed_config_and_runtime_projections():
     )
     assert engine_args["runner"] == "pooling"
     assert engine_args["pooling_output_decoder"] == POOLING_OUTPUT_DECODER_PATH
+
+
+def test_qwen3_asr_registers_transcript_pipeline_and_injects_asr_aligner():
+    pipeline = _PIPELINE_REGISTRY["qwen3_asr"]
+    assert len(pipeline.stages) == 1
+    assert pipeline.default_deploy_config_name == "qwen3_asr.yaml"
+    assert pipeline.stages[0].model_arch == "Qwen3ASRForConditionalGeneration"
+    assert pipeline.stages[0].final_output_type == "text"
+
+    extended, deploy = inject_forced_aligner_stage(
+        pipeline, DeployConfig(), {"forced_aligner": "/models/Qwen3-ForcedAligner-0.6B"}
+    )
+    assert len(extended.stages) == 2
+    assert extended.stages[0].final_output is True
+    assert extended.stages[-1].custom_process_input_func.endswith("asr2aligner")
+    assert extended.stages[-1].input_sources == (0,)
+    assert extended.stages[-1].final_output_type == TIMESTAMPS_MODALITY
+    assert deploy.stages[-1].default_pooling_params == {"task": "token_classify"}
+    assert deploy.stages[-1].async_scheduling is False
+    assert deploy.stages[-1].async_chunk is False
+
+
+def test_qwen3_asr_aligner_config_preserves_aligner_model_and_device(tmp_path):
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    config_path = tmp_path / "aligner.yaml"
+    config_path.write_text("forced_aligner:\n  model: /models/Qwen3-ForcedAligner-0.6B\n")
+    resolution = StageConfigFactory._resolve_legacy_from_registry(
+        _PIPELINE_REGISTRY["qwen3_asr"],
+        {
+            "model": "/models/Qwen3-ASR-1.7B",
+            "forced_aligner_config": str(config_path),
+            "forced_aligner_device": "1",
+        },
+        user_deploy_config=DeployConfig(async_chunk=False),
+    )
+    stages = [stage.to_omegaconf() for stage in resolution.stage_configs]
+    assert len(stages) == 2
+    assert stages[0].engine_args.model_arch == "Qwen3ASRForConditionalGeneration"
+    assert stages[1].engine_args.model == "/models/Qwen3-ForcedAligner-0.6B"
+    assert stages[1].engine_args.runner == "pooling"
+    assert stages[1].runtime.devices == "1"
+    assert stages[1].custom_process_input_func.endswith("asr2aligner")
+
+
+@pytest.mark.parametrize("model_type", ["whisper", "another_asr"])
+def test_asr_aligner_injection_uses_topology_instead_of_a_model_family_name(model_type):
+    pipeline = replace(_PIPELINE_REGISTRY["qwen3_asr"], model_type=model_type)
+    extended, _ = inject_forced_aligner_stage(pipeline, DeployConfig(), {"forced_aligner": "aligner"})
+    assert extended.stages[-1].custom_process_input_func.endswith("asr2aligner")
+
+
+def test_tts_aligner_injection_uses_the_audio_terminal_instead_of_a_model_family_name():
+    pipeline = replace(_PIPELINE_REGISTRY["qwen3_tts"], model_type="another_tts")
+    extended, _ = inject_forced_aligner_stage(pipeline, DeployConfig(), {"forced_aligner": "aligner"})
+    assert extended.stages[-1].custom_process_input_func.endswith("code2wav2aligner")
+
+
+@pytest.mark.parametrize("topology", ["image", "nonterminal_audio"])
+def test_forced_aligner_rejects_unsupported_topology(topology):
+    pipeline = _PIPELINE_REGISTRY["qwen3_asr"]
+    entry = pipeline.stages[0]
+    stages: tuple[StagePipelineConfig, ...]
+    if topology == "image":
+        stages = (replace(entry, final_output_type="image"),)
+    else:
+        stages = (entry, replace(entry, stage_id=1, input_sources=(0,), final_output=False, final_output_type="audio"))
+    with pytest.raises(ValueError, match="Forced alignment requires"):
+        inject_forced_aligner_stage(replace(pipeline, stages=stages), DeployConfig(), {"forced_aligner": "aligner"})
+
+
+@pytest.mark.parametrize("prefix_stages", [1, 3])
+def test_asr_aligner_can_follow_a_multi_stage_pipeline(prefix_stages):
+    pipeline = _PIPELINE_REGISTRY["qwen3_asr"]
+    source = pipeline.stages[0]
+    prefix = tuple(
+        replace(
+            source,
+            stage_id=i,
+            input_sources=() if i == 0 else (i - 1,),
+            final_output=False,
+        )
+        for i in range(prefix_stages)
+    )
+    pipeline = replace(
+        pipeline, stages=(*prefix, replace(source, stage_id=prefix_stages, input_sources=(prefix_stages - 1,)))
+    )
+    extended, deploy = inject_forced_aligner_stage(pipeline, DeployConfig(), {"forced_aligner": "aligner"})
+
+    assert extended.stages[:-1] == pipeline.stages
+    assert extended.stages[-1].input_sources == (prefix_stages,)
+    assert extended.stages[-1].custom_process_input_func.endswith("asr2aligner")
+    assert deploy.stages[-1].stage_id == prefix_stages + 1

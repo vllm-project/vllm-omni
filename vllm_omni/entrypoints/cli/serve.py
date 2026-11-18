@@ -445,7 +445,7 @@ class OmniServeCommand(CLISubcommand):
             type=str,
             default=None,
             help=(
-                "Enable streaming TTS word timestamps via a forced aligner. "
+                "Enable TTS or ASR word timestamps via a forced aligner. "
                 "Pass the aligner model path/name, e.g. 'Qwen/Qwen3-ForcedAligner-0.6B'. "
                 "Disabled when omitted."
             ),
