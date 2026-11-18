@@ -1714,7 +1714,7 @@ stages:
         assert deploy.model_runner == "v2"
 
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
-    def test_qwen3_omni_default_runner_is_v2_on_cuda_and_npu(self, platform, monkeypatch):
+    def test_qwen3_omni_default_runner_is_v2_on_supported_platforms(self, platform, monkeypatch):
         from vllm_omni import platforms
 
         monkeypatch.setattr(platforms.current_omni_platform, "device_name", platform)
@@ -1724,7 +1724,7 @@ stages:
             load_deploy_config(Path(get_deploy_config_path("qwen3_omni_moe.yaml"))),
             platform=platform,
         )
-        expect_v2 = platform in {"cuda", "npu", "xpu"}
+        expect_v2 = platform in {"cuda", "npu", "xpu", "rocm"}
         if not expect_v2:
             with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
                 merge_pipeline_deploy(pipeline, deploy)
@@ -3317,7 +3317,7 @@ class TestPlatformOverrides:
 
         rocm = _apply_platform_overrides(load_deploy_config(deploy_path), platform="rocm")
         assert rocm.model_runner == "v2"
-        assert rocm.stages[0].enable_prefix_caching is False
+        assert rocm.stages[0].engine_extras["enable_prefix_caching"] is False
         assert rocm.stages[2].enforce_eager is True
 
         legacy = merge_pipeline_deploy(pipeline, rocm)

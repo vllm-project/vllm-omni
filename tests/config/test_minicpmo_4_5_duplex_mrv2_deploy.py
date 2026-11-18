@@ -48,7 +48,7 @@ def test_duplex_mrv2_rocm_profile_preserves_shared_contract(monkeypatch) -> None
     assert config.session_mode == "duplex"
     assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True, True]
     assert [s.yaml_engine_args["async_chunk"] for s in stages] == [True, True, True]
-    assert [s.devices for s in stages] == ["0", "0", "0"]
+    assert [s.yaml_runtime["devices"] for s in stages] == ["0", "0", "0"]
     assert stages[2].yaml_engine_args["enforce_eager"] is True
     assert stages[2].input_sources == [1]
 

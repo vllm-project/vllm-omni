@@ -709,8 +709,8 @@ Talker AR runner and the Code2Wav generation
 runner together. Native inter-stage delivery carries codec payloads directly;
 request-owned snapshots preserve buffers through asynchronous completion and
 CUDA graph reuse. Terminal completion waits for upstream stage metrics before
-releasing request state. Platform sections that retain V1 on ROCm and MUSA
-are unsupported. XPU selects V2, but final-release XPU hardware qualification
+releasing request state. The platform section that retains V1 on MUSA is
+unsupported. XPU selects V2, but final-release XPU hardware qualification
 remains pending.
 Selecting V2 for a stage without `supports_native_mrv2_data_plane` emits a warning
 when pipeline and deployment settings are merged. That stage retains the legacy
