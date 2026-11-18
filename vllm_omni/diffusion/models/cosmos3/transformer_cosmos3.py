@@ -49,6 +49,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.layers.fused_fp8_act_quant import add_rms_norm_fp8_per_token, silu_mul_fp8_per_token
 from vllm_omni.diffusion.models.cosmos3.rope import Cosmos3RotaryEmbedding
 from vllm_omni.diffusion.models.utils import release_module_parameters_to_meta
 from vllm_omni.diffusion.offloader.config import (
@@ -607,7 +608,7 @@ class Cosmos3GatedMLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(silu_mul_fp8_per_token(self.gate_proj(x), self.up_proj(x), self.down_proj))
 
 
 # ---------------------------------------------------------------------------
@@ -1149,7 +1150,13 @@ class Cosmos3GenDecoderLayer(nn.Module):
         return self._forward_post_attention(hidden_states, residual)
 
     def _forward_post_attention(self, attn_out: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
-        hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
+        if type(self.mlp) is Cosmos3GatedMLP:
+            # Residual add + post-attention RMSNorm + the MLP input quantization in one kernel.
+            hidden_states, residual = add_rms_norm_fp8_per_token(
+                attn_out, residual, self.post_attention_layernorm, (self.mlp.gate_proj, self.mlp.up_proj)
+            )
+        else:
+            hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
         hidden_states = residual + self.mlp(hidden_states)
 
         return hidden_states
