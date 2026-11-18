@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from dataclasses import fields as dataclass_fields
 from typing import Any, cast
 
+import numpy as np
 import torch
 from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput, PoolingOutput, PoolingRequestOutput, RequestError, RequestOutput
@@ -154,6 +155,15 @@ class OmniRequestState(RequestState):
         # because upstream RequestState.__init__ reorders parameters between
         # releases, making args[12] fragile.
         arrival_time = kwargs.get("arrival_time")
+        # vLLM 0.34 types EngineCoreRequest.prompt_token_ids as a 32-bit int
+        # ndarray at runtime (msgspec array_like), and the in-process
+        # orchestrator forwards that array here, but the client-side
+        # RequestState contract is a plain list (truthiness checks and
+        # list.extend in the base apply_streaming_update).  Normalize once so
+        # every consumer of this state sees list[int].
+        prompt_token_ids = kwargs.get("prompt_token_ids")
+        if isinstance(prompt_token_ids, np.ndarray):
+            kwargs["prompt_token_ids"] = prompt_token_ids.tolist()
         super().__init__(*args, **kwargs)
         self.is_pooling_request = False
         self.native_text_stats = RequestStateStats(arrival_time=float(arrival_time or 0.0))
@@ -166,6 +176,12 @@ class OmniRequestState(RequestState):
         self.mm_accumulated: MultimodalPayload = MultimodalPayload()
 
     def apply_streaming_update(self, update) -> None:
+        # Streaming updates are built from EngineCoreRequest.prompt_token_ids
+        # (a 32-bit ndarray on this side, see __init__); the base
+        # implementation evaluates ``update.prompt_token_ids or ()`` and
+        # extends self.prompt_token_ids with it, so hand it a plain list.
+        if isinstance(update.prompt_token_ids, np.ndarray):
+            update.prompt_token_ids = update.prompt_token_ids.tolist()
         super().apply_streaming_update(update)
         self.native_text_stats = RequestStateStats(arrival_time=float(update.arrival_time or 0.0))
 

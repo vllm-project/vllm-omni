@@ -98,6 +98,12 @@ def _load_cosmos_worker(rank, rendezvous, checkpoint_dir, edge):
                     use_und_k_norm_for_gen=True,
                 )
             config = SimpleNamespace(
+                model=None,
+                lora_backend="peft",
+                enable_multithread_weight_load=False,
+                enable_broadcast_weight_load=False,
+                diffusion_attention_config=None,
+                diffusion_attention_schedule=None,
                 tf_model_config=tf_config,
                 dtype=torch.bfloat16,
                 quantization_config=None,

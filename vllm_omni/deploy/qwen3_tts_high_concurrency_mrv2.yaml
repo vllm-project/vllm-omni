@@ -1,11 +1,9 @@
-# Opt-in CUDA Model Runner V2 profile. The base profile retains V1.
+# Opt-in CUDA Model Runner V2 profile. The base profile also defaults to V2.
 base_config: qwen3_tts_high_concurrency.yaml
 model_runner: v2
 
 platforms:
   npu:
-    model_runner: v1
-  xpu:
     model_runner: v1
   rocm:
     model_runner: v1

@@ -98,7 +98,7 @@ def test_installation_handles_both_import_orders_and_is_idempotent(monkeypatch):
     original = utils.compute_mm_prefix_ranges._omni_mm_prefix_original
     monkeypatch.setattr(utils, "compute_mm_prefix_ranges", original)
     runners = []
-    for name in ("vllm.v1.worker.gpu_model_runner", "vllm.v1.worker.gpu.model_states.default"):
+    for name in ("vllm.v1.worker.gpu.model_runner", "vllm.v1.worker.gpu.model_states.default"):
         module = ModuleType(name)
         setattr(module, "compute_mm_prefix_ranges", original)
         monkeypatch.setitem(sys.modules, name, module)
@@ -117,7 +117,7 @@ def test_installation_handles_both_import_orders_and_is_idempotent(monkeypatch):
 def test_conflicting_runner_alias_fails_before_any_rebinding(monkeypatch):
     original = utils.compute_mm_prefix_ranges._omni_mm_prefix_original
     monkeypatch.setattr(utils, "compute_mm_prefix_ranges", original)
-    module = ModuleType("vllm.v1.worker.gpu_model_runner")
+    module = ModuleType("vllm.v1.worker.gpu.model_runner")
     setattr(module, "compute_mm_prefix_ranges", lambda: None)
     monkeypatch.setitem(sys.modules, module.__name__, module)
     with pytest.raises(RuntimeError, match="Conflicting"):

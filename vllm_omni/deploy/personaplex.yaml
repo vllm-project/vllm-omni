@@ -1,3 +1,6 @@
+# Historical PersonaPlex profile; unavailable with vLLM 0.34 / V2-only execution.
+# Configuration resolution rejects this profile because its Talker requires retired Model Runner V1.
+# Keep the V1 pin to fail explicitly; selecting V2 does not implement model support.
 # PersonaPlex deploy: talker -> code2wav (Mimi) via shared-memory chunk streaming.
 #
 # PersonaPlex is a Moshi finetune (full-duplex S2S), served offline as a 2-stage
