@@ -41,6 +41,11 @@ class _Executor:
 def _od_config(**overrides):
     values = dict(
         model="test-diffusion",
+        stage_role=None,
+        model_stage=None,
+        model_class_name=None,
+        omni_kv_config={},
+        diffusion_attention_schedule=None,
         diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
         dtype=torch.bfloat16,
         max_model_len=64,

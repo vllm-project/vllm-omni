@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import time
 from typing import Any
@@ -10,13 +10,14 @@ from .base import OmniConnectorBase
 logger = get_connector_logger(__name__)
 
 try:
-    from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+    from mooncake.store import MooncakeDistributedStore, ReplicateConfig, SoftPinAction
 except ImportError:
     try:
-        from mooncake import MooncakeDistributedStore, ReplicateConfig
+        from mooncake import MooncakeDistributedStore, ReplicateConfig, SoftPinAction
     except ImportError:
         MooncakeDistributedStore = None
         ReplicateConfig = None
+        SoftPinAction = None
 
 
 class MooncakeStoreConnector(OmniConnectorBase):
@@ -62,7 +63,7 @@ class MooncakeStoreConnector(OmniConnectorBase):
                 raise RuntimeError(f"Mooncake setup failed: {rc}")
 
             self.pin = ReplicateConfig()
-            self.pin.with_soft_pin = True
+            self.pin.soft_pin_action = SoftPinAction.ENABLE
             logger.info("MooncakeStoreConnector initialized successfully")
         except Exception as e:
             logger.error("Failed to initialize Mooncake store: %s", e)

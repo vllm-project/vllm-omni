@@ -165,6 +165,9 @@ def _start_judge_server(judge_params: dict[str, object]):
         [str(item) for item in extra],
         use_omni=bool(judge_params.get("use_omni", False)),
         env_dict={device_env: visible},
+        # The primary model is alive on another visible device. Its outer
+        # OmniServer owns the final device-memory wait after both servers exit.
+        wait_for_device_memory=False,
     ) as judge:
         print(f"Benchmark judge started on {judge.host}:{judge.port}")
         yield judge
@@ -654,7 +657,9 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
         # close-boundary responses. Preserve its eligibility policy; missing
         # client measurements and unfinished counts remain visible in artifacts.
         config = load_accuracy_config(path, params)
-        selected = select_duplex_eval_baseline(config, result.get("Hardware"))
+        selected = select_duplex_eval_baseline(
+            config, result.get("Hardware"), required=params.get("duplex_eval_require_score_floors", False)
+        )
         assert_accuracy_result(
             result,
             {**config, "baseline": selected},
@@ -697,7 +702,7 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
             assert _is_finite_number(score) and 0 <= score <= 1, "Omni-DuplexEval correction score is invalid"
 
 
-def assert_result(result, params, num_prompt, *, check_baseline: bool = False) -> None:
+def assert_result(result, params, num_prompt, *, check_baseline: bool = False, require_baseline: bool = False) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
     if params.get("dataset_name") == "realtime-video":
         video = result.get("realtime_video")
@@ -741,12 +746,13 @@ def assert_result(result, params, num_prompt, *, check_baseline: bool = False) -
                     f"Missing or invalid P{percentile} {metric}"
                 )
     hardware = result.get("Hardware")
-    if check_baseline:
+    if check_baseline or require_baseline:
         baseline = result.get("baseline")
         assert_baseline_within_tolerance(
             result,
             baseline if isinstance(baseline, dict) else None,
             hardware if isinstance(hardware, str) else None,
+            required=require_baseline,
         )
     if params.get("duplex_performance_only"):
         return
@@ -821,8 +827,13 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
     if path := params.get("duplex_eval_accuracy_config"):
         from tests.e2e.accuracy.omni_duplex_eval.validation import load_accuracy_config, select_duplex_eval_baseline
 
+        params["duplex_eval_require_score_floors"] = params.get(
+            "duplex_eval_require_score_floors", False
+        ) or pytestconfig.getoption("require_duplex_eval_score_floors")
         accuracy_config = load_accuracy_config(path, params)
-        accuracy_baseline = select_duplex_eval_baseline(accuracy_config, resource_label)
+        accuracy_baseline = select_duplex_eval_baseline(
+            accuracy_config, resource_label, required=params.get("duplex_eval_require_score_floors", False)
+        )
     elif params.get("omniinteract_evaluate"):
         accuracy_baseline = _omniinteract_accuracy_baseline(params, test_name)
     for dataset_prefix in ("omniinteract", "duplex_eval"):
@@ -883,6 +894,7 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
         _OMNIINTERACT_PERSIST_ARTIFACTS,
         "judge_server_params",
         "duplex_eval_accuracy_config",
+        "duplex_eval_require_score_floors",
         "duplex_eval_score_floor_hardware",
         "duplex_performance_only",
         "required_duplex_metrics",
@@ -948,7 +960,11 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
             assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
             try:
                 assert_result(
-                    result, assert_params, num_prompt, check_baseline=pytestconfig.getoption("assert_baseline")
+                    result,
+                    assert_params,
+                    num_prompt,
+                    check_baseline=pytestconfig.getoption("assert_baseline"),
+                    require_baseline=pytestconfig.getoption("require_baseline"),
                 )
             finally:
                 _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)
@@ -986,7 +1002,11 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
             assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
             try:
                 assert_result(
-                    result, assert_params, num_prompt, check_baseline=pytestconfig.getoption("assert_baseline")
+                    result,
+                    assert_params,
+                    num_prompt,
+                    check_baseline=pytestconfig.getoption("assert_baseline"),
+                    require_baseline=pytestconfig.getoption("require_baseline"),
                 )
             finally:
                 _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)

@@ -3,14 +3,12 @@
 """Same-worker acoustic synthesis after releasing native AR slots."""
 
 import copy
-import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 
 import torch
 from vllm import SamplingParams
 from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.engine import EngineCoreOutputs, FinishReason
-from vllm.v1.outputs import AsyncModelRunnerOutput
 from vllm.v1.request import RequestStatus, StreamingUpdate
 
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
@@ -19,8 +17,6 @@ from vllm_omni.core.sched.output import OmniSchedulerOutput
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.request import OmniRequest
-from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
-from vllm_omni.worker.gpu_ar_worker import GPUARWorker
 
 from .batched_synthesis import BatchedSynthesisQueue
 from .request import AUTO_ABC, SEMANTIC_ARGS
@@ -153,49 +149,6 @@ class Yue2ForCausalLM(Yue2Backbone):
         for positive, negative in pairs:
             result.sampled_token_ids[negative].copy_(result.sampled_token_ids[positive])
         return result
-
-
-class Yue2ModelRunner(GPUARModelRunner):
-    def _update_states(self, scheduler_output):
-        # Only runner bookkeeping sees these IDs as finished. The model callback
-        # still receives the genuine terminal/abort IDs from execute_model.
-        detached = getattr(scheduler_output, "acoustic_req_ids", set())
-        return super()._update_states(
-            replace(scheduler_output, finished_req_ids=scheduler_output.finished_req_ids | detached)
-        )
-
-    def _with_audio(self, output):
-        if isinstance(output, AsyncModelRunnerOutput):
-            output = output.get_output()
-        ready = self.model.poll_audio()
-        # The runner may hold a CUDAGraphWrapper: assignment would shadow the
-        # underlying model's list on that wrapper instead of consuming it.
-        started = list(self.model.acoustic_started)
-        self.model.acoustic_started.clear()
-        return Yue2ModelRunnerOutput(**vars(output), acoustic_started=started, acoustic_ready=ready)
-
-    @torch.inference_mode()
-    def execute_model(self, scheduler_output, *args, **kwargs):
-        replaced = getattr(scheduler_output, "replaced_req_ids", set())
-        if replaced:
-            # A new prompt reuses the native request ID. Retire the old runner
-            # and model phase state before admitting its replacement prefill.
-            scheduler_output = replace(scheduler_output, finished_req_ids=scheduler_output.finished_req_ids | replaced)
-        output = super().execute_model(scheduler_output, *args, **kwargs)
-        if output is not None:
-            output = self._with_audio(output)
-            if not scheduler_output.total_num_scheduled_tokens and not output.acoustic_ready:
-                # shortcut: poll every 1ms while AR is idle; use events if this becomes costly.
-                time.sleep(0.001)
-        return output
-
-    @torch.inference_mode()
-    def sample_tokens(self, grammar_output):
-        return self._with_audio(super().sample_tokens(grammar_output))
-
-
-class Yue2Worker(GPUARWorker):
-    model_runner_cls = Yue2ModelRunner
 
 
 class Yue2SchedulerBase(OmniARScheduler):
