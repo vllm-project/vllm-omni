@@ -272,10 +272,6 @@ def _resolve_offline_model(model: str, revision: str | None = None) -> str:
 def _start_omni_server(server_param):
     test_name, model, stage_config_path, stage_overrides, extra_cli_args, use_omni = server_param
     extra = tuple(extra_cli_args or ())
-    model = _resolve_offline_model(model, revision=_cli_flag_value(extra, "--revision"))
-
-    print(f"Starting OmniServer with test: {test_name}, model: {model}")
-
     server_args: list[str] = _merge_omni_default_server_args(extra, use_omni=use_omni)
     # --deploy-config and --stage-overrides compose at the CLI (see vllm_omni/entrypoints/utils.py):
     # deploy-config sets the base; stage-overrides are applied on top. Both can be set.
@@ -285,6 +281,10 @@ def _start_omni_server(server_param):
         server_args = ["--stage-overrides", stage_overrides] + server_args
     if extra:
         server_args = list(extra) + server_args
+    if use_omni:
+        _preflight_server_vad(test_name, server_args)
+    model = _resolve_offline_model(model, revision=_cli_flag_value(extra, "--revision"))
+    print(f"Starting OmniServer with test: {test_name}, model: {model}")
     judge_params = _judge_server_params_for_test(test_name)
     with OmniServer(model, server_args, use_omni=use_omni, env_dict=_omni_server_env()) as server:
         server.test_name = test_name
@@ -299,6 +299,36 @@ def _start_omni_server(server_param):
         print("OmniServer stopping...")
 
     print("OmniServer stopped")
+
+
+def _preflight_server_vad(test_name: str, server_args: list[str]) -> None:
+    """Validate a required local VAD backend before allocating model GPUs."""
+    config = _config_for_test(test_name)
+    if config is None:
+        return
+    benchmark_params = config.get("benchmark_params") or []
+    if not isinstance(benchmark_params, list):
+        raise TypeError(f"benchmark_params for {test_name} must be a list")
+    if not any(
+        isinstance(params, dict)
+        and params.get("enabled", True)
+        and (
+            params.get("duplex_eval_turn_detection") == "server_vad"
+            or params.get("omniinteract_turn_detection") == "server_vad"
+        )
+        for params in benchmark_params
+    ):
+        return
+
+    from vllm_omni.config.stage_config import resolve_deploy_yaml
+    from vllm_omni.engine.duplex.vad import SileroVADBackendProvider
+
+    model_path = None
+    if deploy_path := _cli_flag_value(server_args, "--deploy-config"):
+        model_path = (resolve_deploy_yaml(deploy_path).get("duplex_session") or {}).get("server_vad_model_path")
+    print(f"Checking server_vad before model startup: {model_path or 'local cache / silero-vad package'}", flush=True)
+    backend = SileroVADBackendProvider(model_path=model_path).get()
+    print(f"server_vad preflight passed: {type(backend).__name__}", flush=True)
 
 
 @pytest.fixture(scope="module")
@@ -703,7 +733,11 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
 
 
 def assert_result(result, params, num_prompt, *, check_baseline: bool = False, require_baseline: bool = False) -> None:
-    assert result["completed"] == num_prompt, "Request failures exist"
+    if result["completed"] != num_prompt:
+        first_error = next((error for error in result.get("errors", []) if error), "No per-request error recorded")
+        raise AssertionError(
+            f"Request failures exist: {result['completed']}/{num_prompt} completed. First request error: {first_error}"
+        )
     if params.get("dataset_name") == "realtime-video":
         video = result.get("realtime_video")
         assert isinstance(video, dict) and video.get("passed") is True, "Realtime video measurement is incomplete"

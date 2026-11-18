@@ -24,6 +24,86 @@ class ServerEndpoint:
     judge_base_url: str | None = None
 
 
+def test_request_failure_assertion_shows_the_underlying_error():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="server_vad_unavailable: missing Silero") as caught:
+        assert_result({"completed": 0, "errors": ["", "server_vad_unavailable: missing Silero"]}, {}, 120)
+    assert "0/120 completed" in str(caught.value)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_server_vad_preflight_checks_only_enabled_vad_workloads(monkeypatch, enabled):
+    from tests.dfx.perf.scripts import run_benchmark
+    from vllm_omni.engine.duplex.vad import ServerVADUnavailableError, SileroVADBackendProvider
+
+    monkeypatch.setattr(
+        run_benchmark,
+        "BENCHMARK_CONFIGS",
+        [
+            {
+                "test_name": "offline-vad",
+                "benchmark_params": [{"enabled": enabled, "duplex_eval_turn_detection": "server_vad"}],
+            }
+        ],
+    )
+    calls = []
+
+    def unavailable(self):
+        calls.append(self.model_path)
+        raise ServerVADUnavailableError("server_vad needs a local Silero artifact")
+
+    monkeypatch.setattr(SileroVADBackendProvider, "get", unavailable)
+    if enabled:
+        with pytest.raises(ServerVADUnavailableError, match="local Silero artifact"):
+            run_benchmark._preflight_server_vad("offline-vad", [])
+        assert calls == [None]
+    else:
+        run_benchmark._preflight_server_vad("offline-vad", [])
+        assert calls == []
+
+
+def test_server_vad_preflight_fails_before_model_resolution_or_server_start(monkeypatch):
+    from tests.dfx.perf.scripts import run_benchmark
+    from vllm_omni.config import stage_config
+    from vllm_omni.engine.duplex.vad import ServerVADUnavailableError, SileroVADBackendProvider
+
+    monkeypatch.setattr(
+        run_benchmark,
+        "BENCHMARK_CONFIGS",
+        [
+            {
+                "test_name": "offline-vad",
+                "benchmark_params": [{"duplex_eval_turn_detection": "server_vad"}],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        stage_config,
+        "resolve_deploy_yaml",
+        lambda path: {
+            "duplex_session": {"server_vad_model_path": "/models/silero.onnx"},
+        },
+    )
+    selected = []
+
+    def unavailable(self):
+        selected.append(self.model_path)
+        raise ServerVADUnavailableError("Configured Silero VAD model does not exist")
+
+    def must_not_start(*args, **kwargs):
+        pytest.fail("model startup ran before VAD validation")
+
+    monkeypatch.setattr(SileroVADBackendProvider, "get", unavailable)
+    monkeypatch.setattr(run_benchmark, "_resolve_offline_model", must_not_start)
+    monkeypatch.setattr(run_benchmark, "OmniServer", must_not_start)
+    server = ("offline-vad", "model", None, None, ("--deploy-config", "offline.yaml"), True)
+    with pytest.raises(ServerVADUnavailableError, match="does not exist"):
+        with run_benchmark._start_omni_server(server):
+            pytest.fail("unavailable VAD yielded a server")
+    assert selected == ["/models/silero.onnx"]
+
+
 def test_task_excluded_from_cli_args():
     """'task' field must not become --task CLI arg."""
     params = {

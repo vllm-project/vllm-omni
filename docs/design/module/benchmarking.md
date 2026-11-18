@@ -47,6 +47,20 @@ outputs before using timings as performance evidence.
 Test workload parsing and metric calculations with deterministic fixtures. Do
 not compare materially different workloads or runtime settings.
 
+The DFX Omni runner validates the local Silero backend before model startup
+when an enabled workload requires `server_vad`. This CPU preflight uses the
+effective deploy configuration, including inherited VAD model paths. It does
+not create the model engine or a duplex session.
+
+The Realtime benchmark client treats `server_vad_unavailable` and
+`semantic_vad_unavailable` as terminal backend configuration errors. It stops
+streaming and waiting while preserving the protocol error code and message.
+An unavailable VAD backend stops readiness retries and prevents warmup from
+proceeding to the measured workload. Ordinary transport retries and advisory
+errors keep their existing behavior.
+Request failures are logged with their cause, and the DFX assertion includes
+the completed count and the first recorded request error.
+
 DFX's opt-in `--require-baseline` validates metrics with the same 10% regression
 tolerance as `--assert-baseline`, but fails when the measured hardware has no
 matching baseline. Existing `--assert-baseline` callers retain their warning and

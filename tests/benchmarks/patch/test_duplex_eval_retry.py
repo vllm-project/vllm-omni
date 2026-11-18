@@ -116,6 +116,72 @@ async def test_latency_covers_only_the_attempt_that_succeeded(monkeypatch) -> No
     assert output.latency < _STALL_S
 
 
+@pytest.mark.parametrize("code", ["server_vad_unavailable", "semantic_vad_unavailable", "invalid_request"])
+async def test_protocol_error_is_reported_without_retry(monkeypatch, caplog, code) -> None:
+    from vllm_omni.clients.duplex import DuplexProtocolError
+
+    attempts = []
+
+    async def generate(*_args, **_kwargs):
+        attempts.append(1)
+        raise DuplexProtocolError("backend rejected configuration", code=code)
+
+    _install_fakes(monkeypatch, _FakeClock(), generate)
+    output = await patch._async_request_duplex_eval(_request(), pbar=None)
+    assert attempts == [1]
+    assert not output.success
+    assert output.duplex_retries == 0
+    assert output.duplex_fatal_error_code == (None if code == "invalid_request" else code)
+    assert output.error == f"{code}: backend rejected configuration"
+    assert code in caplog.text
+
+
+@pytest.mark.parametrize(("ready_check_timeout_sec", "expected_calls"), [(0, 2), (60, 1)])
+async def test_unavailable_vad_stops_before_measured_requests(
+    monkeypatch, ready_check_timeout_sec, expected_calls
+) -> None:
+    calls = []
+    sessions = []
+
+    async def unavailable(request_func_input, session, pbar=None):
+        calls.append(request_func_input)
+        sessions.append(session)
+        return patch.MixRequestFuncOutput(
+            error="server_vad_unavailable: missing local Silero artifact",
+            duplex_fatal_error_code="server_vad_unavailable",
+        )
+
+    monkeypatch.setitem(patch.ASYNC_REQUEST_FUNCS, "openai-realtime-duplex", unavailable)
+    with pytest.raises(ValueError, match="measured requests were not sent: server_vad_unavailable"):
+        await patch.benchmark(
+            task_type=patch.TaskType.GENERATION,
+            endpoint_type="openai-realtime-duplex",
+            api_url="http://127.0.0.1:8000/v1/realtime",
+            base_url="http://127.0.0.1:8000",
+            model_id="model",
+            model_name="model",
+            tokenizer=None,
+            input_requests=[_sample_request() for _ in range(120)],
+            logprobs=None,
+            request_rate=float("inf"),
+            burstiness=1.0,
+            disable_tqdm=True,
+            num_warmups=2,
+            profile=False,
+            selected_percentile_metrics=["ttft"],
+            selected_percentiles=[50],
+            ignore_eos=False,
+            goodput_config_dict={},
+            max_concurrency=2,
+            lora_modules=None,
+            extra_headers=None,
+            extra_body=None,
+            ready_check_timeout_sec=ready_check_timeout_sec,
+        )
+    assert len(calls) == expected_calls
+    assert all(session.closed for session in sessions)
+
+
 async def test_transport_stall_is_retried_once_and_counted(monkeypatch) -> None:
     clock = _FakeClock()
     stalled = _session_result(
