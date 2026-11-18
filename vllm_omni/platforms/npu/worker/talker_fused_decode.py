@@ -17,13 +17,13 @@ from vllm.config import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     HISTORY_WINDOW,
     _codec_int_param,
     _request_key,
 )
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms.npu.attention import static_shape_decode
 from vllm_omni.platforms.npu.attention.static_shape_backend import OmniStaticShapeAttentionBackendImpl
 from vllm_omni.platforms.npu.worker.talker_context import (
@@ -446,8 +446,11 @@ def run_fused_step(runner, mode_path, batch_desc, model_inputs, batch, run_model
                 graph_name = f"_talker_fused_tail_graph_{capacity}"
     accepted = graph_name + "_shadow_passed"
     rejected = graph_name + "_shadow_failed"
-    if not shadow and (not getattr(runner, accepted, False) or getattr(runner, rejected, False)):
-        return baseline()
+    if not shadow:
+        if getattr(runner, rejected, False):
+            return baseline()
+        # Active deployments qualify each graph locally on its first use.
+        shadow = not getattr(runner, accepted, False)
 
     graph = getattr(runner, graph_name, None)
     if graph is None:

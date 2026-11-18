@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.utils.device_copy import to_device_nonblocking
 
@@ -1883,7 +1884,6 @@ class MiniCPMO45Code2Wav(nn.Module):
         from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
             MiniCPMO45Token2wav as Token2wav,
         )
-
         from vllm_omni.platforms import current_omni_platform
 
         extra = self._extra_config()

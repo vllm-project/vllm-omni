@@ -85,6 +85,13 @@ sharing the backing does not share live request contents or shorten context.
 Without DSpark the new mixed-group path is inactive.
 Focused coverage lives in `tests/platforms/npu/test_minicpmo_shared_kv.py`.
 
+The opt-in MiniCPM-o exact-prefill, fused decode and compact-batch graphs
+qualify on their first eligible use in each worker. Active mode still returns
+the reference result while comparing hidden state/KV or codec/stop/KV state;
+only a successful check enables later replay. Mismatches keep the reference
+path. The [Ascend recipe](../../../recipes/OpenBMB/MiniCPM-o-4_5-Ascend.md)
+supplies the deployment, explicit model assets and launcher controls.
+
 ## MiniMax H3 image NPU adapter
 
 The NPU model-patch hook defaults the image pipeline to single-tile VAE decoder

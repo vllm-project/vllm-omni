@@ -29,17 +29,17 @@ from vllm.v1.worker.gpu.model_runner import (
     ExecuteModelState,
     IntermediateTensors,
 )
+
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.worker_v2.omni_model_runner import (
-    OmniGPUModelRunner,
-)
-
 from vllm_omni.worker_v2.omni_ar_model_runner import (
     _async_copy_mm,
     _ensure_tensor_values,
+)
+from vllm_omni.worker_v2.omni_model_runner import (
+    OmniGPUModelRunner,
 )
 from vllm_omni.worker_v2.stage_trace import boundary, enabled, timed
 

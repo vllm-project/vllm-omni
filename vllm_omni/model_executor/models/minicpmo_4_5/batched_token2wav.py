@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
+
 from vllm_omni.utils.device_copy import index_to_device
 
 from .code2wav_stats import Code2WavSolveStats

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from vllm.logger import init_logger
+
 from vllm_omni.engine.duplex.contracts import (
     duplex_resource_request_belongs_to_session,
 )

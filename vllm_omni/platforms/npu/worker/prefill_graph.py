@@ -312,9 +312,8 @@ def run_prefill(runner, mode_path, model_inputs, batch, desc, *, thinker=False):
         runner._prefill_graph_warmup_stream = torch.npu.Stream()
         graphs = runner._exact_prefill_graphs = {}
         runner._exact_prefill_passed = set()
-    shadow = mode == shadow_mode
-    if not shadow and size not in runner._exact_prefill_passed:
-        return None
+    # Qualify each exact length in this worker before enabling replay.
+    shadow = mode == shadow_mode or size not in runner._exact_prefill_passed
     try:
         graph = graphs.get(size)
         if graph is None:

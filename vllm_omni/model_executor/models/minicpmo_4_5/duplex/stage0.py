@@ -19,6 +19,7 @@ import numpy as np
 from numpy.typing import NDArray
 from vllm.logger import init_logger
 from vllm.multimodal.image import open_image
+
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
 
 if TYPE_CHECKING:
@@ -1058,6 +1059,7 @@ class MiniCPMO45Stage0DuplexRuntime:
     @staticmethod
     def _batched_audio_chunk(request: _MiniCPMO45AudioEncodeRequest) -> Any | None:  # Any: StreamingAudioChunk
         import torch
+
         from vllm_omni.model_executor.models.minicpmo_4_5.streaming_audio_encoder import (
             StreamingAudioChunk,
             StreamingAudioKVCache,
@@ -1089,6 +1091,7 @@ class MiniCPMO45Stage0DuplexRuntime:
     def _audio_feature_to_device(self, batch_feature: Any) -> Any:  # Any: transformers BatchFeature
         """Move one unit's log-mel features to the encoder without a host sync; integer lengths stay on the host."""
         import torch
+
         from vllm_omni.utils.device_copy import to_device_nonblocking
 
         data = getattr(batch_feature, "data", None)

@@ -326,7 +326,6 @@ def prepare(runner, talker, model_inputs, input_batch, width):
             key
             for capacity in candidate_capacities
             if (key := (rows, wide_rows, capacity, fixed_down_lanes, fused_rope)) not in rejected
-            and (mode == "shadow" or key in ready)
         ),
         None,
     )
@@ -355,11 +354,14 @@ def prepare(runner, talker, model_inputs, input_batch, width):
             return None
     if tuple(compact.metadata) != tuple(metadata):
         return None
+    # Keep the complete first K-step on the reference path while comparing
+    # every frame; only subsequent steps may use the qualified graph.
+    shadow = mode == "shadow" or graph_key not in ready
 
     def frame_forward(frame, wide_forward):
         if frame == 0 and graph_key not in rejected:
             compact.prepare_step(first, width)
-        if mode == "active" and graph_key not in rejected:
+        if not shadow and graph_key not in rejected:
             try:
                 compact.bind(first, embeds, positions, width, frame)
                 logger.info_once(
@@ -377,7 +379,7 @@ def prepare(runner, talker, model_inputs, input_batch, width):
                 rejected.add(graph_key)
                 logger.exception("[c8-talker-narrow] replay failed rows=%d", rows)
         reference = wide_forward()[frame : rows * width : width].clone()
-        if graph_key in rejected or mode != "shadow":
+        if graph_key in rejected or not shadow:
             return reference
         compact.bind(first, embeds, positions, width, frame)
         slots = compact.slots.long()

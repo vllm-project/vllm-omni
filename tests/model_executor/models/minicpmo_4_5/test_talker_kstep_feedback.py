@@ -36,12 +36,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
-from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import ConditionalChatTTSConfig
-from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
-    codec_sample_result,
-    make_device_state,
-)
 
+from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import ConditionalChatTTSConfig
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     _DRAIN_BOUNDARY_MASK,
     _DRAIN_NONE,
@@ -52,6 +48,10 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     MiniCPMO45OmniTTSForConditionalGeneration,
     _codec_int_param,
     _KStepPendingRow,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
+    codec_sample_result,
+    make_device_state,
 )
 from vllm_omni.worker import talker_multiframe
 
@@ -2018,7 +2018,6 @@ def test_kstep_mixed_outputs_preserve_codec_validity(graph_first):
     from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import (
         _OmniConnectorPayloadTransportMixin,
     )
-
     from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import _extract_codec_delta
 
     model = _make_talker(k_step_frames=8, scripted_samples=[42])

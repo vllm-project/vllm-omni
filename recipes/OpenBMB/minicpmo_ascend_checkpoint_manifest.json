@@ -1,0 +1,191 @@
+{
+  "assets": {
+    "original": {
+      "added_tokens.json": {
+        "sha256": "34d823f7a691ddec4816ac5dfe5fc487963e3d75ab3be374590c02fc0a7fa3f5",
+        "bytes": 2706
+      },
+      "config.json": {
+        "sha256": "b0c03cf9f0cfc1178ade50e4ba62727ca7a77aa6a6a71eda6668d8f289e96c1d",
+        "bytes": 6439
+      },
+      "configuration.json": {
+        "sha256": "a6b66993e9da0feaba8d42d06b21ad9cfaf7d8b591f32fd639ae35b7f5d2d859",
+        "bytes": 43
+      },
+      "configuration_minicpmo.py": {
+        "sha256": "b0c56c192d4aa57d3dc358338a4a93413b8b68e7c7a7c5b82a5af35afab1d86a",
+        "bytes": 10135
+      },
+      "generation_config.json": {
+        "sha256": "cf29e6aecb72503bd220cccb6d86bde84a9f57e77c741dedb8670036106e2119",
+        "bytes": 178
+      },
+      "model-00001-of-00004.safetensors": {
+        "sha256": "30c40b9a10386c1bc404568d8829e5aada2e3501d9de6fb46ff80451aff7e077",
+        "bytes": 5273477136
+      },
+      "model-00002-of-00004.safetensors": {
+        "sha256": "fe0faef420aca8f771bec1f9fcfaae01206c56b8e64e4429a1ff500c962fbf96",
+        "bytes": 5301855080
+      },
+      "model-00003-of-00004.safetensors": {
+        "sha256": "5d0b20153f9bfa88ebcd1cb6bbd5b7cac4c217b3cafb137a291a1b380d8b7821",
+        "bytes": 5301855048
+      },
+      "model-00004-of-00004.safetensors": {
+        "sha256": "f61addf4747c94fedcaee059e5d9918ed15543beec494404139a99f2f86c9b31",
+        "bytes": 2866549964
+      },
+      "model.safetensors.index.json": {
+        "sha256": "e578de05a95804bb15237a6fd7c236414e0160cd76751da82c9f7f0d134596e7",
+        "bytes": 117202
+      },
+      "modeling_minicpmo.py": {
+        "sha256": "fa32717e54ee8e5b1a0a41fb073e9f7e5abf6e433e73510caf479ecfce7dc770",
+        "bytes": 215435
+      },
+      "modeling_navit_siglip.py": {
+        "sha256": "1a40a58cb7dfa93f723685f860d1cf3caf3a0ecf52b7904db0c4007aacd1536f",
+        "bytes": 42559
+      },
+      "preprocessor_config.json": {
+        "sha256": "10350f12d5636b24e19265d72c5543b462251f54ca18afaa147f6f2ece9591e0",
+        "bytes": 842
+      },
+      "processing_minicpmo.py": {
+        "sha256": "3a1f017339b92c2fa768d7737db76cc4689d2280b68a71866b06f7dedc8ac1c2",
+        "bytes": 67284
+      },
+      "special_tokens_map.json": {
+        "sha256": "a119f5bb22d8818d33514e0b58a224c111bb8e7aa1702d625a23fbe82e6e86b5",
+        "bytes": 12002
+      },
+      "tokenization_minicpmo_fast.py": {
+        "sha256": "c9c71d0d7ef0c113829e2d810619c9e0a69cffe04c732c4d80599b40a33bc7bf",
+        "bytes": 3249
+      },
+      "tokenizer.json": {
+        "sha256": "6d55eb34389b8c87403763cc1d80447d91c85c7cd39cd5e3c0dc2d49edad989d",
+        "bytes": 11437712
+      },
+      "tokenizer_config.json": {
+        "sha256": "cb1325fdb3b0b9f38b64607399d3e163fbe32bf49c273c229755a0dbce83f813",
+        "bytes": 101726
+      },
+      "utils.py": {
+        "sha256": "0372698343830d4a96524f56a91a8cabf628fd7c57dde8b25db43eed1f6042c1",
+        "bytes": 95702
+      },
+      "vocab.json": {
+        "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+        "bytes": 2776833
+      }
+    },
+    "thinker-w8a8": {
+      "added_tokens.json": {
+        "sha256": "34d823f7a691ddec4816ac5dfe5fc487963e3d75ab3be374590c02fc0a7fa3f5",
+        "bytes": 2706
+      },
+      "config.json": {
+        "sha256": "ec785ab6d13d810380ed2fe52b03ac6696df5bf4e9f9cb2f8e1223812ca3e870",
+        "bytes": 7368
+      },
+      "configuration.json": {
+        "sha256": "a6b66993e9da0feaba8d42d06b21ad9cfaf7d8b591f32fd639ae35b7f5d2d859",
+        "bytes": 43
+      },
+      "configuration_minicpmo.py": {
+        "sha256": "b0c56c192d4aa57d3dc358338a4a93413b8b68e7c7a7c5b82a5af35afab1d86a",
+        "bytes": 10135
+      },
+      "generation_config.json": {
+        "sha256": "cf29e6aecb72503bd220cccb6d86bde84a9f57e77c741dedb8670036106e2119",
+        "bytes": 178
+      },
+      "model-00001-of-00004.safetensors": {
+        "sha256": "e03c0ceb87b958553e9e8d0f552e71603e659b758cc6b5402ec2c6f9a608a110",
+        "bytes": 4209187360
+      },
+      "model-00002-of-00004.safetensors": {
+        "sha256": "ac41af370d6e33fce271ad1969c411297540f7868c6cdd29e5659545abf1720a",
+        "bytes": 2653739864
+      },
+      "model-00003-of-00004.safetensors": {
+        "sha256": "57377ca7b935b75818f541ee415f132aa2c69aa0e7f0eebd7d35d16d02364bee",
+        "bytes": 2653780776
+      },
+      "model-00004-of-00004.safetensors": {
+        "sha256": "ba776d760a8af51b645be87ed8da9ab895987f2d359d57ce7e401317eac40818",
+        "bytes": 2288324028
+      },
+      "model.safetensors.index.json": {
+        "sha256": "a7a4510d22eaf8f5f4a54f777e78853f464db9d592f8fc1f467d4d8639fdec52",
+        "bytes": 117202
+      },
+      "modeling_minicpmo.py": {
+        "sha256": "25359f891d1aa81de16b51a24a97b8c8262b83ce3920c36b92be441fde8e4282",
+        "bytes": 214356
+      },
+      "modeling_navit_siglip.py": {
+        "sha256": "1a40a58cb7dfa93f723685f860d1cf3caf3a0ecf52b7904db0c4007aacd1536f",
+        "bytes": 42559
+      },
+      "preprocessor_config.json": {
+        "sha256": "10350f12d5636b24e19265d72c5543b462251f54ca18afaa147f6f2ece9591e0",
+        "bytes": 842
+      },
+      "processing_minicpmo.py": {
+        "sha256": "3a1f017339b92c2fa768d7737db76cc4689d2280b68a71866b06f7dedc8ac1c2",
+        "bytes": 67284
+      },
+      "special_tokens_map.json": {
+        "sha256": "a119f5bb22d8818d33514e0b58a224c111bb8e7aa1702d625a23fbe82e6e86b5",
+        "bytes": 12002
+      },
+      "tokenization_minicpmo_fast.py": {
+        "sha256": "c9c71d0d7ef0c113829e2d810619c9e0a69cffe04c732c4d80599b40a33bc7bf",
+        "bytes": 3249
+      },
+      "tokenizer.json": {
+        "sha256": "6d55eb34389b8c87403763cc1d80447d91c85c7cd39cd5e3c0dc2d49edad989d",
+        "bytes": 11437712
+      },
+      "tokenizer_config.json": {
+        "sha256": "cb1325fdb3b0b9f38b64607399d3e163fbe32bf49c273c229755a0dbce83f813",
+        "bytes": 101726
+      },
+      "utils.py": {
+        "sha256": "0372698343830d4a96524f56a91a8cabf628fd7c57dde8b25db43eed1f6042c1",
+        "bytes": 95702
+      },
+      "vocab.json": {
+        "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+        "bytes": 2776833
+      }
+    },
+    "draft-thinker": {
+      "config.json": {
+        "sha256": "b47e4a238f41d92f68ec28cb6c25237a60b78f8c502b326b5b862c9affac1159",
+        "bytes": 1693
+      },
+      "model.safetensors": {
+        "sha256": "6189fd34847451de1527a76d68ba5811bbd6228411ecd5c979b14155e8a409ac",
+        "bytes": 2252658146
+      }
+    }
+  },
+  "versions": {
+    "torch": "2.10.0+cpu",
+    "torch-npu": "2.10.0.post7",
+    "transformers": "5.19.0",
+    "triton": "3.6.0",
+    "triton_ascend": "3.6.0.post2",
+    "compressed-tensors": "0.17.0",
+    "safetensors": "0.8.0"
+  },
+  "vllm_commit": "4ba787ec9959e566d3b587a796dff07673324da5",
+  "vllm_ascend_commit": "221fb096cd1cdf9f0b273da9b9624fbf4bb7f200",
+  "draft_source": "Qun1023/MiniCPM-o-4_5-thinker-DSpark-mm",
+  "draft_revision": "c4c310aca2c768343165261cb22c21b90c1f79e0"
+}

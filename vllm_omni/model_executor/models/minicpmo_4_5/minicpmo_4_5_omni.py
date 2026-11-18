@@ -48,9 +48,8 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
-from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
-
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 
 if TYPE_CHECKING:
     from vllm.v1.sample.metadata import SamplingMetadata

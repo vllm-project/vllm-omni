@@ -32,6 +32,7 @@ from vllm.v1.worker.gpu.eplb_utils import step_eplb_after
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import get_drafter_hidden_states
 from vllm.v1.worker.workspace import use_workspace_lane
+
 from vllm_omni.data_entry_keys import OmniPayload, flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVTransferManager,
@@ -46,10 +47,9 @@ from vllm_omni.worker_v2.mooncake_capture import snapshot_mooncake_output
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 from vllm_omni.worker_v2.omni_sampler import sample_with_output
 from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot, pack_output_snapshot
+from vllm_omni.worker_v2.stage_trace import timed
 from vllm_omni.worker_v2.streaming_audio import StreamingAudioSnapshot
 from vllm_omni.worker_v2.warmup import is_warmup_request
-
-from vllm_omni.worker_v2.stage_trace import timed
 
 logger = init_logger(__name__)
 _ASYNC_MM_SNAPSHOT_MAX_BUCKETS_PER_SLOT = 64

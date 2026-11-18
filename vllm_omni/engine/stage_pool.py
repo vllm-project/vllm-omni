@@ -21,6 +21,7 @@ from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.output_processor import RequestState
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats
+
 from vllm_omni.config.watermarking import ALGORITHM_KEY, WatermarkConfig
 from vllm_omni.core.sched.omni_scheduling_coordinator import uses_full_payload_input_coordinator
 from vllm_omni.data_entry_keys import flatten_payload
@@ -32,6 +33,13 @@ from vllm_omni.distributed.omni_coordinator import (
     ReplicaStatus,
 )
 from vllm_omni.distributed.omni_coordinator.load_balancer import Task
+from vllm_omni.engine import (
+    AdditionalInformationEntry,
+    AdditionalInformationPayload,
+    OmniEngineCoreOutput,
+    OmniEngineCoreOutputs,
+    PayloadSenderInfo,
+)
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_client import (
     DiffusionSubmitKwargs,
@@ -59,14 +67,6 @@ from vllm_omni.metrics.utils import (
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.watermarking import WATERMARKER_REGISTRY, Watermarker
 from vllm_omni.watermarking.utils import watermark_outputs
-
-from vllm_omni.engine import (
-    AdditionalInformationEntry,
-    AdditionalInformationPayload,
-    OmniEngineCoreOutput,
-    OmniEngineCoreOutputs,
-    PayloadSenderInfo,
-)
 
 if TYPE_CHECKING:
     from vllm_omni.engine.orchestrator import OrchestratorRequestState

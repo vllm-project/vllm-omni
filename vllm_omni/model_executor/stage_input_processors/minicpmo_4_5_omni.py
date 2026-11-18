@@ -9,6 +9,7 @@ from typing import Any
 import torch
 from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
+
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.engine.duplex.intermediate import (
     build_duplex_intermediate_buffer,
@@ -16,14 +17,13 @@ from vllm_omni.engine.duplex.intermediate import (
     set_tts_handoff,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
-from vllm_omni.model_executor.models.minicpmo_4_5.handoff import pack_handoff_tensor, unpack_handoff_tensor
-from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
-
 from vllm_omni.model_executor.models.minicpmo_4_5 import (
     MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
     MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+from vllm_omni.model_executor.models.minicpmo_4_5.handoff import pack_handoff_tensor, unpack_handoff_tensor
+from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
 from vllm_omni.worker_v2.stage_trace import boundary as _c8_boundary
 from vllm_omni.worker_v2.stage_trace import enabled as _c8_trace_enabled
 

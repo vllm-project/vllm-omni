@@ -23,14 +23,14 @@ from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.worker.gpu import model_runner as gpu_runner
 from vllm_ascend.worker.v2 import model_runner as ascend_runner
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
+
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import (
     MINICPMO_TALKER_FRAMES_MAX,
     talker_kstep_frames,
 )
 from vllm_omni.worker_v2.ngram_adapter import scheduler_ngram_factory, use_scheduler_ngram
-from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
-
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
+from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.v2.input_batch import AscendInputBuffers
@@ -391,7 +391,6 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         row. The causal mask isolates later rows, while replay rewrites the
         booked KV slots. run_model may be eager or a graph replay."""
         from vllm_omni.model_executor.models.output_templates import OmniOutput
-
         from vllm_omni.worker import talker_multiframe as multiframe
 
         cfg = getattr(self, "vllm_config", None)

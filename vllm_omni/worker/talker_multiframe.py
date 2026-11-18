@@ -68,6 +68,7 @@ from typing import Any, Protocol
 
 import torch
 from vllm.logger import init_logger
+
 from vllm_omni.model_executor.models.interfaces import supports_multi_frame_decode
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import (
     CONTINUE_TOKEN_ID,
