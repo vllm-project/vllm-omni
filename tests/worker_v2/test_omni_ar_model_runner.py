@@ -35,6 +35,8 @@ def test_bagel_img2img_kv_transfer_preserves_compressed_rope(monkeypatch):
 
     model = object.__new__(OmniBagelForConditionalGeneration)
     torch.nn.Module.__init__(model)
+    model._pending_img2img_info = [(6, 4, 32, 32)] * 2
+    model._last_img2img_info = (6, 4, 32, 32)
     model._ropes_pending, model._ropes_metadata = [], {}
     model._img2img_token_id = 99
     # Substitute only the attention kernels; keep Bagel's real position rewrite.
@@ -70,13 +72,7 @@ def test_bagel_img2img_kv_transfer_preserves_compressed_rope(monkeypatch):
     )
 
     def forward(_runner, *_args, **_kwargs):
-        model(
-            input_ids,
-            positions,
-            inputs_embeds=torch.zeros(29, 2),
-            seq_token_counts=lengths,
-            img2img_layouts=[(6, 4, 32, 32), None, (6, 4, 32, 32)],
-        )
+        model(input_ids, positions, inputs_embeds=torch.zeros(29, 2))
         runner.execute_model_state = SimpleNamespace(input_batch=SimpleNamespace(req_ids=req_ids))
         return None
 
@@ -154,6 +150,9 @@ def test_bagel_unassigned_metadata_does_not_leak_into_next_forward(monkeypatch, 
 
     model = object.__new__(OmniBagelForConditionalGeneration)
     torch.nn.Module.__init__(model)
+    # Encoder profiling and earlier image requests leave this image geometry.
+    model._pending_img2img_info = []
+    model._last_img2img_info = (6, 4, 32, 32)
     model._ropes_pending = []
     live_metadata = {"ropes": [7], "image_shape": [32, 32]}
     model._ropes_metadata = {"live": live_metadata}
@@ -173,13 +172,7 @@ def test_bagel_unassigned_metadata_does_not_leak_into_next_forward(monkeypatch, 
     def parent_forward(_runner, scheduler_output, *_args, **_kwargs):
         n = scheduler_output.tokens
         # Keep the real Bagel forward, position rewrite and pending producer.
-        model(
-            torch.full((n,), 99),
-            torch.arange(n),
-            inputs_embeds=torch.zeros(n, 2),
-            seq_token_counts=[n],
-            img2img_layouts=[(6, 4, 32, 32)],
-        )
+        model(torch.full((n,), 99), torch.arange(n), inputs_embeds=torch.zeros(n, 2))
         runner.execute_model_state = SimpleNamespace(input_batch=SimpleNamespace(req_ids=scheduler_output.req_ids))
         return None
 
@@ -187,13 +180,7 @@ def test_bagel_unassigned_metadata_does_not_leak_into_next_forward(monkeypatch, 
     excluded = SimpleNamespace(tokens=12, req_ids=["excluded"])
     if step == "capture":
         # Native graph capture invokes the model directly, bypassing the runner.
-        model(
-            torch.full((12,), 99),
-            torch.arange(12),
-            inputs_embeds=torch.zeros(12, 2),
-            seq_token_counts=[12],
-            img2img_layouts=[(6, 4, 32, 32)],
-        )
+        model(torch.full((12,), 99), torch.arange(12), inputs_embeds=torch.zeros(12, 2))
     elif step == "failed":
         with pytest.raises(RuntimeError, match="attention failed after position metadata"):
             runner.execute_model(excluded)
@@ -211,6 +198,7 @@ def test_bagel_unassigned_metadata_does_not_leak_into_next_forward(monkeypatch, 
     }
     assert model._ropes_pending == []
     assert model._ropes_metadata["live"] is live_metadata
+    assert model._last_img2img_info == (6, 4, 32, 32)
 
 
 class _FakeStream:
