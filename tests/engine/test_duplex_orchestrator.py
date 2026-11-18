@@ -2082,7 +2082,7 @@ async def test_capacity_validation_reuses_engine_expansion_and_recovers_after_re
         expanded["prompt_token_ids"] = [1] * 15
     await submit("fits")
     assert len(clients[0].add_request_calls) == 1
-    assert clients[0].add_request_calls[0][0].prompt_token_ids == [1] * 15
+    assert clients[0].add_request_calls[0][0].prompt_token_ids.tolist() == [1] * 15
     assert renderer.render_cmpl.call_count == 1 + int(rejected)
     assert processor.process_inputs.call_count == 1
 

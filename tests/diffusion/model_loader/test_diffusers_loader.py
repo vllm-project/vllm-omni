@@ -20,7 +20,7 @@ from vllm.config.load import LoadConfig
 
 import vllm_omni.diffusion.model_loader.diffusers_loader as loader_module
 from vllm_omni.diffusion.config import get_current_diffusion_config, get_current_diffusion_config_or_none
-from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.data import AttentionConfig, DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.lora.manager import LoRABackend
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
@@ -123,8 +123,28 @@ class _HWRPipeline(nn.Module):
         return loaded
 
 
+def _loader_config(**overrides) -> SimpleNamespace:
+    """Loader fields read directly; model and multithreading keep the doubles' previous load path."""
+    fields = dict(
+        model="",
+        enable_multithread_weight_load=False,
+        num_weight_load_threads=4,
+        enable_broadcast_weight_load=False,
+        hsdp_weight_load_strategy="full",
+        host_weight_runtime_mode="disabled",
+        lora_backend=LoRABackend.PEFT,
+        lora_path=None,
+        lora_scale=1.0,
+        lora_application="runtime",
+        diffusion_attention_config=AttentionConfig(),
+        diffusion_attention_schedule=None,
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
 def _hwr_config(model: str | Path, root: Path, *, mode: str = "preferred") -> SimpleNamespace:
-    return SimpleNamespace(
+    return _loader_config(
         model=str(model),
         dtype=torch.bfloat16,
         host_weight_runtime_mode=mode,
@@ -134,6 +154,7 @@ def _hwr_config(model: str | Path, root: Path, *, mode: str = "preferred") -> Si
         lora_path=None,
         quantization_config=None,
         diffusion_attention_config=None,
+        diffusion_attention_schedule=None,
         parallel_config=SimpleNamespace(
             use_hsdp=False,
             data_parallel_size=1,
@@ -151,7 +172,7 @@ def _hwr_config(model: str | Path, root: Path, *, mode: str = "preferred") -> Si
 
 
 def _make_loader_with_weights(weight_names: list[str]) -> DiffusersPipelineLoader:
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(use_hsdp=False),
         quantization_config=None,
@@ -265,7 +286,7 @@ def test_hwr_cold_publication_and_warm_restore_skip_ordinary_dit_loading(
 
 
 def test_maybe_fuse_distilled_lora_skips_when_lora_path_unset():
-    cfg = SimpleNamespace(
+    cfg = _loader_config(
         lora_backend="distill",
         lora_path=None,
         lora_scale=1.0,
@@ -290,7 +311,7 @@ def test_maybe_fuse_distilled_lora_skips_when_lora_path_unset():
 )
 def test_maybe_fuse_distilled_lora_fuses_when_not_warm_snapshot(lora_scale, should_warn, mocker):
     warning = mocker.patch.object(loader_module.logger, "warning")
-    cfg = SimpleNamespace(
+    cfg = _loader_config(
         lora_backend=LoRABackend.DISTILL,
         lora_path="/path/to/lora.safetensors",
         lora_scale=lora_scale,
@@ -650,7 +671,7 @@ def test_safetensors_name_filter_yields_only_selected_tensors(tmp_path, monkeypa
         },
         checkpoint,
     )
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         enable_multithread_weight_load=True,
         parallel_config=SimpleNamespace(use_hsdp=False),
         quantization_config=None,
@@ -689,7 +710,7 @@ def test_safetensors_directory_source_selects_model_file_from_package_root(
     selected_file.write_bytes(b"")
     sibling_file.write_bytes(b"")
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(use_hsdp=False),
         quantization_config=None,
@@ -724,7 +745,7 @@ def test_remote_source_without_index_skips_empty_index_download(tmp_path, monkey
 
     checkpoint = tmp_path / "model.safetensors"
     checkpoint.write_bytes(b"")
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(use_hsdp=False),
         quantization_config=None,
@@ -758,7 +779,7 @@ def test_safetensors_directory_source_uses_its_single_checkpoint(tmp_path, mocke
     checkpoint = component_dir / "component.safetensors"
     checkpoint.write_bytes(b"")
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(use_hsdp=False),
         quantization_config=None,
@@ -950,7 +971,7 @@ class _ConfigAwareModel(nn.Module):
 def test_initialize_model_sets_current_diffusion_config_during_model_construction(monkeypatch):
     import vllm_omni.diffusion.registry as registry_mod
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         model_class_name="DummyPipeline",
         parallel_config=DiffusionParallelConfig(vae_patch_parallel_size=1, sequence_parallel_size=1),
         vae_use_slicing=False,
@@ -984,10 +1005,13 @@ def test_load_model_custom_pipeline_sets_current_diffusion_config(monkeypatch):
         def __exit__(self, exc_type, exc, tb):
             return False
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
-        parallel_config=SimpleNamespace(use_hsdp=False),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1, data_parallel_size=1, sequence_parallel_size=1, use_hsdp=False
+        ),
         quantization_config=None,
+        diffusion_attention_schedule=None,
         weight_transfer_config=None,
     )
 
@@ -1012,10 +1036,13 @@ def test_load_model_custom_pipeline_sets_current_diffusion_config(monkeypatch):
 def test_dlo_transfers_loader_plan_and_skips_ordinary_weight_loading(monkeypatch):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
-        parallel_config=SimpleNamespace(use_hsdp=False, tensor_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1, sequence_parallel_size=1, use_hsdp=False, tensor_parallel_size=1
+        ),
         quantization_config=None,
+        diffusion_attention_schedule=None,
         enable_distributed_layerwise_offload=True,
         dlo_use_allgather=False,
         model="unused",
@@ -1052,10 +1079,13 @@ def test_compact_rank_local_layer_offload_skips_dlo_mmap_planning(monkeypatch):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
     from vllm_omni.diffusion.offloader.config import materialize_legacy_offload_flags
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
-        parallel_config=SimpleNamespace(use_hsdp=False, tensor_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1, sequence_parallel_size=1, use_hsdp=False, tensor_parallel_size=1
+        ),
         quantization_config=None,
+        diffusion_attention_schedule=None,
         diffusion_offload_config={"mode": "layer", "components": ["dit"]},
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
@@ -1094,7 +1124,7 @@ def _compact_layer_offload_config(
     components: list[str],
     layer_options: dict[str, dict[str, str]],
 ) -> SimpleNamespace:
-    return SimpleNamespace(
+    return _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(
             use_hsdp=False,
@@ -1103,6 +1133,7 @@ def _compact_layer_offload_config(
             sequence_parallel_size=1,
         ),
         quantization_config=None,
+        diffusion_attention_schedule=None,
         diffusion_offload_config={
             "mode": "layer",
             "components": components,
@@ -1198,10 +1229,13 @@ def test_rank_local_encoder_quantization_does_not_mark_dit_mmap_plan_online(monk
 def test_dlo_plan_loads_component_sources_outside_planned_dit(monkeypatch):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
-        parallel_config=SimpleNamespace(use_hsdp=False, tensor_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1, sequence_parallel_size=1, use_hsdp=False, tensor_parallel_size=1
+        ),
         quantization_config=None,
+        diffusion_attention_schedule=None,
         enable_distributed_layerwise_offload=True,
         dlo_use_allgather=False,
         model="unused",
@@ -1259,10 +1293,13 @@ def test_dlo_plan_loads_component_sources_outside_planned_dit(monkeypatch):
 def test_dlo_plan_fallback_runs_ordinary_loader(monkeypatch):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
-        parallel_config=SimpleNamespace(use_hsdp=False, tensor_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1, sequence_parallel_size=1, use_hsdp=False, tensor_parallel_size=1
+        ),
         quantization_config=None,
+        diffusion_attention_schedule=None,
         enable_distributed_layerwise_offload=True,
         dlo_use_allgather=False,
         model="unused",
@@ -1288,10 +1325,13 @@ def test_dlo_plan_fallback_runs_ordinary_loader(monkeypatch):
 
 
 def test_dlo_mmap_plan_with_distilled_lora_falls_back_to_ordinary_loader(monkeypatch):
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
-        parallel_config=SimpleNamespace(use_hsdp=False, tensor_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1, sequence_parallel_size=1, use_hsdp=False, tensor_parallel_size=1
+        ),
         quantization_config=None,
+        diffusion_attention_schedule=None,
         enable_distributed_layerwise_offload=True,
         dlo_use_allgather=False,
         lora_backend=LoRABackend.DISTILL,
@@ -1598,7 +1638,7 @@ def test_hsdp_enters_host_fallback_context_only_when_offloading_after_quant(mock
     from vllm_omni.diffusion.offloader.module_collector import PipelineModules
     from vllm_omni.quantization import int8_config
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(
             use_hsdp=True,
@@ -1697,7 +1737,7 @@ def test_hsdp_processes_quantized_weights_before_sharding(mocker):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
     from vllm_omni.diffusion.offloader.module_collector import PipelineModules
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(
             use_hsdp=True,
@@ -1750,7 +1790,7 @@ def test_hsdp_fuses_distilled_lora_before_sharding(mocker):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
     from vllm_omni.diffusion.offloader.module_collector import PipelineModules
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(
             use_hsdp=True,
@@ -1803,7 +1843,7 @@ def test_hsdp_fuses_multi_file_distilled_lora_wan22(mocker):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
     from vllm_omni.diffusion.offloader.module_collector import PipelineModules
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(
             use_hsdp=True,
@@ -1860,7 +1900,7 @@ def test_hsdp_fuses_multi_file_distilled_lora_wan22(mocker):
 
 
 def test_load_model_fuses_distilled_lora_non_hsdp(mocker):
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(
             use_hsdp=False,
@@ -1870,6 +1910,7 @@ def test_load_model_fuses_distilled_lora_non_hsdp(mocker):
         ),
         enable_cpu_offload=False,
         quantization_config=None,
+        diffusion_attention_schedule=None,
         lora_backend="distill",
         lora_path="/path/to/lora.safetensors",
         lora_scale=1.0,
@@ -1935,7 +1976,7 @@ def test_hsdp_broadcast_weight_load_rank0(mocker):
     mocker.patch("torch.distributed.get_world_size", return_value=4)
     mocker.patch("torch.distributed.get_rank", return_value=0)
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(
             use_hsdp=True,
@@ -1997,7 +2038,7 @@ def test_hsdp_broadcast_weight_load_rank_nonzero(mocker):
     mocker.patch("torch.distributed.get_world_size", return_value=4)
     mocker.patch("torch.distributed.get_rank", return_value=1)
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(
             use_hsdp=True,
@@ -2069,7 +2110,7 @@ def test_broadcast_model_weights_invokes_dist_broadcast(mocker):
     model.register_buffer("buf", torch.tensor([1.0, 2.0]))
     model.register_buffer("int_buf", torch.tensor([1, 2, 3], dtype=torch.long))
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(use_hsdp=True),
         enable_broadcast_weight_load=True,
@@ -2106,7 +2147,7 @@ def test_broadcast_model_weights_receiver_copies_data(mocker):
     model.register_buffer("buf", torch.zeros(2))
     model.register_buffer("int_buf", torch.zeros(3, dtype=torch.long))
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(use_hsdp=True),
         enable_broadcast_weight_load=True,
@@ -2140,7 +2181,7 @@ def test_broadcast_model_weights_mixed_cpu_and_accelerator_devices(mocker):
     model.vae = nn.Linear(4, 4).to(dev)
     model.text_encoder = nn.Linear(4, 4).to(dev)
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(use_hsdp=True),
         enable_broadcast_weight_load=True,
@@ -2169,7 +2210,7 @@ def test_broadcast_model_weights_mixed_devices_receiver(mocker):
     model.transformer = nn.Linear(2, 2)  # CPU
     model.vae = nn.Linear(2, 2).to(dev)  # Accelerator
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(use_hsdp=True),
         enable_broadcast_weight_load=True,
@@ -2197,7 +2238,7 @@ def test_hsdp_broadcast_weight_load_falls_back_when_online_quantization_enabled(
     mock_quant_config = SimpleNamespace(
         is_checkpoint_quantized=False,
     )
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(
             use_hsdp=True,
@@ -2270,7 +2311,7 @@ def _mp_worker_online_quant(rank: int, world_size: int, rendezvous: str, temp_di
                 return {"transformer.weight", "transformer.bias"}
 
         mock_quant_config = SimpleNamespace(is_checkpoint_quantized=False)
-        od_config = SimpleNamespace(
+        od_config = _loader_config(
             dtype=torch.float32,
             parallel_config=SimpleNamespace(
                 use_hsdp=True,
@@ -2344,7 +2385,7 @@ def test_pre_sharded_hsdp_strategy_dispatches_without_using_full_loader(mocker, 
     from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig
     from vllm_omni.diffusion.offloader.module_collector import PipelineModules
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         hsdp_weight_load_strategy="pre_sharded",
         lora_path=None,

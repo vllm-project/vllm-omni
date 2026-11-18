@@ -12,6 +12,7 @@ from torch.distributed import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import (
     MixedPrecisionPolicy,
     fully_shard,
+    register_fsdp_forward_method,
 )
 from vllm.logger import init_logger
 
@@ -287,6 +288,8 @@ def shard_hsdp_module(module: nn.Module, context: HSDPShardContext) -> None:
         if module_ignored_params:
             module_kwargs["ignored_params"] = module_ignored_params
     fully_shard(module, **module_kwargs)
+    for method_name in getattr(module, "_hsdp_forward_methods", ()):
+        register_fsdp_forward_method(module, method_name)
     for param in module.parameters():
         param.requires_grad = False
 

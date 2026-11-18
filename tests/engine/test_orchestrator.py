@@ -716,7 +716,9 @@ async def test_run_two_stage_llm(orchestrator_factory) -> None:
         await _wait_for(lambda: len(stage1.add_request_calls) == 1)
         stage1_request = stage1.add_request_calls[0][0]
         assert stage1_request.request_id == "req-llm"
-        assert stage1_request.prompt_token_ids == [7, 8, 9]
+        # v0.34 packs prompt token ids as an int32 ndarray (see
+        # build_engine_core_request_from_tokens); compare in list space.
+        assert stage1_request.prompt_token_ids.tolist() == [7, 8, 9]
 
         stage1.push_engine_core_outputs(_engine_core_outputs("stage1-raw", 2.0))
 
@@ -833,7 +835,7 @@ async def test_run_chain_yields_at_each_stage_until_final_output(orchestrator_fa
             await _wait_for(lambda: len(stage.add_request_calls) == 1)
             submitted = stage.add_request_calls[0][0]
             assert submitted.request_id == request_id
-            assert submitted.prompt_token_ids == list(input_token_ids)
+            assert submitted.prompt_token_ids.tolist() == list(input_token_ids)
             assert submitted.sampling_params.max_tokens == sampling_params_list[stage_id].max_tokens
             assert returns_stage_payload(submitted.additional_information) is returns_payload
 
@@ -1548,7 +1550,8 @@ async def test_run_async_chunk(orchestrator_factory) -> None:
         await _wait_for(lambda: len(stage1.add_request_calls) == 1)
         prewarmed_request = stage1.add_request_calls[0][0]
         assert prewarmed_request.request_id == "req-async"
-        assert prewarmed_request.prompt_token_ids
+        # ndarray prompt token ids are falsy when the single placeholder is 0.
+        assert len(prewarmed_request.prompt_token_ids) > 0
         assert all(token_id == 0 for token_id in prewarmed_request.prompt_token_ids)
 
         stage1.push_engine_core_outputs(_engine_core_outputs("stage1-final", 3.0))
