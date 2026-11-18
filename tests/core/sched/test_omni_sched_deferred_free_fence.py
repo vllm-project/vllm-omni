@@ -49,10 +49,12 @@ def _make_update_sched(scheduler_cls) -> MagicMock:
     """MagicMock scheduler driving the real ``update_from_output`` with an
     empty batch; only the fence state carries real values."""
     sched = MagicMock()
+    sched.grammar_compile_error_reqs = {}
     sched.requests = {}
     sched.perf_metrics = None
     sched.chunk_transfer_adapter = None
     sched.defer_block_free = True
+    sched.defer_async_loads = False
     sched.processed_step_seq = 0
     return sched
 
@@ -81,6 +83,31 @@ def test_update_from_output_advances_fence_and_drains(scheduler_cls) -> None:
 
     assert sched.processed_step_seq == 1
     sched._drain_deferred_frees.assert_called_once_with()
+
+
+@pytest.mark.parametrize("scheduler_cls", [OmniARScheduler, OmniGenerationScheduler])
+def test_completed_step_starts_fenced_async_kv_load(scheduler_cls) -> None:
+    """A queued HiSparse load must become runnable when its GPU fence completes."""
+    sched = _make_update_sched(scheduler_cls)
+    sched.defer_async_loads = True
+    pending_loads = {"remote-request": 1}
+    started_loads = []
+
+    def drain_loads():
+        for request_id, fence in list(pending_loads.items()):
+            if fence <= sched.processed_step_seq:
+                started_loads.append(request_id)
+                del pending_loads[request_id]
+
+    sched._drain_deferred_loads.side_effect = drain_loads
+    empty_step, model_output = _empty_frame(total_num_scheduled_tokens=0)
+    scheduler_cls.update_from_output(sched, empty_step, model_output)
+    assert not started_loads
+
+    completed_step, model_output = _empty_frame(total_num_scheduled_tokens=3)
+    scheduler_cls.update_from_output(sched, completed_step, model_output)
+    assert started_loads == ["remote-request"]
+    assert not pending_loads
 
 
 @pytest.mark.parametrize("scheduler_cls", [OmniARScheduler, OmniGenerationScheduler])
@@ -123,13 +150,21 @@ def _make_fast_path_sched(*, defer_block_free: bool) -> tuple[MagicMock, Request
 
     sched = MagicMock()
     sched.max_num_scheduled_tokens = 8
+    sched.max_num_active_reqs = 8
     sched.max_num_running_reqs = 8
     sched._native_data_plane = False
     sched._retains_state_across_chunks = False
+    # Unset MagicMock attributes are truthy. Keep optional scheduling modes
+    # disabled so this fixture actually schedules its one-shot request.
+    sched._generation_defer_batch = False
+    sched._generation_first_chunk_only = False
+    sched._generation_max_regular_batch = 0
     sched._pause_state = PauseState.UNPAUSED
     sched.requests = {request.request_id: request}
     sched.running = [request]
     sched.waiting = []  # falsy: the waiting loop never runs
+    sched.kv_holding_waiting = []
+    sched.deferred_waiting = set()
     sched.policy = SchedulingPolicy.FCFS
     sched.chunk_transfer_adapter = None
     sched.scheduler_config = MagicMock(enable_chunked_prefill=True)

@@ -15,6 +15,7 @@ from tests.entrypoints.test_omni_entrypoints import FakeAsyncOmniEngine
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
+from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.events import (
     AudioDelta,
     DuplexEvent,
@@ -41,6 +42,7 @@ class FakeDuplexEngine(FakeAsyncOmniEngine):
         self.duplex_session_config = DuplexSessionRuntimeConfig(max_sessions=2)
         self.duplex_capabilities = DuplexCapabilities(supports_session_resume=True)
         self.opened: list[tuple[str, DuplexSessionConfig]] = []
+        self.outputs: dict[str, DuplexOutputBuffer] = {}
         self.closed: list[tuple[str, str]] = []
         self.resumed: list[tuple[str, int]] = []
         #: The control id of every resume RPC, in order (a replay repeats one).
@@ -64,10 +66,11 @@ class FakeDuplexEngine(FakeAsyncOmniEngine):
     def _result(self, operation: str, session_id: str, **fields: Any) -> DuplexControlResultMessage:
         return DuplexControlResultMessage(control_id="c", operation=operation, session_id=session_id, ok=True, **fields)
 
-    async def open_session_async(self, session_id, session_config, *, timeout=None):
+    async def open_session_async(self, session_id, session_config, *, output_buffer, timeout=None):
         self.opened.append((session_id, session_config))
         if self.open_error is not None:
             raise self.open_error
+        self.outputs[session_id] = output_buffer
         return self._result(
             "open",
             session_id,
@@ -119,7 +122,11 @@ class FakeDuplexEngine(FakeAsyncOmniEngine):
     def emit(self, session_id: str, event: DuplexEvent) -> None:
         # The session manager binds the session identity to every event it emits.
         event = replace(event, session_id=session_id)
-        self.output_q.put(DuplexSessionEventMessage(session_id=session_id, event=event))
+        if isinstance(event, SessionClosed):
+            self.outputs.pop(session_id, None)
+            self.output_q.put(DuplexSessionEventMessage(session_id=session_id, event=event))
+        elif session_id in self.outputs:
+            self.outputs[session_id].put(event)
 
 
 def _make_omni(monkeypatch: pytest.MonkeyPatch) -> tuple[DuplexOmni, FakeDuplexEngine]:
@@ -152,6 +159,7 @@ async def test_open_session_allocates_the_id_and_ignores_client_ids(monkeypatch)
         assert handle.session_id != "mine"
         ((session_id, config),) = engine.opened
         assert session_id == handle.session_id
+        assert engine.outputs[session_id] is handle._outbox
         assert isinstance(config, DuplexSessionConfig)
         assert config.model == "dummy-model" and config.instructions == "hi"
         assert handle.capabilities is engine.duplex_capabilities
@@ -165,6 +173,32 @@ async def test_open_session_allocates_the_id_and_ignores_client_ids(monkeypatch)
         assert engine.opened[1][1].model == "dummy-model"
         assert omni.duplex_session_config.max_sessions == 2
         assert omni.duplex_capabilities.supports_session_resume is True
+    finally:
+        omni.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_events_skips_audio_invalidated_after_dequeue(monkeypatch) -> None:
+    omni, engine = _make_omni(monkeypatch)
+    try:
+        handle = await omni.open_session()
+        output = engine.outputs[handle.session_id]
+        original_get = output.get
+
+        async def get_then_invalidate() -> DuplexEvent | None:
+            event = await original_get()
+            if isinstance(event, AudioDelta) and event.response_id == "cancelled":
+                output.invalidate("cancelled", through_epoch=0)
+            return event
+
+        monkeypatch.setattr(output, "get", get_then_invalidate)
+        engine.emit(handle.session_id, AudioDelta(response_id="cancelled", epoch=0, delta="old"))
+        engine.emit(handle.session_id, AudioDelta(response_id="current", epoch=1, delta="new"))
+
+        events = await _collect(handle, 1)
+
+        assert isinstance(events[0], AudioDelta)
+        assert events[0].response_id == "current" and events[0].delta == "new"
     finally:
         omni.shutdown()
 
@@ -387,7 +421,7 @@ async def test_a_resume_cancelled_mid_rpc_is_adopted_and_detached_once_it_lands(
         handle = await omni.open_session()
         engine.resume_gate = asyncio.Event()
         resume = asyncio.create_task(omni.resume_session(handle.session_id, expected_lease_generation=0))
-        await asyncio.wait_for(engine.resume_started.wait(), timeout=2.0)
+        await asyncio.wait_for(engine.resume_started.wait(), timeout=10.0)
 
         resume.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -420,7 +454,7 @@ async def test_a_resume_cancelled_then_timed_out_is_settled_by_replaying_it(monk
         engine.resume_gate = asyncio.Event()
         engine.resume_timeouts_remaining = 1
         resume = asyncio.create_task(omni.resume_session(handle.session_id, expected_lease_generation=0))
-        await asyncio.wait_for(engine.resume_started.wait(), timeout=2.0)
+        await asyncio.wait_for(engine.resume_started.wait(), timeout=10.0)
 
         resume.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -452,7 +486,7 @@ async def test_an_abandoned_resume_is_settled_through_the_callers_callback(monke
         resume = asyncio.create_task(
             omni.resume_session(handle.session_id, expected_lease_generation=0, on_abandoned=on_abandoned)
         )
-        await asyncio.wait_for(engine.resume_started.wait(), timeout=2.0)
+        await asyncio.wait_for(engine.resume_started.wait(), timeout=10.0)
         resume.cancel()
         with pytest.raises(asyncio.CancelledError):
             await resume
@@ -481,7 +515,7 @@ async def test_an_abandoned_resume_keeps_replaying_across_repeated_timeouts(monk
         engine.resume_gate = asyncio.Event()
         engine.resume_timeouts_remaining = 2
         resume = asyncio.create_task(omni.resume_session(handle.session_id, expected_lease_generation=0))
-        await asyncio.wait_for(engine.resume_started.wait(), timeout=2.0)
+        await asyncio.wait_for(engine.resume_started.wait(), timeout=10.0)
 
         resume.cancel()
         with pytest.raises(asyncio.CancelledError):

@@ -305,6 +305,31 @@ def _validate_condition_tensors(
             )
 
 
+def _validate_guide_tensors(
+    guide_blocks: Sequence[Mapping[str, Any]],
+    visual: torch.Tensor | None,
+    audio: torch.Tensor | None,
+) -> None:
+    visual_rows = sum(
+        int(block.get("latent_t", 1)) * (int(block["latent_h"]) // 2) * (int(block["latent_w"]) // 2)
+        for block in guide_blocks
+        if block["kind"] != "audio"
+    )
+    audio_rows = _AUDIO_CONDITION_CHANNELS * sum(int(block.get("ref_audio_t", 0)) for block in guide_blocks)
+    for name, value, rows, width in (
+        ("visual", visual, visual_rows, _VIDEO_CONDITION_WIDTH),
+        ("audio", audio, audio_rows, _AUDIO_CONDITION_WIDTH),
+    ):
+        if value is None:
+            if rows:
+                raise ValueError(f"MiniMax H3 timeline guide {name} rows are missing")
+        elif value.dtype != torch.float32 or tuple(value.shape) != (rows, width):
+            raise ValueError(
+                f"MiniMax H3 timeline guide {name} rows must be FP32 with shape [{rows}, {width}], "
+                f"got {value.dtype} {tuple(value.shape)}"
+            )
+
+
 def _ref_block_rows(ref_blocks: Sequence[Mapping[str, Any]]) -> list[list[int]]:
     rows: list[list[int]] = []
     for block in ref_blocks:
@@ -346,6 +371,22 @@ def _decode_ref_blocks(value: torch.Tensor) -> tuple[dict[str, Any], ...]:
 
 
 @dataclass(frozen=True)
+class MiniMaxH3TimelineGuide:
+    """One prepared timeline guide on the output canvas.
+
+    ``start`` is the resolved pixel frame. ``frames`` is uint8 ``[T, H, W, 3]``
+    with ``T`` 1 for a still and ``17k + 5`` for a clip. ``audio_limit`` is the
+    number of audio latent positions the encoded audio may occupy.
+    """
+
+    start: int
+    is_clip: bool = False
+    frames: torch.Tensor | None = None
+    audio: tuple[torch.Tensor, int] | None = None
+    audio_limit: int = 0
+
+
+@dataclass(frozen=True)
 class MiniMaxH3EncoderMediaInput:
     task: str
     height: int
@@ -363,6 +404,7 @@ class MiniMaxH3EncoderMediaInput:
     video_edit_mask: torch.Tensor | None = None
     audio_edit: tuple[torch.Tensor, int] | None = None
     audio_edit_mask: torch.Tensor | None = None
+    timeline_guides: tuple[MiniMaxH3TimelineGuide, ...] = ()
 
     @classmethod
     def from_mm_tensors(
@@ -466,6 +508,36 @@ class MiniMaxH3EncoderMediaInput:
                 raise ValueError("MiniMax H3 encoder audio edit requires a waveform and positive sample rate")
             _validate_edit_mask_structure(audio_edit_mask, name="audio", shape=(2, audio_t))
             audio_edit = (waveform, audio_edit_sample_rate)
+        timeline_guides: list[MiniMaxH3TimelineGuide] = []
+        for start, is_clip, frame_count, audio_sample_rate, audio_limit in metadata.get("timeline_guides", ()):
+            frames = None
+            audio = None
+            if frame_count:
+                if cursor >= len(tensors):
+                    raise ValueError("MiniMax H3 encoder timeline guide input is truncated")
+                frames = tensors[cursor]
+                cursor += 1
+                if tuple(frames.shape) != (int(frame_count), height, width, 3):
+                    raise ValueError("MiniMax H3 timeline guide frames must match the output canvas")
+            if audio_sample_rate:
+                if cursor >= len(tensors):
+                    raise ValueError("MiniMax H3 encoder timeline guide input is truncated")
+                waveform = tensors[cursor]
+                cursor += 1
+                if waveform.ndim not in (1, 2) or int(audio_sample_rate) <= 0:
+                    raise ValueError("MiniMax H3 timeline guide audio requires a waveform and positive sample rate")
+                audio = (waveform, int(audio_sample_rate))
+            if frames is None and audio is None:
+                raise ValueError("MiniMax H3 timeline guide requires frames or audio")
+            timeline_guides.append(
+                MiniMaxH3TimelineGuide(
+                    start=int(start),
+                    is_clip=bool(is_clip),
+                    frames=frames,
+                    audio=audio,
+                    audio_limit=int(audio_limit),
+                )
+            )
         if cursor != len(tensors):
             raise ValueError(f"MiniMax H3 encoder media input has {len(tensors) - cursor} trailing tensors")
         return cls(
@@ -485,6 +557,7 @@ class MiniMaxH3EncoderMediaInput:
             video_edit_mask=video_edit_mask,
             audio_edit=audio_edit,
             audio_edit_mask=audio_edit_mask,
+            timeline_guides=tuple(timeline_guides),
         )
 
     def to_mm_tensors(self) -> list[torch.Tensor]:
@@ -539,6 +612,15 @@ class MiniMaxH3EncoderMediaInput:
             if self.audio_edit_mask is None:
                 raise ValueError("MiniMax H3 encoder audio edit requires a mask")
             tensors.extend((self.audio_edit[0], self.audio_edit_mask))
+        for guide in self.timeline_guides:
+            if guide.frames is None and guide.audio is None:
+                raise ValueError("MiniMax H3 timeline guide requires frames or audio")
+            if guide.frames is not None:
+                if guide.frames.ndim != 4 or tuple(guide.frames.shape[1:]) != (self.height, self.width, 3):
+                    raise ValueError("MiniMax H3 timeline guide frames must match the output canvas")
+                tensors.append(guide.frames)
+            if guide.audio is not None:
+                tensors.append(guide.audio[0])
         return tensors
 
     def to_metadata(self) -> dict[str, Any]:
@@ -562,6 +644,17 @@ class MiniMaxH3EncoderMediaInput:
             metadata["has_video_edit"] = True
         if self.audio_edit is not None:
             metadata["audio_edit_sample_rate"] = int(self.audio_edit[1])
+        if self.timeline_guides:
+            metadata["timeline_guides"] = [
+                [
+                    int(guide.start),
+                    bool(guide.is_clip),
+                    int(guide.frames.shape[0]) if guide.frames is not None else 0,
+                    int(guide.audio[1]) if guide.audio is not None else 0,
+                    int(guide.audio_limit),
+                ]
+                for guide in self.timeline_guides
+            ]
         return metadata
 
 
@@ -584,6 +677,12 @@ class MiniMaxH3EncoderMediaConditioning:
     audio_edit_clean_rows: torch.Tensor | None = None
     audio_edit_mask: torch.Tensor | None = None
     audio_edit_source_t: int = 0
+    # Timeline guides in insertion order. Each block carries its resolved
+    # pixel ``frame_index``; the guide rows are kept apart from the reference
+    # rows and are packed before them.
+    guide_blocks: tuple[dict[str, Any], ...] = ()
+    guide_visual_condition: torch.Tensor | None = None
+    guide_audio_condition: torch.Tensor | None = None
 
     def to_omni_components(
         self,
@@ -591,6 +690,8 @@ class MiniMaxH3EncoderMediaConditioning:
         task_code = _TASK_TO_CODE.get(self.task)
         if task_code is None:
             raise ValueError(f"unsupported MiniMax H3 task {self.task!r}")
+        if self.guide_blocks:
+            raise ValueError("MiniMax H3 timeline guides are not supported across a separate encoder stage")
         if min(self.height, self.width, self.num_frames, self.latent_t, self.audio_t) <= 0:
             raise ValueError("MiniMax H3 encoder media dimensions must be positive")
         _validate_condition_tensors(
@@ -686,6 +787,12 @@ class MiniMaxH3EncoderConditioning:
     audio_edit_clean_rows: torch.Tensor | None = None
     audio_edit_mask: torch.Tensor | None = None
     audio_edit_source_t: int = 0
+    # Timeline guides in insertion order. Each block carries its resolved
+    # pixel ``frame_index``; the guide rows are kept apart from the reference
+    # rows and are packed before them.
+    guide_blocks: tuple[dict[str, Any], ...] = ()
+    guide_visual_condition: torch.Tensor | None = None
+    guide_audio_condition: torch.Tensor | None = None
 
     @classmethod
     def from_components(
@@ -701,6 +808,7 @@ class MiniMaxH3EncoderConditioning:
             media.audio_condition,
             media.audio_condition_lengths,
         )
+        _validate_guide_tensors(media.guide_blocks, media.guide_visual_condition, media.guide_audio_condition)
         return cls(
             hidden_states=text.hidden_states,
             token_tags=text.token_tags,
@@ -877,6 +985,9 @@ class MiniMaxH3EncoderConditioning:
             audio_edit_clean_rows=self.audio_edit_clean_rows,
             audio_edit_mask=self.audio_edit_mask,
             audio_edit_source_t=self.audio_edit_source_t,
+            guide_blocks=self.guide_blocks,
+            guide_visual_condition=self.guide_visual_condition,
+            guide_audio_condition=self.guide_audio_condition,
         ).to_omni_components()
         return {
             "hidden_states": {"output": text.hidden_states},
@@ -901,4 +1012,5 @@ __all__ = [
     "MiniMaxH3EncoderMediaConditioning",
     "MiniMaxH3EncoderMediaInput",
     "MiniMaxH3TextConditioning",
+    "MiniMaxH3TimelineGuide",
 ]

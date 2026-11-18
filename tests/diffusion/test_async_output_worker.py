@@ -5,6 +5,7 @@
 import queue
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -36,6 +37,7 @@ def _make_worker_proc(step_execution=False):
     proc = object.__new__(WorkerProc)
     proc.od_config = MagicMock()
     proc.od_config.step_execution = step_execution
+    proc.od_config.video_output_transport = SimpleNamespace(enable_registered_shm=False)
     proc.gpu_id = 0
     proc.result_mq = MagicMock()
     proc._running = True
@@ -43,6 +45,7 @@ def _make_worker_proc(step_execution=False):
     proc._async_output_thread = None
     proc._async_output_done = threading.Condition()
     proc._async_output_pending = 0
+    proc._chunk_output_pending = 0
     proc._result_mq_lock = threading.Lock()
     return proc
 
@@ -593,3 +596,97 @@ class TestSynchronizeDeviceBarrier:
             proc._async_output_queue.put(None)
             loop_thread.join(timeout=2.0)
             barrier_thread.join(timeout=2.0)
+
+
+def test_worker_emit_chunk_does_not_send_compute_done(mocker) -> None:
+    proc = _make_worker_proc(step_execution=False)
+    mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.record_device_event",
+        return_value=None,
+    )
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.pack_diffusion_output_shm")
+    mock_torch = mocker.MagicMock()
+    mock_torch.accelerator.current_accelerator.return_value.type = "cpu"
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.torch", mock_torch)
+
+    emit = proc._make_emit_chunk("req")
+    chunk = DiffusionOutput(finished=False, chunk_index=1, total_chunks=4, output=torch.zeros(2))
+    emit(chunk)
+    with pytest.raises(ValueError, match="finished=False"):
+        emit(DiffusionOutput(finished=True, chunk_index=2))
+
+    proc.result_mq.enqueue.assert_not_called()
+    assert proc._async_output_pending == 1
+    assert proc._chunk_output_pending == 1
+
+    thread = threading.Thread(target=proc._async_output_loop, daemon=True)
+    thread.start()
+    assert proc.drain_async_outputs(timeout=2.0) is True
+    proc._async_output_queue.put(None)
+    thread.join(timeout=2.0)
+
+    messages = [call.args[0] for call in proc.result_mq.enqueue.call_args_list]
+    assert len(messages) == 1
+    message = messages[0]
+    assert message.kind is AsyncOutputKind.CHUNK_READY
+    assert message.request_id == "req"
+    assert message.chunk_index == 1
+    assert message.rpc_id is None
+    assert message.kind != AsyncOutputKind.COMPUTE_DONE
+    assert proc._chunk_output_pending == 0
+
+
+def test_chunk_reaches_result_mq_while_request_chunk_transport_open(mocker) -> None:
+    """Production emit path: packer enqueues CHUNK_READY before transport closes."""
+    from vllm_omni.diffusion.request_streaming import get_emit_chunk, request_chunk_emitter
+
+    proc = _make_worker_proc(step_execution=False)
+    mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.record_device_event",
+        return_value=None,
+    )
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.pack_diffusion_output_shm")
+    mock_torch = mocker.MagicMock()
+    mock_torch.accelerator.current_accelerator.return_value.type = "cpu"
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.torch", mock_torch)
+
+    release = threading.Event()
+    enqueued = threading.Event()
+    transport_open = threading.Event()
+
+    original_enqueue = proc._enqueue_result
+
+    def track_enqueue(msg):
+        original_enqueue(msg)
+        enqueued.set()
+
+    proc._enqueue_result = track_enqueue  # type: ignore[method-assign]
+    packer = threading.Thread(target=proc._async_output_loop, daemon=True)
+    packer.start()
+
+    def forward():
+        with proc._request_chunk_transport("execute_model", True):
+            transport_open.set()
+            with request_chunk_emitter([SimpleNamespace(request_id="req")], enabled=True):
+                emit = get_emit_chunk()
+                assert emit is not None
+                emit(DiffusionOutput(finished=False, chunk_index=0, output=torch.zeros(2)))
+                assert enqueued.wait(timeout=2), "CHUNK_READY must hit result_mq while transport is open"
+                assert release.wait(timeout=5)
+
+    thread = threading.Thread(target=forward, daemon=True)
+    thread.start()
+    try:
+        assert transport_open.wait(timeout=2)
+        assert enqueued.wait(timeout=2)
+        assert thread.is_alive()
+        messages = [call.args[0] for call in proc.result_mq.enqueue.call_args_list]
+        assert len(messages) == 1
+        assert messages[0].kind is AsyncOutputKind.CHUNK_READY
+        assert messages[0].request_id == "req"
+    finally:
+        release.set()
+        thread.join(timeout=2)
+        proc._async_output_queue.put(None)
+        packer.join(timeout=2)
+    assert not thread.is_alive() and not packer.is_alive()

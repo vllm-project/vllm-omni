@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+FROM golang:1.26-alpine AS builder
+
+ARG LIVEKIT_REF=v1.10.1
+ARG TARGETARCH
+
+RUN apk add --no-cache git ca-certificates
+
+WORKDIR /src
+RUN git clone --depth 1 --branch "${LIVEKIT_REF}" \
+    https://github.com/livekit/livekit.git . \
+    && go mod download \
+    && CGO_ENABLED=0 GOOS=linux GOARCH="${TARGETARCH}" \
+        go build -trimpath -ldflags="-s -w" -o /out/livekit-server ./cmd/server
+
+FROM alpine:3.22
+
+RUN apk add --no-cache ca-certificates tzdata \
+    && addgroup -S livekit \
+    && adduser -S -G livekit livekit
+
+COPY --from=builder /out/livekit-server /usr/local/bin/livekit-server
+
+USER livekit
+ENTRYPOINT ["/usr/local/bin/livekit-server"]

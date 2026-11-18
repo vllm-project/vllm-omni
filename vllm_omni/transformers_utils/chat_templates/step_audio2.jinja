@@ -1,0 +1,28 @@
+{# SPDX-License-Identifier: Apache-2.0
+   SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+   Match Step-Audio2's native text/audio message format.
+   Reference: stepfun-ai/Step-Audio2, revision
+   76e272b56c3917a8d7188f18bbb5a65dfc8a0845, stepaudio2.py.
+#}
+{%- for message in messages -%}
+    {{- '<|BOT|>' + ('human' if message.role == 'user' else message.role) + '\n' -}}
+    {%- if message.content is not none -%}
+        {%- if message.content is string -%}
+            {{- message.content -}}
+        {%- else -%}
+            {%- for part in message.content -%}
+                {%- if part.type == 'text' -%}
+                    {{- part.text -}}
+                {%- elif part.type in ['audio', 'audio_url', 'input_audio'] -%}
+                    {{- '<audio_patch>' -}}
+                {%- else -%}
+                    {{- raise_exception('Unsupported Step-Audio2 content type: ' + part.type) -}}
+                {%- endif -%}
+            {%- endfor -%}
+        {%- endif -%}
+        {{- '<|EOT|>' -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|BOT|>assistant\n' -}}
+{%- endif -%}

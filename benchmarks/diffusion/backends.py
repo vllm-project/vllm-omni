@@ -47,6 +47,7 @@ class RequestFuncInput:
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     default_bot_task: str | None = DEFAULT_EDITS_BOT_TASK
     video_job_timeout: float = 900.0
+    video_poll_interval: float = 2.0
 
 
 @dataclass
@@ -107,6 +108,8 @@ async def async_request_image_edits(
 
     if extra_body.get("guidance_scale") is not None:
         form.add_field("guidance_scale", str(extra_body["guidance_scale"]))
+    if extra_body.get("guidance_scale_2") is not None:
+        form.add_field("guidance_scale_2", str(extra_body["guidance_scale_2"]))
     if extra_body.get("negative_prompt") is not None:
         form.add_field("negative_prompt", str(extra_body["negative_prompt"]))
     if extra_body.get("true_cfg_scale") is not None:
@@ -393,7 +396,8 @@ async def async_request_v1_videos(
         poll_json = {}
         resp_json = {}
 
-        # invoke a post request (POST /v1/videos)
+        # Measure from job submission through receipt of the complete video.
+        output.start_time = time.perf_counter()
         async with session.post(input.api_url, data=form) as response:
             if response.status == 200:
                 resp_json = await response.json()
@@ -409,7 +413,7 @@ async def async_request_v1_videos(
                 return output
 
         # invoke a poll request (GET /v1/videos/{video_id})
-        poll_interval = 2.0  # Unit(s)
+        poll_interval = input.video_poll_interval
         timeout_seconds = input.video_job_timeout
         deadline = time.perf_counter() + timeout_seconds
         job_url = f"{input.api_url}/{job_id}"
@@ -462,6 +466,7 @@ async def async_request_v1_videos(
         output.error = f"{type(e).__name__}: {e}"
         output.success = False
     finally:
+        output.latency = time.perf_counter() - output.start_time
         if image_file is not None:
             image_file.close()
 
@@ -472,7 +477,6 @@ async def async_request_v1_videos(
             except Exception as e:
                 print(f"Failed to clean up video job {job_id}: {e}")
 
-        output.latency = time.perf_counter() - output.start_time
         if pbar is not None:
             pbar.update(1)
 

@@ -21,8 +21,8 @@ def _assert_isolated_import_succeeds(script: str) -> None:
     # unrelated, inconsistent device-selection environment prevent the child
     # interpreter from reaching the boundary assertion.
     env = os.environ.copy()
-    env.pop("CUDA_VISIBLE_DEVICES", None)
-    env.pop("HIP_VISIBLE_DEVICES", None)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["HIP_VISIBLE_DEVICES"] = ""
     result = subprocess.run(
         [sys.executable, "-c", script],
         cwd=REPO_ROOT,
@@ -42,7 +42,12 @@ def test_isolated_import_ignores_conflicting_gpu_visibility(monkeypatch: pytest.
     monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
 
-    _assert_isolated_import_succeeds("import vllm_omni.outputs")
+    _assert_isolated_import_succeeds("""
+import os
+
+assert os.environ["CUDA_VISIBLE_DEVICES"] == ""
+assert os.environ["HIP_VISIBLE_DEVICES"] == ""
+""")
 
 
 def test_turn_based_stack_has_no_duplex_vocabulary() -> None:
@@ -65,6 +70,7 @@ forbidden_prefixes = (
     "vllm_omni.entrypoints.duplex",
     "vllm_omni.entrypoints.duplex_omni",
     "vllm_omni.clients",
+    "vllm_omni.model_executor.common.duplex",
     "vllm_omni.model_executor.models.minicpmo_4_5.duplex",
     "vllm_omni.model_executor.models.nemotron_voicechat.duplex",
     "vllm_omni.model_executor.models.personaplex.duplex",
@@ -104,6 +110,7 @@ if missing:
 
 forbidden_prefixes = (
     "vllm_omni.clients",
+    "vllm_omni.model_executor.common.duplex",
     "vllm_omni.model_executor.models.minicpmo_4_5.duplex",
     "vllm_omni.model_executor.models.nemotron_voicechat.duplex",
     "vllm_omni.model_executor.models.personaplex.duplex",
@@ -173,11 +180,15 @@ if added:
 """)
 
 
-def test_stable_engine_does_not_expose_duplex_contract_modules() -> None:
+def test_stable_duplex_contract_boundaries() -> None:
+    # These schema/module-location assertions do not depend on import order.
+    # Check them together instead of importing the serving stack in three children.
     _assert_isolated_import_succeeds("""
 import importlib.util
+import dataclasses
 
 from vllm_omni.engine import messages
+from vllm_omni.outputs import OmniRequestOutput
 
 legacy_modules = (
     "vllm_omni.engine.duplex_contracts",
@@ -191,24 +202,10 @@ if present:
 duplex_exports = sorted(name for name in vars(messages) if name.startswith("Duplex"))
 if duplex_exports:
     raise SystemExit("stable messages still expose duplex contracts: " + ", ".join(duplex_exports))
-""")
-
-
-def test_stable_outputs_do_not_declare_duplex_decision_field() -> None:
-    _assert_isolated_import_succeeds("""
-import dataclasses
-
-from vllm_omni.outputs import OmniRequestOutput
 
 fields = {field.name for field in dataclasses.fields(OmniRequestOutput)}
 if "duplex_output_decision" in fields:
     raise SystemExit("stable output declares duplex_output_decision")
-""")
-
-
-def test_duplex_sampling_helper_lives_in_model_executor() -> None:
-    _assert_isolated_import_succeeds("""
-import importlib.util
 
 if importlib.util.find_spec("vllm_omni.model_executor.duplex_sampling") is None:
     raise SystemExit("model_executor duplex_sampling helper module is missing")

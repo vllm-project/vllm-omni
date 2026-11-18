@@ -292,7 +292,13 @@ def talker2code2wav_async_chunk(
 # CONCAT across the (already trivial) per-request accumulator history so a
 # regression where decode unexpectedly re-emits them does not silently
 # duplicate the prefill tensor.  See mixin._FULL_PAYLOAD_REPLACE_KEYS.
-_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset({"embed.speech_token", "embed.speech_feat", "embed.embedding"})
+_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset(
+    {"embed.speech_token", "embed.speech_feat", "embed.embedding", "embed.speech_token_len"}
+)
+
+
+# This processor consumes sampled codec IDs even when no tensor payload is emitted.
+talker2code2wav_async_chunk.requires_token_updates = True  # type: ignore[attr-defined]
 
 
 def text2flow_token_only(
@@ -347,20 +353,20 @@ def text2flow_full_payload(
     """
     del transfer_manager
     rid = getattr(request, "external_req_id", None) or getattr(request, "request_id", "?")
-    if not isinstance(pooling_output, dict):
+    if not isinstance(pooling_output, Mapping):
         logger.warning(
-            "cosyvoice3.text2flow_full_payload: pooling_output not a dict "
+            "cosyvoice3.text2flow_full_payload: pooling_output not a mapping "
             "(type=%s) for req=%s; consumer wait gate may hang.",
             type(pooling_output).__name__,
             rid,
         )
         return None
     embed_out: dict[str, Any] = {}
-    for key in ("speech_token", "speech_feat", "embedding"):
+    for key in ("speech_token", "speech_feat", "embedding", "speech_token_len"):
         v = pooling_output.get(f"embed.{key}")
         if v is None:
             nested = pooling_output.get("embed")
-            if isinstance(nested, dict):
+            if isinstance(nested, Mapping):
                 v = nested.get(key)
         if isinstance(v, torch.Tensor) and v.numel() > 0:
             embed_out[key] = v

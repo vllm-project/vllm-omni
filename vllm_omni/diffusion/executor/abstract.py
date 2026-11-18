@@ -49,7 +49,9 @@ class DiffusionExecutor(ABC):
                 )
             executor_class = distributed_executor_backend
         elif distributed_executor_backend == "ray":
-            raise NotImplementedError("ray backend is not yet supported.")
+            from vllm_omni.diffusion.executor.ray_executor import RayDiffusionExecutor
+
+            executor_class = RayDiffusionExecutor
         elif distributed_executor_backend == "mp":
             from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 
@@ -133,13 +135,24 @@ class DiffusionExecutor(ABC):
         """
         return None
 
+    def register_chunk_ready_handler(
+        self,
+        handler: Callable[[str, int, DiffusionOutput | None, str | None], None] | None,
+    ) -> None:
+        """Receive request-mode ``CHUNK_READY`` chunks. Default is a no-op.
+
+        ``handler`` is ``(request_id, chunk_index, output, error)``.
+        A chunk must not complete the in-flight execute RPC. Executors without
+        an async result pump keep this no-op.
+        """
+        return None
+
     def wait_output_ready(self, async_output_id: str) -> Future[DiffusionOutput]:
         """Resolve deferred output; only asynchronous executors implement this."""
         raise NotImplementedError(f"{type(self).__name__} does not support asynchronous output")
 
     def drop_output(self, async_output_id: str) -> None:
-        """Reclaim an async output that will never be waited on (e.g. an
-        aborted request).
+        """Reclaim an async output whose consumer is no longer available.
 
         Only executors with an async output path (result pump) cache outputs
         that a consumer must later claim; executors without one have nothing to

@@ -130,7 +130,7 @@ def test_duplex_event_is_an_alias_but_duplex_command_is_not() -> None:
     An event has no engine-internal half --- what the session emits is what the
     socket sends --- so ``DuplexEvent`` is simply ``RealtimeEvent``. A command
     does: ``payload()`` renders the session runner's mailbox dictionary, and for
-    four of the seventeen the mailbox channel is not even the client event type.
+    four of the eighteen the mailbox channel is not even the client event type.
     """
     from vllm_omni.engine.duplex.commands import DuplexCommand
     from vllm_omni.protocol.duplex.events import DuplexEvent
