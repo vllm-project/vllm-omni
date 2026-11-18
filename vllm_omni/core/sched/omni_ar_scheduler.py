@@ -2494,8 +2494,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _scheduler_reserved_blocks(self, request: Request) -> int:
         """Per-request term of vLLM's ``_inflight_prefill_reserved_blocks`` (the async-load ``reserved_blocks``).
 
-        Must match it: the blocks an in-flight prefill still needs, including speculative-decode slots.
+        Must match it: a parked async KV load's cached reservation, or the blocks an
+        in-flight prefill still needs, both including speculative-decode slots.
         """
+        parked = self._parked_reservations.get(request)
+        if parked is not None:
+            return parked
         return self._request_remaining_blocks(request) if request in self._inflight_prefills else 0
 
     def _free_request(

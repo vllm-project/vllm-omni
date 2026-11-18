@@ -242,7 +242,6 @@ def _step(scheduler, scheduled):
         scheduled,
         ModelRunnerOutput(
             req_ids=ids,
-            req_id_to_index={rid: i for i, rid in enumerate(ids)},
             sampled_token_ids=sampled,
             logprobs=None,
             prompt_logprobs_dict={},
@@ -372,6 +371,17 @@ def test_reserve_counts_an_in_flight_prefill_once_with_an_async_kv_load(monkeypa
         lookups.append(request.request_id)
         return (None, False) if len(lookups) == 1 else (32, True)  # B's lookup resolves in the second step
 
+    scheduler.connector = _async_load_connector(matched_tokens)
+    a, b = _request("a", 160, 160), _request("b", 48, 16, first_token=1000)
+    scheduler.add_request(a)
+    scheduler.add_request(b)
+    _step(scheduler, scheduler.schedule())
+    assert a.num_computed_tokens < a.num_prompt_tokens and b.status == RequestStatus.WAITING
+    scheduler.schedule()
+    assert b.status == (RequestStatus.WAITING_FOR_REMOTE_KVS if admitted else RequestStatus.WAITING)
+
+
+def _async_load_connector(matched_tokens):
     connector = Mock(spec=KVConnectorBase_V1)
     connector.requires_kv_delivery = False
     connector.has_pending_block_frees.return_value = False
@@ -381,13 +391,24 @@ def test_reserve_counts_an_in_flight_prefill_once_with_an_async_kv_load(monkeypa
     connector.build_connector_meta.return_value = None
     connector.take_events.return_value = ()
     connector.get_kv_connector_stats.return_value = None
-    scheduler.connector = connector
+    return connector
+
+
+@pytest.mark.parametrize("num_blocks, admitted", [(25, True), (24, False)])
+def test_reserve_counts_a_parked_async_kv_load_once(monkeypatch, num_blocks, admitted):
+    # A and B both load asynchronously. A (160-token prompt, 32 tokens loaded) is parked first and holds
+    # 2 blocks; the scheduler caches its reservation as parked (10 - 2 = 8 blocks), not as an in-flight
+    # prefill. The admission reserve expects A to need 20 - 2 = 18, so only 10 more are added for A, plus 2
+    # for B's own growth. B needs 2 blocks for its loaded tokens: 8 + 10 + 2 + 2 = 22 free, i.e. 25 blocks
+    # with the null block and A's 2. Adding both reservations for A would need 30 free (33 blocks).
+    scheduler = _reserve_scheduler(monkeypatch, num_blocks=num_blocks, max_model_len=512, max_num_seqs=4)
+    loaded = {"a": 32, "b": 32}
+    scheduler.connector = _async_load_connector(lambda request, _: (loaded[request.request_id], True))
     a, b = _request("a", 160, 160), _request("b", 48, 16, first_token=1000)
     scheduler.add_request(a)
     scheduler.add_request(b)
-    _step(scheduler, scheduler.schedule())
-    assert a.num_computed_tokens < a.num_prompt_tokens and b.status == RequestStatus.WAITING
     scheduler.schedule()
+    assert a.status == RequestStatus.WAITING_FOR_REMOTE_KVS and scheduler._parked_reservations[a] == 8
     assert b.status == (RequestStatus.WAITING_FOR_REMOTE_KVS if admitted else RequestStatus.WAITING)
 
 
