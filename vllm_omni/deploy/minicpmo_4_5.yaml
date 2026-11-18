@@ -1,6 +1,7 @@
 # MiniCPM-o 4.5 three-stage deploy on one large-memory GPU.
 pipeline: minicpmo_4_5
-# Keep MRv1 on other platforms; CUDA selects MRv2 below.
+# Keep MRv1 as the global default for deferred platforms; CUDA, ROCm and NPU
+# select MRv2 below.
 model_runner: v1
 async_chunk: true
 # Use minicpmo_4_5_turn.yaml to select the ordinary turn-based serving engine.
@@ -243,6 +244,11 @@ platforms:
 
   xpu:
     # vLLM 0.34 has no Model Runner V1; without this XPU inherits the global v1.
+    model_runner: v2
+
+  rocm:
+    # vLLM 0.34 removed Model Runner V1; preserve the shared duplex topology
+    # and connector options while selecting the supported runner on ROCm.
     model_runner: v2
 
   npu:

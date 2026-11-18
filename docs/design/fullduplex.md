@@ -1298,6 +1298,13 @@ through stride-5 pooling. Reference audio must not be cropped to a 100 ms
 boundary to simplify budgeting: the remaining samples can change the
 embeddings even when they do not add a pooled token.
 
+The default `minicpmo_4_5.yaml` deployment selects MRv2 for all three stages
+on CUDA, ROCm and NPU. The ROCm override changes runner selection while
+preserving the shared duplex session, async-chunk, device, connector and stage
+topology contracts. The CUDA-only reference-attention, FlashAttention, graph,
+speculation and fused-kernel behavior described below does not apply to ROCm;
+runner selection alone does not establish ROCm runtime or quality qualification.
+
 MiniCPM-o native duplex does not apply a character cap unless
 `max_speak_chars_per_chunk` is set to a positive value. The default is 0,
 so the default length limit is the official 20-token budget; sampled chunk
