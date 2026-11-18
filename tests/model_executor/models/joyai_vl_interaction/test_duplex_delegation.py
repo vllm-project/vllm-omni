@@ -10,12 +10,14 @@ the integration through the real JoyAI plugin is covered by
 """
 
 import json
+from dataclasses import dataclass
 
 import pytest
 
+from vllm_omni.engine.duplex.plugin import DuplexDataPlaneContext
 from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import Action, ParsedAction, parse_action
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex import delegation
-from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.data_plane import advance_chunk
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.data_plane import JoyAIDataPlane, advance_chunk
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -24,6 +26,32 @@ DELEGATED = "</response> Checking the pot. </delegation> Is the pot overheated?"
 
 def delegate_action() -> ParsedAction:
     return parse_action(DELEGATED)
+
+
+@dataclass
+class _StageCompletion:
+    text: str
+
+
+@dataclass
+class _Stage0Output:
+    request_id: str
+    stage_id: int
+    finished: bool
+    outputs: list[_StageCompletion]
+
+
+def _stage0(text: str, *, finished: bool = False) -> _Stage0Output:
+    return _Stage0Output(
+        request_id="req",
+        stage_id=0,
+        finished=finished,
+        outputs=[_StageCompletion(text=text)],
+    )
+
+
+def _delegation_calls(events: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [event["joyai_function_call"] for event in events if isinstance(event.get("joyai_function_call"), dict)]
 
 
 def accepted(*, call_id: str = "call_1", output: str = "It is smoking.", runtime=None):
@@ -67,6 +95,101 @@ def test_delegation_without_question_has_nothing_to_hand_over(raw):
 def test_delegation_without_note_omits_it():
     arguments = delegation.delegation_arguments(parse_action("</delegation> Is the pot overheated?"))
     assert json.loads(arguments) == {"question": "Is the pot overheated?"}
+
+
+@pytest.mark.parametrize(
+    "partial",
+    [
+        "</response> Checking the pot. </delegation>",
+        "</response> Checking the pot. </delegation> Is",
+    ],
+    ids=["empty-question", "partial-question"],
+)
+def test_streaming_delegation_waits_until_generation_completes(partial):
+    """Unfinished ``</delegation>`` must not publish the call or drop the note tail."""
+    plane = JoyAIDataPlane(encode_audio=lambda *_args, **_kwargs: "")
+    plane.begin_request("req")
+    plane.requests["req"].delegation_tools = True
+    context = DuplexDataPlaneContext(modalities=("text", "audio"))
+    prefix = list(
+        plane.project(
+            {"data_plane_outputs": [_stage0("</response> Checking", finished=False)]},
+            context=context,
+        )
+    )
+    at_marker = list(plane.project({"data_plane_outputs": [_stage0(partial, finished=False)]}, context=context))
+    observation = plane.requests["req"]
+    assert observation.call_sent is False
+    assert _delegation_calls(prefix) == []
+    assert _delegation_calls(at_marker) == []
+    assert all(event.get("end_of_turn") is not True for event in prefix + at_marker)
+    assert all(not event.get("abort_data_plane_request") for event in prefix + at_marker)
+    finished = list(plane.project({"data_plane_outputs": [_stage0(DELEGATED, finished=True)]}, context=context))
+    [call] = _delegation_calls(finished)
+    assert json.loads(call["arguments"]) == {"note": "Checking the pot.", "question": "Is the pot overheated?"}
+    spoken = "".join(event.get("text") or "" for event in prefix + at_marker + finished)
+    assert spoken == "Checking the pot."
+    assert "Is the pot overheated?" not in spoken
+
+
+def _note_lifecycle(events: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [event for event in events if not isinstance(event.get("joyai_function_call"), dict)]
+
+
+def test_streamed_note_still_emits_lifecycle_when_the_question_completes():
+    """A fully streamed note must still finish the text-only observation.
+
+    The call handler returns before response cleanup, so an empty finish
+    delta cannot skip the note lifecycle: one call and one ``end_of_turn``.
+    """
+    plane = JoyAIDataPlane(encode_audio=lambda *_args, **_kwargs: "")
+    plane.begin_request("req")
+    plane.requests["req"].delegation_tools = True
+    context = DuplexDataPlaneContext(modalities=("text",))
+    note = "</response> Checking the pot. </delegation>"
+    streamed = list(plane.project({"data_plane_outputs": [_stage0(note)]}, context=context))
+    assert _delegation_calls(streamed) == []
+    assert "Checking the pot." == "".join(event.get("text") or "" for event in streamed)
+    finished = list(plane.project({"data_plane_outputs": [_stage0(DELEGATED, finished=True)]}, context=context))
+    [call] = _delegation_calls(finished)
+    assert json.loads(call["arguments"]) == {"note": "Checking the pot.", "question": "Is the pot overheated?"}
+    [lifecycle] = _note_lifecycle(finished)
+    assert lifecycle.get("text") == ""
+    assert lifecycle.get("end_of_turn") is True
+    assert lifecycle.get("abort_data_plane_request") is True
+    assert lifecycle.get("model_context_text") == "Checking the pot."
+
+
+def test_empty_question_after_a_streamed_note_still_ends_the_turn():
+    """No call is published, but the already-streamed note still needs cleanup."""
+    plane = JoyAIDataPlane(encode_audio=lambda *_args, **_kwargs: "")
+    plane.begin_request("req")
+    plane.requests["req"].delegation_tools = True
+    context = DuplexDataPlaneContext(modalities=("text",))
+    note = "</response> Checking the pot. </delegation>"
+    streamed = list(plane.project({"data_plane_outputs": [_stage0(note)]}, context=context))
+    assert _delegation_calls(streamed) == []
+    finished = list(plane.project({"data_plane_outputs": [_stage0(note, finished=True)]}, context=context))
+    assert _delegation_calls(finished) == []
+    [lifecycle] = _note_lifecycle(finished)
+    assert lifecycle.get("end_of_turn") is True
+    assert lifecycle.get("abort_data_plane_request") is True
+    assert lifecycle.get("model_context_text") == "Checking the pot."
+
+
+def test_streamed_note_lifecycle_does_not_abort_audio_code2wav():
+    """Audio sessions keep Code2Wav as the terminal; the empty note is a no-op."""
+    plane = JoyAIDataPlane(encode_audio=lambda *_args, **_kwargs: "")
+    plane.begin_request("req")
+    plane.requests["req"].delegation_tools = True
+    context = DuplexDataPlaneContext(modalities=("text", "audio"))
+    note = "</response> Checking the pot. </delegation>"
+    list(plane.project({"data_plane_outputs": [_stage0(note)]}, context=context))
+    finished = list(plane.project({"data_plane_outputs": [_stage0(DELEGATED, finished=True)]}, context=context))
+    assert _delegation_calls(finished)
+    [lifecycle] = _note_lifecycle(finished)
+    assert lifecycle.get("end_of_turn") is not True
+    assert not lifecycle.get("abort_data_plane_request")
 
 
 def test_arguments_are_json_safe_for_quotes_and_unicode():

@@ -27,8 +27,10 @@ def test_get_skus_for_platform_cuda_excludes_other_accelerators():
     cuda_skus = get_skus_for_platform("cuda")
     assert cuda_skus >= {"H100", "H200", "H800", "L4", "B200"}
     assert "MI325" not in cuda_skus
+    assert "MI300" not in cuda_skus
     assert "A2" not in cuda_skus
-    assert get_skus_for_platform("rocm") == {"MI325"}
+    # MI300 is the MI300X runtime bucket the AMD NIGHTLY baselines resolve against.
+    assert get_skus_for_platform("rocm") == {"MI300", "MI325"}
 
 
 def test_get_supported_card_counts_comes_from_pyproject():
