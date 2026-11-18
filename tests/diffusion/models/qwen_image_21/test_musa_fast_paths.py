@@ -239,3 +239,36 @@ def test_musa_attention_takes_the_fused_qk_path(monkeypatch):
     result = attention(torch.empty(2, sequence, 4096, device="musa", dtype=torch.bfloat16), freqs)
     assert observed == [True]
     torch.testing.assert_close(result, projection[:, :, 2].flatten(2), rtol=0, atol=0)
+
+
+class _ScaledAttention(nn.Module):
+    def forward(self, values, *args, **kwargs):
+        return values * 0.37
+
+
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
+@torch.no_grad()
+def test_musa_broadcast_modulation_matches_the_per_token_selection():
+    _require_musa()
+    generator = torch.Generator().manual_seed(5)
+    block = transformer.QwenImage21TransformerBlock.__new__(transformer.QwenImage21TransformerBlock)
+    nn.Module.__init__(block)
+    block.img_norm1 = nn.LayerNorm(512, elementwise_affine=False, eps=1e-6)
+    block.img_norm2 = nn.LayerNorm(512, elementwise_affine=False, eps=1e-6)
+    block.attn = _ScaledAttention()
+    block.img_mlp = nn.SiLU()
+    hidden_states = torch.randn(1, 256, 512, generator=generator).to("musa", torch.bfloat16)
+    # One sample row and the trailing t = 0 row; in a decode step every query token is a target token.
+    modulation = torch.randn(2, 4 * 512, generator=generator).to("musa", torch.bfloat16)
+    target_token_mask = torch.ones(256, dtype=torch.bool, device="musa")
+    scale1, gate1, scale2, gate2 = modulation.chunk(4, dim=-1)
+
+    def prepare(select):
+        return 1 + select(scale1), select(gate1).tanh(), 1 + select(scale2), select(gate2).tanh()
+
+    selected = prepare(lambda value: transformer._select_modulation_rows(value, target_token_mask))
+    broadcast = prepare(lambda value: value[:-1].unsqueeze(1))
+    assert selected[0].shape == (1, 256, 512) and broadcast[0].shape == (1, 1, 512)
+    expected = block(hidden_states, modulation, None, target_token_mask, prepared_modulation=selected)
+    actual = block(hidden_states, modulation, None, target_token_mask, prepared_modulation=broadcast)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

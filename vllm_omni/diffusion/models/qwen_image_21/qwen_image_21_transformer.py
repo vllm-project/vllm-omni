@@ -1486,7 +1486,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             # its token selection/scale/tanh once per step, using the same ops.
             scale1, gate1, scale2, gate2 = modulation.chunk(4, dim=-1)
             decode_broadcast = (
-                joint_hidden_states.device.type == "npu"
+                joint_hidden_states.device.type in ("npu", "musa")
                 and joint_hidden_states.dtype == torch.bfloat16
                 and batch_size == 1
                 and is_decode
