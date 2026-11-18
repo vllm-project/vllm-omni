@@ -86,7 +86,8 @@ a partial override. Values are resolved in this order, with later values
 taking precedence:
 
 1. The stage's deployment sampling defaults.
-2. Explicit top-level request parameters, for the comprehension stage only.
+2. Explicit top-level sampling parameters, including `min_p` and
+   `repetition_penalty`, for the comprehension stage only.
 3. Explicit fields in that stage's `sampling_params_list` dictionary.
 
 For example, this request retains `max_tokens=256` and the deployment's

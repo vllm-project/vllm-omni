@@ -402,6 +402,7 @@ def test_text_only_request_reaches_engine_with_comprehension_task_mode(mock_engi
 def mock_request(mocker: MockerFixture):
     """Create a mock request with all OpenAI sampling params set to None."""
     request = mocker.MagicMock()
+    request._DEFAULT_SAMPLING_PARAMS = ChatCompletionRequest(model="test", messages=[])._DEFAULT_SAMPLING_PARAMS
     # OpenAI standard sampling fields
     request.temperature = None
     request.top_p = None
@@ -423,29 +424,28 @@ def mock_request(mocker: MockerFixture):
 
 
 # =============================================================================
-# Tests for _OPENAI_SAMPLING_FIELDS constant
+# Tests for explicit request sampling fields
 # =============================================================================
 
 
-def test_openai_sampling_fields_contains_expected_fields():
-    """Test that _OPENAI_SAMPLING_FIELDS contains all expected OpenAI params."""
-    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
-
-    expected_fields = {
-        "temperature",
-        "top_p",
-        "top_k",
-        "max_tokens",
-        "min_tokens",
-        "seed",
-        "ignore_eos",
-        "stop",
-        "stop_token_ids",
-        "frequency_penalty",
-        "presence_penalty",
-        "n",
+def test_request_sampling_overrides_select_explicit_sampling_fields(mock_engine_client):
+    values = {
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "top_k": 10,
+        "max_tokens": 32,
+        "min_tokens": 2,
+        "seed": 0,
+        "ignore_eos": False,
+        "stop": ["end"],
+        "stop_token_ids": [2],
+        "frequency_penalty": 0.1,
+        "presence_penalty": 0.2,
+        "n": 1,
     }
-    assert OmniOpenAIServingChat._OPENAI_SAMPLING_FIELDS == expected_fields
+    request = ChatCompletionRequest(model="test", messages=[], **values)
+    serving_chat = build_serving_chat(engine_client=mock_engine_client)
+    assert serving_chat._request_sampling_overrides(request) == values
 
 
 # =============================================================================
@@ -592,9 +592,26 @@ def test_multiple_params_override_together(mock_engine_client, mock_request):
     assert comprehension_params.top_p == 0.85
     assert comprehension_params.max_tokens == 200
     assert comprehension_params.seed == 999
-    # Preserved from YAML (not in _OPENAI_SAMPLING_FIELDS)
+    # Preserved from YAML when the request omits these fields.
     assert comprehension_params.top_k == 1
     assert comprehension_params.repetition_penalty == 1.05
+
+
+@pytest.mark.parametrize(
+    "explicit", [{}, {"min_p": 0.2}, {"repetition_penalty": 1.2}, {"min_p": 0.0, "repetition_penalty": 1.0}]
+)
+def test_chat_sampling_overrides_only_apply_to_comprehension_stage(mock_engine_client, explicit):
+    defaults = {"min_p": 0.03, "repetition_penalty": 1.05}
+    _set_raw_sampling_defaults(mock_engine_client, defaults)
+    serving_chat = build_serving_chat(engine_client=mock_engine_client)
+    request = ChatCompletionRequest(model="test", messages=[], **explicit)
+
+    comprehension, other = serving_chat._build_sampling_params_list_from_request(request)
+
+    for field, value in (defaults | explicit).items():
+        assert getattr(comprehension, field) == value
+    assert other.min_p == 0.0
+    assert other.repetition_penalty == 1.0
 
 
 @pytest.mark.parametrize(
