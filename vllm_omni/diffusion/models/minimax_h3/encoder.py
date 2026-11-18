@@ -31,7 +31,6 @@ complete ``[seq, 5120]`` hidden state.
 from __future__ import annotations
 
 import itertools
-import os
 import re
 from collections.abc import Iterable
 from pathlib import Path
@@ -1186,6 +1185,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         device: torch.device,
         load_model: bool,
         encoder_group: Any | None = None,
+        vision_sp_size: int = 1,
         quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
@@ -1237,7 +1237,6 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             self.quant_config = quant_config
         _validate_encoder_quant_config(quant_config)
         dtype = torch.bfloat16
-        vision_sp_size = os.environ.get("VLLM_OMNI_H3_VISION_SP_SIZE", "0")
         self.vision = MiniMaxH3Qwen3VLVisionModel(config.vision_config)
         from .vision_parallel import resolve_vision_sp_group
 
@@ -1253,7 +1252,8 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         if not isinstance(quant_config, FastH3NVFP4Config):
             self.text_model.to(dtype=dtype)
         logger.info(
-            "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, text_encoder_tp_size=%d, vision_sp=%s",
+            "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, text_encoder_tp_size=%d, "
+            "text_encoder_vision_sp_size=%d",
             MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER,
             self._tp_size,
             vision_sp_size,

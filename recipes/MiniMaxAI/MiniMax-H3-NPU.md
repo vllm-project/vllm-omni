@@ -226,27 +226,54 @@ remaining flags stay unchanged.
 MiniMax-H3 can split Qwen3-VL vision-token computation across the eight
 text-encoder TP ranks instead of repeating the full vision forward on each
 rank. This is an opt-in experimental path for evaluating image/video reference
-encoding on Ascend NPU. It is disabled by default and has no dedicated CLI or
-request option.
+encoding on Ascend NPU. Configure it with
+`DiffusionParallelConfig.text_encoder_vision_sp_size`; the default `1` keeps
+vision replicated.
 
-Set the variable in the server's environment **before startup**, then run the
-serving command above with `--num-gpus 8` and `--text-encoder-tp-size 8`:
+Append the vision SP option to the serving command above, keeping
+`--num-gpus 8` and `--text-encoder-tp-size 8`:
 
 ```bash
-export VLLM_OMNI_H3_VISION_SP_SIZE=8
+  --text-encoder-vision-sp-size 8
 ```
 
 | Value | Behavior |
 | --- | --- |
-| Unset or `0` | Keep the replicated vision path. |
+| Unset or `1` | Keep the replicated vision path. |
 | `8` | Enable vision SP8 on the existing eight-rank text-encoder TP group. |
-| Any other value | Raise `ValueError` during encoder initialization. |
+| Any other value | Reject the CLI argument or raise `ValueError` during configuration validation. |
 
 Enabling SP8 with a missing encoder group or a text-encoder TP size other than
 eight also raises `ValueError`; there is no automatic fallback. Set the same
-value for all encoder workers. The variable is read when the encoder is
-constructed, so changing it requires a server restart. In the encoder startup
-log, check for `text_encoder_tp_size=8, vision_sp=8`.
+configuration for all encoder workers. The setting is applied when the encoder
+is constructed, so changing it requires a server restart. In the encoder startup
+log, check for `text_encoder_tp_size=8, text_encoder_vision_sp_size=8`.
+
+For Python callers:
+
+```python
+from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+parallel_config = DiffusionParallelConfig(
+    ulysses_degree=8,
+    text_encoder_tp_size=8,
+    text_encoder_vision_sp_size=8,
+)
+```
+
+In deployment YAML, set the text encoder's diffusion stage `parallel_config`:
+
+```yaml
+parallel_config:
+  ulysses_degree: 8
+  text_encoder_tp_size: 8
+  text_encoder_vision_sp_size: 8
+```
+
+Only pipelines that declare support for text-encoder vision SP accept a
+non-default value. A stage without a local text encoder must keep the default
+`1`. The former `VLLM_OMNI_H3_VISION_SP_SIZE` environment variable is no longer
+read; use the CLI, Python configuration, or deployment YAML instead.
 
 Vision SP8 is separate from DiT `--usp` / `--ring` parallelism: those options
 do not enable it. It affects the Qwen3-VL vision tower when image or video
@@ -258,18 +285,19 @@ original global order and replicated on every encoder rank for downstream
 text encoding. Permutation transport reuse and rank-local position
 interpolation are included in SP8; neither has a separate switch.
 
-To restore the default path, set the variable to `0` and restart the server:
+To restore the default path, set the option to `1` and restart the server:
 
 ```bash
-export VLLM_OMNI_H3_VISION_SP_SIZE=0
+  --text-encoder-vision-sp-size 1
 ```
 
 **Validation scope:** initial device measurements were collected on eight
 Ascend 910B4 NPUs with text-encoder TP8. They showed lower vision-encoder and
 prompt-encoding latency, while the end-to-end change stayed within the reported
 measurement variability. See [PR #10168](https://github.com/vllm-project/vllm-omni/pull/10168)
-for the measurements and revision-specific validation status. For implementation
-revision `08d1ac061`, CPU-focused tests passed, but post-rebase eight-NPU/HCCL execution,
+for the measurements and revision-specific validation status. Those measurements
+predate the configuration migration. For implementation revision `08d1ac061`,
+CPU-focused tests passed, but post-rebase eight-NPU/HCCL execution,
 full-model bitwise output comparison, and same-window performance revalidation
 remain pending. This path is not yet a qualified lossless recommendation for
 other NPU models, input layouts, batching, or quantization combinations.

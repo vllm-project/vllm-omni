@@ -154,14 +154,14 @@ class VisionAllToAll:
         return unpack_heads(self.exchange(packed), len(self.plan.rank_token_indices[self.rank]))
 
 
-def resolve_vision_sp_group(value: str, encoder_group: _EncoderGroup | None) -> dist.ProcessGroup | None:
+def resolve_vision_sp_group(value: int, encoder_group: _EncoderGroup | None) -> dist.ProcessGroup | None:
     """Serve only the validated opt-in SP8/TP8 layout; never silently fall back."""
-    if value == "0":
+    if type(value) is not int or value not in (1, 8):
+        raise ValueError("text_encoder_vision_sp_size must be 1 (replicated) or 8")
+    if value == 1:
         return None
-    if value != "8":
-        raise ValueError("VLLM_OMNI_H3_VISION_SP_SIZE must be 0 (disabled) or 8")
     if encoder_group is None or encoder_group.world_size != 8:
-        raise ValueError("H3 vision SP8 requires text_encoder_tp_size=8")
+        raise ValueError("text_encoder_vision_sp_size=8 requires text_encoder_tp_size=8")
     return encoder_group.device_group
 
 

@@ -98,7 +98,7 @@ def test_full_output_gather_restores_global_merger_order(monkeypatch):
     assert torch.equal(torch.stack([final, *deep]), full)
 
 
-@pytest.mark.parametrize("value", ["2", "16", "yes", "-1"])
+@pytest.mark.parametrize("value", [0, 2, 4, 16, -1, "8", "yes", True, None])
 def test_service_rejects_unsupported_sp_size(mocker, value):
     m = load_module()
     with pytest.raises(ValueError):
@@ -107,11 +107,14 @@ def test_service_rejects_unsupported_sp_size(mocker, value):
 
 def test_service_is_opt_in_and_requires_exact_tp8(mocker):
     m = load_module()
-    assert m.resolve_vision_sp_group("0", None) is None
+    assert m.resolve_vision_sp_group(1, None) is None
     group = mocker.Mock(world_size=8, device_group=object())
-    assert m.resolve_vision_sp_group("8", group) is group.device_group
+    assert m.resolve_vision_sp_group(1, group) is None
+    assert m.resolve_vision_sp_group(8, group) is group.device_group
     with pytest.raises(ValueError):
-        m.resolve_vision_sp_group("8", mocker.Mock(world_size=4))
+        m.resolve_vision_sp_group(8, mocker.Mock(world_size=4))
+    with pytest.raises(ValueError):
+        m.resolve_vision_sp_group(8, None)
 
 
 def test_empty_rank_shard_keeps_explicit_hidden_dimension(mocker):

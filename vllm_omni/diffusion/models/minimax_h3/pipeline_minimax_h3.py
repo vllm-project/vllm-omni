@@ -707,6 +707,7 @@ class MiniMaxH3Pipeline(
     """CFG-distilled joint video/audio generation for MiniMax H3."""
 
     supports_step_execution: ClassVar[bool] = True
+    supports_text_encoder_vision_sp: ClassVar[bool] = True
     denoise_step_updates_state: ClassVar[bool] = True
     # DiT implementation constructed for the primary ``transformer``.
     # ``None`` means this module's ``MiniMaxH3DiTModel`` (resolved at call time);
@@ -977,6 +978,8 @@ class MiniMaxH3Pipeline(
             )
         self.device = get_local_device()
         self.load_text_encoder = od_config.model_loaded.get("text_encoder", True)
+        if not self.load_text_encoder and self.parallel_config.text_encoder_vision_sp_size != 1:
+            raise ValueError("text_encoder_vision_sp_size requires a locally loaded text encoder")
         self.load_vae_encoder = od_config.model_loaded.get("vae_encoder", True)
         self.load_vae_decoder = od_config.model_loaded.get("vae_decoder", True)
         if not self.load_vae_decoder and self.load_vae_encoder:
@@ -1292,6 +1295,7 @@ class MiniMaxH3Pipeline(
                 device=self.device,
                 load_model=rank < text_encoder_tp_size,
                 encoder_group=self.text_encoder_group,
+                vision_sp_size=self.parallel_config.text_encoder_vision_sp_size,
                 quant_config=_resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config),
             )
             if rank < text_encoder_tp_size:

@@ -1233,6 +1233,16 @@ class OmniServeCommand(CLISubcommand):
             "Equivalent to setting DiffusionParallelConfig.text_encoder_tp_size.",
         )
         omni_config_group.add_argument(
+            "--text-encoder-vision-sp-size",
+            type=int,
+            choices=[1, 8],
+            default=None,
+            help="Experimental vision sequence parallelism for the diffusion text encoder. "
+            "MiniMax-H3 supports 1 (replicated, default) or 8 (requires --text-encoder-tp-size 8). "
+            "Reuses the encoder TP group without adding devices. "
+            "Equivalent to setting DiffusionParallelConfig.text_encoder_vision_sp_size.",
+        )
+        omni_config_group.add_argument(
             "--vae-parallel-mode",
             type=str,
             default="tile",
