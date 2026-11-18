@@ -1,14 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Qwen3-TTS streaming-tokenizer unit tests, without serving or engine state."""
+"""Qwen3-TTS tokenizer unit tests and optional offline checkpoint regressions."""
 
 from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
 
 import pytest
 from tokenizers import AddedToken, Regex, Tokenizer, decoders, normalizers, pre_tokenizers
 from tokenizers.models import BPE
-from transformers import PreTrainedTokenizerFast
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from transformers.models.qwen2.tokenization_qwen2 import PRETOKENIZE_REGEX
+from transformers.utils.hub import cached_file
 
 from vllm_omni.model_executor.models.qwen3_tts.streaming_tokenizer import (
     Qwen3TTSStreamingTokenizerSpec,
@@ -17,6 +22,44 @@ from vllm_omni.model_executor.models.qwen3_tts.streaming_tokenizer import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+_REAL_TOKENIZER_PATH_ENV = "VLLM_OMNI_QWEN3_TTS_TEST_TOKENIZER_PATH"
+_REAL_TOKENIZER_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+
+
+@pytest.fixture(scope="module")
+def real_tokenizer():
+    """Use the HF cache, or override its snapshot directory with the test env var."""
+    explicit_path = os.getenv(_REAL_TOKENIZER_PATH_ENV)
+    if explicit_path is None:
+        config_file = cached_file(
+            _REAL_TOKENIZER_MODEL,
+            "tokenizer_config.json",
+            local_files_only=True,
+            _raise_exceptions_for_missing_entries=False,
+            _raise_exceptions_for_connection_errors=False,
+        )
+        if config_file is None:
+            pytest.skip(f"Official tokenizer is not cached; set {_REAL_TOKENIZER_PATH_ENV} to a local checkpoint")
+        directory = Path(config_file).parent
+    else:
+        directory = Path(explicit_path).expanduser()
+        if not explicit_path or not directory.is_dir():
+            pytest.fail(f"{_REAL_TOKENIZER_PATH_ENV} must point to a local tokenizer directory", pytrace=False)
+
+    has_tokenizer = (directory / "tokenizer.json").is_file() or (
+        (directory / "vocab.json").is_file() and (directory / "merges.txt").is_file()
+    )
+    if not (directory / "tokenizer_config.json").is_file() or not has_tokenizer:
+        if explicit_path is None:
+            pytest.skip(f"Official tokenizer cache is incomplete; set {_REAL_TOKENIZER_PATH_ENV} to a local checkpoint")
+        pytest.fail(f"{_REAL_TOKENIZER_PATH_ENV} is missing tokenizer assets", pytrace=False)
+    return AutoTokenizer.from_pretrained(directory, local_files_only=True, trust_remote_code=False)
+
+
+@pytest.fixture(scope="module")
+def real_spec(real_tokenizer):
+    return Qwen3TTSStreamingTokenizerSpec(real_tokenizer.backend_tokenizer)
 
 
 @pytest.fixture(scope="module")
@@ -72,6 +115,64 @@ def tokenizer():
 @pytest.fixture(scope="module")
 def spec(tokenizer):
     return Qwen3TTSStreamingTokenizerSpec(tokenizer.backend_tokenizer)
+
+
+def test_spec_rejects_invalid_header_with_valid_footer_length(tokenizer):
+    config = json.loads(tokenizer.backend_tokenizer.to_str())
+    config["model"]["merges"] = [pair for pair in config["model"]["merges"] if "".join(pair) != "assistant"]
+    backend = Tokenizer.from_str(json.dumps(config))
+    backend.add_special_tokens([AddedToken("<|im_end|>\n", normalized=False, special=True)])
+    assert len(backend.encode("<|im_start|>assistant\n", add_special_tokens=False).ids) == 4
+    assert len(backend.encode("<|im_end|>\n<|im_start|>assistant\n", add_special_tokens=False).ids) == 5
+    with pytest.raises(ValueError, match="assistant header"):
+        Qwen3TTSStreamingTokenizerSpec(backend)
+
+
+def test_spec_rejects_invalid_footer_with_valid_header_length(tokenizer):
+    backend = Tokenizer.from_str(tokenizer.backend_tokenizer.to_str())
+    backend.add_special_tokens([AddedToken("<|im_end|>\n", normalized=False, special=True)])
+    assert len(backend.encode("<|im_start|>assistant\n", add_special_tokens=False).ids) == 3
+    with pytest.raises(ValueError, match="assistant footer"):
+        Qwen3TTSStreamingTokenizerSpec(backend)
+
+
+@pytest.mark.parametrize("separate_eof", [False, True], ids=["coalesced-eof", "separate-eof"])
+@pytest.mark.parametrize(
+    "deltas",
+    [
+        pytest.param(("Hello ", "world.", " "), id="english-trailing-space"),
+        pytest.param(("自动", "驾驶", "系统", "正在", "运行。"), id="chinese-cross-chunk-merges"),
+        pytest.param(("We're ", "测试", "25", "元，", "e\u0301", "\u0327", "，ᄀ", "ᅡ", "ᆨ🙂"), id="mixed-script"),
+        pytest.param(("\n ", "Hello ", "<tool_", "call>中文", "</tool_call>", "\n"), id="literals-and-whitespace"),
+    ],
+)
+def test_real_tokenizer_matches_whole_encoding(real_tokenizer, real_spec, deltas, separate_eof):
+    header = "<|im_start|>assistant\n"
+    text = "".join(deltas)
+    expected = real_tokenizer.encode(header + text, add_special_tokens=False)
+    expected_full = real_tokenizer.encode(f"{header}{text}<|im_end|>\n{header}", add_special_tokens=False)
+    assert real_spec.header_ids == real_tokenizer.encode(header, add_special_tokens=False)
+    assert len(real_spec.header_ids) == 3
+    layouts = {
+        tuple(deltas),
+        tuple(text),
+        (text,),
+        tuple("".join(deltas[index : index + 2]) for index in range(0, len(deltas), 2)),
+    }
+    for layout in sorted(layouts):
+        for use_copy in (False, True):
+            stream = real_spec.create_stream()
+            output = []
+            for index, chunk in enumerate(layout):
+                if use_copy:
+                    stream = stream.copy()
+                source = header + chunk if index == 0 else chunk
+                output.extend(stream.feed(source, final=not separate_eof and index == len(layout) - 1))
+                assert output == expected[: len(output)]
+            if separate_eof:
+                output.extend(stream.feed("", final=True))
+            assert output == expected
+            assert output + real_spec.footer_ids == expected_full
 
 
 @pytest.mark.parametrize(

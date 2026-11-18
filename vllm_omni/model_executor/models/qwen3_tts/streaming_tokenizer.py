@@ -165,6 +165,9 @@ class Qwen3TTSStreamingTokenizerSpec:
             self.added_ids[content] = token["id"]
             self.added_prefixes.update(content[:end] for end in range(1, len(content)))
         self.added_initials = {token[0] for token in self.added_ids}
+        self.header_ids = tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False).ids
+        if len(self.header_ids) != 3:
+            raise ValueError("Unexpected Qwen3-TTS assistant header")
         self.footer_ids = tokenizer.encode("<|im_end|>\n<|im_start|>assistant\n", add_special_tokens=False).ids
         if len(self.footer_ids) != 5:
             raise ValueError("Unexpected Qwen3-TTS assistant footer")

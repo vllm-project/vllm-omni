@@ -163,7 +163,7 @@ def native_app(text_tokenizer, mocker):
     server.engine_client = engine
     server.model_config = engine.model_config
     server._adapter = Qwen3TTSAdapter(SpeechServingContext(server=server, engine_client=engine))
-    spec = mocker.Mock(footer_ids=[0] * 5)
+    spec = mocker.Mock(header_ids=[0] * 3, footer_ids=[0] * 5)
 
     def create_encoder():
         encoder = mocker.Mock()

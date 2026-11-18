@@ -204,14 +204,15 @@ class _Qwen3TTSIncrementalInput:
         encoding = await make_async(
             self._encode_initial_text, executor=getattr(self.adapter.ctx.server, "_tts_executor", None)
         )(text, final=final)
-        if len(encoding.token_ids) <= 3:
+        header_len = len(self._encoder.spec.header_ids)
+        if len(encoding.token_ids) <= header_len:
             if final:
                 raise ValueError("Initial text has no Qwen3-TTS body token at EOF")
             raise IncrementalInputNotReadyError("Initial text has no stable Qwen3-TTS body token yet")
 
         from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import PRECOMPUTED_TEXT_IDS_KEY
 
-        tokens = encoding.token_ids[3:]
+        tokens = encoding.token_ids[header_len:]
         params = self.adapter._build_tts_params(self.request)
         params["text"] = [text]  # Interleaved prefill has one text row, regardless of the unreleased suffix.
         params["non_streaming_mode"] = [False]
