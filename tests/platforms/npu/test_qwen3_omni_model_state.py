@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Qwen3 V2 must preserve Omni lifecycle and build Ascend metadata."""
 
+from __future__ import annotations
+
 from functools import partial
 from unittest.mock import Mock
 
@@ -109,7 +111,7 @@ def test_thinker_only_materializes_payloads_with_consumers(
 class _KvInitRecorder:
     """Record the native → stage-cache ordering without module-level state."""
 
-    def __init__(self, config: object, profiling: bool, spec: object = None) -> None:
+    def __init__(self, config: object, profiling: bool, spec: _SpecConfig | None = None) -> None:
         self.config = config
         self.profiling = profiling
         self.spec = spec
