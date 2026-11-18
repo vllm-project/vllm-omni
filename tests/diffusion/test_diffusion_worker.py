@@ -33,6 +33,7 @@ def patch_cumem_allocator(mocker: MockerFixture):
 def mock_od_config(mocker: MockerFixture):
     """Create a mock OmniDiffusionConfig."""
     config = mocker.Mock()
+    config.diffusion_weight_stack = "legacy"
     config.num_gpus = 1
     config.master_port = 12345
     config.enable_sleep_mode = False
@@ -48,6 +49,7 @@ def mock_gpu_worker(mocker: MockerFixture, mock_od_config):
     mocker.patch.object(DiffusionWorker, "init_device")
     mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.synchronize")
     mocker.patch.object(DiffusionWorker, "load_model")
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env")
     worker = DiffusionWorker(local_rank=0, rank=0, od_config=mock_od_config)
     # Mock the model_runner with pipeline
     worker.model_runner = mocker.Mock()
@@ -55,7 +57,8 @@ def mock_gpu_worker(mocker: MockerFixture, mock_od_config):
     worker.model_runner.pipeline = mocker.Mock()
     worker.device = torch.device("cuda", 0)
     worker._sleep_saved_buffers = {}
-    return worker
+    yield worker
+    worker.shutdown()
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)

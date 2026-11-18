@@ -905,6 +905,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     prompt_embed_cache_size: int = Field(default=32, ge=1)
     enable_session_state_manager: bool = False
     diffusion_load_format: str = "default"
+    diffusion_weight_stack: Literal["legacy", "unified"] = "legacy"
     hsdp_weight_load_strategy: str = "full"
     diffusers_load_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_call_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -1026,6 +1027,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     def from_kwargs(cls, **kwargs: Any) -> _DiffusionConfigProjection:
         from vllm_omni.diffusion.data import (
             normalize_omni_diffusion_kwargs,
+            validate_diffusion_weight_stack,
             validate_omni_diffusion_kwargs,
         )
         from vllm_omni.diffusion.offloader.config import parse_diffusion_offload_config
@@ -1033,13 +1035,15 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
         valid_fields = frozenset(f.name for f in fields(cast(Any, cls)))
         normalized = normalize_omni_diffusion_kwargs(kwargs)
         validate_omni_diffusion_kwargs(normalized, valid_fields)
+        normalized = {name: value for name, value in normalized.items() if value is not None}
+        validate_diffusion_weight_stack(normalized)
         # Validate before stage construction while retaining the raw mapping
         # needed by dataclass/config serialization across process boundaries.
         parse_diffusion_offload_config(normalized.get("diffusion_offload_config"))
         from vllm_omni.diffusion.kv_offload_config import parse_reference_kv_config
 
         parse_reference_kv_config(normalized.get("kv_offload_config"))
-        return cls(**{name: value for name, value in normalized.items() if value is not None})
+        return cls(**normalized)
 
     def __post_init__(self) -> None:
         # Keep diffusion imports lazy so importing vllm_omni.config does not
@@ -1052,12 +1056,15 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
             build_attention_config,
             parse_attention_schedule_config,
             parse_kv_cache_skip_selector,
+            validate_diffusion_weight_stack,
             validate_dlo_host_registration_options,
             validate_host_weight_runtime_options,
             validate_kv_cache_dtype_vs_attention_specs,
         )
         from vllm_omni.diffusion.diffusion_kv.config import parse_diffusion_kv_cache_mode
         from vllm_omni.quantization import build_quant_config
+
+        validate_diffusion_weight_stack(self)
 
         kernels = KernelConfig(moe_backend=self.moe_backend, linear_backend=self.linear_backend)
         self.moe_backend = kernels.moe_backend

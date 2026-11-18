@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Resource accounting for the unified weight stack startup transaction.
+"""Selector, process state and resources for unified weight stack startup.
 
-This module starts as the ``ResourceLedger`` delivered by sub-RFC 01-1.  The
-weight-stack switch (01-2), ``execution_offload_facts`` (01-3) and the startup
-driver with ``FaultPlan`` (01-5) extend the same module later; the ledger is the
-only part that exists today.
+The startup driver (01-5) and execution offload facts (01-3) extend this module
+later.
 
 The ledger is *not* a global resource manager: it is created by the startup
 transaction (and, after commit, by the ``OffloadRuntime``), lives only as long
@@ -18,10 +16,63 @@ import enum
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from threading import Lock
 
-from vllm_omni.diffusion.weight_management.errors import LifecycleError
+from vllm_omni.diffusion.weight_management.errors import ConfigError, LifecycleError
 
 logger = logging.getLogger(__name__)
+
+
+class WeightStack(str, enum.Enum):
+    LEGACY = "legacy"
+    UNIFIED = "unified"
+
+
+def parse_weight_stack(value: object) -> WeightStack:
+    if value is None:
+        return WeightStack.LEGACY
+    if isinstance(value, str):
+        try:
+            return WeightStack(value)
+        except ValueError:
+            pass
+    raise ConfigError(
+        f"diffusion_weight_stack must be 'legacy' or 'unified', got {value!r}",
+        fix="use --diffusion-weight-stack legacy",
+    )
+
+
+def is_unified(config: object) -> bool:
+    return parse_weight_stack(getattr(config, "diffusion_weight_stack", None)) is WeightStack.UNIFIED
+
+
+# Identity keys also support unhashable worker owners.
+_process_owners: dict[int, tuple[object, WeightStack]] = {}
+_process_lock = Lock()
+
+
+def set_process_weight_stack(value: WeightStack, *, owner: object) -> None:
+    value = parse_weight_stack(value)
+    with _process_lock:
+        for current_owner, current_value in _process_owners.values():
+            if current_value is not value:
+                raise ConfigError(
+                    f"stage {getattr(owner, 'stage_id', None)} selects {value.value!r}, but "
+                    f"stage {getattr(current_owner, 'stage_id', None)} already owns {current_value.value!r} "
+                    "in this process",
+                    fix="use the same diffusion_weight_stack for all workers in one process",
+                )
+        _process_owners[id(owner)] = (owner, value)
+
+
+def clear_process_weight_stack(*, owner: object) -> None:
+    with _process_lock:
+        _process_owners.pop(id(owner), None)
+
+
+def process_weight_stack() -> WeightStack:
+    with _process_lock:
+        return next((value for _, value in _process_owners.values()), WeightStack.LEGACY)
 
 
 class ResourceKind(enum.IntEnum):
