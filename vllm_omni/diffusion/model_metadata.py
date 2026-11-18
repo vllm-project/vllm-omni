@@ -154,6 +154,12 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         final_output_type="video",
         attention_mask_free=True,
     ),
+    "InvokerRenderPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        final_output_type="video",
+        attention_mask_free=True,
+    ),
     "Magi2Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=1,

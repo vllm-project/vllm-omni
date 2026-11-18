@@ -33,6 +33,7 @@ from vllm.logger import init_logger
 from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
+from vllm_omni.diffusion.models.invoker_render.pipeline_config import INVOKER_RENDER_PIPELINE
 from vllm_omni.diffusion.models.mossimage_pipeline_config import MOSS_IMAGE_PIPELINE
 from vllm_omni.diffusion.models.physis.h3.pipeline_config import PHYSIS_H3_PIPELINE
 from vllm_omni.diffusion.models.physis.ltx.pipeline_config import PHYSIS_LTX_PIPELINE
@@ -270,6 +271,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "step_audio_2": STEP_AUDIO2_PIPELINE,
     "step_audio_2_asr": STEP_AUDIO2_ASR_PIPELINE,
     "taomate_h3": TAOMATE_H3_PIPELINE,
+    "invoker_render": INVOKER_RENDER_PIPELINE,
     "vibevoice": VIBEVOICE_PIPELINE,
     "voxcpm2": VOXCPM2_PIPELINE,
     "voxtral_tts": VOXTRAL_TTS_PIPELINE,

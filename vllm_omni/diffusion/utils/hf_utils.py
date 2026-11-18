@@ -95,8 +95,11 @@ def _looks_like_flux3(model_name: str, config: Mapping | None = None) -> bool:
 
 def resolve_native_diffusion_model_class(model_name: str) -> str | None:
     """Resolve native checkpoints that have no root HF or Diffusers config."""
+    from vllm_omni.diffusion.models.invoker_render.assets import PIPELINE, is_invoker_render_bundle
     from vllm_omni.diffusion.models.video_depth_anything.checkpoints import resolve_checkpoint
 
+    if is_invoker_render_bundle(model_name):
+        return PIPELINE
     if _looks_like_magi2(model_name):
         return "Magi2Pipeline"
     if resolve_checkpoint(model_name) is not None:

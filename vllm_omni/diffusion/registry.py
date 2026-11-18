@@ -204,6 +204,7 @@ _DIFFUSION_MODELS = {
         "pipeline",
         "TaoMateH3Pipeline",
     ),
+    "InvokerRenderPipeline": ("invoker_render", "pipeline", "InvokerRenderPipeline"),
     "ABotWorldCausalPipeline": (
         "abot_world",
         "pipeline_abot_world",
@@ -907,6 +908,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "WanI2VDMD2Pipeline": "get_wan22_i2v_pre_process_func",
     "LingBotWorldCausalDMDPipeline": "get_lingbot_world_pre_process_func",
     "ABotWorldCausalPipeline": "get_abot_world_pre_process_func",
+    "InvokerRenderPipeline": "get_invoker_render_pre_process_func",
     "OmniGen2Pipeline": "get_omnigen2_pre_process_func",
     "HeliosPipeline": "get_helios_pre_process_func",
     "HeliosPyramidPipeline": "get_helios_pre_process_func",

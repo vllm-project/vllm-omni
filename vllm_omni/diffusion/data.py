@@ -1825,6 +1825,15 @@ class OmniDiffusionConfig:
             self.set_tf_model_config(TransformerConfig())
             return
 
+        from vllm_omni.diffusion.models.invoker_render.assets import PIPELINE, is_invoker_render_bundle
+
+        if self.model_class_name in (None, PIPELINE) and is_invoker_render_bundle(self.model):
+            self.model_class_name = PIPELINE
+            if not self._load_component_transformer_config():
+                raise ValueError("Invoker-Render bundle requires transformer/config.json")
+            self.update_multimodal_support()
+            return
+
         try:
             config_dict = get_diffusion_model_index(
                 self.model,
