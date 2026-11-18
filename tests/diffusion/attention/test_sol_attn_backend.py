@@ -714,11 +714,11 @@ def test_text_audio_configuration_round_trip(bsa_kernels, provider):
 def test_sol_defaults_match_text_audio_bsa_profile(bsa_kernels, options):
     config = AttentionConfig(
         per_role={
-            "minimax_h3.main": {"backend": "SOL_ATTN", "sol_attn": options},
+            "self": {"backend": "SOL_ATTN", "sol_attn": options},
             "minimax_h3.token_refiner": {"backend": "TORCH_SDPA"},
         }
     )
-    spec, _ = config.resolve_with_source("minimax_h3.main")
+    spec, _ = config.resolve_with_source("self")
     impl = SolAttnImpl(2, 128, 0.125, backend_kwargs=spec.backend_kwargs())
     assert impl.config.provider == "cudnn"
     assert impl.config.sink_mode == "text_audio"

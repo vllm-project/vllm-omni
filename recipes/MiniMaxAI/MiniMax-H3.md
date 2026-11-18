@@ -367,8 +367,9 @@ steady-state latency. H3 is CFG-distilled, so `--cfg-parallel-size` must remain
 Selecting it defaults to cuDNN SOL-BSA with block64 text/audio protection and
 no dense step/layer guards; the cuDNN provider requires SM90 or newer.
 For installation and the T2VA, FL2VA, and Ref2VA serve command, see
-[online serving](../../docs/user_guide/diffusion/attention_backends/sol_attn.md#minimax-h3-online-serving).
-The per-role configuration keeps the token refiner dense. This opt-in does not
+[online serving](../../docs/user_guide/diffusion/attention_backends/sol_attn.md#quick-start).
+Use `--diffusion-attention-backend SOL_ATTN`; H3 automatically keeps the token
+refiner dense, without per-role JSON. This opt-in does not
 change the platform default below and still needs full-model quality and latency validation.
 
 On supported datacenter Blackwell systems, MiniMax H3 defaults to dense BF16

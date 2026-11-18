@@ -33,7 +33,13 @@ last_reviewed: 2026-07-16
 Diffusion model integration owns pipeline contracts, registration, checkpoint
 loading, adapters, shared layers, and model-specific processing.
 
-MiniMax-H3 owns the packed text/audio positions used by SOL-BSA's optional
+MiniMax-H3's token refiner declares a model-owned inherited backend policy:
+global or category SOL selections use dense SDPA there, while an exact
+per-role user choice takes precedence. The main DiT retains role `self`.
+Shared attention selection applies this policy to both the baseline and
+startup schedule profiles; the model does not rewrite the global config.
+
+MiniMax-H3 owns the packed text/audio positions used by SOL-BSA's
 `text_audio` protection policy. `MiniMaxH3DenoiseBranch` validates their bounds
 and constructs one block64 `TextAudioBlockMask` per request branch, outside the
 denoising loop. The transformer and attention blocks pass it unchanged to

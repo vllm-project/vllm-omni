@@ -46,6 +46,8 @@ from .vdnh3 import VDNConfig, VDNH3HybridAttention
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
+    from vllm_omni.diffusion.data import AttentionSpec
+
     from .reference_kv_cache import MiniMaxH3ReferenceKVTier2State
 
 _BF16_DTYPE = torch.bfloat16
@@ -211,6 +213,7 @@ class MiniMaxH3Attention(nn.Module):
         role: str = "self",
         role_category: str | None = None,
         skip_sequence_parallel: bool = False,
+        inherited_backend_overrides: Mapping[str, AttentionSpec] | None = None,
     ) -> None:
         super().__init__()
         self.total_num_heads = arch.num_attention_heads
@@ -268,6 +271,7 @@ class MiniMaxH3Attention(nn.Module):
             skip_sequence_parallel=skip_sequence_parallel,
             prefix=prefix,
             impl_overrides={"FASTVIDEO_VSA": MiniMaxH3VSAImpl},
+            inherited_backend_overrides=inherited_backend_overrides,
         )
 
     def enable_vsa_gate(self) -> None:

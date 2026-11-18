@@ -484,6 +484,7 @@ class Attention(nn.Module):
         computation: AttentionComputation | str | None = None,
         cross_parallel_layout: CrossAttentionParallelLayout | str | None = None,
         cross_mask_kind: str | None = None,
+        inherited_backend_overrides: Mapping[str, "AttentionSpec"] | None = None,
     ):
         super().__init__()
 
@@ -574,6 +575,7 @@ class Attention(nn.Module):
                 attention_config=attention_config,
                 role_category=role_category,
                 allow_trtllm_default=allow_trtllm_default,
+                inherited_backend_overrides=inherited_backend_overrides,
             )
             attn_backend_cls = _promote_marked_paged_default(
                 selected_backend_cls,
@@ -646,6 +648,7 @@ class Attention(nn.Module):
                     head_size=head_size,
                     allow_trtllm_default=allow_trtllm_default,
                     impl_overrides=impl_overrides,
+                    inherited_backend_overrides=inherited_backend_overrides,
                     skip_sequence_parallel=skip_sequence_parallel,
                     allgather_degree=allgather_degree,
                 )
@@ -734,6 +737,7 @@ class Attention(nn.Module):
         head_size: int,
         allow_trtllm_default: bool,
         impl_overrides: Mapping[str, type[AttentionImpl]] | None,
+        inherited_backend_overrides: Mapping[str, "AttentionSpec"] | None,
         skip_sequence_parallel: bool,
         allgather_degree: int,
     ) -> None:
@@ -782,6 +786,7 @@ class Attention(nn.Module):
                 attention_config=profiles[name],
                 role_category=role_category,
                 allow_trtllm_default=allow_trtllm_default,
+                inherited_backend_overrides=inherited_backend_overrides,
             )
             backend_cls = _promote_marked_paged_default(
                 backend_cls,

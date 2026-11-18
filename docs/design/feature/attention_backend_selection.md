@@ -101,6 +101,31 @@ preserve common `self` or `cross` policies. A model also decides whether its
 path is compatible with automatic TRTLLM selection, because only the model
 knows whether masking and packing satisfy the kernel contract.
 
+### Model-owned inherited backend policy
+
+`Attention(..., inherited_backend_overrides={backend_name: AttentionSpec(...)})`
+lets a model declare a complete replacement spec for a sensitive submodule
+when its backend is inherited from a category or global default. Keys are
+uppercase backend names. Exact per-role user choices take precedence;
+platform defaults and unmatched backends are unchanged. Replacement specs do
+not inherit options from the original backend or mutate user configuration.
+
+`AttentionConfig.resolve_with_source()` owns this rule. Runtime selection,
+capability queries supplied with the same policy, and each independent startup
+schedule profile use that resolver. Policy is applied before platform validation,
+not as an exception-driven fallback, and the startup log names the replacement.
+No per-forward selection, configuration copying, or model-name checks are added.
+
+This follows the ownership split used by model-declared
+`CacheDiTAdapterConfig`: users select a feature and optional tuning, models
+declare structural policy, and shared infrastructure applies it. Attention
+selection does not reuse Cache-DiT's cache installation or request lifecycle.
+
+H3 declares `SOL_ATTN -> TORCH_SDPA` only on its token refiner. Its main DiT
+keeps role `self` and the selected SOL options. Thus the public shorthand
+`--diffusion-attention-backend SOL_ATTN` needs no internal role configuration.
+Other backends, including TRTLLM and VSA, retain their existing behavior.
+
 ### Model-owned implementation specializations
 
 Use `Attention(..., impl_overrides={backend_name: implementation_class})`

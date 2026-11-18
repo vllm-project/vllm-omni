@@ -33,6 +33,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNLayout
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
+from vllm_omni.diffusion.data import AttentionSpec
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -466,6 +467,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             role="minimax_h3.token_refiner",
             role_category="self",
             skip_sequence_parallel=True,
+            inherited_backend_overrides={"SOL_ATTN": AttentionSpec(backend="TORCH_SDPA")},
         )
         self.mlp = MiniMaxH3MLP(
             arch,

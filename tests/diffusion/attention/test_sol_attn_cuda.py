@@ -93,7 +93,7 @@ def test_real_sol_production_attention_entry():
         }
     )
     with set_current_diffusion_config(config):
-        layer = Attention(2, 128, False, 0.125, prefix="blocks.4.attention", role="minimax_h3.main")
+        layer = Attention(2, 128, False, 0.125, prefix="blocks.4.attention", role="self")
         refiner = Attention(2, 128, False, 0.125, role="minimax_h3.token_refiner")
     assert isinstance(layer.attention, SolAttnImpl)
     assert refiner.attn_backend.get_name() == "SDPA"
@@ -190,7 +190,7 @@ def test_real_sol_bsa_matches_hybrid_oracle(provider, thresh_type, used, compile
         }
     )
     with set_current_diffusion_config(config):
-        layer = Attention(2, 128, False, scale, prefix="blocks.4.attention", role="minimax_h3.main")
+        layer = Attention(2, 128, False, scale, prefix="blocks.4.attention", role="self")
     assert layer.attention.config.provider == provider
     forward = torch.compile(layer, fullgraph=True) if compiled else layer
     actual = forward(query, key, value, metadata)
@@ -302,7 +302,7 @@ def _ulysses_worker(rank, init_method, provider, world_size=2):
             },
         )
         with set_current_diffusion_config(config), set_forward_context(omni_diffusion_config=config):
-            layer = Attention(4, 128, False, 128**-0.5, prefix="blocks.4.attention", role="minimax_h3.main")
+            layer = Attention(4, 128, False, 128**-0.5, prefix="blocks.4.attention", role="self")
             assert layer.parallel_strategy.name == "ulysses"
             generator = torch.Generator(device=device).manual_seed(23)
             query, key, value = (
@@ -354,6 +354,79 @@ def test_real_text_audio_sol_sp4_matches_local(tmp_path, provider):
     else:
         pytest.importorskip("fastvideo_kernel.block_sparse_attn")
     torch.multiprocessing.spawn(_ulysses_worker, args=(f"file://{tmp_path / 'rendezvous'}", provider, 4), nprocs=4)
+
+
+@hardware_test(res={"cuda": ["H100", "B200", "RTX5090"]}, num_cards=1)
+@pytest.mark.parametrize("selection", ["shorthand", "json", "category"])
+def test_real_sol_h3_simple_selection_and_forward(tmp_path, selection):
+    from dataclasses import replace
+
+    from vllm_omni.diffusion.distributed.parallel_state import (
+        destroy_distributed_env,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3DiTArchConfig, MiniMaxH3DiTBlock
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3TokenRefinerBlock
+
+    if current_omni_platform.get_device_capability()[0] < 9:
+        pytest.skip("cuDNN BSA requires SM90 or newer")
+    pytest.importorskip("cudnn", minversion="1.31.0")
+    if selection == "shorthand":
+        config = OmniDiffusionConfig.from_kwargs(diffusion_attention_backend="SOL_ATTN")
+    elif selection == "json":
+        config = OmniDiffusionConfig.from_kwargs(diffusion_attention_config={"default": {"backend": "SOL_ATTN"}})
+    else:
+        config = OmniDiffusionConfig.from_kwargs(diffusion_attention_config={"per_role": {"self": "SOL_ATTN"}})
+    attention_config = config.diffusion_attention_config
+    explicit = OmniDiffusionConfig(
+        diffusion_attention_config=replace(
+            attention_config, per_role={**attention_config.per_role, "minimax_h3.token_refiner": "TORCH_SDPA"}
+        )
+    )
+    arch = MiniMaxH3DiTArchConfig(
+        hidden_size=256, num_attention_heads=2, ffn_hidden_size=512, time_embed_dim=32, adaln_out_features=18 * 256
+    )
+    init_distributed_environment(
+        world_size=1, rank=0, local_rank=0, distributed_init_method=f"file://{tmp_path / 'h3-rendezvous'}"
+    )
+    initialize_model_parallel()
+    try:
+        models = []
+        for settings in (config, explicit):
+            with set_current_diffusion_config(settings), torch.device("cuda"):
+                main = MiniMaxH3DiTBlock(arch, None, prefix="blocks.0", layer_index=0)
+                refiner = MiniMaxH3TokenRefinerBlock(arch, None, prefix="token_refiner.blocks.0")
+            assert main.attn.attention.role == "self"
+            assert isinstance(main.attn.attention.attention, SolAttnImpl)
+            assert refiner.attn.attention.attn_backend.get_name() == "SDPA"
+            assert refiner.attn.attention.skip_sequence_parallel
+            assert main.attn.attention.attention.config.sink_mode == "text_audio"
+            models.append((main.eval(), refiner.eval()))
+        with torch.inference_mode():
+            generator = torch.Generator(device="cuda").manual_seed(79)
+            for model in models[0]:
+                for parameter in model.parameters():
+                    parameter.normal_(std=0.02, generator=generator)
+            for automatic, manual in zip(models[0], models[1]):
+                manual.load_state_dict(automatic.state_dict())
+            inputs = torch.randn(257, 256, device="cuda", dtype=torch.bfloat16, generator=generator)
+            lengths = torch.tensor([0, 257], device="cuda", dtype=torch.int32)
+            mask = TextAudioBlockMask(257, 64, torch.tensor([True, False, False, False, False], device="cuda"))
+            outputs = []
+            for settings, (main, refiner) in zip((config, explicit), models):
+                with set_forward_context(omni_diffusion_config=settings):
+                    main_output = main.attn(
+                        inputs, rope_table=None, cu_seqlens=lengths, max_seqlen=257, text_audio_block_mask=mask
+                    )
+                    refiner_output = refiner(inputs, cu_seqlens=lengths, max_seqlen=257)
+                assert torch.isfinite(main_output).all() and torch.isfinite(refiner_output).all()
+                outputs.append((main_output, refiner_output))
+            for automatic, manual in zip(outputs[0], outputs[1]):
+                torch.testing.assert_close(automatic, manual, atol=0, rtol=0)
+        assert "minimax_h3.token_refiner" not in config.diffusion_attention_config.per_role
+    finally:
+        destroy_distributed_env()
 
 
 @hardware_test(res={"cuda": ["L4", "H100", "B200", "RTX5090"]}, num_cards=1)

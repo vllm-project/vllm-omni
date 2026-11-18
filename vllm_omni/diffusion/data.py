@@ -2696,18 +2696,32 @@ class AttentionConfig:
         self,
         role: str = "self",
         role_category: str | None = None,
+        *,
+        inherited_backend_overrides: Mapping[str, AttentionSpec] | None = None,
     ) -> tuple[AttentionSpec | None, str | None]:
-        """Resolve the AttentionSpec and report which config entry matched."""
+        """Resolve a role, preserving exact user choices over model-owned defaults.
+
+        Model overrides map uppercase inherited backend names to complete specs.
+        They apply to category/global selections, not exact-role or platform
+        defaults, and never merge backend options or mutate user configuration.
+        """
         spec = self.per_role.get(role)
         if spec is not None:
             return spec, f"attention_config.per_role[{role!r}]"
+        source = None
         if role_category is not None:
             spec = self.per_role.get(role_category)
-            if spec is not None:
-                return spec, f"attention_config.per_role[{role_category!r}] (role_category fallback)"
-        if self.default is not None:
-            return self.default, "attention_config.default"
-        return None, None
+            source = (
+                f"attention_config.per_role[{role_category!r}] (role_category fallback)" if spec is not None else None
+            )
+        if spec is None and self.default is not None:
+            spec, source = self.default, "attention_config.default"
+        if spec is not None and inherited_backend_overrides:
+            replacement = inherited_backend_overrides.get(spec.backend.upper())
+            if replacement is not None:
+                source = f"{source} (model override {spec.backend.upper()} -> {replacement.backend})"
+                spec = replacement
+        return spec, source
 
 
 @dataclass

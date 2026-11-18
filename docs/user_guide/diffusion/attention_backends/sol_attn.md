@@ -8,7 +8,7 @@ The algorithm combines exact selected blocks with an approximation of omitted
 blocks, merged using their softmax normalization. It is not VSA and does not
 require VSA-trained weights.
 
-## Installation and scope
+## Requirements
 
 Install the validated upstream kernel package and the cuDNN BSA dependency:
 
@@ -23,7 +23,7 @@ one real sequence, locally or with pure Ulysses. Structural suffix padding is
 excluded; multiple packed documents, arbitrary masks, Ring, AllGather-KV,
 quantized KV, and compact unequal-Q/KV attention are rejected.
 
-## MiniMax-H3 online serving
+## Quick start
 
 Start T2VA or FL2VA with native checkpoints:
 
@@ -31,11 +31,11 @@ Start T2VA or FL2VA with native checkpoints:
 vllm serve /path/to/MiniMax-H3/FL2VA --omni \
   --task-type fl2va \
   --enforce-eager --vae-use-tiling \
-  --diffusion-attention-config '{"per_role":{"minimax_h3.main":{"backend":"SOL_ATTN"},"minimax_h3.token_refiner":{"backend":"TORCH_SDPA"}}}'
+  --diffusion-attention-backend SOL_ATTN
 ```
 
-No `sol_attn` option block is required. The main DiT uses the defaults above;
-the text token refiner stays dense.
+No JSON or internal role names are required. H3 applies SOL to its main DiT
+and automatically keeps the text token refiner on dense `TORCH_SDPA`.
 
 - **T2VA / FL2VA:** set request `extra_params.task` to `t2va` or `fl2va`.
 - **Ref2VA:** replace `/FL2VA` with `/Ref2VA` and `--task-type fl2va` with
@@ -48,7 +48,59 @@ the text token refiner stays dense.
 Submit requests through the
 [MiniMax-H3 online video API](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md#http-api-examples).
 
-## Protection policy
+The startup log identifies both selections: `SOL_ATTN` for role `self`, and
+`SDPA` for `minimax_h3.token_refiner` with
+`model override SOL_ATTN -> TORCH_SDPA` in the resolution source.
+
+## Advanced settings
+
+Only use `--diffusion-attention-config` when overriding defaults. Like
+[TRTLLM attention](trtllm.md#quick-start), it accepts JSON or
+[dotted flags](../attention_backends.md#configuration). For example, replace
+the quick-start backend flag with:
+
+```bash
+--diffusion-attention-config '{"default":{"backend":"SOL_ATTN","sol_attn":{"thresh_type":"exact","tau":1.5}}}'
+```
+
+Unspecified SOL options retain their defaults; the H3 refiner still stays
+dense automatically. `exact` changes the threshold estimator, not attention
+precision or equivalence to dense attention. Higher `tau` generally selects
+fewer exact blocks; validate quality and latency for the actual workload.
+
+### Configuration keys
+
+Optional overrides go in `AttentionSpec.sol_attn`:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `provider` | `cudnn` | BF16 SOL-BSA; `triton` selects the other BSA provider, `native` the upstream fused kernel. |
+| `sink_mode` | `text_audio` | Model-owned text/audio block64 protection; `prefix` selects the legacy prefix/range policy. |
+| `tau` | `1.0` | Nonnegative threshold multiplier; higher values generally select fewer exact blocks. |
+| `thresh_type` | `diag` | `diag` ignores cross-dimension covariance; `exact` includes it. Neither changes precision or means dense attention. |
+| `dense_steps` | `0` | First N denoising steps stay dense; positive values also guard missing step metadata. |
+| `dense_layers` | `[]` | Layer indices/ranges kept dense; nonempty selectors also guard unidentified layers. |
+| `prefix_sink` | `true` | In `prefix` mode, derive the protected prefix from model-owned video layout. Ignored by `text_audio`. |
+| `sink_tokens` | `0` | Additional protected range in `prefix` mode; BSA rounds outward to whole blocks. |
+| `sink_start` | `0` | Range offset in `prefix` mode; `null` places the range at the valid-token suffix. |
+| `kv_splits` | `auto` | BSA resolves to one; native uses four on SM90 with CuTe and at least 65,536 valid tokens, otherwise one. |
+
+### Per-role overrides
+
+An exact `per_role` entry takes precedence over the model's automatic policy.
+For example, select cuDNN dense attention for the H3 refiner instead of SDPA:
+
+```bash
+--diffusion-attention-config '{"default":{"backend":"SOL_ATTN"},"per_role":{"minimax_h3.token_refiner":{"backend":"CUDNN_ATTN"}}}'
+```
+
+H3's main DiT role is `self`, not `minimax_h3.main`. A per-role spec replaces
+the entire inherited spec; SOL options do not leak into a dense backend.
+Explicit selections still require compatible hardware and metadata. The
+automatic refiner policy applies independently to startup schedule profiles
+and does not change other models or non-SOL selections.
+
+### Protection policy
 
 The default adopts the
 [upstream Sol-H3 Ref2VA policy](https://github.com/NVlabs/Sana/blob/cf67a3acad7511acb85053e56a05e5dd24c82ba0/models/minimax_h3/Sol-H3/h3_runtime/engine.py#L302)
@@ -67,22 +119,7 @@ Missing or stale text/audio metadata fails explicitly. Other models must
 publish compatible metadata or explicitly select `sink_mode="prefix"`; there
 is no silent fallback to prefix protection or dense attention.
 
-## Controls
-
-Optional overrides go in `AttentionSpec.sol_attn` under the selected role:
-
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `provider` | `cudnn` | BF16 SOL-BSA; `triton` selects the other BSA provider, `native` the upstream fused kernel. |
-| `sink_mode` | `text_audio` | Model-owned text/audio block64 protection; `prefix` selects the legacy prefix/range policy. |
-| `tau` | `1.0` | Nonnegative threshold multiplier; higher values generally select fewer exact blocks. |
-| `thresh_type` | `diag` | `diag` ignores cross-dimension covariance; `exact` includes it. Neither changes precision or means dense attention. |
-| `dense_steps` | `0` | First N denoising steps stay dense; positive values also guard missing step metadata. |
-| `dense_layers` | `[]` | Layer indices/ranges kept dense; nonempty selectors also guard unidentified layers. |
-| `prefix_sink` | `true` | In `prefix` mode, derive the protected prefix from model-owned video layout. Ignored by `text_audio`. |
-| `sink_tokens` | `0` | Additional protected range in `prefix` mode; BSA rounds outward to whole blocks. |
-| `sink_start` | `0` | Range offset in `prefix` mode; `null` places the range at the valid-token suffix. |
-| `kv_splits` | `auto` | BSA resolves to one; native uses four on SM90 with CuTe and at least 65,536 valid tokens, otherwise one. |
+### Alternative providers
 
 `text_audio` requires a BSA provider and rejects explicit sink ranges. The
 `triton` provider requires `vllm-omni[vsa]` for its shared kernel, SM80+, and
