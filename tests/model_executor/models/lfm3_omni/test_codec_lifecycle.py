@@ -66,6 +66,26 @@ def test_codec_rejects_missing_payload_or_request_identity():
         model(runtime_additional_information=[payload])
 
 
+def test_profile_placeholder_rows_decode_nothing():
+    model = make_model()
+    output = model(runtime_additional_information=[{}, {}])
+    assert output.multimodal_outputs["model_outputs"] == []
+    model.codec.decode.assert_not_called()
+
+
+def test_mrv2_req_id_identifies_the_stream():
+    model = make_model()
+    payload = chunk("a")
+    payload["req_id"] = payload.pop("request_id")
+    model(runtime_additional_information=[payload])
+    assert set(model._streams) == {"a"}
+    model.model_config.hf_config.text_config.hidden_size = 4
+    model.model_config.dtype = torch.float32
+    _, embeds, updates = model.preprocess(torch.tensor([1, 2]), None, req_id="a")
+    assert updates == {"request_id": "a"}
+    assert embeds.shape == (2, 4)
+
+
 def test_transport_coalescing_preserves_reference_decode_chunks():
     model = make_model()
     model(runtime_additional_information=[chunk("a", finished=True, frames=10)])

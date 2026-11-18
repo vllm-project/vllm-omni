@@ -43,7 +43,7 @@ class Lfm3OmniCode2Wav(nn.Module):
         )
 
     def preprocess(self, input_ids, input_embeds, **info):
-        return input_ids, self.embed_input_ids(input_ids), {"request_id": info["request_id"]}
+        return input_ids, self.embed_input_ids(input_ids), {"request_id": info.get("request_id") or info.get("req_id")}
 
     def make_omni_output(self, model_outputs, **kwargs):
         if isinstance(model_outputs, OmniOutput):
@@ -52,6 +52,13 @@ class Lfm3OmniCode2Wav(nn.Module):
 
     def forward(self, input_ids=None, positions=None, **kwargs):
         infos = kwargs.get("runtime_additional_information") or []
+        # Model Runner V2 profiles memory with placeholder rows that carry
+        # neither a request nor a codec payload.
+        if infos and all(
+            (info.get("request_id") or info.get("req_id")) is None and "codes" not in info and "codes.audio" not in info
+            for info in infos
+        ):
+            infos = []
         device = self.codec.from_quantizer.weight.device
         audios = []
         for info in infos:

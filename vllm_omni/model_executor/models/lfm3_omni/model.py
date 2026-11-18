@@ -27,6 +27,16 @@ from .processing import Lfm3OmniDummyInputsBuilder, Lfm3OmniMultiModalProcessor,
 from .reference import reference_module
 
 
+def _request_id(info: dict) -> str | None:
+    # Model Runner V2 keys its per-request buffers by ``req_id``.
+    return info.get("request_id") or info.get("req_id")
+
+
+def _sampling_extra_args(info: dict) -> dict:
+    params = info.get("sampling_params")
+    return dict(getattr(params, "extra_args", None) or {})
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     Lfm3OmniMultiModalProcessor, info=Lfm3OmniProcessingInfo, dummy_inputs=Lfm3OmniDummyInputsBuilder
 )
@@ -34,6 +44,9 @@ class Lfm3OmniForConditionalGeneration(nn.Module, SupportsMultiModal):
     have_multimodal_outputs = True
     has_preprocess = True
     has_postprocess = False
+    # Media understanding runs through the native Model Runner V2 encoder;
+    # preprocess only replaces the rows that feed back generated audio.
+    preprocess_keeps_mm_inputs = True
     omni_pooler_payload_include_hidden = False
     # Checkpoint module and class that define the encoders and depth head.
     _reference = ("modeling_lfm3_omni", "Lfm3OmniModel")
@@ -162,7 +175,9 @@ class Lfm3OmniForConditionalGeneration(nn.Module, SupportsMultiModal):
                 state.slots_left = self.config.interleaved_n_audio if state.speaking else self.config.interleaved_n_text
 
     def preprocess(self, input_ids, input_embeds, **info):
-        req_id = info["request_id"]
+        req_id = _request_id(info)
+        if req_id is None:
+            raise ValueError("LFM3-Omni preprocess requires a scheduler request id")
         is_prefill = info["_omni_is_prefill"]
         state = self._states.get(req_id)
         if state is None:
@@ -261,11 +276,15 @@ class Lfm3OmniForConditionalGeneration(nn.Module, SupportsMultiModal):
 
     def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **kwargs):
         infos = kwargs.get("runtime_additional_information") or []
+        # Model Runner V2 profiles memory with placeholder rows that carry no
+        # request; treat them like the empty batch of the V1 profile run.
+        if infos and all(_request_id(info) is None and "lfm3_span" not in info for info in infos):
+            infos = []
         requests, self._batch_states = [], []
         start = 0
-        extras = kwargs.get("sampling_extra_args") or [{} for _ in infos]
+        extras = kwargs.get("sampling_extra_args") or [_sampling_extra_args(info) for info in infos]
         for info, extra in zip(infos, extras, strict=True):
-            state = self._states[info["request_id"]]
+            state = self._states[_request_id(info)]
             for name in ("audio_temperature", "audio_top_k", "audio_repetition_penalty", "audio_repetition_window"):
                 if name in extra:
                     setattr(state, name, extra[name])

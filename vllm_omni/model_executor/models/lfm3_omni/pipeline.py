@@ -26,6 +26,7 @@ LFM3_OMNI_PIPELINE = PipelineConfig(
             custom_process_next_stage_input_func=f"{_PROC}.temporal_to_codec_full_payload",
             async_chunk_process_next_stage_input_func=f"{_PROC}.temporal_to_codec_async_chunk",
             recompute_preemption="fail",
+            supports_native_mrv2_data_plane=True,
             sampling_constraints={"detokenize": True, "ignore_eos": True, "stop_token_ids": [124900]},
         ),
         StagePipelineConfig(
@@ -39,6 +40,7 @@ LFM3_OMNI_PIPELINE = PipelineConfig(
             engine_output_type="audio",
             sync_process_input_func=f"{_PROC}.temporal_to_codec_token_only",
             requires_full_payload_input=True,
+            supports_native_mrv2_data_plane=True,
             sampling_constraints={"detokenize": False},
         ),
     ),

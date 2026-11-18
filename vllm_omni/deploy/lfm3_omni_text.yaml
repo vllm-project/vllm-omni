@@ -4,7 +4,7 @@
 pipeline: lfm3_omni_text
 # LFM3-Omni bring-up profile. Eager execution owns per-request convolution state.
 async_chunk: false
-model_runner: v1
+model_runner: v2
 dtype: bfloat16
 stages:
   - stage_id: 0
