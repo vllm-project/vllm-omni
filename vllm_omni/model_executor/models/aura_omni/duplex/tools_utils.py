@@ -17,9 +17,9 @@ not DELTA, so the scanning shape differs too.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
-from uuid import uuid4
 
 import regex as re
 
@@ -112,8 +112,18 @@ def _parameter_value(raw: str) -> object:
         return stripped
 
 
-def parse_completed_tool_call(inner: str) -> dict[str, str] | None:
-    """Return one call from a finished ``<tool_call>`` body, or None."""
+def _stable_call_id(anchor: str, name: str, arguments: str) -> str:
+    """Same span parses to the same id; a later ``<|im_end|>`` must not remint it."""
+    digest = hashlib.sha256(f"{anchor}\n{name}\n{arguments}".encode()).hexdigest()
+    return f"call_{digest[:32]}"
+
+
+def parse_completed_tool_call(inner: str, *, anchor: str | None = None) -> dict[str, str] | None:
+    """Return one call from a finished ``<tool_call>`` body, or None.
+
+    ``anchor`` is the span's offset in the cumulative text. Re-parsing the same
+    span keeps ``call_id``; two identical calls at different offsets stay distinct.
+    """
     match = _FUNCTION_RE.search(inner)
     if match is None:
         return None
@@ -128,7 +138,11 @@ def parse_completed_tool_call(inner: str) -> dict[str, str] | None:
         arguments_text = json.dumps(arguments, ensure_ascii=False)
     except (TypeError, ValueError):
         return None
-    return {"call_id": f"call_{uuid4().hex}", "name": name, "arguments": arguments_text}
+    return {
+        "call_id": _stable_call_id(inner if anchor is None else anchor, name, arguments_text),
+        "name": name,
+        "arguments": arguments_text,
+    }
 
 
 def extract_finished_tool_calls(cumulative_text: str) -> list[dict[str, str]]:
@@ -144,7 +158,10 @@ def extract_finished_tool_calls(cumulative_text: str) -> list[dict[str, str]]:
         end = cumulative_text.find(TOOL_CALL_END, start + len(TOOL_CALL_START))
         if end == -1:
             break
-        call = parse_completed_tool_call(cumulative_text[start + len(TOOL_CALL_START) : end])
+        call = parse_completed_tool_call(
+            cumulative_text[start + len(TOOL_CALL_START) : end],
+            anchor=str(start),
+        )
         if call is not None:
             calls.append(call)
         start = cumulative_text.find(TOOL_CALL_START, end + len(TOOL_CALL_END))

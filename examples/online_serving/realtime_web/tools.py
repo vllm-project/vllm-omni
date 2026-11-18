@@ -662,6 +662,13 @@ def _duckduckgo_search(arguments: DuckDuckGoArguments) -> dict[str, Any]:
 
 
 def _check_ssrf(url: str) -> str:
+    """Best-effort block of private and loopback targets.
+
+    The check resolves the host, then ``requests`` resolves it again. A DNS
+    rebinding answer can pass this check and still connect to a private
+    address. WebFetch is off unless ``VLLM_REALTIME_WEB_TOOL_WEBFETCH=1`` and
+    the demo tool profile is ``safe``.
+    """
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("webfetch_invalid_url")

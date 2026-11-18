@@ -343,6 +343,11 @@ This Qwen3 UI profile requires the server-VAD deployment above.
   model-bundled `assets/HT_ref_audio.wav` when it is omitted. Rejected for
   Qwen3 and AURA.
 
+WebFetch stays off unless `VLLM_REALTIME_WEB_TOOL_WEBFETCH=1` and the tool
+profile is `safe`. The private-address check resolves the host once, then the
+HTTP client resolves it again, so a DNS rebinding answer can still reach a
+private address. Treat that check as best effort.
+
 Microphone and camera access require `localhost` or HTTPS. For a remote backend,
 use an SSH tunnel to the UI host or an HTTPS reverse proxy with WebSocket support.
 An explicit `wss://` public URL retains its scheme.

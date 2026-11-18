@@ -270,6 +270,11 @@ async def _pump_backend_to_client(
         if "websocket.send" in str(exc) and "websocket.close" in str(exc):
             return
         raise
+    finally:
+        for task in calls:
+            task.cancel()
+        if calls:
+            await asyncio.gather(*calls, return_exceptions=True)
 
 
 def _expected_proxy_close(exc: BaseException) -> bool:

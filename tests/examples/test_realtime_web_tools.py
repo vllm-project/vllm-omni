@@ -246,3 +246,65 @@ def test_vision_tools_hide_search_and_report_unknown_names() -> None:
     assert executor.uses_latest_frame is True
     assert asyncio.run(executor.run("draw", "{}")) == "tool not found: draw"
     assert "no video frame" in asyncio.run(executor.run("visual_web_search", '{"query": "logo"}'))
+
+
+@pytest.mark.asyncio
+async def test_backend_close_cancels_outstanding_tool_tasks() -> None:
+    cancelled = asyncio.Event()
+
+    class _Tools:
+        async def run(self, name, arguments, frame_b64=""):
+            del name, arguments, frame_b64
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            return "{}"
+
+    class _Backend:
+        def __init__(self) -> None:
+            self._sent = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._sent:
+                await asyncio.sleep(30)
+            self._sent = True
+            return json.dumps(
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "call_x",
+                        "name": "calculator",
+                        "arguments": "{}",
+                    },
+                }
+            )
+
+        async def send(self, message):
+            del message
+
+    class _Client:
+        async def send_text(self, message):
+            del message
+
+        async def send_bytes(self, message):
+            del message
+
+    task = asyncio.create_task(
+        server._pump_backend_to_client(
+            _Client(),
+            _Backend(),
+            _Tools(),
+            {"count": 0, "gen": 0, "final_answer": False},
+        )
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cancelled.is_set()

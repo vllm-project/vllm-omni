@@ -220,3 +220,34 @@ def test_project_emits_every_tool_call_and_only_the_last_releases_the_turn() -> 
         "get_current_location",
     ]
     assert [event["aura_tool_call_ends_turn"] for event in calls] == [False, True]
+
+
+def test_project_does_not_republish_a_tool_call_when_stop_text_is_appended() -> None:
+    plane = AuraDataPlaneSession(_encode_audio)
+    request_id = "duplex-s.abc.e.0.r.stage1-turn8"
+    plane.begin_request(request_id)
+    text = "<|respond|>先查一下。<tool_call>\n<function=calculator>\n<parameter=expression>\n1\n</parameter>\n</function>\n</tool_call>"
+    first = SimpleNamespace(
+        request_id=request_id,
+        finished=True,
+        stage_id=1,
+        outputs=[SimpleNamespace(text=text, cumulative_text=text, finished=True)],
+    )
+    second = SimpleNamespace(
+        request_id=request_id,
+        finished=True,
+        stage_id=1,
+        outputs=[SimpleNamespace(text=text + "<|im_end|>", cumulative_text=text + "<|im_end|>", finished=True)],
+    )
+    first_calls = [
+        event["aura_function_call"]["call_id"]
+        for event in plane.project({"data_plane_outputs": [first]})
+        if event.get("aura_function_call")
+    ]
+    second_calls = [
+        event["aura_function_call"]["call_id"]
+        for event in plane.project({"data_plane_outputs": [second]})
+        if event.get("aura_function_call")
+    ]
+    assert len(first_calls) == 1
+    assert second_calls == []

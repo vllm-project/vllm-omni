@@ -48,6 +48,7 @@ class _RequestState:
     terminal: bool = False
     context_committed: bool = False
     stage_seen: set[int] = field(default_factory=set)
+    emitted_tool_call_ids: set[str] = field(default_factory=set)
 
 
 def _unwrap(output: object) -> tuple[object, object | None, int | None]:
@@ -350,7 +351,14 @@ class AuraDataPlaneSession(DuplexDataPlane):
                 end_of_turn=False,
                 model_context_text=state.text_sent,
             )
-            calls = extract_finished_tool_calls(state.text_sent)
+            calls = [
+                call
+                for call in extract_finished_tool_calls(state.text_sent)
+                if isinstance(call.get("call_id"), str)
+                and call["call_id"] not in state.emitted_tool_call_ids
+            ]
+            for call in calls:
+                state.emitted_tool_call_ids.add(call["call_id"])
             if calls:
                 # One event per call. The session handles each event and then
                 # continues, so every call in this batch is published. Only the

@@ -214,6 +214,77 @@ async def test_released_vision_follow_does_not_abort_draining_talker() -> None:
 
 
 @pytest.mark.asyncio
+async def test_prewarmed_stage3_is_aborted_while_prior_talker_drain_stays() -> None:
+    """A is draining. B has Stage0 plus a prewarmed Stage3 and no Talker.
+
+    A speech commit must abort B. B's Stage3 is not active speech, and A's
+    Talker/Code2Wav bindings stay.
+    """
+    session = _ephemeral_session()
+    a2 = DuplexSessionManager.stage_request_id(session.fence, stage_id=2, resumable=False)
+    a3 = DuplexSessionManager.stage_request_id(session.fence, stage_id=3, resumable=False)
+    session.bind_stage_request(2, a2, fence=session.fence)
+    session.bind_stage_request(3, a3, fence=session.fence)
+    session.bind_draining_request(a3, "resp_a")
+    session.complete_model_turn(0)
+    b0 = DuplexSessionManager.stage_request_id(session.fence, stage_id=0, resumable=False)
+    session.bind_stage_request(0, b0, fence=session.fence)
+    assert session.stage_request_submitted(0, b0)
+    b3 = DuplexSessionManager.stage_request_id(session.fence, stage_id=3, resumable=False)
+    session.bind_stage_request(3, b3, fence=session.fence)
+    port = _StagePort()
+    run = DuplexRunState(concurrent_turn_requests_released=True)
+    channel = _channel(session, port, run, auto_responds=True)
+
+    await channel._append_via_data_plane(
+        {"is_speech": True},
+        final=True,
+        operation_id="speech-while-a-drains",
+        expected_epoch=None,
+        input_audio_part=None,
+    )
+
+    aborted = [rid for ids, abort in port.cleanups if abort for rid in ids]
+    assert b0 in aborted
+    assert b3 in aborted
+    assert a2 not in aborted
+    assert a3 not in aborted
+    assert session.request_resources.get((2, a2)) is not None
+    assert session.request_resources.get((3, a3)) is not None
+    assert session.request_resources.get((3, b3)) is None
+    assert not session.is_draining_request(b3)
+
+
+@pytest.mark.asyncio
+async def test_tool_call_after_speech_uses_the_open_response() -> None:
+    session = _ephemeral_session()
+    request_id = "duplex-s.abc.e.0.r.stage1-turn0"
+    session.bind_request(request_id)
+    response_id = session.begin_response()
+    port = _StagePort()
+    channel = _channel(session, port, DuplexRunState())
+    channel._ctx.plugin.data_plane.is_terminal = lambda request_id: False
+    channel._ctx.plugin.parse_function_call = lambda model_result: model_result["aura_function_call"]
+    channel._ctx.plugin.function_call_releases_turn = lambda model_result: False
+    captured: dict[str, object] = {}
+
+    async def _expose(function_call, response_id=None):
+        captured["response_id"] = response_id
+        captured["call_id"] = function_call["call_id"]
+
+    channel._expose_function_call = _expose
+    await channel._send_one_model_output_event(
+        {
+            "data_plane_request_id": request_id,
+            "aura_function_call": {"call_id": "call_spoken", "name": "calculator", "arguments": "{}"},
+            "aura_tool_call_ends_turn": False,
+        },
+    )
+    assert captured["response_id"] == response_id
+    assert captured["call_id"] == "call_spoken"
+
+
+@pytest.mark.asyncio
 async def test_unreleased_vision_follow_does_not_abort_already_bound_talker() -> None:
     """Gate closed after a prior Stage0 bind, but Talker/Code2Wav still drain.
 

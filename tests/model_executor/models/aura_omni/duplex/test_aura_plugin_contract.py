@@ -437,8 +437,17 @@ def test_session_history_strips_oldest_silent_videos() -> None:
         history.commit_turn(SILENT_TEXT)
     kept = [message["video"] for message in history.messages if message.get("video") is not None]
     assert kept == [("clip-1",), ("clip-2",)]
-    assert not any(message.get("video") == ("clip-0",) for message in history.messages)
-    drop_session_history("hist-ut")
+
+
+def test_session_history_caps_text_rounds_without_video_overflow() -> None:
+    drop_session_history("hist-text-cap")
+    history = get_or_create_session_history("hist-text-cap")
+    history.max_conversation_rounds = 2
+    for index in range(4):
+        history.begin_user_turn(f"q{index}")
+        history.commit_turn(f"a{index}")
+    assert [message["content"] for message in history.messages] == ["q2", "a2", "q3", "a3"]
+    drop_session_history("hist-text-cap")
 
 
 def test_forty_sixth_clip_is_trimmed_before_it_enters_the_prompt() -> None:

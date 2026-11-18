@@ -15,7 +15,7 @@ Stage1 stop ids in the deploy config, not by a separate pipeline.
        plugin.plan_append: one client commit -> one ephemeral four-stage request
   -> Stage0 Qwen3-ASR              speech -> transcript (vision-only turns get a silent pad)
   -> Stage1 AURA_v2 thinker        transcript + frames + session history -> <|silent|> or <|respond|> + text
-       two-token logits processor, greedy
+       two-token logits processor (silent/respond gate, then the reply)
   -> Stage2 Qwen3-TTS Talker       whole reply text -> codec frames (skipped on <|silent|>)
   -> Stage3 Qwen3-TTS Code2Wav     codec frames -> 24 kHz PCM
   -> response.output_audio.delta + response.output_audio_transcript.delta
@@ -61,9 +61,10 @@ plugin sets for v2.
 
 On a tie the lower id (`<|silent|>`) wins. The processor reads vLLM's live
 output list, so Stage1 runs with `async_scheduling: false`; an async step can
-see that list one token stale. Streaming mode also requires greedy decoding and
-no penalties, biases or string stops; the plugin forces these on the Stage1
-sampling params.
+see that list one token stale. Stage1 keeps the temperature from the deploy
+profile (the shipped profile uses 0.2). The plugin forces ``min_tokens`` to 0
+and the penalty fields to their no-penalty values so a penalty cannot push the
+control token; it does not override temperature.
 
 ## Control-token families
 

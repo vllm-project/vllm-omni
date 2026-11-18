@@ -73,6 +73,14 @@ def test_extract_finished_tool_calls_rejects_nan_literal() -> None:
     assert json.loads(call["arguments"]) == {"expression": "NaN"}
 
 
+def test_extract_finished_tool_calls_keeps_the_same_id_when_text_grows() -> None:
+    body = "<tool_call>\n<function=calculator>\n<parameter=expression>\n17 * 23\n</parameter>\n</function>\n</tool_call>"
+    first = extract_finished_tool_calls(body)
+    second = extract_finished_tool_calls(body + "<|im_end|>")
+    assert first[0]["call_id"] == second[0]["call_id"]
+    assert first[0]["call_id"].startswith("call_")
+
+
 def test_extract_finished_tool_calls_empty_without_a_closed_tag() -> None:
     assert extract_finished_tool_calls("just a normal spoken reply") == []
     assert extract_finished_tool_calls("<tool_call>still open, no close tag") == []
