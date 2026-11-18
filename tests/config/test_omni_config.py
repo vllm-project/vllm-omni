@@ -1361,7 +1361,7 @@ def test_qwen3_tts_profiles_default_to_v2():
     assert load_deploy_config(_DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2.yaml").model_runner == "v2"
 
 
-def test_qwen3_tts_default_profile_is_experimental_mrv2_with_v1_platform_fallback():
+def test_qwen3_tts_default_profile_uses_mrv2_on_supported_platforms():
     deploy_path = _DEPLOY_DIR / "qwen3_tts.yaml"
     assert load_deploy_config(deploy_path).model_runner == "v2"
 
@@ -1369,26 +1369,41 @@ def test_qwen3_tts_default_profile_is_experimental_mrv2_with_v1_platform_fallbac
     stages = merge_pipeline_deploy(pipeline, load_deploy_config(deploy_path))
     assert all(stage.yaml_engine_args["use_v2_model_runner"] is True for stage in stages)
 
-    # XPU has no V1 fallback: vLLM 0.34 removed Model Runner V1.
-    for platform in ("cuda", "npu", "xpu"):
+    # vLLM 0.34 removed Model Runner V1. MUSA remains explicitly deferred.
+    for platform in ("cuda", "npu", "xpu", "rocm"):
         assert _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform).model_runner == "v2"
-    for platform in ("rocm", "musa"):
-        assert _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform).model_runner == "v1"
+    assert _apply_platform_overrides(load_deploy_config(deploy_path), platform="musa").model_runner == "v1"
 
 
-def test_qwen3_tts_mrv2_retunes_do_not_change_default_mrv1_profile():
+def test_qwen3_tts_mrv2_retunes_do_not_change_base_profile():
     default = resolve_deploy_yaml(_DEPLOY_DIR / "qwen3_tts_high_concurrency.yaml")
     mrv2 = resolve_deploy_yaml(_DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2.yaml")
     default_extra = default["connectors"]["connector_of_shared_memory"]["extra"]
     mrv2_extra = mrv2["connectors"]["connector_of_shared_memory"]["extra"]
 
-    # B2 batch stays consistent with the graph buckets; V1 profile untouched.
+    # B2 batch stays consistent with the graph buckets; the base profile is untouched.
     assert default_extra["decode_batch_max_size"] == 1
     assert mrv2_extra["decode_batch_max_size"] == 2
     assert mrv2_extra["decode_cudagraph_batch_sizes"] == [1, 2]
     assert mrv2_extra["code_predictor_prefix_graphs"] is False
     assert mrv2["stages"][1]["enforce_eager"] is False
     assert default["stages"][1]["enforce_eager"] is True
+
+
+def test_qwen3_tts_high_concurrency_single_gpu_rocm_uses_mrv2_with_eager_code2wav():
+    deploy_path = _DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2_single_gpu.yaml"
+    deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="rocm")
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+
+    assert deploy.model_runner == "v2"
+    assert deploy.cuda_mps is False
+    assert deploy.stages[1].enforce_eager is True
+
+    stages = merge_pipeline_deploy(pipeline, deploy)
+    assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [True, True]
+    assert stages[1].yaml_engine_args["enforce_eager"] is True
+    assert [stage.yaml_runtime["devices"] for stage in stages] == ["0", "0"]
+    assert all(stage.yaml_runtime.get("cuda_mps", False) is False for stage in stages)
 
 
 def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
