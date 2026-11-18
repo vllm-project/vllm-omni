@@ -156,5 +156,7 @@ python tests/e2e/online_serving/personaplex_realtime_duplex.py \
 - Run the client near the server. The 80 ms cadence is sensitive to
   network jitter; over a high-latency link playback can stutter regardless of
   engine speed. On localhost it is smooth.
-- Sliding window is 3000 frames (~4 min). The ring KV recycles beyond that;
-  very long sessions keep running with a rolling context.
+- Sliding window is 3000 frames (~4 min). Stage 0 frees the KV behind the
+  window, so a call keeps running with a rolling context, up to one hour by
+  default; the comment in `vllm_omni/deploy/personaplex.yaml` shows how to
+  change the cap.
