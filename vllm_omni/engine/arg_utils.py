@@ -40,8 +40,6 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "IndexTTS2TalkerForConditionalGeneration": "indextts2",
     "IndexTTS25S2MelDecoder": "indextts2_5",
     "IndexTTS25TalkerForConditionalGeneration": "indextts2_5",
-    # Kokoro's config.json names neither model_type nor architectures.
-    "KokoroForConditionalGeneration": "kokoro",
     "OmniVoiceModel": "omnivoice",
     # PersonaPlex ships an empty config.json, so create_model_config() must patch
     # model_type=personaplex from the arch name or the staged pipeline can't load
@@ -75,7 +73,6 @@ def _register_omni_hf_configs() -> None:
             IndexTTS2Config,
             IndexTTS25Config,
         )
-        from vllm_omni.model_executor.models.kokoro.configuration_kokoro import KokoroConfig
         from vllm_omni.model_executor.models.ming3_tts.config_ming3_tts import (
             LingV3TTSConfig,
             Ming3TTSConfig,
@@ -125,7 +122,6 @@ def _register_omni_hf_configs() -> None:
         ("lingv3_tts", LingV3TTSConfig),
         ("indextts2", IndexTTS2Config),
         ("indextts2_5", IndexTTS25Config),
-        ("kokoro", KokoroConfig),
         ("moss_tts_local", MossTTSLocalConfig),
         ("moss_tts_realtime", MossTTSRealtimeConfig),
         ("qwen3_tts", Qwen3TTSConfig),
@@ -230,6 +226,37 @@ def _map_offload_config(args: "OmniEngineArgs") -> None:
     kv_store = args.omni_kv_config.get("kv_store_config", {}) if isinstance(args.omni_kv_config, dict) else {}
 
     lmcache_config = kv_store.get("lmcache_config")
+    mooncake_config = kv_store.get("mooncake_config")
+
+    if mooncake_config is not None:
+        from vllm.config.kv_transfer import KVTransferConfig
+
+        from vllm_omni.distributed.kv_transfer.mooncake.config import (
+            CONNECTOR_MODULE,
+            CONNECTOR_NAME,
+            EXTRA_CONFIG_KEY,
+            MooncakeConfig,
+        )
+
+        if "lmcache_config" in kv_store:
+            raise ValueError("Select either mooncake_config or lmcache_config, not both")
+        config = MooncakeConfig.from_dict(mooncake_config)
+        if args.enable_prefix_caching:
+            raise ValueError("Mooncake KV/HS caching requires enable_prefix_caching=false")
+        if args.kv_transfer_config is not None:
+            raise ValueError("mooncake_config cannot be combined with an explicit kv_transfer_config")
+        if kv_store.get("kv_role", "kv_both") != "kv_both":
+            raise ValueError("Mooncake KV/HS caching requires kv_role=kv_both")
+        args.enable_prefix_caching = False
+        args.kv_transfer_config = KVTransferConfig(
+            kv_connector=CONNECTOR_NAME,
+            kv_connector_module_path=CONNECTOR_MODULE,
+            kv_connector_extra_config={EXTRA_CONFIG_KEY: config.to_dict()},
+            kv_role="kv_both",
+            kv_load_failure_policy="recompute",
+        )
+        logger.info("[Omni] kv_transfer_config: kv_connector=%s", CONNECTOR_NAME)
+        return
 
     if lmcache_config:
         # LMCacheConnectorV1 only (OffloadingConnector removed due to
@@ -328,6 +355,7 @@ class OmniEngineArgs(EngineArgs):
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
+    diffusion_flashinfer_autotune: bool | None = None
     worker_type: str | None = None
     scheduling_metadata_adapter: str | None = None
     # Dotted path of a per-stage pooling-output decoder applied worker-side.
@@ -373,6 +401,7 @@ class OmniEngineArgs(EngineArgs):
     diffusion_compile_granularity: str | None = None
     diffusion_compile_dynamic: bool | None = None
     enable_cuda_graph_decode: bool | None = None
+    enable_cfg_batching: bool | None = None
     cache_backend: str | None = None
     cache_config: str | None = None
     video_output_transport: dict[str, object] | None = None
@@ -799,6 +828,11 @@ class OrchestratorArgs:
     # today). None defers to the OmniDiffusionConfig default (enabled);
     # --enforce-eager also disables it.
     enable_cuda_graph_decode: bool | None = None
+    diffusion_use_graph: bool = False
+    diffusion_graph_release_after_denoise: bool = False
+    # Run both CFG branches as one batched denoiser call on pipelines that
+    # support it. None defers to the OmniDiffusionConfig default (disabled).
+    enable_cfg_batching: bool | None = None
     cache_backend: str = "none"
     cache_config: str | None = None
     video_output_transport: dict[str, object] | None = None
@@ -836,6 +870,9 @@ class OrchestratorArgs:
     tts_max_instructions_length: int | None = None
     enable_diffusion_pipeline_profiler: bool = False
     enable_ar_profiler: bool = False
+    enable_mixfusion: bool = False
+    mixfusion_min_chunk_tokens: int = 256
+    mixfusion_max_chunks: int = 128
     log_file: str | None = None
     replica_id: int | None = None
     omni_replica_address: str | None = None
@@ -878,6 +915,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "diffusion_compile_granularity",
         "diffusion_compile_dynamic",
         "enable_cuda_graph_decode",
+        "enable_cfg_batching",
         "cache_backend",
         "cache_config",
         "video_output_transport",

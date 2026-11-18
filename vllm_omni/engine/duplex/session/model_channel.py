@@ -39,6 +39,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexOutputContext,
     DuplexOutputDecision,
     DuplexStageSubmission,
+    ToolCallAbandonReason,
     duplex_data_plane_request_info,
     duplex_is_auxiliary_request,
     duplex_same_turn_request_ids,
@@ -58,7 +59,11 @@ from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.perf_ledger import with_perf_chunk
-from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallRegistrationError
+from vllm_omni.engine.duplex.session.tool_calls import (
+    ToolCallAbandonment,
+    ToolCallOrigin,
+    ToolCallRegistrationError,
+)
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.duplex import attach_duplex_output_decision
@@ -419,15 +424,41 @@ class ModelChannel:
             prompt_payload: dict[str, object] = (
                 {str(key): value for key, value in payload.items()} if isinstance(payload, Mapping) else {}
             )
-            conversation, conversation_item_ids = session.history_snapshot()
+            # View policy is deployment-owned; request runtime config below
+            # contains the plugin's per-request state (for example tool turns).
+            view_policy = self._ctx.plugin.context_view_policy(
+                stage_id=stage_id, runtime_config=self._ctx.manager.runtime_config
+            )
+            if view_policy is None and not self._ctx.plugin.uses_history_context:
+                history, item_ids = session.history_for_prompt()
+                snapshot = None
+            else:
+                snapshot = session.history_snapshot()
+                history, item_ids = session.history, snapshot.item_ids
             prompt_session = {
                 **request_context.session_config,
-                "conversation": list(conversation),
-                "conversation_item_ids": conversation_item_ids,
+                # Keep the prompt accessor's nested content identity: Qwen
+                # binds retained PCM to those containers. History and IDs
+                # are captured synchronously on the owner loop.
+                # Consumers must treat shared nested containers and payloads
+                # as read-only; only the session writes authoritative history.
+                "conversation": list(history),
+                "conversation_item_ids": item_ids,
                 "modalities": list(session.response_config.modalities),
             }
             prompt_session.update(self._ctx.plugin.extra_prompt_config(request_context.runtime_config))
             prompt_session["stage_sampling_params"] = request_context.sampling_params
+            if view_policy is not None:
+                assert snapshot is not None
+                prompt_session["conversation_view"] = list(
+                    session.render_history_view(view_policy, snapshot=snapshot).messages
+                )
+            if self._ctx.plugin.uses_history_context:
+                assert snapshot is not None
+                session.context_ledger.refresh(snapshot)
+                self._ctx.plugin.bind_history_context(
+                    state=self._ctx.model_state, snapshot=snapshot, ledger=session.context_ledger
+                )
             append_plan = await self._ctx.plugin.prepare_append_plan(
                 request_id=request_id,
                 fence=fence,
@@ -470,6 +501,7 @@ class ModelChannel:
                     prompt=prompt,
                     already_submitted=already_submitted,
                     resumable=resumable,
+                    input_capacity=append_plan.input_capacity,
                 )
                 if remaining_transcription_input is not None:
                     self._input_transcriptions[request_id] = remaining_transcription_input
@@ -1132,6 +1164,10 @@ class ModelChannel:
         if not isinstance(arguments, str):
             self._out.emit_error("invalid_function_call", _ARGUMENTS_MUST_BE_JSON)
             return
+        blocked_by = self._ctx.tool_calls.blocked_by(name, arguments)
+        if blocked_by is not None:
+            await self._suppress_function_call(call_id, name, arguments, blocked_by)
+            return
         item_id = f"item_{uuid.uuid4().hex}"
         response_id = f"resp_{uuid.uuid4().hex}"
         try:
@@ -1181,6 +1217,54 @@ class ModelChannel:
                 "response_id": response_id,
             }
         )
+
+    async def _suppress_function_call(self, call_id: str, name: str, arguments: str, blocked_by: str) -> None:
+        """Refuse a repeat without exposing or recording it.
+
+        Only an abandoned call gets a notice: a pending call's result may still
+        arrive, so telling the model it failed would be false.
+        """
+        session = self._ctx.session
+        blocker = self._ctx.tool_calls.record(blocked_by)
+        self._out.emit(
+            {
+                "type": "function_call.suppressed",
+                "session_id": session.session_id,
+                "epoch": session.epoch,
+                "name": name,
+                "arguments": arguments,
+                "blocked_by_call_id": blocked_by,
+                "blocked_by_state": blocker.state.value if blocker is not None else None,
+            }
+        )
+        if blocker is not None and blocker.is_pending:
+            return
+        origin = ToolCallOrigin(
+            call_id=call_id,
+            epoch=session.epoch,
+            turn_id=session.turn_id,
+            response_id=None,
+            item_id=f"item_{uuid.uuid4().hex}",
+            name=name,
+            arguments=arguments,
+        )
+        try:
+            updated_runtime = self._ctx.plugin.runtime_config_for_abandoned_tool_call(
+                session.config,
+                copy.deepcopy(dict(session.runtime_config)),
+                ToolCallAbandonment(origin, ToolCallAbandonReason.SUPPRESSED),
+                history_len=len(session.history),
+            )
+        except Exception:
+            logger.exception("Failed to tell the model a repeated function call was refused")
+            self._out.emit_error(
+                "tool_call_settlement_failed",
+                "the session could not apply a tool-call terminal decision",
+            )
+            await self._close_from_runtime("tool_call_lifecycle")
+            return
+        if updated_runtime is not None:
+            session.replace_runtime_config(copy.deepcopy(updated_runtime))
 
     async def _send_one_model_output_event(
         self,

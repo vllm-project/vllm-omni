@@ -1,0 +1,131 @@
+meta:
+  title: "Sophon-Realtime-32B-Tag"
+  slug: "sophon-realtime-32b-tag"
+  provider: "Adventists AI"
+  description: "Open full-duplex voice model that hears your tone and speaks with one: listens while you talk, takes interruptions, and laughs, sighs or stresses words when the conversation calls for it. Zero-shot voice cloning from a 3-10 s clip. One vLLM-Omni model (thinker -> expressive talker -> vocoder) on a single 80 GB GPU, with an OpenAI-Realtime-style full-duplex WebSocket and /v1/chat/completions (audio in, text + audio out)."
+  date_added: 2026-11-09
+  date_updated: 2026-11-11
+  difficulty: intermediate
+  tasks:
+    - omni
+  related_recipes:
+    - Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+
+model:
+  model_id: "adventists-ai/Sophon-Realtime-32B-Tag"
+  min_vllm_version: "0.30.0"
+  architecture: dense
+  parameter_count: "34.3B"
+  active_parameters: "34.3B"
+  context_length: 0
+  base_args: []
+  base_env: {}
+
+omni:
+  tasks:
+    - id: a2a
+      label: "Speech → Speech (full duplex)"
+      endpoint: "/v1/chat/completions"
+      description: "Audio in, streamed text + audio out; full-duplex sessions on ws://HOST:8000/v1/realtime"
+      curl: |
+        curl -N http://localhost:8000/v1/chat/completions \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "adventists-ai/Sophon-Realtime-32B-Tag",
+            "modalities": ["text", "audio"],
+            "stream": true,
+            "max_tokens": 300,
+            "messages": [
+              {"role": "system", "content": "You are a friendly voice assistant. Reply in one or two short spoken sentences."},
+              {"role": "user", "content": [
+              {"type": "text", "text": "<|audio|>"},
+              {"type": "input_audio", "input_audio": {"data": "<base64 wav>", "format": "wav"}}]}]
+          }'
+
+dependencies:
+  - note: "Out-of-tree model: launch with `sophon-realtime serve`, not `vllm serve`. The Sophon-Realtime plugin pins vLLM 0.30.0 and vLLM-Omni 0.30.0 exactly (newer versions are not supported yet), registers the model, and `sophon-realtime serve` downloads the weights and starts the server with the right deploy config. Keep the `[trt]` extra: it installs TensorRT for the talker; the latency table below was measured with it."
+    command: "uv pip install \"sophon-realtime[trt]\""
+
+features: {}
+opt_in_features: []
+
+variants:
+  default:
+    precision: fp8
+    vram_minimum_gb: 80
+    description: "Thinker FP8 + tag-tts talker (4-step distilled flow) + HiFT, one 80 GB GPU; ~65 GB used, up to 16 concurrent users"
+
+compatible_strategies: []
+hardware_overrides: {}
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  [Sophon-Realtime-32B-Tag](https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Tag) is the recommended build of
+  Sophon-Realtime v1, an open full-duplex voice model. A 32B thinker listens to the user's audio, decides when it is its
+  turn and writes the reply with inline sound tags (`[laughter]`, `[sigh]`, `<strong>…</strong>`); a streaming talker
+  performs those tags while the reply is still being written. The whole pipeline is one vLLM-Omni model.
+  VoiceBench 82.8, Big Bench Audio 81.8%, NVV-SuperBench 0.86 (zh) / 0.80 (en).
+
+  **Out-of-tree model.** Sophon-Realtime is not built into vLLM-Omni. It is served through its own plugin package,
+  `sophon-realtime`, which pins vLLM 0.30.0 and vLLM-Omni 0.30.0 exactly (newer versions are not supported yet) and
+  registers the model architecture. A plain
+  `vllm serve ... --omni` on a stock vLLM-Omni install will not load it: install the plugin and start with
+  `sophon-realtime serve` as shown below.
+
+  ## Prerequisites
+
+  - One 80 GB GPU (H100 / H800 / A100 80G); about 65 GB per instance.
+  - Linux, CUDA, Python 3.12.
+
+  ## Installation and launch
+
+  ```bash
+  uv venv --python 3.12 && source .venv/bin/activate
+  uv pip install "sophon-realtime[trt]"   # [trt] = TensorRT for the talker; without it the talker runs in PyTorch and is slower under load
+  sophon-realtime serve --port 8000       # downloads the weights (~42 GB) on first run
+  ```
+
+  `sophon-realtime serve` starts a CUDA MPS daemon for its GPU by default, so the three stages share the GPU
+  concurrently. MPS applies to every CUDA process on that GPU, and the daemon keeps running after the server exits
+  (`serve` prints the command to stop it). On a shared GPU, or with other CUDA workloads on the same device, set
+  `SOPHON_MPS=0`. After the weights are downloaded, the first start builds kernels and TensorRT engines (about 7–8 min
+  on one H100 with sophon-realtime 1.1.2); later starts take about 4–5 min.
+
+  ## Zero-shot voice cloning
+
+  Put a 3–10 s clip of one speaker at `<model dir>/voices/<name>.wav` (wav or flac, any sample rate; or point
+  `SOPHON_VOICES` at another folder) and set
+  `"voice": "<name>"` in the realtime session or the chat request. No fine-tuning or restart; new clips are picked up
+  on the next request. Only clone your own voice or voices you have permission to use.
+
+  ## Client usage
+
+  - Full duplex: `ws://localhost:8000/v1/realtime` (OpenAI-Realtime-style: `input_audio_buffer.append`; the model decides
+    when the user has finished and handles barge-in).
+  - One-shot: `POST /v1/chat/completions` with `input_audio`, `"modalities": ["text","audio"]`.
+  - OpenAI GPT-Live / OpenAI Realtime compatible gateway (LiveKit, Pipecat, function calling):
+    [live/](https://github.com/adventists-ai/sophon-realtime/tree/main/live).
+
+  ## Performance (one H100 80 GB)
+
+  `sophon-realtime` 1.1.2 from a clean `pip install "sophon-realtime[trt]"`, default `serve` (TensorRT and CUDA MPS on),
+  `/v1/chat/completions` with a short spoken question (replies of about 5 s of speech), users arriving within 10 s,
+  measured after warm-up. First audio = time from sending the request to the first audio chunk.
+
+  | concurrent users | first audio median / max |
+  |---|---|
+  | 1 | 0.61 s |
+  | 8 | 0.64 / 0.70 s |
+  | 16 | 0.69 / 0.98 s |
+  | 24 | 0.72 / 1.02 s |
+
+  With longer replies (16 public spoken questions, about 20 s of speech per reply), first audio at 16 users is
+  0.87 / 1.76 s. The first one or two requests after a start can take several seconds while the server finishes
+  warming up.
+
+  ## References
+
+  - [Model card](https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Tag) · [GitHub](https://github.com/adventists-ai/sophon-realtime)
+  - Apache-2.0

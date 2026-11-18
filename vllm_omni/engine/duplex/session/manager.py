@@ -58,7 +58,12 @@ from vllm_omni.engine.duplex.messages import (
     ResumeDuplexSessionMessage,
     TouchDuplexSessionMessage,
 )
-from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexRuntimeConfigError, validate_duplex_plugin_sampling
+from vllm_omni.engine.duplex.plugin import (
+    DuplexModelPlugin,
+    DuplexRuntimeConfigError,
+    validate_duplex_plugin_sampling,
+    validate_session_tools,
+)
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.input_clock import check_input_clock_supported
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity, DuplexLeaseConfig, DuplexLeaseState
@@ -125,6 +130,7 @@ class DuplexSessionManager:
         tracer: trace.Tracer | None = None,
     ) -> None:
         validate_duplex_plugin_sampling(plugin, sampling_defaults=tuple(stage_port.sampling_defaults()))
+        plugin.configure_server(runtime_config)
         self.plugin = plugin
         self.tracer = tracer
         self.session_traces: dict[str, SessionTrace] = {}
@@ -648,6 +654,7 @@ class DuplexSessionManager:
                 apply_session_stats_capability(self.plugin.capabilities(max_sessions=max_sessions), collect_stats),
                 config.extra_body,
             )
+            validate_session_tools(capabilities, config.extra_body)
             session = DuplexEngineSession(
                 session_id=session_id,
                 config=config,
