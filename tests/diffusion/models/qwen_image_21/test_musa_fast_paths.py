@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""MUSA paths of the Qwen-Image-2.1 transformer fast paths."""
+"""MUSA paths of the Qwen-Image-2.1 fast paths."""
 
 from unittest.mock import Mock
 
@@ -8,9 +8,12 @@ import pytest
 import torch
 from diffusers.models.normalization import RMSNorm
 from torch import nn
+from torch.nn import functional as F
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.layers import exact_bf16_rope_musa as musa_rope
+from vllm_omni.diffusion.layers import vae_norm_epilogue, vae_rms_norm, vae_rms_norm_musa
+from vllm_omni.diffusion.models.qwen_image_21 import autoencoder_kl_qwenimage21 as vae
 from vllm_omni.diffusion.models.qwen_image_21 import qwen_image_21_transformer as transformer
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -82,10 +85,11 @@ def test_musa_tensors_take_the_musa_rotation(monkeypatch):
 
 
 def _on_musa(tensor: torch.Tensor, device: Mock) -> Mock:
-    """``tensor``'s metadata on a MUSA device: enough to pass every input check of the MUSA ops."""
+    """``tensor``'s metadata on a MUSA device: enough to pass every input check of the MUSA helpers."""
     fake = Mock(spec=torch.Tensor, device=device, dtype=tensor.dtype, shape=tensor.shape, ndim=tensor.ndim)
     fake.stride.side_effect = tensor.stride
     fake.numel.return_value = tensor.numel()
+    fake.dim.return_value = tensor.dim()
     fake.is_contiguous.return_value = tensor.is_contiguous()
     return fake
 
@@ -272,3 +276,64 @@ def test_musa_broadcast_modulation_matches_the_per_token_selection():
     expected = block(hidden_states, modulation, None, target_token_mask, prepared_modulation=selected)
     actual = block(hidden_states, modulation, None, target_token_mask, prepared_modulation=broadcast)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def _vae_norm_reference(norm: vae.QwenImage21RMS_norm, x: torch.Tensor) -> torch.Tensor:
+    return F.normalize(x.float(), dim=1).to(x.dtype) * norm.scale * norm.gamma + norm.bias
+
+
+@pytest.mark.cpu
+@torch.no_grad()
+def test_cpu_vae_norm_keeps_the_reference_path(monkeypatch):
+    monkeypatch.setattr(vae, "rms_norm_fastpath", _forbidden("the Wan VAE norm fast path"))
+    monkeypatch.setattr(vae, "rms_norm_fastpath_musa", _forbidden("the MUSA VAE norm fast path"))
+    norm = vae.QwenImage21RMS_norm(16, images=False).to(torch.bfloat16)
+    x = torch.randn(1, 16, 1, 8, 8, generator=torch.Generator().manual_seed(6)).to(torch.bfloat16)
+    torch.testing.assert_close(norm(x), _vae_norm_reference(norm, x), rtol=0, atol=0)
+
+
+@pytest.mark.cpu
+@torch.no_grad()
+def test_musa_vae_norm_declines_off_the_musa_platform(monkeypatch):
+    device = Mock(spec=torch.device, type="musa")
+    norm = vae.QwenImage21RMS_norm(8, images=False).to(torch.bfloat16)
+    x = _on_musa(torch.empty(1, 8, 1, 4, 4, dtype=torch.bfloat16), device)
+    launch = Mock()
+    monkeypatch.setattr(vae_norm_epilogue, "rms_norm_scale", launch)
+    # On MUSA, the dense input takes the epilogue.
+    monkeypatch.setattr(vae_rms_norm_musa, "_HAS_MUSA_KERNEL", True)
+    assert vae_rms_norm_musa.rms_norm_fastpath_musa(norm, x) is launch.return_value.view.return_value
+    # Elsewhere the helper returns None so the caller takes the reference forward.
+    monkeypatch.setattr(vae_rms_norm_musa, "_HAS_MUSA_KERNEL", False)
+    assert vae_rms_norm_musa.rms_norm_fastpath_musa(norm, x) is None
+
+
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("channels_last", [False, True])
+@torch.no_grad()
+def test_musa_vae_norm_matches_the_native_norm(monkeypatch, channels_last, dtype):
+    _require_musa()
+    generator = torch.Generator().manual_seed(7)
+    norm = vae.QwenImage21RMS_norm(96, images=False).to("musa", dtype)
+    norm.gamma.copy_((1 + 0.1 * torch.randn(96, 1, 1, 1, generator=generator)).to("musa", dtype))
+    x = (torch.randn(1, 96, 1, 256, 256, generator=generator) * 3).to("musa", dtype)
+    if channels_last:
+        x = x.squeeze(2).contiguous(memory_format=torch.channels_last).unsqueeze(2)
+    launch = vae_norm_epilogue.rms_norm_scale
+    calls = []
+
+    def counted_launch(*args, **kwargs):
+        calls.append(args)
+        return launch(*args, **kwargs)
+
+    monkeypatch.setattr(vae_norm_epilogue, "rms_norm_scale", counted_launch)
+    # The MUSA path neither goes through the Wan fast path nor probes the reduction.
+    monkeypatch.setattr(vae, "rms_norm_fastpath", _forbidden("the Wan VAE norm fast path"))
+    monkeypatch.setattr(vae_rms_norm, "_fp32_norm_probe", _forbidden("the reduction probe"))
+    torch.testing.assert_close(norm(x), _vae_norm_reference(norm, x), rtol=0, atol=0)
+    # The epilogue kernel takes the dense layout; channels-last inputs take the reference forward.
+    assert len(calls) == (0 if channels_last else 1)
+    rows = x.contiguous().view(1, 96, -1)
+    denom = rows.float().norm(p=2, dim=1, keepdim=True)
+    assert launch(rows, denom, norm.gamma.reshape(-1), norm.scale, silu=True) is None
