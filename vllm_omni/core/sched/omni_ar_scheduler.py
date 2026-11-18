@@ -63,7 +63,7 @@ def _segment_generation_of(request: Request) -> int | None:
 def _enqueue_last_sentence_chunk(
     scheduler: OmniSchedulerMixin,
     request: Request,
-    inter_stage_output: object,
+    inter_stage_output: dict[str, Any] | None,
     scheduler_output: SchedulerOutput,
     req_id: str,
     *,
