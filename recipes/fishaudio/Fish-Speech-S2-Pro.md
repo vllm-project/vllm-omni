@@ -46,10 +46,11 @@ model runs out of the box, including in the official Docker image.
 
 #### Kvcache attention fast path
 
-Fish Speech S2 Pro uses a Triton decode-only kvcache attention fast path by
-default on CUDA builds. Set `VLLM_OMNI_FISH_KVCACHE_ATTN=0` to disable it, or
-`VLLM_OMNI_FISH_KVCACHE_ATTN=required` to fail fast if the fast path cannot be
-installed.
+CUDA uses the Fish Triton attention kernel for eligible decode batches.
+The standard attention backend handles other layouts. Set
+`VLLM_OMNI_FISH_KVCACHE_ATTN=0` to disable the kernel, or set it to
+`required` to raise an error if the kernel cannot load or a decode batch
+cannot use it.
 
 ```bash
 # Verify fast path availability.

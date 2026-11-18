@@ -42,8 +42,6 @@ omni:
 dependencies:
   - note: "vLLM-Omni provides the TTS serving backend and the `--omni` serve path. See the installation guide for pre-built wheels or building from source."
     command: "uv pip install git+https://github.com/vllm-project/vllm-omni.git"
-  - note: "fish-speech supplies the DAC codec used by S2 Pro (pulls pyaudio, which needs PortAudio system libs: apt-get install -y libportaudio2 portaudio19-dev)"
-    command: "uv pip install fish-speech"
 
 features: {}
 
@@ -74,34 +72,22 @@ guide: |
     loads at ~48.3 GiB and peaks ~48.9 GiB during inference. A two-GPU profile
     (`fish_qwen3_omni_2gpu.yaml`) is available for higher concurrency.
   - **vLLM-Omni** targeting vLLM >= 0.19.
-  - **`fish-speech`** for the DAC codec. It depends on `pyaudio`, which needs
-    PortAudio system libraries:
-
-    ```bash
-    # Ubuntu/Debian
-    sudo apt-get update && sudo apt-get install -y libportaudio2 portaudio19-dev
-    ```
+  - The DAC codec is included in vLLM-Omni.
 
   ## Installation
 
   ```bash
   uv venv && source .venv/bin/activate
   uv pip install git+https://github.com/vllm-project/vllm-omni.git
-  uv pip install fish-speech
   ```
 
-  ### Kvcache attention fast path
+  ### Decode attention
 
-  S2 Pro uses a Triton decode-only kvcache-attention fast path by default on
-  CUDA builds. Toggle it with `VLLM_OMNI_FISH_KVCACHE_ATTN`:
-
-  ```bash
-  # Verify availability
-  python -c "from vllm_omni.attention import fish_kvcache_attn; print(fish_kvcache_attn.is_available()); print(fish_kvcache_attn.load_error())"
-
-  export VLLM_OMNI_FISH_KVCACHE_ATTN=0          # disable the fast path
-  # VLLM_OMNI_FISH_KVCACHE_ATTN=required        # fail fast if it can't load
-  ```
+  CUDA uses the Fish Triton attention kernel for eligible decode batches.
+  The standard attention backend handles other layouts. Set
+  `VLLM_OMNI_FISH_KVCACHE_ATTN=0` to disable the kernel, or set it to
+  `required` to raise an error if the kernel cannot load or a decode batch
+  cannot use it.
 
   ## Launch the server
 
