@@ -390,6 +390,7 @@ def _replay_tail_window(
     total_frames: int,
     replay_seconds: float,
     sample_rate: int,
+    video_fps: float,
 ) -> tuple[int, int] | None:
     """Convert a replay duration into (audio samples, video frames) tail sizes.
 
@@ -400,7 +401,7 @@ def _replay_tail_window(
     replay keeps the audio and video windows aligned or absent together.
     """
     samples = min(int(round(replay_seconds * sample_rate)), total_samples)
-    frames = min(int(round(replay_seconds)), total_frames) if total_frames > 0 else 0
+    frames = min(int(round(replay_seconds * video_fps)), total_frames) if total_frames > 0 else 0
     if samples <= 0 or (total_frames > 0 and frames <= 0):
         return None
     return samples, frames
@@ -1123,6 +1124,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                     len(video_frames),
                     post_commit_replay_seconds,
                     PCM16_SAMPLE_RATE,
+                    args.video_fps,
                 )
                 if replay_window is None:
                     # A positive duration that rounds to zero samples or

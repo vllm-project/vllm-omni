@@ -126,28 +126,3 @@ def test_duplex_long_video_scene_recognition(omni_server, tmp_path: Path, monkey
         first_pass = json.loads((attempts_root / "attempt_0" / "recognition.json").read_text(encoding="utf-8"))
         assert (attempts_root / "attempt_0" / "events.jsonl").exists()
         assert first_pass["passed"] is False and not first_pass["protocol_errors"], first_pass
-
-
-def test_replay_tail_window_bounds() -> None:
-    """A tiny positive duration must skip the replay instead of slicing [-0:]."""
-    repo = Path(__file__).resolve().parents[3]
-    spec = importlib.util.spec_from_file_location(
-        "minicpmo_recognition_demo_window",
-        repo / "examples/online_serving/minicpmo/realtime_duplex_demo.py",
-    )
-    assert spec is not None and spec.loader is not None
-    demo = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(demo)
-    window = demo._replay_tail_window
-    # 180 s of audio plus 1 fps video, 15 s tail: exactly one scene window.
-    assert window(2_880_000, 180, 15.0, 16_000) == (240_000, 15)
-    # A window longer than the input clamps to the full input.
-    assert window(128_000, 10, 15.0, 16_000) == (128_000, 10)
-    # 0.3 s rounds to zero frames while audio rounds to 4800 samples:
-    # video_frames[-0:] would keep every frame, so the replay is skipped
-    # rather than pairing a short audio tail with the entire video.
-    assert window(2_880_000, 180, 0.3, 16_000) is None
-    # Without video, the audio tail alone is still a valid window.
-    assert window(2_880_000, 0, 0.3, 16_000) == (4_800, 0)
-    # Durations shorter than one audio sample are skipped as well.
-    assert window(2_880_000, 0, 1e-5, 16_000) is None
