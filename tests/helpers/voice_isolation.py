@@ -30,8 +30,10 @@ import os
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import pytest
@@ -187,16 +189,6 @@ class VoiceIsolationSuite:
                 f"voice upload {voice} failed: {resp.text[:300]}"
             )
 
-    def unregister_voices(self, base_url: str) -> None:
-        """Best effort: do not leave uploaded voices behind on the runner."""
-        import httpx
-
-        for voice in self.voices:
-            try:
-                httpx.delete(f"{base_url}/v1/audio/voices/{self.registered_name(voice)}", timeout=30.0)
-            except Exception as exc:
-                print(f"could not delete registered voice {voice}: {exc}")
-
     def _send(self, client, model: str, req: dict[str, Any], urls: dict[str, str], source: str) -> bytes:
         voice, extra = self.request_kwargs(req, urls, source)
         resp = client.client.audio.speech.create(
@@ -231,26 +223,32 @@ class VoiceIsolationSuite:
 
         mode = server_mode(request.param.server_args)
         urls = self.reference_audio_urls()
-        gen = iter_omni_server(request, run_level, omni_fixture_lock)
-        server = next(gen)
-        base_url = f"http://{server.host}:{server.port}"
-        registered = False
-        try:
-            client = OnlineOmniClient(
-                host=server.host, port=server.port, api_key="EMPTY", run_level=run_level, log_stats=server.log_stats
-            )
-            for source, c in plan:
-                try:
-                    if source == "registered" and not registered:
-                        registered = True  # unregister in finally even if an upload fails part way
-                        self.register_voices(base_url)
-                    self.generated[(mode, source, c)] = self._generate(client, server.model, c, urls, source)
-                except Exception as exc:
-                    self.generated[(mode, source, c)] = {"error": f"{type(exc).__name__}: {exc}"}
-        finally:
-            if registered:
-                self.unregister_voices(base_url)
-            gen.close()  # stops the server and releases its GPU memory
+        with TemporaryDirectory(prefix="omni-voice-isolation-") as voice_dir, pytest.MonkeyPatch.context() as patch:
+            params = request.param
+            env = {**(params.env_dict or {}), "SPEAKER_SAMPLES_DIR": voice_dir}
+            patch.setattr(request, "param", params._replace(env_dict=env))
+            with closing(iter_omni_server(request, run_level, omni_fixture_lock)) as servers:
+                server = next(servers)
+                client = OnlineOmniClient(
+                    host=server.host, port=server.port, api_key="EMPTY", run_level=run_level, log_stats=server.log_stats
+                )
+                with closing(client.client):
+                    registration_error = None
+                    if any(source == "registered" for source, _ in plan):
+                        try:
+                            self.register_voices(client.base_url)
+                        except Exception as exc:
+                            registration_error = f"{type(exc).__name__}: {exc}"
+
+                    for source, c in plan:
+                        key = (mode, source, c)
+                        if source == "registered" and registration_error is not None:
+                            self.generated[key] = {"error": registration_error}
+                            continue
+                        try:
+                            self.generated[key] = self._generate(client, server.model, c, urls, source)
+                        except Exception as exc:
+                            self.generated[key] = {"error": f"{type(exc).__name__}: {exc}"}
         return mode
 
     # ---- scoring --------------------------------------------------------------

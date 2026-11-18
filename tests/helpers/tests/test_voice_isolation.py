@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for tests.helpers.voice_isolation request planning and first-window gating. No server or model."""
 
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 
 from tests.helpers.speaker_similarity import LABEL_CORRECT, LABEL_DISAGREE, LABEL_WRONG_BOTH_AGREE, OutputScore
@@ -71,3 +74,40 @@ def test_gate_first_window_counts_only_openings_right_at_c1() -> None:
     leaks, excused = gate_first_window(mismatched, baseline)
     assert [r.idx for r in leaks] == [0]
     assert [(r.idx, base.label) for r, base in excused] == [(2, LABEL_DISAGREE)]
+
+
+def test_partial_registration_fails_both_registered_batches_and_leaves_inline_running(monkeypatch, tmp_path) -> None:
+    from tests.helpers import runtime
+
+    suite = _suite()
+    params = runtime.OmniServerParams(model="m", env_dict={"SPEAKER_SAMPLES_DIR": str(tmp_path), "OTHER": "keep"})
+    request = SimpleNamespace(param=params)
+    voice_dirs = []
+    generated = []
+
+    def server_fixture(request, run_level, lock):
+        env = request.param.env_dict
+        voice_dir = Path(env["SPEAKER_SAMPLES_DIR"])
+        assert voice_dir.is_dir() and voice_dir != tmp_path and env["OTHER"] == "keep"
+        voice_dirs.append(voice_dir)
+        yield SimpleNamespace(host="127.0.0.1", port=1, model="m", log_stats=False)
+
+    def fail_upload(url):
+        (voice_dirs[0] / "partial-upload.wav").touch()
+        raise RuntimeError("second upload failed")
+
+    def generate(client, model, concurrency, urls, source):
+        generated.append((source, concurrency))
+        return {"audio": []}
+
+    monkeypatch.setattr(runtime, "iter_omni_server", server_fixture)
+    monkeypatch.setattr(suite, "reference_audio_urls", lambda: {})
+    monkeypatch.setattr(suite, "register_voices", fail_upload)
+    monkeypatch.setattr(suite, "_generate", generate)
+    mode = suite.generate(request, "full_model", [("registered", 8), ("inline", 8), ("registered", 1)])
+
+    for concurrency in (8, 1):
+        assert suite.generated[mode, "registered", concurrency] == {"error": "RuntimeError: second upload failed"}
+    assert generated == [("inline", 8)]
+    assert suite.generated[mode, "inline", 8] == {"audio": []}
+    assert request.param is params and not voice_dirs[0].exists()
