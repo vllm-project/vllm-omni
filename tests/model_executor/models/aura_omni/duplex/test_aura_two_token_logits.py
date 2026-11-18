@@ -95,10 +95,11 @@ def _mrv2_proc(*, max_num_reqs: int = 2, max_model_len: int = 16) -> AuraTwoToke
     silent, respond = AURA_V2.silent_id, AURA_V2.respond_id
     assert respond is not None
     vocab = max(silent, respond) + 8
-    prompt_len = SimpleNamespace(np=torch.zeros(max_num_reqs, dtype=torch.int32).numpy())
+    prompt_len = SimpleNamespace(gpu=torch.zeros(max_num_reqs, dtype=torch.int32))
     total_len = SimpleNamespace(gpu=torch.zeros(max_num_reqs, dtype=torch.int32))
     all_token_ids = SimpleNamespace(gpu=torch.zeros((max_num_reqs, max_model_len), dtype=torch.int32))
     req_states = SimpleNamespace(
+        device=torch.device("cpu"),
         max_num_reqs=max_num_reqs,
         vocab_size=vocab,
         prompt_len=prompt_len,
@@ -121,7 +122,7 @@ def test_mrv2_first_step_masks_to_silent_and_respond() -> None:
         extra_args={"aura_mode": "streaming"},
     )
     assert proc.add_request(0, params) is True
-    proc.req_states.prompt_len.np[0] = 4
+    proc.req_states.prompt_len.gpu[0] = 4
     proc.req_states.total_len.gpu[0] = 4
     vocab = max(silent, respond) + 8
     logits = torch.zeros((1, vocab), dtype=torch.float32)
@@ -145,9 +146,8 @@ def test_mrv2_body_masks_both_control_ids() -> None:
         extra_args={"aura_mode": "streaming"},
     )
     assert proc.add_request(0, params) is True
-    proc.req_states.prompt_len.np[0] = 4
+    proc.req_states.prompt_len.gpu[0] = 4
     proc.req_states.total_len.gpu[0] = 5
-    proc.req_states.all_token_ids.gpu[0, 4] = respond
     vocab = max(silent, respond) + 8
     logits = torch.zeros((1, vocab), dtype=torch.float32)
     logits[0, silent] = 3.0
@@ -158,3 +158,55 @@ def test_mrv2_body_masks_both_control_ids() -> None:
     assert out[0, silent] == float("-inf")
     assert out[0, respond] == float("-inf")
     assert out[0, 5] == 1.0
+
+
+def test_mrv2_mixed_batch_touches_only_enabled_rows() -> None:
+    proc = _mrv2_proc(max_num_reqs=3)
+    silent, respond = proc.silent, proc.respond
+    on = SamplingParams(temperature=0.0, min_tokens=0, stop_token_ids=[silent], extra_args={"aura_mode": "streaming"})
+    off = SamplingParams(temperature=0.0)
+    assert proc.add_request(0, on) is True
+    assert proc.add_request(1, off) is False
+    assert proc.add_request(2, on) is True
+    proc.req_states.prompt_len.gpu[:] = torch.tensor([4, 4, 4], dtype=torch.int32)
+    proc.req_states.total_len.gpu[:] = torch.tensor([4, 4, 5], dtype=torch.int32)
+    vocab = max(silent, respond) + 8
+    logits = torch.zeros((3, vocab), dtype=torch.float32)
+    logits[:, silent] = 1.5
+    logits[:, respond] = 2.0
+    logits[:, 3] = 9.0
+    ctx = SimpleNamespace(expanded_idx_mapping=torch.tensor([0, 1, 2], dtype=torch.int32))
+    out = proc.apply(logits, ctx)  # type: ignore[arg-type]
+    # Row 0: first step, enabled -> only the control pair survives.
+    assert out[0, 3] == float("-inf")
+    assert out[0, silent] == 1.5
+    assert out[0, respond] == 2.0
+    # Row 1: not streaming -> untouched.
+    assert torch.equal(out[1], logits[1])
+    # Row 2: body step, enabled -> control pair masked, body kept.
+    assert out[2, silent] == float("-inf")
+    assert out[2, respond] == float("-inf")
+    assert out[2, 3] == 9.0
+
+
+def test_mrv2_tie_prefers_silent_when_silent_id_is_higher() -> None:
+    proc = _mrv2_proc()
+    # Swap the pair so the silent id is the larger one; the tie rule must still pick silent.
+    proc.silent, proc.respond = AURA_V2.respond_id, AURA_V2.silent_id
+    params = SamplingParams(
+        temperature=0.0,
+        min_tokens=0,
+        stop_token_ids=[proc.silent],
+        extra_args={"aura_mode": "streaming"},
+    )
+    assert proc.add_request(0, params) is True
+    proc.req_states.prompt_len.gpu[0] = 4
+    proc.req_states.total_len.gpu[0] = 4
+    vocab = max(proc.silent, proc.respond) + 8
+    logits = torch.zeros((1, vocab), dtype=torch.float32)
+    logits[0, proc.silent] = 2.0
+    logits[0, proc.respond] = 2.0
+    ctx = SimpleNamespace(expanded_idx_mapping=torch.tensor([0], dtype=torch.int32))
+    out = proc.apply(logits, ctx)  # type: ignore[arg-type]
+    assert out[0, proc.silent] == 2.0
+    assert out[0, proc.respond] == float("-inf")

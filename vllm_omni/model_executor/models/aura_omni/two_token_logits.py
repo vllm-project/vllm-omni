@@ -4,13 +4,15 @@
 """AURA_v2 first-token silent/respond force, as in the reference streaming inference.
 
 Opt in per request with ``SamplingParams.extra_args={"aura_mode": "streaming"}``.
-Register on Stage1 via deploy yaml ``logits_processors``. Prefer
-``async_scheduling: false`` on that stage so the live output list is not stale.
+Register on Stage1 via deploy yaml ``logits_processors``.
 
 Model Runner V2 loads this module's ``AuraTwoTokenLogitsProcessor`` (the
-``vllm.v1.worker.gpu.sample.logits_processor.LogitsProcessor`` interface).
-``AuraTwoTokenLogitsProcessorV1`` keeps the legacy runner API for unit tests
-and any V1 deploy that still registers it.
+``vllm.v1.worker.gpu.sample.logits_processor.LogitsProcessor`` interface). It
+decides the first step from ``total_len == prompt_len`` on device, so it does
+not read vLLM's output list. ``AuraTwoTokenLogitsProcessorV1`` keeps the legacy
+runner API: it reads the live output list, which is why its deploy needs
+``async_scheduling: false``. The V2 deploys keep that setting; whether V2
+still needs it is not measured.
 """
 
 from __future__ import annotations
@@ -107,12 +109,20 @@ def _mask_control_pair(row: torch.Tensor, silent: int, respond: int) -> None:
 
 
 class AuraTwoTokenLogitsProcessor(LogitsProcessor):
-    """MRV2 control pair → body: first step only silent/respond; then mask both."""
+    """MRV2 control pair → body: first step only silent/respond; then mask both.
+
+    ``apply()`` runs as whole-batch tensor ops with no per-row host reads. The
+    first step is ``total_len == prompt_len``, read from the device mirrors the
+    runner refreshes each step. Per-request enablement is a host list flushed
+    to a device bool table only when a request is admitted.
+    """
 
     def __init__(self, vllm_config: VllmConfig, req_states: LogitsProcRequestState) -> None:
         self.silent, self.respond = _resolve_control_ids(_tokenizer_path(vllm_config))
         self.req_states = req_states
-        self.enabled = [False] * req_states.max_num_reqs
+        self._enabled_host = [False] * req_states.max_num_reqs
+        self._enabled_gpu = torch.zeros(req_states.max_num_reqs, dtype=torch.bool, device=req_states.device)
+        self._enabled_dirty = False
 
     @classmethod
     def validate_params(cls, sampling_params: SamplingParams) -> None:
@@ -120,32 +130,47 @@ class AuraTwoTokenLogitsProcessor(LogitsProcessor):
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> bool:
         self.validate_params(sampling_params)
-        if (sampling_params.extra_args or {}).get("aura_mode") != "streaming":
-            self.enabled[req_idx] = False
-            return False
-        _validate_control_stops(sampling_params, self.silent, self.respond)
-        self.enabled[req_idx] = True
-        return True
+        enabled = (sampling_params.extra_args or {}).get("aura_mode") == "streaming"
+        if enabled:
+            _validate_control_stops(sampling_params, self.silent, self.respond)
+        self._enabled_host[req_idx] = enabled
+        self._enabled_dirty = True
+        return enabled
+
+    def apply_staged_writes(self) -> None:
+        self._flush_enabled()
+
+    def _flush_enabled(self) -> None:
+        if not self._enabled_dirty:
+            return
+        self._enabled_gpu.copy_(torch.tensor(self._enabled_host, dtype=torch.bool))
+        self._enabled_dirty = False
 
     def apply(self, logits: torch.Tensor, ctx: LogitsContext) -> torch.Tensor:
-        prompt_lens = self.req_states.prompt_len.np
-        total_lens = self.req_states.total_len.gpu
-        token_ids = self.req_states.all_token_ids.gpu
-        for row in range(logits.shape[0]):
-            req_idx = int(ctx.expanded_idx_mapping[row].item())
-            if not self.enabled[req_idx]:
-                continue
-            prompt_len = int(prompt_lens[req_idx])
-            total_len = int(total_lens[req_idx].item())
-            if total_len < prompt_len:
-                raise ValueError("AURA two-token request has total_len < prompt_len")
-            if total_len == prompt_len:
-                _force_control_pair(logits[row], self.silent, self.respond)
-                continue
-            first_out = int(token_ids[req_idx, prompt_len].item())
-            if first_out != self.respond:
-                raise ValueError("Non-Respond request unexpectedly reached body decoding")
-            _mask_control_pair(logits[row], self.silent, self.respond)
+        self._flush_enabled()
+        slot = ctx.expanded_idx_mapping.long()
+        enabled = self._enabled_gpu[slot]
+        first = self.req_states.total_len.gpu[slot] == self.req_states.prompt_len.gpu[slot]
+        force_rows = (enabled & first).unsqueeze(1)
+        body_rows = (enabled & ~first).unsqueeze(1)
+
+        silent, respond = self.silent, self.respond
+        neg_inf = float("-inf")
+        # First step: keep only the control pair, as _force_control_pair does.
+        silent_logit = logits[:, silent].clone()
+        respond_logit = logits[:, respond].clone()
+        logits.masked_fill_(force_rows, neg_inf)
+        force = force_rows[:, 0]
+        logits[:, silent] = torch.where(force, silent_logit, logits[:, silent])
+        logits[:, respond] = torch.where(force, respond_logit, logits[:, respond])
+        if silent > respond:
+            # Argmax ties choose the lower id; Silent should win ties.
+            tie = force & (silent_logit == respond_logit)
+            logits[:, respond] = logits[:, respond].masked_fill(tie, neg_inf)
+        # Body: mask both control ids, as _mask_control_pair does.
+        body = body_rows[:, 0]
+        logits[:, silent] = logits[:, silent].masked_fill(body, neg_inf)
+        logits[:, respond] = logits[:, respond].masked_fill(body, neg_inf)
         return logits
 
 

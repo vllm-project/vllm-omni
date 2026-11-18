@@ -170,8 +170,8 @@ Peak memory is the `nvidia-smi` reservation set by `gpu_memory_utilization`.
   `0.08 + 0.55 + 0.12 + 0.12` of GPU 0.
 - Sizing: with Stage1 prefix caching on, c=16 keeps median TTFP ~601 ms
   (p90 ~946 ms). Lower `max_sessions` for a tighter latency target.
-- Key flags: Stage1 `async_scheduling: false` (the two-token logits processor
-  reads the live output list), `enable_prefix_caching: true` and
+- Key flags: Stage1 `async_scheduling: false` (kept as a conservative setting;
+  the MRV2 two-token processor does not read the output list), `enable_prefix_caching: true` and
   `mamba_cache_mode: align`. `async_chunk: true` is required for Talker to
   Code2Wav audio.
 - Known limitations: no server VAD (the client commits each utterance); no

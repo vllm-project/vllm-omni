@@ -236,7 +236,7 @@ Constraints on the packed path:
 
 - **Model-Specific TP Constraints**: Some models impose divisibility constraints on TP size. For example, Z-Image Turbo (`num_heads=30`) only supports `tensor_parallel_size=2`. Check [Supported Models](diffusion_features.md#supported-models) for per-model constraints.
 
-- **AURA_v2 Stage1 — Native Hybrid Prefix Cache, No Async Scheduling**: The AURA_v2 thinker (`AuraQwen3_5ForConditionalGeneration`) uses Qwen3.5 hybrid attention. It sets `uses_native_kv_cache_only`, and the shipped profiles set Stage1 `enable_prefix_caching: true` with `mamba_cache_mode: align`, so hits reuse vLLM's KV and GDN state. The omni single-group output cache does not apply. Its two-token logits processor reads the live output list, so Stage1 also needs `async_scheduling: false`. The shipped profile keeps Stage1 temperature at 0.2 and sets `async_chunk: true` for Talker to Code2Wav. See [Full-Duplex Runtime (AURA_v2)](../design/aura_v2_duplex.md).
+- **AURA_v2 Stage1 — Native Hybrid Prefix Cache, No Async Scheduling**: The AURA_v2 thinker (`AuraQwen3_5ForConditionalGeneration`) uses Qwen3.5 hybrid attention. It sets `uses_native_kv_cache_only`, and the shipped profiles set Stage1 `enable_prefix_caching: true` with `mamba_cache_mode: align`, so hits reuse vLLM's KV and GDN state. The omni single-group output cache does not apply. The shipped profiles keep Stage1 `async_scheduling: false`. The MRV2 two-token processor does not read the output list, so that setting is conservative and not measured for V2. The shipped profile keeps Stage1 temperature at 0.2 and sets `async_chunk: true` for Talker to Code2Wav. See [Full-Duplex Runtime (AURA_v2)](../design/aura_v2_duplex.md).
 
 ## Troubleshooting
 

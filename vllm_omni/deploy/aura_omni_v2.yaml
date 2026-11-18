@@ -65,8 +65,8 @@ stages:
     enable_prefix_caching: true
     engine_extras:
       mamba_cache_mode: align
-    # The two-token logits processor reads the live output list, which async
-    # scheduling can leave one step stale.
+    # Kept false on the V2 deploy as a conservative setting. The MRV2 processor
+    # does not read the output list; async scheduling with V2 is not measured.
     async_scheduling: false
     max_model_len: 65536
     max_num_batched_tokens: 8192
