@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Real scheduler/runner batching and posterior RNG, with weight-free networks."""
+"""Hunyuan posterior RNG and weight-free model fixtures for runner integration."""
 
 from dataclasses import dataclass, replace
 from functools import partial
@@ -33,7 +33,6 @@ pytestmark = [pytest.mark.core_model]
 class ModelCase:
     model: hunyuan.HunyuanImage3ForConditionalGeneration
     device: torch.device
-    _mm_rng_provider: RequestRNGProvider
 
 
 class TinyVAE:
@@ -60,7 +59,7 @@ def runner_case(device, dtype, *values):
 
 
 @pytest.fixture
-def runner(request, monkeypatch, mocker):
+def runner(request, mocker):
     device, dtype = getattr(request, "param", ("cpu", torch.float32))
     if device == "cuda" and not torch.get_device_module(device).is_available():
         pytest.skip("CUDA unavailable")
@@ -80,7 +79,7 @@ def runner(request, monkeypatch, mocker):
 
     provider = RequestRNGProvider(model.advance_mm_rng)
     model.bind_mm_rng_provider(provider)
-    return ModelCase(model, device, provider)
+    return ModelCase(model, device)
 
 
 def images():
@@ -278,7 +277,7 @@ def test_real_vae_posterior_matches_draw_plan_and_replay(runner, make_request, m
         grid = feature.data["vae_token_grid_hw"]
         feature.data["vae_token_grid_hw"] = replace(grid, data=torch.tensor([h // 16, w // 16]))
     specs = model.get_mm_rng_specs(req.mm_features, 42)
-    provider = runner._mm_rng_provider
+    provider = runner.model._mm_rng_provider
     handle = provider.register(req.request_id, 42, specs)
     reference_generator = torch.Generator(device=runner.device).manual_seed(42)
     with torch.inference_mode():

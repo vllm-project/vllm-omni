@@ -7,6 +7,7 @@ import uuid
 from contextlib import closing
 from copy import copy
 from dataclasses import replace
+from itertools import count
 
 import numpy as np
 import pytest
@@ -60,7 +61,14 @@ def v2(runner, mocker):
     result.lora_state = mocker.Mock()
     result.req_states = mocker.Mock(spec=RequestState)
     slots = result.req_states.req_id_to_index = {}
-    result.req_states.add_request.side_effect = lambda req_id, **_: slots.setdefault(req_id, len(slots))
+    # Request slots only identify rows here; storage and slot recycling are
+    # covered by the runner tests. Keep surviving requests on distinct rows.
+    slot_ids = count()
+
+    def add_request(req_id, **_):
+        slots[req_id] = next(slot_ids)
+
+    result.req_states.add_request.side_effect = add_request
     result.req_states.remove_request.side_effect = lambda req_id: slots.pop(req_id, None)
     state = object.__new__(DefaultModelState)
     state.model, state.encoder_cache = model, result.encoder_cache
@@ -176,10 +184,9 @@ def test_mrv2_readmits_after_input_release_and_preemption(v2, make_request, cons
     provider = v2.model._mm_rng_provider
     handle, plan = provider.handles["A"], v2._mm_rng_state.plans["A"]
 
-    # Pins vLLM 0.34 behavior: _get_encoder_input_updates reads only the four
-    # attributes set below. Revisit this stub on upstream scheduler changes.
+    # Use the upstream release logic with real Request objects.
     scheduler = object.__new__(Scheduler)
-    scheduler.use_v2_model_runner, scheduler.is_encoder_decoder = True, False
+    scheduler.is_encoder_decoder = False
     scheduler.requests, scheduler._pending_encoder_input_ids = {"A": req}, {}
     pos = req.mm_features[consumed - 1].mm_position
     req.num_computed_tokens = pos.offset + pos.length
@@ -424,3 +431,23 @@ def test_request_plan_is_built_once_per_admission(v2, make_request, mocker):
     v2.finish_requests(hunyuan_rng.schedule(finished=["A"]))
     admit(v2, make_request("A", refs))
     assert build_plan.call_count == 2
+
+
+@pytest.mark.cpu
+def test_request_id_reuse_preserves_another_live_request(v2, make_request):
+    refs = hunyuan_rng.images()
+    admit(v2, make_request("A", refs, 42), make_request("B", refs, 123))
+    encode(v2, {"A": [0], "B": [0]})
+    provider = v2._mm_rng_state.provider
+    old_a, live_b = provider.handles["A"], provider.handles["B"]
+    b_slot = v2.req_states.req_id_to_index["B"]
+    v2.finish_requests(hunyuan_rng.schedule(finished=["A"]))
+    admit(v2, make_request("A", refs, 0))
+    assert v2.req_states.req_id_to_index["B"] == b_slot
+    assert v2.req_states.req_id_to_index["A"] != b_slot
+    expected_a, _ = hunyuan_rng.reference(v2, refs, 0)
+    expected_b, _ = hunyuan_rng.reference(v2, refs, 123)
+    hunyuan_rng.assert_latents(encode(v2, {"B": [2], "A": [2]}), [expected_b[2], expected_a[2]])
+    assert provider.handles["B"] == live_b
+    assert provider.handles["A"] != old_a
+    assert old_a not in provider.streams
