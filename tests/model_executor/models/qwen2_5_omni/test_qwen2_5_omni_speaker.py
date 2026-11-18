@@ -98,19 +98,28 @@ def test_talker_prefill_uses_each_request_speaker(monkeypatch: pytest.MonkeyPatc
 def test_code2wav_uses_request_speaker(monkeypatch: pytest.MonkeyPatch) -> None:
     model = _bare_model("code2wav")
     speakers: list[str] = []
+    decoded_codes: list[list[int]] = []
 
     def fake_generate_audio(code, speaker):
         speakers.append(speaker)
+        decoded_codes.append(code.tolist())
         return torch.zeros(4)
 
     monkeypatch.setattr(model, "generate_audio", fake_generate_audio)
     codes, positions = torch.tensor([5, 6, 7]), torch.arange(3)
 
-    model.forward(codes, positions, model_intermediate_buffer=[{"speaker": ["ethan"]}])
+    # The non-async stage bridge schedules zero slots; codec ids arrive on
+    # the worker connector, independently of the prompt's placeholder ids.
+    model.forward(
+        torch.zeros_like(codes),
+        positions,
+        model_intermediate_buffer=[{"speaker": ["ethan"], "codes": {"audio": [5, 0, 7]}}],
+    )
     model.forward(codes, positions, model_intermediate_buffer=[{}])
     model.forward(codes, positions)
 
     assert speakers == ["Ethan", "Chelsie", "Chelsie"]
+    assert decoded_codes == [[5, 0, 7], [5, 6, 7], [5, 6, 7]]
 
 
 # spk_dict.pt keeps the voice's casing; legacy npy inputs use lowercase keys.

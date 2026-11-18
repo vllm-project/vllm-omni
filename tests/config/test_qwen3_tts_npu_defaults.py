@@ -29,7 +29,7 @@ PREDICTOR_OPTIONS = tuple(PREDICTOR_DEFAULTS)
 def test_resolved_optimization_defaults_are_npu_only(monkeypatch, platform):
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: platform == "npu")
     deploy = _apply_platform_overrides(load_deploy_config(get_deploy_config_path("qwen3_tts.yaml")), platform=platform)
-    assert deploy.model_runner == ("v2" if platform in ("cuda", "npu") else "v1")
+    assert deploy.model_runner == ("v2" if platform in ("cuda", "npu", "xpu") else "v1")
     if platform == "npu":
         for stage in deploy.stages:
             assert stage.compilation_config is not None
