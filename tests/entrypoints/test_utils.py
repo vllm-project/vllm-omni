@@ -693,3 +693,26 @@ def test_prepare_stage_config_inputs_filters_frontend_options(api_server_count):
     assert inputs.kwargs == {"max_num_seqs": 8}
     assert inputs.stage_overrides == {"0": {"max_num_seqs": 4}}
     assert kwargs["api_server_count"] == api_server_count
+
+
+@pytest.mark.parametrize(
+    ("policy", "batching_config", "expected"),
+    [
+        ("fixed", None, {"policy": "fixed"}),
+        (
+            "compute_budget",
+            {"compute_unit_budget": 4096},
+            {"compute_unit_budget": 4096, "policy": "compute_budget"},
+        ),
+    ],
+)
+def test_prepare_stage_config_inputs_maps_batching_policy_flag(policy, batching_config, expected):
+    from vllm_omni.entrypoints.utils import prepare_stage_config_inputs
+
+    kwargs = {"diffusion_batching_policy": policy}
+    if batching_config is not None:
+        kwargs["diffusion_batching_config"] = batching_config
+    inputs = prepare_stage_config_inputs("example", kwargs, trust_remote_code=None)
+
+    assert "diffusion_batching_policy" not in inputs.kwargs
+    assert inputs.kwargs == {"diffusion_batching_config": expected}
