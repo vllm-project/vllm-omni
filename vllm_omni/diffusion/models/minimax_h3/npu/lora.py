@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import get_args
 
 import torch
-from safetensors import safe_open
+from safetensors import SafetensorError, safe_open
 from vllm.config.lora import MaxLoRARanks
 from vllm.lora.lora_model import LoRAModel
 from vllm.lora.lora_weights import LoRALayerWeights, PackedLoRALayerWeights
@@ -106,6 +106,8 @@ class NativeDistilledLoRASpec:
     task: str = "t2va"
     rank: int = _NATIVE_RANK
     qkv_rank: int = _NATIVE_RANK
+    video_shift: float | None = None
+    audio_shift: float | None = None
 
     def rank_for(self, name: str) -> int:
         return self.qkv_rank if name.endswith(".attn.qkv_proj") else self.rank
@@ -131,10 +133,14 @@ def _select_native_file(artifact_path: str | Path) -> Path | None:
         if candidate.name == _NATIVE_FILENAME:
             candidates.append(candidate)
             continue
-        with safe_open(candidate, framework="pt", device="cpu") as checkpoint:
-            metadata = checkpoint.metadata() or {}
-            if metadata.get("key_format") == _NATIVE_KEY_FORMAT:
-                candidates.append(candidate)
+        try:
+            with safe_open(candidate, framework="pt", device="cpu") as checkpoint:
+                metadata = checkpoint.metadata() or {}
+        except (SafetensorError, OSError):
+            # An unreadable side file must not block generic PEFT loading.
+            continue
+        if metadata.get("key_format") == _NATIVE_KEY_FORMAT:
+            candidates.append(candidate)
     if len(candidates) > 1:
         raise ValueError(f"Multiple MiniMax-H3 native LoRA files in {path}; pass a specific file")
     return candidates[0] if candidates else None
@@ -242,7 +248,9 @@ def _parse_native_v2(metadata: Mapping[str, str], partition: str) -> NativeDisti
         raise ValueError("MiniMax-H3 native LoRA v2 requires base_schedule=1,0.7,0.4,0.15,0")
     if qkv_rank > max(get_args(MaxLoRARanks)):
         raise ValueError(f"Installed vLLM cannot allocate MiniMax-H3 native LoRA rank {qkv_rank}")
-    return NativeDistilledLoRASpec(schedule, task=task, rank=rank, qkv_rank=qkv_rank)
+    return NativeDistilledLoRASpec(
+        schedule, task=task, rank=rank, qkv_rank=qkv_rank, video_shift=video_shift, audio_shift=audio_shift
+    )
 
 
 def _validate_native_tensors(checkpoint, spec: NativeDistilledLoRASpec | None = None) -> dict[str, torch.Tensor]:

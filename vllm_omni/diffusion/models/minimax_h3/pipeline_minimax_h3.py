@@ -877,6 +877,18 @@ class MiniMaxH3Pipeline(
             raise OmniClientError(
                 f"MiniMax-H3 native LoRA task mismatch: active adapter requires task={spec.task!r}, got task={task!r}"
             )
+        if spec.video_shift is not None and spec.audio_shift is not None:
+            extra = sampling.extra_args or {}
+            for key, expected, default in (
+                ("flow_shift", spec.video_shift, self.default_video_shift),
+                ("audio_flow_shift", spec.audio_shift, self.default_audio_shift),
+            ):
+                try:
+                    shift = float(extra.get(key, default))
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise OmniClientError(f"MiniMax-H3 native LoRA requires {key}={expected:g}") from exc
+                if not math.isclose(shift, expected):
+                    raise OmniClientError(f"MiniMax-H3 native LoRA requires {key}={expected:g}")
         expected_steps = spec.schedule.num_inference_steps
         # Only request mode can take the count from the adapter schedule: step
         # mode admits the request in ``StepScheduler``, which reads

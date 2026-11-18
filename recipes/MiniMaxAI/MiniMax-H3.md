@@ -1639,12 +1639,18 @@ preload the published file with `--lora-path`. Select it in the request with
 the usual `lora` field and `scale=1.0`.
 
 The artifact supplies a four-interval base sigma schedule. Omit `sampler`
-to use the H3 default Euler sampler. The standard H3 video and audio shifts
-are 12 and 3. Send `num_inference_steps=4` when using step execution.
-Ref2VA requires LoRA
-buffers and an execution backend capable of QKV rank 384. The other Ref2VA
-projections use rank 128. The loader applies the exported factors at unit
-scale before applying the request multiplier.
+to use the H3 default Euler sampler. The adapter requires `flow_shift=12`
+and `audio_flow_shift=3`. If the base model defaults differ, pass these
+values explicitly in `extra_params`. Send `num_inference_steps=4` when using
+step execution.
+
+Ref2VA uses rank 384 for packed QKV and rank 128 for the other projections.
+The runtime LoRA manager uses a shared buffer rank across wrapped layers. It
+rounds 384 up to the next supported rank, 512, so rank-128 projections reserve
+four times the LoRA buffer capacity they would need at rank 128. The actual
+per-device memory overhead depends on tensor parallelism and the backend.
+The loader applies the exported factors at unit scale before applying the
+request multiplier.
 
 ### FastH3 adapter
 

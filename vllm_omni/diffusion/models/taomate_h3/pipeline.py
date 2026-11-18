@@ -956,6 +956,7 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         return bank
 
     def _bind_diffusion_lora_manager(self, manager: DiffusionLoRAManager | None) -> None:
+        super()._bind_diffusion_lora_manager(manager)
         self._tm_lora_manager = manager
         if self._tm_teacher is not None:
             self._tm_teacher.manager = manager

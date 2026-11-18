@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Literal
 
@@ -192,6 +193,7 @@ def test_native_v2_loads_published_profiles(tmp_path, monkeypatch, task, target_
     model, helper, parsed = loaded
     assert parsed.task == task
     assert parsed.schedule.base_schedule == (1.0, 0.7, 0.4, 0.15, 0.0)
+    assert (parsed.video_shift, parsed.audio_shift) == (12.0, 3.0)
     assert len(model.loras) == target_count
     assert helper.r == qkv_rank
     qkv = model.loras["blocks.0.attn.qkv_proj"]
@@ -214,6 +216,8 @@ def test_native_v2_request_validation():
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
+    pipeline.default_video_shift = 12.0
+    pipeline.default_audio_shift = 3.0
     pipeline._native_lora_specs = {7: lora_module._parse_native_v2(_v2_metadata("fl2va"), "fl2va")}
     sampling = SimpleNamespace(lora_request=_request("i2va"), lora_scale=1.0, num_inference_steps=4, extra_args={})
     pipeline._validate_native_sampling(sampling, task="fl2va")
@@ -225,6 +229,35 @@ def test_native_v2_request_validation():
         lora_module._parse_native_v2({**_v2_metadata("fl2va"), "sampler": "sde"}, "fl2va")
     sampling.lora_scale = 0
     assert pipeline._active_native_spec(sampling) is None
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("key", "default_attr", "expected", "wrong_shift"),
+    [("flow_shift", "default_video_shift", 12, 5), ("audio_flow_shift", "default_audio_shift", 3, 4)],
+)
+def test_native_v2_validates_effective_flow_shifts(key, default_attr, expected, wrong_shift):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.default_video_shift = 12.0
+    pipeline.default_audio_shift = 3.0
+    pipeline._native_lora_specs = {7: lora_module._parse_native_v2(_v2_metadata("fl2va"), "fl2va")}
+    sampling = SimpleNamespace(lora_request=_request("i2va"), lora_scale=1.0, num_inference_steps=None, extra_args={})
+
+    pipeline._validate_native_sampling(sampling, task="fl2va")
+    for value in (wrong_shift, "invalid"):
+        sampling.extra_args = {key: value}
+        with pytest.raises(OmniClientError, match=f"requires {key}={expected}"):
+            pipeline._validate_native_sampling(sampling, task="fl2va")
+
+    setattr(pipeline, default_attr, wrong_shift)
+    sampling.extra_args = {}
+    with pytest.raises(OmniClientError, match=f"requires {key}={expected}"):
+        pipeline._validate_native_sampling(sampling, task="fl2va")
+    sampling.extra_args = {key: expected}
+    pipeline._validate_native_sampling(sampling, task="fl2va")
 
 
 @pytest.mark.cpu
@@ -730,6 +763,42 @@ def test_legacy_manager_uses_native_loader(tmp_path):
     assert lora_model.id == 7
     assert peft_helper.lora_alpha == _TINY_RANK
     assert len(lora_model.loras) == 259
+
+
+@pytest.mark.cpu
+def test_manager_loads_peft_with_truncated_side_file(tmp_path, monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    # Some accelerator builds pin CPU LoRA tensors by default.
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor)
+    target = "blocks.0.attn.out_proj"
+    prefix = f"base_model.model.{target}"
+    lora_a = torch.ones((1, 2))
+    lora_b = torch.ones((2, 1))
+    weights = tmp_path / "adapter_model.safetensors"
+    save_file({f"{prefix}.lora_A.weight": lora_a, f"{prefix}.lora_B.weight": lora_b}, str(weights))
+    (tmp_path / "adapter_config.json").write_text(
+        json.dumps({"r": 1, "lora_alpha": 1, "target_modules": ["out_proj"]}),
+        encoding="utf-8",
+    )
+    (tmp_path / "partial.safetensors").write_bytes(weights.read_bytes()[:-1])
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.partition = "fl2va"
+    pipeline.transformer = torch.nn.Module()
+    pipeline._turbo_lora_specs = {}
+    pipeline._native_lora_specs = {}
+
+    manager = object.__new__(DiffusionLoRAManager)
+    manager.pipeline = pipeline
+    manager.dtype = torch.float32
+    manager._expected_lora_modules = {"out_proj"}
+
+    lora_model, peft_helper = manager._load_adapter(_request(tmp_path))
+    assert peft_helper.r == 1
+    torch.testing.assert_close(lora_model.loras[target].lora_a, lora_a)
+    torch.testing.assert_close(lora_model.loras[target].lora_b, lora_b)
 
 
 @pytest.mark.cpu

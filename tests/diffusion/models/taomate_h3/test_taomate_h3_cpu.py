@@ -614,6 +614,7 @@ def test_native_artifact_uses_real_manager_and_preserves_teacher(tmp_path, monke
 
     with _native_manager_case(tmp_path, monkeypatch, merge=merge, scale=scale) as case:
         pipeline, manager, prepared, base, originals = case
+        assert pipeline._lora_manager_ref() is manager
         assert pipeline._tm_teacher.manager is manager and pipeline._tm_prepared_lora is None
 
         def unexpected_reload(*args, **kwargs):
@@ -648,6 +649,7 @@ def test_native_artifact_uses_real_manager_and_preserves_teacher(tmp_path, monke
                 torch.testing.assert_close(layer(x)[0], expected, rtol=0, atol=0)
                 assert pointers == (layer.lora_a_stacked[0].data_ptr(), layer.lora_b_stacked[0].data_ptr())
         manager.close()
+        assert pipeline._lora_manager_ref is None
         assert pipeline._tm_teacher.manager is None
         assert all(pipeline.get_submodule(name) is original for name, original in originals.items())
         assert all(original.weight is base[name] for name, original in originals.items())
