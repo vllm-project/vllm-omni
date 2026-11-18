@@ -30,6 +30,7 @@ GPU_OOM_MARKERS = (
     "torch.cuda.outofmemoryerror",
     "cuda error: out of memory",
     "hip error: out of memory",
+    "hip error: 'out of memory'",
     "cuda_error_out_of_memory",
     "hiperroroutofmemory",
     "memory allocation failed with oom on device",
