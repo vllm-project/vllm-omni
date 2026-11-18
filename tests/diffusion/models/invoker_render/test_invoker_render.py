@@ -1,13 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import asyncio
+import io
 import json
+import tempfile
 
+import av
 import numpy as np
 import pytest
 import torch
+from fastapi import HTTPException, UploadFile
 from PIL import Image
 from safetensors.torch import save_file
+from starlette.datastructures import Headers
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig, resolve_model_class_name
 from vllm_omni.diffusion.models.invoker_render.assets import InvokerRenderAssets
@@ -16,6 +22,7 @@ from vllm_omni.diffusion.models.invoker_render.codec import CausalVideoDecoder
 from vllm_omni.diffusion.models.invoker_render.pipeline import get_invoker_render_pre_process_func
 from vllm_omni.diffusion.models.invoker_render.schedule import WindowPlanner
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.entrypoints.openai.video.generation.helpers import _persist_uploaded_media_references
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -141,3 +148,42 @@ def test_decoder_window_partition_keeps_spatial_geometry(shift):
     decoded = CausalVideoDecoder._unwindow(windows, shape, shift)
     assert mask.sum().item() == 2 * 17 * 31
     assert torch.equal(decoded, values.flatten(-2))
+
+
+def test_mixed_matroska_upload_preserves_full_proxy(bundle, monkeypatch):
+    path = bundle / "original.mkv"
+    with av.open(str(path), "w") as container:
+        stream = container.add_stream("ffv1", rate=24)
+        stream.width, stream.height, stream.pix_fmt = 448, 256, "bgr0"
+        for index in range(39):
+            frame = av.VideoFrame.from_ndarray(np.full((256, 448, 3), index, dtype=np.uint8), format="rgb24")
+            container.mux(stream.encode(frame))
+        container.mux(stream.encode())
+    rgb = io.BytesIO()
+    Image.new("RGB", (1344, 768)).save(rgb, format="PNG")
+
+    def uploads():
+        return [
+            UploadFile(
+                io.BytesIO(rgb.getvalue()), filename="first.png", headers=Headers({"content-type": "image/png"})
+            ),
+            UploadFile(
+                io.BytesIO(path.read_bytes()),
+                filename="proxy.mkv",
+                headers=Headers({"content-type": "video/x-matroska"}),
+            ),
+        ]
+
+    monkeypatch.setattr(tempfile, "tempdir", str(bundle))
+    with pytest.raises(HTTPException, match="MP4 or MOV"):
+        asyncio.run(_persist_uploaded_media_references(uploads()))
+    images, videos, audios = asyncio.run(_persist_uploaded_media_references(uploads(), proxy_video=True))
+    assert len(images) == len(videos) == 1 and not audios
+    pre_process = get_invoker_render_pre_process_func(OmniDiffusionConfig.from_kwargs(model=str(bundle)))
+    request = OmniDiffusionRequest(
+        {"prompt": "Render the road", "multi_modal_data": {"image": images[0], "video": videos}},
+        OmniDiffusionSamplingParams(seed=42),
+        "upload",
+    )
+    proxy = pre_process(request).prompt["multi_modal_data"]["video"]
+    np.testing.assert_array_equal(proxy[:, 0, 0, 0], np.arange(39))

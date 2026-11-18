@@ -12,6 +12,7 @@ class DiffusionModelMetadata:
     max_multimodal_image_inputs: int | None = None
     supports_mixed_reference_inputs: bool = False
     supports_multiview_reference_inputs: bool = False
+    supports_proxy_video_input: bool = False
     # Multipart controls are exposed as ``control_reference`` plus
     # ``control_type`` by the video API.  A pipeline that opts in receives the
     # persisted upload through ``extra_args[control_type]["control_path"]``.
@@ -157,6 +158,8 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "InvokerRenderPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=1,
+        supports_mixed_reference_inputs=True,
+        supports_proxy_video_input=True,
         final_output_type="video",
         attention_mask_free=True,
     ),

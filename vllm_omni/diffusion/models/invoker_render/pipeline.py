@@ -21,6 +21,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
 from vllm_omni.diffusion.models.minimax_h3.encoder import MiniMaxH3Qwen3VLEncoder
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3DiTModel
 from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE
@@ -85,6 +86,8 @@ def get_invoker_render_pre_process_func(od_config: OmniDiffusionConfig):
         if not isinstance(image, Image.Image) or image.size != VIDEO_SIZE:
             raise OmniClientError("Invoker-Render requires one 1344x768 reference image")
         proxy = data.get("video")
+        if isinstance(proxy, list) and len(proxy) == 1:
+            proxy = proxy[0]
         if isinstance(proxy, (str, Path)):
             proxy = read_proxy_video(proxy, assets.proxy_size)
         else:
@@ -136,6 +139,10 @@ class _Session:
 class InvokerRenderPipeline(nn.Module):
     support_image_input: ClassVar[bool] = True
     dummy_run_num_frames: ClassVar[int] = 0
+
+    @staticmethod
+    def reference_video_decode_spec(*, num_frames: int | None, extra_args: dict) -> ReferenceVideoDecodeSpec:
+        return ReferenceVideoDecodeSpec()
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__()

@@ -305,6 +305,11 @@ class OmniOpenAIServingVideo:
         return capability is True or any(item.supports_mixed_reference_inputs for item in metadata)
 
     @property
+    def supports_proxy_video_input(self) -> bool:
+        _, metadata = self._resolve_diffusion_metadata()
+        return any(item.supports_proxy_video_input for item in metadata)
+
+    @property
     def supports_latent_mask_editing(self) -> bool:
         """Return whether the configured diffusion model accepts latent edits."""
         _, metadata = self._resolve_diffusion_metadata()
@@ -436,6 +441,10 @@ class OmniOpenAIServingVideo:
         provided_fields = request.model_fields_set
         fps_provided = self._request_fps_provided(request)
         num_frames_provided = self._request_num_frames_provided(request)
+        if self.supports_proxy_video_input and num_frames_provided and request.resolve_video_params().num_frames == 1:
+            raise HTTPException(
+                400, detail="Proxy video rendering requires the source frame count, at least 39 frames."
+            )
         video_defaults = self._resolve_video_generation_defaults(request)
         if video_defaults is None:
             vp = request.resolve_video_params()

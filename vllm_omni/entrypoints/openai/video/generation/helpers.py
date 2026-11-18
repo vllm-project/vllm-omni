@@ -944,6 +944,8 @@ def _validate_minimax_h3_image_payload(
 async def _persist_uploaded_media_references(
     uploads: list[UploadFile],
     resources: VideoRequestResources,
+    *,
+    proxy_video: bool = False,
 ) -> tuple[list[Image.Image], list[str], list[str]]:
     """Persist a mixed MiniMax H3 multipart reference list.
 
@@ -954,6 +956,9 @@ async def _persist_uploaded_media_references(
     images: list[Image.Image] = []
     videos: list[str] = []
     audios: list[str] = []
+    if proxy_video and sorted(_uploaded_media_kind(upload) for upload in uploads) != ["image", "video"]:
+        raise HTTPException(400, detail="Proxy video rendering requires one reference image and one proxy video.")
+    video_suffixes = MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES | ({".mkv"} if proxy_video else set())
     if len(uploads) > MINIMAX_H3_MAX_REFERENCE_COUNT:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
@@ -975,10 +980,14 @@ async def _persist_uploaded_media_references(
                 raise HTTPException(HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
             continue
         suffix = Path(upload.filename or "").suffix.lower()
-        if kind == "video" and suffix and suffix not in MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES:
+        if kind == "video" and suffix and suffix not in video_suffixes:
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
-                detail="MiniMax H3 reference videos must use an MP4 or MOV file.",
+                detail=(
+                    "Proxy videos must use an MKV, MP4 or MOV file."
+                    if proxy_video
+                    else "MiniMax H3 reference videos must use an MP4 or MOV file."
+                ),
             )
         if kind == "audio" and suffix and suffix not in MINIMAX_H3_REFERENCE_AUDIO_SUFFIXES:
             raise HTTPException(
@@ -1392,7 +1401,11 @@ async def _parse_video_form(
                 video_paths = await _persist_uploaded_video_references(input_references, resources)
                 images, audio_paths = [], []
             else:
-                images, video_paths, audio_paths = await _persist_uploaded_media_references(input_references, resources)
+                images, video_paths, audio_paths = await _persist_uploaded_media_references(
+                    input_references,
+                    resources,
+                    proxy_video=handler.supports_proxy_video_input,
+                )
             if images:
                 reference_image = ReferenceImage(data=images if len(images) > 1 else images[0])
             if video_paths:

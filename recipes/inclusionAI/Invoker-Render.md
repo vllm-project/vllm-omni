@@ -36,3 +36,21 @@ try:
 finally:
     omni.close()
 ```
+
+## 文件服务
+
+```bash
+vllm serve /models/invoker-render/bundle --omni --trust-remote-code \
+  --deploy-config vllm_omni/deploy/invoker_render.yaml \
+  --served-model-name invoker-render --port 8091
+```
+
+```bash
+curl --fail-with-body http://127.0.0.1:8091/v1/videos/sync \
+  -F 'model=invoker-render' -F 'seed=42' -F 'prompt=<prompt.txt' \
+  -F 'input_references=@first.png;type=image/png' \
+  -F 'input_references=@proxy.mkv;type=video/x-matroska' \
+  -o output.mp4
+```
+
+`POST /v1/videos` 使用相同字段，按现有视频作业接口获取输出。帧数由代理视频决定。

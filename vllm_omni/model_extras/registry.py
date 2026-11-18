@@ -295,6 +295,9 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         # forward() returns uint8 frames already; declared for completeness.
         "output_tensor_range": "zero_to_one",
     },
+    "InvokerRenderPipeline": {
+        "reference_image_size_resolver": _always_preserve_reference_image_size,
+    },
     "HeliosPyramidPipeline": {
         "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
         "extra_output_params": HELIOS_EXTRA_OUTPUT_PARAMS,
