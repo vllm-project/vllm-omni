@@ -200,6 +200,7 @@ def test_default_sampling_keeps_the_full_main_distribution():
     stage = next(stage for stage in deploy.stages if stage.stage_id == 0)
     assert stage.default_sampling_params["top_k"] == -1
     assert stage.default_sampling_params["top_p"] == 1.0
+    assert stage.default_sampling_params["extra_args"]["fish_omni_reference_top_p"] == 0.9
 
 
 def test_npu_deploy_captures_full_decode_graphs():

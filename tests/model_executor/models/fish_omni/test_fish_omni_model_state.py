@@ -101,6 +101,28 @@ def test_stage_main_token_top_k(make_state, request_k, expected):
     assert top_k == expected
 
 
+@pytest.mark.parametrize(
+    ("reference", "requested", "extra", "expected"),
+    [
+        (None, 1.0, {"fish_omni_reference_top_p": 0.9}, 1.0),
+        ("ref_audio_wav", 1.0, {"fish_omni_reference_top_p": 0.9}, 0.9),
+        ("ref_codes", 1.0, {"fish_omni_reference_top_p": 0.9}, 0.9),
+        ("ref_codes", 1.0, {"fish_omni_reference_top_p": 0.9, "top_p": 1.0}, 1.0),
+        ("ref_codes", 0.8, {"fish_omni_reference_top_p": 0.9}, 0.8),
+        ("ref_codes", 1.0, {}, 1.0),
+    ],
+)
+def test_reference_nucleus_default(make_state, reference, requested, extra, expected):
+    state = make_state()
+    if reference:
+        state.intermediate_buffer.buffers[0][reference] = torch.zeros(1)
+    req = _request("a")
+    req.sampling_params.top_p = requested
+    req.sampling_params.extra_args = extra
+    state.add_request(0, req)
+    assert state._pending_slots[0][0][1] == expected
+
+
 def test_preempted_request_resumes_with_its_generated_frames(make_state):
     state = make_state()
     state.add_request(1, _request("a"))

@@ -164,12 +164,14 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
         req_id = str(new_req_data.req_id)
         prompt_ids = list(new_req_data.prompt_token_ids or [])
         token_ids = list(new_req_data.prefill_token_ids or prompt_ids)
+        info = {}
         if is_warmup_request(req_id):
             # Warmup requests: text rows with zero codes.
             rows = torch.zeros((len(prompt_ids), self.frame_width), dtype=torch.int64)
             rows[:, 0] = torch.tensor(prompt_ids, dtype=torch.int64)
         else:
-            rows = self.model.build_frames(self._request_info(req_index), self.device)
+            info = self._request_info(req_index)
+            rows = self.model.build_frames(info, self.device)
         if rows.shape[0] != len(prompt_ids):
             raise ValueError(
                 f"fish_omni prompt has {rows.shape[0]} rows but request {req_id} reserved {len(prompt_ids)} "
@@ -208,6 +210,12 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
                 self._warned_top_k = True
             top_k = self.model.max_top_k
         top_p = float(params.top_p) if params is not None else 1.0
+        extra = getattr(params, "extra_args", None) or {}
+        has_reference = info.get("ref_codes") is not None or info.get("ref_audio_wav") is not None
+        if has_reference and top_p == 1.0 and extra.get("top_p") is None:
+            top_p = float(extra.get("fish_omni_reference_top_p", top_p))
+            if not 0.0 < top_p <= 1.0:
+                raise ValueError("fish_omni_reference_top_p must be in (0, 1]")
         seed = getattr(params, "seed", None) if params is not None else None
         if seed is not None:
             self._seeds[req_id] = int(seed) & _MASK64

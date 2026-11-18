@@ -138,8 +138,10 @@ which returns the exact prompt row count.
   0.78 of the GPU for stage 0 and 0.1 for the codec stage.
 - The deployment defaults to temperature 1.0, top_p 1.0 and max_tokens 500.
   The main token's first draw considers all 4096 candidates, so low-probability
-  transitions out of quiet frames remain available. Set `extra_params.top_k`
-  to a positive value or lower `extra_params.top_p` to narrow that draw.
+  transitions out of quiet frames remain available. For voice cloning, the
+  deploy's `fish_omni_reference_top_p` defaults to 0.9. An explicit
+  `extra_params.top_p` overrides either default. Set `extra_params.top_k`
+  to a positive value to narrow the main draw.
   Each codebook head keeps at most 30 candidates and honors smaller request
   values. The stage 0 `hf_overrides.fish_omni_max_top_k` option can cap the
   main draw for all requests (powers of two from 32 to 4096). A request's
