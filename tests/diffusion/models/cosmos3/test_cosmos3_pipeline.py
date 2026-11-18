@@ -3341,6 +3341,15 @@ class TestForwardRouting:
                 ),
                 "cannot be combined with action generation",
             ),
+            (
+                {
+                    "prompt": "x",
+                    "modalities": ["image"],
+                    "additional_information": {"preprocessed_image": torch.zeros(1, 3, 16, 16)},
+                },
+                make_sampling_params(),
+                "image-conditioned image generation is unsupported",
+            ),
         ],
     )
     def test_forward_rejects_invalid_public_requests(
@@ -3352,6 +3361,8 @@ class TestForwardRouting:
     ) -> None:
         pipeline = make_cosmos3_pipeline()
         pipeline.transformer = pipeline.transformer.__class__(latent_channel_size=2, sound_gen=True, sound_dim=3)
+        # Stub generation so a request that passes validation returns instead of failing later.
+        self._install_forward_stubs(pipeline)
 
         with pytest.raises(ValueError, match=message):
             pipeline.forward(make_request_batch(prompt, sampling_params))
