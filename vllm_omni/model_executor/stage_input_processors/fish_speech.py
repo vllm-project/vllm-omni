@@ -95,14 +95,23 @@ def _select_backlog_chunk_size(
     return backlog_chunk_size
 
 
-def _extract_last_frame(multimodal_output: dict[str, Any]) -> torch.Tensor | None:
-    """Extract the last frame of audio codes from the multimodal output."""
+def _extract_last_frame(multimodal_output: Mapping[str, Any]) -> torch.Tensor | None:
+    """Extract the last frame of audio codes from the multimodal output.
+
+    The V1 runner publishes ``audio_codes`` (and optionally ``audio_code_valid``);
+    MRV2 publishes ``codes.audio`` with ``meta.codec_frame_valid``.
+    """
     audio_codes = multimodal_output.get("audio_codes")
+    valid = multimodal_output.get("audio_code_valid")
+    if audio_codes is None:
+        codes = multimodal_output.get("codes")
+        meta = multimodal_output.get("meta")
+        audio_codes = codes.get("audio") if isinstance(codes, Mapping) else None
+        valid = meta.get("codec_frame_valid") if isinstance(meta, Mapping) else None
     if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
         return None
     if audio_codes.ndim == 2:
         frame = audio_codes[-1]
-        valid = multimodal_output.get("audio_code_valid")
         if isinstance(valid, torch.Tensor) and valid.numel() > 0:
             is_valid = bool(valid.reshape(-1)[-1].item())
         elif valid is not None:

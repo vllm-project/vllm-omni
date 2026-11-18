@@ -2271,7 +2271,6 @@ def test_cosmos3_weekly_is_blocking_and_replaces_narrow_nightly_owner() -> None:
 )
 def test_v1_only_drama3_is_not_scheduled(pipeline_path: Path) -> None:
     """The retired V1-only workflow must not be advertised as an executable job."""
-    assert not Path("tests/e2e/online_serving/test_drama_3.py").exists()
     pipeline = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
     for step in _walk_steps(pipeline["steps"]):
         assert "Drama 3" not in step.get("label", "")

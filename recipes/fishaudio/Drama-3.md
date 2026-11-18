@@ -1,12 +1,5 @@
 # Fish Audio Drama 3
 
-> **Unavailable with vLLM 0.34 / V2-only execution.** The DAC stage requires the retired Model Runner V1.
-> The commands, configurations, and measurements below are historical reference,
-> not installation or serving instructions for this version. Configuration loading
-> rejects the V1 profile; changing its runner flag does not add V2 support.
->
-> Historical online serving for TTS
-
 ## Summary
 
 - Vendor: FishAudio
@@ -69,9 +62,7 @@ Notes:
   through a private MPS daemon; stage 0 runs on Model Runner V2 with CUDA
   graphs (FULL for decode steps, PIECEWISE for steps with prompt rows).
   Stage 1 (the DAC) also runs on Model Runner V2 on CUDA and replays its own
-  CUDA graphs per window size. To run it on V1, set `model_runner: v1` for
-  stage 1 under `platforms.cuda` in a copy of the file. A `model_runner` set
-  at the top level or under `stages:` does not override that entry.
+  CUDA graphs per window size.
 - The checkpoint's `bsgemm-moe` quantization maps to vLLM's block-FP8 MoE
   kernels for the routed experts; all other weights stay bf16.
 

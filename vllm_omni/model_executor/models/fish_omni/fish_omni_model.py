@@ -190,6 +190,8 @@ class FishOmniForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
     """Qwen3.5 MoE backbone + Drama 3 codebook tower on Model Runner V2."""
 
     have_multimodal_outputs = True
+    # The model state reads sampled frames after forward returns hidden states.
+    mrv2_forward_returns_tensor: bool = True
     # Every sampled main token is decided inside forward.
     mrv2_direct_tokens = True
 

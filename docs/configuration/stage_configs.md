@@ -325,7 +325,7 @@ deployment on a platform.
 
 Profiles that still resolve to V1 are unavailable with this version. These
 include Qwen3-TTS's ROCm/MUSA overrides, Qwen3-Omni's ROCm/MUSA overrides,
-Fish-Omni's DAC stage, PersonaPlex's Talker, VibeVoice, YuE2, and the LFM3-Omni
+PersonaPlex's Talker, VibeVoice, YuE2, and the LFM3-Omni
 profiles. Selecting `v2` manually does not establish support for those paths.
 YuE2's audio synthesis still depends on V1 model sampling hooks; its two
 offline audio export tests are not applicable to the V2 runtime.
@@ -335,12 +335,10 @@ The Qwen3-TTS and Qwen3-Omni XPU profiles select V2; final-release XPU
 hardware validation remains pending. Retained V1 profiles identify unavailable
 workflows and preserve explicit configuration errors. They do not provide a V1
 fallback.
-Drama 3 / Fish-Omni serving and both LFM3-Omni speech and text-only profiles
-are unavailable. Their retired serving E2E tests covered speech generation,
-voice cloning, streaming, concurrency and request validation across those
-workflows. Retained Fish AR and LFM3-Omni component tests are not complete V2
-serving replacements; LFM3-Audio uses a different checkpoint and profile.
-Drama jobs are removed from CUDA Weekly and AMD CI. The Merge matrix also
+The LFM3-Omni speech and text-only profiles remain unavailable; LFM3-Audio
+uses a different checkpoint and profile. Drama 3 uses V2 for the AR and DAC
+stages. Its CUDA weekly tests cover generation, voice cloning, streaming and
+concurrency; its AMD CI coverage remains deferred. The Merge matrix also
 excludes VibeVoice. These exclusions do not count as passing V2 model tests.
 
 Retiring V1 dispatch also reduces the following Weekly CI coverage:

@@ -1332,9 +1332,7 @@ source_file_dependencies:
   tts_drama_3_function:
     - *fish_omni
     - tests/e2e/online_serving/test_drama_3.py
-    # Stage 0 runs on Model Runner V2, and on CUDA so does stage 1, which gets
-    # each window through the native data plane. A change there, or in the NPU
-    # runner that builds Ascend attention metadata, must run the Drama 3 jobs.
+    # Both stages use V2; the DAC receives each window through its native data plane.
     - vllm_omni/worker_v2/
     - vllm_omni/platforms/npu/worker/npu_omni_v2_model_runner.py
     - vllm_omni/model_executor/stage_input_processors/fish_omni.py
