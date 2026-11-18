@@ -420,6 +420,7 @@ class StageRuntime:
         if resolve_plans and self._parallel_stage_init:
             self._reject_unguardable_executors(stage_plans)
             self._run_stage_admission(stage_plans)
+            self._size_shared_device_kv_from_profiling(stage_plans)
 
         client_configs: list[OmniClientConfig] = [
             OmniClientConfig(
@@ -1059,6 +1060,7 @@ class StageRuntime:
             # Both fail fast here rather than OOM at allocation time.
             self._reject_unguardable_executors(stage_plans)
             self._run_stage_admission(stage_plans)
+            self._size_shared_device_kv_from_profiling(stage_plans)
 
         init_groups = self._build_init_groups(stage_plans)
 
@@ -1176,6 +1178,65 @@ class StageRuntime:
                 "for this host's devices, so workers placed on other nodes would initialize unprotected. "
                 f"Offending replicas: {', '.join(offenders)}. Disable parallel_stage_init for "
                 "this deployment, or use a single-node non-Ray executor backend."
+            )
+
+    def _size_shared_device_kv_from_profiling(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
+        """Turn off vLLM's extensible KV cache for LLM stages that share a device.
+
+        The extensible KV cache is sized after warmup from device-level free
+        memory, against the snapshot taken before the weights load. Stages that
+        share a device initialize concurrently under parallel stage init, so that
+        measurement charges each stage for its peers' weights, KV caches and
+        graphs, and finds no memory left. Profiling runs under the exclusive
+        device lock and is measured over that window, so these stages size their
+        KV cache from it instead. Local diffusion replicas finish initializing
+        before the LLM stages start, so they are already in that snapshot.
+        """
+        from vllm.config.kv_transfer import KVCacheAccess
+
+        local = [
+            (plan.stage_id, replica)
+            for plan in stage_plans
+            for replica in plan.replicas
+            if replica.launch_mode != "remote" and replica.metadata.stage_type != "diffusion"
+        ]
+        devices = {
+            id(replica): set(
+                parse_physical_device_ids(
+                    self._resolve_replica_physical_devices(replica.metadata.stage_id, replica.metadata.runtime_cfg)
+                )
+                or ()
+            )
+            for _, replica in local
+        }
+        replicas_on: dict[int, int] = {}
+        for ids in devices.values():
+            for device in ids:
+                replicas_on[device] = replicas_on.get(device, 0) + 1
+        for stage_id, replica in local:
+            vllm_config = replica.stage_vllm_config
+            cache_config = getattr(vllm_config, "cache_config", None)
+            if vllm_config is None or cache_config is None or not cache_config.enable_extensible_kv_cache:
+                continue
+            shared = sorted(device for device in devices[id(replica)] if replicas_on[device] > 1)
+            if not shared:
+                continue
+            kv_transfer_config = vllm_config.kv_transfer_config
+            needs_extensible = (replica.engine_args_dict or {}).get("enable_extensible_kv_cache") or (
+                kv_transfer_config is not None and KVCacheAccess.EXPORTS_FD in kv_transfer_config.kv_cache_access()
+            )
+            if needs_extensible:
+                raise ValueError(
+                    f"Stage {stage_id} needs the extensible KV cache, which parallel_stage_init cannot size on "
+                    f"device(s) {shared} shared with other stages. Disable parallel_stage_init or give the stage "
+                    "its own device."
+                )
+            cache_config.enable_extensible_kv_cache = False
+            logger.info(
+                "parallel_stage_init: stage %s shares device(s) %s with other stages; turning off the extensible "
+                "KV cache, so its KV cache is sized from profiling",
+                stage_id,
+                shared,
             )
 
     def _run_stage_admission(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:

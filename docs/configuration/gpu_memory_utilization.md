@@ -147,6 +147,11 @@ to the deployment, `vllm serve --omni --parallel-stage-init` (or
   kernel launches (about 0.2 GiB per stage for Qwen3-Omni). Like the CUDA
   context, it sits outside the stage's `gpu_memory_utilization` share, so a
   stage gets slightly more KV cache than when stages start one after another.
+- LLM stages that share a GPU with other LLM stages do not use vLLM's extensible
+  KV cache, which is sized after warmup from the device's free memory and would
+  count the peers' memory. Their KV cache is sized from the profiling above.
+  Diffusion stages finish initializing first and don't count. A stage that requests
+  `enable_extensible_kv_cache`, or whose KV connector needs it, fails at startup.
 - Startup log lines that read the device's free memory can include the peers'
   memory: "Free memory on device ... on startup", the CUDA graph capture size
   and the `--kv-cache-memory` suggestion. Start the stages one after another to

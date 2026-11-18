@@ -27,6 +27,7 @@ import types
 from pathlib import Path
 
 import pytest
+from vllm.config.kv_transfer import KVCacheAccess
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 from vllm_omni.engine.stage_admission import (
@@ -917,6 +918,85 @@ def test_window_hook_reaches_the_worker_through_run_method():
     assert run_method(wrapper, _profile_in_quiescent_window, (), {}) is True
     assert worker.window is True
     assert _profile_in_quiescent_window.__qualname__ == _profile_in_quiescent_window.__name__
+
+
+def _extensible_replica(stage_id: int, devices: str, *, launch_mode="local", engine_args=None, kv_access=None):
+    kv_transfer_config = None if kv_access is None else types.SimpleNamespace(kv_cache_access=lambda: kv_access)
+    replica = _llm_replica(
+        stage_id,
+        0,
+        devices,
+        vllm_config=types.SimpleNamespace(
+            cache_config=types.SimpleNamespace(enable_extensible_kv_cache=True),
+            kv_transfer_config=kv_transfer_config,
+        ),
+    )
+    replica.launch_mode = launch_mode
+    replica.engine_args_dict = engine_args
+    return replica
+
+
+def _extensible(plans):
+    return [plan.replicas[0].stage_vllm_config.cache_config.enable_extensible_kv_cache for plan in plans]
+
+
+def test_shared_device_stages_size_kv_from_profiling(monkeypatch):
+    # vLLM sizes an extensible KV cache after warmup against the snapshot taken before
+    # the weights load, which counts concurrently initializing peers on the same device.
+    monkeypatch.delenv(current_omni_platform.device_control_env_var, raising=False)
+    replicas = [
+        _extensible_replica(0, "0"),
+        _extensible_replica(1, "0"),
+        _extensible_replica(2, "1"),  # alone on its device
+        _extensible_replica(3, "2"),
+        _extensible_replica(4, "2", launch_mode="remote"),  # uses a remote node's device
+    ]
+    diffusion = _local_diffusion_replica(5, 0, "3", util=0.3)
+    replicas.append(_extensible_replica(6, "3"))  # the diffusion stage on device 3 initializes first
+    plans = [
+        LogicalStageInitPlan(stage_idx=i, stage_id=r.metadata.stage_id, replicas=[r]) for i, r in enumerate(replicas)
+    ]
+    plans.append(LogicalStageInitPlan(stage_idx=len(plans), stage_id=5, replicas=[diffusion]))
+
+    _runtime(parallel_stage_init=True)._size_shared_device_kv_from_profiling(plans)
+
+    assert _extensible(plans[:-1]) == [False, False, True, True, True, True]
+
+
+def test_parallel_init_turns_off_the_extensible_kv_cache_before_shared_stages_start(monkeypatch):
+    monkeypatch.delenv(current_omni_platform.device_control_env_var, raising=False)
+    runtime = _runtime(parallel_stage_init=True)
+    monkeypatch.setattr(runtime, "_reject_unguardable_executors", lambda plans: None)
+    monkeypatch.setattr(runtime, "_run_stage_admission", lambda plans: None)
+    seen = []
+
+    def _initialize_replica(replica, _timeout):
+        seen.append(replica.stage_vllm_config.cache_config.enable_extensible_kv_cache)
+        return object()
+
+    monkeypatch.setattr(runtime, "_initialize_replica", _initialize_replica)
+    plans = [LogicalStageInitPlan(stage_idx=i, stage_id=i, replicas=[_extensible_replica(i, "0")]) for i in range(2)]
+    runtime._initialize_stage_replicas(plans, stage_init_timeout=5)
+
+    assert seen == [False, False]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"engine_args": {"enable_extensible_kv_cache": True}},
+        {"kv_access": KVCacheAccess.EXPORTS_FD},
+    ],
+    ids=["requested", "connector_exports_fd"],
+)
+def test_shared_device_stage_that_needs_the_extensible_kv_cache_is_rejected(monkeypatch, kwargs):
+    monkeypatch.delenv(current_omni_platform.device_control_env_var, raising=False)
+    plans = [
+        LogicalStageInitPlan(stage_idx=0, stage_id=0, replicas=[_extensible_replica(0, "0", **kwargs)]),
+        LogicalStageInitPlan(stage_idx=1, stage_id=1, replicas=[_extensible_replica(1, "0")]),
+    ]
+    with pytest.raises(ValueError, match="Stage 0 needs the extensible KV cache"):
+        _runtime(parallel_stage_init=True)._size_shared_device_kv_from_profiling(plans)
 
 
 def test_wrapper_locks_warmup_and_capture_separately():
