@@ -434,6 +434,13 @@ retain their existing semantics.
 Eligible NPU inputs automatically use the shared fused kernel; unsupported
 inputs use its native fallback. No deployment switch is required.
 
+Migration: the former stage-2 `additional_config.code2wav_fused_qkv_norm`
+key has been removed. A leftover value, including `false`, is ignored and
+does not disable fusion after restart. Remove this key from deployment and
+overlay YAML files. The NPU stage reader emits a one-time warning when it
+encounters the stale key; eligible FP32 inputs still automatically use fusion,
+and unsupported inputs retain the native fallback.
+
 NPU compilation, graph replay, numerical parity and service performance must be
 validated on the target stack; implementation alone does not establish a speedup.
 
