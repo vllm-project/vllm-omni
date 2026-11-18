@@ -242,7 +242,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             # raced the submit); the cancel path aborts the stale request id.
             logger.debug("[DuplexOrchestrator] stale stage binding ignored for %s stage-%s", request_id, stage_id)
             return
-        req_state.stage_submit_ts[stage_id] = _time.time()
+        req_state.stage_submit_ts.setdefault(stage_id, _time.time())
         if req_state.request_timestamp <= 0.0:
             req_state.request_timestamp = req_state.stage_submit_ts[stage_id]
         self._register_running_request(req_state)
@@ -812,6 +812,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             pool = self.stage_pools[context.stage_id]
             if mark_submitting is not None:
                 mark_submitting()
+            request_state.stage_submit_ts.setdefault(context.stage_id, _time.time())
             try:
                 if submission.already_submitted:
                     if not submission.resumable:
@@ -843,7 +844,6 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 )
         request_state.stage_fences[context.stage_id] = context.fence
         now = _time.time()
-        request_state.stage_submit_ts[context.stage_id] = now
         request_state.request_timestamp = now
         self._register_running_request(request_state)
         return DuplexStageSubmissionResult(

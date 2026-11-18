@@ -86,7 +86,7 @@ from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_k
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.shared_request_queue import SharedRequestQueue
 from vllm_omni.engine.stage_client import DiffusionSubmitKwargs
-from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
+from vllm_omni.engine.stage_pool import StagePool, StageRequestMetrics, StageUnavailableError
 from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError
 from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
 from vllm_omni.metrics import definitions as metric_defs
@@ -1670,7 +1670,6 @@ class OrchestratorBase:
 
     async def _handle_processed_outputs(self, stage_id: int, replica_id: int, outputs: list[Any]) -> None:
         """Route processed stage outputs produced by one stage poll."""
-        pool = self.stage_pools[stage_id]
         for output in outputs:
             req_state = self.request_states.get(output.request_id)
             if req_state is None:
@@ -1689,18 +1688,39 @@ class OrchestratorBase:
             stage_metrics = None
             segment_finished = req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished
             if output.finished or segment_finished:
-                stage_metrics = pool.build_stage_metrics(
-                    [output],
-                    submit_ts=req_state.stage_submit_ts.get(stage_id, _time.time()),
-                    request_timestamp=req_state.request_timestamp,
-                    replica_id=replica_id,
-                    sampling_params=req_state.sampling_params_list[stage_id],
-                )
-                if self.collect_stage_metrics:
-                    stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
+                stage_metrics = self._attach_finished_stage_metrics(stage_id, replica_id, output, req_state)
 
             await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
             self._note_routed_stage_output(stage_id, output, req_state)
+
+    def _attach_finished_stage_metrics(
+        self,
+        stage_id: int,
+        replica_id: int,
+        output: object,
+        req_state: OrchestratorRequestState,
+    ) -> StageRequestMetrics:
+        """Build finished-stage metrics and fold scheduler wait into queue wait.
+
+        The pool returns the measured wait. This method, which owns the request
+        timings, adds it before the per-stage copy. ``extract_queue_wait_s``
+        later reads that one key.
+        """
+        pool = self.stage_pools[stage_id]
+        stage_metrics = pool.build_stage_metrics(
+            [output],
+            submit_ts=req_state.stage_submit_ts.get(stage_id, _time.time()),
+            request_timestamp=req_state.request_timestamp,
+            replica_id=replica_id,
+            sampling_params=req_state.sampling_params_list[stage_id],
+        )
+        wait_ms = stage_metrics.scheduler_queue_wait_ms
+        if wait_ms is not None:
+            # A missing orchestrator hop still records the scheduler wait.
+            req_state.pipeline_timings["queue_wait_ms"] = req_state.pipeline_timings.get("queue_wait_ms", 0.0) + wait_ms
+        if self.collect_stage_metrics:
+            stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
+        return stage_metrics
 
     async def _handle_stage_error(
         self,
@@ -3437,6 +3457,9 @@ class OrchestratorBase:
 
                 if mark_submitting is not None:
                     mark_submitting()
+                # Stamp before enqueue so scheduler wait is inside the stage clock
+                # (#5924 / PR #10084 review: submit_ts after submit_initial under-counts).
+                req_state.stage_submit_ts.setdefault(next_logical, _time.time())
                 if already_submitted:
                     replica_id = await next_pool.submit_update(req_id, req_state, request, **route_kwargs)
                 else:
@@ -3467,7 +3490,6 @@ class OrchestratorBase:
             )
             return
 
-        req_state.stage_submit_ts[next_logical] = _time.time()
         _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
         self._emit_tx_edge(
             from_stage=src_stage_id,
@@ -3515,6 +3537,9 @@ class OrchestratorBase:
         initial_kwargs = dict(update_kwargs)
         if params_override is not None:
             initial_kwargs["params_override"] = params_override
+        # Receiver enqueue can start during submit_initial. Stamp first so
+        # stage_gen_time_ms covers scheduler wait (ZhengWG on #10084).
+        req_state.stage_submit_ts.setdefault(receiver_stage_id, _time.time())
         for request in requests:
             if already_submitted:
                 replica_id = await to_pool.submit_update(req_id, req_state, request, **update_kwargs)
@@ -3522,7 +3547,6 @@ class OrchestratorBase:
                 replica_id = await to_pool.submit_initial(req_id, req_state, request, **initial_kwargs)
             self._on_stage_submitted(receiver_stage_id, req_id, replica_id, req_state)
 
-        req_state.stage_submit_ts[receiver_stage_id] = _time.time()
         self._emit_tx_edge(
             from_stage=source_stage_id,
             from_replica=source_replica_id if source_replica_id is not None else 0,
