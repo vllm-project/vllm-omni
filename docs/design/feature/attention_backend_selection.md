@@ -81,11 +81,11 @@ unstructured keyword dictionaries:
 Sol-Attn consumes producer-owned `PackedPaddingMetadata` to trim structural
 suffix padding before both dense and sparse work. Arbitrary packed documents
 are rejected rather than inferred from maximum sequence lengths. Its optional
-`prefix_sink` uses model-owned video layout to protect the prefix as keys and
+`prefix_sink` in explicit `sink_mode="prefix"` uses model-owned video layout to protect the prefix as keys and
 as dense queries. The sparse kernel has an opaque custom-op compilation boundary;
 Ring and AllGather-KV cannot bypass its full-sequence contract.
 An explicit sink that clamps to an empty range does not enlarge the protected
-video prefix. `kv_splits="auto"` resolves to four splits for SM90 with CuTe and
+video prefix. For the explicit native provider, `kv_splits="auto"` resolves to four splits for SM90 with CuTe and
 at least 65,536 valid tokens, and one otherwise, matching upstream's integration
 policy. Explicit multi-split requests still require SM90 and the CuTe runtime.
 
@@ -148,27 +148,32 @@ cuDNN already returns natural-log LSE. The default remains output-only.
 This normalization contract does not make SOL and VSA interchangeable.
 SOL needs its own training-free routing and a normalization-weighted merge
 of exact selected blocks with omitted-block centroid approximations. H3 VSA
-retains its checkpoint-owned compressed-attention gate. `SOL_ATTN` keeps
-`sol_attn.provider="native"` as its default. Explicit `cudnn` or `triton`
-selects the experimental SOL-BSA composition, not VSA routing: upstream SOL
+retains its checkpoint-owned compressed-attention gate. Selecting `SOL_ATTN`
+defaults to `provider="cudnn"`, `sink_mode="text_audio"`, `tau=1`, and
+`thresh_type="diag"`, including when the `sol_attn` options are omitted.
+This uses the upstream Sol-H3 Ref2VA protection policy for all supported H3
+tasks, not its LoRA, quantized transport, or shortened sampling schedule.
+The platform's default backend is unchanged. Explicit `provider="native"`
+with `sink_mode="prefix"` retains the native fused path; `provider="triton"`
+selects the other BSA provider. Both BSA providers use SOL, not VSA routing: upstream SOL
 preprocessing supplies BF16 K means, BF16 V sums, and base-2 thresholds;
 the adapter routes pooled Q against K means and protects neighboring tiles.
 Sink tiles are dense along both query and key axes, so they do not require
 a second dense-query pass. This rounds sink-query protection up to complete
 64-token tiles, unlike the native path's token-range overwrite.
 
-`sol_attn.sink_mode="text_audio"` replaces the prefix/range policy with a
+The default `sol_attn.sink_mode="text_audio"` replaces the prefix/range policy with a
 producer-owned `AttentionMetadata.text_audio_block_mask`. Its `TextAudioBlockMask`
 records valid length, block size, and a contiguous Boolean vector on the operand
 device. Only block64 metadata matching the global used sequence is accepted,
 including during dense guards. The producer validates nonempty text/audio
 positions once per request; consumers do not read device scalars per layer.
 Both Q rows and KV columns of marked blocks stay exact. Reference video is not
-implicitly protected, apart from mixed boundary blocks. This mode requires an
-explicit BSA provider and rejects explicit sink ranges; it overrides `prefix_sink`
-without changing the default `sink_mode="prefix"`. Pure Ulysses preserves the
+implicitly protected, apart from mixed boundary blocks. This mode requires a
+BSA provider and rejects explicit sink ranges; it overrides `prefix_sink`.
+Pure Ulysses preserves the
 global mask; compact unequal-Q/KV and multi-document layouts remain unsupported.
-`dense_steps=0` and `dense_layers=[]` permit BSA at every main-DiT step and layer,
+The defaults `dense_steps=0` and `dense_layers=[]` permit BSA at every main-DiT step and layer,
 but do not disable exact sink/neighbor blocks or change the sampler step count.
 
 The SOL-BSA residual uses query chunks and the provider's natural-log LSE.

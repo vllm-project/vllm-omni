@@ -1539,7 +1539,7 @@ class MiniMaxH3Pipeline(
             (request.lora_int_id, request.lora_path, scale)
             for request, scale in filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale)
         )
-        if identity != getattr(self, "_adaln_adapter_identity", ()):
+        if identity != getattr(self, "_adaln_adapter_identity", None):
             self._clear_adaln_caches()
             self._adaln_adapter_identity = identity
 

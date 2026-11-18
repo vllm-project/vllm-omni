@@ -154,16 +154,6 @@ Validated offline results can be supplied through `_lookup_precomputed()`;
 this extension is consulted only at TP1 on runtime-cache misses. Artifact
 validation, weight binding, and model-specific layouts remain in the adapter.
 H3's adapter retains its main/Ref2VA sidecars and their eager-only admission.
-Sidecar validation compares payload and expected schedule tensors on CPU,
-independent of the ambient device used to construct the model.
-The first request without an active runtime adapter must preserve a sidecar
-validated at startup; an absent or zero-scale LoRA is not an adapter change.
-Loading, switching, rescaling, or removing an active adapter still invalidates
-the cached results.
-If unchanged CPU projection weights acquire new storage during loader staging
-or pinning, H3 rechecks their manifest digests before accepting a new sidecar
-signature. Changed weight values cannot reuse the precomputed results, and
-unchanged signatures do not trigger repeated weight hashing.
 
 The cache retains projection results and leaves all original weights available.
 It does not reduce weight residency or cancel layerwise prefetch. A future

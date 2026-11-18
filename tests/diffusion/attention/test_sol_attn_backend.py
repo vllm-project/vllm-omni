@@ -61,7 +61,7 @@ def kernel(monkeypatch):
 
 
 def make_impl(**options):
-    settings = {"dense_steps": 0, "dense_layers": "", **options}
+    settings = {"provider": "native", "sink_mode": "prefix", "dense_steps": 0, "dense_layers": "", **options}
     return SolAttnImpl(2, 128, 0.125, prefix="blocks.4.attention", backend_kwargs={"sol_attn": settings})
 
 
@@ -95,7 +95,7 @@ def test_registry_and_dependency_preflight(kernel, monkeypatch):
         SolAttnBackend.validate_available()
 
 
-def test_per_role_configuration_round_trip():
+def test_per_role_configuration_round_trip(bsa_kernels):
     config = AttentionConfig(
         per_role={"self": {"backend": "SOL_ATTN", "sol_attn": {"tau": 1.5, "dense_layers": "0-2,5"}}}
     )
@@ -132,7 +132,7 @@ def test_per_role_configuration_round_trip():
         {"tau": float("inf")},
         {"prefix_sink": "false"},
         {"sink_mode": "video"},
-        {"sink_mode": "text_audio"},
+        {"sink_mode": "text_audio", "provider": "native"},
         {"sink_mode": "text_audio", "provider": "cudnn", "sink_tokens": 1},
         {"sink_mode": "text_audio", "provider": "cudnn", "sink_start": 1},
         {"provider": "auto"},
@@ -613,7 +613,7 @@ def test_bsa_finite_threshold_composition_preserves_head_specific_routes(bsa_ker
         2,
         128,
         scale,
-        backend_kwargs={"sol_attn": {"provider": provider, "dense_steps": 0, "dense_layers": ""}},
+        backend_kwargs={"sol_attn": {"provider": provider, "sink_mode": "prefix"}},
     )
     actual = impl.forward_cuda(query, key, value, packed(used))
     positions = torch.arange(blocks)
@@ -647,7 +647,7 @@ def test_bsa_configuration_round_trip_and_single_split(bsa_kernels, provider):
     assert settings["sol_attn"]["provider"] == provider
     impl = SolAttnImpl(2, 128, 128**-0.5, backend_kwargs=settings)
     assert impl._resolve_kv_splits(65536) == 1
-    assert SolAttnSpec().provider == "native"
+    assert SolAttnSpec().provider == "cudnn"
 
 
 def test_bsa_missing_provider_fails_even_with_dense_guards(monkeypatch):
@@ -707,7 +707,35 @@ def test_text_audio_configuration_round_trip(bsa_kernels, provider):
     restored = SolAttnSpec(**config.default.backend_kwargs()["sol_attn"])
     assert restored.sink_mode == "text_audio"
     assert restored.dense_steps == 0 and restored.dense_layers == []
-    assert SolAttnSpec().sink_mode == "prefix"
+    assert SolAttnSpec().sink_mode == "text_audio"
+
+
+@pytest.mark.parametrize("options", [None, {}])
+def test_sol_defaults_match_text_audio_bsa_profile(bsa_kernels, options):
+    config = AttentionConfig(
+        per_role={
+            "minimax_h3.main": {"backend": "SOL_ATTN", "sol_attn": options},
+            "minimax_h3.token_refiner": {"backend": "TORCH_SDPA"},
+        }
+    )
+    spec, _ = config.resolve_with_source("minimax_h3.main")
+    impl = SolAttnImpl(2, 128, 0.125, backend_kwargs=spec.backend_kwargs())
+    assert impl.config.provider == "cudnn"
+    assert impl.config.sink_mode == "text_audio"
+    assert impl.config.tau == 1.0 and impl.config.thresh_type == "diag"
+    assert impl.config.dense_steps == 0 and impl.dense_layers == set()
+    assert impl._resolve_kv_splits(65536) == 1
+    refiner, _ = config.resolve_with_source("minimax_h3.token_refiner")
+    assert refiner.backend == "TORCH_SDPA"
+    with pytest.raises(ValueError, match="text_audio_block_mask"):
+        impl.forward_cuda(*tensors(), packed())
+
+
+def test_sol_default_layer_selectors_are_independent():
+    first, second = SolAttnSpec(), SolAttnSpec()
+    assert isinstance(first.dense_layers, list)
+    first.dense_layers.append(1)
+    assert second.dense_layers == []
 
 
 @pytest.mark.parametrize("dense_steps", [0, 10])
@@ -743,9 +771,6 @@ def test_text_audio_runs_bsa_for_all_fifty_steps(bsa_kernels, monkeypatch, layer
         128,
         0.125,
         prefix=f"blocks.{layer_index}.attention",
-        backend_kwargs={
-            "sol_attn": {"provider": "cudnn", "sink_mode": "text_audio", "dense_steps": 0, "dense_layers": []}
-        },
     )
     metadata = packed()
     metadata.text_audio_block_mask = TextAudioBlockMask(9, 64, torch.ones(1, dtype=torch.bool))

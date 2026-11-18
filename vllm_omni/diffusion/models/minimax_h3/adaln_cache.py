@@ -13,7 +13,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import weakref
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -54,14 +53,12 @@ class MiniMaxH3RuntimeAdalnCache(ExactProjectionCache):
         self.offload_weights = offload_weights
         self.sidecar: MiniMaxH3AdalnCache | None = None
         self._sidecar_signatures: dict[str, Any] = {}
-        self._sidecar_modules: dict[str, weakref.ReferenceType[nn.Module]] = {}
         self._sidecar_plan: int | None = None
 
     def clear(self) -> None:
         super().clear()
         self.sidecar = None
         self._sidecar_signatures.clear()
-        self._sidecar_modules.clear()
         self._sidecar_plan = None
 
     def seed(self, sidecar: MiniMaxH3AdalnCache, modules: Mapping[str, nn.Module]) -> None:
@@ -69,32 +66,6 @@ class MiniMaxH3RuntimeAdalnCache(ExactProjectionCache):
         signatures = {name: self._signature(module) for name, module in modules.items()}
         self.sidecar = sidecar
         self._sidecar_signatures = signatures
-        self._sidecar_modules = {name: weakref.ref(module) for name, module in modules.items()}
-
-    def _matches_sidecar_signature(self, name: str, signature: Any) -> bool:
-        previous = self._sidecar_signatures.get(name)
-        if previous is None or signature is None:
-            return False
-        if previous == signature:
-            return True
-        reference = self._sidecar_modules.get(name)
-        module = reference() if reference is not None else None
-        if module is None or signature[:3] != previous[:3] or self.sidecar is None:
-            return False
-        parameters = dict(module.named_parameters())
-        if set(parameters) != {"weight", "bias"} or next(module.buffers(), None) is not None:
-            return False
-        if any(parameter.device.type != "cpu" for parameter in parameters.values()):
-            return False
-        for suffix, parameter in parameters.items():
-            if tensor_digest(parameter) != self.sidecar.manifest["weights"].get(f"{name}.{suffix}"):
-                self._sidecar_signatures.pop(name, None)
-                self._sidecar_modules.pop(name, None)
-                return False
-        if self._signature(module) != signature:
-            return False
-        self._sidecar_signatures[name] = signature
-        return True
 
     @torch.compiler.disable
     def prepare(self, embedding: torch.Tensor) -> None:
@@ -114,9 +85,9 @@ class MiniMaxH3RuntimeAdalnCache(ExactProjectionCache):
         if (
             self.sidecar is None
             or self._sidecar_plan is None
+            or self._sidecar_signatures.get(name) != signature
             or torch.is_autocast_enabled(embedding.device.type)
             or math_identity(embedding.device) != self.sidecar.manifest["math"]
-            or not self._matches_sidecar_signature(name, signature)
         ):
             return None
         index, count = self._sidecar_plan, embedding.shape[0]
@@ -218,9 +189,7 @@ def timestep_plans(contract: Mapping[str, Any]) -> list[torch.Tensor]:
             "image": max(1.0 - video_sigma, MINIMAX_H3_IMGVID_COND_TIMESTEP),
             "audio_ref": max(1.0 - audio_sigma, MINIMAX_H3_AUDIO_REF_COND_TIMESTEP),
         }
-        plan = torch.tensor([values[key] for key in MODES[contract["mode"]]], dtype=torch.float32, device="cpu").unique(
-            sorted=True
-        )
+        plan = torch.tensor([values[key] for key in MODES[contract["mode"]]], dtype=torch.float32).unique(sorted=True)
         plans[tuple(plan.tolist())] = plan
     return list(plans.values())
 
@@ -283,8 +252,8 @@ class MiniMaxH3AdalnCache(nn.Module):
             payload = {name: source.get_tensor(name) for name in PAYLOAD_NAMES}
         plans = timestep_plans(contract)
         width = max(len(plan) for plan in plans)
-        expected_lengths = torch.tensor([len(plan) for plan in plans], dtype=torch.int64, device="cpu")
-        expected_plans = torch.zeros((len(plans), width), dtype=torch.float32, device="cpu")
+        expected_lengths = torch.tensor([len(plan) for plan in plans], dtype=torch.int64)
+        expected_plans = torch.zeros((len(plans), width), dtype=torch.float32)
         for index, plan in enumerate(plans):
             expected_plans[index, : len(plan)] = plan
         shapes = {

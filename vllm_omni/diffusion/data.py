@@ -2398,11 +2398,13 @@ class SolAttnSpec:
     queries densely, while BSA protects complete sink tiles. ``dense_steps``
     keeps the first N denoise steps dense, ``dense_layers`` exempts individual
     DiT blocks, and ``kv_splits`` sets the number of KV splits used by the kernel.
-    ``provider`` defaults to the native fused SOL kernel. Explicit ``cudnn``
-    or ``triton`` uses experimental BF16 block-sparse execution with SOL
+    ``provider`` defaults to cuDNN BF16 block-sparse execution with SOL
     routing and a normalization-weighted centroid residual, not VSA gates.
-    ``sink_mode=text_audio`` requires BSA and producer-owned block64 metadata;
-    it overrides ``prefix_sink`` and cannot add an explicit sink range.
+    The default ``sink_mode=text_audio`` requires producer-owned block64
+    metadata; it overrides ``prefix_sink`` and cannot add an explicit sink
+    range. All steps/layers use SOL unless dense guards are explicitly set.
+    Native fused SOL remains available with ``provider=native`` and
+    ``sink_mode=prefix``; ``provider=triton`` selects the other BSA provider.
     """
 
     tau: float = 1.0
@@ -2410,11 +2412,11 @@ class SolAttnSpec:
     sink_tokens: int = 0
     sink_start: int | None = 0
     prefix_sink: bool = True
-    sink_mode: str = "prefix"
-    dense_steps: int = 10
-    dense_layers: str | int | list[int] | None = "0,1"
+    sink_mode: str = "text_audio"
+    dense_steps: int = 0
+    dense_layers: str | int | list[int] | None = field(default_factory=list)
     kv_splits: int | str = "auto"
-    provider: str = "native"
+    provider: str = "cudnn"
 
     _VALID_THRESH_TYPES = frozenset({"diag", "exact"})
 

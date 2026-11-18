@@ -45,6 +45,8 @@ def test_real_sol_kernel_padding_and_sink(used, sink_tokens, compiled, thresh_ty
         0.125,
         backend_kwargs={
             "sol_attn": {
+                "provider": "native",
+                "sink_mode": "prefix",
                 "dense_steps": 0,
                 "dense_layers": "",
                 "sink_tokens": sink_tokens,
@@ -86,7 +88,7 @@ def test_real_sol_kernel_padding_and_sink(used, sink_tokens, compiled, thresh_ty
 def test_real_sol_production_attention_entry():
     config = OmniDiffusionConfig(
         diffusion_attention_config={
-            "default": {"backend": "SOL_ATTN", "sol_attn": {"dense_steps": 0, "dense_layers": ""}},
+            "default": {"backend": "SOL_ATTN", "sol_attn": {"provider": "native", "sink_mode": "prefix"}},
             "per_role": {"minimax_h3.token_refiner": {"backend": "TORCH_SDPA"}},
         }
     )
@@ -116,7 +118,7 @@ def test_real_sol_production_attention_entry():
 
 @hardware_test(res={"cuda": ["L4", "H100", "B200", "RTX5090"]}, num_cards=1)
 def test_real_sol_compile_dynamic_sequence_without_explicit_length():
-    impl = SolAttnImpl(2, 128, 0.125, backend_kwargs={"sol_attn": {"dense_steps": 0, "dense_layers": ""}})
+    impl = SolAttnImpl(2, 128, 0.125, backend_kwargs={"sol_attn": {"provider": "native", "sink_mode": "prefix"}})
     forward = torch.compile(impl.forward_cuda, fullgraph=True, dynamic=True)
     metadata = AttentionMetadata()
     generator = torch.Generator(device="cuda").manual_seed(31)
@@ -244,6 +246,35 @@ def test_real_sol_bsa_matches_hybrid_oracle(provider, thresh_type, used, compile
     torch.compiler.reset()
 
 
+@hardware_test(res={"cuda": ["H100", "B200", "RTX5090"]}, num_cards=1)
+@torch.inference_mode()
+def test_real_sol_defaults_match_explicit_text_audio_profile():
+    if current_omni_platform.get_device_capability()[0] < 9:
+        pytest.skip("cuDNN BSA requires SM90 or newer")
+    pytest.importorskip("cudnn", minversion="1.31.0")
+    generator = torch.Generator(device="cuda").manual_seed(73)
+    query, key, value = (
+        torch.randn(1, 257, 2, 128, device="cuda", dtype=torch.bfloat16, generator=generator) for _ in range(3)
+    )
+    metadata = AttentionMetadata(
+        text_audio_block_mask=TextAudioBlockMask(
+            257, 64, torch.tensor([True, False, False, False, True], device="cuda", dtype=torch.bool)
+        )
+    )
+    default = SolAttnImpl(2, 128, 128**-0.5)
+    explicit = SolAttnImpl(
+        2,
+        128,
+        128**-0.5,
+        backend_kwargs={
+            "sol_attn": {"provider": "cudnn", "sink_mode": "text_audio", "dense_steps": 0, "dense_layers": []}
+        },
+    )
+    actual = default.forward_cuda(query, key, value, metadata)
+    expected = explicit.forward_cuda(query, key, value, metadata)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 def _ulysses_worker(rank, init_method, provider, world_size=2):
     from vllm_omni.diffusion.distributed.parallel_state import (
         destroy_distributed_env,
@@ -344,7 +375,23 @@ def test_real_sol_wan_transformer_forward(tmp_path, monkeypatch):
             backend: OmniDiffusionConfig(
                 diffusion_attention_config={
                     "default": {"backend": "TORCH_SDPA"},
-                    "per_role": {"self": {"backend": backend}},
+                    "per_role": {
+                        "self": {
+                            "backend": backend,
+                            **(
+                                {
+                                    "sol_attn": {
+                                        "provider": "native",
+                                        "sink_mode": "prefix",
+                                        "dense_steps": 10,
+                                        "dense_layers": "0,1",
+                                    }
+                                }
+                                if backend == "SOL_ATTN"
+                                else {}
+                            ),
+                        }
+                    },
                 }
             )
             for backend in ("CUDNN_ATTN", "SOL_ATTN")
