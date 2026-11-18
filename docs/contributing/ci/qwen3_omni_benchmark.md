@@ -29,6 +29,8 @@ The serving topology uses two inference devices: Thinker TP1 on device 0,
 Talker and Code2Wav share device 1. CUDA Seed-TTS evaluators reuse device 1
 after request measurement. NPU reserves a third device for the evaluators.
 Production deploy YAMLs are not changed; JSON applies temporary test overrides.
+Benchmark servers allow 1200 seconds per stage and 1800 seconds for overall
+initialization, covering cold compilation before requests are measured.
 
 The full-duplex JSON configurations use the same shared runner. CUDA covers
 Omni-DuplexEval `PR_correction` (120 selected IDs, c8) and OmniInteract
