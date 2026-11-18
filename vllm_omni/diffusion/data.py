@@ -337,10 +337,12 @@ class DiffusionParallelConfig:
     - "spatial_shard_width": Same as "spatial_shard_height" but sharded along width.
 
     The "spatial_shard_*" modes currently require ``vae_patch_parallel_size``
-    to match the DiT group size; otherwise the VAE falls back to tile-parallel
+    to match the DiT group size; otherwise decode falls back to tile-parallel
     decode at runtime. The Wan VAE also shards encode along the same dimension
-    when that extent divides by ``world_size * 8`` (``* 16`` for Wan2.2 TI2V);
-    other shapes keep tile-parallel encode.
+    when that extent divides by ``world_size * 8`` (``* 16`` for Wan2.2 TI2V).
+    When it does not, or the group size does not match, encode falls back to
+    the unsharded path: native tiling is off in these modes, so every rank
+    encodes the full frame (tile-parallel only if ``vae_use_tiling`` is set).
     """
 
     use_hsdp: bool = False
