@@ -853,6 +853,46 @@ async def test_buffered_speech_refreshes_idle_lease() -> None:
 
 
 @pytest.mark.asyncio
+async def test_incomplete_float_pcm_does_not_refresh_idle_lease() -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
+    from vllm_omni.model_executor.models.aura_omni.duplex.plugin import AuraDuplexPlugin
+
+    frame = BytesIO()
+    Image.new("RGB", (8, 8)).save(frame, format="PNG")
+    video = b64(frame.getvalue())
+    append = translate_realtime_command(
+        {
+            "type": "input_audio_buffer.append",
+            "format": "pcm_f32le",
+            "audio": b64(bytes(1)),
+            "video_frames": [video],
+        }
+    )
+    clock = {"now": 100.0}
+    h = await open_harness(
+        plugin=AuraDuplexPlugin(_fake_encode_audio),
+        model="aura",
+        stage_count=4,
+        runtime_config=DuplexSessionRuntimeConfig(idle_ttl_s=2.0),
+        clock=lambda: clock["now"],
+    )
+    try:
+        clock["now"] = 101.0
+        assert "error" not in types(await h.run(append))
+        assert h.runner.model_state.audio_buffer.pending_byte_count == len(video)
+        assert h.port.submissions == []
+        clock["now"] = 102.0
+        assert await h.manager.reap_expired() == 1
+        assert find(await h.settle(), "session.expired").reason == "idle_ttl_expired"
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_commands_for_a_closed_session_are_answered_with_unknown_session() -> None:
     h = await open_harness()
     await h.manager.handle(CloseDuplexSessionMessage(control_id="c-close", session_id=SESSION_ID, reason="bye"))
