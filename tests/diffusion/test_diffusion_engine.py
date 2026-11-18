@@ -27,6 +27,7 @@ from vllm_omni.diffusion.diffusion_engine import (
     DiffusionExecutionMode,
     _move_tensor_tree_to_cpu,
 )
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
@@ -398,6 +399,10 @@ class TestRequestBatchCapability:
             custom_pipeline_args=custom_pipeline_args,
             streaming_output=False,
             max_num_seqs=1,
+            stage_role=None,
+            model_stage=None,
+            omni_kv_config=None,
+            diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
         )
         fake_executor = SimpleNamespace(
             execute_request=mocker.Mock(return_value="per-request"),
@@ -478,6 +483,10 @@ class TestRequestBatchCapability:
             custom_pipeline_args=None,
             streaming_output=False,
             max_num_seqs=2,
+            stage_role=None,
+            model_stage=None,
+            omni_kv_config=None,
+            diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
             request_batch_max_wait_ms=0,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             enable_distributed_layerwise_offload=True,
@@ -529,6 +538,10 @@ class TestRequestBatchCapability:
             custom_pipeline_args=None,
             streaming_output=False,
             max_num_seqs=2,
+            stage_role=None,
+            model_stage=None,
+            omni_kv_config=None,
+            diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
         )
         fake_executor = SimpleNamespace(
             execute_request=mocker.Mock(return_value="per-request"),
@@ -570,6 +583,11 @@ class TestRequestBatchCapability:
             custom_pipeline_args=None,
             engine_backend="default",
             streaming_output=False,
+            max_num_seqs=1,
+            stage_role=None,
+            model_stage=None,
+            omni_kv_config=None,
+            diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
         )
         fake_executor = SimpleNamespace(
             execute_request=mocker.Mock(),
@@ -781,7 +799,7 @@ class TestRequestBatchAdmission:
     def test_scheduler_exposes_waiting_and_running_counts(self) -> None:
         from vllm_omni.diffusion.sched import RequestScheduler
 
-        od_config = SimpleNamespace(max_num_seqs=4)
+        od_config = OmniDiffusionConfig(max_num_seqs=4, diffusion_attention_schedule=None)
         scheduler = RequestScheduler()
         scheduler.initialize(od_config)
 
@@ -812,10 +830,11 @@ class TestRequestBatchAdmission:
     def test_request_batch_admission_exits_early_when_waiting_queue_stable(self) -> None:
         from vllm_omni.diffusion.sched import RequestScheduler
 
-        od_config = SimpleNamespace(
+        od_config = OmniDiffusionConfig(
             max_num_seqs=32,
             request_batch_max_wait_ms=1000.0,
             step_execution=False,
+            diffusion_attention_schedule=None,
         )
         scheduler = RequestScheduler()
         scheduler.initialize(od_config)
