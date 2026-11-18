@@ -27,7 +27,11 @@ from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
 from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.executor.async_output_cache import AsyncOutputFutureMixin
-from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, unpack_diffusion_output_shm
+from vllm_omni.diffusion.ipc import (
+    DIFFUSION_RPC_RESULT_ENVELOPE,
+    PackedDiffusionRPCReply,
+    unpack_diffusion_output_shm,
+)
 from vllm_omni.diffusion.model_metadata import REQUEST_IDENTITY_EXTRA_ARGS
 from vllm_omni.diffusion.offloader.config import (
     TEXT_ENCODER_COMPONENT,
@@ -350,7 +354,10 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
     ) -> Any:
         """Discard stale RPC responses from a previous wave."""
         discards = 0
-        while discards < self._MAX_STALE_DISCARDS:
+        while True:
+            packed = response if isinstance(response, PackedDiffusionRPCReply) else None
+            if packed is not None:
+                response = packed.reply
             if not isinstance(response, dict):
                 return response
             resp_wave_id = response.get("wave_id")
@@ -362,12 +369,15 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
                 expected_wave_id,
                 method,
             )
+            if packed is not None:
+                packed.discard()
             discards += 1
+            if discards >= self._MAX_STALE_DISCARDS:
+                raise TimeoutError(
+                    f"Discarded {discards} stale RPC responses "
+                    f"without finding wave_id={expected_wave_id} for method={method}."
+                )
             response = self._dequeue_one_with_failure_polling(deadline, method, result_mq)
-        raise TimeoutError(
-            f"Discarded {self._MAX_STALE_DISCARDS} stale RPC responses "
-            f"without finding wave_id={expected_wave_id} for method={method}."
-        )
 
     def _launch_workers(
         self,
@@ -987,8 +997,7 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
             # If shutdown started while we were dequeuing, drop this delivery
             # so it cannot repopulate _completed_outputs after shutdown()
             # cleared it (issue #6413 / #6439 review). OUTPUT_READY must still
-            # flow through the dispatch below: unpack_diffusion_output_shm()
-            # is the only receive-side path that unlinks named SHM segments,
+            # flow through the dispatch below: unpacking it unlinks its named SHM segments,
             # and the closed-time re-checks under _futures_lock already
             # prevent any cache write after unpack.
             if self._closed and msg.kind not in (

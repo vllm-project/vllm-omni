@@ -265,7 +265,7 @@ def test_nested_non_native_endian_numpy_round_trips_through_shm(writeable: bool)
         with pytest.raises(FileNotFoundError):
             shared_memory.SharedMemory(name=handle["name"])
     finally:
-        diffusion_ipc._unlink_shm_handles(created)
+        diffusion_ipc._unlink_shm_names(handle["name"] for handle in created)
 
 
 @pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
@@ -311,6 +311,29 @@ def test_numpy_packing_failure_unlinks_all_allocations(
             segment.close()
             with contextlib.suppress(FileNotFoundError):
                 segment.unlink()
+
+
+def test_rpc_ownership_record_failure_rolls_back_before_sending(monkeypatch):
+    names = []
+
+    def fail_to_wrap(reply, shm_names):
+        names.extend(shm_names)
+        raise MemoryError("cannot allocate reply wrapper")
+
+    monkeypatch.setattr(diffusion_ipc, "_SHM_TENSOR_THRESHOLD", 1)
+    monkeypatch.setattr(diffusion_ipc, "PackedDiffusionRPCReply", fail_to_wrap)
+    frames = np.arange(4)
+    output = DiffusionOutput(output={"frames": frames})
+    reply = {"type": DIFFUSION_RPC_RESULT_ENVELOPE, "wave_id": 1, "result": output}
+    try:
+        with pytest.raises(MemoryError, match="cannot allocate reply wrapper"):
+            pack_diffusion_output_shm(reply, record_rpc_allocations=True)
+        assert output.output["frames"] is frames
+        assert len(names) == 1
+        with pytest.raises(FileNotFoundError):
+            shared_memory.SharedMemory(name=names[0]).close()
+    finally:
+        diffusion_ipc._unlink_shm_names(names)
 
 
 def test_rpc_result_envelope_diffusion_output_round_trips_through_shm() -> None:
