@@ -1590,6 +1590,8 @@ source_file_dependencies:
     - vllm_omni/entrypoints/openai/
 
   diffusion_minimax_h3_accuracy:
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
     - *minimax_h3
     - tests/e2e/accuracy/minimax_h3/
 
