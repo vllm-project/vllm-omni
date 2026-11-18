@@ -2,31 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Relocate retained rows of an unpadded single-session native FA3 paged cache."""
 
-from dataclasses import replace
-
 import torch
-
-
-def scheduler_trim(session, prefix, count):
-    end = prefix + count
-    if not (0 < prefix < end <= session.num_prompt_tokens <= session.num_computed_tokens):
-        raise ValueError("Native Realization window cut lies outside the committed prompt")
-    retained = []
-    for mm in session.mm_features:
-        a, b = mm.mm_position.offset, mm.mm_position.offset + mm.mm_position.length
-        if b <= prefix:
-            retained.append(mm)
-        elif a >= end:
-            retained.append(replace(mm, mm_position=replace(mm.mm_position, offset=a - count)))
-        elif not (prefix <= a and b <= end):
-            raise ValueError("Native Realization chunk cut splits an encoded video")
-    session.mm_features = retained
-    del session.prompt_token_ids[prefix:end]
-    del session._all_token_ids[prefix:end]
-    session.num_prompt_tokens -= count
-    session.num_computed_tokens -= count
-    # APC is disabled. Drop stale hashes; upstream regenerates them on append.
-    session.block_hashes.clear()
 
 
 def move_rows(cache, table, prefix, count, old, page_size):

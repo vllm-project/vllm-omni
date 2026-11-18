@@ -92,12 +92,12 @@ def test_duo_duplex_engine_members_exist():
     }
     assert overridden, "expected DuoDuplexPlugin to override base hooks"
 
-    # Hooks that upstream relies on but `main` never calls are tracked in
-    # docs/models/duo.md rather than asserted here: they are inert, not broken.
-    # Duo must piggyback on existing rollback/lease hooks instead.
-    inert = {"stage_is_resumable", "model_state_session_key", "model_state_stage_ids"}
-    inert |= {"start_transcription_preparation", "record_stage_timing"}
-    unknown = overridden - set(dir(DuplexModelPlugin)) - inert
+    # Every public override must be a hook the base plugin declares. There is no
+    # inert allow-list: an override the engine never calls is dead code, and one
+    # such hook (`record_stage_timing`) was the ONLY producer of
+    # `schedule.complete("codec"/"asr", ...)`, so `alternating`/`serial`
+    # scheduling deadlocked. Anything unsupported has to be wired or deleted.
+    unknown = overridden - set(dir(DuplexModelPlugin))
     assert not unknown, (
         f"DuoDuplexPlugin overrides public hooks the base DuplexModelPlugin does not declare: "
         f"{sorted(unknown)}. The engine has no call site for them, so they are dead code."

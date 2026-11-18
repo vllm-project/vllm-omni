@@ -13,7 +13,7 @@ class DuoModelRunner(DiffusionModelRunner):
         super().load_model(*args, **kwargs)
         freeze_gc_heap()
 
-    def _prepare_batch_inputs(self, states, new_request_ids):
+    def _prepare_batch_inputs(self, states, new_request_ids, use_mixfusion=False):
         from vllm_omni.diffusion.data import DiffusionOutput
         from vllm_omni.diffusion.worker.diffusion_model_runner import _dit_any_rank_failed
         from vllm_omni.diffusion.worker.utils import RunnerOutput
@@ -38,7 +38,10 @@ class DuoModelRunner(DiffusionModelRunner):
                 )
             else:
                 live.append(state)
-        prepared, batch, errors = super()._prepare_batch_inputs(live, new_request_ids)
+        # Forward `use_mixfusion`: the inherited stepwise path calls this with
+        # three arguments, so dropping it raised TypeError on the first step of
+        # any `step_execution: true` Duo stage.
+        prepared, batch, errors = super()._prepare_batch_inputs(live, new_request_ids, use_mixfusion)
         return prepared, batch, aborted + errors
 
     def _execute_stepwise_core(self, *args, **kwargs):

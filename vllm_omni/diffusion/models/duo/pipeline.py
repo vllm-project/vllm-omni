@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -408,6 +409,30 @@ class DuoPipeline(nn.Module):
                     self.pool._realization_fp8_scales = profile["scales"]
         return self.pool
 
+    # Session ids arrive either bare or epoch-qualified (`<id>/epoch/<n>`, see
+    # `DuoDuplexPlugin.model_state_session_key`). Both spellings name the same
+    # logical session, so the epoch suffix is what identifies the generation.
+    _EPOCH_SUFFIX = re.compile(r"^(?P<base>.+)/epoch/(?P<epoch>-?\d+)$")
+
+    def _stale_epoch_sessions(self, session_id):
+        """Live sessions for the same logical session as `session_id`.
+
+        Returns nothing when the id carries no epoch qualifier: a bare id is its
+        own generation and the same-id retire above already covers it.
+        """
+        match = self._EPOCH_SUFFIX.match(session_id)
+        if match is None:
+            return []
+        base = match.group("base")
+        stale = []
+        for live_id in self.sessions:
+            if live_id == session_id:
+                continue
+            other = self._EPOCH_SUFFIX.match(live_id)
+            if other is not None and other.group("base") == base:
+                stale.append(live_id)
+        return stale
+
     def close_session(self, session_id, fence):
         session = self.sessions.get(session_id)
         if session is not None:
@@ -503,6 +528,18 @@ class DuoPipeline(nn.Module):
             self.close_session(c.session_id, session.fence)
             session = None
         if session is None:
+            # Retire earlier epochs of this logical session before admitting the
+            # new one. Session ids are epoch-qualified (`<id>/epoch/<n>`), so the
+            # same-id retire above never fires across an epoch change and the old
+            # epoch's KV would pin the slot forever: with `max_sessions: 1` the
+            # second session then failed with "Realization session capacity
+            # exhausted". Open-ended duplex sessions never set `finite_model_blocks`
+            # (so `final` is False and the close in `post_decode` never runs), which
+            # made that leak the normal case rather than an edge case.
+            for stale_id in self._stale_epoch_sessions(c.session_id):
+                stale = self.sessions.get(stale_id)
+                if stale is not None:
+                    self.close_session(stale_id, stale.fence)
             if c.block != 0 or c.fence <= self.retired_fences.get(c.session_id, -1):
                 raise ValueError("New Realization session needs block zero and fresh fence")
             if len(self.sessions) >= self.options.get("max_sessions", 4):

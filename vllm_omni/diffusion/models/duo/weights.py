@@ -197,41 +197,6 @@ def load_original_stream(model, weights):
     return seen
 
 
-def load_original_directory(model, directory):
-    directory = Path(directory)
-    index_path = directory / "model.safetensors.index.json"
-    if not index_path.exists():
-        index_path = directory / "diffusion_pytorch_model.safetensors.index.json"
-    index = json.loads(index_path.read_text())["weight_map"]
-    if set(index) != set(base_inventory(model)):
-        raise ValueError("Realization original index does not exactly cover native base")
-    # Config comparison must happen before any parameter writes.
-    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3DiTArchConfig
-
-    config_path = directory / "config.json"
-    if MiniMaxH3DiTArchConfig.from_mapping(json.loads(config_path.read_text())) != model.arch:
-        raise ValueError("Realization checkpoint architecture differs from constructed model")
-    for shard in set(index.values()):
-        if Path(shard).name != shard or not shard.endswith(".safetensors"):
-            raise ValueError("Realization shard must be a local safetensors basename")
-
-    def tensors():
-        for shard in sorted(set(index.values())):
-            with safe_open(str(directory / shard), framework="pt", device="cpu") as source:
-                if set(source.keys()) != {k for k, v in index.items() if v == shard}:
-                    raise ValueError("Realization shard/index key mismatch")
-                for name in source.keys():
-                    yield name, source.get_tensor(name)
-
-    loaded = load_original_stream(model, tensors())
-    return dict(
-        path=str(directory.resolve()),
-        tensor_count=len(loaded),
-        index_sha256=hashlib.sha256(index_path.read_bytes()).hexdigest(),
-        config_sha256=hashlib.sha256(config_path.read_bytes()).hexdigest(),
-    )
-
-
 @torch.no_grad()
 def load_fixed_adapter(model, path, *, rank, alpha, role_embedding=True, qkv_layout="logical"):
     if not getattr(model, "_realization_base_loaded", False) or getattr(model, "_realization_adapter_loaded", False):

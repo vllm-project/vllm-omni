@@ -1647,6 +1647,28 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                         noise_pred[offset : offset + row_num] if noise_pred is not None else None
                                     )
                                 pipeline.step_scheduler(req, req_noise_pred)
+
+                            # Intermediate per-step output. Pipelines may publish
+                            # an owned snapshot after the sampling update and
+                            # before the decode gate: Duo's Realization uses it
+                            # to hand finished latents to the codec ahead of the
+                            # clean commit. Returning None keeps the default
+                            # one-final-output contract.
+                            step_output = getattr(pipeline, "post_step_output", None)
+                            if step_output is not None:
+                                step_result = step_output(req)
+                                if step_result is not None:
+                                    step_result = self._prepare_output_for_transport(step_result, req.sampling)
+                                    self._attach_stepwise_metadata(req, step_result)
+                                    self._maybe_send_stage_payload([req], [step_result])  # type: ignore[list-item]
+                                    runner_output_list.append(
+                                        RunnerOutput(
+                                            request_id=req.request_id,
+                                            step_index=req.step_index,
+                                            finished=False,
+                                            result=step_result,
+                                        )
+                                    )
                             if self.od_config.streaming_output:
                                 should_decode = req.chunk_denoise_completed or req.request_denoise_completed
                             else:

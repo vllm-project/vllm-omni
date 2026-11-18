@@ -81,14 +81,10 @@ class DuoDuplexPlugin(DuplexModelPlugin):
             return self.asr_stage_id
         return self.intent_stage_id
 
-    def stage_is_resumable(self, stage_id, capabilities):
-        return stage_id == self.intent_stage_id
-
-    def model_state_session_key(self, session_id, epoch):
+    def _model_state_session_key(self, session_id, epoch):
+        # Internal helper, not an engine hook: it qualifies the Realization
+        # session id with the epoch so a new epoch never reuses old session KV.
         return f"{session_id}/epoch/{epoch}"
-
-    def model_state_stage_ids(self):
-        return frozenset((self.realization_stage_id, self.codec_stage_id))
 
     def split_transcription_input(self, payload):
         if not isinstance(payload, Mapping) or not payload.get("audio"):
@@ -101,34 +97,6 @@ class DuoDuplexPlugin(DuplexModelPlugin):
             if k not in ("audio", "format", "sample_rate_hz", "committed_audio_segments")
         }
         return first, remaining
-
-    def start_transcription_preparation(self, payload):
-        frames = tuple((payload.get("video_frames") or [])[-self._frames_per_block() :])
-        if not frames:
-            return None
-        block_frames = self._frames_per_block()
-        target_size = self.options.get("camera_frame_size", (320, 384))
-        target_size = tuple(target_size) if target_size is not None else None
-
-        async def prepare():
-            await self._camera_prepare_slots.acquire()
-            try:
-                worker = asyncio.create_task(
-                    asyncio.to_thread(self._prepare_camera_frames, frames, block_frames, None, target_size)
-                )
-            except BaseException:
-                self._camera_prepare_slots.release()
-                raise
-
-            def finished(task):
-                self._camera_prepare_slots.release()
-                if not task.cancelled():
-                    task.exception()
-
-            worker.add_done_callback(finished)
-            return await asyncio.shield(worker)
-
-        return asyncio.create_task(prepare())
 
     def create_session_state(self):
         return DuoSessionState(audio_buffer=DuoInputBuffer())
@@ -342,7 +310,7 @@ class DuoDuplexPlugin(DuplexModelPlugin):
         state.close()
         state.consumed_input_items = set()
         state.fence = fence.epoch
-        state.session_id = self.model_state_session_key(fence.session_id, fence.epoch)
+        state.session_id = self._model_state_session_key(fence.session_id, fence.epoch)
         state.request_id = request_id
         state.next_block = state.next_publish = state.sampled_rows = state.history_cursor = 0
         state.asr_next_block = 0
@@ -525,7 +493,7 @@ class DuoDuplexPlugin(DuplexModelPlugin):
                     audio = np.concatenate((previous_audio, audio))
             asr_timing = dict(
                 submitted_ns=time.perf_counter_ns(),
-                session_id=self.model_state_session_key(fence.session_id, fence.epoch),
+                session_id=self._model_state_session_key(fence.session_id, fence.epoch),
                 fence=fence.epoch,
                 item_id=item_id,
                 request_id=request_id,
@@ -692,69 +660,15 @@ class DuoDuplexPlugin(DuplexModelPlugin):
     def decide_output(self, **kwargs):
         return None
 
-    def record_stage_timing(self, *, stage_id, output, stage_metrics, prompt, finished):
-        if stage_id == self.codec_stage_id and finished:
-            chunk = self.data_plane.states.get(output.request_id)
-            if chunk is not None:
-                chunk.owner.schedule.complete("codec", chunk.next_block)
-            return
-        if stage_id == getattr(self, "intent_stage_id", None) and finished:
-            state = self.data_plane.states.get(output.request_id)
-            if state is not None:
-                trace(
-                    "intent_engine_complete",
-                    state,
-                    block=state.next_block - int(state.intent_done),
-                    **{
-                        name: getattr(stage_metrics, name, None)
-                        for name in (
-                            "vllm_queued_ms",
-                            "vllm_prefill_ms",
-                            "vllm_decode_ms",
-                            "stage_gen_time_ms",
-                        )
-                    },
-                    h50_computed_rows=state.connector.computed_rows,
-                )
-            return
-        if stage_id != self.asr_stage_id or not finished or not isinstance(prompt, Mapping):
-            return
-        chunk = self.data_plane.states.get(output.request_id)
-        if chunk is not None:
-            chunk.owner.schedule.complete("asr", chunk.next_block)
-        info = prompt.get("additional_information", {}).get("realization_asr_timing")
-        path = os.environ.get("DUO_TRACE_PATH")
-        if not info or not path:
-            return
-        now = time.perf_counter_ns()
-        metrics = {
-            name: getattr(stage_metrics, name, None)
-            for name in (
-                "vllm_queued_ms",
-                "vllm_prefill_ms",
-                "vllm_decode_ms",
-                "stage_gen_time_ms",
-                "rx_decode_time_ms",
-                "rx_in_flight_time_ms",
-            )
-        }
-        phases = [metrics[k] for k in ("vllm_queued_ms", "vllm_prefill_ms", "vllm_decode_ms")]
-        service_ms = (now - info["submitted_ns"]) / 1e6
-        event = dict(
-            info,
-            phase="asr_complete",
-            monotonic_ns=now,
-            observed_service_ms=service_ms,
-            engine_inference_ms=None if any(x is None for x in phases[1:]) else sum(phases[1:]),
-            outside_engine_ms=None if any(x is None for x in phases) else service_ms - sum(phases),
-            **metrics,
-        )
-        with open(path, "a") as stream:
-            stream.write(json.dumps(event) + "\n")
-
     def user_transcript(self, *, stage_id, output, prompt, finished):
         if stage_id != self.asr_stage_id or not finished or not getattr(output, "outputs", None):
             return None
+        # Release the ASR slot for this block. `serial`/`alternating` admission
+        # waits on `schedule.complete("asr", ...)`; the only other producer was a
+        # plugin hook the engine never calls, which deadlocked those modes.
+        chunk = self.data_plane.states.get(output.request_id)
+        if chunk is not None and chunk.owner.schedule.mode != "free":
+            chunk.owner.schedule.complete("asr", chunk.next_block)
         from vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction import (
             _clean_qwen3_asr_transcript,
             _extract_completed_action_text,

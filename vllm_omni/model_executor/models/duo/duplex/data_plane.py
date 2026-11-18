@@ -157,6 +157,13 @@ class DuoDataPlane(DuplexDataPlane):
                         target.decoded = packet["payload"]
                         target.codec_metadata = dict(meta, **clock, decode_source_block=state.next_block)
                         trace("codec_complete", target_state)
+                        # The codec stage released this block's output. Broadcast it
+                        # from an active path: the only other producer was a
+                        # zero-caller plugin hook, which left `alternating`/`serial`
+                        # scheduling waiting on `schedule.complete("codec", ...)`
+                        # forever.
+                        if owner.schedule.mode != "free":
+                            owner.schedule.complete("codec", block)
                 else:
                     pending.decoded = encode_av_chunk(payload, meta)
                     pending.codec_metadata = dict(meta)
