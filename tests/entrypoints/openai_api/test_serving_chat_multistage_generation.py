@@ -42,6 +42,7 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     extra_body = {
         "negative_prompt": "blurry",
         "cache_salt": "tenant-a",
+        "num_outputs_per_prompt": 2,
         "num_inference_steps": 28,
         "guidance_scale": 7.5,
         "true_cfg_scale": 5.0,

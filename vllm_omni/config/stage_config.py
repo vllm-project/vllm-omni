@@ -21,6 +21,7 @@ from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.speech_cache import SpeechCacheConfig
+from vllm_omni.config.weight_sharing import WeightSharingConfig, parse_weight_sharing
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
@@ -45,6 +46,24 @@ _TOPOLOGY_OWNED_ENGINE_FIELDS = frozenset(
         "scheduling_metadata_adapter",
     }
 )
+
+STREAMING_UPDATE_TRANSFORM_ATTR = "_omni_streaming_update_transform"
+
+
+def on_streaming_updates(
+    transform: Callable[..., Any] | None,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Mark a ``prompt_transform_func`` to run ``transform`` on streaming-input updates instead.
+
+    Those updates carry the later chunks of a request that already passed the
+    transform. ``None`` skips them.
+    """
+
+    def mark(func: Callable[..., Any]) -> Callable[..., Any]:
+        setattr(func, STREAMING_UPDATE_TRANSFORM_ATTR, transform)
+        return func
+
+    return mark
 
 
 def _normalize_stage_backend_fields(stage: StageDeployConfig) -> None:
@@ -123,6 +142,7 @@ def build_stage_runtime_overrides(
         internal_keys = (internal_blacklist_keys() | SHARED_FIELDS) - deploy_runtime_override_keys()
 
     result: dict[str, Any] = {}
+    stage_overrides: dict[str, Any] = {}
 
     for key, value in cli_overrides.items():
         if value is None or key in internal_keys:
@@ -133,11 +153,13 @@ def build_stage_runtime_overrides(
             override_stage_id = int(match.group(1))
             param_name = match.group(2)
             if override_stage_id == stage_id and param_name not in internal_keys:
-                result[param_name] = value
+                stage_overrides[param_name] = value
             continue
 
         result[key] = value
 
+    # Stage-scoped inputs take precedence regardless of their insertion order.
+    result.update(stage_overrides)
     return result
 
 
@@ -391,7 +413,9 @@ class StagePipelineConfig:
     supports_duplex_mrv2: bool = False
     # Rewrites the Stage-0 view of a raw prompt before vLLM input processing.
     # The callable receives ``(prompt, sampling_params_list)``; downstream
-    # stages continue to receive the original prompt.
+    # stages continue to receive the original prompt. It also runs on
+    # streaming-input updates unless ``on_streaming_updates`` names another
+    # transform (or none) for them.
     prompt_transform_func: str | None = None
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
@@ -625,6 +649,7 @@ class StageDeployConfig:
     """Local original H3 Fun ControlNet Union safetensors checkpoint."""
     lora_path: str | list[str] | None = None
     lora_backend: str | None = None
+    lora_application: str | None = None
     lora_scale: float | None = None
     diffusers_load_kwargs: dict[str, Any] | None = None
     diffusers_call_kwargs: dict[str, Any] | None = None
@@ -632,6 +657,7 @@ class StageDeployConfig:
     diffusion_attention_backend: str | None = None
     fastvideo_vsa_topk: int | None = None
     diffusion_attention_config: dict[str, Any] | None = None
+    diffusion_attention_schedule: dict[str, Any] | None = None
 
     # Diffusion execution, cache, and VAE behavior.
     diffusion_compile_granularity: str | None = None
@@ -640,7 +666,10 @@ class StageDeployConfig:
     # today). Independent of compilation_config.cudagraph_mode;
     # enforce_eager=True also disables it.
     enable_cuda_graph_decode: bool | None = None
+    diffusion_use_graph: bool | None = None
+    diffusion_graph_release_after_denoise: bool | None = None
     fa_deterministic: bool | None = None
+    enable_cfg_batching: bool | None = None
     cache_backend: str | None = None
     cache_config: dict[str, Any] | None = None
     video_output_transport: dict[str, Any] | None = None
@@ -677,6 +706,10 @@ class StageDeployConfig:
     dlo_host_registration_limit_gib: float | None = None
     # Diffusion-specific debug and observability knobs.
     enable_diffusion_pipeline_profiler: bool | None = None
+    # Mixed-resolution batch packing (MixFusion) server-level defaults.
+    enable_mixfusion: bool | None = None
+    mixfusion_min_chunk_tokens: int | None = None
+    mixfusion_max_chunks: int | None = None
 
     # Modality/service constraints consumed outside the core engine config.
     max_generated_image_size: int | None = None
@@ -712,6 +745,7 @@ class DuplexSessionRuntimeConfig:
     max_tool_calls_per_session: int = 4096
     replica_policy: Literal["legacy", "least_sessions"] = "legacy"
     max_sessions_per_replica: int | None = None
+    # Omitted groups join every replica combination across the pipeline stages.
     replica_groups: list[dict[int, int]] | None = None
     # Unread by the plugin framework. It used to bound the per-session
     # completed-append table that made a retried append RPC submit once; the
@@ -733,6 +767,9 @@ class DuplexSessionRuntimeConfig:
     history_ms_per_token: float | None = None
     history_calibration_timeout_ms: int = 1000
     history_audio_max_bytes_per_session: int = 8 * 1024 * 1024
+    # Server-only model configuration. Models validate their own options;
+    # client session.update cannot select code or change these limits.
+    model_custom_options: dict[str, object] = field(default_factory=dict)
     # Startup warmup, before real ``/v1/realtime`` clients are admitted.
     # Audio-primary models run this many silent frames; 0 disables that path.
     # Video-required models (AURA) still run one short non-silent audio chunk
@@ -740,12 +777,18 @@ class DuplexSessionRuntimeConfig:
     # compile their real shapes. The empty per-stage JIT registry does not.
     # A negative value disables every startup warmup.
     warmup_frames: int = 0
+    # Opt-in L1 history view for plugins that consume ``conversation_view``
+    # (Qwen3-Omni): user turns before the N most recent user runs drop their
+    # audio and image parts there. ``None`` leaves every prompt unchanged.
+    context_keep_media_turns: int | None = None
     # Record per-turn stage work and emitted audio and answer the client's
     # ``session.stats.get`` (RFC #8325). Off: nothing is recorded or attached.
     # Single-host only: stage and API timestamps share one CLOCK_MONOTONIC.
     collect_stats: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.model_custom_options, dict):
+            raise ValueError("duplex_session.model_custom_options must be a mapping")
         if not isinstance(self.collect_stats, bool):
             raise ValueError("duplex_session.collect_stats must be a boolean")
         if self.replica_policy not in ("legacy", "least_sessions"):
@@ -756,6 +799,12 @@ class DuplexSessionRuntimeConfig:
             or self.max_sessions_per_replica < 1
         ):
             raise ValueError("duplex_session.max_sessions_per_replica must be an integer >= 1 or null")
+        if self.context_keep_media_turns is not None and (
+            isinstance(self.context_keep_media_turns, bool)
+            or not isinstance(self.context_keep_media_turns, int)
+            or self.context_keep_media_turns < 0
+        ):
+            raise ValueError("duplex_session.context_keep_media_turns must be an integer >= 0 or null")
         if self.replica_policy == "least_sessions" and self.max_sessions_per_replica is None:
             raise ValueError("duplex_session.max_sessions_per_replica is required for replica_policy='least_sessions'")
         if self.replica_groups is not None:
@@ -855,8 +904,9 @@ class DeployConfig:
 
     # Async chunk's default depends on whether or not the pipeline supports it.
     async_chunk: bool | None = None
+    weight_sharing: WeightSharingConfig | None = None
     session_mode: str = "turn"
-    model_runner: Literal["v1", "v2"] = "v1"
+    model_runner: Literal["v1", "v2"] = "v2"
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
     active_stream_window: int = 0
     # Experimental local NVIDIA MPS; disabled unless a deploy explicitly opts in.
@@ -1042,7 +1092,7 @@ def _merge_platforms(
     base: dict[str, Any] | None,
     overlay: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """Deep-merge two ``platforms:`` blocks per-platform, per-stage_id."""
+    """Merge platform blocks by stage ID and named connector definition."""
     if not base and not overlay:
         return None
     base = base or {}
@@ -1053,6 +1103,9 @@ def _merge_platforms(
         op = overlay.get(plat) or {}
         merged_plat = {**bp, **{k: v for k, v in op.items() if k != "stages"}}
         merged_plat["stages"] = _merge_stage_lists(bp.get("stages"), op.get("stages"))
+        connectors = _merge_connectors(bp.get("connectors"), op.get("connectors"))
+        if connectors is not None:
+            merged_plat["connectors"] = connectors
         merged[plat] = merged_plat
     return merged
 
@@ -1111,7 +1164,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         raise ValueError("speech_cache must be a mapping")
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
 
-    model_runner = raw_dict.get("model_runner", "v1")
+    model_runner = raw_dict.get("model_runner", "v2")
     if model_runner not in ("v1", "v2"):
         raise ValueError(f"model_runner must be one of ('v1', 'v2'), got {model_runner!r}")
 
@@ -1121,6 +1174,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     # TODO (Alex): Clean this up, we should not have fallback values here
     kwargs: dict[str, Any] = {
         "speech_cache": SpeechCacheConfig(**speech_cache),
+        "weight_sharing": parse_weight_sharing(raw_dict.get("weight_sharing")),
         "cuda_mps": raw_dict.get("cuda_mps", False),
         "async_chunk": raw_dict.get("async_chunk"),
         "session_mode": raw_dict.get("session_mode", "turn"),
@@ -1170,9 +1224,8 @@ def _extract_platform_overrides(ps: dict[str, Any]) -> PlatformOverrides:
 # Why a platform still rejects Model Runner V2. CUDA API aliases alone do not
 # adapt a platform worker, so an entry is removed only with the real integration.
 # NPU AR stages use the Ascend V2 runner (attention metadata and input state).
-_MRV2_UNSUPPORTED_PLATFORMS = {
-    "xpu": "the platform worker still uses the legacy chunk-transfer data plane",
-}
+# Platforms whose workers still force the V1 runner; XPU and NPU build the omni V2 runners.
+_MRV2_UNSUPPORTED_PLATFORMS: dict[str, str] = {}
 
 
 def _apply_platform_overrides(
@@ -1186,6 +1239,8 @@ def _apply_platform_overrides(
         device_name = current_omni_platform.device_name
         platform = device_name.lower() if device_name is not None else None
     platform_section = (deploy.platforms or {}).get(platform) if platform is not None else None
+    if platform_section is not None and "connectors" in platform_section:
+        deploy.connectors = _merge_connectors(deploy.connectors, platform_section["connectors"])
     if platform_section is not None and "cuda_mps" in platform_section:
         cuda_mps = platform_section["cuda_mps"]
         if not isinstance(cuda_mps, bool):
@@ -1236,7 +1291,7 @@ def _apply_platform_overrides(
                 if key in _DEEP_MERGE_KEYS and isinstance(val, dict):
                     base_val = getattr(base, key, None)
                     if isinstance(base_val, dict):
-                        setattr(base, key, {**base_val, **val})
+                        setattr(base, key, _get_recursively_merged_dict(base_val, val))
                         continue
                 setattr(base, key, val)
             else:
@@ -1276,7 +1331,10 @@ def _resolve_execution_mode(
 def resolve_stage_model_runner(deploy: DeployConfig, stage: StageDeployConfig | None) -> str:
     """The stage's own ``model_runner`` if set, else the deploy-level one."""
     runner = getattr(stage, "model_runner", None) if stage is not None else None
-    return runner or deploy.model_runner
+    selected = runner or deploy.model_runner
+    if selected != "v2":
+        raise ValueError("Model Runner V1 is not supported with vLLM 0.34; select model_runner: v2")
+    return selected
 
 
 def validate_native_mrv2_session(deploy: DeployConfig, ps: StagePipelineConfig, stage_runner: str) -> None:
@@ -1293,7 +1351,7 @@ def validate_native_mrv2_session(deploy: DeployConfig, ps: StagePipelineConfig, 
     if deploy.session_mode != "turn":
         raise ValueError(
             f"stage {ps.stage_id}: model_runner v2 supports session_mode 'turn' only, got "
-            f"{deploy.session_mode!r}; run this stage with model_runner: v1 for streaming sessions."
+            f"{deploy.session_mode!r}; this stage does not support streaming sessions with Model Runner V2."
         )
 
 
@@ -1391,14 +1449,15 @@ def _build_engine_args(
                 )
     stage_runner = resolve_stage_model_runner(deploy, ds)
     validate_native_mrv2_session(deploy, ps, stage_runner)
-    engine_args["use_v2_model_runner"] = stage_runner == "v2"
+    # This flag selects the LLM runner; diffusion stages own their runner.
+    engine_args["use_v2_model_runner"] = stage_runner == "v2" and ps.execution_type is not StageExecutionType.DIFFUSION
     engine_args["supports_native_mrv2_data_plane"] = bool(ps.supports_native_mrv2_data_plane)
-    if stage_runner == "v2" and not ps.supports_native_mrv2_data_plane:
+    if engine_args["use_v2_model_runner"] and not ps.supports_native_mrv2_data_plane:
         logger.warning(
             "Stage %s (%s) selects model_runner=v2 without declaring "
             "supports_native_mrv2_data_plane. It will use the legacy transport path; "
-            "MRV2 support for this pipeline has not been validated. Use model_runner=v1 "
-            "unless you are validating a new MRV2 integration.",
+            "MRV2 support for this pipeline has not been validated. "
+            "Validate its V2 hooks before deployment.",
             ps.stage_id,
             ps.model_arch or pipeline.model_arch or pipeline.model_type,
         )

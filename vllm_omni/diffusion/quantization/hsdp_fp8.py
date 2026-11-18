@@ -40,6 +40,8 @@ from vllm.model_executor.layers.quantization.online.fp8 import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8StaticTensorSym
 
+from vllm_omni.quantization.fp8_config import OnlineBlockFp8LinearMethod
+
 logger = init_logger(__name__)
 
 _FP8_TRANSPOSED_WEIGHT_METHODS = (
@@ -97,6 +99,10 @@ def prepare_fp8_layers_for_fsdp(model: nn.Module) -> int:
     n_patched = 0
     for module in model.modules():
         qm = _unwrap_quant_method(getattr(module, "quant_method", None))
+        if isinstance(qm, OnlineBlockFp8LinearMethod):
+            raise ValueError(
+                "HSDP does not yet support configurable online FP8 block scaling; use per-tensor fp8 or disable HSDP."
+            )
         is_modelopt_fp8 = isinstance(qm, ModelOptLinearMethod) and qm.spec == _MODELOPT_FP8_SPEC
         if not is_modelopt_fp8 and not isinstance(qm, _FP8_TRANSPOSED_WEIGHT_METHODS):
             continue
@@ -105,7 +111,12 @@ def prepare_fp8_layers_for_fsdp(model: nn.Module) -> int:
         if weight is None or weight.is_contiguous():
             continue
 
-        kernel = qm.kernel if is_modelopt_fp8 else qm.fp8_linear
+        if is_modelopt_fp8:
+            assert isinstance(qm, ModelOptLinearMethod)
+            kernel = qm.kernel
+        else:
+            assert isinstance(qm, _FP8_TRANSPOSED_WEIGHT_METHODS)
+            kernel = qm.fp8_linear
         if not callable(getattr(kernel, "_get_layer_params", None)):
             raise ValueError(f"FP8 HSDP requires a kernel weight accessor, got {type(kernel).__name__}")
         if weight.ndim != 2:

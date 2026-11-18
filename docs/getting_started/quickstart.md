@@ -19,18 +19,16 @@ uv venv --python 3.12 --seed
 source .venv/bin/activate
 
 # On CUDA (Linux x86_64, CUDA 13.0)
-uv pip install --torch-backend=cu130 \
-  "vllm @ https://wheels.vllm.ai/4ba787ec9959e566d3b587a796dff07673324da5/vllm-0.33.0-cp38-abi3-manylinux_2_28_x86_64.whl"
+uv pip install vllm==0.34.0 --torch-backend=cu130
 
 git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
 uv pip install -e .
 ```
 
-These commands select vLLM 0.33.0 at the frozen release-branch commit,
-with PyTorch 2.14.0 and CUDA 13.0. The final package is available; native model,
-full CI and ROCm/XPU runtime validation remain pending. Install Omni from this source
-checkout. For published Omni wheels and other installation methods, see the
+These commands install the official vLLM 0.34.0 release with PyTorch 2.14.0
+and CUDA 13.0, then install Omni from source. For published Omni wheels,
+other platforms and release qualification limits, see the
 [installation guide](installation/README.md).
 
 For source development or Gradio demos, also follow the

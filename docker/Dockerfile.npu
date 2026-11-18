@@ -1,12 +1,12 @@
-# Legacy Ascend 0.32 runtime; this default does not qualify the vLLM 0.33
-# alignment checkout. A matching 0.33 vLLM-Ascend image and NPU validation
-# are required before using this checkout. Override VLLM_ASCEND_IMAGE and
-# VLLM_ASCEND_VERSION only with that verified runtime; do not relabel 0.32.
+# The published vLLM-Ascend baseline remains v0.33.0; its v0.34.0 release
+# is unavailable. This older NPU image is not qualified for Omni's vLLM 0.34.0
+# target. Device-specific suffixes select -a3/-a5/-310p; no suffix selects A2.
 ARG VLLM_ASCEND_IMAGE=quay.io/atlas-ci/vllm-ascend
-ARG VLLM_ASCEND_VERSION=v0.32.0
+ARG VLLM_ASCEND_VERSION=v0.33.0
 ARG VLLM_ASCEND_DEVICE_SUFFIX=
 FROM ${VLLM_ASCEND_IMAGE}:${VLLM_ASCEND_VERSION}${VLLM_ASCEND_DEVICE_SUFFIX}
 
+ENV VLLM_OMNI_TARGET_DEVICE=npu
 ARG APP_DIR=/vllm-workspace/vllm-omni
 WORKDIR ${APP_DIR}
 COPY . .
@@ -18,7 +18,7 @@ RUN apt-get update && \
 # Avoid glibc heap corruption at Python shutdown with the NPU runtime.
 ENV LD_PRELOAD=libjemalloc.so.2
 
-RUN export PIP_EXTRA_INDEX_URL=https://mirrors.huaweicloud.com/ascend/repos/pypi && \
+RUN export PIP_EXTRA_INDEX_URL="https://mirrors.huaweicloud.com/ascend/repos/pypi https://ascend.devcloud.huaweicloud.com/cann/pypi/simple" && \
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     source /usr/local/Ascend/nnal/atb/set_env.sh && \
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/`uname -i`-linux/devlib && \

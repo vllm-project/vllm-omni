@@ -15,7 +15,6 @@ import pytest
 import torch
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import FullAttentionSpec
-from vllm.v1.worker import block_table as native_block_table
 
 from vllm_omni.diffusion.diffusion_kv import model_runner_backend as model_runner_backend_module
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
@@ -321,7 +320,7 @@ def _install_native_modules(monkeypatch: pytest.MonkeyPatch, events: list[tuple]
         "get_diffusion_kv_block_tables_cls",
         lambda: _FakeBlockTables,
     )
-    monkeypatch.setattr(native_block_table, "get_block_table_width", get_block_table_width, raising=False)
+    monkeypatch.setattr(model_runner_backend_module, "get_block_table_width", get_block_table_width)
 
 
 def _runner(

@@ -1,20 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+from vllm_omni.lora.layers.replicated_linear import DiffusionReplicatedLinearWithLoRA
 
-from __future__ import annotations
-
-from vllm.lora.layers.replicated_linear import ReplicatedLinearWithLoRA
-
-from .base_linear import DiffusionBaseLinearLayerWithLoRA
-
-
-class DiffusionReplicatedLinearWithLoRA(
-    DiffusionBaseLinearLayerWithLoRA,
-    ReplicatedLinearWithLoRA,
-):
-    """
-    Diffusion ReplicatedLinear with LoRA.
-    Prioritize apply() in DiffusionBaseLinearLayerWithLoRA
-    """
-
-    pass
+__all__ = ["DiffusionReplicatedLinearWithLoRA"]

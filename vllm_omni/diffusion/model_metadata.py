@@ -27,6 +27,7 @@ class DiffusionModelMetadata:
     # Default DiT sequence-length ceiling used by ``paged_scheduler`` when the
     # transformer config does not expose ``max_position_embeddings``.
     default_max_model_len: int | None = None
+    paged_kv_profile_num_image_inputs: int | None = None
     # Fine-grained prefix hash/alignment unit for partial physical-page hits.
     prefix_cache_hash_block_size: int | None = None
     # Whether paged HSDP+Ulysses workers require vLLM's deterministic
@@ -56,18 +57,22 @@ REQUEST_IDENTITY_EXTRA_ARGS = frozenset({"latent_cache_key"})
 # FLUX.2 Klein supports up to four reference images.
 FLUX2_KLEIN_MAX_INPUT_IMAGES = 4
 QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES = 4
-# Qwen-Image 2.1 image-conditioned generation caps condition images at 4.
-QWEN_IMAGE_21_MAX_INPUT_IMAGES = 4
+# Qwen-Image 2.1 supports up to 10 reference images for image-conditioned generation.
+QWEN_IMAGE_21_MAX_INPUT_IMAGES = 10
 # 8192 text tokens + 4 condition images (4096 tokens each) + 1024x1024 target (4096 tokens).
 QWEN_IMAGE_21_DEFAULT_MAX_MODEL_LEN = 32768
+QWEN_IMAGE_21_PAGED_KV_PROFILE_NUM_IMAGES = 4
 # Upstream HunyuanImage-3.0 "Multi-Image Fusion" caps reference images at 3.
 HUNYUAN_IMAGE3_MAX_INPUT_IMAGES = 3
-JOY_IMAGE_EDIT_MAX_INPUT_IMAGES = 1
 # Boogu-Image editing (TI2I) supports a single reference image for now.
 BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
+FLUX3_MAX_INPUT_IMAGES = 10
 
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
+    "Praxis1Pipeline": DiffusionModelMetadata(final_output_type="actions"),
+    "HyNomasPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "HyNomasModularPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SeedVR2Pipeline": DiffusionModelMetadata(supports_multimodal_inputs=True, final_output_type="video"),
     "Sam3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
@@ -90,6 +95,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=QWEN_IMAGE_21_MAX_INPUT_IMAGES,
         default_max_model_len=QWEN_IMAGE_21_DEFAULT_MAX_MODEL_LEN,
+        paged_kv_profile_num_image_inputs=QWEN_IMAGE_21_PAGED_KV_PROFILE_NUM_IMAGES,
         prefix_cache_hash_block_size=1,
         requires_batch_invariant_paged_hsdp_ulysses=True,
     ),
@@ -103,10 +109,6 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "BooguImagePipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=BOOGU_IMAGE_MAX_INPUT_IMAGES,
-    ),
-    "JoyImageEditPipeline": DiffusionModelMetadata(
-        supports_multimodal_inputs=True,
-        max_multimodal_image_inputs=JOY_IMAGE_EDIT_MAX_INPUT_IMAGES,
     ),
     "MiniMaxH3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
@@ -137,6 +139,15 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         final_output_type="video",
         attention_mask_free=True,
     ),
+    # MiniMax-H3-Image: t2i without references, edit with ordered references
+    # ("Picture i"); it shares H3's packed layout and padding document.
+    "MiniMaxH3ImagePipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        # MINIMAX_H3_IMAGE_MAX_REFERENCES in pipeline_minimax_h3_image.py.
+        max_multimodal_image_inputs=16,
+        final_output_type="image",
+        attention_mask_free=True,
+    ),
     # TaoMate-H3 is a text-prompted streaming model on the MiniMax-H3 packed
     # layout; alignment padding is a second packed document, as for H3.
     "TaoMateH3Pipeline": DiffusionModelMetadata(
@@ -161,6 +172,11 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         attention_mask_free=True,
         final_output_type="video",
     ),
+    "Flux3Pipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=FLUX3_MAX_INPUT_IMAGES,
+        final_output_type="image",
+    ),
     "WanImageToVideoPipeline": DiffusionModelMetadata(
         attention_mask_free=True,
         final_output_type="video",
@@ -173,6 +189,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         attention_mask_free=True,
         final_output_type="video",
     ),
+    "CausVidWanPipeline": DiffusionModelMetadata(final_output_type="video"),
     "WanT2VDMD2Pipeline": DiffusionModelMetadata(final_output_type="video"),
     "WanI2VDMD2Pipeline": DiffusionModelMetadata(final_output_type="video"),
     "LTX2Pipeline": DiffusionModelMetadata(final_output_type="video"),
@@ -183,6 +200,12 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "HeliosPyramidPipeline": DiffusionModelMetadata(final_output_type="video"),
     "HunyuanVideo15Pipeline": DiffusionModelMetadata(final_output_type="video"),
     "HunyuanVideo15ImageToVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
+    # One pipeline serves text-to-video and, with a first frame, image-to-video.
+    "PAN2ModularPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        final_output_type="video",
+    ),
     "LingBotVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
     "LongCatVideoAvatarPipeline": DiffusionModelMetadata(final_output_type="video"),
     "MagiHumanPipeline": DiffusionModelMetadata(final_output_type="video"),
@@ -201,6 +224,10 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=1,
         final_output_type="video",
+    ),
+    "Cosmos3NanoSimBimanualPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
     ),
 }
 

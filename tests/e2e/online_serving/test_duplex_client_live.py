@@ -14,6 +14,7 @@ completes the response. The assertions remain basic client lifecycle checks.
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -56,60 +57,69 @@ async def _run_live_session(*, url: str, model: str, ref_audio: Path, input_wav:
     collector = EventCollector()
     pcm = read_pcm16_wav(input_wav)
     summary: dict[str, object] = {}
-    async with client:
-        collector_task = asyncio.create_task(collector.consume(client))
-        summary["session_id"] = client.session_id
-        summary["resume_token_issued"] = client.resume_token is not None
+    # Subscribe before opening so session.created/session.updated cannot race
+    # past the collector. This retains the standalone protocol smoke's checks.
+    collector_task = asyncio.create_task(collector.consume(client))
+    try:
+        await asyncio.sleep(0)
+        async with client:
+            summary["session_id"] = client.session_id
+            summary["resume_token_issued"] = client.resume_token is not None
 
-        # Phase 1: stream the validated utterance and consume one speak response.
-        await client.stream_pcm(pcm, chunk_ms=200)
-        await client.commit()
-        listens = 0
-        async for response in client.responses():
-            if response.decision == "listen":
-                listens += 1
-                if listens > _MAX_LISTEN_ROUNDS:
-                    raise AssertionError(f"no speak response after {listens} listen decisions")
-                continue
-            chunk_count = 0
-            audio_byte_count = 0
-            async for chunk in response.audio():
-                chunk_count += 1
-                audio_byte_count += len(chunk)
-                await client.ack_playback(response.played_ms)
-            summary.update(
-                {
-                    "decision": response.decision,
-                    "listen_rounds": listens,
-                    "audio_chunks": chunk_count,
-                    "audio_bytes": audio_byte_count,
-                    "played_ms": response.played_ms,
-                    "transcript": response.transcript,
-                }
-            )
-            break
+            # Phase 1: stream the validated utterance and consume one speak response.
+            await client.stream_pcm(pcm, chunk_ms=200)
+            await client.commit()
+            listens = 0
+            async for response in client.responses():
+                if response.decision == "listen":
+                    listens += 1
+                    if listens > _MAX_LISTEN_ROUNDS:
+                        raise AssertionError(f"no speak response after {listens} listen decisions")
+                    continue
+                chunk_count = 0
+                audio_byte_count = 0
+                async for chunk in response.audio():
+                    chunk_count += 1
+                    audio_byte_count += len(chunk)
+                    await client.ack_playback(response.played_ms)
+                summary.update(
+                    {
+                        "decision": response.decision,
+                        "listen_rounds": listens,
+                        "audio_chunks": chunk_count,
+                        "audio_bytes": audio_byte_count,
+                        "played_ms": response.played_ms,
+                        "transcript": response.transcript,
+                    }
+                )
+                break
 
-        # Phase 2: force-drop the transport underneath the client and require
-        # the automatic session.resume path to bring the session back.
-        resumed_waiter = asyncio.create_task(client.wait_for("session.resumed", timeout_s=90.0))
-        await asyncio.sleep(0.1)  # let the waiter subscribe before the drop
-        assert client._ws is not None
-        await client._ws.close()
-        resumed = await resumed_waiter
-        summary["resumed_session_id"] = resumed.session_id or client.session_id
+            # Phase 2: force-drop the transport underneath the client and require
+            # the automatic session.resume path to bring the session back.
+            resumed_waiter = asyncio.create_task(client.wait_for("session.resumed", timeout_s=90.0))
+            await asyncio.sleep(0.1)  # let the waiter subscribe before the drop
+            assert client._ws is not None
+            await client._ws.close()
+            resumed = await resumed_waiter
+            summary["resumed_session_id"] = resumed.session_id or client.session_id
 
-        # The resumed transport must be live: a heartbeat gets acknowledged.
-        ack_waiter = asyncio.create_task(client.wait_for("session.heartbeat_ack", timeout_s=30.0))
-        await asyncio.sleep(0.1)
-        await client.send({"type": "session.heartbeat"})
-        await ack_waiter
-        summary["post_resume_heartbeat_ok"] = True
+            # The resumed transport must be live: a heartbeat gets acknowledged.
+            ack_waiter = asyncio.create_task(client.wait_for("session.heartbeat_ack", timeout_s=30.0))
+            await asyncio.sleep(0.1)
+            await client.send({"type": "session.heartbeat"})
+            await ack_waiter
+            summary["post_resume_heartbeat_ok"] = True
 
-        await client.close()
-        await asyncio.wait_for(collector_task, timeout=10.0)
+            await client.close()
+            await asyncio.wait_for(collector_task, timeout=10.0)
+
+    finally:
+        collector_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await collector_task
 
     summary["error_events"] = collector.errors()
-    summary["closed_cleanly"] = collector.count("session.closed") > 0
+    summary["protocol_event_types"] = [event["type"] for event in collector.events]
     summary["timing"] = collector.timing_summary(after_s=0.0)
     return summary
 
@@ -137,5 +147,9 @@ def test_duplex_client_live_session(omni_server) -> None:
     assert summary["transcript"], summary
     assert summary["resume_token_issued"] is True, summary
     assert summary["post_resume_heartbeat_ok"] is True, summary
-    assert summary["closed_cleanly"] is True, summary
+    event_types = summary["protocol_event_types"]
+    assert isinstance(event_types, list), summary
+    assert "session.created" in event_types, summary
+    assert "session.updated" in event_types, summary
+    assert event_types[-1] == "session.closed", summary
     assert summary["error_events"] == [], summary

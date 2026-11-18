@@ -25,6 +25,7 @@ from vllm_omni.diffusion.data import (
     OmniSleepTask,
     OmniWakeTask,
 )
+from vllm_omni.lora.weight_transfer import MergedLoRAIPCWeightTransferEngine
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -101,6 +102,8 @@ class OmniGPUWorkerBase(GPUWorker):
     for custom trace naming, background gzip, and trace path collection.
     """
 
+    use_v2_model_runner = True
+
     def _capture_auxiliary_graphs(self) -> None:
         """Let opt-in models warm valid inputs before the worker becomes ready."""
         capture = getattr(self.model_runner.model, "capture_auxiliary_graphs", None)
@@ -146,11 +149,53 @@ class OmniGPUWorkerBase(GPUWorker):
         return result
 
     def load_model(self, *args, **kwargs):
+        weight_transfer = self.vllm_config.weight_transfer_config
+        if (
+            weight_transfer is not None
+            and weight_transfer.backend == "omni_lora_ipc"
+            and self.vllm_config.lora_config is not None
+        ):
+            raise ValueError("omni_lora_ipc requires enable_lora=False on AR stages")
         with self._maybe_get_memory_pool_context("weights"):
             res = super().load_model(*args, **kwargs)
             current_omni_platform.synchronize()
             gc.collect()
             return res
+
+    def finish_weight_update(self) -> None:
+        """End failed merged sessions so the trainer can publish a new adapter.
+
+        Keep this cleanup on the public worker/engine lifecycle: the vLLM
+        version pinned by vLLM-Omni does not provide ``_end_weight_update``.
+        """
+        try:
+            super().finish_weight_update()
+        except Exception:
+            if isinstance(self.weight_transfer_engine, MergedLoRAIPCWeightTransferEngine):
+                self._weight_update_active = False
+                self.weight_transfer_engine.reset_weight_update_target()
+            raise
+
+    def remove_lora(self, lora_id: int) -> bool:
+        """Restore the dense base for a merged policy, or remove a runtime adapter.
+
+        Args:
+            lora_id: Adapter identifier to remove.
+
+        Returns:
+            Whether an adapter was removed.
+        """
+        engine = self.weight_transfer_engine
+        if isinstance(engine, MergedLoRAIPCWeightTransferEngine) and hasattr(engine, "lora_manager"):
+            return engine.lora_manager.remove_adapter(lora_id)
+        return super().remove_lora(lora_id)
+
+    def list_loras(self) -> set[int]:
+        """Return registered merged or runtime adapter identifiers."""
+        engine = self.weight_transfer_engine
+        if isinstance(engine, MergedLoRAIPCWeightTransferEngine) and hasattr(engine, "lora_manager"):
+            return set(engine.lora_manager.list_adapters())
+        return super().list_loras()
 
     def get_stage_post_warmup_memory_stats(self) -> dict[str, int] | None:
         if self.rank != 0:
@@ -444,7 +489,11 @@ class OmniGPUWorkerBase(GPUWorker):
         gc.collect()
 
         mem_before = current_omni_platform.get_current_memory_usage(self.device)
-        offload_tags = ("weights",) if level == 1 else tuple()
+        # V2 keeps block-table pointers and captured inputs in these pools;
+        # waking their allocations does not recreate discarded contents.
+        offload_tags: tuple[str, ...] = ("runtime", "cudagraph")
+        if level == 1:
+            offload_tags = ("weights", *offload_tags)
         allocator = get_mem_allocator_instance()
         if level == 2:
             self._sleep_saved_tensors = _save_non_parameter_tensors(self._sleep_models(), allocator)

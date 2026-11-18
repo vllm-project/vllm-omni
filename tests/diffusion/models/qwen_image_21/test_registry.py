@@ -43,13 +43,13 @@ def test_process_funcs_resolve_to_the_pipeline_module():
     assert callable(getattr(pipeline_qwen_image_21, prefix_cache_name))
 
 
-def test_multimodal_metadata_caps_condition_images_at_four():
+def test_multimodal_metadata_caps_condition_images_at_ten():
     from vllm_omni.diffusion.model_metadata import QWEN_IMAGE_21_MAX_INPUT_IMAGES, get_diffusion_model_metadata
 
     metadata = get_diffusion_model_metadata("QwenImage21Pipeline")
 
     assert metadata.supports_multimodal_inputs
-    assert metadata.max_multimodal_image_inputs == 4
+    assert metadata.max_multimodal_image_inputs == 10
     assert metadata.max_multimodal_image_inputs == QWEN_IMAGE_21_MAX_INPUT_IMAGES
     assert metadata.prefix_cache_hash_block_size == 1
     assert metadata.requires_batch_invariant_paged_hsdp_ulysses
@@ -70,4 +70,4 @@ def test_model_index_resolves_and_enriches(tmp_path):
 
     assert config.model_class_name == "QwenImage21Pipeline"
     assert config.supports_multimodal_inputs
-    assert config.max_multimodal_image_inputs == 4
+    assert config.max_multimodal_image_inputs == 10

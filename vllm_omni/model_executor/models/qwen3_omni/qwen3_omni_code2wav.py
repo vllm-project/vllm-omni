@@ -235,6 +235,13 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
         self._cudagraph_wrapper = None
         # Captured row counts per graph size; empty keeps one padded decode per batch.
         self._streaming_batch_sizes: dict[int, list[int]] = {}
+        # Set the non-streaming limit independently of graph enablement so
+        # enforce_eager deployments retain the same activation bound.
+        self._max_decode_rows: int | None = None
+        if current_omni_platform.is_npu():
+            from vllm_omni.platforms.npu.models.code2wav_graph import MAX_CODE2WAV_NON_STREAMING_BATCH_SIZE
+
+            self._max_decode_rows = MAX_CODE2WAV_NON_STREAMING_BATCH_SIZE
 
     def _apply_cudnn_dtype_workaround(self, vllm_config: VllmConfig) -> None:
         """Promote this decoder on the exact stack reported in issue #8935."""
@@ -282,6 +289,7 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
         codec_left_context_frames: int = 0,
         extra_capture_sizes: Iterable[int] = (),
         streaming_batch_sizes: Iterable[int] = (),
+        npu_graph_shapes: Iterable[tuple[int, int]] = (),
     ):
         """Enable CUDA graph acceleration (same pattern as Qwen3-TTS Code2Wav).
 
@@ -291,7 +299,8 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
         captures multi-row graphs for every bucket up to one streaming window
         (chunk + left context); a streaming batch is then decoded as a few
         length groups (``plan_decode_groups``) instead of one eager call
-        padded to its longest row.
+        padded to its longest row. On NPU only ``npu_graph_shapes`` are
+        captured, exactly and before serving; other shapes run eagerly.
         """
         from vllm_omni.model_executor.models.qwen3_tts.cuda_graph_decoder_wrapper import (
             CUDAGraphDecoderWrapper,
@@ -299,6 +308,24 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
 
         if device is None:
             device = next(self.parameters()).device
+        if device.type == "npu":
+            from vllm_omni.platforms.npu.models.code2wav_graph import (
+                NPUGraphDecoderWrapper,
+                prepare_code2wav_graph_runtime,
+            )
+
+            prepare_code2wav_graph_runtime()
+            shapes = list(npu_graph_shapes)
+            npu_wrapper = NPUGraphDecoderWrapper(self, self.config.num_quantizers)
+            npu_wrapper.warmup(device, shapes)
+            self._cudagraph_wrapper = npu_wrapper
+            self._cudagraph_enabled = True
+            logger.info(
+                "Code2Wav NPUGraph captured %d exact shapes before serving: %s; other shapes run eagerly.",
+                len(shapes),
+                shapes,
+            )
+            return
         if device.type != "cuda":
             logger.warning("Cannot enable CUDA Graph: not on CUDA device (got %s)", device)
             return
@@ -357,7 +384,25 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
             extra_shapes,
         )
 
-    def forward(self, codes: torch.Tensor) -> torch.Tensor:
+    def _graph_attention_mask(self, hidden: torch.Tensor) -> dict[str, torch.Tensor]:
+        # Codec inputs are contiguous, unpadded sequences without a KV
+        # cache. Explicit masks avoid HF packed-sequence detection reading
+        # device values on the host during NPUGraph capture.
+        positions = torch.arange(hidden.shape[1], device=hidden.device)
+        distance = positions[:, None] - positions[None, :]
+        allowed = distance >= 0
+        full_mask = torch.zeros(distance.shape, dtype=hidden.dtype, device=hidden.device)
+        full_mask.masked_fill_(~allowed, torch.finfo(hidden.dtype).min)
+        attention_mask = {"full_attention": full_mask[None, None]}
+        if self.pre_transformer.has_sliding_layers:
+            sliding_mask = torch.zeros_like(full_mask)
+            sliding_mask.masked_fill_(
+                ~(allowed & (distance < self.config.sliding_window)), torch.finfo(hidden.dtype).min
+            )
+            attention_mask["sliding_attention"] = sliding_mask[None, None]
+        return attention_mask
+
+    def forward(self, codes: torch.Tensor, *, graph_safe_mask: bool = False) -> torch.Tensor:
         """
         Convert num_quantizers-layer RVQ codes to audio waveform.
 
@@ -376,7 +421,8 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
         # Shape: [batch, seq_len, hidden_size]
 
         # Stage 2: Pre-Transformer (add temporal context)
-        hidden = self.pre_transformer(inputs_embeds=hidden).last_hidden_state
+        attention_mask = self._graph_attention_mask(hidden) if graph_safe_mask else None
+        hidden = self.pre_transformer(inputs_embeds=hidden, attention_mask=attention_mask).last_hidden_state
         # Shape: [batch, seq_len, hidden_size]
 
         # Algorithm search happens during eager warmup before graph capture.
@@ -444,6 +490,23 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
                 codes. For ``batch_size == 1``, this is a list containing a
                 single tensor with shape ``[1, waveform_len]``.
         """
+        max_rows = self._max_decode_rows
+        if max_rows is not None and codes.shape[0] > max_rows:
+            # Keep temporal chunking and short-output trimming unchanged.
+            # Bound eager execution too, including uncaptured tail windows.
+            return [
+                wav
+                for start in range(0, codes.shape[0], max_rows)
+                for wav in self.chunked_decode(
+                    codes[start : start + max_rows],
+                    chunk_size=chunk_size,
+                    left_context_size=left_context_size,
+                    seq_token_counts=(
+                        seq_token_counts[start : start + max_rows] if seq_token_counts is not None else None
+                    ),
+                )
+            ]
+
         # Use CUDA graph wrapper for chunk-level decode when available
         if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
             batch_wav = self._cudagraph_wrapper.chunked_decode_with_cudagraph(codes, chunk_size, left_context_size)
