@@ -324,14 +324,18 @@ class LazyWeightMixin:
     supports_offload_after_quant: bool = True
     _offload_after_quant: bool = False
 
-    def enable_offload_after_quant(self) -> None:
+    def enable_offload_after_quant(self, layer: torch.nn.Module | None = None) -> None:
         """Return each layer to host memory as soon as it has been quantized.
 
         Caps the load-time device footprint at one layer instead of the whole
         model. A quant method instance belongs to a single layer, so this is not
-        a global switch.
+        a global switch. When the layer is provided, install parameter load
+        tracking before the checkpoint is read so bias-first checkpoints can
+        still finalize as soon as their weight arrives.
         """
         self._offload_after_quant = True
+        if layer is not None:
+            self._install_bias_load_tracking(layer)
 
     def _lazy_load_device(self) -> torch.device:
         """Device the meta weight materializes on at first load.
