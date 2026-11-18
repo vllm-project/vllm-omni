@@ -428,7 +428,17 @@ def _validation_pipeline():
     pipeline.default_video_shift = 12.0
     pipeline.default_audio_shift = 3.0
     pipeline.device = torch.device("cpu")
-    pipeline.od_config = SimpleNamespace()
+    # v0.34 alignment (#10365) reads these config attributes directly, so the
+    # test fixture must carry them (the production code no longer uses
+    # defensive getattr for step_execution / attention schedule fields).
+    pipeline.od_config = SimpleNamespace(
+        step_execution=False,
+        diffusion_attention_schedule=None,
+        attention_sigma_schedule=None,
+        controlnet_model_path=None,
+        cache_backend=None,
+        additional_config=None,
+    )
     pipeline._base_schedule_by_partition = {"t2va": None, "fl2va": None, "ref2va": None}
     pipeline.load_text_encoder = False
     pipeline.load_vae_encoder = False
