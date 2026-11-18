@@ -100,11 +100,12 @@ def test_active_fused_decode_checks_shadow_before_commit(tmp_path, monkeypatch, 
     commit = Mock(return_value="optimized")
     monkeypatch.setattr(talker_fused_decode, "commit", commit)
     batch = Mock(spec=["num_reqs"], num_reqs=1)
-    args = (runner, mode, None, {}, batch, None)
-    assert talker_fused_decode.run_fused_step(*args) == "reference"
+    assert talker_fused_decode.run_fused_step(runner, mode, None, {}, batch, None) == "reference"
     shadow_check.assert_called_once()
     commit.assert_not_called()
-    assert talker_fused_decode.run_fused_step(*args) == ("optimized" if matches else "reference")
+    assert talker_fused_decode.run_fused_step(runner, mode, None, {}, batch, None) == (
+        "optimized" if matches else "reference"
+    )
     assert commit.call_count == int(matches)
     assert graph.run.call_count == (2 if matches else 1)
 

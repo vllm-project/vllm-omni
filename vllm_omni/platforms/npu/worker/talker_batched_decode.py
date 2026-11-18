@@ -79,7 +79,7 @@ class CompactGraph:
         self.capacity = capacity
         self.desc = BatchDescriptor(num_tokens=rows)
         self.graph = None
-        self.down_projections = ()
+        self.down_projections: tuple[torch.nn.Module, ...] = ()
         self.fixed_down_lanes = fixed_down_lanes
         self.fused_rope = fused_rope
         if rows > 4:
