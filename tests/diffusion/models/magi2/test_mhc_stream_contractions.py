@@ -11,6 +11,9 @@ import torch
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.layers.mhc import MHCMix
 from vllm_omni.diffusion.models.magi2 import layers
+from vllm_omni.diffusion.models.magi2.common_layers import ModalityDispatcher
+from vllm_omni.diffusion.models.magi2.layers.musa.mhc import MHCHandler as MUSAMHCHandler
+from vllm_omni.diffusion.models.magi2.layers.native import mhc as mhc_module
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
 
@@ -29,8 +32,8 @@ U32 = 2.0**-24
 
 
 def _handler(monkeypatch, musa):
-    monkeypatch.setattr(layers.current_omni_platform, "is_musa", lambda: musa)
-    return layers.MHCHandler(STREAMS, HIDDEN)
+    handler = MUSAMHCHandler if musa else mhc_module.MHCHandler
+    return handler(STREAMS, HIDDEN)
 
 
 def _pre_inputs(dtype, tokens=37, seed=5):
@@ -102,8 +105,8 @@ def test_compiled_mix_selection(monkeypatch, musa):
 
         return wrapped
 
-    monkeypatch.setattr(layers, "_mhc_mix_fp32", record("fp32", layers._mhc_mix_fp32))
-    monkeypatch.setattr(layers._mhc_mix, "forward_native", record("native", MHCMix.forward_native))
+    monkeypatch.setattr(mhc_module, "_mhc_mix_fp32", record("fp32", mhc_module._mhc_mix_fp32))
+    monkeypatch.setattr(mhc_module._mhc_mix, "forward_native", record("native", MHCMix.forward_native))
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     streams, branch_output, post, residual = _mix_inputs(torch.float32)
     handler.hyper_connect(streams, branch_output, post, residual)
@@ -130,8 +133,7 @@ def test_musa_apply_pre_is_an_fp32_contraction(monkeypatch, dtype):
 @pytest.mark.cpu
 @pytest.mark.parametrize("case", ["float64", "mixed_dtype", "broadcast_tokens", "single_stream", "extra_rank"])
 def test_musa_apply_pre_keeps_the_einsum_contract_elsewhere(monkeypatch, case):
-    monkeypatch.setattr(layers.current_omni_platform, "is_musa", lambda: True)
-    handler = layers.MHCHandler(1 if case == "single_stream" else STREAMS, HIDDEN)
+    handler = MUSAMHCHandler(1 if case == "single_stream" else STREAMS, HIDDEN)
     streams, (alpha, bias, logits) = _pre_inputs(torch.float64 if case == "float64" else torch.float32)
     if case == "single_stream":
         streams, bias, logits = streams[:, :1], bias[:1], logits[:, :1]
@@ -155,7 +157,7 @@ def test_musa_apply_pre_keeps_the_einsum_contract_elsewhere(monkeypatch, case):
 @pytest.mark.cpu
 def test_musa_mix_keeps_float64(monkeypatch):
     streams, branch_output, post, residual = _mix_inputs(torch.float64)
-    mixed = layers._mhc_mix_fp32(streams, branch_output, torch.zeros_like(post), residual)
+    mixed = mhc_module._mhc_mix_fp32(streams, branch_output, torch.zeros_like(post), residual)
     assert mixed.dtype == torch.float64
     torch.testing.assert_close(mixed, torch.einsum("tij,tjc->tic", residual, streams), rtol=1e-12, atol=1e-12)
 
@@ -178,12 +180,12 @@ def test_musa_compute_logits_splits_k_by_stream(monkeypatch):
 def test_musa_mix_is_an_fp32_contraction(dtype):
     streams, branch_output, post, residual = _mix_inputs(dtype)
     # Zero post coefficients isolate the stream mix; a zero matrix isolates the branch term.
-    mixed = layers._mhc_mix_fp32(streams, branch_output, torch.zeros_like(post), residual)
+    mixed = mhc_module._mhc_mix_fp32(streams, branch_output, torch.zeros_like(post), residual)
     assert mixed.dtype == dtype
     products = residual.double().unsqueeze(-1) * streams.double().unsqueeze(1)
     _assert_within(mixed, products.sum(2), products.abs().sum(2), STREAMS, dtype)
 
-    branch = layers._mhc_mix_fp32(streams, branch_output, post, torch.zeros_like(residual))
+    branch = mhc_module._mhc_mix_fp32(streams, branch_output, post, torch.zeros_like(residual))
     torch.testing.assert_close(branch, torch.einsum("tn,tc->tnc", post, branch_output), rtol=0, atol=0)
 
 
@@ -223,7 +225,7 @@ def test_musa_device_contractions_are_as_accurate_as_einsum(dtype):
 
     streams, branch_output, post, residual = (tensor.to("musa") for tensor in _mix_inputs(dtype, tokens=1031))
     with torch.no_grad():
-        mixed = layers._mhc_mix_fp32(streams, branch_output, torch.zeros_like(post), residual)
+        mixed = mhc_module._mhc_mix_fp32(streams, branch_output, torch.zeros_like(post), residual)
         einsum_mixed = torch.einsum("tij,tjc->tic", residual, streams)
     reference = (residual.double().cpu().unsqueeze(-1) * streams.double().cpu().unsqueeze(1)).sum(2)
     einsum_mix_error = (einsum_mixed.double().cpu() - reference).abs().max()
@@ -244,7 +246,7 @@ def _norm(group_sizes, hidden=HIDDEN, seed=8, device="cpu"):
     if len(group_sizes) == 1:
         return norm
     modalities = torch.cat([torch.full((size,), index, dtype=torch.int32) for index, size in enumerate(group_sizes)])
-    dispatcher = layers.ModalityDispatcher(modalities.to(device), len(group_sizes))
+    dispatcher = ModalityDispatcher(modalities.to(device), len(group_sizes))
     return lambda tensor: norm(tensor, dispatcher)
 
 

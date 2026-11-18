@@ -154,6 +154,7 @@ Content-Type: application/json
 | `extra_params` | object | null | Model-specific generation controls. See the model sections for supported fields. |
 | `stream` | bool | false | When true, stream OpenAI `speech.audio.*` SSE events (requires `response_format="pcm"` or `"wav"`). For raw PCM/WAV byte streaming, set `stream_format="audio"`. |
 | `stream_format` | string | null | Streaming output format. `"audio"` streams raw audio bytes as they are decoded; `"sse"` streams OpenAI `speech.audio.*` Server-Sent Events. If omitted, `stream=true` selects SSE and `stream=false` remains non-streaming. See [Response Format](#response-format). |
+| `cache_salt` | string | null | Caller-supplied prefix-cache salt namespace. Composed with the server-derived conditioning identity (adapter-computed or the derived default), so callers narrow sharing (tenants, sessions) without dropping voice/input isolation. |
 
 **Supported languages:** Only applicable to Qwen3-TTS. Derived from the model configuration (`talker_config.codec_language_id` in the checkpoint's `config.json`), plus `Auto`, which is always accepted. Official Qwen3-TTS checkpoints support: Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian.
 
@@ -184,7 +185,31 @@ response headers:
 | `x-vllm-omni-input-audio-tokens` | Reference-audio codec frames, non-zero only for in-context voice cloning. |
 
 Diffusion-mode speech servers route through a separate response path and do not
-emit these headers.
+emit these usage headers. They do report the audio format headers described
+below.
+
+#### Truncated audio
+
+Generation can stop at its token budget (`max_new_tokens` or the model's
+context window) before the model ends the speech, so the audio may stop
+mid-sentence. Models that report this set `x-audio-truncated` on non-streaming
+responses and `truncated` on the SSE `speech.audio.done` event:
+
+- `true`: generation stopped at its budget. To get the rest, raise
+  `max_new_tokens` or split the text.
+- `false`: the model ended the speech itself.
+- absent: the model does not report truncation, or the server did not record
+  why generation stopped. This does not mean the audio is complete.
+
+Models that report it today: Qwen3-TTS, Breeze-TTS-2, Fish Audio Drama 3 and
+YuE2 (YuE2 on non-streaming responses only, from its own metadata). Qwen3-TTS
+rejects some truncated generations with an error instead (Base task requests,
+and requests whose budget the server sizes from the text), so those never
+return audio.
+
+Raw audio streams (`stream_format="audio"`) send their headers before
+generation ends, and the batch endpoint and WebSocket streaming do not carry the
+flag; use a non-streaming request or the SSE stream to detect truncation.
 
 **Raw audio stream** (`stream_format="audio"`). Streams raw audio bytes (PCM or
 WAV) as they are decoded.
@@ -198,6 +223,7 @@ response headers:
 | --- | --- |
 | `x-audio-sample-rate` | Sample rate of the returned audio in Hz (after any `sample_rate` resampling). |
 | `x-audio-channels` | Channel count of the returned audio. |
+| `x-audio-duration-seconds` | Duration of the returned audio in seconds, to three decimals. Non-streaming responses only: a raw stream sends its headers before the audio is generated, so it cannot report a duration. A clip that encoded to zero frames reports `0.000`; the header is omitted only when no duration is known. |
 
 Both streaming modes (`stream_format="audio"` and `"sse"`) require
 `response_format="pcm"` or `"wav"`, and `speed` must be `1.0` (or omitted).
@@ -216,11 +242,13 @@ Each event has an `event:` line and a JSON `data:` line:
     `sample_rate` and `channels` extend the OpenAI event and describe the
     decoded chunk.
 
-- `speech.audio.done` — terminal event, carrying token `usage`:
+- `speech.audio.done` — terminal event, carrying the generated audio `duration`
+  and token `usage`:
 
     ```json
     {
         "type": "speech.audio.done",
+        "duration": 3.2,
         "usage": {
             "input_tokens": 119,
             "output_tokens": 77,
@@ -229,6 +257,17 @@ Each event has an `event:` line and a JSON `data:` line:
         }
     }
     ```
+
+    `duration` extends the OpenAI event: it is the total length in seconds of
+    the audio already sent as `speech.audio.delta` events. Non-streaming
+    responses report the same value in the `x-audio-duration-seconds` header.
+    Like that header, it is `0.0` when the encoder reports zero frames and is
+    absent when no duration is known: empty chunks are skipped before encoding,
+    so a stream with no audio reports no duration rather than `0.0`.
+
+    `truncated` extends the OpenAI event for models that report truncation:
+    `true` if generation stopped at its token budget before the model ended
+    the speech. See [Truncated audio](#truncated-audio).
 
 - `speech.audio.error` — emitted instead of `speech.audio.done` if generation fails:
 
@@ -284,7 +323,7 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
 
 | Parameter | Type | Required | Description |
 | ----------- | ------ | ---------- | ------------- |
-| `audio_sample` | file | Yes | Audio file (max 10MB, supported formats: wav, mp3, flac, ogg, aac, webm, mp4) |
+| `audio_sample` | file | Yes | Audio file (max 10MB, supported formats: wav, mp3, flac, ogg, aac, webm). MP4/M4A is **not** supported — extract the audio track as WAV first, e.g. `ffmpeg -i clip.mp4 -vn -ar 48000 -ac 1 -sample_fmt s16 clip.wav`. |
 | `consent` | string | Yes | Consent recording ID |
 | `name` | string | Yes | Name for the new voice |
 | `ref_text` | string | No | Transcript of the audio. When provided, enables in-context voice cloning (higher quality). Without it, only the speaker embedding is extracted. |
@@ -1035,6 +1074,11 @@ Voice cloning uses the supplied or automatically transcribed reference text and 
 | Model | Description |
 | ------- | ------------- |
 | `openbmb/VoxCPM2` | TTS + voice cloning with built-in speaker presets and uploaded-voice support. Accepts `voice` (preset or uploaded) or `ref_audio` + optional `ref_text`. |
+
+VoxCPM2 accepts a single `ref_audio` URI using `http`, `https`, `data`, or
+`file`. Nonempty reference lists and unsupported URI schemes return HTTP 400
+before reference-audio resolution; the shared request schema still supports
+lists for models with multi-reference conditioning.
 
 #### Startup LoRA adapter
 

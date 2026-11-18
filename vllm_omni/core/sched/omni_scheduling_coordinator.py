@@ -15,6 +15,7 @@ from typing import Any
 from vllm.logger import init_logger
 from vllm.v1.request import Request, RequestStatus
 
+from vllm_omni.core.sched.duplex_stage_work import set_request_perf_chunk
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
 from vllm_omni.outputs import SchedulingMetadataUpdate
 
@@ -88,6 +89,11 @@ class OmniSchedulingCoordinator:
         # detect orphaned waits.
         self._waiting_since: dict[str, float] = {}
 
+    @property
+    def receives_chunks(self) -> bool:
+        """Whether this coordinator receives streamed input from upstream."""
+        return self._stage_id > 0 and self._async_chunk
+
     # ------------------------------------------------------------------ #
     #  Core scheduling methods
     # ------------------------------------------------------------------ #
@@ -107,7 +113,7 @@ class OmniSchedulingCoordinator:
             chunk_ready_req_ids: IDs with a newly arrived chunk this cycle.
             chunk_finished_req_ids: IDs whose final chunk has arrived.
         """
-        if self._stage_id == 0 or not self._async_chunk:
+        if not self.receives_chunks:
             return
 
         self.finished_requests.update(chunk_finished_req_ids)
@@ -323,7 +329,8 @@ class OmniSchedulingCoordinator:
                     new_prompt = [0] * next_len
                     request.prompt_token_ids = new_prompt
                     request.num_prompt_tokens = next_len
-                    request._all_token_ids.clear()
+                    # TokenBuffer (array) has no .clear(); del-slice like the pin.
+                    del request._all_token_ids[:]
                     request._all_token_ids.extend(new_prompt)
                     request._output_token_ids.clear()
                     request.num_computed_tokens = 0
@@ -332,10 +339,12 @@ class OmniSchedulingCoordinator:
             prompt_token_ids = list(update.prompt_token_ids)
             request.prompt_token_ids = prompt_token_ids
             request.num_prompt_tokens = len(prompt_token_ids)
-            request._all_token_ids.clear()
+            # TokenBuffer (array) has no .clear(); del-slice like the pin.
+            del request._all_token_ids[:]
             request._all_token_ids.extend(prompt_token_ids)
             request._output_token_ids.clear()
             request.num_computed_tokens = 0
+        set_request_perf_chunk(request, update.duplex_perf_chunk)
 
     def postprocess_scheduler_output(
         self,
@@ -415,6 +424,7 @@ class OmniSchedulingCoordinator:
                         OmniChunkRecvHandle(
                             request_id=request.request_id,
                             external_req_id=request.external_req_id,
+                            payload_sender_info=getattr(request, "payload_sender_info", None),
                         )
                     )
                     request.status = RequestStatus.WAITING_FOR_CHUNK

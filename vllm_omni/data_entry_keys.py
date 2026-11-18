@@ -24,12 +24,54 @@ FIRST_AUDIO_KEY = "_omni_first_audio"
 FIRST_AUDIO_REQUIRED_KEY = "_omni_first_audio_required"
 
 REQUEST_ARTIFACT_DIRS_KEY = "_omni_request_artifact_dirs"
+# Routing tag: the stage returns its full payload on its output instead of sending it to the
+# next stage. Set on run requests whose next stage takes a full payload.
+RETURN_STAGE_PAYLOAD_KEY = "omni_return_stage_payload"
 TRANSFORM_OWNED_META_KEYS = frozenset({"minimax_h3_prepared_reference_videos"})
 # Prefix of the flat ``f"{NS}.<name>"`` additional_information keys that carry
 # an async-chunk placeholder's prewarm payload. Values stay top-level tensors or
 # scalars (a dict holding a tensor would come back as a list); the receiving
 # scheduler pops these keys before the request reaches the model.
 ASYNC_CHUNK_PREWARM_NS = "_async_chunk_prewarm"
+# Last-sentence Talker unpark: the next 2150 is Code2Wav's request terminal.
+# Duplex sentence TTS stamps this; independent Qwen3-TTS never does.
+JOYAI_FINISH_ON_NEXT_STOP_KEY = "joyai_finish_on_next_stop"
+
+
+def payload_flag_is_set(info: object, key: str) -> bool:
+    """True when ``key`` is set on nested ``meta``, dotted ``meta.key``, or top-level.
+
+    EngineCore may keep a plain dict or an ``AdditionalInformationPayload`` after
+    serialize_payload / to_struct.
+    """
+    dotted = f"meta.{key}"
+
+    def _truthy(value: object) -> bool:
+        return value is True or value == 1
+
+    if isinstance(info, dict):
+        meta = info.get("meta")
+        if isinstance(meta, dict) and _truthy(meta.get(key)):
+            return True
+        return _truthy(info.get(key)) or _truthy(info.get(dotted))
+    entries = getattr(info, "entries", None)
+    if not isinstance(entries, dict):
+        return False
+    for lookup in (dotted, key):
+        entry = entries.get(lookup)
+        if entry is not None and _truthy(getattr(entry, "scalar_data", None)):
+            return True
+    return False
+
+
+def request_flag_is_set(request: object, key: str) -> bool:
+    """True when ``_{key}`` is on the request or ``key`` is in its serialized info."""
+    if bool(getattr(request, f"_{key}", False)):
+        return True
+    return payload_flag_is_set(getattr(request, "additional_information", None), key) or payload_flag_is_set(
+        getattr(request, "model_intermediate_buffer", None), key
+    )
+
 
 if TYPE_CHECKING:
     from vllm_omni.engine import AdditionalInformationEntry, AdditionalInformationPayload
@@ -120,6 +162,11 @@ class OmniPayloadMeta(TypedDict, total=False):
     ref_context_request_id: str
     ref_context_included: bool
     talker_prefill_offset: int
+    # JoyAI last-sentence Talker unpark: this 2150 is Code2Wav's request terminal.
+    joyai_finish_on_next_stop: bool
+    # embed.prefill also holds the accept-layer hidden state at multimodal
+    # placeholder rows, so no hidden_states.output is sent (Qwen3-Omni chunk 0).
+    prefill_holds_accept_hidden: bool
     omni_final_stage_id: int
     # Per-request audio seed. Stages that draw their own noise (flow-matching
     # / diffusion decoders) need the producing stage's seed to stay
@@ -128,6 +175,11 @@ class OmniPayloadMeta(TypedDict, total=False):
     audio_seed: int
     token_role_ids: torch.Tensor
     minimax_h3_prepared_reference_videos: str
+    decode_span: bool
+    # Talker runtime state only: MRv1's indexed cache has become a pending queue.
+    decode_span_queue_started: bool
+    committed_token_count: int
+    consumed_input_span: bool
 
 
 class OmniPayload(TypedDict, total=False):
@@ -243,6 +295,9 @@ class MetaStruct(_StructBase):
     ref_context_request_id: str | None = None
     ref_context_included: bool | None = None
     talker_prefill_offset: int | None = None
+    # Last JoyAI spoken sentence: Talker's coming 2150 finishes Code2Wav.
+    joyai_finish_on_next_stop: bool | None = None
+    prefill_holds_accept_hidden: bool | None = None
     codec_chunk_frames: int | None = None
     codec_left_context_frames: int | None = None
     code_flat_numel: int | None = None
@@ -256,6 +311,12 @@ class MetaStruct(_StructBase):
     # derives one segment's n_k as the increase between consecutive segment
     # boundaries; the value itself is not segment-local.
     request_text_tokens: int | None = None
+    # Duplex session stats (RFC #8325): [epoch, seq] of the chunk the sending
+    # request worked on, stamped by the chunk transfer adapter.
+    duplex_perf_chunk: list[int] | None = None
+    decode_span: bool | None = None
+    committed_token_count: int | None = None
+    consumed_input_span: bool | None = None
 
 
 class OmniPayloadStruct(_StructBase):
@@ -488,3 +549,18 @@ def deserialize_payload(
             flat[key] = entry.scalar_data
 
     return unflatten_payload(flat)  # type: ignore[return-value]
+
+
+def returns_stage_payload(tags: Mapping[str, object] | AdditionalInformationPayload | None) -> bool:
+    """Return whether a request's routing tags ask its stage to return its full payload.
+
+    NOTE: Currently we support reading the serialized or deserialized format for compatibility
+    with both model runner v1 & v2.
+    """
+    if tags is None:
+        return False
+    if isinstance(tags, Mapping):
+        return bool(tags.get(RETURN_STAGE_PAYLOAD_KEY))
+    # Serialized tags: read the one scalar without decoding the payload's tensors.
+    entry = tags.entries.get(RETURN_STAGE_PAYLOAD_KEY)
+    return entry is not None and bool(entry.scalar_data)

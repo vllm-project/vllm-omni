@@ -95,6 +95,25 @@ payload schemas, public protocol rendering, connector transport, or semantic
 error classification. Those responsibilities belong to the stage runtime,
 I/O, entrypoint, connector, and error contracts.
 
+## Stage-0 multimodal preprocessing caches
+
+One frontend can route requests to multiple stage-0 replicas, each with its
+own receiver cache. OpenAI chat requests pass through the frontend renderer
+before replica selection, so a frontend cache hit must still supply tensors
+to a replica that has never received that media or has evicted it.
+
+During stage-0 input-processor construction, replicated deployments select
+the renderer's upstream processor-only cache instead of its LRU or SHM sender
+cache. Distributed frontends select this policy at startup even with zero or
+one initial replica, allowing later joins without switching a live cache.
+Preprocessing results remain reusable; frontend tensor storage and tensor
+transfer per request increase. Local single-replica deployments and disabled
+or already processor-only caches retain their existing behavior. Renderer
+resource cleanup remains owned by upstream vLLM.
+
+`tests/engine/test_stage0_multimodal_cache.py` exercises startup selection,
+repeated media across independent receivers, eviction, and late joins.
+
 ## Candidate invariants
 
 These identifiers are proposals while the document is `draft`.

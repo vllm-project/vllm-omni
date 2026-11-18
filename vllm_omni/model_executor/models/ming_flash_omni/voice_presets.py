@@ -37,6 +37,8 @@ class InvalidPromptWavError(ValueError):
 class VoicePresetRegistry:
     """Loader and registry for Ming voice presets."""
 
+    REFERENCE_CACHE_SIZE = 16
+
     def __init__(
         self,
         *,
@@ -79,7 +81,7 @@ class VoicePresetRegistry:
             paths = self._normalize_paths("request", prompt_wav_path)
             cache_key = (tuple((p, os.stat(p).st_mtime_ns) for p in paths), need_speaker, need_latents)
             if cache_key in self._reference_cache:
-                return self._reference_cache[cache_key]
+                return self._cache_hit(cache_key)
             reference_audio = []
             for path in paths:
                 data, sr = sf.read(path, dtype="float32")
@@ -99,7 +101,7 @@ class VoicePresetRegistry:
                 digest.update(waveform.numpy().tobytes())
             cache_key = (("samples", digest.hexdigest()), need_speaker, need_latents)
             if cache_key in self._reference_cache:
-                return self._reference_cache[cache_key]
+                return self._cache_hit(cache_key)
         if not reference_audio:
             raise ValueError("Reference audio is missing")
         speech = []
@@ -127,10 +129,16 @@ class VoicePresetRegistry:
             latents, projected = self._build_wav_embeddings("request", torch.cat(speech, dim=-1), device=device)
         resolved = {"spk_emb": embeddings, "prompt_wav_lat": latents, "prompt_wav_emb": projected}
         if cache_key is not None:
-            # Bound retained GPU reference features for long evaluation jobs.
-            if len(self._reference_cache) >= 16:
+            # Evict the least recently used reference. Retained GPU features
+            # can include latents and projections whose size depends on audio length.
+            if len(self._reference_cache) >= self.REFERENCE_CACHE_SIZE:
                 self._reference_cache.pop(next(iter(self._reference_cache)))
             self._reference_cache[cache_key] = resolved
+        return resolved
+
+    def _cache_hit(self, cache_key: tuple) -> dict[str, Any]:
+        resolved = self._reference_cache.pop(cache_key)
+        self._reference_cache[cache_key] = resolved
         return resolved
 
     def __contains__(self, voice_name: str) -> bool:

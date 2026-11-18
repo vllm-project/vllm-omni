@@ -25,6 +25,11 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
 )
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+    set_forward_context_denoise_step_idx,
+)
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.qwen_image_21.qwen_image_21_transformer import QwenImage21KVCache
 
@@ -122,6 +127,8 @@ class QwenImage21CFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
         Returns:
             Denoised latents
         """
+        forward_context = get_forward_context() if is_forward_context_available() else None
+        previous_step = forward_context.denoise_step_idx if forward_context is not None else None
         try:
             # Fresh cache for every generation: the pipeline is a singleton shared
             # across requests, so cache state must never leak between them.
@@ -141,6 +148,8 @@ class QwenImage21CFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
                     if self.interrupt:
                         continue
                     self._current_timestep = t
+                    # Both CFG branches share this zero-based step selector.
+                    set_forward_context_denoise_step_idx(i)
 
                     # Broadcast timestep to match batch size
                     timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
@@ -196,4 +205,7 @@ class QwenImage21CFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
 
             return latents
         finally:
+            if forward_context is not None:
+                # Restore the selector only; paged-KV activation belongs to the worker.
+                forward_context.denoise_step_idx = previous_step
             self.transformer.release_request_geometry()

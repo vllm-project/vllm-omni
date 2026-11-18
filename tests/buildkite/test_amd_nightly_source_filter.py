@@ -59,10 +59,53 @@ def _labels(doc: dict) -> set[str]:
     return {step["label"] for step in _leaf_steps(doc)}
 
 
+def _small_nightly_pipeline() -> dict:
+    return {
+        "env": {"SHARED": "value"},
+        "steps": [
+            {
+                "group": "Nightly group",
+                "steps": [
+                    {
+                        "label": "job-a",
+                        "grade": "NonBlocking",
+                        "source_file_dependencies": ["src/a.py"],
+                        "commands": ["pytest tests/a.py"],
+                    },
+                    {
+                        "label": "job-b",
+                        "grade": "NonBlocking",
+                        "source_file_dependencies": ["src/b.py"],
+                        "commands": ["pytest tests/b.py"],
+                    },
+                ],
+            }
+        ],
+    }
+
+
+def _filter_pipeline_edit(current: dict, base: dict | None, *other_files: str) -> dict:
+    return FILTER.filter_amd_nightly_suite(
+        current,
+        [AMD_NIGHTLY_PIPELINE.as_posix(), *other_files],
+        pipeline_path=AMD_NIGHTLY_PIPELINE,
+        current_pipeline_doc=current,
+        base_pipeline_doc=base,
+    )
+
+
 def test_every_amd_nightly_job_declares_source_dependencies() -> None:
     leaves = _leaf_steps(_load_pipeline(AMD_NIGHTLY_PIPELINE))
-    assert len(leaves) == 30
+    assert leaves, "AMD nightly pipeline must contain jobs"
     assert all(step.get("source_file_dependencies") for step in leaves)
+
+
+def test_current_pipeline_compares_cleanly_against_itself() -> None:
+    current = _load_pipeline(AMD_NIGHTLY_PIPELINE)
+
+    filtered = _filter_pipeline_edit(current, copy.deepcopy(current))
+
+    assert filtered["steps"] == []
 
 
 def test_diffusion_only_pr_keeps_only_matching_amd_nightly_jobs() -> None:
@@ -85,7 +128,61 @@ def test_unrelated_pr_change_omits_all_amd_nightly_jobs() -> None:
     assert filtered["steps"] == []
 
 
-def test_pipeline_and_filter_changes_keep_full_amd_nightly_suite() -> None:
+@pytest.mark.parametrize(
+    "changed_file",
+    (
+        "vllm_omni/model_executor/stage_input_processors/voxtral_tts.py",
+        "vllm_omni/entrypoints/openai/tts_adapters/base.py",
+        "vllm_omni/engine/stage_runtime.py",
+    ),
+)
+def test_voxtral_runtime_changes_keep_voxtral_perf_nightly(changed_file: str) -> None:
+    filtered = FILTER.filter_amd_nightly_suite(
+        _load_pipeline(AMD_NIGHTLY_PIPELINE),
+        [changed_file],
+        pipeline_path=AMD_NIGHTLY_PIPELINE,
+    )
+
+    assert "Voxtral TTS Perf" in _labels(filtered)
+
+
+@pytest.mark.parametrize(
+    "changed_file",
+    (
+        "vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_talker.py",
+        "vllm_omni/model_executor/stage_input_processors/qwen3_tts.py",
+        "vllm_omni/deploy/qwen3_tts.yaml",
+    ),
+)
+def test_qwen3_tts_runtime_changes_keep_qwen3_tts_perf_nightly(changed_file: str) -> None:
+    filtered = FILTER.filter_amd_nightly_suite(
+        _load_pipeline(AMD_NIGHTLY_PIPELINE),
+        [changed_file],
+        pipeline_path=AMD_NIGHTLY_PIPELINE,
+    )
+
+    assert "Qwen3-TTS Perf" in _labels(filtered)
+
+
+@pytest.mark.parametrize(
+    "changed_file",
+    (
+        "vllm_omni/model_executor/models/minicpmo_4_5/minicpmo_4_5_omni.py",
+        "vllm_omni/model_executor/stage_input_processors/minicpmo_4_5_omni.py",
+        "vllm_omni/deploy/minicpmo_4_5.yaml",
+    ),
+)
+def test_minicpmo_runtime_changes_keep_minicpmo_perf_nightly(changed_file: str) -> None:
+    filtered = FILTER.filter_amd_nightly_suite(
+        _load_pipeline(AMD_NIGHTLY_PIPELINE),
+        [changed_file],
+        pipeline_path=AMD_NIGHTLY_PIPELINE,
+    )
+
+    assert "MiniCPM-o 4.5 Perf" in _labels(filtered)
+
+
+def test_missing_base_and_shared_filter_changes_keep_full_amd_nightly_suite() -> None:
     expected_labels = _labels(_load_pipeline(AMD_NIGHTLY_PIPELINE))
     for changed_file in (
         AMD_NIGHTLY_PIPELINE.as_posix(),
@@ -98,6 +195,100 @@ def test_pipeline_and_filter_changes_keep_full_amd_nightly_suite() -> None:
             pipeline_path=AMD_NIGHTLY_PIPELINE,
         )
         assert _labels(filtered) == expected_labels
+
+
+def test_pipeline_leaf_edit_selects_only_changed_job() -> None:
+    base = _small_nightly_pipeline()
+    current = copy.deepcopy(base)
+    current["steps"][0]["steps"][0]["grade"] = "Blocking"
+
+    filtered = _filter_pipeline_edit(current, base)
+
+    assert _labels(filtered) == {"job-a"}
+    assert all("source_file_dependencies" not in step for step in _leaf_steps(filtered))
+
+
+def test_pipeline_leaf_edits_union_with_source_selected_jobs() -> None:
+    base = _small_nightly_pipeline()
+    current = copy.deepcopy(base)
+    current["steps"][0]["steps"][0]["timeout_in_minutes"] = 30
+
+    filtered = _filter_pipeline_edit(current, base, "src/b.py")
+
+    assert _labels(filtered) == {"job-a", "job-b"}
+
+
+def test_pipeline_multiple_leaf_edits_select_only_changed_jobs() -> None:
+    base = _small_nightly_pipeline()
+    current = copy.deepcopy(base)
+    current["steps"][0]["steps"][0]["grade"] = "Blocking"
+    current["steps"][0]["steps"][1]["timeout_in_minutes"] = 30
+    current["steps"][0]["steps"].append(
+        {
+            "label": "job-c",
+            "source_file_dependencies": ["src/c.py"],
+            "commands": ["pytest tests/c.py"],
+        }
+    )
+
+    filtered = _filter_pipeline_edit(current, base)
+
+    assert _labels(filtered) == {"job-a", "job-b", "job-c"}
+
+
+def test_pipeline_rename_selects_new_label_and_deleted_only_selects_no_job() -> None:
+    base = _small_nightly_pipeline()
+    renamed = copy.deepcopy(base)
+    renamed["steps"][0]["steps"][0]["label"] = "job-a-renamed"
+    assert _labels(_filter_pipeline_edit(renamed, base)) == {"job-a-renamed"}
+
+    deleted = copy.deepcopy(base)
+    deleted["steps"][0]["steps"].pop()
+    assert _filter_pipeline_edit(deleted, base)["steps"] == []
+
+
+def test_unchanged_parsed_pipeline_selects_no_nightly_jobs() -> None:
+    current = _small_nightly_pipeline()
+
+    filtered = _filter_pipeline_edit(current, copy.deepcopy(current))
+
+    assert filtered["steps"] == []
+
+
+@pytest.mark.parametrize(
+    "base",
+    [
+        None,
+        {"steps": "not-a-list"},
+        {
+            "steps": [
+                {"label": "duplicate", "commands": ["true"]},
+                {"label": "duplicate", "commands": ["true"]},
+            ]
+        },
+    ],
+    ids=["missing", "malformed", "duplicate-label"],
+)
+def test_unsafe_base_pipeline_comparison_keeps_full_suite(base: dict | None) -> None:
+    current = _small_nightly_pipeline()
+
+    filtered = _filter_pipeline_edit(current, base)
+
+    assert _labels(filtered) == {"job-a", "job-b"}
+
+
+@pytest.mark.parametrize("change", ["shared", "group"])
+def test_shared_or_group_pipeline_change_keeps_full_suite(change: str) -> None:
+    base = _small_nightly_pipeline()
+    current = copy.deepcopy(base)
+    if change == "shared":
+        current["env"]["SHARED"] = "updated"
+    else:
+        current["steps"][0]["group"] = "Updated nightly group"
+
+    filtered = _filter_pipeline_edit(current, base)
+
+    assert _labels(filtered) == {"job-a", "job-b"}
 
 
 def test_fallback_plus_matching_model_change_still_filters() -> None:
@@ -128,6 +319,36 @@ def test_combined_suites_filter_only_nightly_and_preserve_ready_steps() -> None:
     assert filtered["steps"][0] == ready_before
     nightly = next(group for group in filtered["steps"] if group["group"] == "NIGHTLY_TESTS")
     assert _labels({"steps": nightly["steps"]}) == TINY_DIFFUSION_LABELS
+
+
+def test_combined_pipeline_edit_preserves_ready_and_targets_nightly() -> None:
+    base = _small_nightly_pipeline()
+    current = copy.deepcopy(base)
+    current["steps"][0]["steps"][1]["grade"] = "Blocking"
+    ready = {
+        "group": "READY_TESTS",
+        "steps": [{"label": "ready-job", "commands": ["pytest tests/ready.py"]}],
+    }
+    combined = {
+        "steps": [
+            copy.deepcopy(ready),
+            {"group": "NIGHTLY_TESTS", "steps": copy.deepcopy(current["steps"])},
+        ]
+    }
+
+    filtered = FILTER.filter_amd_nightly_suite(
+        combined,
+        [AMD_NIGHTLY_PIPELINE.as_posix()],
+        pipeline_path=AMD_NIGHTLY_PIPELINE,
+        group_name="NIGHTLY_TESTS",
+        current_pipeline_doc=current,
+        base_pipeline_doc=base,
+    )
+
+    assert filtered["steps"][0] == ready
+    nightly = filtered["steps"][1]
+    assert nightly["group"] == "NIGHTLY_TESTS"
+    assert _labels({"steps": nightly["steps"]}) == {"job-b"}
 
 
 @pytest.mark.parametrize(

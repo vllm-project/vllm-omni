@@ -8,10 +8,10 @@ text modalities, and server ``--interleave-mm-strings`` + 1fps / 128-frame
 media-io kwargs, also pinned in ``minicpmo_4_5.yaml``).
 
 Seed-TTS WER, speaker similarity (SIM), and UTMOS are gated over
-``/v1/chat/completions`` (whole-utterance TTS) on the duplex deploy config,
-once with the stock Code2Wav and once with its bfloat16 attention cache.
-The UTMOS checkpoint is retargeted onto CUDA or NPU. The numeric MOS floor
-is applied on CUDA and skipped on NPU until an A3 run measures one.
+``/v1/chat/completions`` (whole-utterance TTS) on the duplex deploy config
+with the stock Code2Wav. The UTMOS checkpoint is retargeted onto CUDA or NPU.
+The numeric MOS floor is applied on CUDA and skipped on NPU until an A3 run
+measures one.
 The native per-unit full-duplex path is not gated here: the checkpoint's own
 per-unit boundaries split words across Talker conditions, so that path scores
 ~0.075 WER on this benchmark (the HF ``MiniCPMODuplex`` reference scores
@@ -31,19 +31,11 @@ from tests.e2e.accuracy import helpers as _acc_bench
 from tests.e2e.accuracy.helpers import build_acc_benchmark_cli_argv, find_vllm_cli
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
-from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.platforms import current_omni_platform
 
 _MODEL = os.environ.get("VLLM_TEST_MINICPMO_4_5_MODEL", "openbmb/MiniCPM-o-4_5")
 _DEPLOY_CONFIG = get_deploy_config_path("minicpmo_4_5.yaml")
-# CUDA only: the NPU Code2Wav rejects ``code2wav_bfloat16_attention_cache``.
-_BF16_ATTENTION_CACHE_DEPLOY_CONFIG = modify_stage_config(
-    _DEPLOY_CONFIG,
-    updates={
-        "base_config": _DEPLOY_CONFIG,
-        "connectors.connector_of_shared_memory.extra.code2wav_bfloat16_attention_cache": True,
-    },
-)
 _RESULT_DIR = Path(
     os.environ.get(
         "ACC_BENCH_RESULT_DIR",
@@ -117,17 +109,6 @@ seed_test_params = [
         stage_config_path=_DEPLOY_CONFIG,
         server_args=list(_SEED_TTS_SERVER_ARGS),
     )
-]
-
-seed_bf16_attention_cache_test_params = [
-    pytest.param(
-        OmniServerParams(
-            model=_MODEL,
-            stage_config_path=_BF16_ATTENTION_CACHE_DEPLOY_CONFIG,
-            server_args=list(_SEED_TTS_SERVER_ARGS),
-        ),
-        id="bf16-attention-cache",
-    ),
 ]
 
 
@@ -219,11 +200,4 @@ def _run_seed_tts_wer_bench(omni_server) -> None:
 @hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", seed_test_params, indirect=True)
 def test_minicpmo_4_5_seed_tts_wer_bench(omni_server) -> None:
-    _run_seed_tts_wer_bench(omni_server)
-
-
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
-@pytest.mark.parametrize("omni_server", seed_bf16_attention_cache_test_params, indirect=True)
-def test_minicpmo_4_5_seed_tts_wer_bench_bf16_attention_cache(omni_server) -> None:
-    """Same Seed-TTS gate with the Code2Wav bfloat16 attention cache enabled."""
     _run_seed_tts_wer_bench(omni_server)

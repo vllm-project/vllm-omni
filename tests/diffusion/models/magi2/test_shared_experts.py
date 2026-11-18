@@ -8,7 +8,8 @@ import pytest
 import torch
 
 from tests.diffusion.models.magi2.test_native_packing import _tiny_model
-from vllm_omni.diffusion.models.magi2.layers import ModalityDispatcher, swiglu7
+from tests.helpers.mark import hardware_test
+from vllm_omni.diffusion.models.magi2.common_layers import ModalityDispatcher, swiglu7
 from vllm_omni.diffusion.models.magi2.modeling_magi2 import Magi2MultiHeadMoELayer
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
@@ -120,7 +121,7 @@ def test_swiglu7_of_a_column_concatenation_is_the_concatenation_of_swiglu7(width
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
 def test_musa_device_shared_experts_match_the_concatenated_activation_bitwise(compiled):
     if not hasattr(torch, "musa") or not torch.musa.is_available():
@@ -148,7 +149,7 @@ def test_musa_device_shared_experts_match_the_concatenated_activation_bitwise(co
         torch._dynamo.reset()
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
 def test_musa_device_swiglu7_splits_at_production_widths(compiled):
     if not hasattr(torch, "musa") or not torch.musa.is_available():
