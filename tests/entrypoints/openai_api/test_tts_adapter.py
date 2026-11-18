@@ -53,6 +53,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import (
     MossTTSNanoAdapter,
     _code_grid_cache_salt,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.omnivoice import OmniVoiceAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import (
     QWEN3_TTS_AUTO_BUDGET_KEY,
     QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY,
@@ -967,14 +968,19 @@ def test_ming3_tts_does_not_reinterpret_ip_voice_as_ming2_preset():
     assert prepared.model_type == "ming3_audio_tts"
 
 
-def test_step_audio2_build_constructs_open_assistant_turn():
+@pytest.mark.parametrize(
+    "instructions,expected_system",
+    [(None, "以自然的语速读出下面的文字。"), ("Read warmly.", "Read warmly.")],
+)
+def test_step_audio2_build_constructs_open_assistant_turn(instructions, expected_system):
     adapter = StepAudio2Adapter(SimpleNamespace(server=SimpleNamespace(), engine_client=SimpleNamespace()))
-    request = OpenAICreateSpeechRequest(input="hello", instructions="Read warmly.")
+    request = OpenAICreateSpeechRequest(input="hello", instructions=instructions)
 
     prepared = asyncio.run(adapter.build(request, [], False))
 
-    assert "<|im_start|>system\nRead warmly.<|im_end|>" in prepared.prompt["prompt"]
-    assert prepared.prompt["prompt"].endswith("<|im_start|>assistant\n<tts_start>")
+    assert prepared.prompt["prompt"] == (
+        f"<|BOT|>system\n{expected_system}<|EOT|><|BOT|>human\nhello<|EOT|><|BOT|>assistant\n<tts_start>"
+    )
     assert prepared.tts_params == {}
     assert prepared.model_type == "step_audio2"
 
@@ -1561,10 +1567,56 @@ def test_diffusion_adapter_extra_body_params_fallback():
     class _DiffAdapter(DiffusionTTSAdapter):
         name = "diff_probe"
 
-        async def build(self, request, sampling_params_list):  # pragma: no cover
+        async def build(self, request, sampling_params_list, has_inline_ref_audio):  # pragma: no cover
             raise NotImplementedError
 
     assert _DiffAdapter.extra_body_params() == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_omnivoice_diffusion_adapter_request_preparation():
+    server = SimpleNamespace(
+        _apply_uploaded_speaker=lambda request: None,
+        _get_normalized_voice=lambda voice: voice,
+        _validate_ref_audio_format=lambda ref_audio: None,
+        _resolve_ref_audio=None,
+        uploaded_speakers={"alice": {}},
+        _voice_created_at=lambda voice: 123,
+    )
+    adapter = OmniVoiceAdapter(SpeechServingContext(server=server, diffusion_engine=object()))
+    request = OpenAICreateSpeechRequest(
+        input="Hello",
+        voice="alice",
+        language="English",
+        instructions="男, american accent",
+    )
+
+    adapter.normalize(request)
+    assert adapter.validate(request) is None
+    prepared = await adapter.build(request, [], False)
+
+    assert prepared.model_type == "omnivoice"
+    assert prepared.prompt == {
+        "input": "Hello",
+        "voice_name": "alice",
+        "voice_created_at": 123,
+        "lang": "English",
+        "instruct": "male, american accent",
+    }
+
+
+def test_omnivoice_diffusion_adapter_ref_audio_validation():
+    server = SimpleNamespace(
+        _apply_uploaded_speaker=lambda request: None,
+        _get_normalized_voice=lambda voice: voice,
+        _validate_ref_audio_format=lambda ref_audio: "unsupported reference audio",
+    )
+    adapter = OmniVoiceAdapter(SpeechServingContext(server=server, diffusion_engine=object()))
+    request = OpenAICreateSpeechRequest(input="Hello", ref_audio="unsupported")
+
+    adapter.normalize(request)
+
+    assert adapter.validate(request) == "unsupported reference audio"
 
 
 def _higgs_v2_adapter() -> HiggsAudioV2Adapter:

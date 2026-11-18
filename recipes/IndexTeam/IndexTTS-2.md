@@ -137,3 +137,7 @@ curl http://localhost:8092/v1/audio/speech \
   before audio generation.
 - First request can be slower because reference encoders and auxiliary models
   are lazily loaded and cached.
+- The tokenizer normalizes Chinese punctuation before BPE encoding, including
+  single-character prompts: `。！？` become `.!?`, and `—` / `～` become `-`
+  so long text can split at those boundaries. ASCII `:` and `;` are preserved.
+  This only normalizes punctuation; it does not expand numbers, dates, or currency.

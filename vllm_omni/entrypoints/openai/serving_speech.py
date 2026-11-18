@@ -4,7 +4,6 @@
 import asyncio
 import base64
 import contextlib
-import copy
 import hashlib
 import io
 import json
@@ -71,8 +70,8 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     tts_entry_stage_archs,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, conditioning_cache_salt, validate_tts_request
-from vllm_omni.entrypoints.openai.tts_adapters.omnivoice import OmniVoiceAdapter
 from vllm_omni.entrypoints.utils import coerce_param_message_types
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.metrics.modality import observe_audio_first_packet, observe_audio_streaming_finalize
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.speaker_cache import get_speaker_cache
@@ -92,6 +91,8 @@ SPEECH_AUDIO_CHANNELS_HEADER = "X-Audio-Channels"
 # Raw audio bodies cannot carry metadata, so the duration of the returned audio
 # is stated in a response header for non-streaming requests.
 SPEECH_AUDIO_DURATION_HEADER = "X-Audio-Duration-Seconds"
+# Whether generation stopped at its token budget instead of at end-of-speech.
+SPEECH_AUDIO_TRUNCATED_HEADER = "X-Audio-Truncated"
 # Cached in place of the usage tokenizer after a failed load.
 _USAGE_TOKENIZER_UNAVAILABLE = object()
 
@@ -244,8 +245,10 @@ def _infer_audio_num_channels(audio: np.ndarray) -> int:
 def _audio_format_headers(
     audio_format: dict[str, int] | None,
     duration_s: float | None = None,
+    truncated: bool | None = None,
 ) -> dict[str, str]:
-    """Response headers describing the emitted audio's rate, channels and duration."""
+    """Response headers describing the emitted audio's rate, channels, duration
+    and, when the model reports it, whether it was truncated."""
     headers: dict[str, str] = {}
     exposed: list[str] = []
     if audio_format:
@@ -257,6 +260,10 @@ def _audio_format_headers(
         # really encoded to zero frames reports ``0.000``.
         headers[SPEECH_AUDIO_DURATION_HEADER] = f"{duration_s:.3f}"
         exposed.append(SPEECH_AUDIO_DURATION_HEADER)
+    if truncated is not None:
+        # ``None`` means the model does not report truncation: no header.
+        headers[SPEECH_AUDIO_TRUNCATED_HEADER] = "true" if truncated else "false"
+        exposed.append(SPEECH_AUDIO_TRUNCATED_HEADER)
     if not exposed:
         return {}
     # Without this, CORS hides these headers from cross-origin browser clients.
@@ -667,22 +674,29 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         instance._diffusion_mode = True
         instance._diffusion_engine = diffusion_engine
         instance._diffusion_model_names = frozenset(served_model_names or [model_name])
+        instance._diffusion_model_name = model_name
         instance._allowed_local_media_path = allowed_local_media_path
         instance._media_connector = MediaConnector(
             allowed_local_media_path=allowed_local_media_path,
             allowed_media_domains=allowed_media_domains,
         )
-        instance._tts_model_type = "omnivoice"
-        instance._is_tts = False
-        # Diffusion-only instances don't have a TTS stage; set None so any
-        # ``_tts_stage`` access doesn't raise AttributeError.
-        instance._tts_stage = None
-        # Set adapter to OmniVoice as it is currently the only diffusion TTS model
-        # Temporary assignment until https://github.com/vllm-project/vllm-omni/issues/4327 is completed
-        instance._adapter = OmniVoiceAdapter(
-            SpeechServingContext(server=instance, diffusion_engine=instance._diffusion_engine)
-        )
         instance._init_speaker_storage()
+        instance._adapter = None
+        instance._tts_model_type = next(
+            (
+                model_type
+                for stage in stage_configs or ()
+                if (model_type := detect_tts_model_type(*_stage_speech_metadata(stage)[:2])) is not None
+            ),
+            None,
+        )
+        adapter_cls = resolve_adapter(instance._tts_model_type)
+        if adapter_cls is not None:
+            instance._adapter = adapter_cls(SpeechServingContext(server=instance, diffusion_engine=diffusion_engine))
+            instance._adapter.load_capabilities()
+            logger.info("Resolved diffusion TTS serving adapter: %s", adapter_cls.__name__)
+        else:
+            instance._tts_model_type = None
         return instance
 
     def __init__(self, *args, **kwargs):
@@ -744,8 +758,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def _get_tts_adapter(self):
         """Return the per-model serving adapter for the current ``_tts_model_type``.
 
-        Pure-diffusion speech uses its dedicated request path and does not
-        resolve adapters for AR-stage TTS models.
+        Pure-diffusion speech returns the adapter resolved from its pipeline
+        stage metadata during :meth:`for_diffusion` construction.
 
         Resolved lazily (rebuilt if ``_tts_model_type`` changed since the cached
         instance was built) so callers that set ``_tts_model_type`` after
@@ -753,7 +767,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         ``_tts_model_type`` is fixed at init, so the cached instance is reused.
         """
         if self._diffusion_mode:
-            return None
+            return self._adapter
 
         adapter_cls = resolve_adapter(self._tts_model_type)
         if adapter_cls is None:
@@ -2230,6 +2244,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 # Streaming path: output_tokens = sum of stage-0 deltas.
                 usage = self._build_speech_usage(request, tts_params or {}, usage_acc.total())
                 done_payload["usage"] = usage.model_dump()
+            truncated = self._length_truncated(usage_acc)
+            if truncated is not None:
+                # Additive to the OpenAI schema, like ``duration``.
+                done_payload["truncated"] = truncated
             done = json.dumps(done_payload, separators=(",", ":"))
             yield f"event: speech.audio.done\ndata: {done}\n\n"
         except asyncio.CancelledError:
@@ -2278,6 +2296,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return None, None
         key = "audio" if "audio" in mm else ("model_outputs" if "model_outputs" in mm else None)
         return mm, key
+
+    def _length_truncated(self, usage_acc: SpeechOutputTokenCounter) -> bool | None:
+        """Whether stage 0 stopped at its token budget instead of end-of-speech.
+
+        ``None`` when the adapter does not report truncation or stage 0's
+        finish reason is unknown, so callers leave the signal out rather than
+        claim the audio is complete.
+        """
+        adapter = self._get_tts_adapter()
+        if adapter is None or not adapter.reports_length_truncation:
+            return None
+        finish_reason = usage_acc.stage0_finish_reason
+        if finish_reason is None:
+            return None
+        return finish_reason == "length"
 
     async def _prepare_speech_generation(
         self,
@@ -2601,6 +2634,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # meta.truncated) into ``collect`` for response headers.
         if collect is not None and (adapter := self._get_tts_adapter()) is not None:
             adapter.collect_response_metadata(audio_output, collect)
+            truncated = self._length_truncated(usage_acc)
+            if truncated is not None:
+                # Keep a flag the adapter set itself.
+                collect["audio_truncated"] = collect.get("audio_truncated", False) or truncated
 
         # A model can flag a per-request synthesis failure through the
         # adapter (e.g. YuE2's terminal NAR/VAE pass OOMing on one
@@ -2707,70 +2744,46 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         from vllm_omni.outputs import OmniRequestOutput
 
         try:
-            if not request.input or not request.input.strip():
-                raise ValueError("Input text cannot be empty")
+            adapter = self._get_tts_adapter()
+            if adapter is None:
+                raise ValueError(f"Model {self._diffusion_model_name!r} does not provide a diffusion TTS adapter.")
 
-            # Set `has_inline_ref_audio` before calling validate
-            # since it calls `_apply_uploaded_speaker`
-            # which modifies request.ref_audio
+            adapter.normalize(request)
+
             has_inline_ref_audio = request.ref_audio is not None
-
-            # Normalise voice before specialised adapter validation
-            # to allow tests to catch invalid voices generally
-            request.voice = self._get_normalized_voice(request.voice)
-
-            assert self._adapter is not None
-            validation_error = validate_tts_request(self._adapter, request)
-            if validation_error is not None:
+            validation_error = validate_tts_request(adapter, request)
+            if validation_error:
                 raise ValueError(validation_error)
 
-            if request.ref_audio is not None:
-                fmt_err = self._validate_ref_audio_format(request.ref_audio)
-                if fmt_err:
-                    return self._diffusion_error_response(fmt_err, status_code=400)
-
             request_id = f"speech-{random_uuid()}"
-            prepared_request = await self._adapter.build(
-                request, sampling_params_list=[], has_inline_ref_audio=has_inline_ref_audio
-            )
-            prompt = prepared_request.prompt
-
-            self._log_request(
-                "Diffusion TTS speech request %s: voice_clone=%s",
-                request_id,
-                "ref_audio" in prompt,
-            )
-            _rl = getattr(self, "request_logger", None)
-            if _rl:
-                base_len = len(f"Diffusion TTS speech request {request_id}: text=")
-                raw_max = getattr(_rl, "max_log_len", None)
-                cap = raw_max if isinstance(raw_max, int) else 200
-                text = request.input[: max(cap - base_len, 0)]
-                logger.debug("Diffusion TTS speech request %s: text=%r", request_id, text)
+            sampling_params_list = self._diffusion_engine.default_sampling_params_list
+            if not sampling_params_list or not isinstance(sampling_params_list[0], OmniDiffusionSamplingParams):
+                raise TypeError("Diffusion speech stage 0 requires OmniDiffusionSamplingParams.")
             if request.extra_params is not None and not isinstance(request.extra_params, dict):
                 raise ValueError("extra_params must be a JSON object/dict.")
-            extra = dict(request.extra_params or {})
-            seed = extra.pop("seed", None)
-            if request.seed is not None:
-                seed = request.seed
-            # Apply extra_params from the request to sampling params
-            sampling_params_list = self._diffusion_engine.default_sampling_params_list
-            if extra or seed is not None:
-                sampling_params_list = copy.deepcopy(sampling_params_list)
-                if seed is not None:
-                    sampling_params_list[0].seed = seed
-                if sampling_params_list[0].extra_args is None:
-                    sampling_params_list[0].extra_args = {}
-                if seed is not None and "seed" in sampling_params_list[0].extra_args:
-                    sampling_params_list[0].extra_args["seed"] = seed
-                sampling_params_list[0].extra_args.update(extra)
 
+            extra = dict(request.extra_params or {})
+            if request.seed is not None:
+                extra["seed"] = request.seed
+
+            if extra:
+                import copy
+
+                sampling_params_list = copy.deepcopy(sampling_params_list)
                 sampling = sampling_params_list[0]
+
+                if "seed" in extra:
+                    try:
+                        sampling.seed = int(extra.pop("seed"))
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("seed must be an integer") from exc
+                    if sampling.extra_args is not None and "seed" in sampling.extra_args:
+                        sampling.extra_args["seed"] = sampling.seed
 
                 # This change allows StepScheduler read total_steps from upper
                 # sampling.num_inference_steps, check diffusion/sched/step_scheduler:_get_total_steps
                 if "num_inference_steps" in extra:
-                    value = extra["num_inference_steps"]
+                    value = extra.pop("num_inference_steps")
                     try:
                         sampling.num_inference_steps = int(value)
                     except (TypeError, ValueError, OverflowError) as exc:
@@ -2783,7 +2796,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         raise ValueError("num_inference_steps must be a positive integer")
 
                 if "guidance_scale" in extra:
-                    value = extra["guidance_scale"]
+                    value = extra.pop("guidance_scale")
                     try:
                         sampling.guidance_scale = float(value)
                     except (TypeError, ValueError, OverflowError) as exc:
@@ -2791,7 +2804,31 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     if isinstance(value, bool) or not math.isfinite(sampling.guidance_scale):
                         raise ValueError("guidance_scale must be a finite number")
 
-                logger.info("Applied diffusion speech params: seed=%s extra_params=%s", seed, extra)
+                if sampling.extra_args is None:
+                    sampling.extra_args = {}
+                sampling.extra_args.update(extra)
+
+            sampling_params_list = adapter.apply_sampling_overrides(
+                sampling_params_list,
+                request,
+                request_id=request_id,
+            )
+            prepared = await adapter.build(request, sampling_params_list, has_inline_ref_audio)
+            prompt = prepared.prompt
+
+            self._log_request(
+                "Diffusion TTS speech request %s: model=%s voice_clone=%s",
+                request_id,
+                prepared.model_type,
+                "ref_audio" in prompt,
+            )
+            _rl = getattr(self, "request_logger", None)
+            if _rl:
+                base_len = len(f"Diffusion TTS speech request {request_id}: text=")
+                raw_max = getattr(_rl, "max_log_len", None)
+                cap = raw_max if isinstance(raw_max, int) else 200
+                text = request.input[: max(cap - base_len, 0)]
+                logger.debug("Diffusion TTS speech request %s: text=%r", request_id, text)
 
             generator = self._diffusion_engine.generate(
                 prompt=prompt,
@@ -2814,7 +2851,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             audio_output = cast(dict, audio_output)
 
             audio_tensor = audio_output[audio_key]
-            sample_rate = _coerce_sample_rate(audio_output.get("sr")) or 24000
+            sample_rate = (
+                _coerce_sample_rate(audio_output.get("audio_sample_rate"))
+                or _coerce_sample_rate(audio_output.get("sr"))
+                or 24000
+            )
 
             if isinstance(audio_tensor, list):
                 non_empty = [c for c in audio_tensor if c.numel() > 0]
@@ -3082,12 +3123,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         "(use the WebSocket streaming path for long transcripts)",
                         len(ts_json),
                     )
-            if collect.get("audio_truncated") is not None:
-                headers["X-Audio-Truncated"] = "true" if collect["audio_truncated"] else "false"
             headers.update(
                 _audio_format_headers(
                     collect.get("audio_format"),
                     collect.get("audio_duration_s"),
+                    collect.get("audio_truncated"),
                 )
             )
             return Response(content=audio_bytes, media_type=media_type, headers=headers)
