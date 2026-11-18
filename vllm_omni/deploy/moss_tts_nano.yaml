@@ -47,7 +47,5 @@ platforms:
           head_dim: 64
   npu:
     model_runner: v1
-  xpu:
-    model_runner: v1
   musa:
     model_runner: v1

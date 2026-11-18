@@ -751,6 +751,11 @@ class DuplexModelPlugin(ABC):
         del stage_id, segment_finished, output, context
         return False
 
+    def resumable_downstream_stage_ids(self, *, stage_count: int) -> frozenset[int]:
+        """Stages that keep a turn-commit request open across downstream segments."""
+        del stage_count
+        return frozenset()
+
     def draining_stage_ids(self, *, stage_count: int) -> frozenset[int]:
         """Output stages that may keep running after the next user turn starts.
 

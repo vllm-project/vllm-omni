@@ -248,6 +248,9 @@ class TestPerRequestTaskMode:
     VOCAB = 300
 
     def _run(self, model, histories, per_req_extra_args):
+        pytest.importorskip(
+            "vllm.v1.sample.sampler", reason="These cases exercise the retired ModelRunnerV1 model.sample hook"
+        )
         logits = torch.zeros(len(histories), self.VOCAB)
         logits[:, 50] = 7.0  # ordinary text token, must survive comprehension
         model._sampler = _RecordingSampler()
