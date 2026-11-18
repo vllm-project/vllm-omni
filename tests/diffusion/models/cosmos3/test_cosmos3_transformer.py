@@ -587,6 +587,7 @@ def test_edge_weight_validation_skips_pp_missing_layers(monkeypatch: pytest.Monk
 
 
 def test_edge_gen_cached_k_is_normalized_but_reasoner_uses_raw_k() -> None:
+    from vllm_omni.diffusion.models.cosmos3.rope import Cosmos3RotaryEmbedding
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import RMSNorm
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_edge import (
         Cosmos3EdgeCausalAttention,
@@ -622,6 +623,7 @@ def test_edge_gen_cached_k_is_normalized_but_reasoner_uses_raw_k() -> None:
     attn.to_v = ScaleProjection(1.0)
     attn.to_out = IdentityOutput()
     attn.k_norm_und_for_gen = RMSNorm(2, eps=1e-5)
+    attn.rotary_embedding = Cosmos3RotaryEmbedding()
     attn.attn = RawKAttention()
 
     hidden_states = torch.tensor(
