@@ -788,6 +788,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     vae_patch_parallel_size: int = Field(default=1, ge=1)
     text_encoder_tp_size: int = Field(default=1, ge=1)
     text_encoder_vision_sp_size: int = Field(default=1, ge=1)
+    """MiniMax-H3-only experimental vision SP: 1 (replicated) or 8 (requires TP8)."""
     vae_parallel_mode: str = "tile"
     use_hsdp: bool = False
     mask_sp_padding: bool = False

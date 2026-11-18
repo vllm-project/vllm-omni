@@ -225,8 +225,9 @@ remaining flags stay unchanged.
 
 MiniMax-H3 can split Qwen3-VL vision-token computation across the eight
 text-encoder TP ranks instead of repeating the full vision forward on each
-rank. This is an opt-in experimental path for evaluating image/video reference
-encoding on Ascend NPU. Configure it with
+rank. This opt-in experimental path is specific to MiniMax-H3-family pipelines
+using its Qwen3-VL encoder, for evaluating image/video reference encoding on
+Ascend NPU. Configure it with
 `DiffusionParallelConfig.text_encoder_vision_sp_size`; the default `1` keeps
 vision replicated.
 
@@ -270,9 +271,10 @@ parallel_config:
   text_encoder_vision_sp_size: 8
 ```
 
-Only pipelines that declare support for text-encoder vision SP accept a
-non-default value. A stage without a local text encoder must keep the default
-`1`. The former `VLLM_OMNI_H3_VISION_SP_SIZE` environment variable is no longer
+Currently only MiniMax-H3-family pipelines using the Qwen3-VL encoder support
+the non-default value; other models reject it. A stage without a local text
+encoder must keep the default `1`. The former `VLLM_OMNI_H3_VISION_SP_SIZE`
+environment variable is no longer
 read; use the CLI, Python configuration, or deployment YAML instead.
 
 Vision SP8 is separate from DiT `--usp` / `--ring` parallelism: those options
