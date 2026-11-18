@@ -871,7 +871,7 @@ class MiniMaxH3Pipeline(
         # omission there rather than advertise a contract that would either fail
         # admission or disagree with the denoise loop.
         od_config = getattr(self, "od_config", None)
-        omission_allowed = not getattr(od_config, "step_execution", False)
+        omission_allowed = od_config is None or not od_config.step_execution
         or_omitted = " or omitted" if omission_allowed else ""
         sigma_steps = sampling.num_inference_steps
         if sigma_steps is None:
@@ -962,8 +962,8 @@ class MiniMaxH3Pipeline(
         # A request that omits attention_schedule, attention_sigma_schedule and latent_refine inherits the
         # default step ranges and the latent_refine default, a pair _prepare_encoder_conditioning_inputs
         # rejects; fail here instead of on every such request.
-        service_schedule = getattr(od_config, "diffusion_attention_schedule", None)
-        additional_config = getattr(od_config, "additional_config", None) or {}
+        service_schedule = od_config.diffusion_attention_schedule
+        additional_config = od_config.additional_config or {}
         if (
             service_schedule is not None
             and service_schedule.default
@@ -1015,10 +1015,10 @@ class MiniMaxH3Pipeline(
             self._PROFILER_TARGETS.remove("_encode_local_media")
         modular = is_minimax_h3_modular(str(od_config.model), od_config.revision)
         self.partition = _minimax_h3_partition_for_task(
-            getattr(od_config, "task_type", None),
+            od_config.task_type,
             str(od_config.model),
         )
-        control_path = getattr(od_config, "controlnet_model_path", None)
+        control_path = od_config.controlnet_model_path
         if control_path:
             if not Path(control_path).is_file() or Path(control_path).suffix != ".safetensors":
                 raise ValueError("--controlnet-model-path must be a local original .safetensors file")
@@ -1029,12 +1029,12 @@ class MiniMaxH3Pipeline(
                 or int(self.parallel_config.ulysses_degree) != 1
                 or int(self.parallel_config.ring_degree) != 1
                 or int(self.parallel_config.allgather_degree) != 1
-                or getattr(self.parallel_config, "use_hsdp", False)
-                or getattr(od_config, "step_execution", False)
-                or getattr(od_config, "quantization_config", None)
+                or self.parallel_config.use_hsdp
+                or od_config.step_execution
+                or od_config.quantization_config
                 or resolve_offload(od_config).strategy is not OffloadStrategy.NONE
-                or getattr(od_config, "host_weight_runtime_mode", "disabled") != "disabled"
-                or getattr(od_config, "cache_backend", "none") not in (None, "none")
+                or od_config.host_weight_runtime_mode != "disabled"
+                or od_config.cache_backend not in (None, "none")
             )
             if unsupported:
                 raise ValueError(
@@ -1271,7 +1271,7 @@ class MiniMaxH3Pipeline(
         _, rank, dit_world = _dit_rank_world()
         self._dit_rank = rank
         if self.load_text_encoder:
-            text_encoder_tp_size = int(getattr(self.parallel_config, "text_encoder_tp_size", 1))
+            text_encoder_tp_size = int(self.parallel_config.text_encoder_tp_size)
             if text_encoder_tp_size < 1:
                 raise ValueError(f"text_encoder_tp_size must be >= 1, got {text_encoder_tp_size}")
             if text_encoder_tp_size > dit_world:
@@ -1309,9 +1309,7 @@ class MiniMaxH3Pipeline(
             self.text_encoder_group = None
             self.text_encoder = None
             self._encoder_modules = []
-        legacy_manual_components = getattr(od_config, "diffusion_offload_config", None) is None and (
-            offload_streams_blocks(od_config)
-        )
+        legacy_manual_components = od_config.diffusion_offload_config is None and offload_streams_blocks(od_config)
         # Preserve the legacy MiniMax-H3 low-residency path. The compact API
         # deliberately limits explicit component selection to dit/text_encoder,
         # so VAEs stay resident for new configurations.
@@ -1447,7 +1445,14 @@ class MiniMaxH3Pipeline(
             self._fasth3.validate_fully_applied(transformer_loaded)
         if self._regenerate is not None:
             self._regenerate.validate_fully_applied(transformer_loaded)
-        if self._fasth3_checkpoint is not None:
+        if self._fasth3_checkpoint is not None and "transformer." in loaded_prefixes:
+            # Only the streamed checkpoint is checked here. A DLO host-weight
+            # plan owns the ``transformer.`` source and installs the DiT
+            # without this method (the loader drops that source before calling
+            # us), after binding every DiT parameter, gates included, and
+            # restored final layouts were checked by the canonical load that
+            # produced them. Checking an empty stream would blame a complete
+            # checkpoint for all of its gates.
             parameter_names = set(dict(self.transformer.named_parameters()))
             required_gates = set()
             for i in range(self.transformer.arch.num_layers):
@@ -1738,7 +1743,7 @@ class MiniMaxH3Pipeline(
         od_config = getattr(self, "od_config", None)
         if od_config is None:
             return False
-        if getattr(od_config, "diffusion_offload_config", None) is None:
+        if od_config.diffusion_offload_config is None:
             # The compatibility topology stages every component it can.
             return offload_streams_blocks(od_config)
         return component is getattr(self, "text_encoder", None) and should_offload_component(
@@ -2593,7 +2598,8 @@ class MiniMaxH3Pipeline(
         Resolving here means an unserviceable size is rejected before the
         denoise loop rather than after it.
         """
-        additional = getattr(getattr(self, "od_config", None), "additional_config", None) or {}
+        od_config = getattr(self, "od_config", None)
+        additional = (od_config.additional_config if od_config is not None else None) or {}
         raw = extra["latent_upscale"] if "latent_upscale" in extra else additional.get("latent_upscale")
         try:
             spec = parse_minimax_h3_latent_upscale_request(raw)
@@ -2634,7 +2640,8 @@ class MiniMaxH3Pipeline(
         Read like ``latent_upscale``: ``extra_args['latent_refine']`` wins over
         an ``--additional-config`` default, and ``false`` opts back out.
         """
-        additional = getattr(getattr(self, "od_config", None), "additional_config", None) or {}
+        od_config = getattr(self, "od_config", None)
+        additional = (od_config.additional_config if od_config is not None else None) or {}
         raw = extra["latent_refine"] if "latent_refine" in extra else additional.get("latent_refine")
         try:
             return parse_minimax_h3_latent_refine_request(raw)
@@ -2659,7 +2666,8 @@ class MiniMaxH3Pipeline(
         Count the same rows as the packed layout without materializing its
         large position tensors before the first denoise pass.
         """
-        additional = getattr(getattr(self, "od_config", None), "additional_config", None) or {}
+        od_config = getattr(self, "od_config", None)
+        additional = (od_config.additional_config if od_config is not None else None) or {}
         limit = additional.get("latent_refine_max_tokens_per_rank", 65_536)
         if type(limit) is not int or limit < 0:
             raise OmniClientError("latent_refine_max_tokens_per_rank must be a non-negative integer")
@@ -2683,7 +2691,7 @@ class MiniMaxH3Pipeline(
                     used += block["latent_t"] * (block["latent_h"] // 2) * (block["latent_w"] // 2)
         padded = ((used + MINIMAX_H3_SEQ_ALIGN - 1) // MINIMAX_H3_SEQ_ALIGN) * MINIMAX_H3_SEQ_ALIGN
         parallel = getattr(self, "parallel_config", None)
-        degree = int(getattr(parallel, "ulysses_degree", 1))
+        degree = int(parallel.ulysses_degree) if parallel is not None else 1
         per_rank = (padded + degree - 1) // degree
         if per_rank > limit:
             raise OmniClientError(
@@ -3023,7 +3031,7 @@ class MiniMaxH3Pipeline(
                     continuation = resolve_continuation(
                         sampling.extra_args or {},
                         task=task,
-                        step_execution=bool(getattr(self.od_config, "step_execution", False)),
+                        step_execution=bool(self.od_config.step_execution),
                     )
                 if prompts is not None:
                     if continuation is None or not self.load_text_encoder:
@@ -3192,12 +3200,12 @@ class MiniMaxH3Pipeline(
         except ValueError as exc:
             raise OmniClientError(str(exc)) from exc
         if control is not None:
-            if not getattr(self.od_config, "controlnet_model_path", None):
+            if not self.od_config.controlnet_model_path:
                 raise OmniClientError("Control request requires --controlnet-model-path")
             if sampling.quality == "high" or extra.get(MINIMAX_H3_GENERIC_CACHE_KEY):
                 raise OmniClientError("H3 control does not support Cache-DiT quality profiles")
         continuation = resolve_continuation(
-            extra, task=conditioning.task, step_execution=bool(getattr(self.od_config, "step_execution", False))
+            extra, task=conditioning.task, step_execution=bool(self.od_config.step_execution)
         )
         validate_encoded_frame_limit(extra, conditioning.task, conditioning.num_frames)
         if continuation is not None and (
@@ -3243,7 +3251,7 @@ class MiniMaxH3Pipeline(
         if self._fasth3_checkpoint is not None:
             self._fasth3_checkpoint.check_request(
                 sampling,
-                step_execution=bool(getattr(self.od_config, "step_execution", False)),
+                step_execution=bool(self.od_config.step_execution),
             )
         if self._fasth3 is not None:
             self._fasth3.check_request(
@@ -3397,7 +3405,7 @@ class MiniMaxH3Pipeline(
         # windows do not depend on the step count. Both execution modes reach this point before any denoise
         # forward. Step mode runs it outside the forward context, so the request's own schedule is resolved
         # against the service default; in request mode that is the schedule the runner bound.
-        service = getattr(self.od_config, "diffusion_attention_schedule", None)
+        service = self.od_config.diffusion_attention_schedule
         attention_schedule = require_request_attention_schedule_fits(sampling, service, num_steps)
         sigma_schedule = resolve_request_attention_sigma_schedule(sampling, service)
         transformer = getattr(
@@ -3608,7 +3616,7 @@ class MiniMaxH3Pipeline(
                 "this server regenerates drafts only; send the draft as source_video with regenerate=true "
                 "(extra_params over HTTP)"
             )
-        if getattr(self.od_config, "step_execution", False):
+        if self.od_config.step_execution:
             raise OmniClientError("Open-H3-Regenerate does not support step execution")
         if resolve_continuation_request(extra) is not None:
             raise OmniClientError("Open-H3-Regenerate does not support continue_from")
@@ -3674,7 +3682,7 @@ class MiniMaxH3Pipeline(
         )
         if quality_plan.cache_dit is not None:
             raise OmniClientError("Open-H3-Regenerate requires uncached denoising; set quality=lossless")
-        cache_backend = str(getattr(self.od_config, "cache_backend", None) or "none").lower()
+        cache_backend = str(self.od_config.cache_backend or "none").lower()
         if cache_backend not in ("none", "cache_dit"):
             raise OmniClientError(f"Open-H3-Regenerate does not support --cache-backend {cache_backend}")
         self._cache_dit_runtime.prepare(None)
@@ -3789,7 +3797,7 @@ class MiniMaxH3Pipeline(
         """Guides are validated against base weights and the full schedule only."""
         if cache_dit is not None:
             raise OmniClientError("MiniMax H3 timeline guides require cache-free execution; use quality=lossless")
-        cache_backend = str(getattr(self.od_config, "cache_backend", None) or "none").lower()
+        cache_backend = str(self.od_config.cache_backend or "none").lower()
         if cache_backend not in ("none", "cache_dit"):
             raise OmniClientError("MiniMax H3 timeline guides do not support cache acceleration")
         if self._fasth3 is not None or self._fasth3_checkpoint is not None:
