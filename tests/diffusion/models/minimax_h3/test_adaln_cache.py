@@ -136,6 +136,14 @@ def test_reject_invalid_sidecar(tmp_path, change):
         MiniMaxH3AdalnCache(arch, path=str(path), model_variant="fl2va")
 
 
+@pytest.mark.parametrize("base_model", [False, True])
+def test_sidecar_validation_ignores_ambient_device(tmp_path, base_model):
+    arch, weights, _, _, path = _fixture(tmp_path, base_model=base_model)
+    with torch.device("meta"):
+        cache = _ready(arch, weights, path)
+    assert all(buffer.device.type == "cpu" for buffer in cache.buffers())
+
+
 def test_weight_adapter_schedule_and_uncovered_timestep_checks(tmp_path):
     arch, weights, _, manifest, path = _fixture(tmp_path, adapter="a" * 64)
     cache = MiniMaxH3AdalnCache(arch, path=str(path), model_variant="fl2va")
@@ -160,6 +168,33 @@ def test_weight_adapter_schedule_and_uncovered_timestep_checks(tmp_path):
             cache.check_request(**(manifest["schedule"] | update))
     with pytest.raises(ValueError, match="does not cover"):
         cache.lookup(torch.tensor([0.123]))
+
+
+@pytest.mark.parametrize(
+    "component_name,mode",
+    [("transformer", "t2va"), ("transformer", "ref2va-mixed"), ("transformers_ref", "ref2va-mixed")],
+)
+@pytest.mark.parametrize("inactive_adapter", [False, True])
+def test_base_requests_preserve_loaded_adaln_sidecar(tmp_path, component_name, mode, inactive_adapter):
+    from vllm.lora.request import LoRARequest
+
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    arch, weights, _, manifest, path = _fixture(tmp_path, mode)
+    sidecar = _ready(arch, weights, path, manifest["model_variant"])
+    cache = MiniMaxH3RuntimeAdalnCache()
+    cache.seed(sidecar, {})
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    setattr(pipeline, component_name, SimpleNamespace(adaln_cache=cache))
+    sampling = OmniDiffusionSamplingParams(
+        lora_request=LoRARequest("inactive", 1, "inactive") if inactive_adapter else None,
+        lora_scale=0.0 if inactive_adapter else 1.0,
+    )
+    pipeline._prepare_adaln_adapter(sampling)
+    assert cache.sidecar is sidecar
+    pipeline._prepare_adaln_adapter(sampling)
+    assert cache.sidecar is sidecar
 
 
 def test_adapter_switch_invalidates_runtime_cache(mocker):
@@ -444,6 +479,29 @@ def test_optional_sidecar_seeds_runtime_projection(tmp_path, mocker):
         linear.weight.add_(1)
         runtime.project(name, linear, x, compute)
         assert compute.call_count == 2
+
+
+@pytest.mark.parametrize("change_values", [False, True])
+def test_sidecar_revalidates_rebound_host_storage(tmp_path, mocker, change_values):
+    arch, weights, payload, _, path = _fixture(tmp_path)
+    sidecar = _ready(arch, weights, path)
+    runtime = MiniMaxH3RuntimeAdalnCache()
+    name = "blocks.0.adaln_proj.linear"
+    linear = torch.nn.Linear(arch.time_embed_dim, 18 * arch.hidden_size, dtype=torch.bfloat16)
+    with torch.no_grad():
+        linear.weight.copy_(weights[name + ".weight"])
+        linear.bias.copy_(weights[name + ".bias"])
+        runtime.seed(sidecar, {name: linear})
+        linear.weight.data = linear.weight.detach().clone()
+        linear.bias.data = linear.bias.detach().clone()
+        if change_values:
+            linear.weight.add_(1)
+        embedding = payload["time_embeddings"][1, :2].clone()
+        runtime.prepare(embedding)
+        compute = mocker.Mock(side_effect=lambda: linear(torch.nn.functional.silu(embedding).to(torch.bfloat16)))
+        actual = runtime.project(name, linear, embedding, compute)
+        assert compute.call_count == int(change_values)
+        assert torch.equal(actual, linear(torch.nn.functional.silu(embedding).to(torch.bfloat16)))
 
 
 def test_failed_seed_does_not_attach_sidecar(tmp_path):

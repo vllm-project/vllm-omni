@@ -33,6 +33,16 @@ last_reviewed: 2026-07-16
 Diffusion model integration owns pipeline contracts, registration, checkpoint
 loading, adapters, shared layers, and model-specific processing.
 
+MiniMax-H3 owns the packed text/audio positions used by SOL-BSA's optional
+`text_audio` protection policy. `MiniMaxH3DenoiseBranch` validates their bounds
+and constructs one block64 `TextAudioBlockMask` per request branch, outside the
+denoising loop. The transformer and attention blocks pass it unchanged to
+`AttentionMetadata`, including its global coordinates under pure Ulysses.
+The mask includes reference and target audio but does not blanket-protect visual
+references. Single-request step execution reuses the same branch metadata;
+multi-request and compact unequal-Q/KV SOL execution remain rejected. Dense and
+other sparse backends ignore this optional metadata.
+
 ## Candidate invariants
 
 ### DIFF-MODEL-INV-001: Pipelines implement one runtime contract
@@ -144,6 +154,16 @@ Validated offline results can be supplied through `_lookup_precomputed()`;
 this extension is consulted only at TP1 on runtime-cache misses. Artifact
 validation, weight binding, and model-specific layouts remain in the adapter.
 H3's adapter retains its main/Ref2VA sidecars and their eager-only admission.
+Sidecar validation compares payload and expected schedule tensors on CPU,
+independent of the ambient device used to construct the model.
+The first request without an active runtime adapter must preserve a sidecar
+validated at startup; an absent or zero-scale LoRA is not an adapter change.
+Loading, switching, rescaling, or removing an active adapter still invalidates
+the cached results.
+If unchanged CPU projection weights acquire new storage during loader staging
+or pinning, H3 rechecks their manifest digests before accepting a new sidecar
+signature. Changed weight values cannot reuse the precomputed results, and
+unchanged signatures do not trigger repeated weight hashing.
 
 The cache retains projection results and leaves all original weights available.
 It does not reduce weight residency or cancel layerwise prefetch. A future

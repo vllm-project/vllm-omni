@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import gc
+import math
 import sys
 import types
 import weakref
@@ -13,6 +14,7 @@ from vllm.logger import _print_warning_once, init_logger
 
 from vllm_omni.diffusion.attention.ops import block_sparse
 from vllm_omni.diffusion.attention.ops.block_sparse import (
+    block_sparse_attn_bshd,
     build_prefix_dense_block_map,
     fastvideo_block_sparse_attn_bshd,
     mean_pool_tiles,
@@ -20,6 +22,107 @@ from vllm_omni.diffusion.attention.ops.block_sparse import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize(
+    "provider,precision",
+    [("auto", "bf16"), ("fastvideo", "bf16"), ("flashinfer", "bf16"), ("triton", "sage"), ("cudnn", "sage")],
+)
+def test_lse_requires_a_provider_with_verified_normalization(provider, precision):
+    query = torch.ones(1, 64, 1, 128, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="return_lse requires"):
+        block_sparse_attn_bshd(
+            query,
+            query,
+            query,
+            torch.ones(1, 1, 1, 1, dtype=torch.bool),
+            None,
+            128**-0.5,
+            provider=provider,
+            precision=precision,
+            return_lse=True,
+        )
+
+
+@pytest.mark.parametrize("provider", ["cudnn", "triton"])
+@pytest.mark.parametrize("route", ["mixed", "all_exact", "all_centroids"])
+def test_lse_supports_sol_centroid_merge_against_token_oracle(monkeypatch, provider, route):
+    """CPU kernel substitutes isolate the provider ABI and hybrid normalization."""
+    from vllm_omni.diffusion.attention.ops import cudnn_block_sparse, triton_block_sparse
+
+    generator = torch.Generator().manual_seed(712)
+    query = torch.randn(1, 128, 2, 128, dtype=torch.bfloat16, generator=generator)
+    key = torch.randn(1, 192, 2, 128, dtype=torch.bfloat16, generator=generator)
+    value = torch.randn(1, 192, 2, 128, dtype=torch.bfloat16, generator=generator)
+    sizes = torch.tensor([64, 17, 0], dtype=torch.int32)
+    block_map = torch.tensor(
+        [[[[True, False, True], [False, True, False]], [[False, True, False], [True, False, True]]]]
+    )
+    if route != "mixed":
+        block_map.fill_(route == "all_exact")
+    valid = (torch.arange(64)[None] < sizes[:, None]).flatten()
+    key[:, ~valid] = 100
+    value[:, ~valid] = 100
+    scale = 128**-0.5
+
+    def exact_state(query, key, value, indices, counts, block_sizes):
+        active = torch.arange(indices.shape[-1])[None, None, None, :] < counts[..., None]
+        selected = (indices[..., None] == torch.arange(3)) & active[..., None]
+        token_mask = selected.any(-2).repeat_interleave(64, -2).repeat_interleave(64, -1)
+        valid_keys = (torch.arange(64)[None] < block_sizes[:, None]).flatten()
+        scores = query.float() @ key.float().transpose(-1, -2) * scale
+        scores = scores.masked_fill(~(token_mask & valid_keys), -torch.inf)
+        output = scores.softmax(-1).nan_to_num() @ value.float()
+        return output.to(query.dtype), scores.logsumexp(-1)
+
+    def cudnn_kernel(query, key, value, indices, **options):
+        output, lse = exact_state(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            indices,
+            options["q2k_block_nums"],
+            options["block_sizes"],
+        )
+        return {"o_tensor": output.transpose(1, 2).contiguous(), "lse_tensor": lse}
+
+    def triton_kernel(query, key, value, indices, counts, block_sizes):
+        output, lse = exact_state(query, key, value, indices, counts, block_sizes)
+        return output, lse / math.log(2)
+
+    monkeypatch.setattr(cudnn_block_sparse, "require_cudnn_sparse", lambda device: cudnn_kernel)
+    monkeypatch.setattr(triton_block_sparse, "require_triton_sparse", lambda device: triton_kernel)
+    exact_output, exact_lse = block_sparse_attn_bshd(
+        query,
+        key,
+        value,
+        block_map,
+        sizes,
+        scale,
+        provider=provider,
+        return_lse=True,
+    )
+
+    key_valid = key.float().masked_fill(~valid[None, :, None, None], 0)
+    value_valid = value.float().masked_fill(~valid[None, :, None, None], 0)
+    key_centroids = mean_pool_tiles(key_valid, sizes, 64)
+    value_centroids = mean_pool_tiles(value_valid, sizes, 64)
+    centroid_scores = query.float().transpose(1, 2) @ key_centroids.transpose(-1, -2) * scale
+    approximate = (~block_map & (sizes > 0)).repeat_interleave(64, -2)
+    residual_scores = (centroid_scores + sizes.float().log()).masked_fill(~approximate, -torch.inf)
+    residual_lse = residual_scores.logsumexp(-1)
+    residual_output = residual_scores.softmax(-1).nan_to_num() @ value_centroids
+    joint_lse = torch.logaddexp(exact_lse, residual_lse)
+    merged = exact_output.float().transpose(1, 2) * (exact_lse - joint_lse).exp()[..., None]
+    merged += residual_output * (residual_lse - joint_lse).exp()[..., None]
+
+    exact_scores = query.float().transpose(1, 2) @ key.float().transpose(1, 2).transpose(-1, -2) * scale
+    exact_tokens = block_map.repeat_interleave(64, -2).repeat_interleave(64, -1)
+    hybrid_scores = torch.where(exact_tokens, exact_scores, centroid_scores.repeat_interleave(64, -1))
+    hybrid_scores = hybrid_scores.masked_fill(~valid, -torch.inf)
+    expected = hybrid_scores.softmax(-1) @ value.float().transpose(1, 2)
+    torch.testing.assert_close(joint_lse, hybrid_scores.logsumexp(-1), rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(merged, expected, rtol=0.01, atol=0.002)
 
 
 @pytest.mark.parametrize("capability", [(10, 0), (10, 3)])

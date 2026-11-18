@@ -84,6 +84,10 @@ are rejected rather than inferred from maximum sequence lengths. Its optional
 `prefix_sink` uses model-owned video layout to protect the prefix as keys and
 as dense queries. The sparse kernel has an opaque custom-op compilation boundary;
 Ring and AllGather-KV cannot bypass its full-sequence contract.
+An explicit sink that clamps to an empty range does not enlarge the protected
+video prefix. `kv_splits="auto"` resolves to four splits for SM90 with CuTe and
+at least 65,536 valid tokens, and one otherwise, matching upstream's integration
+policy. Explicit multi-split requests still require SM90 and the CuTe runtime.
 
 A backend reads only the fields it owns and rejects incompatible values. New
 options should be added to a shared typed spec only when more than one backend
@@ -128,7 +132,54 @@ logical block size and valid-token counts. It owns kernel availability,
 provider-specific sparse metadata, transport padding and execution. The cuDNN
 provider consumes tile64 or tile128 directly; selecting it does not change
 the model's top-k policy. Startup checks and execution use the same provider
-resolution path.
+resolution path. The cuDNN adapter imports the public
+`cudnn.block_sparse_attention` namespace; it must not depend on the legacy
+`cudnn.torch` re-export removed in frontend 1.32.
+
+The shared `block_sparse_attn_bshd(..., return_lse=True)` contract exposes
+the selected blocks' normalization state for algorithm-owned residual merges.
+It returns BSHD output and contiguous FP32 **natural-log** LSE in `[B,H,Sq]`
+layout. Empty rows have zero output and negative-infinite LSE. Only explicit
+`cudnn` and `triton` BF16 providers currently implement this contract; other
+provider/precision combinations fail rather than silently discarding LSE or
+switching kernels. The Triton adapter converts its kernel's base-2 LSE;
+cuDNN already returns natural-log LSE. The default remains output-only.
+
+This normalization contract does not make SOL and VSA interchangeable.
+SOL needs its own training-free routing and a normalization-weighted merge
+of exact selected blocks with omitted-block centroid approximations. H3 VSA
+retains its checkpoint-owned compressed-attention gate. `SOL_ATTN` keeps
+`sol_attn.provider="native"` as its default. Explicit `cudnn` or `triton`
+selects the experimental SOL-BSA composition, not VSA routing: upstream SOL
+preprocessing supplies BF16 K means, BF16 V sums, and base-2 thresholds;
+the adapter routes pooled Q against K means and protects neighboring tiles.
+Sink tiles are dense along both query and key axes, so they do not require
+a second dense-query pass. This rounds sink-query protection up to complete
+64-token tiles, unlike the native path's token-range overwrite.
+
+`sol_attn.sink_mode="text_audio"` replaces the prefix/range policy with a
+producer-owned `AttentionMetadata.text_audio_block_mask`. Its `TextAudioBlockMask`
+records valid length, block size, and a contiguous Boolean vector on the operand
+device. Only block64 metadata matching the global used sequence is accepted,
+including during dense guards. The producer validates nonempty text/audio
+positions once per request; consumers do not read device scalars per layer.
+Both Q rows and KV columns of marked blocks stay exact. Reference video is not
+implicitly protected, apart from mixed boundary blocks. This mode requires an
+explicit BSA provider and rejects explicit sink ranges; it overrides `prefix_sink`
+without changing the default `sink_mode="prefix"`. Pure Ulysses preserves the
+global mask; compact unequal-Q/KV and multi-document layouts remain unsupported.
+`dense_steps=0` and `dense_layers=[]` permit BSA at every main-DiT step and layer,
+but do not disable exact sink/neighbor blocks or change the sampler step count.
+
+The SOL-BSA residual uses query chunks and the provider's natural-log LSE.
+Omitted-block token counts weight the denominator, while V sums already
+contain their numerator multiplicity. It is a correctness-first PyTorch
+composition, not a fused residual kernel or a validated speedup. Routing
+metadata still scales quadratically in the number of tiles. BSA providers
+resolve `kv_splits="auto"` to one and reject explicit multi-split requests;
+Triton additionally requires standard head-dimension scaling. Provider and
+preprocessor dependencies are checked at construction and for the operand
+device at execution. Errors do not fall back to native SOL or dense attention.
 
 Qwen-Image-2.1 publishes a zero-based denoising index in
 `ForwardContext.denoise_step_idx` before running the transformer. Both CFG

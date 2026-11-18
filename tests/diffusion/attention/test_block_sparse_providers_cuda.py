@@ -67,14 +67,22 @@ def test_sparse_ragged_tiles_and_graph_replay(provider, tolerance, tile, batch, 
         token_mask = mask.repeat_interleave(tile, -2).repeat_interleave(tile, -1) & valid[None, None, None, :]
         scores = q.float().transpose(1, 2) @ k.float().transpose(1, 2).transpose(-1, -2) / 128**0.5
         probs = scores.masked_fill(~token_mask, -torch.inf).softmax(-1).nan_to_num()
-        return (probs @ v.float().transpose(1, 2)).transpose(1, 2)
+        return (
+            (probs @ v.float().transpose(1, 2)).transpose(1, 2),
+            scores.masked_fill(~token_mask, -torch.inf).logsumexp(-1),
+        )
 
     def run():
-        return block_sparse_attn_bshd(q, k, v, mask, sizes, 128**-0.5, provider=provider, block_size=tile)
+        return block_sparse_attn_bshd(
+            q, k, v, mask, sizes, 128**-0.5, provider=provider, block_size=tile, return_lse=True
+        )
 
-    actual = run()
+    actual, actual_lse = run()
+    expected, expected_lse = reference()
     assert torch.isfinite(actual).all()
-    torch.testing.assert_close(actual.float(), reference(), atol=tolerance, rtol=tolerance)
+    torch.testing.assert_close(actual.float(), expected, atol=tolerance, rtol=tolerance)
+    assert actual_lse.dtype == torch.float32 and actual_lse.is_contiguous()
+    torch.testing.assert_close(actual_lse, expected_lse, atol=tolerance, rtol=tolerance)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -83,13 +91,16 @@ def test_sparse_ragged_tiles_and_graph_replay(provider, tolerance, tile, batch, 
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = run()
+        captured, captured_lse = run()
     mask.zero_()
     graph.replay()
     assert torch.count_nonzero(captured).item() == 0
+    assert torch.isneginf(captured_lse).all()
     mask[..., 0] = True
     sizes.copy_(torch.tensor([17, tile, 1, 0, tile - 1], device="cuda", dtype=torch.int32))
     for tensor in (q, k, v):
         tensor.copy_(torch.randn_like(tensor))
     graph.replay()
-    torch.testing.assert_close(captured.float(), reference(), atol=tolerance, rtol=tolerance)
+    expected, expected_lse = reference()
+    torch.testing.assert_close(captured.float(), expected, atol=tolerance, rtol=tolerance)
+    torch.testing.assert_close(captured_lse, expected_lse, atol=tolerance, rtol=tolerance)

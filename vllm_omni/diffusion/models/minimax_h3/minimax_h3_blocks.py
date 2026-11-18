@@ -22,6 +22,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
     AttentionMetadata,
     PackedPaddingMetadata,
+    TextAudioBlockMask,
     VideoTokenLayout,
 )
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
@@ -349,6 +350,7 @@ class MiniMaxH3Attention(nn.Module):
         packed_total: int,
         num_requests: int = 1,
         video_layout: VideoTokenLayout | None = None,
+        text_audio_block_mask: TextAudioBlockMask | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
         gate_compress: torch.Tensor | None = None,
         reference_kv_state: MiniMaxH3ReferenceKVTier2State | None = None,
@@ -467,6 +469,7 @@ class MiniMaxH3Attention(nn.Module):
             ),
             extra=extra,
             video_layout=video_layout,
+            text_audio_block_mask=text_audio_block_mask,
         )
         return self.attention(
             q.unsqueeze(0),
@@ -516,6 +519,7 @@ class MiniMaxH3Attention(nn.Module):
         num_requests: int = 1,
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
+        text_audio_block_mask: TextAudioBlockMask | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
         reference_kv_state: MiniMaxH3ReferenceKVTier2State | None = None,
         reference_kv_layer_index: int | None = None,
@@ -568,6 +572,7 @@ class MiniMaxH3Attention(nn.Module):
             packed_total=packed_total if packed_total is not None else q.shape[0],
             num_requests=num_requests,
             video_layout=video_layout,
+            text_audio_block_mask=text_audio_block_mask,
             vsa_prefix_segments=vsa_prefix_segments,
             gate_compress=gate_compress,
             reference_kv_state=reference_kv_state,
@@ -810,6 +815,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         num_requests: int = 1,
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
+        text_audio_block_mask: TextAudioBlockMask | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
         reference_kv_state: MiniMaxH3ReferenceKVTier2State | None = None,
         reference_kv_compact: bool = False,
@@ -849,6 +855,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             num_requests=num_requests,
             sp_seq_lens=sp_seq_lens,
             video_layout=video_layout,
+            text_audio_block_mask=text_audio_block_mask,
             vsa_prefix_segments=vsa_prefix_segments,
             reference_kv_state=reference_kv_state,
             reference_kv_layer_index=self.layer_index,

@@ -1417,6 +1417,7 @@ class MiniMaxH3DiTModel(nn.Module):
         # that omits it is packing a single request.
         num_requests = int(self._psp_optional(psp, "num_requests", 1))
         vsa_prefix_segments = tuple(int(length) for length in self._psp_optional(psp, "vsa_prefix_segments", ()))
+        text_audio_block_mask = self._psp_optional(psp, "text_audio_block_mask", None)
         refiner_psp = _required_kwarg(kwargs, "refiner_packed_seq_params")
         refiner_cu = self._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
         refiner_max = int(self._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
@@ -1615,6 +1616,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 packed_total=block_packed_total,
                 num_requests=num_requests,
                 video_layout=block_video_layout,
+                text_audio_block_mask=None if compact_reference else text_audio_block_mask,
                 vsa_prefix_segments=(() if compact_reference else vsa_prefix_segments),
                 reference_kv_state=reference_kv_state,
                 reference_kv_compact=compact_reference,

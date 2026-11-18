@@ -38,7 +38,9 @@ def triton_block_sparse_attention(
     block_sizes: torch.Tensor | None,
     softmax_scale: float,
     block_size: int,
-) -> torch.Tensor:
+    *,
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if block_size not in (64, 128):
         raise ValueError("Triton VSA requires logical tile64 or tile128")
     if not math.isclose(softmax_scale, 128**-0.5, rel_tol=0, abs_tol=1e-6):
@@ -58,7 +60,7 @@ def triton_block_sparse_attention(
         block_map = block_map & (block_sizes > 0)[None, None, None, :]
     indices, counts = block_map_to_indices(block_map)
     kernel = require_triton_sparse(query.device)
-    output, _ = kernel(
+    output, lse_log2 = kernel(
         query.transpose(1, 2).contiguous(),
         key.transpose(1, 2).contiguous(),
         value.transpose(1, 2).contiguous(),
@@ -68,5 +70,11 @@ def triton_block_sparse_attention(
     )
     # The upstream kernel divides by a zero denominator for empty rows.
     # Define those rows as zero without hiding non-finite nonempty results.
-    output = output.masked_fill((counts == 0).repeat_interleave(64, -1).unsqueeze(-1), 0)
-    return output.transpose(1, 2).contiguous()
+    empty_rows = (counts == 0).repeat_interleave(64, -1)
+    output = output.masked_fill(empty_rows.unsqueeze(-1), 0).transpose(1, 2).contiguous()
+    if not return_lse:
+        return output
+    if lse_log2.shape != (query.shape[0], query.shape[2], query.shape[1]) or lse_log2.dtype != torch.float32:
+        raise ValueError("Triton BSA must return FP32 base-2 LSE with shape [B,H,Sq]")
+    lse = (lse_log2 * math.log(2)).masked_fill(empty_rows, -torch.inf).contiguous()
+    return output, lse

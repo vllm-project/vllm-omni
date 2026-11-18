@@ -241,6 +241,22 @@ class PackedPaddingMetadata:
     cu_seqlens_k: torch.Tensor
 
 
+@dataclass(frozen=True, slots=True)
+class TextAudioBlockMask:
+    """Producer-owned protection for text/audio in one global packed sequence.
+
+    ``blocks`` is a contiguous Boolean vector on the attention device. Each
+    element protects both the Q rows and KV columns of a token block. The
+    producer validates nonempty text/audio indices against ``used_len`` and
+    builds this once per request, before sequence sharding. Visual references
+    are not protected except where they share a block with text or audio.
+    """
+
+    used_len: int
+    block_size: int
+    blocks: torch.Tensor
+
+
 @dataclass
 class AttentionMetadata:
     attn_mask: torch.Tensor | None = None
@@ -291,6 +307,8 @@ class AttentionMetadata:
     # Geometry of the video segment for backends that exploit spatiotemporal
     # locality (block-sparse selection, tiled masks). Dense backends ignore it.
     video_layout: VideoTokenLayout | None = None
+
+    text_audio_block_mask: TextAudioBlockMask | None = None
 
     # Canonical mask-free view of structural suffix padding. Backends that do
     # not advertise supports_packed_mask_free ignore it.

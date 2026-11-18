@@ -6,6 +6,7 @@ import functools
 import importlib
 import math
 import os
+from typing import Literal, overload
 
 import torch
 from vllm.logger import init_logger
@@ -288,6 +289,7 @@ def block_map_to_indices(block_map: torch.Tensor) -> tuple[torch.Tensor, torch.T
     return indices, counts
 
 
+@overload
 def block_sparse_attn_bshd(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -299,28 +301,70 @@ def block_sparse_attn_bshd(
     provider: str = "fastvideo",
     precision: str = "bf16",
     block_size: int = 64,
-) -> torch.Tensor:
+    return_lse: Literal[False] = False,
+) -> torch.Tensor: ...
+
+
+@overload
+def block_sparse_attn_bshd(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    block_map: torch.Tensor,
+    block_sizes: torch.Tensor | None,
+    softmax_scale: float,
+    *,
+    provider: str = "fastvideo",
+    precision: str = "bf16",
+    block_size: int = 64,
+    return_lse: Literal[True],
+) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+
+def block_sparse_attn_bshd(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    block_map: torch.Tensor,
+    block_sizes: torch.Tensor | None,
+    softmax_scale: float,
+    *,
+    provider: str = "fastvideo",
+    precision: str = "bf16",
+    block_size: int = 64,
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Dispatch explicit tile64/tile128 attention without model-specific metadata.
 
     FlashInfer accepts rectangular/ragged BSHD inputs. FastVideo accepts
     equally shaped tensors padded to full tiles, FP16/BF16 and the standard
     attention scale. Its optional paired-CTA padding belongs to this adapter,
     so callers always receive exactly their logical query rows.
+
+    ``return_lse=True`` is supported by explicit cuDNN/Triton BF16 providers.
+    It returns BSHD output and contiguous FP32 natural-log LSE [B,H,Sq].
+    Empty attention rows have zero output and negative-infinite LSE.
     """
     if block_size not in (64, 128):
         raise ValueError("block_size must be 64 or 128")
+    if return_lse and (provider not in ("cudnn", "triton") or precision != "bf16"):
+        raise ValueError("return_lse requires an explicit cudnn/bf16 or triton/bf16 provider")
     if provider == "triton":
         from .triton_block_sparse import triton_block_sparse_attention
 
         if precision != "bf16":
             raise ValueError("Triton VSA requires BF16 precision")
-        return triton_block_sparse_attention(query, key, value, block_map, block_sizes, softmax_scale, block_size)
+        return triton_block_sparse_attention(
+            query, key, value, block_map, block_sizes, softmax_scale, block_size, return_lse=return_lse
+        )
     if provider == "cudnn":
         from .cudnn_block_sparse import cudnn_block_sparse_attention
 
         if precision != "bf16":
             raise ValueError("cuDNN VSA currently supports BF16 precision")
-        return cudnn_block_sparse_attention(query, key, value, block_map, block_sizes, softmax_scale, block_size)
+        return cudnn_block_sparse_attention(
+            query, key, value, block_map, block_sizes, softmax_scale, block_size, return_lse=return_lse
+        )
     if provider == "flashinfer" and block_size == 64:
         from .flashinfer_block_sparse import flashinfer_block_sparse_attention
 

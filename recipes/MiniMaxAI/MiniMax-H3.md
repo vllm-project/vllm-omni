@@ -369,6 +369,10 @@ for installation, compatibility, quality safeguards, and the per-role
 configuration that keeps the token refiner dense. This opt-in does not change
 the default backend described below.
 
+For the T2VA, FL2VA, and Ref2VA SOL-BSA serve command and task selection, see
+[online serving](../../docs/user_guide/diffusion/attention_backends/sol_attn.md#minimax-h3-online-serving).
+This experimental profile still needs full-model quality and latency validation.
+
 On supported datacenter Blackwell systems, MiniMax H3 defaults to dense BF16
 `TRTLLM_ATTN`; no attention backend flag is required. To select it explicitly,
 use:

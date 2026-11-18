@@ -2390,12 +2390,19 @@ class SolAttnSpec:
     """User-facing controls for the Sol-Attn sparse attention backend.
 
     ``tau`` scales the routing threshold (higher selects fewer exact KV
-    blocks), ``thresh_type`` is ``diag`` (approximate diagonal routing) or
-    ``exact``. ``prefix_sink`` derives a protected prefix from model-owned
+    blocks). ``thresh_type`` selects a diagonal-covariance (``diag``) or
+    full-covariance (``exact``) threshold estimator, not attention precision.
+    ``prefix_sink`` derives a protected prefix from model-owned
     video layout; ``sink_tokens``/``sink_start`` add an explicit range. Sink
-    rows are exact as K/V and recomputed densely as queries. ``dense_steps``
+    rows are exact as K/V and queries; the native provider recomputes those
+    queries densely, while BSA protects complete sink tiles. ``dense_steps``
     keeps the first N denoise steps dense, ``dense_layers`` exempts individual
     DiT blocks, and ``kv_splits`` sets the number of KV splits used by the kernel.
+    ``provider`` defaults to the native fused SOL kernel. Explicit ``cudnn``
+    or ``triton`` uses experimental BF16 block-sparse execution with SOL
+    routing and a normalization-weighted centroid residual, not VSA gates.
+    ``sink_mode=text_audio`` requires BSA and producer-owned block64 metadata;
+    it overrides ``prefix_sink`` and cannot add an explicit sink range.
     """
 
     tau: float = 1.0
@@ -2403,13 +2410,24 @@ class SolAttnSpec:
     sink_tokens: int = 0
     sink_start: int | None = 0
     prefix_sink: bool = True
+    sink_mode: str = "prefix"
     dense_steps: int = 10
     dense_layers: str | int | list[int] | None = "0,1"
     kv_splits: int | str = "auto"
+    provider: str = "native"
 
     _VALID_THRESH_TYPES = frozenset({"diag", "exact"})
 
     def __post_init__(self) -> None:
+        if self.provider not in ("native", "cudnn", "triton"):
+            raise ValueError("sol_attn.provider must be native, cudnn, or triton.")
+        if self.sink_mode not in ("prefix", "text_audio"):
+            raise ValueError("sol_attn.sink_mode must be prefix or text_audio.")
+        if self.sink_mode == "text_audio":
+            if self.provider == "native":
+                raise ValueError("sol_attn.sink_mode=text_audio requires a cudnn or triton BSA provider.")
+            if self.sink_tokens != 0 or self.sink_start not in (0, None):
+                raise ValueError("sol_attn.sink_mode=text_audio cannot be combined with an explicit sink range.")
         self.tau = _in_range(self.tau, "sol_attn.tau", 0.0, None) or 0.0
         if self.thresh_type not in self._VALID_THRESH_TYPES:
             raise ValueError(
@@ -2435,6 +2453,8 @@ class SolAttnSpec:
             self.kv_splits = "auto"
         else:
             raise ValueError(f"sol_attn.kv_splits must be an int or 'auto'; got {self.kv_splits!r}.")
+        if self.provider != "native" and self.kv_splits not in ("auto", 1):
+            raise ValueError("SOL BSA providers require kv_splits=1 or 'auto' (resolved to 1).")
 
 
 @dataclass
@@ -2568,9 +2588,11 @@ class AttentionSpec:
                 "sink_tokens": sol.sink_tokens,
                 "sink_start": sol.sink_start,
                 "prefix_sink": sol.prefix_sink,
+                "sink_mode": sol.sink_mode,
                 "dense_steps": sol.dense_steps,
                 "dense_layers": sol.dense_layers,
                 "kv_splits": sol.kv_splits,
+                "provider": sol.provider,
             }
         return kw or None
 
