@@ -40,47 +40,72 @@ def test_conflicting_metric_direction_is_rejected() -> None:
         metric_lower_is_better("latency_throughput")
 
 
-def test_exact_10_percent_boundary_passes() -> None:
+@pytest.mark.parametrize("hardware", ["H100", "910B", "910B4"])
+def test_exact_10_percent_boundary_passes(hardware: str) -> None:
     measured = {
         "request_throughput": 0.9,
         "mean_e2el_ms": 110.0,
+        "mean_video_ttfc_ms": 110.0,
+        "mean_video_steady_interval_ms": 110.0,
+        "p95_video_steady_interval_ms": 110.0,
+        "min_video_fps": 0.9,
     }
-    baseline = {"H100": {"request_throughput": 1.0, "mean_e2el_ms": 100.0}}
-    assert_baseline_within_tolerance(measured, baseline, "H100")
+    baseline = {
+        hardware: {
+            "request_throughput": 1.0,
+            "mean_e2el_ms": 100.0,
+            "mean_video_ttfc_ms": 100.0,
+            "mean_video_steady_interval_ms": 100.0,
+            "p95_video_steady_interval_ms": 100.0,
+            "min_video_fps": 1.0,
+        },
+        "A2": {"request_throughput": 2.0},
+    }
+    assert_baseline_within_tolerance(measured, baseline, hardware)
 
 
-def test_throughput_drop_beyond_10_percent_fails() -> None:
-    measured = {"request_throughput": 0.89}
-    baseline = {"H100": {"request_throughput": 1.0}}
+@pytest.mark.parametrize("metric", ["request_throughput", "min_video_fps"])
+@pytest.mark.parametrize("hardware,bucket", [("H100", "H100"), ("910B", "A2"), ("910B4", "A2")])
+def test_throughput_drop_beyond_10_percent_fails(metric: str, hardware: str, bucket: str) -> None:
+    measured = {"Hardware": hardware, metric: 0.89}
+    baseline = {bucket: {metric: 1.0}}
+    assert_baseline_within_tolerance({metric: 1.1}, baseline, hardware)
+    assert_baseline_within_tolerance({metric: 0.91}, baseline, hardware)
     with pytest.raises(AssertionError, match="below baseline 1.0"):
-        assert_baseline_within_tolerance(measured, baseline, "H100")
+        assert_baseline_within_tolerance(measured, baseline, hardware)
+    assert measured == {"Hardware": hardware, metric: 0.89}
 
 
-def test_latency_increase_beyond_10_percent_fails_and_improvement_passes() -> None:
-    baseline = {"A3": {"latency_mean": 10.0, "peak_memory_mb_mean": 1000.0}}
+@pytest.mark.parametrize(
+    "metric", ["latency_mean", "mean_video_ttfc_ms", "mean_video_steady_interval_ms", "p95_video_steady_interval_ms"]
+)
+def test_latency_increase_beyond_10_percent_fails_and_improvement_passes(metric: str) -> None:
+    baseline = {"A3": {metric: 10.0, "peak_memory_mb_mean": 1000.0}}
     assert_baseline_within_tolerance(
-        {"latency_mean": 8.0, "peak_memory_mb_mean": 900.0},
+        {metric: 8.0, "peak_memory_mb_mean": 900.0},
         baseline,
         "A3",
     )
-    with pytest.raises(AssertionError, match="latency_mean"):
+    with pytest.raises(AssertionError, match=metric):
         assert_baseline_within_tolerance(
-            {"latency_mean": 11.01, "peak_memory_mb_mean": 1000.0},
+            {metric: 11.01, "peak_memory_mb_mean": 1000.0},
             baseline,
             "A3",
         )
 
 
-@pytest.mark.parametrize("hardware", ["B200", None, ""])
+@pytest.mark.parametrize(
+    "hardware,bucket", [("B200", "H100"), (None, "H100"), ("", "H100"), ("910B", "H100"), ("910B4", "A3")]
+)
 def test_unmatched_hardware_warns_and_skips(
-    hardware: str | None, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
+    hardware: str | None, bucket: str, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    baseline = {"H100": {"throughput_qps": 1.0}}
+    baseline = {bucket: {"throughput_qps": 1.0}}
     assert_baseline_within_tolerance({"throughput_qps": 0.01}, baseline, hardware)
     output = capsys.readouterr().out
     assert "[baseline-check] WARNING SKIP: No matching baseline" in output
     assert repr(hardware) in output
-    assert "available hardware: ['H100']" in output
+    assert f"available hardware: ['{bucket}']" in output
     assert any(
         record.levelname == "WARNING" and "[baseline-check] SKIP: No matching baseline" in record.message
         for record in caplog.records

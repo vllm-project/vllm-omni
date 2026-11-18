@@ -128,7 +128,7 @@ The following fields belong under `duplex_session` and apply when
 | `max_sessions` | int | `1` | Global session limit, including sessions being opened or closed. |
 | `replica_policy` | `legacy` \| `least_sessions` | `legacy` | `legacy` preserves existing request routing and worker capacities. `least_sessions` reserves a replica group once when a session opens. |
 | `max_sessions_per_replica` | int \| null | `null` | Required and at least `1` for `least_sessions`. Bounds reserved sessions and model-owned session resources on each replica of every stage. |
-| `replica_groups` | list of stage-to-replica maps \| null | `null` | Explicit groups such as `[{0: 0, 1: 0}, {0: 1, 1: 0}]`. Stage and replica IDs must be nonnegative integers. |
+| `replica_groups` | list of stage-to-replica maps \| null | `null` | Omitted or `null` allows every combination of one replica per stage (a Cartesian product / SQL `CROSS JOIN`), selected lazily without expanding the product. Explicit maps restrict the allowed paths. Stage and replica IDs must be nonnegative integers. |
 
 For example, a two-stage local pipeline with two replicas per stage can use:
 
@@ -147,9 +147,13 @@ stages:
     devices: "2,3"
 ```
 
-This example assumes one GPU per replica. With equal replica counts and no
-explicit groups, group `g` maps every stage to replica `g`. Unequal counts
-require explicit groups. Every group must cover every pipeline stage, all
+This example assumes one GPU per replica. Omitting `replica_groups` joins all
+replicas across stages, yielding `{0: 0, 1: 0}`, `{0: 0, 1: 1}`, `{0: 1, 1: 0}`,
+and `{0: 1, 1: 1}`. This also works with unequal counts: `[1, 3, 1]` yields the
+three paths `{0: 0, 1: i, 2: 0}` for `i = 0, 1, 2`. Group IDs follow the
+combination order, with the last stage's replica index changing fastest.
+Specify groups explicitly to pair matching replica indexes or restrict paths.
+Every explicit group must cover every pipeline stage, all
 replica IDs must exist, every replica must belong to at least one group, and
 duplicate groups are rejected. A replica shared by multiple groups has one
 shared capacity counter; the global limit can therefore exceed the capacity
@@ -162,9 +166,23 @@ hold their slots, and closing sessions release them after cleanup completes.
 When no group has capacity, opening a session fails with the retryable
 `resource_exhausted` error containing `replica_capacity_exhausted`.
 
-`least_sessions` supports local single-host deployments only; coordinator or
-distributed routing is rejected at startup. A per-replica cap above `1` also
-requires the model plugin to support concurrent sessions on one replica; use
+`least_sessions` supports replicas attached through distributed runtimes,
+including multiple runtimes serving the same stage across hosts. Declare the
+cluster-wide total with `stages[].num_replicas` and each runtime's local count
+with `--omni-dp-size-local`. On the head, the local count is also the minimum
+total, preserving the CLI override when the configured count defaults to `1`.
+Any stage runtime can be the head by omitting `--headless`; the others connect
+to its master address and port. Use a connector that supports the deployed
+cross-host transport. Automatic groups join the cluster-wide replica slots;
+they do not depend on how those replicas are split across runtimes or hosts.
+Groups refer to registration-assigned replica IDs, not host identities.
+The group topology is fixed at startup; attaching more replicas does not add
+duplex groups or migrate existing sessions. See the
+[multi-runtime design](../design/fullduplex.md#multiple-runtimes-and-hosts)
+for a split-stage topology, ownership boundaries and validation scope.
+
+A per-replica cap above `1` also requires the model plugin to support concurrent
+sessions on one replica; use
 `1` for plugins without that capability, including VoiceChat. A failed replica
 closes all sessions assigned to it, including idle sessions. Those sessions
 are not migrated, and other groups continue serving. Under `least_sessions`,
@@ -179,10 +197,15 @@ require `replica_policy: least_sessions` and a plugin whose capabilities declare
 `supports_session_resume: false`, such as PersonaPlex. Resume-capable models and
 the `legacy` policy remain unsupported with multiple duplex frontends.
 
-Group `g` (its zero-based position in `replica_groups`, or its implicit replica
-index) belongs to frontend `g % K`. `K` cannot exceed the number of groups.
+Group `g` (its zero-based position in the explicit or generated group list)
+belongs to frontend `g % K`. `K` cannot exceed the number of groups.
 Explicit groups sharing any stage replica must have the same frontend owner;
-cross-owner sharing is rejected. Each frontend places sessions only in its
+cross-owner sharing is rejected for both explicit and generated groups.
+Automatic joins commonly share replicas across frontend owners; use explicit
+groups with disjoint ownership for those multi-frontend deployments. For
+example, two stages with two replicas and two frontends can use
+`replica_groups: [{0: 0, 1: 0}, {0: 1, 1: 1}]`.
+Each frontend places sessions only in its
 owned groups, while workers still use `max_sessions_per_replica` as their cap.
 
 The global `max_sessions` budget is split evenly: frontend `i` receives

@@ -32,6 +32,7 @@ class FishOmniAdapter(ARTTSAdapter):
     stage_keys = frozenset({"fish_omni"})
     name = "fish_omni_tts"
     supports_reference_codes = True
+    reports_length_truncation = True
 
     def __init__(self, ctx) -> None:
         super().__init__(ctx)
