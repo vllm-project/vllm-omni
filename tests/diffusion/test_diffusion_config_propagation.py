@@ -64,6 +64,25 @@ def test_direct_config_preserves_explicit_extras():
 class TestParallelConfigPropagation:
     """Core regression tests: parallel_config must survive serialization."""
 
+    @pytest.mark.parametrize("vision_sp_size", [1, 8])
+    def test_text_encoder_vision_sp_roundtrip(self, vision_sp_size):
+        od = _roundtrip_diffusion_config(
+            model="test-model",
+            ulysses_degree=8,
+            text_encoder_tp_size=8,
+            text_encoder_vision_sp_size=vision_sp_size,
+        )
+        assert od.parallel_config.text_encoder_vision_sp_size == vision_sp_size
+        assert od.parallel_config.text_encoder_tp_size == 8
+        assert od.parallel_config.sequence_parallel_size == 8
+        assert od.parallel_config.world_size == od.num_gpus == 8
+
+    def test_nested_vision_sp_config_roundtrip(self):
+        pc = DiffusionParallelConfig(ulysses_degree=8, text_encoder_tp_size=8, text_encoder_vision_sp_size=8)
+        od = _roundtrip_diffusion_config(model="test-model", parallel_config=pc)
+        assert od.parallel_config.text_encoder_vision_sp_size == 8
+        assert od.parallel_config.world_size == od.num_gpus == 8
+
     def test_tp2_roundtrip(self):
         pc = DiffusionParallelConfig(tensor_parallel_size=2)
         od = _roundtrip_diffusion_config(model="test-model", parallel_config=pc)

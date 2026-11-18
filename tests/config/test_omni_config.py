@@ -61,7 +61,7 @@ from vllm_omni.config.stage_config import (
     resolve_deploy_yaml,
     update_deploy_config_async_chunk_enabled,
 )
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.engine.stage_engine_startup import _serialize_stage_config
 from vllm_omni.engine.stage_init_utils import build_legacy_engine_args_dict
@@ -1542,11 +1542,29 @@ def test_sub_config_fields_match_structured_scopes():
         "vae_patch_parallel_size",
         "vae_parallel_mode",
         "text_encoder_tp_size",
+        "text_encoder_vision_sp_size",
         "use_hsdp",
         "mask_sp_padding",
         "hsdp_shard_size",
         "hsdp_replicate_size",
     }
+
+
+@pytest.mark.parametrize("config_cls", [DiffusionParallelConfig, OmniStageDiffusionParallelConfig])
+@pytest.mark.parametrize("vision_sp_size", [0, 2, 4, 16, -1])
+def test_vision_sp_config_rejects_unsupported_sizes(config_cls, vision_sp_size):
+    with pytest.raises(ValueError, match="text_encoder_vision_sp_size"):
+        config_cls(text_encoder_tp_size=8, text_encoder_vision_sp_size=vision_sp_size)
+
+
+@pytest.mark.parametrize("config_cls", [DiffusionParallelConfig, OmniStageDiffusionParallelConfig])
+def test_vision_sp_config_requires_tp8_without_adding_world_size(config_cls):
+    assert config_cls().text_encoder_vision_sp_size == 1
+    with pytest.raises(ValueError, match="requires text_encoder_tp_size=8"):
+        config_cls(text_encoder_tp_size=4, text_encoder_vision_sp_size=8)
+    parallel = config_cls(ulysses_degree=8, text_encoder_tp_size=8, text_encoder_vision_sp_size=8)
+    assert parallel.sequence_parallel_size == 8
+    assert parallel.world_size == 8
 
 
 def test_inherited_sub_configs_initialize_transport_safe_derived_fields():

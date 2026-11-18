@@ -286,6 +286,7 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     vae_patch_parallel_size: int
     vae_parallel_mode: str
     text_encoder_tp_size: int
+    text_encoder_vision_sp_size: int
     use_hsdp: bool
     mask_sp_padding: bool
     hsdp_shard_size: int
@@ -786,6 +787,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     cfg_parallel_size: int = Field(default=1, ge=1)
     vae_patch_parallel_size: int = Field(default=1, ge=1)
     text_encoder_tp_size: int = Field(default=1, ge=1)
+    text_encoder_vision_sp_size: int = Field(default=1, ge=1)
     vae_parallel_mode: str = "tile"
     use_hsdp: bool = False
     mask_sp_padding: bool = False
@@ -795,6 +797,10 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     def __post_init__(self) -> None:
         self.data_parallel_index = self.data_parallel_rank
         self.sequence_parallel_size = self.ulysses_degree * self.ring_degree * self.allgather_degree
+        if self.text_encoder_vision_sp_size not in (1, 8):
+            raise ValueError("text_encoder_vision_sp_size must be 1 (replicated) or 8")
+        if self.text_encoder_vision_sp_size == 8 and self.text_encoder_tp_size != 8:
+            raise ValueError("text_encoder_vision_sp_size=8 requires text_encoder_tp_size=8")
         if self.allgather_degree > 1 and self.ring_degree > 1:
             raise ValueError(
                 "allgather_degree > 1 cannot be composed with ring_degree > 1: the supported "

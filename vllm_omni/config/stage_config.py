@@ -631,6 +631,7 @@ class StageDeployConfig:
     vae_patch_parallel_size: int | None = None
     vae_parallel_mode: str | None = None
     text_encoder_tp_size: int | None = None
+    text_encoder_vision_sp_size: int | None = None
     use_hsdp: bool | None = None
     hsdp_shard_size: int | None = None
     hsdp_replicate_size: int | None = None

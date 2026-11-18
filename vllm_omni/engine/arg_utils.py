@@ -374,6 +374,7 @@ class OmniEngineArgs(EngineArgs):
     # for library callers (#7564); registered pipelines may consume it through
     # their own stage_cli_aliases or deploy YAML.
     text_encoder_tp_size: int | None = None
+    text_encoder_vision_sp_size: int | None = None
     # The rest of the diffusion block is owned by ``OrchestratorArgs`` for
     # top-level CLI parsing and deploy redistribution, but stage engines
     # consume the same keys. Declared here for the same reason as

@@ -317,7 +317,6 @@ _INTERNAL = (
     "VLLM_OMNI_DLO_DP_WAVE_TIMEOUT",
     "VLLM_OMNI_GROUP_NORM_SPLIT_WAVES",
     "VLLM_OMNI_REPLICA_ID",
-    "VLLM_OMNI_H3_VISION_SP_SIZE",
     # Removed in vLLM v0.16.0. Omni reads it only to emit a migration warning;
     # it does not enable profiling or register /start_profile.
     "VLLM_TORCH_PROFILER_DIR",

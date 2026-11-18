@@ -139,8 +139,13 @@ def _loader_config(**overrides) -> SimpleNamespace:
         lora_application="runtime",
         diffusion_attention_config=AttentionConfig(),
         diffusion_attention_schedule=None,
+        parallel_config=DiffusionParallelConfig(),
     )
     fields.update(overrides)
+    # Older loader doubles specify only the dimensions relevant to their test.
+    parallel = fields["parallel_config"]
+    if isinstance(parallel, SimpleNamespace):
+        parallel.__dict__.setdefault("text_encoder_vision_sp_size", 1)
     return SimpleNamespace(**fields)
 
 
@@ -962,6 +967,8 @@ def test_process_weights_skips_completed_online_quant_layer(monkeypatch):
 
 
 class _ConfigAwareModel(nn.Module):
+    supports_text_encoder_vision_sp = True
+
     def __init__(self, *, od_config):
         super().__init__()
         self.captured_config = get_current_diffusion_config()
@@ -969,12 +976,13 @@ class _ConfigAwareModel(nn.Module):
         self.od_config = od_config
 
 
-def test_initialize_model_sets_current_diffusion_config_during_model_construction(monkeypatch):
+@pytest.mark.parametrize("vision_sp_size", [1, 8])
+def test_initialize_model_sets_current_diffusion_config_during_model_construction(monkeypatch, vision_sp_size):
     import vllm_omni.diffusion.registry as registry_mod
 
     od_config = _loader_config(
         model_class_name="DummyPipeline",
-        parallel_config=DiffusionParallelConfig(vae_patch_parallel_size=1, sequence_parallel_size=1),
+        parallel_config=DiffusionParallelConfig(text_encoder_tp_size=8, text_encoder_vision_sp_size=vision_sp_size),
         vae_use_slicing=False,
         vae_use_tiling=False,
     )
@@ -990,7 +998,28 @@ def test_initialize_model_sets_current_diffusion_config_during_model_constructio
 
     assert model.captured_config is od_config
     assert model.seen_config_during_init is od_config
+    assert model.od_config.parallel_config.text_encoder_vision_sp_size == vision_sp_size
     assert get_current_diffusion_config_or_none() is None
+
+
+def test_initialize_model_rejects_unsupported_vision_sp_before_construction(monkeypatch):
+    import vllm_omni.diffusion.registry as registry_mod
+
+    class UnsupportedModel(nn.Module):
+        def __init__(self, **kwargs):
+            raise AssertionError("unsupported pipeline must not be constructed")
+
+    od_config = _loader_config(
+        model_class_name="UnsupportedModel",
+        parallel_config=DiffusionParallelConfig(text_encoder_tp_size=8, text_encoder_vision_sp_size=8),
+    )
+    monkeypatch.setattr(
+        registry_mod.DiffusionModelRegistry,
+        "_try_load_model_cls",
+        staticmethod(lambda _name: UnsupportedModel),
+    )
+    with pytest.raises(ValueError, match="does not support text_encoder_vision_sp_size"):
+        initialize_model(od_config)
 
 
 def test_load_model_custom_pipeline_sets_current_diffusion_config(monkeypatch):

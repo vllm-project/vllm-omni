@@ -456,6 +456,33 @@ def test_serve_cli_accepts_text_encoder_tp_size():
     assert parallel_config["text_encoder_tp_size"] == 4
 
 
+@pytest.mark.parametrize("vision_sp_size", [None, "1", "8"])
+def test_serve_cli_preserves_text_encoder_vision_sp_size(vision_sp_size):
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+    argv = ["serve", "MiniMaxAI/MiniMax-H3", "--omni", "--usp", "8", "--text-encoder-tp-size", "8"]
+    if vision_sp_size is not None:
+        argv += ["--text-encoder-vision-sp-size", vision_sp_size]
+    args = parser.parse_args(argv)
+    explicit = args.get_explicit_kwargs_dict()
+    if vision_sp_size is None:
+        assert "text_encoder_vision_sp_size" not in explicit
+    stage_cfg = StageConfigFactory.create_default_diffusion(explicit)[0]
+    parallel = stage_cfg["engine_args"]["parallel_config"]
+    assert parallel["text_encoder_vision_sp_size"] == (int(vision_sp_size) if vision_sp_size else 1)
+    assert parallel["sequence_parallel_size"] == 8
+
+
+@pytest.mark.parametrize("vision_sp_size", ["0", "2", "4", "16"])
+def test_serve_cli_rejects_unsupported_text_encoder_vision_sp_size(vision_sp_size):
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+    with pytest.raises(SystemExit):
+        parser.parse_args(["serve", "MiniMaxAI/MiniMax-H3", "--omni", "--text-encoder-vision-sp-size", vision_sp_size])
+
+
 def test_serve_cli_forwards_model_defined_task_type_to_diffusion_stage():
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")

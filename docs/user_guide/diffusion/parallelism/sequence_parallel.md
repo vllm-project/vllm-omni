@@ -232,6 +232,7 @@ In `DiffusionParallelConfig`:
 | `allgather_degree` | int | 1 | Number of GPUs for AllGather-KV sequence parallelism. Gathers K/V in an orthogonal group so every rank runs local-Q/global-KV attention. May be combined with `ulysses_degree`, but not with `ring_degree > 1`. |
 | `ulysses_mode` | str | `"strict"` | Ulysses attention mode. Set to `"advanced_uaa"` to handle arbitrary sequence lengths and head counts without padding. |
 | `ulysses_a2a_permute` | bool | `False` | Enable CUDA copy engines (CE) for strict Ulysses; disabled uses NCCL. On NPU, use platform SHMEM. |
+| `text_encoder_vision_sp_size` | int | `1` | Experimental vision SP for the text encoder. MiniMax-H3 supports `1` (replicated) or `8` (requires `text_encoder_tp_size=8`). Reuses the encoder TP group and does not increase the DiT world size. |
 | `mask_sp_padding` | bool | `False` | When the sequence length is not divisible by the SP size, tokens are auto-padded with zeros. Set to `True` to mask those padding tokens (strict, but uses the slower varlen attention path); the default `False` leaves them unmasked, keeping the fast path with negligible numerical impact. |
 
 **Notes:**
@@ -239,6 +240,13 @@ In `DiffusionParallelConfig`:
 - Total sequence parallel size equals `ulysses_degree × ring_degree × allgather_degree`
 - Degrees must evenly divide the sequence length for optimal performance (or use `ulysses_mode="advanced_uaa"` for Ulysses-SP)
 - `mask_sp_padding` is an experimental feature, currently only supported by `Wan2.2`, `Wan2.2 Vace`, `Qwen-Image`, `Flux 2`, and `HunyuanVideo 1.5`
+
+Text-encoder vision SP is independent of the DiT SP dimensions above. Use
+`--text-encoder-tp-size 8 --text-encoder-vision-sp-size 8` for the MiniMax-H3
+opt-in SP8 path. Other pipelines reject a non-default value unless they
+explicitly support this feature. See the
+[Ascend NPU recipe](gh-file:recipes/MiniMaxAI/MiniMax-H3-NPU.md#qwen3-vl-vision-sequence-parallelism-experimental-sp8)
+for startup, rollback, and validation limits.
 
 On CUDA, set `ulysses_a2a_permute=True` (CLI: `--ulysses-a2a-permute`) to use CE.
 This requires `ulysses_mode="strict"`, `ulysses_degree > 1`, and peer-accessible
