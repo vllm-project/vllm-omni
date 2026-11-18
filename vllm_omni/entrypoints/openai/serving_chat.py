@@ -120,7 +120,7 @@ from vllm.tokenizers.mistral import (
     validate_request_params,
 )
 from vllm.tool_parsers import ToolParser
-from vllm.tool_parsers.streaming import extract_required_tool_call_streaming
+from vllm.tool_parsers.streaming import RequiredToolCallScanner, extract_required_tool_call_streaming
 from vllm.utils.collection_utils import as_list
 from vllm.v1.engine.exceptions import EngineDeadError
 
@@ -1712,6 +1712,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         all_previous_token_ids: list[list[int]] | None
         function_name_returned = [False] * num_choices
+        required_tool_call_scanners = [RequiredToolCallScanner() for _ in range(num_choices)]
         if self.tool_call_id_type == "kimi_k2":
             history_tool_call_cnt = get_history_tool_calls_cnt(conversation)
         else:
@@ -2032,7 +2033,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             assert previous_texts is not None
                             previous_text = previous_texts[i]
                             current_text = previous_text + delta_text
-                            fn_name_returned = function_name_returned[i]
                             output_token_ids = as_list(output.token_ids)
 
                             if (
@@ -2065,21 +2065,23 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                 # either finished reasoning or no reasoning at all
                                 content = current_text
 
+                                # The scanner owns the text it has consumed. Feed it
+                                # everything it has not seen, which is more than
+                                # delta_text when the delta that closed reasoning
+                                # also carried the start of the tool-call array.
+                                scanner = required_tool_call_scanners[i]
                                 delta_message, function_name_returned[i] = extract_required_tool_call_streaming(
-                                    previous_text=previous_text,
-                                    current_text=content,
-                                    delta_text=delta_text,
-                                    function_name_returned=fn_name_returned,
+                                    delta_text=content[len(scanner.text) :],
+                                    scanner=scanner,
                                     tool_call_idx=history_tool_call_cnt,
                                     tool_call_id_type=self.tool_call_id_type,
                                 )
-                                if (
-                                    delta_message
-                                    and delta_message.tool_calls
-                                    and delta_message.tool_calls[0].id is not None
-                                ):
-                                    history_tool_call_cnt += 1
-                                    tools_streamed[i] = True
+                                if delta_message and delta_message.tool_calls:
+                                    # One delta may start several tool calls.
+                                    started = sum(tc.id is not None for tc in delta_message.tool_calls)
+                                    if started:
+                                        history_tool_call_cnt += started
+                                        tools_streamed[i] = True
 
                         # handle streaming deltas for tools with "auto" tool choice
                         # and reasoning parser
