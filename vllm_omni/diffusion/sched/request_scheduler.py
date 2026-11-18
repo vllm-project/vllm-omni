@@ -210,9 +210,7 @@ class RequestScheduler(BaseScheduler):
         """
         if not request_batch_key_allowed(request, self.od_config, supported=self._mixfusion_supported):
             return None
-        key = build_request_batch_sampling_params_key(
-            request, getattr(self.od_config, "diffusion_attention_schedule", None)
-        )
+        key = build_request_batch_sampling_params_key(request, self.od_config.diffusion_attention_schedule)
         if uses_rank_local_dp_concurrency(self.od_config):
             # Serialize once before the request enters the queue. Invalid
             # extra_args then fail this submission, rather than schedule()

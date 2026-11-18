@@ -525,6 +525,7 @@ source_file_dependencies:
 
   # Tiny-model diffusion jobs (shared across many model trees under models/).
   diffusion_tiny_model:
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
     - tests/model_tests/diffusion/
     - vllm_omni/diffusion/models/
 
@@ -1589,6 +1590,8 @@ source_file_dependencies:
     - vllm_omni/entrypoints/openai/
 
   diffusion_minimax_h3_accuracy:
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
     - *minimax_h3
     - tests/e2e/accuracy/minimax_h3/
 
