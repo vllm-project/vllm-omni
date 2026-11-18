@@ -28,6 +28,57 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorMode
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_qwen3_thinker_embedding_adapter_materializes_only_committed_ids(dtype) -> None:
+    """The model-side A2 adapter maps verifier IDs to Thinker embeddings."""
+    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni import (
+        Qwen3OmniMoeForConditionalGeneration,
+    )
+
+    class _Thinker(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = torch.nn.Module()
+            self.language_model.model = torch.nn.Module()
+            self.language_model.model.embed_tokens = torch.nn.Embedding(6, 2, dtype=dtype)
+            with torch.no_grad():
+                self.language_model.model.embed_tokens.weight.copy_(torch.arange(12).reshape(6, 2))
+
+        def embed_input_ids(self, *, input_ids):
+            return self.language_model.model.embed_tokens(input_ids)
+
+    model = object.__new__(Qwen3OmniMoeForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.model_stage = "thinker"
+    model.thinker = _Thinker()
+    model.thinker_config = SimpleNamespace(text_config=SimpleNamespace(hidden_size=2))
+
+    def prepare(samples):
+        mm = model.prepare_speculative_multimodal_outputs(
+            multimodal_outputs={},
+            req_ids=["r"],
+            speculative_request_ids={"r"},
+            invalid_req_indices=[],
+            sampled_token_ids=torch.tensor([samples]),
+            input_token_ids=torch.tensor([4]),
+            input_positions=torch.tensor([3]),
+            query_start_loc=[0, 1],
+            prompt_lens=[2],
+            vocab_size=6,
+            consumed_input_span=False,
+        )
+        mm = model.finalize_multimodal_outputs_from_cpu_snapshot(mm)
+        return model.finalize_pooler_payload({}, multimodal_outputs=mm, idx=0)["hidden_states.layer_0"]
+
+    rows = prepare([4, -1, 1])
+    assert torch.equal(rows, torch.tensor([[8.0, 9.0], [2.0, 3.0]]))
+    empty = prepare([-1, -1, -1])
+    assert empty.shape == (0, 2)
+    assert empty.dtype == rows.dtype == dtype
+    assert empty.device == rows.device
+    assert torch.cat([empty, rows]).dtype == dtype
+
+
 @pytest.mark.parametrize(
     ("prompt_lens", "computed", "scheduled", "expected"),
     [
@@ -713,6 +764,93 @@ def test_runner_aligns_prefill_mask_with_flattened_scheduled_tokens(mocker):
         prefill_token_mask,
         torch.tensor([False, True, True, True, True, True, False]),
     )
+
+
+@pytest.mark.parametrize("correct_previous_drafts", [False, True])
+def test_real_prepare_inputs_keeps_linear_positions_separate_from_async_corrected_mrope(
+    monkeypatch, correct_previous_drafts
+):
+    """Run upstream position preparation, including MRoPE and async drift."""
+    # All buffers are on CPU; pinned allocation would unnecessarily require a
+    # visible GPU when the installed vLLM build selects the CUDA platform.
+    monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace()
+    batch = PrefillMaskInputBatch()
+    batch.req_ids = ["image"]
+    batch.req_id_to_index = {"image": 0}
+    batch.num_prompt_tokens = np.array([3], dtype=np.int32)
+    # CPU bookkeeping optimistically accepted all four drafts; GPU accepted
+    # only one. The first decode case has no previous verifier to correct.
+    batch.num_computed_tokens_cpu_tensor = torch.tensor([9 if correct_previous_drafts else 3], dtype=torch.int32)
+    batch.num_computed_tokens_cpu = batch.num_computed_tokens_cpu_tensor.numpy()
+    batch.token_ids_cpu_tensor = torch.zeros(1, 32, dtype=torch.int32)
+    batch.token_ids_cpu = batch.token_ids_cpu_tensor.numpy()
+    batch.prev_req_id_to_index = {"image": 0} if correct_previous_drafts else {}
+    runner.input_batch = batch
+    runner.requests = {
+        "image": SimpleNamespace(
+            num_tokens=9,
+            prompt_token_ids=[1, 2, 3],
+            prompt_embeds=None,
+            mrope_positions=torch.tensor([[0, 1, 1], [0, 1, 1], [0, 1, 1]]),
+            mrope_position_delta=-1,
+        )
+    }
+    runner.arange_np = np.arange(16, dtype=np.int32)
+    runner.input_ids = RunnerBuffer(16, torch.int32)
+    for name in (
+        "query_pos",
+        "query_start_loc",
+        "prev_positions",
+        "prev_num_draft_tokens",
+        "num_accepted_tokens",
+        "req_indices",
+        "num_scheduled_tokens",
+        "num_decode_draft_tokens",
+    ):
+        setattr(runner, name, RunnerBuffer(16, torch.int32))
+    runner.discard_request_mask = RunnerBuffer(16, torch.bool)
+    runner.optimistic_seq_lens_cpu = torch.zeros(16, dtype=torch.int32)
+    runner.num_computed_tokens = torch.tensor([4] + [0] * 15, dtype=torch.int32)
+    runner.valid_sampled_token_count_gpu = torch.tensor([2], dtype=torch.int32) if correct_previous_drafts else None
+    runner.prev_num_draft_tokens.np[0] = 4
+    runner.positions = torch.full((16,), -999, dtype=torch.int64)
+    runner.seq_lens = torch.zeros(16, dtype=torch.int32)
+    runner.mrope_positions = SimpleNamespace(
+        cpu=torch.zeros(3, 17, dtype=torch.int64),
+        gpu=torch.full((3, 17), -999, dtype=torch.int64),
+    )
+    runner.mrope_positions.np = runner.mrope_positions.cpu.numpy()
+    runner.num_accepted_tokens_event = None
+    runner.mamba_prev_last_scheduled_idx = None
+    runner.enable_prompt_embeds = False
+    runner.uses_mrope = runner.use_async_spec_decode = runner.use_async_scheduling = True
+    runner.uses_xdrope_dim = 0
+    runner.device = torch.device("cpu")
+    runner.speculative_config = SimpleNamespace()
+    runner.lora_config = None
+    runner._prepare_input_ids = lambda *_args: None
+
+    class PositionsPreparedError(RuntimeError):
+        pass
+
+    def stop_after_positions(*_args):
+        raise PositionsPreparedError
+
+    runner._calc_spec_decode_metadata = stop_after_positions
+    scheduler = SimpleNamespace(
+        total_num_scheduled_tokens=1, num_scheduled_tokens={"image": 1}, scheduled_spec_decode_tokens={}
+    )
+    with pytest.raises(PositionsPreparedError):
+        runner._prepare_inputs(scheduler, np.array([1], dtype=np.int32))
+
+    expected = 6 if correct_previous_drafts else 3
+    assert runner.positions[0].item() == expected
+    assert runner.num_computed_tokens[0].item() == expected
+    assert runner.mrope_positions.gpu[:, 0].tolist() == [expected - 1] * 3
+    # First decode seeds by linear position, despite its MRoPE coordinate 2.
+    assert (runner.positions[0].item() == 3) is (not correct_previous_drafts)
 
 
 def _make_runner(req_ids=("r1", "r2"), hidden_size=4):

@@ -322,7 +322,7 @@ def test_negative_non_hit_step_is_a_noop_through_manager(monkeypatch):
         runner._shutdown_omni_prefix_cache()
 
 
-def test_shared_runner_shutdown_releases_cache_before_upstream():
+def test_shared_runner_shutdown_releases_connectors_and_cache_before_upstream():
     """Execute the production method without importing CUDA/NPU modules."""
     import ast
 
@@ -349,10 +349,12 @@ def test_shared_runner_shutdown_releases_cache_before_upstream():
     namespace = {"PrefixCacheRunnerMixin": PrefixCacheRunnerMixin, "Base": Base}
     exec(compile(module, "<shared runner shutdown>", "exec"), namespace)
     runner = namespace["OmniGPUModelRunner"]()
+    runner._omni_connector_initialized = True
+    runner.shutdown_omni_connectors = lambda: order.append("connectors")
     runner.omni_prefix_cache = SimpleNamespace(shutdown=lambda: order.append("cache"))
     runner._prefix_cache_group_view = SimpleNamespace()
     runner.shutdown()
-    assert order == ["cache", "upstream"]
+    assert order == ["connectors", "cache", "upstream"]
 
     ar_tree = ast.parse((root / "vllm_omni/worker/gpu_ar_model_runner.py").read_text(encoding="utf-8"))
     ar_cls = next(node for node in ar_tree.body if isinstance(node, ast.ClassDef) and node.name == "GPUARModelRunner")
