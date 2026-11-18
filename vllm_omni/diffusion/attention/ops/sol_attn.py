@@ -115,12 +115,16 @@ def _merge_sol_bsa_residual(
     exact_lse: torch.Tensor,
     scale: float,
 ) -> torch.Tensor:
-    """Reference SOL merge with bounded query chunks and natural-log normalization.
+    """SOL merge with bounded workspace and natural-log normalization.
 
     Upstream summarizes K by its mean and V by its sum. Block multiplicity
-    belongs only in the residual denominator. This correctness-first path
-    deliberately does not claim the speed of a fused SOL residual kernel.
+    belongs only in the residual denominator. CUDA keeps FP32 matrix products
+    and fuses their surrounding normalization/merge; CPU retains the oracle.
     """
+    if query.is_cuda:
+        from .sol_residual import merge_sol_residual
+
+        return merge_sol_residual(query, key_centroids, value_sums, selected, sizes, exact_output, exact_lse, scale)
     output = torch.empty_like(query)
     keys = key_centroids.float().transpose(1, 2).transpose(-1, -2)
     values = value_sums.float().transpose(1, 2)
