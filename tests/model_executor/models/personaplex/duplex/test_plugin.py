@@ -154,20 +154,20 @@ def test_personaplex_deploy_enables_mimi_cuda_graphs_on_both_stage_configs(tmp_p
 
 
 @pytest.mark.parametrize("deploy", ["personaplex.yaml", "personaplex_duplex_mrv2.yaml"])
-def test_personaplex_deploy_serves_calls_past_the_sliding_window(tmp_path: Path, deploy: str) -> None:
-    """Stage 0's context and the temporal RoPE table both reach an hour of
-    80 ms frames, past the 3000-frame window Helium attends to. The MRv2
-    profile inherits that context but replaces hf_overrides, so it has to
-    restate the table."""
+def test_personaplex_deploy_config_keeps_context_past_the_sliding_window(tmp_path: Path, deploy: str) -> None:
+    """Both profiles configure an hour of 80 ms frames, past Helium's 3000-frame window."""
     (tmp_path / "config.json").write_text("{}")
     deploy_config = load_deploy_config(DEPLOY_PATH.with_name(deploy))
-    stage0 = merge_pipeline_deploy(PERSONAPLEX_PIPELINE, deploy_config)[0].yaml_engine_args
+    # The historical mixed-runner profile inherits the context length but
+    # replaces hf_overrides. Check the resolved settings before admission,
+    # which separately rejects its V1 Talker.
+    stage0 = deploy_config.stages[0]
 
     model_config = OmniEngineArgs(
         model=str(tmp_path),
-        model_arch=stage0["model_arch"],
-        hf_overrides=dict(stage0["hf_overrides"]),
-        max_model_len=stage0["max_model_len"],
+        model_arch=PERSONAPLEX_PIPELINE.stages[0].model_arch or PERSONAPLEX_PIPELINE.model_arch,
+        hf_overrides=dict(stage0.engine_extras["hf_overrides"]),
+        max_model_len=stage0.max_model_len,
         skip_tokenizer_init=True,
         trust_remote_code=True,
     ).create_model_config()
