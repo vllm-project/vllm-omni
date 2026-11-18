@@ -888,11 +888,12 @@ for queue updates and the final validity check before delivery.
   `function_call_output` is admitted only against that record:
   `pending -> accepted | timed_out | cancelled`, one transition, no rebinding
   of a call id, and terminal records kept as tombstones until the session
-  closes. Conversation history is not admission authority -- it is history-wide
+  closes. A client can also settle one call with `function_call.cancel`. Conversation history is not admission authority -- it is history-wide
   and epoch-blind, so a result arriving after a barge-in could otherwise be
   admitted against a call the session had already moved past. The epoch
   consequences hang off the single epoch-advance path: pending calls from older
-  epochs are cancelled, and a result the model accepted but never consumed is
+  epochs are cancelled (or, with `function_call_interrupt_policy: keep`, move to the new
+  epoch and stay answerable), and a result the model accepted but never consumed is
   retired from the runtime so the new epoch cannot speak it. A retired or
   already-consumed generation stays *named* in the worker-facing runtime config
   (model-owned state is per resumable stage request, and a cancel moves the
@@ -1054,8 +1055,9 @@ independent real-model verification.
 ## Session-aware replica placement
 
 The opt-in `duplex_session.replica_policy: least_sessions` policy places each
-session on a local replica group mapping every stage to a replica. The
-orchestrator owns a separate session reservation ledger; StagePool's request
+session on a replica group mapping every stage to a replica, including replicas
+attached from headless runtimes on other hosts. The orchestrator owns a separate
+session reservation ledger; StagePool's request
 bindings continue to describe submitted requests only. Admission reserves a
 group synchronously after taking the global admission slot. The group must
 have space under `max_sessions_per_replica` on every member replica. Replicas
@@ -1075,7 +1077,9 @@ replica.
 Replica failure marks the replica unavailable and closes every session in its
 reverse index, including idle sessions without an in-flight request. Other
 groups retain their reservations and can continue serving. This policy does
-not migrate model state or support coordinator/distributed deployments.
+not migrate model state. Distributed pins use StagePool's explicit-routing
+bindings and hub availability checks; detach notifications also close idle
+sessions. Session reservations remain separate from request bindings.
 Worker-local state capacity uses the per-replica cap, while `max_sessions`
 remains the global service cap. The default `legacy` policy preserves the
 existing routing, admission and worker capacity behavior. See the
@@ -1086,6 +1090,82 @@ With metrics enabled, `vllm_omni:duplex_reserved_sessions` reports reservations
 by model, stage and replica, and `vllm_omni:duplex_admission_rejected_total`
 counts global and replica capacity rejections. These collectors are created
 on first use by this policy and carry no session ID labels.
+
+### Multiple runtimes and hosts
+
+A runtime is one `vllm serve --omni` invocation. In a stage-based deployment,
+each stage-hosting runtime launches local replicas of one stage. One runtime is the head:
+it omits `--headless`, serves the API, and owns the master and session
+orchestration. Any stage runtime can take this role. The remaining runtimes
+use `--headless` and connect to the same `--omni-master-address` and
+`--omni-master-port`. A stage can span several runtimes, including runtimes on
+different hosts.
+
+For example, the declared stage totals `[1, 3, 1]` can be placed as follows:
+
+| Host | Stage | Local replicas | Role | Runtime arguments |
+| --- | --- | --- | --- | --- |
+| host0 | 0 | 1 | headless | `--stage-id 0 --omni-dp-size-local 1 --headless` |
+| host0 | 1 | 1 | head | `--stage-id 1 --omni-dp-size-local 1` |
+| host1 | 1 | 2 | headless | `--stage-id 1 --omni-dp-size-local 2 --headless` |
+| host0 | 2 | 1 | headless | `--stage-id 2 --omni-dp-size-local 1 --headless` |
+
+The head's `stages[].num_replicas` declares the cluster total for each stage;
+`--omni-dp-size-local` specifies the runtime's local share. For its own stage,
+the head resolves the total to `max(configured_total, local_count)`, preserving
+the existing CLI override when the configured count is smaller. The first
+`local_count` slots launch locally; the remaining slots attach remotely.
+Other stages attach remotely in their entirety. The existing unfiltered
+`single_stage_mode=True` path keeps all configured replicas local.
+The existing frontend-only head keeps all stage replicas remote.
+
+Device pools are split against the runtime's local replica count. For example,
+total `3`, local `2`, TP `1`, and `devices: "0,1"` assign GPUs 0/1 to the two
+local replicas; the third registration slot has no local device assignment.
+
+`DuplexReplicaPlacement` owns the startup group map and session reservations.
+Omitting `replica_groups` generates the Cartesian product of the stage replica
+slots, equivalent to a SQL `CROSS JOIN`, for both equal and unequal stage counts.
+The example above automatically gets three groups `{0: 0, 1: i, 2: 0}` for
+`i = 0, 1, 2`; `[2, 2]` gets all four pairs. The last stage's replica index
+changes fastest when assigning group IDs.
+Implicit paths are selected lazily from the least occupied replicas at each
+stage, preserving the same group IDs and round-robin tie-breaking without
+enumerating the product. Diagnostics record stage counts and the total group
+count instead of expanding every implicit path. Explicit groups restrict the paths
+instead of adding to the generated product. Each session reserves one path;
+replicas shared across paths retain one capacity counter. Stage 0 and stage 2
+each need a per-replica session cap of at
+least three to admit three sessions concurrently. Registration-assigned replica
+IDs identify replica slots, not durable host identities; explicit groups do
+not establish host affinity.
+
+StagePool owns dispatch and request bindings. A duplex pin reuses
+`bind_requested_replica`, including attachment and hub-UP validation, and uses
+the existing distributed address-affinity ledger. Internal routing errors are
+translated to stage failures. There is no second distributed pin ledger and no
+fallback to another replica after a required pin becomes unavailable.
+`MembershipController` invalidates the removed address and notifies the
+orchestrator. Duplex retirement marks the replica unavailable and closes every
+session reserved on it, including sessions with no active request. Generic
+request cleanup remains responsible for request bindings.
+
+Group topology is fixed for the head's lifetime. Later attachments do not add
+groups or recover closed sessions. This design adds neither elastic placement
+nor session migration or automatic restoration of an unavailable group.
+The distributed stage topology uses a single API frontend; the existing
+`--api-server-count > 1` launcher rejects distributed stage arguments. The
+local multi-frontend mode below is a separate deployment mode.
+
+The master address must be reachable from every runtime. Each cross-host
+pipeline edge also needs a connector with a suitable remote data plane;
+`SharedMemoryConnector` requires its sender and receiver to share a host.
+See [Disaggregated Inference](feature/disaggregated_inference.md) for transport
+configuration. Control-plane registration alone does not validate a connector's
+cross-host data path.
+
+For MiniCPM-o 4.5 on CUDA, keep the deploy profile's native MRv2 runner on all
+three stages when selecting `NixlConnector` for remote payload transfer.
 
 ### Multiple frontends
 
@@ -1099,7 +1179,11 @@ no central per-frame session dispatcher.
 Placement, rather than engine attachment, enforces exclusive ownership. Group
 `g` belongs to frontend `g % K`, and only that frontend may reserve its replicas
 or submit its session requests. Groups sharing a physical stage replica must
-have the same owner, and `K` must not exceed the group count. The global session
+have the same owner, and `K` must not exceed the group count. This validation
+also applies to automatically joined groups. Multi-stage joins usually share
+replicas across frontend owners, so those deployments must supply explicit
+groups with disjoint ownership, such as `[{0: 0, 1: 0}, {0: 1, 1: 1}]` for
+two stages with two replicas and two frontends. The global session
 budget is divided by floor/remainder across frontends and bounded by each
 frontend's owned replica capacity; budgets do not move between frontends.
 The reservation lifetime, strict stage pins and worker caps apply within each
@@ -1152,6 +1236,7 @@ message to `super()`:
 | `_on_stage_submitted(stage_id, request_id, replica_id, req_state)` | — | bind the forwarded stage request to the owning session |
 | `_intercept_stage_output(...) -> bool` | — | hand every session-owned output (Stage0 decision, Stage1 audio) plus its metric snapshot to `runner.on_stage_output`; `True` = do not forward |
 | `_handle_forward_failure(...) -> bool` | — | fail the owning session's response and close the session, keep the loop alive |
+| `_on_replica_removed(stage_id, replica_id)` | — | retire the detached replica and close its reserved sessions, including idle sessions |
 | `_cleanup_request_ids(ids, abort=, release_owners=)` | ignores `release_owners` | brackets `super()` with `close_sessions_for_request_ids` / `defer_request_cleanups` / `finalize_closed_sessions` |
 | `OrchestratorRequestState.session_owned` | never set | set by `ensure_request`: no synthetic terminal, no client emission, no terminal re-forward, no auto-cleanup on finish |
 
@@ -1178,6 +1263,23 @@ policy that used to be two separately configured objects:
 | session policy | `capabilities(max_sessions)`, `validate_client_extra_body`, `prepare_runtime_config(config, model_config)` (server-owned runtime keys, reference audio resolution), `runtime_config_for_update`, `parse_function_call` (recognize one call), `runtime_config_for_function_output` (feed an accepted result back into that model), `note_published_function_call` (plugin stores history length at publish), `has_pending_tool_followup` (plugin still has a tool result to answer), `extra_prompt_config`, `runtime_patch_for_submitted_prompt`, `runtime_config_after_response` (keep or drop a result after the response ends), `runtime_config_after_model_output` (consumption acknowledgement), `create_session_state() -> DuplexModelSessionState`, `data_plane: DuplexDataPlane` (projects raw stage outputs into internal events), `data_plane_context(...)` |
 
 A duplex tool call uses one client sequence. The client supplies tools, receives one function call, runs the function, and sends `function_call_output`. The server does not execute the function. Each model plugin implements both hooks. A recognized call is published through `model_channel._expose_function_call`. Before the plugin sees a `function_call_output`, the session copies `name` and `arguments` from the call origin recorded at publish. Conversation history is not admission authority. The client item stays `call_id` and `output`. Qwen3-Omni `parse_function_call` reads a Hermes `<tool_call>` and returns `{call_id, name, arguments}` without retaining them. One Thinker chunk can carry more than one completed call; each is emitted. `note_published_function_call` stores that call's history length in the Qwen runtime. `runtime_config_for_function_output` reads `name` and `arguments` from the preparation item, refuses when either is absent, and appends one `{history_len, messages}` entry there. The stored length wins over the length at result time. Tool pairs stay out of `session.history`. `has_pending_tool_followup` is how the runner learns that a bare `response.create` may open `{"type":"conversation"}`. `plan_append` splices each turn after the history it was accepted against, and `runtime_patch_for_submitted_prompt` holds those turns aside after the append is accepted. The pair stays owned by that response until playback stores its text. The next prompt puts a still-inflight pair back on the waiting list before the usual splice, and the pair keeps that response id so the playback ACK can drop it once the assistant text is stored. A cancel, a playback clear before any audio is committed, or `realtime_response_conversation: none` stores no text and puts the pair back with that response id. A failure before playback can store the answer puts the pair back without the id, so the retry can own it. `tool_choice: none` is rejected. A result whose published anchor has left the prompt window is refused instead of being attached to the latest question. `runtime_config_after_response` is that step. Nemotron VoiceChat `parse_function_call` reads the data-plane function-channel event, and `runtime_config_for_function_output` places the result on a later frame of the request that is still open. The session call book is #8758.
+
+The application-side `DuplexToolRunner` must consume events before generation
+starts. It delivers tool output independently of generation, but only requests
+continuation after all observed responses end and ACK-only playback is committed.
+Results delivered before the same continuation share one follow-up. Failed result
+writes stay visible in `undelivered_results` / `delivery_errors`; `retry_result`
+resends the cached output after reconnecting without rerunning the handler.
+A failed continuation write instead retains the call in `pending_continuations`
+with its `continuation_errors` entry; `retry_continuation` retries only that
+follow-up. Continuations reserve awaiting-response state before the send can
+yield, so lifecycle events observed during the write remain authoritative.
+Only results delivered before a follow-up begins are covered by that request.
+An acknowledged hard playback truncate retires the targeted playback gate when
+generation ends, including when the ACK precedes terminal metadata. Late ACKs
+cannot reopen a retired gate; the early-stop marker is removed at response end.
+A successful write is not proof of server acceptance, and the runner never sends
+playback ACKs on behalf of the application.
 
 `DuplexOmniEngine._validate_deployment` loads the plugin before any stage
 starts; `DuplexSessionManager.__init__` validates it against the stage
@@ -1285,16 +1387,30 @@ required to retire such a call.
 
 `on_tool_call_settled` handles metadata-only terminal cleanup, including old
 epochs; `on_tool_calls_closed` disposes registered call metadata during teardown.
-Model recovery uses the mailbox-ordered `runtime_config_for_tool_call_timeout`
-only for a timeout in the current epoch. These hooks default to no-ops: a model
-adapter must implement and validate its recovery behavior. Native Nemotron does
-not override the timeout hook: ledger expiry and late-result rejection do not
-establish native call abandonment or guarantee a subsequent model call. Qwen
-tool-result delivery is separate model-adapter work in
-[#8493](https://github.com/vllm-project/vllm-omni/pull/8493); session lifecycle
-support alone is not Qwen tool-call end-to-end support. Accepted results use
-their prepared candidate, while effective epoch cancellation uses
+Model recovery uses the mailbox-ordered `runtime_config_for_abandoned_tool_call`
+for a call that timed out or was cancelled in the current epoch, and for a repeat
+the session refused to expose. The hook shows a fixed status, never client text.
+It defaults to a no-op, and each model adapter decides which reasons it can
+deliver. Qwen, Nemotron and JoyAI implement it. Showing a notice does not
+establish how a model behaves afterwards; validate that per model. Accepted
+results use their prepared candidate, while effective epoch cancellation uses
 `retire_pending_function_output` for queued work according to model policy.
+
+The ledger keeps a fingerprint (name plus canonical JSON arguments) of each
+pending, timed-out or cancelled call. A pending call needs this too: Qwen keeps
+tool pairs out of history until a result arrives, so the model sees an unanswered
+question on the next turn and asks again.
+`model_channel._expose_function_call` refuses a matching call before registering
+it, so a suppressed repeat uses no call budget and arms no timer. A repeat of a
+pending call gets no notice, because its result may still arrive. The ledger takes the session's `user_turn_seq` only when
+`function_call_retry_policy` is `user_turn` and the model declares
+`clears_function_call_block_on_user_commit`, because a commit is not always a user turn:
+JoyAI commits are camera observations and native models free-run. An entry stays
+blocking until that counter moves past the turn it was abandoned in.
+
+`function_call_interrupt_policy: keep` gives each record a mutable `admission_epoch`;
+`ToolCallOrigin` stays immutable. An epoch advance moves the epoch forward instead
+of settling the call, and admission and timeouts read it.
 
 JoyAI-VL-Interaction uses the same call book for a different decision shape. Its
 model emits an action token (`</response> <note> </delegation> <question>`), so
