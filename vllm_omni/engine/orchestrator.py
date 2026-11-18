@@ -27,6 +27,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, cast
 
 import janus
+import numpy as np
 import torch
 from opentelemetry.trace import Tracer
 from vllm.config import ModelConfig
@@ -193,6 +194,13 @@ def build_engine_core_request_from_tokens(
 
     prompt_token_ids = prompt.get("prompt_token_ids")
     prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
+    # vLLM 0.34 types EngineCoreRequest.prompt_token_ids as a 32-bit int
+    # ``np.ndarray`` at runtime (TokenBuffer asserts itemsize == 4); coerce
+    # list prompts so /v1/run stage inputs round-trip through
+    # ``msgspec.convert`` symmetrically (a decoded plain list fails the
+    # ndarray field check).
+    if isinstance(prompt_token_ids, list):
+        prompt_token_ids = np.asarray(prompt_token_ids, dtype=np.int32)
 
     sampling_params = None
     pooling_params = None
@@ -3230,7 +3238,7 @@ class OrchestratorBase:
                 already_submitted=already_submitted,
                 t_submit_start=_t_submit_start,
                 submit_kwargs=submit_kwargs,
-                params_override=self._diffusion_params_for_samples(
+                params_override=cast(Orchestrator, self)._diffusion_params_for_samples(
                     req_state, src_stage_id, self._maybe_clone_diffusion_params_for_cfg(req_id, params)
                 ),
                 pinned_replica_id=pinned_replica_id,
@@ -3555,6 +3563,13 @@ class OrchestratorBase:
             )
         )
 
+    def _prewarm_downstream_resumable(
+        self, stage_id: int, entry_request: Any, req_state: OrchestratorRequestState
+    ) -> bool:
+        """Keep the entry request's streaming lifetime on downstream stages."""
+        del stage_id
+        return bool(getattr(entry_request, "resumable", req_state.streaming.enabled))
+
     async def _prewarm_async_chunk_stages(
         self,
         request_id: str,
@@ -3693,13 +3708,7 @@ class OrchestratorBase:
                 base_input["prompt_token_ids"] = [0] * next_prompt_len
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
-                # Turn-commit duplex (JoyAI/AURA) submits a non-resumable Stage0,
-                # but Code2Wav must stay parked across Talker 2150 so later
-                # sentences can reuse this prewarmed request. MiniCPM-style
-                # Stage0 is already resumable; turn-based HTTP is not session-owned.
-                downstream_resumable = bool(
-                    getattr(entry_request, "resumable", req_state.streaming.enabled) or req_state.session_owned
-                )
+                downstream_resumable = self._prewarm_downstream_resumable(next_stage_id, entry_request, req_state)
                 # Session-owned and resumable requests keep their downstream
                 # request across turns, so they stay on the chunk-0 path.
                 if attach_prewarm_payload and not req_state.session_owned and not downstream_resumable:
@@ -4120,7 +4129,7 @@ class Orchestrator(OrchestratorBase):
                     request_id,
                     stage_id,
                     f"streaming (resumable) input is not supported: stage {mrv2_stage_id} runs on "
-                    "model_runner v2, which supports turn-based requests only; use model_runner: v1 "
+                    "model_runner v2, which supports turn-based requests only; select a V2 duplex profile "
                     "for that stage",
                 )
                 return

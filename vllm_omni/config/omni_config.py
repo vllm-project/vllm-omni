@@ -540,7 +540,7 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     active_stream_window: int = Field(default=0, ge=0)
     session_mode: str = "turn"
     duplex_max_sessions: int = Field(default=1, ge=1)
-    use_v2_model_runner: bool = False
+    use_v2_model_runner: bool = True
     supports_native_mrv2_data_plane: bool = False
     enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None
@@ -2216,7 +2216,10 @@ def _build_model_config(
         kwargs["custom_voice_dir"] = _copy_value(deploy.custom_voice_dir)
     stage_runner = resolve_stage_model_runner(deploy, stage_deploy)
     validate_native_mrv2_session(deploy, topology, stage_runner)
-    kwargs.setdefault("use_v2_model_runner", stage_runner == "v2")
+    kwargs.setdefault(
+        "use_v2_model_runner",
+        stage_runner == "v2" and topology.execution_type is not StageExecutionType.DIFFUSION,
+    )
     kwargs.setdefault(
         "supports_native_mrv2_data_plane",
         topology.supports_native_mrv2_data_plane,
