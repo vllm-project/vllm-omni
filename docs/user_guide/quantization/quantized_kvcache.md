@@ -184,6 +184,10 @@ Setting both an explicit `quant.precision` and a quantized global dtype is
 rejected at config load. Execution options such as `fp8_fa_mode` alone do not
 select a precision or enable quantization.
 
+`fp8_fa_mode`, `mxfp4_scale_alg`, and `mxfp4_dst_type_max` require an NPU;
+other platforms reject these options during backend initialization. For CUDA
+FA3 FP8, use `quant.precision: fp8` without MindIE-SD execution options.
+
 Only non-null options for the active precision are passed to MindIE-SD:
 
 | Option | Precision | Behavior when omitted |

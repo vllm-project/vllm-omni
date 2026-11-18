@@ -297,6 +297,13 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         self.fa_deterministic = bool(getattr(cfg, "fa_deterministic", False)) if cfg is not None else False
         backend_kwargs = dict(backend_kwargs or {})
         self.quant_options = dict(backend_kwargs.pop("quant", None) or {})
+        mindiesd_options = [
+            name
+            for name in ("fp8_fa_mode", "mxfp4_scale_alg", "mxfp4_dst_type_max")
+            if self.quant_options.get(name) is not None
+        ]
+        if mindiesd_options and not current_omni_platform.is_npu():
+            raise ValueError(f"MindIE-SD options {mindiesd_options} require the NPU platform.")
         if backend_kwargs:
             logger.warning("FlashAttentionImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
 

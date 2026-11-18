@@ -61,6 +61,30 @@ def flash(layout="BSND", head_size=64, quant=None):
     )
 
 
+@pytest.mark.parametrize("platform", ["npu", "cuda", "rocm"])
+@pytest.mark.parametrize(
+    "options",
+    [
+        {},
+        {"fp8_fa_mode": "HIGH_PRECISION"},
+        {"fp8_fa_mode": "C8V16_TILING512"},
+        {"mxfp4_scale_alg": 0},
+        {"mxfp4_dst_type_max": 0.0},
+    ],
+)
+def test_mindie_options_require_npu(runtime, monkeypatch, platform, options):
+    monkeypatch.setattr(
+        flash_attn, "current_omni_platform", SimpleNamespace(is_npu=lambda: platform == "npu", device_name=platform)
+    )
+    quant = {"precision": "fp8", **options}
+    if platform != "npu" and options:
+        with pytest.raises(ValueError, match="MindIE-SD.*require.*NPU") as exc:
+            flash(quant=quant)
+        assert next(iter(options)) in str(exc.value)
+    else:
+        assert flash(quant=quant).quant_options == quant
+
+
 def sparse(**kwargs):
     return rainfusion_attn.RainFusionAttentionImpl(
         num_heads=2,

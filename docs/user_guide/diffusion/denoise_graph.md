@@ -134,6 +134,9 @@ omni = Omni(
 ## Related options
 
 `enable_cuda_graph_decode` captures the KV-cache decode steps of Qwen-Image-2.1
-and is independent of this option. When `diffusion_use_graph` is on, the
+and is independent of this option. Its graph eligibility check rejects attention
+quantization selected through either the global dtype or `quant.precision`,
+including quantized schedule candidates, and runs decode eagerly instead.
+When `diffusion_use_graph` is on, the
 regional `torch.compile` path disables Inductor's own CUDA graphs so the two
 graph layers do not stack.
