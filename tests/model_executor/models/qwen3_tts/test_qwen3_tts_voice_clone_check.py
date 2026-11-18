@@ -444,6 +444,7 @@ _FIRST_CHUNKS: dict[str, dict[str, Any]] = {
     "icl-cached-artifacts": {**CACHED, "ref_text": TEXT},
     "icl-ref-ids": {"ref_audio": AUDIO, "ref_ids": [IDS.tolist()[0]]},
     "icl-precomputed-ref-ids": {"ref_audio": AUDIO, PRECOMPUTED_REF_IDS_KEY: IDS},
+    "stored-speaker": {"speaker": ["stored"]},
 }
 _UPDATE_BUFFERS = {
     **_BUFFERS,
@@ -456,6 +457,9 @@ _UPDATE_BUFFERS = {
     "drops-cached-artifacts": {REF_AUDIO_CACHE_KEY: None},
     "drops-ref-ids": {"ref_ids": None},
     "drops-precomputed-ref-ids": {PRECOMPUTED_REF_IDS_KEY: None},
+    "drops-speaker": {"speaker": None},
+    "empty-speaker": {"speaker": []},
+    "blanks-speaker": {"speaker": [""]},
     "resends-embedding-reference": {"voice_clone_prompt": VCP_SPK, "x_vector_only_mode": [True]},
     "next-text": {"text": ["Next words."]},
     # Needs the first chunk's task, which the caller cannot see: left to a follow-up.
@@ -473,6 +477,9 @@ _UPDATE_REJECTS = {
     "drops-cached-artifacts": NO_REF,
     "drops-ref-ids": NO_TEXT,
     "drops-precomputed-ref-ids": NO_TEXT,
+    "drops-speaker": NO_REF,
+    "empty-speaker": NO_REF,
+    "blanks-speaker": NO_REF,
     "array-ref-audio": NOT_INTACT,
     "tensor-ref-code": NOT_INTACT,
     "tensor-ref-ids": NOT_INTACT,

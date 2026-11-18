@@ -170,6 +170,7 @@ _FIRST_CHUNKS = tuple(
         {**_SPK, "x_vector_only_mode": [True]},
         {**_SPK, "codes": {PRECOMPUTED_REF_CODE_KEY: [[[0] * 16]]}, "ref_text": ["ref"]},
         {REF_AUDIO_CACHE_KEY: ["ref"], "ref_text": ["ref"]},
+        {"speaker": ["stored"]},
     )
 )
 
