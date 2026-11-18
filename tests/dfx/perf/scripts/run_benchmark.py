@@ -823,6 +823,13 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
     params = dict(benchmark_params["params"])
     dataset_name = params.get("dataset_name", "")
     resource_label = get_runtime_resource_label()
+    if "qwen3_omni_workload" in params:
+        from tests.dfx.perf.qwen3_omni_workload import run_workload
+
+        run_workload(
+            omni_server, params, test_name, resource_label, enforce_baseline=pytestconfig.getoption("require_baseline")
+        )
+        return
     accuracy_baseline = None
     if path := params.get("duplex_eval_accuracy_config"):
         from tests.e2e.accuracy.omni_duplex_eval.validation import load_accuracy_config, select_duplex_eval_baseline

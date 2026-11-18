@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Reproducible, combined accuracy/performance workloads for Qwen3-Omni nightly."""
+"""Reproducible, combined accuracy/performance workloads for Qwen3-Omni."""
 
 from __future__ import annotations
 
@@ -8,9 +8,12 @@ import hashlib
 import json
 import math
 import os
+import subprocess
+from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import TypedDict
 
 
@@ -23,7 +26,7 @@ class DatasetSpec(TypedDict):
 
 
 MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
-MANIFEST = Path(__file__).with_name("nightly_baselines.json")
+MANIFEST = Path(__file__).with_name("baselines") / "qwen3_omni.json"
 DATASETS: dict[str, DatasetSpec] = {
     "daily-omni": {
         "repo": "liarliar/Daily-Omni",
@@ -43,15 +46,13 @@ DATASETS: dict[str, DatasetSpec] = {
 
 
 @dataclass(frozen=True)
-class NightlyCase:
+class WorkloadCase:
     config: str
     dataset: str
     concurrency: int
     count: int
 
-    @property
-    def accuracy(self) -> bool:
-        return self.concurrency == 64
+    accuracy: bool = False
 
     @property
     def id(self) -> str:
@@ -61,18 +62,6 @@ class NightlyCase:
     def metrics(self) -> tuple[str, ...]:
         audio = ("mean_audio_rtf", "mean_audio_ttfp_ms")
         return ("mean_ttft_ms", *audio) if self.dataset == "daily-omni" else audio
-
-
-def nightly_cases(platform: str) -> list[NightlyCase]:
-    if platform not in ("cuda", "npu"):
-        raise ValueError(f"Unsupported nightly platform: {platform}")
-    sweep = [(1, 32), (16, 256), (32, 512)] if platform == "cuda" else [(1, 32), (4, 64), (8, 128)]
-    return [
-        NightlyCase(config, dataset, concurrency, count)
-        for config in ("default", "async-prefix")
-        for dataset, source in DATASETS.items()
-        for concurrency, count in ([(64, source["count"])] + (sweep if config == "async-prefix" else []))
-    ]
 
 
 def verify_manifest(root: Path, dataset: str) -> None:
@@ -107,7 +96,7 @@ def resolve_dataset(dataset: str) -> Path:
     return root
 
 
-def dataset_args(case: NightlyCase, root: Path, work: Path) -> list[str]:
+def dataset_args(case: WorkloadCase, root: Path, work: Path, *, indices: list[int] | None = None) -> list[str]:
     """Truncate before loading: a skipped early row cannot be replaced by a later one."""
     verify_manifest(root, case.dataset)
     work.mkdir(parents=True, exist_ok=True)
@@ -121,7 +110,8 @@ def dataset_args(case: NightlyCase, root: Path, work: Path) -> list[str]:
         if len(rows) != DATASETS[case.dataset]["count"]:
             raise ValueError("Pinned Daily-Omni question count changed")
         qa = work / "qa.json"
-        qa.write_text(json.dumps(rows[: case.count], ensure_ascii=False), encoding="utf-8")
+        selected = rows[: case.count] if indices is None else [rows[index] for index in indices]
+        qa.write_text(json.dumps(selected, ensure_ascii=False), encoding="utf-8")
         return [
             "--dataset-name",
             "daily-omni",
@@ -154,7 +144,7 @@ def dataset_args(case: NightlyCase, root: Path, work: Path) -> list[str]:
     ]
 
 
-def quality_baseline(case: NightlyCase, platform: str) -> dict[str, float]:
+def quality_baseline(case: WorkloadCase, platform: str) -> dict[str, float]:
     if not case.accuracy:
         return {}
     if case.dataset == "daily-omni":
@@ -177,13 +167,13 @@ def software_versions() -> dict[str, str]:
 
 
 def performance_gate(
-    result: dict, case: NightlyCase, hardware: str, manifest: dict, mode: str
+    result: dict, case: WorkloadCase, hardware: str, manifest: dict, mode: str
 ) -> tuple[list[str], dict]:
     """Return validation errors and an annotated copy, preserving the input artifact."""
     if mode not in ("collect", "enforce"):
         raise ValueError(f"Unknown baseline mode: {mode}")
     if manifest.get("schema_version") != 1:
-        raise ValueError("Unsupported nightly baseline schema")
+        raise ValueError("Unsupported workload baseline schema")
     annotated = dict(result)
     errors = []
     sample_counts = {
@@ -234,8 +224,8 @@ def performance_gate(
     return errors, annotated
 
 
-def accuracy_coverage_errors(result: dict, case: NightlyCase, platform: str) -> list[str]:
-    """Apply full-dataset completeness only to the combined nightly matrix."""
+def accuracy_coverage_errors(result: dict, case: WorkloadCase, platform: str) -> list[str]:
+    """Require scoring for every submitted row in an explicit accuracy case."""
     if not case.accuracy:
         return []
     counts = (
@@ -266,9 +256,185 @@ def accuracy_coverage_errors(result: dict, case: NightlyCase, platform: str) -> 
         if platform == "cuda":
             failure_keys.append("seed_tts_utmos_failed")
             score_keys.append("seed_tts_utmos_mean")
-    errors += [f"{key}={result[key]}; nightly coverage is incomplete" for key in failure_keys if result.get(key, 0)]
+    errors += [f"{key}={result[key]}; workload coverage is incomplete" for key in failure_keys if result.get(key, 0)]
     for key in score_keys:
         value = result.get(key)
         if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
             errors.append(f"{key} must be a finite score: {value!r}")
     return errors
+
+
+@contextmanager
+def scoring_environment(case: WorkloadCase, platform: str):
+    """Limit evaluator switches to this benchmark subprocess and restore them."""
+    enabled = case.accuracy and case.dataset == "seed-tts"
+    values = {
+        "SEED_TTS_WER_EVAL": str(int(enabled)),
+        "SEED_TTS_SIM_EVAL": str(int(enabled)),
+        "SEED_TTS_UTMOS_EVAL": str(int(enabled and platform == "cuda")),
+    }
+    previous = {key: os.environ.get(key) for key in values}
+    os.environ.update(values)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def case_from_params(params: dict) -> tuple[WorkloadCase, str, bool]:
+    """Accuracy is explicit, independent of concurrency or smoke sample count."""
+    spec = params["qwen3_omni_workload"]
+    platform = spec["platform"]
+    if platform not in ("cuda", "npu"):
+        raise ValueError(f"Unsupported workload platform: {platform}")
+    if not isinstance(spec.get("accuracy"), bool) or not isinstance(spec.get("smoke", False), bool):
+        raise ValueError("Workload accuracy and smoke must be explicit booleans")
+    counts, concurrencies = params["num_prompts"], params["max_concurrency"]
+    if len(counts) != 1 or len(concurrencies) != 1:
+        raise ValueError("Each dataset workload entry must identify one count/concurrency")
+    case = WorkloadCase(spec["configuration"], params["dataset_name"], concurrencies[0], counts[0], spec["accuracy"])
+    if case.config not in ("default", "async-prefix") or case.dataset not in DATASETS:
+        raise ValueError("Unknown deployment or pinned dataset")
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in (case.count, case.concurrency)
+    ):
+        raise ValueError("Request count and concurrency must be positive integers")
+    smoke = spec.get("smoke", False)
+    indices = spec.get("smoke_indices")
+    if indices is not None and (
+        not smoke
+        or case.dataset != "daily-omni"
+        or not isinstance(indices, list)
+        or len(indices) != case.count
+        or any(type(index) is not int or not 0 <= index < DATASETS[case.dataset]["count"] for index in indices)
+        or len(set(indices)) != case.count
+    ):
+        raise ValueError("Explicit sample indices require a matching Daily-Omni smoke subset")
+    if case.count > DATASETS[case.dataset]["count"] or (not smoke and case.count != DATASETS[case.dataset]["count"]):
+        raise ValueError("Qualification requires the complete pinned dataset; mark subsets as smoke")
+    return case, platform, smoke
+
+
+def annotate_result(
+    result: dict,
+    case: WorkloadCase,
+    platform: str,
+    hardware: str,
+    *,
+    smoke: bool,
+    exit_code: int,
+    enforce_baseline: bool = False,
+) -> dict:
+    from tests.e2e.accuracy import helpers
+    from vllm_omni.benchmarks.validation import coverage_errors
+
+    errors = coverage_errors(result, case.count, require_audio=True)
+    errors += accuracy_coverage_errors(result, case, platform)
+    limits = quality_baseline(case, platform)
+    if case.accuracy and not smoke:
+        if case.dataset == "daily-omni":
+            errors += helpers._validate_daily_omni(result, min_accuracy=limits["min_daily_omni_accuracy"])
+        else:
+            errors += helpers._validate_seed_tts(
+                result,
+                max_mean_wer=limits["max_seed_tts_mean_wer"],
+                min_mean_sim=limits["min_seed_tts_mean_sim"],
+                min_mean_utmos=limits.get("min_seed_tts_mean_utmos"),
+            )
+    if exit_code != 0:
+        errors.append(f"Benchmark subprocess exited with {exit_code}")
+    manifest = json.loads(MANIFEST.read_text())
+    mode = (
+        "enforce"
+        if enforce_baseline
+        else ("collect" if smoke else os.environ.get("QWEN3_OMNI_BASELINE_MODE", manifest["mode"]))
+    )
+    perf_errors, annotated = performance_gate(result, case, hardware, manifest, mode)
+    errors += perf_errors
+    annotated.update(
+        {
+            "benchmark_suite": "qwen3-omni-datasets",
+            "configuration": case.config,
+            "accuracy_evaluated": case.accuracy,
+            "qualification_scope": "smoke" if smoke else "full-dataset",
+            "async_chunk": case.config == "async-prefix",
+            "thinker_prefix_caching": case.config == "async-prefix",
+            "model_runner": "v2",
+            "inference_devices": 2,
+            "dataset": case.dataset.replace("-", "_"),
+            "dataset_revision": DATASETS[case.dataset]["revision"],
+            "dataset_manifest_sha256": DATASETS[case.dataset]["sha256"],
+            "modalities": ["text", "audio"],
+            "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+            "software_versions": software_versions(),
+            "quality_thresholds": limits,
+            "benchmark_exit_code": exit_code,
+            "validation_errors": errors,
+        }
+    )
+    if annotated.get("num_tpot_samples") == 0:
+        for key in annotated:
+            if key.endswith("_tpot_ms"):
+                annotated[key] = None
+    return helpers._json_safe_metric_value(annotated)
+
+
+def run_workload(server, params: dict, test_name: str, hardware: str, *, enforce_baseline: bool = False) -> dict:
+    """Execute JSON-defined dataset cases through the shared DFX bench runner."""
+    from tests.dfx.conftest import run_benchmark
+
+    case, platform, smoke = case_from_params(params)
+    if smoke and enforce_baseline:
+        raise ValueError("Smoke cannot qualify a full-dataset performance baseline")
+    root = resolve_dataset(case.dataset)
+    with TemporaryDirectory(prefix="qwen3-omni-dataset-") as work, scoring_environment(case, platform):
+        args = [
+            "--host",
+            server.host,
+            "--port",
+            str(server.port),
+            "--model",
+            server.model,
+            "--backend",
+            "openai-chat-omni",
+            "--endpoint",
+            "/v1/chat/completions",
+            "--max-concurrency",
+            str(case.concurrency),
+            "--num-prompts",
+            str(case.count),
+            "--request-rate",
+            "inf",
+            "--temperature",
+            "0",
+            "--no-oversample",
+            "--disable-shuffle",
+            "--omni-isolate-prefix-cache",
+            "--omni-fail-fast-on-timeout",
+            "--percentile-metrics",
+            "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration",
+            "--extra-body",
+            json.dumps({"modalities": ["text", "audio"]}),
+        ]
+        args += dataset_args(case, root, Path(work), indices=params["qwen3_omni_workload"].get("smoke_indices"))
+        if case.accuracy and case.dataset == "seed-tts":
+            args.append("--seed-tts-wer-eval")
+        result = run_benchmark(
+            args,
+            test_name,
+            case.concurrency,
+            case.dataset,
+            case.count,
+            resource_label=hardware,
+            num_warmups=params.get("num_warmups", max(2, case.concurrency)),
+            benchmark_params_name=case.id,
+            result_transform=lambda result, code: annotate_result(
+                result, case, platform, hardware, smoke=smoke, exit_code=code, enforce_baseline=enforce_baseline
+            ),
+        )
+    assert not result["validation_errors"], "\n".join(result["validation_errors"])
+    return result

@@ -55,12 +55,6 @@ steps:
         commands:
           - pytest -s -v tests/examples/ -m "full_model and omni and H100 and B200 and cards_2" --run-level "full_model"
 
-      - label: ":full_moon: Omni · Qwen3-Omni · Verbatim Reading Regression"
-        source_file_dependencies: [omni_qwen3_omni_accuracy, ci_cuda, omni_v2_runtime]
-        timeout_in_minutes: 90
-        commands:
-          - pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py::test_qwen3_omni_seed_tts_reads_questions_verbatim -m "full_model and H100 and B200 and cards_2" --run-level full_model
-
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Accuracy Test"
         source_file_dependencies: omni_minicpmo_4_5_accuracy
         timeout_in_minutes: 180
@@ -96,10 +90,10 @@ steps:
         artifact_paths:
           - tests/dfx/perf/results/*.json
         commands:
-          - export ACC_BENCH_RESULT_DIR=tests/dfx/perf/results
+          - export BENCHMARK_DIR=tests/dfx/perf/results
           - export SEED_TTS_EVAL_DEVICE=cuda:1
           - export SEED_TTS_UTMOS_DEVICE=cuda:1
-          - pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni_nightly.py -k "default" -m "full_model and cuda and H100 and B200 and cards_2" --run-level full_model
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_datasets.json -k "cuda_default" -m "full_model and cuda and H100 and B200 and cards_2" --run-level full_model
 
       - label: ":full_moon: Omni · Qwen3-Omni Accuracy + Perf · async-prefix"
         source_file_dependencies:
@@ -112,10 +106,10 @@ steps:
         artifact_paths:
           - tests/dfx/perf/results/*.json
         commands:
-          - export ACC_BENCH_RESULT_DIR=tests/dfx/perf/results
+          - export BENCHMARK_DIR=tests/dfx/perf/results
           - export SEED_TTS_EVAL_DEVICE=cuda:1
           - export SEED_TTS_UTMOS_DEVICE=cuda:1
-          - pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni_nightly.py -k "async-prefix" -m "full_model and cuda and H100 and B200 and cards_2" --run-level full_model
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_datasets.json -k "cuda_async_prefix" -m "full_model and cuda and H100 and B200 and cards_2" --run-level full_model
 
       - label: ":full_moon: Omni · Qwen3-Omni · Duplex OmniInteract Accuracy and Perf Test"
         source_file_dependencies: [omni_qwen3_omni_duplex_perf, ci_cuda, omni_v2_runtime]

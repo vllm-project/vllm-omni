@@ -666,6 +666,8 @@ source_file_dependencies:
     - vllm_omni/benchmarks/data_modules/utmos_jit.py
 
   omni_qwen3_omni_perf:
+    - tests/dfx/perf/qwen3_omni_workload.py
+    - tests/dfx/perf/baselines/qwen3_omni.json
     - *qwen3_omni_evaluation
     - tests/e2e/accuracy/qwen3_omni/
     - vllm_omni/benchmarks/validation.py

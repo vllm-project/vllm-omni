@@ -26,25 +26,33 @@ def _load(name, path):
     return module
 
 
-nightly = _load("qwen_nightly_contract", "tests/e2e/accuracy/qwen3_omni/nightly.py")
+nightly = _load("qwen_nightly_contract", "tests/dfx/perf/qwen3_omni_workload.py")
 validation = _load("benchmark_coverage_contract", "vllm_omni/benchmarks/validation.py")
 
 
-@pytest.mark.parametrize(
-    "platform,sweep", [("cuda", [(1, 32), (16, 256), (32, 512)]), ("npu", [(1, 32), (4, 64), (8, 128)])]
-)
-def test_matrix_has_four_shared_full_runs_and_six_performance_runs(platform, sweep):
-    cases = nightly.nightly_cases(platform)
-    assert len(cases) == 10 and len({case.id for case in cases}) == 10
-    full = [c for c in cases if c.accuracy]
-    assert {(c.config, c.dataset, c.count) for c in full} == {
-        (config, dataset, count)
-        for config in ("default", "async-prefix")
-        for dataset, count in (("daily-omni", 1197), ("seed-tts", 1088))
-    }
-    for dataset in ("daily-omni", "seed-tts"):
-        assert [(c.concurrency, c.count) for c in cases if c.dataset == dataset and not c.accuracy] == sweep
-    assert all(c.config == "async-prefix" for c in cases if not c.accuracy)
+@pytest.mark.parametrize("platform", ["cuda", "npu"])
+def test_json_matrix_matches_scenario_v2(platform):
+    configs = json.loads((ROOT / "tests/dfx/perf/tests/test_qwen3_omni_datasets.json").read_text())
+    cases = [
+        nightly.case_from_params(p)[0]
+        for c in configs
+        for p in c["benchmark_params"]
+        if p["qwen3_omni_workload"]["platform"] == platform
+    ]
+    expected = (
+        {
+            ("default", "seed-tts", 64, True),
+            ("async-prefix", "daily-omni", 8, True),
+            *{("async-prefix", "seed-tts", c, c == 64) for c in (1, 16, 32, 64)},
+        }
+        if platform == "cuda"
+        else {
+            ("default", "seed-tts", 32, True),
+            *{("async-prefix", "seed-tts", c, c == 32) for c in (1, 16, 32)},
+        }
+    )
+    assert {(c.config, c.dataset, c.concurrency, c.accuracy) for c in cases} == expected
+    assert all(c.count == nightly.DATASETS[c.dataset]["count"] for c in cases)
 
 
 def test_coverage_rejects_partial_success_even_with_high_accuracy():
@@ -52,8 +60,39 @@ def test_coverage_rejects_partial_success_even_with_high_accuracy():
     errors = validation.coverage_errors(result, 1197, require_audio=True)
     assert any("completed" in error for error in errors)
     assert any("successful_audio_requests" in error for error in errors)
-    case = nightly.NightlyCase("default", "daily-omni", 64, 1197)
+    case = nightly.WorkloadCase("default", "daily-omni", 64, 1197, accuracy=True)
     assert nightly.accuracy_coverage_errors({"daily_omni_evaluated_ok": 1000}, case, "cuda")
+
+
+@pytest.mark.parametrize(
+    "platform,dataset,concurrency,count", [("cuda", "daily-omni", 8, 1197), ("npu", "seed-tts", 32, 1088)]
+)
+def test_accuracy_does_not_depend_on_c64(platform, dataset, concurrency, count):
+    params = {
+        "dataset_name": dataset,
+        "num_prompts": [count],
+        "max_concurrency": [concurrency],
+        "qwen3_omni_workload": {"platform": platform, "configuration": "async-prefix", "accuracy": True},
+    }
+    case, actual_platform, smoke = nightly.case_from_params(params)
+    assert case.accuracy and actual_platform == platform and not smoke
+    assert nightly.accuracy_coverage_errors({}, case, platform)
+    params["num_prompts"] = [2]
+    with pytest.raises(ValueError, match="complete pinned dataset"):
+        nightly.case_from_params(params)
+    params["qwen3_omni_workload"]["smoke"] = True
+    assert nightly.case_from_params(params)[2]
+
+
+def test_scoring_switches_are_scoped_and_restored(monkeypatch):
+    monkeypatch.setenv("SEED_TTS_UTMOS_EVAL", "old")
+    monkeypatch.delenv("SEED_TTS_WER_EVAL", raising=False)
+    case = nightly.WorkloadCase("async-prefix", "seed-tts", 32, 1088, accuracy=True)
+    with nightly.scoring_environment(case, "npu"):
+        assert nightly.os.environ["SEED_TTS_WER_EVAL"] == "1"
+        assert nightly.os.environ["SEED_TTS_UTMOS_EVAL"] == "0"
+    assert "SEED_TTS_WER_EVAL" not in nightly.os.environ
+    assert nightly.os.environ["SEED_TTS_UTMOS_EVAL"] == "old"
 
 
 def test_source_rows_cannot_disappear_before_submission():
@@ -62,7 +101,7 @@ def test_source_rows_cannot_disappear_before_submission():
 
 
 def test_invalid_answers_are_not_confused_with_missing_requests():
-    case = nightly.NightlyCase("default", "daily-omni", 64, 1197)
+    case = nightly.WorkloadCase("default", "daily-omni", 64, 1197, accuracy=True)
     result = {
         "request_count": 1197,
         "completed": 1197,
@@ -101,7 +140,7 @@ def test_valid_audio_requires_decodable_duration_and_measurable_latency():
 
 
 def test_seed_requires_all_scores_not_only_high_means():
-    case = nightly.NightlyCase("async-prefix", "seed-tts", 64, 1088)
+    case = nightly.WorkloadCase("async-prefix", "seed-tts", 64, 1088, accuracy=True)
     data = {**_full_quality_result("seed-tts"), "seed_tts_sim_evaluated": 1087}
     assert nightly.accuracy_coverage_errors(data, case, "cuda") == ["seed_tts_sim_evaluated=1087, expected 1088"]
     data["seed_tts_sim_evaluated"] = 1088
@@ -140,7 +179,7 @@ def _full_quality_result(dataset):
     ],
 )
 def test_nightly_rejects_reported_failures_even_with_complete_score_counts(dataset, failure_key):
-    case = nightly.NightlyCase("default", dataset, 64, nightly.DATASETS[dataset]["count"])
+    case = nightly.WorkloadCase("default", dataset, 64, nightly.DATASETS[dataset]["count"], accuracy=True)
     result = {**_full_quality_result(dataset), failure_key: 1}
     errors = nightly.accuracy_coverage_errors(result, case, "cuda")
     assert any(failure_key in error for error in errors)
@@ -156,13 +195,13 @@ def test_nightly_rejects_reported_failures_even_with_complete_score_counts(datas
     ],
 )
 def test_nightly_requires_finite_scores(dataset, metric):
-    case = nightly.NightlyCase("default", dataset, 64, nightly.DATASETS[dataset]["count"])
+    case = nightly.WorkloadCase("default", dataset, 64, nightly.DATASETS[dataset]["count"], accuracy=True)
     result = {**_full_quality_result(dataset), metric: float("nan")}
     assert any(metric in error for error in nightly.accuracy_coverage_errors(result, case, "cuda"))
 
 
 def test_npu_accepts_zero_wer_without_disabled_utmos_scores():
-    case = nightly.NightlyCase("default", "seed-tts", 64, 1088)
+    case = nightly.WorkloadCase("default", "seed-tts", 64, 1088, accuracy=True)
     result = {**_full_quality_result("seed-tts"), "seed_tts_content_error_mean": 0.0}
     result.pop("seed_tts_utmos_evaluated")
     result.pop("seed_tts_utmos_mean")
@@ -205,7 +244,7 @@ def _valid_performance(case, value=10.0):
 
 @pytest.mark.parametrize("mode", ["collect", "enforce"])
 def test_performance_gate_returns_metadata_without_mutating_input(mode):
-    case = nightly.NightlyCase("default", "seed-tts", 64, 1088)
+    case = nightly.WorkloadCase("default", "seed-tts", 64, 1088, accuracy=True)
     result = _valid_performance(case)
     original = dict(result)
     outcome = nightly.performance_gate(result, case, "H100", _reference(case), mode)
@@ -220,7 +259,7 @@ def test_performance_gate_returns_metadata_without_mutating_input(mode):
 
 
 def test_enforced_regression_uses_its_own_hardware_and_workload():
-    case = nightly.NightlyCase("async-prefix", "daily-omni", 16, 256)
+    case = nightly.WorkloadCase("async-prefix", "daily-omni", 16, 256)
     reference = _reference(case)
     result = _valid_performance(case, 10.5)
     assert nightly.performance_gate(result, case, "H100", reference, "enforce")[0] == []
@@ -235,7 +274,7 @@ def test_enforced_regression_uses_its_own_hardware_and_workload():
 
 @pytest.mark.parametrize("bad", [None, 0, float("nan"), float("inf"), True])
 def test_collection_mode_still_rejects_unmeasured_metrics(bad):
-    case = nightly.NightlyCase("default", "seed-tts", 64, 1088)
+    case = nightly.WorkloadCase("default", "seed-tts", 64, 1088, accuracy=True)
     result = _valid_performance(case)
     result["mean_audio_rtf"] = bad
     errors, annotated = nightly.performance_gate(result, case, "H100", _reference(case), "collect")
@@ -244,7 +283,7 @@ def test_collection_mode_still_rejects_unmeasured_metrics(bad):
 
 
 def test_missing_reference_cannot_silently_pass_enforce():
-    case = nightly.NightlyCase("default", "daily-omni", 64, 1197)
+    case = nightly.WorkloadCase("default", "daily-omni", 64, 1197, accuracy=True)
     result = _valid_performance(case)
     manifest = {"schema_version": 1, "references": {}}
     assert nightly.performance_gate(result, case, "H100", manifest, "collect")[0] == []
@@ -252,7 +291,7 @@ def test_missing_reference_cannot_silently_pass_enforce():
 
 
 def test_fast_mean_cannot_hide_missing_latency_samples():
-    case = nightly.NightlyCase("default", "daily-omni", 64, 1197)
+    case = nightly.WorkloadCase("default", "daily-omni", 64, 1197, accuracy=True)
     result = _valid_performance(case)
     result["num_ttft_samples"] = 1000
     errors, _ = nightly.performance_gate(result, case, "H100", _reference(case), "collect")
@@ -272,7 +311,7 @@ def test_seed_subset_is_trimmed_before_loader_can_skip_rows(tmp_path, monkeypatc
     lines = [f"id{i}|reference|prompt_wavs/first.wav|target{i}" for i in range(1088)]
     (root / "en/meta.lst").write_text("\n".join(lines) + "\n")
     monkeypatch.setattr(nightly, "verify_manifest", lambda *_: None)
-    case = nightly.NightlyCase("async-prefix", "seed-tts", 1, 32)
+    case = nightly.WorkloadCase("async-prefix", "seed-tts", 1, 32)
     work = tmp_path / "subset"
     args = nightly.dataset_args(case, root, work)
     assert "--seed-tts-root" in args
@@ -280,18 +319,17 @@ def test_seed_subset_is_trimmed_before_loader_can_skip_rows(tmp_path, monkeypatc
     assert (work / "en/prompt_wavs/first.wav").read_bytes() == b"wav"
 
 
-def test_cuda_nightly_reuses_c64_and_preserves_verbatim_regression():
+def test_cuda_pipeline_uses_json_runner_and_function_regression():
     pipeline = yaml.safe_load((ROOT / ".buildkite/cuda/test-nightly.yml").read_text())
-    steps = [step for group in pipeline["steps"] if "steps" in group for step in group["steps"]]
+    steps = [s for group in pipeline["steps"] if "steps" in group for s in group["steps"]]
     combined = [s for s in steps if "Qwen3-Omni Accuracy + Perf" in s.get("label", "")]
     assert len(combined) == 2
-    commands = "\n".join(command for s in steps for command in s.get("commands", []))
-    assert "test_qwen3_omni_no_async_chunk.json" not in commands
-    assert "test_qwen3_omni_async_chunk.json" not in commands
-    assert "test_qwen3_omni.py -m" not in commands
-    assert all("test_qwen3_omni_nightly.py" in "\n".join(s["commands"]) for s in combined)
-    cuda = (ROOT / ".buildkite/cuda/test-nightly.yml").read_text()
-    assert "test_qwen3_omni_seed_tts_reads_questions_verbatim" in cuda
+    for step in combined:
+        commands = "\n".join(step["commands"])
+        assert "run_benchmark.py" in commands and "test_qwen3_omni_datasets.json" in commands
+    assert not any("Verbatim Reading Regression" in s.get("label", "") for s in steps)
+    expansion = (ROOT / "tests/e2e/online_serving/test_qwen3_omni_expansion.py").read_text(encoding="utf-8")
+    assert "def test_qwen3_omni_seed_tts_reads_questions_verbatim" in expansion
 
 
 def test_a3_keeps_existing_jobs_until_full_matrix_qualification():
@@ -307,7 +345,7 @@ def test_a3_keeps_existing_jobs_until_full_matrix_qualification():
 def test_combined_artifact_enters_performance_report(tmp_path):
     report = _load("nightly_html_contract", "tools/nightly/generate_nightly_perf_html.py")
     combined = {
-        "nightly_suite": "qwen3-omni-non-duplex",
+        "benchmark_suite": "qwen3-omni-datasets",
         "model_id": "Qwen",
         "name": "default-daily-c64",
         "dataset_name": "daily-omni",
@@ -316,7 +354,7 @@ def test_combined_artifact_enters_performance_report(tmp_path):
         "daily_omni_accuracy": 0.75,
         "date": "20261110-000000",
     }
-    (tmp_path / "result_acc_combined.json").write_text(json.dumps(combined))
+    (tmp_path / "result_test_combined.json").write_text(json.dumps(combined))
     (tmp_path / "result_acc_unrelated.json").write_text(json.dumps({"ssim": 0.9}))
     rows = list(report._iter_omni_json_records(str(tmp_path)))
     assert len(rows) == 1

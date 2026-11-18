@@ -7,7 +7,7 @@ import math
 import os
 import subprocess
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any, TypeGuard
@@ -795,6 +795,7 @@ def run_benchmark(
     num_warmups: int = 2,
     benchmark_params_name: str | None = None,
     accuracy_baseline: dict[str, Any] | None = None,
+    result_transform: Callable[[dict[str, Any], int], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Run one ``vllm bench serve --omni`` iteration and return parsed metrics.
 
@@ -910,6 +911,8 @@ def run_benchmark(
     result["test_name"] = test_name
     if benchmark_params_name:
         result["name"] = benchmark_params_name
+    if result_transform is not None:
+        result = result_transform(result, returncode)
     # Accuracy is published only in ``result_acc_*.json`` below; the perf result
     # must not carry a second copy of it. ``result`` keeps it in memory so the
     # caller's IA-QTF1 floor assertions still see it.
