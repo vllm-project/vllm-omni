@@ -37,6 +37,7 @@ from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import eligible as pointwise_eligible
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import residual, rotary, silu_mul
 from vllm_omni.diffusion.layers.exact_bf16_qk_norm_rope import qk_rotary
+from vllm_omni.diffusion.layers.exact_bf16_rope_musa import musa_rotary
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
 from vllm_omni.diffusion.models.qwen_image_21.npu_attention import QwenImage21SDPAImpl
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
@@ -135,6 +136,17 @@ def _apply_qwen_image21_rotary_emb_npu(x: torch.Tensor, freqs: torch.Tensor) -> 
     rot_cos, rot_sin = _npu_rope_tables(freqs)
     rotated = torch_npu.npu_rotary_mul(x.float(), rot_cos, rot_sin, rotary_mode="interleave")
     return rotated.to(dtype=x.dtype)
+
+
+def _apply_qwen_image21_rotary_emb_musa(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """Interleaved RoPE through a Triton kernel with the native rotation's rounding.
+
+    Inputs the kernel does not take use ``_apply_qwen_image21_rotary_emb_native``.
+    """
+    rotated = musa_rotary(x, freqs)
+    if rotated is not None:
+        return rotated
+    return _apply_qwen_image21_rotary_emb_native(x, freqs)
 
 
 def _apply_qwen_image21_rotary_emb_native(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -563,6 +575,8 @@ class QwenImage21Attention(nn.Module):
             return _apply_qwen_image21_rotary_emb(x, freqs)
         if x.device.type == "npu":
             return _apply_qwen_image21_rotary_emb_npu(x, freqs)
+        if x.device.type == "musa":
+            return _apply_qwen_image21_rotary_emb_musa(x, freqs)
         # Platform fallback without complex-tensor kernels (the CustomOp rope layer
         # dispatches by platform, not tensor device, so it cannot serve CPU tensors).
         return _apply_qwen_image21_rotary_emb_native(x, freqs)
