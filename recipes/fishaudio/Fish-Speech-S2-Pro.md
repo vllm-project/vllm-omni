@@ -44,25 +44,12 @@ No extra packages are required: the DAC codec architecture is vendored in
 vLLM-Omni (`vllm_omni/model_executor/models/fish_speech/dac_modules/`), so the
 model runs out of the box, including in the official Docker image.
 
-#### Kvcache attention fast path
+#### Decode attention
 
-Fish Speech S2 Pro uses a Triton decode-only kvcache attention fast path by
-default on CUDA builds. Set `VLLM_OMNI_FISH_KVCACHE_ATTN=0` to disable it, or
-`VLLM_OMNI_FISH_KVCACHE_ATTN=required` to fail fast if the fast path cannot be
-installed.
-
-```bash
-# Verify fast path availability.
-python - <<'PY'
-from vllm_omni.attention import fish_kvcache_attn
-
-print(fish_kvcache_attn.is_available())
-print(fish_kvcache_attn.load_error())
-PY
-
-# Optional: disable the runtime fast path.
-export VLLM_OMNI_FISH_KVCACHE_ATTN=0
-```
+The eager Slow AR profile uses the standard attention backend when the
+per-request CPU sequence-length bounds needed by the Fish Triton decode
+kernel are unavailable. Leave `VLLM_OMNI_FISH_KVCACHE_ATTN` at its default
+for this profile.
 
 #### Command
 
