@@ -17,11 +17,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -34,7 +36,6 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
@@ -48,6 +49,9 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 logger = init_logger(__name__)
 
@@ -327,9 +331,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
     @cached_property
     def sampler(self):
+        from vllm.v1.sample.sampler import Sampler
+
         if hasattr(self.model, "sampler"):
             return self.model.sampler
-        from vllm.v1.sample.sampler import Sampler
 
         return Sampler()
 
@@ -1033,6 +1038,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         raise ValueError(f"Unsupported model stage: {self.model_stage}")
 
+    @property
+    def mrv2_forward_returns_tensor(self) -> bool:
+        # The runner attaches multimodal outputs from the live batch after replay.
+        return self._use_v2_model_runner and (
+            self.model_stage == "tts" or (self.model_stage == "llm" and not self._returns_aux_hidden_states)
+        )
+
+    @property
+    def mrv2_forward_returns_native_aux(self) -> bool:
+        # Target layers belong to the native drafter, not Omni's auxiliary slot.
+        return self._use_v2_model_runner and self.model_stage == "llm" and self._returns_aux_hidden_states
+
     def make_omni_output_mrv2(self, model_outputs, *, input_batch, req_states, model_intermediate_buffer):
         """Attach the Thinker row identities used by the llm2tts bridge."""
         if self.model_stage != "llm":
@@ -1080,17 +1097,16 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             from vllm_omni.model_executor.models.minicpmo_4_5.duplex.mrv2_sampling import (
                 MiniCPMO45DuplexSampler,
             )
-            from vllm_omni.worker_v2.ngram_adapter import use_scheduler_ngram
 
             # Keep the duplex wrapper's output contract. The rejection sampler
             # verifies ordinary requests using the underlying token sampler.
             duplex_sampler = MiniCPMO45DuplexSampler(sampler, self)
-            if not use_scheduler_ngram(self.vllm_config):
+            spec = self.vllm_config.speculative_config
+            if spec is None:
                 return duplex_sampler, None
 
             from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 
-            spec = self.vllm_config.speculative_config
             return duplex_sampler, RejectionSampler(sampler, spec, sampler.req_states.draft_tokens.device)
         # Keep the runner's defaults, including the rejection sampler that
         # verifies draft tokens.

@@ -27,6 +27,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     apply_max_new_tokens,
     conditioning_cache_salt,
 )
+from vllm_omni.model_executor.models.moss_tts.processor_loading import load_moss_processor
 from vllm_omni.model_executor.models.moss_tts.realtime_prompt import build_realtime_prompt
 
 if TYPE_CHECKING:
@@ -37,21 +38,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _MOSS_REALTIME_REF_ENCODER_DEVICE_ENV = "VLLM_OMNI_MOSS_REALTIME_REF_ENCODER_DEVICE"
-
-
-def _load_moss_processor(model_id: str, variant: str) -> object:
-    """Load processors whose remote classes reject AutoProcessor loader kwargs."""
-    native_class = {
-        "local": "processing_moss_tts.MossTTSLocalProcessor",
-        "tts": "processing_moss_tts.MossTTSDelayProcessor",
-    }.get(variant)
-    if native_class is not None:
-        processor_cls = get_class_from_dynamic_module(native_class, model_id)
-        return processor_cls.from_pretrained(model_id, trust_remote_code=True)
-
-    from transformers import AutoProcessor
-
-    return AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
 
 
 def _local_continuation_prompt(proc: Any, user_kwargs: dict[str, Any], reference: Any) -> tuple[list[int], Any] | None:
@@ -384,10 +370,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         cached = getattr(self, "_moss_processor_cache", None)
         if cached is not None:
             return cached
-        model_id = self.engine_client.model_config.model
-        # AutoProcessor injects loader-only kwargs (e.g. revision) that the
-        # Local and Delay remote loaders forward to ProcessorMixin.__init__.
-        proc = cast(Any, _load_moss_processor(model_id, cast(str, self._moss_variant)))
+        proc = load_moss_processor(self.engine_client.model_config.model)
         if hasattr(proc, "audio_tokenizer"):
             device = self._resolve_ref_encoder_device()
             proc._vllm_omni_ref_encoder_device = device
@@ -436,6 +419,8 @@ class _MossTTSAdapterBase(ARTTSAdapter):
                 codec_path,
                 trust_remote_code=True,
             )
+            # This process only encodes references; Stage 1 decodes audio.
+            codec.decoder = None
             # Production follows the codec stage accelerator. Memory-constrained
             # qualification lanes can opt into CPU without weakening the
             # default cold-reference latency for user deployments.

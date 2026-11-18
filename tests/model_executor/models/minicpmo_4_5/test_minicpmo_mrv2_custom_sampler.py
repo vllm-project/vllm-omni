@@ -81,13 +81,15 @@ def test_duplex_k0_draft_method_raises(fake_sampler):
         MiniCPMO45OmniTTSForConditionalGeneration.mrv2_custom_sampler(talker, fake_sampler)
 
 
-def test_thinker_ngram_verifies_with_underlying_sampler(monkeypatch):
+@pytest.mark.parametrize("device_type", ["cuda", "npu"])
+@pytest.mark.parametrize("spec_method", [None, "ngram"])
+def test_thinker_ngram_verifies_with_underlying_sampler(monkeypatch, device_type, spec_method):
     from vllm.v1.worker.gpu.spec_decode import rejection_sampler
 
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.mrv2_sampling import MiniCPMO45DuplexSampler
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
 
-    spec = SimpleNamespace(method="ngram")
+    spec = SimpleNamespace(method=spec_method) if spec_method else None
     model = SimpleNamespace(
         model_stage="llm",
         vllm_config=SimpleNamespace(
@@ -97,7 +99,7 @@ def test_thinker_ngram_verifies_with_underlying_sampler(monkeypatch):
                 architecture="MiniCPMO45OmniForConditionalGeneration",
                 use_v2_model_runner=True,
             ),
-            device_config=SimpleNamespace(device_type="npu"),
+            device_config=SimpleNamespace(device_type=device_type),
             speculative_config=spec,
             scheduler_config=SimpleNamespace(async_scheduling=False),
             parallel_config=SimpleNamespace(
@@ -113,4 +115,4 @@ def test_thinker_ngram_verifies_with_underlying_sampler(monkeypatch):
     sampler, verifier = MiniCPMO45OmniForConditionalGeneration.mrv2_custom_sampler(model, base_sampler)
 
     assert isinstance(sampler, MiniCPMO45DuplexSampler)
-    assert verifier == (base_sampler, spec, device)
+    assert verifier == ((base_sampler, spec, device) if spec is not None else None)

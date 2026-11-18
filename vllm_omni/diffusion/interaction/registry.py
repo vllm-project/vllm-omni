@@ -14,6 +14,7 @@ from vllm_omni.diffusion.interaction.modality_handlers.base import InteractionHa
 from vllm_omni.diffusion.interaction.modality_handlers.camera import SE3DeltaCameraHandler
 from vllm_omni.diffusion.interaction.modality_handlers.prompt import PromptInteractionHandler
 from vllm_omni.diffusion.interaction.modality_handlers.taomate_h3_prompt import TaoMateH3PromptInteractionHandler
+from vllm_omni.diffusion.models.abot_world.interaction import ABotCameraInteractionHandler
 from vllm_omni.diffusion.models.hy_nomas.interaction import (
     HyNomasCameraInteractionHandler,
     HyNomasPromptInteractionHandler,
@@ -37,6 +38,10 @@ STRUCTURED_HANDLER_REGISTRY: dict[str, dict[str, type[InteractionHandler]]] = {
     },
     "LingBotWorldCausalDMDPipeline": {
         "camera": SE3DeltaCameraHandler,
+    },
+    # ABot conditions on discrete W/A/S/D/I/J/K/L key actions, not SE3 poses.
+    "ABotWorldCausalPipeline": {
+        "camera": ABotCameraInteractionHandler,
     },
     # TaoMate-H3 re-reads the prompt at every five-second request boundary; the
     # handler switches embeddings immediately (no cross-length interpolation).

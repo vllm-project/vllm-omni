@@ -20,7 +20,7 @@ import zmq
 from vllm.v1.engine.exceptions import EngineDeadError
 
 import vllm_omni.diffusion.worker.diffusion_worker as diffusion_worker_module
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE
@@ -91,7 +91,7 @@ def _make_engine(num_gpus: int = 1):
     engine = DiffusionEngine.__new__(DiffusionEngine)
     engine.od_config = SimpleNamespace(streaming_output=False)
     sched = RequestScheduler()
-    sched.initialize(SimpleNamespace())
+    sched.initialize(OmniDiffusionConfig(diffusion_attention_schedule=None))
     engine.scheduler = sched
     engine.executor = executor
     engine._rpc_lock = threading.RLock()
@@ -968,6 +968,9 @@ class TestSerialEngineOperations:
 class TestWorkerProcRpcRankStatus:
     def _make_worker_proc(self, has_result_mq: bool = True):
         proc = object.__new__(WorkerProc)
+        proc.od_config = SimpleNamespace(step_execution=False)
+        proc._async_output_done = threading.Condition()
+        proc._chunk_output_pending = 0
         proc.gpu_id = 0
         proc.result_mq = object() if has_result_mq else None
         proc.worker = SimpleNamespace(execute_method=Mock(return_value=True))
@@ -1584,6 +1587,7 @@ class TestExecutorShutdownCleaner:
                 self.pid = 123
                 self.alive = True
                 self.terminated = False
+                self.exitcode = None
                 self.join_timeouts = []
 
             def is_alive(self):
@@ -1593,6 +1597,7 @@ class TestExecutorShutdownCleaner:
                 self.join_timeouts.append(timeout)
                 if self.terminated:
                     self.alive = False
+                    self.exitcode = -signal.SIGTERM
 
             def terminate(self):
                 self.terminated = True
@@ -1938,6 +1943,7 @@ def test_engine_close_interrupts_only_ray_before_join(backend):
     engine._out_streams = {}
     engine._unclaimed_async_outputs = {}
     engine._shutdown_output_futures = {}
+    engine._request_chunk_states = {}
     interrupted = threading.Event()
     engine.executor = MagicMock()
     engine.executor.shutdown.side_effect = interrupted.set

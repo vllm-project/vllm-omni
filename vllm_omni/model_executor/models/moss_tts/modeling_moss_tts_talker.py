@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Iterable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -21,7 +21,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.sequence import IntermediateTensors
-from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import (
     MossTTSDelayConfig,
@@ -39,6 +38,9 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.sampling_utils import get_tts_local_seed
 from vllm_omni.worker_v2.first_audio_sender import supports_in_process_first_audio
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 logger = init_logger(__name__)
 
@@ -794,6 +796,9 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
     """
 
     have_multimodal_outputs: bool = True
+    # forward() returns plain backbone hidden states; make_omni_output() builds
+    # multimodal outputs after replay, keeping MRv2 FULL CUDA graphs enabled (#10435).
+    mrv2_forward_returns_tensor: bool = True
     has_preprocess: bool = True
     has_postprocess: bool = True
     # Intermediate prefill chunks reach make_omni_output but must not produce
@@ -1083,6 +1088,7 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                     "MOSS-TTS make_omni_output requires request_token_spans "
                     f"for {len(info_dicts)} request infos, got {0 if spans is None else len(spans)}"
                 )
+            sampling_params = kwargs.get("request_sampling_params")
             for i, info in enumerate(info_dicts):
                 if not isinstance(info, dict):
                     continue
@@ -1093,9 +1099,27 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                 if row_start >= row_end:
                     continue
 
-                state = info.get("audio_state", {}) or {}
+                state = info["audio_state"]
                 if state.get("is_stopping"):
                     continue  # already stopped — no more audio frames
+
+                generator = state.get("local_generator")
+                if generator is None:
+                    seed = info.get("seed")
+                    if isinstance(seed, (list, tuple)):
+                        seed = seed[0] if seed else None
+                    params = (
+                        sampling_params[i]
+                        if sampling_params is not None and i < len(sampling_params)
+                        else info.get("sampling_params")
+                    )
+                    if seed is None:
+                        seed = get_tts_local_seed(params)
+                    if seed is None:
+                        seed = getattr(params, "seed", None)
+                    if seed is not None:
+                        generator = torch.Generator(device=hidden.device).manual_seed(int(seed))
+                        state["local_generator"] = generator
 
                 last_h = hidden[row_end - 1].unsqueeze(0)  # (1, H)
                 # Sampling parameters mirror upstream ``MossTTSRealtimeInference.generate``:
@@ -1118,6 +1142,7 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                     do_sample=True,
                     repetition_penalty=1.1,
                     history_per_codebook=hist_per_cb,
+                    generators=[generator],
                 ).squeeze(0)  # (n_vq,)
                 if int(state.get("step", 0)) < 5 or int(state.get("step", 0)) % 50 == 0:
                     logger.debug(
