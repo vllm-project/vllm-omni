@@ -441,7 +441,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         model_runner_output.kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.ec_connector_output = ec_connector_output
 
-        self._reserve_native_data_plane_outputs(list(model_runner_output.req_ids))
+        self._reserve_native_data_plane_outputs(model_runner_output)
         if materialize_native:
             return self._materialize_native_output(async_output)
         return async_output
