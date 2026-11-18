@@ -1447,7 +1447,14 @@ class MiniMaxH3Pipeline(
             self._fasth3.validate_fully_applied(transformer_loaded)
         if self._regenerate is not None:
             self._regenerate.validate_fully_applied(transformer_loaded)
-        if self._fasth3_checkpoint is not None:
+        if self._fasth3_checkpoint is not None and "transformer." in loaded_prefixes:
+            # Only the streamed checkpoint is checked here. A DLO host-weight
+            # plan owns the ``transformer.`` source and installs the DiT
+            # without this method (the loader drops that source before calling
+            # us), after binding every DiT parameter, gates included, and
+            # restored final layouts were checked by the canonical load that
+            # produced them. Checking an empty stream would blame a complete
+            # checkpoint for all of its gates.
             parameter_names = set(dict(self.transformer.named_parameters()))
             required_gates = set()
             for i in range(self.transformer.arch.num_layers):
@@ -2060,6 +2067,7 @@ class MiniMaxH3Pipeline(
         position ``refine`` selects, and the returned schedules begin there.
         """
         sampler = resolve_sampler_name(sampler)
+        self._validate_sampler_cache(sampler)
         if sampler != "euler" and base_schedule is not None:
             raise ValueError(
                 f"MiniMax H3 {sampler} sampling with a fixed distilled sigma schedule has not been validated; "
@@ -3423,6 +3431,8 @@ class MiniMaxH3Pipeline(
             num_inference_steps=num_steps,
             extra_args=extra,
         )
+        if sampler == "heun" and quality_plan.cache_dit is not None:
+            raise OmniClientError("Heun requires uncached model runs; set quality=lossless")
         if continuation is not None and quality_plan.cache_dit is not None:
             raise OmniClientError("MiniMax H3 continuation requires uncached denoising; set quality=lossless")
         if (attention_schedule or sigma_schedule) and quality_plan.cache_dit is not None:
@@ -4220,8 +4230,8 @@ class MiniMaxH3Pipeline(
     ) -> dict[str, Exception | None]:
         """Let each algorithm own all predictions for one complete sampler step.
 
-        Compatible requests share packed model evaluations. Failed groups do
-        not commit latents or history.
+        Compatible requests share packed model evaluations, including Heun's
+        correction sub-batch. Failed groups do not commit latents or history.
         A packed evaluation keeps one attention document per request; backends
         that ignore ``cu_seqlens`` fall back to one forward per request. Under a
         bound attention schedule, requests pack only when they carry the same
@@ -4238,6 +4248,7 @@ class MiniMaxH3Pipeline(
             groups.setdefault(state.extra[_STEP_SAMPLER], []).append(state)
         for name, group in groups.items():
             try:
+                self._validate_sampler_cache(name)
                 models = {}
                 pending = []
                 for request in group:
@@ -4275,6 +4286,14 @@ class MiniMaxH3Pipeline(
                 for request in group:
                     results[request.request_id] = exc
         return results
+
+    def _validate_sampler_cache(self, sampler: str) -> None:
+        # Heun's correction evaluates a proposal the cache never saw, so a cached
+        # residual from the previous prediction would corrupt it.
+        if sampler != "heun":
+            return
+        if self.od_config.cache_backend not in (None, "none") or self.is_cache_dit_enabled():
+            raise OmniClientError("Heun requires uncached model runs")
 
     def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput:
         """Unpack the denoised rows and run the joint video/audio VAE decode."""

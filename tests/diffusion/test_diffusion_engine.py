@@ -151,6 +151,8 @@ class MockScheduler:
 
 def _make_admission_engine(pre_process_func) -> DiffusionEngine:
     engine = object.__new__(DiffusionEngine)
+    engine._request_chunk_states = {}
+    engine.od_config = SimpleNamespace(streaming_output=False)
     engine.scheduler = MockScheduler()
     engine.pre_process_func = pre_process_func
     engine._out_streams = {}
@@ -200,6 +202,7 @@ def test_request_started_output_is_emitted_only_for_opted_in_requests() -> None:
     sched_output = _make_request_mode_sched_output("tracked", "untracked")
     sched_output.scheduled_new_reqs[0].req.sampling_params.emit_request_lifecycle = True
     engine = object.__new__(DiffusionEngine)
+    engine._request_chunk_states = {}
     emitted = []
     engine._put_output = lambda request_id, output: emitted.append((request_id, output))
 
@@ -258,6 +261,7 @@ class TestRequestBatchCapability:
         )
 
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         with pytest.raises(ValueError, match="max_num_seqs=1"):
             engine._resolve_execution_mode(od_config)
 
@@ -283,6 +287,7 @@ class TestRequestBatchCapability:
         )
 
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
 
         assert engine._resolve_execution_mode(od_config) is DiffusionExecutionMode.REQUEST_BATCH
         registry_load.assert_not_called()
@@ -621,6 +626,7 @@ class TestMixFusionCapability:
             lambda model_class_name: pipeline_cls,
         )
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         return engine, od_config, engine._resolve_execution_mode(od_config)
 
     def test_engine_rejects_server_level_mixfusion_on_unsupported_pipeline(
@@ -823,6 +829,7 @@ class TestRequestBatchAdmission:
             )
 
         engine = object.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         engine.od_config = od_config
         engine.scheduler = scheduler
         engine.step_execution = False
@@ -1002,6 +1009,7 @@ async def test_engine_admission_preprocesses_request_once(entrypoint: str, mocke
 @pytest.mark.asyncio
 async def test_async_add_req_and_stream_response():
     engine = object.__new__(DiffusionEngine)
+    engine._request_chunk_states = {}
     engine.scheduler = MockScheduler()
     engine._out_streams = {}
     engine._unclaimed_async_outputs = {}

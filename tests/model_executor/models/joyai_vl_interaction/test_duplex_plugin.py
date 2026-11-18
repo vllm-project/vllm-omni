@@ -6,7 +6,7 @@ import base64
 import io
 import struct
 import threading
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 
 import pytest
@@ -51,6 +51,9 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.models.aura_omni.duplex.capabilities import aura_duplex_capabilities
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.input import JoyAIFrameBuffer
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.plugin import JoyAIDuplexPlugin
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts import (
+    JOYAI_TTS_CLOSE_ONLY_KEY,
+)
 from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
     JOYAI_VL_INTERACTION_ASR_PIPELINE,
     JOYAI_VL_INTERACTION_PIPELINE,
@@ -58,6 +61,80 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
 from vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction import asr_to_joyai, joyai_action_to_tts
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def _output_context(*, segment_finished: bool) -> DuplexOutputContext:
+    return DuplexOutputContext(
+        identity=DuplexRequestIdentity(session_id=SESSION_ID, fence=DuplexFence(session_id=SESSION_ID)),
+        final_stage_id=2,
+        segment_finished=segment_finished,
+    )
+
+
+@dataclass
+class _PartialStageClient:
+    custom_process_input_func: object = None
+
+
+@dataclass
+class _PartialPool:
+    stage_client: _PartialStageClient = field(default_factory=_PartialStageClient)
+
+
+@dataclass
+class _PartialOrchestrator:
+    stage_pools: list[_PartialPool]
+
+    def _stage_receives_async_chunks(self, stage_id: int) -> bool:
+        del stage_id
+        return False
+
+
+def _partial_orchestrator(talker_processor: object) -> _PartialOrchestrator:
+    # Two pools: ``_stage1_processor_name`` reads ``stage_pools[1]`` for the
+    # Talker's input processor, and an out-of-range lookup would make
+    # ``plan_partial_stage_output`` bail out before the switch is consulted.
+    return _PartialOrchestrator(
+        stage_pools=[
+            _PartialPool(_PartialStageClient(None)),
+            _PartialPool(_PartialStageClient(talker_processor)),
+        ]
+    )
+
+
+@dataclass
+class _PartialStreaming:
+    bridge_states: dict[str, object] = field(default_factory=dict)
+    enabled: bool = False
+
+
+@dataclass
+class _PartialReqState:
+    session_owned: bool = True
+    final_stage_id: int = 2
+    request_id: str = "req-1"
+    prompt: dict[str, object] = field(default_factory=lambda: {"additional_information": {}})
+    streaming: _PartialStreaming = field(default_factory=_PartialStreaming)
+
+
+@dataclass
+class _PartialCompletion:
+    text: str
+    cumulative_text: str | None = None
+
+
+@dataclass
+class _PartialOutput:
+    request_id: str = "req-1"
+    outputs: list[_PartialCompletion] = field(default_factory=list)
+    finished: bool = False
+
+
+def _stage0_output(text: str, *, finished: bool = False) -> _PartialOutput:
+    return _PartialOutput(
+        finished=finished,
+        outputs=[_PartialCompletion(text=text, cumulative_text=text if finished else None)],
+    )
 
 
 class Processor:
@@ -314,10 +391,221 @@ def test_opt_in_profile_preserves_turn_pipeline():
     assert duplex.session_mode == "duplex"
     assert normal.stages == duplex.stages
     assert normal.connectors == duplex.connectors
+    # The duplex overlay streams Talker codec frames into Code2Wav; the turn
+    # profile keeps the all-sync full-payload path.
+    assert not normal.async_chunk
     assert duplex.async_chunk
     stages = merge_pipeline_deploy(JOYAI_VL_INTERACTION_PIPELINE, duplex)
     assert len(stages) == 3
     assert all(stage.session_mode == "duplex" for stage in stages)
+    assert all(stage.yaml_engine_args["async_chunk"] is True for stage in stages)
+    assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith("talker2code2wav_async_chunk")
+
+
+def test_joyai_drains_talker_and_code2wav_after_the_action():
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    plugin.configure_pipeline(JOYAI_VL_INTERACTION_PIPELINE)
+    assert plugin.draining_stage_ids(stage_count=3) == frozenset({1, 2})
+    plugin.configure_pipeline(JOYAI_VL_INTERACTION_ASR_PIPELINE)
+    assert plugin.draining_stage_ids(stage_count=4) == frozenset({2, 3})
+
+
+def test_joyai_streams_text_and_talker_sentence_parks():
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    plugin.configure_pipeline(JOYAI_VL_INTERACTION_PIPELINE)
+    plugin.configure_async_chunk(enabled=True)
+    defaults = (SamplingParams(), SamplingParams(), SamplingParams())
+    configured = plugin.configure_sampling_params(runtime_config={}, defaults=defaults)
+    assert configured[0].output_kind == RequestOutputKind.DELTA
+    assert configured[1].output_kind == RequestOutputKind.DELTA
+    assert configured[2].output_kind == RequestOutputKind.DELTA
+    from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts import (
+        JOYAI_TTS_SEED,
+        JOYAI_TTS_TEMPERATURE,
+    )
+
+    assert configured[1].seed == JOYAI_TTS_SEED
+    assert configured[1].extra_args["tts_local_seed"] == JOYAI_TTS_SEED
+    assert configured[1].temperature == JOYAI_TTS_TEMPERATURE
+    assert configured[0].seed is None
+    assert configured[2].seed is None
+    assert plugin.project_intermediate_output(
+        stage_id=0, output=object(), context=_output_context(segment_finished=False)
+    )
+    assert not plugin.project_intermediate_output(
+        stage_id=1, output=object(), context=_output_context(segment_finished=False)
+    )
+
+
+def test_async_chunk_disabled_reverts_the_whole_streaming_profile():
+    """``async_chunk: false`` is the off switch for every streaming behavior.
+
+    The per-sentence handoff needs a prewarmed, connector-fed Code2Wav and a
+    DELTA Talker whose 2150 park is visible. With the edge off none of that
+    holds, so the plugin goes back to one-shot text, Talker and no draining.
+    """
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    plugin.configure_pipeline(JOYAI_VL_INTERACTION_PIPELINE)
+    plugin.configure_async_chunk(enabled=False)
+
+    assert plugin.draining_stage_ids(stage_count=3) == frozenset()
+    defaults = (SamplingParams(), SamplingParams(), SamplingParams())
+    configured = plugin.configure_sampling_params(runtime_config={}, defaults=defaults)
+    # JoyAI and Talker complete before the next stage runs; Code2Wav still
+    # streams its single decode.
+    assert [p.output_kind for p in configured] == [
+        RequestOutputKind.FINAL_ONLY,
+        RequestOutputKind.FINAL_ONLY,
+        RequestOutputKind.DELTA,
+    ]
+    from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts import (
+        JOYAI_TTS_SEED,
+        JOYAI_TTS_TEMPERATURE,
+    )
+
+    # One-shot Talker still uses FINAL_ONLY, but CustomVoice is pinned for the
+    # whole duplex profile (not only async_chunk=true).
+    assert configured[1].seed == JOYAI_TTS_SEED
+    assert configured[1].extra_args["tts_local_seed"] == JOYAI_TTS_SEED
+    assert configured[1].temperature == JOYAI_TTS_TEMPERATURE
+    assert configured[0].seed is None
+    assert configured[2].seed is None
+
+    # Text is projected once, at the segment boundary, as before live text.
+    assert not plugin.project_intermediate_output(
+        stage_id=0, output=object(), context=_output_context(segment_finished=False)
+    )
+    assert plugin.project_intermediate_output(
+        stage_id=0, output=object(), context=_output_context(segment_finished=True)
+    )
+
+
+def test_joyai_system_prompt_extra_replaces_silence_persona():
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    runtime = plugin.runtime_config_for_update(
+        DuplexSessionConfig(model="joyai", extra_body={"joyai_system_prompt": "Read aloud."}),
+        {},
+    )
+    assert plugin._system_prompt(runtime) == "Read aloud."
+    with_instructions = plugin.runtime_config_for_update(
+        DuplexSessionConfig(
+            model="joyai",
+            instructions="Keep going.",
+            extra_body={"joyai_system_prompt": "Read aloud."},
+        ),
+        {},
+    )
+    assert plugin._system_prompt(with_instructions) == "Read aloud.\n\nKeep going."
+
+
+def test_plan_partial_is_off_when_async_chunk_is_disabled():
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    plugin.configure_pipeline(JOYAI_VL_INTERACTION_PIPELINE)
+    plugin.configure_async_chunk(enabled=False)
+
+    orchestrator = _partial_orchestrator(joyai_action_to_tts)
+    req_state = _PartialReqState()
+    output = _stage0_output("</response> 水开了。", finished=True)
+    # A spoken, complete action: only the disabled switch can make this None.
+    assert plugin.plan_partial_stage_output(orchestrator, 0, 0, output, req_state) is None
+    assert req_state.streaming.enabled is False
+    assert req_state.streaming.bridge_states == {}
+
+    # Control: the same output does plan when the switch is on.
+    plugin.configure_async_chunk(enabled=True)
+    planned = plugin.plan_partial_stage_output(orchestrator, 0, 0, output, req_state)
+    assert planned is not None
+    assert "水开了" in planned.output.text
+
+
+def test_plugin_queues_a_close_sentinel_after_the_last_sentence():
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    plugin.configure_pipeline(JOYAI_VL_INTERACTION_PIPELINE)
+
+    orchestrator = _partial_orchestrator(joyai_action_to_tts)
+    req_state = _PartialReqState()
+    first = _stage0_output("</response> 水开了。关")
+    plan = plugin.plan_partial_stage_output(orchestrator, 0, 0, first, req_state)
+    assert plan is not None
+    assert plan.is_final_update is False
+    assert plan.close_only is False
+    assert plugin.partial_stage_followup(plan, req_state) is None
+
+    done = _PartialOutput(
+        finished=True,
+        request_id="req-1",
+        outputs=[_PartialCompletion(text="关火。", cumulative_text="</response> 水开了。关火。")],
+    )
+    last = plugin.plan_partial_stage_output(orchestrator, 0, 0, done, req_state)
+    assert last is not None
+    assert last.output.text == ""
+    assert last.queue_close_after is False
+    assert last.is_final_update is False
+    assert last.close_only is False
+    assert plugin.partial_stage_followup(last, req_state) is None
+    assert req_state.prompt["additional_information"][JOYAI_TTS_CLOSE_ONLY_KEY] is False
+    bridge = req_state.streaming.bridge_states["joyai_sentence_tts"]
+    queued = bridge["queued"]
+    assert isinstance(queued, list)
+    assert any(isinstance(item, str) and "关火" in item for item in queued)
+
+
+def test_plugin_closes_after_an_idle_talker_finishes_the_last_sentence():
+    """The last sentence lands after the Talker already parked.
+
+    Sentence 2 must stay resumable so the parked session is unparked, and
+    finish-on-next-stop so that 2150 is Code2Wav's request terminal. A plugin
+    close_only would miss the vocoder.
+    """
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    plugin.configure_pipeline(JOYAI_VL_INTERACTION_PIPELINE)
+    plugin.configure_async_chunk(enabled=True)
+
+    orchestrator = _partial_orchestrator(joyai_action_to_tts)
+    req_state = _PartialReqState()
+
+    first = plugin.plan_partial_stage_output(orchestrator, 0, 0, _stage0_output("</response> 水开了。关"), req_state)
+    assert first is not None
+    assert plugin.partial_stage_followup(first, req_state) is None
+    # Talker finished sentence 1 and parked with nothing queued.
+    req_state.streaming.bridge_states["joyai_sentence_tts"]["talker_busy"] = False
+
+    last = plugin.plan_partial_stage_output(
+        orchestrator, 0, 0, _stage0_output("</response> 水开了。关火。", finished=True), req_state
+    )
+    assert last is not None
+    assert "关火" in last.output.text
+    assert last.queue_close_after is True
+    assert last.is_final_update is False
+    # 2150 of this last sentence is the request terminal; do not send a
+    # parked close_only that Code2Wav would never see as finished.
+    assert plugin.partial_stage_followup(last, req_state) is None
+    assert req_state.prompt["additional_information"]["joyai_finish_on_next_stop"] is True
+
+
+@pytest.mark.asyncio
+async def test_spoken_text_streams_before_joyai_finishes():
+    h = await open_joyai()
+    try:
+        request_id = await observe(h)
+        await h.deliver_and_settle(
+            tts_output(request_id, text="</response> The po", finished=False),
+            stage_id=0,
+            segment_finished=False,
+        )
+        events = [event.to_realtime() for event in h.events]
+        assert any(e.get("delta") == "The po" for e in events)
+        consumed = h.deliver(
+            tts_output(request_id, text="</response> The pot is smoking.", finished=True),
+            stage_id=0,
+            segment_finished=True,
+        )
+        assert not consumed
+        await h.settle()
+        events = [event.to_realtime() for event in h.events]
+        assert any(e.get("delta") == "t is smoking." for e in events)
+    finally:
+        await h.manager.shutdown()
 
 
 @pytest.mark.asyncio
@@ -1495,8 +1783,8 @@ async def test_streamed_audio_chunks_complete_on_empty_final_delta():
     plugin.configure_pipeline(JOYAI_VL_INTERACTION_PIPELINE)
     params = plugin.configure_sampling_params(runtime_config={}, defaults=tuple(SamplingParams() for _ in range(3)))
     assert [p.output_kind for p in params] == [
-        RequestOutputKind.FINAL_ONLY,
-        RequestOutputKind.FINAL_ONLY,
+        RequestOutputKind.DELTA,
+        RequestOutputKind.DELTA,
         RequestOutputKind.DELTA,
     ]
     h = await open_joyai()

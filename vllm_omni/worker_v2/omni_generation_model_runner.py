@@ -601,7 +601,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
                 check_ep_fault=self.check_ep_fault,
                 pending_aux_output=pending_aux_output,
             )
-            self._reserve_native_data_plane_outputs(list(req_ids))
+            self._reserve_native_data_plane_outputs(output)
             if not self._retains_state_across_chunks:
                 self._release_generation_slots(input_batch, keep=pending)
             return async_output
@@ -609,7 +609,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         # Non-CUDA execution keeps the synchronous materialization path. Final
         # generation stages publish audio only through multimodal_outputs,
         # matching the V1 generation-runner contract.
-        self._reserve_native_data_plane_outputs(list(req_ids))
+        self._reserve_native_data_plane_outputs(output)
         multimodal_outputs = self._build_pooler_output(model_output, num_reqs)
         output.multimodal_outputs = [
             _ensure_tensor_values(payload) if payload else {} for payload in multimodal_outputs
