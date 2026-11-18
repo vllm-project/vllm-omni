@@ -78,6 +78,7 @@ def test_leading_digit_bound_to_unit_or_date_keeps_no_comma():
     assert shape_voxcpm2_edge_digits("3公里后右转") == "3公里后右转"
     assert shape_voxcpm2_edge_digits("2千元已到账") == "2千元已到账"
     assert shape_voxcpm2_edge_digits("8公斤重") == "8公斤重"
+    assert shape_voxcpm2_edge_digits("3天后再来") == "3天后再来"
 
 
 def test_leading_standalone_digit_run_still_gets_comma():

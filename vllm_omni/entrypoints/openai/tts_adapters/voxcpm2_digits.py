@@ -48,7 +48,7 @@ _VOXCPM2_ZERO_SENTINEL = "\uee00"
 # comma over inserting one inside a normal amount - a comma inside
 # "1小时"/"3公里" garbles the reading, while a missed comma on a true edge
 # number only keeps the baseline pronunciation):
-# - dates & clock: 月日年号点分秒
+# - dates & clock: 月日年号点分秒时周天
 # - magnitudes & currency: 万亿两千百亿万元角块毛
 # - metric & market units: 公里米寸尺升斗吨磅克毫厘斤两亩顷度
 # - ratio: 倍折成
@@ -61,7 +61,7 @@ _VOXCPM2_ZERO_SENTINEL = "\uee00"
 # ("10今天...") need it.
 _VOXCPM2_BOUND_FOLLOW_RE = re.compile(
     "["
-    "月日年号点分秒时周"
+    "月日年号点分秒时周天"
     "万亿两千百亿元角块毛"
     "小公里米寸尺升斗吨磅克毫厘斤两亩顷度"
     "倍折成"
