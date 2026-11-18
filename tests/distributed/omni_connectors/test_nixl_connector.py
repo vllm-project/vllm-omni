@@ -1147,6 +1147,29 @@ def test_omni_payload_struct_uses_structured_tensor_path(producer):
     assert skeleton["meta"]["left_context_size"] == 2
 
 
+def test_pending_payloads_own_disjoint_tensor_regions(producer):
+    source = torch.arange(256)
+    payload = {"tokens": source, "alias": source, "view": source[:128]}
+    regions: list[tuple[int, int]] = []
+    for key in ("first", "second"):
+        ok, _, metadata = producer.put("0", "1", key, payload)
+        assert ok
+        for group in metadata["descriptor_groups"]:
+            regions.extend((address, address + size) for address, size, *_ in group["regions"])
+
+    # Repeated leaves and concurrent payloads must not register overlapping
+    # memory: retiring one registration must not invalidate another payload.
+    for index, (start, end) in enumerate(regions):
+        assert all(end <= other_start or other_end <= start for other_start, other_end in regions[index + 1 :])
+
+    source.zero_()
+    for key in ("first", "second"):
+        retained = producer._pending[key].tensors
+        torch.testing.assert_close(retained[1], torch.arange(256))
+        torch.testing.assert_close(retained[2], torch.arange(256))
+        torch.testing.assert_close(retained[3], torch.arange(128))
+
+
 def test_partial_group_registration_failure_rolls_back(producer, monkeypatch):
     monkeypatch.setattr(
         producer,
