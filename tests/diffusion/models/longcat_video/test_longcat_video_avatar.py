@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
 import torch
+from diffusers.video_processor import VideoProcessor
 from PIL import Image
 
 from vllm_omni.diffusion.models.longcat_video.longcat_video_avatar_bsa import (
@@ -20,6 +23,7 @@ from vllm_omni.diffusion.models.longcat_video.longcat_video_avatar_transformer i
     replace_linear_with_quantized,
 )
 from vllm_omni.diffusion.models.longcat_video.pipeline_longcat_video_avatar import (
+    LongCatVideoAvatarPipeline,
     _avatar_model_allow_patterns,
     _build_multi_speaker_ref_target_masks,
     _default_at2v_shape,
@@ -28,6 +32,7 @@ from vllm_omni.diffusion.models.longcat_video.pipeline_longcat_video_avatar impo
     _resolve_num_segments,
     prepare_longcat_video_avatar_model_for_omni,
 )
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -44,6 +49,81 @@ def test_longcat_video_avatar_at2v_default_shape_uses_resolution_bucket(
     expected_shape: tuple[int, int],
 ):
     assert _default_at2v_shape(resolution) == expected_shape
+
+
+@pytest.mark.parametrize("dimensions", [(None, None), (512, 768)])
+@pytest.mark.parametrize("num_segments", [1, 2])
+def test_longcat_video_avatar_ai2v_dimensions_reach_image_masks_and_continuation(dimensions, num_segments):
+    pipeline = LongCatVideoAvatarPipeline.__new__(LongCatVideoAvatarPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline.save_fps = 25
+    pipeline.audio_stride = 1
+    pipeline.use_distill = True
+    pipeline.video_processor = VideoProcessor(vae_scale_factor=8)
+    pipeline.transformer = Mock(
+        dtype=torch.float32,
+        config=SimpleNamespace(in_channels=1),
+        side_effect=lambda **kwargs: torch.zeros_like(kwargs["hidden_states"]),
+    )
+    pipeline.scheduler = Mock(timesteps=[torch.tensor(1.0)])
+    pipeline.scheduler.step.side_effect = lambda noise, t, latents, **kwargs: (latents,)
+    pipeline.encode_prompt = Mock(return_value=(torch.zeros(1, 1, 8), torch.ones(1, 1), None, None))
+    pipeline.prepare_latents = Mock(
+        side_effect=lambda **kwargs: torch.zeros(1, 1, 2, kwargs["height"] // 8, kwargs["width"] // 8)
+    )
+    frames = np.zeros((1, 1, 2, 2, 3), dtype=np.float32)
+    pipeline._decode_latents = Mock(return_value=frames)
+    pipeline._generate_avc = Mock(return_value=(frames, torch.zeros(1, 1, 2, 1, 1)))
+    pipeline._resolve_request_inputs = Mock(
+        return_value={
+            "stage": "ai2v",
+            "resolution": "480p",
+            "prompt": "Two people speaking.",
+            "negative_prompt": "",
+            "is_multi_speaker": True,
+            "image": Image.new("RGB", (160, 90)),
+            "bbox": {},
+        }
+    )
+    audio_emb = torch.zeros(2, 2, 5, 12, 4)
+    pipeline._prepare_audio_embeddings = Mock(return_value=(audio_emb, [audio_emb], num_segments))
+    pipeline._slice_multi_audio_embeddings = Mock(return_value=audio_emb)
+    req = SimpleNamespace(
+        is_dummy_run=lambda: False,
+        sampling_params=OmniDiffusionSamplingParams(
+            height=dimensions[0], width=dimensions[1], num_frames=93, extra_args={"num_segments": num_segments}
+        ),
+    )
+
+    pipeline.forward(req)
+
+    expected_height, expected_width = dimensions if dimensions[0] is not None else (480, 832)
+    latent_args = pipeline.prepare_latents.call_args.kwargs
+    assert (latent_args["height"], latent_args["width"]) == (expected_height, expected_width)
+    assert latent_args["image"].shape[-2:] == (expected_height, expected_width)
+    assert pipeline.transformer.call_args.kwargs["ref_target_masks"].shape == (3, expected_height, expected_width)
+    if num_segments > 1:
+        avc_args = pipeline._generate_avc.call_args.kwargs
+        assert (avc_args["height"], avc_args["width"]) == (expected_height, expected_width)
+    else:
+        pipeline._generate_avc.assert_not_called()
+
+
+@pytest.mark.parametrize("stage", ["at2v", "ai2v"])
+@pytest.mark.parametrize("dimensions", [(512, None), (None, 768), (0, 768), (512, -1)])
+def test_longcat_video_avatar_rejects_invalid_dimensions_before_audio_preparation(stage, dimensions):
+    pipeline = Mock()
+    pipeline._resolve_request_inputs.return_value = {"stage": stage, "resolution": "480p"}
+    req = SimpleNamespace(
+        is_dummy_run=lambda: False,
+        sampling_params=OmniDiffusionSamplingParams(height=dimensions[0], width=dimensions[1]),
+    )
+
+    with pytest.raises(ValueError, match="height and width must be"):
+        LongCatVideoAvatarPipeline.forward(pipeline, req)
+
+    pipeline._prepare_audio_embeddings.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -224,13 +304,21 @@ def test_longcat_video_avatar_bsa_cdf_selection_uses_lower_bound_count(
 
 def test_longcat_video_avatar_bsa_skips_cpu():
     attention = Attention(dim=8, num_heads=1, enable_bsa=True)
-    q = torch.randn(1, 1, 16, 8)
-    k = torch.randn(1, 1, 16, 8)
+    q = torch.randn(1, 1, 128, 8)
+    k = torch.randn(1, 1, 128, 8)
 
-    assert attention._bsa_latent_shapes(q, k, (4, 2, 2)) is None
+    assert attention._bsa_latent_shapes(q, k, (4, 4, 8)) is None
 
 
-def test_longcat_video_avatar_bsa_skips_incompatible_cuda_metadata_shapes():
+@pytest.mark.parametrize(
+    ("query_length", "key_length", "latent_shape", "expected"),
+    [
+        (16, 16, (4, 2, 2), None),
+        (128, 128, (4, 4, 8), ((4, 4, 8), (4, 4, 8))),
+        (128, 256, (8, 4, 8), None),
+    ],
+)
+def test_longcat_video_avatar_bsa_cuda_metadata_shapes(query_length, key_length, latent_shape, expected):
     # _bsa_latent_shapes only needs tensor metadata; avoid requiring CUDA in unit tests.
     class TensorMetadata:
         device = torch.device("cuda")
@@ -239,10 +327,10 @@ def test_longcat_video_avatar_bsa_skips_incompatible_cuda_metadata_shapes():
             self.shape = shape
 
     attention = Attention(dim=8, num_heads=1, enable_bsa=True)
-    q = TensorMetadata((1, 1, 16, 8))
-    k = TensorMetadata((1, 1, 16, 8))
+    q = TensorMetadata((1, 1, query_length, 8))
+    k = TensorMetadata((1, 1, key_length, 8))
 
-    assert attention._bsa_latent_shapes(q, k, (4, 2, 2)) is None
+    assert attention._bsa_latent_shapes(q, k, latent_shape) == expected
 
 
 def test_longcat_video_avatar_multi_speaker_para_audio_arrays_are_aligned():

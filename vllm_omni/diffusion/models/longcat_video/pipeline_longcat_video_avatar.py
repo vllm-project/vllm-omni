@@ -1433,8 +1433,11 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
         max_sequence_length: int,
         resize_mode: str,
         ref_target_masks: torch.Tensor | None = None,
+        height: int | None = None,
+        width: int | None = None,
     ):
-        height, width = self._condition_shape(image, resolution)
+        if height is None and width is None:
+            height, width = self._condition_shape(image, resolution)
         self._text_guidance_scale = text_guidance_scale
         self._audio_guidance_scale = audio_guidance_scale
         device = self.device
@@ -1775,6 +1778,15 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
         if resolution not in {"480p", "720p"}:
             raise ValueError(f"Unsupported LongCat-Video-Avatar resolution {resolution!r}.")
 
+        height = extra.get("height") if extra.get("height") is not None else req.sampling_params.height
+        width = extra.get("width") if extra.get("width") is not None else req.sampling_params.width
+        if (height is None) != (width is None):
+            raise ValueError("LongCat-Video-Avatar height and width must be provided together.")
+        if height is not None:
+            height, width = int(height), int(width)
+            if height <= 0 or width <= 0:
+                raise ValueError("LongCat-Video-Avatar height and width must be positive.")
+
         num_frames = _adjust_num_frames(int(extra.get("num_frames") or req.sampling_params.num_frames or 93))
         save_fps = int(extra.get("save_fps") or req.sampling_params.fps or self.save_fps)
         num_cond_frames = int(extra.get("num_cond_frames") or 13)
@@ -1839,9 +1851,8 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
 
         latent = None
         if stage == "at2v":
-            default_height, default_width = _default_at2v_shape(resolution)
-            height = int(extra.get("height") or req.sampling_params.height or default_height)
-            width = int(extra.get("width") or req.sampling_params.width or default_width)
+            if height is None:
+                height, width = _default_at2v_shape(resolution)
             output = self._generate_at2v(
                 prompt=inputs["prompt"],
                 negative_prompt=inputs["negative_prompt"],
@@ -1878,6 +1889,8 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
                 max_sequence_length=max_sequence_length,
                 resize_mode=resize_mode,
                 ref_target_masks=ref_target_masks,
+                height=height,
+                width=width,
             )
 
         if num_segments > 1:
