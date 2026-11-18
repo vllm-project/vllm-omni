@@ -83,9 +83,9 @@ def test_generic_transcription_can_coexist_with_other_output_modalities(extra_ou
 
 def test_tts_timestamps_do_not_disable_plain_transcription_or_enable_asr_alignment():
     configs, metadata, runtime = _pipeline("text", "audio", "timestamps")
-    configs[2].custom_process_input_func = (
-        "vllm_omni.model_executor.stage_input_processors.forced_aligner.code2wav2aligner"
-    )
+    configs[
+        2
+    ].custom_process_input_func = "vllm_omni.model_executor.stage_input_processors.forced_aligner.code2wav2aligner"
     assert supports_transcription_pipeline(configs, metadata, runtime)
     assert not has_transcription_aligner(configs, metadata, runtime)
 
