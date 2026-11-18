@@ -4,14 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from functools import cached_property
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.model_executor.models import SupportsPP
 from vllm.model_executor.models.utils import init_vllm_registered_model
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 
@@ -39,6 +38,9 @@ from .config_ming_tts import (
 )
 from .prompt_encoder import _resolve_prompt_latents
 from .speaker_extractor import _resolve_speaker_embeddings
+
+if TYPE_CHECKING:
+    pass
 
 
 class _ModelSampleAdapter(nn.Module):
@@ -85,6 +87,8 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
 
     @cached_property
     def sampler(self):
+        from vllm.v1.sample.sampler import Sampler
+
         if hasattr(self.model, "sample"):
             return _ModelSampleAdapter(self.model)
         if hasattr(self.model, "sampler"):

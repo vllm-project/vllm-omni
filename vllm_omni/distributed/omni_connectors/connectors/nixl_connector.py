@@ -1109,7 +1109,10 @@ class NixlConnector(OmniConnectorBase):
         normalized: list[torch.Tensor] = []
         specs: list[dict[str, Any]] = []
         for tensor in tensors:
-            contiguous = tensor.detach().contiguous()
+            # Each pending payload owns its registrations. A contiguous view
+            # can still alias another leaf or an earlier pending payload;
+            # deregistering either would invalidate the other's NIXL region.
+            contiguous = tensor.detach().clone(memory_format=torch.contiguous_format)
             normalized.append(contiguous)
             specs.append(
                 {
