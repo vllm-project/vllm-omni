@@ -123,7 +123,9 @@ def qwen_oom():
         ("api_dead", None),
         ("driver_oom", None),
         ("accelerator_oom", None),
+        ("hip_quoted_oom", None),
         ("allocator_oom", None),
+        ("hip_launch_resources", "without explicit GPU OOM evidence"),
         ("no_oom_evidence", "without explicit GPU OOM evidence"),
         ("stale_oom_evidence", "without explicit GPU OOM evidence"),
         ("warmup_failed", "expected successful multimodal"),
@@ -197,6 +199,8 @@ def test_qwen_oom_uses_one_injection_and_stops_before_recovery(qwen_oom, outcome
                     {
                         "driver_oom": "Returning 2 (CUDA_ERROR_OUT_OF_MEMORY) from cuDevicePrimaryCtxRetain",
                         "accelerator_oom": "torch.AcceleratorError: CUDA error: out of memory",
+                        "hip_quoted_oom": "Hip error: 'out of memory'(2)",
+                        "hip_launch_resources": "hipErrorLaunchOutOfResources",
                         "allocator_oom": (
                             "[rank0]: CUDACachingAllocator.cpp:3934 memory allocation failed with OOM on device 0 "
                             "while trying to allocate 109051904 bytes (free: 3997696, total: 84942979072)."
@@ -238,7 +242,7 @@ def test_qwen_oom_uses_one_injection_and_stops_before_recovery(qwen_oom, outcome
     if expected_error is not None:
         with pytest.raises(AssertionError, match=expected_error) as error:
             run()
-        if outcome in {"no_oom_evidence", "stale_oom_evidence"}:
+        if outcome in {"hip_launch_resources", "no_oom_evidence", "stale_oom_evidence"}:
             assert "status=500" in str(error.value)
             assert "engine dead" in str(error.value)
             assert "stderr_tail=" in str(error.value)

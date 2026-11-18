@@ -1007,10 +1007,26 @@ def test_tiny_diffusion_multigpu_nightly_uses_native_rocm_collection(
 
     assert step["agent_pool"] == agent_pool
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == ("Blocking" if agent_pool == "mi300_2" else "NonBlocking")
     assert step["timeout_in_minutes"] == 50
     assert step["artifact_paths"] == [artifacts]
     assert "retry" not in step
+
+    if agent_pool == "mi300_2":
+        assert step["env"]["ROCM_DIFFUSION_RUN_LEVEL"] == "core_model"
+        assert len(step["commands"]) == 1
+        assert split(step["commands"][0]) == [
+            "bash",
+            ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh",
+            "2",
+            str(expected_count),
+            "40m",
+            "rocm-tiny-diffusion-2gpu",
+            TINY_DIFFUSION_PATH,
+            "-m",
+            markers,
+        ]
+        return
 
     commands = step["commands"]
     collect_commands = [command for command in commands if AMD_COLLECTION_GUARD.name in command]
@@ -1317,14 +1333,23 @@ def test_cosyvoice_ready_smoke_uses_sdpa() -> None:
 def test_cosyvoice_full_default_backend_suite_runs_nightly() -> None:
     step = _find_step("CosyVoice3-TTS E2E Test", AMD_NIGHTLY_PIPELINE)
 
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["timeout_in_minutes"] == 90
     assert step["retry"] == {"automatic": [{"exit_status": 134, "limit": 1}]}
-    assert all("DIFFUSION_ATTENTION_BACKEND" not in command for command in step["commands"])
-
-    pytest_command = next(command for command in step["commands"] if "pytest" in command)
-    assert "tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py" in pytest_command
-    assert "::" not in pytest_command
+    assert step["env"] == {
+        "ROCM_E2E_LEVEL_MARKER": "slow",
+        "ROCM_E2E_RUN_LEVEL": "core_model",
+        "ROCM_E2E_TIMEOUT_MINUTES": "75",
+    }
+    assert step["artifact_paths"] == ["artifacts/rocm-cosyvoice3-e2e-nightly/**/*"]
+    assert split(step["commands"][0]) == [
+        "bash",
+        ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh",
+        "tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py",
+        "3",
+        "tts",
+        "rocm-cosyvoice3-e2e-nightly",
+    ]
 
 
 def test_amd_template_preserves_step_retry_policy() -> None:
@@ -3059,7 +3084,7 @@ def test_hunyuanvideo15_accuracy_is_one_blocking_nightly_job() -> None:
         assert "HunyuanVideo-1.5 Video Similarity" not in text
 
 
-def test_minimax_h3_accuracy_keeps_i2va_nonblocking_and_promotes_timeline() -> None:
+def test_minimax_h3_accuracy_jobs_are_blocking() -> None:
     timeline = _find_step("MiniMax-H3 Timeline Guide Accuracy", AMD_NIGHTLY_PIPELINE)
     i2va = _find_step("MiniMax-H3 I2VA Ref2VA Accuracy", AMD_NIGHTLY_PIPELINE)
     assert timeline["agent_pool"] == "mi300_2"
@@ -3077,21 +3102,24 @@ def test_minimax_h3_accuracy_keeps_i2va_nonblocking_and_promotes_timeline() -> N
         ),
     )
     for step, marker, path in pairs:
-        assert step["grade"] == ("Blocking" if step is timeline else "NonBlocking")
+        assert step["grade"] == "Blocking"
         assert step["timeout_in_minutes"] == 180
         assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
         commands = "\n".join(step["commands"])
         assert marker in commands
         assert path in commands
-        assert "--collect-only" in commands
-        assert "exit 5" in commands
     timeline_commands = "\n".join(timeline["commands"])
     assert "test_minimax_h3_timeline_guides_condition_frames_and_audio" in timeline_commands
     assert "Expected exactly one MiniMax-H3 timeline accuracy node" in timeline_commands
     i2va_commands = "\n".join(i2va["commands"])
     assert "test_minimax_h3_i2va_matches_official_reference" in i2va_commands
     assert "test_minimax_h3_ref2va_matches_official_reference" in i2va_commands
-    assert "Expected exactly $${#nodes[@]} MiniMax-H3 I2VA/Ref2VA nodes" in i2va_commands
+    assert "--collect-only" in timeline_commands
+    assert "exit 5" in timeline_commands
+    assert "run-rocm-diffusion-nightly.sh" in i2va_commands
+    assert "4 2 165m rocm-minimax-h3-i2va" in i2va_commands
+    assert 'exit "$$status"' in i2va_commands
+    assert "cp -a tests/e2e/accuracy/artifacts/." in i2va_commands
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert "MiniMax-H3 Timeline Guide Accuracy" not in text
@@ -3239,7 +3267,7 @@ def test_qwen3_tts_perf_is_one_nonblocking_nightly_job() -> None:
         assert "Qwen3-TTS Perf" not in text
 
 
-def test_minicpmo_accuracy_is_two_nonblocking_nightly_jobs() -> None:
+def test_minicpmo_accuracy_keeps_daily_nonblocking_and_promotes_seed_tts() -> None:
     group = _find_group(":full_moon: MiniCPM-o 4.5 Accuracy MI300 Nightly", AMD_NIGHTLY_PIPELINE)
     jobs: tuple[tuple[str, str, str, str, str, dict[str, str]], ...] = (
         (
@@ -3257,6 +3285,7 @@ def test_minicpmo_accuracy_is_two_nonblocking_nightly_jobs() -> None:
             "ROCM_MINICPMO_SEED_ACCURACY_ARTIFACT_DIR",
             "Expected exactly one MiniCPM-o 4.5 Seed-TTS accuracy node",
             {
+                "ROCM_E2E_TIMEOUT_MINUTES": "165",
                 "SEED_TTS_WER_EVAL": "1",
                 "SEED_TTS_SIM_EVAL": "1",
                 "VLLM_OMNI_CODE2WAV_WATCHDOG_TIMEOUT_S": "60",
@@ -3269,22 +3298,35 @@ def test_minicpmo_accuracy_is_two_nonblocking_nightly_jobs() -> None:
     for step, (label, node, artifact, artifact_env, collection_guard, env) in zip(group["steps"], jobs, strict=True):
         commands = "\n".join(step["commands"])
         assert step["label"] == label
-        assert step["grade"] == "NonBlocking"
+        assert step["grade"] == ("Blocking" if env else "NonBlocking")
         assert step["agent_pool"] == "mi300_1"
         assert step["mirror_hardwares"] == ["amdproduction"]
         assert step["timeout_in_minutes"] == 180
         assert step["source_file_dependencies"] == "omni_minicpmo_4_5_accuracy"
         assert step["artifact_paths"] == [artifact]
         assert step.get("env", {}) == env
-        assert "full_model and omni and rocm and MI325 and cards_1" in commands
-        assert "--run-level full_model" in commands
-        assert commands.count("--collect-only") == 1
-        assert "exit 5" in commands
-        assert "pytest.xml" in commands
-        assert "timeout --signal=TERM --kill-after=2m 165m" in commands
-        assert artifact_env in commands
-        assert collection_guard in commands
-        assert commands.count(node) == 2
+        if env:
+            runner_command = commands.split("; then", 1)[0].removeprefix("if ")
+            assert split(runner_command.replace("\\\n", " ")) == [
+                "bash",
+                ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh",
+                f"tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py::{node}",
+                "1",
+                "omni",
+                "rocm-minicpmo-seed-tts-accuracy",
+            ]
+            assert "cp -a tests/e2e/accuracy/minicpmo_4_5/results/." in commands
+            assert 'exit "$$status"' in commands
+        else:
+            assert "full_model and omni and rocm and MI325 and cards_1" in commands
+            assert "--run-level full_model" in commands
+            assert commands.count("--collect-only") == 1
+            assert "exit 5" in commands
+            assert "pytest.xml" in commands
+            assert "timeout --signal=TERM --kill-after=2m 165m" in commands
+            assert artifact_env in commands
+            assert collection_guard in commands
+            assert commands.count(node) == 2
         for other_node in all_nodes - {node}:
             assert other_node not in commands
         assert "SEED_TTS_EVAL_DEVICE" not in commands
@@ -3376,22 +3418,12 @@ def test_omni_duplex_eval_is_one_nonblocking_nightly_job() -> None:
     assert step["timeout_in_minutes"] == 240
     commands = "\n".join(step["commands"])
     assert "full_model and omni and rocm and MI325 and cards_2" in commands
-    assert "--run-level full_model" in commands
-    assert "--collect-only" in commands
-    assert "exit 5" in commands
-    assert step["artifact_paths"] == [
-        "artifacts/rocm-omni-duplex-eval/collection.txt",
-        "tests/dfx/perf/results/*.json",
-        "tests/e2e/accuracy/omni_duplex_eval/results/*.json",
-    ]
-    assert "$$ROCM_OMNI_DUPLEX_EVAL_ARTIFACT_DIR/collection.txt" in commands
-    assert "pytest.xml" not in commands
-    assert "pytest.log" not in commands
-    assert "timeout --signal=INT --kill-after=2m 220m" in commands
-    assert step["env"]["BENCHMARK_DIR"] == "tests/dfx/perf/results"
-    assert step["env"]["ACC_BENCH_RESULT_DIR"] == "tests/e2e/accuracy/omni_duplex_eval/results"
+    assert "run-rocm-diffusion-nightly.sh 2 1 220m rocm-omni-duplex-eval" in commands
+    assert step["artifact_paths"] == ["artifacts/rocm-omni-duplex-eval/**/*"]
+    root = "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-omni-duplex-eval"
+    assert step["env"]["BENCHMARK_DIR"] == f"{root}/benchmark-results"
+    assert step["env"]["ACC_BENCH_RESULT_DIR"] == f"{root}/accuracy"
     assert "test_minicpmo_4_5_omni_duplex_eval.json" in commands
-    assert "Expected exactly one MiniCPM-o Omni-DuplexEval node" in commands
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert "MiniCPM-o Omni-DuplexEval CI Guard" not in text

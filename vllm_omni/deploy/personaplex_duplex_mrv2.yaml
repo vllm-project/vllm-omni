@@ -13,9 +13,13 @@ stages:
     # Stage 0 Talker stays on V1 for lockstep post-sample depformer execution
     model_runner: v1
     async_scheduling: false
+    # hf_overrides replaces personaplex.yaml's rather than merging into it, so
+    # restate the RoPE table that covers the max_model_len inherited from it.
     hf_overrides:
       mimi_cuda_graphs: true
       depformer_cuda_graphs: true
+      temporal_config:
+        max_position_embeddings: 46080
 
   - stage_id: 1
     # Stage 1 Code2Wav runs on MRv2 with shared Mimi decode
