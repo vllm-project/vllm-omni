@@ -223,32 +223,16 @@ remaining flags stay unchanged.
 
 #### Qwen3-VL vision sequence parallelism (experimental SP8)
 
-MiniMax-H3 can split Qwen3-VL vision-token computation across the eight
-text-encoder TP ranks instead of repeating the full vision forward on each
-rank. This opt-in experimental path is specific to MiniMax-H3-family pipelines
-using its Qwen3-VL encoder, for evaluating image/video reference encoding on
-Ascend NPU. Configure it with
-`DiffusionParallelConfig.text_encoder_vision_sp_size`; the default `1` keeps
-vision replicated.
+This experimental option is specific to MiniMax-H3's Qwen3-VL encoder on
+Ascend NPU. It shards visual tokens over the existing encoder TP8 group;
+weights, final embeddings, and DeepStack outputs remain replicated. Vision SP
+is independent of DiT `--usp` / `--ring` and does not add devices.
 
-Append the vision SP option to the serving command above, keeping
-`--num-gpus 8` and `--text-encoder-tp-size 8`:
+Append to the serving command above:
 
 ```bash
-  --text-encoder-vision-sp-size 8
+  --text-encoder-tp-size 8 --text-encoder-vision-sp-size 8
 ```
-
-| Value | Behavior |
-| --- | --- |
-| Unset or `1` | Keep the replicated vision path. |
-| `8` | Enable vision SP8 on the existing eight-rank text-encoder TP group. |
-| Any other value | Reject the CLI argument or raise `ValueError` during configuration validation. |
-
-Enabling SP8 with a missing encoder group or a text-encoder TP size other than
-eight also raises `ValueError`; there is no automatic fallback. Set the same
-configuration for all encoder workers. The setting is applied when the encoder
-is constructed, so changing it requires a server restart. In the encoder startup
-log, check for `text_encoder_tp_size=8, text_encoder_vision_sp_size=8`.
 
 For Python callers:
 
@@ -262,50 +246,18 @@ parallel_config = DiffusionParallelConfig(
 )
 ```
 
-In deployment YAML, set the text encoder's diffusion stage `parallel_config`:
+Deployment YAML uses the same fields under the diffusion stage's
+`parallel_config`. Only `1` (replicated, default) and `8` are accepted; `8`
+requires TP8 and a local text encoder. Unsupported models or parallel
+configurations are rejected. Restart the server after changing this setting;
+set `1` to disable SP8. The startup log reports `text_encoder_vision_sp_size`.
+The former `VLLM_OMNI_H3_VISION_SP_SIZE` environment variable is no longer read.
 
-```yaml
-parallel_config:
-  ulysses_degree: 8
-  text_encoder_tp_size: 8
-  text_encoder_vision_sp_size: 8
-```
-
-Currently only MiniMax-H3-family pipelines using the Qwen3-VL encoder support
-the non-default value; other models reject it. A stage without a local text
-encoder must keep the default `1`. The former `VLLM_OMNI_H3_VISION_SP_SIZE`
-environment variable is no longer
-read; use the CLI, Python configuration, or deployment YAML instead.
-
-Vision SP8 is separate from DiT `--usp` / `--ring` parallelism: those options
-do not enable it. It affects the Qwen3-VL vision tower when image or video
-inputs are encoded, rather than text-only encoding or DiT denoising. Vision
-weights remain replicated. Tokens are sharded by whole spatial-merger groups;
-AllToAll exchanges switch between token shards and attention-head shards.
-Final vision embeddings and DeepStack features are AllGathered in their
-original global order and replicated on every encoder rank for downstream
-text encoding. Permutation transport reuse and rank-local position
-interpolation are included in SP8; neither has a separate switch.
-
-To restore the default path, set the option to `1` and restart the server:
-
-```bash
-  --text-encoder-vision-sp-size 1
-```
-
-**Validation scope:** initial device measurements were collected on eight
-Ascend 910B4 NPUs with text-encoder TP8. They showed lower vision-encoder and
-prompt-encoding latency, while the end-to-end change stayed within the reported
-measurement variability. See [PR #10168](https://github.com/vllm-project/vllm-omni/pull/10168)
-for the measurements and revision-specific validation status. Those measurements
-predate the configuration migration. For implementation revision `08d1ac061`,
-CPU-focused tests passed, but post-rebase eight-NPU/HCCL execution,
-full-model bitwise output comparison, and same-window performance revalidation
-remain pending. This path is not yet a qualified lossless recommendation for
-other NPU models, input layouts, batching, or quantization combinations.
-Before adopting it, compare against SP8 disabled with the same checkpoint,
-inputs, seed, and serving configuration; validate output bytes and measure
-latency after exactly two successful complete warmup requests per configuration.
+**Validation:** current-head eight-NPU/HCCL, full-model bitwise comparison, and
+performance revalidation remain pending. Initial Ascend 910B4 measurements
+predate the configuration migration; see
+[PR #10168](https://github.com/vllm-project/vllm-omni/pull/10168) for evidence
+and validation status.
 
 #### Cache-DiT
 

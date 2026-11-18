@@ -328,11 +328,9 @@ class DiffusionParallelConfig:
     """
 
     text_encoder_vision_sp_size: int = 1
-    """MiniMax-H3-only experimental sequence parallelism for its Qwen3-VL vision tower.
+    """MiniMax-H3-only experimental vision SP: 1 (replicated, default) or 8 (requires TP8).
 
-    MiniMax-H3 supports 1 (replicated, default) or 8 (requires text-encoder TP8).
-    Reuses the encoder TP group; it does not increase the DiT world size.
-    Currently supported only by MiniMax-H3-family pipelines using that encoder.
+    Reuses the encoder TP group without increasing the DiT world size.
     """
 
     vae_parallel_mode: str = "tile"
