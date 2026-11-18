@@ -135,5 +135,3 @@ def test_applies_refuses_non_uniform_spans():
 def test_applies_skips_a_stage_without_multi_frame_support():
     model = _mf_model(stage="thinker")
     assert talker_multiframe.applies(model, {}) == 0
-
-
