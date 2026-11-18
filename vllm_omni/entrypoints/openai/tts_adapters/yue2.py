@@ -66,7 +66,7 @@ _UNSUPPORTED_OPTIONAL_FIELDS = (
     "non_streaming_mode",
 )
 
-_EXTRA_PARAMS_KEYS = ("cot", "abc")
+_EXTRA_PARAMS_KEYS = ("cot", "abc", "abc_max_tokens", "cfg_scale")
 
 
 @register_tts_adapter
@@ -158,7 +158,7 @@ class Yue2Adapter(ARTTSAdapter):
             return "YuE2 has fixed sampling and does not accept: " + ", ".join(rejected)
         unknown = sorted(key for key, value in extra.items() if value is not None and key not in _EXTRA_PARAMS_KEYS)
         if unknown:
-            return "YuE2 accepts only 'cot' and 'abc' in extra_params; got: " + ", ".join(unknown)
+            return f"Unknown YuE2 extra_params: {', '.join(unknown)}. Supported: {', '.join(_EXTRA_PARAMS_KEYS)}"
         return None
 
     async def warmup(self) -> None:

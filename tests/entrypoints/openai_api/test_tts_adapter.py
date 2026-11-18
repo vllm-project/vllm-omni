@@ -1877,3 +1877,11 @@ def test_yue2_validate_accepts_supported_request() -> None:
     full = _yue2_request(max_new_tokens=400, seed=7, extra_params={"cot": "full", "abc": "X:1\nK:C\nCDEF|"})
     assert adapter.validate(full) is None
     assert adapter.validate(_yue2_request(extra_params={"cot": "off", "foo": None})) is None
+
+
+@pytest.mark.parametrize(
+    "extra", [{"abc_max_tokens": 512}, {"cfg_scale": 1.5}, {"abc_max_tokens": 512, "cfg_scale": 1.5}]
+)
+def test_yue2_accepts_abc_budget_and_guidance(extra: dict[str, int | float]) -> None:
+    request = _yue2_request(extra_params={"cot": "full", **extra})
+    assert Yue2Adapter(SimpleNamespace()).validate(request) is None
