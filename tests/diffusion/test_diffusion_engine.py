@@ -20,6 +20,7 @@ from vllm_omni.diffusion.data import (
     DIFFUSION_REQUEST_LIFECYCLE_KEY,
     DIFFUSION_REQUEST_STARTED,
     DiffusionOutput,
+    DiffusionParallelConfig,
     OmniDiffusionConfig,
 )
 from vllm_omni.diffusion.diffusion_engine import (
@@ -531,15 +532,13 @@ class TestRequestBatchCapability:
         monkeypatch: pytest.MonkeyPatch,
         mocker: MockerFixture,
     ) -> None:
-        od_config = SimpleNamespace(
+        od_config = OmniDiffusionConfig(
             model_class_name="SinglePipeline",
-            custom_pipeline_args=None,
-            streaming_output=False,
             max_num_seqs=1,
             request_batch_max_wait_ms=0,
-            parallel_config=SimpleNamespace(
-                data_parallel_size=8,
+            parallel_config=DiffusionParallelConfig(
                 use_hsdp=True,
+                hsdp_shard_size=8,
                 hsdp_data_parallel=True,
             ),
         )

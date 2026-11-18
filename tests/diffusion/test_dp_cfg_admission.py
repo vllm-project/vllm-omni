@@ -4,13 +4,12 @@
 """Admission must align collective schedules across sharded-weight ranks."""
 
 import threading
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.data import DiffusionOutput, DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.executor.ray_executor import RayDiffusionExecutor
@@ -71,25 +70,31 @@ def executor(request):
 
 
 def _make_wave_config(mode):
-    config = SimpleNamespace(
+    if mode == "hsdp":
+        return OmniDiffusionConfig(
+            max_num_seqs=2,
+            parallel_config=DiffusionParallelConfig(use_hsdp=True, hsdp_shard_size=2, hsdp_data_parallel=True),
+        )
+    component = "text_encoder" if mode == "dlo_text_encoder" else "dit"
+    return OmniDiffusionConfig(
         max_num_seqs=2,
-        step_execution=False,
-        diffusion_attention_schedule=None,
-        parallel_config=SimpleNamespace(data_parallel_size=2, hsdp_data_parallel=mode == "hsdp"),
-    )
-    if mode != "hsdp":
-        component = "text_encoder" if mode == "dlo_text_encoder" else "dit"
-        config.diffusion_offload_config = {
+        parallel_config=DiffusionParallelConfig(data_parallel_size=2),
+        diffusion_offload_config={
             "mode": "layer",
             "components": [component],
             "layer_options": {component: {"weight_transfer": "allgather"}},
-        }
-    return config
+        },
+    )
 
 
 @pytest.fixture(params=["hsdp", "dlo", "dlo_text_encoder"])
 def wave_config(request):
     return _make_wave_config(request.param)
+
+
+@pytest.fixture
+def ordinary_dp_config():
+    return OmniDiffusionConfig(max_num_seqs=2, parallel_config=DiffusionParallelConfig(data_parallel_size=2))
 
 
 @pytest.mark.parametrize("true_cfg_scale", [None, 4.0])
@@ -105,7 +110,7 @@ def test_negative_inputs_change_qwen_cfg_admission_key(negative_inputs, true_cfg
 @pytest.mark.parametrize("true_cfg_scale", [None, 4.0])
 def test_scheduler_separates_mixed_qwen_cfg_requests(negative_inputs, true_cfg_scale):
     scheduler = RequestScheduler()
-    scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+    scheduler.initialize(OmniDiffusionConfig(max_num_seqs=2))
     scheduler.add_request(_make_request("positive", true_cfg_scale=true_cfg_scale))
     scheduler.add_request(_make_request("guided", negative_inputs, true_cfg_scale))
 
@@ -195,7 +200,6 @@ def test_negative_pooled_embeds_change_admission_key():
     ],
 )
 def test_dp_extra_args_mismatch_runs_in_separate_waves(executor, wave_config, first_extra_args, second_extra_args):
-    wave_config.max_num_seqs = 2
     executor.od_config = wave_config
     scheduler = RequestScheduler()
     scheduler.initialize(wave_config)
@@ -242,7 +246,6 @@ def test_dp_extra_args_mismatch_runs_in_separate_waves(executor, wave_config, fi
     ],
 )
 def test_dp_matching_extra_args_share_wave(executor, wave_config, first_extra_args, second_extra_args):
-    wave_config.max_num_seqs = 2
     executor.od_config = wave_config
     scheduler = RequestScheduler()
     scheduler.initialize(wave_config)
@@ -268,9 +271,9 @@ def test_dp_matching_extra_args_share_wave(executor, wave_config, first_extra_ar
     executor.collective_rpc.assert_called_once()
 
 
-def test_ordinary_batching_keeps_extra_args_request_local():
+def test_ordinary_batching_keeps_extra_args_request_local(ordinary_dp_config):
     scheduler = RequestScheduler()
-    scheduler.initialize(SimpleNamespace(max_num_seqs=2, parallel_config=SimpleNamespace(data_parallel_size=2)))
+    scheduler.initialize(ordinary_dp_config)
     for request_id, enabled in (("first", True), ("second", False)):
         request = _make_request(request_id)
         request.sampling_params.extra_args = {"use_resolution_template": enabled}
@@ -293,11 +296,11 @@ def unserializable_extra_args(request):
 
 
 def test_dp_invalid_extra_args_only_fail_submission(executor, wave_config, unserializable_extra_args):
-    wave_config.max_num_seqs = 2
     executor.od_config = wave_config
     scheduler = RequestScheduler()
     scheduler.initialize(wave_config)
     engine = object.__new__(DiffusionEngine)
+    engine.od_config = wave_config
     engine.scheduler = scheduler
     engine.executor = executor
     engine._cv = threading.Condition()
@@ -340,9 +343,9 @@ def test_dp_invalid_extra_args_only_fail_submission(executor, wave_config, unser
     executor.collective_rpc.assert_called_once()
 
 
-def test_ordinary_batching_does_not_serialize_extra_args(unserializable_extra_args):
+def test_ordinary_batching_does_not_serialize_extra_args(unserializable_extra_args, ordinary_dp_config):
     scheduler = RequestScheduler()
-    scheduler.initialize(SimpleNamespace(max_num_seqs=2, parallel_config=SimpleNamespace(data_parallel_size=2)))
+    scheduler.initialize(ordinary_dp_config)
     for request_id in ("first", "second"):
         request = _make_request(request_id)
         request.sampling_params.extra_args = unserializable_extra_args[0]
@@ -593,9 +596,9 @@ def test_dp_batches_nonempty_token_and_embedding_inputs(executor, wave_config, p
 
 
 @pytest.mark.parametrize("input_kind", ["empty", "embeddings"])
-def test_ordinary_batching_keeps_prompt_paths_request_local(input_kind):
+def test_ordinary_batching_keeps_prompt_paths_request_local(input_kind, ordinary_dp_config):
     scheduler = RequestScheduler()
-    scheduler.initialize(SimpleNamespace(max_num_seqs=2, parallel_config=SimpleNamespace(data_parallel_size=2)))
+    scheduler.initialize(ordinary_dp_config)
     first = _make_encoded_request("first", positive_embeds=input_kind == "embeddings")
     if input_kind == "empty":
         first.prompt = ""
