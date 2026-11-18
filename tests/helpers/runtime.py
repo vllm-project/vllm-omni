@@ -17,7 +17,7 @@ import tempfile
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -57,15 +57,49 @@ SERVER_SHUTDOWN_TIMEOUT_S = 60
 # Auto-port OmniServer launches can lose the reserved TCP port between the
 # parent's probe close and the child bind under xdist; retry a few times.
 SERVER_PORT_IN_USE_RETRIES = 3
-# Reliability fault tests inspect server stderr after multi-rank workers have
-# emitted their shutdown traces. Keep enough bounded history to retain the
-# original fault line, while diagnostics below still print only a short tail.
-SERVER_STDERR_HISTORY_LINES = 4096
 SERVER_STDERR_DIAGNOSTIC_TAIL_LINES = 100
 
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
 PromptVideoInput = list[Any] | Any | None
+
+
+class _ServerStderrEvidenceCapture:
+    """Latch the first stderr line containing one of the watched markers."""
+
+    def __init__(self, markers: Iterable[str]) -> None:
+        self._markers = tuple(marker.casefold() for marker in markers if marker)
+        if not self._markers:
+            raise ValueError("stderr evidence capture requires at least one non-empty marker")
+        self._condition = threading.Condition()
+        self._line: str | None = None
+        self._closed = False
+
+    def _observe(self, line: str) -> None:
+        normalized = line.casefold()
+        if not any(marker in normalized for marker in self._markers):
+            return
+        with self._condition:
+            if self._closed:
+                return
+            if self._line is None:
+                self._line = line
+                self._condition.notify_all()
+
+    def _close(self) -> None:
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+
+    def wait(self, timeout: float = 2.0) -> str:
+        """Return the latched evidence line, waiting briefly for the reader."""
+        with self._condition:
+            if self._line is None:
+                self._condition.wait_for(
+                    lambda: self._line is not None or self._closed,
+                    timeout=max(timeout, 0.0),
+                )
+            return self._line or ""
 
 
 def get_open_port(host: str = "127.0.0.1", *, max_attempts: int = 128) -> int:
@@ -219,10 +253,11 @@ class OmniServer:
         self._auto_port = port is None
         self._port_lock: FileLock | None = None
         self.port = get_open_port() if port is None else port
-        # Bounded history is also fault evidence for reliability tests. A
-        # 100-line buffer can discard the originating OOM before several ranks
-        # finish printing their secondary shutdown traces.
-        self._server_error_lines: deque[str] = deque(maxlen=SERVER_STDERR_HISTORY_LINES)
+        # Keep a short diagnostic tail. Reliability tests that need durable
+        # evidence register a marker capture before triggering the fault.
+        self._server_error_lines: deque[str] = deque(maxlen=SERVER_STDERR_DIAGNOSTIC_TAIL_LINES)
+        self._server_stderr_capture_lock = threading.Lock()
+        self._server_stderr_captures: list[_ServerStderrEvidenceCapture] = []
         self._server_log_thread: threading.Thread | None = None
 
     def _reserve_port(self) -> None:
@@ -284,6 +319,26 @@ class OmniServer:
             )
         )
 
+    def _record_server_stderr_line(self, line: str) -> None:
+        self._server_error_lines.append(line)
+        with self._server_stderr_capture_lock:
+            captures = tuple(self._server_stderr_captures)
+        for capture in captures:
+            capture._observe(line)
+
+    @contextmanager
+    def capture_stderr_evidence(self, markers: Iterable[str]) -> Generator[_ServerStderrEvidenceCapture, None, None]:
+        """Capture the first future stderr line matching any supplied marker."""
+        capture = _ServerStderrEvidenceCapture(markers)
+        with self._server_stderr_capture_lock:
+            self._server_stderr_captures.append(capture)
+        try:
+            yield capture
+        finally:
+            with self._server_stderr_capture_lock:
+                self._server_stderr_captures.remove(capture)
+                capture._close()
+
     def _abandon_launch_attempt(self) -> None:
         """Kill a failed child and drop the port lock so a retry can rebind."""
         if self.proc is not None:
@@ -297,7 +352,7 @@ class OmniServer:
         if self._port_lock is not None:
             self._port_lock.release()
             self._port_lock = None
-        self._server_error_lines = deque(maxlen=SERVER_STDERR_HISTORY_LINES)
+        self._server_error_lines = deque(maxlen=SERVER_STDERR_DIAGNOSTIC_TAIL_LINES)
 
     def _start_server(self) -> None:
         attempts = SERVER_PORT_IN_USE_RETRIES if self._auto_port else 1
@@ -356,7 +411,7 @@ class OmniServer:
         # Inherit stdout (INFO still shows in CI); capture stderr only for the
         # exited-before-ready RuntimeError message. errors=replace keeps the
         # reader alive on undecodable bytes so a full pipe cannot hang serve.
-        self._server_error_lines = deque(maxlen=SERVER_STDERR_HISTORY_LINES)
+        self._server_error_lines = deque(maxlen=SERVER_STDERR_DIAGNOSTIC_TAIL_LINES)
         self._server_log_thread = None
         self.proc = subprocess.Popen(
             cmd,
@@ -370,12 +425,11 @@ class OmniServer:
         stderr = getattr(self.proc, "stderr", None)
         # Test doubles may omit a pipe; skip capture rather than asserting.
         if stderr is not None:
-            error_lines = self._server_error_lines
 
             def _drain_stderr() -> None:
                 try:
                     for line in stderr:
-                        error_lines.append(line)
+                        self._record_server_stderr_line(line)
                 except Exception:
                     pass
 
@@ -552,8 +606,7 @@ class OmniServer:
             self._server_log_thread.join(timeout=2)
         if not self._server_error_lines:
             return ""
-        lines = list(self._server_error_lines)[-SERVER_STDERR_DIAGNOSTIC_TAIL_LINES:]
-        return "\n=== OmniServer stderr ===\n{}".format("".join(lines))
+        return "\n=== OmniServer stderr ===\n{}".format("".join(self._server_error_lines))
 
     def _stop_stderr_reader(self) -> None:
         """Join the drain thread; close stderr only if the reader has stopped.

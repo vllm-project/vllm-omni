@@ -10,7 +10,7 @@ import errno
 import json
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from io import BytesIO
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -20,6 +20,32 @@ import pytest
 from tests.dfx.reliability.unit._loader import RELIABILITY_ROOT, exec_ast_nodes
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+class _ListBackedStderrCapture:
+    """Small fake of OmniServer's future-only stderr evidence capture."""
+
+    def __init__(self, server: SimpleNamespace, markers: Iterable[str]) -> None:
+        self._server = server
+        self._markers = tuple(marker.lower() for marker in markers)
+        self._start = len(server._server_error_lines)
+
+    def __enter__(self) -> _ListBackedStderrCapture:
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        return None
+
+    def wait(self, timeout: float = 2.0) -> str:
+        del timeout
+        for line in self._server._server_error_lines[self._start :]:
+            if any(marker in line.lower() for marker in self._markers):
+                return line
+        return ""
+
+
+def _add_list_backed_stderr_capture(server: SimpleNamespace) -> None:
+    server.capture_stderr_evidence = lambda markers: _ListBackedStderrCapture(server, markers)
 
 
 def test_minicpm_fault_images_are_independent_and_preflight_stays_small(capsys):
@@ -167,6 +193,7 @@ def test_qwen_oom_uses_one_injection_and_stops_before_recovery(qwen_oom, outcome
     qwen_oom._deploy_config_path = lambda _: None
     qwen_oom.resolve_oom_device_spec = lambda *args: "0,1"
     server = SimpleNamespace(model="qwen", host="localhost", port=8000, _server_error_lines=[])
+    _add_list_backed_stderr_capture(server)
     if outcome == "stale_oom_evidence":
         server._server_error_lines.append("torch.OutOfMemoryError: CUDA out of memory from an earlier request")
 
@@ -309,6 +336,7 @@ def wan_oom():
 def test_wan_oom_submits_one_fault_job_and_stops_pressure_before_recovery(wan_oom, outcome, error):
     events: list[str] = []
     server = SimpleNamespace(_server_error_lines=[])
+    _add_list_backed_stderr_capture(server)
     config = dict(target_mem_ratio=0.95, hold_seconds=0, startup_timeout_sec=120, strict=False, max_free_bytes=256)
 
     def warmup(client, request_config):

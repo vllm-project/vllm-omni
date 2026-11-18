@@ -240,45 +240,48 @@ def _run_oom_at_load(server: Any, client: Any) -> None:
         client,
         _video_request_config(width=256, height=256, num_frames=5, num_inference_steps=2, reference_size=(256, 256)),
     )
-    stderr_before = set(getattr(server, "_server_error_lines", ()))
     config = MODEL.hard_oom_config
-    handle = inject_gpu_oom(
-        device=resolve_oom_device_spec(config, _deploy_config_path(server)),
-        target_mem_ratio=config["target_mem_ratio"],
-        hold_seconds=config["hold_seconds"],
-        startup_timeout_sec=config["startup_timeout_sec"],
-        strict=config["strict"],
-        max_free_bytes=config.get("max_free_bytes"),
-    )
-    detail: Any = None
-    try:
-        started = time.monotonic()
-        print("[wan-oom] preflight passed; pressure ready; submitting one fault job", flush=True)
-        try:
-            result = _create_and_wait_video_job(client, fault_request, timeout_sec=180, err_code=(200, 500, 503))
-        except Exception as exc:
-            assert _looks_like_server_unreachable(exc), f"unexpected OOM job failure: {exc!r}"
-            detail = repr(exc)
-        else:
-            detail = result.json_body
-            print(f"[wan-oom] fault status={result.status_code}, body={str(detail)[:4096]}", flush=True)
-            assert isinstance(detail, dict) and detail.get("status") != "completed", (
-                f"OOM fault job must fail, got {detail!r}"
-            )
-            assert_http_error(result, err_code=(500, 503))
-            assert extract_openai_error_contract_from_payload(detail) is not None, (
-                f"OOM response lacks an error object: {detail!r}"
-            )
-        assert time.monotonic() - started < 180, "OOM job did not fail within 180 seconds"
-        stderr_delta = "".join(line for line in getattr(server, "_server_error_lines", ()) if line not in stderr_before)
-        evidence = str(detail) + stderr_delta
-        assert any(marker in evidence.lower() for marker in GPU_OOM_MARKERS), (
-            f"video job failed without explicit GPU OOM evidence; detail={str(detail)[:4096]}, "
-            f"stderr_tail={stderr_delta[-4096:]!r}"
+    with server.capture_stderr_evidence(GPU_OOM_MARKERS) as stderr_capture:
+        handle = inject_gpu_oom(
+            device=resolve_oom_device_spec(config, _deploy_config_path(server)),
+            target_mem_ratio=config["target_mem_ratio"],
+            hold_seconds=config["hold_seconds"],
+            startup_timeout_sec=config["startup_timeout_sec"],
+            strict=config["strict"],
+            max_free_bytes=config.get("max_free_bytes"),
         )
-    finally:
-        stop_gpu_oom_hogs(handle)
-        print("[wan-oom] memory pressure removed", flush=True)
+        detail: Any = None
+        try:
+            started = time.monotonic()
+            print("[wan-oom] preflight passed; pressure ready; submitting one fault job", flush=True)
+            try:
+                result = _create_and_wait_video_job(client, fault_request, timeout_sec=180, err_code=(200, 500, 503))
+            except Exception as exc:
+                assert _looks_like_server_unreachable(exc), f"unexpected OOM job failure: {exc!r}"
+                detail = repr(exc)
+            else:
+                detail = result.json_body
+                print(f"[wan-oom] fault status={result.status_code}, body={str(detail)[:4096]}", flush=True)
+                assert isinstance(detail, dict) and detail.get("status") != "completed", (
+                    f"OOM fault job must fail, got {detail!r}"
+                )
+                assert_http_error(result, err_code=(500, 503))
+                assert extract_openai_error_contract_from_payload(detail) is not None, (
+                    f"OOM response lacks an error object: {detail!r}"
+                )
+            assert time.monotonic() - started < 180, "OOM job did not fail within 180 seconds"
+            response_evidence = str(detail)
+            response_has_oom = any(marker in response_evidence.lower() for marker in GPU_OOM_MARKERS)
+            stderr_evidence = stderr_capture.wait(timeout=0 if response_has_oom else 2)
+            evidence = response_evidence + stderr_evidence
+            stderr_tail = "".join(getattr(server, "_server_error_lines", ()))[-4096:]
+            assert any(marker in evidence.lower() for marker in GPU_OOM_MARKERS), (
+                f"video job failed without explicit GPU OOM evidence; detail={str(detail)[:4096]}, "
+                f"captured_stderr={stderr_evidence!r}, stderr_tail={stderr_tail!r}"
+            )
+        finally:
+            stop_gpu_oom_hogs(handle)
+            print("[wan-oom] memory pressure removed", flush=True)
 
     try:
         health = client.send_health_http_request({"timeout": 5}, err_code=(200, 503))[0].status_code
