@@ -797,11 +797,13 @@ class TestMixFusionCapability:
         assert engine._resolve_execution_mode(od_config) is DiffusionExecutionMode.STEP_BATCH
         assert od_config.step_execution is True
 
-    def test_engine_allows_fixed_policy_without_mixfusion(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_engine_allows_fixed_policy_with_mixfusion(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # policy="fixed" keeps MixFusion but disables DRR; the startup guard
+        # must reject only policy="compute_budget", not MixFusion itself.
         od_config = SimpleNamespace(
             model_class_name="MixfusionPipeline",
             custom_pipeline_args=None,
-            enable_mixfusion=False,
+            enable_mixfusion=True,
             diffusion_batching_config=DiffusionBatchingConfig(policy="fixed"),
             streaming_output=False,
             max_num_seqs=1,
@@ -813,7 +815,8 @@ class TestMixFusionCapability:
         )
 
         engine = DiffusionEngine.__new__(DiffusionEngine)
-        assert engine._resolve_execution_mode(od_config) is DiffusionExecutionMode.REQUEST_BATCH
+        assert engine._resolve_execution_mode(od_config) is DiffusionExecutionMode.STEP_BATCH
+        assert od_config.step_execution is True
 
 
 class TestDiffusionCompileConfig:
