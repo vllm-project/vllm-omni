@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import replace
 
 import torch
@@ -50,11 +51,16 @@ class SolAttnBackend(AttentionBackend):
         except ImportError as error:
             raise ImportError(
                 "SOL_ATTN requires the upstream sol_attn package. Install it with "
-                "`pip install 'git+https://github.com/NVlabs/Sana.git@f4035e0a976d828ed41c7b0b799e9712b47cd60d"
+                "`pip install 'git+https://github.com/lishunyang12/Sana.git@8bbb1a828218a1cc495f54ee354bf3467a0d216d"
                 "#subdirectory=techniques/sparse_backends'`."
             ) from error
         if not callable(sol_attn):
             raise ImportError("SOL_ATTN requires a sol_attn package exporting the callable sol_attn kernel.")
+        if "exact_block_mask" not in inspect.signature(sol_attn).parameters:
+            raise ImportError(
+                "SOL_ATTN requires upstream sol_attn with exact_block_mask support; "
+                "reinstall the pinned version in the SOL attention guide."
+            )
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
@@ -109,9 +115,7 @@ class SolAttnImpl(AttentionImpl):
             raise ValueError("SOL_ATTN needs full Q/K/V sequences; use local attention or Ulysses with ring_degree=1.")
         capability = current_omni_platform.get_device_capability()
         self.kv_splits = 1 if isinstance(self.config.kv_splits, str) else self.config.kv_splits
-        if self.config.provider != "native":
-            sol_ops.require_sol_bsa(self.config.provider, softmax_scale, torch.device("cuda"))
-        elif self.config.kv_splits != 1:
+        if self.config.kv_splits != 1:
             if capability is None or tuple(capability) != (9, 0):
                 if self.config.kv_splits != "auto":
                     raise ValueError("SOL_ATTN kv_splits=2/4 requires SM90; use kv_splits=1 or 'auto'.")
@@ -241,15 +245,14 @@ class SolAttnImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
     ) -> ExecutionPathResult:
-        sparse_path = "sol_sparse" if self.config.provider == "native" else "sol_bsa"
-        path = "dense_guard" if self._should_use_dense() else sparse_path
+        path = "dense_guard" if self._should_use_dense() else "sol_sparse"
         result = ExecutionPathResult(
             backend="SOL_ATTN",
             path=path,
             support=CapabilityResult.supported(),
             compilation_mode=CompilationMode.CUSTOM_OP,
             platform=context.platform,
-            kernel_variant=f"bsa_{self.config.provider}_bf16" if path == "sol_bsa" else None,
+            kernel_variant=None,
             parallel_strategy=context.parallel_strategy,
         )
         if context.platform != "cuda":
@@ -289,8 +292,6 @@ class SolAttnImpl(AttentionImpl):
         return replace(result, support=CapabilityResult.unsupported(reason))
 
     def _resolve_kv_splits(self, used: int) -> int:
-        if self.config.provider != "native":
-            return 1
         splits = 1 if self.config.kv_splits == "auto" and used < 65536 else self.kv_splits
         if splits > (used + 4095) // 4096:
             raise ValueError("SOL_ATTN needs at least one 4096-token route group per KV split; use kv_splits=1.")
@@ -309,19 +310,6 @@ class SolAttnImpl(AttentionImpl):
         query_used, key_used, value_used = (tensor[:, :used].contiguous() for tensor in (query, key, value))
         if self._should_use_dense() or sink_tokens == used:
             output = self.dense_attention.forward_cuda(query_used, key_used, value_used)
-        elif self.config.provider != "native":
-            output = sol_ops.sol_bsa_attention(
-                query_used,
-                key_used,
-                value_used,
-                self.softmax_scale,
-                self.config.tau,
-                self.config.thresh_type,
-                sink_start,
-                sink_tokens,
-                self.config.provider,
-                sink_block_mask,
-            )
         else:
             kv_splits = self._resolve_kv_splits(used)
             output = sol_ops.sol_attention(
@@ -334,6 +322,7 @@ class SolAttnImpl(AttentionImpl):
                 kv_splits,
                 sink_start,
                 sink_tokens,
+                sink_block_mask,
             )
             if sink_tokens:
                 output[:, sink_start : sink_start + sink_tokens] = self.dense_attention.forward_cuda(

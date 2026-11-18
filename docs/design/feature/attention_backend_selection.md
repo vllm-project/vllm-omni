@@ -137,15 +137,11 @@ provider consumes tile64 or tile128 directly; selecting it does not change
 the model's top-k policy. Startup checks and execution use the same provider
 resolution path.
 
-`block_sparse_attn_bshd(..., return_lse=True)` returns BSHD output and contiguous
-FP32 natural-log LSE in `[B,H,Sq]` for normalization-weighted residual merges.
-Empty rows have zero output and negative-infinite LSE. Only explicit cuDNN/Triton
-BF16 providers support this option; other combinations fail. The default remains
-output-only, preserving existing callers.
-
-SOL owns its training-free routing and omitted-block approximation; sharing a
-provider does not make it VSA. H3 supplies a global block64 `TextAudioBlockMask`
-matching the valid sequence length; marked Q rows and KV columns stay exact.
+SOL delegates routing and omitted-block approximation directly to the upstream
+Sol-Attn kernel. H3 supplies a global block64 `TextAudioBlockMask`
+matching the valid sequence length; it is passed as upstream `exact_block_mask`
+so marked Q rows and KV columns stay exact in the fused kernel. There is no SOL
+provider switch or separate BSA/residual composition in Omni.
 Missing or stale metadata fails explicitly. `PackedPaddingMetadata` excludes
 structural suffix padding before attention. See the
 [SOL guide](../../user_guide/diffusion/attention_backends/sol_attn.md) for defaults,

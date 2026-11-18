@@ -25,7 +25,7 @@ def require_cudnn_sparse(device: torch.device) -> Callable[..., dict[str, torch.
     try:
         if Version(version("nvidia-cudnn-frontend")) < Version("1.31.0"):
             raise ImportError("cuDNN BSA requires nvidia-cudnn-frontend>=1.31.0")
-        from cudnn.block_sparse_attention import block_sparse_attention_forward
+        from cudnn.torch import block_sparse_attention_forward
     except ImportError as exc:
         raise ImportError("cuDNN BSA requires nvidia-cudnn-frontend>=1.31.0; install vllm-omni[cudnn-bsa]") from exc
     return block_sparse_attention_forward
@@ -41,9 +41,9 @@ def _cudnn_block_sparse_attn(
     sizes: torch.Tensor | None,
     scale: float,
     block_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     kernel = require_cudnn_sparse(query.device)
-    result = kernel(
+    return kernel(
         query,
         key,
         value,
@@ -54,11 +54,7 @@ def _cudnn_block_sparse_attn(
         allow_empty_block_nums=True,
         softmax_scale=scale,
         layout="bshd",
-    )
-    output, lse = result["o_tensor"], result["lse_tensor"]
-    if lse.shape != (query.shape[0], query.shape[2], query.shape[1]) or lse.dtype != torch.float32:
-        raise ValueError("cuDNN BSA must return FP32 natural-log LSE with shape [B,H,Sq]")
-    return output.contiguous(), lse.contiguous()
+    )["o_tensor"].contiguous()
 
 
 @_cudnn_block_sparse_attn.register_fake
@@ -71,11 +67,8 @@ def _(
     sizes: torch.Tensor | None,
     scale: float,
     block_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return (
-        torch.empty_like(query, memory_format=torch.contiguous_format),
-        torch.empty((query.shape[0], query.shape[2], query.shape[1]), device=query.device, dtype=torch.float32),
-    )
+) -> torch.Tensor:
+    return torch.empty_like(query, memory_format=torch.contiguous_format)
 
 
 def cudnn_block_sparse_attention(
@@ -86,9 +79,7 @@ def cudnn_block_sparse_attention(
     block_sizes: torch.Tensor | None,
     softmax_scale: float,
     block_size: int,
-    *,
-    return_lse: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """Convert the selected mask without changing top-k or its logical tiles."""
     if block_size not in (64, 128):
         raise ValueError("cuDNN sparse block_size must be 64 or 128")
@@ -102,5 +93,4 @@ def cudnn_block_sparse_attention(
     validate_sparse_inputs(query, key, value, indices, counts, block_sizes, block_size)
     if block_map.shape[-1] != (key.shape[1] + block_size - 1) // block_size:
         raise ValueError("block_map key blocks must match ceil(Sk/block_size)")
-    output, lse = _cudnn_block_sparse_attn(query, key, value, indices, counts, block_sizes, softmax_scale, block_size)
-    return (output, lse) if return_lse else output
+    return _cudnn_block_sparse_attn(query, key, value, indices, counts, block_sizes, softmax_scale, block_size)

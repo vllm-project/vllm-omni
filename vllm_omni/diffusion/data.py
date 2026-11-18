@@ -2390,9 +2390,8 @@ class SolAttnSpec:
     """SOL routing and execution settings; no VSA-trained weights are required.
 
     ``tau`` controls sparsity; ``thresh_type`` selects the threshold estimator,
-    not attention precision. The default cuDNN path protects text/audio tiles
-    on both Q and KV axes using model-owned metadata. Native fused execution
-    requires ``sink_mode=prefix`` instead. Dense guards are opt-in.
+    not attention precision. Upstream Sol-Attn protects text/audio tiles on
+    both Q and KV axes using model-owned metadata. Dense guards are opt-in.
     """
 
     tau: float = 1.0
@@ -2404,18 +2403,13 @@ class SolAttnSpec:
     dense_steps: int = 0
     dense_layers: str | int | list[int] | None = field(default_factory=list)
     kv_splits: int | str = "auto"
-    provider: str = "cudnn"
 
     _VALID_THRESH_TYPES = frozenset({"diag", "exact"})
 
     def __post_init__(self) -> None:
-        if self.provider not in ("native", "cudnn", "triton"):
-            raise ValueError("sol_attn.provider must be native, cudnn, or triton.")
         if self.sink_mode not in ("prefix", "text_audio"):
             raise ValueError("sol_attn.sink_mode must be prefix or text_audio.")
         if self.sink_mode == "text_audio":
-            if self.provider == "native":
-                raise ValueError("sol_attn.sink_mode=text_audio requires a cudnn or triton BSA provider.")
             if self.sink_tokens != 0 or self.sink_start not in (0, None):
                 raise ValueError("sol_attn.sink_mode=text_audio cannot be combined with an explicit sink range.")
         self.tau = _in_range(self.tau, "sol_attn.tau", 0.0, None) or 0.0
@@ -2443,8 +2437,6 @@ class SolAttnSpec:
             self.kv_splits = "auto"
         else:
             raise ValueError(f"sol_attn.kv_splits must be an int or 'auto'; got {self.kv_splits!r}.")
-        if self.provider != "native" and self.kv_splits not in ("auto", 1):
-            raise ValueError("SOL BSA providers require kv_splits=1 or 'auto' (resolved to 1).")
 
 
 @dataclass
@@ -2582,7 +2574,6 @@ class AttentionSpec:
                 "dense_steps": sol.dense_steps,
                 "dense_layers": sol.dense_layers,
                 "kv_splits": sol.kv_splits,
-                "provider": sol.provider,
             }
         return kw or None
 

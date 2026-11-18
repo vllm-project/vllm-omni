@@ -45,7 +45,6 @@ def test_real_sol_kernel_padding_and_sink(used, sink_tokens, compiled, thresh_ty
         0.125,
         backend_kwargs={
             "sol_attn": {
-                "provider": "native",
                 "sink_mode": "prefix",
                 "dense_steps": 0,
                 "dense_layers": "",
@@ -88,7 +87,7 @@ def test_real_sol_kernel_padding_and_sink(used, sink_tokens, compiled, thresh_ty
 def test_real_sol_production_attention_entry():
     config = OmniDiffusionConfig(
         diffusion_attention_config={
-            "default": {"backend": "SOL_ATTN", "sol_attn": {"provider": "native", "sink_mode": "prefix"}},
+            "default": {"backend": "SOL_ATTN", "sol_attn": {"sink_mode": "prefix"}},
             "per_role": {"minimax_h3.token_refiner": {"backend": "TORCH_SDPA"}},
         }
     )
@@ -118,7 +117,7 @@ def test_real_sol_production_attention_entry():
 
 @hardware_test(res={"cuda": ["L4", "H100", "B200", "RTX5090"]}, num_cards=1)
 def test_real_sol_compile_dynamic_sequence_without_explicit_length():
-    impl = SolAttnImpl(2, 128, 0.125, backend_kwargs={"sol_attn": {"provider": "native", "sink_mode": "prefix"}})
+    impl = SolAttnImpl(2, 128, 0.125, backend_kwargs={"sol_attn": {"sink_mode": "prefix"}})
     forward = torch.compile(impl.forward_cuda, fullgraph=True, dynamic=True)
     metadata = AttentionMetadata()
     generator = torch.Generator(device="cuda").manual_seed(31)
@@ -135,21 +134,14 @@ def test_real_sol_compile_dynamic_sequence_without_explicit_length():
 
 
 @hardware_test(res={"cuda": ["L4", "H100", "B200", "RTX5090"]}, num_cards=1)
-@pytest.mark.parametrize("provider", ["cudnn", "triton"])
 @pytest.mark.parametrize("thresh_type", ["diag", "exact"])
 @pytest.mark.parametrize(
     "used,compiled,tau",
     [(63, False, 1e6), (257, False, 1e6), (513, True, 1e6), (513, False, 0.0), (513, True, 1.0), (513, False, 1.5)],
 )
 @torch.inference_mode()
-@pytest.mark.parametrize("sink_mode", ["prefix", "text_audio"])
-def test_real_sol_bsa_matches_hybrid_oracle(provider, thresh_type, used, compiled, tau, sink_mode):
-    if provider == "cudnn":
-        if current_omni_platform.get_device_capability()[0] < 9:
-            pytest.skip("cuDNN BSA requires SM90 or newer")
-        pytest.importorskip("cudnn", minversion="1.31.0")
-    else:
-        pytest.importorskip("fastvideo_kernel.block_sparse_attn")
+def test_real_sol_matches_hybrid_oracle(thresh_type, used, compiled, tau):
+    sink_mode = "text_audio"
     from sol_attn.triton_ref.preprocess import prepare
 
     generator = torch.Generator(device="cuda").manual_seed(71)
@@ -176,7 +168,6 @@ def test_real_sol_bsa_matches_hybrid_oracle(provider, thresh_type, used, compile
             "default": {
                 "backend": "SOL_ATTN",
                 "sol_attn": {
-                    "provider": provider,
                     "dense_steps": 0,
                     "dense_layers": "",
                     "prefix_sink": True,
@@ -191,7 +182,6 @@ def test_real_sol_bsa_matches_hybrid_oracle(provider, thresh_type, used, compile
     )
     with set_current_diffusion_config(config):
         layer = Attention(2, 128, False, scale, prefix="blocks.4.attention", role="self")
-    assert layer.attention.config.provider == provider
     forward = torch.compile(layer, fullgraph=True) if compiled else layer
     actual = forward(query, key, value, metadata)
     key_centroids, value_sums, threshold = prepare(
@@ -249,9 +239,6 @@ def test_real_sol_bsa_matches_hybrid_oracle(provider, thresh_type, used, compile
 @hardware_test(res={"cuda": ["H100", "B200", "RTX5090"]}, num_cards=1)
 @torch.inference_mode()
 def test_real_sol_defaults_match_explicit_text_audio_profile():
-    if current_omni_platform.get_device_capability()[0] < 9:
-        pytest.skip("cuDNN BSA requires SM90 or newer")
-    pytest.importorskip("cudnn", minversion="1.31.0")
     generator = torch.Generator(device="cuda").manual_seed(73)
     query, key, value = (
         torch.randn(1, 257, 2, 128, device="cuda", dtype=torch.bfloat16, generator=generator) for _ in range(3)
@@ -266,16 +253,14 @@ def test_real_sol_defaults_match_explicit_text_audio_profile():
         2,
         128,
         128**-0.5,
-        backend_kwargs={
-            "sol_attn": {"provider": "cudnn", "sink_mode": "text_audio", "dense_steps": 0, "dense_layers": []}
-        },
+        backend_kwargs={"sol_attn": {"sink_mode": "text_audio", "dense_steps": 0, "dense_layers": []}},
     )
     actual = default.forward_cuda(query, key, value, metadata)
     expected = explicit.forward_cuda(query, key, value, metadata)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
-def _ulysses_worker(rank, init_method, provider, world_size=2):
+def _ulysses_worker(rank, init_method, sink_mode, world_size=2):
     from vllm_omni.diffusion.distributed.parallel_state import (
         destroy_distributed_env,
         init_distributed_environment,
@@ -295,8 +280,7 @@ def _ulysses_worker(rank, init_method, provider, world_size=2):
                     "sol_attn": {
                         "dense_steps": 0,
                         "dense_layers": [],
-                        "provider": provider,
-                        "sink_mode": "prefix" if provider == "native" else "text_audio",
+                        "sink_mode": sink_mode,
                     },
                 }
             },
@@ -329,31 +313,18 @@ def _ulysses_worker(rank, init_method, provider, world_size=2):
 
 
 @hardware_test(res={"cuda": ["L4", "H100", "B200", "RTX5090"]}, num_cards=2)
-@pytest.mark.parametrize("provider", ["native", "cudnn", "triton"])
-def test_real_sol_ulysses_matches_local(tmp_path, provider):
+@pytest.mark.parametrize("sink_mode", ["prefix", "text_audio"])
+def test_real_sol_ulysses_matches_local(tmp_path, sink_mode):
     if torch.accelerator.device_count() < 2:
         pytest.skip("Requires two CUDA GPUs")
-    if provider == "cudnn":
-        if current_omni_platform.get_device_capability()[0] < 9:
-            pytest.skip("cuDNN BSA requires SM90 or newer")
-        pytest.importorskip("cudnn", minversion="1.31.0")
-    elif provider == "triton":
-        pytest.importorskip("fastvideo_kernel.block_sparse_attn")
-    torch.multiprocessing.spawn(_ulysses_worker, args=(f"file://{tmp_path / 'rendezvous'}", provider), nprocs=2)
+    torch.multiprocessing.spawn(_ulysses_worker, args=(f"file://{tmp_path / 'rendezvous'}", sink_mode), nprocs=2)
 
 
 @hardware_test(res={"cuda": ["H100", "B200", "RTX5090"]}, num_cards=4)
-@pytest.mark.parametrize("provider", ["cudnn", "triton"])
-def test_real_text_audio_sol_sp4_matches_local(tmp_path, provider):
+def test_real_text_audio_sol_sp4_matches_local(tmp_path):
     if torch.accelerator.device_count() < 4:
         pytest.skip("Requires four CUDA GPUs")
-    if provider == "cudnn":
-        if current_omni_platform.get_device_capability()[0] < 9:
-            pytest.skip("cuDNN BSA requires SM90 or newer")
-        pytest.importorskip("cudnn", minversion="1.31.0")
-    else:
-        pytest.importorskip("fastvideo_kernel.block_sparse_attn")
-    torch.multiprocessing.spawn(_ulysses_worker, args=(f"file://{tmp_path / 'rendezvous'}", provider, 4), nprocs=4)
+    torch.multiprocessing.spawn(_ulysses_worker, args=(f"file://{tmp_path / 'rendezvous'}", "text_audio", 4), nprocs=4)
 
 
 @hardware_test(res={"cuda": ["H100", "B200", "RTX5090"]}, num_cards=1)
@@ -369,9 +340,6 @@ def test_real_sol_h3_simple_selection_and_forward(tmp_path, selection):
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3DiTArchConfig, MiniMaxH3DiTBlock
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3TokenRefinerBlock
 
-    if current_omni_platform.get_device_capability()[0] < 9:
-        pytest.skip("cuDNN BSA requires SM90 or newer")
-    pytest.importorskip("cudnn", minversion="1.31.0")
     if selection == "shorthand":
         config = OmniDiffusionConfig.from_kwargs(diffusion_attention_backend="SOL_ATTN")
     elif selection == "json":
@@ -444,6 +412,7 @@ def test_real_sol_wan_transformer_forward(tmp_path, monkeypatch):
     )
     initialize_model_parallel()
     try:
+        dense_backend = "CUDNN_ATTN" if current_omni_platform.get_device_capability().major == 12 else "TORCH_SDPA"
         configs = {
             backend: OmniDiffusionConfig(
                 diffusion_attention_config={
@@ -454,7 +423,6 @@ def test_real_sol_wan_transformer_forward(tmp_path, monkeypatch):
                             **(
                                 {
                                     "sol_attn": {
-                                        "provider": "native",
                                         "sink_mode": "prefix",
                                         "dense_steps": 10,
                                         "dense_layers": "0,1",
@@ -467,7 +435,7 @@ def test_real_sol_wan_transformer_forward(tmp_path, monkeypatch):
                     },
                 }
             )
-            for backend in ("CUDNN_ATTN", "SOL_ATTN")
+            for backend in (dense_backend, "SOL_ATTN")
         }
         models = {}
         for backend, config in configs.items():
@@ -490,10 +458,10 @@ def test_real_sol_wan_transformer_forward(tmp_path, monkeypatch):
                 models[backend] = model
         generator = torch.Generator(device="cuda").manual_seed(29)
         with torch.no_grad():
-            for name, parameter in models["CUDNN_ATTN"].named_parameters():
+            for name, parameter in models[dense_backend].named_parameters():
                 offset = 1.0 if "norm" in name and parameter.ndim == 1 else 0.0
                 parameter.copy_(torch.randn(parameter.shape, device="cuda", generator=generator) * 0.02 + offset)
-            models["SOL_ATTN"].load_state_dict(models["CUDNN_ATTN"].state_dict())
+            models["SOL_ATTN"].load_state_dict(models[dense_backend].state_dict())
         latents = torch.randn(1, 4, 4, 32, 32, device="cuda", dtype=torch.bfloat16, generator=generator)
         text = torch.randn(1, 16, 32, device="cuda", dtype=torch.bfloat16, generator=generator)
         timestep = torch.tensor([500.0], device="cuda", dtype=torch.bfloat16)
@@ -516,7 +484,7 @@ def test_real_sol_wan_transformer_forward(tmp_path, monkeypatch):
                     output = model(latents, timestep, text, return_dict=False)[0]
                 assert output.shape == latents.shape and torch.isfinite(output).all()
                 outputs[backend, step] = output
-        torch.testing.assert_close(outputs["SOL_ATTN", 0], outputs["CUDNN_ATTN", 0], atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(outputs["SOL_ATTN", 0], outputs[dense_backend, 0], atol=1e-3, rtol=1e-3)
         assert calls == [torch.Size([1, 1024, 2, 128])]
     finally:
         destroy_distributed_env()

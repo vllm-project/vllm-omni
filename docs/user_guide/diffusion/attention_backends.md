@@ -40,7 +40,7 @@ For the internal selector, registry, and platform contract, see
 | `SPARGE_ATTN` | Block sparse + quantized | INT8 Q/K SPARGE top-k attention on Intel XPU | [SPARGE Attention](attention_backends/sparge.md) |
 | `FLASH_ATTN_HUB` | Hub kernel | FlashAttention 2 from Hugging Face `kernels` | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
 | `FLASH_ATTN_3_HUB` | Hub kernel | FlashAttention 3 from Hugging Face `kernels` on Hopper or newer | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
-| `SOL_ATTN` | Block sparse | Training-free BF16 self-attention; default cuDNN on SM90+, explicit native/Triton on SM80+ | [Sol-Attn](attention_backends/sol_attn.md) |
+| `SOL_ATTN` | Block sparse | Training-free BF16 self-attention; upstream CuTe/Triton kernels on SM80+ | [Sol-Attn](attention_backends/sol_attn.md) |
 | `RAINFUSION_ATTN` | Block sparse | MindIE-SD RainFusion video attention on Ascend NPU | [RainFusion](attention_backends/rainfusion.md) |
 | `FASTVIDEO_VSA` | Block sparse | FastVideo variable sparse self-attention for FastWan2.2-TI2V-5B and FastH3 MiniMax-H3 on CUDA | [FastVideo VSA](attention_backends/fastvideo_vsa.md) |
 | `VDNH3_ATTN` | Hybrid window | Frame-window softmax of VDN-H3 hybrid attention; the model adds the linear branch | [VDN-H3 Hybrid Attention](attention_backends/vdnh3_attn.md) |

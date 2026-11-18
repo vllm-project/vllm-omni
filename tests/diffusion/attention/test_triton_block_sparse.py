@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import math
 import sys
 from types import ModuleType
 from unittest.mock import Mock
@@ -9,8 +8,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from vllm_omni.diffusion.attention.ops import triton_block_sparse
-from vllm_omni.diffusion.attention.ops.block_sparse import block_sparse_attn_bshd, resolve_block_sparse_provider
+from vllm_omni.diffusion.attention.ops.block_sparse import resolve_block_sparse_provider
 from vllm_omni.diffusion.attention.ops.triton_block_sparse import require_triton_sparse
 from vllm_omni.diffusion.data import AttentionSpec
 from vllm_omni.platforms import current_omni_platform
@@ -64,68 +62,3 @@ def test_triton_config_rejects_sage_and_other_backends():
         AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_provider="triton", fastvideo_vsa_precision="sage")
     with pytest.raises(ValueError, match="FASTVIDEO_VSA"):
         AttentionSpec(backend="FLASH_ATTN", fastvideo_vsa_provider="triton")
-
-
-@pytest.mark.parametrize("block_size", [64, 128])
-def test_triton_normalizes_base2_lse_and_empty_rows(monkeypatch, block_size):
-    query = torch.ones(1, block_size * 2, 2, 128, dtype=torch.bfloat16)
-    block_map = torch.tensor([[[[True, True], [False, True]]]]).expand(1, 2, 2, 2)
-    sizes = torch.tensor([17, 0], dtype=torch.int32)
-
-    def kernel(query, key, value, indices, counts, block_sizes):
-        output = torch.ones_like(query)
-        lse = torch.full(query.shape[:3], math.log2(17), dtype=torch.float32)
-        output[:, :, block_size:] = torch.nan
-        lse[:, :, block_size:] = torch.nan
-        assert counts[:, :, block_size // 64 :].count_nonzero() == 0
-        return output, lse
-
-    monkeypatch.setattr(triton_block_sparse, "require_triton_sparse", lambda device: kernel)
-    output, lse = block_sparse_attn_bshd(
-        query,
-        query,
-        query,
-        block_map,
-        sizes,
-        128**-0.5,
-        provider="triton",
-        block_size=block_size,
-        return_lse=True,
-    )
-    torch.testing.assert_close(output[:, :block_size], query[:, :block_size])
-    torch.testing.assert_close(lse[:, :, :block_size], torch.full((1, 2, block_size), math.log(17)))
-    assert output[:, block_size:].count_nonzero() == 0
-    assert torch.isneginf(lse[:, :, block_size:]).all()
-    assert lse.is_contiguous() and lse.dtype == torch.float32
-    default_output = block_sparse_attn_bshd(
-        query,
-        query,
-        query,
-        block_map,
-        sizes,
-        128**-0.5,
-        provider="triton",
-        block_size=block_size,
-    )
-    torch.testing.assert_close(default_output, output, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("bad_lse", [torch.zeros(1, 64, 2), torch.zeros(1, 2, 64, dtype=torch.bfloat16)])
-def test_triton_rejects_incompatible_lse_abi(monkeypatch, bad_lse):
-    query = torch.ones(1, 64, 2, 128, dtype=torch.bfloat16)
-    monkeypatch.setattr(
-        triton_block_sparse,
-        "require_triton_sparse",
-        lambda device: lambda query, *args: (query.clone(), bad_lse),
-    )
-    with pytest.raises(ValueError, match="FP32 base-2 LSE"):
-        block_sparse_attn_bshd(
-            query,
-            query,
-            query,
-            torch.ones(1, 2, 1, 1, dtype=torch.bool),
-            torch.tensor([64], dtype=torch.int32),
-            128**-0.5,
-            provider="triton",
-            return_lse=True,
-        )
