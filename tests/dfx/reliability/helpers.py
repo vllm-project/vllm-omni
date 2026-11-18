@@ -17,7 +17,10 @@ markers; post-fault **process** cleanup assertions use the full captured
 from __future__ import annotations
 
 import concurrent.futures
+import copy
+import errno
 import http.client
+import inspect
 import json
 import logging
 import os
@@ -25,17 +28,43 @@ import re
 import select
 import shlex
 import signal
+import stat as stat_module
 import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import psutil
 import pytest
+from typing_extensions import NotRequired
+
+if TYPE_CHECKING:
+    from tests.helpers.runtime import OmniServerParams
 
 logger = logging.getLogger(__name__)
+
+
+class GpuOomInjectionConfig(TypedDict, total=False):
+    """Fields read by :func:`inject_gpu_oom` and ``resolve_oom_device_spec``."""
+
+    device: str
+    target_mem_ratio: float
+    hold_seconds: int
+    startup_timeout_sec: int
+    strict: bool
+
+
+class ServerFaultSnapshot(TypedDict):
+    root_pids: list[int]
+    tree_pids: list[int]
+    worker_pids: list[int]
+    worker_markers: list[str]
+    shm_objects: NotRequired[list[tuple[str, int, int]]]
+    killed_root_fifo_objects: NotRequired[list[tuple[str, int, int]]]
+
 
 # Substrings matched against ``psutil.Process.name`` + argv text for classifying GPU
 # workers under the test server tree. Extend per-suite via
@@ -75,17 +104,6 @@ def post_chat_completions_raw(
         resp = conn.getresponse()
         data = resp.read()
         return resp.status, data
-    finally:
-        conn.close()
-
-
-def get_health_raw(host: str, port: int, *, timeout_sec: int = 20) -> tuple[int, bytes]:
-    """GET /health with stdlib HTTP client; returns (status, body)."""
-    conn = http.client.HTTPConnection(host, port, timeout=timeout_sec)
-    try:
-        conn.request("GET", "/health")
-        resp = conn.getresponse()
-        return resp.status, resp.read()
     finally:
         conn.close()
 
@@ -158,6 +176,72 @@ def extract_openai_error_contract_from_payload(payload: Any) -> dict[str, Any] |
     return error_obj
 
 
+_ALLOC_ATTEMPT_TIMEOUT_SEC = 2.0
+# ``torch.cuda.mem_get_info`` can report a few MiB more free memory after the
+# exact ceiling allocation than it reported before it. Keep this allowance
+# absolute and small so the pressure gate remains fail-closed.
+_OOM_RESIDUAL_SLACK_BYTES = 8 * 1024 * 1024
+
+
+def reliability_scenarios_for_eager_oom(
+    scenarios: list[dict[str, Any]],
+    *,
+    is_hip: bool,
+    stage_ids: Sequence[int],
+) -> list[dict[str, Any]]:
+    """Clone scenarios and force selected HIP stages to allocate eagerly.
+
+    External sidecars only consume device-global free memory. A server can
+    otherwise reuse captured graph pools or cached profile buffers, causing an
+    OOM probe to succeed without making a new device allocation.
+    """
+    cloned = copy.deepcopy(scenarios)
+    if not is_hip:
+        return cloned
+    for scenario in cloned:
+        server_params = scenario["server_params"]
+        updates = server_params.setdefault("update", {})
+        stages = updates.setdefault("stages", {})
+        for stage_id in stage_ids:
+            stages.setdefault(int(stage_id), {})["enforce_eager"] = True
+    return cloned
+
+
+def allocate_device_chunk(
+    req_elems: int,
+    *,
+    allocate: Callable[[int], Any],
+    free_bytes: Callable[[], int],
+    timeout_sec: float = _ALLOC_ATTEMPT_TIMEOUT_SEC,
+) -> Any | None:
+    """Return one chunk, or None when the allocator rejects or stalls.
+
+    A ``RuntimeError``, a call that exceeds ``timeout_sec``, or a call that
+    does not reduce reported free memory is rejection. HIP can log an OOM and
+    retry inside ``allocate`` without raising; the timeout lets the sidecar
+    print READY instead of blocking the startup wait.
+    """
+    import threading
+
+    free_before = int(free_bytes())
+    box: dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            box["chunk"] = allocate(req_elems)
+        except RuntimeError as exc:
+            box["error"] = exc
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(timeout_sec)
+    if thread.is_alive() or "error" in box or "chunk" not in box:
+        return None
+    if int(free_bytes()) >= free_before:
+        return None
+    return box["chunk"]
+
+
 def _build_sidecar_cmd(
     device: int,
     target_mem_ratio: float,
@@ -165,9 +249,17 @@ def _build_sidecar_cmd(
     strict: bool,
     max_free_bytes: int | None,
 ) -> list[str]:
-    sidecar = r"""
+    sidecar = (
+        "from __future__ import annotations\n"
+        "from collections.abc import Callable\n"
+        "from typing import Any\n"
+        f"_ALLOC_ATTEMPT_TIMEOUT_SEC = {_ALLOC_ATTEMPT_TIMEOUT_SEC!r}\n\n"
+        f"_OOM_RESIDUAL_SLACK_BYTES = {_OOM_RESIDUAL_SLACK_BYTES!r}\n\n"
+        + inspect.getsource(allocate_device_chunk)
+        + r"""
 import sys
 import time
+print("STARTING:import_torch", flush=True)
 import torch
 
 device = int(sys.argv[1])
@@ -177,46 +269,71 @@ strict = sys.argv[4] == "1"
 max_free_bytes_arg = int(sys.argv[5])
 max_free_bytes = None if max_free_bytes_arg < 0 else max_free_bytes_arg
 
+print("STARTING:initialize_device", flush=True)
 torch.cuda.init()
 torch.cuda.set_device(device)
 props = torch.cuda.get_device_properties(device)
 free_before, total_bytes = torch.cuda.mem_get_info(device)
+print(f"STARTING:allocate_memory;device={device};free_before={int(free_before)}", flush=True)
 ratio_target_bytes = int(free_before * target_ratio)
 ceiling_target_bytes = 0 if max_free_bytes is None else max(0, int(free_before) - max_free_bytes)
 target_bytes = max(ratio_target_bytes, ceiling_target_bytes)
 chunk_bytes = 256 * 1024 * 1024
 chunks = []
 allocated = 0
+rejected = False
+
+def _take(req_elems):
+    return allocate_device_chunk(
+        req_elems,
+        allocate=lambda n: torch.empty((n,), dtype=torch.float16, device=f"cuda:{device}"),
+        free_bytes=lambda: torch.cuda.mem_get_info(device)[0],
+    )
 
 while allocated < target_bytes:
     req_bytes = min(chunk_bytes, target_bytes - allocated)
     req_elems = max(1, req_bytes // 2)  # float16 -> 2 bytes
-    try:
-        chunk = torch.empty((req_elems,), dtype=torch.float16, device=f"cuda:{device}")
-        chunks.append(chunk)
-        allocated += chunk.numel() * 2
-    except RuntimeError:
+    chunk = _take(req_elems)
+    if chunk is None:
+        rejected = True
         break
+    chunks.append(chunk)
+    allocated += chunk.numel() * 2
 
-# In strict mode, keep filling with smaller chunks until allocator rejects.
-# This minimizes residual free memory and makes fault-path assertions steadier.
-if strict:
+# Strict mode keeps filling with smaller chunks until the allocator rejects.
+# Rejection is a raised error, a stalled call, or an alloc that does not
+# reduce free memory. HIP can log OOM and retry without raising.
+if strict and not rejected:
     tail_chunk_bytes = [64 * 1024 * 1024, 16 * 1024 * 1024, 4 * 1024 * 1024, 1 * 1024 * 1024]
     for tail_bytes in tail_chunk_bytes:
         while True:
-            req_elems = max(1, tail_bytes // 2)
-            try:
-                chunk = torch.empty((req_elems,), dtype=torch.float16, device=f"cuda:{device}")
-                chunks.append(chunk)
-                allocated += chunk.numel() * 2
-            except RuntimeError:
+            chunk = _take(max(1, tail_bytes // 2))
+            if chunk is None:
+                rejected = True
                 break
+            chunks.append(chunk)
+            allocated += chunk.numel() * 2
+        if rejected:
+            break
 
 achieved_ratio = allocated / max(1, props.total_memory)
 achieved_free_ratio = allocated / max(1, int(free_before))
 free_after, _ = torch.cuda.mem_get_info(device)
-ratio_target_missed = strict and allocated < ratio_target_bytes
-free_ceiling_missed = max_free_bytes is not None and int(free_after) > max_free_bytes
+# A full device is readiness, even when the byte target was not met. Allow a
+# few MiB of reported allocator reserve above an explicit ceiling. This can
+# remain after an exact target allocation even when non-strict callers do not
+# probe until allocator rejection. A rejected allocation after the ratio target
+# is also saturated: the explicit ceiling is a pressure goal, not a requirement
+# to ignore the allocator's stronger evidence that no next chunk fits.
+if max_free_bytes is None:
+    residual_floor = 64 * 1024 * 1024
+else:
+    residual_floor = max_free_bytes + _OOM_RESIDUAL_SLACK_BYTES
+allocator_saturated = rejected and target_ratio > 0.0 and allocated >= ratio_target_bytes
+residual_ceiling_reached = int(free_after) <= residual_floor
+pressure_ready = allocator_saturated or residual_ceiling_reached
+ratio_target_missed = strict and allocated < ratio_target_bytes and not pressure_ready
+free_ceiling_missed = max_free_bytes is not None and not pressure_ready
 if ratio_target_missed or free_ceiling_missed:
     print(
         "ERROR:"
@@ -226,6 +343,7 @@ if ratio_target_missed or free_ceiling_missed:
         f"free_after={int(free_after)};"
         f"target_bytes={target_bytes};"
         f"max_free_bytes={max_free_bytes};"
+        f"allocator_saturated={int(allocator_saturated)};"
         f"allocated={allocated}",
         flush=True,
     )
@@ -239,6 +357,7 @@ print(
     f"free_after={int(free_after)};"
     f"target_bytes={target_bytes};"
     f"max_free_bytes={max_free_bytes};"
+    f"allocator_saturated={int(allocator_saturated)};"
     f"allocated={allocated}",
     flush=True,
 )
@@ -248,6 +367,7 @@ if hold_seconds <= 0:
 time.sleep(hold_seconds)
 print("DONE", flush=True)
 """
+    )
     return [
         sys.executable,
         "-u",
@@ -276,9 +396,10 @@ def start_gpu_oom_hog(
     Note:
         ``target_mem_ratio`` is evaluated against free memory at injection start
         (not total GPU memory), i.e. success gate is ``allocated / free_before``.
-        When ``max_free_bytes`` is set, the sidecar also allocates until no more
-        than that many bytes remain free and fails startup if it cannot reach the
-        ceiling.
+        When ``max_free_bytes`` is set, the sidecar also targets that residual
+        free-memory ceiling. Allocator rejection after reaching
+        ``target_mem_ratio`` is accepted as stronger evidence that the device is
+        saturated even if the reported residual remains above the ceiling.
         ``hold_seconds <= 0`` means keeping OOM pressure until the sidecar is
         explicitly stopped via ``stop_gpu_oom_hog(s)``.
     """
@@ -304,37 +425,51 @@ def start_gpu_oom_hog(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
+        bufsize=0,
     )
     assert proc.stdout is not None
 
-    deadline = time.time() + startup_timeout_sec
+    handle = OomHandle(proc=proc, device=device, target_mem_ratio=target_mem_ratio, start_ts=time.time())
+    deadline = time.monotonic() + startup_timeout_sec
     logs: list[str] = []
-    while time.time() < deadline:
-        ready, _, _ = select.select([proc.stdout], [], [], poll_interval_sec)
-        if ready:
-            line = proc.stdout.readline().strip()
-            if line:
+    pending = b""
+    handed_off = False
+    try:
+        while time.monotonic() < deadline:
+            wait = min(poll_interval_sec, max(0.0, deadline - time.monotonic()))
+            ready, _, _ = select.select([proc.stdout], [], [], wait)
+            if not ready:
+                continue
+            # Read raw bytes: TextIOWrapper can buffer READY behind progress
+            # lines even when select reports no more bytes on the OS pipe.
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                if pending:
+                    logs.append(pending.decode("utf-8", errors="replace"))
+                raise RuntimeError(f"OOM sidecar closed stdout before READY; returncode={proc.poll()}; logs={logs}")
+            pending += chunk
+            lines = pending.split(b"\n")
+            pending = lines.pop()
+            for raw_line in lines:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
                 logs.append(line)
                 print(f"[oom-sidecar][gpu={device}] {line}", flush=True)
                 if line.startswith("READY:"):
-                    return OomHandle(
-                        proc=proc,
-                        device=device,
-                        target_mem_ratio=target_mem_ratio,
-                        start_ts=time.time(),
-                    )
+                    handed_off = True
+                    return handle
                 if line.startswith("ERROR:"):
-                    proc.terminate()
-                    raise RuntimeError(f"OOM sidecar failed to reach target: {line}")
-        if proc.poll() is not None:
-            break
-
-    proc.terminate()
-    if logs:
-        print(f"[oom-sidecar][gpu={device}] startup logs: {' | '.join(logs)}", flush=True)
-    raise TimeoutError(f"OOM sidecar startup timeout. logs={logs}")
+                    raise RuntimeError(f"OOM sidecar failed to reach target: {line}; logs={logs}")
+        if pending:
+            logs.append(pending.decode("utf-8", errors="replace"))
+        raise TimeoutError(f"OOM sidecar startup timeout after {startup_timeout_sec}s; logs={logs}")
+    finally:
+        if not handed_off:
+            # Reap before the next injection: terminate alone leaves cleanup
+            # asynchronous and can overlap the next CUDA context/allocations.
+            stop_gpu_oom_hog(handle)
+            proc.stdout.close()
 
 
 def stop_gpu_oom_hog(handle: OomHandle, *, timeout_sec: int = 5) -> None:
@@ -342,14 +477,47 @@ def stop_gpu_oom_hog(handle: OomHandle, *, timeout_sec: int = 5) -> None:
     proc = handle.proc
     if proc is None:
         return
-    if proc.poll() is not None:
-        return
-    proc.terminate()
-    try:
-        proc.wait(timeout=timeout_sec)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=timeout_sec)
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=timeout_sec)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=timeout_sec)
+    if proc.stdout is not None:
+        proc.stdout.close()
+
+
+def _device_spec_from_deploy(deploy: Any, stage_config_path: str | Path) -> str:
+    device_ids: set[int] = set()
+    for stage in deploy.stages:
+        devices = stage.devices
+        if not isinstance(devices, str):
+            continue
+        for token in devices.split(","):
+            token = token.strip()
+            if token:
+                device_ids.add(int(token))
+    if not device_ids:
+        raise ValueError(f"No runtime.devices found in stage config: {stage_config_path}")
+    return ",".join(str(device_id) for device_id in sorted(device_ids))
+
+
+def stage_config_device_spec(stage_config_path: str | Path, platform: str | None) -> str:
+    """Devices the server keeps after ``base_config`` inheritance and one platform overlay.
+
+    ``platform=None`` keeps the inherited base stages and does not apply
+    ``platforms.*``. A named platform uses
+    :func:`vllm_omni.config.stage_config._apply_platform_overrides` with that
+    same ``device_name`` key. Other platform blocks, including an XPU 8-GPU
+    list, stay out of the result.
+    """
+    from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config
+
+    deploy = load_deploy_config(stage_config_path)
+    if platform is not None:
+        deploy = _apply_platform_overrides(deploy, platform)
+    return _device_spec_from_deploy(deploy, stage_config_path)
 
 
 def inject_gpu_oom(
@@ -380,17 +548,22 @@ def inject_gpu_oom(
     if not devices:
         raise ValueError("device must not be empty.")
 
-    handles = [
-        start_gpu_oom_hog(
-            device=dev,
-            target_mem_ratio=target_mem_ratio,
-            hold_seconds=hold_seconds,
-            startup_timeout_sec=startup_timeout_sec,
-            strict=strict,
-            max_free_bytes=max_free_bytes,
-        )
-        for dev in devices
-    ]
+    handles: list[OomHandle] = []
+    try:
+        for dev in devices:
+            handles.append(
+                start_gpu_oom_hog(
+                    device=dev,
+                    target_mem_ratio=target_mem_ratio,
+                    hold_seconds=hold_seconds,
+                    startup_timeout_sec=startup_timeout_sec,
+                    strict=strict,
+                    max_free_bytes=max_free_bytes,
+                )
+            )
+    except BaseException:
+        stop_gpu_oom_hogs(handles)
+        raise
     if len(handles) == 1:
         return handles[0]
     return handles
@@ -541,6 +714,27 @@ def _resolve_runtime_worker_markers(
             )
         )
     return tuple(dict.fromkeys(merged))
+
+
+def _pid_is_dead(pid: int) -> bool:
+    """True when ``pid`` is gone or only a zombie remains."""
+    if not psutil.pid_exists(pid):
+        return True
+    try:
+        return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+    except psutil.Error:
+        return True
+
+
+def _wait_until_pid_dead(pid: int, timeout_sec: float) -> bool:
+    """Poll until ``pid`` is dead or ``timeout_sec`` elapses."""
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    while True:
+        if _pid_is_dead(pid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 def _pid_looks_like_runtime_worker(pid: int, markers: Sequence[str]) -> bool:
@@ -817,15 +1011,361 @@ def query_gpu_compute_pid_used_memory_mb() -> dict[int, int] | None:
         return None
 
 
+_TERMINAL_HEALTH_ERRNOS = frozenset(
+    {
+        errno.ECONNREFUSED,
+        errno.ECONNRESET,
+        errno.EPIPE,
+        errno.ETIMEDOUT,
+        errno.EHOSTUNREACH,
+        errno.ENETUNREACH,
+    }
+)
+
+
+def post_fault_health_exception_is_terminal(exc: BaseException) -> bool:
+    """Return whether a ``/health`` poll failed because the API is gone or the read timed out.
+
+    An ``AssertionError`` from an unexpected HTTP status means something is still
+    listening. Callers decide whether that is a failure or a reason to keep polling.
+    """
+    if isinstance(exc, AssertionError):
+        return False
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    errno_val = getattr(exc, "errno", None)
+    if errno_val in _TERMINAL_HEALTH_ERRNOS:
+        return True
+    message = str(exc).lower()
+    return any(
+        token in message
+        for token in (
+            "timed out",
+            "timeout",
+            "connection refused",
+            "actively refused",
+            "connection aborted",
+            "connection reset",
+        )
+    )
+
+
+def assert_post_fault_health_503(online_client: Any, *, scenario: str) -> None:
+    """Wait 20s, then require one ``/health`` response of HTTP 503.
+
+    The API process must still be listening. A connection error propagates.
+    """
+    time.sleep(20.0)
+    status = online_client.send_health_http_request({"timeout": 5}, err_code=(200, 503))[0].status_code
+    assert status == 503, f"[{scenario} health] expected /health 503 after 20s, got status={status}"
+
+
+def assert_post_fault_api_unreachable(online_client: Any, *, scenario: str) -> None:
+    """Poll ``/health`` until it fails to connect, or until 20s elapse.
+
+    HTTP 200 and HTTP 503 both mean a process is still listening, so polling
+    continues. A connection failure means the API process is gone.
+    """
+    deadline = time.monotonic() + 20.0
+    last_observation = "no response"
+    while time.monotonic() < deadline:
+        try:
+            status = online_client.send_health_http_request({"timeout": 5}, err_code=(200, 503))[0].status_code
+            last_observation = f"http={status}"
+        except Exception as exc:  # noqa: BLE001
+            if post_fault_health_exception_is_terminal(exc):
+                return
+            last_observation = f"exception={exc!r}"
+        time.sleep(0.5)
+    pytest.fail(
+        f"[{scenario} health] /health stayed reachable for 20s after the API process was killed; "
+        f"last_observation={last_observation}"
+    )
+
+
+SIGTERM_CLEANUP_GRACE_SEC = 60.0
+ESCALATION_GRACE_SEC = 90.0
+LAUNCH_FAILURE_TIMEOUT_SEC = 180
+PARTIAL_ISOLATION_HTTP_TIMEOUT_SEC = 30.0
+_LAUNCH_FAILURE_HINTS = (
+    "oom",
+    "out of memory",
+    "cuda",
+    "memory",
+    "exited",
+    "failed to start",
+    "accelerator",
+)
+
+
+def assert_api_still_listening(online_client: Any, *, scenario: str) -> None:
+    """The API process is still bound. HTTP 200 and HTTP 503 both count."""
+    status = online_client.send_health_http_request({"timeout": 5}, err_code=(200, 503))[0].status_code
+    assert status in (200, 503), f"[{scenario}] expected /health 200 or 503 while the API is still up, got {status}"
+
+
+def sigterm_serve_root_and_assert_cleanup(
+    server: Any,
+    *,
+    scenario: str,
+    grace_sec: float = SIGTERM_CLEANUP_GRACE_SEC,
+) -> None:
+    """Send one SIGTERM to the serve root and require the process tree and GPU to clear."""
+    make_server_root_kill_fault_injector(signal_name="SIGTERM", post_kill_wait_seconds=0.0)(server)
+    assert_no_server_tree_process_residual_and_gpu_release(server, scenario=scenario, timeout_sec=grace_sec)
+
+
+def escalate_live_pids(pids: Sequence[int], *, grace_sec: float) -> bool:
+    """Return True when ``pids`` are still alive after ``grace_sec`` and were sent SIGKILL.
+
+    SIGTERM is the caller's job. This is the shutdown-escalation checkpoint: a
+    stuck exit must not wait forever.
+    """
+    deadline = time.monotonic() + grace_sec
+    while time.monotonic() < deadline:
+        if not list_alive_pids(pids):
+            return False
+        time.sleep(0.05)
+    sigkill = getattr(signal, "SIGKILL", None)
+    if sigkill is None:
+        raise RuntimeError("SIGKILL is not available; cannot escalate a stuck shutdown")
+    for pid in list_alive_pids(pids):
+        try:
+            os.kill(pid, sigkill)
+        except ProcessLookupError:
+            continue
+        print(f"[reliability][escalation] pid={pid} still alive after {grace_sec:.0f}s; sent SIGKILL", flush=True)
+    return True
+
+
+def assert_launch_failure_observable(exc: BaseException) -> None:
+    """A failed launch must surface as an error, an exit, or a bounded timeout."""
+    text = str(exc).lower()
+    assert any(hint in text for hint in _LAUNCH_FAILURE_HINTS), f"startup failure was not observable: {exc!r}"
+
+
+def start_server_from_params(
+    params: Any, *, startup_timeout: int | None = None, wait_for_device_memory: bool = True
+) -> Any:
+    """Build an ``OmniServer`` the same way the reliability fixture does, without entering it."""
+    from tests.helpers.runtime import OmniServer, _resolve_server_deploy_args, get_model_prefix
+
+    original_model = get_model_prefix() + params.model
+    server_args, stage_config_path, replaced = _resolve_server_deploy_args(
+        list(params.server_args or []),
+        params.stage_config_path,
+        "advanced_model",
+    )
+    if params.use_omni:
+        if "--stage-init-timeout" not in server_args:
+            server_args += ["--stage-init-timeout", "600"]
+        if "--init-timeout" not in server_args:
+            server_args += ["--init-timeout", "900"]
+        if "--disable-log-stats" not in server_args and "--log-stats" not in server_args:
+            server_args += ["--log-stats"]
+    if stage_config_path is not None and not replaced:
+        server_args += ["--deploy-config", stage_config_path]
+    if original_model != params.model and "--served-model-name" not in server_args:
+        server_args += ["--served-model-name", params.model]
+    server = OmniServer(
+        original_model,
+        server_args,
+        env_dict=params.env_dict,
+        use_omni=params.use_omni,
+        startup_timeout=params.startup_timeout if startup_timeout is None else startup_timeout,
+        wait_for_device_memory=wait_for_device_memory,
+    )
+    server.model = params.model
+    return server
+
+
+def _deploy_config_path(server: Any) -> str | None:
+    stage_config_path = getattr(server, "stage_config_path", None)
+    if stage_config_path:
+        return str(stage_config_path)
+    args: list[str] = getattr(server, "serve_args", [])
+    for index, arg in enumerate(args):
+        if arg == "--deploy-config" and index + 1 < len(args):
+            return args[index + 1]
+        if arg.startswith("--deploy-config="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def client_for_server(server: Any) -> Any:
+    from tests.helpers.client import OnlineOmniClient
+
+    return OnlineOmniClient(
+        host=server.host,
+        port=server.port,
+        api_key="EMPTY",
+        log_stats=getattr(server, "log_stats", False),
+    )
+
+
+def _process_visible_devices(pid: int) -> set[str]:
+    try:
+        env = psutil.Process(pid).environ()
+    except psutil.Error:
+        return set()
+    for key in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES"):
+        raw = env.get(key)
+        if raw:
+            return {token.strip() for token in raw.split(",") if token.strip()}
+    return set()
+
+
+def kill_bad_replica(
+    server: Any,
+    *,
+    pattern: str,
+    devices: str,
+    signal_name: str = "SIGKILL",
+) -> None:
+    """Kill one replica, leaving the other replica's processes alone.
+
+    AR workers are matched by process title (``_replica1``). Diffusion workers
+    that do not carry a replica id are matched by the device set they were given.
+    """
+    _log_server_process_tree(server)
+    root_pids = set(_list_server_process_tree(server)[:1])
+    hits: list[int] = []
+    if pattern:
+        hits = [pid for pid in _pids_in_server_tree_substring_match(server, pattern, limit=16) if pid not in root_pids]
+    if not hits and devices:
+        wanted = {token.strip() for token in devices.split(",") if token.strip()}
+        for pid in _list_server_process_tree(server):
+            if pid in root_pids:
+                continue
+            visible = _process_visible_devices(pid)
+            if visible and visible <= wanted:
+                hits.append(pid)
+    if not hits:
+        pytest.fail(f"no bad-replica process matched pattern={pattern!r} devices={devices!r}")
+    sig = getattr(signal, signal_name, None)
+    if sig is None:
+        raise ValueError(f"Unsupported signal_name: {signal_name}")
+    for pid in hits:
+        name, cmdline = _safe_proc_info(pid)
+        print(
+            f"[reliability][replica] killing pid={pid} name={name} signal={signal_name} cmdline={cmdline}",
+            flush=True,
+        )
+        os.kill(pid, sig)
+
+
 def worker_residual_timeout_after_kill_signal(signal_name: str) -> float:
     """Wall-clock budget for fault-snapshot PIDs / GPU to clear after ``signal_name``."""
     if signal_name == "SIGKILL":
         return 30.0
-    if signal_name == "SIGINT":
-        return 120.0
     if signal_name == "SIGTERM":
         return 90.0
     return 30.0
+
+
+_LINUX_PROC_ROOT = Path("/proc")
+_LINUX_SHM_ROOT = Path("/dev/shm")
+
+
+def _linux_fd_counts(pids: Sequence[int]) -> dict[int, int]:
+    """Include zombie PIDs: they must not retain open file descriptors either."""
+    if sys.platform != "linux":
+        return {}
+    counts: dict[int, int] = {}
+    for pid in pids:
+        try:
+            count = sum(1 for _ in (_LINUX_PROC_ROOT / str(pid) / "fd").iterdir())
+        except FileNotFoundError:
+            continue
+        if count:
+            counts[pid] = count
+    return counts
+
+
+def _capture_linux_shm_objects(pids: Sequence[int]) -> list[tuple[str, int, int]]:
+    """Track named POSIX SHM/semaphores referenced by this tree, not global growth.
+
+    Closed descriptors can leave live mappings, so inspect both fd and maps.
+    Already-unlinked objects have no name to leak; the process/FD checks cover
+    their holders. Permission errors propagate rather than claiming coverage.
+    """
+    if sys.platform != "linux":
+        return []
+    objects: set[tuple[str, int, int]] = set()
+    for pid in pids:
+        proc = _LINUX_PROC_ROOT / str(pid)
+        try:
+            descriptors = list((proc / "fd").iterdir())
+        except FileNotFoundError:
+            descriptors = []
+        for descriptor in descriptors:
+            try:
+                target = descriptor.readlink()
+                if target.is_relative_to(_LINUX_SHM_ROOT):
+                    stat = target.stat()
+                    fd_stat = descriptor.stat()
+                    if (stat.st_dev, stat.st_ino) == (fd_stat.st_dev, fd_stat.st_ino):
+                        objects.add((str(target), stat.st_dev, stat.st_ino))
+            except FileNotFoundError:
+                continue
+        try:
+            mappings = (proc / "maps").read_text().splitlines()
+        except FileNotFoundError:
+            continue
+        for line in mappings:
+            fields = line.split(maxsplit=5)
+            if len(fields) != 6:
+                continue
+            target = Path(fields[5])
+            if not target.is_relative_to(_LINUX_SHM_ROOT):
+                continue
+            try:
+                stat = target.stat()
+            except FileNotFoundError:
+                continue
+            major, minor = fields[3].split(":")
+            if stat.st_ino == int(fields[4]) and stat.st_dev == os.makedev(int(major, 16), int(minor, 16)):
+                objects.add((str(target), stat.st_dev, stat.st_ino))
+    return sorted(objects)
+
+
+def _remaining_linux_shm_objects(
+    objects: Sequence[tuple[str, int, int]],
+    *,
+    ignore_named_fifos: bool = False,
+    allowed_fifo_objects: Sequence[tuple[str, int, int]] = (),
+) -> list[str]:
+    remaining: list[str] = []
+    for name, device, inode in objects:
+        try:
+            stat = Path(name).stat()
+        except FileNotFoundError:
+            continue
+        # A reused name with a different inode belongs to a different object.
+        if (stat.st_dev, stat.st_ino) == (device, inode):
+            if stat_module.S_ISFIFO(stat.st_mode) and (
+                ignore_named_fifos or (name, device, inode) in allowed_fifo_objects
+            ):
+                continue
+            remaining.append(name)
+    return remaining
+
+
+def capture_exclusive_fifo_objects(target_pids: Sequence[int], tree_pids: Sequence[int]) -> list[tuple[str, int, int]]:
+    """Snapshot FIFOs held by killed targets, excluding references from survivors."""
+    target_objects = set(_capture_linux_shm_objects(target_pids))
+    other_objects = set(_capture_linux_shm_objects(sorted(set(tree_pids) - set(target_pids))))
+    exclusive = []
+    for name, device, inode in sorted(target_objects - other_objects):
+        try:
+            current = Path(name).stat()
+        except FileNotFoundError:
+            continue
+        if (current.st_dev, current.st_ino) == (device, inode) and stat_module.S_ISFIFO(current.st_mode):
+            exclusive.append((name, device, inode))
+    return exclusive
 
 
 def assert_no_server_tree_process_residual_and_gpu_release(
@@ -834,6 +1374,8 @@ def assert_no_server_tree_process_residual_and_gpu_release(
     scenario: str,
     timeout_sec: float = 30.0,
     poll_interval_sec: float = 0.5,
+    allow_fifo_residual: bool = False,
+    allowed_fifo_objects: Sequence[tuple[str, int, int]] = (),
 ) -> None:
     """Assert no live PIDs remain from the fault-time server tree and no GPU use by those PIDs.
 
@@ -843,6 +1385,17 @@ def assert_no_server_tree_process_residual_and_gpu_release(
 
     **Zombie** PIDs (exited children not yet reaped by the test ``Popen``) are excluded
     from the "alive" list; ``psutil.pid_exists`` alone would false-positive on them.
+
+    On Linux, also require captured PIDs' FD tables to empty and the named
+    /dev/shm objects referenced at injection time to disappear. Identity uses
+    device/inode pairs, so unrelated objects reusing a name do not fail cleanup.
+    Objects created after the snapshot and references retained by processes
+    outside the captured tree are not independently inventoried here.
+
+    Whole-tree SIGKILL may allow named FIFO paths to remain: no owner survives
+    to unlink them. Other SHM objects, process/FD and GPU checks stay mandatory.
+    For shutdown-time partial crashes, allowed_fifo_objects may exempt only
+    pre-injection target-exclusive FIFO identities. All other FIFOs stay strict.
 
     Note: if a child is reparented to PID 1 while staying alive, its PID is unchanged
     and remains detected; if it **exits and a new unrelated process reuses the same
@@ -860,6 +1413,8 @@ def assert_no_server_tree_process_residual_and_gpu_release(
     deadline = time.monotonic() + timeout_sec
     last_alive: list[int] = []
     last_gpu_leaks: dict[int, int] = {}
+    last_fds: dict[int, int] = {}
+    last_shm: list[str] = []
     gpu_telemetry_available: bool | None = None
     while time.monotonic() < deadline:
         last_alive = list_alive_pids(tree_pids)
@@ -875,35 +1430,33 @@ def assert_no_server_tree_process_residual_and_gpu_release(
         else:
             gpu_telemetry_available = True
             last_gpu_leaks = {pid: mem_mb for pid, mem_mb in gpu_map.items() if pid in tree_pid_set and mem_mb > 0}
-        if not last_alive and not last_gpu_leaks:
+        last_fds = _linux_fd_counts(tree_pids)
+        shm_objects = snapshot.get("shm_objects", [])
+        last_shm = _remaining_linux_shm_objects(shm_objects)
+        fifo_residual: list[str] = []
+        if allow_fifo_residual or allowed_fifo_objects:
+            required_shm = _remaining_linux_shm_objects(
+                shm_objects, ignore_named_fifos=allow_fifo_residual, allowed_fifo_objects=allowed_fifo_objects
+            )
+            fifo_residual = sorted(set(last_shm) - set(required_shm))
+            last_shm = required_shm
+        if not last_alive and not last_gpu_leaks and not last_fds and not last_shm:
+            if fifo_residual:
+                logger.warning("[%s] exempt named FIFO paths remain after SIGKILL: %s", scenario, fifo_residual)
             return
         time.sleep(poll_interval_sec)
 
     assert not last_alive, f"[{scenario}] residual server-tree processes remain alive: {last_alive}"
     assert not last_gpu_leaks, f"[{scenario}] server-tree PID GPU memory not released: {last_gpu_leaks}"
-
-
-def assert_no_worker_residual_and_gpu_release(
-    server: Any,
-    *,
-    scenario: str,
-    timeout_sec: float = 30.0,
-    poll_interval_sec: float = 0.5,
-) -> None:
-    """Deprecated: use :func:`assert_no_server_tree_process_residual_and_gpu_release`."""
-    assert_no_server_tree_process_residual_and_gpu_release(
-        server,
-        scenario=scenario,
-        timeout_sec=timeout_sec,
-        poll_interval_sec=poll_interval_sec,
-    )
+    assert not last_fds, f"[{scenario}] server-tree file descriptors remain open: {last_fds}"
+    assert not last_shm, f"[{scenario}] named shared memory/semaphores remain: {last_shm}"
 
 
 def _capture_server_fault_snapshot(
     server: Any,
     *,
     worker_markers_extra: Sequence[str] | None = None,
-) -> dict[str, list[int] | list[str]]:
+) -> ServerFaultSnapshot:
     """Capture current server process snapshot for post-fault assertions.
 
     ``tree_pids`` is ``[root, ...descendants]`` and is used by
@@ -919,12 +1472,18 @@ def _capture_server_fault_snapshot(
             continue
         if _pid_looks_like_runtime_worker(pid, markers):
             worker_pids.append(pid)
-    snapshot: dict[str, list[int] | list[str]] = {
+    snapshot: ServerFaultSnapshot = {
         "root_pids": [root_pid] if root_pid is not None else [],
         "tree_pids": tree_pids,
         "worker_pids": worker_pids,
         "worker_markers": list(markers),
+        "shm_objects": _capture_linux_shm_objects(tree_pids),
     }
+    # Later shutdown injection must retain objects captured before a stage died.
+    previous = getattr(server, "reliability_fault_snapshot", None)
+    if isinstance(previous, dict):
+        snapshot["tree_pids"] = sorted(set(tree_pids) | set(previous.get("tree_pids", [])))
+        snapshot["shm_objects"] = sorted(set(snapshot["shm_objects"]) | set(previous.get("shm_objects", [])))
     setattr(server, "reliability_fault_snapshot", snapshot)
     return snapshot
 
@@ -949,6 +1508,9 @@ def make_server_root_kill_fault_injector(
         if not root_pids:
             pytest.skip("no server root process found for root-kill injection")
         root_pid = int(root_pids[0])
+        if signal_name == "SIGKILL":
+            # Capture before killing: child-owned/shared FIFOs remain mandatory.
+            snapshot["killed_root_fifo_objects"] = capture_exclusive_fifo_objects([root_pid], snapshot["tree_pids"])
         sig = getattr(signal, signal_name, None)
         if sig is None:
             raise ValueError(f"Unsupported signal_name: {signal_name}")
@@ -971,7 +1533,11 @@ def make_server_tree_kill_fault_injector(
     inter_kill_wait_seconds: float = 0.2,
     worker_markers_extra: Sequence[str] | None = None,
 ) -> FaultInjector:
-    """Kill current server root first, then kill all remaining descendants.
+    """Kill the root and business descendants, leaving resource trackers to reap.
+
+    Trackers remain in the fault snapshot: cleanup still requires their exit
+    and removal of tracked shared memory/semaphores. Identify them before root
+    death, while their command lines are still available.
 
     See :func:`make_server_root_kill_fault_injector` for ``worker_markers_extra``.
     """
@@ -988,8 +1554,21 @@ def make_server_tree_kill_fault_injector(
             raise ValueError(f"Unsupported signal_name: {signal_name}")
 
         root_pid = tree_pids[0]
+        tracker_modules = (
+            "multiprocessing.resource_tracker",
+            "multiprocessing.semaphore_tracker",
+            "loky.backend.resource_tracker",
+        )
+        tracker_pids = {
+            pid
+            for pid in tree_pids
+            if pid != root_pid and any(module in _safe_proc_info(pid)[1] for module in tracker_modules)
+        }
         kill_order = [root_pid, *[pid for pid in tree_pids if pid != root_pid]]
         for pid in kill_order:
+            if pid in tracker_pids:
+                print(f"[reliability][process-kill] preserve resource tracker pid={pid} for cleanup", flush=True)
+                continue
             if not psutil.pid_exists(pid):
                 continue
             name, cmdline = _safe_proc_info(pid)
@@ -1007,6 +1586,17 @@ def make_server_tree_kill_fault_injector(
     return _inject
 
 
+def _server_is_single_process_uniproc(server: Any) -> bool:
+    """True when the server tree holds only the root process (UniProc inline worker).
+
+    The UniProc executor runs the diffusion worker inside the API-server process,
+    so there is no dedicated worker process to kill; killing the root would take
+    the whole server down. Multi-process deployments (``mp``/``ray``) spawn worker
+    subprocesses as descendants of the root.
+    """
+    return len(_list_server_process_tree(server)) <= 1
+
+
 def make_process_kill_fault_injector(
     *,
     grep_patterns: str | Sequence[str],
@@ -1015,6 +1605,11 @@ def make_process_kill_fault_injector(
     post_kill_wait_seconds: float = 0.0,
 ) -> FaultInjector:
     """Build a post-ready injector that kills processes matched by ordered ``grep_patterns``.
+
+    The worker-kill scenario needs a dedicated worker process: when the server
+    tree holds only the root (UniProc / single process), the injector skips
+    unconditionally — there is no worker to kill, and matching the serving
+    process would tear the whole server down.
 
     Matching is tried in two phases per pattern (first hit wins):
 
@@ -1037,6 +1632,11 @@ def make_process_kill_fault_injector(
 
     def _inject(server: Any) -> None:
         _log_server_process_tree(server)
+        if _server_is_single_process_uniproc(server):
+            pytest.skip(
+                "worker-kill scenario invalid: UniProc single-process deployment has no "
+                "dedicated worker process to kill"
+            )
         server_tree = set(_list_server_process_tree(server))
         if not server_tree:
             logger.warning(
@@ -1055,17 +1655,22 @@ def make_process_kill_fault_injector(
                     flush=True,
                 )
                 os.kill(pid, sig)
+                waited_from = time.monotonic()
+                dead = _wait_until_pid_dead(pid, post_kill_wait_seconds)
+                remaining = post_kill_wait_seconds - (time.monotonic() - waited_from)
+                if dead and remaining > 0:
+                    time.sleep(remaining)
+                print(
+                    f"[reliability][process-kill] killed pid={pid} stage={name} signal={signal_name} dead={int(dead)}",
+                    flush=True,
+                )
+                if signal_name == "SIGKILL" and not dead:
+                    raise RuntimeError(f"pid {pid} ({name}) still alive after SIGKILL")
             print(
                 f"[reliability][process-kill] matched pattern={pattern!r} source={source} "
                 f"killed_pids={filtered} killed_count={len(filtered)}",
                 flush=True,
             )
-            if post_kill_wait_seconds > 0:
-                print(
-                    f"[reliability][process-kill] waiting {post_kill_wait_seconds:.2f}s after kill",
-                    flush=True,
-                )
-                time.sleep(post_kill_wait_seconds)
 
         for pattern in patterns:
             print(
@@ -1110,3 +1715,194 @@ def make_process_kill_fault_injector(
         pytest.skip("no matching runtime process found for kill injection")
 
     return _inject
+
+
+# (signal name, skip reason). ``None`` means the signal runs.
+SignalSpec = tuple[str, str | None]
+
+# Crash injection is abrupt; graceful shutdown has its own scenario.
+CRASH_SIGNALS: tuple[SignalSpec, ...] = (("SIGKILL", None),)
+
+INFLIGHT_INJECTION_REQUEST_RATE = 0.3
+INFLIGHT_INJECTION_REQUEST_COUNT = 10
+
+
+class FaultModel:
+    """One model's deploy, hardware, and request probes for a fault scenario."""
+
+    model_id: str
+    res: dict[str, str]
+    num_cards: int
+    extra_marks: tuple[Any, ...] = ()
+    scenarios: list[dict[str, Any]]
+    deploy_dir: Any = None
+    lifecycle_scenario: str | None = None
+    eager_oom_stage_ids: tuple[int, ...] | None = None
+    worker_pattern: str
+    isolation_pattern: str
+    hard_oom_config: dict[str, Any]
+    process_kill_error_keywords: tuple[str, ...]
+    with_load_timeout_sec: float = 120.0
+    concurrent_workers: int = 3
+    concurrent_timeout_sec: float = 40.0
+    health_miss_skip: str | None = None
+    worker_signals: tuple[SignalSpec, ...] = CRASH_SIGNALS
+    serve_root_signals: tuple[SignalSpec, ...] = CRASH_SIGNALS
+    serve_root_with_load_signals: tuple[SignalSpec, ...] = CRASH_SIGNALS
+    tree_signals: tuple[SignalSpec, ...] = CRASH_SIGNALS
+    tree_with_load_signals: tuple[SignalSpec, ...] = CRASH_SIGNALS
+    replica_scenarios: list[dict[str, Any]] | None = None
+    bad_replica_pattern: str = ""
+    bad_replica_devices: str = ""
+
+    def scenarios_for_server_set(self, server_set: str) -> list[dict[str, Any]]:
+        """Return deploy scenarios for one fault server set.
+
+        The ``oom`` set forces ``enforce_eager`` on ``eager_oom_stage_ids``
+        under HIP. Models that do not declare those stages keep their deploy.
+        ``launch`` uses the lifecycle scenario when one is set, so startup
+        faults do not repeat every server mode.
+        """
+        scenarios = list(self.scenarios)
+        if server_set in ("lifecycle", "launch"):
+            if self.lifecycle_scenario is not None:
+                scenarios = [item for item in scenarios if item["test_name"] == self.lifecycle_scenario]
+        elif server_set == "replica":
+            if not self.replica_scenarios:
+                raise ValueError(f"{self.model_id} has no replica deploy")
+            scenarios = list(self.replica_scenarios)
+        elif server_set == "oom" and self.eager_oom_stage_ids:
+            import torch
+
+            scenarios = reliability_scenarios_for_eager_oom(
+                scenarios,
+                is_hip=bool(getattr(torch.version, "hip", None)),
+                stage_ids=self.eager_oom_stage_ids,
+            )
+        elif server_set not in ("default", "oom"):
+            raise ValueError(f"unknown server set {server_set!r} for {self.model_id}")
+        return scenarios
+
+    def servers(self, server_set: str) -> list[tuple[str, OmniServerParams]]:
+        scenarios = self.scenarios_for_server_set(server_set)
+        from tests.dfx.conftest import create_reliability_omni_server_params
+
+        params = create_reliability_omni_server_params(scenarios, self.deploy_dir)
+        return [(str(item["test_name"]), param) for item, param in zip(scenarios, params, strict=True)]
+
+    def warmup(self, client: Any, server: Any) -> None:
+        raise NotImplementedError(self.model_id)
+
+    def submit_worker_load(self, client: Any, server: Any) -> None:
+        self.warmup(client, server)
+
+    def submit_serve_load(self, client: Any, server: Any) -> None:
+        self.warmup(client, server)
+
+    def submit_concurrent(self, client: Any, server: Any) -> Any:
+        self.warmup(client, server)
+        return None
+
+    def assert_fast_fail(self, client: Any, server: Any) -> None:
+        raise NotImplementedError(self.model_id)
+
+    def isolation_warmup(self, client: Any, server: Any) -> None:
+        self.warmup(client, server)
+
+    def isolation_after(self, client: Any, server: Any) -> None:
+        self.assert_fast_fail(client, server)
+
+    def oom_under_load_request(self, server: Any) -> dict[str, Any]:
+        raise NotImplementedError(self.model_id)
+
+    def oom_preflight_request(self, server: Any) -> dict[str, Any]:
+        return self.oom_under_load_request(server)
+
+
+def _skip_marks(reason: str | None) -> list[Any]:
+    if not reason:
+        return []
+    return [pytest.mark.skip(reason=reason)]
+
+
+class FaultScenario:
+    """Shared fault steps. A model test calls ``run`` with its ``FaultModel``."""
+
+    server_set: str = "default"
+    signals_attr: str | None = None
+
+    def run(self, model: FaultModel, server: Any, client: Any, signal_name: str | None = None) -> None:
+        raise NotImplementedError(type(self).__name__)
+
+
+def server_params(
+    model: FaultModel,
+    *,
+    server_set: str = "default",
+    skip_reason: str | None = None,
+) -> list[Any]:
+    """One indirect server param per scenario of ``model``."""
+    return [
+        pytest.param(server, marks=_skip_marks(skip_reason), id=scenario_name)
+        for scenario_name, server in model.servers(server_set)
+    ]
+
+
+def server_and_signal_params(
+    model: FaultModel,
+    signals_attr: str,
+    *,
+    server_set: str = "default",
+    skip_reason: str | None = None,
+) -> list[Any]:
+    """Server param plus a direct signal name. A fault skip covers every signal."""
+    items: list[Any] = []
+    for scenario_name, server in model.servers(server_set):
+        for signal_name, signal_skip in getattr(model, signals_attr):
+            items.append(
+                pytest.param(
+                    server,
+                    signal_name,
+                    marks=_skip_marks(skip_reason or signal_skip),
+                    id=f"{scenario_name}__{signal_name.lower()}",
+                )
+            )
+    return items
+
+
+def launch_scenario_params(
+    model: FaultModel,
+    scenario: type[FaultScenario],
+    *,
+    skip_reason: str | None = None,
+) -> Any:
+    """Parametrize a server spec the test starts itself. The fixture must not start it first."""
+    return pytest.mark.parametrize(
+        "launch_params",
+        server_params(model, server_set=scenario.server_set, skip_reason=skip_reason),
+    )
+
+
+def scenario_params(
+    model: FaultModel,
+    scenario: type[FaultScenario],
+    *,
+    skip_reason: str | None = None,
+) -> Any:
+    """Parametrize ``omni_server_function`` from the scenario's server set and signals."""
+    if scenario.signals_attr is None:
+        return pytest.mark.parametrize(
+            "omni_server_function",
+            server_params(model, server_set=scenario.server_set, skip_reason=skip_reason),
+            indirect=True,
+        )
+    return pytest.mark.parametrize(
+        ("omni_server_function", "signal_name"),
+        server_and_signal_params(
+            model,
+            scenario.signals_attr,
+            server_set=scenario.server_set,
+            skip_reason=skip_reason,
+        ),
+        indirect=["omni_server_function"],
+    )

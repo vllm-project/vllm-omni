@@ -33,6 +33,11 @@ cloned. A late capture waits for earlier replay work and output clones before
 reusing the pool. Set `encoder_cuda_graph_share_pools` to `false` for an A/B
 comparison with a separate pool and capture stream per graph.
 
+By default, capture uses vLLM's garbage-collection guard so finalizers cannot
+release older CUDA graphs or kernels while a new graph is being recorded. The
+guard restores the previous GC enabled state on exit, including when capture
+raises.
+
 The graph count is **not a byte limit**. Sharing pools reuses intermediate
 storage but does not eliminate per-shape static input and output buffers.
 Before a new capture, the adapter checks device-free memory against

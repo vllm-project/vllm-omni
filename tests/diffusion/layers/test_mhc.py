@@ -115,7 +115,6 @@ def test_meta_shapes_and_empty():
 
 @pytest.mark.cpu
 def test_sinkhorn_alias_and_rectangular_native_contract():
-    assert model_layers.sinkhorn_knopp is mhc.sinkhorn_knopp
     logits = torch.randn(2, 3, 4)
     expected = torch.exp(logits - logits.amax((-2, -1), keepdim=True))
     torch.testing.assert_close(mhc.sinkhorn_knopp(logits, 0, 1e-12), expected, rtol=0, atol=0)
@@ -134,7 +133,9 @@ def test_model_wiring_uses_fused_eager_path(monkeypatch):
             calls.append("native")
             return reference(args, **kwargs)
 
-    monkeypatch.setattr(model_layers, "_mhc_post_residual", Prepare())
+    from vllm_omni.diffusion.models.magi2.layers.native import mhc as model_mhc
+
+    monkeypatch.setattr(model_mhc, "_mhc_post_residual", Prepare())
     handler = model_layers.MHCHandler(4, 16)
     post, residual, ap, bp, ar, br = coefficients()
     handler.compute_post_residual((ap, bp, post), (ar, br, residual), out_dtype=torch.float32)

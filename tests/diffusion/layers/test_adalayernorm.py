@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for shared AdaLayerNorm layers used by FLUX and other models."""
 
-import os
-
 import pytest
 import torch
 
@@ -20,8 +18,9 @@ def _init_distributed():
         initialize_model_parallel,
     )
 
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29501")
+    from tests.helpers.runtime import assign_ephemeral_master_port
+
+    assign_ephemeral_master_port()
     init_distributed_environment(
         world_size=1,
         rank=0,

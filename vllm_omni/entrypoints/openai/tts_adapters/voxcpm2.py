@@ -70,10 +70,11 @@ class VoxCPM2Adapter(ARTTSAdapter):
         ref_sr = None
         voice_profile = None
         if request.ref_audio is not None:
-            ref_audio, ref_sr, _ = await server._resolve_ref_audio(request.ref_audio)
+            wav_np, ref_sr, _ = await server._resolve_ref_audio_array(request.ref_audio)
+            ref_audio = np.ascontiguousarray(wav_np, dtype=np.float32).tobytes()
         elif uploaded_ref is not None:
             wav_np, ref_sr = uploaded_ref
-            ref_audio = wav_np.tolist()
+            ref_audio = np.ascontiguousarray(wav_np, dtype=np.float32).tobytes()
         elif request.voice is not None:
             voice_profile = self.capabilities.precomputed_speakers.get(request.voice.lower())
         return build_voxcpm2_prompt(
@@ -92,6 +93,11 @@ class VoxCPM2Adapter(ARTTSAdapter):
         server = self.ctx.server
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
+
+        if request.ref_audio is not None:
+            fmt_err = server._validate_ref_audio_format(request.ref_audio)
+            if fmt_err:
+                return fmt_err
 
         if request.voice is not None:
             request.voice = request.voice.lower()
@@ -124,9 +130,13 @@ class VoxCPM2Adapter(ARTTSAdapter):
         if request.voice:
             voice_lower = request.voice.lower()
             if voice_lower in server.uploaded_speakers or voice_lower in self.capabilities.precomputed_speakers:
+                created_at = server._voice_created_at(voice_lower)
                 additional = prompt.setdefault("additional_information", {})
                 additional["voice_name"] = voice_lower
-                additional["voice_created_at"] = server._voice_created_at(voice_lower)
+                additional["voice_created_at"] = created_at
+                # conditioning_cache_salt() reads voice_created_at from
+                # tts_params, so a re-upload mints a fresh derived salt.
+                tts_params["voice_created_at"] = created_at
         return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type="voxcpm2")
 
     async def warmup(self) -> None:

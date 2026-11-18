@@ -16,14 +16,17 @@ from starlette.datastructures import State
 from starlette.websockets import WebSocketDisconnect
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 
+import vllm_omni.entrypoints.duplex.openai as duplex_openai
 from vllm_omni.config import stage_config
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig, StagePipelineConfig
 from vllm_omni.engine.duplex.config import DuplexCapabilities
+from vllm_omni.entrypoints.duplex.openai import OpenAIRealtimeHandler
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
 from vllm_omni.entrypoints.duplex.warmup import wait_for_duplex_warmup
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni
 from vllm_omni.entrypoints.openai import api_server
+from vllm_omni.entrypoints.openai.realtime import connection as realtime_connection
 from vllm_omni.utils.tracking_parser import TrackingNamespace
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -61,6 +64,7 @@ _DUPLEX_APP_STATE_KEYS = {
     "openai_serving_realtime_robot",
     "anthropic_serving_messages",
     "openai_serving_duplex",
+    "run_serving",
     "enable_server_load_tracking",
     "server_load_metrics",
 }
@@ -140,6 +144,58 @@ class _FakeDuplexOmni(DuplexOmni):
 class _FakeModels:
     def __init__(self, *args, **kwargs) -> None:
         self.base_model_paths = kwargs.get("base_model_paths") or []
+
+
+def test_realtime_handler_reads_both_vad_model_paths() -> None:
+    config = DuplexSessionRuntimeConfig(
+        server_vad_model_path="/silero.onnx",
+        semantic_vad_model_path="/smart-turn.onnx",
+    )
+    engine = SimpleNamespace(engine=SimpleNamespace(duplex_session_config=config))
+
+    handler = OpenAIRealtimeHandler.from_engine_client(engine)
+
+    assert handler._vad_backend_provider.model_path == "/silero.onnx"
+    assert handler._semantic_vad_backend_provider.model_path == "/smart-turn.onnx"
+
+
+@pytest.mark.asyncio
+async def test_realtime_handler_passes_both_vad_providers(monkeypatch) -> None:
+    created = []
+
+    class _RecordingConnection:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            created.append(self)
+
+        async def handle_connection(self) -> None:
+            return None
+
+    async def _no_warmup(_websocket) -> None:
+        return None
+
+    monkeypatch.setattr(realtime_connection, "OpenAIFullDuplexConnection", _RecordingConnection)
+    monkeypatch.setattr(duplex_openai, "wait_for_duplex_warmup", _no_warmup)
+    config = DuplexSessionRuntimeConfig(
+        server_vad_model_path="/silero.onnx",
+        semantic_vad_model_path="/smart-turn.onnx",
+    )
+    handler = OpenAIRealtimeHandler.from_engine_client(
+        SimpleNamespace(engine=SimpleNamespace(duplex_session_config=config))
+    )
+    state = SimpleNamespace(
+        diffusion_engine=None,
+        engine_client=object(),
+        openai_serving_chat=object(),
+        openai_serving_models=_FakeModels(base_model_paths=[BaseModelPath(name="demo-model", model_path="demo-model")]),
+        args=Namespace(tool_call_parser=None, enable_auto_tool_choice=False),
+    )
+    websocket = SimpleNamespace(app=SimpleNamespace(state=state), query_params={})
+
+    await handler.handle_websocket(websocket)
+
+    assert created[0].kwargs["vad_backend_provider"] is handler._vad_backend_provider
+    assert created[0].kwargs["semantic_vad_backend_provider"] is handler._semantic_vad_backend_provider
 
 
 def _minimal_args(**overrides) -> SimpleNamespace:
@@ -312,6 +368,23 @@ def test_minicpmo_serving_profiles(monkeypatch, deploy_name, expected):
     assert api_server._should_serve_duplex("openbmb/MiniCPM-o-4_5", {}) is True
 
 
+@pytest.mark.parametrize("asr", [False, True])
+@pytest.mark.parametrize("duplex", [False, True])
+def test_joyai_serving_profiles(monkeypatch, asr, duplex):
+    from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
+        JOYAI_VL_INTERACTION_ASR_PIPELINE,
+        JOYAI_VL_INTERACTION_PIPELINE,
+    )
+
+    pipeline = JOYAI_VL_INTERACTION_ASR_PIPELINE if asr else JOYAI_VL_INTERACTION_PIPELINE
+    monkeypatch.setattr(StageConfigFactory, "get_pipeline_config", lambda **_: pipeline)
+    name = "joyai_vl_interaction" + ("_asr" if asr else "") + ("_duplex" if duplex else "") + ".yaml"
+    assert (
+        api_server._should_serve_duplex("jdopensource/JoyAI-VL-Interaction-Preview", {"deploy_config": name}) is duplex
+    )
+    assert not api_server._should_serve_duplex("jdopensource/JoyAI-VL-Interaction-Preview", {})
+
+
 # --------------------------------------------------------------------------- #
 # app.state of a duplex-only server                                           #
 # --------------------------------------------------------------------------- #
@@ -330,6 +403,7 @@ async def test_duplex_app_state_wires_only_the_session_surfaces(monkeypatch, moc
     """
     monkeypatch.setattr(api_server, "OpenAIServingModels", _FakeModels)
     renderer_ctor = mocker.patch.object(api_server, "OnlineRenderer")
+    derenderer_ctor = mocker.patch.object(api_server, "OnlineDerenderer")
     monkeypatch.setattr(api_server, "OmniOpenAIServingChat", lambda **kwargs: SimpleNamespace(**kwargs))
     engine = _FakeDuplexOmni()
     state = State()
@@ -345,7 +419,9 @@ async def test_duplex_app_state_wires_only_the_session_surfaces(monkeypatch, moc
     assert isinstance(state.openai_serving_duplex, OmniDuplexSessionHandler)
     assert state.openai_serving_chat is not None
     renderer_ctor.assert_called_once()
+    derenderer_ctor.assert_called_once()
     assert renderer_ctor.call_args.kwargs["log_error_stack"] is log_error_stack
+    assert derenderer_ctor.call_args.kwargs["log_error_stack"] is log_error_stack
     assert state.openai_serving_chat.online_renderer is state.online_renderer is renderer_ctor.return_value
     state.online_renderer.warmup.assert_called_once_with()
     assert state.engine_client is engine
@@ -385,6 +461,7 @@ def _turn_based_realtime_app(handler: object | None, mocker) -> FastAPI:
     )
     app.state.engine_client = mocker.Mock()
     app.state.openai_serving_chat = mocker.Mock()
+    app.state.openai_realtime_handler = OpenAIRealtimeHandler()
     return app
 
 
@@ -526,6 +603,7 @@ async def test_duplex_chat_initialization_respects_model_gates(
     """Neither gate may construct or warm up a chat renderer."""
     monkeypatch.setattr(api_server, "OpenAIServingModels", _FakeModels)
     renderer_ctor = mocker.patch.object(api_server, "OnlineRenderer")
+    derenderer_ctor = mocker.patch.object(api_server, "OnlineDerenderer")
     chat_ctor = mocker.patch.object(api_server, "OmniOpenAIServingChat")
     engine = _FakeDuplexOmni()
     engine._capabilities = DuplexCapabilities(supports_chat_completions=supports_chat)
@@ -537,6 +615,7 @@ async def test_duplex_chat_initialization_respects_model_gates(
     assert state.openai_serving_chat is None
     assert state.openai_serving_chat_batch is None
     renderer_ctor.assert_not_called()
+    derenderer_ctor.assert_not_called()
     chat_ctor.assert_not_called()
     assert isinstance(state.openai_serving_duplex, OmniDuplexSessionHandler)
 

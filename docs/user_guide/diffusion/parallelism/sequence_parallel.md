@@ -230,7 +230,8 @@ In `DiffusionParallelConfig`:
 | `ulysses_degree` | int | 1 | Number of GPUs for Ulysses-SP. Uses all-to-all communication. |
 | `ring_degree` | int | 1 | Number of GPUs for Ring-Attention. Uses P2P ring communication. |
 | `allgather_degree` | int | 1 | Number of GPUs for AllGather-KV sequence parallelism. Gathers K/V in an orthogonal group so every rank runs local-Q/global-KV attention. May be combined with `ulysses_degree`, but not with `ring_degree > 1`. |
-| `ulysses_mode` | str | `"default"` | Ulysses attention mode. Set to `"advanced_uaa"` to handle arbitrary sequence lengths and head counts without padding. |
+| `ulysses_mode` | str | `"strict"` | Ulysses attention mode. Set to `"advanced_uaa"` to handle arbitrary sequence lengths and head counts without padding. |
+| `ulysses_a2a_permute` | bool | `False` | Enable CUDA copy engines (CE) for strict Ulysses; disabled uses NCCL. On NPU, use platform SHMEM. |
 | `mask_sp_padding` | bool | `False` | When the sequence length is not divisible by the SP size, tokens are auto-padded with zeros. Set to `True` to mask those padding tokens (strict, but uses the slower varlen attention path); the default `False` leaves them unmasked, keeping the fast path with negligible numerical impact. |
 
 **Notes:**
@@ -238,6 +239,17 @@ In `DiffusionParallelConfig`:
 - Total sequence parallel size equals `ulysses_degree × ring_degree × allgather_degree`
 - Degrees must evenly divide the sequence length for optimal performance (or use `ulysses_mode="advanced_uaa"` for Ulysses-SP)
 - `mask_sp_padding` is an experimental feature, currently only supported by `Wan2.2`, `Wan2.2 Vace`, `Qwen-Image`, `Flux 2`, and `HunyuanVideo 1.5`
+
+On CUDA, set `ulysses_a2a_permute=True` (CLI: `--ulysses-a2a-permute`) to use CE.
+This requires `ulysses_mode="strict"`, `ulysses_degree > 1`, and peer-accessible
+GPUs on one NVLink-connected node.
+
+```bash
+vllm serve Qwen/Qwen-Image --omni --ulysses-degree 2 --ulysses-a2a-permute
+```
+
+On NPU, the flag retains the existing
+[NPU symmetric-memory requirements](../../../design/feature/sequence_parallel.md#npu-symmetric-memory-ulysses).
 
 ## Best Practices
 

@@ -10,7 +10,7 @@ import torch
 
 from tests.helpers.mark import hardware_test
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 # Small mock dimensions (head_dim = HIDDEN_SIZE / NUM_HEADS = 16 must equal
 # sum(AXES_DIM_ROPE)).
@@ -135,12 +135,14 @@ def _tiny_od_config(**overrides):
     )
 
 
+@pytest.mark.cpu
 def test_boogu_image_transformer_import():
     from vllm_omni.diffusion.models.boogu_image import BooguImageTransformer2DModel
 
     assert BooguImageTransformer2DModel is not None
 
 
+@pytest.mark.cpu
 def test_real_rotary_emb_matches_complex_reference():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import apply_rotary_emb
 
@@ -160,6 +162,7 @@ def test_real_rotary_emb_matches_complex_reference():
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.cpu
 def test_real_rotary_frequency_tables_are_real_and_repeated():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageDoubleStreamRotaryPosEmbed,
@@ -177,6 +180,7 @@ def test_real_rotary_frequency_tables_are_real_and_repeated():
         torch.testing.assert_close(freqs_sin[..., ::2], freqs_sin[..., 1::2])
 
 
+@pytest.mark.cpu
 def test_real_rotary_frequency_tables_use_float32_on_npu(monkeypatch):
     from vllm_omni.diffusion.models.boogu_image import boogu_image_transformer
 
@@ -190,6 +194,7 @@ def test_real_rotary_frequency_tables_use_float32_on_npu(monkeypatch):
     assert all(freqs.dtype == torch.float32 for pair in freqs_real for freqs in pair)
 
 
+@pytest.mark.cpu
 def test_real_rotary_frequency_tables_use_float32_on_mps(monkeypatch):
     from vllm_omni.diffusion.models.boogu_image import boogu_image_transformer
 
@@ -207,6 +212,7 @@ def test_real_rotary_frequency_tables_use_float32_on_mps(monkeypatch):
     assert all(freqs.dtype == torch.float32 for pair in freqs_real for freqs in pair)
 
 
+@pytest.mark.cpu
 def test_single_stream_block_shape():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageTransformerBlock,
@@ -237,6 +243,7 @@ def test_single_stream_block_shape():
         block(hidden_states, attention_mask, rotary_emb, None)
 
 
+@pytest.mark.cpu
 def test_single_stream_block_no_modulation():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageTransformerBlock,
@@ -260,6 +267,7 @@ def test_single_stream_block_no_modulation():
     assert torch.isfinite(out).all()
 
 
+@pytest.mark.cpu
 def test_double_stream_block_shape():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageDoubleStreamTransformerBlock,
@@ -306,6 +314,7 @@ def test_double_stream_block_shape():
     assert torch.isfinite(instruct_out).all()
 
 
+@pytest.mark.cpu
 def test_transformer_instantiates():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageTransformer2DModel,
@@ -371,6 +380,7 @@ def recording_quant_config():
     return RecordingQuantConfig()
 
 
+@pytest.mark.cpu
 def test_transformer_propagates_quant_config_and_prefix(recording_quant_config):
     from vllm.model_executor.layers.linear import LinearBase
 
@@ -402,6 +412,7 @@ def test_transformer_propagates_quant_config_and_prefix(recording_quant_config):
     }
 
 
+@pytest.mark.cpu
 def test_transformer_preprocesses_multiple_instruction_feature_layers():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageTransformer2DModel,
@@ -424,6 +435,7 @@ def test_transformer_preprocesses_multiple_instruction_feature_layers():
     assert torch.equal(processed, torch.cat(hidden_states, dim=-1))
 
 
+@pytest.mark.cpu
 def test_transformer_validates_rope_dims():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageTransformer2DModel,
@@ -433,6 +445,7 @@ def test_transformer_validates_rope_dims():
         BooguImageTransformer2DModel(od_config=_tiny_od_config(axes_dim_rope=[8, 8, 8]))
 
 
+@pytest.mark.cpu
 def test_transformer_rejects_prompt_tuning():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageTransformer2DModel,
@@ -496,6 +509,7 @@ def _native_to_checkpoint_weights(name: str, param: torch.Tensor) -> list[tuple[
     return [(name, param)]
 
 
+@pytest.mark.cpu
 def test_transformer_exposes_stacked_params_mapping():
     """The packed -> sub-layer mapping must be discoverable from the module tree.
 
@@ -524,6 +538,7 @@ def test_transformer_exposes_stacked_params_mapping():
     assert mapped_leaves == {"to_qkv", "img_to_qkv", "instruct_to_qkv", "gate_up_proj"}
 
 
+@pytest.mark.cpu
 def test_transformer_load_weights_round_trip():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageTransformer2DModel,
@@ -557,6 +572,7 @@ def test_transformer_load_weights_round_trip():
         assert torch.allclose(reloaded[native_name], expected[native_name])
 
 
+@pytest.mark.cpu
 def test_transformer_load_weights_rejects_partial_fused_params():
     """A fused parameter must not count as loaded until all its shards arrive.
 
@@ -587,6 +603,7 @@ def test_transformer_load_weights_rejects_partial_fused_params():
     assert partial_name not in loaded
 
 
+@pytest.mark.cpu
 def test_transformer_load_weights_warns_for_unexpected_and_unloaded():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageTransformer2DModel,
@@ -629,6 +646,7 @@ def test_transformer_load_weights_warns_for_unexpected_and_unloaded():
     assert next(name for name in native_params if name != loaded_name) in text
 
 
+@pytest.mark.cpu
 def test_transformer_forward_t2i_shape():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageDoubleStreamRotaryPosEmbed,
@@ -658,6 +676,7 @@ def test_transformer_forward_t2i_shape():
     assert torch.isfinite(out).all()
 
 
+@pytest.mark.cpu
 def test_transformer_forward_ti2i_shape():
     """Editing path: a non-empty ``ref_image_hidden_states`` exercises the
     reference-image patch embedder + refiner and must not change the output
@@ -701,6 +720,7 @@ def test_transformer_forward_ti2i_shape():
     assert torch.isfinite(out).all()
 
 
+@pytest.mark.cpu
 def test_transformer_forward_batch_invariant_to_partner_padding():
     """Row A must not change when only row B's padded length changes.
 
@@ -859,7 +879,7 @@ def _operand_ulp_bound(x, weight, cos, sin):
     return 2.0**-6 * torch.stack((even_mag, odd_mag), dim=-1).flatten(-2) + 1e-6
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_packed_rope_table_layout(monkeypatch):
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
@@ -885,7 +905,7 @@ def test_packed_rope_table_layout(monkeypatch):
     assert len(short) == 2
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_fused_qk_norm_rope_matches_eager_chain():
     """The fused path vs the previous eager chain at real Boogu shapes.
@@ -918,7 +938,7 @@ def test_fused_qk_norm_rope_matches_eager_chain():
         assert (diff <= bound).all(), "fused path beyond one operand ulp of the eager chain"
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_fallback_with_no_packed_table():
     """Without a packed table the helper is bit-exact to the old chain."""
@@ -940,6 +960,7 @@ def test_fallback_with_no_packed_table():
     assert torch.equal(out_k, ref_k)
 
 
+@pytest.mark.cpu
 def test_packed_rope_table_env_override(monkeypatch):
     """VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS steers the packing gate: 0 packs
     even a 43-token table, a huge value leaves a 4139-token table untouched,

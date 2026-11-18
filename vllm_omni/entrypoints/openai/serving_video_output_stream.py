@@ -30,15 +30,18 @@ Protocol:
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 import math
 import time
 import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import aclosing
 from http import HTTPStatus
+from pathlib import Path
 from typing import Any, cast
 
+import anyio
 import numpy as np
 import torch
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect
@@ -47,15 +50,19 @@ from pydantic import ValidationError
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.async_omni_base import ABORT_TIMEOUT_S
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest, VideoParams
 from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
     get_default_sampling_params_list,
+    resolve_diffusion_sampling_params,
 )
-from vllm_omni.entrypoints.openai.utils import is_video_generation_pipeline, parse_lora_request
+from vllm_omni.entrypoints.openai.utils import is_video_generation_pipeline, parse_lora_requests
 from vllm_omni.entrypoints.openai.video_api_utils import (
+    FragmentedMP4VideoEncoder,
     StreamingVideoFormat,
+    _resolve_audio_sample_rate,
     create_streaming_video_encoder,
     decode_input_reference,
 )
@@ -109,6 +116,54 @@ class OmniStreamingVideoOutputHandler:
         self._stage_configs = stage_configs
         self._stall_timeout = stall_timeout
         self._start_timeout = start_timeout
+
+    async def warmup(self, request_path: str, *, timeout: float = 180.0) -> None:
+        """Drain a configured generation and its encoder before HTTP admission.
+
+        The file uses the session.start schema, with an explicit finite frame
+        count and no playback pacing: this internal consumer has no player.
+        Model-specific inputs and dimensions belong in the request, not here.
+        """
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("video output warmup timeout must be finite and positive")
+        raw = await asyncio.to_thread(Path(request_path).read_text, encoding="utf-8")
+        message = json.loads(raw)
+        if not isinstance(message, dict) or message.get("type", "session.start") != "session.start":
+            raise ValueError("video output warmup must be a session.start JSON object")
+        output_format = self._coerce_output_format(message.get("format", "m4s"))
+        request = VideoGenerationRequest(**self._coerce_request_data(message))
+        if request.resolve_video_params().num_frames is None:
+            raise ValueError("video output warmup requires an explicit num_frames")
+        if request.streaming_buffer_seconds is not None:
+            raise ValueError("video output warmup does not support playback pacing")
+        if request.model is not None and self._model_name is not None and request.model != self._model_name:
+            raise ValueError("video output warmup model does not match the served model")
+
+        request_id = f"video_warmup-{uuid.uuid4().hex}"
+        started = time.monotonic()
+        complete = False
+
+        async def drain() -> None:
+            frames = 0
+            byte_count = 0
+            async with aclosing(
+                self._stream_video_bytes(request, request_id, output_format, _SessionProgress())
+            ) as stream:
+                async for chunk, metadata in stream:
+                    frames += metadata["num_frames"]
+                    byte_count += len(chunk)
+            if frames == 0 or byte_count == 0:
+                raise RuntimeError("video output warmup completed without encoded video")
+
+        logger.info("Running streaming video startup warmup from %s", request_path)
+        try:
+            await asyncio.wait_for(drain(), timeout=timeout)
+            complete = True
+        finally:
+            if not complete:
+                with anyio.CancelScope(shield=True):
+                    await self._abort_request(request_id)
+        logger.info("Streaming video startup warmup completed in %.2f seconds", time.monotonic() - started)
 
     async def handle_session(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -177,6 +232,7 @@ class OmniStreamingVideoOutputHandler:
                     send_lock=send_lock,
                     progress=progress,
                     interaction_event_ids=interaction_event_ids,
+                    track_playback=request.streaming_buffer_seconds is not None,
                 )
             )
             control_task = asyncio.create_task(
@@ -188,6 +244,7 @@ class OmniStreamingVideoOutputHandler:
                     progress,
                     interaction_event_ids,
                     interaction_queue,
+                    request.streaming_buffer_seconds is not None,
                     stop_received_at=stop_received_at,
                     response_queue=response_queue,
                 )
@@ -273,18 +330,28 @@ class OmniStreamingVideoOutputHandler:
             logger.exception("Streaming video output session error: %s", e)
             await self._send_error(websocket, str(e))
         finally:
-            stop_event.set()
-            if control_task is not None:
-                control_task.cancel()
-                await asyncio.gather(control_task, return_exceptions=True)
-            if interaction_delivery_task is not None and request_id is not None:
-                interaction_delivery_task.cancel()
-                await asyncio.gather(interaction_delivery_task, return_exceptions=True)
-            if response_task is not None:
-                response_task.cancel()
-                await asyncio.gather(response_task, return_exceptions=True)
-            if request_id is not None and not generation_done:
-                await self._abort_request(request_id)
+            # ASGI disconnect cancellation can arrive after session.done, while
+            # we await a child. Finish reaping every task and aborting unfinished
+            # generation before leaving the session's cancellation scope.
+            with anyio.CancelScope(shield=True):
+                stop_event.set()
+                if control_task is not None:
+                    control_task.cancel()
+                    await asyncio.gather(control_task, return_exceptions=True)
+                if interaction_delivery_task is not None and request_id is not None:
+                    interaction_delivery_task.cancel()
+                    await asyncio.gather(interaction_delivery_task, return_exceptions=True)
+                    await self._release_queued_interactions(
+                        interaction_queue,
+                        request_id=request_id,
+                        track_playback=request is not None and request.streaming_buffer_seconds is not None,
+                        interaction_event_ids=interaction_event_ids,
+                    )
+                if response_task is not None:
+                    response_task.cancel()
+                    await asyncio.gather(response_task, return_exceptions=True)
+                if request_id is not None and not generation_done:
+                    await self._abort_request(request_id)
 
     async def _receive_start(self, websocket: WebSocket) -> tuple[VideoGenerationRequest, StreamingVideoFormat] | None:
         try:
@@ -362,7 +429,7 @@ class OmniStreamingVideoOutputHandler:
         send_lock: asyncio.Lock,
         stop_event: asyncio.Event,
         request_id: str,
-        timeout: float,
+        timeout: float | None,
     ) -> None:
         try:
             while True:
@@ -392,6 +459,7 @@ class OmniStreamingVideoOutputHandler:
         progress: _SessionProgress,
         interaction_event_ids: set[str],
         interaction_queue: asyncio.Queue[OmniInteractionPrompt],
+        track_playback: bool = False,
         *,
         stop_received_at: list[float],
         response_queue: asyncio.Queue[dict[str, Any]],
@@ -497,6 +565,7 @@ class OmniStreamingVideoOutputHandler:
                         interaction_queue=interaction_queue,
                         stop_event=stop_event,
                         progress=progress,
+                        track_playback=track_playback,
                     )
                     continue
                 await self._send_error(
@@ -522,23 +591,51 @@ class OmniStreamingVideoOutputHandler:
         send_lock: asyncio.Lock,
         progress: _SessionProgress,
         interaction_event_ids: set[str],
+        track_playback: bool,
     ) -> None:
         """Deliver accepted interactions in ingress order without blocking the reader."""
+
+        async def on_rejected(event_id: str, reason: str) -> None:
+            # A rejection that arrives after the queued ack is reported as a
+            # correlated error; the generation keeps streaming.
+            logger.info("Interaction %s rejected for request %s: %s", event_id, request_id, reason)
+            interaction_event_ids.discard(event_id)
+            await self._send_error(
+                websocket,
+                "Failed to apply interaction",
+                code="interaction_failed",
+                request_id=request_id,
+                event_id=event_id,
+                send_lock=send_lock,
+                response_queue=response_queue,
+            )
+
         try:
             while True:
                 interaction = await interaction_queue.get()
                 try:
                     try:
-                        await self._engine_client.submit_interaction_async(
-                            request_id,
-                            interaction=interaction,
-                        )
+                        if track_playback:
+                            await self._engine_client.submit_interaction_async(
+                                request_id,
+                                interaction=interaction,
+                                track_playback=True,
+                                on_error=on_rejected,
+                            )
+                        else:
+                            await self._engine_client.submit_interaction_async(
+                                request_id,
+                                interaction=interaction,
+                                on_error=on_rejected,
+                            )
                         progress.touch()
                     except asyncio.CancelledError:
+                        await self._release_interaction_reservation(request_id, interaction["event_id"], track_playback)
                         raise
                     except Exception:
                         logger.exception("Failed to apply interaction for request %s", request_id, exc_info=True)
                         interaction_event_ids.discard(interaction["event_id"])
+                        await self._release_interaction_reservation(request_id, interaction["event_id"], track_playback)
                         await self._send_error(
                             websocket,
                             "Failed to apply interaction",
@@ -555,9 +652,39 @@ class OmniStreamingVideoOutputHandler:
             stop_event.set()
             await self._abort_request(request_id)
 
+    async def _release_interaction_reservation(self, request_id: str, event_id: str, track_playback: bool) -> None:
+        if not track_playback:
+            return
+        try:
+            await self._engine_client.release_streaming_interaction(request_id, event_id)
+        except Exception:
+            logger.debug("Failed to release interaction reservation", exc_info=True)
+
+    async def _release_queued_interactions(
+        self,
+        interaction_queue: asyncio.Queue[OmniInteractionPrompt],
+        *,
+        request_id: str,
+        track_playback: bool,
+        interaction_event_ids: set[str],
+    ) -> None:
+        while True:
+            try:
+                interaction = interaction_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            interaction_event_ids.discard(interaction["event_id"])
+            await self._release_interaction_reservation(request_id, interaction["event_id"], track_playback)
+            interaction_queue.task_done()
+
     async def _abort_request(self, request_id: str) -> None:
         try:
-            await self._engine_client.abort(request_id)
+            # Bound both the coroutine and the executor thread waiting for the
+            # orchestrator acknowledgement, including inside shielded cleanup.
+            await asyncio.wait_for(
+                self._engine_client.abort(request_id, timeout=ABORT_TIMEOUT_S),
+                timeout=ABORT_TIMEOUT_S,
+            )
         except Exception:
             logger.debug("Failed to abort streaming video request %s", request_id, exc_info=True)
 
@@ -572,6 +699,7 @@ class OmniStreamingVideoOutputHandler:
         interaction_queue: asyncio.Queue[OmniInteractionPrompt],
         stop_event: asyncio.Event,
         progress: _SessionProgress,
+        track_playback: bool = False,
         response_queue: asyncio.Queue[dict[str, Any]],
     ) -> None:
         interaction = msg.get("interaction")
@@ -718,19 +846,26 @@ class OmniStreamingVideoOutputHandler:
             return
         interaction_event_ids.add(event_id)
 
+        received_at: float | None = None
+        reservation_attempted = False
         try:
             if interaction_queue.full():
                 raise asyncio.QueueFull
+            if track_playback:
+                reservation_attempted = True
+                received_at = await self._engine_client.reserve_streaming_interaction(request_id, event_id)
             response_queue.put_nowait(
                 {
                     "type": "session.interaction.queued",
                     "request_id": request_id,
                     "event_id": event_id,
+                    **({"received_at": received_at} if received_at is not None else {}),
                 }
             )
             interaction_queue.put_nowait(normalized)
         except asyncio.QueueFull:
             interaction_event_ids.discard(event_id)
+            await self._release_interaction_reservation(request_id, event_id, reservation_attempted)
             stop_event.set()
             await self._abort_request(request_id)
             await self._send_error(
@@ -745,10 +880,12 @@ class OmniStreamingVideoOutputHandler:
             return
         except asyncio.CancelledError:
             interaction_event_ids.discard(event_id)
+            await self._release_interaction_reservation(request_id, event_id, reservation_attempted)
             raise
         except Exception:
-            logger.exception("Failed to queue interaction for request %s", request_id, exc_info=True)
+            logger.exception("Failed to reserve interaction for request %s", request_id, exc_info=True)
             interaction_event_ids.discard(event_id)
+            await self._release_interaction_reservation(request_id, event_id, reservation_attempted)
             await self._send_error(
                 websocket,
                 "Failed to queue interaction",
@@ -783,30 +920,38 @@ class OmniStreamingVideoOutputHandler:
         )
         pacing = request.streaming_pacing
         max_output_bytes = pacing.max_output_bytes if pacing is not None and pacing.enabled else None
-        completed = False
+        # Encoding must not block playback feedback, interactions, or stop.
+        # One worker also serializes close behind an encode that is still
+        # running when its asyncio waiter is cancelled.
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="video-stream-encoder")
+        loop = asyncio.get_running_loop()
+        close_future: Future[bytes] | None = None
+
+        def close_encoder() -> bytes:
+            try:
+                return encoder.close()
+            except Exception:
+                logger.exception("Failed to close streaming video encoder for %s", request_id)
+                raise
+
         try:
             async for result in self._iter_generation_outputs(prompt, gen_params, request_id, progress):
                 if result.error:
                     raise RuntimeError(str(result.error))
-                videos = self._extract_video_outputs(result)
-                for video in videos:
-                    chunk = encoder.encode(video)
-                    if max_output_bytes is not None and len(chunk or b"") > max_output_bytes:
+                encoded_chunks = await loop.run_in_executor(
+                    executor, lambda: list(self._encode_generation_result(result, request_id, encoder))
+                )
+                for chunk, metadata in encoded_chunks:
+                    if max_output_bytes is not None and len(chunk) > max_output_bytes:
                         raise ValueError("encoded streaming chunk exceeds streaming_pacing.max_output_bytes")
-                    if chunk:
-                        yield (
-                            chunk,
-                            self._build_chunk_metadata(
-                                request_id=request_id,
-                                kind="media",
-                                byte_length=len(chunk),
-                                num_frames=self._num_video_frames(video),
-                                stream_metadata=self._extract_stream_metadata(result),
-                            ),
-                        )
+                    yield (chunk, metadata)
 
-            completed = True
-            final_chunk = encoder.close()
+            close_future = executor.submit(close_encoder)
+            # Shield the queued close: cancelling the session must not cancel
+            # the cleanup operation before the encoder thread gets to it.
+            close_waiter = asyncio.wrap_future(close_future)
+            close_waiter.add_done_callback(lambda future: None if future.cancelled() else future.exception())
+            final_chunk = await asyncio.shield(close_waiter)
             if max_output_bytes is not None and len(final_chunk or b"") > max_output_bytes:
                 raise ValueError("encoded streaming trailer exceeds streaming_pacing.max_output_bytes")
             if final_chunk:
@@ -821,8 +966,37 @@ class OmniStreamingVideoOutputHandler:
                     ),
                 )
         finally:
-            if not completed:
-                encoder.close()
+            if close_future is None:
+                executor.submit(close_encoder)
+            # Do not join a running encode on the event-loop thread. The
+            # executor drains its queued close and then releases its worker.
+            executor.shutdown(wait=False)
+
+    def _encode_generation_result(
+        self,
+        result: OmniRequestOutput,
+        request_id: str,
+        encoder: FragmentedMP4VideoEncoder,
+    ) -> Iterator[tuple[bytes, dict[str, Any]]]:
+        """Encode one result, preserving metadata even when the muxer buffers all bytes."""
+        videos = self._extract_video_outputs(result)
+        audio, audio_sample_rate = self._extract_audio_output(result)
+        if audio is not None and len(videos) != 1:
+            raise ValueError("A streaming result with audio must contain exactly one video.")
+        stream_metadata = self._extract_stream_metadata(result)
+        for index, video in enumerate(videos):
+            chunk = encoder.encode(video, audio, audio_sample_rate=audio_sample_rate)
+            metadata = self._build_chunk_metadata(
+                request_id=request_id,
+                kind="media",
+                byte_length=len(chunk),
+                num_frames=self._num_video_frames(video),
+                stream_metadata=stream_metadata if index == 0 else {},
+            )
+            if audio is not None:
+                metadata["num_audio_samples"] = self._num_audio_samples(audio)
+                metadata["audio_sample_rate"] = encoder.audio_sample_rate
+            yield (chunk, metadata)
 
     async def _build_prompt_and_sampling_params(
         self,
@@ -833,7 +1007,7 @@ class OmniStreamingVideoOutputHandler:
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
 
-        gen_params = self._resolve_default_sampling_params()
+        gen_params = resolve_diffusion_sampling_params(get_default_sampling_params_list(self._engine_client))
         gen_params.streaming_buffer_seconds = request.streaming_buffer_seconds
         if request.streaming_pacing is not None and request.streaming_pacing.enabled:
             gen_params.streaming_max_output_bytes = request.streaming_pacing.max_output_bytes
@@ -909,29 +1083,21 @@ class OmniStreamingVideoOutputHandler:
             )
         return media_data
 
-    def _resolve_default_sampling_params(self) -> OmniDiffusionSamplingParams:
-        default_sampling_params_list = self._engine_client.default_sampling_params_list
-        for params in default_sampling_params_list:
-            if isinstance(params, OmniDiffusionSamplingParams):
-                return copy.deepcopy(params)
-        return OmniDiffusionSamplingParams()
-
     @staticmethod
     def _apply_lora(lora_body: Any, gen_params: OmniDiffusionSamplingParams) -> None:
         try:
-            lora_request, lora_scale = parse_lora_request(lora_body)
+            lora_requests, lora_scales = parse_lora_requests(lora_body)
         except ValueError as e:
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail=str(e),
             ) from e
 
-        if lora_request is None:
+        if not lora_requests:
             return
 
-        gen_params.lora_request = lora_request
-        if lora_scale is not None:
-            gen_params.lora_scale = lora_scale
+        gen_params.lora_request = lora_requests
+        gen_params.lora_scale = lora_scales
 
     async def _iter_generation_outputs(
         self,
@@ -1014,6 +1180,37 @@ class OmniStreamingVideoOutputHandler:
         return normalized
 
     @staticmethod
+    def _extract_audio_output(result: OmniRequestOutput) -> tuple[Any | None, int | None]:
+        """Return the chunk's audio payload and sample rate, if the model streams audio."""
+        multimodal_output = result.multimodal_output
+        if not isinstance(multimodal_output, dict):
+            return None, None
+        audio = multimodal_output.get("audio")
+        if audio is None:
+            return None, None
+        if isinstance(audio, list) and len(audio) == 1 and isinstance(audio[0], (np.ndarray, torch.Tensor)):
+            audio = audio[0]
+        metadata = multimodal_output.get("metadata")
+        sample_rate = None
+        if isinstance(metadata, dict):
+            audio_metadata = metadata.get("audio")
+            if isinstance(audio_metadata, dict):
+                sample_rate = audio_metadata.get("sample_rate")
+        return audio, _resolve_audio_sample_rate(audio, sample_rate) if sample_rate is not None else None
+
+    @staticmethod
+    def _num_audio_samples(audio: Any) -> int:
+        if isinstance(audio, (np.ndarray, torch.Tensor)):
+            if audio.ndim == 0:
+                return 0
+            if audio.ndim == 1:
+                return int(audio.shape[0])
+            return int(max(audio.shape[0], audio.shape[-1]))
+        if isinstance(audio, list):
+            return len(audio)
+        return 0
+
+    @staticmethod
     def _extract_stream_metadata(result: OmniRequestOutput) -> dict[str, Any]:
         multimodal_output = result.multimodal_output
         if not isinstance(multimodal_output, dict):
@@ -1041,6 +1238,12 @@ class OmniStreamingVideoOutputHandler:
         num_frames: int,
         stream_metadata: dict[str, Any],
     ) -> dict[str, Any]:
+        """Describe submitted media and emitted byte length, not a standalone fragment.
+
+        Frame/sample counts and event IDs refer to the source generation chunk.
+        Codec/muxer buffering can move its media into a later binary frame;
+        a trailer reports zero submitted frames while flushing buffered media.
+        """
         return {
             "type": "video.chunk_metadata",
             "request_id": request_id,
@@ -1052,6 +1255,16 @@ class OmniStreamingVideoOutputHandler:
             "active_event_ids": stream_metadata.get("active_event_ids", []),
             "completed_event_ids": stream_metadata.get("completed_event_ids", []),
             **{key: stream_metadata[key] for key in ("pacing", "output_chunk_index") if key in stream_metadata},
+            **{
+                key: stream_metadata[key]
+                for key in ("frame_start", "generated_raw_frames", "generated_frames", "withheld_frames")
+                if key in stream_metadata
+            },
+            **(
+                {"coalesced_event_ids": stream_metadata["coalesced_event_ids"]}
+                if stream_metadata.get("coalesced_event_ids")
+                else {}
+            ),
         }
 
     @staticmethod

@@ -38,6 +38,7 @@ from vllm_omni.diffusion.layers.exact_bf16_pointwise import eligible as pointwis
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import residual, rotary, silu_mul
 from vllm_omni.diffusion.layers.exact_bf16_qk_norm_rope import qk_rotary
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
+from vllm_omni.diffusion.models.qwen_image_21.npu_attention import QwenImage21SDPAImpl
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 
 if TYPE_CHECKING:
@@ -106,6 +107,34 @@ def _apply_qwen_image21_rotary_emb(x: torch.Tensor, freqs: torch.Tensor) -> torc
         return fused
     paired = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
     return torch.view_as_real(paired * freqs.unsqueeze(1)).flatten(3).to(x.dtype)
+
+
+# Hold the freqs object so its id cannot be recycled into a different table.
+_NPU_ROPE: dict[str, object] = {"freqs": None, "tables": None}
+
+
+def _npu_rope_tables(freqs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if _NPU_ROPE["freqs"] is freqs:
+        return _NPU_ROPE["tables"]  # type: ignore[return-value]
+    cos = torch.real(freqs).float().repeat_interleave(2, dim=-1).unsqueeze(0).unsqueeze(2)
+    sin = torch.imag(freqs).float().repeat_interleave(2, dim=-1).unsqueeze(0).unsqueeze(2)
+    tables = (cos, sin)
+    _NPU_ROPE["freqs"] = freqs
+    _NPU_ROPE["tables"] = tables
+    return tables
+
+
+def _apply_qwen_image21_rotary_emb_npu(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """Interleaved RoPE through ``npu_rotary_mul``.
+
+    Atlas A2 has no interleave mode on ``npu_apply_rotary_pos_emb``. The table
+    is reused only while the same freqs object is current.
+    """
+    import torch_npu
+
+    rot_cos, rot_sin = _npu_rope_tables(freqs)
+    rotated = torch_npu.npu_rotary_mul(x.float(), rot_cos, rot_sin, rotary_mode="interleave")
+    return rotated.to(dtype=x.dtype)
 
 
 def _apply_qwen_image21_rotary_emb_native(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -303,8 +332,24 @@ class QwenImage21SwiGLUFeedForward(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.out",
         )
+        self._npu_inplace_mlp = quant_config is None
 
     def forward(self, hidden_states: torch.Tensor, *, _pointwise_validated: bool = False) -> torch.Tensor:
+        if (
+            self._npu_inplace_mlp
+            and hidden_states.device.type == "npu"
+            and hidden_states.dtype == torch.bfloat16
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+        ):
+            # Both projections own their outputs. Preserve the BF16 rounding
+            # between SiLU and multiplication, including in the fused path.
+            from vllm_omni.diffusion.models.qwen_image_21.npu_fused_ops import can_fuse_swiglu, swiglu_inplace
+
+            if can_fuse_swiglu(hidden_states):
+                return self.out(swiglu_inplace(self.gate_layer(hidden_states), self.proj(hidden_states)))
+            activated = F.silu(self.gate_layer(hidden_states), inplace=True)
+            return self.out(activated.mul_(self.proj(hidden_states)))
         return self.out(
             silu_mul(self.gate_layer(hidden_states), self.proj(hidden_states), _validated=_pointwise_validated)
         )
@@ -495,14 +540,78 @@ class QwenImage21Attention(nn.Module):
             softmax_scale=1.0 / (dim_head**0.5),
             causal=False,
             num_kv_heads=self.num_kv_heads,
+            impl_overrides={"SDPA": QwenImage21SDPAImpl} if quant_config is None else None,
+        )
+        # Ring SP prefill (_ring_prefill) attends the replicated prefix rows locally: the same backend
+        # selection, never sharded. No weights; built only when ring is active.
+        self.prefix_attn = (
+            Attention(
+                num_heads=self.num_heads,
+                head_size=dim_head,
+                softmax_scale=1.0 / (dim_head**0.5),
+                causal=False,
+                num_kv_heads=self.num_kv_heads,
+                impl_overrides={"SDPA": QwenImage21SDPAImpl} if quant_config is None else None,
+                skip_sequence_parallel=True,
+            )
+            if getattr(self.attn, "use_ring", False)
+            else None
         )
 
     def _apply_rotary_emb(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         if x.device.type == "cuda":
             return _apply_qwen_image21_rotary_emb(x, freqs)
+        if x.device.type == "npu":
+            return _apply_qwen_image21_rotary_emb_npu(x, freqs)
         # Platform fallback without complex-tensor kernels (the CustomOp rope layer
         # dispatches by platform, not tensor device, so it cannot serve CPU tensors).
         return _apply_qwen_image21_rotary_emb_native(x, freqs)
+
+    def _ring_prefill(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        prefix_len: int,
+    ) -> torch.Tensor:
+        r"""Block-causal prefill under ring SP. The local layout is `[replicated prefix P, target shard T]`.
+
+        Block-causal attention gives P rows causal attention over P alone (full within each condition-image
+        block) and T rows full attention over P and every T shard. The ring takes no mask, and its joint-query
+        path would let P rows attend to T as well; their hidden states feed the prefix KV cache of every later
+        step. So P is attended locally (it is replicated: every rank computes the same rows) with P's own spans,
+        and only the T rows go round the ring, with P as joint K/V prepended once.
+        """
+        if attn_metadata.full_attn_spans is not None:
+            prefix_metadata = AttentionMetadata(
+                full_attn_spans=[
+                    [span for span in spans if span[1] <= prefix_len] for spans in attn_metadata.full_attn_spans
+                ],
+                extra=dict(attn_metadata.extra),
+            )
+        else:
+            # Dense block-causal mask `(B, 1, S_pad, S_pad)` in global coordinates: the replicated prefix is
+            # the first `prefix_len` rows/cols on every rank, so its local mask is a slice.
+            prefix_metadata = AttentionMetadata(
+                attn_mask=attn_metadata.attn_mask[:, :, :prefix_len, :prefix_len],
+                extra=dict(attn_metadata.extra),
+            )
+        prefix_output = self.prefix_attn(
+            query[:, :prefix_len], key[:, :prefix_len], value[:, :prefix_len], prefix_metadata
+        )
+        target_output = self.attn(
+            query[:, prefix_len:],
+            key[:, prefix_len:],
+            value[:, prefix_len:],
+            AttentionMetadata(
+                joint_key=key[:, :prefix_len],
+                joint_value=value[:, :prefix_len],
+                joint_strategy="front",
+                extra=dict(attn_metadata.extra),
+            ),
+        )
+        return torch.cat([prefix_output, target_output], dim=1)
 
     def forward(
         self,
@@ -590,7 +699,14 @@ class QwenImage21Attention(nn.Module):
                         cached_value = _dequantize_prefix_kv_fp8(cached_value, branch_cache["value_scale"], value.dtype)
 
         metadata = copy.copy(attn_metadata) if attn_metadata is not None else None
-        if sp_prefix_len > 0:
+        # Ring prefill with block-causal structure (piecewise spans or a dense 4D mask). Without it
+        # (`causal_block=False`) prefix rows attend everything, which the joint path below already does.
+        block_causal = metadata is not None and (
+            metadata.full_attn_spans is not None or (metadata.attn_mask is not None and metadata.attn_mask.dim() == 4)
+        )
+        if sp_prefix_len > 0 and self.prefix_attn is not None and block_causal:
+            attn_output = self._ring_prefill(query, key, value, metadata, sp_prefix_len)
+        elif sp_prefix_len > 0:
             # Ulysses joint attention: the prefix is replicated across SP ranks, so it is
             # concatenated (front) after the all-to-all instead of being sharded.
             if metadata is None:
@@ -704,7 +820,24 @@ class QwenImage21TransformerBlock(nn.Module):
             cache_branch=cache_branch,
             cache_write_len=cache_write_len,
         )
-        hidden_states = residual(hidden_states, attn_output, img_gate1, _validated=_pointwise_validated)
+        use_inplace_residual = (
+            hidden_states.device.type == "npu"
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape[0] == 1
+            and prepared_modulation is not None  # Only prepared in eager, non-graph execution.
+            and not sp_decode
+            and sp_prefix_len == 0
+            and not (is_forward_context_available() and get_forward_context().sp_active)
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+        )
+        if use_inplace_residual:
+            # Mutate only the fresh projection output, preserving input ownership
+            # and the BF16 rounding between multiplication and addition.
+            attn_output.mul_(img_gate1).add_(hidden_states)
+            hidden_states = attn_output
+        else:
+            hidden_states = residual(hidden_states, attn_output, img_gate1, _validated=_pointwise_validated)
 
         if prepared_modulation is None:
             img_modulated2, img_gate2 = self._modulate(self.img_norm2(hidden_states), mod2, target_token_mask)
@@ -716,7 +849,11 @@ class QwenImage21TransformerBlock(nn.Module):
             if _pointwise_validated
             else self.img_mlp(img_modulated2)
         )
-        hidden_states = residual(hidden_states, mlp_output, img_gate2, _validated=_pointwise_validated)
+        if use_inplace_residual:
+            mlp_output.mul_(img_gate2).add_(hidden_states)
+            hidden_states = mlp_output
+        else:
+            hidden_states = residual(hidden_states, mlp_output, img_gate2, _validated=_pointwise_validated)
 
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
@@ -875,6 +1012,19 @@ class QwenImage21Transformer2DModel(CachedTransformer):
     ):
         super().__init__()
         self.parallel_config = od_config.parallel_config
+        if (
+            self.parallel_config is not None
+            and getattr(self.parallel_config, "ring_degree", 1) > 1
+            and getattr(self.parallel_config, "ulysses_degree", 1) > 1
+        ):
+            # Ring prefill attends the replicated prefix locally with all heads (QwenImage21Attention._ring_prefill);
+            # under Ulysses x ring the heads are split first, and that path is not implemented.
+            raise NotImplementedError(
+                "Qwen-Image-2.1 supports Ulysses SP (--usp) or ring SP (--ring), not both at once: got "
+                f"ulysses_degree={self.parallel_config.ulysses_degree}, "
+                f"ring_degree={self.parallel_config.ring_degree}."
+            )
+        self._nz_weights_supported = self._nz_weights_supported_for(od_config, quant_config)
         self.in_channels = in_channels
         self.out_channels = out_channels or in_channels
         self.patch_size = patch_size
@@ -962,9 +1112,14 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         # on this top-level module rather than on individual blocks; graphs
         # stay eligible only when that hook keeps weights on persistent
         # staging storage (see QwenImage21DecodeGraphManager._offload_reason).
-        self.enable_cuda_graph_decode = (
-            getattr(od_config, "enable_cuda_graph_decode", True) and not od_config.enforce_eager
-        )
+        self._enforce_eager = bool(od_config.enforce_eager)
+        self.enable_cuda_graph_decode = getattr(od_config, "enable_cuda_graph_decode", True) and not self._enforce_eager
+        # Ascend does not torch.compile this transformer. CUDA graph capture
+        # also refuses non-CUDA devices, so a default graph manager still
+        # executes eagerly on NPU. NZ eligibility uses this fact directly.
+        from vllm_omni.platforms import current_omni_platform
+
+        self._nz_runs_eager = current_omni_platform.is_npu() and not current_omni_platform.supports_torch_inductor()
         self._decode_graph_manager = (
             QwenImage21DecodeGraphManager(
                 self,
@@ -1276,6 +1431,17 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 attn_metadata = AttentionMetadata(attn_mask=joint_key_valid)
         else:
             attn_path = self._resolve_attn_path(attn_path_hint, has_padding, sp_padding > 0)
+            if (
+                sp_active
+                and getattr(self.parallel_config, "ring_degree", 1) > 1
+                and attn_path == "mask"
+                and (has_padding or sp_padding > 0)
+            ):
+                # Ring attention takes no mask: target rows would attend padded text / SP keys.
+                raise NotImplementedError(
+                    "Qwen-Image-2.1 ring SP prefill cannot mask padded keys (text padding or SP padding); "
+                    "use Ulysses SP (--usp) or a batch without padding."
+                )
             if kv_cache is not None:
                 cache_write_len = prefix_len
             if attn_path == "piecewise":
@@ -1293,20 +1459,32 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         prepared_modulation = None
         pointwise_validated = False
         if (
-            joint_hidden_states.device.type == "cuda"
+            joint_hidden_states.device.type in {"cuda", "npu"}
             and not torch.is_grad_enabled()
             and not torch.compiler.is_compiling()
-            and self._decode_graph_manager is None
         ):
+            # Successful graph replay returned above; prefill and graph fallback
+            # still use this eager block loop and can share modulation.
             # The model shares one modulation across all blocks. Materialize
             # its token selection/scale/tanh once per step, using the same ops.
             scale1, gate1, scale2, gate2 = modulation.chunk(4, dim=-1)
-            prepared_modulation = (
-                1 + _select_modulation_rows(scale1, local_mask),
-                _select_modulation_rows(gate1, local_mask).tanh(),
-                1 + _select_modulation_rows(scale2, local_mask),
-                _select_modulation_rows(gate2, local_mask).tanh(),
+            decode_broadcast = (
+                joint_hidden_states.device.type == "npu"
+                and joint_hidden_states.dtype == torch.bfloat16
+                and batch_size == 1
+                and is_decode
+                and not sp_active
             )
+            if decode_broadcast:
+                scale1, gate1, scale2, gate2 = (value[:-1].unsqueeze(1) for value in (scale1, gate1, scale2, gate2))
+                prepared_modulation = (1 + scale1, gate1.tanh(), 1 + scale2, gate2.tanh())
+            else:
+                prepared_modulation = (
+                    1 + _select_modulation_rows(scale1, local_mask),
+                    _select_modulation_rows(gate1, local_mask).tanh(),
+                    1 + _select_modulation_rows(scale2, local_mask),
+                    _select_modulation_rows(gate2, local_mask).tanh(),
+                )
             if getattr(self, "_pointwise_contract_allowed", False):
                 # Native unquantized linear/norm operations preserve dtype,
                 # device and dense row layout. Validate the shared gates once
@@ -1397,8 +1575,19 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         # request cannot leave its prefix KV owned by the model singleton.
         if not isinstance(kv_cache, QwenImage21KVCache):
             return None
-        previous = getattr(self, "_request_geometry_owner", None)
-        if previous is None or previous[0]() is not kv_cache or previous[1] is not img_mask or previous[2] != signature:
+        # The prefix layout is immutable for a request/CFG branch once its KV
+        # exists. Step execution rebuilds equivalent mask objects, so identity
+        # is not a validity key. Shapes, layout and mutation versions are.
+        key = (signature, tuple(img_mask.shape), img_mask.dtype, img_mask.device)
+        entries = getattr(kv_cache, "_geometry", None)
+        if entries is None:
+            entries = kv_cache._geometry = {}
+        branch = signature[1] if len(signature) > 1 else "cond"
+        previous = entries.get(branch)
+        if previous is None or previous[0] != key:
+            previous = entries[branch] = (key, {})
+        owner = getattr(self, "_request_geometry_owner", None)
+        if owner is None or owner[0]() is not kv_cache:
             model_ref = weakref.ref(self)
 
             def release_expired_request(owner_ref: weakref.ReferenceType) -> None:
@@ -1407,13 +1596,8 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 if model is not None and owner is not None and owner[0] is owner_ref:
                     model.release_request_geometry()
 
-            previous = self._request_geometry_owner = (
-                weakref.ref(kv_cache, release_expired_request),
-                img_mask,
-                signature,
-                {},
-            )
-        return previous[3]
+            self._request_geometry_owner = (weakref.ref(kv_cache, release_expired_request),)
+        return previous[1]
 
     def release_request_geometry(self) -> None:
         """Release request-owned metadata and prefix KV references after denoising."""
@@ -1425,6 +1609,33 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         if self._decode_graph_manager is not None:
             self._decode_graph_manager.clear()
         self.release_request_geometry()
+
+    @staticmethod
+    def _nz_weights_supported_for(od_config: OmniDiffusionConfig, quant_config: QuantizationConfig | None) -> bool:
+        # NZ conversion runs inside load_weights. Distilled LoRA fusion adds
+        # ND deltas in place afterwards, and HSDP shards or broadcasts the
+        # loaded parameters, so both must see the original ND storage.
+        return (
+            quant_config is None
+            and resolve_offload_strategy(od_config) == OffloadStrategy.NONE
+            and od_config.parallel_config.tensor_parallel_size == 1
+            and not od_config.parallel_config.use_hsdp
+            and not od_config.lora_path
+        )
+
+    def _automatic_nz_eligible(self) -> bool:
+        """Return whether automatic NZ conversion matches eager execution.
+
+        ``enable_cuda_graph_decode`` is not the eager signal. Capture is
+        CUDA-only, and Ascend does not torch.compile this transformer, so the
+        default NPU graph manager still runs eagerly. Sequence parallelism
+        stays excluded.
+        """
+        parallel = getattr(self, "parallel_config", None)
+        sequence_parallel_size = 1 if parallel is None else int(getattr(parallel, "sequence_parallel_size", 1) or 1)
+        if sequence_parallel_size != 1:
+            return False
+        return bool(getattr(self, "_enforce_eager", False) or getattr(self, "_nz_runs_eager", False))
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
@@ -1466,4 +1677,23 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         unloaded = sorted(set(params_dict) - set(loaded_params))
         if unloaded:
             logger.warning("Model parameters not loaded from checkpoint: %s", unloaded)
+        if self._nz_weights_supported and self._automatic_nz_eligible():
+            weights = [
+                module.weight
+                for module in self.modules()
+                if isinstance(module, (ColumnParallelLinear, RowParallelLinear, ReplicatedLinear))
+                and module.weight is not None
+                and module.weight.device.type == "npu"
+                and module.weight.dtype == torch.bfloat16
+                and module.weight.ndim == 2
+            ]
+            if weights:
+                import torch_npu
+
+                # Never change the process-wide internal-format setting.
+                # Skip conversion when internal formats are disabled.
+                if torch_npu._C._npu_getOption("ALLOW_INTERNAL_FORMAT") == b"enable":
+                    for weight in weights:
+                        weight.data = torch_npu.npu_format_cast(weight.data, 29)
+                    logger.info("Qwen-Image 2.1 NZ weights: converted %d BF16 linear weights", len(weights))
         return loaded_params

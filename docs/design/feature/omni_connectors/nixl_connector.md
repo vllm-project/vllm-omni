@@ -31,10 +31,22 @@ uint8 tensor. Mapping and sequence structure is preserved. `msgspec.Struct` valu
 including `OmniPayloadStruct`, are normalised to mappings so their tensor leaves use
 the direct NIXL path rather than CPU object serialisation.
 
+Before registration, the connector copies each tensor into its own contiguous
+buffer. This keeps aliased leaves and concurrent payloads from sharing a memory
+registration that one transfer could retire while another still needs it. The
+connector retains these buffers until the consumer acknowledges completion.
+
 Each NIXL agent uses strict thread synchronization. A consumer performs one short
 metadata query per scheduler poll (10ms by default), which prevents an unavailable
 producer from blocking unrelated requests. The regular transfer-completion handshake
 keeps the configured transfer timeout.
+
+NIXL READs are not ordered with PyTorch streams. Before publishing, `put()`
+synchronizes the current stream of each accelerator device in the payload, so
+the kernels that wrote it have finished. Before a READ, `get()` does the same
+for the freshly allocated receive buffers, whose memory the caching allocator
+may hand back while queued kernels still use it. A caller that writes a payload
+on another stream must finish those writes before calling `put()`.
 
 ## Installation
 

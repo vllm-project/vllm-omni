@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Static regression checks for VoxCPM2 runner-assisted unified graph hooks.
 
 These tests intentionally avoid importing torch/vLLM so they can run in a
@@ -154,7 +154,8 @@ def test_voxcpm2_batch_unified_graph_requires_runner_metadata_marker():
     forward_source = source[source.index("def _forward_unified_decode") :]
     forward_source = forward_source[: forward_source.index("# -------------------- vllm hooks")]
     assert "graph_size = self._select_unified_graph_bucket_size(num_reqs)" in forward_source
-    assert "self._unified_graphs[graph_size]" in forward_source
+    assert "self._unified_graphs if mixed_token_capacity is None else self._mixed_graphs" in forward_source
+    assert "graph_cache[graph_key] = g" in forward_source
     assert "g.input_embeds[num_reqs:graph_size].zero_()" not in forward_source
     assert "padded rows as valid duplicates" in forward_source
     assert "g.input_embeds[last : last + 1].expand" in forward_source

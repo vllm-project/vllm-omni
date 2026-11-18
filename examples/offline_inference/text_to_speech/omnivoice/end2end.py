@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """End-to-end OmniVoice TTS inference via vLLM-Omni.
 
 Supports:
 - Auto voice mode: text only → generated speech
 - Voice cloning mode: text + reference audio → cloned voice speech
+- Automatic reference transcription: reference audio without reference text
 
 Usage:
     # Auto voice
@@ -13,6 +14,11 @@ Usage:
     # Voice cloning
     python end2end.py --model k2-fsa/OmniVoice --text "Hello" \
         --ref-audio ref.wav --ref-text "reference transcription"
+
+    # Automatic reference transcription (lazy by default; set
+    # load_asr_on_startup: true to preload Whisper at worker startup)
+    python end2end.py --model k2-fsa/OmniVoice --text "hello" \
+        --ref-audio trump_ref.wav
 """
 
 import argparse
@@ -113,7 +119,8 @@ def run_e2e():
 
         audio_signal, sr = load_audio(args.ref_audio, sr=None)
         multi_modal_data["audio"] = (audio_signal.astype(np.float32), sr)
-        mm_processor_kwargs["ref_text"] = args.ref_text or ""
+        if args.ref_text is not None:
+            mm_processor_kwargs["ref_text"] = args.ref_text
         mm_processor_kwargs["sample_rate"] = sr
 
     if args.lang:
@@ -130,7 +137,7 @@ def run_e2e():
     if mm_processor_kwargs:
         prompts["mm_processor_kwargs"] = mm_processor_kwargs
 
-    sampling_params_list = [OmniDiffusionSamplingParams(extra_args={"seed": args.seed})]
+    sampling_params_list = [OmniDiffusionSamplingParams(seed=args.seed)]
 
     print(f"Generating speech for: {args.text}")
 
