@@ -13,7 +13,7 @@ This backend integrates their algorithm; it does not require VSA-trained weights
 Install the pinned Sol-Attn package with arbitrary exact-block protection:
 
 ```bash
-pip install 'git+https://github.com/lishunyang12/Sana.git@8bbb1a828218a1cc495f54ee354bf3467a0d216d#subdirectory=techniques/sparse_backends'
+pip install 'git+https://github.com/lishunyang12/Sana.git@088897e0c6a9cb970f00b43ab2177c3be7336b36#subdirectory=techniques/sparse_backends'
 ```
 
 This pin contains the generic `exact_block_mask` extension on top of upstream
