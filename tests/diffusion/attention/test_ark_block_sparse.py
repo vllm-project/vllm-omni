@@ -99,7 +99,7 @@ def test_ark_provider_dispatches_lut_and_tile64_multirrow(monkeypatch):
         block_map,
         torch.tensor([64, 64], dtype=torch.int32),
         128**-0.5,
-        provider="ark",
+        provider="xpu",
         block_size=64,
     )
 
@@ -128,7 +128,7 @@ def test_ark_provider_passes_partial_block_sizes_when_supported(monkeypatch):
         block_map,
         sizes,
         128**-0.5,
-        provider="ark",
+        provider="xpu",
         block_size=128,
     )
 
@@ -151,7 +151,7 @@ def test_ark_tile64_prefers_q256_multirow_when_supported(monkeypatch):
         block_map,
         torch.full((4,), 64, dtype=torch.int32),
         128**-0.5,
-        provider="ark",
+        provider="xpu",
         block_size=64,
     )
 
@@ -173,7 +173,7 @@ def test_ark_old_build_uses_q64_fallback(monkeypatch):
         block_map,
         torch.full((4,), 64, dtype=torch.int32),
         128**-0.5,
-        provider="ark",
+        provider="xpu",
         block_size=64,
     )
 
@@ -182,7 +182,7 @@ def test_ark_old_build_uses_q64_fallback(monkeypatch):
 
 
 @pytest.mark.parametrize("block_size", [64, 128])
-def test_auto_selects_ark_on_xpu(monkeypatch, block_size):
+def test_auto_selects_xpu_on_xpu(monkeypatch, block_size):
     from vllm_omni.diffusion.attention.ops import ark_block_sparse
 
     monkeypatch.setattr(ark_block_sparse, "require_ark_sparse", lambda *args: None)
@@ -197,13 +197,13 @@ def test_auto_selects_ark_on_xpu(monkeypatch, block_size):
                 128,
                 block_size,
             )
-            == "ark"
+            == "xpu"
         )
     finally:
         resolve_block_sparse_provider.cache_clear()
 
 
-def test_xpu_tile128_rejects_non_ark_provider():
+def test_xpu_tile128_rejects_non_xpu_provider():
     resolve_block_sparse_provider.cache_clear()
     with pytest.raises(ValueError, match="unavailable on XPU"):
         resolve_block_sparse_provider(

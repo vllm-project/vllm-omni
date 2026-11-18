@@ -49,7 +49,7 @@ trained for eight steps.
 ## Intel Arc Pro B70 (XPU)
 
 Use the B70 config to run the checkpoint with 4x Arc Pro B70, Ulysses-4,
-layer offload, the ARK block-sparse attention provider, and regional
+layer offload, the XPU block-sparse provider (ARK executor), and regional
 `torch.compile`:
 
 ```bash

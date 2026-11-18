@@ -182,11 +182,11 @@ def resolve_block_sparse_provider(
     """
     if block_size not in (64, 128):
         raise ValueError("block_size must be 64 or 128")
-    if provider == "ark":
+    if provider == "xpu":
         from .ark_block_sparse import require_ark_sparse
 
         if precision != "bf16":
-            raise ValueError("ARK VSA requires BF16 precision")
+            raise ValueError("XPU VSA requires BF16 precision")
         require_ark_sparse(device, dtype, head_size, block_size)
         return provider
     if provider == "triton":
@@ -208,8 +208,8 @@ def resolve_block_sparse_provider(
             raise ValueError("tile128 VSA requires BF16 with head dimension 128")
         if device.type == "xpu":
             if provider == "auto":
-                return resolve_block_sparse_provider("ark", precision, device, dtype, head_size, block_size)
-            raise ValueError(f"tile128 provider {provider!r} is unavailable on XPU; use provider='ark'")
+                return resolve_block_sparse_provider("xpu", precision, device, dtype, head_size, block_size)
+            raise ValueError(f"tile128 provider {provider!r} is unavailable on XPU; use provider='xpu'")
         if device.type != "cuda":
             raise ValueError("tile128 VSA requires CUDA")
         capability = current_omni_platform.get_device_capability(device.index)
@@ -256,7 +256,7 @@ def resolve_block_sparse_provider(
         if precision == "sage":
             raise ValueError(reason)
         if device.type == "xpu":
-            return resolve_block_sparse_provider("ark", precision, device, dtype, head_size, block_size)
+            return resolve_block_sparse_provider("xpu", precision, device, dtype, head_size, block_size)
         # Non-CUDA dispatch belongs to the existing backend fallback; do not
         # import accelerator kernels while resolving its host-side metadata.
         return "fastvideo"
@@ -322,11 +322,11 @@ def block_sparse_attn_bshd(
     """
     if block_size not in (64, 128):
         raise ValueError("block_size must be 64 or 128")
-    if provider == "ark":
+    if provider == "xpu":
         from .ark_block_sparse import ark_block_sparse_attention
 
         if precision != "bf16":
-            raise ValueError("ARK VSA requires BF16 precision")
+            raise ValueError("XPU VSA requires BF16 precision")
         return ark_block_sparse_attention(query, key, value, block_map, block_sizes, softmax_scale, block_size)
     if provider == "triton":
         from .triton_block_sparse import triton_block_sparse_attention
@@ -347,7 +347,7 @@ def block_sparse_attn_bshd(
             query, key, value, block_map, block_sizes, softmax_scale, precision=precision
         )
     if provider not in ("fastvideo", "flashinfer") or precision != "bf16":
-        raise ValueError("block-sparse attention requires ark/bf16, fastvideo/bf16, cudnn/bf16 or flashinfer/bf16|sage")
+        raise ValueError("block-sparse attention requires xpu/bf16, fastvideo/bf16, cudnn/bf16 or flashinfer/bf16|sage")
     if query.ndim != 4 or query.shape != key.shape or query.shape != value.shape or min(query.shape) < 1:
         raise ValueError("FastVideo block-sparse requires matching nonempty BSHD inputs")
     if query.shape[1] % block_size:

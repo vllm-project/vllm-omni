@@ -238,7 +238,7 @@ def test_h3_forward_xpu_uses_ark_and_honours_packed_padding(monkeypatch, tile_si
     )
     monkeypatch.setattr(
         "vllm_omni.diffusion.models.minimax_h3.attention.fastvideo_h3.resolve_block_sparse_provider",
-        lambda provider, precision, device, dtype, head_size, *, block_size: "ark",
+        lambda provider, precision, device, dtype, head_size, *, block_size: "xpu",
     )
     impl = _h3_impl()
     prefix_segments, video_shape = (5,), (2, 4, 4)
@@ -265,7 +265,7 @@ def test_h3_forward_xpu_uses_ark_and_honours_packed_padding(monkeypatch, tile_si
     assert calls["q_shape"][0] == 1 and calls["q_shape"][2:] == (2, 8)
     assert calls["q_shape"][1] >= valid and calls["q_shape"][1] % tile_size == 0
     assert calls["block_size"] == tile_size
-    assert calls["provider"] == "ark"
+    assert calls["provider"] == "xpu"
     assert calls["precision"] == "bf16"
     assert all(size <= tile_size for size in calls["block_sizes"])
 

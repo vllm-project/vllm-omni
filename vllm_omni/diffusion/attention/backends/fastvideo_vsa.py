@@ -182,16 +182,16 @@ class FastVideoVSAImpl(AttentionImpl):
 
         self.provider = backend_kwargs.get("provider", "auto")
         self.precision = backend_kwargs.get("precision", "bf16")
-        if self.provider not in ("auto", "fastvideo", "flashinfer", "cudnn", "triton", "ark") or self.precision not in (
+        if self.provider not in ("auto", "fastvideo", "flashinfer", "cudnn", "triton", "xpu") or self.precision not in (
             "bf16",
             "sage",
         ):
-            raise ValueError("VSA requires provider auto/fastvideo/flashinfer/cudnn/triton/ark and precision bf16/sage")
-        if self.provider in ("cudnn", "triton", "ark") and not self._supports_tile64_provider:
+            raise ValueError("VSA requires provider auto/fastvideo/flashinfer/cudnn/triton/xpu and precision bf16/sage")
+        if self.provider in ("cudnn", "triton", "xpu") and not self._supports_tile64_provider:
             raise ValueError(f"{self.provider} VSA requires an implementation with explicit block routing")
         if self.provider == "auto" and not self._supports_tile64_provider:
             self.provider = "fastvideo"
-        if self.precision == "sage" and self.provider in ("fastvideo", "cudnn", "triton", "ark"):
+        if self.precision == "sage" and self.provider in ("fastvideo", "cudnn", "triton", "xpu"):
             raise ValueError("Sage VSA requires the FlashInfer provider")
         if self.provider == "flashinfer":
             from vllm_omni.diffusion.attention.ops.flashinfer_block_sparse import require_flashinfer_sparse
