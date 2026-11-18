@@ -352,9 +352,13 @@ def test_sample_tokens_drafts_from_target_layers_after_postprocess(monkeypatch, 
         (7, True, None),
     ],
 )
-def test_speculative_load_requires_verifier_only_on_final_rank(monkeypatch, steps, last_rank, has_verifier):
+@pytest.mark.cpu
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_speculative_load_requires_verifier_only_on_final_rank(monkeypatch, steps, last_rank, has_verifier, device):
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    runner.device = torch.device(device)
     calls = []
+    patched = []
 
     def load(self, *args, **kwargs):
         calls.append((args, kwargs))
@@ -364,6 +368,7 @@ def test_speculative_load_requires_verifier_only_on_final_rank(monkeypatch, step
             self.rejection_sampler = object() if has_verifier else None
 
     monkeypatch.setattr(omni_ar_model_runner.OmniGPUModelRunner, "load_model", load)
+    monkeypatch.setattr(omni_ar_model_runner, "patch_resampled_token_insertion", lambda: patched.append(True))
     if steps and last_rank and has_verifier is None:
         # Missing base-runner state is an API-contract violation, not a disabled verifier.
         with pytest.raises(AttributeError, match="rejection_sampler"):
@@ -374,6 +379,7 @@ def test_speculative_load_requires_verifier_only_on_final_rank(monkeypatch, step
     else:
         runner.load_model(load_dummy_weights=True)
     assert calls == [((), {"load_dummy_weights": True})]
+    assert patched == ([True] if steps and last_rank and device == "cuda" else [])
 
 
 @pytest.mark.parametrize("scheduled", [0, 3, 7])

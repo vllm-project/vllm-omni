@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import torch
@@ -20,6 +21,20 @@ from vllm_omni.worker_v2.output_snapshot import RequestOutputSnapshot
 StandardSample = Callable[
     [torch.Tensor, InputBatch, GrammarOutput | None], tuple[SamplerOutput, torch.Tensor, torch.Tensor]
 ]
+
+
+def patch_resampled_token_insertion() -> None:
+    """Backport vLLM #66048's launch configuration to the pinned 0.33 runtime."""
+    from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import _insert_resampled_kernel
+
+    # Every warp loads num_sampled, but warp 0 increments it before the others
+    # necessarily read it. A late warp can then use an out-of-range logits index
+    # or skip the bonus-token reduction. Keep the upstream kernel and algorithm;
+    # remove this adapter when the minimum vLLM includes #66048.
+    run = _insert_resampled_kernel.run
+    if isinstance(run, partial) and run.keywords.get("num_warps") == 1:
+        return
+    _insert_resampled_kernel.run = partial(run, num_warps=1)
 
 
 @dataclass

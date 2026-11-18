@@ -69,6 +69,15 @@ uses PIECEWISE graphs must not make the MTP wrapper bypass its captured graph.
 This does not enable graphs for an eager or graph-unsafe MTP implementation;
 requests without a supported capture bucket retain eager execution.
 
+MRv2 GPU AR workers use one warp for upstream resampled-token insertion.
+The pinned vLLM 0.33 runtime reads and increments `num_sampled` in place in
+that kernel; multiple warps can observe different counts and index outside
+the request's logits range or omit part of the bonus-token reduction.
+The worker installs the launch-only backport of
+[vLLM #66048](https://github.com/vllm-project/vllm/pull/66048) before sampler
+warmup, retaining upstream sampling and request-state updates. Remove the
+adapter when the minimum vLLM dependency includes the upstream fix.
+
 After applying sampled output, the AR scheduler publishes only completed KV
 blocks to upstream prefix caching, including on its plain-decode path. Async
 placeholders and speculative steps use `num_computed_tokens - num_in_flight_tokens`

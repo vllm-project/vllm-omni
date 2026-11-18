@@ -45,7 +45,7 @@ from vllm_omni.utils.mm_outputs import partition_flat_payload
 from vllm_omni.worker.sparse_audio import resolve_sparse_mm_routing
 from vllm_omni.worker_v2.mooncake_capture import snapshot_mooncake_output
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
-from vllm_omni.worker_v2.omni_sampler import sample_with_output
+from vllm_omni.worker_v2.omni_sampler import patch_resampled_token_insertion, sample_with_output
 from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot, pack_output_snapshot
 from vllm_omni.worker_v2.streaming_audio import StreamingAudioSnapshot
 from vllm_omni.worker_v2.warmup import is_warmup_request
@@ -162,6 +162,8 @@ class OmniARModelRunner(OmniGPUModelRunner):
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         super().load_model(*args, **kwargs)
+        if self.num_speculative_steps > 0 and self.is_last_pp_rank and self.device.type == "cuda":
+            patch_resampled_token_insertion()
         if (
             self.num_speculative_steps > 0
             and self.is_last_pp_rank
