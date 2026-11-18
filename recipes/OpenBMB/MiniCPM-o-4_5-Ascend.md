@@ -4,9 +4,16 @@ This profile retains a 40,960-token Thinker, a 4,096-token Talker, MRv2,
 two Talker replicas, two Code2Wav replicas, and five-step FP32 CFM.
 It is an explicit deployment profile; it does not change the default recipe.
 
-- [Deployment template](../../vllm_omni/deploy/minicpmo_4_5_ascend.yaml)
+- [Deployment template](../../vllm_omni/deploy/minicpmo_4_5_2gpu.yaml)
 - [Launcher](serve_minicpmo_ascend.sh)
 - [Qualified checkpoint manifest](minicpmo_ascend_checkpoint_manifest.json)
+
+Common NPU chunking, reference caching, encoder graph and K16 settings live
+in `minicpmo_4_5.yaml`. The two-card YAML inherits it through `base_config`
+and adds replica placement, per-card memory budgets, the larger graph budget
+and the prepared Thinker/draft checkpoint selection. Complete nested engine
+options are retained where the configuration loader replaces an entire field.
+There is no separate Ascend deployment YAML.
 
 ## Dependencies
 

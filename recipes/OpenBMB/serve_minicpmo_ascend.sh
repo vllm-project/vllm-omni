@@ -33,6 +33,7 @@ import sys
 from pathlib import Path
 
 import yaml
+from vllm_omni.config.stage_config import resolve_deploy_yaml
 
 repo, runtime, model, draft = (Path(p).resolve() for p in sys.argv[1:5])
 seqs = int(sys.argv[5])
@@ -44,8 +45,10 @@ for directory in (model, model / "original", model / "thinker-w8a8", draft):
 quant = json.loads((model / "thinker-w8a8/config.json").read_text()).get("quantization_config", {})
 if quant.get("quant_method") != "compressed-tensors":
     raise ValueError("thinker-w8a8 must contain the qualified compressed-tensors W8A8 checkpoint")
-config = yaml.safe_load((repo / "vllm_omni/deploy/minicpmo_4_5_ascend.yaml").read_text())
+config = resolve_deploy_yaml(repo / "vllm_omni/deploy/minicpmo_4_5_2gpu.yaml")
 for stage in config["stages"]:
+    stage["max_num_seqs"] = seqs
+for stage in config["platforms"]["npu"]["stages"]:
     stage["max_num_seqs"] = seqs
     if stage["stage_id"] == 0:
         stage["speculative_config"]["model"] = str(draft)
