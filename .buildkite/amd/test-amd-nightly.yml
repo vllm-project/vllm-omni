@@ -1987,7 +1987,7 @@ steps:
       - label: "BAGEL Sleep Mode"
         agent_pool: mi300_2
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: omni_bagel_sleep_function
         env:

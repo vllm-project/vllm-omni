@@ -4350,7 +4350,7 @@ def test_entrypoints_full_nightly_splits_qwen_and_bagel_without_skips() -> None:
         step = _find_step(label, AMD_NIGHTLY_PIPELINE)
         assert step["agent_pool"] == "mi300_2"
         assert step["mirror_hardwares"] == ["amdproduction"]
-        assert step["grade"] == ("Blocking" if label == "Qwen3-Omni Duplex Playback" else "NonBlocking")
+        assert step["grade"] == "Blocking"
         assert step["timeout_in_minutes"] == 180
         assert step["source_file_dependencies"] == dependency_key
         assert step["artifact_paths"] == [artifacts]
