@@ -47,6 +47,7 @@ from vllm_omni.diffusion.diffusion_kv.config import (
 from vllm_omni.diffusion.lora.manager import LoRABackend
 from vllm_omni.diffusion.media import DiffusionMediaOutput
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+from vllm_omni.diffusion.utils.flow_matching import normalize_shift
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.quantization import build_quant_config
@@ -1416,6 +1417,8 @@ class OmniDiffusionConfig:
             raise ValueError(
                 f"request_batch_max_wait_ms must be a finite non-negative number, got {self.request_batch_max_wait_ms}."
             )
+        if self.flow_shift is not None:
+            self.flow_shift = normalize_shift(self.flow_shift, name="flow_shift", error_cls=ValueError)
 
         if isinstance(self.profiler_config, dict):
             from vllm.config import ProfilerConfig
