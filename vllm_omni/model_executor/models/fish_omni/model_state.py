@@ -197,12 +197,11 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
 
         params = new_req_data.sampling_params
         temperature = float(params.temperature) if params is not None else 1.0
-        top_k = int(params.top_k) if params is not None and params.top_k and params.top_k > 0 else 1 << 20
+        top_k = int(params.top_k) if params is not None and params.top_k and params.top_k > 0 else self.model.max_top_k
         if top_k > self.model.max_top_k:
             if not self._warned_top_k:
                 logger.warning(
-                    "fish_omni fused sampling caps top_k at %d (request asked for %s); "
-                    "set hf_overrides fish_omni_max_top_k to raise it",
+                    "fish_omni main-token sampling caps top_k at %d (request asked for %s)",
                     self.model.max_top_k,
                     params.top_k if params is not None else None,
                 )

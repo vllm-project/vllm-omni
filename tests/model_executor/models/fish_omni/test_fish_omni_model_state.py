@@ -35,7 +35,7 @@ class _Model:
             dtype=torch.float32,
             device=torch.device("cpu"),
         )
-        self.buffers.noise = torch.zeros((4, 5, 8))
+        self.buffers.noise = torch.zeros((4, 154))
 
     def build_frames(self, info, device):
         assert info["text"] == "hello"
@@ -88,6 +88,17 @@ def test_new_request_stages_its_prompt_rows(make_state):
     _, (top_k, generated), ras = state._pending_slots[1]
     assert (top_k, generated) == (30, 0)
     assert ras[-PROMPT.shape[0] :] == PROMPT[:, 0].tolist()
+
+
+@pytest.mark.parametrize(("request_k", "expected"), [(-1, 4096), (0, 4096), (7, 7), (128, 128), (8192, 4096)])
+def test_stage_main_token_top_k(make_state, request_k, expected):
+    state = make_state()
+    state.model.max_top_k = 4096
+    request = _request("a")
+    request.sampling_params.top_k = request_k
+    state.add_request(0, request)
+    _, (top_k, _), _ = state._pending_slots[0]
+    assert top_k == expected
 
 
 def test_preempted_request_resumes_with_its_generated_frames(make_state):
@@ -214,7 +225,7 @@ def test_max_top_k_is_a_power_of_two_from_the_ras_top_k_to_the_codebook(value, o
 
     config = SimpleNamespace() if value is None else SimpleNamespace(fish_omni_max_top_k=value)
     if ok:
-        assert max_top_k(config, 4096) == (64 if value is None else value)
+        assert max_top_k(config, 4096) == (4096 if value is None else value)
     else:
         with pytest.raises(ValueError, match="power of two"):
             max_top_k(config, 4096)

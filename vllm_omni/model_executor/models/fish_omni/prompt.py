@@ -16,6 +16,9 @@ import torch
 TTS_INSTRUCTION = "convert the provided text to speech"
 REFERENCE_INSTRUCTION = "convert the provided text to speech reference to the following:"
 _SPEAKER_TAG = re.compile(r"\s*<\|speaker:(\d+)\|>")
+_EVENT = r"\[\p{L}+(?:[ -]\p{L}+)*\]"
+_LEADING_EVENT = re.compile(rf"\s*{_EVENT}")
+_NEXT_EVENT = re.compile(rf"(?<=[.!?。！？])\s*(?={_EVENT}\s*\S)")
 
 
 @dataclass(frozen=True)
@@ -49,6 +52,10 @@ def _segments(text: str, references: list[Reference]) -> list[str | torch.Tensor
             f"\n\n[Reference {index + 1}]\nText: {_reference_transcript(reference.transcript)}\nSpeech: ",
             reference.codes,
         ]
+    # An unconditioned expressive script can lose the speech following its
+    # next event. Start that sentence as another turn of the same speaker.
+    if not references and _LEADING_EVENT.match(text) and not _SPEAKER_TAG.search(text):
+        text = _NEXT_EVENT.sub("\n<|speaker:0|> ", text)
     segments += ["<|im_end|>\n", "<|im_start|>user\n", with_speaker_tag(text)]
     segments += ["<|im_end|>\n", "<|im_start|>assistant\n<|voice|>"]
     return segments

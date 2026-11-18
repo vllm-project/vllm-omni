@@ -130,6 +130,32 @@ def test_inline_event_tags_pass_through():
     assert text in _decode(frames[:, 0])
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("[sighs] Fine. [laughs] Well.", "[sighs] Fine.\n<|speaker:0|> [laughs] Well."),
+        ("[轻声] 好。[叹气] 回来了。", "[轻声] 好。\n<|speaker:0|> [叹气] 回来了。"),
+        ("[sighs] Fine, [laughs] really. [pause]", "[sighs] Fine, [laughs] really. [pause]"),
+        ("[sighs] Fine. <|speaker:3|> [laughs] Well.", "[sighs] Fine. <|speaker:3|> [laughs] Well."),
+        ("See the table. [1] This row.", "See the table. [1] This row."),
+    ],
+)
+def test_unconditioned_event_turns(text, expected):
+    tokenizer = CharTokenizer()
+    frames = _build(tokenizer, text, [])
+    assert with_speaker_tag(expected) in tokenizer.calls
+    assert prompt_length(tokenizer, text, [], []) == len(frames)
+
+
+def test_reference_conditioned_event_turns_preserve_text():
+    tokenizer = CharTokenizer()
+    text = "[sighs] Fine. [laughs] Well."
+    reference = Reference("Fine.", torch.zeros((1, NUM_CODEBOOKS), dtype=torch.long))
+    frames = _build(tokenizer, text, [reference])
+    assert with_speaker_tag(text) in tokenizer.calls
+    assert prompt_length(tokenizer, text, [reference.transcript], [1]) == len(frames)
+
+
 @pytest.mark.parametrize("frame_counts", [[], [1], [37]])
 def test_prompt_length_matches_frames(frame_counts):
     text = "<|speaker:1|> The quarterly report is due on Thursday."
