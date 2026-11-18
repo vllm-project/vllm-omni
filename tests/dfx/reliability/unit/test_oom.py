@@ -111,18 +111,22 @@ def qwen_oom():
         )
     )
     oom_tree = ast.parse(((RELIABILITY_ROOT / "scenarios") / "oom.py").read_text(encoding="utf-8"))
-    marker_assignment = next(
-        n
-        for n in oom_tree.body
-        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "GPU_OOM_MARKERS" for t in n.targets)
-    )
-    module.__dict__["GPU_OOM_MARKERS"] = ast.literal_eval(marker_assignment.value)
+    for constant_name in ("GPU_OOM_MARKERS", "EXECUTOR_SHUTDOWN_MARKERS"):
+        assignment = next(
+            n
+            for n in oom_tree.body
+            if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == constant_name for t in n.targets)
+        )
+        module.__dict__[constant_name] = ast.literal_eval(assignment.value)
     sources = {
         (RELIABILITY_ROOT / "test_hunyuan_image.py"): {"_run_image_oom_at_load"},
         (RELIABILITY_ROOT / "scenarios") / "oom.py": {
             "_assert_multimodal_success",
             "_assert_image_success",
+            "_assert_oom_failure_evidence",
             "_looks_like_server_unreachable",
+            "_require_oom_pressure",
+            "_snapshot_oom_workers",
             "run_oom_under_load",
             "GpuOomUnderLoad",
         },
@@ -151,6 +155,10 @@ def qwen_oom():
         ("accelerator_oom", None),
         ("hip_quoted_oom", None),
         ("allocator_oom", None),
+        ("composite_oom", None),
+        ("executor_shutdown_no_worker", "without explicit GPU OOM evidence"),
+        ("executor_shutdown_unverified_pressure", "pressure was not verified"),
+        ("worker_death_generic_error", "without explicit GPU OOM evidence"),
         ("hip_launch_resources", "without explicit GPU OOM evidence"),
         ("no_oom_evidence", "without explicit GPU OOM evidence"),
         ("stale_oom_evidence", "without explicit GPU OOM evidence"),
@@ -178,13 +186,14 @@ def test_qwen_oom_uses_one_injection_and_stops_before_recovery(qwen_oom, outcome
             expected_error = "no image output"
     qwen_oom._image_request = lambda server, *, size, steps: {"json": preflight if size == "512x512" else payload}
     qwen_oom.MODEL = SimpleNamespace(
+        worker_pattern="model-specific-worker",
         hard_oom_config={
             "target_mem_ratio": 0.95,
             "hold_seconds": 0,
             "startup_timeout_sec": 120,
             "strict": False,
             "max_free_bytes": 256,
-        }
+        },
     )
     qwen_oom.MODEL.oom_under_load_request = lambda _: payload
     qwen_oom.MODEL.oom_preflight_request = lambda _: preflight
@@ -205,6 +214,30 @@ def test_qwen_oom_uses_one_injection_and_stops_before_recovery(qwen_oom, outcome
         assert handle == "handle"
         events.append("stop")
 
+    pressure_checks = 0
+
+    def pressure_status(handle):
+        nonlocal pressure_checks
+        assert handle == "handle"
+        pressure_checks += 1
+        if outcome == "executor_shutdown_unverified_pressure" and pressure_checks > 1:
+            return False, "gpu=0,state=ready,alive=0,ceiling_reached=1"
+        return True, "gpu=0,state=ready,alive=1,ceiling_reached=1"
+
+    qwen_oom.gpu_oom_pressure_status = pressure_status
+    worker_marker_calls: list[tuple[str, ...]] = []
+
+    def snapshot_server_worker_pids(server, *, worker_markers_extra):
+        worker_marker_calls.append(tuple(worker_markers_extra))
+        return [101, 102]
+
+    qwen_oom.snapshot_server_worker_pids = snapshot_server_worker_pids
+    qwen_oom.wait_for_worker_pid_death = lambda pids, timeout_sec: (
+        [101]
+        if outcome in {"composite_oom", "executor_shutdown_unverified_pressure", "worker_death_generic_error"}
+        else []
+    )
+
     def post(host, port, path, body, *, timeout_sec):
         if entrypoint == "hunyuan":
             assert path == "/v1/images/generations"
@@ -221,7 +254,15 @@ def test_qwen_oom_uses_one_injection_and_stops_before_recovery(qwen_oom, outcome
             assert body is payload
             assert events == ["warmup", "inject"]
             events.append("fault")
-            if outcome not in {"no_oom_evidence", "stale_oom_evidence"}:
+            no_explicit_oom = {
+                "no_oom_evidence",
+                "stale_oom_evidence",
+                "composite_oom",
+                "executor_shutdown_no_worker",
+                "executor_shutdown_unverified_pressure",
+                "worker_death_generic_error",
+            }
+            if outcome not in no_explicit_oom:
                 server._server_error_lines.append(
                     {
                         "driver_oom": "Returning 2 (CUDA_ERROR_OUT_OF_MEMORY) from cuDevicePrimaryCtxRetain",
@@ -238,6 +279,12 @@ def test_qwen_oom_uses_one_injection_and_stops_before_recovery(qwen_oom, outcome
                 raise TimeoutError("request timed out")
             if outcome == "fault_succeeded":
                 return 200, json.dumps(success).encode()
+            if outcome in {
+                "composite_oom",
+                "executor_shutdown_no_worker",
+                "executor_shutdown_unverified_pressure",
+            }:
+                return 500, b'{"error":{"message":"Executor shut down"}}'
             return 500, b"{}" if outcome == "invalid_error" else b'{"error":{"message":"engine dead"}}'
         assert len(requests) == 3 and events[-1] == "health"
         assert "stop" in events
@@ -269,12 +316,21 @@ def test_qwen_oom_uses_one_injection_and_stops_before_recovery(qwen_oom, outcome
     if expected_error is not None:
         with pytest.raises(AssertionError, match=expected_error) as error:
             run()
-        if outcome in {"hip_launch_resources", "no_oom_evidence", "stale_oom_evidence"}:
+        if outcome in {
+            "hip_launch_resources",
+            "no_oom_evidence",
+            "stale_oom_evidence",
+            "executor_shutdown_no_worker",
+            "worker_death_generic_error",
+        }:
             assert "status=500" in str(error.value)
-            assert "engine dead" in str(error.value)
+            expected_response = "Executor shut down" if outcome == "executor_shutdown_no_worker" else "engine dead"
+            assert expected_response in str(error.value)
             assert "stderr_tail=" in str(error.value)
     else:
         run()
+    if outcome != "warmup_failed":
+        assert worker_marker_calls == [("model-specific-worker",)]
     if outcome == "warmup_failed":
         assert events == ["warmup"]
     else:
@@ -298,7 +354,15 @@ def wan_oom():
     root = RELIABILITY_ROOT
     for path, names in [
         (root / "test_wan22.py", {"_run_oom_at_load", "_create_and_wait_video_job"}),
-        (root / "scenarios/oom.py", {"_looks_like_server_unreachable"}),
+        (
+            root / "scenarios/oom.py",
+            {
+                "_assert_oom_failure_evidence",
+                "_looks_like_server_unreachable",
+                "_require_oom_pressure",
+                "_snapshot_oom_workers",
+            },
+        ),
         (root / "helpers.py", {"extract_openai_error_contract_from_payload"}),
     ]:
         nodes: list[ast.stmt] = [
@@ -308,12 +372,13 @@ def wan_oom():
         ]
         exec_ast_nodes(nodes, path, module.__dict__)
     tree = ast.parse((root / "scenarios/oom.py").read_text(encoding="utf-8"))
-    assignment = next(
-        n
-        for n in tree.body
-        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "GPU_OOM_MARKERS" for t in n.targets)
-    )
-    module.__dict__["GPU_OOM_MARKERS"] = ast.literal_eval(assignment.value)
+    for constant_name in ("GPU_OOM_MARKERS", "EXECUTOR_SHUTDOWN_MARKERS"):
+        assignment = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == constant_name for t in n.targets)
+        )
+        module.__dict__[constant_name] = ast.literal_eval(assignment.value)
     return module
 
 
@@ -323,6 +388,10 @@ def wan_oom():
         ("recovered", None),
         ("stage_dead", None),
         ("api_dead", None),
+        ("composite_oom", None),
+        ("executor_shutdown_no_worker", "without explicit GPU OOM"),
+        ("executor_shutdown_unverified_pressure", "pressure was not verified"),
+        ("worker_death_generic_error", "without explicit GPU OOM"),
         ("completed_under_pressure", "fault job must fail"),
         ("no_oom", "without explicit GPU OOM"),
         ("stale_oom", "without explicit GPU OOM"),
@@ -348,7 +417,10 @@ def test_wan_oom_submits_one_fault_job_and_stops_pressure_before_recovery(wan_oo
         if outcome == "stale_oom":
             server._server_error_lines.append("CUDA out of memory from earlier request")
 
-    wan_oom.MODEL = SimpleNamespace(hard_oom_config=config)
+    wan_oom.MODEL = SimpleNamespace(
+        hard_oom_config=config,
+        worker_pattern="wan-model-worker",
+    )
     wan_oom._video_request_config = lambda **kwargs: kwargs
     wan_oom._assert_video_preflight = warmup
 
@@ -367,6 +439,29 @@ def test_wan_oom_submits_one_fault_job_and_stops_pressure_before_recovery(wan_oo
 
     wan_oom.inject_gpu_oom = inject
     wan_oom.stop_gpu_oom_hogs = lambda handle: events.append("stop")
+    pressure_checks = 0
+
+    def pressure_status(handle):
+        nonlocal pressure_checks
+        assert handle == "handle"
+        pressure_checks += 1
+        if outcome == "executor_shutdown_unverified_pressure" and pressure_checks > 1:
+            return False, "gpu=0,state=ready,alive=0,ceiling_reached=1"
+        return True, "gpu=0,state=ready,alive=1,ceiling_reached=1"
+
+    wan_oom.gpu_oom_pressure_status = pressure_status
+    worker_marker_calls: list[tuple[str, ...]] = []
+
+    def snapshot_server_worker_pids(server, *, worker_markers_extra):
+        worker_marker_calls.append(tuple(worker_markers_extra))
+        return [201]
+
+    wan_oom.snapshot_server_worker_pids = snapshot_server_worker_pids
+    wan_oom.wait_for_worker_pid_death = lambda pids, timeout_sec: (
+        [201]
+        if outcome in {"composite_oom", "executor_shutdown_unverified_pressure", "worker_death_generic_error"}
+        else []
+    )
     creates = []
 
     def create(request, **kwargs):
@@ -374,7 +469,15 @@ def test_wan_oom_submits_one_fault_job_and_stops_pressure_before_recovery(wan_oo
         if len(creates) == 1:
             assert events[-1] == "inject"
             events.append("fault_create")
-            if outcome not in {"no_oom", "stale_oom"}:
+            no_explicit_oom = {
+                "no_oom",
+                "stale_oom",
+                "composite_oom",
+                "executor_shutdown_no_worker",
+                "executor_shutdown_unverified_pressure",
+                "worker_death_generic_error",
+            }
+            if outcome not in no_explicit_oom:
                 server._server_error_lines.append("memory allocation failed with OOM on device 0")
             if outcome in {"admission_oom", "invalid_error"}:
                 return [
@@ -394,9 +497,14 @@ def test_wan_oom_submits_one_fault_job_and_stops_pressure_before_recovery(wan_oo
             if outcome == "poll_timeout":
                 raise TimeoutError("video job timed out")
             failed = outcome != "completed_under_pressure"
+            message = (
+                "Executor shut down"
+                if outcome in {"composite_oom", "executor_shutdown_no_worker", "executor_shutdown_unverified_pressure"}
+                else "internal error"
+            )
             return SimpleNamespace(
                 status_code=500 if failed else 200,
-                json_body={"status": "failed" if failed else "completed", "error": {"message": "internal error"}},
+                json_body={"status": "failed" if failed else "completed", "error": {"message": message}},
             )
         assert video_id == "recovery" and events[-1] == "recovery_create"
         events.append("recovery_poll")
@@ -425,6 +533,7 @@ def test_wan_oom_submits_one_fault_job_and_stops_pressure_before_recovery(wan_oo
             wan_oom._run_oom_at_load(server, client)
     else:
         wan_oom._run_oom_at_load(server, client)
+    assert worker_marker_calls == [("wan-model-worker",)]
     assert events.count("inject") == events.count("stop") == 1
     assert events.count("fault_create") == 1
     if outcome in {"stage_dead", "api_dead"}:

@@ -38,7 +38,13 @@ from tests.dfx.reliability.scenarios import (
     ProcessKillWorkerWithLoad,
     ServeRootCrashAtLaunch,
 )
-from tests.dfx.reliability.scenarios.oom import GPU_OOM_MARKERS, _looks_like_server_unreachable
+from tests.dfx.reliability.scenarios.oom import (
+    GPU_OOM_MARKERS,
+    _assert_oom_failure_evidence,
+    _looks_like_server_unreachable,
+    _require_oom_pressure,
+    _snapshot_oom_workers,
+)
 from tests.helpers.assertions import assert_http_error
 from tests.helpers.mark import hardware_marks
 from tests.helpers.media import generate_synthetic_image
@@ -252,6 +258,12 @@ def _run_oom_at_load(server: Any, client: Any) -> None:
         )
         detail: Any = None
         try:
+            pressure_diagnostics = _require_oom_pressure(handle, phase="before the fault request")
+            workers_before = _snapshot_oom_workers(
+                server,
+                worker_markers_extra=(MODEL.worker_pattern,),
+            )
+            print(f"[wan-oom] verified pressure: {pressure_diagnostics}", flush=True)
             started = time.monotonic()
             print("[wan-oom] preflight passed; pressure ready; submitting one fault job", flush=True)
             try:
@@ -271,13 +283,13 @@ def _run_oom_at_load(server: Any, client: Any) -> None:
                 )
             assert time.monotonic() - started < 180, "OOM job did not fail within 180 seconds"
             response_evidence = str(detail)
-            response_has_oom = any(marker in response_evidence.lower() for marker in GPU_OOM_MARKERS)
-            stderr_evidence = stderr_capture.wait(timeout=0 if response_has_oom else 2)
-            evidence = response_evidence + stderr_evidence
-            stderr_tail = "".join(getattr(server, "_server_error_lines", ()))[-4096:]
-            assert any(marker in evidence.lower() for marker in GPU_OOM_MARKERS), (
-                f"video job failed without explicit GPU OOM evidence; detail={str(detail)[:4096]}, "
-                f"captured_stderr={stderr_evidence!r}, stderr_tail={stderr_tail!r}"
+            _assert_oom_failure_evidence(
+                server=server,
+                handle=handle,
+                workers_before=workers_before,
+                response_evidence=response_evidence,
+                stderr_capture=stderr_capture,
+                context="video job",
             )
         finally:
             stop_gpu_oom_hogs(handle)

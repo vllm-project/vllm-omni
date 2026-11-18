@@ -15,7 +15,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import Mock
 
 import pytest
@@ -287,10 +287,13 @@ def test_sidecar_program_uses_rejection_helper_and_compiles() -> None:
 
 
 @pytest.mark.skipif(os.name == "nt", reason="OOM sidecar pipe polling requires Linux")
-@pytest.mark.parametrize("outcome", ["ready", "error", "eof", "timeout", "partial_line"])
+@pytest.mark.parametrize("outcome", ["ready", "malformed_ready", "error", "eof", "timeout", "partial_line"])
 def test_sidecar_startup_drains_progress_and_reaps_failed_process(monkeypatch, outcome):
     payloads = {
-        "ready": b"STARTING:import_torch\nREADY:fake\n",
+        "ready": (
+            b"STARTING:import_torch\nREADY:free_after=256;max_free_bytes=256;allocator_saturated=0;allocated=1024\n"
+        ),
+        "malformed_ready": b"STARTING:import_torch\nREADY:fake\n",
         "error": b"STARTING:initialize_device\nERROR:allocation failed\n",
         "eof": b"STARTING:import_torch\nimport failed\n",
         "timeout": b"STARTING:initialize_device\n",
@@ -312,8 +315,15 @@ def test_sidecar_startup_drains_progress_and_reaps_failed_process(monkeypatch, o
     monkeypatch.setattr(helpers.subprocess, "Popen", capture_process)
     started = time.monotonic()
     if outcome == "ready":
-        handle = helpers.start_gpu_oom_hog(startup_timeout_sec=2)
+        handle = helpers.start_gpu_oom_hog(startup_timeout_sec=2, max_free_bytes=256)
+        assert handle.state == "ready"
+        assert handle.free_after == 256
+        assert handle.max_free_bytes == 256
+        assert handle.allocated_bytes == 1024
         helpers.stop_gpu_oom_hog(handle)
+    elif outcome == "malformed_ready":
+        with pytest.raises(RuntimeError, match="invalid READY evidence"):
+            helpers.start_gpu_oom_hog(startup_timeout_sec=2)
     else:
         error = TimeoutError if outcome in {"timeout", "partial_line"} else RuntimeError
         with pytest.raises(error, match="STARTING:"):
@@ -323,6 +333,98 @@ def test_sidecar_startup_drains_progress_and_reaps_failed_process(monkeypatch, o
     assert processes[0].poll() is not None
     assert processes[0].stdout is not None
     assert processes[0].stdout.closed
+
+
+class _FakeOomProcess:
+    def __init__(self, exit_code: int | None) -> None:
+        self._exit_code = exit_code
+
+    def poll(self) -> int | None:
+        return self._exit_code
+
+
+def _fake_oom_proc(exit_code: int | None = None) -> subprocess.Popen[Any]:
+    return cast(subprocess.Popen[Any], _FakeOomProcess(exit_code))
+
+
+@pytest.mark.parametrize(
+    ("state", "free_after", "allocated_bytes", "proc_exit_code", "expected"),
+    [
+        ("ready", 256, 1024, None, True),
+        ("starting", 256, 1024, None, False),
+        ("ready", 9 * 1024 * 1024 + 256, 1024, None, False),
+        ("ready", 256, 0, None, False),
+        ("ready", 256, 1024, 6, False),
+    ],
+)
+def test_gpu_oom_pressure_status_requires_live_ready_ceiling_pressure(
+    state,
+    free_after,
+    allocated_bytes,
+    proc_exit_code,
+    expected,
+):
+    handle = helpers.OomHandle(
+        proc=_fake_oom_proc(proc_exit_code),
+        device=0,
+        target_mem_ratio=0.95,
+        start_ts=0.0,
+        max_free_bytes=256,
+        state=state,
+        free_after=free_after,
+        allocated_bytes=allocated_bytes,
+        allocator_saturated=False,
+    )
+
+    verified, diagnostics = helpers.gpu_oom_pressure_status(handle)
+
+    assert verified is expected
+    assert "gpu=0" in diagnostics
+
+
+def test_gpu_oom_pressure_status_requires_every_sidecar() -> None:
+    ready = helpers.OomHandle(
+        proc=_fake_oom_proc(),
+        device=0,
+        target_mem_ratio=0.95,
+        start_ts=0.0,
+        max_free_bytes=256,
+        state="ready",
+        free_after=256,
+        allocated_bytes=1024,
+        allocator_saturated=False,
+    )
+    missed = helpers.OomHandle(
+        proc=_fake_oom_proc(),
+        device=1,
+        target_mem_ratio=0.95,
+        start_ts=0.0,
+        max_free_bytes=256,
+        state="ready",
+        free_after=16 * 1024 * 1024,
+        allocated_bytes=1024,
+        allocator_saturated=True,
+    )
+
+    verified, diagnostics = helpers.gpu_oom_pressure_status([ready, missed])
+
+    assert not verified
+    assert "gpu=0" in diagnostics and "gpu=1" in diagnostics
+
+
+def test_snapshot_server_worker_pids_excludes_root_dead_and_nonworkers(monkeypatch) -> None:
+    monkeypatch.setattr(helpers, "_list_server_process_tree", lambda server: [10, 11, 12, 13])
+    monkeypatch.setattr(helpers, "_resolve_runtime_worker_markers", lambda *args: ("worker",))
+    monkeypatch.setattr(helpers, "_pid_is_dead", lambda pid: pid == 13)
+    monkeypatch.setattr(helpers, "_pid_looks_like_runtime_worker", lambda pid, markers: pid in {11, 13})
+
+    assert helpers.snapshot_server_worker_pids(SimpleNamespace()) == [11]
+
+
+def test_wait_for_worker_pid_death_returns_previously_live_failure(monkeypatch) -> None:
+    monkeypatch.setattr(helpers, "_pid_is_dead", lambda pid: pid == 12)
+
+    assert helpers.wait_for_worker_pid_death([11, 12], timeout_sec=0) == [12]
 
 
 def test_sidecar_program_runs_in_fresh_subprocess(tmp_path: Path) -> None:

@@ -230,3 +230,26 @@ def test_server_stderr_evidence_latch_survives_noisy_shutdown():
         pass
     server._record_server_stderr_line(marker)
     assert ended_capture.wait(timeout=0) == ""
+
+
+def test_stage_cli_stderr_evidence_capture_reads_only_future_stage_output(tmp_path):
+    server = object.__new__(runtime.OmniServerStageCli)
+    server._server_error_lines = runtime.deque(maxlen=runtime.SERVER_STDERR_DIAGNOSTIC_TAIL_LINES)
+    server._server_stderr_capture_lock = runtime.threading.Lock()
+    server._server_stderr_captures = []
+    stage_log = tmp_path / "stage-1.log"
+    stale_marker = "torch.OutOfMemoryError: HIP out of memory from an earlier request\n"
+    stage_log.write_text(stale_marker, encoding="utf-8")
+    server._stage_log_paths = {1: stage_log}
+
+    marker = "torch.OutOfMemoryError: HIP out of memory from this injection\n"
+    with server.capture_stderr_evidence(("hip out of memory",)) as capture:
+        assert capture.wait(timeout=0) == ""
+        with stage_log.open("a", encoding="utf-8") as stage_output:
+            stage_output.write("unrelated shutdown trace\n")
+            stage_output.write(marker)
+        assert capture.wait(timeout=0.1) == marker
+
+    with stage_log.open("a", encoding="utf-8") as stage_output:
+        stage_output.write("torch.OutOfMemoryError: HIP out of memory after capture ended\n")
+    assert capture.wait(timeout=0) == marker
