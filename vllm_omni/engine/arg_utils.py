@@ -40,6 +40,9 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "IndexTTS2TalkerForConditionalGeneration": "indextts2",
     "IndexTTS25S2MelDecoder": "indextts2_5",
     "IndexTTS25TalkerForConditionalGeneration": "indextts2_5",
+    # Magenta RealTime 2 ships JAX safetensors checkpoints without config.json.
+    "MagentaRT2ForConditionalGeneration": "magenta_realtime",
+    "SpectroStreamCode2Wav": "magenta_realtime",
     "OmniVoiceModel": "omnivoice",
     # PersonaPlex ships an empty config.json, so create_model_config() must patch
     # model_type=personaplex from the arch name or the staged pipeline can't load
@@ -96,6 +99,7 @@ def _register_omni_hf_configs() -> None:
         )
         from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
         from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
+        from vllm_omni.transformers_utils.configs.magenta_rt2 import MagentaRT2Config
         from vllm_omni.transformers_utils.configs.ming3_audio import (
             BailingMoeV3AudioConfig,
         )
@@ -130,6 +134,7 @@ def _register_omni_hf_configs() -> None:
         ("nemotron_voicechat", NemotronVoiceChatConfig),
         ("cosyvoice3", CosyVoice3Config),
         ("glm_tts", GLMTTSConfig),
+        ("magenta_realtime", MagentaRT2Config),
         ("omnivoice", OmniVoiceConfig),
         ("voxcpm2", VoxCPM2Config),
     ]:
@@ -521,15 +526,27 @@ class OmniEngineArgs(EngineArgs):
             if config_dict.get("model_type"):
                 return  # config.json already has model_type, no patching needed
         except Exception:
-            # The official IndexTTS 2.5 bundle has no HuggingFace config.json.
+            # Official IndexTTS 2.5 / MagentaRT2 bundles have no HuggingFace config.json.
             # Keep this exception model-scoped so other loader failures retain
             # vLLM's normal error path.
-            if model_type != "indextts2_5" or not os.path.isdir(self.model):
+            if model_type not in ("indextts2_5", "magenta_realtime"):
                 return
-            config_path = os.path.join(self.model, "config.json")
-            if os.path.lexists(config_path):
+            if os.path.isdir(self.model):
+                config_path = os.path.join(self.model, "config.json")
+                if os.path.lexists(config_path):
+                    return
+            elif model_type != "magenta_realtime":
                 return
             config_dict = {}
+            if model_type == "magenta_realtime" and os.path.isdir(self.model):
+                base_ckpt = os.path.join(self.model, "checkpoints", "mrt2_base.safetensors")
+                small_ckpt = os.path.join(self.model, "checkpoints", "mrt2_small.safetensors")
+                base_root = os.path.join(self.model, "mrt2_base.safetensors")
+                small_root = os.path.join(self.model, "mrt2_small.safetensors")
+                if (os.path.isfile(small_ckpt) or os.path.isfile(small_root)) and not (
+                    os.path.isfile(base_ckpt) or os.path.isfile(base_root)
+                ):
+                    config_dict["variant"] = "mrt2_small"
 
         # Create a temp dir with a patched config.json
         temp_dir = tempfile.mkdtemp(prefix="omni_hf_config_")

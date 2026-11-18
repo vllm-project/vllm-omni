@@ -34,7 +34,11 @@ def encode_audio(
             audio_tensor = audio_data.detach().cpu().float().numpy()
         else:
             audio_tensor = np.asarray(audio_data, dtype=np.float32)
-        if audio_tensor.ndim > 1:
+        if audio_tensor.ndim == 2 and (
+            audio_tensor.shape[1] == 2 or (audio_tensor.shape[0] == 2 and audio_tensor.shape[1] > 1)
+        ):
+            pass  # Preserve 2-channel stereo [samples, 2] or [2, samples] for AudioMixin.create_audio.
+        elif audio_tensor.ndim > 1:
             audio_tensor = audio_tensor.reshape(-1)
         audio_response = AudioMixin().create_audio(
             CreateAudio(

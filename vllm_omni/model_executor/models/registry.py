@@ -544,6 +544,17 @@ _OMNI_MODELS = {
         "runtime",
         "Yue2ForCausalLM",
     ),
+    ## Magenta RealTime 2 (Google, 48 kHz stereo streaming music generation)
+    "MagentaRT2ForConditionalGeneration": (
+        "magenta_rt2",
+        "magenta_rt2_talker",
+        "MagentaRT2ForConditionalGeneration",
+    ),
+    "SpectroStreamCode2Wav": (
+        "magenta_rt2",
+        "magenta_rt2_code2wav",
+        "SpectroStreamCode2Wav",
+    ),
 }
 
 

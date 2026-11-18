@@ -1,0 +1,80 @@
+# Magenta RealTime 2 full-duplex MRv2 deploy config:
+# Stage 0 (Talker + 12-step Depthformer) + Stage 1 (SpectroStream 48 kHz stereo).
+# Both stages run natively on Model Runner V2 (model_runner: v2).
+
+pipeline: magenta_realtime
+session_mode: duplex
+model_runner: v2
+
+duplex_session:
+  max_sessions: 4
+
+async_chunk: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: true
+      # 25 Hz codec (40 ms/frame, 1920 stereo samples @ 48 kHz): push every frame immediately.
+      codec_chunk_frames: 1
+      initial_codec_chunk_frames: 1
+
+stages:
+  - stage_id: 0
+    model_runner: v2
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.45
+    trust_remote_code: true
+    skip_tokenizer_init: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    max_num_batched_tokens: 512
+    # MagentaRT2 uses fixed O(1) GPU slot ring buffers (16s = 400 frames);
+    # max_model_len bounds continuous session frames per request.
+    max_model_len: 16384
+    devices: "0"
+    hf_overrides:
+      depthformer_cuda_graphs: true
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 1.3
+      top_k: 40
+      max_tokens: 4096
+      seed: 42
+      repetition_penalty: 1.0
+
+  - stage_id: 1
+    model_runner: v2
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.25
+    enforce_eager: true
+    trust_remote_code: true
+    skip_tokenizer_init: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    hf_overrides:
+      spectrostream_cuda_graphs: true
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      repetition_penalty: 1.0
+
+platforms:
+  npu:
+    model_runner: v1
+  xpu:
+    model_runner: v1
+  rocm:
+    model_runner: v1
+  musa:
+    model_runner: v1
