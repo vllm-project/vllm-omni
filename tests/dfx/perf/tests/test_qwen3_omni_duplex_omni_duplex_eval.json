@@ -1,6 +1,7 @@
 [
   {
     "test_name": "test_qwen3_omni_duplex_omni_duplex_eval",
+    "description": "Provisional H100 mean_duplex_busy_rtf baseline: 2026-11-17 single-day response mean (120 valid samples), rounded to four decimals without margin. Source: JiusiServe/omni-reviewbot@4f93b732ca04, Buildkite #20013. Cross-day stability is not yet established.",
     "mark": [
       {
         "hardware_marks": {
@@ -190,7 +191,14 @@
           "duplex_client_ttft_ms",
           "duplex_busy_rtf",
           "duplex_stall_ratio"
-        ]
+        ],
+        "baseline": {
+          "H100": {
+            "mean_duplex_busy_rtf": [
+              0.1772
+            ]
+          }
+        }
       }
     ],
     "judge_server_params": {
