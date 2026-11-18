@@ -66,6 +66,13 @@ Models such as Qwen3-TTS whose `forward()` returns a tensor and whose
 `mrv2_forward_returns_tensor = True`. Their multimodal-output capability does
 not require excluding FULL capture.
 
+MRv2 computes prompt logprobs after sampling and may split prompt hidden states
+into arbitrary row chunks. A model whose sampling logits depend on request-local
+state or full-batch row spans can expose `compute_prompt_logits(hidden_states)`
+for this stateless path. The runner uses that hook only for prompt logprobs and
+otherwise falls back to `compute_logits`; sampling keeps the model's normal
+request-state validation.
+
 Request-batched MTP uses its own FULL graph wrapper. Capture and replay select
 the same FULL descriptor from the MTP capture sizes, bounded by
 `max_num_seqs`, independently of the backbone's graph mode. A backbone that
