@@ -67,30 +67,28 @@ def test_stepwise_loop_publishes_intermediate_step_output(monkeypatch):
         model_runner_module,
     )
 
-    class _SnapshotPipeline(type(_make_runner().pipeline)):
-        """Publishes an owned snapshot once, on the first step."""
+    calls = {"post_step": 0}
 
-        def __init__(self):
-            super().__init__()
-            self.post_step_calls = 0
-
-        def post_step_output(self, state):
-            self.post_step_calls += 1
-            if state.step_index != 1:
-                return None
-            return DiffusionOutput(
-                output={"payload": {"video_latent": torch.zeros(2), "audio_latent": torch.zeros(2)}},
-                finished=False,
-            )
+    def _post_step_output(state):
+        calls["post_step"] += 1
+        if state.step_index != 1:
+            return None
+        return DiffusionOutput(
+            output={"payload": {"video_latent": torch.zeros(2), "audio_latent": torch.zeros(2)}},
+            finished=False,
+        )
 
     runner = _make_runner()
-    runner.pipeline = _SnapshotPipeline()
+    # Attach the hook to the instance: the stepwise loop resolves it with
+    # getattr(pipeline, "post_step_output", None), so a plain function is
+    # reached unbound and receives the state as its only argument.
+    runner.pipeline.post_step_output = _post_step_output
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
 
     first = DiffusionModelRunner.execute_stepwise(
         runner, _make_scheduler_output(_make_step_request(), step_id=0)
     ).get_request_output("req-1")
-    assert runner.pipeline.post_step_calls == 1
+    assert calls["post_step"] == 1
     assert first.finished is False
     assert first.result is not None, (
         "the intermediate snapshot must reach the batch; the non-terminal entry "

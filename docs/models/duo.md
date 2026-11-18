@@ -110,15 +110,19 @@ video share one playback acknowledgement.
   output-processor hooks that are **not** part of this integration (bounded
   Realization-window trimming around `scheduler_trim`, and the
   `DUO_SEGMENT_H50` / `DUO_INCREMENTAL_H50` scheduled-row handoff). Neither hook
-  exists on `main` and none of the ported model code imports them. Two
-  consequences to be explicit about:
-  - the plugin's `stage_is_resumable`, `model_state_stage_ids`,
-    `start_transcription_preparation` and `record_stage_timing` overrides are
-    inert here, because the engine on `main` has no call site for them;
-  - upstream's `abort_requests` closes the Realization session through
-    `close_ar_diffusion_session`, which neither the upstream nor this ported
-    DuoTransformer implements. Duo session state is therefore released through
-    `close_session` only, and interrupted sessions are not torn down early.
+  exists on `main` and none of the ported model code imports them. The ported
+  overrides that had no caller here are not kept as inert stubs: the plugin's
+  `stage_is_resumable`, `model_state_stage_ids`, `start_transcription_preparation`
+  and `record_stage_timing` overrides, plus `scheduler_trim` and
+  `close_ar_diffusion_session`, were dropped instead, so nothing advertises
+  behaviour the engine cannot drive. Two consequences to be explicit about:
+    - upstream's `abort_requests` closes the Realization session through
+      `close_ar_diffusion_session`, which neither the upstream nor this ported
+      DuoTransformer implements. Duo session state is therefore released through
+      `close_session` only, and interrupted sessions are not torn down early;
+    - the Realization session is retired per epoch at admission instead (session
+      ids are `<id>/epoch/<n>`), so a superseded generation cannot pin the
+      single allowed session slot.
   Long online sessions depend on the untaken paths above; treat this as a
   preview port of the model, not of the full streaming scheduler.
 - Online duplex serving requires the duplex plugin and a deploy config; the
