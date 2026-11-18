@@ -17,6 +17,7 @@ from torch import nn
 from torch.distributed.tensor import DeviceMesh, DTensor, Replicate
 
 import vllm_omni.diffusion.offloader.distributed_layerwise_backend as dist_backend_module
+import vllm_omni.diffusion.offloader.tensor_utils as tensor_utils_module
 from tests.diffusion.offloader.helpers import (
     DummyStream,
     _PlainEncoder,
@@ -33,6 +34,7 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
 )
 from vllm_omni.diffusion.offloader import plan_resolver
 from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
+from vllm_omni.diffusion.offloader.chunked_transport import build_part_manifest, pack_local_shard
 from vllm_omni.diffusion.offloader.distributed_layerwise_backend import (
     DistributedLayerwiseOffloadBackend,
     DistributedLayerwiseOffloadHook,
@@ -101,6 +103,114 @@ def _install_flat_shards(hook: DistributedLayerwiseOffloadHook, source_block: nn
         for dtype, metas in hook.metadata.items()
         for m in metas
     )
+
+
+class TestPackedMxfp4Storage:
+    def test_zeros_for_storage_uses_byte_backing_for_packed_fp4(self, monkeypatch):
+        real_zeros = torch.zeros
+
+        def guarded_zeros(*args, **kwargs):
+            if kwargs.get("dtype") == torch.float4_e2m1fn_x2:
+                raise NotImplementedError('"fill_cpu" not implemented for Float4_e2m1fn_x2')
+            return real_zeros(*args, **kwargs)
+
+        monkeypatch.setattr(torch, "zeros", guarded_zeros)
+        tensor = tensor_utils_module.zeros_for_storage(8, torch.float4_e2m1fn_x2)
+        assert tensor.dtype == torch.float4_e2m1fn_x2
+        assert tensor.view(torch.uint8).tolist() == [0] * 8
+
+    def test_zero_tensor_storage_uses_byte_view_for_packed_fp4(self, monkeypatch):
+        tensor = torch.arange(8, dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+        real_zero_ = torch.Tensor.zero_
+
+        def guarded_zero_(self, *args, **kwargs):
+            if self.dtype == torch.float4_e2m1fn_x2:
+                raise NotImplementedError('"fill_cpu" not implemented for Float4_e2m1fn_x2')
+            return real_zero_(self, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, "zero_", guarded_zero_)
+        tensor_utils_module.zero_tensor_storage(tensor)
+        assert tensor.view(torch.uint8).tolist() == [0] * 8
+
+    def test_flatten_physical_storage_uses_byte_backing_for_packed_fp4(self, monkeypatch):
+        backing = torch.arange(12, dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+        tensor = backing.view(3, 4).t()
+        real_zeros = torch.zeros
+
+        def guarded_zeros(*args, **kwargs):
+            if kwargs.get("dtype") == torch.float4_e2m1fn_x2:
+                raise NotImplementedError('"fill_cpu" not implemented for Float4_e2m1fn_x2')
+            return real_zeros(*args, **kwargs)
+
+        monkeypatch.setattr(torch, "zeros", guarded_zeros)
+        flattened = tensor_utils_module.flatten_physical_storage(tensor)
+        assert flattened.view(torch.uint8).tolist() == list(range(12))
+
+    def test_shard_and_pin_allocates_packed_fp4_without_fill(self, monkeypatch):
+        block = nn.Module()
+        block.weight = nn.Parameter(
+            torch.arange(12, dtype=torch.uint8).view(torch.float4_e2m1fn_x2),
+            requires_grad=False,
+        )
+        real_zeros = torch.zeros
+
+        def guarded_zeros(*args, **kwargs):
+            if kwargs.get("dtype") == torch.float4_e2m1fn_x2:
+                raise NotImplementedError('"fill_cpu" not implemented for Float4_e2m1fn_x2')
+            return real_zeros(*args, **kwargs)
+
+        monkeypatch.setattr(torch, "zeros", guarded_zeros)
+        shards, _ = DistributedLayerwiseOffloadHook._shard_and_pin(
+            dict(block.named_parameters()),
+            {},
+            dp_size=2,
+            rank=0,
+            pin_memory=False,
+        )
+        assert shards[torch.float4_e2m1fn_x2].view(torch.uint8).tolist() == list(range(6))
+
+    def test_pack_local_shard_zeroes_packed_fp4_without_fill(self, monkeypatch):
+        tensor = torch.arange(8, dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+        specs = [("weight", tensor, False)]
+        manifest = build_part_manifest(
+            specs,
+            block_id=0,
+            part_id="block",
+            weight_shard_size=2,
+            weight_shard_rank=0,
+            chunk_size_bytes=8,
+            alignment_bytes=1,
+        )
+        real_zero_ = torch.Tensor.zero_
+
+        def guarded_zero_(self, *args, **kwargs):
+            if self.dtype == torch.float4_e2m1fn_x2:
+                raise NotImplementedError('"fill_cpu" not implemented for Float4_e2m1fn_x2')
+            return real_zero_(self, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, "zero_", guarded_zero_)
+        shards = pack_local_shard(
+            specs,
+            manifest,
+            allocator=lambda numel, dtype: torch.empty(numel, dtype=dtype),
+        )
+        assert shards[torch.float4_e2m1fn_x2].view(torch.uint8).tolist() == [0, 1, 2, 3]
+
+    def test_all_gather_shard_byte_views_packed_fp4(self, monkeypatch):
+        local = torch.arange(4, dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+        output = torch.empty(8, dtype=torch.float4_e2m1fn_x2)
+        calls = []
+
+        def fake_allgather(output, input_tensor, *, group):
+            del group
+            calls.append((output.dtype, input_tensor.dtype))
+            output.view(torch.uint8)[:4].copy_(input_tensor.view(torch.uint8))
+            output.view(torch.uint8)[4:].copy_(torch.arange(4, 8, dtype=torch.uint8))
+
+        monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fake_allgather)
+        dist_backend_module._all_gather_shard(output, local, None)
+        assert calls == [(torch.uint8, torch.uint8)]
+        assert output.view(torch.uint8).tolist() == list(range(8))
 
 
 class TestDistributedLayerwiseOffloadHook:

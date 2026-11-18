@@ -1471,7 +1471,7 @@ def test_dlo_allgather_rejects_unvalidated_online_quant_method(monkeypatch):
         ),
     )
 
-    with pytest.raises(ValueError, match="per-tensor FP8, INT8, and MXFP8 linears"):
+    with pytest.raises(ValueError, match="per-tensor FP8, INT8, MXFP8, and MXFP4 linears"):
         loader.load_model(load_device="cpu")
 
 
@@ -1484,6 +1484,16 @@ def test_dlo_allgather_allows_unquantized_host_fallback():
     model = nn.Module()
     model.transformer = nn.Linear(2, 2, bias=False)
     model.transformer.quant_method = object.__new__(UnquantizedHostLinearMethod)
+
+    assert DiffusersPipelineLoader._unsupported_dlo_allgather_online_quant_methods(model) == ()
+
+
+def test_dlo_allgather_allows_online_mxfp4_vllm_method():
+    from vllm_omni.quantization.mxfp4_config import VllmMxfp4OnlineLinearMethod
+
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    model.transformer.quant_method = object.__new__(VllmMxfp4OnlineLinearMethod)
 
     assert DiffusersPipelineLoader._unsupported_dlo_allgather_online_quant_methods(model) == ()
 
