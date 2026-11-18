@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from vllm_omni.diffusion.models.hyperflow_h3_flash.schedule import (
+from vllm_omni.diffusion.models.minimax_h3.hyperflow.schedule import (
     AUDIO_SHIFT,
     DEFAULT_STEPS,
     SIGMA_GRIDS,

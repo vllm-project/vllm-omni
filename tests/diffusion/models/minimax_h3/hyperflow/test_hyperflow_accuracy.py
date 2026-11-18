@@ -17,25 +17,36 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.diffusion.models.hyperflow_h3_flash.int8_convrot import regular_hadamard
-from vllm_omni.diffusion.models.hyperflow_h3_flash.prepare import (
+from vllm_omni.diffusion.models.minimax_h3.hyperflow.int8_convrot import regular_hadamard
+from vllm_omni.diffusion.models.minimax_h3.hyperflow.prepare import (
     OFFICIAL_T2VA_PROMPT,
     resolve_hyperflow_sigma_positions,
 )
-from vllm_omni.diffusion.models.hyperflow_h3_flash.schedule import (
+from vllm_omni.diffusion.models.minimax_h3.hyperflow.schedule import (
     AUDIO_SHIFT,
     DEFAULT_STEPS,
     SIGMA_GRIDS,
     VIDEO_SHIFT,
     sigma_grid,
 )
-from vllm_omni.diffusion.models.hyperflow_h3_flash.transformer import densify_int8, densify_lowrank
+from vllm_omni.diffusion.models.minimax_h3.hyperflow.transformer import (
+    HyperFlowH3FlashDiTModel,
+    densify_int8,
+    densify_lowrank,
+)
+from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3DiTModel
 from vllm_omni.errors import OmniClientError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 # Official upstream clone used during RFC work (optional).
 _UPSTREAM = Path("/dataset/home/z00897794/hyperflow-h3-flash/src")
+
+
+def test_hsdp_excludes_both_fp32_time_embedders():
+    assert "endpoint_time_embedder" in HyperFlowH3FlashDiTModel._hsdp_ignored_modules
+    assert "endpoint_time_embedder" not in MiniMaxH3DiTModel._hsdp_ignored_modules
+    assert set(MiniMaxH3DiTModel._hsdp_ignored_modules) <= set(HyperFlowH3FlashDiTModel._hsdp_ignored_modules)
 
 
 def _load_upstream_schedule():

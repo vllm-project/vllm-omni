@@ -20,8 +20,8 @@ import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from vllm_omni.diffusion.models.hyperflow_h3_flash.checkpoint import DEFAULT_DROPPED_BLOCKS
-from vllm_omni.diffusion.models.hyperflow_h3_flash.int8_convrot import regular_hadamard
+from vllm_omni.diffusion.models.minimax_h3.hyperflow.checkpoint import DEFAULT_DROPPED_BLOCKS
+from vllm_omni.diffusion.models.minimax_h3.hyperflow.int8_convrot import regular_hadamard
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3Attention
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
     MiniMaxH3DiTModel,
@@ -65,6 +65,8 @@ def densify_lowrank(down: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
 
 class HyperFlowH3FlashDiTModel(MiniMaxH3DiTModel):
     """MiniMax-H3 DiT with HyperFlow dropped blocks and two-time embeddings."""
+
+    _hsdp_ignored_modules = [*MiniMaxH3DiTModel._hsdp_ignored_modules, "endpoint_time_embedder"]
 
     def __init__(
         self,

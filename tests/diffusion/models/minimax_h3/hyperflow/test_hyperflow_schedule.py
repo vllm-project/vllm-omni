@@ -3,7 +3,7 @@
 
 import pytest
 
-from vllm_omni.diffusion.models.hyperflow_h3_flash.schedule import (
+from vllm_omni.diffusion.models.minimax_h3.hyperflow.schedule import (
     DEFAULT_STEPS,
     SIGMA_GRIDS,
     SUPPORTED_STEPS,

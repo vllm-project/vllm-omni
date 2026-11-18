@@ -86,7 +86,7 @@ def _looks_like_flux3(model_name: str, config: Mapping | None = None) -> bool:
 
 def resolve_native_diffusion_model_class(model_name: str) -> str | None:
     """Resolve native checkpoints that have no root HF or Diffusers config."""
-    from vllm_omni.diffusion.models.hyperflow_h3_flash.checkpoint import looks_like_hyperflow_h3_flash
+    from vllm_omni.diffusion.models.minimax_h3.hyperflow.checkpoint import looks_like_hyperflow_h3_flash
     from vllm_omni.diffusion.models.video_depth_anything.checkpoints import resolve_checkpoint
 
     # Same architecture key as FastH3 full checkpoints: HyperFlow attaches inside

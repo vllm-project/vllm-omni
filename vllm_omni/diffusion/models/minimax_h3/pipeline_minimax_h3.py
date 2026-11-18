@@ -1001,7 +1001,7 @@ class MiniMaxH3Pipeline(
             self._PROFILER_TARGETS.remove("_encode_local_media")
         # HyperFlow H3 Flash: same MiniMaxH3Pipeline serve path as FastH3 full
         # checkpoints; only the DiT weights + few-step schedule differ.
-        from vllm_omni.diffusion.models.hyperflow_h3_flash.prepare import (
+        from vllm_omni.diffusion.models.minimax_h3.hyperflow.prepare import (
             apply_hyperflow_runtime_pins,
             prepare_hyperflow_on_od_config,
         )
@@ -1173,7 +1173,7 @@ class MiniMaxH3Pipeline(
             )
         transformer_cls = type(self)._transformer_cls or MiniMaxH3DiTModel
         if self._hyperflow_layout is not None:
-            from vllm_omni.diffusion.models.hyperflow_h3_flash.transformer import HyperFlowH3FlashDiTModel
+            from vllm_omni.diffusion.models.minimax_h3.hyperflow.transformer import HyperFlowH3FlashDiTModel
 
             transformer_cls = HyperFlowH3FlashDiTModel
         self.transformer = transformer_cls(
@@ -1554,7 +1554,7 @@ class MiniMaxH3Pipeline(
         request speaks in.
         """
         if self._hyperflow_layout is not None:
-            from vllm_omni.diffusion.models.hyperflow_h3_flash.prepare import resolve_hyperflow_sigma_positions
+            from vllm_omni.diffusion.models.minimax_h3.hyperflow.prepare import resolve_hyperflow_sigma_positions
 
             return resolve_hyperflow_sigma_positions(sampling)
         if self._fasth3 is not None:

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -11,14 +12,14 @@ from typing import Any
 
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.models.hyperflow_h3_flash.checkpoint import (
+from vllm_omni.diffusion.models.minimax_h3.hyperflow.checkpoint import (
     HYPERFLOW_BASE_MODEL,
     HyperFlowH3FlashLayout,
     looks_like_hyperflow_h3_flash,
     resolve_hyperflow_layout,
     write_omni_model_index,
 )
-from vllm_omni.diffusion.models.hyperflow_h3_flash.schedule import (
+from vllm_omni.diffusion.models.minimax_h3.hyperflow.schedule import (
     DEFAULT_STEPS,
     SUPPORTED_STEPS,
     VIDEO_SHIFT,
@@ -37,7 +38,7 @@ def _symlink_tree(src: Path, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() or dest.is_symlink():
         return
-    os.symlink(src, dest, target_is_directory=src.is_dir())
+    os.symlink(src.absolute(), dest, target_is_directory=src.is_dir())
 
 
 def materialize_hyperflow_omni_snapshot(layout: HyperFlowH3FlashLayout, *, staging_root: Path | None = None) -> Path:
@@ -84,38 +85,45 @@ def prepare_hyperflow_on_od_config(od_config: Any) -> HyperFlowH3FlashLayout | N
     """
     model = str(getattr(od_config, "model", "") or "")
     staged = Path(model)
-    if staged.is_dir() and (staged / ".hyperflow_h3_flash").is_file():
-        # Already staged (e.g. thin alias re-entered). Still refresh tf config.
-        partition = (staged / ".hyperflow_h3_flash").read_text(encoding="utf-8").strip() or "fl2va"
-        cfg_path = staged / ("Ref2VA" if partition == "ref2va" else "FL2VA") / "transformer" / "config.json"
-        if cfg_path.is_file():
-            import json
-
-            _apply_hyperflow_tf_model_config(od_config, json.loads(cfg_path.read_text(encoding="utf-8")))
+    marker = staged / ".hyperflow_h3_flash"
+    already_staged = marker.is_file()
+    if not already_staged and not looks_like_hyperflow_h3_flash(model):
         return None
-    if not looks_like_hyperflow_h3_flash(model):
-        return None
+    if getattr(od_config, "cache_backend", None) == "tea_cache":
+        raise ValueError("HyperFlow H3 Flash does not support --cache-backend tea_cache")
 
     extras = dict(getattr(od_config, "extras", None) or {})
     base_model = extras.get("base_model") or os.environ.get("HYPERFLOW_BASE_MODEL") or HYPERFLOW_BASE_MODEL
-    layout = resolve_hyperflow_layout(
-        model,
-        task_type=getattr(od_config, "task_type", None),
-        revision=getattr(od_config, "revision", None),
-        base_model=str(base_model),
-        base_revision=extras.get("base_revision"),
-        load_text_encoder=bool(getattr(getattr(od_config, "model_loaded", None), "text_encoder", True)),
-        subfolder=extras.get("hyperflow_subfolder"),
-    )
-    staging = materialize_hyperflow_omni_snapshot(layout)
-    logger.info(
-        "HyperFlow H3 Flash: staging MiniMax-shaped layout at %s (DiT=%s, base=%s, partition=%s)",
-        staging,
-        layout.transformer_root,
-        layout.base_partition_root,
-        layout.partition,
-    )
-    od_config.model = str(staging)
+    if already_staged:
+        partition = marker.read_text(encoding="utf-8").strip()
+        partition_root = staged / ("Ref2VA" if partition == "ref2va" else "FL2VA")
+        config_path = partition_root / "transformer" / "config.json"
+        layout = HyperFlowH3FlashLayout(
+            weights_root=partition_root,
+            transformer_subfolder="transformer",
+            base_partition_root=partition_root,
+            partition=partition,
+            transformer_config=json.loads(config_path.read_text(encoding="utf-8")),
+        )
+    else:
+        layout = resolve_hyperflow_layout(
+            model,
+            task_type=getattr(od_config, "task_type", None),
+            revision=getattr(od_config, "revision", None),
+            base_model=str(base_model),
+            base_revision=extras.get("base_revision"),
+            load_text_encoder=bool(getattr(getattr(od_config, "model_loaded", None), "text_encoder", True)),
+            subfolder=extras.get("hyperflow_subfolder"),
+        )
+        staging = materialize_hyperflow_omni_snapshot(layout)
+        logger.info(
+            "HyperFlow H3 Flash: staging MiniMax-shaped layout at %s (DiT=%s, base=%s, partition=%s)",
+            staging,
+            layout.transformer_root,
+            layout.base_partition_root,
+            layout.partition,
+        )
+        od_config.model = str(staging)
     if hasattr(od_config, "task_type"):
         od_config.task_type = layout.partition
     _apply_hyperflow_tf_model_config(od_config, layout.transformer_config)

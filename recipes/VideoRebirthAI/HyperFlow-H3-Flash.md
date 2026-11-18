@@ -120,6 +120,7 @@ the main cause of earlier large visual drift.
 
 - Reuses **`MiniMaxH3Pipeline`** (same pattern as FastH3 full checkpoints): Hub
   id resolves to that class; no separate serve pipeline.
+- TeaCache (`--cache-backend tea_cache`) is unsupported because HyperFlow uses two-timestep conditioning.
 - Startup stages a MiniMax-shaped tree: HyperFlow INT8 DiT + base TE/VAE
   symlinks (no 31B transformer download).
 - P0 densifies INT8 convrot + low-rank into Omni's fused H3 modules for
