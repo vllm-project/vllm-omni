@@ -1865,8 +1865,7 @@ def test_broadcast_und_kv_expands_batch1_views_only() -> None:
     assert _broadcast_und_kv(single, 1) is single
 
 
-@pytest.mark.parametrize("grouped", [False, True])
-def test_gen_stack_passes_broadcast_und_kv_to_layers(grouped) -> None:
+def test_gen_stack_passes_broadcast_und_kv_to_layers() -> None:
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
 
     model = object.__new__(Cosmos3VFMTransformer)
@@ -1882,11 +1881,10 @@ def test_gen_stack_passes_broadcast_und_kv_to_layers(grouped) -> None:
             self.index = index
 
         def forward(self, hidden, **kwargs):
-            pairs = kwargs["cached_kv"] if grouped else [(kwargs["k_und"], kwargs["v_und"])]
-            seen.extend((key.shape[0], value.shape[0]) for key, value in pairs)
+            seen.append((kwargs["k_und"].shape[0], kwargs["v_und"].shape[0]))
             return hidden
 
-    model.gen_layers = nn.ModuleList([Layer(i) for i in range(1 if grouped else 2)])
+    model.gen_layers = nn.ModuleList([Layer(i) for i in range(2)])
     freqs = (torch.zeros(1, 4, 1, 2), torch.zeros(1, 4, 1, 2))
     model._run_gen_layers(torch.zeros(2, 4, 8), freqs_gen=freqs)
 

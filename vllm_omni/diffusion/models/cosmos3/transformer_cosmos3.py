@@ -2077,7 +2077,9 @@ class Cosmos3VFMTransformer(nn.Module):
                     "Cosmos3 Cache-Dit is not supported together with pipeline parallelism; disable one of them."
                 )
             for layer in self.gen_layers:
-                hidden_gen = layer(hidden_gen, cached_kv=und_kv, freqs_gen=(freqs_cos, freqs_sin), **layer_kwargs)
+                hidden_gen = layer(
+                    hidden_gen, cached_kv=self.cached_kv, freqs_gen=(freqs_cos, freqs_sin), **layer_kwargs
+                )
                 if isinstance(hidden_gen, tuple):
                     hidden_gen = hidden_gen[0]
         return self.gen_sp_gather(hidden_gen) if gather_output else hidden_gen
