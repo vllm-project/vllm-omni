@@ -219,6 +219,20 @@ def test_transfer_default_request_spec_uses_control_latent_layout():
         p.validate_ar_diffusion_effective_spec(worst.kv_spec)
 
 
+@pytest.mark.parametrize("chunk_size,initial_window,request_window", [(1, 1, 17), (4, 11, 19)])
+def test_transfer_full_history_manifest_starts_then_sizes_clip(chunk_size, initial_window, request_window):
+    p = paged_pipeline(chunk_size)
+    p.manifest.window_frames = None
+    p.manifest.sink_frames = 0
+    startup = p.ar_diffusion_default_request_spec().kv_spec
+    assert startup.window_frames == initial_window
+    p.validate_ar_diffusion_effective_spec(startup)
+    sp = params(33, aspect_ratio="16,9")
+    admitted = p.ar_diffusion_request_spec(SimpleNamespace(prompt="test", sampling_params=sp)).kv_spec
+    assert admitted.window_frames == request_window
+    p.validate_ar_diffusion_effective_spec(admitted)
+
+
 def test_transfer_paged_rejects_unpaired_spec():
     p = paged_pipeline()
     spec = p.ar_diffusion_kv_cache_spec()
