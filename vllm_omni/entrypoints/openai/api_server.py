@@ -883,6 +883,10 @@ async def _init_duplex_chat(
 async def _resolve_chat_template(engine_client: EngineClient, args: Namespace) -> str | None:
     resolved_chat_template = load_chat_template(args.chat_template)
     if resolved_chat_template is None:
+        # Reuse the selected topology, including deploy-config overrides.
+        pipeline = getattr(getattr(engine_client, "engine", None), "pipeline_config", None)
+        resolved_chat_template = getattr(pipeline, "chat_template", None)
+    if resolved_chat_template is None:
         try:
             tokenizer = await engine_client.get_tokenizer()
         except Exception as exc:
