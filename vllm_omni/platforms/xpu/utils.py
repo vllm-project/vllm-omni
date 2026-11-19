@@ -15,7 +15,9 @@ def torch_cuda_wrapper():
     torch.cuda.set_stream = partial(torch.xpu.set_stream)
     torch.cuda.set_device = partial(torch.xpu.set_device)
 
-    def _xpu_event(*args, blocking=None, **kwargs):
+    # torch.xpu.Event does not accept the ``blocking`` or ``external`` kwargs
+    # that torch.cuda.Event supports (vLLM 0.34 drops both the same way).
+    def _xpu_event(*args, blocking=None, external=None, **kwargs):
         return torch.xpu.Event(*args, **kwargs)
 
     torch.cuda.Event = _xpu_event

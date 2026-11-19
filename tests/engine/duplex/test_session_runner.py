@@ -2734,6 +2734,86 @@ async def test_terminal_listen_preserves_manual_turn_lifecycle(budget_spent: boo
 
 
 @pytest.mark.asyncio
+async def test_forced_response_first_silence_unit_opens_the_assistant_turn() -> None:
+    """The first silence unit of a response.create-owned response must carry
+    ``open_assistant_turn`` so the model can release a stale turn-ended latch
+    (left set by a truncated prior turn) and actually answer.
+
+    The recognition CI sessions run with auto-responds enabled and hit exactly
+    this path, so the marker must be tied to the explicitly created response,
+    not to the session mode (silence continuations only run in auto sessions
+    anyway -- a manual session's listen clears the active request first).
+    """
+    h = await open_harness(extra_body={"force_listen_count": 0})
+    try:
+        for _ in range(7):
+            await h.run(append_audio(3200, value=0.05))
+        await h.run(commands.Commit(create_response=True))
+        first = h.port.submissions[-1].context
+        assert h.session.active_response_id is not None
+        submissions_before = len(h.port.submissions)
+
+        def silence_payload(index: int) -> dict:
+            duplex = h.port.submissions[index].prompt["model_intermediate_buffer"]["duplex"]
+            return duplex["payload"]
+
+        listen = listen_output(first.request_id)
+        listen.finished = False
+        await h.deliver_and_settle(
+            listen,
+            stage_id=0,
+            segment_finished=True,
+            segment_token_ids=[11, 12, LISTEN_TOKEN_ID],
+            segment_output_metadata={"meta.listen_token_id": LISTEN_TOKEN_ID},
+        )
+        assert len(h.port.submissions) == submissions_before + 1
+        assert silence_payload(submissions_before).get("open_assistant_turn") is True
+
+        # Later units of the same response do not repeat the marker.
+        second = h.port.submissions[-1].context
+        listen_again = listen_output(second.request_id)
+        listen_again.finished = False
+        await h.deliver_and_settle(
+            listen_again,
+            stage_id=0,
+            segment_finished=True,
+            segment_token_ids=[11, 12, LISTEN_TOKEN_ID],
+            segment_output_metadata={"meta.listen_token_id": LISTEN_TOKEN_ID},
+        )
+        assert len(h.port.submissions) == submissions_before + 2
+        assert "open_assistant_turn" not in silence_payload(submissions_before + 1)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_auto_response_silence_unit_has_no_turn_marker() -> None:
+    """Engine-owned auto responses must not carry the open-turn marker."""
+    h = await open_harness()
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"))
+        assert h.session.active_response_id is not None
+        submissions_before = len(h.port.submissions)
+
+        listen = listen_output(request_id)
+        listen.finished = False
+        await h.deliver_and_settle(
+            listen,
+            stage_id=0,
+            segment_finished=True,
+            segment_token_ids=[11, 12, LISTEN_TOKEN_ID],
+            segment_output_metadata={"meta.listen_token_id": LISTEN_TOKEN_ID},
+        )
+        assert len(h.port.submissions) == submissions_before + 1
+        duplex = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
+        assert "open_assistant_turn" not in duplex["payload"]
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_listen_decision_on_a_resumable_request_keeps_the_turn_going() -> None:
     """Same unfinished listen, budget left: it must schedule the next unit.
 

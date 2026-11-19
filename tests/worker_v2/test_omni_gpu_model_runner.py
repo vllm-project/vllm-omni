@@ -374,6 +374,7 @@ def test_capture_model_unwraps_multimodal_output_and_excludes_full(output_form, 
     runner.cudagraph_manager = SimpleNamespace(
         _capture_descs={CUDAGraphMode.PIECEWISE: [piecewise], CUDAGraphMode.FULL: [full]},
         _candidates={(1, 0): [piecewise, full]},
+        _decode_descs={},
     )
     runner.model_state = SimpleNamespace(capture_mtp_graphs=mocker.Mock(), _is_mtp_graph_runner=lambda: True)
     runner._dispatch_mtp_batch_descriptor = mocker.Mock(return_value="desc")
@@ -393,6 +394,73 @@ def test_capture_model_unwraps_multimodal_output_and_excludes_full(output_form, 
     runner.model_state.capture_mtp_graphs.assert_called_once_with(
         runner._dispatch_mtp_batch_descriptor, restore_capturing=profile_only
     )
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.FULL_AND_PIECEWISE, CUDAGraphMode.FULL_DECODE_ONLY, CUDAGraphMode.FULL])
+@pytest.mark.parametrize("supports_full", [False, True])
+def test_capture_exclusion_keeps_native_decode_dispatch_consistent(mode, supports_full, monkeypatch):
+    from vllm.v1.worker.gpu import cudagraph_utils
+
+    monkeypatch.setattr(cudagraph_utils, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True))
+    monkeypatch.setattr(cudagraph_utils.current_platform, "get_global_graph_pool", lambda: None)
+    monkeypatch.setattr(cudagraph_utils, "get_offloader", lambda: SimpleNamespace(sync_prev_onload=lambda: None))
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=64),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1),
+        cache_config=SimpleNamespace(use_kda_recoverssm=False),
+        uniform_decode_query_len=1,
+        compilation_config=SimpleNamespace(
+            prefill_cudagraph_capture_token_sizes=[1, 8, 16, 64, 512, 1024],
+            decode_cudagraph_capture_request_sizes=[1, 2, 8, 32, 64],
+            max_cudagraph_capture_size=1024,
+            max_decode_cudagraph_capture_tokens=1024,
+            use_breakable_cudagraph=False,
+        ),
+    )
+    manager = cudagraph_utils.CudaGraphManager(config, torch.device("cpu"), mode, {1: 64, 8: 64, 16: 64}, [0, 2])
+    runner = _make_runner()
+    runner.model = SimpleNamespace(
+        _returns_tuple=True, supports_mrv2_full_graph_aux_outputs=supports_full, forward=lambda: ()
+    )
+    runner._configure_cudagraph_output_contract()
+    runner.use_aux_hidden_state_outputs = False
+    runner.cudagraph_manager = manager
+    runner.model_state = SimpleNamespace()
+
+    def capture(_self, *, profile_only=False):
+        # Replace CUDA recording only; native candidate construction and
+        # dispatch remain real, including the request-indexed decode tables.
+        manager.graphs.update(
+            {desc: SimpleNamespace(replay=lambda: None) for desc in manager._capture_descs.get(CUDAGraphMode.FULL, [])}
+        )
+        manager._graphs_captured = True
+        return 0
+
+    monkeypatch.setattr(GPUModelRunner, "capture_model", capture)
+    runner.capture_model()
+    expected = CUDAGraphMode.FULL if supports_full else mode.mixed_mode()
+    if not supports_full and expected == CUDAGraphMode.FULL:
+        expected = CUDAGraphMode.NONE
+    # Plain decode and the MiniCPM K7/K15 ngram verification widths.
+    for query_len in (1, 8, 16):
+        for num_reqs in (1, 2, 5, 32, 64):
+            for num_loras in (0, 1, 2):
+                desc = manager.dispatch(num_reqs, num_reqs * query_len, query_len, num_loras)
+                if desc.cg_mode == CUDAGraphMode.FULL:
+                    # The startup sampler dummy run must never replay an
+                    # excluded graph, even when decode lookup precedes tokens.
+                    manager.run_fullgraph(desc)
+                assert desc.cg_mode == expected
+                assert desc.num_active_loras == (2 if num_loras else 0)
+                if desc.cg_mode != CUDAGraphMode.NONE:
+                    assert desc in manager._capture_descs[desc.cg_mode]
+    mixed = manager.dispatch(2, 8, None, 0)
+    expected_mixed = mode.mixed_mode()
+    if not supports_full and expected_mixed == CUDAGraphMode.FULL:
+        expected_mixed = CUDAGraphMode.NONE
+    assert mixed.cg_mode == expected_mixed
+    if not supports_full:
+        assert manager._decode_descs == {}
 
 
 @pytest.mark.parametrize(
@@ -536,6 +604,9 @@ def test_hybrid_state_constructs_and_reuses_request_slots(remove_by_id):
         ),
         scheduler_config=SimpleNamespace(max_num_seqs=2, max_num_batched_tokens=16),
         cache_config=SimpleNamespace(mamba_cache_mode="none", use_kda_recoverssm=False),
+        # The pin's VllmConfig grew this top-level field; the pin's
+        # MambaHybridModelState reads it unconditionally in __init__.
+        use_flashinfer_replayssm=False,
     )
     # Exercise both real parent constructors and their lifecycle methods.
     state = OmniMambaHybridModelState(config, torch.nn.Linear(8, 8), None, torch.device("cpu"))
@@ -585,7 +656,7 @@ def test_aux_hidden_state_contract_uses_tuple_slot_not_structured_output():
 @pytest.mark.parametrize("stage,declared", [("thinker", False), ("custom_ar", True)])
 def test_capture_contract_uses_model_declaration(stage, declared):
     runner = _make_runner()
-    runner.model = SimpleNamespace(model_stage=stage, _returns_tuple=declared)
+    runner.model = SimpleNamespace(model_stage=stage, _returns_tuple=declared, mrv2_forward_returns_native_aux=True)
     runner._configure_cudagraph_output_contract()
     assert runner._model_has_structured_output is declared
     assert runner._exclude_full_graph is declared
@@ -594,7 +665,7 @@ def test_capture_contract_uses_model_declaration(stage, declared):
 
 @pytest.mark.parametrize(
     ("stage", "use_mrv2", "returns_aux", "exclude_full"),
-    [("llm", True, False, False), ("tts", True, False, False), ("llm", True, True, True), ("llm", False, False, True)],
+    [("llm", True, False, False), ("tts", True, False, False), ("llm", True, True, False), ("llm", False, False, True)],
 )
 def test_minicpmo_capture_contract(stage, use_mrv2, returns_aux, exclude_full):
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
@@ -607,6 +678,8 @@ def test_minicpmo_capture_contract(stage, use_mrv2, returns_aux, exclude_full):
     model._use_v2_model_runner = use_mrv2
     model._returns_aux_hidden_states = returns_aux
     model.have_multimodal_outputs = True
+    assert model.mrv2_forward_returns_tensor is (use_mrv2 and (stage == "tts" or not returns_aux))
+    assert model.mrv2_forward_returns_native_aux is (use_mrv2 and stage == "llm" and returns_aux)
 
     runner = _make_runner()
     runner.model = model

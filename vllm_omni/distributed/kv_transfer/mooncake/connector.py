@@ -326,7 +326,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
             scheduler.lookup_async is not True
             or not isinstance(executor, ThreadPoolExecutor)
             or executor._max_workers != 1
-            or not isinstance(getattr(client, "futures", None), dict)
+            or not isinstance(getattr(client, "_lookups", None), dict)
             or not callable(getattr(client, "discard", None))
         ):
             raise ValueError(
