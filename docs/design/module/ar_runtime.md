@@ -36,6 +36,23 @@ implementations and their exclusive helpers are removed. Shared utilities under
 `worker/` remain in use by `worker_v2/`. The upstream `vllm.v1` package name
 does not select Model Runner V1.
 
+## Model-state compatibility
+
+The MRv2 AR runner accepts core vLLM model states with tensor model output
+and the applicable model forward signature. Factory dispatch preserves the
+selected state. The AR runner calls the standard core attention and state
+hooks and invokes Omni extensions when the state provides them. Configured
+native data planes, Omni KV transfer, and model-owned stream graph capture
+require their corresponding state capabilities at load time. AR structured
+or auxiliary output requires an existing Omni output conversion hook.
+
+The MRv2 generation runner (for example, Code2Wav) has its own execution
+path. It does not drive the core `prepare_attn`, `preprocess_state`, and
+`postprocess_state` hooks. Core-state step, sampling, and teardown
+compatibility is validated on AR. Generation keeps the existing
+`OmniOutput` path and uses the model's converter and request buffer when
+legacy output conversion is needed.
+
 The experimental Mooncake KV/HS backend uses the existing MRv2 external-load
 state transitions for Qwen3-Omni turn requests and duplex utterances, which
 are also ordinary requests. Its connector must withhold

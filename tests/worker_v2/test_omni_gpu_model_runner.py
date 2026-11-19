@@ -624,15 +624,27 @@ def test_hybrid_state_constructs_and_reuses_request_slots(remove_by_id):
     assert state.intermediate_buffer.req_id_to_index == {"replacement": 0, "peer": 1}
 
 
-def test_finish_requests_notifies_model_and_cleans_only_known_slots(monkeypatch):
+def test_finish_requests_notifies_before_delegating_cleanup(monkeypatch):
     runner = _make_runner()
-    calls = []
-    runner.model = SimpleNamespace(on_requests_finished=lambda ids: calls.append(set(ids)))
-    runner.model_state = MagicMock()
-    monkeypatch.setattr(GPUModelRunner, "finish_requests", lambda *args: None)
-    runner.finish_requests(SimpleNamespace(finished_req_ids={"released"}, preempted_req_ids={"r1"}))
-    assert calls == [{"released"}]
-    assert sorted(c.args[0] for c in runner.model_state.remove_request.call_args_list) == [0]
+    calls: list[tuple[object, ...]] = []
+    output = SimpleNamespace(finished_req_ids={"released"}, preempted_req_ids={"r1", "unknown"})
+    runner.model = SimpleNamespace(on_requests_finished=lambda ids: calls.append(("model", ids)))
+    runner.model_state = SimpleNamespace(
+        on_requests_finished=lambda ids: calls.append(("state", ids)),
+        on_request_preempted=lambda req_id, idx: calls.append(("preempt", req_id, idx)),
+        remove_request=MagicMock(),
+    )
+
+    def finish(self, scheduler_output):
+        assert self is runner
+        assert scheduler_output is output
+        calls.append(("core",))
+
+    monkeypatch.setattr(GPUModelRunner, "finish_requests", finish)
+    runner.finish_requests(output)
+
+    assert calls == [("model", {"released"}), ("state", {"released"}), ("preempt", "r1", 0), ("core",)]
+    runner.model_state.remove_request.assert_not_called()
 
 
 def test_aux_hidden_state_contract_uses_tuple_slot_not_structured_output():

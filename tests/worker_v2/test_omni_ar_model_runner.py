@@ -371,7 +371,7 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
         postprocess_model_output=MagicMock(return_value=(text_hidden, multimodal_outputs)),
         run_postprocess=MagicMock(),
     )
-    runner.model_state.intermediate_buffer = SimpleNamespace(buffers={0: {"global_request_id": "global-req"}})
+    runner.model_state.intermediate_buffer = SimpleNamespace(buffers=[{"global_request_id": "global-req"}])
     runner.req_states = SimpleNamespace(req_id_to_index={"req": 0})
     runner.req_states.all_token_ids = SimpleNamespace(gpu=torch.tensor([[1]]))
     runner.req_states.num_computed_tokens = SimpleNamespace(gpu=torch.tensor([0]))

@@ -11,6 +11,7 @@ buffer and lifecycle hooks.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
 
@@ -29,6 +30,7 @@ from vllm.v1.worker.gpu.model_runner import (
     ExecuteModelState,
     IntermediateTensors,
 )
+from vllm.v1.worker.gpu.model_states.interface import ModelState
 
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
 from vllm_omni.data_entry_keys import flatten_payload
@@ -40,6 +42,7 @@ from vllm_omni.worker_v2.omni_ar_model_runner import (
 )
 from vllm_omni.worker_v2.omni_model_runner import (
     OmniGPUModelRunner,
+    _require_buffer_method,
 )
 
 logger = init_logger(__name__)
@@ -193,6 +196,25 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         self._dummy_hidden = torch.zeros(1, dtype=self.dtype, device=self.device)
         self._retains_state_across_chunks = bool(getattr(self.model_config, "retains_state_across_chunks", False))
 
+    @staticmethod
+    def _require_generation_converter(state: ModelState, model: torch.nn.Module) -> Callable[..., OmniOutput]:
+        converter = getattr(model, "make_omni_output", None)
+        if not callable(converter):
+            raise NotImplementedError(
+                f"MRv2 generation output requires model.make_omni_output on {type(model).__name__} "
+                f"with {type(state).__name__}"
+            )
+        return converter
+
+    def _validate_model_state_capabilities(self, state: ModelState, model: torch.nn.Module) -> None:
+        super()._validate_model_state_capabilities(state, model)
+        if (
+            getattr(model, "mrv2_forward_returns_tensor", False) is True
+            or getattr(model, "_returns_tuple", False) is True
+        ):
+            _require_buffer_method(state, "gather", "MRv2 generation output")
+            self._require_generation_converter(state, model)
+
     def _call_optional_model_hook(self, name: str, *args: object) -> None:
         """Keep optional cache warmup failures from terminating the engine."""
         hook = getattr(self.model, name, None)
@@ -269,7 +291,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
 
             # Reset chunk-local model inputs using the same initialization as
             # re-adding a released chunk, without recycling the runner slot.
-            self.model_state.remove_request(req_idx)
+            self.model_state.remove_request(req_id)
             self.model_state.add_request(req_idx, chunk_data)
 
             # In-place update token state — same slot, no remove/re-add.
@@ -495,10 +517,12 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
 
         # Convert raw model output to OmniOutput.
         if not isinstance(model_output, OmniOutput):
-            buffer_list = self.model_state.intermediate_buffer.gather(input_batch)
+            gather = _require_buffer_method(self.model_state, "gather", "MRv2 generation output")
+            converter = self._require_generation_converter(self.model_state, self.model)
+            buffer_list = gather(input_batch)
             make_output_kwargs = {"model_intermediate_buffer": buffer_list}
             make_output_kwargs["runtime_additional_information"] = buffer_list
-            model_output = self.model.make_omni_output(model_output, **make_output_kwargs)
+            model_output = converter(model_output, **make_output_kwargs)
 
         self._gen_model_output = model_output
         self._gen_input_batch = input_batch
