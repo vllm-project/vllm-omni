@@ -4,8 +4,9 @@
 import pytest
 import torch
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 
-from vllm_omni.attention import fish_kvcache_attn, fish_kvcache_backend
+from vllm_omni.attention import fish_kvcache_attn, fish_kvcache_backend, fish_kvcache_triton
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -1134,6 +1135,42 @@ def test_fish_kvcache_native_op_matches_reference_with_vllm_strided_cache(seq_le
 
     expected = _reference_decode_attention(q, k_cache, v_cache, block_table, seq_lens, scale)
     torch.testing.assert_close(out, expected, atol=3e-2, rtol=3e-2)
+
+
+@triton.jit
+def _fish_kvcache_offset_probe(block_ids, output):
+    rows = tl.arange(0, 2)
+    dims = tl.arange(0, 2)
+    offsets = fish_kvcache_triton._kv_cache_offsets(
+        tl.load(block_ids + rows),
+        tl.full((2,), 0, tl.int32),
+        tl.full((), 0, tl.int32),
+        dims,
+        32768,
+        256,
+        4096,
+        1,
+    )
+    tl.store(output + rows[:, None] * 2 + dims[None, :], offsets)
+
+
+@pytest.mark.skipif(
+    not torch.accelerator.is_available() or not fish_kvcache_attn.is_available(),
+    reason="Fish kvcache Triton attention is not available",
+)
+def test_fish_kvcache_packed_offsets_cross_int32_boundary():
+    # A packed [block, 8 heads, 16 tokens, 2 * 128] cache has 32768 elements per block.
+    block_ids = torch.tensor([65535, 65536], device="cuda", dtype=torch.int32)
+    offsets = torch.empty((2, 2), device=block_ids.device, dtype=torch.int64)
+    _fish_kvcache_offset_probe[(1,)](block_ids, offsets)
+
+    boundary = 2**31
+    expected = torch.tensor(
+        [[boundary - 32768, boundary - 32768 + 1], [boundary, boundary + 1]],
+        device=offsets.device,
+        dtype=torch.int64,
+    )
+    torch.testing.assert_close(offsets, expected)
 
 
 @pytest.mark.skipif(

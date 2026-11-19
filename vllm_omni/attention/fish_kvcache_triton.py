@@ -30,6 +30,25 @@ def load_error() -> Exception | None:
 if is_available():
 
     @triton.jit
+    def _kv_cache_offsets(
+        physical_block,
+        block_offset,
+        kv_head,
+        offs_d,
+        STRIDE_BLOCK: tl.constexpr,
+        STRIDE_TOKEN: tl.constexpr,
+        STRIDE_HEAD: tl.constexpr,
+        STRIDE_DIM: tl.constexpr,
+    ):
+        # Packed caches can exceed the signed int32 range in element offsets.
+        return (
+            physical_block[:, None].to(tl.int64) * STRIDE_BLOCK
+            + block_offset[:, None].to(tl.int64) * STRIDE_TOKEN
+            + kv_head.to(tl.int64) * STRIDE_HEAD
+            + offs_d[None, :].to(tl.int64) * STRIDE_DIM
+        )
+
+    @triton.jit
     def _small_decode_kernel(
         Q,
         K,
@@ -88,21 +107,29 @@ if is_available():
                 other=0,
             )
 
-            k_offsets = (
-                physical_block[:, None] * K_STRIDE_BLOCK
-                + block_offset[:, None] * K_STRIDE_TOKEN
-                + kv_head * K_STRIDE_HEAD
-                + offs_d[None, :] * K_STRIDE_DIM
+            k_offsets = _kv_cache_offsets(
+                physical_block,
+                block_offset,
+                kv_head,
+                offs_d,
+                K_STRIDE_BLOCK,
+                K_STRIDE_TOKEN,
+                K_STRIDE_HEAD,
+                K_STRIDE_DIM,
             )
             k = tl.load(K + k_offsets, mask=mask_n[:, None], other=0.0)
             qk = tl.dot(q, tl.trans(k)) * SCALE
             qk = tl.where(mask_h[:, None] & mask_n[None, :], qk, -float("inf"))
 
-            v_offsets = (
-                physical_block[:, None] * V_STRIDE_BLOCK
-                + block_offset[:, None] * V_STRIDE_TOKEN
-                + kv_head * V_STRIDE_HEAD
-                + offs_d[None, :] * V_STRIDE_DIM
+            v_offsets = _kv_cache_offsets(
+                physical_block,
+                block_offset,
+                kv_head,
+                offs_d,
+                V_STRIDE_BLOCK,
+                V_STRIDE_TOKEN,
+                V_STRIDE_HEAD,
+                V_STRIDE_DIM,
             )
             v = tl.load(V + v_offsets, mask=mask_n[:, None], other=0.0)
             m_new = tl.maximum(m_i, tl.max(qk, axis=1))
@@ -190,21 +217,29 @@ if is_available():
                 other=0,
             )
 
-            k_offsets = (
-                physical_block[:, None] * K_STRIDE_BLOCK
-                + block_offset[:, None] * K_STRIDE_TOKEN
-                + kv_head * K_STRIDE_HEAD
-                + offs_d[None, :] * K_STRIDE_DIM
+            k_offsets = _kv_cache_offsets(
+                physical_block,
+                block_offset,
+                kv_head,
+                offs_d,
+                K_STRIDE_BLOCK,
+                K_STRIDE_TOKEN,
+                K_STRIDE_HEAD,
+                K_STRIDE_DIM,
             )
             k = tl.load(K + k_offsets, mask=mask_n[:, None], other=0.0)
             qk = tl.dot(q, tl.trans(k)) * SCALE
             qk = tl.where(mask_h[:, None] & mask_n[None, :], qk, -float("inf"))
 
-            v_offsets = (
-                physical_block[:, None] * V_STRIDE_BLOCK
-                + block_offset[:, None] * V_STRIDE_TOKEN
-                + kv_head * V_STRIDE_HEAD
-                + offs_d[None, :] * V_STRIDE_DIM
+            v_offsets = _kv_cache_offsets(
+                physical_block,
+                block_offset,
+                kv_head,
+                offs_d,
+                V_STRIDE_BLOCK,
+                V_STRIDE_TOKEN,
+                V_STRIDE_HEAD,
+                V_STRIDE_DIM,
             )
             v = tl.load(V + v_offsets, mask=mask_n[:, None], other=0.0)
             m_new = tl.maximum(m_i, tl.max(qk, axis=1))
