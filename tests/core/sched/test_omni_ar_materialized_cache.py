@@ -82,7 +82,6 @@ def _frame(*, general=False, token=8, sync_spec=False):
     scheduler_output.scheduled_spec_decode_tokens = {"source": [9, 10]} if sync_spec else {}
     runner_output = OmniModelRunnerOutput(
         req_ids=["source"],
-        req_id_to_index={"source": 0},
         sampled_token_ids=[[token]],
         logprobs=None,
         prompt_logprobs_dict={},

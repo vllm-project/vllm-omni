@@ -412,7 +412,10 @@ def test_pre_sharded_load_restores_checkpoint_values(cpu_process_group, tmp_path
         lora_path=None,
         hsdp_weight_load_strategy="pre_sharded",
         num_weight_load_threads=1,
-        parallel_config=SimpleNamespace(use_hsdp=True, hsdp_replicate_size=1, hsdp_shard_size=1),
+        model="",
+        parallel_config=SimpleNamespace(
+            use_hsdp=True, hsdp_replicate_size=1, hsdp_shard_size=1, tensor_parallel_size=1
+        ),
     )
     loader = DiffusersPipelineLoader(LoadConfig(), config)
     monkeypatch.setattr(loader, "_init_from_load_format", lambda *args, **kwargs: model)
