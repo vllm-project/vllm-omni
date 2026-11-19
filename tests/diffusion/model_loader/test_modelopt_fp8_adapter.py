@@ -399,3 +399,66 @@ def test_modelopt_nvfp4_rejects_partial_blocks():
     tensors[0] = (tensors[0][0], torch.zeros(2, 15, dtype=torch.uint8))
     with pytest.raises(ValueError, match="weight_scale shape"):
         list(adapter.adapt(tensors))
+
+
+def test_modelopt_nvfp4_dequantizes_column_parallel_target_before_shard():
+    """Column-parallel full-precision targets see a rank-local [N/tp, K] parameter.
+
+    The checkpoint tensor is still the global packed [N, K/2]. Dequantize that
+    full tensor, then let ColumnParallelLinear.weight_loader shard the rows.
+    """
+    from unittest.mock import patch
+
+    from vllm.model_executor.layers.linear import ColumnParallelLinear
+
+    tp_size = 2
+    dtype = torch.bfloat16
+    tensors = _nvfp4_checkpoint_tensors()
+    values = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
+    expected = torch.stack(
+        [
+            torch.cat([values * 0.125, values * 0.5]),
+            torch.cat([values.flip(0) * 0.25, values.flip(0) * 1.0]),
+        ]
+    ).to(dtype)
+
+    patches = (
+        patch("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", return_value=tp_size),
+        patch("vllm.model_executor.parameter.get_tensor_model_parallel_rank", return_value=0),
+        patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size", return_value=tp_size),
+        patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_rank", return_value=0),
+    )
+    for item in patches:
+        item.start()
+    try:
+        layers = [
+            ColumnParallelLinear(
+                32,
+                2,
+                bias=False,
+                return_bias=False,
+                params_dtype=dtype,
+                tp_rank=rank,
+                tp_size=tp_size,
+                prefix="transformer.proj",
+            )
+            for rank in range(tp_size)
+        ]
+    finally:
+        for item in patches:
+            item.stop()
+
+    for rank, layer in enumerate(layers):
+        assert tuple(layer.weight.shape) == (1, 32)
+        assert layer.weight.tp_size == tp_size
+        model = nn.Module()
+        model.transformer = nn.Module()
+        model.transformer.proj = layer
+        adapted = list(ModelOptNvFp4CheckpointAdapter(model, _make_source()).adapt(tensors))
+        assert [name for name, _ in adapted] == ["transformer.proj.weight"]
+        weight = adapted[0][1]
+        assert weight.dtype == dtype
+        assert tuple(weight.shape) == (2, 32)
+        assert torch.equal(weight, expected)
+        layer.weight.weight_loader(layer.weight, weight)
+        torch.testing.assert_close(layer.weight.data, expected[rank : rank + 1])

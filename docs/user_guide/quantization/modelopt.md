@@ -26,14 +26,16 @@ otherwise.
 
 Some transformer modules, such as modulation linears, intentionally remain in
 full precision. For `modelopt_fp4` checkpoints, the adapter dequantizes packed
-`uint8` weights of shape `[N, K/2]` when the target is a replicated, unfused
-full-precision parameter of shape `[N, K]`. This requires both the
+`uint8` weights of shape `[N, K/2]` when the target is a full-precision
+parameter of shape `[N, K]`, or a column-parallel shard of shape `[N/tp, K]`.
+Column-parallel targets are dequantized from the global packed tensor; the
+existing weight loader then shards the rows. This requires both the
 per-16-element `weight_scale` and scalar `weight_scale_2`. Block scales must be
 `float8_e4m3fn` values or their raw `uint8` byte representation; other dtypes
 are rejected. The module continues to execute in full precision; other
 quantized layers keep their packed weights and scales. This conversion does
-not cover `modelopt_mixed` checkpoints or TP-sharded or fused full-precision
-targets.
+not cover `modelopt_mixed` checkpoints, row-parallel shards, or fused
+full-precision targets whose checkpoint tensors do not match one parameter.
 
 ## Supported ModelOpt Checkpoint Formats
 

@@ -301,15 +301,29 @@ class ModelOptNvFp4CheckpointAdapter(ModelOptFp8CheckpointAdapter):
     def _is_packed_nvfp4_for_full_precision_target(self, tensor: torch.Tensor, target_name: str | None) -> bool:
         # Models may intentionally keep some layers in full precision (for
         # example AdaLN modulation linears) even when the checkpoint stores
-        # them as packed NVFP4. Detect a uint8 [N, K // 2] tensor whose target
-        # is a full-precision [N, K] parameter.
+        # them as packed NVFP4. The checkpoint tensor is the global uint8
+        # [N, K/2]. The parameter is either the full [N, K] tensor or, for a
+        # column-parallel layer, the rank-local [N/tp, K] shard. Dequantize
+        # the global tensor; the existing weight loader shards the rows.
         if target_name is None or tensor.dtype != torch.uint8 or tensor.ndim != 2:
             return False
         target = self._loadable_tensors[target_name]
+        if target.dtype not in self._FULL_PRECISION_DTYPES or target.ndim != 2:
+            return False
+        packed_rows, packed_cols = tensor.shape
+        local_rows, local_cols = target.shape
+        if local_cols != packed_cols * 2:
+            return False
+        if packed_rows == local_rows:
+            return True
+        tp_size = getattr(target, "tp_size", None)
+        # output_dim 0 is the row axis that ColumnParallelLinear shards.
+        # Row-parallel targets fail the K check above and stay packed.
         return (
-            target.dtype in self._FULL_PRECISION_DTYPES
-            and target.ndim == 2
-            and tuple(target.shape) == (tensor.shape[0], tensor.shape[1] * 2)
+            getattr(target, "output_dim", None) == 0
+            and isinstance(tp_size, int)
+            and tp_size > 1
+            and packed_rows == local_rows * tp_size
         )
 
     def _target_dtype_for_dequantization(

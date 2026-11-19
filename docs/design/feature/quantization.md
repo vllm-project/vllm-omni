@@ -167,14 +167,18 @@ schedulers, and tokenizers are not rewritten automatically. A component map can
 select a narrower scope, but it cannot add quantization support to a layer.
 
 For checkpoints using `modelopt_fp4`, a transformer module may intentionally
-keep a replicated, unfused full-precision `[N, K]` parameter even when the
-checkpoint stores a packed `uint8` weight of shape `[N, K/2]`. The checkpoint
-adapter dequantizes matching weights at load time using a per-16-element
-`weight_scale` and scalar `weight_scale_2`; both scales are required and may
-arrive in any order. Block scales must be `float8_e4m3fn` values or their raw
-`uint8` byte representation; other dtypes are rejected. This conversion does
-not cover `modelopt_mixed` checkpoints or TP-sharded or fused full-precision
-targets. Quantized targets retain their packed weights and scale tensors.
+keep a full-precision parameter even when the checkpoint stores a packed
+`uint8` weight of shape `[N, K/2]`. The checkpoint adapter dequantizes matching
+weights at load time using a per-16-element `weight_scale` and scalar
+`weight_scale_2`; both scales are required and may arrive in any order. Block
+scales must be `float8_e4m3fn` values or their raw `uint8` byte representation;
+other dtypes are rejected. A replicated target has shape `[N, K]`. A
+column-parallel target already holds one rank's `[N/tp, K]` shard; the adapter
+still dequantizes the global packed tensor, and the existing weight loader
+shards the rows. This conversion does not cover `modelopt_mixed` checkpoints,
+row-parallel shards, or fused full-precision targets whose checkpoint tensors
+do not match one parameter. Quantized targets retain their packed weights and
+scale tensors.
 
 Weight quantization and quantized KV cache are separate paths. The former is
 resolved through `quantization_config`; runtime attention/KV-cache quantization
