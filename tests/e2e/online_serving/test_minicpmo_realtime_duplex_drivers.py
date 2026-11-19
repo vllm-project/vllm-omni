@@ -2531,6 +2531,8 @@ def test_realtime_duplex_demo_writes_audio_per_response(tmp_path):
     [
         ("cancelled", True),
         ("completed_cleared", True),
+        ("completed_after_onset", False),
+        ("completed_after_onset_with_audio", False),
         ("completed_uncleared", False),
         ("wrong_clear_target", False),
         ("wrong_cancel_reason", False),
@@ -2553,7 +2555,14 @@ def test_server_vad_interrupt_validates_generation_and_playback(
     def audio(response_id):
         return {"type": "response.output_audio.delta", "response_id": response_id}
 
-    completed = scenario in {"completed_cleared", "completed_uncleared", "wrong_clear_target", "stale_audio"}
+    completed = scenario in {
+        "completed_cleared",
+        "completed_after_onset",
+        "completed_after_onset_with_audio",
+        "completed_uncleared",
+        "wrong_clear_target",
+        "stale_audio",
+    }
     target_done = terminal(
         "target", "completed" if completed else "cancelled", "stop" if completed else "turn_detected"
     )
@@ -2561,6 +2570,11 @@ def test_server_vad_interrupt_validates_generation_and_playback(
         target_done["response"]["status_details"]["reason"] = "client_cancelled"
     onset = {"type": "input_audio_buffer.speech_started"}
     tail = [target_done, onset] if completed else [onset, target_done]
+    if scenario in {"completed_after_onset", "completed_after_onset_with_audio"}:
+        tail = [onset]
+        if scenario == "completed_after_onset_with_audio":
+            tail.append(audio("target"))
+        tail.append(target_done)
     if completed and scenario != "completed_uncleared":
         tail.append(
             {
