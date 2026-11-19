@@ -1228,6 +1228,8 @@ def _project_omni_stage_engine_args(
     engine_args["model_arch"] = copy.deepcopy(stage_config.model_config.model_arch)
     # Preserve the legacy adapter key even when the topology leaves it unset.
     engine_args["scheduling_metadata_adapter"] = stage_config.model_config.scheduling_metadata_adapter
+    if stage_config.model_config.scheduler_window_policy is not None:
+        engine_args["scheduler_window_policy"] = stage_config.model_config.scheduler_window_policy
     _maybe_set_qwen3_omni_moe_backend(
         engine_args,
         moe_backend_is_explicit="moe_backend" in getattr(stage_config.model_config, "_omni_explicit_fields", ()),

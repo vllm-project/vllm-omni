@@ -61,10 +61,14 @@ unit in the sink page.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from vllm.v1.request import Request, StreamingUpdate
 
 # Barge-in carry: a Stage-0 request a barge-in or cancel aborted leaves its
 # completed window units to the session's next Stage-0 request. The scheduler
-# (MiniCPMO45DuplexSchedulerHelper) decides which windows are kept, for how long
+# (MiniCPMO45SchedulerWindowPolicy) decides which windows are kept, for how long
 # and which new request gets one, and sends each step's decisions to the worker
 # in ``OmniSchedulerOutput.duplex_carry_ops``; the worker
 # (MiniCPMO45Stage0DuplexRuntime) only follows them, so the two never disagree.
@@ -265,3 +269,185 @@ def plan_position_reanchor(
         moved_from=moved_from,
         sink_blocks=sink_end_block,
     )
+
+
+def prepare_stage0_window(
+    session: Request,
+    update: StreamingUpdate,
+    *,
+    segment_output_ids: list[int],
+    completed_terminator: int | None = None,
+) -> bool:
+    """Plan an official-style MiniCPM Stage-0 window at unit boundaries.
+
+    vLLM owns a paged KV cache, so deleting a middle span and rotating the
+    retained K tensors in place is not a safe model hook.  Instead, record
+    completed unit lengths in the scheduler and request a full prompt
+    replacement when a watermark fires.  The worker rebuilds matching
+    embeddings from its unit history, which recomputes RoPE at the new
+    contiguous positions.
+    """
+    info = getattr(update, "model_intermediate_buffer", None)
+    if not isinstance(info, dict):
+        return False
+    duplex = info.get("duplex")
+    if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
+        return False
+    runtime_config = duplex.get("runtime_config")
+    runtime_config = runtime_config if isinstance(runtime_config, dict) else {}
+    window = runtime_config.get("duplex_window_config")
+    mode = window.get("sliding_window_mode", "off") if isinstance(window, dict) else "off"
+    if mode not in {"basic", "context"}:
+        # Without a window the worker keeps no unit history to carry.
+        session._minicpmo45_carried_window = None
+
+    try:
+        seq = int(duplex.get("seq", 0) or 0)
+        preserve_len = int(runtime_config.get("duplex_first_append_context_tokens", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    if seq <= 1:
+        return False
+
+    # The sampled terminator is discarded by the normal session update and
+    # re-injected at the head of this append, followed by </unit>.
+    # generated_ids contains only the confirmed output span retained by
+    # the streaming update, excluding its final uncomputed sample.
+    generated_ids = segment_output_ids
+    # Sampler-side history can contain speculative or stale async output.
+    # The worker must rebuild from the same accepted ids used for lengths.
+    duplex["stage0_window"] = {"completed_token_ids": list(generated_ids)}
+    if completed_terminator is not None:
+        duplex["stage0_window"]["completed_terminator_token_id"] = int(completed_terminator)
+    # The worker drops its carried units at the first plan it gets, placed or
+    # not, so the carry is taken here, before any return below, and none is
+    # handed to this request afterwards.
+    carry = getattr(session, "_minicpmo45_carried_window", None)
+    session._minicpmo45_carried_window = None
+    session._minicpmo45_window_planned = True
+    # Boundary reconciliation is required even with an unbounded context:
+    # async lookahead can overwrite the worker's pending terminator after
+    # the scheduler accepted the segment stop. Window retention is optional.
+    if not isinstance(window, dict) or mode not in {"basic", "context"}:
+        return False
+    base_len = int(getattr(session, "num_prompt_tokens", 0) or 0) + len(generated_ids)
+    boundary = base_len + 2
+    # A legitimate open_start of 0 (an empty context prefix) must not fall
+    # back to preserve_len, which would double-count the suffix below.
+    recorded_open_start = getattr(session, "_minicpmo45_window_open_start", None)
+    open_start = preserve_len if recorded_open_start is None else int(recorded_open_start)
+    unit_len = boundary - open_start
+    if unit_len <= 0:
+        return False
+
+    special_ids = {
+        int(token_id)
+        for token_id in runtime_config.get("duplex_window_special_token_ids", ())
+        if isinstance(token_id, int)
+    }
+    units = list(getattr(session, "_minicpmo45_window_units", ()))
+    units.append(
+        {
+            "length": unit_len,
+            "generated_token_ids": [int(token_id) for token_id in generated_ids if token_id not in special_ids],
+        }
+    )
+    projected_len = base_len + len(update.prompt_token_ids)
+    carried_units: list[dict[str, Any]] = []
+    if carry is not None:
+        # This request replaced one a barge-in aborted. Its first plan puts
+        # that request's completed units back ahead of this one's own, with
+        # the text the context window had already moved out of them.
+        carried_units = [dict(unit) for unit in carry.get("units", ())]
+        units = [*carried_units, *units]
+        projected_len += sum(int(unit["length"]) for unit in carried_units)
+        if mode == "context":
+            session._minicpmo45_window_previous_token_ids = list(carry.get("previous", ()))
+    drop_count = 0
+    dropped_len = 0
+
+    if mode == "basic":
+        try:
+            high = int(window.get("basic_window_high_tokens", 8000))
+            low = int(window.get("basic_window_low_tokens", 6000))
+        except (TypeError, ValueError):
+            return False
+        if projected_len > high:
+            while units and projected_len - dropped_len > low:
+                dropped_len += int(units[drop_count]["length"])
+                drop_count += 1
+                if drop_count >= len(units):
+                    break
+    else:
+        try:
+            max_units = int(window.get("context_max_units", 24))
+            previous_max = int(window.get("context_previous_max_tokens", 500))
+        except (TypeError, ValueError):
+            return False
+        drop_count = max(0, len(units) - max_units)
+        dropped_len = sum(int(unit["length"]) for unit in units[:drop_count])
+        previous = list(getattr(session, "_minicpmo45_window_previous_token_ids", ()))
+        for unit in units[:drop_count]:
+            previous.extend(unit["generated_token_ids"])
+        if len(previous) > previous_max:
+            previous = previous[-previous_max:]
+        marker = [
+            int(token_id)
+            for token_id in runtime_config.get("duplex_window_previous_marker_token_ids", ())
+            if isinstance(token_id, int)
+        ]
+        previous_with_marker = marker + previous if previous else []
+        old_previous_len = int(getattr(session, "_minicpmo45_window_previous_len", 0) or 0)
+        session._minicpmo45_window_previous_token_ids = previous
+        session._minicpmo45_window_previous_len = len(previous_with_marker)
+        projected_len += len(previous_with_marker) - old_previous_len
+
+    retained_units = units[drop_count:]
+    session._minicpmo45_window_units = retained_units
+    if drop_count == 0 and not carried_units:
+        session._minicpmo45_window_open_start = boundary
+        return False
+
+    replacement_len = projected_len - dropped_len
+    if replacement_len <= 0:
+        return False
+    scheduler_token_id = runtime_config.get("duplex_scheduler_token_id", 0)
+    try:
+        scheduler_token_id = max(0, int(scheduler_token_id))
+    except (TypeError, ValueError):
+        scheduler_token_id = 0
+    update.prompt_token_ids = [scheduler_token_id] * replacement_len
+    meta = info.setdefault("meta", {})
+    if isinstance(meta, dict):
+        meta["replace_streaming_prompt"] = True
+    previous_ids = list(getattr(session, "_minicpmo45_window_previous_token_ids", ()))
+    # The worker embeds the marker ids the window plan carries: it must not
+    # re-tokenize the marker with its own tokenizer, which could differ
+    # from the ids this length is computed from.
+    marker_ids = [
+        int(token_id)
+        for token_id in runtime_config.get("duplex_window_previous_marker_token_ids", ())
+        if isinstance(token_id, int)
+    ]
+    duplex["stage0_window"] = {
+        "completed_token_ids": list(generated_ids),
+        "replace": True,
+        "mode": mode,
+        "drop_units": drop_count,
+        "dropped_tokens": dropped_len,
+        "previous_token_ids": previous_ids,
+        "previous_marker_token_ids": marker_ids,
+        "replacement_prompt_len": replacement_len,
+    }
+    if carried_units:
+        duplex["stage0_window"]["carried_units"] = len(carried_units)
+        duplex["stage0_window"]["carried_unit_lengths"] = [int(unit["length"]) for unit in carried_units]
+    if completed_terminator is not None:
+        duplex["stage0_window"]["completed_terminator_token_id"] = int(completed_terminator)
+    recorded_prefix_len = runtime_config.get("duplex_window_prefix_tokens")
+    prefix_len = preserve_len if recorded_prefix_len is None else int(recorded_prefix_len)
+    suffix_len = len(runtime_config.get("duplex_window_suffix_token_ids", ()) or ())
+    previous_len = int(getattr(session, "_minicpmo45_window_previous_len", 0) or 0)
+    new_preserve_len = prefix_len + previous_len + suffix_len if mode == "context" else preserve_len
+    session._minicpmo45_window_open_start = new_preserve_len + sum(int(unit["length"]) for unit in retained_units)
+    return True

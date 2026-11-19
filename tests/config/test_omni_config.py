@@ -444,6 +444,11 @@ def test_minicpmo_cuda_duplex_profile_isolated_from_turn_defaults(filename, cli_
     args = build_engine_args_dict_from_omni_stage_config(config.stage_by_id(0), model=str(tmp_path))
     resolved = OmniEngineArgs(**filter_dataclass_kwargs(OmniEngineArgs, args))
 
+    assert resolved.scheduler_window_policy == (
+        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv.MiniCPMO45SchedulerWindowPolicy"
+    )
+    assert all(config.stage_by_id(i).model_config.scheduler_window_policy is None for i in (1, 2))
+
     if cli_prefix is not None:
         assert resolved.kernel_config.ir_op_priority.rms_norm == ["vllm_c", "native"]
         assert resolved.kernel_config.ir_op_priority.fused_add_rms_norm == ["vllm_c", "native"]
@@ -1540,6 +1545,7 @@ def test_sub_config_fields_match_structured_scopes():
         "override_generation_config",
         "enable_prompt_embeds",
         "scheduling_metadata_adapter",
+        "scheduler_window_policy",
     }
     vllm_load_fields = {f.name for f in fields(VllmLoadConfig)}
     assert issubclass(OmniStageLoadConfig, VllmLoadConfig)

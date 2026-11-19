@@ -7,6 +7,7 @@ from typing import Any
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
 
+from vllm_omni.core.sched.window_policy import WindowOperation
 from vllm_omni.engine import AdditionalInformationPayload, PayloadSenderInfo
 
 
@@ -141,6 +142,5 @@ class OmniSchedulerOutput(SchedulerOutput):
     data_plane_terminal_req_ids: set[str] = field(default_factory=set)
     input_terminal_req_ids: set[str] = field(default_factory=set)
     pending_request_prewarms: list[OmniRequestPrewarm] = field(default_factory=list)
-    #: MiniCPM-o duplex barge-in carry decisions the worker applies in order at the start of the step
-    #: (``(op, session_id, request_id)``; see ``MiniCPMO45DuplexSchedulerHelper.on_schedule``).
-    duplex_carry_ops: list[tuple[str, str, str]] = field(default_factory=list)
+    #: Apply in list order before worker cleanup, including steps with no scheduled tokens.
+    duplex_carry_ops: list[WindowOperation] = field(default_factory=list)

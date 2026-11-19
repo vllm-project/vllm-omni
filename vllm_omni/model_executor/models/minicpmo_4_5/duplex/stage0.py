@@ -20,6 +20,7 @@ from numpy.typing import NDArray
 from vllm.logger import init_logger
 from vllm.multimodal.image import open_image
 
+from vllm_omni.core.sched.window_policy import WindowOperation
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
 
 if TYPE_CHECKING:
@@ -230,7 +231,7 @@ class MiniCPMO45Stage0DuplexRuntime:
 
     def apply_carry_ops(
         self,
-        ops: list[tuple[str, str, str]],
+        ops: list[WindowOperation],
         state_of_request: Callable[[str], _MiniCPMO45Stage0SessionState | None],
         live_state_of_session: Callable[[str], _MiniCPMO45Stage0SessionState | None],
     ) -> None:

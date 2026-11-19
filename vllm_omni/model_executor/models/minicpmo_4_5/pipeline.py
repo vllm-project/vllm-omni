@@ -63,6 +63,9 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             final_output=True,
             final_output_type="text",
             owns_tokenizer=True,
+            scheduler_window_policy=(
+                "vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv.MiniCPMO45SchedulerWindowPolicy"
+            ),
             requires_multimodal_data=True,
             engine_output_type="latent",
             supports_native_mrv2_data_plane=True,

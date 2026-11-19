@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import time
 from types import SimpleNamespace
+from typing import TypedDict
 from unittest.mock import MagicMock
 
 import pytest
@@ -22,6 +23,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+from vllm_omni.core.sched.window_policy import WindowOperation
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
     MiniCPMO45Stage0DuplexRuntime,
     _MiniCPMO45CarriedWindow,
@@ -30,9 +32,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
     MiniCPMO45CarriedWindows,
-)
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
-    MiniCPMO45DuplexSchedulerHelper as Helper,
+    MiniCPMO45SchedulerWindowPolicy,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
     CARRIED_WINDOW_MAX_SESSIONS,
@@ -52,33 +52,39 @@ def _stage0_id(session_id: str, epoch: int) -> str:
 
 
 def _carry(sched: OmniARScheduler) -> MiniCPMO45CarriedWindows:
-    if getattr(sched, "_minicpmo45_carry", None) is None:
-        sched._minicpmo45_carry = MiniCPMO45CarriedWindows()
-    return sched._minicpmo45_carry
+    policy = sched._window_policy
+    assert isinstance(policy, MiniCPMO45SchedulerWindowPolicy)
+    if policy.carry is None:
+        policy.carry = MiniCPMO45CarriedWindows()
+    return policy.carry
 
 
 def _kept(sched: OmniARScheduler) -> dict:
     return _carry(sched).windows
 
 
-def _finish(sched: OmniARScheduler, request_ids: list[str], *, aborted: bool = True) -> None:
+def _finish(sched: OmniARScheduler, request_ids: list[str], *, aborted: bool = True) -> list[WindowOperation]:
     """Requests finish, then the next step hands their finish to the worker (``schedule`` -> ``on_schedule``)."""
     _carry(sched)
-    Helper.release_windows(sched, request_ids, aborted=aborted)
-    Helper.on_schedule(sched, SimpleNamespace(finished_req_ids=set(request_ids), scheduled_new_reqs=[]))
+    sched._window_policy.before_finish(sched.requests, request_ids, aborted=aborted)
+    return sched._window_policy.on_schedule(
+        sched.requests, SimpleNamespace(finished_req_ids=set(request_ids), scheduled_new_reqs=[])
+    )
 
 
 def _start(sched: OmniARScheduler, request: Request) -> None:
     """A session's new Stage-0 request gets its first scheduled step."""
     sched.requests[request.request_id] = request
     _carry(sched)
-    Helper.on_schedule(
-        sched, SimpleNamespace(finished_req_ids=set(), scheduled_new_reqs=[SimpleNamespace(req_id=request.request_id)])
+    sched._window_policy.on_schedule(
+        sched.requests,
+        SimpleNamespace(finished_req_ids=set(), scheduled_new_reqs=[SimpleNamespace(req_id=request.request_id)]),
     )
 
 
 def _scheduler() -> OmniARScheduler:
     sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched._window_policy = MiniCPMO45SchedulerWindowPolicy()
     sched._new_prompt_len_snapshot = {}
     sched._hold_payloadless_outputs = False
     sched.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=0, session_mode="duplex"))
@@ -250,7 +256,7 @@ def test_abort_keeps_the_window_the_worker_has(scheduled: bool, kept: list[int])
     sched._update_request_as_session(session, update)
     assert update.model_intermediate_buffer["duplex"]["stage0_window"]["drop_units"] == 2
     if scheduled:
-        Helper.commit_window_snapshots(sched, SimpleNamespace(num_scheduled_tokens={request_id: 8}))
+        sched._window_policy.before_book(sched.requests, SimpleNamespace(num_scheduled_tokens={request_id: 8}))
 
     _finish(sched, [request_id])
 
@@ -266,9 +272,9 @@ def test_a_second_append_before_booking_keeps_the_first_snapshot() -> None:
     session._minicpmo45_window_units = [dict(unit) for unit in CARRIED]
     sched.requests[request_id] = session
 
-    Helper.snapshot_window(sched, session)
+    sched._window_policy.snapshot_window(session)
     session._minicpmo45_window_units = [{"length": 9, "generated_token_ids": []}]
-    Helper.snapshot_window(sched, session)
+    sched._window_policy.snapshot_window(session)
     _finish(sched, [request_id])
 
     assert [unit["length"] for unit in _kept(sched)["s"]["units"]] == [5, 6]
@@ -386,12 +392,12 @@ def _worker() -> MiniCPMO45Stage0DuplexRuntime:
 
 def _keep(helper: MiniCPMO45Stage0DuplexRuntime, session_id: str, state, request_id: str = "old") -> None:
     """The scheduler's ``keep`` for a finished request whose state is ``state``."""
-    helper.apply_carry_ops([("keep", session_id, request_id)], {request_id: state}.get, lambda sid: None)
+    helper.apply_carry_ops([WindowOperation("keep", session_id, request_id)], {request_id: state}.get, lambda sid: None)
 
 
 def _hand(helper: MiniCPMO45Stage0DuplexRuntime, session_id: str, live=None) -> None:
     """The scheduler's ``hand`` to the session's new request (``live``: a state the session already has)."""
-    helper.apply_carry_ops([("hand", session_id, "new")], lambda rid: None, lambda sid: live)
+    helper.apply_carry_ops([WindowOperation("hand", session_id, "new")], lambda rid: None, lambda sid: live)
 
 
 def _unit(first: int, length: int) -> _MiniCPMO45WindowUnit:
@@ -557,7 +563,7 @@ def test_model_follows_the_schedulers_decisions_before_freeing_the_state() -> No
         model=SimpleNamespace(),
     )
     finished = {old_id, other_id}
-    output = SimpleNamespace(finished_req_ids=finished, duplex_carry_ops=[("keep", "s", old_id)])
+    output = SimpleNamespace(finished_req_ids=finished, duplex_carry_ops=[WindowOperation("keep", "s", old_id)])
 
     MiniCPMO45OmniForConditionalGeneration.on_scheduler_output(model, output)
     MiniCPMO45OmniForConditionalGeneration.on_requests_finished(model, finished)
@@ -566,7 +572,7 @@ def test_model_follows_the_schedulers_decisions_before_freeing_the_state() -> No
     assert list(helper._carried_window_units) == ["s"]  # only what the scheduler kept
     new_id = _stage0_id("s", 1)
     MiniCPMO45OmniForConditionalGeneration.on_scheduler_output(
-        model, SimpleNamespace(finished_req_ids=set(), duplex_carry_ops=[("hand", "s", new_id)])
+        model, SimpleNamespace(finished_req_ids=set(), duplex_carry_ops=[WindowOperation("hand", "s", new_id)])
     )
     state = _state()
     helper.restore_window_units(state)
@@ -589,7 +595,7 @@ def test_worker_drops_what_the_scheduler_drops() -> None:
     helper = _worker()
     _keep(helper, "s", _state(window_units=[_unit(100, 5)]))
 
-    helper.apply_carry_ops([("drop", "s", "")], lambda rid: None, lambda sid: None)
+    helper.apply_carry_ops([WindowOperation("drop", "s", "")], lambda rid: None, lambda sid: None)
 
     assert helper._carried_window_units == {}
 
@@ -702,8 +708,9 @@ def test_scheduler_round_trip_carries_only_an_aborted_window(
     new = _new_request(_stage0_id("s", 1))
     sched.add_request(new)
     # The step that hands the finish to the worker and schedules the new request (OmniARScheduler.schedule).
-    Helper.on_schedule(
-        sched, SimpleNamespace(finished_req_ids={old_id}, scheduled_new_reqs=[SimpleNamespace(req_id=new.request_id)])
+    sched._window_policy.on_schedule(
+        sched.requests,
+        SimpleNamespace(finished_req_ids={old_id}, scheduled_new_reqs=[SimpleNamespace(req_id=new.request_id)]),
     )
     update = _second_append("basic")
     sched._update_request_as_session(new, update)
@@ -819,23 +826,16 @@ def test_the_scheduler_keeps_at_most_the_session_cap_and_the_worker_follows() ->
         request = _new_request(request_id)
         request._minicpmo45_window_units = [dict(unit) for unit in CARRIED[:1]]
         sched.requests[request_id] = request
-        _finish(sched, [request_id])
+        ops = _finish(sched, [request_id])
         worker_state = _state(session_id=name, window_units=[_unit(100, 5)])
-        helper.apply_carry_ops(Helper.take_carry_ops(sched), {request_id: worker_state}.get, lambda sid: None)
+        helper.apply_carry_ops(ops, {request_id: worker_state}.get, lambda sid: None)
 
     expected = [*names[2:-1], names[0], names[-1]]
     assert list(_kept(sched)) == expected
     assert list(helper._carried_window_units) == expected
 
 
-def test_scheduler_hooks_stay_out_until_a_duplex_stage0_append_was_planned(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Without a duplex Stage-0 request the scheduler hooks never call into the MiniCPM-o helper."""
-
-    def fail(*args, **kwargs):
-        raise AssertionError("MiniCPM-o carry helper called")
-
-    for name in ("on_schedule", "release_windows", "commit_window_snapshots"):
-        monkeypatch.setattr(Helper, name, classmethod(fail))
+def test_ordinary_request_does_not_allocate_window_carry_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         _upstream(OmniARScheduler, "add_request"),
         "add_request",
@@ -853,6 +853,7 @@ def test_scheduler_hooks_stay_out_until_a_duplex_stage0_append_was_planned(monke
     sched.add_request(request)
     sched._update_after_schedule(SimpleNamespace(num_scheduled_tokens={"chatcmpl-1": 1}))
     sched.finish_requests(["chatcmpl-1"], RequestStatus.FINISHED_ABORTED)
+    assert sched._window_policy.carry is None
 
 
 def test_an_abort_and_the_next_request_in_one_step_hand_the_window_over() -> None:
@@ -863,12 +864,12 @@ def test_an_abort_and_the_next_request_in_one_step_hand_the_window_over() -> Non
     old._minicpmo45_window_units = [dict(unit) for unit in CARRIED]
     sched.requests[old_id] = old
     _carry(sched)
-    Helper.release_windows(sched, [old_id], aborted=True)
+    sched._window_policy.before_finish(sched.requests, [old_id], aborted=True)
     new = _new_request(new_id)
     sched.requests[new_id] = new
 
-    Helper.on_schedule(
-        sched, SimpleNamespace(finished_req_ids={old_id}, scheduled_new_reqs=[SimpleNamespace(req_id=new_id)])
+    sched._window_policy.on_schedule(
+        sched.requests, SimpleNamespace(finished_req_ids={old_id}, scheduled_new_reqs=[SimpleNamespace(req_id=new_id)])
     )
 
     assert [unit["length"] for unit in new._minicpmo45_carried_window["units"]] == [5, 6]
@@ -935,16 +936,15 @@ def test_the_worker_restores_exactly_what_the_scheduler_hands_over(monkeypatch: 
             else:
                 new_reqs.append(req)
         finished_ids = set(aborted) | set(normal)
-        Helper.release_windows(sched, aborted, aborted=True)
-        Helper.release_windows(sched, normal, aborted=False)
-        Helper.on_schedule(
-            sched,
+        sched._window_policy.before_finish(sched.requests, aborted, aborted=True)
+        sched._window_policy.before_finish(sched.requests, normal, aborted=False)
+        ops = sched._window_policy.on_schedule(
+            sched.requests,
             SimpleNamespace(
                 finished_req_ids=finished_ids,
                 scheduled_new_reqs=[SimpleNamespace(req_id=r.request_id) for r in new_reqs],
             ),
         )
-        ops = Helper.take_carry_ops(sched)
         # The worker's step: the scheduler's ops while the finished requests' state still exists, then the frees,
         # then the new requests' first prefill.
         states = {rid: helper.sessions.get(session_of[rid]) for rid in finished_ids}
@@ -984,10 +984,10 @@ def test_finishes_of_one_session_are_ordered_by_epoch_number() -> None:
         request._minicpmo45_window_units = [dict(unit) for unit in units]
         sched.requests[request_id] = request
 
-    _finish(sched, [_stage0_id("s", 10), _stage0_id("s", 9)])
+    ops = _finish(sched, [_stage0_id("s", 10), _stage0_id("s", 9)])
 
     assert [unit["length"] for unit in _kept(sched)["s"]["units"]] == [5, 6]
-    assert [op[2] for op in Helper.take_carry_ops(sched) if op[0] == "keep"] == [
+    assert [op.request_id for op in ops if op.kind == "keep"] == [
         _stage0_id("s", 9),
         _stage0_id("s", 10),
     ]
@@ -1002,7 +1002,8 @@ def test_an_abort_of_a_request_that_already_finished_keeps_nothing() -> None:
     request.status = RequestStatus.FINISHED_STOPPED
     sched.requests[request_id] = request
 
-    Helper.release_windows(_carry(sched) and sched, [request_id], aborted=True)
+    _carry(sched)
+    sched._window_policy.before_finish(sched.requests, [request_id], aborted=True)
 
     assert _carry(sched).pending == {}
 
@@ -1029,11 +1030,11 @@ def test_a_request_aborted_before_its_first_step_leaves_the_sessions_window_for_
 def test_units_handed_to_a_request_that_never_got_its_state_go_on_with_its_abort() -> None:
     helper = _worker()
     _keep(helper, "s", _state(window_units=[_unit(100, 5)]), request_id="w")
-    helper.apply_carry_ops([("hand", "s", "x")], lambda rid: None, lambda sid: None)
+    helper.apply_carry_ops([WindowOperation("hand", "s", "x")], lambda rid: None, lambda sid: None)
 
     # x is aborted before its state was created; the scheduler keeps the units it carried.
-    helper.apply_carry_ops([("keep", "s", "x")], lambda rid: None, lambda sid: None)
-    helper.apply_carry_ops([("hand", "s", "z")], lambda rid: None, lambda sid: None)
+    helper.apply_carry_ops([WindowOperation("keep", "s", "x")], lambda rid: None, lambda sid: None)
+    helper.apply_carry_ops([WindowOperation("hand", "s", "z")], lambda rid: None, lambda sid: None)
     state = _state()
     helper.restore_window_units(state)
 
@@ -1043,7 +1044,7 @@ def test_units_handed_to_a_request_that_never_got_its_state_go_on_with_its_abort
 def test_units_handed_to_a_request_that_finished_without_a_state_are_freed() -> None:
     helper = _worker()
     _keep(helper, "s", _state(window_units=[_unit(100, 5)]))
-    helper.apply_carry_ops([("hand", "s", "x")], lambda rid: None, lambda sid: None)
+    helper.apply_carry_ops([WindowOperation("hand", "s", "x")], lambda rid: None, lambda sid: None)
 
     helper.forget_handed_window_units("s", "other")
     assert "s" in helper._handed_window_units
@@ -1057,10 +1058,12 @@ def test_the_real_schedule_hands_the_window_and_sends_the_decision_with_the_step
     from vllm.config import CacheConfig, SchedulerConfig, VllmConfig
     from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
     from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
     from vllm.v1.structured_output import StructuredOutputManager
 
     config = VllmConfig()
     config.model_config = SimpleNamespace(
+        scheduler_window_policy="vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv.MiniCPMO45SchedulerWindowPolicy",
         multimodal_config=None,
         uses_mrope=False,
         is_encoder_decoder=False,
@@ -1101,7 +1104,14 @@ def test_the_real_schedule_hands_the_window_and_sends_the_decision_with_the_step
 
     output = sched.schedule()
 
-    assert output.duplex_carry_ops == [("hand", "s", request.request_id)]
+    assert output.duplex_carry_ops == [WindowOperation("hand", "s", request.request_id)]
+
+    class WindowFields(TypedDict):
+        duplex_carry_ops: list[WindowOperation]
+
+    decoded = MsgpackDecoder(WindowFields).decode(MsgpackEncoder().encode(output))
+    assert decoded["duplex_carry_ops"] == output.duplex_carry_ops
+    assert isinstance(decoded["duplex_carry_ops"][0], WindowOperation)
     assert [unit["length"] for unit in request._minicpmo45_carried_window["units"]] == [5, 6]
     assert sched.schedule().duplex_carry_ops == []
 
@@ -1112,7 +1122,7 @@ def test_a_keep_this_side_cannot_fill_stores_nothing_and_says_so(caplog: pytest.
     _keep(helper, "s", _state(window_units=[_unit(100, 5)]), request_id="w")
 
     with caplog.at_level("WARNING"):
-        helper.apply_carry_ops([("keep", "s", "x")], lambda rid: None, lambda sid: None)
+        helper.apply_carry_ops([WindowOperation("keep", "s", "x")], lambda rid: None, lambda sid: None)
 
     assert helper._carried_window_units == {}
     assert "kept request x for session s" in caplog.text
