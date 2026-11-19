@@ -1130,13 +1130,16 @@ class StagePool:
         request_outputs: list[Any],
         *,
         submit_ts: float,
+        submit_perf: float | None = None,
         request_timestamp: float,
         replica_id: int,
         sampling_params: Any | None = None,
     ) -> StageRequestMetrics:
         """Build stage metrics for outputs produced on one replica."""
-        now = _time.time()
-        stage_gen_time_ms = (now - submit_ts) * 1000.0
+        if submit_perf is not None:
+            stage_gen_time_ms = (_time.perf_counter() - submit_perf) * 1000.0
+        else:
+            stage_gen_time_ms = (_time.time() - submit_ts) * 1000.0
         scheduler_wait_ms = extract_diffusion_scheduler_wait_ms(request_outputs[0]) if request_outputs else None
         if scheduler_wait_ms is not None:
             if scheduler_wait_ms > stage_gen_time_ms:
@@ -1229,6 +1232,7 @@ class StagePool:
         image_pixels = self._count_image_pixels(request_outputs) if output_unit_type == "image" else 0
         num_inference_steps = coerce_positive_int_scalar(getattr(sampling_params, "num_inference_steps", None)) or 0
         has_output_timestamps = bool(output_timestamps)
+        now = _time.time()
         first_ts = output_timestamps[0] if has_output_timestamps else now
         serving_time_to_first_output_ms = (
             max((non_empty_first_output_ts - request_timestamp) * 1000.0, 0.0)

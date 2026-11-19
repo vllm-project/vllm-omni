@@ -3220,10 +3220,16 @@ async def test_submit_to_stage_stamps_before_submit_initial() -> None:
 
 
 @pytest.mark.asyncio
-async def test_submit_to_stage_keeps_existing_submit_ts() -> None:
-    """setdefault must not restart the stage clock on a later submit_update."""
+async def test_submit_to_stage_refreshes_clocks_for_the_next_segment(monkeypatch) -> None:
+    """A later segment on the same request id starts its own wall and monotonic clocks."""
+    clock = {"wall": 1_000.0, "perf": 10.0}
+    monkeypatch.setattr("vllm_omni.engine.orchestrator._time.time", lambda: clock["wall"])
+    monkeypatch.setattr("vllm_omni.engine.orchestrator._time.perf_counter", lambda: clock["perf"])
 
     class RecordingPool:
+        async def submit_initial(self, request_id, req_state, request, **_kwargs):
+            return 0
+
         async def submit_update(self, request_id, req_state, request, **_kwargs):
             return 0
 
@@ -3236,8 +3242,22 @@ async def test_submit_to_stage_keeps_existing_submit_ts() -> None:
         final_stage_id=1,
     )
     req_state.yield_stage_id = None
-    req_state.stage_submit_ts[1] = 42.0
 
+    await orchestrator._submit_to_stage(
+        "req-clock",
+        req_state,
+        [SimpleNamespace()],
+        source_stage_id=0,
+        source_replica_id=0,
+        receiver_stage_id=1,
+        already_submitted=False,
+        t_submit_start=time.perf_counter(),
+    )
+    assert req_state.stage_submit_ts[1] == pytest.approx(1_000.0)
+    assert req_state.stage_submit_perf[1] == pytest.approx(10.0)
+
+    clock["wall"] = 6_000.0
+    clock["perf"] = 20.0
     await orchestrator._submit_to_stage(
         "req-clock",
         req_state,
@@ -3248,8 +3268,8 @@ async def test_submit_to_stage_keeps_existing_submit_ts() -> None:
         already_submitted=True,
         t_submit_start=time.perf_counter(),
     )
-
-    assert req_state.stage_submit_ts[1] == pytest.approx(42.0)
+    assert req_state.stage_submit_ts[1] == pytest.approx(6_000.0)
+    assert req_state.stage_submit_perf[1] == pytest.approx(20.0)
 
 
 @pytest.mark.asyncio
@@ -3421,6 +3441,35 @@ def test_build_stage_metrics_subtracts_scheduler_queue_wait(mocker) -> None:
 
     assert metrics.stage_gen_time_ms == pytest.approx(600.0)
     assert metrics.scheduler_queue_wait_ms == pytest.approx(400.0)
+
+
+def test_stage_gen_ignores_backward_wall_clock(mocker) -> None:
+    """Queue wait is a perf_counter duration, so a wall-clock step must not make gen negative."""
+    processor = mocker.Mock(spec=MultimodalOutputProcessor)
+    processor.pop_native_text_metrics.return_value = {}
+    pool = StagePool(
+        0,
+        [FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")],
+        output_processor=processor,
+    )
+    pool.collect_stage_metrics = False
+    mocker.patch("vllm_omni.engine.stage_pool._time.time", return_value=999.9)
+    mocker.patch("vllm_omni.engine.stage_pool._time.perf_counter", return_value=15.02)
+    output = SimpleNamespace(
+        request_id="req-step",
+        metrics={"scheduler_queue_wait_ms": 5_000.0},
+        outputs=[],
+    )
+
+    metrics = pool.build_stage_metrics(
+        [output],
+        submit_ts=1_000.0,
+        submit_perf=10.0,
+        request_timestamp=1_000.0,
+        replica_id=0,
+    )
+
+    assert metrics.stage_gen_time_ms == pytest.approx(20.0)
 
 
 def test_stage_pool_does_not_track_output_timestamps_when_metrics_disabled() -> None:

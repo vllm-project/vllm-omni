@@ -55,6 +55,7 @@ from vllm_omni.engine.orchestrator import (
     OrchestratorRequestState,
     _build_terminal_empty_output,
     build_engine_core_request_from_tokens,
+    stamp_stage_submit,
 )
 from vllm_omni.engine.stage_pool import StageUnavailableError
 from vllm_omni.outputs import OmniRequestOutput
@@ -242,7 +243,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             # raced the submit); the cancel path aborts the stale request id.
             logger.debug("[DuplexOrchestrator] stale stage binding ignored for %s stage-%s", request_id, stage_id)
             return
-        req_state.stage_submit_ts.setdefault(stage_id, _time.time())
+        stamp_stage_submit(req_state, stage_id, refresh=False)
         if req_state.request_timestamp <= 0.0:
             req_state.request_timestamp = req_state.stage_submit_ts[stage_id]
         self._register_running_request(req_state)
@@ -812,14 +813,10 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             pool = self.stage_pools[context.stage_id]
             if mark_submitting is not None:
                 mark_submitting()
-            # The first enqueue must be stamped before submit_initial so diffusion
-            # scheduler wait stays inside the stage clock. A resumable append reuses
-            # the request id; refreshing here keeps this segment from counting the
-            # previous one and the idle gap between them.
-            if submission.already_submitted:
-                request_state.stage_submit_ts[context.stage_id] = _time.time()
-            else:
-                request_state.stage_submit_ts.setdefault(context.stage_id, _time.time())
+            # The first enqueue is stamped before submit_initial so scheduler wait
+            # stays inside the stage clock. A resumable append reuses the request
+            # id and refreshes both clocks for this segment only.
+            stamp_stage_submit(request_state, context.stage_id, refresh=submission.already_submitted)
             try:
                 if submission.already_submitted:
                     if not submission.resumable:

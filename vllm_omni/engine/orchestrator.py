@@ -299,6 +299,20 @@ def _update_stale_request_metadata(
         request.additional_information.entries[RETURN_STAGE_PAYLOAD_KEY] = return_stage_payload_entry
 
 
+def stamp_stage_submit(req_state: OrchestratorRequestState, stage_id: int, *, refresh: bool) -> float:
+    """Record a stage's submit clocks.
+
+    ``stage_submit_ts`` stays wall time for published output messages. Generation
+    elapsed uses the paired ``stage_submit_perf`` so it is on the same monotonic
+    clock as diffusion ``scheduler_queue_wait_ms``. ``refresh`` starts a later
+    segment; the first submit keeps the clocks already recorded.
+    """
+    if refresh or stage_id not in req_state.stage_submit_ts:
+        req_state.stage_submit_ts[stage_id] = _time.time()
+        req_state.stage_submit_perf[stage_id] = _time.perf_counter()
+    return req_state.stage_submit_ts[stage_id]
+
+
 @dataclass
 class OrchestratorRequestState:
     """Per-request bookkeeping inside the Orchestrator."""
@@ -319,8 +333,12 @@ class OrchestratorRequestState:
     # Wall-clock timestamp when the client-facing engine request was accepted.
     request_timestamp: float = 0.0
 
-    # Metrics: timestamp when request was submitted to each stage.
+    # Wall-clock time the request was submitted to each stage. Output messages
+    # publish this. Elapsed generation uses stage_submit_perf, not this value.
     stage_submit_ts: dict[int, float] = field(default_factory=dict)
+    # perf_counter() at the same instant as stage_submit_ts. Paired so a wall-clock
+    # step cannot disagree with the diffusion scheduler's monotonic queue wait.
+    stage_submit_perf: dict[int, float] = field(default_factory=dict)
     mm_processor_kwargs: dict | None = None
     mm_features: list | None = None
     pd_prefill_multimodal_output: dict[str, Any] | None = None
@@ -1710,6 +1728,7 @@ class OrchestratorBase:
         stage_metrics = pool.build_stage_metrics(
             [output],
             submit_ts=req_state.stage_submit_ts.get(stage_id, _time.time()),
+            submit_perf=req_state.stage_submit_perf.get(stage_id),
             request_timestamp=req_state.request_timestamp,
             replica_id=replica_id,
             sampling_params=req_state.sampling_params_list[stage_id],
@@ -3373,8 +3392,7 @@ class OrchestratorBase:
                 final_output_type=final_output_type,
                 audio_sample_rate=final_pool._infer_audio_sample_rate(),
             )
-            submit_ts = _time.time()
-            req_state.stage_submit_ts[final_stage_id] = submit_ts
+            submit_ts = stamp_stage_submit(req_state, final_stage_id, refresh=True)
             logger.info(
                 "[Orchestrator] req=%s stage-%s produced no terminal inputs for stage-%s; "
                 "returning empty %s output from final stage-%s",
@@ -3457,9 +3475,9 @@ class OrchestratorBase:
 
                 if mark_submitting is not None:
                     mark_submitting()
-                # Stamp before enqueue so scheduler wait is inside the stage clock
-                # (#5924 / PR #10084 review: submit_ts after submit_initial under-counts).
-                req_state.stage_submit_ts.setdefault(next_logical, _time.time())
+                # First enqueue is stamped before submit so scheduler wait stays inside
+                # the stage clock. A later segment on the same request refreshes both clocks.
+                stamp_stage_submit(req_state, next_logical, refresh=already_submitted)
                 if already_submitted:
                     replica_id = await next_pool.submit_update(req_id, req_state, request, **route_kwargs)
                 else:
@@ -3537,9 +3555,9 @@ class OrchestratorBase:
         initial_kwargs = dict(update_kwargs)
         if params_override is not None:
             initial_kwargs["params_override"] = params_override
-        # Receiver enqueue can start during submit_initial. Stamp first so
-        # stage_gen_time_ms covers scheduler wait (ZhengWG on #10084).
-        req_state.stage_submit_ts.setdefault(receiver_stage_id, _time.time())
+        # First enqueue is stamped before submit so scheduler wait stays inside the
+        # stage clock. A later segment on the same request refreshes both clocks.
+        stamp_stage_submit(req_state, receiver_stage_id, refresh=already_submitted)
         for request in requests:
             if already_submitted:
                 replica_id = await to_pool.submit_update(req_id, req_state, request, **update_kwargs)
@@ -3664,7 +3682,7 @@ class OrchestratorBase:
                     await self._fail_request_dead_stage(request_id, route_stage_id)
                     return False
             route_kwargs: dict[str, Any] = {} if pinned_replica_id is None else {"pinned_replica_id": pinned_replica_id}
-            req_state.stage_submit_ts[next_stage_id] = _time.time()
+            stamp_stage_submit(req_state, next_stage_id, refresh=True)
             _t_submit_start = _time.perf_counter()
 
             if next_pool.stage_type == "diffusion":
@@ -4284,7 +4302,7 @@ class Orchestrator(OrchestratorBase):
                     await asyncio.to_thread(self._clear_stage_input_cache, stage_id)
                     return
                 req_state.pipeline_timings["preprocess_ms"] = (_time.perf_counter() - _t_preprocess) * 1000.0
-            req_state.stage_submit_ts[stage_id] = _time.time()
+            stamp_stage_submit(req_state, stage_id, refresh=True)
             if mark_submitting is not None:
                 mark_submitting()
             if not await self._dispatch_or_fail_request(
@@ -4331,7 +4349,7 @@ class Orchestrator(OrchestratorBase):
             req_state.sampling_params_list = [_without_per_sample_kv_count(p) for p in msg.sampling_params_list]
 
         req_state.streaming.enabled = True
-        req_state.stage_submit_ts[stage_id] = _time.time()
+        stamp_stage_submit(req_state, stage_id, refresh=True)
         if not await self._dispatch_or_fail_request(
             lambda: self.stage_pools[stage_id].submit_update(
                 request_id,
@@ -4382,7 +4400,7 @@ class Orchestrator(OrchestratorBase):
             ),
         )
         self.request_states[companion_id] = companion_state
-        companion_state.stage_submit_ts[0] = _time.time()
+        stamp_stage_submit(companion_state, 0, refresh=True)
 
         # A dead-stage failure is attributed to the parent request; its cleanup
         # also releases this companion.
