@@ -3267,20 +3267,24 @@ class TestForwardRouting:
             image, expected + torch.arange(3, dtype=expected.dtype).view(-1, 1, 1, 1, 1), atol=0, rtol=0
         )
 
-    @pytest.mark.parametrize("fallback", ["distilled", "cache_dit", "sea_cache", "paired_cfg", "pipeline_parallel"])
+    @pytest.mark.parametrize(
+        "fallback", ["batch_invariant", "distilled", "cache_dit", "sea_cache", "pipeline_parallel", "sequence_parallel"]
+    )
     def test_t2i_outputs_fall_back_to_serial(self, make_cosmos3_pipeline, monkeypatch, fallback) -> None:
         pipeline = make_cosmos3_pipeline()
         self._install_forward_stubs(pipeline)
         events = self._record_t2i_events(pipeline)
-        if fallback == "distilled":
+        if fallback == "batch_invariant":
+            monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+        elif fallback == "distilled":
             pipeline.is_distilled_model = True
             pipeline._scheduler_init_t_list = [1.0, 0.5]
         elif fallback in ("cache_dit", "sea_cache"):
             pipeline.od_config.cache_backend = fallback
-        elif fallback == "paired_cfg":
-            pipeline._cache_dit_requires_paired_cfg = True
-        else:
+        elif fallback == "pipeline_parallel":
             monkeypatch.setattr(pipeline, "_pp_parallel_active", lambda: True)
+        else:
+            pipeline.od_config.parallel_config = SimpleNamespace(sequence_parallel_size=2)
         assert not pipeline._can_batch_t2i_outputs()
 
         output = pipeline.forward(
