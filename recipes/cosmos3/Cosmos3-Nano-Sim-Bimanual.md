@@ -3,96 +3,18 @@
 Cosmos3-Nano-Sim-Bimanual is the causal action-conditioned Cosmos3 world model.
 The checkpoint manifest defines the distilled SDE schedule, latent chunk size,
 history policy, and action contract. Generation interleaves action and video
-tokens per latent frame. The original
-reference artifact is `interact_8b_tfdcm_chunk4_agibot` at `iter_000001600`.
-Camera-conditioned generation requires a compatible checkpoint export and the
-camera inference profile described below.
+tokens per latent frame.
 
 ## Artifact contract
 
-Use the two-stage imaginaire4 exporter with `--cosmos3-nano-sim-bimanual`.
-Stage 1 derives checkpoint identity, sampler settings, and the action contract
-from the resolved experiment and materialized checkpoint. It validates the
-selected EMA/student tensor inventory and publishes
-`cosmos3_nano_sim_bimanual_manifest.json`. Stage 2 discovers that manifest
-automatically, writes `Cosmos3NanoSimBimanualPipeline` into `model_index.json`,
-and embeds the full runtime contract under `cosmos3_nano_sim_bimanual` in
-`transformer/config.json`. It emits `cosmos3_nano_sim_bimanual_artifact.json`
-with tensor headers and per-shard SHA-256 hashes.
+Use a Diffusers checkpoint with a schema-v1 `cosmos3_nano_sim_bimanual`
+manifest in `transformer/config.json`.
 
-Raw DCP is intentionally not accepted by Stage 2.
-
-Schema-v1 artifacts may also contain the frozen pre-unification YAM datasets
-exported by imaginaire4: `abc_yam`, `molmoact2_yam`, and `xdof_yam`. vLLM-Omni
-validates their 20D left-arm/right-arm layout, domain 16, and separate legacy
-normalizer sources before serving them. The unified `yam_dataset` classes have
-different coordinate semantics and are not interchangeable with these legacy
-contracts.
-
-From the `imaginaire4/packages/cosmos3` checkout, materialize the complete
-checkpoint locally, then run both stages. No hand-written manifest is needed:
-
-```bash
-python -m cosmos3.scripts.export_model \
-  --checkpoint-path /checkpoints/iter_000001600/model \
-  --config-file /runs/interact_8b_tfdcm_chunk4_agibot/config.yaml \
-  --experiment interact_8b_tfdcm_chunk4_agibot \
-  --cosmos3-nano-sim-bimanual \
-  --student-only-checkpoint-metadata \
-  -o /exports/cosmos3-nano-sim-bimanual-hf
-
-python -m cosmos3.scripts.convert_model_to_diffusers \
-  --checkpoint-path /exports/cosmos3-nano-sim-bimanual-hf \
-  -o /exports/cosmos3-nano-sim-bimanual-diffusers
-```
-
-The renamed runtime requires newly exported metadata. Regenerate existing
-exports through both stages; legacy imports, deployment names, and export
-flags are no longer supported. Existing action-schema-v3 exports remain valid;
-the cookbook camera profile uses action schema v4. Neither changes model weights.
-
-### Action and camera export
-
-For the private-preview experiment
-`causal_8b_sf_dmd_max_4step_cam_chunk4_480p_961f`, supply its actual materialized
-checkpoint and saved resolved config. Add these flags to Stage 1 above:
-
-```bash
---cosmos3-nano-sim-bimanual-add-embodiments agibotworld camera_pose \
---cosmos3-nano-sim-bimanual-camera-inference-profile cookbook
-```
-
-Then run Stage 2 on that Stage 1 output. The resulting artifact contains both
-29D AgiBot (domain 15) and 9D camera (domain 2) contracts. Adding an embodiment
-declares a conditioning contract; use a checkpoint trained for that embodiment.
-The camera profile records backward pose deltas anchored every 16 pixel frames,
-translation scale 1.0, and `global_asinh` normalization using the first nine
-channels of the canonical 59D global camera/gripper statistics. Both export
-stages bundle and verify those statistics and their hashes.
-
-This is an explicit **inference override**. The saved training dataset
-descriptor remains unchanged, including a framewise/scale camera configuration
-when present. Do not edit a v3 artifact by hand or pass runtime flags that
-contradict its camera contract. Existing framewise/scale exports continue to
-work with an explicitly matching legacy camera recipe.
-
-The statistics JSON declares `allowed_pose_conventions=["backward_anchored"]`.
-The `cookbook` inference profile explicitly selects chunk-anchored poses. Exports
-reconcile this through `normalizer.source.pose_convention_override`, naming
-the `bimanual_camera_global_asinh_v1` policy, the original declaration,
-the effective `backward_chunk_anchored_16f` convention, and
-`inference_camera_profile` as the authority for inference. Both export stages require this
-provenance and validate the statistics metadata against the supported profile;
-they preserve the original statistics bytes. Existing numerical transforms and
-behavioral hashes remain unchanged. Earlier v4 bundles without the override
-record need a fresh Stage 1 export before conversion with this exporter.
-
-Stage 1 rejects remote DCP paths for causal exports: download the complete tree
-first so `checkpoint_hash` can be verified. It compares the selected
-`net_ema.*` namespace against the export target before DCP loading, preventing
-missing tensors from surviving as random initialization. Stage 2 then compares
-the serialized tensor names, shapes, and dtypes against its strict remap
-inventory. Keep `cosmos3_nano_sim_bimanual_artifact.json` with the model directory.
+The cookbook camera examples use an action-schema-v4 checkpoint with the
+`camera_pose` embodiment and its `cookbook` inference profile. The profile
+uses backward pose deltas anchored every 16 pixel frames and `global_asinh`
+normalization. Use the matching legacy camera recipe for an action-schema-v3
+checkpoint with framewise poses.
 
 ## Unified actions
 
@@ -221,8 +143,7 @@ camera commands. The supported sampler uses the exported four-step distilled
 schedule and guidance 1.0; the framework command's guidance 3.0, shift 5.0,
 defaults file, and latency preset are not interchangeable CLI settings here.
 
-Use the matching two-stage exporter described above to obtain an artifact for
-the private-preview checkpoint. Then validate the four 61-frame camera cases,
+With a compatible checkpoint, validate the four 61-frame camera cases,
 the 901-frame action rollout, and a 1801-frame endurance run on CUDA. Compare
 conditioning and pre-VAE latents first, then causal versus one-shot decoding,
 and record actual frame counts, action/camera adherence, memory, and throughput.
