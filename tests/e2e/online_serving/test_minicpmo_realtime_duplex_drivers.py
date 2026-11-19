@@ -2555,3 +2555,122 @@ def test_realtime_duplex_demo_replay_tail_window_bounds(monkeypatch):
         with pytest.raises(SystemExit) as exc:
             demo.parse_args()
         assert exc.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected"),
+    [
+        ("cancelled", True),
+        ("completed_cleared", True),
+        ("completed_after_onset", False),
+        ("completed_after_onset_with_audio", False),
+        ("completed_uncleared", False),
+        ("wrong_clear_target", False),
+        ("wrong_cancel_reason", False),
+        ("stale_audio", False),
+        ("duplicate_terminal", False),
+        ("missing_followup_audio", False),
+    ],
+)
+def test_server_vad_interrupt_validates_generation_and_playback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scenario: str, expected: bool
+) -> None:
+    from tests.e2e.online_serving import run_minicpmo_realtime_duplex_server_vad as driver
+
+    def terminal(response_id, status, reason):
+        return {
+            "type": "response.done",
+            "response": {"id": response_id, "status": status, "status_details": {"reason": reason}},
+        }
+
+    def audio(response_id):
+        return {"type": "response.output_audio.delta", "response_id": response_id}
+
+    completed = scenario in {
+        "completed_cleared",
+        "completed_after_onset",
+        "completed_after_onset_with_audio",
+        "completed_uncleared",
+        "wrong_clear_target",
+        "stale_audio",
+    }
+    target_done = terminal(
+        "target", "completed" if completed else "cancelled", "stop" if completed else "turn_detected"
+    )
+    if scenario == "wrong_cancel_reason":
+        target_done["response"]["status_details"]["reason"] = "client_cancelled"
+    onset = {"type": "input_audio_buffer.speech_started"}
+    tail = [target_done, onset] if completed else [onset, target_done]
+    if scenario in {"completed_after_onset", "completed_after_onset_with_audio"}:
+        tail = [onset]
+        if scenario == "completed_after_onset_with_audio":
+            tail.append(audio("target"))
+        tail.append(target_done)
+    if completed and scenario != "completed_uncleared":
+        tail.append(
+            {
+                "type": "output_audio_buffer.cleared",
+                "response_id": "other" if scenario == "wrong_clear_target" else "target",
+            }
+        )
+    if scenario == "stale_audio":
+        tail.append(audio("target"))
+    if scenario == "duplicate_terminal":
+        tail.append(target_done)
+    tail.extend([{"type": "input_audio_buffer.speech_stopped"}, {"type": "input_audio_buffer.committed"}])
+    if scenario != "missing_followup_audio":
+        tail.append(audio("followup"))
+    tail.append(terminal("followup", "completed", "stop"))
+
+    class Client:
+        def __init__(self, url):
+            self.events = driver.RealtimeEventCollector()
+            self.streams = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def configure(self, *args, **kwargs):
+            pass
+
+        async def stream_pcm16(self, *args, **kwargs):
+            events = (
+                [{"type": "response.created", "response": {"id": "target"}}, audio("target")]
+                if self.streams == 0
+                else tail
+            )
+            self.streams += 1
+            for event in events:
+                self.events.add(event, received_at_s=float(len(self.events.events)))
+
+        async def commit(self):
+            pass
+
+        async def close_session(self, **kwargs):
+            pass
+
+    async def wait_for(predicate, **kwargs):
+        assert predicate()
+
+    ref_audio = tmp_path / "reference.wav"
+    ref_audio.write_bytes(b"reference")
+    monkeypatch.setattr(driver, "RealtimeDuplexClient", Client)
+    monkeypatch.setattr(driver, "read_pcm16_wav", lambda path: b"\0\0")
+    monkeypatch.setattr(driver, "wait_for", wait_for)
+    result = asyncio.run(
+        driver.run_server_vad_interrupt(
+            SimpleNamespace(
+                url="ws://localhost/v1/realtime",
+                model="test",
+                input_wav="initial.wav",
+                interrupt_wav="interrupt.wav",
+                ref_audio=str(ref_audio),
+                chunk_ms=200,
+                timeout_s=1,
+            )
+        )
+    )
+    assert result["ok"] is expected

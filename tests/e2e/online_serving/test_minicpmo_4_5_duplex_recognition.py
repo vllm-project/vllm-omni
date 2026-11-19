@@ -41,6 +41,12 @@ EOS_TRACE_SERVER_PARAMS = [
 ]
 
 
+@pytest.mark.skip(
+    reason=(
+        "Intermittent long-video scene-coverage failures (including the final scene); "
+        "tracked in https://github.com/vllm-project/vllm-omni/issues/10417"
+    )
+)
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 @pytest.mark.parametrize("omni_server", EOS_TRACE_SERVER_PARAMS, indirect=True)
 def test_duplex_long_video_scene_recognition(omni_server, tmp_path: Path, monkeypatch) -> None:

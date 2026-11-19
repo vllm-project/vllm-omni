@@ -1256,7 +1256,7 @@ class DuplexSessionRunner:
         if self.run.closing:
             return False
         had_stream = self.model.cancel_data_plane_stream() or had_stream
-        if not cancelled and had_stream:
+        if not cancelled and had_stream and not playback_was_active:
             old_epoch = session.epoch
             old_response_id = session.active_response_id
             committed_ms = session.playback.committed_ms
@@ -2112,7 +2112,7 @@ class DuplexSessionRunner:
         if self.run.closing:
             return
         had_stream = self.model.cancel_data_plane_stream() or had_stream
-        if not cancelled and (had_stream or had_append or had_unbuffered_append):
+        if not cancelled and not playback_was_active and (had_stream or had_append or had_unbuffered_append):
             old_epoch = session.epoch
             old_response_id = session.active_response_id
             committed_ms = session.playback.committed_ms
@@ -2242,6 +2242,9 @@ class DuplexSessionRunner:
 
         old_epoch = session.epoch
         old_response_id = session.active_response_id
+        if old_response_id is None and helpers.assistant_playback_active(session):
+            # Generation can end before the retained request or its playback.
+            old_response_id = session.last_response_id
         committed_ms = session.playback.committed_ms
         audio_started = session.playback.generated_ms > 0 or session.playback.sent_ms > 0
         # Barge-in / cancel aborts prior TTS; clear the concurrent-turn release.
