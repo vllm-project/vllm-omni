@@ -461,6 +461,111 @@ def test_native_token_only_chunks_preserve_later_tokens_and_terminal_tail(plane,
     assert [bool(payload.meta.finished) for payload in payloads] == [False] * (len(expected) - 1) + [True]
 
 
+@pytest.mark.parametrize(
+    "processor",
+    [
+        lambda transfer_manager, request, pooling_output: pooling_output,
+        lambda transfer_manager, request, multimodal_output: multimodal_output,
+        lambda transfer_manager, request, pooling_output=None, **kwargs: pooling_output,
+        lambda transfer_manager, request, multimodal_output=None, **kwargs: multimodal_output,
+        lambda **kwargs: kwargs["pooling_output"],
+        lambda multimodal_output=None, **kwargs: multimodal_output,
+    ],
+)
+def test_connector_dispatch_prefers_explicit_payload_argument(plane, processor):
+    plane._custom_process_func = processor
+    model_output = {"codes": {"audio": torch.ones(1, 8, dtype=torch.long)}}
+    payload = plane._build_custom_process_payload("external", _new_request(), model_output, propagate_errors=True)
+    assert payload is model_output
+
+
+@pytest.mark.parametrize("model", ["nemotron", "higgs", "voxtral"])
+@pytest.mark.parametrize("total_frames", [0, 1, 5, 13, 15, 25, 26, 50, 53])
+@pytest.mark.parametrize("terminal_in_flight", [False, True])
+def test_native_codec_chunks_deliver_each_frame_once(plane, model, total_frames, terminal_in_flight):
+    from vllm_omni.model_executor.stage_input_processors.higgs_audio_v2 import (
+        talker2code2wav_async_chunk as higgs,
+    )
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import (
+        talker2code2wav_async_chunk as nemotron,
+    )
+    from vllm_omni.model_executor.stage_input_processors.voxtral_tts import (
+        generator2tokenizer_async_chunk as voxtral,
+    )
+
+    plane._custom_process_func = {"nemotron": nemotron, "higgs": higgs, "voxtral": voxtral}[model]
+    plane._omni_connector = SharedMemoryConnector(
+        {
+            "extra": {
+                "codec_chunk_frames": 13 if model == "nemotron" else 25,
+                "codec_chunk_frames_at_begin": 5,
+                "codec_left_context_frames": 25,
+            }
+        }
+    )
+    plane.request_payload = {}
+    plane._code_prompt_token_ids = defaultdict(list)
+    payloads = []
+
+    def send_chunks(entries, **_kw):
+        for snapshot, model_output in entries:
+            payload = plane._build_custom_process_payload(
+                snapshot.external_req_id, snapshot, model_output, propagate_errors=True
+            )
+            if payload is not None:
+                payloads.append(payload)
+                plane._put_req_chunk[snapshot.external_req_id] += 1
+        return len(entries)
+
+    plane.send_chunks = send_chunks
+    request = _new_request()
+    request.resumable = False
+    plane.register_request(request)
+    num_codebooks = 31 if model == "nemotron" else 8
+    prompt_len = 3
+    expected = torch.arange(total_frames).reshape(-1, 1).expand(-1, num_codebooks)
+    try:
+        for count in range(1, total_frames + 1):
+            if model == "nemotron":
+                # Nemotron supplies cumulative timeline rows, including prompt
+                # context. The independent EOF has neither codes nor metadata.
+                codes = torch.cat([torch.full((prompt_len - 1, num_codebooks), -1), expected[:count]])
+                model_output = {"codes": {"audio": codes}, "meta": {"nvc_logical_prompt_len": prompt_len}}
+            else:
+                model_output = {"codes": {"audio": expected[count - 1 : count]}}
+            plane.reserve_outputs([request.req_id])
+            if terminal_in_flight and count == total_frames:
+                assert plane.request_terminal({request.req_id}) == 0
+            _complete(plane, [model_output])
+            if count < total_frames:
+                # A wake without a new frame must not replay a chunk boundary.
+                emitted = len(payloads)
+                plane.reserve_outputs([request.req_id])
+                _complete(plane, [{}])
+                assert len(payloads) == emitted
+        plane.request_terminal({request.req_id})
+    finally:
+        plane._omni_connector.close()
+
+    emitted_frames = []
+    for payload in payloads:
+        codes = payload.codes.audio
+        if codes.numel() == 0:
+            continue
+        if model == "voxtral":
+            context, new_frames = codes[:2].tolist()
+            frames = codes[2:].reshape(-1, num_codebooks)
+            assert frames.shape[0] == context + new_frames
+        else:
+            context = int(payload.meta.left_context_size or 0)
+            frames = codes if model == "nemotron" else codes.reshape(num_codebooks, -1).T
+        emitted_frames.append(frames[context:])
+    actual = torch.cat(emitted_frames) if emitted_frames else torch.empty((0, num_codebooks), dtype=torch.long)
+    torch.testing.assert_close(actual, expected)
+    assert [bool(payload.meta.finished) for payload in payloads] == [False] * (len(payloads) - 1) + [True]
+    assert plane.record.cleaned == [request.req_id]
+
+
 def test_terminal_reserved_abort_and_cleanup_lifecycle(plane):
     batches, cleaned = plane.record.batches, plane.record.cleaned
     plane.register_request(_new_request())
