@@ -10,6 +10,7 @@ from math import prod
 import torch
 from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import SupportsEncoderCudaGraph
+from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 from vllm.v1.worker.encoder_cudagraph_defs import (
     EncoderCudaGraphCaptureInputs,
@@ -254,7 +255,9 @@ class EncoderCudaGraph:
         # reuse freed blocks from earlier captures. Manager input/output buffers
         # are allocated outside capture; only transient intermediates share it.
         stream.wait_stream(replay_stream)
-        with torch.cuda.stream(stream):
+        # Keep old graph/kernel finalizers out of this late capture, just as
+        # vLLM does for bulk encoder graph capture.
+        with freeze_gc_for_cudagraph_capture(), torch.cuda.stream(stream):
             manager.capture(graph_pool=pool)
         replay_stream.wait_stream(stream)
         if self.share_pools:

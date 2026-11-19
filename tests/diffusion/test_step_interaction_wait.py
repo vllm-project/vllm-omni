@@ -2,13 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import threading
-from types import SimpleNamespace
 
 import pytest
 
 from tests.diffusion.test_diffusion_engine_rpc_routing import _make_engine_with_loop, _stop_engine
 from tests.diffusion.test_diffusion_scheduler import _make_step_request
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionExecutionMode
 from vllm_omni.diffusion.sched import DiffusionRequestStatus, StepScheduler
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput, StepWait
@@ -18,7 +17,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 def _scheduler():
     scheduler = StepScheduler()
-    scheduler.initialize(SimpleNamespace(max_num_seqs=1))
+    scheduler.initialize(OmniDiffusionConfig(max_num_seqs=1, diffusion_attention_schedule=None))
     scheduler.add_request(_make_step_request("held"))
     return scheduler
 
