@@ -67,6 +67,9 @@ def test_only_general_serving_examples_get_generated_pages():
         ('model = "Qwen/Qwen-Image-2.1"\nfor model in ["other/model"]: pass\nOmni(model=model)', False),
         ('model = "Qwen/Qwen-Image-2.1"\n(model := "other/model")\nOmni(model=model)', False),
         ('model = "Qwen/Qwen-Image-2.1"\ndel model\nOmni(model=model)', False),
+        ('model = "Qwen/Qwen-Image-2.1"\nmatch "other/model":\n    case model:\n        Omni(model=model)', False),
+        ('model = "Qwen/Qwen-Image-2.1"\nmatch ["other/model"]:\n    case [*model]:\n        Omni(model=model)', False),
+        ('model = "Qwen/Qwen-Image-2.1"\nmatch {"x": 1}:\n    case {**model}:\n        Omni(model=model)', False),
         ("model = get_model()\nOmni(model=model)", False),
         ('Omni(model="Qwen/Qwen-Image-2.1")\nOmni(model="other/model")', False),
     ],
@@ -83,6 +86,7 @@ def test_doc_scope_filters_before_preparation(tmp_path, monkeypatch):
     readme = tmp_path / "README.md"
     readme.write_text(
         "```bash\npython missing.py --model other/model --lora-path missing\n```\n"
+        "```bash\npython missing.py --model Qwen/Qwen3-Omni-${SIZE} --lora-path missing\n```\n"
         '```python\nOmni(model="Qwen/Qwen-Image-2.1")\n```\n',
         encoding="utf-8",
     )
