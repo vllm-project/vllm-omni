@@ -7,11 +7,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.longcat_video.longcat_video_avatar_bsa import flash_attn_bsa_3d
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None, reason="NVIDIA CUDA required")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("chunk_shape", [(4, 4, 8), (4, 4, 16)])
