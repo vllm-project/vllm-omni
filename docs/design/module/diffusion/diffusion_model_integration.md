@@ -59,6 +59,12 @@ cross-stage routing.
 Test registry selection, checkpoint loading, minimal inference, input and output
 contracts, and every declared optional capability.
 
+Qwen-Image-Edit-Plus initializes its Qwen2.5-VL encoder on CPU before sharding
+and moving it to the execution device. Its non-persistent FP32 RoPE frequency
+buffers must match Diffusers' CPU initialization: computing them on the
+accelerator can change BF16 conditioning and image accuracy. The DiT retains
+the loader's device context and the selected compilation and attention modes.
+
 HunyuanImage3 uses `OmniDiffusionConfig.revision` for model configuration,
 generation configuration, tokenizer, and weight loading, including preprocessing.
 The shared-weight runtime pins remote loads to the commit resolved by AR;

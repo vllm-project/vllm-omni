@@ -5,6 +5,8 @@
 import pytest
 import torch
 from vllm.config import CUDAGraphMode
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor, CudaGraphManager
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
@@ -13,6 +15,9 @@ from vllm.v1.worker.gpu.sample.states import SamplingStates
 from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import Qwen3TTSTalkerForConditionalGeneration
+from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+from vllm_omni.worker_v2.staged_writes import StagedWrites
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -81,7 +86,9 @@ def test_rocm_does_not_probe_cuda_pdl_capability(monkeypatch):
         (True, False, CUDAGraphMode.FULL, False, True, True),
     ],
 )
-def test_talker_graph_configuration_before_loading_weights(monkeypatch, is_npu, v2, mode, eager, enabled, rejected):
+def test_talker_graph_configuration_before_loading_weights(
+    monkeypatch, mocker, is_npu, v2, mode, eager, enabled, rejected
+):
     from types import SimpleNamespace
 
     from vllm_omni.model_executor.models.qwen3_tts import qwen3_tts_talker as talker_module
@@ -118,3 +125,30 @@ def test_talker_graph_configuration_before_loading_weights(monkeypatch, is_npu, 
     with pytest.raises(ReachedBackboneError):
         talker.__init__(vllm_config=vllm_config)
     assert talker.talker_mtp_graph_safe is not (is_npu and enabled)
+
+    # Exercise the real model's output declaration and the Omni capture path.
+    # Multimodal packaging happens after forward, so FULL candidates must survive.
+    hidden = torch.ones(1, 16)
+    talker.model = mocker.Mock(return_value=hidden)
+    runner = object.__new__(OmniGPUModelRunner)
+    runner._staged_writes = StagedWrites()
+    runner.model = talker
+    runner.model_state = mocker.Mock(spec=OmniModelState)
+    runner.model_state._is_mtp_graph_runner.return_value = False
+    runner.model_state._get_mtp_capture_sizes.return_value = [1]
+    runner._configure_cudagraph_output_contract()
+    manager = runner.cudagraph_manager = object.__new__(CudaGraphManager)
+    full = BatchExecutionDescriptor(CUDAGraphMode.FULL, 1, 1, 1)
+    piecewise = BatchExecutionDescriptor(CUDAGraphMode.PIECEWISE, 1, None)
+    manager._capture_descs = {CUDAGraphMode.FULL: [full], CUDAGraphMode.PIECEWISE: [piecewise]}
+    manager._candidates = {(1, 0): [full, piecewise]}
+
+    def capture_tensor_model(_runner, *, profile_only=False):
+        assert full in manager._capture_descs[CUDAGraphMode.FULL]
+        assert manager._candidates[(1, 0)] == [full, piecewise]
+        assert talker.forward(None, None) is hidden
+        return 0
+
+    monkeypatch.setattr(GPUModelRunner, "capture_model", capture_tensor_model)
+    runner.capture_model(profile_only=True)
+    runner.capture_model(profile_only=False)
