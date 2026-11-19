@@ -188,7 +188,7 @@ def test_sp8_position_dispatches_only_local_tokens(mocker, rank):
         rot_pos_emb=lambda grid: torch.zeros(24, 2),
         blocks=[],
         deepstack_visual_indexes=[],
-        merger=lambda hidden: hidden,
+        merger=lambda hidden, sequence_parallel=None: hidden,
     )
     calls = []
 
@@ -197,8 +197,16 @@ def test_sp8_position_dispatches_only_local_tokens(mocker, rank):
         return current_method()(model, grid, **kwargs)
 
     model.fast_pos_embed_interpolate = interpolate
+    patch_shapes = []
+
+    def patch_embed(value):
+        patch_shapes.append(tuple(value.shape))
+        return value
+
+    model.patch_embed = patch_embed
     pixels, grid = torch.zeros(24, 4), torch.tensor([[2, 2, 6]])
     result, deep = namespace["forward_sp8"](model, pixels, grid, group=None)
+    assert patch_shapes == [(24, 4)]
     ids = namespace["build_vision_plan"]((12, 12), 8).rank_token_indices[rank]
     assert_bytes(result, reference_interpolate(model, grid)[list(ids)])
     assert deep == []

@@ -124,19 +124,89 @@ def test_empty_rank_shard_keeps_explicit_hidden_dimension(mocker):
     path = Path(__file__).resolve().parents[4] / "vllm_omni/diffusion/models/minimax_h3/vision_sp.py"
     tree = ast.parse(path.read_text())
     function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "attention_sp8")
+    aligned = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "row_aligned_call")
     namespace = {"torch": torch, "segment_attention": lambda q, k, v: v}
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
-    module = ast.fix_missing_locations(ast.Module(body=[future, function], type_ignores=[]))
+    module = ast.fix_missing_locations(ast.Module(body=[future, aligned, function], type_ignores=[]))
     exec(compile(module, str(path), "exec"), namespace)
-    attention = mocker.Mock(num_heads=16, head_dim=2, qkv=lambda x: x.new_empty((0, 96)), proj=lambda x: x)
+    attention = mocker.Mock(num_heads=16, head_dim=2, qkv=lambda x: x.new_empty((x.shape[0], 96)), proj=lambda x: x)
     transport = mocker.Mock(
         plan=mocker.Mock(segment_lengths=(4,)),
         to_heads=lambda x: x.new_zeros((4, 2, 2)),
         to_tokens=lambda x: x.new_empty((0, 16, 2)),
+        row_layout=lambda device, merged=False: (torch.empty(0, dtype=torch.long, device=device), 4),
     )
     hidden = torch.empty(0, 32)
     result = namespace["attention_sp8"](attention, hidden, (None, None), transport, lambda q, k, c, s: (q, k))
     assert result.shape == (0, 32)
+
+
+def load_row_aligned_call():
+    import ast
+
+    path = Path(__file__).resolve().parents[4] / "vllm_omni/diffusion/models/minimax_h3/vision_sp.py"
+    tree = ast.parse(path.read_text())
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "row_aligned_call")
+    future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+    namespace = {"torch": torch}
+    exec(
+        compile(ast.fix_missing_locations(ast.Module(body=[future, function], type_ignores=[])), str(path), "exec"),
+        namespace,
+    )
+    return namespace["row_aligned_call"]
+
+
+@pytest.mark.parametrize("rank", [0, 1, 7])
+@pytest.mark.parametrize("lengths", [(4,), (12, 4, 20), (0, 0)])
+@pytest.mark.parametrize("merged", [False, True])
+def test_original_row_layout_is_cached_metadata_only(monkeypatch, rank, lengths, merged):
+    module = load_module()
+    monkeypatch.setattr(module.dist, "get_rank", lambda group=None: rank)
+    monkeypatch.setattr(module.dist, "get_world_size", lambda group=None: 8)
+    plan = module.build_vision_plan(lengths, 8)
+    transport = module.VisionAllToAll(plan)
+    positions, count = transport.row_layout(torch.device("cpu"), merged=merged)
+    rows = plan.rank_merger_indices if merged else plan.rank_token_indices
+    assert positions.tolist() == list(rows[rank])
+    assert count == sum(map(len, rows))
+    assert positions.dtype == torch.long
+    assert transport.row_layout(torch.device("cpu"), merged=merged)[0] is positions
+    assert transport.calls == 0 and transport.sent_bytes == 0
+
+
+@pytest.mark.parametrize("rank", [0, 1, 7])
+@pytest.mark.parametrize("merged", [False, True])
+def test_row_aligned_kernel_retains_original_shape_and_positions(monkeypatch, rank, merged):
+    module = load_module()
+    monkeypatch.setattr(module.dist, "get_rank", lambda group=None: rank)
+    monkeypatch.setattr(module.dist, "get_world_size", lambda group=None: 8)
+    transport = module.VisionAllToAll(module.build_vision_plan((12, 4, 20), 8))
+    indices, count = transport.row_layout(torch.device("cpu"), merged=merged)
+    full = torch.arange(count * 3).reshape(count, 3).float()
+
+    class LayoutSensitiveKernel(torch.nn.Module):
+        # Emulate backend dependence on outer shape and row position, rather
+        # than assuming a CPU Linear reproduces the NPU rounding failure.
+        def forward(self, value):
+            row = torch.arange(value.shape[0], dtype=value.dtype)[:, None]
+            return value.sum(dim=-1, keepdim=True) + row + value.shape[0] * 0.25
+
+    kernel = LayoutSensitiveKernel()
+    expected = kernel(full).index_select(0, indices)
+    local = full.index_select(0, indices)
+    actual = load_row_aligned_call()(kernel, local, transport, merged=merged)
+    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    if indices.numel():
+        assert not torch.equal(kernel(local), expected)
+
+
+def test_row_aligned_input_rejects_mismatched_layout(monkeypatch):
+    module = load_module()
+    monkeypatch.setattr(module.dist, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(module.dist, "get_world_size", lambda group=None: 8)
+    transport = module.VisionAllToAll(module.build_vision_plan((32,), 8))
+    with pytest.raises(ValueError, match="shard layout"):
+        load_row_aligned_call()(torch.nn.Identity(), torch.zeros(3, 4), transport)
 
 
 def load_segment_attention():

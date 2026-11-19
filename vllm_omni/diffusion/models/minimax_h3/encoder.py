@@ -545,7 +545,16 @@ class MiniMaxH3Qwen3VLVisionPatchMerger(nn.Module):
         self.act_fn = nn.GELU()
         self.linear_fc2 = nn.Linear(self.hidden_size, config.out_hidden_size)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, sequence_parallel: VisionAllToAll | None = None) -> torch.Tensor:
+        if sequence_parallel is not None:
+            from .vision_sp import row_aligned_call
+
+            x = x.view(-1, self.hidden_size) if self.use_postshuffle_norm else x
+            x = row_aligned_call(self.norm, x, sequence_parallel, merged=self.use_postshuffle_norm)
+            x = x.view(-1, self.hidden_size)
+            x = row_aligned_call(self.linear_fc1, x, sequence_parallel, merged=True)
+            x = row_aligned_call(self.act_fn, x, sequence_parallel, merged=True)
+            return row_aligned_call(self.linear_fc2, x, sequence_parallel, merged=True)
         x = self.norm(x.view(-1, self.hidden_size) if self.use_postshuffle_norm else x).view(-1, self.hidden_size)
         x = self.linear_fc2(self.act_fn(self.linear_fc1(x)))
         return x
@@ -562,7 +571,13 @@ class MiniMaxH3Qwen3VLVisionMLP(nn.Module):
         # (``gelu_pytorch_tanh``), which differs from the exact erf GELU.
         self.act_fn = nn.GELU(approximate="tanh")
 
-    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_state: torch.Tensor, sequence_parallel: VisionAllToAll | None = None) -> torch.Tensor:
+        if sequence_parallel is not None:
+            from .vision_sp import row_aligned_call
+
+            hidden_state = row_aligned_call(self.linear_fc1, hidden_state, sequence_parallel)
+            hidden_state = row_aligned_call(self.act_fn, hidden_state, sequence_parallel)
+            return row_aligned_call(self.linear_fc2, hidden_state, sequence_parallel)
         return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_state)))
 
 
@@ -638,17 +653,22 @@ class MiniMaxH3Qwen3VLVisionBlock(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         sequence_parallel: VisionAllToAll | None = None,
     ) -> torch.Tensor:
-        normalized = self.norm1(hidden_states)
         if sequence_parallel is None:
+            normalized = self.norm1(hidden_states)
             output = self.attn(normalized, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
         else:
-            from .vision_sp import attention_sp8
+            from .vision_sp import attention_sp8, row_aligned_call
 
+            normalized = row_aligned_call(self.norm1, hidden_states, sequence_parallel)
             output = attention_sp8(
                 self.attn, normalized, position_embeddings, sequence_parallel, _apply_rotary_pos_emb_vision
             )
         hidden_states = hidden_states + output
-        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+        if sequence_parallel is None:
+            hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+        else:
+            normalized = row_aligned_call(self.norm2, hidden_states, sequence_parallel)
+            hidden_states = hidden_states + self.mlp(normalized, sequence_parallel=sequence_parallel)
         return hidden_states
 
 
