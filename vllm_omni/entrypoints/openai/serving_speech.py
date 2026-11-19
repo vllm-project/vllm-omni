@@ -1875,6 +1875,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         target_sample_rate: int | None = None,
         cumulative_audio: bool = False,
         audio_format: dict[str, int] | None = None,
+        stream_flag: str = "true",
     ):
         """Generate audio chunks for streaming response.
 
@@ -2115,15 +2116,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if first_audio_chunk_s is not None:
                 first_chunk_ms = (first_audio_chunk_s - stream_start_s) * 1000.0
                 self._log_request(
-                    "[SpeechE2E] request_id=%s stream=true status=ok total_ms=%.2f first_chunk_ms=%.2f",
+                    "[SpeechE2E] request_id=%s stream=%s status=ok total_ms=%.2f first_chunk_ms=%.2f",
                     request_id,
+                    stream_flag,
                     total_ms,
                     first_chunk_ms,
                 )
             else:
                 self._log_request(
-                    "[SpeechE2E] request_id=%s stream=true status=ok total_ms=%.2f first_chunk_ms=NA",
+                    "[SpeechE2E] request_id=%s stream=%s status=ok total_ms=%.2f first_chunk_ms=NA",
                     request_id,
+                    stream_flag,
                     total_ms,
                 )
         except GeneratorExit:
@@ -2133,8 +2136,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             record_stream_abort("cancelled")
             total_ms = (time.perf_counter() - stream_start_s) * 1000.0
             logger.info(
-                "[SpeechE2E] request_id=%s stream=true status=cancelled total_ms=%.2f",
+                "[SpeechE2E] request_id=%s stream=%s status=cancelled total_ms=%.2f",
                 request_id,
+                stream_flag,
                 total_ms,
             )
             logger.info("Streaming request %s cancelled by client", request_id)
@@ -2143,8 +2147,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             record_stream_abort("engine_dead")
             total_ms = (time.perf_counter() - stream_start_s) * 1000.0
             logger.error(
-                "[SpeechE2E] request_id=%s stream=true status=engine_dead total_ms=%.2f",
+                "[SpeechE2E] request_id=%s stream=%s status=engine_dead total_ms=%.2f",
                 request_id,
+                stream_flag,
                 total_ms,
             )
             logger.error(
@@ -2163,8 +2168,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             record_stream_abort("error")
             total_ms = (time.perf_counter() - stream_start_s) * 1000.0
             logger.exception(
-                "[SpeechE2E] request_id=%s stream=true status=error total_ms=%.2f error=%s",
+                "[SpeechE2E] request_id=%s stream=%s status=error total_ms=%.2f error=%s",
                 request_id,
+                stream_flag,
                 total_ms,
                 e,
             )

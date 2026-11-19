@@ -161,6 +161,43 @@ async def test_moss_empty_stream_is_an_error(sse, payload):
                 await anext(chunks)
 
 
+@pytest.mark.asyncio
+async def test_speech_e2e_log_reports_real_stream_flag(caplog):
+    """[SpeechE2E] must log the caller's own stream flag: with
+    stream=false + stream_format=audio the raw-audio branch still serves
+    the request, and a hardcoded stream=true hides non-streaming traffic
+    from anyone grepping the log (delivery-site triage needs both)."""
+    import logging as _logging
+
+    serving = OmniOpenAIServingSpeech.__new__(OmniOpenAIServingSpeech)
+    serving._tts_model_type = "moss_tts"
+    serving.engine_client = SimpleNamespace(
+        model_config=SimpleNamespace(model="OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5")
+    )
+    serving._adapter = MossTTSAdapter(SpeechServingContext(server=serving, engine_client=serving.engine_client))
+
+    async def results():
+        for _ in range(2):
+            yield SimpleNamespace(multimodal_output={"model_outputs": torch.zeros(320), "sr": 24000})
+
+    async def run(flag):
+        with caplog.at_level(_logging.INFO, logger="vllm_omni.entrypoints.openai.serving_speech"):
+            chunks = serving._generate_audio_chunks(
+                results(), f"stream-flag-{flag}", response_format="pcm", stream_flag=flag
+            )
+            _ = [chunk async for chunk in chunks]
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if "[SpeechE2E]" in r.getMessage() and f"stream-flag-{flag}" in r.getMessage()
+        ]
+
+    explicit = await run("false")
+    assert explicit and "stream=false" in explicit[-1], explicit
+    default = await run("true")
+    assert default and "stream=true" in default[-1], default
+
+
 class TestAudioMixin:
     @pytest.fixture
     def audio_mixin(self):
