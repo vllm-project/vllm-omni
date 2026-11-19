@@ -442,9 +442,15 @@ def test_core_state_runs_ar_step_sampling_and_parent_teardown(monkeypatch, mode)
 
     tags = [event[0] for event in model.events]
     assert tags.index("get_model_state_cls") < tags.index("state_created") < tags.index("sampler_constructed")
-    assert (
-        tags.index("preprocess_state") < tags.index("forward") < tags.index("sample") < tags.index("postprocess_state")
-    )
+    step_hooks = {"preprocess_state", "prepare_attn", "prepare_inputs", "forward", "sample", "postprocess_state"}
+    assert [tag for tag in tags if tag in step_hooks] == [
+        "preprocess_state",
+        "prepare_attn",
+        "prepare_inputs",
+        "forward",
+        "sample",
+        "postprocess_state",
+    ]
     assert tags.index("model_finished") < tags.index("state_remove")
     assert [event for event in model.events if event[0] == "state_remove"] == [("state_remove", "A")]
 
@@ -495,6 +501,8 @@ def test_inactive_execution_does_not_call_optional_hooks(monkeypatch, dummy_run)
 def test_finish_requests_cleans_each_id_once(monkeypatch, mocker, state_cls, finished, preempted):
     runner, model = loaded_runner(monkeypatch, model=TinyModel(state_cls))
     configure_step(monkeypatch, runner, model)
+    if isinstance(runner.model_state, OmniModelState):
+        runner.model_state.intermediate_buffer.buffers[0]["old_chunk"] = torch.ones(1)
     state_remove = mocker.spy(runner.model_state, "remove_request")
     request_remove = mocker.spy(runner.req_states, "remove_request")
     output = scheduled(finished=finished)
@@ -511,8 +519,35 @@ def test_finish_requests_cleans_each_id_once(monkeypatch, mocker, state_cls, fin
     assert runner.req_states.free_indices == ([0] if released else [])
     if isinstance(runner.model_state, OmniModelState):
         assert runner.model_state.intermediate_buffer.req_id_to_index == expected
+        assert bool(runner.model_state.intermediate_buffer.buffers[0]) == (not released)
     else:
         assert runner.model_state.live == expected
+    assert model.events.count(("lora_remove", "A")) == int(released)
+    if released:
+        runner.req_states.add_request("C", 1, [7], 0, 1)
+        slot = runner.req_states.req_id_to_index["C"]
+        assert slot == 0
+        runner.model_state.add_request(slot, SimpleNamespace(req_id="C", mm_features=[], num_computed_tokens=0))
+        if isinstance(runner.model_state, OmniModelState):
+            assert runner.model_state.intermediate_buffer.buffers[slot] == {"req_id": "C"}
+        else:
+            assert runner.model_state.live == {"B": 1, "C": 0}
+
+
+def cached_chunk_output(prompt_token_ids):
+    output = scheduled()
+    req_ids = list(prompt_token_ids)
+    count = len(req_ids)
+    output.scheduled_cached_reqs = OmniCachedRequestData(
+        req_ids=req_ids,
+        new_token_ids=[[] for _ in req_ids],
+        new_block_ids=[()] * count,
+        num_computed_tokens=[0] * count,
+        num_output_tokens=[0] * count,
+        prompt_token_ids=prompt_token_ids,
+        additional_information={},
+    )
+    return output
 
 
 @pytest.mark.parametrize("mode", ["none", "align"])
@@ -532,28 +567,22 @@ def test_cached_chunk_reset_preserves_peer_and_hybrid_slot(monkeypatch, mocker, 
     state_remove = mocker.spy(state, "remove_request")
     state_add = mocker.spy(state, "add_request")
     state_flush = mocker.spy(state, "apply_staged_writes")
-    output = scheduled()
-    output.scheduled_cached_reqs = OmniCachedRequestData(
-        req_ids=["A", "unknown"],
-        new_token_ids=[[], []],
-        new_block_ids=[(), ()],
-        num_computed_tokens=[0, 0],
-        num_output_tokens=[0, 0],
-        prompt_token_ids={"A": None, "unknown": None},
-        additional_information={},
-    )
+    request_flush = mocker.spy(runner.req_states, "apply_staged_writes")
+    order = mocker.Mock()
+    order.attach_mock(state_remove, "remove")
+    order.attach_mock(state_add, "add")
+    order.attach_mock(request_flush, "request_flush")
+    order.attach_mock(state_flush, "state_flush")
 
-    runner._handle_async_chunk_updates(output)
-    state_remove.assert_not_called()
-    state_add.assert_not_called()
-    state_flush.assert_not_called()
-    output.scheduled_cached_reqs.prompt_token_ids["A"] = []
-    runner._handle_async_chunk_updates(output)
+    runner._handle_async_chunk_updates(cached_chunk_output({"A": None, "unknown": None}))
+    assert order.mock_calls == []
+    runner._handle_async_chunk_updates(cached_chunk_output({"A": []}))
 
     state_remove.assert_called_once_with("A")
     state_add.assert_called_once()
     assert state_add.call_args.args[0] == 0
     state_flush.assert_called_once_with()
+    assert [call[0] for call in order.mock_calls] == ["remove", "add", "request_flush", "state_flush"]
     assert runner.req_states.req_id_to_index == {"B": 1, "A": 0}
     assert runner.req_states.free_indices == []
     assert runner.req_states.prompt_len.np.tolist() == [0, 2]
@@ -561,6 +590,33 @@ def test_cached_chunk_reset_preserves_peer_and_hybrid_slot(monkeypatch, mocker, 
     assert state.num_accepted_tokens_gpu.tolist() == [1, 7]
     if mode == "align":
         assert state._mamba_state_idx_gpu.tolist() == [-1, 6]
+
+
+def test_cached_chunk_readds_released_request_through_core(monkeypatch):
+    runner, model = loaded_runner(monkeypatch, runner_cls=OmniGenerationModelRunner)
+    batch = configure_step(monkeypatch, runner, model)
+    runner.model_config.async_chunk = True
+    runner._release_generation_slots(batch)
+    assert runner.req_states.req_id_to_index == {"B": 1}
+    assert runner.req_states.free_indices == [0]
+    assert not any(event[0] == "model_finished" for event in model.events)
+    runner.adaptive_verification = None
+    runner.lora_state.add_request = lambda *args: None
+    runner.sampler.apply_staged_writes = lambda: None
+    model.events.clear()
+
+    runner._handle_async_chunk_updates(cached_chunk_output({"A": [7, 8]}))
+
+    lifecycle = {"state_remove", "state_add", "request_apply", "state_apply"}
+    assert [event for event in model.events if event[0] in lifecycle] == [
+        ("state_remove", "A"),
+        ("state_add", "A", 0),
+        ("request_apply",),
+        ("state_apply",),
+    ]
+    assert runner.req_states.req_id_to_index == runner.model_state.live == {"B": 1, "A": 0}
+    assert runner.req_states.free_indices == []
+    assert runner.req_states.all_token_ids.np[0, :2].tolist() == [7, 8]
 
 
 @pytest.mark.parametrize("capability", ["native", "kv-send", "kv-receive", "stream-capture", "ar-structured"])
@@ -714,14 +770,16 @@ def test_profile_capture_with_no_sizing_does_not_call_model_hook(monkeypatch):
 
 
 @pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL])
-@pytest.mark.parametrize("kind", ["empty-omni-output", "empty-aux-tuple", "dict"])
+@pytest.mark.parametrize("kind", ["empty-omni-output", "omni-output", "empty-aux-tuple", "aux-tuple", "dict"])
 def test_rejects_unconverted_outputs_before_unpack(monkeypatch, mode, kind):
     runner, model = loaded_runner(monkeypatch)
     configure_step(monkeypatch, runner, model, mode)
     hidden = torch.zeros(2, 2)
     raw = {
         "empty-omni-output": OmniOutput(text_hidden_states=hidden, multimodal_outputs={}),
+        "omni-output": OmniOutput(text_hidden_states=hidden, multimodal_outputs={"audio": hidden}),
         "empty-aux-tuple": (hidden, None),
+        "aux-tuple": (hidden, {"audio": hidden}),
         "dict": {"hidden": hidden},
     }[kind]
     monkeypatch.setattr(model, "forward", lambda **kwargs: raw)
@@ -732,6 +790,34 @@ def test_rejects_unconverted_outputs_before_unpack(monkeypatch, mode, kind):
     with pytest.raises(NotImplementedError, match="structured output.*CoreState"):
         runner.execute_model(scheduled())
     assert runner.execute_model_state is None
+
+
+@pytest.mark.parametrize("source", ["platform-full", "kstep-converter"])
+def test_optional_output_producers_are_checked_before_unpack(monkeypatch, mocker, source):
+    runner, model = loaded_runner(monkeypatch)
+    mode = CUDAGraphMode.FULL if source == "platform-full" else CUDAGraphMode.NONE
+    configure_step(monkeypatch, runner, model, mode)
+    structured = OmniOutput(text_hidden_states=torch.ones(2, 2), multimodal_outputs={"audio": torch.ones(2)})
+    producer = mocker.Mock(return_value=structured)
+    if source == "platform-full":
+        monkeypatch.setattr(runner, "_full_graph_step_output", producer)
+        runner.cudagraph_manager = SimpleNamespace(run_fullgraph=mocker.Mock())
+    else:
+        runner._kstep_frames = 2
+        monkeypatch.setattr(model, "flush_cuda_kstep_feedback", lambda: None, raising=False)
+        monkeypatch.setattr(runner, "_build_kstep_model_kwargs_extra", lambda *args: {"step": 1})
+        monkeypatch.setattr(model, "make_omni_output", producer, raising=False)
+
+    with pytest.raises(NotImplementedError, match=r"structured output \(OmniOutput\).*CoreState"):
+        runner.execute_model(scheduled())
+
+    producer.assert_called_once()
+    assert runner.execute_model_state is None
+    assert runner._last_multimodal_outputs is None
+    if source == "platform-full":
+        runner.cudagraph_manager.run_fullgraph.assert_not_called()
+    else:
+        assert producer.call_args.kwargs["request_sample_eligible"] == [True]
 
 
 def test_cached_payload_fails_before_core_request_update(monkeypatch):
@@ -914,6 +1000,7 @@ def test_generation_converter_gets_buffers_in_batch_order(monkeypatch, dummy_run
     batch.query_start_loc_np = batch.query_start_loc.numpy()
     runner._prev_step_idle = False
     runner._dummy_hidden = torch.empty(1)
+    runner._retains_state_across_chunks = False
     state = runner.model_state
     state.intermediate_buffer.buffers[:] = [{"sentinel": "A"}, {"sentinel": "B"}]
     seen = []
@@ -921,7 +1008,7 @@ def test_generation_converter_gets_buffers_in_batch_order(monkeypatch, dummy_run
     def convert(output, *, model_intermediate_buffer, runtime_additional_information):
         assert model_intermediate_buffer is runtime_additional_information
         seen.extend(model_intermediate_buffer)
-        return OmniOutput(text_hidden_states=output, multimodal_outputs={})
+        return OmniOutput(text_hidden_states=None, multimodal_outputs={"model_outputs": [row[:1] for row in output]})
 
     monkeypatch.setattr(model, "make_omni_output", convert, raising=False)
     monkeypatch.setattr(runner, "_make_dummy_input_batch", lambda *args, **kwargs: batch)
@@ -931,6 +1018,13 @@ def test_generation_converter_gets_buffers_in_batch_order(monkeypatch, dummy_run
 
     assert seen == [{"sentinel": "B"}, {"sentinel": "A"}]
     assert isinstance(runner._gen_model_output, OmniOutput)
+    if not dummy_run:
+        result = runner.sample_tokens()
+        assert result.req_ids == ["B", "A"]
+        assert result.sampled_token_ids == [[], []]
+        assert [item["model_outputs"].tolist() for item in result.multimodal_outputs] == [[2.0], [5.0]]
+        assert runner.execute_model_state is None
+        assert runner.req_states.num_computed_tokens.np.tolist() == [2, 2]
     assert not {"prepare_attn", "preprocess_state", "postprocess_state"}.intersection(e[0] for e in model.events)
 
 
