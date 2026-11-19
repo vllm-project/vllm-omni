@@ -6,6 +6,7 @@ Unit tests for StageConfigFactory and related classes.
 
 import importlib
 import json
+import logging
 import warnings
 from dataclasses import fields
 from pathlib import Path
@@ -542,6 +543,31 @@ class TestStageConfigFactory:
 
 class TestStageResolutionHelpers:
     """Tests for shared stage override / filtering helpers."""
+
+    def test_build_stage_runtime_overrides_warns_when_stage_key_is_internal(self, caplog):
+        cli_overrides = {
+            "stage_0_default_sampling_params": {"temperature": 0.2},
+            "stage_0_env": {"TEST_ENV": "1"},
+            "stage_0_gpu_memory_utilization": 0.5,
+        }
+
+        with caplog.at_level(logging.WARNING, logger="vllm_omni.config.stage_config"):
+            overrides = build_stage_runtime_overrides(0, cli_overrides)
+
+        assert overrides == {
+            "env": {"TEST_ENV": "1"},
+            "gpu_memory_utilization": 0.5,
+        }
+        assert "default_sampling_params" in caplog.text
+
+    def test_build_stage_runtime_overrides_can_suppress_internal_key_warnings(self, caplog):
+        cli_overrides = {"stage_0_default_sampling_params": {"temperature": 0.2}}
+
+        with caplog.at_level(logging.WARNING, logger="vllm_omni.config.stage_config"):
+            overrides = build_stage_runtime_overrides(0, cli_overrides, warn_dropped=False)
+
+        assert overrides == {}
+        assert "default_sampling_params" not in caplog.text
 
     @pytest.mark.parametrize("global_first", [True, False], ids=["global-first", "stage-first"])
     def test_build_stage_runtime_overrides_ignores_other_stage_and_internal_keys(self, global_first):
@@ -3380,9 +3406,12 @@ class TestPlatformOverrides:
     ):
         deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
         deploy = _apply_platform_overrides(deploy, platform=platform)
-        # MOSS realtime inherits V2 on every platform; other profiles retain
-        # their explicit platform overrides.
-        all_platforms_mrv2 = filename == "moss_tts_realtime.yaml"
+        # MOSS realtime and Nano inherit V2 on every platform; other profiles
+        # retain their explicit platform overrides.
+        all_platforms_mrv2 = filename in (
+            "moss_tts_nano.yaml",
+            "moss_tts_realtime.yaml",
+        )
         npu_full_mrv2 = platform == "npu" and filename in (
             "qwen3_tts.yaml",
             "minicpmo_4_5.yaml",
@@ -3569,12 +3598,27 @@ class TestPlatformOverrides:
         assert compilation["cudagraph_mode"] == "FULL"
         assert max(compilation["cudagraph_capture_sizes"]) == 128
         assert "inductor_compile_config" not in compilation
-        assert not any(
-            stage.supports_native_mrv2_data_plane for stage in resolve_pipeline_config("moss_tts_delay").stages
-        )
+        assert all(stage.supports_native_mrv2_data_plane for stage in resolve_pipeline_config("moss_tts_delay").stages)
         assert all(
             stage.supports_native_mrv2_data_plane for stage in resolve_pipeline_config("moss_tts_realtime").stages
         )
+
+    @pytest.mark.parametrize(
+        "pipeline_key,filename,native_stages",
+        [
+            ("aura_omni", "aura_omni.yaml", (2, 3)),
+            ("nemotron_voicechat", "nemotron_labs_voicechat_duplex.yaml", (0, 1, 2)),
+            ("personaplex", "personaplex.yaml", (0, 1)),
+        ],
+    )
+    def test_native_transport_preserves_duplex_deploy(self, pipeline_key, filename, native_stages):
+        pipeline = resolve_pipeline_config(pipeline_key)
+        deploy = load_deploy_config(get_deploy_config_path(filename))
+        assert deploy.session_mode == "duplex"
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        for stage in stages:
+            if stage.stage_id in native_stages:
+                assert stage.yaml_engine_args["supports_native_mrv2_data_plane"]
 
     def test_platform_mps_rejects_non_boolean(self):
         deploy = load_deploy_config(get_deploy_config_path("moss_tts_local.yaml"))
