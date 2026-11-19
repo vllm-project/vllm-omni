@@ -12,6 +12,8 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
+from vllm_omni.platforms import current_omni_platform
+
 
 def packed_qkv_eligible(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, world_size: int) -> bool:
     """The strict S<->H layout supports equal-shaped, equally typed Q/K/V.
@@ -33,8 +35,8 @@ def packed_qkv_eligible(query: torch.Tensor, key: torch.Tensor, value: torch.Ten
 
 
 def _synchronize(tensor: torch.Tensor, use_sync: bool) -> None:
-    if use_sync and tensor.is_cuda:
-        torch.accelerator.synchronize(tensor.device)
+    if use_sync and tensor.device.type != "cpu":
+        current_omni_platform.synchronize()
 
 
 def packed_qkv_all_to_all(

@@ -21,6 +21,7 @@ import traceback
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -76,6 +77,7 @@ from vllm_omni.diffusion.ipc import (
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, LoRABackend
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.request_streaming import request_chunk_transport
 from vllm_omni.diffusion.sched.interface import (
     DiffusionSchedulerOutput,
     KVPrefetchJob,
@@ -113,6 +115,31 @@ _ASYNC_OUTPUT_DRAIN_TIMEOUT_S = 10.0
 # Worker entry points that release device memory. Background D2H/SHM packing
 # still reads model output tensors, so it must finish before these run.
 _MEMORY_RELEASING_METHODS = frozenset({"sleep", "handle_sleep_task"})
+_REQUEST_CHUNK_EXECUTE_METHODS = frozenset({"execute_model", "execute_model_batch"})
+
+
+@dataclass
+class _AsyncOutputJob:
+    """One background D2H/SHM pack.
+
+    Final outputs stay ``OUTPUT_READY``. ``CHUNK_READY`` jobs are intermediate
+    media and must not send ``COMPUTE_DONE``.
+    """
+
+    output: Any
+    async_output_id: str
+    gpu_event: Any = None
+    kind: AsyncOutputKind = AsyncOutputKind.OUTPUT_READY
+    request_id: str | None = None
+    chunk_index: int | None = None
+
+
+def _coerce_async_output_job(item: Any) -> _AsyncOutputJob:
+    """Accept the historical ``(output, async_output_id, gpu_event)`` tuple."""
+    if isinstance(item, _AsyncOutputJob):
+        return item
+    output, async_output_id, gpu_event = item
+    return _AsyncOutputJob(output=output, async_output_id=async_output_id, gpu_event=gpu_event)
 
 
 def _cleanup_after_execution_error(exc: Exception) -> None:
@@ -240,6 +267,168 @@ def _force_cutlass_fp8_linear_kernel(quant_config: object | None) -> Iterator[No
     yield
 
 
+def _stable_config_repr(value: Any, depth: int = 0) -> str:
+    """Process-independent text for a config value (default object reprs embed memory addresses)."""
+    import dataclasses
+
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return repr(value)
+    if isinstance(value, torch.dtype):
+        return str(value)
+    if depth > 4:
+        return type(value).__qualname__
+    if isinstance(value, dict):
+        items = sorted((str(k), _stable_config_repr(v, depth + 1)) for k, v in value.items())
+        return "{" + ",".join(f"{k}:{v}" for k, v in items) + "}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_stable_config_repr(v, depth + 1) for v in value) + "]"
+    if isinstance(value, (set, frozenset)):
+        return "{" + ",".join(sorted(_stable_config_repr(v, depth + 1) for v in value)) + "}"
+    get_name = getattr(value, "get_name", None)
+    if callable(get_name):
+        # A quantization config: its method and the layers it skips, not runtime state the model load adds to it.
+        try:
+            name = get_name()
+        except Exception:
+            name = None
+        skipped = next(
+            (getattr(value, a) for a in ("ignored_layers", "ignore", "modules_to_not_convert") if hasattr(value, a)),
+            None,
+        )
+        method, skip = _stable_config_repr(name, depth + 1), _stable_config_repr(skipped, depth + 1)
+        return f"{type(value).__qualname__}({method},{skip})"
+    if dataclasses.is_dataclass(value):
+        attrs = {f.name: getattr(value, f.name) for f in dataclasses.fields(value)}
+    else:
+        attrs = {k: v for k, v in vars(value).items() if not k.startswith("_")} if hasattr(value, "__dict__") else {}
+    body = ",".join(f"{k}={_stable_config_repr(v, depth + 1)}" for k, v in sorted(attrs.items()))
+    return f"{type(value).__qualname__}({body})"
+
+
+def _flashinfer_autotune_cache_path(od_config: OmniDiffusionConfig, rank: int) -> str:
+    """Per-rank FlashInfer autotune cache file for this diffusion stage.
+
+    The key covers what changes the GEMM shapes and kernels a rank runs: the model, its quantization, the dtype and
+    the parallel layout. FlashInfer itself records the GPU and library versions in the file and rejects a file
+    written under a different environment; ``_load_flashinfer_autotune_cache`` then moves this worker to an
+    environment-specific sibling path, because FlashInfer also refuses to overwrite the other environment's file.
+    """
+    import hashlib
+
+    import vllm.envs as envs
+
+    key_src = "|".join(
+        _stable_config_repr(part)
+        for part in (
+            od_config.model,
+            od_config.quantization_config,
+            od_config.dtype,
+            od_config.num_gpus,
+            od_config.parallel_config,
+        )
+    )
+    key = hashlib.sha256(key_src.encode()).hexdigest()[:16]
+    return os.path.join(envs.VLLM_CACHE_ROOT, "flashinfer_autotune", "diffusion", key, f"rank{rank}.json")
+
+
+def _flashinfer_autotune_env_tag() -> str:
+    """Short fingerprint of the GPU and library versions a tuned tactic is only valid for.
+
+    FlashInfer's own metadata is used when it can be read, so the tag changes exactly when FlashInfer
+    would reject the cache file; otherwise the library version, the CUDA version and the device name
+    stand in for it.
+    """
+    import hashlib
+
+    try:
+        from flashinfer.autotuner.autotuner import _collect_metadata
+
+        fingerprint = _stable_config_repr(dict(_collect_metadata()))
+    except Exception:
+        import flashinfer
+        from vllm.platforms import current_platform
+
+        fingerprint = _stable_config_repr(
+            (
+                getattr(flashinfer, "__version__", "unknown"),
+                getattr(torch.version, "cuda", None),
+                current_platform.get_device_name(),
+            )
+        )
+    return hashlib.sha256(fingerprint.encode()).hexdigest()[:8]
+
+
+def _flashinfer_autotune_env_cache_path(cache_path: str) -> str:
+    """Sibling of ``cache_path`` for this GPU / library environment."""
+    base, ext = os.path.splitext(cache_path)
+    return f"{base}.env-{_flashinfer_autotune_env_tag()}{ext}"
+
+
+def _device_capability_at_least(capability: int) -> bool:
+    from vllm.platforms import current_platform
+
+    return bool(current_platform.has_device_capability(capability))
+
+
+def _flashinfer_autotune_wanted(od_config: Any) -> bool:
+    """Resolve ``diffusion_flashinfer_autotune``: True / False are explicit; None (default) means auto.
+
+    Auto turns it on for CUDA SM100+ with FlashInfer installed. That is where vLLM routes diffusion
+    GEMMs through FlashInfer (MXFP8 linears, per-tensor-activation FP8 linears) and where tuned
+    tactics measurably beat the heuristic (B200 MXFP8 Wan2.2: 1.19x); on SM90 the heuristic already
+    matches. Online per-token FP8 runs on CUTLASS, so auto mode tunes nothing there.
+    """
+    setting = getattr(od_config, "diffusion_flashinfer_autotune", None)
+    if setting is False or not current_omni_platform.is_cuda():
+        return False
+    from vllm.utils.flashinfer import has_flashinfer
+
+    if not has_flashinfer():
+        if setting:
+            logger.warning_once("diffusion_flashinfer_autotune is set but FlashInfer is not installed; ignoring it.")
+        return False
+    if setting is None:
+        if not _device_capability_at_least(100):
+            return False
+        logger.info_once(
+            "FlashInfer autotune auto-enabled for this diffusion stage (CUDA SM100+); the first request of each "
+            "new shape is slower while it tunes. Disable with --no-diffusion-flashinfer-autotune."
+        )
+    return True
+
+
+def _flashinfer_tune_signature(request: Any) -> str:
+    """Text for the shapes a request makes the forward run.
+
+    The scheduler's batch-compatibility key already collects everything that has to be homogeneous for
+    requests to share a forward -- output geometry, outputs per prompt, CFG, LoRA and the pipeline's own
+    condition key (Qwen-Image's reference-image sizes, Wan's image condition) -- which is also what sets
+    the GEMM shapes that forward runs.
+
+    Prompt-dependent rows are not part of it: text embeddings are padded to the longest prompt of the
+    batch, so no single request's admission data predicts them. GEMMs on those rows keep FlashInfer's
+    heuristic tactic (a cache miss falls back, it does not fail).
+    """
+    try:
+        from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
+
+        key: Any = build_request_batch_sampling_params_key(request)
+    except Exception:
+        # Request shapes the key builder does not accept (older callers, test stubs): fall back to the
+        # geometry and condition identity that are always readable.
+        sampling_params = getattr(request, "sampling_params", request)
+        cfg = any((getattr(sampling_params, name, None) or 0) > 1 for name in ("guidance_scale", "true_cfg_scale"))
+        key = (
+            *(
+                getattr(sampling_params, name, None)
+                for name in ("height", "width", "num_frames", "resolution", "num_outputs_per_prompt")
+            ),
+            cfg,
+            getattr(request, "batch_compatibility_key", None),
+        )
+    return _stable_config_repr(key)
+
+
 def _get_mem_allocator_instance() -> Any:
     from vllm.device_allocator import get_mem_allocator_instance
 
@@ -297,7 +486,7 @@ class DiffusionWorker:
         # Worker-side cache of (lora_request, lora_scale) per scheduled
         # request id. Used by step mode to recover LoRA identity for cached
         # requests, which only carry their request_id in subsequent ticks.
-        self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
+        self._step_lora_state: dict[str, tuple[LoRARequest | list[LoRARequest] | None, float | list[float]]] = {}
         self._shutdown_complete = False
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.weight_transfer_engine: WeightTransferEngine | None = None
@@ -440,6 +629,7 @@ class DiffusionWorker:
                 fully_shard_degree=parallel_config.hsdp_shard_size if parallel_config.use_hsdp else 1,
                 enable_expert_parallel=parallel_config.enable_expert_parallel,
                 use_hsdp=parallel_config.use_hsdp,
+                hsdp_data_parallel=getattr(parallel_config, "hsdp_data_parallel", False),
             )
             _setup_diffusion_worker_proc_title_and_log_prefix(
                 enable_ep=parallel_config.enable_expert_parallel,
@@ -507,6 +697,132 @@ class DiffusionWorker:
     def _get_profiler(self) -> WorkerProfiler | None:
         return getattr(self, "profiler", None)
 
+    def _flashinfer_autotune_context(
+        self,
+        requests: list[Any] | None = None,
+        *,
+        request_ids: list[str] | None = None,
+        new_request_ids: list[str] | None = None,
+    ) -> AbstractContextManager[Any]:
+        """FlashInfer autotune for forwards that run a request shape this worker has not tuned yet.
+
+        On by default on CUDA SM100+ with FlashInfer (``diffusion_flashinfer_autotune=None``), explicit
+        True / False override that (see ``_flashinfer_autotune_wanted``).
+
+        vLLM tunes FlashInfer kernels only in its LLM worker warm-up, so without this the diffusion
+        stage runs FlashInfer GEMMs (on SM100+: MXFP8 linears and per-tensor-activation FP8 linears;
+        online per-token FP8 uses CUTLASS) on the library's heuristic tactic. Tune mode profiles
+        only cache misses, but it also adds milliseconds of host time to every FlashInfer call even
+        on cache hits, so it is entered only for the first forward of each new batch composition
+        (the sorted per-request signatures of ``_flashinfer_tune_signature``, so a batch of two ``S``
+        requests differs from one; with step execution: every step of the requests in that batch
+        until they finish, since prefill and decode differ). All other forwards run in normal mode,
+        which looks the tuned tactics up.
+        The per-rank cache file is loaded once and rewritten when new tactics were profiled.
+        Graph-captured paths are safe: their eager warm-up runs before capture, so capture only
+        sees cache hits.
+        """
+        od_config = getattr(self, "od_config", None)
+        enabled = self.__dict__.get("_flashinfer_autotune_on")
+        if enabled is None:
+            enabled = self._flashinfer_autotune_on = _flashinfer_autotune_wanted(od_config)
+        if not enabled:
+            return nullcontext()
+        cache_path = self.__dict__.get("_flashinfer_autotune_cache_file") or _flashinfer_autotune_cache_path(
+            od_config, self.rank
+        )
+        cache_path = self._load_flashinfer_autotune_cache(cache_path)
+        seen: set[tuple[str, ...]] = self.__dict__.setdefault("_flashinfer_tuned_signatures", set())
+        pending: dict[tuple[str, ...], set[str]] = self.__dict__.setdefault("_flashinfer_pending_signatures", {})
+        tuning_ids: set[str] = self.__dict__.setdefault("_flashinfer_tuning_request_ids", set())
+        step_signatures: dict[str, str] = self.__dict__.setdefault("_flashinfer_step_signatures", {})
+        signatures = [_flashinfer_tune_signature(request) for request in requests or []]
+        if request_ids is not None:
+            # Step mode: the forward batches every scheduled request, not only the newly admitted ones.
+            step_signatures.update(zip(new_request_ids or [], signatures))
+            signatures = [step_signatures[rid] for rid in request_ids if rid in step_signatures]
+        # GEMM row counts follow the whole batch (requests x outputs per prompt x CFG), so the batch
+        # composition is the key: [S] and [S, S] are different shapes.
+        batch_signature = tuple(sorted(signatures))
+        # A composition counts as tuned only once a forward of it ran to the end, so a request that
+        # fails or is cancelled part way through does not mark the shapes it never reached.
+        new_batch = bool(batch_signature) and batch_signature not in seen and batch_signature not in pending
+        if new_batch and request_ids is not None:
+            pending[batch_signature] = set(request_ids)
+            tuning_ids.update(request_ids)
+        tune = new_batch or bool(request_ids and tuning_ids.intersection(request_ids))
+        if not tune:
+            return nullcontext()
+        # Step mode commits when the requests finish; a one-shot forward commits when it returns.
+        return self._flashinfer_autotune_session(cache_path, None if request_ids is not None else batch_signature)
+
+    def _finish_flashinfer_tuning(self, request_ids: list[str], *, completed: bool) -> None:
+        """Retire the tuning state of requests that left the step batch.
+
+        ``completed`` requests commit the compositions they were tuning; cancelled or failed ones drop
+        them, so a retry of the same shape tunes the steps the dropped request never reached.
+        """
+        tuning_ids = self.__dict__.get("_flashinfer_tuning_request_ids")
+        if tuning_ids:
+            tuning_ids.difference_update(request_ids)
+        step_signatures = self.__dict__.get("_flashinfer_step_signatures")
+        if step_signatures:
+            for request_id in request_ids:
+                step_signatures.pop(request_id, None)
+        pending = self.__dict__.get("_flashinfer_pending_signatures")
+        if not pending:
+            return
+        seen = self.__dict__.setdefault("_flashinfer_tuned_signatures", set())
+        for signature, waiting in list(pending.items()):
+            if not waiting.intersection(request_ids):
+                continue
+            if not completed:
+                del pending[signature]
+                continue
+            waiting.difference_update(request_ids)
+            if not waiting:
+                del pending[signature]
+                seen.add(signature)
+
+    def _load_flashinfer_autotune_cache(self, cache_path: str) -> str:
+        """Load this rank's tactic cache once; returns the file the worker should write back to."""
+        loaded = self.__dict__.get("_flashinfer_autotune_loaded")
+        if loaded is not None and loaded[0] == cache_path:
+            return loaded[1]
+        from flashinfer.autotuner import AutoTuner
+
+        save_path = cache_path
+        if os.path.exists(cache_path) and AutoTuner.get().load_configs(cache_path) is False:
+            # The file was tuned under other GPU or library versions, so FlashInfer neither loads it
+            # nor overwrites it. Give this environment its own file instead of re-tuning every start.
+            save_path = _flashinfer_autotune_env_cache_path(cache_path)
+            if os.path.exists(save_path):
+                AutoTuner.get().load_configs(save_path)
+            logger.info(
+                "Worker %d: FlashInfer rejected the autotune cache %s (different environment); using %s",
+                self.rank,
+                cache_path,
+                save_path,
+            )
+        self._flashinfer_autotune_loaded = (cache_path, save_path)
+        logger.info("Worker %d: FlashInfer autotune enabled, cache %s", self.rank, save_path)
+        return save_path
+
+    @contextmanager
+    def _flashinfer_autotune_session(self, cache_path: str, commit: tuple[str, ...] | None = None) -> Iterator[None]:
+        from flashinfer.autotuner import AutoTuner, autotune
+
+        tuner = AutoTuner.get()
+        with autotune(tune_mode=True):
+            yield
+        # The forward returned, so this composition is covered; a raising forward leaves it uncovered.
+        if commit is not None:
+            self.__dict__.setdefault("_flashinfer_tuned_signatures", set()).add(commit)
+        # Only shapes that missed the cache were profiled; persist them for the next start.
+        if getattr(tuner, "_dirty", False):
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            tuner.save_configs(cache_path)
+
     def load_model(self, load_format: str = "default", custom_pipeline_name: str | None = None, **kwargs) -> None:
         """Load the diffusion model using DiffusionModelRunner."""
         from vllm_omni.distributed.weight_sharing.worker_session import (
@@ -515,6 +831,10 @@ class DiffusionWorker:
         )
 
         assert self.model_runner is not None, "Model runner not initialized"
+        self._flashinfer_autotune_on = _flashinfer_autotune_wanted(self.od_config)
+        if self._flashinfer_autotune_on:
+            # Key the autotune cache before loading: the load attaches runtime state to the quantization config.
+            self._flashinfer_autotune_cache_file = _flashinfer_autotune_cache_path(self.od_config, self.rank)
         load_format = kwargs.get("load_format", load_format)
         custom_pipeline_name = kwargs.get("custom_pipeline_name", custom_pipeline_name)
         cutlass_fp8_context = (
@@ -880,12 +1200,11 @@ class DiffusionWorker:
     ) -> DiffusionOutput | dict[str, int | DiffusionOutput]:
         """Execute a forward pass by delegating to the model runner.
 
-        If *req* is a list (DP multi-concurrency), each rank picks one complete
-        NewRequestData envelope based on its distributed rank. AllGather in
-        the layerwise offload only gathers weight shards (request-independent),
-        so all ranks stay synchronised at each AllGather call while computing
-        different activations. Selecting the envelope keeps Scheduler-issued
-        KV metadata bound to the request that owns its block tables.
+        If *req* is a list (rank-local DP concurrency), each rank picks one
+        complete NewRequestData envelope based on its distributed rank. Weight
+        collectives are request-independent, so ranks can compute different
+        activations while remaining synchronized. Selecting the envelope keeps
+        Scheduler-issued KV metadata bound to its owning request.
 
         Each rank returns its OWN DiffusionOutput (no gather). The executor
         collects N responses via the per-worker result queues.
@@ -910,7 +1229,7 @@ class DiffusionWorker:
 
         if self.lora_manager is not None:
             try:
-                self.lora_manager.set_request_adapter(
+                self.lora_manager.set_request_adapters(
                     request.sampling_params.lora_request, request.sampling_params.lora_scale
                 )
             except Exception as exc:
@@ -919,7 +1238,7 @@ class DiffusionWorker:
                 logger.warning("LoRA activation skipped: %s", exc)
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward") if profiler else nullcontext()
-        with ctx:
+        with ctx, self._flashinfer_autotune_context([request]):
             kwargs: dict[str, Any] = {"kv_prefetch_job": kv_prefetch_job}
             if diffusion_kv_metadata is not None:
                 kwargs["diffusion_kv_metadata"] = diffusion_kv_metadata
@@ -945,14 +1264,15 @@ class DiffusionWorker:
         if self.lora_manager is not None and scheduler_output.scheduled_new_reqs:
             sp = scheduler_output.scheduled_new_reqs[0].req.sampling_params
             try:
-                self.lora_manager.set_request_adapter(sp.lora_request, sp.lora_scale)
+                self.lora_manager.set_request_adapters(sp.lora_request, sp.lora_scale)
             except Exception as exc:
                 if sp.lora_request is not None:
                     raise
                 logger.warning("LoRA activation skipped: %s", exc)
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward_batch") if profiler else nullcontext()
-        with ctx:
+        batch_requests = [new_req.req for new_req in scheduler_output.scheduled_new_reqs]
+        with ctx, self._flashinfer_autotune_context(batch_requests):
             output = self.model_runner.execute_model_batch(scheduler_output, od_config)
         if profiler:
             profiler.step()
@@ -965,18 +1285,28 @@ class DiffusionWorker:
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_step") if profiler else nullcontext()
         try:
-            with ctx:
+            new_reqs = scheduler_output.scheduled_new_reqs
+            tune_ctx = self._flashinfer_autotune_context(
+                [new_req.req for new_req in new_reqs],
+                request_ids=list(scheduler_output.scheduled_request_ids),
+                new_request_ids=[new_req.req.request_id for new_req in new_reqs],
+            )
+            with ctx, tune_ctx:
                 output = self.model_runner.execute_stepwise(scheduler_output)
         except Exception:
             # The engine terminates every scheduled request when execution raises.
             for request_id in scheduler_output.scheduled_request_ids:
                 self._step_lora_state.pop(request_id, None)
+            self._finish_flashinfer_tuning(list(scheduler_output.scheduled_request_ids), completed=False)
             raise
         # The runner owns model state; retire the worker's metadata before idle.
+        finished_ids = []
         for request_id in scheduler_output.scheduled_request_ids:
             request_output = output.get_request_output(request_id)
             if request_output is not None and request_output.finished:
                 self._step_lora_state.pop(request_id, None)
+                finished_ids.append(request_id)
+        self._finish_flashinfer_tuning(finished_ids, completed=True)
         if profiler:
             profiler.step()
         return output
@@ -987,6 +1317,8 @@ class DiffusionWorker:
         self.model_runner.release_step_requests(request_ids)
         for request_id in request_ids:
             self._step_lora_state.pop(request_id, None)
+        # Reached on abort and on the error path, so these requests did not complete their shapes.
+        self._finish_flashinfer_tuning(request_ids, completed=False)
 
     def _activate_step_lora(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Activate the LoRA adapter for the scheduled step batch.
@@ -1010,8 +1342,8 @@ class DiffusionWorker:
         if self.lora_manager is None:
             return
 
-        lora_request: LoRARequest | None = None
-        lora_scale = 1.0
+        lora_request: LoRARequest | list[LoRARequest] | None = None
+        lora_scale: float | list[float] = 1.0
         for request_id in scheduler_output.scheduled_request_ids:
             entry = self._step_lora_state.get(request_id)
             if entry is not None:
@@ -1019,7 +1351,7 @@ class DiffusionWorker:
                 break
 
         try:
-            self.lora_manager.set_request_adapter(lora_request, lora_scale)
+            self.lora_manager.set_request_adapters(lora_request, lora_scale)
         except Exception as exc:
             if lora_request is not None:
                 raise
@@ -1464,6 +1796,10 @@ class WorkerProc:
         self._async_output_thread: threading.Thread | None = None
         self._async_output_done = threading.Condition()
         self._async_output_pending = 0
+        # CHUNK_READY packs share ``_async_output_pending`` so drain waits for
+        # them, and use this counter so COMPUTE_DONE is enqueued only after
+        # those packs are already on ``result_mq``.
+        self._chunk_output_pending = 0
         # MessageQueue.acquire_write() is single-writer: it reads current_idx,
         # writes that block, then advances the index. The async output thread
         # enqueues OUTPUT_READY while the main loop enqueues COMPUTE_DONE, so
@@ -1516,6 +1852,8 @@ class WorkerProc:
             return
 
         # Async path: enqueue compute_done immediately, bg thread does D2H+SHM.
+        # CHUNK_READY packs already queued for this forward must hit result_mq
+        # first so the result pump delivers them before the RPC future resolves.
         if not self.od_config.step_execution and isinstance(output, (DiffusionOutput, BatchRunnerOutput)):
             async_output_id = WorkerProc._generate_async_output_id()
             gpu_event = current_omni_platform.record_device_event()
@@ -1564,39 +1902,136 @@ class WorkerProc:
             item = output_queue.get()
             if item is None:
                 break
-            output, async_output_id, gpu_event = item
+            job = _coerce_async_output_job(item)
             try:
                 # Cross-stream ordering: wait for default stream to finish
                 # writing the output tensors before the side stream reads.
-                if gpu_event is not None:
-                    d2h_stream.wait_event(gpu_event)
-                pack_diffusion_output_shm(output, d2h_stream=d2h_stream, **transport_options)
+                if job.gpu_event is not None:
+                    d2h_stream.wait_event(job.gpu_event)
+                pack_diffusion_output_shm(job.output, d2h_stream=d2h_stream, **transport_options)
                 d2h_stream.synchronize()
+                if (
+                    job.output is not None
+                    and hasattr(job.output, "async_output_id")
+                    and getattr(job.output, "async_output_id", None) is None
+                ):
+                    job.output.async_output_id = job.async_output_id
 
-                self._enqueue_result(
-                    AsyncDiffusionOutput(
-                        kind=AsyncOutputKind.OUTPUT_READY,
-                        async_output_id=async_output_id,
-                        output=output,
-                    )
-                )
+                self._enqueue_result(self._async_output_message(job))
             except Exception:
                 logger.exception(
                     "Async output packing failed for id '%s'; sending error",
-                    async_output_id,
+                    job.async_output_id,
                 )
                 self._enqueue_result(
-                    AsyncDiffusionOutput(
-                        kind=AsyncOutputKind.OUTPUT_READY,
-                        async_output_id=async_output_id,
+                    self._async_output_message(
+                        job,
+                        output=None,
                         error="Background D2H/SHM packing failed",
                     )
                 )
             finally:
                 with self._async_output_done:
-                    # Clamped: only items enqueued by _return_result are counted.
+                    # Clamped: only items enqueued by _return_result / emit_chunk are counted.
                     self._async_output_pending = max(0, self._async_output_pending - 1)
+                    if job.kind == AsyncOutputKind.CHUNK_READY:
+                        self._chunk_output_pending = max(0, getattr(self, "_chunk_output_pending", 0) - 1)
                     self._async_output_done.notify_all()
+
+    @staticmethod
+    def _async_output_message(
+        job: _AsyncOutputJob,
+        *,
+        output: Any | None = None,
+        error: str | None = None,
+    ) -> AsyncDiffusionOutput:
+        """Build the result-queue envelope for one packed async output."""
+        if output is None and error is None:
+            output = job.output
+        message = AsyncDiffusionOutput(
+            kind=job.kind,
+            async_output_id=job.async_output_id,
+            output=output,
+            error=error,
+        )
+        if job.kind == AsyncOutputKind.CHUNK_READY:
+            message.request_id = job.request_id
+            message.chunk_index = job.chunk_index
+        return message
+
+    def _wait_chunk_outputs(self, timeout: float | None = None) -> bool:
+        """Block until CHUNK_READY packs from this forward are on ``result_mq``."""
+        if timeout is None:
+            timeout = _ASYNC_OUTPUT_DRAIN_TIMEOUT_S
+        with self._async_output_done:
+            if getattr(self, "_chunk_output_pending", 0) == 0:
+                return True
+            return bool(
+                self._async_output_done.wait_for(
+                    lambda: getattr(self, "_chunk_output_pending", 0) == 0,
+                    timeout=timeout,
+                )
+            )
+
+    def _make_emit_chunk(self, request_id: str) -> Callable[[DiffusionOutput], None]:
+        """Return the media-rank emitter. It never sends ``COMPUTE_DONE``."""
+
+        def emit_chunk(output: DiffusionOutput) -> None:
+            if not isinstance(output, DiffusionOutput):
+                raise TypeError(f"emit_chunk expected DiffusionOutput, got {type(output).__name__}")
+            if output.finished:
+                raise ValueError("request chunk emit requires DiffusionOutput.finished=False")
+            if self._async_output_queue is None:
+                raise RuntimeError("request chunk emit requires the async output queue")
+            async_output_id = WorkerProc._generate_async_output_id()
+            output.async_output_id = async_output_id
+            gpu_event = current_omni_platform.record_device_event()
+            with self._async_output_done:
+                self._async_output_pending += 1
+                self._chunk_output_pending = getattr(self, "_chunk_output_pending", 0) + 1
+            self._async_output_queue.put(
+                _AsyncOutputJob(
+                    output=output,
+                    async_output_id=async_output_id,
+                    gpu_event=gpu_event,
+                    kind=AsyncOutputKind.CHUNK_READY,
+                    request_id=request_id,
+                    chunk_index=output.chunk_index,
+                )
+            )
+
+        return emit_chunk
+
+    @contextmanager
+    def _request_chunk_transport(self, method: str, should_reply: bool) -> Iterator[None]:
+        """Close emits and drain chunks before either success or error RPC return."""
+        if method not in _REQUEST_CHUNK_EXECUTE_METHODS or self.od_config.step_execution:
+            yield
+            return
+        factory = self._make_emit_chunk if should_reply and self.result_mq is not None else None
+        forward_error: BaseException | None = None
+        try:
+            with request_chunk_transport(factory):
+                yield
+        except BaseException as exc:
+            forward_error = exc
+            raise
+        finally:
+            if not self._wait_chunk_outputs():
+                # Returning an error while old chunks remain queued would allow
+                # the same request id to be reused before its output retires.
+                # Stop this Worker; the failure monitor tears down the group.
+                pending = int(getattr(self, "_chunk_output_pending", 0) or 0)
+                logger.error(
+                    "Worker %s: request CHUNK_READY drain timed out with %s pack(s) still "
+                    "pending (method=%s); shutting down Worker to avoid request-id reuse. "
+                    "forward_error=%r",
+                    self.gpu_id,
+                    pending,
+                    method,
+                    forward_error,
+                )
+                raise SystemExit("Request chunk outputs did not drain; refusing to reuse the Worker") from forward_error
 
     def drain_async_outputs(self, timeout: float | None = None) -> bool:
         """Block until background D2H/SHM packing has no work left.
@@ -1724,8 +2159,8 @@ class WorkerProc:
                 raise TimeoutError("Diffusion async outputs did not drain before pause")
             if method in _MEMORY_RELEASING_METHODS:
                 self.drain_async_outputs()
-            # Use execute_method from WorkerWrapperBase for consistent method resolution
-            result = self.worker.execute_method(method, *args, **kwargs)
+            with self._request_chunk_transport(method, should_reply):
+                result = self.worker.execute_method(method, *args, **kwargs)
         except Exception as e:
             logger.error(f"Error executing RPC: {e}", exc_info=True)
             status.update(
@@ -1908,10 +2343,17 @@ class WorkerProc:
         custom_pipeline_args: dict[str, Any] | None = None,
         *,
         sharing_registry: ConsumerWorkerRegistry | None = None,
+        parent_pid: int | None = None,
     ) -> None:
         """Worker initialization and execution loops."""
         if sharing_registry is not None and not sharing_registry.register(rank):
             return  # Parent sealed the sharing group before this worker started.
+
+        # Register first, then catch a parent that exited before registration.
+        set_death_signal(signal.SIGKILL)
+        if sys.platform == "linux" and parent_pid is not None and os.getppid() != parent_pid:
+            os.kill(os.getpid(), signal.SIGKILL)
+
         from vllm_omni.plugins import load_omni_general_plugins
 
         # Spawned workers do not inherit the API server's logging setup.
@@ -1930,13 +2372,6 @@ class WorkerProc:
 
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
-
-        # Normal executor shutdown still reaches the handlers above and cleans
-        # up gracefully. If the API-server parent is already gone, however, no
-        # manager remains to escalate a worker that stalls during cleanup. Use
-        # a hard parent-death signal so an abrupt parent exit cannot orphan a
-        # GPU-owning diffusion worker.
-        set_death_signal(signal.SIGKILL)
 
         _setup_diffusion_worker_proc_title_and_log_prefix(
             enable_ep=od_config.parallel_config.enable_expert_parallel,

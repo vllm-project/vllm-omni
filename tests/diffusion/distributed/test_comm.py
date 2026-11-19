@@ -551,10 +551,9 @@ def _check_packed_strategy(group, device: torch.device) -> None:
     for joint in (None, "front", "rear"):
         outputs, strategies, metadata = [], [], []
         for enabled in (False, True):
-            strategy = UlyssesParallelAttention(group, 2, 1, False)
-            # Exercise the portable layout on CPU/Gloo and GPU collectives.
-            # Public platform selection is checked separately without a group.
-            strategy._rocm_packed_qkv = enabled
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setenv("VLLM_OMNI_PACKED_QKV", "1" if enabled else "0")
+                strategy = UlyssesParallelAttention(group, 2, 1, False)
             strategies.append(strategy)
             if joint is None:
                 mask = torch.ones((2, 11 * group.ulysses_world_size), device=device, dtype=torch.bool)
@@ -591,8 +590,8 @@ def _check_packed_strategy(group, device: torch.device) -> None:
             mode = "advanced_uaa" if case == "uaa" else "strict"
             patch.setattr(ulysses, "get_ulysses_mode", lambda **kwargs: mode)
             for enabled in (False, True):
+                patch.setenv("VLLM_OMNI_PACKED_QKV", "1" if enabled else "0")
                 strategy = UlyssesParallelAttention(group, 2, 1, False)
-                strategy._rocm_packed_qkv = enabled
                 md = AttentionMetadata(extra={"gate_compress": inputs[0].clone()}) if case == "gate" else None
                 out = strategy.pre_attention(*inputs, md)
                 assert out[4].use_packed_qkv is False

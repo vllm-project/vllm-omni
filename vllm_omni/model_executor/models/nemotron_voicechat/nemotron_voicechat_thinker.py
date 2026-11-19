@@ -39,8 +39,10 @@ from __future__ import annotations
 
 import copy
 import os
+from collections import defaultdict
 from collections.abc import Iterable
-from typing import Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -50,14 +52,20 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
+from vllm.v1.worker.gpu.sample.output import SamplerOutput as MRv2SamplerOutput
 
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
+from vllm_omni.model_executor.models.nemotron_voicechat.duplex.input import decode_pcm_f32le
 from vllm_omni.model_executor.models.nemotron_voicechat.runtime_info import (
     merge_runtime_info,
     require_request_id,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.worker_v2.omni_sampler import OmniSampler
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 logger = init_logger(__name__)
 
@@ -67,6 +75,19 @@ logger = init_logger(__name__)
 _DUPLEX_MEL_MARGIN_COLS = 8
 
 _LM_ARCHITECTURE = "NemotronHForCausalLM"
+
+
+@dataclass(frozen=True, slots=True)
+class _PerceptionFrame:
+    """A request's next audio window and caches, prepared without a commit."""
+
+    session: dict[str, Any]
+    source_input_seq: int
+    seq_base: int
+    frame_idx: int
+    audio: torch.Tensor
+    window_col0: int
+    caches: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 
 def _streaming_cfg_at(value: Any, index: int) -> int:
@@ -211,6 +232,41 @@ def compute_acoustic_frame_count(nemo_stt_cfg: dict[str, Any], num_samples: int)
     return int(out[0])
 
 
+class _NemotronDuplexSampler(OmniSampler):
+    """Commit the existing frame policy through native MRv2 sampling."""
+
+    def __init__(self, sampler: Any, model: NemotronVoiceChatThinkerForConditionalGeneration):
+        super().__init__(sampler)
+        self.model = model
+
+    def __call__(self, logits: torch.Tensor, input_batch: Any) -> MRv2SamplerOutput:
+        rows = tuple(
+            DuplexSamplingRow(i, request_id, None, None, None, None)
+            for i, request_id in enumerate(input_batch.req_ids)
+            if "sampling_frame_eligible" in self.model._sessions.get(request_id, {})
+        )
+        if rows and input_batch.num_draft_tokens:
+            raise NotImplementedError("Nemotron VoiceChat duplex sampling does not support speculative decoding")
+        self.model.prepare_duplex_sampling(logits, None, rows)
+        output = self.model.sample(logits, None)
+        if output is None:
+            return self.base_sampler(logits, input_batch)
+        counts, rejected = get_num_sampled_and_rejected(
+            input_batch.seq_lens.new_ones(input_batch.num_reqs),
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.req_states.prefill_len.gpu,
+        )
+        return MRv2SamplerOutput(
+            sampled_token_ids=output.sampled_token_ids.long(),
+            logprobs_tensors=output.logprobs_tensors,
+            num_nans=None,
+            num_sampled=counts,
+            num_rejected=rejected,
+        )
+
+
 class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
     """vLLM-native thinker (perception + fusion + NemotronH + dual heads).
 
@@ -333,8 +389,6 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         # The per-step function token is a scalar; no GPU-resident buffers needed.
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = set()
 
-        # Stateful per-request execution is only validated at batch size 1
-        # (the shipped offline scope); fail fast on silent multi-request use.
         # Multi-session batching: all per-request state (audio frames, fused
         # prefill embeds, function-token feedback) lives in _sessions keyed by
         # request id; the runner drives preprocess per request and hands
@@ -346,6 +400,8 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
 
         # request_id -> per-request state (audio frames, prefill embeds, counters).
         self._sessions: dict[str, dict[str, Any]] = {}
+        # postprocess() owns feedback until the MRv2 duplex sampler is registered.
+        self._mrv2_duplex_sampling = False
         self._duplex_sampling_rows: dict[int, str] = {}
         self._duplex_previous_text_tokens: dict[str, int] = {}
         self._nvc_function_sampling_tokens: torch.Tensor | None = None
@@ -431,10 +487,13 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 if prompt_len and computed + (end - start) < prompt_len:
                     tokens.append(None)
                     continue
-            with torch.inference_mode():
-                function_token = self.function_head(model_outputs[end - 1 : end].to(self._dtype)).argmax(dim=-1)
             request_id = info.get("request_id") if isinstance(info, dict) else None
             session = self._sessions.get(request_id) if isinstance(request_id, str) else None
+            if isinstance(session, dict) and not session.get("sampling_frame_eligible", True):
+                tokens.append(None)
+                continue
+            with torch.inference_mode():
+                function_token = self.function_head(model_outputs[end - 1 : end].to(self._dtype)).argmax(dim=-1)
             forced_token = session.get("forced_function_token") if isinstance(session, dict) else None
             if isinstance(forced_token, int):
                 function_token = torch.full_like(function_token, forced_token)
@@ -492,6 +551,12 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
             multimodal_outputs=multimodal_outputs,
         )
 
+    def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, None] | None:
+        if getattr(self.vllm_config.model_config, "session_mode", "turn") != "duplex":
+            return None
+        self._mrv2_duplex_sampling = True
+        return _NemotronDuplexSampler(sampler, self), None
+
     def prepare_duplex_sampling(
         self,
         logits: torch.Tensor,
@@ -546,6 +611,10 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                     active = True
                 elif function_token == int(session["nvc_function_eotc_id"]):
                     active = False
+            if forced and getattr(self, "_mrv2_duplex_sampling", False):
+                queue = session["forced_function_tokens"]
+                if not queue or queue[0] != session["forced_function_token"]:
+                    raise RuntimeError("Nemotron VoiceChat forced function-token queue lost alignment")
             decisions.append((row_idx, request_id, session, active, forced, pad_id))
         # All rows are validated before committing any request's policy state.
         sampled = logits.argmax(dim=-1).to(dtype=torch.int32)
@@ -555,6 +624,14 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
             session["function_call_active"] = active
             # PAD must also reach the next frame's text fusion, not just the wire.
             self._duplex_previous_text_tokens[request_id] = int(sampled[row_idx].item())
+            if getattr(self, "_mrv2_duplex_sampling", False) and function_tokens is not None:
+                # V2 postprocess precedes sampling. Commit both feedback
+                # channels here, after this frame's function/text decision.
+                function_token = function_tokens[row_idx]
+                if forced:
+                    function_token = session.pop("forced_function_token")
+                    session["forced_function_tokens"].pop(0)
+                session["func_token"] = function_token
         return SamplerOutput(
             sampled_token_ids=sampled.unsqueeze(-1),
             logprobs_tensors=None,
@@ -583,31 +660,200 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
             return duplex
         return None
 
+    def _get_duplex_session(
+        self, request_id: str, runtime_config: dict[str, Any], device: torch.device
+    ) -> dict[str, Any]:
+        """Return existing state or new state for the caller to publish on success."""
+        session = self._sessions.get(request_id)
+        if session is not None:
+            return session
+        sotc_id: int | None = None
+        eotc_id: int | None = None
+        if self._use_function_head:
+            try:
+                sotc_id = int(runtime_config["nvc_function_sotc_id"])
+                eotc_id = int(runtime_config["nvc_function_eotc_id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("Nemotron VoiceChat function boundary metadata is incomplete") from exc
+        prompt_ids_raw = runtime_config.get("nvc_prompt_token_ids")
+        if not isinstance(prompt_ids_raw, list | tuple) or not prompt_ids_raw:
+            raise ValueError("Nemotron VoiceChat duplex runtime requires nvc_prompt_token_ids")
+        pad_id = int(runtime_config["nvc_text_pad_id"])
+        prompt_ids = torch.as_tensor([int(token_id) for token_id in prompt_ids_raw], dtype=torch.long, device=device)
+        session = {
+            "prompt_ids": prompt_ids,
+            "prompt_len": int(prompt_ids.numel()),
+            "func_token": pad_id,
+            "last_input_seq": 0,
+            "nvc_text_pad_id": pad_id,
+            "nvc_function_sotc_id": sotc_id,
+            "nvc_function_eotc_id": eotc_id,
+            "function_call_active": False,
+            "function_response_generation": 0,
+            "forced_function_tokens": [],
+        }
+        return session
+
+    def preprocess_batch(
+        self,
+        *,
+        req_ids: list[str],
+        model_intermediate_buffer: dict[str, dict[str, Any]],
+        device: torch.device,
+    ) -> None:
+        """Prepare new duplex acoustic frames before the runner's scalar fusion."""
+        entries = []
+        sessions = {}
+        for request_id in req_ids:
+            info = model_intermediate_buffer.get(request_id)
+            if not isinstance(info, dict):
+                continue
+            duplex = self._duplex_info(merge_runtime_info(info))
+            if duplex is None:
+                continue
+            runtime_config = duplex.get("runtime_config")
+            if not isinstance(runtime_config, dict):
+                raise ValueError("Nemotron VoiceChat duplex input lacks runtime_config")
+            # Prompt and function-boundary IDs are session-owned after creation;
+            # the scalar path only rereads the PAD token ID each step.
+            try:
+                int(runtime_config["nvc_text_pad_id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("Nemotron VoiceChat duplex runtime token metadata is incomplete") from exc
+            if request_id in sessions:
+                raise ValueError("Nemotron VoiceChat perception batch contains a duplicate session")
+            session = self._get_duplex_session(request_id, runtime_config, device)
+            sessions[request_id] = session
+            entries.append((session, duplex))
+        self._duplex_stable_frames(entries, device)
+        self._sessions.update(sessions)
+
     def _duplex_stable_frame(
         self,
         session: dict[str, Any],
         duplex: dict[str, Any],
         device: torch.device,
     ) -> torch.Tensor:
-        try:
-            source_input_seq = int(duplex["source_input_seq"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError("Nemotron VoiceChat duplex input lacks source_input_seq") from exc
-        if source_input_seq == session.get("last_input_seq"):
-            return session["duplex_frame"]
+        """Compute once per source_input_seq; retries reuse the committed frame."""
+        self._duplex_stable_frames([(session, duplex)], device)
+        return session["duplex_frame"]
+
+    @torch.inference_mode()
+    def _duplex_stable_frames(
+        self,
+        entries: list[tuple[dict[str, Any], dict[str, Any]]],
+        device: torch.device,
+    ) -> None:
+        """Batch new frames while keeping each request's streaming state independent.
+
+        Equal-length waveform windows share a mel call without padding their
+        STFT boundaries. Conformer groups also require equal chunk widths and
+        drop counts: stream-start and steady frames use different subsampling
+        rules. Replayed appends do no work.
+        """
+        audio_groups: dict[int, list[_PerceptionFrame]] = defaultdict(list)
+        seen: set[int] = set()
+        for session, duplex in entries:
+            if id(session) in seen:
+                raise ValueError("Nemotron VoiceChat perception batch contains a duplicate session")
+            seen.add(id(session))
+            try:
+                seq = int(duplex["source_input_seq"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("Nemotron VoiceChat duplex input lacks source_input_seq") from exc
+            if seq == session.get("last_input_seq"):
+                continue
+            frame = self._prepare_perception_frame(session, duplex, device, seq)
+            audio_groups[frame.audio.numel()].append(frame)
+
+        if not audio_groups:
+            return
+        encoder = self.perception.encoder
+        encoder_groups: dict[tuple[int, int], list[tuple[_PerceptionFrame, torch.Tensor]]] = defaultdict(list)
+        for frames in audio_groups.values():
+            audio = torch.stack([frame.audio for frame in frames])
+            processed, _ = self._streaming_preprocessor(
+                input_signal=audio,
+                length=torch.full((len(frames),), audio.shape[1], device=device, dtype=torch.long),
+            )
+            for row, frame in enumerate(frames):
+                mel, drop = slice_perception_streaming_mel(
+                    processed[row : row + 1],
+                    frame.frame_idx,
+                    encoder.streaming_cfg,
+                    window_col0=frame.window_col0,
+                )
+                encoder_groups[(mel.shape[-1], drop)].append((frame, mel))
+
+        pending_updates = []
+        for (_, drop), group in encoder_groups.items():
+            frames, chunks = zip(*group)
+            # NeMo caches are [layers, batch, ...]; their valid lengths are [batch].
+            cache_channel = torch.cat([frame.caches[0] for frame in frames], dim=1)
+            cache_time = torch.cat([frame.caches[1] for frame in frames], dim=1)
+            cache_channel_len = torch.cat([frame.caches[2] for frame in frames], dim=0)
+            mel = torch.cat(chunks, dim=0).to(next(encoder.parameters()).dtype)
+            encoded, encoded_len, channel, time, channel_len = encoder.cache_aware_stream_step(
+                processed_signal=mel,
+                processed_signal_length=torch.full((len(frames),), mel.shape[-1], device=device, dtype=torch.long),
+                cache_last_channel=cache_channel,
+                cache_last_time=cache_time,
+                cache_last_channel_len=cache_channel_len,
+                keep_all_outputs=True,
+                drop_extra_pre_encoded=drop,
+            )
+            encoded, encoded_len = self.perception.modality_adapter(audio_signal=encoded, length=encoded_len)
+            stable = self.perception.proj(encoded.transpose(1, 2)).to(self._dtype)
+            if (
+                stable.shape[:2] != (len(frames), 1)
+                or encoded_len.numel() != len(frames)
+                or not bool((encoded_len == 1).all())
+            ):
+                raise RuntimeError(
+                    "Nemotron VoiceChat cache-aware perception must produce exactly "
+                    f"one frame per 80 ms input; got encoded_len={encoded_len.tolist()}, shape={tuple(stable.shape)}"
+                )
+            for row, frame in enumerate(frames):
+                # Own each row's storage so a paused session neither retains
+                # other sessions' caches nor aliases a subsequent batch.
+                pending_updates.append(
+                    (
+                        frame.session,
+                        dict(
+                            duplex_audio=frame.audio,
+                            duplex_seq_base=frame.seq_base,
+                            duplex_window_col0=frame.window_col0,
+                            perception_cache_last_channel=channel[:, row : row + 1].clone(),
+                            perception_cache_last_time=time[:, row : row + 1].clone(),
+                            perception_cache_last_channel_len=channel_len[row : row + 1].clone(),
+                            duplex_frame=stable[row].clone(),
+                            last_input_seq=frame.source_input_seq,
+                        ),
+                    )
+                )
+        # A failed group must leave every session ready to retry the same input.
+        for session, updates in pending_updates:
+            session.update(updates)
+
+    def _prepare_perception_frame(
+        self,
+        session: dict[str, Any],
+        duplex: dict[str, Any],
+        device: torch.device,
+        source_input_seq: int,
+    ) -> _PerceptionFrame:
+        """Prepare the rolling window and caches without advancing request state."""
         last_input_seq = int(session.get("last_input_seq", 0))
         if source_input_seq < last_input_seq:
             raise ValueError(
                 f"Nemotron VoiceChat duplex input sequence moved backwards: {source_input_seq} < {last_input_seq}"
             )
 
-        from vllm_omni.model_executor.models.nemotron_voicechat.duplex.input import (
-            decode_pcm_f32le,
-        )
-
         raw = decode_pcm_f32le(duplex.get("payload"), exact_frame=True)
         frame_audio = torch.from_numpy(np.frombuffer(raw, dtype="<f4").copy()).to(device=device, dtype=torch.float32)
         audio = session.get("duplex_audio")
+        seq_base = int(session.get("duplex_seq_base", 0))
+        window_col0 = int(session.get("duplex_window_col0", 0))
         if isinstance(audio, torch.Tensor):
             if source_input_seq != last_input_seq + 1:
                 raise ValueError(
@@ -626,15 +872,14 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                     "Nemotron VoiceChat perception session reset mid-stream; restarting at input sequence %d.",
                     source_input_seq,
                 )
-            session["duplex_seq_base"] = source_input_seq - 1
-            session["duplex_window_col0"] = 0
+            seq_base = source_input_seq - 1
+            window_col0 = 0
             audio = frame_audio
 
-        frame_idx = source_input_seq - 1 - int(session.get("duplex_seq_base", 0))
+        frame_idx = source_input_seq - 1 - seq_base
 
         encoder = self.perception.encoder
         streaming_cfg = encoder.streaming_cfg
-        window_col0 = int(session.get("duplex_window_col0", 0))
         if frame_idx > 0:
             # Bound the rolling audio window: each mel column is local (STFT
             # centered on hop-aligned samples, no cross-stream normalization),
@@ -650,69 +895,22 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
             if desired_col0 > window_col0:
                 audio = audio[(desired_col0 - window_col0) * hop :]
                 window_col0 = desired_col0
-        with torch.inference_mode():
-            processed_signal, _ = self._streaming_preprocessor(
-                input_signal=audio.unsqueeze(0),
-                length=torch.tensor([audio.numel()], device=device, dtype=torch.long),
+        if frame_idx == 0:
+            caches = encoder.get_initial_cache_state(
+                batch_size=1, dtype=next(encoder.parameters()).dtype, device=device
             )
-
-            mel_chunk, drop_extra_pre_encoded = slice_perception_streaming_mel(
-                processed_signal,
-                frame_idx,
-                streaming_cfg,
-                window_col0=window_col0,
-            )
-            if frame_idx == 0:
-                caches = encoder.get_initial_cache_state(
-                    batch_size=1,
-                    dtype=next(encoder.parameters()).dtype,
-                    device=device,
+        else:
+            caches = tuple(
+                session.get(key)
+                for key in (
+                    "perception_cache_last_channel",
+                    "perception_cache_last_time",
+                    "perception_cache_last_channel_len",
                 )
-            else:
-                caches = (
-                    session.get("perception_cache_last_channel"),
-                    session.get("perception_cache_last_time"),
-                    session.get("perception_cache_last_channel_len"),
-                )
-                if any(cache is None for cache in caches):
-                    raise RuntimeError("Nemotron VoiceChat perception cache is missing")
-
-            encoder_dtype = next(encoder.parameters()).dtype
-            encoded, encoded_len, cache_channel, cache_time, cache_channel_len = encoder.cache_aware_stream_step(
-                processed_signal=mel_chunk.to(encoder_dtype),
-                processed_signal_length=torch.tensor(
-                    [mel_chunk.shape[-1]],
-                    device=device,
-                    dtype=torch.long,
-                ),
-                cache_last_channel=caches[0],
-                cache_last_time=caches[1],
-                cache_last_channel_len=caches[2],
-                keep_all_outputs=True,
-                drop_extra_pre_encoded=drop_extra_pre_encoded,
             )
-            encoded, encoded_len = self.perception.modality_adapter(
-                audio_signal=encoded,
-                length=encoded_len,
-            )
-            stable = self.perception.proj(encoded.transpose(1, 2))
-
-        frame_count = int(encoded_len.reshape(-1)[0])
-        if frame_count != 1 or stable.shape[1] != 1:
-            raise RuntimeError(
-                "Nemotron VoiceChat cache-aware perception must produce exactly "
-                f"one frame per 80 ms input; got encoded_len={frame_count}, "
-                f"shape={tuple(stable.shape)}"
-            )
-        stable = stable[0].to(self._dtype)
-        session["duplex_audio"] = audio
-        session["duplex_window_col0"] = window_col0
-        session["perception_cache_last_channel"] = cache_channel
-        session["perception_cache_last_time"] = cache_time
-        session["perception_cache_last_channel_len"] = cache_channel_len
-        session["duplex_frame"] = stable
-        session["last_input_seq"] = source_input_seq
-        return stable
+            if any(cache is None for cache in caches):
+                raise RuntimeError("Nemotron VoiceChat perception cache is missing")
+        return _PerceptionFrame(session, source_input_seq, seq_base, frame_idx, audio, window_col0, caches)
 
     def _preprocess_duplex(
         self,
@@ -732,37 +930,10 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("Nemotron VoiceChat duplex runtime token metadata is incomplete") from exc
 
-        session = self._sessions.get(request_id)
-        if session is None:
-            sotc_id: int | None = None
-            eotc_id: int | None = None
-            if self._use_function_head:
-                try:
-                    sotc_id = int(runtime_config["nvc_function_sotc_id"])
-                    eotc_id = int(runtime_config["nvc_function_eotc_id"])
-                except (KeyError, TypeError, ValueError) as exc:
-                    raise ValueError("Nemotron VoiceChat function boundary metadata is incomplete") from exc
-            prompt_ids_raw = runtime_config.get("nvc_prompt_token_ids")
-            if not isinstance(prompt_ids_raw, list | tuple) or not prompt_ids_raw:
-                raise ValueError("Nemotron VoiceChat duplex runtime requires nvc_prompt_token_ids")
-            prompt_ids = torch.as_tensor(
-                [int(token_id) for token_id in prompt_ids_raw],
-                dtype=torch.long,
-                device=device,
-            )
-            session = {
-                "prompt_len": int(prompt_ids.numel()),
-                "func_token": pad_id,
-                "last_input_seq": 0,
-                "nvc_text_pad_id": pad_id,
-                "nvc_function_sotc_id": sotc_id,
-                "nvc_function_eotc_id": eotc_id,
-                "function_call_active": False,
-                "function_response_generation": 0,
-                "forced_function_tokens": [],
-            }
-            self._sessions[request_id] = session
-            frame = self._duplex_stable_frame(session, duplex, device)
+        session = self._get_duplex_session(request_id, runtime_config, device)
+        frame = self._duplex_stable_frame(session, duplex, device)
+        if "prefill_embeds" not in session:
+            prompt_ids = session["prompt_ids"]
             timeline = torch.cat(
                 [self.embed_tokens(prompt_ids).to(self._dtype), frame],
                 dim=0,
@@ -774,9 +945,8 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 device=device,
             )
             session["prefill_embeds"] = self._fuse(pad_ids, timeline, pad_ids)
-        else:
-            frame = self._duplex_stable_frame(session, duplex, device)
-
+            del session["prompt_ids"]
+        self._sessions[request_id] = session
         if self._use_function_head:
             self._sync_forced_function_response(session, runtime_config)
 
@@ -1063,6 +1233,18 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         On multi-chunk prefill, only the final chunk (whose forward covers the
         last prefill position, acoustic frame 0) contributes a token.
         """
+        request_id = kwargs.get("request_id")
+        if request_id is None:
+            request_id = kwargs.get("req_id")
+        session = self._sessions.get(request_id) if isinstance(request_id, str) else None
+        if (
+            getattr(self, "_mrv2_duplex_sampling", False)
+            and session is not None
+            and "sampling_frame_eligible" in session
+        ):
+            # The registered sampler owns duplex feedback, including discarded
+            # prefill rows. Offline requests retain the ordinary hook below.
+            return {}
         if hidden_states is None or hidden_states.numel() == 0 or not self._use_function_head:
             return {}
         if kwargs.get("_omni_is_prefill"):
@@ -1077,22 +1259,19 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 func_logits = self.function_head(hidden_states[-1, :].reshape(1, -1).to(self._dtype))
             token = func_logits.argmax(dim=-1)
         token = token.reshape(-1)[-1].reshape(()).detach()
-        request_id = kwargs.get("request_id")
-        if isinstance(request_id, str):
-            session = self._sessions.get(request_id)
-            if session is not None:
-                forced = session.pop("forced_function_token", None)
-                if isinstance(forced, int):
-                    queue = session.get("forced_function_tokens")
-                    if not isinstance(queue, list) or not queue or queue.pop(0) != forced:
-                        raise RuntimeError("Nemotron VoiceChat forced function-token queue lost alignment")
-                    # The client list is per request, but this hook receives the
-                    # whole batch output. Recompute from this request's hidden
-                    # slice, then apply the same override the client token used.
-                    token = torch.full_like(token, forced)
-                # StreamingUpdate replaces the runner payload at each append;
-                # retain the function channel in model-owned session state.
-                session["func_token"] = int(token.item())
+        if session is not None:
+            forced = session.pop("forced_function_token", None)
+            if isinstance(forced, int):
+                queue = session.get("forced_function_tokens")
+                if not isinstance(queue, list) or not queue or queue.pop(0) != forced:
+                    raise RuntimeError("Nemotron VoiceChat forced function-token queue lost alignment")
+                # The client list is per request, but this hook receives the
+                # whole batch output. Recompute from this request's hidden
+                # slice, then apply the same override the client token used.
+                token = torch.full_like(token, forced)
+            # StreamingUpdate replaces the runner payload at each append;
+            # retain the function channel in model-owned session state.
+            session["func_token"] = int(token.item())
         update: dict[str, Any] = {"nvc_prev_function_token": token}
         if os.environ.get("NEMOTRON_VOICECHAT_DEBUG_FUNCTION_TIMELINE", "0") == "1":
             existing = kwargs.get("nvc_function_tokens")

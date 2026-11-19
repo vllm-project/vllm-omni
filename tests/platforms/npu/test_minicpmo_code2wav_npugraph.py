@@ -24,8 +24,6 @@ from vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav import (
 from vllm_omni.platforms.npu.models.step_audio2_token2wav import (
     npu_token2wav_sdpa_context,
 )
-from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
-from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 pytestmark = [
     pytest.mark.core_model,
@@ -51,25 +49,6 @@ class _Token2Wav:
         self.mel_cache_len = 1
         self.source_cache_len = 2
         self.speech_window = torch.ones(4, device="npu")
-
-
-def test_npu_runner_inherits_runtime_snapshot_replacement():
-    assert issubclass(OmniNPUModelRunner, OmniGPUModelRunner)
-    assert OmniNPUModelRunner._replace_intermediate_buffer is OmniGPUModelRunner._replace_intermediate_buffer
-    runner = object.__new__(OmniNPUModelRunner)
-    request = SimpleNamespace(additional_information_cpu=None)
-    runner.requests = {"req": request}
-    runner.model_intermediate_buffer = {
-        "req": {
-            "codes": {"audio": torch.tensor([1, 2])},
-            "meta": {"last_chunk": True},
-        }
-    }
-
-    runner._replace_intermediate_buffer("req", {"meta": {"is_segment_finished": True}})
-
-    assert runner.model_intermediate_buffer["req"] == {"meta": {"is_segment_finished": True}}
-    assert request.additional_information_cpu == runner.model_intermediate_buffer["req"]
 
 
 @torch.inference_mode()

@@ -25,6 +25,7 @@ _EOS = 6561
 
 def _talker(max_reqs: int = 8, max_position_embeddings: int = 4096):
     talker = object.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
+    talker._k_step_frames = 0
     talker._codec_eos_id = _EOS
     talker._tts_config = SimpleNamespace(max_position_embeddings=max_position_embeddings)
     talker._mrv2_empty_speech = torch.zeros(max_reqs, dtype=torch.bool)
@@ -621,7 +622,8 @@ def test_codec_penalty_reads_draft_rows_only_when_a_request_has_them(mocker, dra
         assert kwargs["draft_ids"] is None and kwargs["local_pos"] is None
 
 
-def test_draft_verification_forces_codec_eos_after_processing(mocker):
+@pytest.mark.parametrize("with_draft_logits", [False, True])
+def test_draft_verification_forces_codec_eos_after_processing(mocker, with_draft_logits):
     from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import MiniCPMO45TalkerRejectionSampler
@@ -649,7 +651,8 @@ def test_draft_verification_forces_codec_eos_after_processing(mocker):
     rejection = MiniCPMO45TalkerRejectionSampler(sampler, spec_config, talker)
     seen = {}
 
-    def verify(self, logits, input_batch, draft_logits, invalid_drafts):
+    def verify(self, logits, input_batch, draft_logits):
+        seen["draft_logits"] = draft_logits
         seen["processed"] = self.sampler.apply_sampling_params(
             logits,
             input_batch.expanded_idx_mapping,
@@ -663,7 +666,11 @@ def test_draft_verification_forces_codec_eos_after_processing(mocker):
         return "verified"
 
     mocker.patch.object(RejectionSampler, "__call__", autospec=True, side_effect=verify)
-    assert rejection(torch.zeros(3, 8), batch) == "verified"
+    from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache
+
+    draft_logits = DraftLogitsCache(4, 1, 8, dtype=torch.float32, fill=0.0, device="cpu") if with_draft_logits else None
+    assert rejection(torch.zeros(3, 8), batch, draft_logits) == "verified"
+    assert seen["draft_logits"] is draft_logits
     talker.take_mrv2_forced_eos.assert_called_once_with(batch, sampler.req_states, 3)
     processed = seen["processed"]
     # An unforced row keeps the processors' result; a forced row's target is codec EOS alone.
@@ -723,6 +730,9 @@ def test_draft_verification_at_forced_rows_with_the_rejection_kernels():
             max_num_logprobs=lambda idx: NO_LOGPROBS,
         ),
         apply_sampling_params=apply_sampling_params,
+        get_logprobs_dims=lambda idx: None,
+        trace_replay_state=None,
+        may_mask_logits=np.ones(8, dtype=bool),
         logprobs_mode="raw_logprobs",
         compute_nans=False,
         use_fp64_gumbel=False,
@@ -745,7 +755,7 @@ def test_draft_verification_at_forced_rows_with_the_rejection_kernels():
     assert batch.input_ids[:kept].tolist() == [5, 6] and valid[:kept].tolist() == [True, True]
 
 
-def test_talker_verifies_drafts_with_its_codec_sampler(mocker):
+def test_talker_verifies_drafts_with_its_codec_sampler(mocker, monkeypatch):
     import vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts as module
 
     talker = object.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
@@ -766,8 +776,7 @@ def test_talker_verifies_drafts_with_its_codec_sampler(mocker):
     assert rejection.sampler._sampler is sampler
     assert rejection.talker is talker
     # Any draft method is refused at load where draft codes can't be verified.
-    # duplex K=0 hits the shared fail-closed raise; turn K>0 hits the
-    # K-step-specific raise pointing at session_mode: duplex.
+    monkeypatch.setattr(module.current_omni_platform, "is_cuda", lambda: False)
     for session, k_step, pattern in (
         ("duplex", 0, "turn sessions only"),
         ("turn", 2, "K-step frames require session_mode: duplex"),
@@ -778,6 +787,14 @@ def test_talker_verifies_drafts_with_its_codec_sampler(mocker):
         talker._k_step_frames = k_step
         with pytest.raises(NotImplementedError, match=pattern):
             talker.mrv2_custom_sampler(sampler)
+    # K-step frames on a turn session sample inside the runner's frame
+    # orchestration, so no draft-code verification sampler is built.
+    talker.vllm_config = SimpleNamespace(
+        speculative_config=spec_config, model_config=SimpleNamespace(session_mode="turn")
+    )
+    talker._k_step_frames = 2
+    monkeypatch.setattr(module.current_omni_platform, "is_cuda", lambda: True)
+    assert talker.mrv2_custom_sampler(sampler) == ("talker-sampler", None)
 
 
 def test_drafter_loading_finds_the_codec_table_and_no_head(mocker):

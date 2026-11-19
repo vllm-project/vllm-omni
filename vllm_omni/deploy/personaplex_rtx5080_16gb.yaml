@@ -1,0 +1,10 @@
+# PersonaPlex, one RTX 5080 Laptop 16 GB, Stage 0 online FP8 with 0.80/0.15 stage budgets.
+base_config: personaplex.yaml
+
+stages:
+  - stage_id: 0
+    engine_args:
+      quantization: fp8
+    gpu_memory_utilization: 0.8
+  - stage_id: 1
+    gpu_memory_utilization: 0.15

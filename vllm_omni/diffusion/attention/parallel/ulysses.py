@@ -258,9 +258,9 @@ class UlyssesParallelAttention:
         self._gather_idx = gather_idx
         self._use_sync = use_sync
         self._ulysses_a2a_permute = ulysses_a2a_permute
-        # Every rank must use the same setting. Unsupported platforms/layouts
-        # keep their existing exchange, including explicit symmetric memory.
-        self._rocm_packed_qkv = envs.VLLM_OMNI_ROCM_PACKED_QKV and current_omni_platform.is_rocm()
+        # Every rank must use the same setting. Unsupported layouts keep their
+        # existing exchange, and explicit symmetric memory takes precedence.
+        self._packed_qkv = not ulysses_a2a_permute and envs.VLLM_OMNI_PACKED_QKV
         if ulysses_a2a_permute:
             from vllm_omni.diffusion.distributed.a2a_permute import (
                 ensure_a2a_permute_available,
@@ -571,7 +571,7 @@ class UlyssesParallelAttention:
                 if self._use_sync:
                     current_omni_platform.synchronize()
             elif (
-                self._rocm_packed_qkv
+                self._packed_qkv
                 and self._scatter_idx == 2
                 and self._gather_idx == 1
                 and gate_compress is None

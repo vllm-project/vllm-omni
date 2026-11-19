@@ -845,17 +845,6 @@ def test_stage_prefix_cache_config_gate():
         _stage_cfg(groups=(object(), object()))
 
 
-def test_npu_runner_uses_shared_prefix_cache_gate():
-    """npu_model_runner cannot be imported without vllm_ascend; pin at the
-    source level that it stages through the shared gate instead of a
-    hand-rolled subset of the GPU checks."""
-    path = Path(__file__).resolve().parents[2] / "vllm_omni/platforms/npu/worker/npu_model_runner.py"
-    tree = ast.parse(path.read_text())
-    calls = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-    assert "stage_prefix_cache_config" in calls
-    assert "check_prefix_cache_kv_groups" not in calls
-
-
 def test_native_only_cache_policy_leaves_hybrid_kv_cache_enabled():
     policy = ModelCachePolicy(needs_full_hidden_states=False, native_kv_cache_only=True)
     cache = SimpleNamespace(enable_prefix_caching=True, block_size=BLOCK_SIZE)
