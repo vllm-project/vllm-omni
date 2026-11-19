@@ -234,6 +234,10 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
             inputs_embeds=inputs_embeds,
         )
 
+    def compute_prompt_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        """Return stateless text logits for an arbitrary prompt chunk."""
+        return self.logits_processor(self.text_lm_head, hidden_states)
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor | OmniOutput,
@@ -253,7 +257,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
             hidden_states = hidden_states.text_hidden_states
         if hidden_states is None:
             return None
-        logits = self.logits_processor(self.text_lm_head, hidden_states)
+        logits = self.compute_prompt_logits(hidden_states)
         if logits is None or self._batch_state is None:
             return logits
 
@@ -899,6 +903,12 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
             inputs_embeds=inputs_embeds,
         )
 
+    def compute_prompt_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return request-independent continuation logits for a prompt chunk."""
+        logits = hidden_states.new_full((hidden_states.shape[0], self.text_vocab_size), float("-inf"))
+        logits[:, self.text_pad_id] = 0.0
+        return logits
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor | OmniOutput,
@@ -1426,6 +1436,12 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
         )
+
+    def compute_prompt_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return request-independent continuation logits for a prompt chunk."""
+        logits = hidden_states.new_full((hidden_states.shape[0], self.text_vocab_size), float("-inf"))
+        logits[:, self.audio_assistant_slot_token_id] = 0.0
+        return logits
 
     def compute_logits(
         self,

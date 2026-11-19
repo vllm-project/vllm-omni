@@ -148,13 +148,16 @@ def test_aborted_held_tokens_are_dropped_only_without_terminal_notification(noti
 
 def test_window_operations_round_trip_in_order_on_a_finish_only_step():
     class WindowFields(TypedDict):
+        discarded_req_ids: set[str]
         duplex_carry_ops: list[WindowOperation]
 
     base = SchedulerOutput.make_empty()
     base.finished_req_ids = {"old"}
     output = _make_scheduler()._wrap_omni_scheduler_output(base)
+    output.discarded_req_ids = {"old"}
     output.duplex_carry_ops = [WindowOperation("keep", "s", "old"), WindowOperation("drop", "s")]
     decoded = MsgpackDecoder(WindowFields).decode(MsgpackEncoder().encode(output))
+    assert decoded["discarded_req_ids"] == {"old"}
     assert decoded["duplex_carry_ops"] == output.duplex_carry_ops
     assert all(isinstance(op, WindowOperation) for op in decoded["duplex_carry_ops"])
 
