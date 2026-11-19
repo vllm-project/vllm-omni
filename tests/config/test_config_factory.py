@@ -1814,6 +1814,7 @@ stages:
         [
             ("mammoth_moda2.yaml", "mammoth_moda2", 2, "image", "mammoth_moda2"),
             ("mammoth_moda2_ar.yaml", "mammoth_moda2_ar", 1, "text", "mammoth_moda2_ar"),
+            ("qwen3_asr.yaml", "qwen3_asr", 1, "text", "qwen3_asr"),
             ("omnivoice.yaml", "omnivoice", 1, "audio", "omnivoice"),
             ("mimo_audio.yaml", "mimo_audio", 2, "audio", None),
             ("step_audio_2.yaml", "step_audio_2", 2, "audio", None),
