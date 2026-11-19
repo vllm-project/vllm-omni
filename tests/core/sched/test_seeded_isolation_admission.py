@@ -20,6 +20,8 @@ parked (review P2 on #9937).
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import RequestStatus
@@ -50,9 +52,11 @@ class _StubRequest:
         status: RequestStatus = RequestStatus.WAITING,
         *,
         stage_default: bool = False,
+        num_computed_tokens: int = 0,
     ) -> None:
         self.request_id = request_id
         self.status = status
+        self.num_computed_tokens = num_computed_tokens
         self.priority = 0
         self.arrival_time = 0.0
         extra_args = None
@@ -75,6 +79,10 @@ def _make_scheduler(
         scheduler.waiting.add_request(request)
     scheduler.kv_holding_waiting = create_request_queue(SchedulingPolicy.FCFS)
     for request in kv_holding:
+        # KV-holding stubs own blocks, which upstream reports through
+        # ``num_computed_tokens > 0``; the restore path uses that classification.
+        if getattr(request, "num_computed_tokens", 0) == 0:
+            request.num_computed_tokens = 1
         scheduler.kv_holding_waiting.add_request(request)
     scheduler.deferred_waiting = set()
     scheduler.running = []
@@ -518,3 +526,40 @@ def test_unit_split_across_queues_is_gathered_not_deferred(monkeypatch) -> None:
     assert seen["limit"] == 2
     assert seen["waiting_ids"] == ["cond", "uncond"]
     assert seen["kv_len"] == 0
+
+
+def test_stalled_drain_hands_the_next_step_to_the_seeded_holder(monkeypatch) -> None:
+    """Inverse allocation pressure: a drain that scheduled nothing must alternate."""
+    fresh = _StubRequest("seeded-fresh", seed=7)
+    seeded_holder = _StubRequest("seeded-holder", seed=9)
+    unseeded_holder = _StubRequest("unseeded-holder")
+    scheduler = _make_scheduler(parked=0, waiting=[fresh], kv_holding=[unseeded_holder, seeded_holder])
+
+    first = _run_schedule(scheduler, monkeypatch)
+    assert first["kv_ids"] == ["unseeded-holder"]  # the drain step
+    assert getattr(scheduler, "_isolation_drain_stalled", False) is True
+
+    second = _run_schedule(scheduler, monkeypatch)
+    # The next step promotes the seeded holder instead of repeating the drain.
+    assert second["kv_ids"] == ["seeded-holder"]
+    assert second["limit"] == 1
+
+
+def test_restore_uses_current_kv_ownership(monkeypatch) -> None:
+    """A request moved to KV holding mid-step must not be restored to waiting."""
+    seeded = _StubRequest("seeded", seed=7)
+    scheduler = _make_scheduler(parked=0, waiting=[seeded])
+    scheduler._holds_kv_blocks = lambda request: request is seeded
+
+    def upstream(_self, _throttle_prefills=False):
+        # Simulate upstream starting an async KV load: the request leaves the
+        # waiting queue for `kv_holding_waiting` and is not scheduled yet.
+        scheduler.waiting.remove_requests([seeded])
+        scheduler.kv_holding_waiting.add_request(seeded)
+        return SimpleNamespace(num_scheduled_tokens={})
+
+    monkeypatch.setattr(ar_sched_mod.VLLMScheduler, "schedule", upstream)
+    OmniARScheduler.schedule(scheduler)
+
+    assert [request.request_id for request in scheduler.kv_holding_waiting] == ["seeded"]
+    assert [request.request_id for request in scheduler.waiting] == []

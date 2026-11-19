@@ -1005,6 +1005,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             drain_unit = [
                 holder for holder in self._runnable_kv_holders(seeded=False) if not self._paired_with_seeded(holder)
             ]
+            # A drain step that scheduled nothing means the selected holders
+            # could not allocate; give the seeded holder the next step instead,
+            # and vice versa (review P2 on #9937).
+            if getattr(self, "_isolation_drain_stalled", False):
+                drain_unit = []
             promoted = None
             if drain_unit:
                 drain_kv = True
@@ -1098,19 +1103,30 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if reserved_running_slots:
             limit = min(limit, max(0, original_max_num_active_reqs - reserved_running_slots))
         self.max_num_active_reqs = limit
+        scheduled_any = False
         try:
             scheduler_output = super().schedule(throttle_prefills)
+            scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", None)
+            if scheduled_tokens is None and isinstance(scheduler_output, dict):
+                scheduled_tokens = scheduler_output.get("num_scheduled_tokens")
+            scheduled_any = bool(scheduled_tokens)
         finally:
             self.max_num_active_reqs = original_max_num_active_reqs
             if original_wait_queues is not None:
                 original_waiting, original_kv_holding = original_wait_queues
                 if unit_origins:
-                    # Put leftovers back where they came from: a gathered unit
-                    # can contain members from both queues.
+                    # Restore by current KV ownership: upstream can move a
+                    # waiting request into `kv_holding_waiting` mid-step when it
+                    # starts an async KV load, so the recorded origin can be
+                    # stale (review P2 on #9937).
                     origins_by_member = {id(member): origin for member, origin in unit_origins}
+                    holds_kv_blocks = getattr(self, "_holds_kv_blocks", None)
                     for leftover in (*self.waiting, *self.kv_holding_waiting):
-                        origin = origins_by_member.get(id(leftover))
-                        target = original_kv_holding if origin == "kv_holding" else original_waiting
+                        if holds_kv_blocks is not None:
+                            target = original_kv_holding if holds_kv_blocks(leftover) else original_waiting
+                        else:
+                            origin = origins_by_member.get(id(leftover))
+                            target = original_kv_holding if origin == "kv_holding" else original_waiting
                         target.prepend_requests([leftover])
                 else:
                     if self.waiting is not original_waiting:
@@ -1119,6 +1135,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         original_kv_holding.prepend_requests(self.kv_holding_waiting)
                 self.waiting, self.kv_holding_waiting = original_wait_queues
             self._restore_omni_wait_queues()
+
+        if not deferred:
+            if drain_kv:
+                # Remember a stalled drain so the next step promotes the seeded
+                # holder instead of repeating the failing allocation.
+                self._isolation_drain_stalled = not scheduled_any
+            elif solo_queue is not None:
+                self._isolation_drain_stalled = False
 
         # Backstop: a step built without ``_update_after_schedule`` (nothing
         # booked, so nothing to reconcile) still leaves here uniform. On the
