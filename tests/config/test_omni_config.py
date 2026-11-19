@@ -146,6 +146,17 @@ def test_hunyuan_ar_platform_runner_defaults(platform, deploy_name, pipeline_key
     assert stages[0].yaml_engine_args["supports_native_mrv2_data_plane"] is True
 
 
+def test_higgs_default_profile_enables_mrv2_async_audio_payload() -> None:
+    deploy = load_deploy_config(_DEPLOY_DIR / "higgs_multimodal_qwen3.yaml")
+    stage = deploy.stages[0]
+
+    assert stage.engine_extras["async_scheduling"] is True
+    assert stage.engine_extras["hf_overrides"] == {
+        "audio_async_prompt_mode": True,
+        "audio_async_payload": True,
+    }
+
+
 @pytest.mark.parametrize("pending", [False, True])
 def test_pending_generation_capability_reaches_both_engine_config_paths(pending, tmp_path):
     from vllm_omni.engine.arg_utils import OmniEngineArgs

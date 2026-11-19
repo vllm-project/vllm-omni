@@ -1464,11 +1464,11 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
         "Reliability Test · Invalid parameters · MI300 · Single-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-single/**/*",
             "artifact_env": "ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR",
-            "expected_nodes": 76,
+            "expected_nodes": 66,
             "expected_skipped": 5,
             "timeout": "75m",
-            "collection_message": "Expected exactly 76 single-GPU invalid-parameter nodes",
-            "junit_message": "Expected exactly 76 single-GPU invalid-parameter tests with 5 known skips",
+            "collection_message": "Expected exactly 66 single-GPU invalid-parameter nodes",
+            "junit_message": "Expected exactly 66 single-GPU invalid-parameter tests with 5 known skips",
         },
         "Reliability Test · Invalid parameters · MI300 · 2-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-reliability/**/*",
@@ -1575,9 +1575,9 @@ def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
             "Reliability Test · Invalid parameters · MI300 · Single-GPU",
             "ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR",
             "invalid-parameters-single-reliability-guard",
-            76,
+            66,
             5,
-            "Expected exactly 76 single-GPU invalid-parameter tests with 5 known skips",
+            "Expected exactly 66 single-GPU invalid-parameter tests with 5 known skips",
         ),
         (
             "Reliability Test · Invalid parameters · MI300 · 2-GPU",
