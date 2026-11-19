@@ -60,6 +60,8 @@ class HiggsAudioSpeculator(BaseSpeculator):
         self.pending: dict[str, tuple[int, int, torch.Tensor]] = {}
         # Target rows sampled after a rejected candidate; the next candidates.
         self.guesses: dict[str, torch.Tensor] = {}
+        # Requests resumed after preemption, which decode one row per step.
+        self.single_step: set[str] = set()
         self.drafts: DraftTokenIds | None = None
         self.batch: DraftBatch | None = None
 
@@ -218,7 +220,7 @@ class HiggsAudioSpeculator(BaseSpeculator):
         anchor = input_batch.num_computed_tokens_np + input_batch.num_scheduled_tokens - logits_per_request + committed
         rows, lengths = [], []
         for i, req_id in enumerate(input_batch.req_ids):
-            if not (committed[i] and stable[i] and req_id in state.generators):
+            if not (committed[i] and stable[i] and req_id in state.generators) or req_id in self.single_step:
                 continue
             params = state.requests[req_id].sampling_params
             limit = min(self.max_model_len, int(state.prompt_len_np[input_batch.idx_mapping_np[i]]) + params.max_tokens)

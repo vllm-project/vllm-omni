@@ -156,10 +156,8 @@ curl --fail-with-body --no-buffer http://127.0.0.1:8098/v1/audio/speech \
 ```
 
 Compare the `speech.audio.delta` chunk sizes and the final
-`speech.audio.done` event. Unseeded requests and the closing delay ramp use
-single-step sampling.
-Keep enough KV capacity to avoid preempting requests after audio generation
-starts, since replaying an audio prefix is unsupported.
+`speech.audio.done` event. Unseeded requests, the closing delay ramp, and
+requests resumed after preemption use single-step sampling.
 
 ## Notes
 

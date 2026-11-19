@@ -83,7 +83,9 @@ class HiggsModelState(OmniModelState):
             and not is_warmup
             and len(new_req_data.prefill_token_ids) > len(new_req_data.prompt_token_ids or ())
         ):
-            raise ValueError("Higgs audio speculation cannot replay a preempted audio prefix")
+            # A resumed request replays its audio prefix as single-step decoding
+            # does; it no longer drafts.
+            self.audio_speculator.single_step.add(new_req_data.req_id)
         if not is_warmup and (
             params.frequency_penalty != 0
             or params.presence_penalty != 0
@@ -123,6 +125,7 @@ class HiggsModelState(OmniModelState):
                 self.generators.pop(req_id, None)
                 if self.audio_speculator is not None:
                     self.audio_speculator.pending.pop(req_id, None)
+                    self.audio_speculator.single_step.discard(req_id)
                 self.metadata_key = None
         super().remove_request(req_index_or_id)
 

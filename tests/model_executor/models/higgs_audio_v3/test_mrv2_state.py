@@ -61,13 +61,34 @@ def test_speculation_requires_batch_invariant_math(monkeypatch):
         HiggsAudioSpeculator(config, torch.device("cpu"))
 
 
-def test_speculation_rejects_resumed_audio_prefix():
+def test_resumed_request_decodes_single_step_without_failing_the_batch():
     s = make_state()
-    s.audio_speculator = Mock()
-    resumed = request("r", 1)
+    spec = object.__new__(HiggsAudioSpeculator)
+    spec.max_model_len, spec.pending, spec.guesses, spec.single_step = 128, {}, {}, set()
+    s.audio_speculator = spec
+    s.add_request(0, request("0", 0, max_tokens=100))
+    resumed = request("1", 1, max_tokens=100)
     resumed.prefill_token_ids = [1, 2, 99, 1024]
-    with pytest.raises(ValueError, match="preempted audio prefix"):
-        s.add_request(0, resumed)
+    s.add_request(1, resumed)
+    s.model._decode_has_codes = torch.ones(2, dtype=torch.bool)
+    s.model._decode_delay_count = torch.full((2,), 7)
+    s.model._decode_eoc_countdown = torch.full((2,), -1)
+    s.model._decode_last_codes = torch.arange(16).view(2, 8)
+    s.model._step_audio_mode_rows = 2
+    s.model.num_codebooks = 8
+    batch = SimpleNamespace(
+        req_ids=["0", "1"],
+        num_reqs=2,
+        idx_mapping_np=np.arange(2),
+        cu_num_logits_np=np.array([0, 1, 2]),
+        num_computed_tokens_np=np.full(2, 20),
+        num_scheduled_tokens=np.ones(2),
+    )
+    spec.propose_audio(s, batch, torch.zeros(2, 8), torch.tensor([1, 1]), 1)
+    assert list(spec.pending) == ["0"]
+    assert spec.drafts.req_ids == ["0"]
+    s.remove_request("1")
+    assert spec.single_step == set()
 
 
 def test_verified_prefix_ends_at_correction_bonus_or_eoc():
@@ -98,6 +119,7 @@ def test_draft_feedback_tracks_request_slot_and_position_after_reorder():
     s.add_request(0, request("a", 42))
     s.add_request(2, request("b", 43))
     spec = object.__new__(HiggsAudioSpeculator)
+    spec.single_step = set()
     s.audio_speculator = spec
     a, b = torch.full((1, 8), 10), torch.full((2, 8), 20)
     b[1] = 21
@@ -137,7 +159,7 @@ def test_proposer_reanchors_to_last_commit_and_reuses_leftover_rows():
     for i in range(3):
         s.add_request(i, request(str(i), i, max_tokens=100))
     spec = object.__new__(HiggsAudioSpeculator)
-    spec.max_model_len, spec.pending = 128, {}
+    spec.max_model_len, spec.pending, spec.single_step = 128, {}, set()
     spec.guesses = {"1": torch.full((2, 8), 5)}
     s.model.num_codebooks = 8
     s.model._decode_has_codes = torch.ones(3, dtype=torch.bool)
@@ -173,7 +195,7 @@ def test_verifier_commits_only_the_verified_rows_and_rng_prefix(monkeypatch):
     for i in range(4):
         s.add_request(i, request(str(i), i, temperature=0))
     spec = object.__new__(HiggsAudioSpeculator)
-    spec.guesses = {}
+    spec.guesses, spec.single_step = {}, set()
     spec.pending = {str(i): (i, 20, torch.tensor([11, 22])[:, None].expand(-1, 8)) for i in range(3)}
     s.audio_speculator = spec
     model = s.model
