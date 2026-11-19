@@ -14,7 +14,6 @@ from __future__ import annotations
 import base64
 import time
 from types import SimpleNamespace
-from typing import TypedDict
 from unittest.mock import MagicMock
 
 import pytest
@@ -1058,7 +1057,6 @@ def test_the_real_schedule_hands_the_window_and_sends_the_decision_with_the_step
     from vllm.config import CacheConfig, SchedulerConfig, VllmConfig
     from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
     from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
-    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
     from vllm.v1.structured_output import StructuredOutputManager
 
     config = VllmConfig()
@@ -1106,12 +1104,6 @@ def test_the_real_schedule_hands_the_window_and_sends_the_decision_with_the_step
 
     assert output.duplex_carry_ops == [WindowOperation("hand", "s", request.request_id)]
 
-    class WindowFields(TypedDict):
-        duplex_carry_ops: list[WindowOperation]
-
-    decoded = MsgpackDecoder(WindowFields).decode(MsgpackEncoder().encode(output))
-    assert decoded["duplex_carry_ops"] == output.duplex_carry_ops
-    assert isinstance(decoded["duplex_carry_ops"][0], WindowOperation)
     assert [unit["length"] for unit in request._minicpmo45_carried_window["units"]] == [5, 6]
     assert sched.schedule().duplex_carry_ops == []
 

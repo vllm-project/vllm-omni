@@ -11,6 +11,7 @@ window fills with stale entries after K completions.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import TypedDict
 from unittest.mock import MagicMock
 
 import pytest
@@ -20,6 +21,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 from vllm_omni.config.model import OmniModelConfig
+from vllm_omni.core.sched.window_policy import WindowOperation
 
 # Imports must run in this order: vllm_omni applies patches to vllm.v1.request before
 # Request / RequestStatus are bound in this module. Ruff isort would reorder them.
@@ -142,6 +144,19 @@ def test_aborted_held_tokens_are_dropped_only_without_terminal_notification(noti
 
     # Notified clients retain tokens until the terminal output flush.
     assert sched._held_token_ids == ({"req-1": [11]} if notify_client else {})
+
+
+def test_window_operations_round_trip_in_order_on_a_finish_only_step():
+    class WindowFields(TypedDict):
+        duplex_carry_ops: list[WindowOperation]
+
+    base = SchedulerOutput.make_empty()
+    base.finished_req_ids = {"old"}
+    output = _make_scheduler()._wrap_omni_scheduler_output(base)
+    output.duplex_carry_ops = [WindowOperation("keep", "s", "old"), WindowOperation("drop", "s")]
+    decoded = MsgpackDecoder(WindowFields).decode(MsgpackEncoder().encode(output))
+    assert decoded["duplex_carry_ops"] == output.duplex_carry_ops
+    assert all(isinstance(op, WindowOperation) for op in decoded["duplex_carry_ops"])
 
 
 def test_native_mooncake_finish_uses_confirmed_token_boundary() -> None:
