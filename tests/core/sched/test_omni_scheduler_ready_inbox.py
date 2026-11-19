@@ -142,3 +142,42 @@ def test_native_input_gate_preserves_upstream_blocked_waits(async_chunk, status)
     assert scheduler.deferred_waiting == {request}
     assert not scheduler.input_coordinator.pending_chunk_registrations
     assert not scheduler.input_coordinator.pending_input_registrations
+
+
+def test_native_resume_prompt_replacement_clears_token_buffer(mocker):
+    scheduler = OmniSchedulerMixin()
+    request = Request("r", [1, 2, 3], SamplingParams(max_tokens=16), pooling_params=None)
+    request.resumable = True
+    request.append_output_token_ids([4, 5])
+    request.num_computed_tokens = 4
+    request.block_hashes.append(b"old")
+    token_buffer = request._all_token_ids
+    scheduler.requests = {"r": request}
+    scheduler.waiting, scheduler.running, scheduler.kv_holding_waiting = [], [], []
+    scheduler._native_resumable = True
+    scheduler._outputs_awaiting_stage_payload = {}
+    scheduler._release_replaced_streaming_prompt_cache = mocker.Mock()
+    scheduler._reset_streaming_session_replacement_state = mocker.Mock()
+    scheduler.input_coordinator = SimpleNamespace(
+        receives_chunks=True,
+        _async_chunk=True,
+        update_request_metadata=mocker.Mock(),
+        process_pending_chunks=mocker.Mock(),
+    )
+    scheduler._init_omni_connector_output_inbox()
+    scheduler.enqueue_omni_connector_output(
+        OmniConnectorOutput(
+            request_metadata={"r": SchedulingMetadataUpdate(replace_prompt=True, resize_prompt_to=2)},
+            chunk_ready_req_ids={"r"},
+        )
+    )
+
+    scheduler._consume_pending_connector_output(model_mode="ar")
+
+    assert request._all_token_ids is token_buffer
+    assert len(request.all_token_ids) == 0
+    assert not request.output_token_ids
+    assert not request.block_hashes
+    assert request.num_computed_tokens == 0
+    assert request.prompt_token_ids == []
+    scheduler._release_replaced_streaming_prompt_cache.assert_called_once_with(request)

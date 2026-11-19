@@ -639,7 +639,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
                     self._release_replaced_streaming_prompt_cache(request)
                     self._reset_streaming_session_replacement_state(request)
                     request._output_token_ids.clear()
-                    request._all_token_ids.clear()
+                    del request._all_token_ids[:]
                     request.block_hashes.clear()
                     request.prompt_token_ids = []
                     request.num_computed_tokens = 0
