@@ -21,6 +21,7 @@ from torch import nn
 from transformers import AutoConfig, AutoTokenizer, UMT5EncoderModel
 from typing_extensions import override
 from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.utils.math_utils import round_down
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -49,6 +50,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 DEFAULT_NUM_LATENT_FRAMES_PER_CHUNK = 9
+REQUEST_RESOLUTION_ALIGNMENT = 16
 
 
 def calculate_shift(
@@ -351,8 +353,8 @@ class HeliosPipeline(
         num_latent_frames_per_chunk = int(extra.get("num_latent_frames_per_chunk", DEFAULT_NUM_LATENT_FRAMES_PER_CHUNK))
         keep_first_frame = bool(extra.get("keep_first_frame", True))
         frame_num = int(extra.get("frame_num", 132))
-        height = (int(state.sampling.height or extra.get("height", 384)) // 16) * 16
-        width = (int(state.sampling.width or extra.get("width", 640)) // 16) * 16
+        height = round_down(int(state.sampling.height or extra.get("height", 384)), REQUEST_RESOLUTION_ALIGNMENT)
+        width = round_down(int(state.sampling.width or extra.get("width", 640)), REQUEST_RESOLUTION_ALIGNMENT)
         num_frames = max(int(state.sampling.num_frames or frame_num), 1)
         num_steps = int(state.sampling.num_inference_steps or extra.get("num_inference_steps", 50))
         output_type = extra.get("output_type", "np")
@@ -1085,8 +1087,8 @@ class HeliosPipeline(
 
         self._guidance_scale = guidance_scale
 
-        height = (height // 16) * 16
-        width = (width // 16) * 16
+        height = round_down(height, REQUEST_RESOLUTION_ALIGNMENT)
+        width = round_down(width, REQUEST_RESOLUTION_ALIGNMENT)
         num_frames = max(num_frames, 1)
 
         device = self.device
@@ -1799,10 +1801,10 @@ class HeliosPipeline(
             if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in geometry):
                 raise ValueError(f"Helios VAE warmup profile {index} height and width must be positive integers")
             height, width = geometry
-            if height % 16 or width % 16:
+            if height % REQUEST_RESOLUTION_ALIGNMENT or width % REQUEST_RESOLUTION_ALIGNMENT:
                 raise ValueError(
-                    f"Helios VAE warmup profile {index} height and width must be multiples of 16 "
-                    "to match the request path without changing its geometry"
+                    f"Helios VAE warmup profile {index} height and width must be multiples of "
+                    f"{REQUEST_RESOLUTION_ALIGNMENT} to match the request path without changing its geometry"
                 )
             if geometry not in seen:
                 seen.add(geometry)
@@ -1823,11 +1825,14 @@ class HeliosPipeline(
             try:
                 with torch.inference_mode():
                     latents = torch.zeros(latent_shape, device=self.vae.device, dtype=self.vae.dtype)
-                    if getattr(current_omni_platform, "is_available", lambda: False)():
+                    sync_device = (
+                        latents.device.type != "cpu" and getattr(current_omni_platform, "is_available", lambda: False)()
+                    )
+                    if sync_device:
                         current_omni_platform.synchronize()
                     profile_started = time.perf_counter()
                     output = self.vae.decode(latents, return_dict=False)
-                    if getattr(current_omni_platform, "is_available", lambda: False)():
+                    if sync_device:
                         current_omni_platform.synchronize()
                     elapsed = time.perf_counter() - profile_started
                 logger.info(

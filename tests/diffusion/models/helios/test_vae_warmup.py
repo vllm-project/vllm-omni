@@ -19,6 +19,7 @@ from vllm_omni.diffusion.models.helios.pipeline_helios import (
 )
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+from vllm_omni.platforms.interface import UnspecifiedOmniPlatform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -213,6 +214,7 @@ def test_warmup_preserves_synchronization_error(
     monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, successful_profiles: int, sync_call: int
 ) -> None:
     pipeline = _pipeline()
+    pipeline.vae.device = torch.device("meta")
     error = RuntimeError("warmup synchronization failed")
     successful_syncs = successful_profiles * 2 + sync_call - 1
     synchronize = mocker.Mock(side_effect=[None] * successful_syncs + [error])
@@ -227,6 +229,7 @@ def test_warmup_preserves_synchronization_error(
 
 def test_platform_synchronization_brackets_decode(monkeypatch):
     pipeline = _pipeline()
+    pipeline.vae.device = torch.device("meta")
     events = []
     monkeypatch.setattr(
         pipeline_module,
@@ -245,9 +248,9 @@ def test_platform_synchronization_brackets_decode(monkeypatch):
     assert events == ["sync", "decode", "sync"]
 
 
-def test_cpu_warmup_skips_platform_sync_when_unavailable(monkeypatch):
+def test_cpu_warmup_skips_platform_sync(monkeypatch):
     pipeline = _pipeline()
-    monkeypatch.setattr(pipeline_module, "current_omni_platform", SimpleNamespace(is_available=lambda: False))
+    monkeypatch.setattr(pipeline_module, "current_omni_platform", UnspecifiedOmniPlatform())
 
     pipeline.warmup_vae_profiles([{"height": 384, "width": 640}])
 
