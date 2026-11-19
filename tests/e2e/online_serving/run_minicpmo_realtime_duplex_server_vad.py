@@ -97,6 +97,7 @@ async def run_server_vad_interrupt(args) -> dict[str, object]:
                 target_response.get("status") == "completed"
                 and target_response.get("status_details", {}).get("reason") == "stop"
                 and playback_cleared
+                and events.index(terminal) < events.index(speech_started[0])
             )
         )
         and not stale
