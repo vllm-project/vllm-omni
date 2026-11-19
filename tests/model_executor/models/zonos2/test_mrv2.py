@@ -14,6 +14,8 @@ from vllm.v1.worker.gpu.states import RequestState
 from vllm_omni.data_entry_keys import LAST_OUTPUT_TOKEN_KEY, OUTPUT_TOKEN_COUNT_KEY, REQUEST_SAMPLING_PARAMS_KEY
 from vllm_omni.model_executor.models.zonos2.configuration_zonos2 import Zonos2Config
 from vllm_omni.model_executor.models.zonos2.model_state import Zonos2ModelState, Zonos2Sampler
+from vllm_omni.model_executor.models.zonos2.zonos2_codec import DACStreamDecoder, LocalDAC
+from vllm_omni.model_executor.models.zonos2.zonos2_dac_decoder import Zonos2Code2WavForConditionalGeneration
 from vllm_omni.model_executor.models.zonos2.zonos2_keys import FRAMES
 from vllm_omni.model_executor.models.zonos2.zonos2_sampler import sample_frame
 from vllm_omni.model_executor.models.zonos2.zonos2_talker import (
@@ -200,3 +202,23 @@ def test_cancellation_cleans_preempted_request_without_a_live_slot(state, mocker
     state.on_requests_finished({"a"})
     assert not state.model._request_states and not state.last_tokens
     assert state.intermediate_buffer.buffers[0] == {}
+
+
+def test_decoder_primes_valid_codes_without_consuming_talker_weights_or_request_state(mocker):
+    decoder = Zonos2Code2WavForConditionalGeneration.__new__(Zonos2Code2WavForConditionalGeneration)
+    nn.Module.__init__(decoder)
+    decoder._dac = mocker.Mock(spec=LocalDAC)
+    decoder._stream = mocker.Mock(spec=DACStreamDecoder)
+
+    def talker_weights():
+        raise AssertionError("DAC must not iterate the talker checkpoint")
+        yield
+
+    assert decoder.load_weights(talker_weights()) == set()
+    decoder._dac.load.assert_called_once_with()
+    assert decoder._dac.decode.call_count >= 2
+    for call in decoder._dac.decode.call_args_list:
+        codes = call.args[0]
+        assert codes.shape[0] == 9 and codes.shape[1] > 0
+        assert codes.dtype == torch.long and torch.all((codes >= 0) & (codes < 1024))
+    decoder._stream.push.assert_not_called()

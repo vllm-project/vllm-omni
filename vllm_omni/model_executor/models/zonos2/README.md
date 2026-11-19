@@ -99,6 +99,8 @@ native MRv2 data plane for both stages. Eager execution, synchronous AR
 scheduling and no prefix cache are required; speculative decoding is rejected.
 The initial supported scope is single-request offline and SSE generation.
 Batch quality and the RFC C4/C16 performance matrix remain unqualified.
+The DAC loads its local FP32 checkpoint and warms valid codec codes at startup;
+MRv2 generation profiling does not execute a model-specific dummy request.
 
 For offline generation, omitting `sampling_params_list` selects the shipped
 deployment defaults: temperature 1.15, top-k 106, min-p 0.18, repetition

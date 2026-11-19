@@ -37,8 +37,13 @@ class Zonos2Code2WavForConditionalGeneration(nn.Module):
         return None
 
     def load_weights(self, weights: Any) -> set[str]:
-        # Stage 0 safetensors are unrelated to DAC; local codec loads on first
-        # real decode. Do not consume the large talker weights again.
+        # Stage 0 safetensors are unrelated to DAC; never iterate them here.
+        # MRv2 skips generation profiling. Prime DAC's scripted activations
+        # with valid codes so its cold first pass cannot change public PCM.
+        self._dac.load()
+        codes = torch.zeros((9, 16), dtype=torch.long)
+        for _ in range(3):
+            self._dac.decode(codes)
         return set()
 
     def get_dummy_runtime_additional_information(self, num_reqs):
