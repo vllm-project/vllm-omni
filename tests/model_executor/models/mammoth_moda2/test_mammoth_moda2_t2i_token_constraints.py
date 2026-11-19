@@ -129,3 +129,30 @@ def test_top_level_wrapper_delegates_decode_metadata() -> None:
     wrapper.model = inner
     wrapper.update_decode_step_metadata(runtime_additional_information=[_t2i_info(7)])
     assert inner._last_runtime_additional_information[0]["generated_len"] == 7
+
+
+@pytest.mark.parametrize("has_draft", [False, True])
+def test_mrv2_sampling_applies_grid_constraints_to_each_logit_row(has_draft: bool) -> None:
+    inner = _host()
+    wrapper = m.MammothModa2ForConditionalGeneration.__new__(m.MammothModa2ForConditionalGeneration)
+    wrapper.model = inner
+    t2i = _t2i_info(0)
+    del t2i["generated_len"]
+    infos = [{"omni_task": ["chat"]}, {"meta": t2i}]
+    lengths = [0, _AR_WIDTH - 1, _AR_WIDTH, _AR_WIDTH + 1] if has_draft else [0, 0]
+    expected = [0, _VISUAL_START, _EOL, _VISUAL_START] if has_draft else [0, _VISUAL_START]
+
+    with wrapper.mrv2_sampling_context(
+        req_ids=["chat", "image"],
+        num_output_tokens=torch.tensor(lengths),
+        runtime_additional_information=infos,
+        num_logits_per_req=[1, 3] if has_draft else None,
+    ):
+        logits = torch.ones(len(lengths), 16)
+        result = inner._apply_t2i_token_constraints(logits)
+        assert result.argmax(dim=1).tolist() == expected
+        for index, token in enumerate(expected[1:], start=1):
+            allowed = [_EOL] if token == _EOL else list(range(_VISUAL_START, _VISUAL_END + 1))
+            assert result[index].isfinite().nonzero().flatten().tolist() == allowed
+    assert inner._last_runtime_additional_information is infos
+    assert all("generated_len" not in info for info in infos)

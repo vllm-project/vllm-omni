@@ -4,7 +4,8 @@
 from __future__ import annotations
 
 import gc
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from itertools import islice
 from typing import Any
 
@@ -75,6 +76,11 @@ def _runtime_meta(runtime_info: dict[str, Any]) -> dict[str, Any]:
     """Accept both legacy flat metadata and the canonical nested payload."""
     meta = runtime_info.get("meta")
     return meta if isinstance(meta, dict) else runtime_info
+
+
+def _is_t2i(meta: dict[str, Any]) -> bool:
+    task = meta.get("omni_task")
+    return isinstance(task, list) and bool(task) and task[0] == "t2i"
 
 
 def _enable_moe_routing_cudagraph_specialize(vllm_config: VllmConfig) -> None:
@@ -841,34 +847,12 @@ def _drop_parent_language_model(model: nn.Module, prefix: str) -> None:
 
 
 class _MammothModa2T2ITokenConstraints:
-    """Refresh t2i AR-grid constraints on every runner step, including graph replay.
-
-    CUDA-graph FULL replay skips Python ``forward``, which previously cached
-    ``runtime_additional_information``. ``compute_logits`` still runs in Python,
-    so the runner calls ``update_decode_step_metadata`` before each step with
-    the current ``generated_len``. Without that refresh, column_id stays frozen
-    (or the cache stays None after dummy capture) and greedy decode can emit
-    EOS before the visual grid is complete (#7318).
-
-    Any model that stashes per-step metadata in Python ``forward`` and reads it
-    from ``compute_logits`` must set ``supports_omni_decode_step_metadata`` so
-    the runner refreshes that cache outside capture; otherwise FULL replay
-    reintroduces the same stale-cache bug.
-
-    Only the v1 runner (``vllm_omni/worker/gpu_model_runner.py``) calls this
-    hook. A runner that does not call it leaves the cache at whatever Python
-    ``forward`` last wrote, which is the pre-fix behavior.
-    """
-
-    supports_omni_decode_step_metadata = True
+    """Apply AR-grid constraints using metadata refreshed outside graph replay."""
 
     def _cache_runtime_additional_information(self, runtime_infos: Any) -> None:
         self._last_runtime_additional_information = runtime_infos if isinstance(runtime_infos, list) else None
 
     def update_decode_step_metadata(self, **kwargs: Any) -> None:
-        # The runner emits both keys today with the same payload
-        # (gpu_model_runner._build_model_kwargs_extra); only the canonical one
-        # is read here so the contract stays single-sourced.
         if "runtime_additional_information" in kwargs:
             self._cache_runtime_additional_information(kwargs["runtime_additional_information"])
 
@@ -897,8 +881,7 @@ class _MammothModa2T2ITokenConstraints:
                 continue
             runtime_info = runtime_infos[i] if isinstance(runtime_infos[i], dict) else {}
             meta = _runtime_meta(runtime_info)
-            omni_task = meta.get("omni_task")
-            if not isinstance(omni_task, list) or not omni_task or omni_task[0] != "t2i":
+            if not _is_t2i(meta):
                 # Text/understanding/chat: forbid sampling from the extra gen vocab.
                 logits[i, self.language_model.base_vocab_size :] = neg_inf
                 continue
@@ -917,10 +900,20 @@ class _MammothModa2T2ITokenConstraints:
                     "unconstrained. Check the update_decode_step_metadata refresh."
                 )
                 continue
-            generated_len = int(runtime_info["generated_len"])
-
             row = logits[i]
-            column_id = generated_len % (ar_width + 1)
+            generated_len = runtime_info["generated_len"]
+            if isinstance(generated_len, torch.Tensor):
+                # The MRv2 count lives on the device. A Python branch on it
+                # would synchronize with the host for every generated token.
+                at_eol = generated_len.remainder(ar_width + 1) == ar_width
+                eol_logit = row[eol_token_id].masked_fill(~at_eol, neg_inf)
+                row[:visual_start] = neg_inf
+                row[visual_end + 1 :] = neg_inf
+                row[visual_start : visual_end + 1].masked_fill_(at_eol, neg_inf)
+                row[eol_token_id] = eol_logit
+                continue
+
+            column_id = int(generated_len) % (ar_width + 1)
             if column_id == ar_width:
                 # End-of-row token: only allow eol.
                 eol_logit = row[eol_token_id].clone()
@@ -1164,12 +1157,9 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                 ],
             )
             self.model = self.ar
-            # Runner reads both flags on the top-level module:
-            # requires_raw_input_tokens keeps input_ids on the mm graph path
-            # (gen_token_mask / MoE routing); supports_omni_decode_step_metadata
-            # refreshes decode metadata outside FULL capture. See AR wrappers.
+            # Keep input_ids for MoE routing and refresh metadata during sampling.
             self.requires_raw_input_tokens = True
-            self.supports_omni_decode_step_metadata = True
+            self.mrv2_sampling_needs_runtime_info = True
         elif self.model_stage == "dit":
             self.dit = init_vllm_registered_model(
                 vllm_config=vllm_config,
@@ -1265,6 +1255,33 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         update = getattr(inner, "update_decode_step_metadata", None)
         if callable(update):
             update(**kwargs)
+
+    @contextmanager
+    def mrv2_sampling_context(
+        self,
+        *,
+        req_ids: list[str],
+        num_output_tokens: torch.Tensor,
+        runtime_additional_information: list[dict[str, Any]],
+        num_logits_per_req: list[int] | None = None,
+    ) -> Iterator[None]:
+        """Align request metadata with the sampler's logits rows for this step."""
+        sampling_infos = runtime_additional_information
+        if num_logits_per_req is not None:
+            sampling_infos = [
+                info for info, count in zip(sampling_infos, num_logits_per_req, strict=True) for _ in range(count)
+            ]
+        if any(_is_t2i(_runtime_meta(info)) for info in sampling_infos):
+            lengths = num_output_tokens.clamp_min(0).unbind()
+            sampling_infos = [
+                dict(info, generated_len=length) for info, length in zip(sampling_infos, lengths, strict=True)
+            ]
+
+        self.update_decode_step_metadata(runtime_additional_information=sampling_infos)
+        try:
+            yield
+        finally:
+            self.update_decode_step_metadata(runtime_additional_information=runtime_additional_information)
 
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, *args, **kwargs):
         if isinstance(hidden_states, OmniOutput):

@@ -298,15 +298,36 @@ class OmniARModelRunner(OmniGPUModelRunner):
         # --- Standard v2 sampling ---
         sampling_context = nullcontext()
         model_sampling_context = getattr(self.model, "mrv2_sampling_context", None)
-        if callable(model_sampling_context) and getattr(self.model, "logitsprocs_need_output_token_ids", False):
+        needs_runtime_info = getattr(self.model, "mrv2_sampling_needs_runtime_info", False) is True
+        if callable(model_sampling_context) and (
+            needs_runtime_info or getattr(self.model, "logitsprocs_need_output_token_ids", False)
+        ):
             # seq_lens includes this forward's input, but not its sampled token:
             # final prefill has zero prior outputs; the first decode has one.
+            num_reqs = input_batch.num_reqs
+            request_slots = input_batch.idx_mapping[:num_reqs]
+            sequence_lengths = input_batch.seq_lens[:num_reqs]
+            runtime_kwargs = {}
+            if needs_runtime_info:
+                runtime_kwargs["runtime_additional_information"] = self.model_state.intermediate_buffer.gather(
+                    input_batch
+                )
+                if input_batch.num_draft_tokens:
+                    # Verification produces one logit row per candidate position.
+                    # Use the positions and request slots selected by the sampler.
+                    sequence_lengths = input_batch.positions[input_batch.logits_indices] + 1
+                    request_slots = input_batch.expanded_idx_mapping
+                    if input_batch.num_admitted_draft_tokens is None:
+                        num_logits_per_req = np.diff(input_batch.cu_num_logits_np).tolist()
+                    else:
+                        # Adaptive verification can reassign rows on the device.
+                        num_logits_per_req = input_batch.cu_num_logits.diff().tolist()
+                    runtime_kwargs["num_logits_per_req"] = num_logits_per_req
+            num_output_tokens = sequence_lengths - self.req_states.prompt_len.gpu[request_slots]
             sampling_context = model_sampling_context(
                 req_ids=input_batch.req_ids,
-                num_output_tokens=(
-                    input_batch.seq_lens[: input_batch.num_reqs]
-                    - self.req_states.prompt_len.gpu[input_batch.idx_mapping]
-                ),
+                num_output_tokens=num_output_tokens,
+                **runtime_kwargs,
             )
         with sampling_context:
             sampling_output = sample_with_output(

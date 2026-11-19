@@ -338,12 +338,12 @@ def test_voxcpm2_streaming_output_owns_channels_and_finalizes_once(monkeypatch, 
         assert output.multimodal_outputs == [{}, {}]
 
 
-@pytest.mark.parametrize("needs_history", [False, True])
+@pytest.mark.parametrize("sampling_mode", ["none", "history", "grid", "grid_draft", "grid_adaptive"])
 @pytest.mark.parametrize("include_hidden", [None, False, True])
 @pytest.mark.parametrize("engine_output_type", ["text", "latent"])
 @pytest.mark.cpu
 def test_last_pp_rank_orchestration_and_kv_resolver(
-    monkeypatch, needs_history, include_hidden, engine_output_type
+    monkeypatch, sampling_mode, include_hidden, engine_output_type
 ) -> None:
     # Native prompt-logprob preparation otherwise pins memory using CUDA.
     monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
@@ -355,6 +355,19 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
     input_batch.num_scheduled_tokens = np.array([3])
     input_batch.prefill_len_np = np.array([3])
     input_batch.query_start_loc_np = np.array([0, 3])
+    needs_runtime_info = sampling_mode.startswith("grid")
+    has_draft = sampling_mode in ("grid_draft", "grid_adaptive")
+    input_batch.num_draft_tokens = int(has_draft)
+    if has_draft:
+        input_batch.seq_lens = torch.tensor([7])
+        input_batch.positions = torch.tensor([5, 6])
+        input_batch.logits_indices = torch.tensor([0, 1])
+        input_batch.expanded_idx_mapping = torch.tensor([0, 0])
+        input_batch.cu_num_logits = torch.tensor([0, 2])
+        # Adaptive verification can change the number of logits after the CPU estimate.
+        adaptive = sampling_mode == "grid_adaptive"
+        input_batch.cu_num_logits_np = np.array([0, 3 if adaptive else 2])
+        input_batch.num_admitted_draft_tokens = object() if adaptive else None
     state = SimpleNamespace(input_batch=input_batch, hidden_states=torch.zeros(1, 2))
     state.finished_req_ids, state.ec_connector_output = {"finished"}, None
     runner.execute_model_state = state
@@ -371,7 +384,10 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
         postprocess_model_output=MagicMock(return_value=(text_hidden, multimodal_outputs)),
         run_postprocess=MagicMock(),
     )
-    runner.model_state.intermediate_buffer = SimpleNamespace(buffers={0: {"global_request_id": "global-req"}})
+    runtime_infos = [{"omni_task": ["t2i"]}]
+    runner.model_state.intermediate_buffer = SimpleNamespace(
+        buffers={0: {"global_request_id": "global-req"}}, gather=MagicMock(return_value=runtime_infos)
+    )
     runner.req_states = SimpleNamespace(req_id_to_index={"req": 0})
     runner.req_states.all_token_ids = SimpleNamespace(gpu=torch.tensor([[1]]))
     runner.req_states.num_computed_tokens = SimpleNamespace(gpu=torch.tensor([0]))
@@ -382,19 +398,27 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
     sampling_active = False
 
     @contextmanager
-    def sampling_context(*, req_ids, num_output_tokens):
+    def sampling_context(*, req_ids, num_output_tokens, **kwargs):
         nonlocal sampling_active
-        assert needs_history and req_ids == ["req"]
+        assert sampling_mode != "none" and req_ids == ["req"]
+        assert num_output_tokens.tolist() == ([3, 4] if has_draft else [0])
+        expected = {"runtime_additional_information": runtime_infos} if needs_runtime_info else {}
+        if has_draft:
+            expected["num_logits_per_req"] = [2]
+        assert kwargs == expected
         sampling_active = True
         yield
         sampling_active = False
 
     # Exercise the deferred structured-output branch in one existing matrix
     # case without doubling the full orchestration parametrization.
-    requires_multimodal_postprocess = not needs_history and include_hidden is None and engine_output_type == "text"
+    requires_multimodal_postprocess = (
+        sampling_mode == "none" and include_hidden is None and engine_output_type == "text"
+    )
     runner.model = SimpleNamespace(
         compute_logits=lambda hidden: hidden,
-        logitsprocs_need_output_token_ids=needs_history,
+        logitsprocs_need_output_token_ids=sampling_mode == "history",
+        mrv2_sampling_needs_runtime_info=needs_runtime_info,
         postprocess_requires_multimodal_outputs=requires_multimodal_postprocess,
     )
     if include_hidden is not None:
@@ -404,7 +428,9 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
     runner.speculator = None
     runner.num_speculative_steps = 0
     runner.sample = MagicMock(return_value=sampler_out)
-    runner.sample.side_effect = lambda *_: sampler_out if sampling_active is needs_history else pytest.fail()
+    runner.sample.side_effect = lambda *_: (
+        sampler_out if sampling_active == (sampling_mode != "none") else pytest.fail()
+    )
     logprobs_mock = MagicMock(side_effect=lambda *_: pytest.fail("inside ctx") if sampling_active else {})
     runner.prompt_logprobs_worker = PromptLogprobsWorker(1, torch.device("cpu"), logprobs_mode="raw_logits")
     runner.prompt_logprobs_worker.add_request(
@@ -423,6 +449,10 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
     monkeypatch.setattr(omni_ar_model_runner, "OmniAsyncOutput", MagicMock(return_value=mock_out))
 
     assert runner.sample_tokens(None) is mock_out
+    if needs_runtime_info:
+        runner.model_state.intermediate_buffer.gather.assert_called_once_with(input_batch)
+    else:
+        runner.model_state.intermediate_buffer.gather.assert_not_called()
     if requires_multimodal_postprocess:
         runner.model_state.run_postprocess.assert_called_once_with(text_hidden, input_batch, multimodal_outputs)
     else:
