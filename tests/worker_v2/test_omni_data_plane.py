@@ -365,15 +365,23 @@ def test_emit_cohort_one_batch_and_trims_non_resumable_history(plane):
     assert request.output_token_count == 1025 and request.all_token_ids == []
 
 
-@pytest.mark.parametrize("model_type", ["ming3", "cosyvoice3"])
+@pytest.mark.parametrize("model_type", ["ming3", "cosyvoice3", "audex", "step_audio2", "nemotron_voicechat"])
 @pytest.mark.parametrize("terminal", [False, True])
 def test_async_token_producer_opts_into_full_token_history(plane, model_type, terminal):
+    from vllm_omni.model_executor.stage_input_processors.audex import thinker2code2wav_async_chunk
     from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2code2wav_async_chunk
     from vllm_omni.model_executor.stage_input_processors.ming3_audio import thinker2talker_async_chunk
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import (
+        thinker2talker_async_chunk as nemotron_thinker2talker_async_chunk,
+    )
+    from vllm_omni.model_executor.stage_input_processors.step_audio2 import thinker2token2wav_async_chunk
 
     plane._custom_process_func = {
         "ming3": thinker2talker_async_chunk,
         "cosyvoice3": talker2code2wav_async_chunk,
+        "audex": thinker2code2wav_async_chunk,
+        "step_audio2": thinker2token2wav_async_chunk,
+        "nemotron_voicechat": nemotron_thinker2talker_async_chunk,
     }[model_type]
     request = _new_request()
     request.resumable = False
@@ -390,6 +398,67 @@ def test_async_token_producer_opts_into_full_token_history(plane, model_type, te
     assert payload is None
     assert snapshot.all_token_ids == [10, 11, 21]
     assert snapshot.is_finished() is terminal
+
+
+@pytest.mark.parametrize("model_type", ["audex", "step_audio2", "nemotron_voicechat"])
+def test_native_token_only_chunks_preserve_later_tokens_and_terminal_tail(plane, model_type):
+    from vllm_omni.model_executor.stage_input_processors.audex import thinker2code2wav_async_chunk
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import thinker2talker_async_chunk
+    from vllm_omni.model_executor.stage_input_processors.step_audio2 import thinker2token2wav_async_chunk
+
+    processor, tokens, expected = {
+        "audex": (
+            thinker2code2wav_async_chunk,
+            list(range(131077, 131084)),
+            [[0, 1], [2, 3], [4, 5], [6]],
+        ),
+        "step_audio2": (
+            thinker2token2wav_async_chunk,
+            list(range(151696, 151757)),
+            [list(range(28)), list(range(25, 53)), list(range(50, 61))],
+        ),
+        "nemotron_voicechat": (
+            thinker2talker_async_chunk,
+            [31, 32, 33],
+            [[12, 31], [12, 31, 32], [12, 31, 32, 33], [12, 31, 32, 33]],
+        ),
+    }[model_type]
+    plane._custom_process_func = processor
+    plane._omni_connector = SharedMemoryConnector({"extra": {"codec_chunk_frames": 2}})
+    plane.request_payload = {}
+    plane._code_prompt_token_ids = defaultdict(list)
+    payloads = []
+
+    def send_chunks(entries, **_kw):
+        for snapshot, model_output in entries:
+            payload = plane._build_custom_process_payload(
+                snapshot.external_req_id, snapshot, model_output, propagate_errors=True
+            )
+            if payload is not None:
+                payloads.append(payload)
+                plane._put_req_chunk[snapshot.external_req_id] += 1
+        return len(entries)
+
+    plane.send_chunks = send_chunks
+    request = _new_request()
+    request.resumable = False
+    plane.register_request(request)
+    for token in tokens:
+        plane.emit_chunks(
+            req_ids=[request.req_id],
+            inter_stage_outputs=None,
+            sampled_token_ids=[[token]],
+            terminal_req_ids=set(),
+        )
+    plane.request_terminal({request.req_id})
+    plane._omni_connector.close()
+
+    actual = [
+        payload.ids.all if model_type == "nemotron_voicechat" else payload.codes.audio.reshape(-1).tolist()
+        for payload in payloads
+    ]
+    assert actual == expected
+    assert [bool(payload.meta.finished) for payload in payloads] == [False] * (len(expected) - 1) + [True]
 
 
 def test_terminal_reserved_abort_and_cleanup_lifecycle(plane):
@@ -931,15 +1000,44 @@ def test_payload_builders_see_stage_model_config(monkeypatch):
     assert _get_accept_hidden_layer_index(plane) == 24
 
 
-@pytest.mark.parametrize("model_type", ["qwen2_5_omni", "cosyvoice3"])
-def test_full_payload_stages_create_native_data_plane(monkeypatch, model_type):
+def _stage_transport_cases():
+    from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
+    from vllm_omni.config.stage_config import PipelineConfig, StageExecutionType
+    from vllm_omni.model_executor.models.cosyvoice3.pipeline import COSYVOICE3_PIPELINE
+    from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
+
+    seen = set()
+    pipelines = {**OMNI_PIPELINES, "cosyvoice3": COSYVOICE3_PIPELINE, "qwen3_omni_moe": QWEN3_OMNI_PIPELINE}
+    for model_type, pipeline in pipelines.items():
+        if not isinstance(pipeline, PipelineConfig):
+            continue
+        if pipeline.model_type in seen:
+            continue
+        seen.add(pipeline.model_type)
+        stages = {stage.stage_id: stage for stage in pipeline.stages}
+        for consumer in pipeline.stages:
+            if consumer.execution_type is StageExecutionType.DIFFUSION:
+                continue
+            for source in consumer.input_sources:
+                producer = stages[source]
+                for async_chunk, processor in (
+                    (False, producer.custom_process_next_stage_input_func),
+                    (True, producer.async_chunk_process_next_stage_input_func),
+                ):
+                    if processor:
+                        yield pytest.param(
+                            producer,
+                            consumer,
+                            async_chunk,
+                            id=f"{model_type}-{source}-{consumer.stage_id}-{'chunk' if async_chunk else 'full'}",
+                        )
+
+
+@pytest.mark.parametrize("producer,consumer,async_chunk", list(_stage_transport_cases()))
+def test_connected_stages_create_native_data_plane(monkeypatch, producer, consumer, async_chunk):
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
-    from vllm_omni.model_executor.models.cosyvoice3.pipeline import COSYVOICE3_PIPELINE
-    from vllm_omni.model_executor.models.qwen2_5_omni.pipeline import QWEN2_5_OMNI_PIPELINE
     from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
-
-    pipeline = {"qwen2_5_omni": QWEN2_5_OMNI_PIPELINE, "cosyvoice3": COSYVOICE3_PIPELINE}[model_type]
 
     def cpu_init(self, config, device):
         self.vllm_config, self.model_config, self.device = config, config.model_config, device
@@ -947,14 +1045,19 @@ def test_full_payload_stages_create_native_data_plane(monkeypatch, model_type):
     # Only native GPU allocation is substituted. Runner selection, the
     # topology's capability gate and payload-builder loading remain real.
     monkeypatch.setattr(GPUModelRunner, "__init__", cpu_init)
-    for stage in pipeline.stages:
+    for stage in (producer, consumer):
+        processor = (
+            stage.async_chunk_process_next_stage_input_func
+            if async_chunk
+            else stage.custom_process_next_stage_input_func
+        )
         model_config = SimpleNamespace(
             stage_id=stage.stage_id,
             model_stage=stage.model_stage,
-            async_chunk=False,
+            async_chunk=async_chunk,
             supports_native_mrv2_data_plane=stage.supports_native_mrv2_data_plane,
             requires_full_payload_input=stage.requires_full_payload_input,
-            custom_process_next_stage_input_func=stage.custom_process_next_stage_input_func,
+            custom_process_next_stage_input_func=processor,
         )
         config = SimpleNamespace(
             model_config=model_config,
@@ -962,9 +1065,11 @@ def test_full_payload_stages_create_native_data_plane(monkeypatch, model_type):
         )
         runner = OmniGPUModelRunner(config, torch.device("cpu"))
         plane = runner._omni_data_plane
-        assert plane is not None, f"stage {stage.stage_id} has no full-payload owner"
+        assert plane is not None, f"stage {stage.stage_id} has no payload transport owner"
         try:
-            assert plane._can_send is (stage.custom_process_next_stage_input_func is not None)
+            assert plane._can_send is (processor is not None)
+            if stage is consumer and not async_chunk:
+                assert stage.requires_full_payload_input, "consumer can run before its full payload arrives"
         finally:
             plane.close()
 

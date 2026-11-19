@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage transfer processors for the NemotronVoiceChat 3-stage pipeline.
 
 thinker (0) -> talker (1): token path only. The thinker's frame-locked text
@@ -256,6 +256,10 @@ def thinker2talker_async_chunk(
             expected_total_tokens=expected_total,
         ),
     )
+
+
+# Turn-based streaming sends the cumulative text timeline to the talker.
+setattr(thinker2talker_async_chunk, "_requires_full_token_history", True)
 
 
 def talker2code2wav_async_chunk(
