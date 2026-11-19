@@ -50,6 +50,7 @@ class DuplexEvalEvaluation:
     fps: int = 2
     window_size: float = 10.0
     workers: int = 1
+    judge_samples: int = 1
 
 
 @dataclass
@@ -106,6 +107,7 @@ def get_duplex_eval_samples(args: argparse.Namespace) -> list[SampleRequest]:
             fps=args.duplex_eval_judge_fps,
             window_size=args.duplex_eval_window_size,
             workers=args.duplex_eval_eval_workers,
+            judge_samples=args.duplex_eval_judge_samples,
         )
     requests: list[SampleRequest] = []
     reference = PreparedReferenceAudio.from_path(args.duplex_eval_ref_audio) if args.duplex_eval_ref_audio else None
@@ -171,6 +173,7 @@ def _evaluate_published_samples(
                 judge_fps=options.fps,
                 judge_video_mode=options.video_mode,
                 window_size=options.window_size,
+                judge_samples=options.judge_samples,
             )
         except Exception as exc:  # noqa: BLE001 - preserve other cases and completed service measurements
             logger.exception("Omni-DuplexEval judge failed for %s", relative)
@@ -189,6 +192,7 @@ def _evaluate_published_samples(
         failed=len(errors),
         errors=errors,
         judge_model=options.model,
+        judge_samples=options.judge_samples,
         score_root=str(score_root),
     )
     (score_root / "evaluation_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")

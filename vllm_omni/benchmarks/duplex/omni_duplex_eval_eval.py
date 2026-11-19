@@ -23,6 +23,7 @@ from .omni_duplex_eval_judge import DuplexJudge, JudgeResponseError
 from .omni_duplex_eval_media import extract_jpeg, materialize_media, video_duration
 from .omni_duplex_eval_metrics import (
     PROTOCOL_PIN,
+    aggregate_judge_votes,
     build_content_prompt,
     build_reminder_prompt,
     build_temporal_prompt,
@@ -90,7 +91,10 @@ def evaluate_sample(
     judge_video_mode: str = "video_url",
     window_size: float = 10.0,
     allow_invalid_clock: bool = False,
+    judge_samples: int = 1,
 ) -> dict[str, Any]:
+    if judge_samples < 1:
+        raise ValueError(f"judge_samples must be at least 1, got {judge_samples}")
     score_path.parent.mkdir(parents=True, exist_ok=True)
     if score_path.exists():
         # A failed retry must not leave an older score eligible for aggregation.
@@ -99,8 +103,10 @@ def evaluate_sample(
     trace_path = score_path.with_suffix(".judge.jsonl")
     trace_path.write_text("", encoding="utf-8")
 
-    def judge_result(call: Callable[..., str], required: tuple[str, ...]) -> dict[str, Any]:
+    def judge_result(call: Callable[..., str], required: tuple[str, ...], draw: int | None = None) -> dict[str, Any]:
         def _trace(payload: dict[str, Any]) -> None:
+            if draw is not None:
+                payload = {"judge_draw": draw, **payload}
             with trace_path.open("a", encoding="utf-8") as trace:
                 trace.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
@@ -147,6 +153,12 @@ def evaluate_sample(
         _trace({"raw_response": retry_response, "judge_retry": True})
         return parsed
 
+    def judge_vote(call: Callable[..., str], required: tuple[str, ...]) -> dict[str, Any]:
+        if judge_samples == 1:
+            return judge_result(call, required)
+        votes = [judge_result(call, required, draw) for draw in range(judge_samples)]
+        return {**aggregate_judge_votes(votes, required), "judge_votes": votes}
+
     raw = _read(response_path)
     meta = (
         _read(response_path.with_name(response_path.stem + ".meta.json"))
@@ -163,6 +175,8 @@ def evaluate_sample(
         "judge_model": getattr(judge, "model", None),
         "judge_video_mode": judge_video_mode,
     }
+    if judge_samples > 1:
+        result["judge_samples"] = judge_samples
     if sample.family == "rtd":
         items = normalize_response_items(raw)
         video_path = materialize_media(sample.video, score_path.parent / ".media", sample.id, ".mp4")
@@ -184,7 +198,7 @@ def evaluate_sample(
                 )
                 continue
             frames = _extract_frames(video_path, _times(*window, fps=judge_fps))
-            parsed = judge_result(
+            parsed = judge_vote(
                 lambda **kw: judge.temporal(
                     build_temporal_prompt(*window, item["sentence"], sample.question_text), frames, **kw
                 ),
@@ -209,7 +223,7 @@ def evaluate_sample(
             _text(items), sample.question_text, _gt_references([sample.answer1, sample.answer2])
         )
         try:
-            content = judge_result(
+            content = judge_vote(
                 lambda **kw: judge.content(
                     content_prompt, video_path, frames=content_frames, mode=judge_video_mode, **kw
                 ),
@@ -232,7 +246,8 @@ def evaluate_sample(
             if not content_frames:
                 # Nothing to fall back to: keep the original judge error.
                 raise
-            content = judge_result(
+            # With judge_samples > 1, every draw is repeated here so all votes judge the same input.
+            content = judge_vote(
                 lambda **kw: judge.content(
                     content_prompt, video_path, frames=content_frames, mode="frame-sample", **kw
                 ),
@@ -258,7 +273,7 @@ def evaluate_sample(
         event_rows = []
         if task == "correction" or not times:
             response = separator.join(chunk["text"] for chunk in chunks).strip()
-            parsed = judge_result(
+            parsed = judge_vote(
                 lambda **kw: judge.chat(
                     build_reminder_prompt(sample.question_text, response, task, sample.answer1), **kw
                 ),
@@ -274,7 +289,7 @@ def evaluate_sample(
                 if not response:
                     event_rows.append({"start_time": start, "response_segment": "", "success_score": 0})
                 else:
-                    parsed = judge_result(
+                    parsed = judge_vote(
                         lambda **kw: judge.chat(
                             build_reminder_prompt(sample.question_text, response, task, sample.answer1), **kw
                         ),
