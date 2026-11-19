@@ -286,6 +286,12 @@ def _validate_cosmos3_pp_model_offload(od_config: Any, strategy: OffloadStrategy
         )
 
 
+def _cosmos3_cache_backend_active(od_config: Any) -> bool:
+    """Whether a diffusion cache backend (Cache-DiT, SeaCache, ...) is configured."""
+    cache_backend = getattr(od_config, "cache_backend", None)
+    return cache_backend is not None and str(cache_backend).lower() not in ("", "none")
+
+
 def _validate_cosmos3_pp_cache_backend(od_config: Any) -> None:
     """Reject diffusion cache backends together with pipeline parallelism.
 
@@ -297,13 +303,10 @@ def _validate_cosmos3_pp_cache_backend(od_config: Any) -> None:
     Fail at startup instead of on the first request.
     """
     pp_size = _cosmos3_pp_size(od_config)
-    if pp_size <= 1:
-        return
-    cache_backend = getattr(od_config, "cache_backend", None)
-    if cache_backend is None or str(cache_backend).lower() in ("", "none"):
+    if pp_size <= 1 or not _cosmos3_cache_backend_active(od_config):
         return
     raise ValueError(
-        f"Cosmos3 does not support cache_backend={cache_backend!r} together with pipeline parallelism "
+        f"Cosmos3 does not support cache_backend={od_config.cache_backend!r} together with pipeline parallelism "
         f"(pipeline_parallel_size={pp_size}). Remove --cache-backend or set --pipeline-parallel-size 1."
     )
 
@@ -1734,6 +1737,22 @@ class Cosmos3OmniDiffusersPipeline(
         Returns False when cache-dit is not active, preserving the skip speedup.
         """
         return self._cache_dit_requires_paired_cfg
+
+    def _can_batch_t2i_outputs(self) -> bool:
+        """Whether T2I ``num_outputs_per_prompt > 1`` can run as one B=N denoising loop.
+
+        Falls back to one loop per output when batching would change results
+        or is unvalidated: the distilled SDE scheduler draws per-step noise from
+        the shared generator, so the serial draw order cannot be reproduced;
+        cache backends make one skip decision per batch (and Cache-DiT counts
+        forwards for CFG parity); PP forwards the UND cache across stages.
+        """
+        return (
+            not self.is_distilled_model
+            and not _cosmos3_cache_backend_active(self.od_config)
+            and not self._cache_dit_requires_paired_cfg
+            and not self._pp_parallel_active()
+        )
 
     @staticmethod
     def _get_sp_param(sp: OmniDiffusionSamplingParams, key: str, default: Any = None) -> Any:
@@ -4312,8 +4331,8 @@ class Cosmos3OmniDiffusersPipeline(
         if generator is None:
             generator = torch.Generator(device=self.device).manual_seed(seed)
 
-        # --- Format prompts & tokenize (B=1; reused across loop iterations
-        # for T2I num_outputs_per_prompt > 1) ---
+        # --- Format prompts & tokenize (B=1; shared by every T2I output when
+        # num_outputs_per_prompt > 1) ---
         cond_ids, cond_mask, uncond_ids, uncond_mask = self._format_and_tokenize_prompts(
             prompt,
             negative_prompt,
@@ -4330,10 +4349,8 @@ class Cosmos3OmniDiffusersPipeline(
         # --- Prepare latents (T2I, T2V, or I2V) ---
         # T2I shares _prepare_latents with T2V; the math collapses cleanly
         # at num_frames=1 ((1-1)//4 + 1 = 1 latent frame).  For T2I with
-        # ``num_outputs_per_prompt > 1`` we loop the diffusion below;
-        # batching B=N together would require expanding text K/V (UND
-        # pathway is text-only and cached) and is left as a future
-        # optimization.
+        # ``num_outputs_per_prompt > 1`` the outputs are denoised below, as
+        # one B=N batch when ``_can_batch_t2i_outputs()`` allows it.
         action_latents = None
         action_velocity_mask = None
         action_condition_latents = None
@@ -4479,14 +4496,19 @@ class Cosmos3OmniDiffusersPipeline(
                 generator=generator,
             )
 
-        if is_t2i and batch_size > 1:
-            # Generate N independent images by re-running the full diffusion
-            # loop with different noise seeds.  The first sample reuses
-            # ``latents`` already drawn from ``generator``; subsequent
-            # samples draw fresh noise from the same generator (state
-            # advances per call), giving distinct outputs from a single
-            # user-provided seed.  Batched B=N would be more efficient but
-            # requires expanding cached UND text K/V to match.
+        if is_t2i and batch_size > 1 and self._can_batch_t2i_outputs():
+            # Generate N independent images in one denoising loop. The first
+            # sample reuses ``latents``; the others are drawn one at a time
+            # from the same generator, matching the serial loop's draws. The
+            # transformer broadcasts the batch-1 UND text K/V to B=N.
+            samples = [latents]
+            for _ in range(batch_size - 1):
+                samples.append(self._prepare_latents(height, width, num_frames, generator))
+            latents = _run_diffusion(torch.cat(samples, dim=0))
+        elif is_t2i and batch_size > 1:
+            # Serial fallback: re-run the full diffusion loop per output,
+            # drawing each latent just before its loop so stochastic
+            # schedulers keep the generator order.
             samples = [_run_diffusion(latents)]
             for _ in range(batch_size - 1):
                 next_latents = self._prepare_latents(height, width, num_frames, generator)
