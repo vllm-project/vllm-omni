@@ -924,11 +924,15 @@ def test_payload_builders_see_stage_model_config(monkeypatch):
     assert _get_accept_hidden_layer_index(plane) == 24
 
 
-def test_qwen25_full_payload_stages_create_native_data_plane(monkeypatch):
+@pytest.mark.parametrize("model_type", ["qwen2_5_omni", "cosyvoice3"])
+def test_full_payload_stages_create_native_data_plane(monkeypatch, model_type):
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
+    from vllm_omni.model_executor.models.cosyvoice3.pipeline import COSYVOICE3_PIPELINE
     from vllm_omni.model_executor.models.qwen2_5_omni.pipeline import QWEN2_5_OMNI_PIPELINE
     from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+    pipeline = {"qwen2_5_omni": QWEN2_5_OMNI_PIPELINE, "cosyvoice3": COSYVOICE3_PIPELINE}[model_type]
 
     def cpu_init(self, config, device):
         self.vllm_config, self.model_config, self.device = config, config.model_config, device
@@ -936,7 +940,7 @@ def test_qwen25_full_payload_stages_create_native_data_plane(monkeypatch):
     # Only native GPU allocation is substituted. Runner selection, the
     # topology's capability gate and payload-builder loading remain real.
     monkeypatch.setattr(GPUModelRunner, "__init__", cpu_init)
-    for stage in QWEN2_5_OMNI_PIPELINE.stages:
+    for stage in pipeline.stages:
         model_config = SimpleNamespace(
             stage_id=stage.stage_id,
             model_stage=stage.model_stage,
@@ -953,7 +957,7 @@ def test_qwen25_full_payload_stages_create_native_data_plane(monkeypatch):
         plane = runner._omni_data_plane
         assert plane is not None, f"stage {stage.stage_id} has no full-payload owner"
         try:
-            assert plane._can_send is (stage.stage_id < 2)
+            assert plane._can_send is (stage.custom_process_next_stage_input_func is not None)
         finally:
             plane.close()
 
