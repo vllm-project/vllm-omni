@@ -80,6 +80,21 @@ NIGHTLY_BLOCKING_FULL_MODEL_LABELS = (
     "MiniCPM-o Online Full-Model Modalities",
 )
 TINY_DIFFUSION_PATH = "tests/model_tests/diffusion/test_common_offline.py"
+TINY_DIFFUSION_STABLE_4GPU_CASES = (
+    "test_pipeline_on_supported_tasks[SanaVideoPipeline[tensor_parallel+cfg_parallel]]",
+    "test_pipeline_on_supported_tasks[SanaVideoPipeline[sequence_parallel+cfg_parallel]]",
+    "test_pipeline_on_supported_tasks[SanaVideoPipeline[tensor_parallel+sequence_parallel]]",
+    "test_pipeline_on_supported_tasks[SanaImageToVideoPipeline[tensor_parallel+cfg_parallel]]",
+    "test_pipeline_on_supported_tasks[SanaImageToVideoPipeline[sequence_parallel+cfg_parallel]]",
+    "test_pipeline_on_supported_tasks[LongCatImageEditPipeline[cfg_parallel+tensor_parallel+cpu_offload]]",
+    "test_pipeline_on_supported_tasks[Flux2Pipeline[cfg_parallel+sequence_parallel+cpu_offload]]",
+    "test_pipeline_on_supported_tasks[Flux2Pipeline[tensor_parallel+vae_patch_parallel]]",
+    "test_pipeline_on_supported_tasks[StableDiffusion3Pipeline[cfg_parallel+tensor_parallel+cpu_offload]]",
+)
+TINY_DIFFUSION_STARTUP_4GPU_CASES = (
+    "test_pipeline_on_supported_tasks[Flux2KleinPipeline[cfg_parallel+tensor_parallel+cpu_offload]]",
+    "test_pipeline_on_supported_tasks[LongCatImagePipeline[cfg_parallel+tensor_parallel+cpu_offload]]",
+)
 TINY_DIFFUSION_JOBS = (
     (
         "ROCm · Tiny Diffusion Multi-GPU · 2-GPU",
@@ -91,9 +106,16 @@ TINY_DIFFUSION_JOBS = (
     (
         "ROCm · Tiny Diffusion Multi-GPU · 4-GPU",
         "mi300_4",
-        11,
+        2,
         "full_model and diffusion and rocm and MI325 and cards_4 and not nvidia_only",
         "artifacts/rocm-tiny-diffusion-4gpu/**/*",
+    ),
+    (
+        "ROCm · Tiny Diffusion Multi-GPU · 4-GPU Stable",
+        "mi300_4",
+        9,
+        "full_model and diffusion and rocm and MI325 and cards_4 and not nvidia_only",
+        "artifacts/rocm-tiny-diffusion-4gpu-stable/**/*",
     ),
 )
 ENTRYPOINTS_FULL_SELECTOR = "full_model and omni and rocm and MI325 and cards_2 and not nvidia_only"
@@ -767,7 +789,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t",
         AMD_READY_PIPELINE,
         "NonBlocking",
-        1435,
+        1436,
         "core_model and rocm and MI325 and not nvidia_only and not "
         "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
     ),
@@ -1007,54 +1029,32 @@ def test_tiny_diffusion_multigpu_nightly_uses_native_rocm_collection(
 
     assert step["agent_pool"] == agent_pool
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == ("Blocking" if agent_pool == "mi300_2" else "NonBlocking")
+    assert step["grade"] == ("NonBlocking" if expected_count == 2 else "Blocking")
     assert step["timeout_in_minutes"] == 50
     assert step["artifact_paths"] == [artifacts]
     assert "retry" not in step
-
+    assert step["env"]["ROCM_DIFFUSION_RUN_LEVEL"] == "core_model"
+    assert len(step["commands"]) == 1
     if agent_pool == "mi300_2":
-        assert step["env"]["ROCM_DIFFUSION_RUN_LEVEL"] == "core_model"
-        assert len(step["commands"]) == 1
-        assert split(step["commands"][0]) == [
-            "bash",
-            ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh",
-            "2",
-            str(expected_count),
-            "40m",
-            "rocm-tiny-diffusion-2gpu",
-            TINY_DIFFUSION_PATH,
-            "-m",
-            markers,
-        ]
-        return
-
-    commands = step["commands"]
-    collect_commands = [command for command in commands if AMD_COLLECTION_GUARD.name in command]
-    run_commands = [command for command in commands if "pytest -s" in command]
-    assert len(collect_commands) == 1
-    assert len(run_commands) == 1
-
-    collect_command = collect_commands[0]
-    run_command = run_commands[0]
-    collect_argv = split(collect_command)
-    run_argv = split(run_command)
-    assert collect_argv[:2] == ["bash", str(AMD_COLLECTION_GUARD)]
-    assert collect_argv[2] == str(expected_count)
-    assert "timeout --signal=TERM --kill-after=2m 40m" in run_command
-
-    for command, argv in ((collect_command, collect_argv), (run_command, run_argv)):
-        assert TINY_DIFFUSION_PATH in argv
-        assert _marker_expressions({"commands": [command]}) == [markers]
-        assert argv[argv.index("--run-level") + 1] == "core_model"
-
+        nodes = [TINY_DIFFUSION_PATH]
+    else:
+        cases = TINY_DIFFUSION_STABLE_4GPU_CASES if expected_count == 9 else TINY_DIFFUSION_STARTUP_4GPU_CASES
+        nodes = [f"{TINY_DIFFUSION_PATH}::{case}" for case in cases]
+        assert len(nodes) == expected_count
+        assert set(TINY_DIFFUSION_STABLE_4GPU_CASES).isdisjoint(TINY_DIFFUSION_STARTUP_4GPU_CASES)
+    assert split(step["commands"][0]) == [
+        "bash",
+        ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh",
+        agent_pool.rsplit("_", 1)[1],
+        str(expected_count),
+        "40m",
+        artifacts.split("/")[1],
+        *nodes,
+        "-m",
+        markers,
+    ]
     for cuda_marker in ("cuda", "L4", "H100", "B200"):
         assert re.search(rf"\b{cuda_marker}\b", markers) is None
-
-    all_commands = "\n".join(commands)
-    assert "collection.txt" in all_commands
-    assert "pytest.xml" in all_commands
-    assert "pytest.log" in all_commands
-    assert "pytest-summary.txt" in all_commands
 
 
 def test_flux2_klein_tiny_diffusion_has_cold_start_headroom() -> None:
@@ -3237,30 +3237,50 @@ def test_minicpmo_accuracy_keeps_daily_nonblocking_and_promotes_seed_tts() -> No
             assert label not in text
 
 
-def test_qwen_image_21_accuracy_is_one_nonblocking_nightly_job() -> None:
-    step = _find_step("Qwen-Image 2.1 Accuracy", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
+@pytest.mark.parametrize(("case", "grade"), [("T2I", "Blocking"), ("IT2I", "NonBlocking")])
+def test_qwen_image_21_accuracy_nightly_splits_the_qualified_case(case: str, grade: str) -> None:
+    step = _find_step(f"Qwen-Image 2.1 {case} Accuracy", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == grade
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
+    assert step["source_file_dependencies"] == "diffusion_qwen_image_21_accuracy"
     commands = "\n".join(step["commands"])
     assert "full_model and diffusion and rocm and MI325 and cards_1" in commands
-    assert "--run-level full_model" in commands
-    assert "--collect-only" in commands
-    assert "exit 5" in commands
-    assert "pytest.xml" in commands
     assert step["env"]["QWEN_IMAGE_21_CALIBRATE"] == "0"
     assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
     assert "setup_reference.sh" in commands
-    assert "test_qwen_image_21_matches_reference[it2i]" in commands
-    assert "test_qwen_image_21_matches_reference[t2i]" in commands
-    assert "Expected exactly $${#nodes[@]} Qwen-Image 2.1 accuracy nodes" in commands
+    assert f"test_qwen_image_21_matches_reference[{case.lower()}]" in commands
+    other_case = "it2i" if case == "T2I" else "t2i"
+    assert f"test_qwen_image_21_matches_reference[{other_case}]" not in commands
+    assert 'exit "$$status"' in commands
+    assert "cp -a tests/e2e/accuracy/artifacts/." in commands
     accuracy_test = Path("tests/e2e/accuracy/qwen_image_21/test_qwen_image_21.py").read_text(encoding="utf-8")
     assert "write_accuracy_result" in accuracy_test
     assert "write_json_artifact" not in accuracy_test
+    if case == "T2I":
+        assert "run-rocm-diffusion-nightly.sh" in commands
+        assert "1 1 165m rocm-qwen-image-21-t2i" in commands
+        assert "status=$$?" in commands
+        assert step["artifact_paths"] == ["artifacts/rocm-qwen-image-21-t2i/**/*"]
+        assert step["env"]["ACC_BENCH_RESULT_DIR"] == (
+            "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen-image-21-t2i/accuracy-results"
+        )
+        dependencies = yaml.safe_load(AMD_SOURCE_DEPENDENCIES.read_text(encoding="utf-8"))["source_file_dependencies"]
+        for script in ("run-rocm-diffusion-nightly.sh", "assert-pytest-collection.sh"):
+            assert f".buildkite/amd/scripts/{script}" in dependencies["diffusion_qwen_image_21_accuracy"]
+        policy = json.loads(Path("tests/e2e/accuracy/qwen_image_21/thresholds.json").read_text(encoding="utf-8"))
+        assert policy["status"] == "selected"
+        assert policy["t2i"]["default"] == {"ssim": 0.99, "psnr": 40.0}
+        assert not policy.get("expected_xfail", {}).get("t2i")
+    else:
+        assert "--run-level full_model" in commands
+        assert "--collect-only" in commands
+        assert "exit 5" in commands
+        assert "pytest.xml" in commands
+        assert "Expected exactly $${#nodes[@]} Qwen-Image 2.1 accuracy nodes" in commands
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
-        text = pipeline_path.read_text(encoding="utf-8")
-        assert "Qwen-Image 2.1 Accuracy" not in text
+        assert f"Qwen-Image 2.1 {case} Accuracy" not in pipeline_path.read_text(encoding="utf-8")
 
 
 def test_minicpmo_4_5_perf_is_one_nonblocking_nightly_job() -> None:
@@ -4906,7 +4926,7 @@ _WORKER_ONE_CARD_NODES = (
 def test_worker_one_card_ready_stays_outside_r2_01() -> None:
     """READY blocks on the collected one-card worker nodes.
 
-    The V2/shared one-card cases retain their exact IDs after V1 removal. R2-01 still collects 1435 model-executor nodes and does not run them.
+    The V2/shared one-card cases retain their exact IDs after V1 removal. R2-01 still collects 1436 model-executor nodes and does not run them.
     """
     step = _find_step("ROCm · One-Card Worker GPU Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -4952,7 +4972,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1435" in r2_01_command
+    assert "assert-pytest-collection.sh 1436" in r2_01_command
     assert "tests/model_executor/" in r2_01_command
     for path in _WORKER_ONE_CARD_FILES:
         assert path not in r2_01_command
@@ -5060,7 +5080,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
 
     The marker selects both intermediate-buffer residency rows and the three
     device-copy GPU tests. #9552's worker files stay on the other job. R2-01
-    still collects 1435 model-executor nodes.
+    still collects 1436 model-executor nodes.
     """
     step = _find_step("ROCm · One-Card Worker Copy Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -5112,7 +5132,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1435" in r2_01_command
+    assert "assert-pytest-collection.sh 1436" in r2_01_command
     for path in _WORKER_COPY_FILES:
         assert path not in r2_01_command
 

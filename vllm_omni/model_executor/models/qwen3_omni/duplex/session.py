@@ -31,6 +31,7 @@ class QwenDuplexSessionState(DuplexModelSessionState):
     committed_audio_consume_started: bool = False
     deferred_response_create: bool = False
     deferred_precreate_response: bool = False
+    explicit_response_create_id: str | None = None
     continuation_owner_id: str | None = None
     continuation_units: int = 0
     pending_silence_task: asyncio.Task[bool] | None = None
