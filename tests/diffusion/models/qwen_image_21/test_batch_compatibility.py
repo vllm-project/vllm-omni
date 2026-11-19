@@ -9,6 +9,7 @@ import pytest
 import torch
 from PIL import Image
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import (
     get_qwen_image_21_pre_process_func,
 )
@@ -61,7 +62,7 @@ def test_scheduler_groups_by_condition_layout(preprocess, scheduler_class, first
     first = preprocess(make_request("first", first_sizes))
     second = preprocess(make_request("second", second_sizes, color="blue"))
     scheduler = scheduler_class()
-    scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+    scheduler.initialize(OmniDiffusionConfig(max_num_seqs=2, diffusion_attention_schedule=None))
     scheduler.add_request(first)
     scheduler.add_request(second)
 
@@ -106,7 +107,7 @@ def test_late_prefill_waits_until_all_decode_requests_finish(preprocess):
     from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 
     scheduler = StepScheduler()
-    scheduler.initialize(SimpleNamespace(max_num_seqs=3))
+    scheduler.initialize(OmniDiffusionConfig(max_num_seqs=3, diffusion_attention_schedule=None))
     for request_id in ("a", "b"):
         scheduler.add_request(preprocess(make_request(request_id, [])))
     wave = scheduler.schedule()
