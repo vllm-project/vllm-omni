@@ -8,15 +8,17 @@ from dataclasses import replace
 import pytest
 import torch
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, PackedPaddingMetadata
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.diffusion.attention.backends.sparge_attn import (
+    _SM90_SPARSE_ENTRY_POINT,
     SpargeAttentionBackend,
     SpargeAttentionImpl,
 )
 from vllm_omni.diffusion.attention.capabilities import (
     CompilationMode,
     ExecutionContext,
+    MaskMode,
     ParallelStrategy,
     SupportStatus,
 )
@@ -48,24 +50,38 @@ def fake_ark(monkeypatch):
 def test_registry_resolves_sparge_backend():
     assert DiffusionAttentionBackendEnum.SPARGE_ATTN.get_class() is SpargeAttentionBackend
     assert SpargeAttentionBackend.get_name() == "SPARGE_ATTN"
-    assert SpargeAttentionBackend.supported_platforms == ("xpu",)
+    assert SpargeAttentionBackend.supported_platforms == ("xpu", "cuda")
     assert SpargeAttentionBackend.get_supported_head_sizes() == [64, 128]
 
 
-def test_validate_available_reports_missing_package(monkeypatch):
+@pytest.fixture
+def xpu_platform(monkeypatch):
+    module = sys.modules["vllm_omni.diffusion.attention.backends.sparge_attn"]
+    monkeypatch.setattr(module, "current_omni_platform", types.SimpleNamespace(is_cuda=lambda: False))
+    return module
+
+
+@pytest.fixture
+def cuda_platform(monkeypatch):
+    module = sys.modules["vllm_omni.diffusion.attention.backends.sparge_attn"]
+    monkeypatch.setattr(module, "current_omni_platform", types.SimpleNamespace(is_cuda=lambda: True))
+    return module
+
+
+def test_validate_available_reports_missing_package(monkeypatch, xpu_platform):
     monkeypatch.setitem(sys.modules, "auto_round_kernel", None)
     with pytest.raises(ImportError, match="pip install auto-round-lib"):
         SpargeAttentionBackend.validate_available()
 
 
-def test_validate_available_reports_missing_kernel(monkeypatch):
+def test_validate_available_reports_missing_kernel(monkeypatch, xpu_platform):
     package = types.ModuleType("auto_round_kernel")
     monkeypatch.setitem(sys.modules, "auto_round_kernel", package)
     with pytest.raises(ImportError, match="ARK XPU sparse attention kernel"):
         SpargeAttentionBackend.validate_available()
 
 
-def test_validate_available_accepts_ark_kernel(fake_ark):
+def test_validate_available_accepts_ark_kernel(fake_ark, xpu_platform):
     SpargeAttentionBackend.validate_available()
 
 
@@ -159,7 +175,7 @@ def test_cross_head_geometry(q_heads, kv_heads, expected):
         ({"sparge_q_block_tokens": 64, "sparge_q_tile_override": 256}, "requires q_tile_override"),
     ],
 )
-def test_invalid_tuning_is_rejected(kwargs, match):
+def test_invalid_tuning_is_rejected(kwargs, match, xpu_platform):
     with pytest.raises(ValueError, match=match):
         SpargeAttentionImpl(8, 128, 0.125, backend_kwargs=kwargs)
 
@@ -222,3 +238,273 @@ def test_unverified_execution_path_is_not_advertised(change):
     context = replace(ExecutionContext(platform="xpu"), **change)
     result = impl.resolve_execution_path(context, query, query, query, None)
     assert result.support.status is SupportStatus.UNMIGRATED
+
+
+@pytest.fixture
+def fake_spas_cuda(monkeypatch):
+    package = types.ModuleType("spas_sage_attn")
+    calls = []
+
+    def kernel(query, key, value, **kwargs):
+        calls.append((query, key, value, kwargs))
+        return query.clone()
+
+    setattr(package, "spas_sage2_attn_meansim_topk_cuda", kernel)
+    qattn = types.ModuleType("spas_sage_attn._qattn")
+    setattr(qattn, _SM90_SPARSE_ENTRY_POINT, object())
+    setattr(package, "_qattn", qattn)
+    monkeypatch.setitem(sys.modules, "spas_sage_attn", package)
+    monkeypatch.setitem(sys.modules, "spas_sage_attn._qattn", qattn)
+    return calls
+
+
+def test_cuda_packed_padding_is_sliced_before_the_kernel(fake_spas_cuda):
+    impl = SpargeAttentionImpl(4, 128, 0.125)
+    query = torch.randn(1, 300, 4, 128, dtype=torch.bfloat16)
+    key = torch.randn(1, 300, 4, 128, dtype=torch.bfloat16)
+    value = torch.randn(1, 300, 4, 128, dtype=torch.bfloat16)
+    metadata = AttentionMetadata(
+        packed_padding=PackedPaddingMetadata(
+            q_length=200,
+            kv_length=200,
+            cu_seqlens_q=torch.tensor([0, 200], dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 200], dtype=torch.int32),
+        ),
+        extra={"cu_seqlens_q": torch.tensor([0, 200, 300], dtype=torch.int32)},
+    )
+
+    output = impl.forward_cuda(query, key, value, metadata)
+
+    assert output.shape == query.shape
+    called_query, called_key, called_value, kwargs = fake_spas_cuda[0]
+    assert called_query.shape[1] == 200
+    assert called_key.shape[1] == 200
+    assert called_value.shape[1] == 200
+    assert kwargs["tensor_layout"] == "NHD"
+    assert kwargs["topk"] == 0.5
+    assert torch.count_nonzero(output[:, 200:]) == 0
+
+
+def test_cuda_short_query_uses_dense_and_skips_the_sparse_kernel(fake_spas_cuda):
+    # The kernel needs >=128 query rows, and zero-padding a shorter query would
+    # put pad rows into the first meansim tile and change block selection for
+    # the real rows. Short calls must not enter the sparse kernel at all.
+    impl = SpargeAttentionImpl(4, 128, 0.125)
+    query = torch.randn(1, 64, 4, 128, dtype=torch.float16)
+    key = torch.randn(1, 160, 4, 128, dtype=torch.float16)
+    value = torch.randn(1, 160, 4, 128, dtype=torch.float16)
+
+    output = impl.forward_cuda(query, key, value)
+
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), scale=0.125
+    ).transpose(1, 2)
+    assert fake_spas_cuda == []
+    assert output.shape == query.shape
+    torch.testing.assert_close(output, expected)
+
+
+def test_cuda_raw_cu_seqlens_without_packed_padding_is_rejected(fake_spas_cuda):
+    # max_seqlen_* is per document, not a prefix of the packed tensor: slicing it
+    # as one prefix would drop later documents or keep padding.
+    impl = SpargeAttentionImpl(4, 128, 0.125)
+    query = torch.randn(1, 300, 4, 128, dtype=torch.float16)
+    metadata = AttentionMetadata(
+        extra={
+            "cu_seqlens_q": torch.tensor([0, 100, 120, 300], dtype=torch.int32),
+            "cu_seqlens_k": torch.tensor([0, 100, 120, 300], dtype=torch.int32),
+            "max_seqlen_q": 180,
+            "max_seqlen_k": 180,
+        },
+    )
+    with pytest.raises(NotImplementedError, match="packed_padding"):
+        impl.forward_cuda(query, query, query, metadata)
+    assert fake_spas_cuda == []
+
+
+def test_cuda_raw_cu_seqlens_execution_path_is_unsupported():
+    impl = SpargeAttentionImpl(4, 128, 0.125)
+    query = torch.empty(1, 300, 4, 128, dtype=torch.float16)
+    metadata = AttentionMetadata(
+        extra={"cu_seqlens_q": torch.tensor([0, 100, 200], dtype=torch.int32)},
+    )
+    result = impl.resolve_execution_path(ExecutionContext(platform="cuda"), query, query, query, metadata)
+    assert result.support.status is SupportStatus.UNSUPPORTED
+    assert "packed_padding" in result.support.reason
+
+
+def test_cuda_short_kv_matches_the_kernel_contract(fake_spas_cuda):
+    # SpargeAttn only asserts on the query length; short text K/V is legal.
+    impl = SpargeAttentionImpl(4, 128, 0.125)
+    query = torch.randn(1, 256, 4, 128, dtype=torch.float16)
+    key = torch.randn(1, 96, 4, 128, dtype=torch.float16)
+
+    output = impl.forward_cuda(query, key, key)
+
+    assert output.shape == query.shape
+    assert fake_spas_cuda[0][1].shape[1] == 96
+    assert fake_spas_cuda[0][0].shape[1] == 256
+
+
+def test_cuda_requires_equal_head_counts(fake_spas_cuda):
+    impl = SpargeAttentionImpl(8, 128, 0.125, num_kv_heads=2)
+    query = torch.randn(1, 256, 8, 128, dtype=torch.float16)
+    key = torch.randn(1, 256, 2, 128, dtype=torch.float16)
+    with pytest.raises(NotImplementedError, match="equal query and KV head counts"):
+        impl.forward_cuda(query, key, key)
+
+
+def test_cuda_execution_path_is_supported_with_packing():
+    impl = SpargeAttentionImpl(4, 128, 0.125)
+    query = torch.empty(1, 256, 4, 128, dtype=torch.bfloat16)
+    context = ExecutionContext(platform="cuda", require_fullgraph=True)
+    metadata = AttentionMetadata(
+        packed_padding=PackedPaddingMetadata(
+            q_length=200,
+            kv_length=200,
+            cu_seqlens_q=torch.tensor([0, 200], dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 200], dtype=torch.int32),
+        ),
+    )
+    result = impl.resolve_execution_path(context, query, query, query, metadata)
+    assert result.support.status is SupportStatus.SUPPORTED
+    assert result.compilation_mode is CompilationMode.CUSTOM_OP
+
+
+def test_cuda_gqa_execution_path_is_unsupported():
+    impl = SpargeAttentionImpl(8, 128, 0.125, num_kv_heads=2)
+    query = torch.empty(1, 256, 8, 128, dtype=torch.float16)
+    key = torch.empty(1, 256, 2, 128, dtype=torch.float16)
+    result = impl.resolve_execution_path(ExecutionContext(platform="cuda"), query, key, key, None)
+    assert result.support.status is SupportStatus.UNSUPPORTED
+    assert "equal query and KV head counts" in result.support.reason
+
+
+def test_cuda_validate_available_requires_spas_sage_attn(monkeypatch):
+    module = sys.modules["vllm_omni.diffusion.attention.backends.sparge_attn"]
+    monkeypatch.setattr(module, "current_omni_platform", types.SimpleNamespace(is_cuda=lambda: True))
+    monkeypatch.setitem(sys.modules, "spas_sage_attn", None)
+    with pytest.raises(ImportError, match="SpargeAttn CUDA extension"):
+        SpargeAttentionBackend.validate_available()
+
+
+def test_cuda_validate_available_accepts_spas_sage_attn(monkeypatch, fake_spas_cuda):
+    module = sys.modules["vllm_omni.diffusion.attention.backends.sparge_attn"]
+    monkeypatch.setattr(module, "current_omni_platform", types.SimpleNamespace(is_cuda=lambda: True))
+    SpargeAttentionBackend.validate_available()
+
+
+def test_cuda_causal_execution_path_is_unsupported():
+    impl = SpargeAttentionImpl(4, 128, 0.125, causal=True)
+    query = torch.empty(1, 256, 4, 128, dtype=torch.float16)
+    result = impl.resolve_execution_path(ExecutionContext(platform="cuda"), query, query, query, None)
+    assert result.support.status is SupportStatus.UNSUPPORTED
+    assert "causal" in result.support.reason
+
+
+def test_cuda_causal_forward_is_rejected(fake_spas_cuda):
+    impl = SpargeAttentionImpl(4, 128, 0.125, causal=True)
+    query = torch.randn(1, 256, 4, 128, dtype=torch.float16)
+    with pytest.raises(NotImplementedError, match="causal"):
+        impl.forward_cuda(query, query, query)
+    assert fake_spas_cuda == []
+
+
+def test_cuda_validate_available_requires_sm90_entry_point(monkeypatch, fake_spas_cuda):
+    module = sys.modules["vllm_omni.diffusion.attention.backends.sparge_attn"]
+    monkeypatch.setattr(module, "current_omni_platform", types.SimpleNamespace(is_cuda=lambda: True))
+    monkeypatch.setattr(module, "_cuda_device_capability", lambda: (9, 0))
+    qattn = sys.modules["spas_sage_attn._qattn"]
+    monkeypatch.delattr(qattn, _SM90_SPARSE_ENTRY_POINT)
+    with pytest.raises(ImportError, match="SM90"):
+        SpargeAttentionBackend.validate_available()
+
+
+def test_cuda_validate_available_accepts_sm90_entry_point(monkeypatch, fake_spas_cuda):
+    module = sys.modules["vllm_omni.diffusion.attention.backends.sparge_attn"]
+    monkeypatch.setattr(module, "current_omni_platform", types.SimpleNamespace(is_cuda=lambda: True))
+    monkeypatch.setattr(module, "_cuda_device_capability", lambda: (9, 0))
+    SpargeAttentionBackend.validate_available()
+
+
+def test_cuda_short_query_execution_path_reports_dense():
+    impl = SpargeAttentionImpl(4, 128, 0.125)
+    query = torch.empty(1, 64, 4, 128, dtype=torch.bfloat16)
+    context = ExecutionContext(platform="cuda", require_fullgraph=True)
+    result = impl.resolve_execution_path(context, query, query, query, None)
+    assert result.support.status is SupportStatus.SUPPORTED
+    assert result.compilation_mode is CompilationMode.TRACEABLE
+    assert result.path == "sparge_dense_short_query"
+
+
+def test_cuda_sparse_execution_path_keeps_custom_op():
+    impl = SpargeAttentionImpl(4, 128, 0.125)
+    query = torch.empty(1, 256, 4, 128, dtype=torch.bfloat16)
+    result = impl.resolve_execution_path(ExecutionContext(platform="cuda"), query, query, query, None)
+    assert result.support.status is SupportStatus.SUPPORTED
+    assert result.compilation_mode is CompilationMode.CUSTOM_OP
+    assert result.path == "sparge_int8"
+
+
+def test_cuda_unsupported_arch_is_rejected(monkeypatch, fake_spas_cuda):
+    module = sys.modules["vllm_omni.diffusion.attention.backends.sparge_attn"]
+    monkeypatch.setattr(module, "current_omni_platform", types.SimpleNamespace(is_cuda=lambda: True))
+    monkeypatch.setattr(module, "_cuda_device_capability", lambda: (10, 0))
+    with pytest.raises(ImportError, match="8.0/8.6/8.7/8.9/9.0"):
+        SpargeAttentionBackend.validate_available()
+
+
+def test_cuda_sm80_arch_skips_the_sm90_entry_point_check(monkeypatch, fake_spas_cuda):
+    module = sys.modules["vllm_omni.diffusion.attention.backends.sparge_attn"]
+    package = sys.modules["spas_sage_attn"]
+    monkeypatch.setattr(module, "current_omni_platform", types.SimpleNamespace(is_cuda=lambda: True))
+    monkeypatch.setattr(module, "_cuda_device_capability", lambda: (8, 0))
+    monkeypatch.delitem(sys.modules, "spas_sage_attn._qattn")
+    monkeypatch.delattr(package, "_qattn")
+    SpargeAttentionBackend.validate_available()
+
+
+def test_cuda_ignores_xpu_tiling_knobs(cuda_platform):
+    # XPU-only knobs must not be validated on CUDA; the CUDA kernel owns its tiling.
+    impl = SpargeAttentionImpl(
+        8,
+        128,
+        0.125,
+        backend_kwargs={"sparge_q_block_tokens": 64, "sparge_k_block_tokens": 128},
+    )
+    assert impl.q_block_tokens == 64
+    assert impl.k_block_tokens == 128
+
+
+def test_cuda_warns_only_for_explicit_tiling_knobs(cuda_platform, monkeypatch):
+    calls = []
+    stub = types.SimpleNamespace(
+        warning=lambda *args, **kwargs: None,
+        warning_once=lambda *args, **kwargs: calls.append(args),
+    )
+    monkeypatch.setattr(cuda_platform, "logger", stub)
+
+    SpargeAttentionImpl(8, 128, 0.125)
+    assert calls == []
+
+    SpargeAttentionImpl(8, 128, 0.125, backend_kwargs={"sparge_q_tile_override": 256})
+    assert len(calls) == 1
+
+
+def test_cuda_padding_mask_mode_is_not_advertised():
+    impl = SpargeAttentionImpl(4, 128, 0.125)
+    query = torch.empty(1, 256, 4, 128, dtype=torch.bfloat16)
+    context = ExecutionContext(platform="cuda", mask_mode=MaskMode.PADDING)
+    result = impl.resolve_execution_path(context, query, query, query, None)
+    assert result.support.status is SupportStatus.UNMIGRATED
+
+
+def test_cuda_short_query_compiles_fullgraph(cuda_platform):
+    # The short-query path must stay traceable: the resolver advertises it as
+    # CompilationMode.TRACEABLE, so a fullgraph compile may not hit a graph break
+    # on the informational log line.
+    impl = SpargeAttentionImpl(4, 128, 0.125)
+    query = torch.randn(1, 16, 4, 128, dtype=torch.bfloat16)
+    expected = impl.forward_cuda(query, query, query)
+    actual = torch.compile(impl.forward_cuda, fullgraph=True)(query, query, query)
+    torch.testing.assert_close(actual, expected)
