@@ -158,6 +158,48 @@ def test_mrv2_output_empty_condition_and_length_cap() -> None:
         assert talker.take_mrv2_forced_eos(batch, None, 1).tolist() == [forced]
 
 
+_OPEN_BLOCK = {"meta": {"turn_chunk": True, "turn_chunk_close": False, "turn_chunk_max_codes": 200}}
+_CLOSING_BLOCK = {"meta": {"turn_chunk": True, "turn_chunk_close": True, "turn_chunk_max_codes": 200}}
+
+
+def test_mrv2_single_frame_open_turn_chunk_block_stops_at_its_code_cap() -> None:
+    """Without the K-step path, an open block still ends at the cap the bridge charged."""
+    talker = _talker()
+    prompt_lens = {0: 50, 1: 60, 2: 70}
+    buffers = [_OPEN_BLOCK, _CLOSING_BLOCK, {}]
+    for step, forced in ((198, [False, False, False]), (199, [True, False, False])):
+        rows = [
+            dict(slot=slot, prompt_len=prompt_len, computed=prompt_len + step - 1, span=[5], prefill=False)
+            for slot, prompt_len in prompt_lens.items()
+        ]
+        batch, _ = _batch(rows)
+        talker.make_omni_output_mrv2(
+            torch.zeros((3, 4)),
+            input_batch=batch,
+            req_states=_req_states(prompt_lens),
+            model_intermediate_buffer=buffers,
+        )
+        assert talker.take_mrv2_forced_eos(batch, None, 3).tolist() == forced
+
+
+def test_mrv2_open_turn_chunk_cap_maps_to_each_requests_draft_rows() -> None:
+    talker = _talker()
+    prompt_lens = {0: 50, 1: 60}
+    rows = [
+        # Rows at steps 198, 199 and 200: the last two pass the 200-code cap.
+        dict(slot=0, prompt_len=50, computed=50 + 197, span=[5, 6, 7], prefill=False, drafts=2),
+        dict(slot=1, prompt_len=60, computed=60 + 198, span=[5], prefill=False),
+    ]
+    batch, padded = _batch(rows)
+    talker.make_omni_output_mrv2(
+        torch.zeros((padded, 4)),
+        input_batch=batch,
+        req_states=_req_states(prompt_lens),
+        model_intermediate_buffer=[_OPEN_BLOCK, {}],
+    )
+    assert talker.take_mrv2_forced_eos(batch, None, 4).tolist() == [False, True, True, False]
+
+
 @pytest.mark.parametrize("forced", [None, [False, True]])
 def test_sampler_adapter_keeps_upstream_counts_and_only_forces_codec_eos(mocker, forced):
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import MiniCPMO45TalkerSampler

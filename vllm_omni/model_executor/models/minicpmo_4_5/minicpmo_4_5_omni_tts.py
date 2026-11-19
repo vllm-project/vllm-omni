@@ -142,6 +142,23 @@ _DUPLEX_CODEC_FRAMES_PER_CHUNK = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK - 1
 _DUPLEX_TURN_END_BOUNDARY_MASK_STEPS = 5
 
 
+def _turn_chunk_open_block_cap(info: Mapping[str, Any] | None) -> int | None:
+    """Codes an open turn-chunked block may take, or None for any other condition.
+
+    generate_with_buffer's per-block ceiling, lowered to the cap the bridge
+    (``llm2tts_chunked``) counted against the Talker context for this block.
+    """
+    if not isinstance(info, Mapping) or info.get("native_duplex") is True:
+        return None
+    meta = info.get("meta")
+    if not isinstance(meta, Mapping) or meta.get("turn_chunk") is not True or meta.get("turn_chunk_close") is True:
+        return None
+    block_cap = meta.get("turn_chunk_max_codes")
+    if not isinstance(block_cap, int) or isinstance(block_cap, bool) or block_cap <= 0:
+        return _TURN_CHUNK_CODEC_MAX_NEW_TOKENS
+    return min(block_cap, _TURN_CHUNK_CODEC_MAX_NEW_TOKENS)
+
+
 def _native_duplex_chunk_budget(meta: Mapping[str, Any] | None) -> tuple[int, int]:
     """Return ``(max_tokens, min_tokens)`` for one native-duplex Talker request."""
     turn_start = isinstance(meta, Mapping) and bool(meta.get("turn_start"))
@@ -1906,14 +1923,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 )
             if native_duplex:
                 max_tokens, min_tokens = _native_duplex_chunk_budget(meta if isinstance(meta, Mapping) else None)
-            elif turn_chunk and meta.get("turn_chunk_close") is not True:
-                # generate_with_buffer's per-block ceiling, lowered to the cap
-                # the bridge counted against the Talker context for this block.
+            elif (block_cap := _turn_chunk_open_block_cap(info_dict)) is not None:
                 remaining = int(self._tts_config.max_position_embeddings) - target_len
-                block_cap = meta.get("turn_chunk_max_codes")
-                if not isinstance(block_cap, int) or isinstance(block_cap, bool) or block_cap <= 0:
-                    block_cap = _TURN_CHUNK_CODEC_MAX_NEW_TOKENS
-                max_tokens = max(min(block_cap, _TURN_CHUNK_CODEC_MAX_NEW_TOKENS, remaining), 1)
+                max_tokens = max(min(block_cap, remaining), 1)
                 min_tokens = None
             else:
                 # MiniCPMTTS.generate()'s max_new_token, clamped to what the
@@ -2359,6 +2371,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         remaining = int(self._tts_config.max_position_embeddings) - prompt_len
         if not native_duplex_batch:
             limit = torch.clamp(remaining, min=1, max=_OFFLINE_CODEC_MAX_NEW_TOKENS) - 1
+            block_caps = [_turn_chunk_open_block_cap(info) for info in model_intermediate_buffer[:num_reqs]]
+            if any(cap is not None for cap in block_caps):
+                # Open turn-chunked blocks stop at the cap the bridge charged,
+                # as on the K-step path.
+                caps = [_OFFLINE_CODEC_MAX_NEW_TOKENS if cap is None else cap for cap in block_caps]
+                caps += [_OFFLINE_CODEC_MAX_NEW_TOKENS] * (num_reqs - len(caps))
+                row_caps = index_to_device(caps, device, dtype=torch.long)
+                if num_rows != num_reqs:
+                    first_rows = input_batch.expanded_local_pos[:num_rows].long() == 0
+                    row_caps = row_caps.index_select(0, first_rows.long().cumsum(0) - 1)
+                limit = torch.minimum(limit, row_caps - 1)
             self._mrv2_forced_eos = empty | eos_input | (step >= limit)
             self._mrv2_masked_eos = None
         else:
