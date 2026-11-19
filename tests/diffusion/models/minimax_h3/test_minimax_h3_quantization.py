@@ -346,7 +346,7 @@ def test_pipeline_resolves_transformer_component_quant_config():
     assert _resolve_component_quant_config(transformer_config, "transformer") is transformer_config
 
 
-@pytest.mark.parametrize("case", ["offline", "online", "missing_op", "non_int8", "wrapped"])
+@pytest.mark.parametrize("case", ["offline", "online", "missing_sdk", "missing_native", "non_int8", "wrapped"])
 def test_mlp_optional_mindiesd_int8_swiglu(mocker, case):
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear, UnquantizedLinearMethod
 
@@ -390,17 +390,17 @@ def test_mlp_optional_mindiesd_int8_swiglu(mocker, case):
     fused_output = torch.arange(30, dtype=x.dtype).reshape(6, 5)
     torch_npu = ModuleType("torch_npu")
     torch_npu.__dict__["npu_dynamic_quant"] = mocker.Mock(return_value=(quantized, pertoken_scale))
-    custom_ops = ModuleType("mindiesd.layers._custom_ops")
+    fused_ops = ModuleType("mindiesd.fused_ops")
     fused_op = mocker.Mock(return_value=fused_output)
-    if case != "missing_op":
-        custom_ops.__dict__["eagle_quant_batch_matmul_swiglu"] = fused_op
+    fused_ops.__dict__["eagle_quant_batch_matmul_swiglu"] = fused_op
+    if case == "missing_native":
+        fused_op.side_effect = ImportError("native SwiGLU unavailable")
     mocker.patch.dict(
         sys.modules,
         {
             "torch_npu": torch_npu,
             "mindiesd": ModuleType("mindiesd"),
-            "mindiesd.layers": ModuleType("mindiesd.layers"),
-            "mindiesd.layers._custom_ops": custom_ops,
+            "mindiesd.fused_ops": None if case == "missing_sdk" else fused_ops,
         },
     )
 
@@ -418,9 +418,13 @@ def test_mlp_optional_mindiesd_int8_swiglu(mocker, case):
         fc1.forward.assert_not_called()
         mlp.act_fn.assert_not_called()
     else:
-        x.reshape.assert_not_called()
-        torch_npu.npu_dynamic_quant.assert_not_called()
-        fused_op.assert_not_called()
+        if case == "missing_native":
+            torch_npu.npu_dynamic_quant.assert_called_once()
+            fused_op.assert_called_once()
+        else:
+            x.reshape.assert_not_called()
+            torch_npu.npu_dynamic_quant.assert_not_called()
+            fused_op.assert_not_called()
         fc1.forward.assert_called_once_with(x)
         mlp.act_fn.assert_called_once_with(linear_output)
         mlp.fc2.assert_called_once_with(activated)

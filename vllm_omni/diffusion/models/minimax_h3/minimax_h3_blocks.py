@@ -493,10 +493,8 @@ class MiniMaxH3Attention(nn.Module):
         q_raw, k_raw = q, k
         if qkv.device.type == "npu" and rope_table is not None:
             try:
-                from mindiesd.layers._custom_ops import eagle_split_norm_rope_concat
-            except ImportError:
-                pass
-            else:
+                from mindiesd.fused_ops import eagle_split_norm_rope_concat
+
                 # H3 packs half-width cos and sin side by side; Eagle takes contiguous halves.
                 cos, sin = rope_table.reshape(total, 2, self.rot_dim // 2).transpose(0, 1).contiguous().unbind(0)
                 q, k, v = eagle_split_norm_rope_concat(
@@ -507,11 +505,15 @@ class MiniMaxH3Attention(nn.Module):
                     sin,
                     [self.num_heads, self.num_kv_heads, self.num_kv_heads],
                     norm_type=3,  # weighted RMSNorm
-                    rope_type=1,  # HALF (NeoX)
+                    rope_mode=1,  # HALF (NeoX)
                     rotary_dim=self.rot_dim,
-                    eps=self.q_norm.variance_epsilon,
+                    epsilon=self.q_norm.variance_epsilon,
                     output_bnsd=False,  # preserve [local tokens, local heads, head_dim]
                 )
+            except ImportError:
+                # The SD facade imports its optional native operator on first use.
+                pass
+            else:
                 return q, k, v, q_raw, k_raw
 
         if rope_table is None:
@@ -645,11 +647,8 @@ class MiniMaxH3MLP(nn.Module):
 
             if isinstance(self.fc1.quant_method, NPUInt8LinearMethod):
                 try:
-                    from mindiesd.layers._custom_ops import eagle_quant_batch_matmul_swiglu
-                except ImportError:
-                    pass
-                else:
                     import torch_npu
+                    from mindiesd.fused_ops import eagle_quant_batch_matmul_swiglu
 
                     quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x.reshape(-1, x.shape[-1]))
                     hidden = eagle_quant_batch_matmul_swiglu(
@@ -658,8 +657,11 @@ class MiniMaxH3MLP(nn.Module):
                         self.fc1.weight_scale,
                         pertoken_scale=pertoken_scale,
                         output_dtype=x.dtype,
-                    ).reshape(*x.shape[:-1], -1)
-                    out, _ = self.fc2(hidden)
+                    )
+                except ImportError:
+                    pass
+                else:
+                    out, _ = self.fc2(hidden.reshape(*x.shape[:-1], -1))
                     return out
         hidden, _ = self.fc1(x)
         hidden = self.act_fn(hidden)

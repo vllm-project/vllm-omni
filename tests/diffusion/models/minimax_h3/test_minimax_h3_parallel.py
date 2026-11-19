@@ -153,7 +153,7 @@ def test_project_qkv_calls_eagle_with_local_rope_halves(monkeypatch):
     q, k, _ = packed.view(7, 6, 128).split(2, dim=1)
     outputs = (object(), object(), object())
     op = Mock(return_value=outputs)
-    monkeypatch.setitem(sys.modules, "mindiesd.layers._custom_ops", SimpleNamespace(eagle_split_norm_rope_concat=op))
+    monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", SimpleNamespace(eagle_split_norm_rope_concat=op))
 
     actual_q, actual_k, actual_v, raw_q, raw_k = attention._project_qkv(packed, table)
 
@@ -165,21 +165,21 @@ def test_project_qkv_calls_eagle_with_local_rope_halves(monkeypatch):
     assert cos.is_contiguous() and sin.is_contiguous()
     torch.testing.assert_close(cos, table[:, :48], atol=0, rtol=0)
     torch.testing.assert_close(sin, table[:, 48:], atol=0, rtol=0)
-    assert op.call_args.kwargs == dict(norm_type=3, rope_type=1, rotary_dim=96, eps=1e-6, output_bnsd=False)
+    assert op.call_args.kwargs == dict(norm_type=3, rope_mode=1, rotary_dim=96, epsilon=1e-6, output_bnsd=False)
     assert (actual_q, actual_k, actual_v) == outputs
     for actual, expected in ((raw_q, q), (raw_k, k)):
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("mode", ["missing_op", "no_rope"])
+@pytest.mark.parametrize("mode", ["missing_sdk", "missing_native", "no_rope"])
 def test_project_qkv_preserves_fallback(monkeypatch, mode):
     from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
 
     attention, packed, table = _qkv_inputs()
     attention.qkv_proj = lambda x: (Mock(wraps=x, device=SimpleNamespace(type="npu")), None)
-    op = Mock()
-    interface = SimpleNamespace() if mode == "missing_op" else SimpleNamespace(eagle_split_norm_rope_concat=op)
-    monkeypatch.setitem(sys.modules, "mindiesd.layers._custom_ops", interface)
+    op = Mock(side_effect=ImportError("native QKV unavailable"))
+    interface = None if mode == "missing_sdk" else SimpleNamespace(eagle_split_norm_rope_concat=op)
+    monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", interface)
     q, k, v = packed.view(packed.shape[0], 6, 128).split(2, dim=1)
     if mode == "no_rope":
         table = None
@@ -189,7 +189,10 @@ def test_project_qkv_preserves_fallback(monkeypatch, mode):
     actual = attention._project_qkv(packed, table)
     for value, reference in zip(actual, (*expected, v, q, k)):
         torch.testing.assert_close(value, reference, atol=0, rtol=0)
-    op.assert_not_called()
+    if mode == "missing_native":
+        op.assert_called_once()
+    else:
+        op.assert_not_called()
 
 
 def test_h3_rope_table_materializes_local_rows_in_fused_kernel_layout():
