@@ -1023,7 +1023,15 @@ async def test_reaper_runs_as_a_background_task_and_survives_one_failure(monkeyp
     tasks = orchestrator._background_tasks()
     assert len(tasks) == 1
     task = asyncio.create_task(tasks[0])
-    await asyncio.sleep(0.05)
+    # Wait for the second reap instead of sampling a fixed window: the first
+    # failure's log.exception writes a multi-line traceback synchronously, and
+    # under CI stdout backpressure that alone can stall the event loop past
+    # any fixed sleep (observed: 93 ms in build 20129, killing the old 50 ms
+    # window). Only a dead reaper misses the 500 ms deadline.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 0.5
+    while calls["count"] < 2 and loop.time() < deadline:
+        await asyncio.sleep(0.01)
     orchestrator._shutdown_event.set()
     await task
     assert calls["count"] >= 2
@@ -2082,7 +2090,7 @@ async def test_capacity_validation_reuses_engine_expansion_and_recovers_after_re
         expanded["prompt_token_ids"] = [1] * 15
     await submit("fits")
     assert len(clients[0].add_request_calls) == 1
-    assert clients[0].add_request_calls[0][0].prompt_token_ids == [1] * 15
+    assert clients[0].add_request_calls[0][0].prompt_token_ids.tolist() == [1] * 15
     assert renderer.render_cmpl.call_count == 1 + int(rejected)
     assert processor.process_inputs.call_count == 1
 
