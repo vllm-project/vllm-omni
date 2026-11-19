@@ -1324,17 +1324,19 @@ class MiniMaxH3DiTModel(nn.Module):
             device=device,
             dtype=_BF16_DTYPE,
         )
-        embeddings.index_add_(
+        # The packed layout gives text, video and audio disjoint rows, so each row is written once into zeros:
+        # index_copy_ stores exactly what index_add_ would, without BF16 atomics (~0.7 ms each at 37k x 5376).
+        embeddings.index_copy_(
             0,
             text_local_pos,
             text_embed.to(_BF16_DTYPE)[: text_local_pos.shape[0]],
         )
-        embeddings.index_add_(
+        embeddings.index_copy_(
             0,
             img_local_pos,
             video_embed.to(_BF16_DTYPE)[: img_local_pos.shape[0]],
         )
-        embeddings.index_add_(
+        embeddings.index_copy_(
             0,
             audio_local_pos,
             audio_embed.to(_BF16_DTYPE)[: audio_local_pos.shape[0]],

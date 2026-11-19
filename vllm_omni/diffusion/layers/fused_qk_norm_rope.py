@@ -180,6 +180,79 @@ if HAS_TRITON:
         tl.store(out_ptr + out_offsets, output, mask=mask)
 
     @triton.jit
+    def _token_qk_norm_rope_kernel(
+        q_ptr,
+        k_ptr,
+        q_weight_ptr,
+        k_weight_ptr,
+        rope_table_ptr,
+        out_q_ptr,
+        out_k_ptr,
+        q_stride_t,
+        k_stride_t,
+        rope_stride_t,
+        out_q_stride_t,
+        out_k_stride_t,
+        num_heads: tl.constexpr,
+        head_dim: tl.constexpr,
+        rotary_half: tl.constexpr,
+        eps: tl.constexpr,
+        heads_per_program: tl.constexpr,
+    ):
+        """Half-split RMSNorm + RoPE of every head of one token of Q (even programs) or K (odd).
+
+        Each head group is the same [heads_per_program, head_dim] tile, with the same arithmetic, as
+        _rms_norm_rope_kernel, so the results are bit-identical to it; walking the groups inside one
+        program per token replaces tokens * ceil(heads / heads_per_program) programs per tensor, which
+        are instruction-bound at diffusion sequence lengths. Heads are contiguous (head stride == head_dim).
+        """
+        pid = tl.program_id(0)
+        token = (pid // 2).to(tl.int64)
+        if pid % 2 == 0:
+            in_ptr = q_ptr + token * q_stride_t
+            weight_ptr = q_weight_ptr
+            out_ptr = out_q_ptr + token * out_q_stride_t
+        else:
+            in_ptr = k_ptr + token * k_stride_t
+            weight_ptr = k_weight_ptr
+            out_ptr = out_k_ptr + token * out_k_stride_t
+        dims = tl.arange(0, head_dim)
+        rotary_dim = rotary_half * 2
+        pair_dims = tl.where(
+            dims < rotary_half,
+            dims + rotary_half,
+            tl.where(dims < rotary_dim, dims - rotary_half, dims),
+        )
+        freq_dims = tl.where(
+            dims < rotary_half,
+            dims,
+            tl.where(dims < rotary_dim, dims - rotary_half, 0),
+        )
+        weight = tl.load(weight_ptr + dims).to(tl.float32)
+        pair_weight = tl.load(weight_ptr + pair_dims).to(tl.float32)
+        table_offsets = token * rope_stride_t + freq_dims
+        cos = tl.load(rope_table_ptr + table_offsets).to(tl.float32)
+        sin = tl.load(rope_table_ptr + table_offsets + rotary_half).to(tl.float32)
+        for head_group in tl.static_range(0, (num_heads + heads_per_program - 1) // heads_per_program):
+            heads = head_group * heads_per_program + tl.arange(0, heads_per_program)
+            mask = heads[:, None] < num_heads
+            offsets = heads[:, None] * head_dim + dims[None, :]
+            x = tl.load(in_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+            inv_rms = tl.rsqrt(tl.sum(x * x, axis=1) / head_dim + eps)
+            normalized = (x * inv_rms[:, None] * weight[None, :]).to(tl.bfloat16)
+            pair_offsets = heads[:, None] * head_dim + pair_dims[None, :]
+            pair_x = tl.load(in_ptr + pair_offsets, mask=mask, other=0.0).to(tl.float32)
+            pair_normalized = (pair_x * inv_rms[:, None] * pair_weight[None, :]).to(tl.bfloat16)
+            first = normalized.to(tl.float32) * cos - pair_normalized.to(tl.float32) * sin
+            second = normalized.to(tl.float32) * cos + pair_normalized.to(tl.float32) * sin
+            output = tl.where(
+                dims < rotary_dim,
+                tl.where(dims < rotary_half, first, second),
+                normalized.to(tl.float32),
+            )
+            tl.store(out_ptr + offsets, output, mask=mask)
+
+    @triton.jit
     def _norm_rope_tile(
         in_ptr,
         weight_ptr,
@@ -702,6 +775,54 @@ def _launch_fused_rms_norm_rope(
     return out
 
 
+def _token_qk_norm_rope_supported(q: torch.Tensor, k: torch.Tensor) -> bool:
+    return (
+        q.shape == k.shape
+        and q.dtype == torch.bfloat16
+        and q.shape[1] <= 64
+        and q.stride(2) == 1
+        and k.stride(2) == 1
+        and q.stride(1) == q.shape[2]
+        and k.stride(1) == k.shape[2]
+    )
+
+
+def _launch_token_qk_norm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    rope_table: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    tokens, heads, head_dim = q.shape
+    out_q = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    out_k = torch.empty(k.shape, dtype=k.dtype, device=k.device)
+    if tokens == 0:
+        return out_q, out_k
+    _token_qk_norm_rope_kernel[(2 * tokens,)](
+        q,
+        k,
+        q_weight,
+        k_weight,
+        rope_table,
+        out_q,
+        out_k,
+        q.stride(0),
+        k.stride(0),
+        rope_table.stride(0),
+        out_q.stride(0),
+        out_k.stride(0),
+        num_heads=heads,
+        head_dim=head_dim,
+        rotary_half=rope_table.shape[-1] // 2,
+        eps=eps,
+        heads_per_program=_HEADS_PER_PROGRAM,
+        num_warps=8,
+    )
+    return out_q, out_k
+
+
 def _launch_fused_qk_norm_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -806,7 +927,9 @@ def _fused_qk_norm_rope_impl(
         return _launch_fused_qk_norm_rope(
             q, k, q_weight, k_weight, rope_table, eps, interleaved=True, cuda_rms_norm=cuda_rms_norm
         )
-    # Half-split production traffic keeps the historical per-tensor kernel;
+    if _token_qk_norm_rope_supported(q, k):
+        return _launch_token_qk_norm_rope(q, k, q_weight, k_weight, rope_table, eps)
+    # Other half-split layouts keep the historical per-tensor kernel;
     # _qk_norm_rope_kernel's half-split mode awaits the maintainers' call.
     return (
         _launch_fused_rms_norm_rope(q, q_weight, rope_table, eps),

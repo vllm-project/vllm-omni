@@ -9,6 +9,8 @@ from vllm.triton_utils import tl, triton
 
 # Ascend CANN limits the launch coreDim to uint16.
 _MAX_1D_GRID_SIZE = 65535
+# Column block of the CUDA gate kernel.
+_GATE_BLOCK_N = 2048
 
 
 def _iter_row_chunks(rows: int):
@@ -73,6 +75,38 @@ def _indexed_gate_kernel(
 ):
     row = tl.program_id(0) + row_offset
     columns = tl.arange(0, block_n)
+    mask = columns < hidden_size
+    index = tl.load(indices_ptr + row * stride_indices)
+
+    x = tl.load(x_ptr + row * stride_x_row + columns, mask=mask, other=0.0).to(tl.float32)
+    gate = tl.load(gate_ptr + index * stride_gate_row + columns, mask=mask, other=0.0).to(tl.float32)
+    other = tl.load(other_ptr + row * stride_other_row + columns, mask=mask, other=0.0).to(tl.float32)
+
+    tl.store(
+        output_ptr + row * stride_output_row + columns,
+        x + gate * other,
+        mask=mask,
+    )
+
+
+@triton.jit
+def _indexed_gate_column_tiled_kernel(
+    output_ptr,
+    x_ptr,
+    gate_ptr,
+    other_ptr,
+    indices_ptr,
+    hidden_size,
+    stride_output_row,
+    stride_x_row,
+    stride_gate_row,
+    stride_other_row,
+    stride_indices,
+    block_n: tl.constexpr,
+):
+    # Same arithmetic as _indexed_gate_kernel over one column block of one row.
+    row = tl.program_id(0).to(tl.int64)
+    columns = tl.program_id(1) * block_n + tl.arange(0, block_n)
     mask = columns < hidden_size
     index = tl.load(indices_ptr + row * stride_indices)
 
@@ -219,6 +253,25 @@ def indexed_gate(
     rows, hidden_size = x.shape
     if rows == 0:
         return output
+    if x.device.type == "cuda":
+        # A few column blocks per row instead of one whole padded row per program: H3's 5,376-wide rows
+        # otherwise leave a third of an 8,192-lane block masked, and the gate is elementwise per column.
+        _indexed_gate_column_tiled_kernel[(rows, triton.cdiv(hidden_size, _GATE_BLOCK_N))](
+            output,
+            x,
+            gate,
+            other,
+            indices,
+            hidden_size,
+            output.stride(0),
+            x.stride(0),
+            gate.stride(0),
+            other.stride(0),
+            indices.stride(0),
+            block_n=_GATE_BLOCK_N,
+            num_warps=4,
+        )
+        return output
     _launch_row_chunks(
         _indexed_gate_kernel,
         rows,
@@ -303,6 +356,12 @@ def indexed_gate_rms_norm_scale_shift(
             input_dtype
         )
         return residual_out, modulated_out
+    if residual.device.type == "cuda" and residual.dtype == torch.bfloat16:
+        # The fused kernel stores the BF16-rounded residual and normalizes that value, which is exactly the
+        # gate kernel followed by the RMSNorm kernel (same FP32 reduction over the same padded row). Two lean
+        # passes run faster on CUDA than one program holding six full-row operands.
+        residual_out = indexed_gate(residual, gate, branch, indices)
+        return residual_out, rms_norm_indexed_scale_shift(residual_out, weight, shift, scale, indices, eps)
     residual_out = torch.empty_like(residual)
     modulated_out = torch.empty_like(residual)
     rows, hidden_size = residual.shape
