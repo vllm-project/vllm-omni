@@ -31,6 +31,19 @@ reference media is still encoded locally.
 
 The generated MP4 contains H.264 video and synchronized stereo audio.
 
+## Optional LiteVAE video decoder
+
+To use the standard non-INT8 H3 Lite decoder, add:
+
+```bash
+--additional-config '{"lightvae_decoder_path":"/weights/lightvae-lite-h3-decoder.safetensors"}'
+```
+
+LiteVAE changes the video decoder while preserving the video encoder and audio
+VAE. Omit `video_vae_decoder` when selecting LiteVAE. See the
+[LiteVAE guide](../../docs/user_guide/diffusion/light_vae.md) for checkpoint
+requirements, decoder selection, and quality review.
+
 ## Prerequisites
 
 The checkpoint requires Hugging Face access approval. Authenticate once;
@@ -609,16 +622,18 @@ Select the device with `HIP_VISIBLE_DEVICES` (not `CUDA_VISIBLE_DEVICES`), drop 
 CUDA-only `FLASHINFER_DISABLE_VERSION_CHECK`, and install without the `[fa4]` extra
 (FA4 is CUDA-only). The VAE uses AITER GroupNorm on ROCm.
 
-Install (ROCm wheel + source vLLM-Omni):
+For this source checkout, build the image with the matching vLLM 0.34.0
+ROCm runtime from the Omni repository root:
 
 ```bash
-pip install "vllm==0.26.0+rocm723" \
-  --extra-index-url https://wheels.vllm.ai/rocm/0.26.0/rocm723
-VLLM_OMNI_TARGET_DEVICE=rocm pip install -e . --no-build-isolation
+docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm:v034-source .
 ```
 
-Prebuilt image: `vllm/vllm-omni-rocm:minimax-h3`. All tasks work out of the box:
-the image bundles TorchCodec (for image+audio Ref2VA) and `ffmpeg` (for
+See the [ROCm installation guide](../../docs/getting_started/installation/gpu/rocm.inc.md)
+for source/runtime details. Container and native H3 validation on ROCm remain
+pending for this checkout; an older ROCm wheel cannot provide its 0.34 APIs.
+
+Historical prebuilt image: `vllm/vllm-omni-rocm:minimax-h3`. That image bundles TorchCodec (for image+audio Ref2VA) and `ffmpeg` (for
 video-reference Ref2VA).
 
 ### ROCm single GPU
@@ -1116,6 +1131,9 @@ not supplied by this feature.
 
 ### Latent-tail continuation with global temporal positions (A+B)
 
+To continue a finished job in a separate request, see
+[MiniMax H3 Continuation Across Requests](../../docs/serving/videos_api.md#minimax-h3-continuation-across-requests).
+
 `long_video=true` selects this mode by default for Ref2VA. It can also be selected
 explicitly with `long_video_mode=continuation`. This experimental mode supports
 Ref2VA request execution with uncached denoising (`quality=lossless`); step
@@ -1207,7 +1225,7 @@ full and windowed latents.
 
 ## Request-scoped sampler
 
-H3 supports `euler` (the default) and `res_multistep`. Select the sampler per
+H3 supports `euler` (the default), `res_multistep`, and `heun`. Select the sampler per
 request; it applies to both video and audio, using their separate sigma schedules.
 For the HTTP examples above, set `num_inference_steps=20` and add
 `"sampler":"res_multistep"` to the existing `extra_params` object. For example,
@@ -1230,7 +1248,11 @@ sampling_params = OmniDiffusionSamplingParams(
 )
 ```
 
-Both samplers use one DiT evaluation per step in request mode and step execution.
+`euler` and `res_multistep` use one DiT evaluation per step in request mode and
+step execution. `heun` evaluates the DiT a second time at the Euler proposal and
+averages the two derivatives, so an N-step schedule ending at zero uses `2N - 1`
+evaluations; the final step to zero is a plain Euler update. Heun needs uncached
+model runs, so it is rejected with `quality=high` or a server-wide cache backend.
 `res_multistep` retains the previous denoised prediction independently for each
 request and each stream; its first and final updates use Euler. Omitting `sampler`
 or selecting `euler` preserves the existing Euler update. Reducing the step count
@@ -1238,8 +1260,8 @@ reduces model evaluations, but quality depends on the prompt and configuration;
 20 RES steps are a candidate to compare against an Euler-50 reference.
 
 Requests using a fixed distilled `base_schedule` from a checkpoint or adapter
-must keep `sampler="euler"`. RES sampling with those schedules has not been
-validated and is rejected with `ValueError`.
+must keep `sampler="euler"`. RES and Heun sampling with those schedules have not
+been validated and are rejected with `ValueError`.
 
 ## Request-scoped quality
 
@@ -1545,7 +1567,7 @@ The two `ref2v` rows are not served by this FL2VA command. Start a
 already send `audio_flow_shift=3.0`.
 
 For FL2VA, change `task` and add `input_reference` as shown above. This
-integration is dynamic-only and does not support prefusion or LoRA composition. DLO is
+integration is dynamic-only and does not support prefusion. DLO is
 supported by keeping the request-switchable LoRA A/B buffers resident on the
 accelerator while DLO streams only the base blocks; budget for this additional
 fixed HBM usage. Model-level and standard layerwise offload remain unsupported.
@@ -1614,6 +1636,13 @@ differ from each other.
 The four-step adapter recipe has moved to the [FastH3 section](../FastVideo/README.md):
 [FastH3](../FastVideo/FastH3.md).
 
+### Open-H3-Regenerate-2K
+
+[Open-H3-Regenerate-2K](https://huggingface.co/Efficient-Large-Model/Open-H3-Regenerate-2K)
+re-renders a 768P draft from this model at 2560x1440 in three steps. It is a
+load-time adapter served as its own deployment; see
+[Open-H3-Regenerate-2K — H200](../Efficient-Large-Model/Open-H3-Regenerate-2K-H200.md).
+
 ### FastH3 8-Step V2 full checkpoint
 
 See [FastH3 V2 — T2VA](../FastVideo/FastH3-V2.md) in the
@@ -1659,7 +1688,7 @@ FL2VA takes a first frame, a last frame, or both, with the same
 
 The student was distilled at 8 steps with H3's default video/audio shifts of
 12/3 and the Euler sampler. A request with another step count, a shift
-override, `sampler=res_multistep`, or a `lora=` field is rejected. Add
+override, a non-Euler `sampler`, or a `lora=` field is rejected. Add
 `--quantization fp8` to run the DiT and text-encoder linears in FP8, including
 the linear branch's output projection.
 
@@ -1705,6 +1734,14 @@ H3 replayed the same way. Software: Ubuntu 22.04, driver 580.178.04, Python
 See [FastH3 Omni — Ref2VA](../FastVideo/FastH3-Omni.md) in the
 [FastH3 section](../FastVideo/README.md) for reference-conditioned generation.
 
+### ComfyUI-style LoRA adapters
+
+Use `--lora-backend peft` to load ComfyUI-style single-file A/B LoRA adapters using the native H3 parameter layout. Provide a server-local `.safetensors` path in the request's `lora` object.
+
+Use a `lora` array to combine multiple adapters, each with its own `scale`. These adapters can also be combined with the supported Turbo LoRA. Start with `scale=1.0` and adjust it to control adapter strength.
+
+Select a specific file when a directory contains multiple adapters. General Diffusers checkpoint conversion is not supported.
+
 ## Key parameters
 
 | Parameter | Recommended value | Notes |
@@ -1715,7 +1752,7 @@ See [FastH3 Omni — Ref2VA](../FastVideo/FastH3-Omni.md) in the
 | `duration` | Workload-specific | Decimal seconds in `extra_params`; converted to H3-compatible frame count |
 | `fps` | `24` | H3 output FPS is fixed |
 | `num_inference_steps` | `50` | Matches the reference accuracy workloads |
-| `extra_params.sampler` | `euler` | Per-request `euler` or `res_multistep` for both streams; fixed distilled schedules require Euler |
+| `extra_params.sampler` | `euler` | Per-request `euler`, `res_multistep`, or `heun` for both streams; fixed distilled schedules require Euler; Heun requires uncached runs |
 | `flow_shift` | `12` | Video sigma shift |
 | `audio_flow_shift` | `3` | Audio sigma shift, passed in `extra_params` |
 | `seed` | Task-specific | Use a fixed value for reproducibility |
@@ -1959,6 +1996,7 @@ reused as they are.
 | `latent_refine_max_tokens_per_rank` | `65536` | Reject larger refine layouts before denoising. Set `0` only after validating a larger deployment. |
 | `latent_upscale` | unset | A default target applied to every request, in the request's own format. A request overrides it, and `false` opts out. |
 | `latent_refine` | unset | A default refine strength applied to every request. A request overrides it, and `false` opts out. |
+| `latent_cache_clips` | `16` | Finished clips whose latents each DiT worker keeps for `continue_from`. `0` disables continuation. |
 
 The `latent_upscale` request value is a multiplier (`2.0`), `false`, or an
 object naming one mode: `{"scale": 2.0}`, `{"width": …, "height": …}` or
@@ -1994,6 +2032,9 @@ memory a full-length activation volume takes (10.1 GiB against 5.6 GiB at
   own resolution and its own truncated schedule, and the step contract carries
   one schedule per request, so step execution rejects it. `latent_upscale`
   without `latent_refine` works in both modes.
+- Non-empty attention step ranges reject `latent_refine` in request mode too;
+  disable them (`attention_schedule=[]`) or refinement (`latent_refine=false`).
+  Sigma windows work with `latent_refine`.
 - Large refine layouts can abort workers with `CUDA error: an illegal memory
   access was encountered`. On B300, observed video token counts of 54,144 per
   rank complete while 108,288 and 109,360 abort. The preflight limit of 65,536

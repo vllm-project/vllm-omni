@@ -18,7 +18,7 @@ from vllm_omni.worker_v2.omni_ar_model_runner import OmniAsyncOutput
 pytestmark = pytest.mark.core_model
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_chunked_fixed_token_scores_are_copied_from_cuda() -> None:
     device = torch.device("cuda")
     hidden = torch.tensor([[1.0, 2.0, 3.0], [3.0, 1.0, 2.0], [2.0, 3.0, 1.0], [4.0, 5.0, 6.0]], device=device)
@@ -39,7 +39,6 @@ def test_chunked_fixed_token_scores_are_copied_from_cuda() -> None:
     scores = worker.compute_prompt_token_id_logprobs(lambda hidden: hidden, hidden[2:], batch, np.array([4]))
     mro = omni_ar_model_runner.OmniModelRunnerOutput(
         req_ids=["req"],
-        req_id_to_index={"req": 0},
         sampled_token_ids=None,
         prompt_logprobs_dict={},
         prompt_token_id_logprobs_dict=scores,

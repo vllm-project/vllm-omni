@@ -9,12 +9,12 @@ No request dictionary holds a view into a mutable slot or CUDA graph buffer.
 
 import numpy as np
 import torch
+import vllm.v1.worker.gpu.buffer_utils as buffer_utils
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import async_tensor_h2d
-from vllm.v1.worker.gpu import buffer_utils
 from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
@@ -406,7 +406,7 @@ class MossLocalModelState(OmniModelState):
             if prefill and computed is not None and prompt_len is not None and computed + count >= prompt_len:
                 completing_rows.append(row)
                 early = getattr(self, "_early_first_audio", None)
-                if early is not None:
+                if early is not None and not (buf.get("meta") or {}).get("ref_code_len", 0):
                     early.record_prefill(str(buf["req_id"]), buf.get("sampling_params"), prompt_len=prompt_len)
             if count == 1 and not prefill and isinstance(buf.get("audio_state"), dict):
                 active = not bool(buf["audio_state"].get("is_stopping"))

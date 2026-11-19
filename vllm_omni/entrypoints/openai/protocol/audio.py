@@ -167,10 +167,33 @@ class OpenAICreateSpeechRequest(BaseModel):
         ge=0.0,
         description="Target audio duration in seconds (MOSS-SoundEffect). Converted to ~12.5 frames/s internally.",
     )
+    token_count: StrictInt | None = Field(
+        default=None,
+        gt=0,
+        le=_INT64_MAX,
+        description="Optional target for new audio, in codec frames (12.5/s), for MOSS-TTS Local. "
+        "Does not change max_new_tokens. Resolve automatic estimates on the client before sending.",
+    )
     x_vector_only_mode: bool | None = Field(
         default=None,
         description="Use speaker embedding only without in-context learning (Base task)",
     )
+    cache_salt: str | None = Field(
+        default=None,
+        description="Caller-supplied prefix-cache salt namespace. Composed "
+        "with the server-derived conditioning identity (adapter-computed or "
+        "the derived default), so callers narrow sharing (tenants, sessions) "
+        "without dropping voice/input isolation.",
+    )
+
+    @field_validator("cache_salt", mode="before")
+    @classmethod
+    def _validate_cache_salt(cls, cache_salt):
+        from vllm.entrypoints.generate.base.protocol import validate_cache_salt
+
+        validate_cache_salt(cache_salt)
+        return cache_salt
+
     speaker_embedding: list[float] | list[list[float]] | None = Field(
         default=None,
         max_length=_MAX_EMBEDDING_DIM,
@@ -674,8 +697,8 @@ class StreamingSpeechSessionConfig(BaseModel):
     stream_audio: bool = Field(
         default=False,
         description=(
-            "If true, send raw PCM audio chunks progressively over WebSocket. "
-            "Requires response_format='pcm'. WebSocket streaming currently requires "
+            "If true, send PCM or WAV audio chunks progressively over WebSocket. "
+            "Requires response_format='pcm' or 'wav'. WebSocket streaming currently requires "
             "speed=1.0, including for models with native speed control."
         ),
     )
@@ -712,9 +735,9 @@ class StreamingSpeechSessionConfig(BaseModel):
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "StreamingSpeechSessionConfig":
         if self.stream_audio:
-            if self.response_format != "pcm":
+            if self.response_format not in ("pcm", "wav"):
                 raise ValueError(
-                    "WebSocket streaming audio (stream_audio=true) requires response_format='pcm'. "
+                    "WebSocket streaming audio (stream_audio=true) requires response_format='pcm' or 'wav'. "
                     f"Got response_format='{self.response_format}'."
                 )
             if self.speed is None:

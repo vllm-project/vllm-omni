@@ -56,6 +56,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.routing import APIRoute, APIWebSocketRoute
 from fastapi.testclient import TestClient
 from starlette.datastructures import State
+from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.websockets import WebSocketDisconnect
 from vllm.entrypoints.serve.tokenize import api_router as tokenization_api_router
@@ -63,6 +64,7 @@ from vllm.entrypoints.serve.tokenize.protocol import DetokenizeResponse, Tokeniz
 from vllm.exceptions import RetryableRequestError
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.engine.omni_engine_base import OmniEngineBase
 from vllm_omni.entrypoints.openai import api_server
 from vllm_omni.entrypoints.serve.utils import errors as serve_errors
 
@@ -95,37 +97,204 @@ def test_omni_api_worker_sets_parent_death_signal_before_validation(mocker):
 
 
 @pytest.mark.asyncio
-async def test_omni_run_server_worker_forwards_client_config(monkeypatch):
+@pytest.mark.parametrize(
+    ("disable_compression", "uvicorn_kwargs", "expected_kwargs"),
+    [
+        (False, {}, {}),
+        (False, {"ws_per_message_deflate": True}, {"ws_per_message_deflate": True}),
+        (False, {"ws_per_message_deflate": False}, {"ws_per_message_deflate": False}),
+        (True, {"ws_per_message_deflate": True}, {"ws_per_message_deflate": False}),
+    ],
+)
+@pytest.mark.parametrize("tracing_mode", ["enabled", "disabled", "no-engine", "no-provider"])
+async def test_omni_run_server_worker_forwards_client_config(
+    monkeypatch, tracing_mode, disable_compression, uvicorn_kwargs, expected_kwargs
+):
+    import httpx
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from vllm_omni.tracing import capture_trace_headers
+
+    tracing_enabled = tracing_mode == "enabled"
+    if tracing_enabled:
+        pytest.importorskip("opentelemetry.instrumentation.fastapi")
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    app = FastAPI()
+    app.add_middleware(CORSMiddleware, allow_origins=["http://client"])
+
+    @app.get("/trace")
+    async def trace_context():
+        return capture_trace_headers()
+
+    app.middleware_stack = app.build_middleware_stack()
     captured: dict[str, object] = {}
 
     @asynccontextmanager
     async def fake_build_async_omni(*_args, **kwargs):
         captured.update(kwargs)
-        yield _FakeEngineClient(vllm_config=_FakeVllmConfig(_FakeParallelConfig(_api_process_rank=1)))
+        engine = _FakeEngineClient(vllm_config=_FakeVllmConfig(_FakeParallelConfig(_api_process_rank=1)))
+        if tracing_mode == "no-engine":
+            del engine.engine
+        elif tracing_mode == "no-provider":
+            del engine.engine.tracer_provider
+        else:
+            engine.engine.tracer_provider = provider if tracing_enabled else None
+        yield engine
 
     monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
-    monkeypatch.setattr(api_server, "build_openai_app", lambda *_args: FastAPI())
+    monkeypatch.setattr(api_server, "build_openai_app", lambda *_args: app)
     monkeypatch.setattr(api_server, "omni_init_app_state", lambda *_args: asyncio.sleep(0))
     monkeypatch.setattr(api_server, "shutdown_unsupported_routes", lambda *_args: None)
 
-    async def fake_storage_start() -> None:
+    async def fake_storage_start(*, on_expire) -> None:
+        assert on_expire == api_server.VIDEO_STORE.remove_many
         return None
 
     monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", fake_storage_start)
 
-    async def fake_serve_http(app, **_kwargs):
+    async def fake_serve_http(app, **kwargs):
         assert app.state.api_server_count == 2
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+            for sampled in ("01", "00"):
+                parent = f"00-12345678901234567890123456789012-1234567890123456-{sampled}"
+                response = await client.get(
+                    "/trace",
+                    headers={"traceparent": parent, "tracestate": "vendor=state", "origin": "http://client"},
+                )
+                assert response.status_code == 200
+                assert response.headers["access-control-allow-origin"] == "http://client"
+                carrier = response.json()
+                if tracing_enabled:
+                    assert carrier["traceparent"].split("-")[1] == parent.split("-")[1]
+                    assert int(carrier["traceparent"].split("-")[3], 16) & 1 == int(sampled, 16)
+                    assert carrier["tracestate"] == "vendor=state"
+                else:
+                    assert carrier == {}
+        actual = {key: value for key, value in kwargs.items() if key == "ws_per_message_deflate"}
+        assert actual == expected_kwargs
         task = asyncio.create_task(asyncio.sleep(0))
         await asyncio.sleep(0)
         return task
 
     monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
 
-    args = _minimal_args(model="dummy")
+    args = _minimal_args(model="dummy", disable_websocket_compression=disable_compression)
     config = {"client_count": 2, "client_index": 1, "stage_addresses": {}}
 
-    await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), args, config)
+    await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), args, config, **uvicorn_kwargs)
     assert captured["client_config"] is config
+    spans = exporter.get_finished_spans()
+    assert len(spans) == int(tracing_enabled)
+    if tracing_enabled:
+        assert spans[0].parent.span_id == int("1234567890123456", 16)
+    provider.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cli_options, request_headers, expected_status, expected_origin",
+    [
+        pytest.param([], {}, 400, None, id="default"),
+        pytest.param(
+            ["--allowed-origins", '["http://localhost:8000"]'],
+            {},
+            200,
+            "http://localhost:8000",
+            id="allowed-origin",
+        ),
+        pytest.param(
+            ["--allowed-origins", '["http://localhost:8000"]'],
+            {"Origin": "http://localhost:8001"},
+            400,
+            None,
+            id="unlisted-origin",
+        ),
+        pytest.param(
+            ["--allowed-origins", '["http://localhost:8000"]', "--allowed-methods", '["GET"]'],
+            {"Access-Control-Request-Method": "DELETE"},
+            400,
+            "http://localhost:8000",
+            id="disallowed-method",
+        ),
+        pytest.param(
+            ["--allowed-origins", '["http://localhost:8000"]', "--allowed-headers", '["Content-Type"]'],
+            {"Access-Control-Request-Headers": "x-unlisted-header"},
+            400,
+            "http://localhost:8000",
+            id="disallowed-header",
+        ),
+        pytest.param(
+            ["--allowed-origins", '["http://localhost:8000"]', "--allow-credentials"],
+            {},
+            200,
+            "http://localhost:8000",
+            id="credentials",
+        ),
+    ],
+)
+async def test_omni_worker_preserves_cli_cors_policy(
+    mocker, cli_options, request_headers, expected_status, expected_origin
+):
+    """Exercise real CLI -> upstream app -> Omni routes, without a model.
+
+    Catch dropped CORS options, permissive defaults, and middleware lost when
+    Omni replaces upstream routes. CORS controls browser access, not whether
+    an ordinary HTTP request executes.
+    """
+    import httpx
+
+    from vllm_omni.entrypoints.cli.serve import OmniServeCommand
+    from vllm_omni.utils.tracking_parser import TrackingArgumentParser
+
+    parser = TrackingArgumentParser()
+    OmniServeCommand().subparser_init(parser.add_subparsers(dest="command"))
+    args = parser.parse_args(["serve", "dummy", "--omni", *cli_options])
+
+    @asynccontextmanager
+    async def fake_engine(*_args, **_kwargs):
+        yield _FakeEngineClient(vllm_config=_FakeVllmConfig(_FakeParallelConfig(_api_process_rank=0)))
+
+    mocker.patch.object(api_server, "build_async_omni", fake_engine)
+    mocker.patch.object(api_server, "omni_init_app_state", new_callable=mocker.AsyncMock)
+    mocker.patch.object(api_server.STORAGE_MANAGER, "start", new_callable=mocker.AsyncMock)
+
+    async def exercise_http(app, **_kwargs):
+        headers = {
+            "Origin": "http://localhost:8000",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "authorization",
+            **request_headers,
+        }
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://server") as client:
+            # CORS controls browser access; it does not reject ordinary HTTP requests.
+            response = await client.get("/v1/models", headers={"Origin": headers["Origin"]})
+            assert response.status_code == 200
+            assert response.json() == {"object": "list", "data": []}
+            assert response.headers.get("access-control-allow-origin") == expected_origin
+            assert response.headers.get("access-control-allow-credentials") == (
+                "true" if "--allow-credentials" in cli_options else None
+            )
+
+            preflight = await client.options("/v1/models", headers=headers)
+            assert preflight.status_code == expected_status
+            assert preflight.headers.get("access-control-allow-origin") == expected_origin
+        return asyncio.create_task(asyncio.sleep(0))
+
+    listener = mocker.patch.object(api_server, "serve_http", side_effect=exercise_http)
+    sock = _FakeSocket()
+    root_logger = logging.getLogger()
+    original_level = root_logger.level
+    try:
+        await api_server.omni_run_server_worker("127.0.0.1:8091", sock, args)
+    finally:
+        # Building the real app imports SageMaker standards, which changes root logging.
+        root_logger.setLevel(original_level)
+    listener.assert_awaited_once()
+    assert sock.closed
 
 
 # FastAPI/Starlette auto-adds HEAD on every GET route. Including HEAD here
@@ -156,6 +325,7 @@ _EXPECTED_ROUTER_ROUTES = {
     ("WEBSOCKET", "/v1/realtime"),
     ("WEBSOCKET", "/v1/realtime/robot/openpi"),
     ("WEBSOCKET", "/v1/duplex"),
+    ("POST", "/v1/run"),
     ("POST", "/v1/realtime/sessions"),
     ("POST", "/v1/realtime/sessions/{session_id}/step"),
     ("POST", "/v1/realtime/sessions/{session_id}/reset"),
@@ -167,6 +337,7 @@ _EXPECTED_ROUTER_ROUTES = {
     ("POST", "/v1/images/edits"),
     ("POST", "/v1/images/segmentations"),
     ("POST", "/v1/videos/segmentations"),
+    ("POST", "/v1/videos/depth"),
     ("POST", "/v1/videos"),
     ("POST", "/v1/videos/sync"),
     ("GET", "/v1/videos"),
@@ -204,6 +375,7 @@ _DIFFUSION_APP_STATE_KEYS = {
     "openai_streaming_video",
     "openai_serving_realtime_robot",
     "rl_rollout_serving",
+    "run_serving",
     "enable_server_load_tracking",
     "server_load_metrics",
 }
@@ -235,6 +407,7 @@ _MULTISTAGE_APP_STATE_KEYS = {
     "openai_serving_video",
     "openai_serving_realtime_robot",
     "rl_rollout_serving",
+    "run_serving",
     "enable_server_load_tracking",
     "server_load_metrics",
 }
@@ -372,10 +545,66 @@ class _FakeSocket:
         self.closed = True
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("warmup", ["disabled", "success", "failure", "unsupported"])
+async def test_video_output_warmup_gates_http_startup(monkeypatch, warmup):
+    events = []
+    app = FastAPI()
+
+    @asynccontextmanager
+    async def build_engine(*_args, **_kwargs):
+        try:
+            yield _FakeEngineClient()
+        finally:
+            events.append("engine_closed")
+
+    async def run_warmup(path, *, timeout):
+        assert path == "warmup.json"
+        assert timeout == 90
+        events.append("warmup_started")
+        await asyncio.sleep(0)
+        if warmup == "failure":
+            raise RuntimeError("warmup failed")
+        events.append("warmup_done")
+
+    async def init_state(engine, state, args):
+        state.engine_client = engine
+        state.openai_streaming_video_output = None if warmup == "unsupported" else SimpleNamespace(warmup=run_warmup)
+
+    async def serve(app, **kwargs):
+        events.append("http_started")
+        return asyncio.create_task(asyncio.sleep(0))
+
+    monkeypatch.setattr(api_server, "build_async_omni", build_engine)
+    monkeypatch.setattr(api_server, "build_openai_app", lambda *_: app)
+    monkeypatch.setattr(api_server, "omni_init_app_state", init_state)
+    monkeypatch.setattr(api_server, "shutdown_unsupported_routes", lambda *_: None)
+    monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", lambda *, on_expire: asyncio.sleep(0))
+    monkeypatch.setattr(api_server, "serve_http", serve)
+    args = _minimal_args(
+        video_output_warmup=None if warmup == "disabled" else "warmup.json",
+        video_output_warmup_timeout=90,
+    )
+    if warmup in {"failure", "unsupported"}:
+        with pytest.raises((RuntimeError, ValueError)):
+            await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), args)
+        assert "http_started" not in events
+    else:
+        await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), args)
+        assert events == (
+            ["http_started", "engine_closed"]
+            if warmup == "disabled"
+            else ["warmup_started", "warmup_done", "http_started", "engine_closed"]
+        )
+    assert events[-1] == "engine_closed"
+
+
 class _FakeEngineClient:
     config_path: str | None = None
 
     def __init__(self, *, stage_configs=None, endpoint_restrictions=None, vllm_config=None) -> None:
+        self.engine = object.__new__(OmniEngineBase)
+        self.engine.tracer_provider = None
         self.stage_configs = stage_configs if stage_configs is not None else []
         self.endpoint_restrictions = endpoint_restrictions if endpoint_restrictions is not None else {}
         self.model_config = SimpleNamespace()
@@ -395,6 +624,88 @@ class _FakeEngineClient:
 
     async def check_health(self) -> None:
         return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_path", ["normal", "app_init", "config", "http_start", "http_run", "cancelled"])
+async def test_server_worker_closes_storage_and_socket_on_exit(monkeypatch, mocker, exit_path):
+    events = []
+    http_running = asyncio.Event()
+    sock = _FakeSocket()
+    close_socket = mocker.spy(sock, "close")
+
+    @asynccontextmanager
+    async def build_engine(*_args, **_kwargs):
+        try:
+            yield _FakeEngineClient()
+        finally:
+            events.append("engine_closed")
+
+    async def init_state(engine, state, _args):
+        if exit_path == "app_init":
+            raise RuntimeError("app_init failed")
+        state.engine_client = engine
+
+    async def get_config(_engine):
+        if exit_path == "config":
+            raise RuntimeError("config failed")
+        return None
+
+    async def start_storage(*, on_expire):
+        assert on_expire == api_server.VIDEO_STORE.remove_many
+        events.append("storage_started")
+
+    async def stop_storage():
+        events.append("storage_stopped")
+
+    async def serve_http(_app, **_kwargs):
+        if exit_path == "http_start":
+            raise RuntimeError("http_start failed")
+
+        async def run_http():
+            http_running.set()
+            if exit_path == "http_run":
+                raise RuntimeError("http_run failed")
+            if exit_path == "cancelled":
+                await asyncio.Future()
+            events.append("http_finished")
+
+        return asyncio.create_task(run_http())
+
+    storage_start = mocker.AsyncMock(side_effect=start_storage)
+    storage_stop = mocker.AsyncMock(side_effect=stop_storage)
+    monkeypatch.setattr(api_server, "build_async_omni", build_engine)
+    monkeypatch.setattr(api_server, "build_openai_app", lambda *_args: FastAPI())
+    monkeypatch.setattr(api_server, "omni_init_app_state", init_state)
+    monkeypatch.setattr(api_server.openai_app_state, "_get_vllm_config", get_config)
+    monkeypatch.setattr(api_server, "shutdown_unsupported_routes", lambda *_args: None)
+    monkeypatch.setattr(api_server, "STORAGE_MANAGER", SimpleNamespace(start=storage_start, stop=storage_stop))
+    monkeypatch.setattr(api_server, "serve_http", serve_http)
+
+    worker = asyncio.create_task(api_server.omni_run_server_worker("127.0.0.1:8000", sock, _minimal_args()))
+    if exit_path == "normal":
+        await asyncio.wait_for(worker, timeout=2)
+    elif exit_path == "cancelled":
+        await asyncio.wait_for(http_running.wait(), timeout=2)
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+    else:
+        with pytest.raises(RuntimeError, match=f"{exit_path} failed"):
+            await asyncio.wait_for(worker, timeout=2)
+
+    close_socket.assert_called_once_with()
+    assert sock.closed
+    assert events[-1] == "engine_closed"
+    if exit_path == "app_init":
+        storage_start.assert_not_awaited()
+        storage_stop.assert_not_awaited()
+    else:
+        storage_start.assert_awaited_once_with(on_expire=api_server.VIDEO_STORE.remove_many)
+        storage_stop.assert_awaited_once_with()
+        assert events.index("storage_started") < events.index("storage_stopped") < events.index("engine_closed")
+    if exit_path == "normal":
+        assert events.index("http_finished") < events.index("storage_stopped")
 
 
 def _marker(name: str):
@@ -538,8 +849,12 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
             shutdown=lambda: captured.__setitem__("speech_shutdown", True),
         )
 
-    async def fake_storage_start():
+    async def fake_storage_start(*, on_expire):
+        assert on_expire == api_server.VIDEO_STORE.remove_many
         captured["storage_started"] = True
+
+    async def fake_storage_stop():
+        captured["storage_stopped"] = True
 
     async def fake_serve_http(app, **_kwargs):
         captured["served_app"] = app
@@ -555,7 +870,9 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
         "shutdown_unsupported_routes",
         lambda app, restrictions: captured.setdefault("restrictions", restrictions),
     )
-    monkeypatch.setattr(api_server, "STORAGE_MANAGER", SimpleNamespace(start=fake_storage_start))
+    monkeypatch.setattr(
+        api_server, "STORAGE_MANAGER", SimpleNamespace(start=fake_storage_start, stop=fake_storage_stop)
+    )
     monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
 
     sock = _FakeSocket()
@@ -571,6 +888,7 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
 
     assert captured["supported_tasks"] == ("generate",)
     assert captured["storage_started"] is True
+    assert captured["storage_stopped"] is True
     assert captured["restrictions"] == {}
     assert captured["video_shutdown"] is True
     assert captured["speech_shutdown"] is True
@@ -647,10 +965,14 @@ async def test_profiler_env_var_without_stage_config_warns_and_skips_routes(monk
     monkeypatch.setattr(api_server, "omni_init_app_state", fake_omni_init_app_state)
     monkeypatch.setattr(api_server, "shutdown_unsupported_routes", lambda app, restrictions: None)
 
-    async def fake_storage_start():
+    async def fake_storage_start(*, on_expire):
         captured["storage_started"] = True
 
-    monkeypatch.setattr(api_server, "STORAGE_MANAGER", SimpleNamespace(start=fake_storage_start))
+    monkeypatch.setattr(
+        api_server,
+        "STORAGE_MANAGER",
+        SimpleNamespace(start=fake_storage_start, stop=lambda: asyncio.sleep(0)),
+    )
     monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
 
     with caplog.at_level(logging.WARNING):
@@ -707,7 +1029,7 @@ async def test_api_server_assembly_exposes_only_supported_tokenization_routes(
     monkeypatch.setattr(api_server, "build_async_omni", build_engine)
     monkeypatch.setattr(api_server, "omni_init_app_state", init_app_state)
     monkeypatch.setattr(api_server, "serve_http", serve_http)
-    monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", lambda *, on_expire: asyncio.sleep(0))
 
     await api_server.omni_run_server_worker(
         "127.0.0.1:8000", _FakeSocket(), _minimal_args(enable_tokenizer_info_endpoint=tokenizer_info_enabled)
@@ -772,7 +1094,11 @@ async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch
     monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
     monkeypatch.setattr(api_server, "omni_init_app_state", fake_omni_init_app_state)
     monkeypatch.setattr(api_server, "shutdown_unsupported_routes", lambda *_a, **_k: None)
-    monkeypatch.setattr(api_server, "STORAGE_MANAGER", SimpleNamespace(start=lambda: asyncio.sleep(0)))
+    monkeypatch.setattr(
+        api_server,
+        "STORAGE_MANAGER",
+        SimpleNamespace(start=lambda *, on_expire: asyncio.sleep(0), stop=lambda: asyncio.sleep(0)),
+    )
     monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
 
     await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), _minimal_args())
@@ -792,7 +1118,7 @@ async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch
     async def inner(scope, receive, send):
         called[scope["type"]] = True
 
-    middleware._inner = inner
+    middleware._asgi = inner
     await middleware(http_scope, _receive, _send)
     await middleware(ws_scope, _receive, _send)
 
@@ -1445,6 +1771,7 @@ async def test_multistage_app_state_key_snapshot(
     monkeypatch.setattr(api_server, "process_lora_modules", lambda modules, _defaults: modules or [])
     monkeypatch.setattr(api_server, "OpenAIServingModels", _FakeModels)
     monkeypatch.setattr(api_server, "OnlineRenderer", _FakeCtor)
+    monkeypatch.setattr(api_server, "OnlineDerenderer", _FakeCtor)
     monkeypatch.setattr(api_server, "OpenAIServingResponses", _FakeCtor)
     monkeypatch.setattr(api_server, "OmniOpenAIServingChat", _FakeCtor)
     monkeypatch.setattr(api_server, "OmniOpenAIServingChatBatch", _FakeCtor)

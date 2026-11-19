@@ -27,19 +27,43 @@ committed audio remains associated with its history item even when that item
 is no longer last. Prompt preparation snapshots the selected inputs; later
 items do not modify an already prepared request.
 
-The duplex adapter retains its existing budgets: at most four audio payloads
-(including the current input), an 8 MiB encoded-audio history budget (keeping
-at least the newest payload), and at most eight prompt images. The recent
-16-message window is rounded outwards to a complete turn. If any audio in an
-older turn is no longer retained, the entire turn's model context, including
-its images/text and assistant replies, is omitted. Images from that turn are
-therefore **not** permanent session-wide model context. These limits differ
-from the demo's one image-bearing turn and five audio-bearing turns; the
-shared rule is grouping before pruning, rather than copying its UI budgets.
+When `history_policy` is omitted, the duplex adapter uses `full_history`. Every
+request includes the effective original Session history and retained input audio
+and images. It does not discard old turns or substitute transcripts for their
+media. Playback acknowledgement, interruption handling and explicit deletion
+still determine which source records are effective.
 
-Grouping and pruning affect only the model-input view. They do not merge or
-delete the source conversation items exposed to clients, and do not change
-playback acknowledgement or interruption handling.
+!!! note "Qwen default history policy changed"
+    The default changes from `recent` to `full_history`. Existing deployments
+    that need the previous automatic clipping must explicitly configure `recent`.
+    Full history can reach the deployment's token or media limits sooner.
+
+The complete request must fit the deployed model's token and media limits,
+including reserved output tokens. The engine validates its processed input and
+reuses those media features for inference. Overflow returns the recoverable
+`input_capacity_exceeded` error and preserves history; clients can delete source
+items and retry. It does not silently switch to a smaller history window. Original
+input audio remains retained while its source items exist, so session storage can
+grow with the conversation. Session input-admission limits also remain in effect.
+
+To restore the previous clipping behavior, select `recent` in a deployment overlay:
+
+```yaml
+duplex_session:
+  model_custom_options:
+    history_policy: recent
+```
+
+`recent` retains the legacy 16-message window, rounded outwards to a complete
+history group, at most four audio payloads including current input, and an 8 MiB
+encoded-audio cache budget that keeps at least its newest payload. Its renderer
+also limits prompts to eight images. Evicted audio can cause its whole group to
+leave model input when no text view is available. These transformations affect
+only the model-input view and do not delete client-addressable source items.
+
+For budget-based clipping or incremental compression, explicitly select
+`bounded_recent` or `incremental`. Configuration, policy hooks and resource
+behavior are described in [Qwen history policies](../design/fullduplex.md#experimental-qwen-history-policy).
 
 ### Qwen3-Omni voice selection
 
@@ -285,6 +309,35 @@ stops retaining output PCM for calibration. Broader language, boundary and
 sustained-load validation is still needed before enabling either strategy by
 default.
 
+## Qwen3-Omni L1 history views
+
+With explicit `history_policy: recent`, the deployment setting
+`duplex_session.context_keep_media_turns` opts the Qwen3-Omni Thinker (stage 0)
+into L1 history views. Its default, `null`, leaves that view disabled.
+`full_history` always uses original sources and does not enable L1 media removal.
+Set both fields to use the legacy policy with a media-dropped view:
+
+```yaml
+duplex_session:
+  model_custom_options:
+    history_policy: recent
+  context_keep_media_turns: 2
+```
+
+This keeps the two most recent user runs verbatim. Eligible older user messages
+use their text and available transcripts instead of resubmitting audio and image
+parts. Consecutive user messages form one run. Setting `0` makes all older runs
+eligible, while the Qwen consumer still protects the current input's media,
+including during tool continuations. If dropping media would empty a whole user
+run, that run is kept unchanged.
+
+Lower values trade older media access for text-only context. This does not add
+ASR, create captions or preserve an old image's meaning without an existing text
+representation. The setting changes the Thinker's prompt view, not authoritative
+history; it does not bound total session memory. The existing 16-message prompt
+window, retained-audio slot count and byte limits remain in effect. Clients
+cannot override this deployment-owned policy through session updates.
+
 ## JoyAI visual and conversation memory
 
 JoyAI keeps three levels of visual memory: accepted observation frames, summaries
@@ -382,11 +435,14 @@ backlog remains in the session ledger for successive summary requests to process
 
 Standing instructions and the current user query remain explicit in the normal
 interaction prompt. Summary input contains committed conversation text, not
-unplayed generated speech or retained image/audio payloads. With JoyAI's current
-all-sync audio output, the assistant transcript becomes eligible only after the
-complete audio has been acknowledged. Playback corrections and conversation
-edits invalidate summaries derived from the changed text; newer appended turns
-can coexist with consolidation of an unchanged older prefix.
+unplayed generated speech or retained image/audio payloads. In the JoyAI duplex
+profile with `async_chunk` enabled, the assistant text is projected as it is
+generated, while the transcript still becomes eligible for summary only after the
+complete audio has been acknowledged. With `async_chunk` disabled the profile
+projects the text once, when the action completes. Playback corrections and
+conversation edits invalidate summaries derived from
+the changed text; newer appended turns can coexist with consolidation of an
+unchanged older prefix.
 
 The text summary and model-input context are bounded; the underlying Session
 conversation ledger retains its source items. Visual facts can also enter the
@@ -431,8 +487,7 @@ for the command and configuration requirements.
 #### Compare MiniCPM-o attention backends
 
 The default `minicpmo_4_5.yaml` selects Triton attention for the CUDA Thinker
-(stage 0). The Talker's backend selection and graph settings are unchanged.
-The vision tower defaults to reference attention for CUDA BF16 duplex sessions to
+(stage 0) and FlashAttention for the CUDA Talker (stage 1). The vision tower defaults to reference attention for CUDA BF16 duplex sessions to
 preserve long-video scene recognition. Turn-mode and non-CUDA vision use
 SDPA by default; explicit engine or vision overrides still win. The turn-mode
 profile also inherits the CUDA Thinker's Triton backend from the base
@@ -518,9 +573,12 @@ record rejection and retry counts when measuring service capacity.
 
 PersonaPlex startup warmup is opt-in: set `duplex_session.warmup_frames` to a
 positive frame count to enable it. Frontends with nonzero admission budgets
-then warm their owned groups locally and gate their own duplex connections
-until warmup completes; clients wait at most `DUPLEX_WARMUP_CLIENT_WAIT_S` (180 s)
-before being admitted, as in single-frontend mode.
+then warm their owned groups locally. Native duplex endpoints accept the
+WebSocket transport immediately, then hold session configuration and engine
+admission until warmup completes; clients wait at most
+`DUPLEX_WARMUP_CLIENT_WAIT_S` (180 s) before session admission, as in
+single-frontend mode. The warmup wait does not consume the WebSocket opening
+handshake deadline.
 `/health` retains the engine-health check; it is not an
 all-frontend warmup barrier, and a 200 response does not mean that the accepting
 frontend has free admission slots.
@@ -791,7 +849,7 @@ two events the call is *pending*, and it settles exactly once:
 | --- | --- |
 | `accepted` | the result was admitted and the item was created |
 | `timed_out` | the deadline passed (only when `tool_result_timeout_s` is set) |
-| `cancelled` | the session's epoch advanced (an effective barge-in or `input.cancel`) |
+| `cancelled` | the session's epoch advanced (an effective barge-in or `input.cancel`), or the client sent `function_call.cancel` |
 
 Admission is authoritative per session, and it is about the *call*, not about
 conversation history: only a call this session exposed can be answered, and only
@@ -834,19 +892,175 @@ the call as timed out at most once, and that settlement emits one `error`
 with `code: "tool_result_timeout"` naming the expired `call_id`. When
 admission settles it, the correlated `invalid_function_call_output` is also
 present. The notices have no promised order. No business result is fabricated,
-and input keeps flowing. If the model emits another call in the same session,
-including the same turn, that call can be answered normally. Closing the
+and input keeps flowing. If the model emits a different call in the same
+session, including the same turn, that call can be answered normally; an
+identical call is refused as described under "Repeated calls". Closing the
 session disarms every pending deadline.
 
-This deadline settles the session ledger and rejects late results; it does not
-by itself make the model abandon a call or guarantee that it emits another one.
-Model recovery requires an adapter implementation of
-`runtime_config_for_tool_call_timeout`. The native Nemotron adapter currently
-inherits the no-op hook, so enabling its deadline does not guarantee native
-timeout recovery. The session admission and settlement support here is also
-separate from Qwen tool-result delivery in
-[#8493](https://github.com/vllm-project/vllm-omni/pull/8493); this runtime change
-alone does not establish Qwen tool-call end-to-end support.
+This deadline settles the session ledger and rejects late results. It does not
+by itself make the model abandon a call or guarantee that it emits another one;
+the notice and repeat guard below address that, and how a model responds to a
+notice depends on the model.
+
+**Ending a call from the client.** Send `function_call.cancel` to end one pending
+call. `reason` is `cancelled` (the default) or `failed`. Report a failed tool
+this way rather than sending its error as `function_call_output`: the session
+cannot tell an error string from a result, and would pass it to the model. A
+`call_id` that is unknown or already settled gets `invalid_function_call_cancel`.
+
+**Knowing a call ended.** Every call that ends without a result produces
+`duplex.function_call.settled`, whose `event` body carries `call_id`, `state`
+(`timed_out` or `cancelled`), `reason` (`timeout`, `epoch_cancelled`,
+`client_cancelled` or `client_failed`) and `epoch`. Stop the tool and discard its
+result when this arrives.
+
+**Repeated calls.** A pending, timed-out or cancelled call blocks later calls with
+the same name and arguments, compared as JSON so key order does not matter. A
+blocked call is not published or recorded; the client gets
+`duplex.function_call.suppressed`, whose `event` body carries `name`, `arguments`,
+`blocked_by_call_id`, `blocked_by_state` and `epoch`. A retry with different
+arguments is not blocked.
+
+A pending call blocks only until it settles, and the model gets no notice, because
+its result may still arrive. For a timed-out or cancelled call,
+`extra_body.function_call_retry_policy` sets when the block lifts. It is fixed at session
+open.
+
+| Value | Meaning |
+| --- | --- |
+| `user_turn` (default) | The next user turn lifts the block, on models with `capabilities.clears_function_call_block_on_user_commit`. On other models it lasts for the session, because they have no reliable user-turn boundary. |
+| `never` | The block lasts for the session. |
+
+The session object reports the effective value as `function_call_retry_policy`, so a client can see when `user_turn` behaves as `never`.
+
+**Notices.** The session also shows the model a fixed status saying the call did
+not complete, through the plugin hook `runtime_config_for_abandoned_tool_call`.
+It never contains client text.
+
+| Model | How the model sees it |
+| --- | --- |
+| Qwen3-Omni | As a tool message on the next prompt, for every reason except a suppressed repeat. A notice does not start a response by itself. |
+| Nemotron VoiceChat | On the function channel of the open request. After an epoch cancellation the model is told only if it repeats the call. |
+| JoyAI-VL-Interaction | As a delegated result on the next observation. After an epoch cancellation the question does not resurface, and the model is told only if it asks again. |
+
+**Interruptions.** `extra_body.function_call_interrupt_policy` sets what an epoch advance
+does to pending calls. It is fixed at session open. With `cancel` (the default),
+they settle as `cancelled`. With `keep`, they stay pending and can still be
+answered, so only the deadline, `function_call.cancel` or close ends them. A result
+already accepted follows the model's existing retirement rules either way.
+
+**Discovering what a model supports.** `capabilities` reports these fields. The
+model sets them; a client only reads them.
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `tool_mode` | string | `none` | Which tools a session may declare |
+| `function_call_output_continuation` | string | `none` | What the client does after `function_call_output` for the model to use the result |
+| `max_tools` | integer or `null` | `0` | Most tools one session may declare, or `null` for no model limit. More is refused with `too_many_tools`. |
+| `clears_function_call_block_on_user_commit` | boolean | `false` | Whether a committed input is a user turn, so `function_call_retry_policy: user_turn` can lift a block. When it is `false`, the session applies `never` and reports that as `function_call_retry_policy`. |
+
+`tool_mode` values:
+
+| Value | Meaning | Models |
+| --- | --- | --- |
+| `none` | The model has no tool support. Non-empty `tools` is refused with `tools_unsupported`. | MiniCPM-o, PersonaPlex, Aura |
+| `declared` | The client defines the tools. The model reads their name, description and parameters in its prompt and calls them by name. | Qwen3-Omni, Nemotron VoiceChat |
+| `delegate_only` | The model has one built-in function, `delegate`, which hands a plain-language question to the application. Other tools are refused. | JoyAI-VL-Interaction |
+
+`function_call_output_continuation` values:
+
+| Value | What the client does after `function_call_output` | Models |
+| --- | --- | --- |
+| `client_response_create` | Send `response.create`. The model is turn-based, and the result is used in the response that event opens. Without it, the result waits for the next user turn. | Qwen3-Omni |
+| `automatic` | Nothing more. The result is fed into a later frame of the running request, and the model continues by itself. | Nemotron VoiceChat |
+| `next_observation` | Nothing more. The next camera commit carries the result. To have it spoken, send a short user turn such as "Answer now with the result you received." | JoyAI-VL-Interaction |
+| `none` | Not applicable: the model has no tool support. | MiniCPM-o, PersonaPlex, Aura |
+
+Non-empty `tools` on a `none` model is refused with `tools_unsupported`.
+`tool_choice` other than `auto` is refused with `unsupported_tool_choice`, because
+no duplex model honours it.
+
+**Client library.** `DuplexClientBase.send_function_call_output` and `cancel_function_call`
+send these events. `vllm_omni.clients.tool_calls.DuplexToolRunner` runs each tool
+in its own task, so audio keeps streaming. A handler must return a `str`: anything
+else is reported as a failed tool, so serialize structured output yourself. The runner reports failures with `function_call.cancel`, stops a tool when its call settles, and
+sends `response.create` only when the model needs it. Pass `function_call_session_defaults()` as `extra_body` when
+opening the session to keep pending tools across an interruption.
+
+```python
+from vllm_omni.clients.duplex import DuplexClient, SessionConfig
+from vllm_omni.clients.tool_calls import DuplexToolRunner, function_call_session_defaults
+
+async def get_weather(arguments: dict[str, object]) -> str:
+    return "25C"
+
+config = SessionConfig(extra_body=function_call_session_defaults())
+async with DuplexClient("ws://127.0.0.1:8099/v1/realtime", model="Qwen/Qwen3-Omni-30B-A3B-Instruct", config=config) as client:
+    await DuplexToolRunner(client, {"get_weather": get_weather}).run()
+```
+
+Failed result writes stay available in `runner.undelivered_results`, with the
+exception in `runner.delivery_errors`. After reconnecting to the same session,
+await `runner.retry_result(call_id)` in an application task while `run()` keeps
+consuming events. The handler is not executed again. Transport success does not
+acknowledge server acceptance. Follow-ups wait for generation and, with
+`ack_only`, playback acknowledgements. Playback ACKs remain the application's job.
+An acknowledged hard truncate (`truncate=true`) releases that response's playback
+gate once generation ends, without requiring another full ACK. Later stale ACKs
+cannot restore its playback debt.
+
+If the result write succeeds but its required `response.create` write fails,
+`runner.pending_continuations` retains the call ID and
+`runner.continuation_errors` exposes the error. After transport recovery, await
+`runner.retry_continuation(call_id)` while `run()` consumes events. This retries
+only the follow-up, without rerunning the handler or resending the result.
+Settling the call removes its recovery state. A failed write can still have
+reached the server, so the application must decide when a retry is safe.
+
+#### Command-line example
+
+With the serving environment active, start Qwen's duplex server:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+  --deploy-config vllm_omni/deploy/qwen3_omni_duplex.yaml --port 8099
+```
+
+In your working directory, define an async tool and its declaration:
+
+```bash
+cat > tool_handlers.py <<'PY'
+import json
+
+async def add(arguments):
+    return json.dumps({"sum": arguments["a"] + arguments["b"]})
+PY
+cat > tools.json <<'JSON'
+[{"type":"function","name":"add","description":"Add two numbers",
+  "parameters":{"type":"object","properties":{"a":{"type":"number"},
+  "b":{"type":"number"}},"required":["a","b"]}}]
+JSON
+```
+
+Run the client in another terminal, from the directory containing those files:
+
+```bash
+PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" \
+python -m vllm_omni.clients.tool_calls \
+  --url 'ws://127.0.0.1:8099/v1/realtime?duplex=1' \
+  --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --tools-json tools.json --handler add=tool_handlers:add \
+  --prompt 'Use the add tool to add 12 and 30.' --timeout 30
+```
+
+The client prints JSON events until the timeout or session closure. Repeat
+`--handler NAME=MODULE:ASYNC_FUNCTION` for more tools, and add their declarations
+to the JSON list. Handlers must return strings. The example requests text output,
+so audio playback and ACKs are not needed. List all flags with:
+
+```bash
+python -m vllm_omni.clients.tool_calls --help
+```
 
 Deployment setting `duplex_session.max_tool_calls_per_session` (default 4096)
 bounds the records one session may track, pending calls and settled tombstones
@@ -893,7 +1107,7 @@ through a `DuplexSessionHandle`.
 
 ```python
 from vllm_omni.engine.duplex.commands import AppendAudio, Commit
-from vllm_omni.engine.duplex.events import AudioDelta, SessionClosed
+from vllm_omni.engine.duplex.events import AudioDelta, ResponseDone, SessionClosed
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni
 
 omni = DuplexOmni(model="openbmb/MiniCPM-o-4_5", trust_remote_code=True)
@@ -1166,6 +1380,7 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | --- | --- | --- |
 | `session.update` | 2 | Open handshake on first send (creates the session); later sends reconfigure it. OpenAI name; `session` object carries vLLM-Omni keys (`ref_audio`, `overlap_policy`, `playback_commit_policy`, `extra_body`, ...). |
 | `session.heartbeat` | 3 | Keepalive; refreshes the engine session lease. |
+| `session.stats.get` | 3 | Ask for the session's server-side stage work and audio by turn (no fields; returns every retained turn, up to the last 256); answered with `session.stats`. Needs `capabilities.supports_session_stats` (deploy `duplex_session.collect_stats: true`, single-host deployments only), otherwise `error` `session_stats_disabled`. |
 | `session.event_ack` | 3 | Acknowledges received server events by `server_event_seq`; trims the resume replay journal. |
 | `session.close` | 3 | Graceful close; answered with `session.closed`. |
 | `session.resume` | 3 | Re-attach a live session on a new socket (`session_id`, `resume_token`, `last_received_server_event_seq`). |
@@ -1174,6 +1389,7 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `input.commit` | 3 | Alias of `input_audio_buffer.commit` accepted by the runner. |
 | `input_audio_buffer.clear` | 1 | Drop un-committed input audio. |
 | `input.cancel` | 3 | Cancel pending input; advances `epoch`. |
+| `function_call.cancel` | 3 | End one pending function call (`call_id`, `reason`: `cancelled` or `failed`). |
 | `input.text.append` | 3 | Append text input; model-native sessions reject it with `native_text_append_unsupported`. |
 | `conversation.item.create` | 1 | Add a completed user item (text, audio, or `function_call_output`) to history. |
 | `conversation.item.retrieve` | 1 | Fetch a stored item by id. |
@@ -1193,6 +1409,7 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `session.created` | 2 | Session opened. OpenAI name; adds `attachment_generation`, `resume_token` and vLLM-Omni keys inside `session` (`id` is the server-allocated session id, `epoch`, `turn_id`, `playback`, `capabilities`, ...). |
 | `session.updated` | 2 | Echo of the effective session config after every `session.update` (same extended `session` object). |
 | `session.heartbeat_ack` | 3 | Reply to `session.heartbeat`. |
+| `session.stats` | 3 | Reply to `session.stats.get`: `request_event_id` and a raw `stats` document (per turn: `status`, `final`, `late_spans`, chunks with `submitted_ns`, `done_ns`, `complete` and per-stage `[start_ns, duration_ns]` spans, plus the turn's audio pieces; times relative to the session open). Not journaled, so never replayed on resume. |
 | `session.closed` | 3 | Last event on the socket, emitted once the engine released the session; `reason` ∈ `client_close`, `disconnect`, `timeout`, `transport_error`, `shutdown`, `output_backpressure`, `close_details_exceed_output_limit`, ... |
 | `session.resumed` | 3 | Resume accepted; carries the new `attachment_generation` and rotated `resume_token`; journaled events are replayed after it. |
 | `session.replaced` | 3 | Sent to the superseded socket when another socket resumes the session. |
@@ -1227,6 +1444,8 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `response.function_call_arguments.delta` | 1 | Tool-call arguments delta (Nemotron VoiceChat). |
 | `response.function_call_arguments.done` | 1 | Tool-call arguments complete. |
 | `duplex.function_call.done` | 3 | Raw fallback when a model tool call is malformed. |
+| `duplex.function_call.settled` | 3 | A function call ended without a result; details under `event`. |
+| `duplex.function_call.suppressed` | 3 | The session refused to publish a repeat of a pending or abandoned call; `blocked_by_state` says which. Details under `event`. |
 | `output_audio_buffer.cleared` | 1 | Reply to `output_audio_buffer.clear`. |
 | `playback.acknowledged` | 3 | Reply to `playback.ack`; returns the playback ledger and `history_committed`. |
 | `overlap.decision` | 3 | How an append that overlapped an active response was handled (`drop` \| `listen` \| `barge_in`); details under `metadata`. |
@@ -1341,6 +1560,38 @@ additionally carries `"server_event_seq": <int>` (omitted below for brevity).
 
 ```json
 {"type": "session.heartbeat_ack", "session_id": "duplex-5f2a…"}
+```
+
+`C→S session.stats.get` / `S→C session.stats`
+
+Clients derive per-turn busy RTF (union of all stage spans / emitted audio) and
+stall ratio from the raw document with
+`vllm_omni.benchmarks.duplex_session_metrics.session_stats_turn_metrics`; a turn
+counts only once the server marks it `final` (RFC #8325): the model turn completed,
+every response bound to it ended (a draining TTS response included) and every
+chunk was handled. A cancelled turn (barge-in, session close) never becomes final,
+and spans that arrive after a turn is final are counted in `late_spans` instead of
+changing it. A chunk's `done_ns` is the end of its last stage span: the wait for
+the next input is not engine time. Given the snapshot's `stages`, the helper also
+withholds numbers for a turn that emitted audio but has no spans from some stage
+(`missing_stage_ids`). The server still answers while the session closes. Times are
+comparable only when every stage runs on the API server's
+host.
+
+```json
+{"type": "session.stats.get", "event_id": "evt_42"}
+```
+
+```json
+{"type": "session.stats", "session_id": "duplex-5f2a…", "request_event_id": "evt_42",
+ "stats": {"schema_version": 1, "clock": {"source": "CLOCK_MONOTONIC", "unit": "ns", "origin": "session_opened"},
+  "stages": [{"stage_id": 0, "name": "thinker"}, {"stage_id": 1, "name": "talker"}, {"stage_id": 2, "name": "code2wav"}],
+  "turns": [{"epoch": 0, "turn_id": 0, "status": "done", "final": true, "late_spans": 0, "response_ids": ["resp-…"],
+   "chunks": [{"seq": 1, "turn_seq": 1, "submitted_ns": 4000312000, "done_ns": 4291000000,
+    "complete": true, "truncated": false,
+    "stage_work": [{"stage_id": 0, "spans": [[4001100000, 48000000]]}]}],
+   "audio": [{"response_id": "resp-…", "emitted_ns": 4215000000, "duration_ms": 520.0}]}],
+  "dropped_turns": 0, "dropped_spans": 0}}
 ```
 
 `C→S session.event_ack`

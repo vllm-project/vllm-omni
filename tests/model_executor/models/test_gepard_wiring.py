@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU coverage for the seam between Gepard's talker and the AR runner.
 
 ``test_gepard_window.py`` pins the decode arithmetic *below* this layer, and
@@ -295,6 +295,17 @@ def _make_talker(*, max_model_len: int = 4096) -> tuple[GepardTalkerForCondition
     talker._audio_queue = []
     talker._deferred_cleanup_ids = set()
     return talker, fake
+
+
+def test_mrv2_req_ids_create_distinct_request_states() -> None:
+    """MRv2 names the request hook field ``req_id``, not ``request_id``."""
+    talker, _codec = _make_talker()
+    infos = [_ReqInfo.from_hook_kwargs({"req_id": req_id}, span=1) for req_id in ("req-a", "req-b")]
+    states = [talker._get_or_create_state(info.request_id) for info in infos]
+
+    assert [info.request_id for info in infos] == ["req-a", "req-b"]
+    assert states[0] is not states[1]
+    assert set(talker._active_states) == {"req-a", "req-b"}
 
 
 def _install_scripted_sampling(talker: GepardTalkerForConditionalGeneration, engine: _MiniEngine) -> None:
