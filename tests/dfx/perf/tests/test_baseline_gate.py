@@ -171,6 +171,25 @@ def test_omni_assert_result_uses_resolved_baseline_only_when_enabled() -> None:
     assert_result(result, params, 1, check_baseline=True)
 
 
+def test_omni_assert_result_finishes_nonbaseline_validation_before_reporting_regression() -> None:
+    from tests.dfx.conftest import PerformanceBaselineRegressionError
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result = {
+        "completed": 1,
+        "Hardware": "H100",
+        "request_throughput": 0.7,
+        "baseline": {"H100": {"request_throughput": 1.0}},
+    }
+    params = {"expected_duplex_audio_turns_per_session": 2}
+    with pytest.raises(AssertionError, match="Duplex session metrics are missing"):
+        assert_result(result, params, 1, check_baseline=True)
+
+    result["duplex_session_metrics"] = [{"audio_turn_count": 2}]
+    with pytest.raises(PerformanceBaselineRegressionError, match="request_throughput"):
+        assert_result(result, params, 1, check_baseline=True)
+
+
 def test_diffusion_assert_result_checks_named_hardware_only_when_enabled() -> None:
     from tests.dfx.perf.scripts.run_diffusion_benchmark import assert_result
 

@@ -908,6 +908,46 @@ def test_num_warmups_resolves_each_sweep_point():
     ] == [1, 8, 16]
 
 
+def test_perf_sweep_collects_all_baseline_regressions(monkeypatch, pytestconfig):
+    from tests.dfx.conftest import PerformanceBaselineRegressionError
+    from tests.dfx.perf.scripts import run_benchmark
+
+    config = {
+        "test_name": "test_collect_baselines",
+        "server_params": {"model": "test-model"},
+        "benchmark_params": [],
+    }
+    calls = []
+
+    def benchmark(**kwargs):
+        calls.append(kwargs["flow"])
+        return {"completed": kwargs["num_prompt"], "flow": kwargs["flow"]}
+
+    def assert_regression(result, _params, _num_prompt, *, check_baseline=False, require_baseline=False):
+        raise PerformanceBaselineRegressionError(f"performance baseline regression:\nflow={result['flow']}")
+
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    monkeypatch.setattr(run_benchmark, "assert_result", assert_regression)
+    case = {
+        "test_name": config["test_name"],
+        "params": {"num_prompts": [2, 4], "max_concurrency": [1, 4]},
+    }
+
+    with pytest.raises(PerformanceBaselineRegressionError) as exc_info:
+        run_benchmark.test_performance_benchmark(
+            SimpleNamespace(host="localhost", port=8000, model="test-model"),
+            case,
+            pytestconfig=pytestconfig,
+        )
+
+    assert calls == [1, 4]
+    message = str(exc_info.value)
+    assert "across 2 sweep(s)" in message
+    assert "max_concurrency=1 num_prompts=2" in message
+    assert "max_concurrency=4 num_prompts=4" in message
+
+
 @pytest.mark.parametrize(
     "warmups,message",
     [

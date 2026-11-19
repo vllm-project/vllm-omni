@@ -73,10 +73,13 @@ MI300 entries use the conservative observed envelope from successful result
 artifacts in [16741](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/16741),
 [16817](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/16817),
 [16823](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/16823), and
-[16833](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/16833): minimum
+[16833](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/16833), plus the
+diagnostic artifacts from
+[16838](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/16838): minimum
 throughput and maximum latency or RTF for each revised metric. Missing result
 artifacts are excluded rather than treated as measurements; build 16817 has no
-Qwen3-Omni async or MiniCPM-o result JSONs.
+Qwen3-Omni async or MiniCPM-o result JSONs. Build 16838 produced all three
+Voxtral results and the first two MiniCPM-o results.
 
 Only metrics that failed in the current-runtime window, or sat within a few
 percent of a repeated failure, are revised. All metric names, workload
@@ -88,17 +91,43 @@ calibration uses the available result artifacts across 16741, 16817, 16823 and
 16833; its 0.1, 0.5 and 1.0 RPS latency or RTF references follow the same
 maximum-observed envelope rule.
 
-Voxtral's throughput-sweep TTFP is addressed in source configuration rather
-than normalized to the 892 ms outlier: the initial codec chunk is reduced from
-five frames to three while the steady-state 25-frame chunk and 25-frame left
-context remain unchanged. This directly shortens time to the first packet; the
-next exact-head AMD and CUDA runs must verify its throughput and runtime
-behavior.
+Build 16838 showed that reducing Voxtral's initial codec chunk from five frames
+to three did not improve throughput-sweep TTFP: it measured 908 ms after the
+earlier 892 ms outlier. The experiment is therefore reverted to five frames.
+Voxtral references use the conservative five-build observed envelope instead
+of attributing the variance to an unverified source fix. Offline replay of all
+15 Voxtral result artifacts from those five builds passes the unchanged 10%
+tolerance with the revised entries.
 
-The next exact-head AMD run after this recalibration is the held-out
-qualification run. Record its Buildkite link and every job result in the PR
-qualification evidence before merge; do not promote these jobs to blocking on
-the calibration data alone.
+The same build aborted Qwen3-Omni async after an explicit `GPU Hang` hardware
+exception on node `gpu8f17`. The server had started and one result artifact was
+written; cleanup reported no leaked processes. This is not treated as a model
+or baseline regression and requires a fresh-node rerun.
+
+The paired Qwen3-Omni no-async job produced and passed all eight expected
+results, and Qwen3-TTS produced and passed all 14. Those completed controls
+support the revised current-runtime envelopes but do not waive the async rerun.
+
+Its AR Diffusion Paged Attention job also timed out on node `gpu8ed6`: the
+first paged-attention case made no progress for the 15-minute command budget,
+then the first chunked-transfer case made no progress for its five-minute
+budget. There was no assertion or traceback. The identical job passed in
+builds 16817, 16823 and 16833 on three other nodes, and this PR changes no
+diffusion code, so the timeout is classified as a node/kernel hang pending the
+fresh exact-head rerun.
+
+MiniCPM-o passed C1 after recalibration, then C4 exceeded three references and
+stopped before C8/C16/C32. The runner now preserves strict failure semantics
+but completes every configured sweep before raising the combined baseline
+regressions. The next exact-head AMD diagnostic must publish all five results;
+only repeated measured values may update the remaining envelope.
+
+The next exact-head AMD run after this recalibration is held out for Voxtral and
+collects the complete MiniCPM-o diagnostic sweep. If that evidence requires a
+further baseline update, the following exact-head AMD and CUDA runs become the
+final held-out qualification. Record each Buildkite link and every job result
+in the PR qualification evidence before merge; do not promote these jobs to
+blocking on calibration data alone.
 
 ## Buildkite validation and promotion criteria
 

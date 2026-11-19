@@ -16,6 +16,7 @@ from typing import Any, NamedTuple, TypeGuard
 import pytest
 
 from tests.dfx.conftest import (
+    PerformanceBaselineRegressionError,
     assert_baseline_within_tolerance,
     create_paired_omni_benchmark_pytest_params,
     create_test_parameter_mapping,
@@ -782,15 +783,21 @@ def assert_result(result, params, num_prompt, *, check_baseline: bool = False, r
                     f"Missing or invalid P{percentile} {metric}"
                 )
     hardware = result.get("Hardware")
+    baseline_regression: PerformanceBaselineRegressionError | None = None
     if check_baseline or require_baseline:
         baseline = result.get("baseline")
-        assert_baseline_within_tolerance(
-            result,
-            baseline if isinstance(baseline, dict) else None,
-            hardware if isinstance(hardware, str) else None,
-            required=require_baseline,
-        )
+        try:
+            assert_baseline_within_tolerance(
+                result,
+                baseline if isinstance(baseline, dict) else None,
+                hardware if isinstance(hardware, str) else None,
+                required=require_baseline,
+            )
+        except PerformanceBaselineRegressionError as exc:
+            baseline_regression = exc
     if params.get("duplex_performance_only"):
+        if baseline_regression is not None:
+            raise baseline_regression
         return
     if params.get("dataset_name") == "omni-duplex-eval":
         _assert_duplex_eval_result(result, params, num_prompt)
@@ -846,6 +853,33 @@ def assert_result(result, params, num_prompt, *, check_baseline: bool = False, r
             isinstance(metric, dict) and metric.get("audio_turn_count") == expected_audio_turns
             for metric in session_metrics
         ), f"Not every duplex session emitted {expected_audio_turns} audio turns"
+    if baseline_regression is not None:
+        raise baseline_regression
+
+
+def _assert_sweep_result(
+    result: dict[str, Any],
+    params: dict[str, Any],
+    num_prompt: int,
+    pytestconfig: pytest.Config,
+    *,
+    context: str,
+    baseline_regressions: list[str],
+) -> None:
+    try:
+        assert_result(
+            result,
+            params,
+            num_prompt,
+            check_baseline=pytestconfig.getoption("assert_baseline"),
+            require_baseline=pytestconfig.getoption("require_baseline"),
+        )
+    except PerformanceBaselineRegressionError as exc:
+        baseline_regressions.append(f"{context}\n{exc}")
+        print(
+            f"[baseline-check] DEFER {context}; continuing remaining sweeps to preserve diagnostic artifacts",
+            flush=True,
+        )
 
 
 @pytest.mark.benchmark
@@ -889,6 +923,7 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
 
     print(f"Running benchmark for model: {model}")
     print(f"Benchmark parameters: {benchmark_params}")
+    baseline_regressions: list[str] = []
 
     def to_list(value, default=None):
         if value is None:
@@ -995,12 +1030,13 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
             )
             assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
             try:
-                assert_result(
+                _assert_sweep_result(
                     result,
                     assert_params,
                     num_prompt,
-                    check_baseline=pytestconfig.getoption("assert_baseline"),
-                    require_baseline=pytestconfig.getoption("require_baseline"),
+                    pytestconfig,
+                    context=f"request_rate={qps!r} num_prompts={num_prompt}",
+                    baseline_regressions=baseline_regressions,
                 )
             finally:
                 _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)
@@ -1037,15 +1073,21 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
             )
             assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
             try:
-                assert_result(
+                _assert_sweep_result(
                     result,
                     assert_params,
                     num_prompt,
-                    check_baseline=pytestconfig.getoption("assert_baseline"),
-                    require_baseline=pytestconfig.getoption("require_baseline"),
+                    pytestconfig,
+                    context=f"max_concurrency={concurrency!r} num_prompts={num_prompt}",
+                    baseline_regressions=baseline_regressions,
                 )
             finally:
                 _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)
+        if baseline_regressions:
+            raise PerformanceBaselineRegressionError(
+                f"performance baseline regression across {len(baseline_regressions)} sweep(s); "
+                "all configured sweeps completed:\n\n" + "\n\n".join(baseline_regressions)
+            )
         if (stage_id := params.get("require_speculative_stage")) is not None:
             import httpx
             from prometheus_client.parser import text_string_to_metric_families

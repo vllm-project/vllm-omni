@@ -1822,11 +1822,6 @@ stages:
         assert deploy.stages[0].config_format == "mistral"
         assert deploy.stages[0].load_format == "mistral"
         assert deploy.stages[0].tokenizer_mode == "mistral"
-        assert deploy.connectors is not None
-        connector_extra = deploy.connectors["connector_of_shared_memory"]["extra"]
-        assert connector_extra["codec_chunk_frames_at_begin"] == 3
-        assert connector_extra["codec_chunk_frames"] == 25
-        assert connector_extra["codec_left_context_frames"] == 25
         assert not any(
             name in deploy.stages[0].engine_extras for name in ("config_format", "load_format", "tokenizer_mode")
         )

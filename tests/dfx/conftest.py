@@ -28,6 +28,10 @@ _LOWER_IS_BETTER_TOKENS = ("latency", "ttft", "tpot", "itl", "e2el", "ttfp", "tt
 _HIGHER_IS_BETTER_TOKENS = ("throughput", "qps", "fps")
 
 
+class PerformanceBaselineRegressionError(AssertionError):
+    """One or more measured metrics exceeded their configured envelope."""
+
+
 def metric_lower_is_better(name: str) -> bool:
     """Return whether a smaller measured value is the better one."""
     key = name.lower().replace("-", "_")
@@ -156,7 +160,7 @@ def assert_baseline_within_tolerance(
         )
     if failures:
         logging.getLogger(__name__).error("[baseline-check] FAIL hardware=%s: %s", hardware, "; ".join(failures))
-        raise AssertionError("performance baseline regression:\n" + "\n".join(failures))
+        raise PerformanceBaselineRegressionError("performance baseline regression:\n" + "\n".join(failures))
     print(f"[baseline-check] PASS hardware={hardware}: all {len(bucket)} metrics passed", flush=True)
 
 
