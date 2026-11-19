@@ -34,7 +34,7 @@ INVALID_PARAMETER_ROCM_MARKS = {
     "test_invalid_audio_diffusion.py": {'hardware_marks(res={"cuda": "L4", "rocm": "MI325"})': 1},
     "test_invalid_audio_speech.py": {
         'hardware_marks(res={"cuda": "L4", "rocm": "MI325"})': 1,
-        'hardware_marks(res={"cuda": "H100", "rocm": "MI325"})': 2,
+        'hardware_marks(res={"cuda": "H100", "rocm": "MI325"})': 1,
     },
 }
 
