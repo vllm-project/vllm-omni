@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 # which guards the path that performs the actual cast. Defined here rather than
 # imported to keep config.py free of a pipeline import cycle.
 SUPPORTED_DTYPE_NAMES = frozenset({"float32", "bfloat16"})
+SUPPORTED_LM_PRECISIONS = frozenset({"legacy", "lerobot_bf16"})
 
 # LeRobot / OpenPI observation key conventions.
 ACTION = "action"
@@ -133,6 +134,11 @@ class Pi05Config:
     # Weight dtype the checkpoint was saved in.
     dtype: str = "float32"
 
+    # Decoder activation policy, independent of vision precision and weight
+    # storage. LeRobot casts both decoder inputs to BF16 when their Q weights
+    # are BF16; legacy preserves the incoming FP32 residual stream.
+    lm_precision: str = "legacy"
+
     # ── Relative actions ──────────────────────────────────────────────
     # True when the checkpoint was trained on actions relative to the current
     # state. Its ``norm_stats`` are then in relative space, so serving it without
@@ -191,6 +197,10 @@ class Pi05Config:
         # from the top-level OmniDiffusionConfig and is validated there.
         if self.dtype not in SUPPORTED_DTYPE_NAMES:
             raise ValueError(f"dtype must be one of {sorted(SUPPORTED_DTYPE_NAMES)}, got {self.dtype!r}.")
+        if not isinstance(self.lm_precision, str) or self.lm_precision not in SUPPORTED_LM_PRECISIONS:
+            raise ValueError(
+                f"lm_precision must be one of {sorted(SUPPORTED_LM_PRECISIONS)}, got {self.lm_precision!r}."
+            )
 
         # Derive the camera order from input_features if not given explicitly.
         if self.image_feature_keys is None and self.input_features:
