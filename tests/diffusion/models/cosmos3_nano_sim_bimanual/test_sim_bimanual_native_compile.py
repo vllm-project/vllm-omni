@@ -142,9 +142,11 @@ def test_committed_history_survives_reuse_of_graph_output_storage(frame_causal):
             condition_vision=commit,
             commit_current=commit,
             frame_causal=frame_causal,
-            action_latents=torch.zeros(1),
-            action_domain_ids=torch.zeros(1),
-            null_action_frame_indexes=(),
+            conditioning_kwargs={
+                "action_latents": torch.zeros(1),
+                "action_domain_ids": torch.zeros(1),
+                "null_action_frame_indexes": (),
+            },
         )
 
     first = forward(True)
