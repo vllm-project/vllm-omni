@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import fields as dataclass_fields
 
 import numpy as np
@@ -33,6 +34,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.pi05.config import SUPPORTED_DTYPE_NAMES, Pi05Config
+from vllm_omni.diffusion.models.pi05.cuda_graph_pi05 import Pi05CUDAGraphs
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import Pi05ForActionPrediction
 from vllm_omni.diffusion.models.pi05.processor_pi05 import Pi05Processor
 from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE as PI05_PIPELINE
@@ -138,6 +140,9 @@ class Pi05Pipeline(nn.Module):
 
         self.tokenizer = self._load_tokenizer()
         self.model = self._initialize_model()
+        # OpenPI serving is one observation per call (``max_num_seqs: 1``).
+        self.model.kv_cache = self.model.new_kv_cache(batch_size=1)
+        self._install_cuda_graphs(od_config)
 
         self.processor = Pi05Processor(self.config, self.tokenizer, self._device)
 
@@ -240,6 +245,41 @@ class Pi05Pipeline(nn.Module):
         self._load_checkpoint(model)
         model.eval()
         return model
+
+    def _install_cuda_graphs(self, od_config: OmniDiffusionConfig) -> None:
+        """Pick the ``sample_actions`` execution path.
+
+        The stage's ``enforce_eager`` (deploy yaml, or ``--enforce-eager`` on the
+        CLI, which takes precedence) keeps the eager baseline. Otherwise the
+        optimized path is set up here, at init: the fused Triton kernels are
+        enabled, and the CUDA graphs are captured over them and installed. A
+        failure of either raises rather than silently serving eagerly.
+        """
+        if od_config.enforce_eager:
+            logger.info("Pi05Pipeline: enforce_eager is set; sample_actions runs eagerly.")
+            return
+        if self._device.type != "cuda":
+            logger.warning(
+                "Pi05Pipeline: CUDA graphs need a CUDA device, got %s; sample_actions runs eagerly.",
+                self._device,
+            )
+            return
+        try:
+            self.model.enable_fused_kernels()
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "π0.5's optimized path needs its fused kernels. Set `enforce_eager: true` in the deploy "
+                "config, or pass --enforce-eager, to serve eagerly."
+            ) from exc
+        graphs = Pi05CUDAGraphs(self.model)
+        start = time.perf_counter()
+        graphs.capture()
+        self.model.cuda_graphs = graphs
+        logger.info(
+            "Pi05Pipeline: captured the sample_actions CUDA graphs over the fused kernels in %.2f s; "
+            "sample_actions runs its optimized path.",
+            time.perf_counter() - start,
+        )
 
     def _load_checkpoint(self, model: Pi05ForActionPrediction) -> None:
         import safetensors.torch
