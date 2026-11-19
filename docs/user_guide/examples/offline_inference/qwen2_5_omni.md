@@ -1,7 +1,7 @@
 # Qwen2.5-Omni: Offline inference
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/qwen2_5_omni>.
-Deployment recipe: [`recipes/Qwen/Qwen2.5-Omni.md`](../../../recipes/Qwen/Qwen2.5-Omni.md).
+Deployment recipe: [`recipes/Qwen/Qwen2.5-Omni.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen2.5-Omni.md).
 
 ## Setup
 
