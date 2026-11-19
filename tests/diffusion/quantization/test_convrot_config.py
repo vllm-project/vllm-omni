@@ -247,6 +247,8 @@ def test_layers_route_to_int4_int8_or_unquantized(mocker: MockerFixture, monkeyp
 
 
 @cuda_available
+@hardware_test(res={"cuda": ["H100", "H200", "B200"]}, num_cards=1)
+@pytest.mark.full_model
 class TestCudaConvRot:
     """Real kernels: rotated quantization tracks BF16 and beats unrotated quantization on outliers."""
 
