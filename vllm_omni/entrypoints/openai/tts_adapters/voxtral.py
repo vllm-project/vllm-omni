@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 class VoxtralTTSAdapter(ARTTSAdapter):
     stage_keys = frozenset({"audio_generation"})
     name = "voxtral_tts"
+    reports_length_truncation = True
 
     def __init__(self, ctx) -> None:
         super().__init__(ctx)

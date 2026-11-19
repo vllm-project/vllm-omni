@@ -119,6 +119,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
     prefer_model_sampler: bool = True
     # Tell the runner to call postprocess() to emit per-step audio codes.
     have_multimodal_outputs: bool = True
+    mrv2_forward_returns_tensor = True
     has_postprocess: bool = False
     skips_model_sampler_output_token_history: bool = True
     postprocess_uses_hidden_states: bool = False
