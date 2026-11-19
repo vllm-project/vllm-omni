@@ -15,6 +15,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.experimental.ar_diffusion import runner as runner_module
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVBranchSpec,
@@ -23,6 +24,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionRequestRejectedError,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
+from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -79,13 +81,14 @@ def runner(monkeypatch):
     value._ar_diffusion_kv_cache_spec = pipeline.spec
     value.ar_diffusion_kv_config = ARDiffusionKVConfig(enable=True)
     value.kv_cache = object()
+    value.noisy_kv_cache = None
     value._sessions = OrderedDict()
     value._session_geometry_keys = {}
     value._session_capacity = 2
     value._perf_e2e_times = []
     value._stepwise_chunk_started = {}
     value.state_cache = {}
-    monkeypatch.setattr(value, "_new_session_state", lambda sid: SimpleNamespace(close=Mock()))
+    monkeypatch.setattr(value, "_new_session_state", lambda sid: Mock(spec_set=ARDiffusionKVState))
     monkeypatch.setattr(runner_module, "supports_step_execution", lambda pipeline: True)
     monkeypatch.setattr(runner_module, "current_omni_platform", SimpleNamespace(synchronize=Mock(), empty_cache=Mock()))
     return value
@@ -114,7 +117,7 @@ def test_oversized_request_preserves_pool_and_session_before_reset(runner):
         runner._prepare_ar_request(req, "s1", reset=True)
     assert runner.kv_cache is old_cache
     assert runner._sessions["s1"] is old_state
-    old_state.close.assert_not_called()
+    old_state.release_history.assert_not_called()
     assert not runner.pipeline.reset and not runner.pipeline.closed
 
 
@@ -126,9 +129,12 @@ def request(runner, *, geometry="small", tokens=1, reset=False):
 
 
 def wave(req=None, *, finished=False):
-    return SimpleNamespace(
-        scheduled_request_ids=[] if finished else ["s1"],
-        scheduled_new_reqs=[] if req is None else [SimpleNamespace(request_id="s1", req=req)],
+    return DiffusionSchedulerOutput(
+        step_id=0,
+        scheduled_new_reqs=[] if req is None else [NewRequestData(request_id="s1", req=req)],
+        scheduled_cached_reqs=CachedRequestData(request_ids=["s1"] if req is None and not finished else []),
+        num_running_reqs=int(not finished),
+        num_waiting_reqs=0,
         finished_req_ids={"s1"} if finished else set(),
     )
 
@@ -140,7 +146,7 @@ def test_request_geometry_rejection_preserves_existing_session(runner, monkeypat
     with pytest.raises(ARDiffusionRequestRejectedError, match="reset is required"):
         runner.execute_model(request(runner, geometry="wide"))
     assert runner._sessions["s1"] is original
-    original.close.assert_not_called()
+    original.release_history.assert_not_called()
     forward.assert_not_called()
     assert not runner.pipeline.closed
 
@@ -163,9 +169,10 @@ def test_request_reset_binds_fresh_state_with_new_geometry(runner, monkeypatch):
         lambda *args, **kwargs: seen.append(runner.pipeline.bound),
     )
     runner.execute_model(request(runner, geometry="wide", reset=True))
-    original.close.assert_called_once()
+    original.release_history.assert_called_once_with("s1")
     assert seen == [runner._sessions["s1"]]
     assert seen[0] is not original
+    seen[0].finish_request.assert_called_once_with("s1")
     assert runner._session_geometry_keys["s1"] == "wide"
     assert runner.pipeline.bound is None
 
@@ -180,7 +187,10 @@ def test_request_admission_rejection_retains_history_but_execution_failure_relea
     assert runner.pipeline.bound is None
     assert ("s1" in runner._sessions) is rejected
     assert ("s1" in runner._session_geometry_keys) is rejected
-    assert original.close.call_count == (0 if rejected else 1)
+    if rejected:
+        original.release_history.assert_not_called()
+    else:
+        original.release_history.assert_called_once_with("s1")
     assert not runner._perf_e2e_times
 
 
@@ -234,7 +244,7 @@ def test_stepwise_reuses_admitted_geometry_and_retires_session(runner, monkeypat
     assert seen[0] is seen[1]
     assert runner._session_geometry_keys["s1"] == "wide"
     runner.execute_stepwise(wave(finished=True))
-    seen[0].close.assert_called_once()
+    seen[0].release_history.assert_called_once_with("s1")
     assert not runner._sessions
     assert not runner._session_geometry_keys
     assert not runner._stepwise_chunk_started
