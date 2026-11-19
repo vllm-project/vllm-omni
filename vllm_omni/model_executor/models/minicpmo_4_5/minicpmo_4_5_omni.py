@@ -53,6 +53,8 @@ from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 if TYPE_CHECKING:
     from vllm.v1.sample.metadata import SamplingMetadata
 
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex import diagnostic_trace as _i417_trace
+
 logger = init_logger(__name__)
 
 
@@ -359,7 +361,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         rows: tuple[DuplexSamplingRow, ...],
     ) -> None:
         """Apply MiniCPM duplex policy before the standard model sampler."""
-        del sampling_metadata
         # The previous step's deferred decisions update the session state read below.
         self._commit_minicpmo45_duplex_pending_samples()
         self._minicpmo45_active_duplex_rows = [row.row_idx for row in rows]
@@ -387,6 +388,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if listen_id < 0 or listen_id >= logits.shape[-1]:
             return
 
+        _i417_trace.begin(self, logits, sampling_metadata, rows)
         force_listen_segments = getattr(
             self,
             "_minicpmo45_force_listen_applied_segments",
@@ -440,6 +442,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 continue
             if force_listen:
                 # fill_ keeps the scalars on the host; an element assignment copies a scalar tensor and syncs.
+                _i417_trace.force(self, row_idx)
                 logits[row_idx].fill_(float("-inf"))
                 logits[row_idx].narrow(0, listen_id, 1).fill_(0.0)
                 force_listen_segments.add(segment_key)
@@ -1286,16 +1289,16 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if deferred is not None:
                 sampled = index_to_device(sampled_ids, logits.device, torch.int32)
                 sampled[index_to_device(pending_rows, logits.device)] = deferred.to(torch.int32)
+                _i417_trace.finish(self, sampled, self._minicpmo45_duplex_pending_samples)
                 return SamplerOutput(sampled_token_ids=sampled.unsqueeze(-1), logprobs_tensors=None)
             synchronous = self._sample_minicpmo45_native_duplex_rows(logits, sampling_metadata, **kwargs)
             for row_idx, sampled in zip(pending_rows, synchronous, strict=True):
                 sampled_ids[row_idx] = sampled
                 self._record_minicpmo45_duplex_terminator(row_idx, sampled, token_ids)
 
-        return SamplerOutput(
-            sampled_token_ids=index_to_device(sampled_ids, logits.device, torch.int32).unsqueeze(-1),
-            logprobs_tensors=None,
-        )
+        sampled = index_to_device(sampled_ids, logits.device, torch.int32)
+        _i417_trace.finish(self, sampled, None)
+        return SamplerOutput(sampled_token_ids=sampled.unsqueeze(-1), logprobs_tensors=None)
 
     def _minicpmo45_duplex_row_params(
         self,
@@ -1437,6 +1440,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             # Distinct (row, col) pairs, so one indexed division equals dividing each once.
             rows_t, cols_t = index_to_device(penalty_rows, device), index_to_device(penalty_cols, device)
             stage2_logits[rows_t, cols_t] = stage2_logits[rows_t, cols_t] / 1.05
+
+        if _i417_trace.ENABLED:
+            for local_idx, row_idx in enumerate(rows):
+                state = self._minicpmo45_duplex_state_for_row(row_idx)
+                repetition_tokens = getattr(state, "generated_tokens", None) or recent[row_idx]
+                _i417_trace.adjusted(self, row_idx, stage2_logits[local_idx], repetition_tokens[-history_size:])
 
         samples: list[torch.Tensor | None] = [None] * len(rows)
         greedy = [local for local, row_idx in enumerate(rows) if all_greedy or float(row_params[row_idx][0]) <= 0]

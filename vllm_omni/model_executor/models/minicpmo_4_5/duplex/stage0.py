@@ -589,6 +589,38 @@ class MiniCPMO45Stage0DuplexRuntime:
         if window_result is not None:
             embed_parts, token_ids = window_result
         inputs_embeds = torch.cat([self._as_2d_tensor(embed) for embed in embed_parts], dim=0)
+
+        from . import diagnostic_trace
+
+        if diagnostic_trace.ENABLED and state.audio_chunk_idx <= 50:
+            import hashlib
+
+            cpu = inputs_embeds.detach().cpu().contiguous()
+            frames = encoded_frames or []
+
+            def tensor_hash(t):
+                return hashlib.sha256(t.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()
+
+            record = {
+                "session": state.session_id,
+                "unit": state.audio_chunk_idx,
+                "seq": seq,
+                "token_ids": token_ids,
+                "hash": tensor_hash(cpu),
+                "shape": list(cpu.shape),
+                "is_speech": is_speech,
+                "context_prefix": state.context_prefix_token_ids,
+                "audio_hash": tensor_hash(audio_embeds) if audio_embeds is not None else None,
+                "units_built": units_built,
+                "context_suffix": state.context_suffix_token_ids,
+                "mode": state.window_enabled,
+                "wave_hash": hashlib.sha256(audio_waveform.tobytes()).hexdigest()
+                if audio_waveform is not None
+                else None,
+                "frames": [[tensor_hash(t) for t in f] for f in frames],
+            }
+            with open(diagnostic_trace.trace_path("prefills.log"), "a") as log:
+                print(repr(record), file=log)
         result = self._stage_prefill_result(True, start_time)
         result.update(
             {
