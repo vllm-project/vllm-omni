@@ -9,8 +9,8 @@ Directly inherits from vLLM's AsyncMPClient to reuse EngineCore architecture.
 
 from __future__ import annotations
 
-import ipaddress
 import inspect
+import ipaddress
 import os
 import socket
 from typing import TYPE_CHECKING, Any
