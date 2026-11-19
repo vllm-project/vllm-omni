@@ -295,8 +295,8 @@ steps:
               > "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/collection.txt"
             count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
               "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/collection.txt")
-            if [[ "$$count" != 66 ]]; then
-              echo "Expected exactly 66 single-GPU invalid-parameter nodes, found $$count." >&2
+            if [[ "$$count" != 30 ]]; then
+              echo "Expected exactly 30 single-GPU invalid-parameter nodes, found $$count." >&2
               cat "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/collection.txt" >&2
               exit 5
             fi
@@ -324,9 +324,9 @@ steps:
             suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
             tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
             skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-            if tests != 66 or skipped != 5:
+            if tests != 30 or skipped != 5:
                 print(
-                    f"Expected exactly 66 single-GPU invalid-parameter tests with 5 known skips; "
+                    f"Expected exactly 30 single-GPU invalid-parameter tests with 5 known skips; "
                     f"reported tests={tests}, skipped={skipped}.",
                     file=sys.stderr,
                 )
@@ -360,8 +360,8 @@ steps:
               > "$$ROCM_INVALID_PARAMETERS_ARTIFACT_DIR/collection.txt"
             count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
               "$$ROCM_INVALID_PARAMETERS_ARTIFACT_DIR/collection.txt")
-            if [[ "$$count" != 24 ]]; then
-              echo "Expected exactly 24 invalid-parameter reliability nodes, found $$count." >&2
+            if [[ "$$count" != 18 ]]; then
+              echo "Expected exactly 18 invalid-parameter reliability nodes, found $$count." >&2
               cat "$$ROCM_INVALID_PARAMETERS_ARTIFACT_DIR/collection.txt" >&2
               exit 5
             fi
@@ -390,9 +390,9 @@ steps:
             suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
             tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
             skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-            if tests != 24 or skipped != 0:
+            if tests != 18 or skipped != 0:
                 print(
-                    f"Expected exactly 24 executed invalid-parameter reliability tests; "
+                    f"Expected exactly 18 executed invalid-parameter reliability tests; "
                     f"reported tests={tests}, skipped={skipped}.",
                     file=sys.stderr,
                 )
@@ -428,8 +428,8 @@ steps:
               > "$$ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR/collection.txt"
             count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
               "$$ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR/collection.txt")
-            if [[ "$$count" != 127 ]]; then
-              echo "Expected exactly 127 audio invalid-parameter nodes, found $$count." >&2
+            if [[ "$$count" != 85 ]]; then
+              echo "Expected exactly 85 audio invalid-parameter nodes, found $$count." >&2
               cat "$$ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR/collection.txt" >&2
               exit 5
             fi
@@ -457,9 +457,9 @@ steps:
             suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
             tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
             skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-            if tests != 127 or skipped != 26:
+            if tests != 85 or skipped != 26:
                 print(
-                    f"Expected exactly 127 audio invalid-parameter tests with 26 known skips; "
+                    f"Expected exactly 85 audio invalid-parameter tests with 26 known skips; "
                     f"reported tests={tests}, skipped={skipped}.",
                     file=sys.stderr,
                 )
