@@ -4,6 +4,10 @@
 
 For detailed hardware and software requirements, please refer to the [vLLM-Ascend installation documentation](https://docs.vllm.ai/projects/ascend/en/latest/installation.html).
 
+Look up your vLLM release in the [NPU version compatibility table](https://github.com/vllm-project/vllm-omni/issues/2223#issuecomment-4705062827).
+To install a released combination, choose a row marked `released` and use the vLLM-Ascend and vLLM-Omni revisions listed there.
+For versions before v0.19.0, see the [earlier compatibility table](https://github.com/vllm-project/vllm-omni/issues/886).
+
 # --8<-- [end:requirements]
 
 # --8<-- [start:installation-release]
@@ -68,8 +72,6 @@ The default workdir is `/workspace`, with vLLM, vLLM-Ascend and vLLM-Omni code p
 
 For other installation methods (pip installation, building from source, custom Docker builds), please refer to the [vllm-ascend installation guide](https://docs.vllm.ai/projects/ascend/en/latest/installation.html).
 
-We are keeping [issue #886](https://github.com/vllm-project/vllm-omni/issues/886) up to date with the aligned versions of vLLM, vLLM-Ascend, and vLLM-Omni, and also outlining the Q1 roadmap there.
-
 # --8<-- [end:installation-release]
 
 # --8<-- [start:installation-main]
@@ -77,9 +79,7 @@ We are keeping [issue #886](https://github.com/vllm-project/vllm-omni/issues/886
 You can also install vLLM-Omni from source if you want to use the latest features
 or bug fixes. This alignment checkout targets vLLM 0.34.0 and requires a
 matching vLLM-Ascend runtime validated on your NPU. The v0.30.0 Ascend images
-above do not establish compatibility with this vLLM 0.34.0 checkout. Check
-[issue #886](https://github.com/vllm-project/vllm-omni/issues/886) for aligned
-versions and NPU validation before selecting a development image.
+above do not establish compatibility with this vLLM 0.34.0 checkout.
 
 ```bash
 # Inside a container with matching vLLM and vLLM-Ascend, install Omni from source
