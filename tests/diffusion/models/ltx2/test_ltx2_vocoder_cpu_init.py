@@ -116,6 +116,18 @@ def test_ltx_bwe_filter_restore_matches_fp32_reference(monkeypatch, supported):
     assert restored is vocoder.resampler._ltx_restored_filter
 
 
+def _to_target_device(args, kwargs) -> torch.device | None:
+    # Return the device a ``Tensor.to`` call targets, or None for dtype-only casts.
+    if kwargs.get("device") is not None:
+        return torch.device(kwargs["device"])
+    for arg in args:
+        if isinstance(arg, torch.Tensor):
+            return arg.device
+        if isinstance(arg, (torch.device, str)):
+            return torch.device(arg)
+    return None
+
+
 @pytest.mark.parametrize(
     ("supported", "expected_sinc_device", "expected_to_calls"),
     [(False, "cpu", ["meta"]), (True, "meta", [])],
@@ -140,7 +152,10 @@ def test_ltx_bwe_filter_restore_device_follows_platform_flag(
         return original_sinc(value)
 
     def recording_to(self, *args, **kwargs):
-        to_calls.append(str(args[0]) if args else str(kwargs))
+        # Record device moves only; torch may issue dtype-only casts internally.
+        target = _to_target_device(args, kwargs)
+        if target is not None:
+            to_calls.append(target.type)
         return original_to(self, *args, **kwargs)
 
     monkeypatch.setattr(torch, "sinc", recording_sinc)
