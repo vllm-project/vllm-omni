@@ -193,7 +193,10 @@ class OmniModelConfig(ModelConfig):
             hashed.omni_kv_config = dict(self.omni_kv_config)
             hashed.omni_kv_config["connector_config"] = connector_hash_factors(self.omni_kv_config["connector_config"])
 
-        return super(OmniModelConfig, hashed).compile_factors()
+        factors = super(OmniModelConfig, hashed).compile_factors()
+        # Window policies run in the scheduler and do not change the model graph.
+        factors.pop("scheduler_window_policy", None)
+        return factors
 
     @property
     def registry(self):
