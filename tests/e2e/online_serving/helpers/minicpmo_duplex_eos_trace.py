@@ -56,6 +56,21 @@ class _CaptureGreedy(TorchFunctionMode):
 
 class MiniCPMDuplexEOSTrace:
     def init_worker_extension(self):
+        config = self.model_config
+        _write(
+            "runtime.jsonl",
+            {
+                "model": str(config.model),
+                "checkpoint_commit": getattr(config.hf_config, "_commit_hash", None),
+                "revision": config.revision,
+                "dtype": str(config.dtype),
+                "seed": config.seed,
+                "torch": str(torch.__version__),
+                "cuda": torch.version.cuda,
+                "allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+                "allow_bf16_reduced_precision_reduction": torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+            },
+        )
         from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import MiniCPMO45Stage0DuplexRuntime
         from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
             MiniCPMO45OmniForConditionalGeneration as Model,
