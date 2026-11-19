@@ -16,12 +16,33 @@ import pytest
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import SERVER_PARAMS, realtime_url, resolve_ref_audio
 from tests.e2e.online_serving.helpers.minicpmo_duplex_recognition import evaluate_session, load_manifest, unpack_inputs
 from tests.helpers.mark import hardware_test
+from tests.helpers.stage_config import modify_stage_config
 
 pytestmark = [pytest.mark.omni, pytest.mark.core_model]
 
+# Temporary diagnostics are confined to this existing recognition fixture.
+EOS_TRACE_SERVER_PARAMS = [
+    pytest.param(
+        param.values[0]._replace(
+            stage_config_path=modify_stage_config(
+                param.values[0].stage_config_path,
+                updates={
+                    "stages": {
+                        0: {
+                            "worker_extension_cls": "tests.e2e.online_serving.helpers.minicpmo_duplex_eos_trace.MiniCPMDuplexEOSTrace"
+                        }
+                    }
+                },
+            )
+        ),
+        id=param.id,
+    )
+    for param in SERVER_PARAMS
+]
+
 
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
-@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+@pytest.mark.parametrize("omni_server", EOS_TRACE_SERVER_PARAMS, indirect=True)
 def test_duplex_long_video_scene_recognition(omni_server, tmp_path: Path, monkeypatch) -> None:
     manifest = load_manifest()
     wav, frames = unpack_inputs(tmp_path / "input")
