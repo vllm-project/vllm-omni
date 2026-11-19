@@ -18,6 +18,7 @@ from vllm.forward_context import (
     set_forward_context,
 )
 from vllm.logger import init_logger
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, set_dummy_context
@@ -745,11 +746,40 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         supports_multi_frame_decode(self.model, mrv2=frames > 1)
         return frames
 
+    def _prompt_logits_fn(self) -> Any:
+        """Resolve stateless logits for prompt chunks and sampler warmup."""
+        prompt_logits_fn = getattr(self.model, "compute_prompt_logits", None)
+        return prompt_logits_fn if callable(prompt_logits_fn) else self.model.compute_logits
+
+    @torch.inference_mode()
     def _dummy_sampler_run(self, hidden_states: Any) -> Any:
-        """The Talker's two control logits cannot satisfy profiling's top-k request."""
+        """Warm the sampler without consuming request-local model state."""
         if self._kstep_frames > 1:
             return None
-        return super()._dummy_sampler_run(hidden_states)
+        prompt_logits_fn = getattr(self.model, "compute_prompt_logits", None)
+        if not callable(prompt_logits_fn):
+            return super()._dummy_sampler_run(hidden_states)
+
+        assert self.sampler is not None
+        if self.model_state.dummy_sampler_run(self.sampler, hidden_states):
+            return None
+
+        num_reqs = hidden_states.shape[0]
+        logits = prompt_logits_fn(hidden_states)
+        dummy_input_batch = InputBatch.make_dummy(num_reqs, num_reqs, self.input_buffers)
+
+        # Mirror vLLM 0.34's default sampler profiling passes. Only the logits
+        # projection differs: dummy rows have no request-local sampling state.
+        self.sampler(logits, dummy_input_batch)
+        if current_omni_platform.is_cpu():
+            return None
+
+        warmup_params = SamplingParams.for_sampler_warmup()
+        for req_idx in range(num_reqs):
+            self.sampler.add_request(req_idx, warmup_params)
+        self.sampler.apply_staged_writes()
+        self.sampler(logits, dummy_input_batch)
+        return None
 
     def _build_kstep_model_kwargs_extra(self, model_inputs: dict[str, Any], input_batch: InputBatch) -> dict[str, Any]:
         """Build per-request spans and codec state for the multi-frame loop."""

@@ -69,9 +69,9 @@ not require excluding FULL capture.
 MRv2 computes prompt logprobs after sampling and may split prompt hidden states
 into arbitrary row chunks. A model whose sampling logits depend on request-local
 state or full-batch row spans can expose `compute_prompt_logits(hidden_states)`
-for this stateless path. The runner uses that hook only for prompt logprobs and
-otherwise falls back to `compute_logits`; sampling keeps the model's normal
-request-state validation.
+for stateless prompt chunks and the startup sampler profiling pass. The runner
+otherwise falls back to `compute_logits`; real sampling keeps the model's normal
+request-state validation and updates.
 
 Request-batched MTP uses its own FULL graph wrapper. Capture and replay select
 the same FULL descriptor from the MTP capture sizes, bounded by
