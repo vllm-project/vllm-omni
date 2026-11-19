@@ -46,8 +46,10 @@ from vllm_omni.config.omni_config import (
     VllmOmniGenerationStageConfig,
 )
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_config
+from vllm_omni.config.resolver import _apply_generic_stage_overrides, _flatten_stage_overrides
 from vllm_omni.config.stage_config import (
     _STAGE_DEPLOY_FIELDS,
+    NON_STAGE_OVERRIDE_FIELDS,
     PIPELINE_WIDE_ENGINE_FIELDS,
     DeployConfig,
     DuplexSessionRuntimeConfig,
@@ -146,6 +148,17 @@ def test_hunyuan_ar_platform_runner_defaults(platform, deploy_name, pipeline_key
     assert stages[0].yaml_engine_args["supports_native_mrv2_data_plane"] is True
 
 
+def test_higgs_default_profile_enables_mrv2_async_audio_payload() -> None:
+    deploy = load_deploy_config(_DEPLOY_DIR / "higgs_multimodal_qwen3.yaml")
+    stage = deploy.stages[0]
+
+    assert stage.async_scheduling is True
+    assert stage.engine_extras["hf_overrides"] == {
+        "audio_async_prompt_mode": True,
+        "audio_async_payload": True,
+    }
+
+
 @pytest.mark.parametrize("pending", [False, True])
 def test_pending_generation_capability_reaches_both_engine_config_paths(pending, tmp_path):
     from vllm_omni.engine.arg_utils import OmniEngineArgs
@@ -184,6 +197,99 @@ def test_mammothmoda2_diffusion_stage_projects_native_backend_config() -> None:
     assert stage.diffusion_config.step_execution is False
     assert stage.scheduler_config.max_num_seqs == 8
     assert stage.connector_config.omni_kv_config == {"need_recv_cache": False}
+
+
+@pytest.mark.parametrize("field", sorted(NON_STAGE_OVERRIDE_FIELDS))
+def test_flatten_stage_overrides_warns_and_skips_non_stage_fields(field: str, caplog) -> None:
+    cli_overrides: dict = {}
+    stage_overrides = {"0": {field: {"value": 1}}}
+
+    with caplog.at_level(logging.WARNING, logger="vllm_omni.config.resolver"):
+        _flatten_stage_overrides(cli_overrides, stage_overrides)
+
+    assert cli_overrides == {}
+    assert "--stage-overrides['0']" in caplog.text
+    assert field in caplog.text
+
+
+def test_flatten_stage_overrides_warns_for_nested_duplex_session_key(caplog) -> None:
+    cli_overrides: dict = {}
+    stage_overrides = {"0": {"duplex_session.idle_ttl_s": 60}}
+
+    with caplog.at_level(logging.WARNING, logger="vllm_omni.config.resolver"):
+        _flatten_stage_overrides(cli_overrides, stage_overrides)
+
+    assert cli_overrides == {}
+    assert "duplex_session.idle_ttl_s" in caplog.text
+
+
+def test_flatten_stage_overrides_preserves_supported_fields() -> None:
+    cli_overrides: dict = {}
+    stage_overrides = {
+        "0": {
+            "env": {"TEST_ENV": "1"},
+            "extras": {"ltx2_use_conv_vae": True},
+            "kv_cache_dtype": "fp8",
+            "stage_connector_spec": {"name": "SharedMemoryConnector", "extra": {}},
+        }
+    }
+
+    _flatten_stage_overrides(cli_overrides, stage_overrides)
+
+    assert cli_overrides == {
+        "stage_0_env": {"TEST_ENV": "1"},
+        "stage_0_extras": {"ltx2_use_conv_vae": True},
+        "stage_0_kv_cache_dtype": "fp8",
+        "stage_0_stage_connector_spec": {"name": "SharedMemoryConnector", "extra": {}},
+    }
+
+
+def test_generic_stage_overrides_use_filtered_stage_overrides(caplog) -> None:
+    registry_overrides: dict = {}
+    generic_overrides: dict = {}
+    stage_overrides = {"0": {"edges": [], "env": {"TEST_ENV": "1"}}}
+
+    with caplog.at_level(logging.WARNING, logger="vllm_omni.config.resolver"):
+        filtered_stage_overrides = _flatten_stage_overrides(registry_overrides, stage_overrides)
+        _apply_generic_stage_overrides(generic_overrides, filtered_stage_overrides)
+
+    assert generic_overrides == {"env": {"TEST_ENV": "1"}}
+    assert "edges" in caplog.text
+
+
+def test_diffusion_stage_cli_overrides_skip_default_sampling_params(caplog) -> None:
+    cli_overrides = {"stage_0_default_sampling_params": {"guidance_scale": 7.5}}
+
+    with caplog.at_level(logging.WARNING):
+        overrides = omni_config_module._stage_cli_overrides(
+            0,
+            cli_overrides,
+            execution_type=StageExecutionType.DIFFUSION,
+        )
+
+    assert overrides == {}
+    warnings = [record for record in caplog.records if "default_sampling_params" in record.getMessage()]
+    assert len(warnings) == 1
+    assert warnings[0].name == "vllm_omni.config.omni_config"
+
+
+def test_diffusion_stage_cli_overrides_do_not_warn_for_valid_internal_fields(caplog) -> None:
+    cli_overrides = {
+        "stage_0_parallel_config": {"tensor_parallel_size": 2},
+        "stage_0_num_gpus": 2,
+    }
+
+    with caplog.at_level(logging.WARNING):
+        overrides = omni_config_module._stage_cli_overrides(
+            0,
+            cli_overrides,
+            execution_type=StageExecutionType.DIFFUSION,
+        )
+
+    assert overrides["parallel_config"] == {"tensor_parallel_size": 2}
+    assert overrides["num_gpus"] == 2
+    assert "Ignoring --stage-overrides[0].parallel_config" not in caplog.text
+    assert "Ignoring --stage-overrides[0].num_gpus" not in caplog.text
 
 
 def test_minimax_h3_text_encoder_tp_targets_only_structured_stage_zero() -> None:
@@ -1618,6 +1724,7 @@ def test_sub_config_fields_match_structured_scopes():
         "vae_parallel_mode",
         "text_encoder_tp_size",
         "use_hsdp",
+        "hsdp_data_parallel",
         "mask_sp_padding",
         "hsdp_shard_size",
         "hsdp_replicate_size",
@@ -1764,6 +1871,51 @@ def test_diffusion_parallel_config_supports_diffusion_hsdp_auto_sharding():
 
     assert cfg.hsdp_shard_size == 2
     assert cfg.world_size == 4
+
+
+def test_diffusion_parallel_config_supports_hsdp_rank_local_requests():
+    cfg = OmniStageDiffusionParallelConfig(
+        use_hsdp=True,
+        hsdp_data_parallel=True,
+        hsdp_shard_size=8,
+    )
+
+    assert cfg.world_size == 8
+    assert cfg.data_parallel_size == 8
+    assert cfg.text_encoder_tp_size == 1
+
+
+@pytest.mark.parametrize("text_encoder_tp_size", [2, 4, 8])
+def test_diffusion_parallel_config_rejects_hsdp_rank_local_requests_with_text_encoder_tp(text_encoder_tp_size):
+    with pytest.raises(ValueError, match="hsdp_data_parallel requires text_encoder_tp_size to be 1"):
+        OmniStageDiffusionParallelConfig(
+            use_hsdp=True,
+            hsdp_data_parallel=True,
+            hsdp_shard_size=8,
+            text_encoder_tp_size=text_encoder_tp_size,
+        )
+
+
+def test_diffusion_parallel_config_supports_hsdp_with_text_encoder_tp():
+    cfg = OmniStageDiffusionParallelConfig(
+        use_hsdp=True,
+        hsdp_shard_size=8,
+        text_encoder_tp_size=2,
+    )
+
+    assert cfg.world_size == 8
+    assert cfg.data_parallel_size == 1
+    assert cfg.text_encoder_tp_size == 2
+
+
+def test_diffusion_parallel_config_rejects_hsdp_rank_local_requests_with_vae_patch_parallel():
+    with pytest.raises(ValueError, match="vae_patch_parallel_size to be 1"):
+        OmniStageDiffusionParallelConfig(
+            use_hsdp=True,
+            hsdp_data_parallel=True,
+            hsdp_shard_size=8,
+            vae_patch_parallel_size=8,
+        )
 
 
 def test_diffusion_parallel_config_rejects_hsdp_with_tp_or_dp():

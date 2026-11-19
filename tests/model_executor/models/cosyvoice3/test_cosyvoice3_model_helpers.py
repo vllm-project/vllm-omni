@@ -1078,6 +1078,7 @@ def test_code2wav_consumes_v2_conditioning_without_mutating_runner_state():
             },
             "meta": {"req_id": [f"voice-{i}"], "talker_prefill_offset": i},
             "request_id": f"upstream-{i}",
+            "global_request_id": [f"global-{i}"],
         }
         buffers.add_request(
             i,
@@ -1104,6 +1105,7 @@ def test_code2wav_consumes_v2_conditioning_without_mutating_runner_state():
         assert info["sampling_params"] is params[index]
         assert info["sampling_params"].seed == (11, 22)[index]
         assert info["req_id"] == f"runner-{index}"
+        assert info["global_request_id"] == [f"global-{index}"]
         if index == 0:
             assert info["mm_features"] == ["feature-0"]
             assert info["prompt_embeds_cpu"].shape == (1, 2)
