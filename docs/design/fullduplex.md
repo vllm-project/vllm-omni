@@ -841,6 +841,14 @@ close    DuplexOmni.close_session -> close RPC; the manager tears the runner dow
 reap     DuplexSessionManager.reaper_loop: idle TTL / disconnect grace expiry, cleanup retries
 ```
 
+Accepted audio that remains buffered refreshes the idle lease when server VAD
+classifies it as speech. Without a server VAD result, valid nonempty buffered
+audio counts as activity regardless of client speech hints or the overlap RMS
+threshold. The refresh happens after buffer and input-byte admission checks;
+rejected input, video-only input, and incomplete Float32 samples discarded by
+the buffer do not qualify. Model operations and output retain their own lease
+activity, so this buffered-input rule does not replace those activity sources.
+
 ### Concurrency and ordering model of the runner
 
 The runner's session state is owned by the orchestrator asyncio loop and

@@ -2020,7 +2020,12 @@ class DuplexSessionRunner:
             if pcm_reservation is not None:
                 pcm_reservation.commit()
             # A buffer can retain video while dropping an incomplete float PCM sample.
-            if payload["is_speech"] and raw_audio_bytes > 0 and (fmt != "pcm_f32le" or raw_audio_bytes % 4 == 0):
+            # Without server VAD, any valid nonempty audio counts as activity.
+            if (
+                (vad_result is None or vad_result.is_speech)
+                and raw_audio_bytes > 0
+                and (fmt != "pcm_f32le" or raw_audio_bytes % 4 == 0)
+            ):
                 session.touch_lease(DuplexLeaseActivity.APPEND)
             # Fresh input for an ephemeral request is an explicit retry even
             # when the buffer waits until commit to start the append.

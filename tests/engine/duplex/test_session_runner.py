@@ -829,23 +829,45 @@ async def test_idle_expiry_emits_session_expired() -> None:
 
 
 @pytest.mark.asyncio
-async def test_buffered_speech_refreshes_idle_lease() -> None:
+@pytest.mark.parametrize("audio_format", ["pcm16", "pcm_f32le"])
+@pytest.mark.parametrize(
+    "server_speech,client_speech,value,refresh",
+    [
+        pytest.param(None, True, 0.05, True, id="no-vad-speech"),
+        pytest.param(None, None, 0.001, True, id="no-vad-quiet"),
+        pytest.param(None, None, 0.0, True, id="no-vad-silence"),
+        pytest.param(None, False, 0.05, True, id="no-vad-client-false"),
+        pytest.param(True, False, 0.0, True, id="server-speech-overrides-client"),
+        pytest.param(False, True, 0.05, False, id="server-silence-overrides-client"),
+    ],
+)
+async def test_buffered_audio_idle_lease(
+    audio_format: str, server_speech: bool | None, client_speech: bool | None, value: float, refresh: bool
+) -> None:
+    from vllm_omni.engine.duplex.turn_detection import TurnDetectionResult
+
     clock = {"now": 100.0}
     h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(idle_ttl_s=2.0), clock=lambda: clock["now"])
     try:
-        audio = append_audio(samples=1600)
+        if server_speech is not None:
+            h.runner.control._detector = _ScriptedDetector(
+                [TurnDetectionResult(is_speech=server_speech, speech_active=server_speech) for _ in range(2)]
+            )
+        audio = append_audio(samples=1600, value=value, is_speech=client_speech, audio_format=audio_format)
         for count, now in enumerate((101.0, 102.0), start=1):
             clock["now"] = now
             events = await h.run(audio)
             assert "error" not in types(events)
-            assert h.runner.model_state.audio_buffer.pending_byte_count == count * len(audio.audio)
+            # Both ingress formats are retained as Float32 PCM.
+            assert h.runner.model_state.audio_buffer.pending_byte_count == count * 1600 * 4
             assert h.port.submissions == []
-            assert await h.manager.reap_expired() == 0
 
-        clock["now"] = 103.5
-        assert await h.manager.reap_expired() == 0
-        clock["now"] = 104.0
-        assert await h.manager.reap_expired() == 1
+        assert await h.manager.reap_expired() == (0 if refresh else 1)
+        if refresh:
+            clock["now"] = 103.5
+            assert await h.manager.reap_expired() == 0
+            clock["now"] = 104.0
+            assert await h.manager.reap_expired() == 1
         events = await h.settle()
         assert types(events) == ["session.expired"]
         assert events[0].reason == "idle_ttl_expired"
