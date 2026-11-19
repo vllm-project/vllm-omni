@@ -97,7 +97,7 @@ INPUT_CLOCK = {"clock": "input"}
 
 @pytest.fixture
 def input_clock_model(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No model opts into the input clock in this change: let the harness model stand in for one that has."""
+    """The harness model (MiniCPM-o 4.5) opts in; kept explicit so these tests do not depend on it."""
     monkeypatch.setattr(MiniCPMO45DuplexPlugin, "supports_input_clock", True)
 
 
@@ -1484,8 +1484,9 @@ async def test_without_the_clock_nothing_changes(monkeypatch: pytest.MonkeyPatch
 # ---- capability, mode lock and idle window -----------------------------------
 
 
-async def test_a_model_that_has_not_opted_in_refuses_an_input_clocked_session() -> None:
-    assert MiniCPMO45DuplexPlugin.supports_input_clock is False
+async def test_a_model_that_has_not_opted_in_refuses_an_input_clocked_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The harness model opts in; stand it in for one that has not.
+    monkeypatch.setattr(MiniCPMO45DuplexPlugin, "supports_input_clock", False)
     limits = DuplexSessionRuntimeConfig()
     results: asyncio.Queue[object] = asyncio.Queue()
     manager = DuplexSessionManager(

@@ -427,6 +427,27 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
     def retains_separate_vision_units(self) -> bool:
         return True
 
+    def prepare_backlog(self, *, operation_id: str, chunk_period_ms: int) -> MiniCPMO45PcmAppendReservation | None:
+        """Reserve the next whole chunk of audio already buffered (input-clocked sessions), or ``None``.
+
+        An append longer than one chunk leaves its later chunks buffered; the
+        runner of an input-clocked session drains them right after the append,
+        so the append's acknowledgement covers every chunk it completed.
+        """
+        sample_rate_hz = self._sample_rate_hz
+        if sample_rate_hz is None:
+            return None
+        min_samples = max(1, int(sample_rate_hz * max(1, int(chunk_period_ms)) / 1000))
+        if len(self._buffer) // 4 < min_samples:
+            return None
+        payload: dict[str, object] = {
+            "type": "audio",
+            "audio": "",
+            "format": "pcm_f32le",
+            "sample_rate_hz": sample_rate_hz,
+        }
+        return self.prepare_append(payload, operation_id=operation_id, chunk_period_ms=chunk_period_ms)
+
     def prepare_commit_prefix(
         self, *, operation_id: str, chunk_period_ms: int
     ) -> MiniCPMO45PcmAppendReservation | None:

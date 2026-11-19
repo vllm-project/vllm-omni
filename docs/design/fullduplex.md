@@ -1372,7 +1372,29 @@ all of them for that append. The timeouts' defaults are the same for every
 model (a per-plugin default is a possible follow-up). A plugin enables the mode with
 `supports_input_clock = True` once those hooks match its real unit
 boundaries; sessions of other models that ask for it are refused
-(`input_clock_unsupported`). No model opts in yet.
+(`input_clock_unsupported`). A plugin whose committed turn can split into
+several Stage-0 submissions for some input modality (vision units it
+replays separately, `prepare_commit_prefix`) names the modalities its
+clocked sessions do accept in `input_clock_input_modalities`; the session
+is then created without the others (`apply_input_clock_capabilities`), so
+the modality check refuses them (`invalid_input_modality`). MiniCPM-o 4.5
+opts in, for audio: its Code2Wav stage streams across unit boundaries, so
+its `unit_output_complete` waits for the Talker segment end and the Code2Wav
+output of the chunk that flushes the unit's remaining codes
+(`tts_is_last_chunk`), remembered in `state` (a Code2Wav segment end alone
+does not complete a unit, so a trailing control-only turn-end snapshot of
+the previous unit cannot complete the next one); a Stage-0 segment that
+hands the Talker nothing (`<|speak|>` straight into `<|chunk_eos|>`) is
+forwarded as an empty hand-off, which the Talker closes like any segment,
+so the default `unit_decision` is enough; and its input buffer implements
+`prepare_backlog`. The flag marks the end of what the bridge hands Code2Wav
+for the unit, not of its audio: the vocoder's lookahead, and a remainder
+shorter than 5 frames that the connector carries into the next unit's first
+chunk, put the unit's last codec frames (usually 200–440 ms of audio; no
+structural bound) into audio emitted with the next unit, as in real-time
+operation, so the codec path is the same with and without the clock. Only
+the chunk that ends the turn flushes everything; the API doc states this lag
+in the model's entry.
 
 What a plugin must guarantee before it opts in:
 
