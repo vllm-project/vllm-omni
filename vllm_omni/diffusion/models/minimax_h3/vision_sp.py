@@ -27,6 +27,29 @@ if TYPE_CHECKING:
 _MIN_SHORT_SEGMENT_HEADS = 8
 
 
+def row_aligned_call(
+    module: torch.nn.Module,
+    local: torch.Tensor,
+    transport: VisionAllToAll,
+    *,
+    merged: bool = False,
+) -> torch.Tensor:
+    """Keep the baseline kernel shape and row positions for row-wise computation.
+
+    On NPU, smaller Conv/GEMM row counts can change BF16 rounding and eventually
+    generated speech. Full-sized compact padding alone is insufficient: original
+    row positions must also be retained. This deliberately repeats projection
+    work; only attention is distributed. Inputs outside this rank are zero and
+    cannot affect its output for Linear, LayerNorm or elementwise activation.
+    """
+    indices, count = transport.row_layout(local.device, merged=merged)
+    if local.ndim != 2 or local.shape[0] != indices.numel():
+        raise ValueError("row-aligned vision input does not match its shard layout")
+    full = local.new_zeros((count, local.shape[1]))
+    full.index_copy_(0, indices, local)
+    return module(full).index_select(0, indices)
+
+
 def segment_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """Run SDPA per segment, padding short segments to the validated head count."""
     heads = q.shape[1]
@@ -50,7 +73,8 @@ def forward_sp8(
     transport = VisionAllToAll(plan, group=group)
     ids = plan.rank_token_indices[transport.rank]
     select = torch.tensor(ids, dtype=torch.long, device=pixels.device)
-    hidden = model.patch_embed(pixels.index_select(0, select))
+    # Preserve the original Conv3D batch shape before selecting local tokens.
+    hidden = model.patch_embed(pixels).index_select(0, select)
     position = model.fast_pos_embed_interpolate(grid, token_indices=ids)
     hidden = hidden + position
     rope = model.rot_pos_emb(grid).reshape(sum(lengths), -1)
@@ -62,8 +86,8 @@ def forward_sp8(
         hidden = block(hidden, cu_seqlens=None, position_embeddings=(cos, sin), sequence_parallel=transport)
         if number in model.deepstack_visual_indexes:
             index = model.deepstack_visual_indexes.index(number)
-            deepstack.append(model.deepstack_merger_list[index](hidden))
-    final = model.merger(hidden)
+            deepstack.append(model.deepstack_merger_list[index](hidden, sequence_parallel=transport))
+    final = model.merger(hidden, sequence_parallel=transport)
     return gather_vision_outputs((final, deepstack), plan, group=group)
 
 
@@ -75,7 +99,7 @@ def attention_sp8(
     rotate: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
 ) -> torch.Tensor:
     """Attention body called inside the original offloader-managed block."""
-    qkv = attention.qkv(hidden)
+    qkv = row_aligned_call(attention.qkv, hidden, transport)
     q, k, v = qkv.reshape(hidden.shape[0], 3, attention.num_heads, attention.head_dim).permute(1, 0, 2, 3).unbind(0)
     q, k = rotate(q, k, *position_embeddings)
     q, k, v = [transport.to_heads(tensor).transpose(0, 1).unsqueeze(0) for tensor in (q, k, v)]
@@ -83,4 +107,4 @@ def attention_sp8(
     outputs = [segment_attention(qi, ki, vi) for qi, ki, vi in zip(*splits)]
     full = torch.cat(outputs, dim=2).squeeze(0).transpose(0, 1).contiguous()
     local = transport.to_tokens(full).reshape(hidden.shape[0], attention.num_heads * attention.head_dim)
-    return attention.proj(local)
+    return row_aligned_call(attention.proj, local, transport)

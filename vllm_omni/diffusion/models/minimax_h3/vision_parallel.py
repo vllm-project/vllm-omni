@@ -114,6 +114,18 @@ class VisionAllToAll:
         # or indices across requests with different segment layouts.
         self._permutation_device: torch.device | None = None
         self._permutation: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None
+        self._row_layouts: dict[tuple[torch.device, bool], tuple[torch.Tensor, int]] = {}
+
+    def row_layout(self, device: torch.device, *, merged: bool = False) -> tuple[torch.Tensor, int]:
+        """Return this rank's original row positions and full replicated row count."""
+        key = (device, merged)
+        if key not in self._row_layouts:
+            rows = self.plan.rank_merger_indices if merged else self.plan.rank_token_indices
+            self._row_layouts[key] = (
+                torch.tensor(rows[self.rank], dtype=torch.long, device=device),
+                sum(map(len, rows)),
+            )
+        return self._row_layouts[key]
 
     def _permutation_for(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         if device != self._permutation_device:

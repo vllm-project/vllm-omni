@@ -224,9 +224,11 @@ remaining flags stay unchanged.
 #### Qwen3-VL vision sequence parallelism (experimental SP8)
 
 This experimental option is specific to MiniMax-H3's Qwen3-VL encoder on
-Ascend NPU. It shards visual tokens over the existing encoder TP8 group;
-weights, final embeddings, and DeepStack outputs remain replicated. Vision SP
-is independent of DiT `--usp` / `--ring` and does not add devices.
+Ascend NPU. Attention heads are sharded over the existing encoder TP8 group;
+row-wise operations retain SP1 batch shapes and row positions for numerical
+stability, repeating projection work. Weights, final embeddings, and DeepStack
+outputs remain replicated. Vision SP is independent of DiT `--usp` / `--ring`
+and does not add devices.
 
 Append to the serving command above:
 
@@ -253,12 +255,11 @@ configurations are rejected. Restart the server after changing this setting;
 set `1` to disable SP8. The startup log reports `text_encoder_vision_sp_size`.
 The former `VLLM_OMNI_H3_VISION_SP_SIZE` environment variable is no longer read.
 
-**Validation:** eight Ascend 910B4 NPUs, TP8, Ref2VA case01 pass HCCL execution,
-media integrity, and repeatability within each setting. SP1/SP8 full-model
-bitwise comparison fails, so SP8 is not yet a qualified lossless replacement;
-real-input single-NPU probes reproduce Conv3D/linear projection differences
-before communication. Formal performance acceptance is gated on resolving this difference. Earlier
-measurements predate the configuration migration; see
+**Validation:** original-row alignment passes 35 bytewise checks on the real
+case01 input and full 27-block vision checkpoint on one Ascend 910B4 NPU.
+Eight-card full-model accuracy and current-version E2E acceptance remain
+required; this single-card result establishes neither. Earlier performance
+measurements do not qualify the aligned implementation; see
 [PR #10168](https://github.com/vllm-project/vllm-omni/pull/10168).
 
 #### Cache-DiT
