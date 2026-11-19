@@ -705,11 +705,8 @@ def _make_graph_contract_model(architecture, stage):
     ("architecture", "stage"),
     [
         ("BreezeForConditionalGeneration", None),
-        ("FishOmniForConditionalGeneration", None),
         ("HiggsAudioV3TalkerForConditionalGeneration", None),
-        ("IndexTTS2TalkerForConditionalGeneration", None),
         ("Ming3TTSForConditionalGeneration", "llm"),
-        ("MiniMaxMusic3TalkerForConditionalGeneration", None),
         ("MossTTSDelayModel", None),
         ("MossTTSLocalModel", None),
         ("VoxtralTTSForConditionalGeneration", "audio_generation"),

@@ -133,8 +133,6 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
     and accumulates hidden_states as latent for Stage 1 S2Mel decoder.
     """
 
-    mrv2_forward_returns_tensor = True
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.vllm_config = vllm_config
