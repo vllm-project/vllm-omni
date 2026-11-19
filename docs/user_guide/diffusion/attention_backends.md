@@ -32,7 +32,7 @@ For the internal selector, registry, and platform contract, see
 | `TORCH_SDPA` | Dense | Conservative reference; always available | [Dense Backends](attention_backends/dense_backends.md#torch_sdpa) |
 | `FLASH_ATTN` | Dense | FlashAttention 4/3/2 depending on the installed package and GPU | [Dense Backends](attention_backends/dense_backends.md#flash_attn) |
 | `CUDNN_ATTN` | Dense | Mask-heavy DiTs on Blackwell with cuDNN 9.5 or newer | [Dense Backends](attention_backends/dense_backends.md#cudnn_attn) |
-| `FLASHINFER_ATTN` | Dense or quantized | FlashInfer batch prefill; optional mixed Q/K and V dtypes | [Dense Backends](attention_backends/dense_backends.md#flashinfer_attn) |
+| `FLASHINFER_ATTN` | Dense or quantized | FlashInfer batch prefill; optional mixed Q/K and V dtypes (cute-dsl only) | [Dense Backends](attention_backends/dense_backends.md#flashinfer_attn) |
 | `TRTLLM_ATTN` | Dense, sparse, or quantized | Datacenter Blackwell with `head_dim=128` and compatible packed paths | [TRTLLM Attention](attention_backends/trtllm.md) |
 | `SAGE_ATTN` | Quantized | SageAttention 2.2 INT8 attention | [SageAttention](attention_backends/sage.md#sage_attn) |
 | `SAGE_ATTN_3` | Quantized | SageAttention3 on Blackwell | [SageAttention](attention_backends/sage.md#sage_attn_3) |

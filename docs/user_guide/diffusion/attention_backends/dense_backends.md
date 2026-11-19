@@ -119,8 +119,8 @@ vllm-omni serve <model> --diffusion-attention-backend FLASHINFER_ATTN
 
 ### FlashInfer quantized attention
 
-The backend accepts an `AttentionSpec.quant` block. For QK16/V8, keep Q and K
-in FP16 or BF16 and use FP8 E4M3 for V:
+The backend accepts an `AttentionSpec.quant` block. For QK16/V8 (cute-dsl
+only, see below), keep Q and K in FP16 or BF16 and use FP8 E4M3 for V:
 
 ```python
 from vllm_omni.diffusion.data import (
@@ -145,6 +145,10 @@ config = OmniDiffusionConfig(
 ```
 
 `dtype_qk` controls Q and K; `dtype_vo` controls V. Mixed-dtype
-configurations require FlashInfer 0.6.16rc1 or newer. The shared quantization
-schema is also consumed by TRTLLM, but each backend validates its own allowed
-fields and values; see [TRTLLM SAGE quantization](trtllm.md#sage-quantization).
+configurations require FlashInfer 0.6.16rc1 or newer and the cute-dsl backend
+(the `auto` choice on SM 10.x/11.x). With any other backend (`fa2` on SM
+8.x/12.x, `fa3` on SM 9.x), `FLASHINFER_ATTN` raises a `ValueError` when V's
+dtype differs from K's, because those kernels read K and V with one dtype. The
+shared quantization schema is also consumed by TRTLLM, but each backend
+validates its own allowed fields and values; see
+[TRTLLM SAGE quantization](trtllm.md#sage-quantization).
