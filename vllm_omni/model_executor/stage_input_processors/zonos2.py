@@ -70,15 +70,18 @@ def talker2dac_async_chunk(
     multimodal_output: dict[str, Any] | None,
     request: Any,
     is_finished: bool = False,
-    new_token_ids: tuple[int, ...] = (),
+    new_token_ids: tuple[int, ...] | None = None,
 ) -> OmniPayloadStruct | None:
     key = request.external_req_id
     final = bool(is_finished or request.is_finished())
     buffer = transfer_manager.code_prompt_token_ids[key]
     mm = multimodal_output or {}
     audio = mm.get("codes", {}).get("audio")
-    # save_async snapshots new_token_ids; a terminal flush with no sampled
-    # token must not append the last frame a second time.
+    # Native MRv2 snapshots current-step tokens on the request; the legacy
+    # transfer adapter supplies the explicit argument. Neither channel includes
+    # old tokens on terminal flush, so the last frame is never appended twice.
+    if new_token_ids is None:
+        new_token_ids = tuple(getattr(request, "sampled_token_ids", ()))
     if new_token_ids and isinstance(audio, torch.Tensor) and audio.numel():
         frames = _frames(audio)
         if len(frames) != len(new_token_ids):

@@ -15,6 +15,7 @@ from vllm_omni.data_entry_keys import LAST_OUTPUT_TOKEN_KEY, OUTPUT_TOKEN_COUNT_
 from vllm_omni.model_executor.models.zonos2.configuration_zonos2 import Zonos2Config
 from vllm_omni.model_executor.models.zonos2.model_state import Zonos2ModelState, Zonos2Sampler
 from vllm_omni.model_executor.models.zonos2.zonos2_keys import FRAMES
+from vllm_omni.model_executor.models.zonos2.zonos2_sampler import sample_frame
 from vllm_omni.model_executor.models.zonos2.zonos2_talker import (
     Zonos2MultiEmbedder,
     Zonos2TalkerForConditionalGeneration,
@@ -137,15 +138,20 @@ def test_partial_prefill_does_not_sample_or_advance_codec_history(state, mocker)
     assert state.last_tokens["a"] is None
 
 
-def test_preemption_rebuilds_full_codec_history_in_a_different_slot(state, mocker):
-    admit(state, mocker, "a")
+@pytest.mark.parametrize("seed", [42, None])
+def test_preemption_rebuilds_full_codec_history_in_a_different_slot(state, mocker, seed):
+    admit(state, mocker, "a", seed=seed)
     for offset, span in [(0, 3), (3, 1)]:
         step, _ = preprocess(state, mocker, ["a"], [0], [offset], [span], [3])
         sample(state, mocker, step)
     history = state.model._request_states["a"].history.clone()
+    original = state.model._request_states["a"]
+    next_codes = sample_frame(
+        state.model.fused_audio_logits()[0], history, original.params, original.seed, len(history)
+    )
     state.remove_request(0)
     admit(state, mocker, "other", 0, seed=99)
-    admit(state, mocker, "a", 2, replay=2)
+    admit(state, mocker, "a", 2, replay=2, seed=seed)
     partial, _ = preprocess(state, mocker, ["a"], [2], [0], [2], [5])
     assert sample(state, mocker, partial).num_sampled.tolist() == [0]
     torch.testing.assert_close(state.model._request_states["a"].history, history, rtol=0, atol=0)
@@ -153,9 +159,12 @@ def test_preemption_rebuilds_full_codec_history_in_a_different_slot(state, mocke
     sample(state, mocker, final)
     assert len(state.model._request_states["a"].history) == 3
     torch.testing.assert_close(state.model._request_states["a"].history[:2], history, rtol=0, atol=0)
+    torch.testing.assert_close(state.model._request_states["a"].history[2], next_codes, rtol=0, atol=0)
+    assert state.model._request_states["a"].seed == original.seed
 
 
-def test_batch_reordering_and_cancelled_slot_reuse_keep_request_rng_separate(state, mocker):
+@pytest.mark.parametrize("replacement", ["a", "c"])
+def test_batch_reordering_and_cancelled_slot_reuse_keep_request_rng_separate(state, mocker, replacement):
     admit(state, mocker, "a", 0, seed=42)
     admit(state, mocker, "b", 3, seed=99)
     step, _ = preprocess(state, mocker, ["b", "a"], [3, 0], [0, 0], [3, 3], [3, 3])
@@ -168,11 +177,11 @@ def test_batch_reordering_and_cancelled_slot_reuse_keep_request_rng_separate(sta
     state.on_requests_finished({"a"})
     state.remove_request(0)
     assert "a" not in state.last_tokens and "a" not in state.model._request_states
-    admit(state, mocker, "c", 0, seed=7)
-    step, _ = preprocess(state, mocker, ["c", "b"], [0, 3], [0, 3], [3, 1], [3, 3])
+    admit(state, mocker, replacement, 0, seed=7)
+    step, _ = preprocess(state, mocker, [replacement, "b"], [0, 3], [0, 3], [3, 1], [3, 3])
     sample(state, mocker, step)
-    assert state.model._request_states["c"].seed == 7
-    assert len(state.model._request_states["c"].history) == 1
+    assert state.model._request_states[replacement].seed == 7
+    assert len(state.model._request_states[replacement].history) == 1
     assert len(state.model._request_states["b"].history) == 2
 
 
@@ -180,3 +189,14 @@ def test_slot_identity_mismatch_fails_before_preprocess(state, mocker):
     admit(state, mocker, "a", 0)
     with pytest.raises(ValueError, match="identity"):
         preprocess(state, mocker, ["a"], [1], [0], [3], [3])
+
+
+def test_cancellation_cleans_preempted_request_without_a_live_slot(state, mocker):
+    admit(state, mocker, "a")
+    step, _ = preprocess(state, mocker, ["a"], [0], [0], [3], [3])
+    sample(state, mocker, step)
+    state.remove_request(0)
+    state.model.on_requests_finished({"a"})
+    state.on_requests_finished({"a"})
+    assert not state.model._request_states and not state.last_tokens
+    assert state.intermediate_buffer.buffers[0] == {}
