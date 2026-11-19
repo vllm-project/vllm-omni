@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Higgs delay-pattern sampling and owned audio output on Model Runner V2."""
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -13,12 +13,18 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import HiggsAudioSamplingParams
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.omni_sampler import OmniSampler, OmniSamplingOutput
+from vllm_omni.worker_v2.output_snapshot import RequestOutputSnapshot
 from vllm_omni.worker_v2.warmup import is_warmup_request
+
+if TYPE_CHECKING:
+    from .spec_decode import HiggsAudioSpeculator
 
 logger = init_logger(__name__)
 
 
 class HiggsModelState(OmniModelState):
+    audio_speculator: "HiggsAudioSpeculator | None" = None
+
     def __init__(self, vllm_config, model, encoder_cache, device):
         super().__init__(vllm_config, model, encoder_cache, device)
         model._use_external_decode_cudagraph = True
@@ -71,6 +77,12 @@ class HiggsModelState(OmniModelState):
     def add_request(self, req_index, new_req_data):
         params = new_req_data.sampling_params
         is_warmup = is_warmup_request(new_req_data.req_id)
+        if (
+            self.audio_speculator is not None
+            and not is_warmup
+            and len(new_req_data.prefill_token_ids) > len(new_req_data.prompt_token_ids or ())
+        ):
+            raise ValueError("Higgs audio speculation cannot replay a preempted audio prefix")
         if not is_warmup and (
             params.frequency_penalty != 0
             or params.presence_penalty != 0
@@ -108,6 +120,8 @@ class HiggsModelState(OmniModelState):
                 self.requests.pop(req_id, None)
                 self.request_slots.pop(req_id, None)
                 self.generators.pop(req_id, None)
+                if self.audio_speculator is not None:
+                    self.audio_speculator.pending.pop(req_id, None)
                 self.metadata_key = None
         super().remove_request(req_index_or_id)
 
@@ -150,6 +164,8 @@ class HiggsModelState(OmniModelState):
                 info,
             )
         embeds = self._apply_audio_feedback(embeds, ids, input_batch)
+        if self.audio_speculator is not None and not all(is_warmup_request(r) for r in input_batch.req_ids):
+            self.audio_speculator.prepare(self, input_batch, embeds)
         self._static_inputs_embeds[:n].copy_(embeds)
         padded = input_batch.num_tokens_after_padding
         self._static_inputs_embeds[n:padded].zero_()
@@ -236,9 +252,13 @@ class HiggsModelState(OmniModelState):
         return HiggsSampler(sampler, self), None
 
     def finalize_audio_snapshot(self, payload: dict[str, Any], num_sampled: list[int]):
+        if payload and "_higgs_spec_audio" in payload:
+            codes = payload["_higgs_spec_audio"]
+            valid = payload["_higgs_audio_snapshot"][:, self.model.num_codebooks].tolist()
+            return RequestOutputSnapshot(
+                [{"codes.audio": codes[i, :n]} if valid[i] and n else None for i, n in enumerate(num_sampled)]
+            )
         if payload and "_higgs_audio_snapshot" in payload and getattr(self, "direct_payload", False):
-            from vllm_omni.worker_v2.output_snapshot import RequestOutputSnapshot
-
             snapshot = payload["_higgs_audio_snapshot"]
             if snapshot.device.type != "cpu":
                 raise RuntimeError("Higgs snapshot finalized before D2H")
@@ -272,11 +292,14 @@ class HiggsSampler(OmniSampler):
         # penalties, with synthetic non-audio prompts. Keep that path intact.
         if all(is_warmup_request(r) for r in input_batch.req_ids):
             return super().sample_step(hidden_states, input_batch, req_states, grammar_output, standard_sample)
-        if grammar_output is not None or input_batch.num_draft_tokens:
-            raise ValueError("Higgs MRV2 does not support grammar or speculative sampling")
-        metadata = self.state.sampling_metadata(input_batch.req_ids, input_batch.idx_mapping[: input_batch.num_reqs])
+        if grammar_output is not None:
+            raise ValueError("Higgs MRV2 does not support grammar sampling")
+        state = self.state
+        speculator = state.audio_speculator
+        if input_batch.num_draft_tokens and (speculator is None or speculator.batch is None):
+            raise ValueError("Higgs MRV2 requires audio candidates for speculative sampling")
+        meta = state.sampling_metadata(input_batch.req_ids, input_batch.idx_mapping[: input_batch.num_reqs])
         hidden = hidden_states[input_batch.logits_indices]
-        logits = self.state.model.compute_logits(hidden, metadata)
         stock_output = None
 
         def sample_text(text_logits):
@@ -284,9 +307,28 @@ class HiggsSampler(OmniSampler):
             stock_output = self.base_sampler(text_logits, input_batch)
             return stock_output.sampled_token_ids
 
-        sampled = self.state.model.sample(logits, metadata, sample_text=sample_text)
+        if input_batch.num_draft_tokens:
+            first = hidden[input_batch.cu_num_logits[:-1].long()]
+            logits = state.model.compute_logits(first, meta)
+            sampled = state.model.sample(logits, meta, sample_text=sample_text, draft_rows=speculator.batch.batch_rows)
+        else:
+            logits = state.model.compute_logits(hidden, meta)
+            sampled = state.model.sample(logits, meta, sample_text=sample_text)
+        counts = torch.ones(input_batch.num_reqs, dtype=torch.int32, device=hidden.device)
+        payload = state.model.post_sample_multimodal_outputs(
+            req_ids=input_batch.req_ids,
+            invalid_req_indices=[],
+            multimodal_outputs=None,
+        )
+        if input_batch.num_draft_tokens:
+            if state.model._step_audio_mode_rows == input_batch.num_reqs:
+                sampled = speculator.verify(state, hidden, input_batch, sampled, counts, payload)
+            else:
+                # A mixed prefill can use the stock text sampler. Its RNG
+                # calls are outside the audio-only verification contract.
+                speculator.batch = None
         count, rejected = get_num_sampled_and_rejected(
-            torch.ones(input_batch.num_reqs, dtype=torch.int32, device=hidden.device),
+            counts,
             input_batch.seq_lens,
             input_batch.cu_num_logits,
             input_batch.idx_mapping,
@@ -299,11 +341,6 @@ class HiggsSampler(OmniSampler):
             num_sampled=count,
             num_rejected=rejected,
             sampling_mask_tensors=None if stock_output is None else stock_output.sampling_mask_tensors,
-        )
-        payload = self.state.model.post_sample_multimodal_outputs(
-            req_ids=input_batch.req_ids,
-            invalid_req_indices=[],
-            multimodal_outputs=None,
         )
         return OmniSamplingOutput(
             output,

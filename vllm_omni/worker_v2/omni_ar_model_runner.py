@@ -26,7 +26,7 @@ from vllm.model_executor.layers.fused_moe.all2all_utils import (
 )
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.outputs import AsyncModelRunnerOutput, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.worker.gpu.eplb_utils import step_eplb_after
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
@@ -160,8 +160,17 @@ class OmniARModelRunner(OmniGPUModelRunner):
         self._async_mm_snapshot_cursor = 0
         self._last_multimodal_snapshot_slot: int | None = None
 
+    @property
+    def _model_state_drafts(self) -> bool:
+        """Whether the speculator drafts through the model state (Higgs audio)."""
+        return hasattr(self.speculator, "bind_model_state")
+
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         super().load_model(*args, **kwargs)
+        if self._model_state_drafts:
+            # The model state embeds and verifies these drafts in its sampler.
+            self.speculator.bind_model_state(self.model_state)
+            return
         if (
             self.num_speculative_steps > 0
             and self.is_last_pp_rank
@@ -468,6 +477,14 @@ class OmniARModelRunner(OmniGPUModelRunner):
     ) -> None:
         """Draft the next step's tokens, as the parent runner's ``sample_tokens`` does."""
         num_spec_tokens = draft.num_spec_tokens
+        if self._model_state_drafts:
+            proposal = self.speculator.propose_audio(
+                self.model_state, input_batch, draft.hidden_states, num_sampled, num_spec_tokens
+            )
+            if proposal is not None:
+                rows, control = proposal
+                self.req_states.draft_tokens[input_batch.idx_mapping[rows]] = control
+            return
         if self._kstep_frames > 1:
             # The placeholders reserve query positions for the next Talker
             # step. Only rows with confirmed codec state may enter that loop.
@@ -521,6 +538,13 @@ class OmniARModelRunner(OmniGPUModelRunner):
         )
         if self.pp_handler is not None:
             self.pp_handler.broadcast_drafts(self.req_states.draft_tokens, input_batch)
+
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        if self._model_state_drafts:
+            # Draft widths differ per request, unlike the batch-wide handler.
+            result, self.speculator.drafts = self.speculator.drafts, None
+            return result
+        return super().take_draft_token_ids()
 
     def _retain_multimodal_outputs(self, outputs: dict[str, Any]) -> dict[str, Any]:
         if not bool(getattr(self.model_config, "async_chunk", False)) or not outputs:

@@ -103,6 +103,64 @@ trace for the exact Higgs batch/context distribution. Until vLLM has a
 workload-aware selector or XQA is faster for this BF16 shape, the model-level
 pin is the deterministic choice.
 
+## MRv2 self-speculation (experimental)
+
+The `higgs_audio_self` method drafts one row per step from a row the verifier
+already sampled, so it needs no drafter checkpoint. It is off unless Stage 0
+sets `speculative_config`, and seeded output matches single-step decoding only
+when both runs set `VLLM_BATCH_INVARIANT=1`. The
+[L20 comparison](https://github.com/vllm-project/vllm-omni/issues/9795#issuecomment-6998547374)
+found no throughput gain on vLLM 0.33.0.
+
+Copy `higgs_multimodal_qwen3_mrv2_h200.yaml` to `higgs-k1.yaml`. For Stage 0,
+merge the fields below into the existing stage entry and remove
+`compilation_config.max_cudagraph_capture_size`.
+
+```yaml
+max_num_seqs: 16
+gpu_memory_utilization: 0.45
+async_scheduling: false
+max_num_batched_tokens: 2048
+max_model_len: 2048
+default_sampling_params:
+  max_tokens: 512
+compilation_config:
+  mode: 0
+  cudagraph_capture_sizes: [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48]
+speculative_config:
+  method: higgs_audio_self
+  num_speculative_tokens: 1
+hf_overrides:
+  audio_full_sample_graph: false
+  enable_mlp_cudagraph: false
+```
+
+For Stage 1, set `max_num_seqs: 16`, `gpu_memory_utilization: 0.2`, and
+`hf_overrides.codec_cuda_graph: false`. For the single-step baseline, copy
+the resulting profile, remove Stage 0's `speculative_config`, and set Stage 0
+`async_scheduling: true`; only speculation runs this payload synchronously.
+
+```bash
+VLLM_BATCH_INVARIANT=1 VLLM_USE_DEEP_GEMM=0 VLLM_MOE_USE_DEEP_GEMM=0 \
+  vllm-omni serve bosonai/higgs-tts-3-4b --omni --trust-remote-code \
+  --revision 239f63fb7b02b1aa085f98d9efae5e35cc5523e8 --port 8098 \
+  --deploy-config higgs-k1.yaml
+```
+
+Send the same seeded request to each server to check streaming.
+
+```bash
+curl --fail-with-body --no-buffer http://127.0.0.1:8098/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"bosonai/higgs-tts-3-4b","input":"The morning train arrived just as the lights came on.","seed":42,"max_new_tokens":512,"stream":true,"stream_format":"sse","response_format":"pcm"}'
+```
+
+Compare the `speech.audio.delta` chunk sizes and the final
+`speech.audio.done` event. Unseeded requests and the closing delay ramp use
+single-step sampling.
+Keep enough KV capacity to avoid preempting requests after audio generation
+starts, since replaying an audio prefix is unsupported.
+
 ## Notes
 
 - Stage 1 remains `enforce_eager: true` in both profiles.

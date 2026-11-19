@@ -689,6 +689,21 @@ def test_minicpmo_capture_contract(stage, use_mrv2, returns_aux, exclude_full):
     assert runner._exclude_full_graph is exclude_full
 
 
+def test_higgs_keeps_structured_capture_without_speculation():
+    from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+        HiggsAudioV3TalkerForConditionalGeneration,
+    )
+
+    runner = _make_runner()
+    runner.model = HiggsAudioV3TalkerForConditionalGeneration.__new__(HiggsAudioV3TalkerForConditionalGeneration)
+    torch.nn.Module.__init__(runner.model)
+    runner._configure_cudagraph_output_contract()
+    assert runner._model_has_structured_output
+    runner.model.mrv2_forward_returns_tensor = True
+    runner._configure_cudagraph_output_contract()
+    assert not runner._exclude_full_graph
+
+
 def _aux_output(num_tokens):
     hidden = torch.arange(num_tokens * 2, dtype=torch.float32).reshape(num_tokens, 2)
     return hidden, {"hidden_states": {"layers": {0: hidden + 1, 24: hidden + 2}}}

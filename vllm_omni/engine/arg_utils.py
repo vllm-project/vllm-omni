@@ -160,6 +160,15 @@ def register_omni_models_to_vllm():
     for arch, (mod_folder, mod_relname, cls_name) in _OMNI_MODELS.items():
         ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
 
+    from vllm.v1.worker.gpu.spec_decode.speculator_config import register_speculative_method
+
+    from vllm_omni.model_executor.models.higgs_audio_v3.spec_config import (
+        HIGGS_AUDIO_SPEC_METHOD,
+        HiggsAudioSpeculatorConfig,
+    )
+
+    register_speculative_method(HIGGS_AUDIO_SPEC_METHOD, HiggsAudioSpeculatorConfig)
+
     # Register omni-specific reasoning parsers (e.g., step_audio).
     import vllm_omni.reasoning  # noqa: F401
 
