@@ -150,7 +150,7 @@ def test_higgs_default_profile_enables_mrv2_async_audio_payload() -> None:
     deploy = load_deploy_config(_DEPLOY_DIR / "higgs_multimodal_qwen3.yaml")
     stage = deploy.stages[0]
 
-    assert stage.engine_extras["async_scheduling"] is True
+    assert stage.async_scheduling is True
     assert stage.engine_extras["hf_overrides"] == {
         "audio_async_prompt_mode": True,
         "audio_async_payload": True,
