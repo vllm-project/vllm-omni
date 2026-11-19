@@ -445,6 +445,10 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
     ) -> ARDiffusionKVCacheSpec:
         chunk_size = self.manifest.chunk_size
         window = self.manifest.window_frames if window_frames is None else window_frames
+        if window is None:
+            # Startup has no clip length. Reserve the shortest supported rollout;
+            # admission sizes the replacement pool from the actual frame count.
+            window = 1 if chunk_size == 1 else 2 * (1 + chunk_size) + 1
         sinks = self.manifest.sink_frames if sink_frames is None else sink_frames
         text = self.manifest.text_cache_max_len if text_capacity is None else text_capacity
         if not 0 <= sinks < window:
