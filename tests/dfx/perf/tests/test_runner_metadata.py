@@ -2175,3 +2175,111 @@ def test_offline_model_resolution_uses_the_pinned_revision(monkeypatch, extra):
     revision = runner._cli_flag_value(extra, "--revision")
     assert runner._resolve_offline_model("org/model", revision=revision) == "/cache/snapshot"
     assert calls == [("org/model", {"revision": "a" * 40 if extra else None, "local_files_only": True})]
+
+
+def test_minicpmo_nightly_default_and_async_prefix_seed_tts_matrix():
+    configs = json.loads((Path(__file__).parent / "test_minicpmo_4_5.json").read_text())
+    by_name = {config["test_name"]: config for config in configs}
+    default = by_name["test_minicpmo_4_5_nightly_default"]
+    prefix = by_name["test_minicpmo_4_5_nightly_async_prefix"]
+    default_params = default["benchmark_params"][0]
+    prefix_perf, prefix_acc = prefix["benchmark_params"]
+    assert default["server_params"]["update"]["async_chunk"] is False
+    assert "--no-async-chunk" in default["server_params"]["extra_cli_args"]
+    assert default_params["max_concurrency"] == [64]
+    assert default_params["num_prompts"] == [1088]
+    assert default_params["seed_tts_wer_eval"] is True
+    assert default_params["max_seed_tts_mean_wer"] == 0.05
+    assert default_params["min_seed_tts_mean_sim"] == 0.80
+    assert "tpot" in default_params["percentile-metrics"]
+    assert prefix["server_params"]["extra_cli_args"][1] == "vllm_omni/deploy/minicpmo_4_5_turn.yaml"
+    assert prefix["server_params"]["update"]["stages"]["0"]["enable_prefix_caching"] is True
+    assert prefix_perf["max_concurrency"] == [1, 16, 32]
+    assert "seed_tts_wer_eval" not in prefix_perf
+    assert prefix_acc["max_concurrency"] == [64]
+    assert prefix_acc["num_prompts"] == [1088]
+    assert prefix_acc["seed_tts_wer_eval"] is True
+    assert prefix_acc["min_seed_tts_mean_sim"] == 0.80
+    daily = by_name["test_minicpmo_4_5_nightly_async_prefix_daily_omni"]
+    daily_params = daily["benchmark_params"][0]
+    assert daily["mark"][0]["hardware_marks"]["num_cards"] == 2
+    assert daily_params["max_concurrency"] == [8]
+    assert daily_params["num_prompts"] == [1197]
+    assert daily_params["daily_omni_pack_mode"] == "minicpm-interleave"
+    assert daily_params["temperature"] == 0
+    assert daily_params["output_len"] == 512
+    assert daily_params["min_daily_omni_accuracy"] == 0.77
+    assert "tpot" in daily_params["percentile-metrics"]
+    assert daily["server_params"]["update"]["session_mode"] == "turn"
+    assert daily["server_params"]["update"]["stages"]["0"]["enable_prefix_caching"] is True
+
+
+def test_minicpmo_daily_omni_nightly_config_uses_c8_and_minicpm_recipe():
+    configs = json.loads((Path(__file__).parent / "test_minicpmo_4_5.json").read_text())
+    config = next(item for item in configs if item["test_name"] == "test_minicpmo_4_5_nightly_async_prefix_daily_omni")
+    params = config["benchmark_params"][0]
+    assert params["max_concurrency"] == [8]
+    assert params["num_prompts"] == [1197]
+    assert params["daily_omni_pack_mode"] == "minicpm-interleave"
+    assert params["temperature"] == 0
+    assert params["output_len"] == 512
+    assert params["min_daily_omni_accuracy"] == 0.77
+    assert "tpot" in params["percentile-metrics"]
+    assert config["server_params"]["update"]["session_mode"] == "turn"
+    assert config["server_params"]["update"]["stages"]["0"]["enable_prefix_caching"] is True
+
+
+def test_chat_accuracy_gates_daily_omni_and_seed_tts():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    daily = {
+        "completed": 1,
+        "daily_omni_accuracy": 0.5,
+        "daily_omni_evaluated_ok": 1,
+    }
+    with pytest.raises(AssertionError, match="daily_omni_accuracy"):
+        assert_result(daily, {"dataset_name": "daily-omni", "min_daily_omni_accuracy": 0.77}, 1)
+    daily["daily_omni_accuracy"] = 0.8
+    assert_result(daily, {"dataset_name": "daily-omni", "min_daily_omni_accuracy": 0.77}, 1)
+
+    seed = {
+        "completed": 1,
+        "seed_tts_content_evaluated": 1,
+        "seed_tts_content_error_mean": 0.2,
+        "seed_tts_sim_evaluated": 1,
+        "seed_tts_sim_mean": 0.9,
+        "timed_out_requests": 0,
+        "cancelled_after_timeout_requests": 0,
+    }
+    with pytest.raises(AssertionError, match="WER"):
+        assert_result(
+            seed,
+            {
+                "dataset_name": "seed-tts",
+                "seed_tts_wer_eval": True,
+                "max_seed_tts_mean_wer": 0.05,
+                "min_seed_tts_mean_sim": 0.80,
+            },
+            1,
+        )
+    seed["seed_tts_content_error_mean"] = 0.02
+    assert_result(
+        seed,
+        {
+            "dataset_name": "seed-tts",
+            "seed_tts_wer_eval": True,
+            "max_seed_tts_mean_wer": 0.05,
+            "min_seed_tts_mean_sim": 0.80,
+        },
+        1,
+    )
+
+
+def test_tpot_in_percentile_metrics_requires_samples():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result = {"completed": 1, "num_tpot_samples": 0, "mean_tpot_ms": 1.0}
+    with pytest.raises(AssertionError, match="No measured tpot samples"):
+        assert_result(result, {"percentile-metrics": "ttft,tpot,e2el"}, 1)
+    result["num_tpot_samples"] = 1
+    assert_result(result, {"percentile-metrics": "ttft,tpot,e2el"}, 1)
