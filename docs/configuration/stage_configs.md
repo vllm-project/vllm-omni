@@ -316,17 +316,16 @@ resolution still applies platform overrides before stage selection; any
 resolved `v1` stage raises an error. There is no V1 fallback. Runner selection
 does not change `PipelineConfig` topology or the connector payload contract.
 
-The default CUDA Qwen3-TTS and Qwen3-Omni profiles, and the CUDA overlays in
-MiniCPM-o 4.5 and Moss-TTS-local, already select V2. The default
-`qwen3_tts.yaml` and `qwen3_omni_moe.yaml` also select the existing Ascend V2
-implementations on NPU; the CUDA-tuned `*_mrv2.yaml` overlays are not NPU
-profiles. A V2 worker implementation alone does not qualify every model or
-deployment on a platform.
+The default Qwen3-TTS and Qwen3-Omni profiles select V2 on CUDA, ROCm, NPU and
+XPU. MiniCPM-o 4.5 selects V2 through its CUDA, ROCm and NPU platform overlays,
+while Moss-TTS-local selects V2 on CUDA. The CUDA-tuned `*_mrv2.yaml` overlays
+are not NPU profiles. A V2 worker implementation alone does not qualify every
+model or deployment on a platform.
 
 Profiles that still resolve to V1 are unavailable with this version. These
-include Qwen3-TTS's ROCm/MUSA overrides, Qwen3-Omni's ROCm/MUSA overrides,
-PersonaPlex's Talker, VibeVoice, YuE2, and the LFM3-Omni
-profiles. Selecting `v2` manually does not establish support for those paths.
+include Qwen3-TTS's and Qwen3-Omni's MUSA overrides, PersonaPlex's Talker,
+VibeVoice, YuE2, and the LFM3-Omni profiles. Selecting `v2` manually does not
+establish support for those paths.
 YuE2's audio synthesis still depends on V1 model sampling hooks; its two
 offline audio export tests are not applicable to the V2 runtime.
 The complete PersonaPlex workflow is also unavailable: its Talker still
@@ -492,6 +491,9 @@ platform-specific value in a user overlay, use the same platform block.
 | `--deploy-config PATH` | Load a deploy YAML. **Optional** — when omitted, the bundled `vllm_omni/deploy/<model_type>.yaml` is auto-loaded by the model registry. |
 | `--stage-overrides JSON` | Per-stage JSON overrides, e.g. `'{"0":{"gpu_memory_utilization":0.5}}'`. Per-stage values always win over global flags. |
 | `--async-chunk` / `--no-async-chunk` | Flip the deploy YAML's `async_chunk:` bool. Unset (default) leaves the YAML value in force. |
+
+`--stage-overrides` logs a warning and ignores deploy-only fields such
+as `session_mode` and `connectors`. Set those fields in the deploy YAML.
 
 ### Stage-Based CLI Paradigm
 
@@ -676,16 +678,18 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/depl
 
 ## Qwen3-TTS with Model Runner V2
 
-Qwen3-TTS selects Model Runner V2 by default on CUDA, NPU and XPU. With
-vLLM 0.34.0, V2 is the only supported model runner; overrides that select V1
-on ROCm and MUSA are rejected. MRV2 remains experimental for this model.
+Qwen3-TTS selects Model Runner V2 by default on CUDA, ROCm, NPU and XPU. With
+vLLM 0.34.0, V2 is the only supported model runner; the MUSA override that
+selects V1 is rejected. MRV2 remains experimental for this model.
+ROCm keeps Code2Wav eager because its decoder convolutions are not safe inside
+the outer graph capture.
 On NPU, the V2 Talker uses `FULL_AND_PIECEWISE`; Code2Wav retains
 `PIECEWISE`. These settings do not establish hardware qualification.
 Select one of these deployment profiles:
 
 | Profile | Runner | Code2Wav graph batches | Intended use |
 | --- | --- | --- | --- |
-| `qwen3_tts.yaml` | V2 on CUDA/NPU/XPU; V1 overrides unsupported | B1 | Shipped default; experimental |
+| `qwen3_tts.yaml` | V2 on CUDA/ROCm/NPU/XPU; MUSA V1 override unsupported | B1 | Shipped default; experimental |
 | `qwen3_tts_high_concurrency_mrv2.yaml` | V2 | B1, B2 | Opt-in throughput tuning |
 | `qwen3_tts_high_concurrency_mrv2_b4.yaml` | V2 | B1, B2, B3, B4 | Experimental throughput / buffered playback |
 | `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` | V2 | B1–B8 | Experimental two-stage deployment on one GPU, with MPS |
@@ -693,7 +697,7 @@ Select one of these deployment profiles:
 | `qwen3_tts_fused_single_gpu.yaml` | V2 | N/A (in-Talker decoder) | Opt-in single-stage CUDA pipeline on one GPU |
 
 The former `qwen3_tts_mrv2.yaml` profile has been removed. Use
-`qwen3_tts.yaml` instead; it selects V2 on CUDA, NPU and XPU.
+`qwen3_tts.yaml` instead; it selects V2 on CUDA, ROCm, NPU and XPU.
 
 ```bash
 # Use the bundled V2 profile.
@@ -706,8 +710,8 @@ Talker AR runner and the Code2Wav generation
 runner together. Native inter-stage delivery carries codec payloads directly;
 request-owned snapshots preserve buffers through asynchronous completion and
 CUDA graph reuse. Terminal completion waits for upstream stage metrics before
-releasing request state. Platform sections that retain V1 on ROCm and MUSA
-are unsupported. XPU selects V2, but final-release XPU hardware qualification
+releasing request state. The platform section that retains V1 on MUSA is
+unsupported. XPU selects V2, but final-release XPU hardware qualification
 remains pending.
 Selecting V2 for a stage without `supports_native_mrv2_data_plane` emits a warning
 when pipeline and deployment settings are merged. That stage retains the legacy
