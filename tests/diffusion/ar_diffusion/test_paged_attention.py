@@ -63,6 +63,20 @@ class _MockNPUQuery:
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize("frames", [1, 3])
+def test_npu_partial_pages_write_text_to_each_frame(frames):
+    slots = torch.tensor([[4, 1], [3, 8], [6, 0]])[:frames]
+    text = torch.arange(1, 9, dtype=torch.float32).reshape(2, 2, 2)
+    pool = torch.zeros(9, 2, 2, dtype=torch.bfloat16)
+    expected = torch.zeros_like(pool)
+    expected[slots] = text.to(expected.dtype)
+    # Exercise the NPU dispatch with the real index_copy_ operation on CPU.
+    npu_pool = SimpleNamespace(device=SimpleNamespace(type="npu"), dtype=pool.dtype, index_copy_=pool.index_copy_)
+    paged_attention_module._write_kv_slots(npu_pool, slots, text)
+    torch.testing.assert_close(pool, expected)
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize("batched", [False, True])
 def test_npu_host_lengths_preserve_gather_without_device_readback(monkeypatch, batched):
     torch.manual_seed(0)

@@ -393,7 +393,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                     "Disabling superpage_tokens=%s: requires legal pages divisible by %s and FA3/FA4", page, block_size
                 )
                 config = dataclasses.replace(config, superpage_tokens=0)
-                self.ar_diffusion_kv_config = config
+                self.ar_diffusion_kv_config.superpage_tokens = 0
         self.kv_cache = ARDiffusionKVCache(
             config,
             num_layers=spec.num_layers,

@@ -859,7 +859,6 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
     "Cosmos3NanoSimBimanualPipeline": "get_cosmos3_post_process_func",
     "Cosmos3NanoSimTransferPipeline": "get_cosmos3_nano_sim_transfer_post_process_func",
-    "HiDreamImagePipeline": "get_hidream_image_post_process_func",
     "HiDreamO1ImagePipeline": "get_hidream_o1_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
     "Krea2Pipeline": "get_krea2_post_process_func",
