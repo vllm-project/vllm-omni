@@ -260,7 +260,9 @@ case01 input and the full 27-block vision checkpoint on one Ascend 910B4 NPU.
 On eight cards the whole model is also bit-identical to SP1: 720 tensor pairs
 across five strict comparisons with zero differences, and identical media bytes
 for both settings in every measured request. Because the encoder output is
-unchanged, DiT and VAE work is unchanged by construction.
+unchanged, DiT and VAE work is unchanged by construction. The short-segment
+attention path, used when a frame has at most 1024 tokens, is also bitwise: 93 of
+93 comparisons at 784, 512, and 128 tokens.
 
 The encoder itself is faster: the vision tower drops from 229.2 ms to 167.4 ms
 and 228.4 ms to 167.0 ms in two independent windows (about 27%, 61-66 ms), with
