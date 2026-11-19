@@ -23,6 +23,14 @@ RAS_TOP_P = 0.95
 CODEBOOK_TOP_K = 30
 # Pads the window of a request with fewer frames; it matches no token id.
 EMPTY_RAS_SLOT = -1
+DEFAULT_REFERENCE_TOP_P = 0.9
+
+
+def parse_reference_top_p(value: object) -> float | None:
+    """Return a reference nucleus probability for a JSON number in (0, 1]."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value <= 1:
+        return float(value)
+    return None
 
 
 class FusedFrameSampler:
