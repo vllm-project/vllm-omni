@@ -3189,6 +3189,8 @@ async def test_submit_to_stage_stamps_before_submit_initial() -> None:
     seen_at_submit: list[float] = []
 
     class RecordingPool:
+        stage_type = "diffusion"
+
         async def submit_initial(self, request_id, req_state, request, **_kwargs):
             seen_at_submit.append(req_state.stage_submit_ts.get(1, -1.0))
             return 0
@@ -3227,6 +3229,8 @@ async def test_submit_to_stage_refreshes_clocks_for_the_next_segment(monkeypatch
     monkeypatch.setattr("vllm_omni.engine.orchestrator._time.perf_counter", lambda: clock["perf"])
 
     class RecordingPool:
+        stage_type = "llm"
+
         async def submit_initial(self, request_id, req_state, request, **_kwargs):
             return 0
 
@@ -3270,6 +3274,49 @@ async def test_submit_to_stage_refreshes_clocks_for_the_next_segment(monkeypatch
     )
     assert req_state.stage_submit_ts[1] == pytest.approx(6_000.0)
     assert req_state.stage_submit_perf[1] == pytest.approx(20.0)
+
+
+@pytest.mark.asyncio
+async def test_submit_to_stage_excludes_llm_replica_wait(monkeypatch) -> None:
+    """Unpinned LLM submit_initial can wait for a replica; that wait is not generation."""
+    clock = {"wall": 1_000.0, "perf": 10.0}
+    monkeypatch.setattr("vllm_omni.engine.orchestrator._time.time", lambda: clock["wall"])
+    monkeypatch.setattr("vllm_omni.engine.orchestrator._time.perf_counter", lambda: clock["perf"])
+    seen_at_submit: list[float] = []
+
+    class DelayedLLMPool:
+        stage_type = "llm"
+
+        async def submit_initial(self, request_id, req_state, request, **_kwargs):
+            seen_at_submit.append(req_state.stage_submit_ts.get(1, -1.0))
+            clock["wall"] = 2_000.0
+            clock["perf"] = 11.0
+            return 0
+
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.stage_pools = [None, DelayedLLMPool()]
+    orchestrator._transfer_emitter = None
+    req_state = OrchestratorRequestState(
+        request_id="req-clock",
+        sampling_params_list=[None, None],
+        final_stage_id=1,
+    )
+    req_state.yield_stage_id = None
+
+    await orchestrator._submit_to_stage(
+        "req-clock",
+        req_state,
+        [SimpleNamespace()],
+        source_stage_id=0,
+        source_replica_id=0,
+        receiver_stage_id=1,
+        already_submitted=False,
+        t_submit_start=time.perf_counter(),
+    )
+
+    assert seen_at_submit == [-1.0]
+    assert req_state.stage_submit_ts[1] == pytest.approx(2_000.0)
+    assert req_state.stage_submit_perf[1] == pytest.approx(11.0)
 
 
 @pytest.mark.asyncio

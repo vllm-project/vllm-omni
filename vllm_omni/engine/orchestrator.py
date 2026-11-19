@@ -313,6 +313,29 @@ def stamp_stage_submit(req_state: OrchestratorRequestState, stage_id: int, *, re
     return req_state.stage_submit_ts[stage_id]
 
 
+def stamp_downstream_stage_submit(
+    req_state: OrchestratorRequestState,
+    stage_id: int,
+    pool: object,
+    *,
+    already_submitted: bool,
+    after_submit: bool,
+) -> None:
+    """Stamp a downstream stage around ``submit_initial`` / ``submit_update``.
+
+    Diffusion stamps before enqueue so scheduler admission stays in the stage
+    clock. LLM stamps after a successful submit so replica-selection wait is
+    not counted as generation.
+    """
+    is_diffusion = getattr(pool, "stage_type", None) == "diffusion"
+    if after_submit:
+        if not is_diffusion:
+            stamp_stage_submit(req_state, stage_id, refresh=True)
+        return
+    if is_diffusion:
+        stamp_stage_submit(req_state, stage_id, refresh=already_submitted)
+
+
 @dataclass
 class OrchestratorRequestState:
     """Per-request bookkeeping inside the Orchestrator."""
@@ -3475,9 +3498,13 @@ class OrchestratorBase:
 
                 if mark_submitting is not None:
                     mark_submitting()
-                # First enqueue is stamped before submit so scheduler wait stays inside
-                # the stage clock. A later segment on the same request refreshes both clocks.
-                stamp_stage_submit(req_state, next_logical, refresh=already_submitted)
+                stamp_downstream_stage_submit(
+                    req_state,
+                    next_logical,
+                    next_pool,
+                    already_submitted=already_submitted,
+                    after_submit=False,
+                )
                 if already_submitted:
                     replica_id = await next_pool.submit_update(req_id, req_state, request, **route_kwargs)
                 else:
@@ -3489,6 +3516,13 @@ class OrchestratorBase:
                         expected_replica_id=scoped_replica_id,
                         **route_kwargs,
                     )
+                stamp_downstream_stage_submit(
+                    req_state,
+                    next_logical,
+                    next_pool,
+                    already_submitted=already_submitted,
+                    after_submit=True,
+                )
             self._on_stage_submitted(
                 next_logical,
                 req_id,
@@ -3555,14 +3589,25 @@ class OrchestratorBase:
         initial_kwargs = dict(update_kwargs)
         if params_override is not None:
             initial_kwargs["params_override"] = params_override
-        # First enqueue is stamped before submit so scheduler wait stays inside the
-        # stage clock. A later segment on the same request refreshes both clocks.
-        stamp_stage_submit(req_state, receiver_stage_id, refresh=already_submitted)
         for request in requests:
+            stamp_downstream_stage_submit(
+                req_state,
+                receiver_stage_id,
+                to_pool,
+                already_submitted=already_submitted,
+                after_submit=False,
+            )
             if already_submitted:
                 replica_id = await to_pool.submit_update(req_id, req_state, request, **update_kwargs)
             else:
                 replica_id = await to_pool.submit_initial(req_id, req_state, request, **initial_kwargs)
+            stamp_downstream_stage_submit(
+                req_state,
+                receiver_stage_id,
+                to_pool,
+                already_submitted=already_submitted,
+                after_submit=True,
+            )
             self._on_stage_submitted(receiver_stage_id, req_id, replica_id, req_state)
 
         self._emit_tx_edge(
@@ -3682,7 +3727,13 @@ class OrchestratorBase:
                     await self._fail_request_dead_stage(request_id, route_stage_id)
                     return False
             route_kwargs: dict[str, Any] = {} if pinned_replica_id is None else {"pinned_replica_id": pinned_replica_id}
-            stamp_stage_submit(req_state, next_stage_id, refresh=True)
+            stamp_downstream_stage_submit(
+                req_state,
+                next_stage_id,
+                next_pool,
+                already_submitted=False,
+                after_submit=False,
+            )
             _t_submit_start = _time.perf_counter()
 
             if next_pool.stage_type == "diffusion":
@@ -3791,6 +3842,13 @@ class OrchestratorBase:
             # request is already cleaned up, so stop prewarming.
             if not submitted:
                 return False
+            stamp_downstream_stage_submit(
+                req_state,
+                next_stage_id,
+                next_pool,
+                already_submitted=False,
+                after_submit=True,
+            )
 
             # The guard swallows submit_initial's return value; the pool binding
             # it recorded carries the same replica.
