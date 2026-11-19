@@ -80,6 +80,21 @@ NIGHTLY_BLOCKING_FULL_MODEL_LABELS = (
     "MiniCPM-o Online Full-Model Modalities",
 )
 TINY_DIFFUSION_PATH = "tests/model_tests/diffusion/test_common_offline.py"
+TINY_DIFFUSION_STABLE_4GPU_CASES = (
+    "test_pipeline_on_supported_tasks[SanaVideoPipeline[tensor_parallel+cfg_parallel]]",
+    "test_pipeline_on_supported_tasks[SanaVideoPipeline[sequence_parallel+cfg_parallel]]",
+    "test_pipeline_on_supported_tasks[SanaVideoPipeline[tensor_parallel+sequence_parallel]]",
+    "test_pipeline_on_supported_tasks[SanaImageToVideoPipeline[tensor_parallel+cfg_parallel]]",
+    "test_pipeline_on_supported_tasks[SanaImageToVideoPipeline[sequence_parallel+cfg_parallel]]",
+    "test_pipeline_on_supported_tasks[LongCatImageEditPipeline[cfg_parallel+tensor_parallel+cpu_offload]]",
+    "test_pipeline_on_supported_tasks[Flux2Pipeline[cfg_parallel+sequence_parallel+cpu_offload]]",
+    "test_pipeline_on_supported_tasks[Flux2Pipeline[tensor_parallel+vae_patch_parallel]]",
+    "test_pipeline_on_supported_tasks[StableDiffusion3Pipeline[cfg_parallel+tensor_parallel+cpu_offload]]",
+)
+TINY_DIFFUSION_STARTUP_4GPU_CASES = (
+    "test_pipeline_on_supported_tasks[Flux2KleinPipeline[cfg_parallel+tensor_parallel+cpu_offload]]",
+    "test_pipeline_on_supported_tasks[LongCatImagePipeline[cfg_parallel+tensor_parallel+cpu_offload]]",
+)
 TINY_DIFFUSION_JOBS = (
     (
         "ROCm · Tiny Diffusion Multi-GPU · 2-GPU",
@@ -91,9 +106,16 @@ TINY_DIFFUSION_JOBS = (
     (
         "ROCm · Tiny Diffusion Multi-GPU · 4-GPU",
         "mi300_4",
-        11,
+        2,
         "full_model and diffusion and rocm and MI325 and cards_4 and not nvidia_only",
         "artifacts/rocm-tiny-diffusion-4gpu/**/*",
+    ),
+    (
+        "ROCm · Tiny Diffusion Multi-GPU · 4-GPU Stable",
+        "mi300_4",
+        9,
+        "full_model and diffusion and rocm and MI325 and cards_4 and not nvidia_only",
+        "artifacts/rocm-tiny-diffusion-4gpu-stable/**/*",
     ),
 )
 ENTRYPOINTS_FULL_SELECTOR = "full_model and omni and rocm and MI325 and cards_2 and not nvidia_only"
@@ -1007,54 +1029,32 @@ def test_tiny_diffusion_multigpu_nightly_uses_native_rocm_collection(
 
     assert step["agent_pool"] == agent_pool
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == ("Blocking" if agent_pool == "mi300_2" else "NonBlocking")
+    assert step["grade"] == ("NonBlocking" if expected_count == 2 else "Blocking")
     assert step["timeout_in_minutes"] == 50
     assert step["artifact_paths"] == [artifacts]
     assert "retry" not in step
-
+    assert step["env"]["ROCM_DIFFUSION_RUN_LEVEL"] == "core_model"
+    assert len(step["commands"]) == 1
     if agent_pool == "mi300_2":
-        assert step["env"]["ROCM_DIFFUSION_RUN_LEVEL"] == "core_model"
-        assert len(step["commands"]) == 1
-        assert split(step["commands"][0]) == [
-            "bash",
-            ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh",
-            "2",
-            str(expected_count),
-            "40m",
-            "rocm-tiny-diffusion-2gpu",
-            TINY_DIFFUSION_PATH,
-            "-m",
-            markers,
-        ]
-        return
-
-    commands = step["commands"]
-    collect_commands = [command for command in commands if AMD_COLLECTION_GUARD.name in command]
-    run_commands = [command for command in commands if "pytest -s" in command]
-    assert len(collect_commands) == 1
-    assert len(run_commands) == 1
-
-    collect_command = collect_commands[0]
-    run_command = run_commands[0]
-    collect_argv = split(collect_command)
-    run_argv = split(run_command)
-    assert collect_argv[:2] == ["bash", str(AMD_COLLECTION_GUARD)]
-    assert collect_argv[2] == str(expected_count)
-    assert "timeout --signal=TERM --kill-after=2m 40m" in run_command
-
-    for command, argv in ((collect_command, collect_argv), (run_command, run_argv)):
-        assert TINY_DIFFUSION_PATH in argv
-        assert _marker_expressions({"commands": [command]}) == [markers]
-        assert argv[argv.index("--run-level") + 1] == "core_model"
-
+        nodes = [TINY_DIFFUSION_PATH]
+    else:
+        cases = TINY_DIFFUSION_STABLE_4GPU_CASES if expected_count == 9 else TINY_DIFFUSION_STARTUP_4GPU_CASES
+        nodes = [f"{TINY_DIFFUSION_PATH}::{case}" for case in cases]
+        assert len(nodes) == expected_count
+        assert set(TINY_DIFFUSION_STABLE_4GPU_CASES).isdisjoint(TINY_DIFFUSION_STARTUP_4GPU_CASES)
+    assert split(step["commands"][0]) == [
+        "bash",
+        ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh",
+        agent_pool.rsplit("_", 1)[1],
+        str(expected_count),
+        "40m",
+        artifacts.split("/")[1],
+        *nodes,
+        "-m",
+        markers,
+    ]
     for cuda_marker in ("cuda", "L4", "H100", "B200"):
         assert re.search(rf"\b{cuda_marker}\b", markers) is None
-
-    all_commands = "\n".join(commands)
-    assert "collection.txt" in all_commands
-    assert "pytest.xml" in all_commands
-    assert "pytest.log" in all_commands
-    assert "pytest-summary.txt" in all_commands
 
 
 def test_flux2_klein_tiny_diffusion_has_cold_start_headroom() -> None:
