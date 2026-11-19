@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
 import logging
 import os
 
+from vllm_omni.config.stage_config import DiffusionStageOperator
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.dmd2.config import DMD2Config
 from vllm_omni.diffusion.models.schedulers import DMD2EulerScheduler
@@ -81,6 +82,11 @@ class DMD2PipelineMixin:
             if isinstance(p, dict) and "negative_prompt" in p:
                 logger.warning("DMD2: ignoring negative_prompt.")
                 request.prompt = {k: v for k, v in p.items() if k != "negative_prompt"}
+
+    def _prepare_stage_request(self, req, operator: DiffusionStageOperator) -> None:
+        """Keep explicit stage operators on the DMD2 request contract."""
+        del operator
+        self._sanitize_dmd2_request(req)
 
     def forward(self, req: DiffusionRequestBatch, **kwargs) -> list[DiffusionOutput]:
         self._sanitize_dmd2_request(req)

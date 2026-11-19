@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Generic cross-stage handoff for disaggregated diffusion pipelines.
 
 A producing diffusion stage (e.g. an ``encode`` stage running only the text
@@ -34,6 +34,7 @@ _PASSTHROUGH_KEYS: tuple[str, ...] = (
     "num_inference_steps",
     "guidance_scale",
     "guidance_scale_2",
+    "true_cfg_scale",
     "boundary_ratio",
     "fps",
     "seed",
@@ -41,6 +42,7 @@ _PASSTHROUGH_KEYS: tuple[str, ...] = (
     "output_type",
     "num_outputs_per_prompt",
     "max_sequence_length",
+    "sigmas",
 )
 
 # Suffix marking connector transfer-handle entries on ``custom_output`` (e.g.
