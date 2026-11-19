@@ -74,10 +74,18 @@ def control_startup(tmp_path, monkeypatch):
         model="/unused/FL2VA",
         task_type="fl2va",
         model_loaded={"text_encoder": True},
-        parallel_config=SimpleNamespace(cfg_parallel_size=1, ulysses_degree=1, ring_degree=1, allgather_degree=1),
+        parallel_config=SimpleNamespace(
+            cfg_parallel_size=1, ulysses_degree=1, ring_degree=1, allgather_degree=1, use_hsdp=False
+        ),
+        additional_config=None,
+        step_execution=False,
+        quantization_config=None,
+        host_weight_runtime_mode="disabled",
+        cache_backend="none",
         controlnet_model_path=str(path),
         diffusion_offload_config=None,
         revision=None,
+        diffusion_attention_schedule=None,
     )
     return pipeline_module, config
 
@@ -673,8 +681,10 @@ def test_encoder_conditioning_keeps_control_separate_from_latent_edit(monkeypatc
     nn.Module.__init__(pipeline)
     pipeline.device = torch.device("cpu")
     pipeline.od_config = SimpleNamespace(
+        additional_config={},
         controlnet_model_path="/control.safetensors",
         step_execution=False,
+        diffusion_attention_schedule=None,
     )
     pipeline.load_vae_encoder = True
     pipeline.video_vae = nn.Module()

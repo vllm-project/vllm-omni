@@ -16,6 +16,23 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 
+def categorical_sample(
+    probs: torch.Tensor, generators: dict[int, torch.Generator], use_fp64_gumbel: bool = False
+) -> torch.Tensor:
+    """Draw model tokens with ordered Torch generators, including mixed seeds.
+
+    The default generator draws the whole matrix before seeded rows overwrite
+    their noise. Same-dtype scores reuse ``probs``; fp64 noise leaves it intact.
+    """
+    noise = torch.empty(probs.shape, dtype=torch.float64 if use_fp64_gumbel else probs.dtype, device=probs.device)
+    if len(generators) != probs.shape[0]:
+        noise.exponential_()
+    for row, generator in generators.items():
+        noise[row].exponential_(generator=generator)
+    scores = probs.div_(noise) if noise.dtype == probs.dtype else noise.reciprocal_().mul_(probs)
+    return scores.argmax(dim=-1).view(-1)
+
+
 @triton.jit
 def torch_exponential_noise(seed, offset, elements, threads):
     # torch's grid-stride kernel: thread t draws curand_uniform4 once per grid

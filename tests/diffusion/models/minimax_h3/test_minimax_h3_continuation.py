@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -193,7 +195,7 @@ def test_request_encodes_only_window_prompts_and_prepares_references_once(monkey
     torch.nn.Module.__init__(pipeline)
     pipeline.load_text_encoder = True
     pipeline.device = torch.device("cpu")
-    pipeline.od_config = None
+    pipeline.od_config = SimpleNamespace(step_execution=False)
     pipeline._active_turbo_spec = lambda sampling: None
     pipeline._active_native_spec = lambda sampling: None
     pipeline._resolve_task = lambda *args, **kwargs: "ref2va"

@@ -155,6 +155,20 @@ def test_process_pending_chunks_uses_public_receive_gate(mocker, receives_chunks
     assert coordinator.requests_with_ready_chunks == set()
 
 
+@pytest.mark.parametrize("from_running", [False, True])
+def test_chunk_registration_preserves_selected_producer(from_running):
+    coordinator = OmniSchedulingCoordinator(scheduler_max_num_seqs=4, stage_id=2, async_chunk=True)
+    request = _make_request("receiver", status=RequestStatus.RUNNING if from_running else RequestStatus.WAITING)
+    request.payload_sender_info = {"host": "10.0.0.3", "zmq_port": 52099}
+    waiting = MockQueue([] if from_running else [request])
+    running = [request] if from_running else []
+
+    coordinator.process_pending_chunks(waiting, running, set(), set())
+
+    [handle] = coordinator.pending_chunk_registrations
+    assert handle.payload_sender_info == request.payload_sender_info
+
+
 def test_chunk_registration_ready_and_terminal_lifecycle():
     coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
     req = _make_request("internal", status=RequestStatus.WAITING)
