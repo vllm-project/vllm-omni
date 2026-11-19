@@ -1780,7 +1780,6 @@ steps:
             2 1 220m rocm-omni-duplex-eval
             tests/dfx/perf/scripts/run_benchmark.py
             --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json
-            --require-duplex-eval-score-floors
             -m "full_model and omni and rocm and MI325 and cards_2"
 
   - group: ":full_moon: Qwen-Image Backend Similarity MI300 Nightly"

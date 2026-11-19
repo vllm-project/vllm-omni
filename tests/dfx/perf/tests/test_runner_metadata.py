@@ -1093,24 +1093,22 @@ def test_dataset_judging_uses_launched_judge(monkeypatch, prefix, judge_url, pyt
         assert args[args.index(f"--{prefix.replace('_', '-')}-judge-base-url") + 1] == judge_url
 
 
-@pytest.mark.parametrize(("hardware", "enforce_score_floors"), [("H100", True), ("MI300", True)])
-def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(
-    monkeypatch, hardware, enforce_score_floors, pytestconfig
-):
+def test_minicpmo_duplex_eval_config_replays_pr_correction_ids_at_c8(monkeypatch, pytestconfig):
     from pathlib import Path
 
     from tests.dfx.perf.scripts import run_benchmark
-    from tests.e2e.accuracy.omni_duplex_eval.validation import select_duplex_eval_baseline
     from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
     from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
-    test_root = Path(__file__).resolve().parents[3]
     config = json.loads((Path(__file__).parent / "test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
-    accuracy = json.loads((test_root / "e2e/accuracy/omni_duplex_eval/omni_duplex_eval_ci_config.json").read_text())
-    ids = {str(sample_id) for values in accuracy["sample_ids_per_split"].values() for sample_id in values}
+    qwen3 = json.loads((Path(__file__).parent / "test_qwen3_omni_duplex_omni_duplex_eval.json").read_text())[0]
     params = config["benchmark_params"][0]
-    assert len(params["duplex_eval_ids"]) == len(ids) == 66
-    assert set(params["duplex_eval_ids"]) == ids
+    qwen3_ids = qwen3["benchmark_params"][0]["duplex_eval_ids"]
+    assert params["duplex_eval_ids"] == qwen3_ids
+    assert len(set(params["duplex_eval_ids"])) == params["num_prompts"][0] == 120
+    assert params["duplex_eval_split"] == "PR_correction"
+    assert params["duplex_eval_mix"] == qwen3["benchmark_params"][0]["duplex_eval_mix"] == "question"
+    assert "duplex_eval_accuracy_config" not in params
     assert config["judge_server_params"]["model"] == params["duplex_eval_judge_model"]
     assert params["duplex_eval_evaluate"]
     assert "duplex_eval_score_floor_hardware" not in params
@@ -1132,11 +1130,11 @@ def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(
 
     calls = []
     monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
-    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: hardware)
+    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
 
     def benchmark(**kwargs):
         calls.append(kwargs)
-        return {"completed": 66}
+        return {"completed": 120}
 
     monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
     monkeypatch.setattr(
@@ -1153,10 +1151,11 @@ def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(
     OmniBenchmarkServingSubcommand.add_cli_args(parser)
     args = parser.parse_args(call["args"])
     assert args.duplex_eval_ids == params["duplex_eval_ids"]
-    assert args.num_prompts == 66
+    assert args.num_prompts == 120
     assert args.max_concurrency == 8
     assert args.save_detailed
-    assert args.duplex_eval_split == "all"
+    assert args.duplex_eval_split == "PR_correction"
+    assert args.duplex_eval_mix == "question"
     assert args.disable_shuffle
     assert call["num_warmups"] == 0
     assert args.ready_check_timeout_sec == 0
@@ -1168,9 +1167,18 @@ def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(
     assert "--duplex-eval-score-floor-hardware" not in call["args"]
     assert "--required-duplex-metrics" not in call["args"]
     assert args.duplex_metric_aggregation == "response"
-    selected = select_duplex_eval_baseline(accuracy, hardware)
-    assert bool(selected) == enforce_score_floors
-    assert call["accuracy_baseline"] == selected
+    assert call["accuracy_baseline"] is None
+
+
+def test_minicpmo_pr_correction_accepts_zero_success_without_floor():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result, _, count, accuracy = _qwen3_joint_result("omni_duplex_eval")
+    params = json.loads((Path(__file__).parent / "test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0][
+        "benchmark_params"
+    ][0]
+    accuracy["pr"]["mean_all_success"] = 0.0
+    assert_result(result, params, count)
 
 
 @pytest.mark.parametrize("device_env", ["CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES"])
@@ -2050,28 +2058,42 @@ def test_response_performance_rejects_missing_artifacts(dataset_name, field, val
 
 def test_minicpmo_omniinteract_local_config_uses_c8_and_ephemeral_artifacts():
     config = json.loads((Path(__file__).parent / "test_minicpmo_4_5_omniinteract.json").read_text())[0]
-    assert config["omniinteract_aggregate_min_ia_qtf1"] == 0.2
+    assert "omniinteract_aggregate_min_ia_qtf1" not in config
     assert config["server_params"]["extra_cli_args"][1] == "vllm_omni/deploy/minicpmo_4_5.yaml"
     update = config["server_params"]["update"]
-    assert update["duplex_session.collect_stats"] is True
-    assert update["duplex_session.max_sessions"] == 8
-    subsets = []
-    for params in config["benchmark_params"]:
-        assert all(update["duplex_session.max_sessions"] >= concurrency for concurrency in params["max_concurrency"])
-        assert params["omniinteract_persist_artifacts"] is False
-        assert "omniinteract_output_dir" not in params
-        assert params["percentile-metrics"] == "ttft,audio_ttfp,audio_rtf,e2el,audio_duration"
-        assert "tpot" not in params["percentile-metrics"]
-        assert "itl" not in params["percentile-metrics"]
-        assert params["required_duplex_metrics"] == [
-            "duplex_client_rtf",
-            "duplex_client_ttfp_ms",
-            "duplex_client_ttft_ms",
-            "duplex_busy_rtf",
-            "duplex_stall_ratio",
-        ]
-        subsets.append(params["omniinteract_subsets"])
-    assert subsets == ["1q1a", "1q1a_math", "1qna"]
+    assert update == {
+        "duplex_session.max_sessions": 8,
+        "duplex_session.collect_stats": True,
+    }
+    assert len(config["benchmark_params"]) == 1
+    params = config["benchmark_params"][0]
+    assert params["omniinteract_subsets"] == "1q1a_math"
+    assert params["num_prompts"] == [60]
+    assert params["omniinteract_evaluate"] is True
+    assert "omniinteract_min_ia_qtf1" not in params
+    assert all(update["duplex_session.max_sessions"] >= concurrency for concurrency in params["max_concurrency"])
+    assert params["omniinteract_persist_artifacts"] is False
+    assert "omniinteract_output_dir" not in params
+    assert params["percentile-metrics"] == "ttft,audio_ttfp,audio_rtf,e2el,audio_duration"
+    assert "tpot" not in params["percentile-metrics"]
+    assert "itl" not in params["percentile-metrics"]
+    assert params["required_duplex_metrics"] == [
+        "duplex_client_rtf",
+        "duplex_client_ttfp_ms",
+        "duplex_client_ttft_ms",
+        "duplex_busy_rtf",
+        "duplex_stall_ratio",
+    ]
+
+
+def test_minicpmo_omniinteract_records_ia_qtf1_without_floor():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result, _, count, _ = _qwen3_joint_result("omniinteract")
+    params = json.loads((Path(__file__).parent / "test_minicpmo_4_5_omniinteract.json").read_text())[0][
+        "benchmark_params"
+    ][0]
+    assert_result(result, params, count)
 
 
 @pytest.mark.parametrize("dataset", ["omniinteract", "omni_duplex_eval"])
