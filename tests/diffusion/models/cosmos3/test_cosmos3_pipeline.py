@@ -1708,9 +1708,10 @@ def test_transfer_source_direct_resize_precedes_control_generation() -> None:
         transfer_target_size=(16, 32),
         transfer_direct_resize=True,
     )
-    request = SimpleNamespace(
+    request = OmniDiffusionRequest(
+        request_id="transfer-direct-resize",
         prompt={"prompt": "transfer", "multi_modal_data": {"video": [Image.fromarray(frame)]}},
-        sampling_params=SimpleNamespace(height=16, width=32, extra_args={"edge": True, "max_frames": 1}),
+        sampling_params=OmniDiffusionSamplingParams(height=16, width=32, extra_args={"edge": True, "max_frames": 1}),
     )
     additional = preprocess(request).prompt["additional_information"]
     actual = transfer.normalized_video_to_uint8_cthw(additional["preprocessed_transfer_video"])

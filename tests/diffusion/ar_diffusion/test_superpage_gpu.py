@@ -214,3 +214,6 @@ def test_runner_superpage_selection(monkeypatch, page, version, expected):
     assert runner.kv_cache.block_size == expected
     assert runner.kv_cache.visibility_block_size == 16
     assert runner.kv_cache.superpage_size == (page if expected == page else 0)
+    next_spec = replace(pipeline.spec, window_frames=pipeline.spec.window_frames + 1)
+    effective, _ = runner._effective_spec(pipeline, next_spec)
+    assert effective.window_frames == next_spec.window_frames

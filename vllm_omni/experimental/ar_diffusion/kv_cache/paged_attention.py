@@ -1127,6 +1127,10 @@ def _write_kv_slots(pool: torch.Tensor, slots: torch.Tensor, values: torch.Tenso
     if values.dtype != pool.dtype:
         values = values.to(pool.dtype)
     if pool.device.type in ("npu", "privateuseone"):
+        if slots.ndim == 2:
+            # Partial pages give each frame its own slots for the same text K/V.
+            values = values.expand(slots.shape[0], *values.shape).flatten(0, 1)
+            slots = slots.flatten()
         # The cache planner supplies distinct physical rows for each write.
         pool.index_copy_(0, slots, values)
     else:
