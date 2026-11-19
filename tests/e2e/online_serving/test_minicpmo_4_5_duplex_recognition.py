@@ -19,22 +19,9 @@ from tests.helpers.mark import hardware_test
 
 pytestmark = [pytest.mark.omni, pytest.mark.core_model]
 
-TRACE_SERVER_PARAMS = [
-    pytest.param(
-        param.values[0]._replace(
-            env_dict={
-                **(param.values[0].env_dict or {}),
-                "MINICPMO_DUPLEX_TRACE_DIR": "tests/e2e/online_serving/results/minicpmo_duplex_recognition/thinker_trace",
-            }
-        ),
-        id=param.id,
-    )
-    for param in SERVER_PARAMS
-]
-
 
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
-@pytest.mark.parametrize("omni_server", TRACE_SERVER_PARAMS, indirect=True)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 def test_duplex_long_video_scene_recognition(omni_server, tmp_path: Path, monkeypatch) -> None:
     manifest = load_manifest()
     wav, frames = unpack_inputs(tmp_path / "input")
