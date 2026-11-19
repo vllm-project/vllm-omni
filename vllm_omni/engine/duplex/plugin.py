@@ -213,6 +213,11 @@ class DuplexModelSessionState(ABC):
     committed_audio_consume_started: bool
     deferred_response_create: bool
     deferred_precreate_response: bool
+    # Response id of a response precreated by an explicit response.create
+    # (vs engine-owned auto responses). The model channel uses it to tag the
+    # response's first silence unit so the model can open the assistant turn
+    # even when the previous turn's turn-ended latch is still set.
+    explicit_response_create_id: str | None
     continuation_owner_id: str | None
     continuation_units: int
     pending_silence_task: asyncio.Task[bool] | None
@@ -270,6 +275,8 @@ class DefaultDuplexModelSessionState(DuplexModelSessionState):
     committed_audio_consume_started: bool = False
     deferred_response_create: bool = False
     deferred_precreate_response: bool = False
+    # See the field comment on DuplexModelSessionState above.
+    explicit_response_create_id: str | None = None
     continuation_owner_id: str | None = None
     continuation_units: int = 0
     pending_silence_task: asyncio.Task[bool] | None = None
@@ -386,12 +393,18 @@ class PartialStageForward:
     finished and an earlier sentence is already in flight. The text must be
     submitted resumable. A non-resumable submit is an end sentinel
     (``StreamingUpdate.from_request`` returns None) and aborts that sentence.
+
+    ``source_stage_id`` is the stage the orchestrator forwards *from*
+    (``_forward_to_next_stage`` always goes to source + 1). ``None`` means
+    the producing stage that just emitted ``output``. A Talker-park follow-up
+    must name the thinker stage; forwarding from Talker would hit Code2Wav.
     """
 
     output: object
     is_final_update: bool
     close_only: bool = False
     queue_close_after: bool = False
+    source_stage_id: int | None = None
 
 
 def duplex_text_history(conversation: Iterable[Mapping[str, object]]) -> tuple[tuple[str, str], ...]:
@@ -495,6 +508,15 @@ class DuplexModelPlugin(ABC):
 
     def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
         """Bind model policy to the resolved deployment topology before admission."""
+
+    def configure_async_chunk(self, *, enabled: bool) -> None:
+        """Receive the deploy-resolved ``async_chunk`` flag before admission.
+
+        The engine always calls this. Models that do not gate streaming on the
+        flag keep this no-op; JoyAI overrides it to switch sentence TTS, Talker
+        DELTA parks, and draining.
+        """
+        del enabled
 
     def configure_server(self, runtime_config: DuplexSessionRuntimeConfig) -> None:
         """Validate server-owned model options before accepting sessions."""
@@ -696,7 +718,8 @@ class DuplexModelPlugin(ABC):
         """Return a Talker update the orchestrator should submit, or None.
 
         Default models do not split Stage1 text. The orchestrator owns the
-        actual ``_forward_to_next_stage`` call.
+        actual ``_forward_to_next_stage`` call, including follow-ups whose
+        ``source_stage_id`` is not the producing stage.
         """
         del orchestrator, stage_id, replica_id, output, req_state
         return None
@@ -734,6 +757,11 @@ class DuplexModelPlugin(ABC):
         """
         del stage_id, segment_finished, output, context
         return False
+
+    def resumable_downstream_stage_ids(self, *, stage_count: int) -> frozenset[int]:
+        """Stages that keep a turn-commit request open across downstream segments."""
+        del stage_count
+        return frozenset()
 
     def draining_stage_ids(self, *, stage_count: int) -> frozenset[int]:
         """Output stages that may keep running after the next user turn starts.
@@ -1109,14 +1137,13 @@ def validate_duplex_plugin_sampling(plugin: DuplexModelPlugin, *, sampling_defau
 def validate_duplex_replica_policy(
     plugin: DuplexModelPlugin,
     runtime_config: DuplexSessionRuntimeConfig,
-    *,
-    distributed: bool,
 ) -> None:
-    """Validate replica policy before workers start and against the actual stage pools."""
+    """Validate plugin sharing capability before workers start.
+
+    DuplexReplicaPlacement validates group topology against the actual pools.
+    """
     if runtime_config.replica_policy == "legacy":
         return
-    if distributed:
-        raise ValueError("duplex_session.replica_policy=least_sessions does not support distributed hub/LB mode")
     cap = runtime_config.max_sessions_per_replica
     assert cap is not None
     # This capability depends on the requested capacity for some plugins; the
