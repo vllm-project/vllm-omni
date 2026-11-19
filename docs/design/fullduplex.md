@@ -33,6 +33,30 @@ turn-based stack free of duplex code, and exposes the same session to three
 consumers: the OpenAI Realtime WebSocket route, the in-process Python API and
 the model plugins.
 
+## Incremental text input
+
+`AppendText` is admitted only when the model advertises `text` as an input
+modality. MiniCPM-o consumes each fragment as a native TEXT unit in automatic
+response mode. The manager charges UTF-8 bytes before mailbox admission; the
+runner keeps that charge until its ordered append task completes or is
+cancelled. Text shares the audio/video append tail and epoch fencing, without
+flushing partial PCM or advancing the first audio-encoder window.
+
+The MiniCPM plugin tokenizes off the owner loop and reserves exactly the
+context/previous-unit closure, `<unit>`, and text tokens. Stage 0 embeds these
+tokens using the native `streaming_prefill(text_list=...)` layout and retains
+them in sliding-window units. Repeated prefill of the same append identity
+reuses its embeddings. `force_listen` permits intermediate fragments to enter
+the KV cache without generating a reply; an unforced text unit opens the
+assistant turn once during prefill, since text has no microphone silence
+marking the end of input. The runner creates its response before submission;
+an empty `<|chunk_eos|>` unit returns directly to the session to advance the
+normal continuation clock instead of waiting for nonexistent Talker output.
+The Talker handoff skips those completed control units in cumulative output
+before aligning the next speech unit's text and hidden states.
+Replayed prefill cannot reopen an ended reply. This does not change the separate
+conversation-item text-turn capability or replace assistant playback controls.
+
 ## Playback completion ownership
 
 Cancellation of a retained model stream identifies the response owning its

@@ -1097,7 +1097,7 @@ def test_minicpmo_native_capabilities_separate_model_state_from_core_kv_lease():
 
     assert caps["implementation_level"] == "model_native_duplex"
     assert caps["supports_input_append"] is True
-    assert caps["input_modes"] == ["append_audio_chunk"]
+    assert caps["input_modes"] == ["append_audio_chunk", "append_text"]
     assert caps["adapter_patterns"] == ["scheduler_data_plane"]
     assert caps["supports_model_internal_state"] is True
     assert caps["requires_model_runner_kv"] is True

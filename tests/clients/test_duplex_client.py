@@ -466,6 +466,25 @@ async def test_resync_required_drops_resume_credential():
 
 
 @pytest.mark.asyncio
+async def test_append_text_interleaves_with_audio_without_advancing_audio_clock():
+    sock = FakeSocket()
+    sock.feed(SESSION_CREATED)
+    client, _ = make_client(sock)
+    async with client:
+        await client.append_audio(b"\x00\x10" * 1600)
+        await client.append_text("hello", force_listen=True)
+        await client.append_audio(b"\x00\x10" * 1600)
+        await client.append_text("world")
+        appends = [e for e in sock.sent if e.get("type") in {"input.text.append", "input_audio_buffer.append"}]
+        assert [e.get("audio_end_ms") for e in appends] == [100, None, 200, None]
+        assert appends[1]["text"] == "hello" and appends[1]["force_listen"] is True
+        assert appends[3]["text"] == "world" and appends[3]["force_listen"] is False
+        with pytest.raises(ValueError, match="non-empty"):
+            await client.append_text("")
+        sock.feed(SESSION_CLOSED)
+
+
+@pytest.mark.asyncio
 async def test_append_audio_tracks_cumulative_end_ms():
     sock = FakeSocket()
     sock.feed(SESSION_CREATED)
