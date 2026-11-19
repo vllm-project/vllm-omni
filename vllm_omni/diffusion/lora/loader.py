@@ -459,22 +459,6 @@ class LoraLoaderMixin:
 
 class QwenImageLoraLoaderMixin(LoraLoaderMixin):
     def _prepare_lora_state_dict(self, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        has_alpha = any(k.endswith(".alpha") for k in state_dict)
-        is_non_diffusers_format = any(k.startswith("diffusion_model.") for k in state_dict)
-        is_diffusers_lora_format = any(k.endswith(".lora_A.weight") for k in state_dict)
-        needs_conversion = has_alpha or is_non_diffusers_format
-        if has_alpha and is_diffusers_lora_format:
-            state_dict = _apply_diffusers_lora_alpha_scaling(state_dict)
-            # The converter adds the transformer prefix; canonical keys already have it.
-            needs_conversion = not all(k.startswith("transformer.") for k in state_dict)
-
-        if needs_conversion:
-            converter = get_converter_by_pipeline(self)
-            if converter is None:
-                raise ValueError(f"Converter for Lora weights not found for {self.__class__.__name__}")
-
-            state_dict = converter(state_dict)
-
         return _remap_state_dict_keys(state_dict, [(".to_out.0.", ".to_out.")])
 
     def load_lora_weights(
@@ -490,7 +474,21 @@ class QwenImageLoraLoaderMixin(LoraLoaderMixin):
         else:
             state_dict = _load_lora_state_dict(pretrained_model_name_or_path_or_dict)
 
+        has_alpha = any(k.endswith(".alpha") for k in state_dict)
+        is_non_diffusers_format = any(k.startswith("diffusion_model.") for k in state_dict)
+        is_diffusers_lora_format = any(k.endswith(".lora_A.weight") for k in state_dict)
+        if has_alpha and is_diffusers_lora_format:
+            state_dict = _apply_diffusers_lora_alpha_scaling(state_dict)
+
+        if has_alpha or is_non_diffusers_format:
+            converter = get_converter_by_pipeline(self)
+            if converter is None:
+                raise ValueError(f"Converter for Lora weights not found for {self.__class__.__name__}")
+
+            state_dict = converter(state_dict)
+
         state_dict = self._prepare_lora_state_dict(state_dict)
+
         self.load_lora_into_module(
             state_dict,
             self.transformer,

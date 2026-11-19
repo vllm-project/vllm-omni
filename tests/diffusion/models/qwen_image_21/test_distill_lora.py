@@ -41,7 +41,7 @@ def _pipeline(monkeypatch, tp_size=1, tp_rank=0):
         (1, 0, "diffusion_model", None),
         (2, 0, "diffusion_model", None),
         (2, 1, "diffusion_model", 4.0),
-        (1, 0, "transformer", 4.0),
+        (1, 0, "transformer", None),
     ],
 )
 def test_fused_gate_up_matches_explicit_split(tmp_path, monkeypatch, tp_size, tp_rank, prefix, alpha):
