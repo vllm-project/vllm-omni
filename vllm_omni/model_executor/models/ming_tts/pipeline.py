@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Ming TTS pipeline: Stage-0 LLM+flow -> Stage-1 audio VAE."""
 
 from vllm_omni.config.stage_config import (
@@ -23,6 +23,7 @@ MING_TTS_PIPELINE = PipelineConfig(
             stage_id=0,
             model_stage="llm",
             execution_type=StageExecutionType.LLM_AR,
+            supports_native_mrv2_data_plane=True,
             input_sources=(),
             owns_tokenizer=True,
             hf_config_name="llm_config",
@@ -40,6 +41,7 @@ MING_TTS_PIPELINE = PipelineConfig(
             stage_id=1,
             model_stage="audio_vae",
             execution_type=StageExecutionType.LLM_GENERATION,
+            supports_native_mrv2_data_plane=True,
             input_sources=(0,),
             final_output=True,
             final_output_type="audio",
