@@ -327,6 +327,10 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         req_id = str(request_data.req_id)
         external_req_id = str(getattr(request_data, "external_req_id", None) or req_id)
         with self._native_output_lock:
+            # MRv2 admits preempted requests through scheduled_new_reqs again.
+            # Keep the live token history and deferred output holds until terminal cleanup.
+            if req_id in self._native_requests:
+                return
             self._native_outputs_in_flight.pop(req_id, None)
             self._native_terminal_pending.discard(req_id)
             self._native_requests[req_id] = _NativeRequestState(

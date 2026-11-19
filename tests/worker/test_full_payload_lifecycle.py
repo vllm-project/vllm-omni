@@ -23,6 +23,7 @@ from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.request import RequestStatus
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+from vllm_omni.model_executor.stage_input_processors.qwen3_tts import talker2code2wav_full_payload
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 from vllm_omni.worker_v2.omni_data_plane import OmniRunnerDataPlane
@@ -282,7 +283,7 @@ def test_generation_free_request_records_discard_before_upstream_free():
     assert sched._discarded_req_ids == {"failed"}
 
 
-def test_data_plane_replay_uses_token_range_and_prefix_keys():
+def test_data_plane_replay_preserves_token_history_and_codec_payload():
     plane = OmniRunnerDataPlane.__new__(OmniRunnerDataPlane)
     plane._native_requests = {}
     plane._native_output_lock = threading.RLock()
@@ -296,24 +297,43 @@ def test_data_plane_replay_uses_token_range_and_prefix_keys():
     plane._pending_full_payload_send = {}
     plane._full_payload_replace_keys_cached = frozenset()
     plane._full_payload_token_ends = {}
-    plane.register_request(SimpleNamespace(req_id="preempt", external_req_id="preempt", prompt_token_ids=[1]))
+    plane.recv_full_payload_inputs = MagicMock()
+    plane.send_chunks = MagicMock(return_value=1)
+    plane.cleanup_finished_request = MagicMock()
+    plane._deferred_shm_releases = set()
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model_config = SimpleNamespace(async_chunk=False)
+    runner._omni_data_plane = plane
+    initial = SchedulerOutput.make_empty()
+    initial.scheduled_new_reqs = [SimpleNamespace(req_id="preempt", prompt_token_ids=[1])]
+    runner._prepare_native_data_plane(initial)
+    original = torch.tensor([[10, 11], [20, 21]])
+    appended = torch.tensor([[30, 31]])
     plane.complete_outputs(
         req_ids=["preempt"],
-        inter_stage_outputs=[{"hidden": torch.arange(10).reshape(5, 2)}],
-        sampled_token_ids=[[4]],
-        full_payload_token_ranges={"preempt": (0, 5)},
+        inter_stage_outputs=[{"codes.audio": original}],
+        sampled_token_ids=[[4, 5]],
+        full_payload_token_ranges={"preempt": (0, 2)},
     )
+    resumed = SchedulerOutput.make_empty()
+    resumed.scheduled_new_reqs = [SimpleNamespace(req_id="preempt", prompt_token_ids=[1], prefill_token_ids=[1, 4, 5])]
+    runner._prepare_native_data_plane(resumed)
     plane.complete_outputs(
         req_ids=["preempt"],
-        inter_stage_outputs=[{"hidden": torch.full((7, 2), 3)}],
-        sampled_token_ids=[[5]],
-        full_payload_token_ranges={"preempt": (4, 7)},
-        full_payload_prefix_cache_keys={"preempt": frozenset({"hidden"})},
+        inter_stage_outputs=[{"codes.audio": torch.cat([torch.full_like(original, 99), appended])}],
+        sampled_token_ids=[[6, 7]],
+        full_payload_token_ranges={"preempt": (1, 3)},
+        full_payload_prefix_cache_keys={"preempt": frozenset({"codes.audio"})},
     )
-    assert torch.equal(
-        _payload(plane, "preempt")["hidden"],
-        torch.cat([torch.arange(10).reshape(5, 2), torch.full((2, 2), 3)]),
-    )
+    plane.send_chunks.assert_not_called()
+    plane.request_terminal({"preempt"})
+    plane.send_chunks.assert_called_once()
+    [(request, payload)] = plane.send_chunks.call_args.args[0]
+    assert request.is_finished()
+    assert request.prompt_token_ids == [1]
+    assert request.output_token_ids == [4, 5, 6, 7]
+    codec = talker2code2wav_full_payload(None, payload, request)
+    assert torch.equal(codec["codes"]["audio"], torch.tensor([10, 20, 30, 11, 21, 31]))
 
 
 def test_prefix_cache_rewrite_records_only_replaced_keys():
