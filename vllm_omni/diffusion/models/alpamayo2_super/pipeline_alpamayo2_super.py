@@ -215,7 +215,7 @@ class Alpamayo2SuperPipeline(nn.Module):
                 use_cache=True,
                 is_causal=not expert.non_causal,
             ).last_hidden_state
-            prefix.crop(padded_len)
+            prefix.crop(padded_len - prefix.get_seq_length())
             velocity = expert.action_out_proj(hidden).view(batch, num_waypoints, action_dim)
             # A (1, 1, 1) step keeps the update in float32, as in the reference.
             action = action + (time_steps[i + 1] - time_steps[i]).view(1, 1, 1) * velocity
