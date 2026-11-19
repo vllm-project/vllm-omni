@@ -1640,6 +1640,33 @@ steps:
             tests/model_tests/diffusion/test_common_offline.py
             -m "full_model and diffusion and rocm and MI325 and cards_2 and not nvidia_only"
 
+      # These nine cases passed every scheduled NIGHTLY run on Nov 2-18, 2026.
+      - label: "ROCm · Tiny Diffusion Multi-GPU · 4-GPU Stable"
+        agent_pool: mi300_4
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 50
+        source_file_dependencies: diffusion_tiny_model
+        artifact_paths:
+          - artifacts/rocm-tiny-diffusion-4gpu-stable/**/*
+        env:
+          ROCM_DIFFUSION_RUN_LEVEL: core_model
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            4 9 40m rocm-tiny-diffusion-4gpu-stable
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaVideoPipeline[tensor_parallel+cfg_parallel]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaVideoPipeline[sequence_parallel+cfg_parallel]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaVideoPipeline[tensor_parallel+sequence_parallel]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaImageToVideoPipeline[tensor_parallel+cfg_parallel]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaImageToVideoPipeline[sequence_parallel+cfg_parallel]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[LongCatImageEditPipeline[cfg_parallel+tensor_parallel+cpu_offload]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[Flux2Pipeline[cfg_parallel+sequence_parallel+cpu_offload]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[Flux2Pipeline[tensor_parallel+vae_patch_parallel]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[StableDiffusion3Pipeline[cfg_parallel+tensor_parallel+cpu_offload]]"
+            -m "full_model and diffusion and rocm and MI325 and cards_4 and not nvidia_only"
+
+      # Keep the Flux2Klein and LongCatImage startup failures observational.
       - label: "ROCm · Tiny Diffusion Multi-GPU · 4-GPU"
         agent_pool: mi300_4
         mirror_hardwares: [amdproduction]
@@ -1648,28 +1675,15 @@ steps:
         source_file_dependencies: diffusion_tiny_model
         artifact_paths:
           - artifacts/rocm-tiny-diffusion-4gpu/**/*
+        env:
+          ROCM_DIFFUSION_RUN_LEVEL: core_model
         commands:
-          - export ROCM_TINY_DIFFUSION_4GPU_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-tiny-diffusion-4gpu"
-          - mkdir -p "$$ROCM_TINY_DIFFUSION_4GPU_ARTIFACT_DIR"
-          - |
-            bash .buildkite/amd/scripts/assert-pytest-collection.sh 11 \
-              tests/model_tests/diffusion/test_common_offline.py \
-              -m "full_model and diffusion and rocm and MI325 and cards_4 and not nvidia_only" \
-              --run-level core_model \
-              | tee "$$ROCM_TINY_DIFFUSION_4GPU_ARTIFACT_DIR/collection.txt"
-          - |
-            set +e
-            timeout --signal=TERM --kill-after=2m 40m \
-              pytest -s -v -ra tests/model_tests/diffusion/test_common_offline.py \
-              -m "full_model and diffusion and rocm and MI325 and cards_4 and not nvidia_only" \
-              --run-level core_model --durations=20 \
-              --junitxml="$$ROCM_TINY_DIFFUSION_4GPU_ARTIFACT_DIR/pytest.xml" \
-              2>&1 | tee "$$ROCM_TINY_DIFFUSION_4GPU_ARTIFACT_DIR/pytest.log"
-            status=$${PIPESTATUS[0]}
-            set -e
-            tail -n 100 "$$ROCM_TINY_DIFFUSION_4GPU_ARTIFACT_DIR/pytest.log" > \
-              "$$ROCM_TINY_DIFFUSION_4GPU_ARTIFACT_DIR/pytest-summary.txt"
-            exit "$$status"
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            4 2 40m rocm-tiny-diffusion-4gpu
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[Flux2KleinPipeline[cfg_parallel+tensor_parallel+cpu_offload]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[LongCatImagePipeline[cfg_parallel+tensor_parallel+cpu_offload]]"
+            -m "full_model and diffusion and rocm and MI325 and cards_4 and not nvidia_only"
 
   - group: ":full_moon: MiniCPM-o 4.5 Perf MI300 Nightly"
     steps:
