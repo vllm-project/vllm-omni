@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 from transformers import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-from vllm.utils.network_utils import get_open_port
+from vllm.utils.network_utils import get_file_store_init_method
 
 from vllm_omni.diffusion.models.minimax_h3 import encoder as encoder_module
 from vllm_omni.diffusion.models.minimax_h3.encoder import MiniMaxH3Qwen3VLEncoder
@@ -29,14 +29,13 @@ def _init_distributed(monkeypatch: pytest.MonkeyPatch):
         initialize_model_parallel,
     )
 
-    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
-    monkeypatch.setenv("MASTER_PORT", str(get_open_port()))
     try:
+        # A fresh file store avoids the free-port probe/bind race of env://.
         init_distributed_environment(
             world_size=1,
             rank=0,
             local_rank=0,
-            distributed_init_method="env://",
+            distributed_init_method=get_file_store_init_method(),
             backend="gloo",
         )
         initialize_model_parallel()

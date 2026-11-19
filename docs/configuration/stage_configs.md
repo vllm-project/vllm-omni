@@ -494,6 +494,9 @@ platform-specific value in a user overlay, use the same platform block.
 | `--stage-overrides JSON` | Per-stage JSON overrides, e.g. `'{"0":{"gpu_memory_utilization":0.5}}'`. Per-stage values always win over global flags. |
 | `--async-chunk` / `--no-async-chunk` | Flip the deploy YAML's `async_chunk:` bool. Unset (default) leaves the YAML value in force. |
 
+`--stage-overrides` logs a warning and ignores deploy-only fields such
+as `session_mode` and `connectors`. Set those fields in the deploy YAML.
+
 ### Stage-Based CLI Paradigm
 
 The stage-based CLI paradigm facilitates the execution of discrete pipeline stages within isolated processes:
