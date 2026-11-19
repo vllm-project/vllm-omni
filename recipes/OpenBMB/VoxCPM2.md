@@ -105,6 +105,50 @@ non-empty residual state and fail at `aclnnCat`.
 
 ## GPU
 
+### Concurrency tuning
+
+The bundled deploy config keeps `max_num_seqs: 8` and
+`unified_decode_graph_max_batch_size: 8` as the latency-oriented defaults.
+For a throughput-oriented workload with many concurrent clients, evaluate
+`max_num_seqs: 32` as an opt-in setting in a local copy of
+[`voxcpm2.yaml`](../../vllm_omni/deploy/voxcpm2.yaml), then pass that file with
+`--deploy-config /path/to/voxcpm2-throughput.yaml`. Keep the other settings
+unchanged for the initial comparison. This is a tuning candidate, not a
+recommended default for every GPU or workload.
+
+The scheduler can defer new admissions during decode, but does not split an
+already-running batch to fit the unified decode graph maximum. A higher
+admission limit can therefore increase streaming audio chunk intervals and
+end-to-end latency even when aggregate audio throughput improves. Audio chunk
+intervals measure emitted audio, not per-step inter-token latency (ITL).
+
+In the [reported RTX 3090 comparison](https://github.com/vllm-project/vllm-omni/pull/5071#issuecomment-5618173455),
+30 measured runs completed 752 requests across short text, long text, and
+reference-audio workloads. At client concurrency 32, the report found roughly
+33–47% higher audio throughput with the larger admission limit, alongside
+6–11% higher median end-to-end latency and typical audio chunk intervals of
+325–335 ms instead of about 120 ms. At client concurrency 1 and 8, it found
+no consistent throughput benefit. These measurements used an older checkout
+on one RTX 3090; they are not validation of current main, H100 CI, or a fix
+for the concurrency-8 CI regression.
+
+Before selecting a setting, compare identical requests at your expected client
+concurrency, warm up both configurations, and repeat measured runs. Include
+long inputs and reference audio when relevant. Record the model and software
+revisions, GPU, successful requests, peak memory, audio throughput, time to
+first audio, end-to-end latency, and streaming chunk intervals. Derive audio
+duration from the actual output sample rate (VoxCPM2 emits 48 kHz), and choose
+the setting that meets your latency and memory requirements.
+
+The pinned 6 GiB KV cache is a separate budget from diffusion and AudioVAE
+memory. For the BF16 configuration used in that report, the theoretical KV
+footprint is `2 (K/V) × (28 backbone + 8 residual layers) × 2 KV heads × 128
+head dimension × 2 bytes = 36 KiB/token`. Thus `6 × 1024³ / 36864` is about
+175k tokens before block alignment and runtime overhead. Recheck the actual
+model configuration and runtime-reported capacity when changing model,
+context length, concurrency, or prefix caching. This estimate guarantees
+neither total GPU memory fit nor throughput or latency.
+
 ### 1 x RTX 4090 24GB (Single GPU, Minimum Recommended)
 
 VoxCPM2 (2B params in bfloat16) fits comfortably on a single 24 GB GPU.

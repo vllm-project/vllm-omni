@@ -25,6 +25,7 @@ except ImportError as exc:  # pragma: no cover - example dependency
 
 PCM16_SAMPLE_RATE = 16_000
 PCM16_BYTES_PER_SAMPLE = 2
+_BACKEND_UNAVAILABLE_CODES = frozenset({"server_vad_unavailable", "semantic_vad_unavailable"})
 
 # Server-side model unit boundaries, in cumulative appended audio.
 # Stage0 configures the streaming mel processor with first_chunk_ms=1035 and
@@ -115,6 +116,7 @@ class RealtimeEventCollector:
     response_ids: list[str] = field(default_factory=list)
     output_sample_rate_hz: int = 24_000
     client_appends: list[dict[str, object]] = field(default_factory=list)
+    _backend_error: dict[str, object] | None = field(default=None, init=False, repr=False)
 
     def note_client_append(self, record: dict[str, object]) -> None:
         """Record one successful append send (same monotonic clock as ``add``)."""
@@ -140,6 +142,15 @@ class RealtimeEventCollector:
         self.event_received_at_s.append(received_at)
         response_id = self.response_id(stored_event)
         event_type = stored_event.get("type")
+        error = stored_event.get("error")
+        if (
+            self._backend_error is None
+            and event_type == "error"
+            and isinstance(error, dict)
+            and isinstance(error.get("code"), str)
+            and error.get("code") in _BACKEND_UNAVAILABLE_CODES
+        ):
+            self._backend_error = stored_event
         if event_type == "response.created" and response_id and response_id not in self.response_ids:
             self.response_ids.append(response_id)
         if event_type == "response.output_audio.delta":
@@ -312,7 +323,22 @@ class RealtimeDuplexClient:
         )
 
     def raise_if_reader_stopped(self) -> None:
-        """Fail a caller waiting on events after the WebSocket reader exits."""
+        """Stop waiting after a transport failure or an unavailable backend."""
+
+        event = self.events._backend_error
+        if event is not None:
+            # Benchmark modules reach the CLI import graph; keep the public
+            # client dependency lazy until a session is actually running.
+            from vllm_omni.clients.duplex import DuplexProtocolError
+
+            error = event["error"]
+            assert isinstance(error, dict)
+            raise DuplexProtocolError(
+                str(error.get("message") or error["code"]),
+                code=str(error["code"]),
+                event_id=str(event["event_id"]) if event.get("event_id") else None,
+                raw=event,
+            )
 
         task = self._reader_task
         if task is None or not task.done():
@@ -371,9 +397,9 @@ class RealtimeDuplexClient:
         await self.send({"type": "session.update", "session": session})
 
         def session_created() -> bool:
+            self.raise_if_reader_stopped()
             if self.events.count("session.created") > 0:
                 return True
-            self.raise_if_reader_stopped()
             return False
 
         await wait_for(
@@ -458,6 +484,7 @@ class RealtimeDuplexClient:
         frames_sent = 0
         started_at = time.monotonic()
         for chunk, frame in units:
+            self.raise_if_reader_stopped()
             if not chunk:
                 continue
             duration_ms = len(chunk) * 1000 // (PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE)

@@ -403,6 +403,9 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
         self._init_omni_connector_output_inbox()
         self._pending_data_plane_terminal_req_ids: set[str] = set()
+        # Aborted, errored, and ignored requests. Wrapped onto the next
+        # scheduler output so the runner can drop their pending payloads.
+        self._discarded_req_ids: set[str] = set()
         # Async-chunk prewarm payloads popped in add_request, keyed by request
         # id; handed to the runner once by _wrap_omni_scheduler_output.
         self._pending_request_prewarms: dict[str, dict[str, Any]] = {}
@@ -900,6 +903,20 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             return
         self._latest_omni_connector_output = omni_output
 
+    def _record_full_payload_discard(self, request: Request) -> None:
+        """Remember a failed request so its pending full payload is dropped."""
+        if getattr(request, "status", None) not in (
+            RequestStatus.FINISHED_ABORTED,
+            RequestStatus.FINISHED_ERROR,
+            RequestStatus.FINISHED_IGNORED,
+        ):
+            return
+        discarded = getattr(self, "_discarded_req_ids", None)
+        if discarded is None:
+            discarded = set()
+            self._discarded_req_ids = discarded
+        discarded.add(request.request_id)
+
     def _wrap_omni_scheduler_output(
         self,
         base: SchedulerOutput,
@@ -950,6 +967,12 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         finished_output_ids = {
             req_id: pending_output_ids.pop(req_id) for req_id in base.finished_req_ids if req_id in pending_output_ids
         }
+        discarded_req_ids: set[str] | None = getattr(self, "_discarded_req_ids", None)
+        if discarded_req_ids is None:
+            finished_discarded_req_ids: set[str] = set()
+        else:
+            finished_discarded_req_ids = discarded_req_ids & set(base.finished_req_ids)
+            discarded_req_ids.difference_update(finished_discarded_req_ids)
         scheduler_output = OmniSchedulerOutput(
             **base_data,
             finished_requests_needing_kv_transfer=finished_requests_needing_kv_transfer or {},
@@ -958,6 +981,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             data_plane_terminal_req_ids=data_plane_terminal_req_ids,
             input_terminal_req_ids=input_terminal_req_ids or set(),
             pending_request_prewarms=request_prewarms,
+            discarded_req_ids=finished_discarded_req_ids,
         )
         OmniSchedulerMixin._duplex_stage_work_recorder(self).step_begin(scheduler_output, getattr(self, "requests", {}))
         return scheduler_output
