@@ -1677,6 +1677,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             and state is not None
             and not getattr(state, "current_turn_ended", True)
             and not force_listen
+            and not (
+                isinstance(payload, dict)
+                and payload.get("open_assistant_turn") is True
+                and getattr(state, "pending_speech_response_open", False)
+            )
         ):
             return int(tts_bos_id)
         return int(sampled)
@@ -1723,7 +1728,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if sampled in self._minicpmo45_chunk_terminator_token_ids(token_ids):
             state.pending_terminator_token = int(sampled)
             state.last_terminator_token = int(sampled)
-            if sampled == listen_id and force_listen:
+            opening_explicit_response = (
+                isinstance(payload, dict)
+                and payload.get("open_assistant_turn") is True
+                and getattr(state, "pending_speech_response_open", False)
+            )
+            if sampled == listen_id and (force_listen or opening_explicit_response):
                 state.current_turn_ended = True
                 with suppress(Exception):
                     state.pending_speech_response_open = False
