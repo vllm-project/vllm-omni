@@ -45,6 +45,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from torch import nn
 from transformers import AutoTokenizer
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader, is_pp_missing_parameter
 from vllm.sequence import IntermediateTensors
@@ -273,6 +274,11 @@ def _cosmos3_batch_compatibility_key(request: OmniDiffusionRequest) -> tuple[Any
 def _cosmos3_pp_size(od_config: Any) -> int:
     parallel_config = getattr(od_config, "parallel_config", None)
     return int(getattr(parallel_config, "pipeline_parallel_size", 1) or 1)
+
+
+def _cosmos3_sp_size(od_config: Any) -> int:
+    parallel_config = getattr(od_config, "parallel_config", None)
+    return int(getattr(parallel_config, "sequence_parallel_size", 1) or 1)
 
 
 def _validate_cosmos3_pp_model_offload(od_config: Any, strategy: OffloadStrategy) -> None:
@@ -1754,16 +1760,20 @@ class Cosmos3OmniDiffusersPipeline(
         """Whether T2I ``num_outputs_per_prompt > 1`` can run as one B=N denoising loop.
 
         Falls back to one loop per output when batching would change results
-        or is unvalidated: the distilled SDE scheduler draws per-step noise from
-        the shared generator, so the serial draw order cannot be reproduced;
-        cache backends make one skip decision per batch (and Cache-DiT counts
-        forwards for CFG parity); PP forwards the UND cache across stages.
+        or is unvalidated: batched bf16 math is not bitwise equal to serial, so
+        ``VLLM_BATCH_INVARIANT`` keeps the serial path; the distilled SDE
+        scheduler draws per-step noise from the shared generator, so the serial
+        draw order cannot be reproduced; cache backends make one skip decision
+        per batch (and Cache-DiT counts forwards for CFG parity); PP forwards
+        the UND cache across stages; the SP joint K/V path is not validated
+        with a broadcast cache yet.
         """
         return (
-            not self.is_distilled_model
+            not envs.VLLM_BATCH_INVARIANT
+            and not self.is_distilled_model
             and not _cosmos3_cache_backend_active(self.od_config)
-            and not self._cache_dit_requires_paired_cfg
             and not self._pp_parallel_active()
+            and _cosmos3_sp_size(self.od_config) == 1
         )
 
     @staticmethod
