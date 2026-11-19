@@ -5,6 +5,11 @@ second GPU is available, and distributed layerwise offload (DLO). It is a
 memory-first serving configuration; lower resident counts reduce HBM use and
 increase CPU-to-GPU transfer time.
 
+The SM120 exact VAE operators and decoder Linear FP16 precast also apply to
+these DLO commands. Their end-to-end, memory, and multi-GPU patch-parallel
+behavior have not been revalidated with that path enabled. Measured operator
+evidence is limited to one RTX 5090 D v2 using tiled eager decode without DLO.
+
 ## Capacity requirements
 
 | Resource | One RTX 5090 | Two RTX 5090s |
