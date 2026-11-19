@@ -7,7 +7,7 @@ import inspect
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, TypedDict
 
 import numpy as np
@@ -175,6 +175,18 @@ def _slice_sampled_logprobs(logprobs: Any, req_index: int, sampled_token_ids: li
         bad_rows = np.flatnonzero(~np.isfinite(value_rows[:, 0])).tolist()
         raise SampledLogprobContractError(f"AR sampled-token logprobs contain non-finite values at rows {bad_rows}")
     return sliced
+
+
+@dataclass
+class _SeededIsolationStep:
+    """Queue surgery applied for one scheduling step of the seeded policy."""
+
+    limit: int | None
+    deferred: bool
+    drain: bool
+    solo: bool
+    saved_queues: tuple | None
+    unit_origins: list
 
 
 class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
@@ -968,22 +980,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         unit = self._isolation_unit(request)
         return None if unit is None else len(unit)
 
-    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
-        # Remove FINISHED_ABORTED requests before the upstream scheduler sees
-        # them. Upstream vllm raises RuntimeError on this status; omni allows
-        # async abort (e.g. client disconnect during TTS streaming) to leave
-        # requests in the waiting/running queues temporarily.
-        self._drop_aborted_queued_requests()
-        self._process_pending_omni_inputs(model_mode="ar")
-        self._drop_aborted_queued_requests()
-        self._resync_streaming_input_counter()
-        # Talker K-frame guard: a step whose decode spans would be uneven
-        # (mixed prefill+decode rows, or a first-step decode joining a
-        # steady-state K-step request) must not carry the K-step drafts --
-        # the multi-frame loop requires uniform decode spans and the runner
-        # refuses the rest.
-        self._drop_talker_drafts_if_prefill_pending()
+    def _begin_seeded_isolation(self) -> _SeededIsolationStep:
+        """Apply this step's seeded-isolation queue surgery.
 
+        Kept out of ``schedule()`` so the policy keeps a small, self-contained
+        surface that is easy to rebase (review on #9937).
+        """
         seeded_defer, seeded_solo = self._seeded_isolation_plan()
         solo_queue = None
         solo_group = 1
@@ -1103,6 +1105,68 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if reserved_running_slots:
             limit = min(limit, max(0, original_max_num_active_reqs - reserved_running_slots))
         self.max_num_active_reqs = limit
+        return _SeededIsolationStep(
+            limit=limit,
+            deferred=deferred,
+            drain=drain_kv,
+            solo=solo_queue is not None,
+            saved_queues=original_wait_queues,
+            unit_origins=unit_origins,
+        )
+
+    def _finish_seeded_isolation(self, step: _SeededIsolationStep, *, scheduled_any: bool) -> None:
+        """Restore the queues and remember whether the step made progress."""
+        saved = step.saved_queues
+        if saved is not None:
+            original_waiting, original_kv_holding = saved
+            if step.unit_origins:
+                # Restore by current KV ownership: upstream can move a waiting
+                # request into `kv_holding_waiting` mid-step when it starts an
+                # async KV load, so the recorded origin can be stale (review P2
+                # on #9937).
+                origins_by_member = {id(member): origin for member, origin in step.unit_origins}
+                holds_kv_blocks = getattr(self, "_holds_kv_blocks", None)
+                for leftover in (*self.waiting, *self.kv_holding_waiting):
+                    if holds_kv_blocks is not None:
+                        target = original_kv_holding if holds_kv_blocks(leftover) else original_waiting
+                    else:
+                        origin = origins_by_member.get(id(leftover))
+                        target = original_kv_holding if origin == "kv_holding" else original_waiting
+                    target.prepend_requests([leftover])
+            else:
+                if self.waiting is not original_waiting:
+                    original_waiting.prepend_requests(self.waiting)
+                if self.kv_holding_waiting is not original_kv_holding:
+                    original_kv_holding.prepend_requests(self.kv_holding_waiting)
+            self.waiting, self.kv_holding_waiting = saved
+        self._restore_omni_wait_queues()
+        if not step.deferred:
+            if step.drain:
+                # Remember a stalled drain so the next step promotes the seeded
+                # holder instead of repeating the failing allocation.
+                self._isolation_drain_stalled = not scheduled_any
+            elif step.solo:
+                self._isolation_drain_stalled = False
+
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        # Remove FINISHED_ABORTED requests before the upstream scheduler sees
+        # them. Upstream vllm raises RuntimeError on this status; omni allows
+        # async abort (e.g. client disconnect during TTS streaming) to leave
+        # requests in the waiting/running queues temporarily.
+        self._drop_aborted_queued_requests()
+        self._process_pending_omni_inputs(model_mode="ar")
+        self._drop_aborted_queued_requests()
+        self._resync_streaming_input_counter()
+        # Talker K-frame guard: a step whose decode spans would be uneven
+        # (mixed prefill+decode rows, or a first-step decode joining a
+        # steady-state K-step request) must not carry the K-step drafts --
+        # the multi-frame loop requires uniform decode spans and the runner
+        # refuses the rest.
+        self._drop_talker_drafts_if_prefill_pending()
+
+        step = self._begin_seeded_isolation()
+        original_max_num_active_reqs = self.max_num_active_reqs
+        self.max_num_active_reqs = step.limit
         scheduled_any = False
         try:
             scheduler_output = super().schedule(throttle_prefills)
@@ -1112,37 +1176,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             scheduled_any = bool(scheduled_tokens)
         finally:
             self.max_num_active_reqs = original_max_num_active_reqs
-            if original_wait_queues is not None:
-                original_waiting, original_kv_holding = original_wait_queues
-                if unit_origins:
-                    # Restore by current KV ownership: upstream can move a
-                    # waiting request into `kv_holding_waiting` mid-step when it
-                    # starts an async KV load, so the recorded origin can be
-                    # stale (review P2 on #9937).
-                    origins_by_member = {id(member): origin for member, origin in unit_origins}
-                    holds_kv_blocks = getattr(self, "_holds_kv_blocks", None)
-                    for leftover in (*self.waiting, *self.kv_holding_waiting):
-                        if holds_kv_blocks is not None:
-                            target = original_kv_holding if holds_kv_blocks(leftover) else original_waiting
-                        else:
-                            origin = origins_by_member.get(id(leftover))
-                            target = original_kv_holding if origin == "kv_holding" else original_waiting
-                        target.prepend_requests([leftover])
-                else:
-                    if self.waiting is not original_waiting:
-                        original_waiting.prepend_requests(self.waiting)
-                    if self.kv_holding_waiting is not original_kv_holding:
-                        original_kv_holding.prepend_requests(self.kv_holding_waiting)
-                self.waiting, self.kv_holding_waiting = original_wait_queues
-            self._restore_omni_wait_queues()
-
-        if not deferred:
-            if drain_kv:
-                # Remember a stalled drain so the next step promotes the seeded
-                # holder instead of repeating the failing allocation.
-                self._isolation_drain_stalled = not scheduled_any
-            elif solo_queue is not None:
-                self._isolation_drain_stalled = False
+            self._finish_seeded_isolation(step, scheduled_any=scheduled_any)
 
         # Backstop: a step built without ``_update_after_schedule`` (nothing
         # booked, so nothing to reconcile) still leaves here uniform. On the
