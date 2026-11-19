@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from vllm_omni.worker_v2.ngram_adapter import is_thinker_ngram, scheduler_ngram_factory, use_scheduler_ngram
+from vllm_omni.worker_v2.ngram_adapter import (
+    allow_ascend_scheduler_ngram,
+    is_thinker_ngram,
+    scheduler_ngram_factory,
+    use_scheduler_ngram,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -26,6 +32,30 @@ def thinker_config():
         ),
         kv_transfer_config=None,
     )
+
+
+@pytest.fixture
+def ascend_mrv2_utils(monkeypatch):
+    ascend = ModuleType("vllm_ascend")
+    ascend.mrv2_utils = ModuleType("vllm_ascend.mrv2_utils")
+    monkeypatch.setitem(sys.modules, "vllm_ascend", ascend)
+    return ascend.mrv2_utils
+
+
+def test_ascend_ngram_guard_missing_legacy_blacklist(ascend_mrv2_utils):
+    allow_ascend_scheduler_ngram()
+
+    assert not hasattr(ascend_mrv2_utils, "_v2_blacklist")
+
+
+def test_ascend_ngram_guard_preserves_legacy_blacklist_behavior(ascend_mrv2_utils, thinker_config):
+    reasons = ["ngram speculative decoding", "another restriction"]
+    ascend_mrv2_utils._v2_blacklist = lambda config: reasons
+    allow_ascend_scheduler_ngram()
+
+    assert ascend_mrv2_utils._v2_blacklist(thinker_config) == ["another restriction"]
+    thinker_config.model_config.model_stage = "talker"
+    assert ascend_mrv2_utils._v2_blacklist(thinker_config) == reasons
 
 
 def test_ascend_mrv2_thinker_uses_scheduler_drafts(thinker_config):
