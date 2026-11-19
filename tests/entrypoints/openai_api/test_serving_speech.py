@@ -7122,7 +7122,13 @@ def test_per_request_success_logs_follow_enable_log_requests(mocker: MockerFixtu
 class TestLengthTruncationSignal:
     """A ``length`` finish of stage 0 is reported to clients by opted-in adapters."""
 
-    OPTED_IN = ["breeze_tts_2", "fish_omni", "qwen3_tts"]
+    OPTED_IN = [
+        "audio_generation",
+        "breeze_tts_2",
+        "cosyvoice3_talker",
+        "fish_omni",
+        "qwen3_tts",
+    ]
 
     @pytest.fixture
     def make_server(self, mocker: MockerFixture):
@@ -7217,7 +7223,7 @@ class TestLengthTruncationSignal:
 
     @pytest.mark.asyncio
     async def test_adapters_that_do_not_opt_in_are_unchanged(self, make_server, mocker: MockerFixture):
-        server = make_server("cosyvoice3_talker")
+        server = make_server("glm_tts")
         assert server._get_tts_adapter().reports_length_truncation is False
 
         response = await self._create_speech(server, mocker, self._output("req-no-opt-in", "length"))
