@@ -91,3 +91,23 @@ def test_invalid_gate_up_rejected_before_fusion(monkeypatch, error):
         pipe.load_lora_weights(state, "invalid")
     assert not pipe.lora_loaded
     assert all(torch.count_nonzero(p) == 0 for p in pipe.transformer.parameters())
+
+
+def test_unknown_gate_up_preserves_matched_projection(monkeypatch):
+    pipe = _pipeline(monkeypatch)
+    a = torch.ones(2, 4)
+    b = torch.ones(6, 2)
+    unknown = "transformer.transformer_blocks.99.img_mlp.gate_up"
+    state = {
+        f"transformer.{MLP}.proj.lora_A.weight": a,
+        f"transformer.{MLP}.proj.lora_B.weight": b,
+        f"{unknown}.lora_A.weight": a,
+        f"{unknown}.lora_B.weight": torch.ones(12, 2),
+    }
+
+    pipe.load_lora_weights(state, "mixed")
+    mlp = pipe.transformer.transformer_blocks[0].img_mlp
+    torch.testing.assert_close(mlp.proj.weight, b @ a)
+    assert torch.count_nonzero(mlp.gate_layer.weight) == 0
+    pipe.unload_lora_weights("mixed")
+    assert torch.count_nonzero(mlp.proj.weight) == 0

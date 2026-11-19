@@ -517,11 +517,15 @@ class QwenImage21LoraLoaderMixin(QwenImageLoraLoaderMixin):
         suffix = ".img_mlp.gate_up."
         mlps = {key.partition(suffix)[0] + ".img_mlp" for key in state_dict if suffix in key}
         for mlp in sorted(mlps):
+            try:
+                gate = self.transformer.get_submodule(mlp.removeprefix("transformer.") + ".gate_layer")
+            except AttributeError:
+                # Leave unknown targets for the loader's existing unmatched-key warnings.
+                continue
             a = state_dict.pop(f"{mlp}.gate_up.lora_A.weight", None)
             b = state_dict.pop(f"{mlp}.gate_up.lora_B.weight", None)
             if a is None or b is None:
                 raise ValueError(f"{mlp}.gate_up requires both lora_A and lora_B weights.")
-            gate = self.transformer.get_submodule(mlp.removeprefix("transformer.") + ".gate_layer")
             width = gate.output_size  # global size of the column-parallel projection
             if a.ndim != 2 or a.shape[0] == 0 or a.shape[1] != gate.input_size or b.shape != (2 * width, a.shape[0]):
                 raise ValueError(f"Invalid {mlp}.gate_up LoRA shapes: A={tuple(a.shape)}, B={tuple(b.shape)}.")
