@@ -1218,6 +1218,7 @@ records what its integration advertises once the follow-up PR ports it:
 | `supports_barge_in` | yes | no | no | `barge_in`, `turn.signal{event:"barge_in"}`, `overlap_policy=barge_in_on_speech`, `turn_detection.server_vad` |
 | `supports_audio_truncate` | yes | no | no | `conversation.item.truncate` and truncating `playback.ack` adjusting the stored assistant item |
 | video input (`video_frames` on append) | consumed by Stage 0 | ignored | ignored | omni camera track |
+| text input (`input.text.append`) | incremental prefill | unsupported | unsupported | `text` in `optional_input_modalities`; `auto_response: true` |
 | tool calls | no | no | yes | `response.function_call_arguments.*`, `function_call` items |
 
 Everything else in the catalogue — session lifecycle, heartbeat and event
@@ -1741,7 +1742,7 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `input_audio_buffer.clear` | 1 | Drop un-committed input audio. |
 | `input.cancel` | 3 | Cancel pending input; advances `epoch`. |
 | `function_call.cancel` | 3 | End one pending function call (`call_id`, `reason`: `cancelled` or `failed`). |
-| `input.text.append` | 3 | Append text input; model-native sessions reject it with `native_text_append_unsupported`. |
+| `input.text.append` | 3 | Prefill a text fragment on models advertising text input; otherwise `native_text_append_unsupported`. |
 | `conversation.item.create` | 1 | Add a completed user item (text, audio, or `function_call_output`) to history. |
 | `conversation.item.retrieve` | 1 | Fetch a stored item by id. |
 | `conversation.item.delete` | 1 | Delete a stored item by id. |
@@ -2171,6 +2172,38 @@ deferred commit during an active response (`event.response_create_deferred`)
 ```json
 {"type": "input.text.append", "text": "and tomorrow?"}
 ```
+
+MiniCPM-o 4.5 accepts non-empty text fragments in a native session with
+`extra_body.auto_response: true` (the default). Each fragment is tokenized and
+prefilled immediately as its own model unit, using the checkpoint's native
+`streaming_prefill(text_list=...)` format. It does not wait for the complete
+text, reset the session, or insert synthetic input audio. Tokenization occurs
+per fragment, so send complete words when possible.
+
+Text can be interleaved with microphone appends on the same connection:
+
+```python
+await client.append_text("Remember this code: ", force_listen=True)
+await client.append_audio(pcm_chunk, is_speech=True)
+await client.append_text("blue whale. Answer the spoken question.")
+```
+
+`force_listen: true` prefills the fragment while suppressing generation for
+that unit. It does not cancel speech already generated. Omit it, or set it to
+false, on a later text unit to open the assistant turn; an unforced audio
+unit retains the native listen/speak decision. Text fragments need no audio
+commit or `response.create`. To collect a complete mixed input
+before answering, send `force_listen: true` on **both** the intermediate text
+and audio events, then release it on the final text fragment. The low-level
+`client.send` method can set this hint on an audio event.
+
+Text and completed media units use the same ordered append queue. A partial
+microphone unit stays buffered while a text unit is prefilled; text does not
+advance the audio clock or consume the partial PCM. Text is subject to the
+session's pending-input byte limit, counted as UTF-8. Empty text and manual
+`auto_response: false` sessions are rejected. This capability is separate from
+`supports_text_only_turn`, which controls `conversation.item.create` followed
+by `response.create`; that message-based path is unchanged.
 
 `C→S conversation.item.create` (text turn, or a tool result)
 
@@ -2621,14 +2654,12 @@ them out into typed events before they reach a client.
   barge-in, or audio truncation; Nemotron VoiceChat does not support barge-in
   or audio truncation; camera frames are consumed only by MiniCPM-o 4.5; tool
   calls are produced only by Nemotron VoiceChat.
-- A response is generated from committed **audio**, so the OpenAI text-prompt
-  shape does not drive one: `conversation.item.create` with an `input_text`
-  part adds the item to history, but a following `response.create` with no
-  committed audio is rejected with `response_create_without_input`, and
-  `input.text.append` is rejected with `native_text_append_unsupported`.
-  Text-to-speech has its own shape here — put the text in
-  `extra_body.duplex_initial_user_text` on `session.update`, then stream audio
-  units (silence is enough). The seeded turn is what the model answers.
+- MiniCPM-o accepts incremental text through `input.text.append` as described
+  above. `conversation.item.create` with an `input_text` part followed by
+  `response.create` still requires `supports_text_only_turn`; MiniCPM-o rejects
+  that path with `text_only_turn_unsupported`. An initial text prompt can also
+  be supplied through `initial_user_text` or the legacy
+  `extra_body.duplex_initial_user_text` on `session.update`.
 - `turn_detection` supports `server_vad` and, for turn-based sessions,
   `semantic_vad`, both with `interrupt_response=true`; `interrupt_response=false`
   is not supported.

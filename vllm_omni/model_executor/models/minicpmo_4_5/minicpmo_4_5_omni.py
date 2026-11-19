@@ -863,6 +863,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             "epoch": _optional_int(duplex.get("epoch")),
             "seq": _optional_int(duplex.get("seq")),
             "is_speech": bool(payload.get("is_speech", False)),
+            "text_token_ids": payload.get("text_token_ids"),
+            "force_listen": payload.get("force_listen") is True,
             "final": bool(duplex.get("final")),
             "stage0_window": window if isinstance(window, dict) else None,
             "stage0_reanchor": reanchor if isinstance(reanchor, dict) else None,

@@ -80,6 +80,38 @@ def test_plugin_keeps_a_plain_listen_unit_a_listen_decision() -> None:
     assert decision.metadata["duplex_native_decision"] == "listen"
 
 
+def test_empty_chunk_returns_to_the_session_without_hiding_speech() -> None:
+    decision = _decide([CHUNK_EOS])
+    assert decision is not None
+    assert decision.metadata["model_listen"] is False
+    assert decision.metadata["listen_source"] == "empty_input_unit"
+    assert _decide([TEXT, CHUNK_EOS]) is None
+
+
+@pytest.mark.parametrize(
+    ("history", "empty"),
+    [
+        ([LISTEN, LISTEN], True),
+        ([TEXT, CHUNK_EOS], True),
+        ([LISTEN, TEXT], False),
+    ],
+)
+def test_empty_chunk_uses_unit_boundaries_in_a_resumed_request(history: list[int], empty: bool) -> None:
+    output = _stage0_output([CHUNK_EOS])
+    output.outputs[0].cumulative_token_ids = [*history, CHUNK_EOS]
+    decision = MiniCPMO45DuplexPlugin(lambda *args: None).decide_output(
+        stage_id=0,
+        final_stage_id=2,
+        segment_finished=True,
+        segment_token_ids=(CHUNK_EOS,),
+        segment_output_metadata={},
+        output=output,
+    )
+    assert (decision is not None) is empty
+    if decision is not None:
+        assert decision.metadata["listen_source"] == "empty_input_unit"
+
+
 def _projected_model_listens(token_ids: list[int]) -> list[dict[str, object]]:
     session = MiniCPMO45DataPlaneSession(lambda *args, **kwargs: "")
     return [result for result in session.project_output(_stage0_output(token_ids)) if result.get("model_listen")]

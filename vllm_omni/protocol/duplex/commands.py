@@ -94,6 +94,7 @@ class Commit(realtime_commands.Commit):
 class AppendText(RealtimeCommand):
     wire_type: ClassVar[str] = "input.text.append"
     text: str
+    force_listen: bool | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

@@ -986,6 +986,9 @@ async def test_input_backpressure_is_rejected_before_the_buffer_is_touched() -> 
 async def test_text_append_is_not_supported_by_the_native_runtime() -> None:
     h = await open_harness()
     try:
+        h.session.capabilities = replace(
+            h.session.capabilities, optional_input_modalities=frozenset({"audio", "video"})
+        )
         events = await h.run(commands.AppendText(text="hello", event_id="evt-text"))
         assert types(events) == ["error"]
         assert events[0].code == "native_text_append_unsupported"

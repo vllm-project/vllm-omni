@@ -395,20 +395,24 @@ class MiniCPMO45Stage0DuplexRuntime:
         *,
         video_frames: list[Image.Image] | None = None,
         encoded_frames: list[list[torch.Tensor]] | None = None,
+        text_token_ids: list[int] | None = None,
         epoch: int | None = None,
         seq: int | None = None,
         is_speech: bool = False,
+        force_listen: bool = False,
         final: bool = False,
         stage0_window: dict[str, object] | None = None,
         stage0_reanchor: dict[str, object] | None = None,
     ) -> _PrefillSteps:
-        """Build scheduler-owned Stage0 input embeddings for one audio append.
+        """Build scheduler-owned Stage0 input embeddings for one input unit.
 
         Unlike the legacy worker-control path, this method never calls an eager
         model forward. The normal vLLM runner consumes the returned embeddings
         and owns attention metadata, block tables, KV cache, and sampling.
         Yields each unit's encoder request; the caller sends back its embeddings.
         """
+        import torch
+
         start_time = time.time()
         processor = self._configure_streaming_processor(state)
         append_identity = (epoch, seq) if seq is not None else None
@@ -434,8 +438,9 @@ class MiniCPMO45Stage0DuplexRuntime:
                 # the scheduler's canonical boundary, just like its content.
                 state.pending_terminator_token = completed_terminator
         num_frames = len(encoded_frames) if encoded_frames is not None else len(video_frames or ())
+        has_text = bool(text_token_ids)
         vision_only = audio_waveform is None or len(audio_waveform) == 0
-        if vision_only and not num_frames:
+        if vision_only and not num_frames and not has_text:
             return self._stage_prefill_result(False, start_time, "empty audio")
         if not vision_only:
             state.audio_buffer = np.concatenate([state.audio_buffer, np.asarray(audio_waveform, dtype=np.float32)])
@@ -568,6 +573,12 @@ class MiniCPMO45Stage0DuplexRuntime:
                 token_ids.extend(
                     [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
                 )
+            if text_token_ids and units_built == 0:
+                # Match native streaming_prefill(text_list=...): raw text after
+                # this unit's media, without a new chat template or audio clock.
+                text_ids = torch.tensor(text_token_ids, dtype=torch.long, device=self._model_device())
+                embed_parts.append(self._token_embedder()(text_ids))
+                token_ids.extend(text_token_ids)
             state.audio_buffer = state.audio_buffer[consumed_samples:]
             state.audio_chunk_idx += 1
             units_built += 1
@@ -582,8 +593,6 @@ class MiniCPMO45Stage0DuplexRuntime:
         # re-opened the turn each chunk -> degenerate repetition. tts_bos/listen/turn_eos are
         # model-generated and tracked via current_turn_ended (mirrors streaming_generate).
         prompt_suffix_len = 0
-
-        import torch
 
         window_result = self._window_replacement_parts(state, stage0_window)
         if window_result is not None:
@@ -606,11 +615,17 @@ class MiniCPMO45Stage0DuplexRuntime:
         # Standalone VISION input can open a response without speech. Camera
         # frames accompanying silent audio must retain the OMNI speech gate:
         # otherwise every frame can re-open a completed conversation turn.
-        if (is_speech or (vision_only and num_frames)) and (
+        if (is_speech or has_text or (vision_only and num_frames)) and (
             append_identity is None or state.pending_speech_append_identity != append_identity
         ):
             state.pending_speech_context = True
             state.pending_speech_append_identity = append_identity
+            if has_text and not force_listen and state.current_turn_ended:
+                # Like the initial text prompt, an unforced fragment opens an
+                # assistant turn. Apply this once at prefill, never on each
+                # decode step: turn_eos must keep the turn closed afterward.
+                state.current_turn_ended = False
+                state.pending_speech_response_open = True
         if append_identity is not None:
             state.prepared_append_identity = append_identity
             state.prepared_inputs_embeds = inputs_embeds
@@ -1314,7 +1329,7 @@ class MiniCPMO45Stage0DuplexRuntime:
     @staticmethod
     def _decode_audio_payload(payload: dict[str, object]) -> NDArray[np.float32]:
         audio = payload.get("audio") or payload.get("data")
-        if not audio and payload.get("video_frames"):
+        if not audio and (payload.get("video_frames") or payload.get("text_token_ids")):
             return np.empty(0, dtype=np.float32)
         if not isinstance(audio, str):
             raise ValueError("audio append payload requires base64 audio")

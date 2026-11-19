@@ -205,7 +205,7 @@ class DuplexCapabilities:
                 "model_native_duplex" if self.supports_model_native_turn_policy else "turn_based_duplex"
             ),
             "adapter_patterns": self.adapter_patterns,
-            "input_modes": ["append_audio_chunk"],
+            "input_modes": ["append_audio_chunk"] + (["append_text"] if self.accepts_input_modality("text") else []),
             "signal_sources": self.signal_sources,
             "stage_handoff_transport": self.stage_handoff_transport,
             "chunk_period_ms": self.chunk_period_ms,

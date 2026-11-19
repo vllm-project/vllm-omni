@@ -195,8 +195,8 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
             listen_result = runtime_result(
                 stage_role="llm",
                 is_listen=True,
-                model_listen=True,
-                listen_source="model_listen",
+                model_listen=mm_output.get("model_listen") is not False,
+                listen_source=mm_output.get("listen_source") or "model_listen",
                 data_plane_request_id=request_id,
                 end_of_turn=False,
             )
