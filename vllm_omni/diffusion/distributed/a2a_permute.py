@@ -1,37 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Fused permute-free Ulysses all-to-all over platform symmetric memory.
+"""Fused Ulysses all-to-all over symmetric memory.
 
-JIT-compiles the CUDA kernel from pytorch/pytorch#178230 (``all_to_all_permute``)
-and exposes it as two *functional* custom ops:
+Uses CUDA copy engines, exposed through functional custom ops:
 
-    ulysses_qkv_fwd(x, group_name, world_size)  # (B, S/p, H, D) -> (B, S, H/p, D)
+    ulysses_qkv_ce(q, k, v, group_name, world_size)  # grouped CE forward
     ulysses_o_rev(y, group_name, world_size)     # (B, S, H/p, D) -> (B, S/p, H, D)
 
 These replace the synchronous ``all_to_all_4D`` (permute + NCCL all_to_all_single)
-used by Ulysses SP. All symmetric-memory bookkeeping (a shape-keyed, rendezvoused
-buffer cache + the copy-in) lives *inside* the ops, so from torch.compile's point
+used by Ulysses SP. All symmetric-memory bookkeeping (a grow-only workspace
+and transport) lives *inside* the ops, so from torch.compile's point
 of view each op is an opaque ``input -> output`` function: no graph break, no
 visible buffer mutation, no Python control flow in the traced graph. A
 ``register_fake`` provides output metadata so Dynamo keeps the op in-graph.
 
-NPU tensors dispatch to the symmetric memory implementation, which currently
-requires eager execution. Its grouped QKV path amortizes barriers across all
-three tensors; CUDA uses batched QKV exchange when eligible, with per-tensor
-custom ops as the fallback.
+NPU tensors retain their platform symmetric-memory implementation and eager
+execution constraints. Grouped QKV and single-tensor gate exchanges dispatch
+through the same platform entry points.
 """
 
 from __future__ import annotations
 
-import glob
+import ctypes
 import math
-import os
-import shlex
 import sys
-import sysconfig
 import threading
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from functools import cache
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
@@ -39,13 +35,18 @@ import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed.distributed_c10d import _resolve_process_group
 from vllm.logger import init_logger
 
+if TYPE_CHECKING:
+    from vllm.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
+
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
-_BUILD_LOCK = threading.Lock()
-_BUILT = False
 _WORKSPACE_LOCK = threading.Lock()
+# Bound graph staging per group to 15 MiB for equal-shape Q/K/V and 4 MiB
+# each for gate and O (fixed inputs only, excluding allocator rounding).
+_CE_GRAPH_MAX_INPUT_BYTES = 4 * 1024 * 1024
+_CE_QKV_GRAPH_MAX_INPUT_BYTES = 5 * 1024 * 1024
 
 
 @dataclass(slots=True)
@@ -54,6 +55,10 @@ class _SymmWorkspace:
     handle: Any
     capacity_bytes: int
     stream_id: int
+    views: dict[tuple[tuple[int, ...], torch.dtype], torch.Tensor] = field(default_factory=dict)
+    # QKV, gate and O each retain their latest layout without evicting one another.
+    ce_plans: dict[tuple[bool, int], _CEPlan] = field(default_factory=dict)
+    ce_stream: torch.cuda.Stream | None = None
 
 
 # A single grow-only byte workspace per device/process-group. Shape changes
@@ -62,43 +67,53 @@ class _SymmWorkspace:
 _SYMM_WORKSPACES: dict[tuple[torch.device, str], _SymmWorkspace] = {}
 
 
-def _ensure_built() -> None:
-    """JIT-compile + load the kernel once (process-wide). Cached by torch."""
-    global _BUILT
-    if _BUILT:
-        return
-    with _BUILD_LOCK:
-        if _BUILT:
-            return
-        from torch.utils.cpp_extension import load
+class _Extent3D(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_size_t) for name in ("width", "height", "depth")]
 
-        here = os.path.dirname(__file__)
-        src = os.path.join(here, "csrc", "a2a_permute.cu")
-        site_packages = sysconfig.get_paths()["purelib"]
-        nvidia_root = os.path.join(site_packages, "nvidia")
-        include_paths = glob.glob(os.path.join(nvidia_root, "*", "include"))
-        nccl_libs = glob.glob(os.path.join(nvidia_root, "nccl", "lib", "libnccl.so*"))
-        if not nccl_libs:
-            raise RuntimeError("a2a_permute: could not locate nvidia-nccl libnccl.so")
-        if not any(os.path.isfile(os.path.join(path, "nccl.h")) for path in include_paths):
-            raise RuntimeError("a2a_permute: could not locate nvidia-nccl nccl.h")
-        # PyTorch adds its selected toolkit with -isystem. Vendor -I paths
-        # would take precedence even if the same toolkit were also passed as
-        # -I (compilers keep duplicate system directories in their system slot).
-        # Append vendor directories as system includes after toolkit defaults.
-        vendor_includes = [f"-isystem {shlex.quote(path)}" for path in include_paths]
-        load(
-            name="vllm_omni_a2a_permute",
-            sources=[src],
-            extra_cflags=["-DUSE_NCCL", "-DUSE_C10D_NCCL", "-O3", *vendor_includes],
-            extra_cuda_cflags=["-DUSE_NCCL", "-DUSE_C10D_NCCL", "-O3", "--expt-relaxed-constexpr", *vendor_includes],
-            extra_ldflags=[nccl_libs[0]],
-            is_python_module=False,
-            verbose=False,
-        )
-        symm_mem.set_backend("NCCL")
-        logger.info("[a2a_permute] JIT kernel built and loaded; symm-mem backend=NCCL")
-        _BUILT = True
+
+class _PitchedPtr(ctypes.Structure):
+    _fields_ = [("ptr", ctypes.c_void_p)] + [(name, ctypes.c_size_t) for name in ("pitch", "xsize", "ysize")]
+
+
+class _Memcpy3DParams(ctypes.Structure):
+    _fields_ = [
+        ("srcArray", ctypes.c_void_p),
+        ("srcPos", _Extent3D),
+        ("srcPtr", _PitchedPtr),
+        ("dstArray", ctypes.c_void_p),
+        ("dstPos", _Extent3D),
+        ("dstPtr", _PitchedPtr),
+        ("extent", _Extent3D),
+        ("kind", ctypes.c_int),
+    ]
+
+
+@cache
+def _ce_runtime() -> CudaRTLibrary:
+    from vllm.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
+
+    if not current_omni_platform.is_cuda():
+        raise ValueError("CE Ulysses requires the CUDA platform")
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    if symm_mem.get_backend(device) != "CUDA":
+        symm_mem.set_backend("CUDA")
+    runtime = CudaRTLibrary()
+    copy = runtime.lib.cudaMemcpy2DAsync
+    copy.restype = ctypes.c_int
+    copy.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.c_void_p,
+    ]
+    copy3d = runtime.lib.cudaMemcpy3DAsync
+    copy3d.restype = ctypes.c_int
+    copy3d.argtypes = [ctypes.POINTER(_Memcpy3DParams), ctypes.c_void_p]
+    return runtime
 
 
 def validate_a2a_permute_config(
@@ -136,7 +151,7 @@ def validate_a2a_permute_config(
 
 
 def ensure_a2a_permute_available() -> None:
-    """Check/build the platform backend during worker initialization."""
+    """Initialize the platform transport before serving requests."""
     if current_omni_platform.is_npu():
         from vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu import (
             ensure_a2a_permute_available as ensure_npu,
@@ -144,11 +159,11 @@ def ensure_a2a_permute_available() -> None:
 
         ensure_npu()
     else:
-        _ensure_built()
+        _ce_runtime()
 
 
 def _required_nbytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
-    return math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+    return math.prod(shape) * dtype.itemsize
 
 
 def _get_symm_buffer(
@@ -177,15 +192,16 @@ def _get_symm_buffer(
                     "warm up the maximum request shape before capture"
                 )
             if workspace is None:
-                # NCCL symmetric-memory rendezvous requires the communicator to
-                # exist before the first allocation.
+                # Initialize the process-group communicator before rendezvous.
                 pg = _resolve_process_group(group_name)
                 warm = torch.ones(1, device=device)
                 dist.all_reduce(warm, group=pg)
             # Growth is rare and must not release the previous allocation while
             # an earlier kernel is still consuming it.
             torch.accelerator.synchronize(device)
-            allocation = symm_mem.empty(required_bytes, dtype=torch.uint8, device=device)
+            # Peer pointers must identify this allocation, not the base of
+            # an implicit pool containing it at a nonzero offset.
+            allocation = symm_mem._SymmetricMemory.empty_strided_p2p((required_bytes,), (1,), torch.uint8, device)
             handle = symm_mem.rendezvous(allocation, group_name)
             workspace = _SymmWorkspace(
                 allocation=allocation,
@@ -194,7 +210,21 @@ def _get_symm_buffer(
                 stream_id=stream_id,
             )
             _SYMM_WORKSPACES[key] = workspace
-        return workspace.allocation[:required_bytes].view(dtype).view(symm_shape)
+        view_key = (symm_shape, dtype)
+        buffer = workspace.views.get(view_key)
+        if buffer is not None:
+            return buffer
+        buffer = workspace.handle.get_buffer(workspace.handle.rank, symm_shape, dtype)
+        # Peer writes target the allocation base; keep the local view aligned
+        # even when the handle exposes a window-relative pointer.
+        if isinstance(buffer, torch.Tensor) and buffer.data_ptr() != workspace.allocation.data_ptr():
+            buffer = workspace.allocation[:required_bytes].view(dtype).view(symm_shape)
+        # Keep at most the forward and reverse views; capacity stays grow-only
+        # without retaining a view for every historical request shape.
+        if len(workspace.views) == 2:
+            workspace.views.clear()
+        workspace.views[view_key] = buffer
+        return buffer
 
 
 def clear_a2a_permute_workspaces() -> None:
@@ -213,33 +243,189 @@ def clear_a2a_permute_workspaces() -> None:
     logger.info("[a2a_permute] Released %d symmetric-memory workspace(s)", count)
 
 
+class _CEPlan:
+    """Cache copy geometry and stream resources for one exchange layout."""
+
+    def __init__(self, inputs, shared, handle, world_size, reverse, transfer):
+        self.signature = tuple((x.shape, x.stride(), x.dtype) for x in inputs)
+        self.shared = shared
+        self.handle = handle
+        self.current = torch.cuda.current_stream(shared.device)
+        self.transfer = transfer
+        self.ready, self.done = torch.cuda.Event(), torch.cuda.Event()
+        self.runtime = _ce_runtime()
+        self.reverse = reverse
+        self.graph: torch.cuda.CUDAGraph | None = None
+        self.coalesce_inputs = len(inputs) == 3 and inputs[0].shape == inputs[1].shape == inputs[2].shape
+        limit = _CE_QKV_GRAPH_MAX_INPUT_BYTES if self.coalesce_inputs else _CE_GRAPH_MAX_INPUT_BYTES
+        self.use_graph = max(x.nbytes for x in inputs) <= limit
+        p, rank = world_size, handle.rank
+        order = [rank ^ i for i in range(p)] if p & (p - 1) == 0 else [(rank + i) % p for i in range(p)]
+        self.remote = order[1:]
+        self.operations: list[list[tuple[int, int, list[int] | _Memcpy3DParams]]] = [[] for _ in range(p)]
+        section = 0
+        for index, x in enumerate(inputs):
+            batch, sequence, heads, dim = x.shape
+            width = (heads if reverse else heads // p) * dim * x.element_size()
+            rows = sequence // p if reverse else sequence
+            source_pitch = x.stride(1) * x.element_size()
+            dest_pitch = p * width if reverse else width
+            for peer in range(p):
+                dest = handle.buffer_ptrs[peer] + section + rank * (width if reverse else rows * width)
+                offset = peer * (rows * source_pitch if reverse else width)
+                args: list[int] | _Memcpy3DParams
+                if batch == 1:
+                    args = [dest, dest_pitch, 0, source_pitch, width, rows, 4]
+                else:
+                    args = _Memcpy3DParams()
+                    args.srcPtr = _PitchedPtr(None, source_pitch, source_pitch, sequence)
+                    args.dstPtr = _PitchedPtr(dest, dest_pitch, dest_pitch, rows if reverse else p * rows)
+                    args.extent = _Extent3D(width, rows, batch)
+                    args.kind = 4  # cudaMemcpyDefault, using symmetric peer mappings.
+                self.operations[peer].append((index, offset, args))
+            section += x.nbytes
+
+    def run(self, inputs):
+        # An outer graph already amortizes submission costs. Avoid nested
+        # capture and staging in that case; large requests use direct CE.
+        if not self.use_graph or torch.cuda.is_current_stream_capturing():
+            return self._run_eager(inputs)
+        if self.graph is None:
+            if self.coalesce_inputs:
+                batch, sequence, heads, dim = inputs[0].shape
+                self.staging = inputs[0].new_empty(3 * batch, sequence, heads, dim)
+                self.static_inputs = self.staging.view(3, batch, sequence, heads, dim).unbind(0)
+            else:
+                self.static_inputs = tuple(torch.empty_like(x, memory_format=torch.contiguous_format) for x in inputs)
+            capture_stream = torch.cuda.Stream(device=self.shared.device)
+            capture_stream.wait_stream(self.current)
+            with torch.cuda.stream(capture_stream):
+                self.graph_plan = _CEPlan(
+                    self.static_inputs, self.shared, self.handle, len(self.operations), self.reverse, self.transfer
+                )
+                self.graph_plan._run_eager(self.static_inputs, copy_out=False)
+            capture_stream.synchronize()
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph, stream=capture_stream):
+                self.graph_plan._run_eager(self.static_inputs, copy_out=False)
+            self.current.wait_stream(capture_stream)
+        if self.coalesce_inputs:
+            torch.cat(inputs, dim=0, out=self.staging)
+        else:
+            for fixed, incoming in zip(self.static_inputs, inputs):
+                fixed.copy_(incoming)
+        self.graph.replay()
+        # The next exchange's initial barrier protects this copy-out. Clone
+        # directly from symmetric memory to avoid retaining a graph output.
+        return self.shared.clone()
+
+    def _run_eager(self, inputs, *, copy_out=True):
+        pointers = [x.data_ptr() for x in inputs]
+        out = torch.empty_like(self.shared) if copy_out else None
+        runtime = self.runtime
+
+        def emit(peer, stream):
+            for index, offset, args in self.operations[peer]:
+                source = pointers[index] + offset
+                if isinstance(args, list):
+                    args[2] = source
+                    result = runtime.lib.cudaMemcpy2DAsync(*args, stream)
+                else:
+                    args.srcPtr.ptr = source
+                    result = runtime.lib.cudaMemcpy3DAsync(ctypes.byref(args), stream)
+                runtime.CUDART_CHECK(result)
+
+        # Peers must finish their previous copy-outs before we overwrite them.
+        self.handle.barrier()
+        self.ready.record(self.current)
+        self.transfer.wait_event(self.ready)
+        for peer in self.remote:
+            emit(peer, self.transfer.cuda_stream)
+        emit(self.handle.rank, self.current.cuda_stream)
+        self.done.record(self.transfer)
+        self.current.wait_event(self.done)
+        self.handle.barrier()
+        # Ordinary outputs survive later exchanges and satisfy custom-op aliasing.
+        if out is not None:
+            out.copy_(self.shared)
+        return out
+
+
+def _exchange_ce(inputs, group_name: str, world_size: int, reverse: bool = False) -> torch.Tensor:
+    # Reuse a validated plan before repeating layout and workspace bookkeeping.
+    plan_key = (reverse, len(inputs))
+    workspace = _SYMM_WORKSPACES.get((inputs[0].device, group_name))
+    if workspace is not None:
+        plan = workspace.ce_plans.get(plan_key)
+        signature = tuple((x.shape, x.stride(), x.dtype) for x in inputs)
+        if plan is not None and plan.signature == signature:
+            stream_id = torch.cuda.current_stream(inputs[0].device).cuda_stream
+            if workspace.stream_id != stream_id:
+                raise RuntimeError("a2a_permute workspace must be used from a single CUDA stream")
+            return plan.run(inputs)
+    _ce_runtime()
+    # Preserve regular row-strided QKV views; pack only unsupported layouts.
+    inputs = tuple(
+        x
+        if (
+            x.stride(3) == 1 and x.stride(2) == x.size(3) and (x.size(0) == 1 or x.stride(0) == x.size(1) * x.stride(1))
+        )
+        else x.contiguous()
+        for x in inputs
+    )
+    first = inputs[0]
+    shared = _get_symm_buffer((sum(x.numel() for x in inputs),), first.dtype, first.device, group_name)
+    workspace = _SYMM_WORKSPACES[(first.device, group_name)]
+    if workspace.ce_stream is None:
+        workspace.ce_stream = torch.cuda.Stream(device=first.device)
+    signature = tuple((x.shape, x.stride(), x.dtype) for x in inputs)
+    plan = workspace.ce_plans.get(plan_key)
+    if plan is None or plan.signature != signature:
+        plan = _CEPlan(inputs, shared, workspace.handle, world_size, reverse, workspace.ce_stream)
+        workspace.ce_plans[plan_key] = plan
+    return plan.run(inputs)
+
+
+@torch.library.custom_op("vllm_omni_a2a::ulysses_qkv_ce", mutates_args=(), device_types="cuda")
+def ulysses_qkv_ce(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, group_name: str, world_size: int
+) -> torch.Tensor:
+    """Push Q/K/V together into packed, batch-major symmetric outputs."""
+    return _exchange_ce((query, key, value), group_name, world_size)
+
+
+@ulysses_qkv_ce.register_fake
+def _(query, key, value, group_name, world_size):
+    return query.new_empty(query.numel() + key.numel() + value.numel())
+
+
 # ---------------------------------------------------------------------------
-# Forward: (B, S_local, H, D) -> (B, S_global, H_local, D)
-#   scatter heads (dim 2), gather sequence (dim 1). Matches all_to_all_4D(x,2,1).
+# Reverse: (B, S_global, H_local, D) -> (B, S_local, H, D)
+#   scatter sequence (dim 1), gather heads (dim 2). Matches all_to_all_4D(y,1,2).
 # ---------------------------------------------------------------------------
+@torch.library.custom_op("vllm_omni_a2a::ulysses_o_rev", mutates_args=(), device_types="cuda")
+def ulysses_o_rev(y: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
+    B, S, H, D = y.shape
+    return _exchange_ce((y,), group_name, world_size, reverse=True).view(B, S // world_size, H * world_size, D)
+
+
+@ulysses_o_rev.register_fake
+def _(y: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
+    B, s_global, Hl, D = y.shape
+    return y.new_empty(B, s_global // world_size, Hl * world_size, D)
+
+
 @torch.library.custom_op("vllm_omni_a2a::ulysses_qkv_fwd", mutates_args=(), device_types="cuda")
 def ulysses_qkv_fwd(x: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
-    _ensure_built()
-    p = world_size
-    B, s_local, H, D = x.shape
-    Hl = H // p
-    lc = Hl * D
-    rows = B * s_local
-    symm_in = _get_symm_buffer((rows, p, lc), x.dtype, x.device, group_name)
-    # (B, S_local, H, D) -> (rows, p, lc); H is row-major so column block r = heads [r*Hl:(r+1)*Hl]
-    # Fused QKV projections produce row-strided views. Stage complete rows with
-    # the copy engine instead of materializing the view with TensorIterator.
-    torch.ops.a2ap.copy_rows(x.view(rows, p, lc), symm_in)
-    out = torch.empty(p, rows, lc, device=x.device, dtype=x.dtype)
-    torch.ops.a2ap.all_to_all_permute(symm_in, out, 1, 0, group_name)
-    # (p, rows, lc) -> (B, S_global, H_local, D), sequence ordered rank-major
-    return out.reshape(p, B, s_local, Hl, D).permute(1, 0, 2, 3, 4).reshape(B, p * s_local, Hl, D).contiguous()
+    """Exchange one forward tensor, including optional attention gates."""
+    b, s, h, d = x.shape
+    return _exchange_ce((x,), group_name, world_size).view(b, s * world_size, h // world_size, d)
 
 
 @ulysses_qkv_fwd.register_fake
 def _(x: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
-    B, s_local, H, D = x.shape
-    return x.new_empty(B, s_local * world_size, H // world_size, D)
+    b, s, h, d = x.shape
+    return x.new_empty(b, s * world_size, h // world_size, d)
 
 
 @ulysses_qkv_fwd.register_kernel("privateuseone")
@@ -256,51 +442,22 @@ def ulysses_qkv_fwd_group(
     group_name: str,
     world_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Exchange Q/K/V, using a grouped transport when the platform supports it."""
+    """Exchange Q/K/V together using the platform transport."""
     if query.device.type == "npu":
         from vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu import ulysses_qkv_fwd_group as npu_fwd_group
 
         return npu_fwd_group(query, key, value, group_name, world_size)
-    if query.device.type == "cuda":
-        # This optional backend defines Triton kernels at import time. Keep
-        # it out of the NPU path and the default Ulysses import chain.
-        from vllm_omni.diffusion.distributed.qkv_a2a import eligible, qkv_fwd_batched
-
-        if eligible(query, key, value, world_size):
-            return qkv_fwd_batched(query, key, value, group_name, world_size)
-    return (
-        ulysses_qkv_fwd(query, group_name, world_size),
-        ulysses_qkv_fwd(key, group_name, world_size),
-        ulysses_qkv_fwd(value, group_name, world_size),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Reverse: (B, S_global, H_local, D) -> (B, S_local, H, D)
-#   scatter sequence (dim 1), gather heads (dim 2). Matches all_to_all_4D(y,1,2).
-# ---------------------------------------------------------------------------
-@torch.library.custom_op("vllm_omni_a2a::ulysses_o_rev", mutates_args=(), device_types="cuda")
-def ulysses_o_rev(y: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
-    _ensure_built()
-    p = world_size
-    B, s_global, Hl, D = y.shape
-    s_local = s_global // p
-    H = Hl * p
-    cols = Hl * D
-    rows = B * s_local
-    symm_in = _get_symm_buffer((p, rows, cols), y.dtype, y.device, group_name)
-    # (B, p*S_local, Hl, D) -> (p, B*S_local, cols): block r = sequence shard destined to rank r
-    symm_in.copy_(y.reshape(B, p, s_local, Hl, D).permute(1, 0, 2, 3, 4).reshape(p, rows, cols))
-    out = torch.empty(rows, p, cols, device=y.device, dtype=y.dtype)
-    torch.ops.a2ap.all_to_all_permute(symm_in, out, 0, 1, group_name)
-    # (rows, p, cols) -> (B, S_local, H, D), heads ordered rank-major
-    return out.reshape(B, s_local, p, Hl, D).reshape(B, s_local, H, D).contiguous()
-
-
-@ulysses_o_rev.register_fake
-def _(y: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
-    B, s_global, Hl, D = y.shape
-    return y.new_empty(B, s_global // world_size, Hl * world_size, D)
+    inputs = (query, key, value)
+    packed = ulysses_qkv_ce(*inputs, group_name, world_size)
+    if query.shape == key.shape == value.shape:
+        b, s, h, d = query.shape
+        query, key, value = packed.view(3, b, s * world_size, h // world_size, d).unbind(0)
+    else:
+        query, key, value = (
+            part.view(x.size(0), x.size(1) * world_size, x.size(2) // world_size, x.size(3))
+            for part, x in zip(packed.split([x.numel() for x in inputs]), inputs)
+        )
+    return query, key, value
 
 
 @ulysses_o_rev.register_kernel("privateuseone")

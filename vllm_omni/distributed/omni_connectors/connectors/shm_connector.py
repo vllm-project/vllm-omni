@@ -85,7 +85,9 @@ class SharedMemoryConnector(OmniConnectorBase):
     def __init__(self, config: dict[str, Any]):
         self.config = config
         self.stage_id = config.get("stage_id", -1)
-        scope = config.get("extra", {}).get("wakeup_scope")
+        # load_omni_transfer_config puts the scope in the edge's extra, which
+        # the factory passes as this config.
+        scope = config.get("wakeup_scope")
         self._wake_directory = (
             f"{self.shm_directory}/omni_shm_wake_{os.getuid()}_{hashlib.sha256(str(scope).encode()).hexdigest()[:24]}"
             if scope is not None
