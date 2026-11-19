@@ -4964,8 +4964,12 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
     for path in _WORKER_ONE_CARD_FILES[:1]:
         source = Path(path).read_text(encoding="utf-8")
         assert source.count('res={"cuda": "L4", "rocm": "MI325"}, num_cards=1') == 1
+    # The Intel single-card lane selects some cases of this file too, so their
+    # res dicts name a third platform. The AMD node list is unchanged: the marker
+    # expression for this step is still core_model and rocm and MI325 and cards_1.
     eager = Path(_WORKER_ONE_CARD_FILES[1]).read_text(encoding="utf-8")
-    assert eager.count('res={"cuda": "L4", "rocm": "MI325"}, num_cards=1') == 6
+    assert eager.count('res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1') == 3
+    assert eager.count('res={"cuda": "L4", "rocm": "MI325"}, num_cards=1') == 3
 
     r2_01 = _find_step(
         "ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t",
@@ -5119,8 +5123,10 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
     assert "--junitxml=" in command
     assert "Expected exactly 6 executed one-card worker copy tests" in command
 
+    # As above: the Intel lane also runs this file, so the dicts name xpu as well.
     device_copy = Path(_WORKER_COPY_FILES[0]).read_text(encoding="utf-8")
-    assert device_copy.count('res={"cuda": "L4", "rocm": "MI325"}, num_cards=1') == 3
+    assert device_copy.count('res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1') == 1
+    assert device_copy.count('res={"cuda": "L4", "rocm": "MI325"}, num_cards=1') == 2
     assert device_copy.count("@pytest.mark.cpu") == 2
     residency_source = Path(_WORKER_COPY_FILES[1]).read_text(encoding="utf-8")
     assert residency_source.count('res={"cuda": "L4", "rocm": "MI325"}, num_cards=1') == 1
