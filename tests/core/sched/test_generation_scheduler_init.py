@@ -54,6 +54,10 @@ def test_moss_profile_generation_constructor_after_platform_resolution(
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
     deploy = load_deploy_config(get_deploy_config_path("moss_tts_local.yaml"))
     pipeline = resolve_pipeline_config("moss_tts_local")
+    if platform != "cuda":
+        with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
+            merge_pipeline_deploy(pipeline, deploy)
+        return
     codec = merge_pipeline_deploy(pipeline, deploy)[1]
     extras = deploy.connectors["shm"]["extra"]
     config = _config(

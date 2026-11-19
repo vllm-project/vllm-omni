@@ -15,7 +15,7 @@ import torch.multiprocessing as mp
 from tests.diffusion.ar_diffusion.test_capability_runner import make_runner, scheduler_output
 from tests.diffusion.models.hy_nomas.test_ar import PipelineWithCPUComponents
 from tests.diffusion.models.hy_nomas.test_pixelumm_parallel import make_decoder
-from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.data import DiffusionKVCacheMode, DiffusionParallelConfig
 from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
@@ -240,6 +240,9 @@ def _prepare_failure_worker(rank, world_size, rendezvous):
                 data_parallel_size=1, sequence_parallel_size=world_size, ulysses_degree=world_size
             )
             runner.od_config.cache_backend = None
+            runner.od_config.diffusion_attention_schedule = None
+            runner.od_config.diffusion_kv_mode = DiffusionKVCacheMode.DENSE_LEGACY
+            runner.od_config.cfg_kv_collect_func = None
             runner.od_config.streaming_output = True
             runner.kv_transfer_manager = OmniKVTransferManager.from_od_config(runner.od_config)
             runner.cache_backend = None

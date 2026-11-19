@@ -1593,8 +1593,9 @@ class Wan22Pipeline(
                 # ranks get an empty placeholder. Emit typed media only from the
                 # owning rank and keep the placeholder on the legacy output field, so
                 # the media batch-dimension check in split_diffusion_output_by_request
-                # does not trip on every non-owner rank.
-                if decoded.dim() == 5:
+                # does not trip on every non-owner rank. Under pipeline parallelism a
+                # non-decoding stage receives None from the PP decode wrapper.
+                if decoded is not None and decoded.dim() == 5:
                     output = None
                     media = DiffusionMediaOutput(
                         video=VideoMediaOutput(
