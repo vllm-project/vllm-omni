@@ -90,7 +90,10 @@ def allow_ascend_scheduler_ngram() -> None:
     except ImportError:
         return
 
-    original = mrv2_utils._v2_blacklist
+    # Newer vLLM-Ascend builds no longer expose this private helper.
+    original = getattr(mrv2_utils, "_v2_blacklist", None)
+    if original is None:
+        return
 
     @wraps(original)
     def blacklist(config: VllmConfig) -> list[str]:
