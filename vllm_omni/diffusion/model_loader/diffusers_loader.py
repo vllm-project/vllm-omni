@@ -260,7 +260,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 continue
 
             try:
-                downloaded_index_path = hf_api().hf_hub_download(
+                index_path = hf_api().hf_hub_download(
                     repo_id=str(model_name_or_path),
                     filename=repo_index_path,
                     cache_dir=self.load_config.download_dir,
@@ -269,7 +269,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 )
             except huggingface_hub.errors.EntryNotFoundError:
                 continue
-            index_paths.append((index_file, Path(downloaded_index_path)))
+            index_paths.append((index_file, Path(index_path)))
 
         if len(index_paths) > 1:
             raise ValueError(
@@ -798,8 +798,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 dit_uses_allgather = dit_distributed_offload and resolved_offload.uses_allgather(DIT_COMPONENT)
                 tensor_parallel_size = int(self.parallel_config.tensor_parallel_size)
                 use_hsdp = bool(self.parallel_config.use_hsdp)
-                data_parallel_size = int(cast(int, self.parallel_config.data_parallel_size))
-                sequence_parallel_size = int(cast(int, self.parallel_config.sequence_parallel_size))
+                data_parallel_size = int(self.parallel_config.data_parallel_size)
+                sequence_parallel_size = int(self.parallel_config.sequence_parallel_size)
                 dlo_group_size = data_parallel_size if data_parallel_size > 1 else sequence_parallel_size
                 modules = ModuleDiscovery.discover(model)
                 plan = get_offload_plan(model)
