@@ -65,6 +65,7 @@ def _make_state(max_num_reqs=4, has_preprocess=False, has_postprocess=False, hav
     model.mtp_output_key = ("codes", "audio")
     model.mtp_validity_key = None
     model.mtp_sampling_params = {}
+    model.get_mtp_sampling_overrides = None
     model.get_mtp_seed = lambda params: (getattr(params, "extra_args", None) or {}).get("test_seed")
     model.preprocess_batch_mrv2 = None
     model.preprocess_prefill_rows_mrv2 = None
@@ -512,6 +513,115 @@ def test_seeded_mtp_bypasses_outer_graph_runner():
     )
     assert raw_calls == [{"generators": generators}]
     state._mtp_state._mtp_runner.assert_not_called()
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("explicit_temperature", [None, 0.4])
+def test_mtp_request_policies_bypass_cached_graph_and_preserve_rows(reverse, explicit_temperature):
+    from vllm_omni.model_executor.models.qwen3_tts.sampling_policy import get_mtp_sampling_overrides
+
+    state = _make_state(max_num_reqs=2)
+    defaults = {"do_sample": True, "temperature": 0.9, "top_k": 50, "top_p": 1.0}
+    state.model.mtp_sampling_params = defaults
+    state.model.mtp_accepts_per_row_generators = True
+    state.model.get_mtp_sampling_overrides = get_mtp_sampling_overrides
+    state.intermediate_buffer.buffers[0] = {
+        "req_id": "changed",
+        "sampling_params": SimpleNamespace(
+            temperature=0.0 if explicit_temperature is None else explicit_temperature,
+            extra_args={"test_seed": 11, **({"temperature": explicit_temperature} if explicit_temperature else {})},
+        ),
+    }
+    state.intermediate_buffer.buffers[1] = {
+        "req_id": "default",
+        "sampling_params": SimpleNamespace(temperature=0.7, extra_args={"test_seed": 22}),
+    }
+    mtp_state = state._mtp_state
+    mtp_state._mtp_sample_uniforms = torch.empty((2, 2, 4))
+    replay = MagicMock(side_effect=AssertionError("dynamic policy must bypass cached default graph"))
+    mtp_state._mtp_replays[2] = (2, SimpleNamespace(cudagraph=SimpleNamespace(replay=replay), output=None))
+    calls = []
+    # Both rows reuse these buffers to prove that the runner owns each row's
+    # output before invoking the next row.
+    shared_emb = torch.empty(1, 3)
+    shared_codes = torch.empty(1, 1, dtype=torch.long)
+
+    def mtp(input_ids, input_embeds, last_hidden, text_step, **kwargs):
+        assert input_ids.numel() == 1
+        token = input_ids.item()
+        uniform = kwargs.get("sample_uniforms")
+        calls.append((token, kwargs["do_sample"], kwargs["temperature"], None if uniform is None else uniform.clone()))
+        shared_emb.fill_(token)
+        shared_codes.fill_(token)
+        return shared_emb, shared_codes
+
+    state.model.mtp = mtp
+    indices = [1, 0] if reverse else [0, 1]
+    ids = [202, 101] if reverse else [101, 202]
+    output, codes = mtp_state._mtp_forward(
+        indices,
+        torch.tensor(ids),
+        torch.zeros(2, 3),
+        torch.zeros(2, 3),
+        torch.zeros(2, 3),
+        lambda bsz: SimpleNamespace(num_tokens=bsz),
+    )
+
+    replay.assert_not_called()
+    assert [call[0] for call in calls] == ids
+    by_id = {call[0]: call for call in calls}
+    assert by_id[101][1:3] == ((False, 0.0) if explicit_temperature is None else (True, explicit_temperature))
+    assert by_id[202][1:3] == (True, 0.9)
+    if explicit_temperature is None:
+        assert by_id[101][3] is None
+        assert torch.equal(
+            mtp_state._mtp_generators["changed"].get_state(), torch.Generator().manual_seed(11).get_state()
+        )
+    expected = torch.empty((1, 2, 4)).uniform_(1e-20, 1.0 - 1e-20, generator=torch.Generator().manual_seed(22))
+    torch.testing.assert_close(by_id[202][3], expected)
+    assert codes[:, 0].tolist() == ids
+    assert output[:, 0].tolist() == ids
+    assert defaults == {"do_sample": True, "temperature": 0.9, "top_k": 50, "top_p": 1.0}
+
+
+def test_mtp_equal_greedy_policies_remain_batched_without_random_draws():
+    from vllm_omni.model_executor.models.qwen3_tts.sampling_policy import get_mtp_sampling_overrides
+
+    state = _make_state(max_num_reqs=2)
+    state.model.mtp_sampling_params = {"do_sample": True, "temperature": 0.9}
+    state.model.get_mtp_sampling_overrides = get_mtp_sampling_overrides
+    for index in range(2):
+        state.intermediate_buffer.buffers[index] = {
+            "req_id": f"r{index}",
+            "sampling_params": SimpleNamespace(temperature=0.0, extra_args={}),
+        }
+    calls = []
+
+    def mtp(input_ids, input_embeds, last_hidden, text_step, **kwargs):
+        calls.append(kwargs)
+        assert kwargs["do_sample"] is False
+        assert kwargs["temperature"] == 0
+        assert "sample_uniforms" not in kwargs
+        return input_embeds + 1, input_ids[:, None]
+
+    state.model.mtp = mtp
+    state._mtp_state._mtp_sample_uniforms = torch.empty((2, 2, 4))
+    replay = MagicMock(side_effect=AssertionError("unseeded greedy requests must not replay a sampled graph"))
+    state._mtp_state._mtp_replays[2] = (2, SimpleNamespace(cudagraph=SimpleNamespace(replay=replay), output=None))
+    before = torch.random.get_rng_state().clone()
+    _, codes = state._mtp_state._mtp_forward(
+        [0, 1],
+        torch.tensor([101, 202]),
+        torch.zeros(2, 3),
+        torch.zeros(2, 3),
+        torch.zeros(2, 3),
+        lambda bsz: SimpleNamespace(num_tokens=bsz),
+        req_ids=["r0", "r1"],
+    )
+    replay.assert_not_called()
+    assert len(calls) == 1
+    assert codes[:, 0].tolist() == [101, 202]
+    assert torch.equal(before, torch.random.get_rng_state())
 
 
 def test_mtp_forward_uses_dispatched_graph_descriptor():

@@ -2157,6 +2157,25 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         subtalker_params = getattr(self.vllm_config.model_config, "subtalker_sampling_params", None)
         if not isinstance(subtalker_params, dict):
             subtalker_params = {}
+        talker_kwargs = {
+            "do_sample": subtalker_params.get("do_sample"),
+            "temperature": subtalker_params.get("temperature"),
+            "top_k": subtalker_params.get("top_k"),
+            "top_p": subtalker_params.get("top_p"),
+        }
+        resolve_sampling = getattr(self.model, "get_mtp_sampling_overrides", None)
+        sampling_policies = []
+        has_sampling_override = False
+        if callable(resolve_sampling):
+            for req_id in decode_req_ids:
+                override = resolve_sampling(getattr(self.requests[req_id], "sampling_params", None))
+                sampling_policies.append({**talker_kwargs, **(override or {})})
+                has_sampling_override |= bool(override)
+        mixed_sampling = bool(sampling_policies) and any(
+            policy != sampling_policies[0] for policy in sampling_policies[1:]
+        )
+        if sampling_policies and not mixed_sampling:
+            talker_kwargs = sampling_policies[0]
 
         def _explicit_talker_seed(req_id: str) -> int | None:
             sampling_params = getattr(self.requests[req_id], "sampling_params", None)
@@ -2204,8 +2223,10 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         # (generators) must also run eagerly: a graph wrapper only replays a
         # previously captured device graph and never re-executes the Python
         # talker_mtp, so the per-row generators would be silently ignored.
-        if not isinstance(self.talker_mtp, current_omni_platform.get_graph_wrapper_cls()) or any(
-            generator is not None for generator in row_generators
+        if (
+            has_sampling_override
+            or not isinstance(self.talker_mtp, current_omni_platform.get_graph_wrapper_cls())
+            or any(generator is not None for generator in row_generators)
         ):
             _cudagraph_mode = CUDAGraphMode.NONE
             num_tokens_padded = decode_batch_size
@@ -2216,14 +2237,18 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]
         text_step = self.text_step.gpu[:num_tokens_padded]
 
-        if (
-            decode_batch_size > 1
-            and any(generator is not None for generator in row_generators)
-            and not getattr(self.model, "talker_mtp_accepts_per_row_generators", False)
+        if decode_batch_size > 1 and (
+            mixed_sampling
+            or (
+                any(generator is not None for generator in row_generators)
+                and not getattr(self.model, "talker_mtp_accepts_per_row_generators", False)
+            )
         ):
             # A torch.Generator is a single stream. Using one generator for a
             # multi-row batch would make explicitly-seeded requests depend on
             # other rows in the same scheduler step, so keep that path scalar.
+            # The MTP hook also takes scalar sampling settings: mixed request
+            # policies must run separately rather than borrowing another row's.
             saved_input_ids = self.talker_mtp_input_ids.gpu[:decode_batch_size].clone()
             saved_embeds = self.talker_mtp_inputs_embeds.gpu[:decode_batch_size].clone()
             saved_hidden = self.last_talker_hidden.gpu[:decode_batch_size].clone()
@@ -2243,12 +2268,6 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 self.text_step.gpu[:decode_batch_size].copy_(saved_text)
             return
 
-        talker_kwargs = {
-            "do_sample": subtalker_params.get("do_sample"),
-            "temperature": subtalker_params.get("temperature"),
-            "top_k": subtalker_params.get("top_k"),
-            "top_p": subtalker_params.get("top_p"),
-        }
         if decode_batch_size == 1:
             if row_generators[0] is not None:
                 talker_kwargs["generator"] = row_generators[0]
@@ -2259,10 +2278,13 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             talker_kwargs["req_infos"] = [
                 self.model_intermediate_buffer.setdefault(req_id, {}) for req_id in decode_req_ids
             ]
+        # A captured whole-MTP graph fixes Python sampling branches. Request
+        # overrides must execute the raw hook; predictor-owned graphs can stay.
+        talker_mtp = self.model.talker_mtp if has_sampling_override else self.talker_mtp
         with current_omni_platform.set_forward_context(
             None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):
-            req_embeds, code_predictor_codes = self.talker_mtp(
+            req_embeds, code_predictor_codes = talker_mtp(
                 req_input_ids,
                 req_embeds,
                 last_talker_hidden,

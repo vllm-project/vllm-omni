@@ -871,6 +871,133 @@ def test_talker_mtp_forward_passes_qwen3_tts_subtalker_sampling_params_to_talker
     assert runner.talker_mtp.calls[0]["generator"] is not None
 
 
+class _PolicyCaptureTalkerMTP(torch.nn.Module):
+    """Identify request rows while observing the runner's effective MTP policy."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def forward(self, input_ids, input_embeds, last_hidden, text_step, **kwargs):
+        ids = input_ids.reshape(-1).clone()
+        self.calls.append({"input_ids": ids.tolist(), **kwargs})
+        return input_embeds + ids[:, None], ids[:, None]
+
+
+def _make_policy_mtp_runner(monkeypatch, req_ids=("greedy", "sample")):
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
+    runner = _make_runner(req_ids=req_ids)
+    defaults = {"do_sample": True, "temperature": 0.9, "top_k": 50, "top_p": 1.0}
+    raw = _PolicyCaptureTalkerMTP()
+    runner.talker_mtp = raw
+    runner.model.talker_mtp = raw
+    runner.model.talker_mtp_accepts_per_row_generators = True
+    # The model owns interpretation of request fields; this test exercises
+    # the runner's contract with its returned per-request policy.
+    runner.model.get_mtp_sampling_overrides = Mock(side_effect=lambda params: params.mtp_policy)
+    runner.vllm_config.model_config.subtalker_sampling_params = defaults
+    runner._determine_batch_execution_and_padding = lambda **kwargs: (
+        CUDAGraphMode.FULL,
+        SimpleNamespace(num_tokens=kwargs["num_tokens"]),
+        None,
+        None,
+        None,
+    )
+    return runner, defaults, raw
+
+
+def test_talker_mtp_forward_batches_equal_overrides_and_bypasses_default_graph(monkeypatch):
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    runner, defaults, raw = _make_policy_mtp_runner(monkeypatch)
+    original_defaults = dict(defaults)
+    policy = {"do_sample": False, "temperature": 0.0}
+    for req_id in runner.requests:
+        runner.requests[req_id].sampling_params = SimpleNamespace(temperature=0.0, extra_args={}, mtp_policy=policy)
+    runner.talker_mtp_input_ids.gpu[:] = torch.tensor([101, 202])
+
+    class DefaultGraph:
+        def __call__(self, *args, **kwargs):
+            pytest.fail("request overrides must not replay the default MTP graph")
+
+    runner.talker_mtp = DefaultGraph()
+    monkeypatch.setattr(mod.current_omni_platform, "get_graph_wrapper_cls", lambda: DefaultGraph)
+    contexts = Mock(side_effect=lambda *args, **kwargs: _noop_forward_context())
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", contexts)
+
+    output = torch.zeros(6, 4)
+    runner._talker_mtp_forward(["greedy", "sample"], output)
+
+    assert len(raw.calls) == 1  # equal policies retain a batched raw call
+    assert raw.calls[0]["input_ids"] == [101, 202]
+    assert (raw.calls[0]["do_sample"], raw.calls[0]["temperature"]) == (False, 0.0)
+    assert (raw.calls[0]["top_k"], raw.calls[0]["top_p"]) == (50, 1.0)
+    assert contexts.call_args.kwargs["cudagraph_runtime_mode"] == CUDAGraphMode.NONE
+    assert output[0].tolist() == [101.0] * 4
+    assert output[3].tolist() == [202.0] * 4
+    assert defaults == original_defaults
+    assert policy == {"do_sample": False, "temperature": 0.0}
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_talker_mtp_forward_isolates_mixed_policies_and_seeded_rows(monkeypatch, reverse):
+    runner, defaults, raw = _make_policy_mtp_runner(monkeypatch)
+    original_defaults = dict(defaults)
+    runner.requests["greedy"].sampling_params = SimpleNamespace(
+        temperature=0.0,
+        extra_args={"tts_local_seed": 11},
+        mtp_policy={"do_sample": False, "temperature": 0.0},
+    )
+    runner.requests["sample"].sampling_params = SimpleNamespace(
+        temperature=0.7, extra_args={"tts_local_seed": 22}, mtp_policy=None
+    )
+    req_ids = ["sample", "greedy"] if reverse else ["greedy", "sample"]
+    ids = {"greedy": 101, "sample": 202}
+    runner.talker_mtp_input_ids.gpu[:] = torch.tensor([ids[req_id] for req_id in req_ids])
+    runner.talker_mtp_inputs_embeds.gpu[:] = torch.arange(8).reshape(2, 4)
+    saved_ids = runner.talker_mtp_input_ids.gpu.clone()
+    saved_embeds = runner.talker_mtp_inputs_embeds.gpu.clone()
+    output = torch.zeros(6, 4)
+
+    runner._talker_mtp_forward(req_ids, output)
+
+    assert [call["input_ids"] for call in raw.calls] == [[ids[req_id]] for req_id in req_ids]
+    by_id = {call["input_ids"][0]: call for call in raw.calls}
+    assert (by_id[101]["do_sample"], by_id[101]["temperature"]) == (False, 0.0)
+    assert (by_id[202]["do_sample"], by_id[202]["temperature"]) == (True, 0.9)
+    assert by_id[202]["generator"].initial_seed() == 22
+    assert by_id[202]["generator"] is runner._talker_mtp_generators["sample"]
+    for row, req_id in enumerate(req_ids):
+        offset = 0 if req_id == "greedy" else 3
+        torch.testing.assert_close(output[offset], saved_embeds[row] + ids[req_id])
+        assert runner.requests[req_id].additional_information_cpu["codes"]["audio"].item() == ids[req_id]
+    torch.testing.assert_close(runner.talker_mtp_input_ids.gpu, saved_ids)
+    torch.testing.assert_close(runner.talker_mtp_inputs_embeds.gpu, saved_embeds)
+    assert defaults == original_defaults
+
+
+@pytest.mark.parametrize("policy", [None, {}], ids=["default", "explicit-empty-opt-out"])
+def test_talker_mtp_forward_default_policy_keeps_one_batched_call(monkeypatch, policy):
+    runner, defaults, raw = _make_policy_mtp_runner(monkeypatch)
+    original_defaults = dict(defaults)
+    for req_id in runner.requests:
+        runner.requests[req_id].sampling_params = SimpleNamespace(
+            temperature=0.0 if policy == {} else 0.9,
+            extra_args={"subtalker_sampling_params": {}} if policy == {} else {},
+            mtp_policy=policy,
+        )
+    runner.talker_mtp_input_ids.gpu[:] = torch.tensor([101, 202])
+
+    runner._talker_mtp_forward(["greedy", "sample"], torch.zeros(6, 4))
+
+    assert len(raw.calls) == 1
+    assert raw.calls[0]["input_ids"] == [101, 202]
+    assert (raw.calls[0]["do_sample"], raw.calls[0]["temperature"]) == (True, 0.9)
+    assert defaults == original_defaults
+
+
 def test_talker_mtp_forward_keeps_explicit_seeded_requests_scalar(monkeypatch):
     import vllm_omni.worker.gpu_model_runner as mod
 

@@ -239,8 +239,52 @@ class OpenAICreateSpeechRequest(BaseModel):
     )
     extra_params: dict[str, Any] | None = Field(
         default=None,
-        description=("Optional model-specific parameters passed directly to the model's extra_args."),
+        description=("Optional model-specific parameters and first-stage sampling overrides."),
     )
+    temperature: float | None = Field(
+        default=None,
+        ge=0,
+        allow_inf_nan=False,
+        strict=True,
+        description="First-stage temperature override; takes precedence over extra_params.temperature.",
+    )
+    repetition_penalty: float | None = Field(
+        default=None,
+        gt=0,
+        allow_inf_nan=False,
+        strict=True,
+        description="First-stage repetition penalty override; takes precedence over extra_params.repetition_penalty.",
+    )
+
+    @field_validator("extra_params")
+    @classmethod
+    def _validate_sampling_overrides(cls, values: dict[str, Any] | None) -> dict[str, Any] | None:
+        # The serving layer assigns these overrides to a request-local
+        # SamplingParams copy, after its constructor validation has run.
+        for name in ("temperature", "repetition_penalty"):
+            value = (values or {}).get(name)
+            if value is None:
+                continue
+            bound = "> 0" if name == "repetition_penalty" else ">= 0"
+            message = f"extra_params.{name} must be a finite number {bound}"
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(message)
+            number = float(value)
+            if not math.isfinite(number) or number < 0 or (name == "repetition_penalty" and number == 0):
+                raise ValueError(message)
+        return values
+
+    @model_validator(mode="after")
+    def _merge_sampling_overrides(self) -> "OpenAICreateSpeechRequest":
+        # Canonicalize both public spellings before adapter validation so a
+        # model that rejects sampling overrides sees top-level fields too.
+        overrides = {
+            name: value for name in ("temperature", "repetition_penalty") if (value := getattr(self, name)) is not None
+        }
+        if overrides:
+            self.extra_params = {**(self.extra_params or {}), **overrides}
+        return self
+
     word_timestamps: bool = Field(
         default=False,
         description=(

@@ -24,6 +24,10 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     conditioning_cache_salt,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_precomputed_speakers
+from vllm_omni.model_executor.models.qwen3_tts.sampling_policy import (
+    SUBTALKER_SAMPLING_PARAMS_KEY,
+    validate_subtalker_sampling_params,
+)
 from vllm_omni.utils.speaker_cache import validate_qwen3_tts_profile
 
 if TYPE_CHECKING:
@@ -264,6 +268,13 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         # Validate input is not empty
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
+
+        extras = request.extra_params or {}
+        if SUBTALKER_SAMPLING_PARAMS_KEY in extras:
+            try:
+                validate_subtalker_sampling_params(extras[SUBTALKER_SAMPLING_PARAMS_KEY])
+            except ValueError as exc:
+                return str(exc)
 
         # Validate language (case-insensitive; normalized to the title-cased config form)
         if request.language is not None:

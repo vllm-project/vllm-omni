@@ -235,11 +235,19 @@ def test_post_sample_talker_mtp_before_bookkeeping_gathers_the_kept_rows() -> No
     assert multimodal["codes"]["audio"][1].tolist() == [[11, 12, 13]] and multimodal["codes"]["audio"][0].numel() == 0
 
 
-def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatch):
-    requested = {"temperature": 0.7, "top_p": 0.8, "top_k": 17}
-    request = OpenAICreateSpeechRequest.model_validate(
-        {"input": "Hello", "extra_params": requested},
-    )
+@pytest.mark.parametrize("repetition_penalty", [1.0, 1.1])
+@pytest.mark.parametrize("placement", ["top-level", "extra_params"])
+def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatch, repetition_penalty, placement):
+    requested = {"temperature": 0.7, "top_p": 0.8, "top_k": 17, "repetition_penalty": repetition_penalty}
+    payload = {"input": "Hello", "extra_params": requested}
+    if placement == "top-level":
+        payload = {
+            "input": "Hello",
+            "temperature": requested["temperature"],
+            "repetition_penalty": repetition_penalty,
+            "extra_params": {"top_p": requested["top_p"], "top_k": requested["top_k"]},
+        }
+    request = OpenAICreateSpeechRequest.model_validate(payload)
 
     class Adapter:
         def normalize(self, request):
@@ -262,7 +270,7 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
 
     engine = SimpleNamespace(
         errored=False,
-        default_sampling_params_list=[SamplingParams(temperature=1.0, top_p=0.95, top_k=50)],
+        default_sampling_params_list=[SamplingParams(temperature=1.0, top_p=0.95, top_k=50, repetition_penalty=1.05)],
         generate=lambda **kwargs: kwargs["sampling_params_list"],
     )
     serving = object.__new__(OmniOpenAIServingSpeech)
@@ -274,6 +282,8 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
 
     _, stage_sampling_params, _ = asyncio.run(serving._prepare_speech_generation(request, request_id="speech-test"))
     stage0_params = stage_sampling_params[0]
+    assert stage0_params.repetition_penalty == repetition_penalty
+    assert engine.default_sampling_params_list[0].repetition_penalty == 1.05
 
     monkeypatch.setattr(gpu_input_batch, "PIN_MEMORY", False)
     input_batch = InputBatch(
@@ -329,6 +339,9 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     torch.testing.assert_close(sampling_metadata.temperature, torch.tensor([requested["temperature"]]))
     torch.testing.assert_close(sampling_metadata.top_p, torch.tensor([requested["top_p"]]))
     assert sampling_metadata.top_k.tolist() == [requested["top_k"]]
+    assert sampling_metadata.no_penalties is (repetition_penalty == 1.0)
+    if repetition_penalty != 1.0:
+        torch.testing.assert_close(sampling_metadata.repetition_penalties, torch.tensor([repetition_penalty]))
 
 
 def test_resolve_pooler_payload_req_ids_audio_terminal_stage_keeps_payload():
