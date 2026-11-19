@@ -43,24 +43,32 @@ can change generated pixels. Enable it with `additional_config.lightvae_decoder_
 [KV prefix caching](../design/feature/prefix_caching.md#diffusion-kv-prefix-caching)
 reuses stable context KV across requests, rather than approximating denoise
 steps. Enable `diffusion_kv_mode: paged_scheduler` and `enable_prefix_caching: true`
-on the HunyuanImage3 standalone DiT stage. This is separate from the AR stage-output
+on supported standalone DiT stages (`HunyuanImage3` and `QwenImage21Pipeline`). This is separate from the AR stage-output
 cache, TeaCache and Cache-DiT.
 
 | Model / combination | Scope |
 |---------------------|-------|
 | HunyuanImage3 standalone DiT | Stable text/reference-image prefix reuse; dynamic image tokens are excluded |
-| TP4/SP1 + EP, CFGP1 | Validated reference-image prefix hits |
+| Qwen-Image 2.1 (`QwenImage21Pipeline`) | Block-causal reference-image and text prefix reuse across requests; skips condition-image VAE encoding on covering hits. GPU validation is configuration-specific; see the [recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen-Image-2.1.md#scheduler-managed-paged-kv-and-cross-request-prefix-caching-diffusionkvcachemodepaged_scheduler) for GPU, precision, and parallelism details |
+| TP4/SP1 + EP, CFGP1 | Validated reference-image prefix hits (HunyuanImage3) |
 | TP2/SP2 (Ulysses) + EP, CFGP1 | Validated reference-image prefix hits; CFG guidance does not require CFG parallelism |
-| Other SP/TP combinations, CFGP>1 | Prefix-hit E2E accuracy not yet validated |
+| Other HunyuanImage3 SP/TP combinations, CFGP>1 | Prefix-hit E2E accuracy not yet validated |
 | AR-imported KV / cross-stage missing-page transfer | Not covered by local prefix caching |
 | Sleep mode | Rejected with prefix caching; discarded KV pages would leave stale cache hits |
 | TeaCache / Cache-DiT, offload, quantization | Not validated with prefix hits |
-| Step execution | Not supported with HunyuanImage3 paged KV; use request-level execution |
+| Step execution | Not supported with paged KV; use request-level execution |
 | Other diffusion models | No prefix-cache model adapter yet |
 
 This table describes prefix-cache scope; the general parallelism tables below do
 not establish prefix-hit compatibility. Floating-point kernel differences still
 require accuracy validation. `dense_legacy` remains the default.
+Qwen paged KV disables decode CUDA graphs and does not support FP8 prefix-KV
+storage. Image layout and CFG rows remain isolated; changing a later reference
+image's size or the number of references does not reuse an earlier layout.
+Qwen requests can provide `cache_salt` to isolate prefix reuse by application
+policy. Numerical comparisons must distinguish observed bitwise equality from
+tolerance-based parity; cache-on versus cache-off alone does not measure the
+performance or numerical difference from default dense execution.
 
 #### Lossless Acceleration
 

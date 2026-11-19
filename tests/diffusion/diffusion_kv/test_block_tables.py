@@ -13,6 +13,7 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import torch
+from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_omni.diffusion.diffusion_kv import model_runner_backend as model_runner_backend_module
@@ -111,6 +112,25 @@ def test_cache_layer_registration_rejects_backend_without_paged_support() -> Non
 
     with pytest.raises(NotImplementedError, match="layer-0.*paged support.*SDPA"):
         backend.register_kv_cache_layers({"layer-0": (layer, spec)})
+
+
+def test_batch_invariant_registration_rejects_other_native_backends(monkeypatch) -> None:
+    backend, vllm_config, _ = _registration_backend(_parallel_config())
+    backend._batch_invariant_paged_attention = True
+    layer = SimpleNamespace(
+        skip_sequence_parallel=False,
+        attn_backend=SimpleNamespace(supports_paged_kv=True, get_name=lambda: "FLASH_ATTN"),
+    )
+    spec = FullAttentionSpec(block_size=16, num_kv_heads=4, head_size=8, dtype=torch.float16)
+    monkeypatch.setattr(
+        model_runner_backend_module,
+        "DiffusionPagedAttentionLayerAdapter",
+        lambda **kwargs: SimpleNamespace(attn_backend=SimpleNamespace(get_name=lambda: "TRITON_ATTN")),
+    )
+    monkeypatch.setattr(model_runner_backend_module, "set_current_vllm_config", lambda config: nullcontext())
+    with pytest.raises(NotImplementedError, match="FlashAttention.*TRITON_ATTN"):
+        backend.register_kv_cache_layers({"layer-0": (layer, spec)})
+    assert not vllm_config.attention_config.use_non_causal
 
 
 def test_cache_layer_registration_resolves_platform_paged_hooks(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -595,6 +615,7 @@ def test_generation_is_idempotent_stale_safe_and_conflict_safe(monkeypatch: pyte
         (_metadata(sequence_block_ids=([1, 2, 3],)), "block groups"),
         (_metadata(sequence_block_ids=([1, 2], [4, 5])), "expected 3"),
         (_metadata(sequence_block_ids=([1, 2, 32], [4, 5])), "outside"),
+        (replace(_metadata(), block_copies=(KVCacheBlockCopy(1, 32),)), "block copy"),
         (
             _metadata(
                 seq_len=17,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -65,6 +65,7 @@ def get_dummy_run_num_frames(model_class_name: str, supports_audio_input: bool) 
 
 
 def get_dummy_run_num_image_inputs(model_class_name: str) -> int:
-    """Return the maximum advertised image-input count for profiling."""
+    """Return the reference-image count for paged KV startup profiling."""
 
-    return get_diffusion_model_metadata(model_class_name).max_multimodal_image_inputs or 1
+    metadata = get_diffusion_model_metadata(model_class_name)
+    return metadata.paged_kv_profile_num_image_inputs or metadata.max_multimodal_image_inputs or 1

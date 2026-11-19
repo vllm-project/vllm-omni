@@ -170,8 +170,9 @@ Finally, we look up the output hidden states/multimodal tensors corresponding to
 
 ### Diffusion KV Prefix Caching
 
-HunyuanImage3's standalone DiT pipeline can reuse stable text/reference-image KV
-across requests. Enable it on the diffusion stage in the deploy config:
+HunyuanImage3's standalone DiT pipeline and Qwen-Image 2.1 (`QwenImage21Pipeline`)
+can reuse stable text/reference-image KV across requests. Enable it on the
+diffusion stage in the deploy config:
 
 ```yaml
 pipeline: hunyuan_image3_dit
@@ -199,7 +200,14 @@ prefix caching or sleep mode.
 
 The current scope is local DiT reuse, not AR-imported KV or missing-page-only
 cross-stage transfer. Prefix-hit accuracy has been exercised with TP4/SP1 and
-TP2/SP2 (Ulysses), both with EP and CFGP1. Other combinations still require validation. See the
+TP2/SP2 (Ulysses), both with EP and CFGP1, for HunyuanImage3. Qwen's
+configuration-specific numerical and memory constraints are described in its
+[recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen-Image-2.1.md#scheduler-managed-paged-kv-and-cross-request-prefix-caching-diffusionkvcachemodepaged_scheduler).
+Qwen keys may additionally include an application-supplied request `cache_salt`;
+different salts are isolated before any native block lookup. The model keeps
+CFG rows and whole reference layouts separate as conservative numerical guards.
+Bitwise equality is reported only where observed, rather than inferred from
+block causality. Other combinations still require validation. See the
 [diffusion compatibility notes](../../user_guide/diffusion_features.md#diffusion-kv-prefix-caching).
 
 #### Shared-reference benchmark

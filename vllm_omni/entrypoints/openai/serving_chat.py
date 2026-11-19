@@ -199,6 +199,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             "width",
             "num_outputs_per_prompt",
             "seed",
+            "cache_salt",
             "quality",
             "num_inference_steps",
             "guidance_scale",
@@ -3422,6 +3423,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if custom_system_prompt is not None:
             engine_prompt["system_prompt"] = custom_system_prompt
         engine_prompt["modalities"] = modalities
+        if extra_body.get("cache_salt") is not None:
+            engine_prompt["cache_salt"] = extra_body["cache_salt"]
         if negative_prompt is not None:
             engine_prompt["negative_prompt"] = negative_prompt
         if ar_prompt_info is not None:
@@ -3630,6 +3633,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             prompt=prompt,
             modalities=["image"],
         )
+        if extra_body.get("cache_salt") is not None:
+            gen_prompt["cache_salt"] = extra_body["cache_salt"]
         if negative_prompt is not None:
             gen_prompt["negative_prompt"] = negative_prompt
         if pil_images:
@@ -3989,6 +3994,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 prompt=prompt,
                 modalities=["image"],
             )
+            if extra_body.get("cache_salt") is not None:
+                gen_prompt["cache_salt"] = extra_body["cache_salt"]
             if negative_prompt is not None:
                 gen_prompt["negative_prompt"] = negative_prompt
             diffusion_engine = cast(AsyncOmni, self._diffusion_engine)

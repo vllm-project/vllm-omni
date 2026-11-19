@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+
 
 @dataclass
 class DiffusionKVContextMetadata:
@@ -57,3 +59,4 @@ class DiffusionKVMetadata:
     allocation_generation: int
     sequences: tuple[DiffusionKVSequenceMetadata, ...]
     contexts: tuple[DiffusionKVContextMetadata, ...] = ()
+    block_copies: tuple[KVCacheBlockCopy, ...] = ()
