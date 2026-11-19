@@ -842,10 +842,13 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         if self._ar_diffusion_capability is None:
             raise RuntimeError("AR-Diffusion capability missing after KV cache initialization")
 
-        session_id, extra_args, tick = self._request_session(req)
-        reset = tick.reset if tick is not None else bool(extra_args.get("reset", False))
-        close_session = tick.close_session if tick is not None else bool(extra_args.get("close_session", False))
-        spec, geometry_key = self._resolve_ar_request(req, session_id, reset=reset)
+        try:
+            session_id, extra_args, tick = self._request_session(req)
+            reset = tick.reset if tick is not None else bool(extra_args.get("reset", False))
+            close_session = tick.close_session if tick is not None else bool(extra_args.get("close_session", False))
+            spec, geometry_key = self._resolve_ar_request(req, session_id, reset=reset)
+        except ARDiffusionRequestRejectedError as exc:
+            return DiffusionOutput.from_exception(exc)
         started = time.perf_counter()
         bound = False
         with ExitStack() as stack:
