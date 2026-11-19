@@ -8,8 +8,12 @@ from collections.abc import Callable
 from functools import wraps
 from typing import TYPE_CHECKING, Any
 
+from vllm_omni.logger import init_logger
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+logger = init_logger(__name__)
 
 
 def is_thinker_ngram(config: VllmConfig) -> bool:
@@ -102,6 +106,10 @@ def allow_ascend_scheduler_ngram() -> None:
 
     original = getattr(mrv2_utils, "_v2_blacklist", None)
     if original is None:
+        logger.warning(
+            "vllm_ascend.mrv2_utils._v2_blacklist is unavailable; "
+            "skipping the legacy Ascend MRv2 N-gram compatibility hook."
+        )
         return
 
     @wraps(original)
