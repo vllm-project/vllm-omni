@@ -200,6 +200,17 @@ def attention_env(monkeypatch):
     return SimpleNamespace(build=build, calls=calls, monkeypatch=monkeypatch)
 
 
+def test_model_layer_count_reaches_base_and_scheduled_implementations(attention_env):
+    schedule = AttentionScheduleConfig(
+        profiles={"sparse": AttentionConfig(default=AttentionSpec(backend="SOL_ATTN"))},
+        default=[{"start": 1, "end": None, "profile": "sparse"}],
+    )
+    attention = attention_env.build(_make_config(schedule=schedule), layer_count=50, prefix="blocks.49.attention")
+    for impl in (attention.attention, attention._schedule_candidates["sparse"].impl):
+        assert impl.kwargs["layer_count"] == 50
+        assert impl.kwargs["prefix"] == "blocks.49.attention"
+
+
 def test_identical_effective_profiles_dedup_to_shared_record(attention_env):
     schedule = AttentionScheduleConfig(
         profiles={

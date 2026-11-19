@@ -214,6 +214,7 @@ class MiniMaxH3Attention(nn.Module):
         role_category: str | None = None,
         skip_sequence_parallel: bool = False,
         inherited_backend_overrides: Mapping[str, AttentionSpec] | None = None,
+        layer_count: int | None = None,
     ) -> None:
         super().__init__()
         self.total_num_heads = arch.num_attention_heads
@@ -272,6 +273,7 @@ class MiniMaxH3Attention(nn.Module):
             prefix=prefix,
             impl_overrides={"FASTVIDEO_VSA": MiniMaxH3VSAImpl},
             inherited_backend_overrides=inherited_backend_overrides,
+            layer_count=arch.num_layers if layer_count is None else layer_count,
         )
 
     def enable_vsa_gate(self) -> None:

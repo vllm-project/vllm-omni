@@ -485,6 +485,9 @@ class Attention(nn.Module):
         cross_parallel_layout: CrossAttentionParallelLayout | str | None = None,
         cross_mask_kind: str | None = None,
         inherited_backend_overrides: Mapping[str, "AttentionSpec"] | None = None,
+        # Number of blocks in this model-owned attention stack. Used to resolve
+        # relative layer selectors; unrelated stacks (e.g. refiners) own counts.
+        layer_count: int | None = None,
     ):
         super().__init__()
 
@@ -620,6 +623,8 @@ class Attention(nn.Module):
                 role=role,
                 computation=self.computation,
             )
+            if layer_count is not None:
+                impl_kwargs["layer_count"] = layer_count
             self.attention = self.attn_impl_cls(
                 **impl_kwargs, backend_kwargs=backend_kwargs, backend_explicit=self.backend_explicit
             )

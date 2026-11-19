@@ -40,6 +40,7 @@ from vllm_omni.diffusion.attention.schedule import (
     validate_attention_schedule,
     validate_attention_sigma_schedule,
 )
+from vllm_omni.diffusion.attention.sol_config import parse_sol_block_ranges, parse_sol_tau_profile
 from vllm_omni.diffusion.diffusion_kv.config import (
     DiffusionKVCacheMode,
     parse_diffusion_kv_cache_mode,
@@ -2403,6 +2404,9 @@ class SolAttnSpec:
     dense_steps: int = 0
     dense_layers: str | int | list[int] | None = field(default_factory=list)
     kv_splits: int | str = "auto"
+    min_tokens: int = 0
+    dense_blocks: str = ""
+    tau_profile: str = ""
 
     _VALID_THRESH_TYPES = frozenset({"diag", "exact"})
 
@@ -2417,7 +2421,7 @@ class SolAttnSpec:
             raise ValueError(
                 f"sol_attn.thresh_type={self.thresh_type!r} unsupported; use one of {sorted(self._VALID_THRESH_TYPES)}."
             )
-        for name in ("sink_tokens", "sink_start", "dense_steps"):
+        for name in ("sink_tokens", "sink_start", "dense_steps", "min_tokens"):
             value = getattr(self, name)
             if name == "sink_start" and value is None:
                 continue
@@ -2429,7 +2433,10 @@ class SolAttnSpec:
             raise ValueError("sol_attn.dense_layers must be a layer selector, not a boolean.")
         if isinstance(self.dense_layers, int):
             self.dense_layers = [self.dense_layers]
-        parse_kv_cache_skip_selector(self.dense_layers)
+        dense_layers = parse_kv_cache_skip_selector(self.dense_layers)
+        if parse_sol_block_ranges(self.dense_blocks) and dense_layers:
+            raise ValueError("Specify only one of sol_attn.dense_blocks and sol_attn.dense_layers.")
+        parse_sol_tau_profile(self.tau_profile)
         if type(self.kv_splits) is int:
             if self.kv_splits not in (1, 2, 4):
                 raise ValueError(f"sol_attn.kv_splits must be 1, 2, or 4; got {self.kv_splits!r}.")
@@ -2574,6 +2581,9 @@ class AttentionSpec:
                 "dense_steps": sol.dense_steps,
                 "dense_layers": sol.dense_layers,
                 "kv_splits": sol.kv_splits,
+                "min_tokens": sol.min_tokens,
+                "dense_blocks": sol.dense_blocks,
+                "tau_profile": sol.tau_profile,
             }
         return kw or None
 

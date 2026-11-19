@@ -29,6 +29,7 @@ from vllm_omni.diffusion.attention.capabilities import (
     ParallelStrategy,
 )
 from vllm_omni.diffusion.attention.ops import sol_attn as sol_ops
+from vllm_omni.diffusion.attention.sol_config import parse_sol_block_ranges, parse_sol_tau_profile, sol_block_selected
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.diffusion.data import SolAttnSpec, parse_kv_cache_skip_selector
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
@@ -87,6 +88,7 @@ class SolAttnImpl(AttentionImpl):
         qkv_layout: str | None = None,
         backend_kwargs: dict | None = None,
         computation: AttentionComputation | str = AttentionComputation.SELF,
+        layer_count: int | None = None,
         **extra_impl_args,
     ) -> None:
         if head_size != 128:
@@ -109,6 +111,18 @@ class SolAttnImpl(AttentionImpl):
             self.layer_idx = extract_layer_index(prefix) if prefix else None
         except (AssertionError, ValueError):
             self.layer_idx = None
+        if layer_count is not None and (type(layer_count) is not int or layer_count <= 0):
+            raise ValueError("SOL_ATTN layer_count must be a positive model-owned integer.")
+        self.tau = self.config.tau
+        self.dense_block = False
+        tau_rules = parse_sol_tau_profile(self.config.tau_profile)
+        if parse_sol_block_ranges(self.config.dense_blocks) or tau_rules:
+            if self.layer_idx is None or (layer_count is not None and self.layer_idx >= layer_count):
+                raise ValueError("SOL_ATTN dense_blocks/tau_profile require a valid model-owned block index.")
+            self.dense_block = sol_block_selected(self.config.dense_blocks, self.layer_idx, layer_count)
+            for blocks, tau in tau_rules:
+                if sol_block_selected(blocks, self.layer_idx, layer_count):
+                    self.tau = tau
         diffusion_config = get_current_diffusion_config_or_none()
         parallel = getattr(diffusion_config, "parallel_config", None)
         if getattr(parallel, "ring_degree", 1) > 1 or getattr(parallel, "allgather_degree", 1) > 1:
@@ -134,7 +148,9 @@ class SolAttnImpl(AttentionImpl):
         dense_impl = CuDNNAttentionImpl if capability is not None and capability.major == 12 else SDPAImpl
         self.dense_attention = dense_impl(num_heads, head_size, softmax_scale, num_kv_heads=num_kv_heads)
 
-    def _should_use_dense(self) -> bool:
+    def _should_use_dense(self, used: int) -> bool:
+        if used < self.config.min_tokens or self.dense_block:
+            return True
         if self.layer_idx is None and self.dense_layers:
             return True
         if self.layer_idx in self.dense_layers:
@@ -245,10 +261,9 @@ class SolAttnImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
     ) -> ExecutionPathResult:
-        path = "dense_guard" if self._should_use_dense() else "sol_sparse"
         result = ExecutionPathResult(
             backend="SOL_ATTN",
-            path=path,
+            path="sol_sparse",
             support=CapabilityResult.supported(),
             compilation_mode=CompilationMode.CUSTOM_OP,
             platform=context.platform,
@@ -275,7 +290,7 @@ class SolAttnImpl(AttentionImpl):
                 used = self._used_length(query, key, value, attn_metadata)
                 _, sink_tokens = self._sink_range(attn_metadata, used)
                 self._sink_block_mask(attn_metadata, used, query.device)
-                if sink_tokens == used:
+                if self._should_use_dense(used) or sink_tokens == used:
                     result = replace(result, path="dense_guard", kernel_variant=None)
                 if result.path == "sol_sparse":
                     self._resolve_kv_splits(used)
@@ -308,7 +323,7 @@ class SolAttnImpl(AttentionImpl):
         sink_start, sink_tokens = self._sink_range(attn_metadata, used)
         sink_block_mask = self._sink_block_mask(attn_metadata, used, query.device)
         query_used, key_used, value_used = (tensor[:, :used].contiguous() for tensor in (query, key, value))
-        if self._should_use_dense() or sink_tokens == used:
+        if self._should_use_dense(used) or sink_tokens == used:
             output = self.dense_attention.forward_cuda(query_used, key_used, value_used)
         else:
             kv_splits = self._resolve_kv_splits(used)
@@ -317,7 +332,7 @@ class SolAttnImpl(AttentionImpl):
                 key_used,
                 value_used,
                 self.softmax_scale,
-                self.config.tau,
+                self.tau,
                 self.config.thresh_type,
                 kv_splits,
                 sink_start,

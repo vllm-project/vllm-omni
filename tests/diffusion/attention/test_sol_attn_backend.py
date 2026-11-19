@@ -27,6 +27,7 @@ from vllm_omni.diffusion.attention.capabilities import (
     ParallelStrategy,
     SupportStatus,
 )
+from vllm_omni.diffusion.attention.sol_config import sol_block_selected
 from vllm_omni.diffusion.data import (
     AttentionConfig,
     AttentionSpec,
@@ -133,6 +134,19 @@ def test_per_role_configuration_round_trip(kernel):
         {"dense_layers": -1},
         {"dense_layers": True},
         {"dense_layers": "bad"},
+        {"dense_blocks": [0, 2]},
+        {"dense_blocks": "bad"},
+        {"dense_blocks": "0", "dense_layers": "1"},
+        {"min_tokens": -1},
+        {"min_tokens": True},
+        {"min_tokens": 1.5},
+        {"tau_profile": "0-2"},
+        {"tau_profile": "=1.0"},
+        {"tau_profile": "0=nan"},
+        {"tau_profile": "0=inf"},
+        {"tau_profile": "0=-0.1"},
+        {"tau_profile": "0=word"},
+        {"tau_profile": {"0": 1.0}},
         {"thresh_type": "unknown"},
         {"tau": float("nan")},
         {"tau": float("inf")},
@@ -150,6 +164,79 @@ def test_per_role_configuration_round_trip(kernel):
 def test_invalid_options_fail_at_parse_time(options):
     with pytest.raises((TypeError, ValueError)):
         AttentionSpec(backend="SOL_ATTN", sol_attn=options)
+
+
+@pytest.mark.parametrize(
+    ("selector", "expected"),
+    [
+        ("0-2,-1", {0, 1, 2, 4}),
+        ("-3--1", {2, 3, 4}),
+        ("3-1", {1, 2, 3}),
+        (" 0 - 2, , -1 ", {0, 1, 2, 4}),
+        ("-99-1", {0, 1}),
+        ("3-9999999999", {3, 4}),
+        ("9", set()),
+    ],
+)
+def test_relative_block_selectors_resolve_against_model_stack(selector, expected):
+    assert {index for index in range(5) if sol_block_selected(selector, index, 5)} == expected
+
+
+def test_layer_tuning_round_trip_and_last_rule_wins(kernel):
+    settings = {
+        "tau": 1.1,
+        "min_tokens": 10,
+        "dense_blocks": "0-2,-1",
+        "tau_profile": "0-4=2.0;3-4=0.8 # sensitive layers\n4=0.6",
+        "sink_mode": "prefix",
+    }
+    spec = AttentionSpec(backend="SOL_ATTN", sol_attn=settings)
+    restored = SolAttnSpec(**spec.backend_kwargs()["sol_attn"])
+    assert all(getattr(restored, name) == value for name, value in settings.items())
+    impl = SolAttnImpl(2, 128, 0.125, prefix="blocks.4.attention", layer_count=6, backend_kwargs=spec.backend_kwargs())
+    assert not impl.dense_block
+    impl.forward_cuda(*tensors())
+    assert kernel[-1][3]["tau"] == 0.6
+    last = SolAttnImpl(2, 128, 0.125, prefix="blocks.5.attention", layer_count=6, backend_kwargs=spec.backend_kwargs())
+    query, key, value = tensors()
+    torch.testing.assert_close(last.forward_cuda(query, key, value), dense(query, key, value))
+    assert last.tau == 1.1
+    assert len(kernel) == 1
+
+
+@pytest.mark.parametrize("options", [{"dense_blocks": "-1"}, {"tau_profile": "-1=0.8"}])
+def test_relative_selectors_require_model_depth(options):
+    with pytest.raises(ValueError, match="model-owned layer_count"):
+        make_impl(**options)
+
+
+@pytest.mark.parametrize("options", [{"dense_blocks": "0"}, {"tau_profile": "0=0.8"}])
+def test_layer_tuning_requires_known_block_index(options):
+    with pytest.raises(ValueError, match="model-owned block index"):
+        SolAttnImpl(2, 128, 0.125, backend_kwargs={"sol_attn": options})
+    with pytest.raises(ValueError, match="model-owned block index"):
+        SolAttnImpl(2, 128, 0.125, prefix="blocks.5.attention", layer_count=5, backend_kwargs={"sol_attn": options})
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("min_tokens", [9, 10])
+def test_min_tokens_uses_unpadded_length_and_reports_actual_path(kernel, min_tokens, compiled):
+    torch.compiler.reset()
+    impl = make_impl(min_tokens=min_tokens, tau_profile="0-5=0.7")
+    query, key, value = tensors()
+    metadata = packed(used=9)
+    result = impl.resolve_execution_path(ExecutionContext(platform="cuda"), query, key, value, metadata)
+    assert result.path == ("dense_guard" if min_tokens > 9 else "sol_sparse")
+    forward = torch.compile(impl.forward_cuda, backend="aot_eager", fullgraph=True) if compiled else impl.forward_cuda
+    output = forward(query, key, value, metadata)
+    if min_tokens > 9:
+        torch.testing.assert_close(output[:, :9], dense(query[:, :9], key[:, :9], value[:, :9]))
+        assert not kernel
+    else:
+        assert torch.all(output[:, :9] == 37)
+        assert kernel[-1][3]["tau"] == 0.7
+    assert torch.count_nonzero(output[:, 9:]) == 0
+    torch.compiler.reset()
 
 
 @pytest.mark.parametrize(

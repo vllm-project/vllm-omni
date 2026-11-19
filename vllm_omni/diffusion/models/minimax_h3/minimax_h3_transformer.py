@@ -468,6 +468,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             role_category="self",
             skip_sequence_parallel=True,
             inherited_backend_overrides={"SOL_ATTN": AttentionSpec(backend="TORCH_SDPA")},
+            layer_count=arch.token_refiner_num_layers,
         )
         self.mlp = MiniMaxH3MLP(
             arch,

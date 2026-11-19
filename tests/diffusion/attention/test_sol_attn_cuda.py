@@ -28,6 +28,48 @@ if not torch.cuda.is_available():
 sol_attn = pytest.importorskip("sol_attn").sol_attn
 
 
+@hardware_test(res={"cuda": ["H100", "B200", "RTX5090"]}, num_cards=1)
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("guard", ["none", "dense_blocks", "min_tokens"])
+def test_real_sol_layer_tuning_and_short_sequence_guard(compiled, guard):
+    used = 257
+    settings: dict[str, str | int] = {"sink_mode": "prefix", "tau_profile": "0-4=1.5;-1=0.6"}
+    if guard == "dense_blocks":
+        settings["dense_blocks"] = "-1"
+    elif guard == "min_tokens":
+        settings["min_tokens"] = used + 1
+    impl = SolAttnImpl(2, 128, 0.125, prefix="blocks.4.attention", layer_count=5, backend_kwargs={"sol_attn": settings})
+    generator = torch.Generator(device="cuda").manual_seed(113)
+    query, key, value = (
+        torch.randn(1, used + 17, 2, 128, device="cuda", dtype=torch.bfloat16, generator=generator) for _ in range(3)
+    )
+    lengths = torch.tensor([0, used], dtype=torch.int32, device="cuda")
+    metadata = AttentionMetadata(packed_padding=PackedPaddingMetadata(used, used, lengths, lengths))
+    forward = torch.compile(impl.forward_cuda, fullgraph=True) if compiled else impl.forward_cuda
+    with torch.inference_mode():
+        actual = forward(query, key, value, metadata)
+        if guard == "none":
+            reference = sol_attn(
+                query[:, :used].contiguous(),
+                key[:, :used].contiguous(),
+                value[:, :used].contiguous(),
+                scale=0.125,
+                tau=0.6,
+                kv_splits=1,
+            )
+            torch.testing.assert_close(actual[:, :used], reference, rtol=0, atol=0)
+        else:
+            reference = torch.nn.functional.scaled_dot_product_attention(
+                query[:, :used].transpose(1, 2).float(),
+                key[:, :used].transpose(1, 2).float(),
+                value[:, :used].transpose(1, 2).float(),
+                scale=0.125,
+            ).transpose(1, 2)
+            torch.testing.assert_close(actual[:, :used].float(), reference, rtol=0.02, atol=0.02)
+    assert torch.count_nonzero(actual[:, used:]) == 0
+    torch.compiler.reset()
+
+
 @hardware_test(res={"cuda": ["L4", "H100", "B200", "RTX5090"]}, num_cards=1)
 @pytest.mark.parametrize("used,sink_tokens", [(63, 5), (64, 5), (257, 5), (4097, 951)])
 @pytest.mark.parametrize("compiled", [False, True])
