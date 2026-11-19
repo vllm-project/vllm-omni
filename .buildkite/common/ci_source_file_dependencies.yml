@@ -1685,6 +1685,8 @@ source_file_dependencies:
     - tests/diffusion/models/pi05/test_pi05_units.py
 
   diffusion_lingbot_function:
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
     - *lingbot_video
     - *lingbot_world
     - vllm_omni/diffusion/offloader/
