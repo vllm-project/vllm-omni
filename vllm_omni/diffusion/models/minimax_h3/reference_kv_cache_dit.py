@@ -13,6 +13,8 @@ from cache_dit.caching.cache_adapters.cache_adapter import CachedAdapter
 from cache_dit.caching.cache_blocks.pattern_3_4_5 import CachedBlocks_Pattern_3_4_5
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.kv_offload_config import REFERENCE_ISOLATION_STATE
+
 logger = init_logger(__name__)
 
 
@@ -95,6 +97,7 @@ class MiniMaxH3CachedBlocks(CachedBlocks_Pattern_3_4_5):
         phase_key = (
             ref(state),
             state.reference_epoch,
+            getattr(kwargs.get(REFERENCE_ISOLATION_STATE), "policy_version", None),
             bool(kwargs.get("reference_kv_compact", False)),
             tuple(hidden_states.shape),
             hidden_states.dtype,

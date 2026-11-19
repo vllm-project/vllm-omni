@@ -38,6 +38,27 @@ Cache methods trade minimal quality for significant speedup. Quality loss is typ
 MiniMax-H3 decode latency. It preserves the video encoder and audio VAE but
 can change generated pixels. Enable it with `additional_config.lightvae_decoder_path`.
 
+#### Experimental MiniMax-H3 Reference Isolation
+
+`--kv-isolate` changes MiniMax-H3's bidirectional attention: visual-reference
+queries read only visual-reference K/V, while other valid queries can read all
+valid K/V. A fixed reference condition timestep allows one reference-KV capture
+per denoising pass. Reuse uses pinned Host INT8 storage and asynchronous prefetch
+into a two-layer device ring.
+
+```bash
+vllm serve /path/to/MiniMax-H3 --omni --task-type ref2va --kv-isolate
+```
+
+| Configuration | Behavior |
+|---------------|----------|
+| Neither KV flag | Existing model path |
+| Only `--kv-offload-config` | Existing periodic reference-KV refresh policy |
+| Only `--kv-isolate` | Isolation, one-time capture, Host INT8 and asynchronous prefetch |
+| Both flags | Same as isolation alone; the entire offload configuration is ignored |
+
+This option defaults to off and does not use an environment-variable switch. **Isolation changes the learned model computation. It is not a lossless optimization.**
+
 #### Diffusion KV Prefix Caching
 
 [KV prefix caching](../design/feature/prefix_caching.md#diffusion-kv-prefix-caching)
