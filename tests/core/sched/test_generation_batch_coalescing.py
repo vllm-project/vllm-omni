@@ -6,6 +6,7 @@ import queue
 from types import SimpleNamespace
 
 import pytest
+import torch
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.request import RequestStatus
 
@@ -263,3 +264,18 @@ def test_deferred_schedule_keeps_pending_request_and_allocates_nothing(monkeypat
     assert list(s.waiting) == [request]
     assert request.num_computed_tokens == request.num_in_flight_tokens == 0
     assert s.chunk_transfer_adapter.restore_called
+
+
+def test_continuation_playback_horizon_bounds_coalescing_deadline(monkeypatch):
+    events = [notification("0"), notification("1")]
+    s, clock = scheduler(monkeypatch, events[:1], [(0.009, events[1])])
+    # Stream "0" emits 5 ms of audio (< 12 ms max_wait), so deadline is shortened to +5 ms.
+    s._record_stream_audio("0", {"model_outputs": torch.zeros(120), "sr": 24000})
+    assert s._drain_omni_connector_outputs() == events[:1]
+    assert clock[0] == pytest.approx(10.005)
+    assert s._omni_connector_output_inbox.waits == pytest.approx([0.005])
+    # Once slack is exhausted (10.005 <= now), it dispatches immediately without waiting.
+    s._omni_connector_output_inbox.waits.clear()
+    s._omni_connector_output_inbox.initial.append(notification("0"))
+    assert len(s._drain_omni_connector_outputs()) == 1
+    assert not s._omni_connector_output_inbox.waits
