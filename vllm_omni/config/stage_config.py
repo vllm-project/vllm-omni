@@ -405,6 +405,9 @@ class StagePipelineConfig:
     sync_process_input_func: str | None = None
     supports_native_mrv2_data_plane: bool = False
     supports_duplex_mrv2: bool = False
+    # Rejects ``model_runner: v1`` for this stage: its input bridge relies on
+    # MRv2-only handling (e.g. MiniCPM-o's turn-chunked Talker conditions).
+    requires_mrv2: bool = False
     # Rewrites the Stage-0 view of a raw prompt before vLLM input processing.
     # The callable receives ``(prompt, sampling_params_list)``; downstream
     # stages continue to receive the original prompt. It also runs on
@@ -1332,7 +1335,12 @@ def validate_native_mrv2_session(deploy: DeployConfig, ps: StagePipelineConfig, 
     Streaming-session prompt replacement exists only in the V1 chunk adapter,
     so a stage that receives from an upstream stage on MRv2 supports
     turn-based sessions only unless it explicitly declares supports_duplex_mrv2.
+    A stage that declares requires_mrv2 is rejected on any other runner.
     """
+    if ps.requires_mrv2 and stage_runner != "v2":
+        raise ValueError(
+            f"stage {ps.stage_id}: this pipeline needs model_runner v2 for this stage, got {stage_runner!r}."
+        )
     if stage_runner != "v2" or not ps.supports_native_mrv2_data_plane or not ps.input_sources:
         return
     if deploy.session_mode == "duplex" and ps.supports_duplex_mrv2:

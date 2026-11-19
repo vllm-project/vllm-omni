@@ -2865,6 +2865,16 @@ def test_mrv2_duplex_session_validation():
         validate_native_mrv2_session(deploy_duplex, ps_no_duplex, "v2")
 
 
+def test_stage_requiring_mrv2_rejects_model_runner_v1():
+    from vllm_omni.config.stage_config import validate_native_mrv2_session
+
+    ps = StagePipelineConfig(stage_id=1, model_stage="tts", input_sources=(0,), requires_mrv2=True)
+    validate_native_mrv2_session(DeployConfig(session_mode="turn"), ps, "v2")
+    with pytest.raises(ValueError, match="stage 1: this pipeline needs model_runner v2"):
+        validate_native_mrv2_session(DeployConfig(session_mode="turn"), ps, "v1")
+    validate_native_mrv2_session(DeployConfig(session_mode="turn"), replace(ps, requires_mrv2=False), "v1")
+
+
 @pytest.mark.parametrize("execution_type", list(StageExecutionType))
 @pytest.mark.parametrize("mode", ["allow", "fail"])
 def test_recompute_preemption_projection_is_ar_only(execution_type, mode):

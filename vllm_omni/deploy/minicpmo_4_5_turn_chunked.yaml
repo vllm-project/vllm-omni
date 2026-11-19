@@ -5,7 +5,9 @@
 # block's EOS and finishes after the last block. Audio differs from
 # minicpmo_4_5_turn.yaml, which conditions on the whole reply at once.
 # Non-streaming requests still hand over the whole reply when it finishes,
-# but take the stage-1 min_tokens below too.
+# but take the stage-1 min_tokens below too, and so do replies without a
+# <|tts_bos|> (chat_template_kwargs.use_tts_template). The Talker needs
+# model_runner v2 (the CUDA and NPU default); V1 is rejected at startup.
 base_config: minicpmo_4_5_turn.yaml
 pipeline: minicpmo_4_5_turn_chunked
 
