@@ -86,6 +86,10 @@ class DiffusionModelTestOpts(NamedTuple):
     # Keep this False for models whose runtime path is not yet qualified on ROCm.
     rocm_multigpu: bool = True
 
+    # Whether one-card groups should receive native ROCm hardware marks.
+    # Keep this False when the one-card path is unqualified on MI325.
+    rocm_base: bool = True
+
     # When True (default), online tests only run the base case (no accelerations).
     # When False, online tests run all test_groups, same as offline. This should be
     # True unless there is a good reason for it not to be, because the execution of

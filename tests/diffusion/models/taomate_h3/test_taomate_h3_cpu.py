@@ -952,8 +952,8 @@ def test_teacher_warm_shapes_cover_the_request_cycle(monkeypatch) -> None:
     """Session-start warming runs one forward per distinct teacher document shape (three)."""
     from types import SimpleNamespace
 
+    from vllm_omni.diffusion.cuda_graph import kwargs_signature
     from vllm_omni.diffusion.models.taomate_h3.audio_teacher import TaoMateAudioTeacher
-    from vllm_omni.diffusion.models.taomate_h3.cuda_graph import kwargs_signature
     from vllm_omni.diffusion.models.taomate_h3.geometry import CanvasGeometry
 
     teacher = TaoMateAudioTeacher(SimpleNamespace(), manager=None, device=torch.device("cpu"))

@@ -129,6 +129,18 @@ steps:
         "
     mirror_hardwares: l4_1
 
+  - label: "CUDA IPC Weight Sharing · 2-GPU"
+    depends_on: upload-ready-pipeline
+    timeout_in_minutes: 15
+    source_file_dependencies:
+      - "vllm_omni/distributed/weight_sharing/"
+      - "tests/distributed/weight_sharing/"
+      - "tests/helpers/mark.py"
+      - ".buildkite/cuda/test-ready.yml"
+    commands:
+      - pytest -sv tests/distributed/weight_sharing/test_cuda_ipc_pairing.py -m 'core_model and cuda and L4 and cards_2' --run-level 'core_model'
+    mirror_hardwares: l4_2
+
   - label: "Entrypoints Test"
     depends_on: upload-ready-pipeline
     # Workaround https://github.com/vllm-project/vllm-omni/issues/8016: shutdown()
@@ -242,16 +254,6 @@ steps:
             timeout 40m bash -c "
               export VLLM_IMAGE_FETCH_TIMEOUT=60
               pytest -s -v tests/e2e/online_serving/test_wan22_t2v.py -m 'core_model and cuda' --run-level 'core_model'
-            "
-        mirror_hardwares: h100_1
-
-      - label: "Diffusion · Cosmos3 Test"
-        source_file_dependencies: diffusion_cosmos3_function
-        commands:
-          - |
-            timeout 40m bash -c "
-              export VLLM_IMAGE_FETCH_TIMEOUT=60
-              pytest -s -v tests/e2e/online_serving/test_cosmos3.py -m 'core_model' --run-level 'core_model'
             "
         mirror_hardwares: h100_1
 

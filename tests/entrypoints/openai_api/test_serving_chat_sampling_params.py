@@ -18,6 +18,7 @@ from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import SamplingParams
 
 from tests.helpers.serving_chat import build_serving_chat
+from vllm_omni.entrypoints.openai.stage_params import to_sampling_params_list
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -648,14 +649,14 @@ def test_to_sampling_params_list_pads_missing_tail_stage_with_defaults(mocker: M
     engine_client = mocker.MagicMock()
     engine_client.stage_configs = [SimpleNamespace(stage_type="llm") for _ in range(4)]
     engine_client.default_sampling_params_list = default_params
-    instance = build_serving_chat(engine_client=engine_client)
 
-    result = instance._to_sampling_params_list(
+    result = to_sampling_params_list(
+        engine_client,
         [
             {"max_tokens": 1},
             {"max_tokens": 2},
             {"max_tokens": 3},
-        ]
+        ],
     )
 
     assert len(result) == 4
@@ -812,7 +813,11 @@ def test_partial_stage_params_inherit_request_and_deploy_defaults(mock_engine_cl
     defaults[0].extra_args = {"deploy_option": True}
     request = ChatCompletionRequest(model="test", messages=[], temperature=0, **{token_field: 256})
 
-    result = instance._to_sampling_params_list([{"extra_args": {"no_repeat_ngram_size": 10}}], request=request)
+    result = to_sampling_params_list(
+        mock_engine_client,
+        [{"extra_args": {"no_repeat_ngram_size": 10}}],
+        request_overrides=instance._request_sampling_overrides(request),
+    )
 
     assert result[0].max_tokens == 256
     assert result[0].temperature == 0
@@ -826,20 +831,22 @@ def test_partial_stage_params_inherit_request_and_deploy_defaults(mock_engine_cl
 def test_explicit_stage_params_override_top_level_request(mock_engine_client):
     instance = build_serving_chat(engine_client=mock_engine_client)
     request = ChatCompletionRequest(model="test", messages=[], max_tokens=256, temperature=0)
-    result = instance._to_sampling_params_list([{"max_tokens": 64, "temperature": 0.7}], request=request)
+    result = to_sampling_params_list(
+        mock_engine_client,
+        [{"max_tokens": 64, "temperature": 0.7}],
+        request_overrides=instance._request_sampling_overrides(request),
+    )
     assert result[0].max_tokens == 64
     assert result[0].temperature == 0.7
 
 
 def test_partial_stage_params_validate_max_tokens(mock_engine_client):
-    instance = build_serving_chat(engine_client=mock_engine_client)
     with pytest.raises(VLLMValidationError):
-        instance._to_sampling_params_list([{"max_tokens": 0}])
+        to_sampling_params_list(mock_engine_client, [{"max_tokens": 0}])
 
 
 def test_partial_stage_params_without_request_preserve_yaml_defaults(mock_engine_client):
-    instance = build_serving_chat(engine_client=mock_engine_client)
-    result = instance._to_sampling_params_list([{"extra_args": {"no_repeat_ngram_size": 10}}])
+    result = to_sampling_params_list(mock_engine_client, [{"extra_args": {"no_repeat_ngram_size": 10}}])
     assert result[0].max_tokens == 4353
     assert result[0].temperature == 0.4
 
@@ -867,8 +874,7 @@ def _set_raw_sampling_defaults(engine, values, layout="typed"):
 def test_partial_stage_params_recompute_prompt_logprobs_cache_policy(mock_engine_client, layout, prompt_logprobs):
     defaults = {"prompt_logprobs": 1 if prompt_logprobs is None else None}
     _set_raw_sampling_defaults(mock_engine_client, defaults, layout)
-    instance = build_serving_chat(engine_client=mock_engine_client)
-    result = instance._to_sampling_params_list([{"prompt_logprobs": prompt_logprobs}])
+    result = to_sampling_params_list(mock_engine_client, [{"prompt_logprobs": prompt_logprobs}])
     assert result[0].skip_reading_prefix_cache is (prompt_logprobs is not None)
     assert mock_engine_client.default_sampling_params_list[0].prompt_logprobs == defaults["prompt_logprobs"]
 
@@ -887,8 +893,7 @@ def test_partial_stage_params_preserve_explicit_cache_policy(
 ):
     defaults = {"skip_reading_prefix_cache": deploy_policy, "extra_args": {"deploy": True}}
     _set_raw_sampling_defaults(mock_engine_client, defaults)
-    instance = build_serving_chat(engine_client=mock_engine_client)
-    result = instance._to_sampling_params_list([stage_overrides])
+    result = to_sampling_params_list(mock_engine_client, [stage_overrides])
     assert result[0].skip_reading_prefix_cache is expected
     result[0].extra_args["request_only"] = True
     assert defaults == {"skip_reading_prefix_cache": deploy_policy, "extra_args": {"deploy": True}}
@@ -899,7 +904,9 @@ def test_partial_stage_params_preserve_explicit_cache_policy(
 def test_empty_stage_params_inherit_explicit_request(mock_engine_client, partial):
     instance = build_serving_chat(engine_client=mock_engine_client)
     request = ChatCompletionRequest(model="test", messages=[], max_tokens=256, temperature=0)
-    result = instance._to_sampling_params_list(partial, request=request)
+    result = to_sampling_params_list(
+        mock_engine_client, partial, request_overrides=instance._request_sampling_overrides(request)
+    )
     assert result[0].max_tokens == 256
     assert result[0].temperature == 0
     assert result[1].max_tokens == 4096
@@ -910,7 +917,9 @@ def test_omitted_comprehension_stage_inherits_explicit_request(mock_engine_clien
     mock_engine_client.default_sampling_params_list.reverse()
     instance = build_serving_chat(engine_client=mock_engine_client)
     request = ChatCompletionRequest(model="test", messages=[], max_tokens=256)
-    result = instance._to_sampling_params_list([{}], request=request)
+    result = to_sampling_params_list(
+        mock_engine_client, [{}], request_overrides=instance._request_sampling_overrides(request)
+    )
     assert result[0].max_tokens == 4096
     assert result[1].max_tokens == 256
 
@@ -921,7 +930,9 @@ def test_request_sampling_preserves_raw_deploy_filters(mock_engine_client, with_
     instance = build_serving_chat(engine_client=mock_engine_client)
     request = ChatCompletionRequest(model="test", messages=[], temperature=0.7)
     result = (
-        instance._to_sampling_params_list([{}], request=request)
+        to_sampling_params_list(
+            mock_engine_client, [{}], request_overrides=instance._request_sampling_overrides(request)
+        )
         if with_stage_params
         else instance._build_sampling_params_list_from_request(request)
     )
@@ -939,13 +950,17 @@ def test_stage_sampling_preserves_diffusion_and_constructed_params(mock_engine_c
     instance = build_serving_chat(engine_client=mock_engine_client)
     explicit = SamplingParams(max_tokens=64)
     request = ChatCompletionRequest(model="test", messages=[], max_tokens=256, seed=99)
-    result = instance._to_sampling_params_list([explicit, {"height": 512}], request=request)
+    result = to_sampling_params_list(
+        mock_engine_client, [explicit, {"height": 512}], request_overrides=instance._request_sampling_overrides(request)
+    )
     assert result[0] is explicit
     assert result[0].max_tokens == 64
     assert result[1].height == 512
     assert result[1].width == OmniDiffusionSamplingParams().width
     assert result[1].seed == OmniDiffusionSamplingParams().seed
-    omitted = instance._to_sampling_params_list([explicit], request=request)
+    omitted = to_sampling_params_list(
+        mock_engine_client, [explicit], request_overrides=instance._request_sampling_overrides(request)
+    )
     assert omitted[1] is not default
     assert omitted[1].height == 1024
     assert omitted[1].num_inference_steps == 9
@@ -961,7 +976,9 @@ def test_omitted_pooling_stage_keeps_parameter_type(mock_engine_client):
     mock_engine_client.default_sampling_params_list[1] = default
     instance = build_serving_chat(engine_client=mock_engine_client)
     request = ChatCompletionRequest(model="test", messages=[], max_tokens=256)
-    result = instance._to_sampling_params_list([{}], request=request)
+    result = to_sampling_params_list(
+        mock_engine_client, [{}], request_overrides=instance._request_sampling_overrides(request)
+    )
     assert isinstance(result[1], PoolingParams)
     assert result[1] is not default
     assert result[1].task == "token_classify"

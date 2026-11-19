@@ -88,8 +88,10 @@ Canonical layout (prefer these paths for new changes):
 
     On scheduled release-line builds (`main` or non-PR `release/vX.Y.Z`), `test-weekly.yml` is uploaded when **`WEEKLY=1` or `NON_CRITICAL=1`**. Inside that file:
 
-    - **Reliability** / **Perf Test** / **Simple · CPU Coverage Test** → `WEEKLY=1` (or PR label `weekly-test` for Reliability/Perf). Pipeline upload for scheduled env vars still requires a release line: `main` or a branch named `release/vX.Y.Z` (for example `release/v0.30.0`).
+    - **Reliability** / **Perf Test** → `WEEKLY=1` (or PR label `weekly-test`). Pipeline upload for scheduled env vars still requires a release line: `main` or a branch named `release/vX.Y.Z` (for example `release/v0.30.0`).
     - **E2E Tests** group (slow Omni/TTS/Diffusion sweeps) → `NON_CRITICAL=1`
+
+    **Simple · CPU Coverage Test** is in `test-nightly.yml` and runs when `NIGHTLY=1`.
 
     **`--e2e`:** when uploading ready/merge on a release line (`main` or `release/vX.Y.Z`) with **`WEEKLY=1`**, bootstrap passes `--e2e` so only the **E2E Test** group is kept (same flag `run_cov_split.sh` uses to enable per-model coverage).
 
@@ -329,8 +331,8 @@ CUDA **L2** (`.buildkite/cuda/test-ready.yml`), **L3** (`.buildkite/cuda/test-me
 
 ### Policy
 
-- **Always uploaded** (no key): L2/L3 groups outside **E2E Test**—Simple Test, Diffusion unit tests, Engine/Model Executor, Distributed, Custom Pipeline, Entrypoints (L2), LoRA / Entrypoints (L3).
-- **Diff-gated**: every **E2E Test** leaf job in L2/L3, L4 nightly leaf jobs (CUDA and NPU), and L5 weekly jobs whose `if` includes the `weekly-test` label (Reliability / Perf). Jobs gated only by `WEEKLY=1` or `NON_CRITICAL=1` have no `source_file_dependencies`. Registry layout: YAML anchors are model business code only (`vllm_omni/model_executor/models/`, `vllm_omni/diffusion/models/`, plus `stage_input_processors/` and `vllm_omni/deploy/*.yaml` when applicable). Job keys alias the anchor and **also** list the scripts that job runs (pytest files, `run_cov_split.sh --offline` / `--online` targets, example README runners). Feature keys stay cross-cutting. A **group** may define the key instead; the whole group drops if no prefix matches.
+- **Always uploaded** (no key): L2 **Simple Test**, plus L2/L3 groups outside **E2E Test** (Diffusion unit tests, Engine/Model Executor, Distributed, Custom Pipeline, Entrypoints on L2, LoRA / Entrypoints on L3).
+- **Diff-gated**: every **E2E Test** leaf job in L2/L3, L4 nightly leaf jobs (CUDA and NPU), and L5 weekly jobs whose `if` includes the `weekly-test` label (Reliability / Perf). Jobs gated only by `WEEKLY=1`, `NON_CRITICAL=1`, or the nightly **Simple · CPU Coverage Test** (`NIGHTLY=1`) have no `source_file_dependencies`. Registry layout: YAML anchors are model business code only (`vllm_omni/model_executor/models/`, `vllm_omni/diffusion/models/`, plus `stage_input_processors/` and `vllm_omni/deploy/*.yaml` when applicable). Job keys alias the anchor and **also** list the scripts that job runs (pytest files, `run_cov_split.sh --offline` / `--online` targets, example README runners). Feature keys stay cross-cutting. A **group** may define the key instead; the whole group drops if no prefix matches.
 
 ### YAML examples
 
@@ -374,7 +376,7 @@ Test". Coverage + artifact upload run only when bootstrap uploaded that job with
 the same job runs plain pytest without `--cov`. It runs on a single GPU so the
 pilot is cheap to reproduce.
 
-**L1 package coverage (CPU):** ready/merge Simple Test jobs run without `--cov`. Scheduled weekly on a release line (`main` or `release/vX.Y.Z`) with `WEEKLY=1` runs **Simple · CPU Coverage Test** in `.buildkite/cuda/test-weekly.yml` (`pytest -m 'core_model and cpu'` + Cobertura XML artifact).
+**L1 package coverage (CPU):** ready Simple Test jobs run without `--cov`. Scheduled nightly on a release line (`main` or `release/vX.Y.Z`) with `NIGHTLY=1` runs **Simple · CPU Coverage Test** in `.buildkite/cuda/test-nightly.yml` (`pytest -m 'core_model and cpu'` + Cobertura XML artifact).
 
 **Naming convention**: `coverage-<model_id>-<mode>-<step_id>.xml.gz`, where
 `<model_id>` is the model's directory name under

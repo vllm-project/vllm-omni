@@ -736,7 +736,11 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 # pooling_output. Preserve the payload, then clear the field so
                 # upstream still runs the normal detokenization path.
                 if eco.pooling_output is not None and req_state.detokenizer is not None:
-                    req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
+                    # MRV2 can expose the same AR payload through both fields.
+                    # The explicit multimodal field is authoritative; pooling
+                    # is only its compatibility carrier, not a second chunk.
+                    if mm_output is None:
+                        req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
                     eco.pooling_output = None
 
             # Native pooling cache-miss errors carry no tensor. Upstream

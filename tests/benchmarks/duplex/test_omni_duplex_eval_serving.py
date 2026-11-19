@@ -304,7 +304,8 @@ def test_evaluation_reports_incomplete_coverage(tmp_path, prepared, monkeypatch,
         calls += 1
         if failure == "judge" and calls == 1:
             raise ConnectionError("judge unavailable")
-        if failure == "invalid_judge" and calls == 1:
+        if failure == "invalid_judge" and calls <= 2:
+            # 1: the original ask, 2: the format-correction retry; both invalid.
             return '{"success_score": "bad"}'
         return '{"success_score": 1}'
 

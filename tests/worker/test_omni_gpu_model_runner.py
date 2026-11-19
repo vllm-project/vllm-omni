@@ -433,6 +433,49 @@ def test_model_forward_passes_request_ids_to_decode_metadata(monkeypatch):
     assert received["req_ids"] == ["request-a", "request-b"]
 
 
+def test_model_forward_passes_runtime_additional_information_to_decode_metadata(monkeypatch):
+    received = {}
+    model = SimpleNamespace(
+        supports_omni_decode_step_metadata=True,
+        update_decode_step_metadata=lambda **kwargs: received.update(kwargs),
+    )
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = model
+    runner.input_batch = DummyInputBatch(["request-a"])
+    runtime = [{"generated_len": 64, "omni_task": ["t2i"]}]
+    runner._build_model_kwargs_extra = lambda: {
+        "runtime_additional_information": runtime,
+        "model_intermediate_buffer": runtime,
+    }
+    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *_args, **_kwargs: torch.zeros(1))
+
+    OmniGPUModelRunner._model_forward(runner, input_ids=torch.ones(1, dtype=torch.long))
+
+    assert received["runtime_additional_information"] is runtime
+    assert received["model_intermediate_buffer"] is runtime
+
+
+def test_model_forward_clears_decode_metadata_when_runtime_info_absent(monkeypatch):
+    """FULL-replay steps with no runtime payload must clear, not skip, the cache."""
+    received = {}
+    model = SimpleNamespace(
+        supports_omni_decode_step_metadata=True,
+        update_decode_step_metadata=lambda **kwargs: received.update(kwargs),
+    )
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = model
+    runner.input_batch = DummyInputBatch(["request-a"])
+    runner._build_model_kwargs_extra = lambda: {}
+    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *_args, **_kwargs: torch.zeros(1))
+
+    OmniGPUModelRunner._model_forward(runner, input_ids=torch.ones(1, dtype=torch.long))
+
+    assert "runtime_additional_information" in received
+    assert received["runtime_additional_information"] is None
+    assert "model_intermediate_buffer" in received
+    assert received["model_intermediate_buffer"] is None
+
+
 class MiMoAudioForConditionalGeneration(torch.nn.Module):
     """Dummy model whose class name must exactly match the production check."""
 

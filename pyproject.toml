@@ -34,6 +34,12 @@ classifiers = [
 
 [project.optional-dependencies]
 
+tracing = [
+    "opentelemetry-sdk>=1.28.0",
+    "opentelemetry-exporter-otlp>=1.28.0",
+    "opentelemetry-instrumentation-fastapi>=0.49b0",
+]
+
 ming-tn = [
     "pynini",
     "inflect",
@@ -44,6 +50,8 @@ watermarking = [
 ]
 
 dev = [
+    "opentelemetry-sdk>=1.28.0",
+    "opentelemetry-instrumentation-fastapi>=0.49b0",
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
     "pytest-cov==7.1.0",
@@ -107,6 +115,12 @@ indextts2 = [
     "unidic-lite>=1.0.0",
     "wetext>=0.0.9; sys_platform != 'linux'",
     "WeTextProcessing; sys_platform == 'linux'",
+]
+
+# Kokoro-82M grapheme-to-phoneme frontend (English + espeak-ng languages).
+# Japanese / Mandarin voices additionally need misaki[ja] / misaki[zh].
+kokoro = [
+    "misaki[en]>=0.9.4",
 ]
 
 # Local-test-only extras

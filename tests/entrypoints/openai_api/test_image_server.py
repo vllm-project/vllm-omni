@@ -794,6 +794,64 @@ def test_multistage_images_async_omni_construction(async_omni_test_client):
     assert captured[1].guidance_scale == 6.5
 
 
+def test_multistage_generate_forwards_layers(async_omni_test_client):
+    """Regression: multi-stage /v1/images/generations must forward ``layers``.
+
+    The multi-stage generations path builds ``extra_body`` by hand and used to
+    drop the requested layer count, so layered models kept their default layer
+    count. The single-stage generations path and the multi-stage edits path
+    both forward it.
+    """
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat",
+            "layers": 7,
+        },
+    )
+    assert response.status_code == 200
+
+    engine = async_omni_test_client.app.state.engine_client
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+    assert captured[1].layers == 7
+
+
+def test_multistage_generate_without_layers_keeps_default(async_omni_test_client):
+    """Omitting ``layers`` must leave the stage default layer count untouched."""
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a cat"},
+    )
+    assert response.status_code == 200
+
+    engine = async_omni_test_client.app.state.engine_client
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+    assert captured[1].layers == OmniDiffusionSamplingParams().layers
+
+
+def test_single_stage_generate_forwards_layers(test_client, mock_async_diffusion):
+    """The single-stage path also has to carry the requested layer count.
+
+    Sibling of ``test_multistage_generate_forwards_layers``: the two
+    ``/v1/images/generations`` branches build their sampling params
+    differently, so each one needs its own guard.
+    """
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat",
+            "layers": 7,
+        },
+    )
+    assert response.status_code == 200
+
+    captured = mock_async_diffusion.captured_sampling_params_list
+    assert captured is not None
+    assert captured[0].layers == 7
+
+
 def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
     """GLM-Image multistage: stage-0 gets target_h/w from requested size.
 

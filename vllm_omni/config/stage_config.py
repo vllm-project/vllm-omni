@@ -740,8 +740,14 @@ class DuplexSessionRuntimeConfig:
     # compile their real shapes. The empty per-stage JIT registry does not.
     # A negative value disables every startup warmup.
     warmup_frames: int = 0
+    # Record per-turn stage work and emitted audio and answer the client's
+    # ``session.stats.get`` (RFC #8325). Off: nothing is recorded or attached.
+    # Single-host only: stage and API timestamps share one CLOCK_MONOTONIC.
+    collect_stats: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.collect_stats, bool):
+            raise ValueError("duplex_session.collect_stats must be a boolean")
         if self.replica_policy not in ("legacy", "least_sessions"):
             raise ValueError("duplex_session.replica_policy must be 'legacy' or 'least_sessions'")
         if self.max_sessions_per_replica is not None and (

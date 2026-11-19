@@ -511,6 +511,10 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch,
     sock = FakeServerSocket()
 
     class FakeEngine:
+        from vllm_omni.engine.omni_engine_base import OmniEngineBase
+
+        engine = object.__new__(OmniEngineBase)
+        engine.tracer_provider = None
         stage_configs = []
 
         def get_diffusion_od_config(self):
@@ -1512,6 +1516,28 @@ def test_h3_latent_edit_uploads_reach_generation_and_are_cleaned(endpoint, test_
     )
     assert not Path(multi_modal_data["source_video"]).exists()
     assert not Path(multi_modal_data["source_audio"]).exists()
+
+
+def test_h3_regenerate_forwards_a_maskless_draft(test_client, mocker: MockerFixture):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "A red fox in fresh snow.", "extra_params": json.dumps({"regenerate": True})},
+        files=[("source_video", ("draft.mp4", b"draft-video", "video/mp4"))],
+    )
+
+    assert response.status_code == 200
+    multi_modal_data = engine.captured_prompt["multi_modal_data"]
+    assert engine.captured_latent_edit_source_bytes == {"source_video": b"draft-video"}
+    assert "video_noise_mask" not in multi_modal_data and "audio_noise_mask" not in multi_modal_data
+    # A 2K regenerate is never continued, so its job is not tagged for the latent cache.
+    assert "latent_cache_key" not in engine.captured_sampling_params_list[0].extra_args
 
 
 def test_latent_edit_fields_are_rejected_for_models_without_capability(test_client):
@@ -3849,6 +3875,69 @@ def test_worker_fps_multiplier_is_applied_to_sync_encoding(test_client, mocker: 
     assert response.status_code == 200
     assert response.content == b"fps-multiplied"
     assert fps_values == [16]
+
+
+def test_h3_latent_continuation_chains_completed_jobs(test_client, mocker: MockerFixture):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    first = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "A lighthouse at dusk.",
+            # A client cannot pick the cache key; the server tags the job id.
+            "extra_params": json.dumps({"task": "t2va", "aspect_ratio": "16:9", "latent_cache_key": "spoofed"}),
+        },
+    )
+    assert first.status_code == 200
+    source_id = first.json()["id"]
+    _wait_for_status(test_client, source_id, VideoGenerationStatus.COMPLETED.value)
+    assert engine.captured_sampling_params_list[0].extra_args["latent_cache_key"] == source_id
+
+    second = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "The beam sweeps across the waves.",
+            "extra_params": json.dumps({"continue_from": source_id, "continue_overlap_frames": 22}),
+        },
+    )
+    assert second.status_code == 200
+    assert second.json()["remixed_from_video_id"] == source_id
+    continued_id = second.json()["id"]
+    _wait_for_status(test_client, continued_id, VideoGenerationStatus.COMPLETED.value)
+    extra_args = engine.captured_sampling_params_list[0].extra_args
+    assert extra_args["continue_from"] == source_id
+    assert extra_args["latent_cache_key"] == continued_id
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize(
+    "model_class_name,continue_from,detail",
+    [
+        ("MiniMaxH3Pipeline", "video_gen_missing", "unknown or has not completed"),
+        ("MiniMaxH3Pipeline", 7, "must be a video id"),
+        ("WanPipeline", "video_gen_missing", "not supported by this model"),
+    ],
+)
+def test_latent_continuation_rejects_invalid_sources(
+    endpoint, model_class_name, continue_from, detail, test_client, mocker: MockerFixture
+):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = model_class_name
+    response = test_client.post(
+        endpoint,
+        data={"prompt": "Continue.", "extra_params": json.dumps({"continue_from": continue_from})},
+    )
+    assert response.status_code == 400
+    assert detail in response.text
+    assert engine.captured_prompt is None
 
 
 @pytest.mark.parametrize(

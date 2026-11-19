@@ -278,6 +278,13 @@ _DIFFUSION_MODELS = {
         "pipeline_sam3",
         "Sam3Pipeline",
     ),
+    # The released Video Depth Anything repositories hold one .pth and no config;
+    # ``resolve_native_diffusion_model_class`` recognizes them by checkpoint name.
+    "VideoDepthAnythingPipeline": (
+        "video_depth_anything",
+        "pipeline_video_depth_anything",
+        "VideoDepthAnythingPipeline",
+    ),
     "LongCatImageEditPipeline": (
         "longcat_image",
         "pipeline_longcat_image_edit",

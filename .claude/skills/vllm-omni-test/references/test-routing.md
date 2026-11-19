@@ -37,7 +37,7 @@ Every model-centric e2e test must declare **exactly one** type marker:
 | **Diffusion X2I(&A&T) Model Test** | x2**i** / x2**a** / x2**t** — image, audio, text (non-video) | Qwen-Image*, BAGEL, FLUX, SD3, Z-Image, LongCat, DreamZero |
 | **Diffusion X2V Model Test** | x2**v** — video only | Wan2.2, HunyuanVideo 1.5, Wan VACE |
 
-PR label for L4 on a branch: `nightly-test` (jobs then filtered by `source_file_dependencies`). Scheduled `main` uses `NIGHTLY=1` and runs every nightly job. L5 Reliability / Perf use `weekly-test` with the same path filter; CPU coverage and the weekly E2E group are env-only (`WEEKLY=1` / `NON_CRITICAL=1`) and are not source-filtered.
+PR label for L4 on a branch: `nightly-test` (jobs then filtered by `source_file_dependencies`). Scheduled `main` uses `NIGHTLY=1` and runs every nightly job, including **Simple · CPU Coverage Test** (`NIGHTLY=1` only, no `source_file_dependencies`). L5 Reliability / Perf use `weekly-test` with the same path filter; the weekly E2E group is env-only (`NON_CRITICAL=1`) and is not source-filtered.
 
 ## Level and Marker Mapping
 
@@ -47,7 +47,7 @@ PR label for L4 on a branch: `nightly-test` (jobs then filtered by `source_file_
 
 ### L1 unit tests — mocking (`mocker`, not `unittest.mock`)
 
-L1 modules run in **Simple Test** (`test-ready.yml` / `test-merge.yml`: `-m 'core_model and cpu'`). When isolation requires doubles:
+L1 modules run in **Simple Test** (`test-ready.yml`: `-m 'core_model and cpu'`). When isolation requires doubles:
 
 - **Use** the **`mocker`** fixture (`pytest-mock`): `mocker.patch`, `mocker.spy`, `mocker.Mock`, `mocker.MagicMock`, `mocker.AsyncMock`.
 - **Use** **`monkeypatch`** for env vars and simple `setattr` / `delattr` without mock objects.

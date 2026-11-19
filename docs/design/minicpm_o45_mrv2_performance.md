@@ -88,6 +88,32 @@ continues producing its existing lists. Each decode owns its storage, and the
 packed snapshot cannot be changed by later producer mutations. Transport
 microbenchmarks alone do not establish service throughput or speech quality.
 
+## Thinker speculative decoding
+
+The MRv2 Thinker accepts a stage-0 `speculative_config` whose drafter reads
+Thinker layers (EAGLE-3, DFlash or DSpark). The MRv2 AR runner proposes drafts
+after sampling and verifies them with the rejection sampler. Only the rows of
+accepted tokens reach `llm2tts`, so the Talker still receives one Thinker row
+per committed token. Example overlay:
+
+```yaml
+base_config: minicpmo_4_5_turn_mrv2.yaml
+stages:
+  - stage_id: 0
+    speculative_config:
+      method: dspark
+      model: <DSpark draft trained on the MiniCPM-o 4.5 Thinker>
+      num_speculative_tokens: 7
+```
+
+vLLM 0.32 resolves a draft config with `architectures: ["DSparkDraftModel"]`
+and `model_type: qwen3` to `Qwen3DSparkModel`. Drafters that read Thinker
+layers require the Thinker on MRv2; the V1 Thinker rejects them at load.
+Validation covers CUDA turn sessions with greedy text and speech output.
+Duplex sessions keep their own sampler and are not covered, and platforms
+whose profiles fall back to V1 (NPU, XPU, ROCm, MUSA) do not run this path.
+Greedy text can differ from decoding without drafts at near-tied tokens.
+
 ## Code2Wav batching across reference audio
 
 With CUDA ragged Whole-Euler enabled, ready requests with different reference

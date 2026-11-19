@@ -170,15 +170,17 @@ def _make_loader_with_weights(weight_names: list[str]) -> DiffusersPipelineLoade
     return loader
 
 
-def test_serialized_torchao_component_uses_pytorch_iterator(mocker):
-    torchao_config = SimpleNamespace(
-        get_name=lambda: "torchao",
-        is_checkpoint_torchao_serialized=True,
-    )
+@pytest.mark.parametrize(
+    ("torchao_serialized", "suffix"),
+    [(True, ".bin"), (False, ".pth")],  # torchao checkpoints, and plain state dicts such as Video Depth Anything's
+)
+def test_pytorch_checkpoints_use_pytorch_iterator(mocker, torchao_serialized, suffix):
     loader = _make_loader_with_weights([])
-    loader.quant_config = ComponentQuantizationConfig({"transformer": torchao_config})
+    if torchao_serialized:
+        torchao_config = SimpleNamespace(get_name=lambda: "torchao", is_checkpoint_torchao_serialized=True)
+        loader.quant_config = ComponentQuantizationConfig({"transformer": torchao_config})
     loader.load_config.pt_load_map_location = "cpu"
-    files = ["/weights/model-10.bin", "/weights/model-2.bin"]
+    files = [f"/weights/model-10{suffix}", f"/weights/model-2{suffix}"]
     mocker.patch.object(loader, "_prepare_weights", return_value=("/weights", files, False))
     pt_iterator = mocker.patch.object(
         loader_module,
@@ -197,7 +199,7 @@ def test_serialized_torchao_component_uses_pytorch_iterator(mocker):
     weights = list(loader._get_weights_iterator(source))
 
     pt_iterator.assert_called_once_with(
-        ["/weights/model-2.bin", "/weights/model-10.bin"],
+        [f"/weights/model-2{suffix}", f"/weights/model-10{suffix}"],
         loader.load_config.use_tqdm_on_load,
         "cpu",
     )

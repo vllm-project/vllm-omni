@@ -102,6 +102,9 @@ class DuplexOutputContext:
     segment_finished: bool
     segment_token_ids: tuple[int, ...] = ()
     segment_output_metadata: Mapping[str, object] = field(default_factory=dict)
+    # Session stats (RFC #8325): the (epoch, seq) chunks this output finishes
+    # handling for. Their spans reach the ledger directly (``on_stage_work``).
+    perf_chunks: frozenset[tuple[int, int]] = frozenset()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "segment_token_ids", tuple(self.segment_token_ids))
@@ -110,6 +113,7 @@ class DuplexOutputContext:
             "segment_output_metadata",
             MappingProxyType(dict(self.segment_output_metadata)),
         )
+        object.__setattr__(self, "perf_chunks", frozenset(self.perf_chunks))
 
 
 class DuplexStagePort(ABC):

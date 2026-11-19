@@ -727,6 +727,11 @@ class CodePredictorWrapper(nn.Module):
 
     _kv_cache_enabled: bool = False
     _fused_sampling_enabled: bool = False
+    # Plain-branch compile budget: 1 static bsz==1 graph + 1 dynamic graph
+    # reused for every bsz>1 bucket. Shared by _compile_cache_size_limit()
+    # and the mark_dynamic branching in _warmup_buckets() -- keep both in
+    # sync if that loop's compile structure ever changes.
+    _PLAIN_BRANCH_MAX_COMPILES = 2
 
     def __init__(
         self,
@@ -1104,8 +1109,14 @@ class CodePredictorWrapper(nn.Module):
 
     def _compile_cache_size_limit(self) -> int:
         bucket_sizes = self._batch_bucket_sizes()
-        if not self._prefix_reprefill_enabled:
-            required_entries = len(bucket_sizes)
+        if self._kv_cache_enabled:
+            required_entries = 4  # {first step, later steps} x {batch 1, dynamic batch}
+        elif not self._prefix_reprefill_enabled:
+            # Returned directly, not via max() with the global default: this
+            # limit only scopes this warmup. A regression here logs a
+            # recompile-limit warning and falls back to eager for unseen
+            # shapes rather than raising.
+            return min(len(bucket_sizes), self._PLAIN_BRANCH_MAX_COMPILES)
         else:
             prefix_buckets = (
                 self._prefix_graph_buckets.intersection(bucket_sizes)
@@ -1118,8 +1129,6 @@ class CodePredictorWrapper(nn.Module):
             if needs_full_graph:
                 full_graph_entries += len(prefix_buckets)
             required_entries = full_graph_entries + len(prefix_buckets) * len(prefix_seq_lens)
-        if self._kv_cache_enabled:
-            required_entries = 4  # {first step, later steps} x {batch 1, dynamic batch}
         return max(torch._dynamo.config.cache_size_limit, required_entries)
 
     def _warmup_buckets(self) -> None:
@@ -1191,8 +1200,16 @@ class CodePredictorWrapper(nn.Module):
                     torch.arange(max_seq, device=device, dtype=torch.long).unsqueeze(0).expand(bsz, -1).contiguous()
                 )
                 self._bucket_pos_ids[bsz] = pos_ids
+                hidden = proj_buf[:bsz, :max_seq, :]
+                # Reuses one compiled graph across all bsz>1 buckets instead
+                # of compiling per bucket (same technique as the K/V-cache
+                # branch above; keep in sync with _PLAIN_BRANCH_MAX_COMPILES).
+                # NPU runs model.forward eager here, so skip.
+                if bsz > 1 and not current_omni_platform.is_npu():
+                    torch._dynamo.mark_dynamic(hidden, 0)
+                    torch._dynamo.mark_dynamic(pos_ids, 0)
                 for _ in range(3):
-                    self._compiled_model_fwd(proj_buf[:bsz, :max_seq, :], pos_ids)
+                    self._compiled_model_fwd(hidden, pos_ids)
             logger.info("code_predictor: warmup done for buckets %s", self._bucket_sizes)
 
         # Compiled attention warmup is asynchronous. Complete it before graph

@@ -28,7 +28,7 @@ ENV LD_PRELOAD=libjemalloc.so.2
 
 RUN python3 -m pip install -U pip && \
     python3 -m pip install -v \
-      "mindiesd==3.1.0" \
+      "mindiesd==3.2.0" \
       "pytest>=7.0.0" \
       "pytest-asyncio>=0.21.0" \
       "pytest-cov>=4.0.0" \

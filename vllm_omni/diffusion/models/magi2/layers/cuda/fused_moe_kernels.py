@@ -3,12 +3,14 @@
 # Copyright (c) 2025-2026 SandAI. All Rights Reserved.
 # ruff: noqa: N803
 
-"""BF16 routed GEMMs for the MAGI-2 fast path.
+"""CUDA/MUSA BF16 routed GEMMs for the MAGI-2 fast path.
 
 The BF16 grouped GEMM is adapted from SGLang's Apache-2.0 implementation at
 ``d533d3bf464d280f180e18d4d396e613a5998502``. This module implements only
 MAGI-2's interleaved gate/up GEMM with SwiGLU7 and routed down GEMM.
-The existing SandAI-derived reference kernel is retained below unchanged.
+CUDA and MUSA share these kernels, with launch settings owned by each backend.
+The SandAI-derived Triton reference kernel is retained below unchanged;
+the pure-Torch reference implementation is owned by the native backend.
 """
 
 from __future__ import annotations
@@ -20,14 +22,7 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 
 from vllm_omni.platforms import current_omni_platform
 
-
-def swiglu7_pair(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
-    """Reference SwiGLU7 activation used by the CPU correctness path."""
-
-    dtype = gate.dtype
-    gate = gate.float().clamp(max=7.0)
-    up = up.float().clamp(min=-7.0, max=7.0)
-    return (gate * torch.sigmoid(1.702 * gate) * (up + 1.0)).to(dtype)
+from ..native.mh_moe import torch_mh_moe_forward
 
 
 @triton.jit
@@ -354,38 +349,6 @@ def global_sort_routes(
     bounds = torch.arange(flat_experts + 1, device=device, dtype=key_dtype)
     offsets = torch.searchsorted(sorted_keys, bounds)
     return gather_ids, sorted_probs, offsets
-
-
-def torch_mh_moe_forward(
-    x: torch.Tensor,
-    gather_ids: torch.Tensor,
-    probs: torch.Tensor,
-    expert_offsets: torch.Tensor,
-    w_gate: torch.Tensor,
-    w_up: torch.Tensor,
-    w_down: torch.Tensor,
-) -> torch.Tensor:
-    """Small-shape correctness oracle for the fused expert kernel."""
-
-    if x.ndim != 3:
-        raise ValueError("multi-head MoE input must be [tokens,heads,head_dim]")
-    output = torch.zeros_like(x)
-    experts_per_head = (expert_offsets.numel() - 1) // x.shape[1]
-    for flat_expert in range(expert_offsets.numel() - 1):
-        begin = int(expert_offsets[flat_expert].item())
-        end = int(expert_offsets[flat_expert + 1].item())
-        if begin == end:
-            continue
-        head = flat_expert // experts_per_head
-        token_ids = gather_ids[begin:end].long()
-        expert_input = x.index_select(0, token_ids)[:, head]
-        gate = expert_input @ w_gate[flat_expert]
-        up = expert_input @ w_up[flat_expert]
-        hidden = swiglu7_pair(gate, up)
-        expert_output = hidden @ w_down[flat_expert]
-        expert_output = expert_output * probs[begin:end, None].to(expert_output.dtype)
-        output[:, head].index_add_(0, token_ids, expert_output)
-    return output
 
 
 # Keep these compile-time constants portable across Triton 3.2 and 3.7 while

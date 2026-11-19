@@ -478,7 +478,7 @@ steps:
       agent_pool: mi300_2
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
-      grade: NonBlocking
+      grade: Blocking
       timeout_in_minutes: 50
       artifact_paths:
         - artifacts/rocm-qwen3-omni-shm-leak/**/*
@@ -594,6 +594,284 @@ steps:
           tests/e2e/offline_inference/test_qwen3_tts_base.py
           -m 'advanced_model and rocm and MI325 and cards_1 and not nvidia_only'
           --run-level "advanced_model"
+
+    # SDPA function check. Nightly keeps the separate AITER official-weight smoke.
+    - label: "MERGE · Qwen-Image Online Smoke"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 60
+      artifact_paths:
+        - artifacts/rocm-qwen-image-merge/**/*
+      commands:
+        - export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA
+        - export QWEN_IMAGE_MERGE_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen-image-merge"
+        - mkdir -p "$$QWEN_IMAGE_MERGE_ARTIFACT_DIR"
+        - |
+          set -euo pipefail
+          node='tests/e2e/online_serving/test_qwen_image.py::test_text_to_image_001[default]'
+          pytest --collect-only -q "$$node" \
+            -m 'advanced_model and diffusion and rocm and MI325 and cards_1' \
+            --run-level advanced_model \
+            > "$$QWEN_IMAGE_MERGE_ARTIFACT_DIR/collection.txt"
+          count=$$(awk -v node="$$node" 'index($$0, node) { n++ } END { print n + 0 }' \
+            "$$QWEN_IMAGE_MERGE_ARTIFACT_DIR/collection.txt")
+          if [[ "$$count" != 1 ]]; then
+            echo "Expected exactly one Qwen-Image MERGE node, found $$count." >&2
+            cat "$$QWEN_IMAGE_MERGE_ARTIFACT_DIR/collection.txt" >&2
+            exit 5
+          fi
+        - |
+          status=0
+          timeout --signal=TERM --kill-after=2m 45m \
+            pytest -s -v -ra \
+            'tests/e2e/online_serving/test_qwen_image.py::test_text_to_image_001[default]' \
+            -m 'advanced_model and diffusion and rocm and MI325 and cards_1' \
+            --run-level advanced_model \
+            --junitxml="$$QWEN_IMAGE_MERGE_ARTIFACT_DIR/pytest.xml" \
+            || status=$$?
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+          skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+          if tests != 1 or skipped != 0:
+              print(
+                  f"Expected exactly one executed Qwen-Image MERGE test; "
+                  f"reported tests={tests}, skipped={skipped}.",
+                  file=sys.stderr,
+              )
+              raise SystemExit(5)
+          ' "$$QWEN_IMAGE_MERGE_ARTIFACT_DIR/pytest.xml"
+            then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          (exit "$$status")
+
+    # Same one-card text-to-audio node as READY. Voice-clone cases stay out.
+    - label: "MERGE · Drama 3 Text-to-Audio"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 40
+      artifact_paths:
+        - "artifacts/rocm-drama3-merge/**/*"
+      commands:
+        - |
+          timeout 30m bash <<'DRAMA3_MERGE'
+          set -euo pipefail
+          export DRAMA3_MERGE_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-drama3-merge"
+          mkdir -p "$$DRAMA3_MERGE_ARTIFACT_DIR"
+          nodes=(
+            "tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]"
+          )
+          printf '%s\n' "$${nodes[@]}" | sort > /tmp/drama3-merge-expected.txt
+          pytest -q tests/e2e/online_serving/test_drama_3.py \
+            -m "core_model and tts and rocm and MI325 and cards_1" \
+            --run-level "core_model" \
+            --collect-only \
+            | sed -n 's/^\(tests\/.*::.*\)/\1/p' \
+            | sort > /tmp/drama3-merge-collected.txt
+          if ! diff -u /tmp/drama3-merge-expected.txt /tmp/drama3-merge-collected.txt; then
+            echo "Drama 3 MERGE collection drifted from test_text_to_audio_001[drama_3-rocm]" >&2
+            exit 1
+          fi
+          pytest -s -v tests/e2e/online_serving/test_drama_3.py \
+            -m "core_model and tts and rocm and MI325 and cards_1" \
+            --run-level "core_model" \
+            --junitxml="$$DRAMA3_MERGE_ARTIFACT_DIR/pytest.xml"
+          python -c 'import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+          skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+          if tests != 1 or skipped != 0:
+              print(
+                  f"Expected exactly one executed Drama 3 MERGE test; "
+                  f"reported tests={tests}, skipped={skipped}.",
+                  file=sys.stderr,
+              )
+              raise SystemExit(5)
+          ' "$$DRAMA3_MERGE_ARTIFACT_DIR/pytest.xml"
+          DRAMA3_MERGE
+
+- group: ":full_moon: MiniCPM-o 4.5 MERGE"
+  steps:
+    - label: "MERGE · MiniCPM-o 4.5 Offline"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 30
+      artifact_paths:
+        - artifacts/rocm-minicpmo-45-merge-offline/**/*
+      commands:
+        - export ROCM_MINICPMO_MERGE_OFFLINE_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minicpmo-45-merge-offline"
+        - mkdir -p "$$ROCM_MINICPMO_MERGE_OFFLINE_ARTIFACT_DIR"
+        - |
+          set -euo pipefail
+          nodes=(
+            "tests/e2e/offline_inference/test_minicpmo_4_5.py::test_text_to_text[omni_runner0]"
+            "tests/e2e/offline_inference/test_minicpmo_4_5.py::test_mix_to_audio[omni_runner0]"
+          )
+          marker="core_model and omni and rocm and MI325 and cards_1"
+          pytest --collect-only -q "$${nodes[@]}" \
+            --shard-id=0 --num-shards=1 \
+            -m "$$marker" --run-level core_model \
+            > "$$ROCM_MINICPMO_MERGE_OFFLINE_ARTIFACT_DIR/collection.txt"
+          count=$$(awk '/::/ { n++ } END { print n + 0 }' \
+            "$$ROCM_MINICPMO_MERGE_OFFLINE_ARTIFACT_DIR/collection.txt")
+          if [[ "$$count" != "$${#nodes[@]}" ]]; then
+            echo "Expected exactly $${#nodes[@]} MiniCPM-o offline nodes, found $$count." >&2
+            cat "$$ROCM_MINICPMO_MERGE_OFFLINE_ARTIFACT_DIR/collection.txt" >&2
+            exit 1
+          fi
+          for node in "$${nodes[@]}"; do
+            if ! grep -Fq "$$node" "$$ROCM_MINICPMO_MERGE_OFFLINE_ARTIFACT_DIR/collection.txt"; then
+              echo "MiniCPM-o offline node was not collected: $$node" >&2
+              exit 1
+            fi
+          done
+        - |
+          nodes=(
+            "tests/e2e/offline_inference/test_minicpmo_4_5.py::test_text_to_text[omni_runner0]"
+            "tests/e2e/offline_inference/test_minicpmo_4_5.py::test_mix_to_audio[omni_runner0]"
+          )
+          status=0
+          timeout --signal=TERM --kill-after=1m 20m \
+            pytest -s -v "$${nodes[@]}" \
+            --shard-id=0 --num-shards=1 \
+            -m "core_model and omni and rocm and MI325 and cards_1" --run-level core_model \
+            --junitxml="$$ROCM_MINICPMO_MERGE_OFFLINE_ARTIFACT_DIR/pytest.xml" || status=$$?
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET; root = ET.parse(sys.argv[1]).getroot(); suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite")); tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites); skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites); ok = tests == 2 and skipped == 0; print(f"Expected exactly two executed MiniCPM-o offline tests; reported tests={tests}, skipped={skipped}.", file=sys.stderr) if not ok else None; raise SystemExit(0 if ok else 5)' "$$ROCM_MINICPMO_MERGE_OFFLINE_ARTIFACT_DIR/pytest.xml"
+            then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          (exit "$$status")
+
+    - label: "MERGE · MiniCPM-o 4.5 Online"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 30
+      artifact_paths:
+        - artifacts/rocm-minicpmo-45-merge-online/**/*
+      commands:
+        - export ROCM_MINICPMO_MERGE_ONLINE_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minicpmo-45-merge-online"
+        - mkdir -p "$$ROCM_MINICPMO_MERGE_ONLINE_ARTIFACT_DIR"
+        - |
+          set -euo pipefail
+          nodes=(
+            "tests/e2e/online_serving/test_minicpmo_4_5.py::test_text_to_text_001[async_chunk]"
+            "tests/e2e/online_serving/test_minicpmo_4_5.py::test_text_to_text_001[turn_async_chunk]"
+            "tests/e2e/online_serving/test_minicpmo_4_5.py::test_mix_to_text_audio_001[async_chunk]"
+          )
+          marker="core_model and omni and rocm and MI325 and cards_1"
+          pytest --collect-only -q "$${nodes[@]}" \
+            --shard-id=0 --num-shards=1 \
+            -m "$$marker" --run-level core_model \
+            > "$$ROCM_MINICPMO_MERGE_ONLINE_ARTIFACT_DIR/collection.txt"
+          count=$$(awk '/::/ { n++ } END { print n + 0 }' \
+            "$$ROCM_MINICPMO_MERGE_ONLINE_ARTIFACT_DIR/collection.txt")
+          if [[ "$$count" != "$${#nodes[@]}" ]]; then
+            echo "Expected exactly $${#nodes[@]} MiniCPM-o online nodes, found $$count." >&2
+            cat "$$ROCM_MINICPMO_MERGE_ONLINE_ARTIFACT_DIR/collection.txt" >&2
+            exit 1
+          fi
+          for node in "$${nodes[@]}"; do
+            if ! grep -Fq "$$node" "$$ROCM_MINICPMO_MERGE_ONLINE_ARTIFACT_DIR/collection.txt"; then
+              echo "MiniCPM-o online node was not collected: $$node" >&2
+              exit 1
+            fi
+          done
+        - |
+          nodes=(
+            "tests/e2e/online_serving/test_minicpmo_4_5.py::test_text_to_text_001[async_chunk]"
+            "tests/e2e/online_serving/test_minicpmo_4_5.py::test_text_to_text_001[turn_async_chunk]"
+            "tests/e2e/online_serving/test_minicpmo_4_5.py::test_mix_to_text_audio_001[async_chunk]"
+          )
+          status=0
+          timeout --signal=TERM --kill-after=1m 20m \
+            pytest -s -v "$${nodes[@]}" \
+            --shard-id=0 --num-shards=1 \
+            -m "core_model and omni and rocm and MI325 and cards_1" --run-level core_model \
+            --junitxml="$$ROCM_MINICPMO_MERGE_ONLINE_ARTIFACT_DIR/pytest.xml" || status=$$?
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET; root = ET.parse(sys.argv[1]).getroot(); suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite")); tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites); skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites); ok = tests == 3 and skipped == 0; print(f"Expected exactly three executed MiniCPM-o online tests; reported tests={tests}, skipped={skipped}.", file=sys.stderr) if not ok else None; raise SystemExit(0 if ok else 5)' "$$ROCM_MINICPMO_MERGE_ONLINE_ARTIFACT_DIR/pytest.xml"
+            then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          (exit "$$status")
+
+    - label: "MERGE · MiniCPM-o 4.5 Duplex"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 45
+      artifact_paths:
+        - artifacts/rocm-minicpmo-45-merge-duplex/**/*
+      commands:
+        - export ROCM_MINICPMO_MERGE_DUPLEX_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minicpmo-45-merge-duplex"
+        - mkdir -p "$$ROCM_MINICPMO_MERGE_DUPLEX_ARTIFACT_DIR"
+        - |
+          set -euo pipefail
+          nodes=(
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex.py::test_duplex_websocket_protocol_smoke[three-stage-single-gpu]"
+            "tests/e2e/online_serving/test_duplex_client_live.py::test_duplex_client_live_session[three-stage-single-gpu]"
+          )
+          marker="core_model and omni and rocm and MI325 and cards_1"
+          pytest --collect-only -q "$${nodes[@]}" \
+            --shard-id=0 --num-shards=1 \
+            -m "$$marker" --run-level core_model \
+            > "$$ROCM_MINICPMO_MERGE_DUPLEX_ARTIFACT_DIR/collection.txt"
+          count=$$(awk '/::/ { n++ } END { print n + 0 }' \
+            "$$ROCM_MINICPMO_MERGE_DUPLEX_ARTIFACT_DIR/collection.txt")
+          if [[ "$$count" != "$${#nodes[@]}" ]]; then
+            echo "Expected exactly $${#nodes[@]} MiniCPM-o duplex nodes, found $$count." >&2
+            cat "$$ROCM_MINICPMO_MERGE_DUPLEX_ARTIFACT_DIR/collection.txt" >&2
+            exit 1
+          fi
+          for node in "$${nodes[@]}"; do
+            if ! grep -Fq "$$node" "$$ROCM_MINICPMO_MERGE_DUPLEX_ARTIFACT_DIR/collection.txt"; then
+              echo "MiniCPM-o duplex node was not collected: $$node" >&2
+              exit 1
+            fi
+          done
+        - |
+          nodes=(
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex.py::test_duplex_websocket_protocol_smoke[three-stage-single-gpu]"
+            "tests/e2e/online_serving/test_duplex_client_live.py::test_duplex_client_live_session[three-stage-single-gpu]"
+          )
+          status=0
+          timeout --signal=TERM --kill-after=1m 35m \
+            pytest -s -v "$${nodes[@]}" \
+            --shard-id=0 --num-shards=1 \
+            -m "core_model and omni and rocm and MI325 and cards_1" --run-level core_model \
+            --junitxml="$$ROCM_MINICPMO_MERGE_DUPLEX_ARTIFACT_DIR/pytest.xml" || status=$$?
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET; root = ET.parse(sys.argv[1]).getroot(); suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite")); tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites); skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites); ok = tests == 2 and skipped == 0; print(f"Expected exactly two executed MiniCPM-o duplex tests; reported tests={tests}, skipped={skipped}.", file=sys.stderr) if not ok else None; raise SystemExit(0 if ok else 5)' "$$ROCM_MINICPMO_MERGE_DUPLEX_ARTIFACT_DIR/pytest.xml"
+            then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          (exit "$$status")
 
 # TODO: Bagel test on ROCm is very unstable. @tjtanaa
 # Need to debug before reneable numerical changes across large PRs

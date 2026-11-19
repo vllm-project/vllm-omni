@@ -54,11 +54,13 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`Bagel/BAGEL-7B-MoT.md`](./Bagel/BAGEL-7B-MoT.md) | Text-to-image with shared online/offline examples | 1x A100 80GB / 2x CUDA GPUs |
 | [`black-forest-labs/FLUX.1-schnell.md`](./black-forest-labs/FLUX.1-schnell.md) | Offline text-to-image generation with CPU offload | 1x NVIDIA GeForce RTX 5090 32GB |
 | [`black-forest-labs/FLUX.2-klein.md`](./black-forest-labs/FLUX.2-klein.md) | Offline image editing (FLUX.2-klein-4B) | 1x Intel Arc Pro B70 32GB |
-| [`Boogu/Boogu-Image.md`](./Boogu/Boogu-Image.md) | Text-to-image online serving (Boogu-Image-0.1-Base) | 1x A100/H100 40GB+ |
+| [`Boogu/Boogu-Image.md`](./Boogu/Boogu-Image.md) | Text-to-image online serving (Boogu-Image-0.1-Base / Turbo) | 1x A100/H100 40GB+ / 1x Atlas 910B3 64GB (Turbo) |
 | [`BosonAI/Higgs-Audio-V3-TTS.md`](./BosonAI/Higgs-Audio-V3-TTS.md) | Online + offline multilingual TTS with voice cloning | 1x H100 80GB |
 | [`BreezeBlue/Breeze-TTS-2.md`](./BreezeBlue/Breeze-TTS-2.md) | Online + offline TTS (plain / voice design / voice clone / voice direction, streaming PCM) | 1x NVIDIA L20 48GB |
 | [`ByteDance/Lance.md`](./ByteDance/Lance.md) | Unified AR+diffusion: text/img/video gen + understanding (Lance 3B) | 1x B300 / A100 80GB |
 | [`circlestone-labs/Anima.md`](./circlestone-labs/Anima.md) | Native single-file text-to-image serving | 1x AMD MI300X |
+| [`depth-anything/Video-Depth-Anything-H200.md`](./depth-anything/Video-Depth-Anything-H200.md) | Temporally consistent video depth estimation (relative and metric) | 1x H200 141GB |
+| [`Efficient-Large-Model/Open-H3-Regenerate-2K-H200.md`](./Efficient-Large-Model/Open-H3-Regenerate-2K-H200.md) | Regenerate a 768P MiniMax-H3 draft at 2560x1440 (Open-H3-Regenerate-2K) | 2x H200 141GB |
 | [`FastVideo/FastH3.md`](./FastVideo/FastH3.md) | FastH3 four-step Preview V1 T2VA adapter | CUDA with a compatible dense or VSA attention backend |
 | [`FastVideo/FastH3-V2.md`](./FastVideo/FastH3-V2.md) | FastH3 V2 eight-step T2VA checkpoint | CUDA with FastVideo tile64 or FlashInfer on SM120/SM121; full-model qualification pending |
 | [`FastVideo/FastH3-Omni.md`](./FastVideo/FastH3-Omni.md) | FastH3 Omni eight-step Ref2VA, multi-GPU serving | Shared eight-GPU profile; PRO 5000 baseline in recipe |
@@ -68,6 +70,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`fishaudio/Drama-3.md`](./fishaudio/Drama-3.md) | Online serving for TTS | 1x H200 141GB / 2x Ascend 910B 64GB |
 | [`fishaudio/Fish-Speech-S2-Pro.md`](./fishaudio/Fish-Speech-S2-Pro.md) | Online serving for TTS | 1x A800 80GB |
 | [`Helios/Helios.md`](./Helios/Helios.md) | Text-to-video, image-to-video, and video-to-video generation | 1x NVIDIA H20 |
+| [`hexgrad/Kokoro-82M-A6000.md`](./hexgrad/Kokoro-82M-A6000.md) | Online + offline TTS with 54 built-in voices (streaming PCM/WAV, SSE) | 1x RTX A6000 48GB |
 | [`HiDream-ai/HiDream-O1-Image.md`](./HiDream-ai/HiDream-O1-Image.md) | Text-to-image with shared offline example | 1x or 2x H100 80GB |
 | [`inclusionAI/Ming-3.0-audio-flash.md`](./inclusionAI/Ming-3.0-audio-flash.md) | Online multilingual ASR and speech QA with optional 44.1 kHz speech output | 4x 80GB GPU / 2x H200 141GB |
 | [`inclusionAI/Ming-flash-omni-2.0.md`](./inclusionAI/Ming-flash-omni-2.0.md) | Online serving for multimodal chat + standalone TTS | 4x H100 / 1x H100 80GB |

@@ -2302,6 +2302,88 @@ def test_video_vae_keeps_reference_fp32_weights(monkeypatch):
     assert next(video_vae.parameters()).dtype == torch.float32
 
 
+def test_lightvae_installs_before_device_move_and_stager(monkeypatch, tmp_path):
+    from safetensors.torch import save_file
+
+    from tests.diffusion.models.minimax_h3.test_minimax_h3_vae_lightvae import (
+        _native_checkpoint,
+    )
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    model, checkpoint, expected = _native_checkpoint()
+    path = tmp_path / "lite.safetensors"
+    save_file(
+        checkpoint.state_dict, path, metadata={"architecture": json.dumps(dict(checkpoint.config, kept_layers=[1, 3]))}
+    )
+    events = []
+
+    class Remote(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = model
+
+        def to(self, *args, **kwargs):
+            assert torch.equal(self.model.decoder.x_embedder.weight, expected["decoder.x_embedder.weight"])
+            events.append("move")
+            return super().to(*args, **kwargs)
+
+    def stage(vae, device):
+        assert len(vae.model.decoder.transformer_blocks) == 2
+        assert torch.equal(vae.model.decoder.x_embedder.weight, expected["decoder.x_embedder.weight"])
+        events.append("stager")
+
+    monkeypatch.setattr(vae_module, "_load_component_config", lambda _: checkpoint.config)
+    monkeypatch.setattr(vae_module, "_load_remote_component", lambda *args, **kwargs: Remote())
+    monkeypatch.setattr(vae_module, "install_h3_vae_optimizations", lambda *args, **kwargs: events.append("optimize"))
+    monkeypatch.setattr(vae_module.MiniMaxH3VideoVAE, "_build_residency_stagers", stage)
+    vae = vae_module.MiniMaxH3VideoVAE(
+        "unused",
+        device=torch.device("cuda"),
+        load_device=torch.device("cpu"),
+        lightvae_decoder_path=str(path),
+    )
+    assert events == ["move", "optimize", "stager"]
+    assert vae.model is model
+
+
+def test_lightvae_rejects_nvfp4_decoder_before_loading(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    def unexpected_load(*args, **kwargs):
+        pytest.fail("Conflicting decoder selections must fail before loading assets")
+
+    monkeypatch.setattr(vae_module, "_load_component_config", unexpected_load)
+    with pytest.raises(ValueError, match="cannot be combined with video_vae_decoder"):
+        vae_module.MiniMaxH3VideoVAE(
+            "unused",
+            device=torch.device("cpu"),
+            decoder_source="decoder-nvfp4.safetensors",
+            lightvae_decoder_path="lite.safetensors",
+        )
+
+
+def test_encode_only_does_not_open_lightvae_checkpoint(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    remote = nn.Module()
+    remote.model = nn.Module()
+    remote.model.encoder = nn.Linear(2, 2)
+    monkeypatch.setattr(
+        vae_module,
+        "_load_component_config",
+        lambda _: {"latent_channels": 2, "latents_mean": [0.0, 0.0], "latents_std": [1.0, 1.0]},
+    )
+    monkeypatch.setattr(vae_module, "_load_video_vae_encoder", lambda *args: remote)
+    vae = vae_module.MiniMaxH3VideoVAE(
+        "unused",
+        device=torch.device("cpu"),
+        encode_only=True,
+        lightvae_decoder_path="does-not-exist.safetensors",
+    )
+    assert vae.remote is remote
+    assert not hasattr(vae.model, "decoder")
+
+
 @pytest.mark.parametrize("fail_encode", [False, True])
 def test_keyframe_encode_enters_backend_context(monkeypatch, fail_encode):
     from PIL import Image

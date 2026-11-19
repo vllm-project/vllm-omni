@@ -36,6 +36,7 @@ import numpy as np
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.cuda_graph import GraphedForward
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
 from vllm_omni.diffusion.interaction.modality_handlers.taomate_h3_prompt import sync_prompt_length
@@ -65,6 +66,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.model_executor.models.minimax_h3.conditioning import MiniMaxH3EncoderMediaInput
 from vllm_omni.model_executor.models.minimax_h3.encoder_processing import PreparedEncoderInputs
+from vllm_omni.platforms import current_omni_platform
 
 from .attention import StreamContext, StreamMode, _ulysses_state, stream_context
 from .audio_teacher import (
@@ -73,7 +75,6 @@ from .audio_teacher import (
     TeacherResult,
     official_request_noise,
 )
-from .cuda_graph import GraphedForward
 from .geometry import (
     AUDIO_SAMPLE_RATE,
     PHASE_GROUP_COUNTS,
@@ -123,6 +124,26 @@ _VIDEO_NOISE_REQUEST_STRIDE = 1_000_003
 _VIDEO_ROW_WIDTH = 96
 _AUDIO_ROW_WIDTH = 32
 _AR_BRANCH = "main"
+
+
+@contextmanager
+def _adaln_cache_bypassed(module: torch.nn.Module) -> Iterator[None]:
+    """Turn the host-keyed AdaLN projection cache off for the duration.
+
+    Its key is a host-side digest of the timestep embedding, which a graph
+    capture cannot read; the graph then contains the projections themselves,
+    which are cheap for the three teacher timestep rows.
+    """
+    cache = getattr(module, "adaln_cache", None)
+    if cache is None or not hasattr(cache, "max_bytes"):
+        yield
+        return
+    previous = cache.max_bytes
+    cache.max_bytes = 0
+    try:
+        yield
+    finally:
+        cache.max_bytes = previous
 
 
 def _prompt_version(state: StepRequestState) -> int:
@@ -765,15 +786,16 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         graph: GraphedForward | None = None
         if self._tm_teacher_cuda_graph:
             _, _, group = _ulysses_state()
-            graph = GraphedForward(
+            graph = current_omni_platform.get_graphed_forward_cls()(
                 self.transformer,
                 device=self.device,
                 max_entries=self._tm_cuda_graph_max_entries,
                 group=group,
                 name="TaoMate-H3 teacher",
+                capture_context=lambda: _adaln_cache_bypassed(self.transformer),
             )
             if not graph.enabled:
-                logger.warning("TaoMate-H3 teacher CUDA graphs requested but the device is not CUDA; running eager")
+                logger.warning("TaoMate-H3 teacher device graphs requested but %s has none; running eager", self.device)
         self._tm_teacher_graph = graph
         self._tm_text_graph = self._build_text_encoder_graph()
         if self._tm_fp8_quant_cuda_op and self.device.type == "cuda":
@@ -799,7 +821,7 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
             return None  # not an encoder TP rank
         group = getattr(self, "text_encoder_group", None)
         device_group = getattr(group, "device_group", None) if int(getattr(group, "world_size", 1)) > 1 else None
-        text_graph = GraphedForward(
+        text_graph = current_omni_platform.get_graphed_forward_cls()(
             GraphSafeTextEncode(encoder),
             device=self.device,
             max_entries=max(self._tm_cuda_graph_max_entries, 128),
@@ -807,7 +829,9 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
             name="TaoMate-H3 text encoder",
         )
         if not text_graph.enabled:
-            logger.warning("TaoMate-H3 text encoder CUDA graphs requested but the device is not CUDA; running eager")
+            logger.warning(
+                "TaoMate-H3 text encoder device graphs requested but %s has none; running eager", self.device
+            )
             return None
         return text_graph
 

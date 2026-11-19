@@ -117,6 +117,53 @@ def _expand_expected_modules_for_packed_layers(
     return expanded
 
 
+def moe_lora_kernel_requires_context(layer: nn.Module) -> bool:
+    """Whether this wrapper's MoE kernel needs a context even with no adapter.
+
+    Only the FlashInfer TRT-LLM BF16 LoRA experts do: ``apply()`` asserts the
+    context exists and then takes its own base-model fast path through
+    ``_batch_has_no_lora()``, so publishing the slot-0 mapping is both required
+    (vllm-omni #9232) and free.
+
+    Every other LoRA-capable MoE kernel treats the *presence* of a context as
+    the LoRA switch and keeps doing LoRA work for a guaranteed-zero delta:
+    Triton disables ``skip_invalid`` in ``_prepare_expert_assignment`` and still
+    runs ``apply_w13_lora`` / ``apply_w2_lora``, whose config lookup and
+    ``moe_lora_align_block_size`` happen before the ``no_lora_flag`` return
+    inside ``add_lora_fused_moe``; the Ascend runner pays considerably more.
+    """
+    experts = getattr(getattr(layer, "_moe_kernel", None), "fused_experts", None)
+    return callable(getattr(experts, "_batch_has_no_lora", None))
+
+
+def detach_moe_lora_context(layer: nn.Module) -> bool:
+    """Release the LoRA context on a wrapper whose kernel branches on it.
+
+    Returns False when the wrapper exposes no way to detach, so the caller can
+    fall back to publishing the no-adapter mapping rather than leaving a kernel
+    that may require a context without one.
+    """
+    set_runner_idle = getattr(layer, "_set_diffusion_moe_lora_idle", None)
+    if callable(set_runner_idle):
+        # Ascend: the runner owns the context (set_lora_context(None)).
+        set_runner_idle()
+        return True
+
+    # GPU: FusedMoEWithLoRA.set_mapping() publishes into the kernel, and into
+    # prepare_finalize when it accepts one; mirror both on the way out.
+    moe_kernel = getattr(layer, "_moe_kernel", None)
+    detached = False
+    for target in (
+        getattr(moe_kernel, "fused_experts", None),
+        getattr(moe_kernel, "prepare_finalize", None),
+    ):
+        set_lora_context = getattr(target, "set_lora_context", None)
+        if callable(set_lora_context):
+            set_lora_context(None)
+            detached = True
+    return detached
+
+
 def from_layer_diffusion(
     layer: nn.Module,
     max_loras: int,
@@ -201,6 +248,21 @@ def from_layer_diffusion(
 
         instance.suspend_lora = _suspend_lora  # type: ignore[method-assign]
         instance.resume_lora = _resume_lora  # type: ignore[method-assign]
+
+        # Ascend's MoE runner takes the LoRA data path whenever a context is
+        # published, regardless of whether any token selects an adapter: index
+        # recovery, an extra all_to_all of the LoRA indices and bgmv
+        # shrink/expand launches run per layer per step (the -1 sentinel only
+        # skips rows inside the kernel). Expose an idle hook so the manager can
+        # detach the context while no adapter is active. The GPU wrappers are
+        # detached through their kernel instead (see detach_moe_lora_context).
+        publish_to_runner = getattr(layer, "set_lora_context", None)
+        if callable(publish_to_runner):
+
+            def _set_diffusion_moe_lora_idle() -> None:
+                publish_to_runner(None)
+
+            instance._set_diffusion_moe_lora_idle = _set_diffusion_moe_lora_idle  # type: ignore[method-assign]
         return instance
 
     diffusion_lora_classes = [

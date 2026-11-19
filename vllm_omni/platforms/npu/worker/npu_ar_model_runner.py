@@ -52,6 +52,7 @@ from vllm_omni.model_executor.models.interfaces import supports_multi_frame_deco
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
+from vllm_omni.worker.duplex_reanchor import apply_duplex_window_reanchor, validate_duplex_kv_cache
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     needs_omni_connector,
@@ -339,9 +340,17 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             return drafts
         return super().propose_draft_token_ids(valid_sampled_token_ids, *args, **kwargs)
 
+    def initialize_kv_cache(self, *args, **kwargs) -> None:
+        super().initialize_kv_cache(*args, **kwargs)
+        validate_duplex_kv_cache(self)
+
     def _update_states(self, scheduler_output: SchedulerOutput):
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
         self._update_duplex_sampling_states(scheduler_output)
+        # The parent installs the scheduler's compacted block table and token
+        # counts. Apply the matching worker-side rotation/history eviction before
+        # forward, without compacting or decrementing the logical state again.
+        apply_duplex_window_reanchor(self, scheduler_output)
         return deferred_state_corrections_fn
 
     def _make_buffer(self, *size, dtype, numpy=True):

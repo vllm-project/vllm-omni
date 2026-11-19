@@ -93,15 +93,19 @@ def _rehydrated_output(*, pooling_output=None, finish_reason=FinishReason.STOP):
     )
 
 
-def test_text_tokens_are_detokenized_when_mrv2_ar_output_has_pooling_payload():
+@pytest.mark.parametrize("dual_carrier", [False, True])
+def test_ar_pooling_fallback_keeps_text_and_accumulates_payload_once(dual_carrier):
     detokenizer = _Detokenizer()
     processor, state = _make_processor(OutputModality.LATENT, detokenizer)
 
     # StagePool has already rehydrated the MRv2 carrier.  Use a structural
     # output here because upstream EngineCoreOutput strictly validates
     # pooling_output as torch.Tensor | None on construction.
-    output = _rehydrated_output(pooling_output={"hidden": torch.ones(1, 4)})
+    codes = torch.tensor([[1, 2], [3, 4]])
+    output = _rehydrated_output(pooling_output={"codes": {"audio": codes}})
 
+    if dual_carrier:
+        output.multimodal_output = {"codes": {"audio": codes.clone()}}
     processed = processor.process_outputs([output])
 
     assert detokenizer.update_calls == [([42], True)]
@@ -109,6 +113,7 @@ def test_text_tokens_are_detokenized_when_mrv2_ar_output_has_pooling_payload():
     assert list(completion.token_ids) == [42]
     assert completion.text == "X"
     assert not state.mm_accumulated.is_empty
+    torch.testing.assert_close(completion.multimodal_output["codes"]["audio"], codes)
 
 
 def test_fixed_token_scores_survive_output_processing_and_stage_wrapping():

@@ -46,6 +46,24 @@ class OmniNPUWorkerBase(NPUWorker):
         """NPU workers do not provide the optional CUDA warmup snapshot."""
         return None
 
+    def compile_or_warm_up_model(self):
+        result = super().compile_or_warm_up_model()
+        self._capture_auxiliary_graphs()
+        return result
+
+    def _capture_auxiliary_graphs(self) -> None:
+        """Let opt-in models warm valid inputs before the worker becomes ready.
+
+        Mirrors ``OmniGPUWorkerBase._capture_auxiliary_graphs``: the CUDA base
+        has called this from ``compile_or_warm_up_model`` for a while, the NPU
+        base did not, so a model that relies on the hook (e.g. capturing its
+        audio graphs at startup rather than on the first request) silently
+        skipped it on Ascend.
+        """
+        capture = getattr(self.model_runner.model, "capture_auxiliary_graphs", None)
+        if callable(capture):
+            capture()
+
     def profile(
         self,
         is_start: bool = True,

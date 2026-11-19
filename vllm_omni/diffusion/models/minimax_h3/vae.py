@@ -345,6 +345,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         decode_only: bool = False,
         trust_remote_code: bool = False,
         decoder_source: str | Mapping[str, str] | None = None,
+        lightvae_decoder_path: str | None = None,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -352,6 +353,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self.decode_only = bool(decode_only)
         if self.encode_only and self.decode_only:
             raise ValueError("MiniMax H3 video VAE cannot be both encode-only and decode-only")
+        if lightvae_decoder_path is not None and decoder_source is not None:
+            raise ValueError("lightvae_decoder_path cannot be combined with video_vae_decoder")
         from .vae_nvfp4 import (
             install_nvfp4_video_decoder,
             released_decoder_pixels,
@@ -370,6 +373,18 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             self.remote = _load_remote_component(component_path, self.config_dict, trust_remote_code=trust_remote_code)
             if self.decode_only:
                 _remove_modules(self.remote.model, ("encoder", "quant_conv"))
+            if lightvae_decoder_path is not None:
+                from .lightvae import install_h3_lite_decoder, read_h3_lite_decoder_checkpoint
+
+                checkpoint = read_h3_lite_decoder_checkpoint(lightvae_decoder_path)
+                install_h3_lite_decoder(self.remote.model, checkpoint, native_config=self.config_dict)
+                logger.info(
+                    "Loaded H3 Lite video decoder: path=%s layers=%d device=%s",
+                    lightvae_decoder_path,
+                    len(checkpoint.kept_layers),
+                    device,
+                )
+                del checkpoint
         # Match the reference loader contract before installing inference-only
         # decoder fast paths. Keyframe encoding remains FP32; decoder Linear
         # weights may be materialized in FP16 because reference decode casts

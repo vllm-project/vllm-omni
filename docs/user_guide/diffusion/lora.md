@@ -42,6 +42,36 @@ validation; unsupported module suffixes may already fail during loading.
 Checkpoint-to-engine name mapping is tracked in [#8001](https://github.com/vllm-project/vllm-omni/issues/8001);
 until it is available, adapter keys must resolve to supported engine modules.
 
+## LoRA scale semantics
+
+The request-level `lora_scale` is a multiplier applied on top of the adapter's
+own PEFT scaling, not a replacement for it. The applied weight delta is:
+
+```text
+delta = lora_scale × (lora_alpha / r) × (B @ A)
+```
+
+At load time the `lora_alpha / r` factor is folded into the adapter weights
+(upstream `LoRALayerWeights.optimize`); `lora_scale` is applied when the adapter
+is activated. This is the same convention as diffusers'
+`cross_attention_kwargs={"scale": s}` and LightX2V's `--lora-scale`: to
+reproduce a reference invocation, pass the same numeric value here.
+
+Do **not** pass the already-multiplied effective strength `scale × alpha /
+rank`. That applies `alpha / r` a second time and shrinks the adapter by that
+factor.
+
+!!! example "MiniMax-H3 Turbo"
+    LightX2V's reference script drives
+    `minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors` (rank 128,
+    declared `alpha` 8) with `--lora-scale 1.3`, an effective strength of
+    `1.3 × 8 / 128 = 0.08125`. Passing `0.08125` as vLLM-Omni's `lora_scale`
+    yields `0.08125 × 8 / 128 ≈ 0.005` — 1/16 of the intended strength. An
+    8-step distilled sampler running at 1/16 adapter strength produces blurred
+    output. Pass `1.3`, the same number the reference uses. See the
+    [Turbo LoRA table](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md#turbo-lora)
+    for the declared `alpha` of every published artifact.
+
 ## Quick Start
 
 ### Offline Inference

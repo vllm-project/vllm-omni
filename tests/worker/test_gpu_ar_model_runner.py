@@ -1961,6 +1961,13 @@ class TestPreferModelSamplerNoneFallback:
             def emit(self, record):
                 records.append(record)
 
+        import vllm.logger as vllm_logger
+
+        # warning_once is cached for the whole worker process. Another test on
+        # the same xdist worker can consume this message before we attach a handler.
+        vllm_logger._print_warning_once.cache_clear()
+        previous_level = ar_module.logger.level
+        ar_module.logger.setLevel(logging.INFO)
         handler = _Capture(level=logging.WARNING)
         ar_module.logger.addHandler(handler)
         try:
@@ -1969,6 +1976,8 @@ class TestPreferModelSamplerNoneFallback:
                 assert out is sentinel
         finally:
             ar_module.logger.removeHandler(handler)
+            ar_module.logger.setLevel(previous_level)
+            vllm_logger._print_warning_once.cache_clear()
 
         fallback_records = [r for r in records if "falling back to the default sampler" in r.getMessage()]
         assert len(fallback_records) == 1

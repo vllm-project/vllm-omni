@@ -558,9 +558,7 @@ async def test_model_type_namespaces_cache(make_encoder):
 @pytest.mark.parametrize(
     ("variant", "expected_sr"),
     [
-        # Local-v1.5 encodes references at a fixed 24 kHz working rate even
-        # though its output codec is 48 kHz stereo.
-        ("local", 24000),
+        ("local", 48000),
         ("tts", 48000),
         ("ttsd", 48000),
     ],

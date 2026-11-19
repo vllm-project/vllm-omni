@@ -19,7 +19,6 @@ from vllm.sampling_params import SamplingParams
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
-from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
@@ -310,9 +309,7 @@ def test_auk_sampling_overrides_reach_stage1_pipeline(auk_adapter, mocker):
             wire_params = StageDiffusionClient._sampling_params_to_dict(sampling_params)
             self.request = OmniDiffusionRequest(
                 prompt=prompt,
-                sampling_params=StageDiffusionProc._reconstruct_sampling_params(
-                    object.__new__(StageDiffusionProc), wire_params
-                ),
+                sampling_params=OmniDiffusionSamplingParams.from_dict(wire_params),
                 request_id=request_id,
             )
 
@@ -340,6 +337,7 @@ def test_auk_sampling_overrides_reach_stage1_pipeline(auk_adapter, mocker):
         stage_type="llm",
         final_output=False,
         get_kv_sender_info=lambda: None,
+        get_payload_sender_info=lambda: None,
     )
     diffusion_stage = RecordingDiffusionStage()
     orchestrator = object.__new__(Orchestrator)
@@ -546,7 +544,8 @@ def test_moss_tts_seed_falls_back_to_stage_default(adapter_cls, mocker):
         ("tts", "Reference.", "generation"),
     ],
 )
-def test_moss_reference_transcript_mode(variant, ref_text, mode, mocker):
+@pytest.mark.parametrize("token_count", [None, 64])
+def test_moss_reference_transcript_mode(variant, ref_text, mode, token_count, mocker):
     import torch
 
     reference = [torch.ones((3, 12), dtype=torch.int64)]
@@ -560,7 +559,13 @@ def test_moss_reference_transcript_mode(variant, ref_text, mode, mocker):
     )
     server._voice_created_at.return_value = 123
     request = OpenAICreateSpeechRequest(
-        input="Target.", ref_text=ref_text, language="English", voice="Speaker", seed=0, max_new_tokens=2048
+        input="Target.",
+        ref_text=ref_text,
+        language="English",
+        voice="Speaker",
+        seed=0,
+        max_new_tokens=2048,
+        token_count=token_count,
     )
     adapter = MossTTSAdapter(SpeechServingContext(server=server))
 
@@ -572,12 +577,19 @@ def test_moss_reference_transcript_mode(variant, ref_text, mode, mocker):
 
     prepared = asyncio.run(adapter.build(request, [], has_inline_ref_audio=False))
 
+    duration = {"tokens": token_count} if variant == "local" and token_count is not None else {}
+    if mode == "continuation" and token_count is not None:
+        duration["tokens"] = 67
     if mode == "continuation":
-        processor.build_user_message.assert_called_once_with(text="Reference. Target.", language="English")
+        assert prepared.tts_params["meta"] == {"ref_code_len": 3}
+        processor.build_user_message.assert_called_once_with(text="Reference. Target.", language="English", **duration)
         processor.build_assistant_message.assert_called_once_with(audio_codes_list=reference)
         conversation = [processor.build_user_message.return_value, processor.build_assistant_message.return_value]
     else:
-        processor.build_user_message.assert_called_once_with(text="Target.", language="English", reference=reference)
+        assert "meta" not in prepared.tts_params
+        processor.build_user_message.assert_called_once_with(
+            text="Target.", language="English", reference=reference, **duration
+        )
         processor.build_assistant_message.assert_not_called()
         conversation = [processor.build_user_message.return_value]
     processor.assert_called_once_with(conversations=[conversation], mode=mode)
@@ -739,7 +751,9 @@ def test_moss_get_processor_places_audio_tokenizer_on_codec_stage_device(mocker)
     audio_tokenizer = mocker.Mock()
     audio_tokenizer.to.return_value = audio_tokenizer
     processor = SimpleNamespace(audio_tokenizer=audio_tokenizer)
-    from_pretrained = mocker.patch("transformers.AutoProcessor.from_pretrained", return_value=processor)
+    native_loader = mocker.patch("vllm_omni.entrypoints.openai.tts_adapters.moss_tts.get_class_from_dynamic_module")
+    from_pretrained = native_loader.return_value.from_pretrained
+    from_pretrained.return_value = processor
 
     assert adapter._get_moss_processor() is processor
     audio_tokenizer.to.assert_called_once_with(torch.device("cuda", 3))
