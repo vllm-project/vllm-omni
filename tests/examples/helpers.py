@@ -68,19 +68,29 @@ def models_in_snippet(language: str, code: str) -> tuple[str, ...]:
             tree = ast.parse(code)
         except SyntaxError:
             return ()
-        bindings: dict[str, str | None] = {}
+        # Resolve only a single module-level literal assignment. Count all
+        # writes, including annotated/augmented assignments, tuple unpacking,
+        # loop targets and named expressions, before trusting a binding.
+        writes: defaultdict[str, int] = defaultdict(int)
         for node in ast.walk(tree):
-            if isinstance(node, ast.Assign):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                writes[node.id] += 1
+            elif isinstance(node, ast.arg):
+                writes[node.arg] += 1
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                writes[node.name] += 1
+            elif isinstance(node, ast.alias):
+                writes[node.asname or node.name.split(".")[0]] += 1
+        bindings: dict[str, str] = {}
+        for node in tree.body:
+            if (
+                isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+            ):
                 for target in node.targets:
-                    if isinstance(target, ast.Name):
-                        value = node.value
-                        bindings[target.id] = (
-                            value.value
-                            if target.id not in bindings
-                            and isinstance(value, ast.Constant)
-                            and isinstance(value.value, str)
-                            else None
-                        )
+                    if isinstance(target, ast.Name) and writes[target.id] == 1:
+                        bindings[target.id] = node.value.value
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
