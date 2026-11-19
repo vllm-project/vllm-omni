@@ -1071,3 +1071,20 @@ def test_close_retains_cancellation_signal_until_stuck_worker_stops():
         assert not registry._signals
     finally:
         registry.close()
+
+
+def test_required_cfg_error_finishes_and_removes_scheduler_request() -> None:
+    from vllm_omni.distributed.omni_connectors.kv_transfer_manager import KVCacheReceiveError
+
+    engine = _make_engine()
+    engine._request_cancellations = None
+    request_id = engine.scheduler.add_request(_make_request("missing-cfg"))
+    scheduled = engine.scheduler.schedule()
+    result = DiffusionOutput.from_exception(KVCacheReceiveError("Missing required CFG KV: cfg_text"))
+    output = RunnerOutput(request_id=request_id, step_index=None, finished=True, result=result)
+    finished = engine.scheduler.update_from_output(scheduled, output)
+    assert request_id in finished
+    assert engine.scheduler.get_request_state(request_id).status == DiffusionRequestStatus.FINISHED_ERROR
+    assert engine._finalize_finished_request(request_id, output) is result
+    assert engine.scheduler.get_request_state(request_id) is None
+    assert not engine.scheduler.has_requests()

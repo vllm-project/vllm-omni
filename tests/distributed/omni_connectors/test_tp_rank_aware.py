@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for rank-aware KV transfer (TP > 1) and heterogeneous TP support.
 
 Covers:
@@ -557,6 +557,12 @@ class _MockBroadcastGroup:
 
 
 class TestDistributedReceive:
+    @pytest.fixture(autouse=True)
+    def successful_receive_verdict(self, monkeypatch):
+        # These scripted groups exercise KV payload routing only. Concurrent
+        # verdict exchange is covered by test_required_cfg_gloo.py.
+        monkeypatch.setattr(OmniKVTransferManager, "_merge_receive_errors", staticmethod(lambda group, errors: errors))
+
     def test_tp_cfg_leader_receives_then_sends_branch_local_payloads(self):
         mgr = _make_manager(from_tp=2, to_tp=4, local_rank=0)
         req = SimpleNamespace(request_id="req-1", sampling_params=SimpleNamespace())
@@ -682,10 +688,10 @@ class TestDistributedReceive:
         mgr = _make_manager(from_tp=2, to_tp=2, local_rank=1)
         req = SimpleNamespace(request_id="req-1", sampling_params=SimpleNamespace())
         world_group = _MockBroadcastGroup(world_size=2, rank_in_group=1)
-        # broadcast_value=True: rank 0's verdict says every TP rank has the
+        # broadcast_value=(True, ()): rank 0 reports no errors and the
         # same KV state, so the per-rank receive result stands (see #5627
         # consensus). The exchange runs on the TP group, not world.
-        tp_group = _MockBroadcastGroup(world_size=2, rank_in_group=1, broadcast_value=True)
+        tp_group = _MockBroadcastGroup(world_size=2, rank_in_group=1, broadcast_value=(True, ()))
         mgr.receive_multi_kv_cache = MagicMock(return_value=True)
 
         with (
@@ -718,8 +724,8 @@ class TestDistributedReceive:
         # for the identical-state verdict instead of silently diverging on a
         # miss (#5627). World must stay untouched — it holds DP/PP ranks.
         assert len(tp_group.send_calls) == 1
-        dst, sig = tp_group.send_calls[0]
-        assert dst == 0 and sig[0] is True
+        dst, (sig, errors) = tp_group.send_calls[0]
+        assert dst == 0 and sig[0] is True and errors == ()
         assert world_group.send_calls == []
 
     # ── SP-only scenarios ────────────────────────────────────────────

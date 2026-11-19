@@ -276,36 +276,31 @@ def collect_cfg_kv_caches(
     Returns:
         Dict with keys like "cfg_text_past_key_values",
         "cfg_text_kv_metadata", etc.
+
+    Connector and payload errors propagate to the manager's distributed
+    receive verdict; logging and continuing here would hide the real failure.
     """
     result: dict[str, Any] = {}
 
     for role, companion_rid in cfg_request_ids.items():
-        try:
-            data, size = kv_transfer_manager.receive_kv_cache_for_request(companion_rid, target_device)
-            if data and "layer_blocks" in data:
-                layer_blocks = data["layer_blocks"]
-                kv_obj = SimpleNamespace(**layer_blocks)
-                result[f"{role}_past_key_values"] = kv_obj
-                if "metadata" in data:
-                    result[f"{role}_kv_metadata"] = data["metadata"]
-                logger.info(
-                    "Collected CFG KV cache for role=%s, rid=%s, size=%d bytes",
-                    role,
-                    companion_rid,
-                    size,
-                )
-            else:
-                logger.warning(
-                    "Failed to collect CFG KV cache for role=%s, rid=%s",
-                    role,
-                    companion_rid,
-                )
-        except Exception as e:
-            logger.exception(
-                "Error collecting CFG KV cache for role=%s, rid=%s: %s",
+        data, size = kv_transfer_manager.receive_kv_cache_for_request(companion_rid, target_device)
+        if data and "layer_blocks" in data:
+            layer_blocks = data["layer_blocks"]
+            kv_obj = SimpleNamespace(**layer_blocks)
+            result[f"{role}_past_key_values"] = kv_obj
+            if "metadata" in data:
+                result[f"{role}_kv_metadata"] = data["metadata"]
+            logger.info(
+                "Collected CFG KV cache for role=%s, rid=%s, size=%d bytes",
                 role,
                 companion_rid,
-                e,
+                size,
+            )
+        else:
+            logger.warning(
+                "Failed to collect CFG KV cache for role=%s, rid=%s",
+                role,
+                companion_rid,
             )
 
     return result
