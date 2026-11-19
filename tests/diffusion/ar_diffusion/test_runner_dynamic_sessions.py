@@ -114,7 +114,7 @@ def test_oversized_request_preserves_pool_and_session_before_reset(runner):
     runner.od_config = SimpleNamespace(dtype=torch.float32)
     req = request(runner, geometry="large", tokens=2, reset=True)
     with pytest.raises(ARDiffusionRequestRejectedError, match="capacity exceeds"):
-        runner._prepare_ar_request(req, "s1", reset=True)
+        runner._resolve_ar_request(req, "s1", reset=True)
     assert runner.kv_cache is old_cache
     assert runner._sessions["s1"] is old_state
     old_state.release_history.assert_not_called()
@@ -273,3 +273,31 @@ def test_stepwise_chunk_barrier_failure_clears_geometry_and_cached_state(runner,
     assert not runner._session_geometry_keys
     assert not runner.state_cache
     assert not runner._stepwise_chunk_started
+
+
+def test_rejected_replacement_can_resume_original_session(runner, monkeypatch):
+    runner._session_capacity = 1
+    original = runner._get_or_create_session("s1", "small")
+    pending = None
+
+    @contextmanager
+    def defer(session_id, spec, bind):
+        nonlocal pending
+        pending = bind
+        yield
+
+    def forward(self, req, **kwargs):
+        if req.sampling_params.extra_args["session_id"] == "s2":
+            raise ARDiffusionRequestRejectedError("invalid conditioning")
+        pending()
+        assert runner.pipeline.bound is original
+
+    monkeypatch.setattr(runner.pipeline, "defer_ar_diffusion_binding", defer, raising=False)
+    monkeypatch.setattr(runner_module.DiffusionModelRunner, "execute_model", forward)
+    replacement = request(runner, geometry="large", tokens=2)
+    replacement.sampling_params.extra_args["session_id"] = "s2"
+    with pytest.raises(ARDiffusionRequestRejectedError):
+        runner.execute_model(replacement)
+    runner.execute_model(request(runner))
+    original.release_history.assert_not_called()
+    original.finish_request.assert_called_once_with("s1")

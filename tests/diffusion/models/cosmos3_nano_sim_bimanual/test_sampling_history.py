@@ -168,6 +168,7 @@ def test_dense_text_kv_is_not_capped_by_manifest_cache_length():
     from test_action_schema import manifest as unified_manifest
 
     pipe.manifest = unified_manifest()
+    pipe._admission_spec = None
     pipe._ar_diffusion_kv_state = None
     pipe._MAIN_BRANCH = "main"
     cached = [(torch.ones(1, 513, 1), torch.ones(1, 513, 1))]

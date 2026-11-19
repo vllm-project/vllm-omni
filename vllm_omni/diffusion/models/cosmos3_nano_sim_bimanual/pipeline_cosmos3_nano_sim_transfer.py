@@ -525,6 +525,8 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
 
     def _validate_bound_kv_geometry(self, state, geometry=None, *, expected_spec=None) -> None:
         cache = state.kv_cache
+        if expected_spec is None and geometry is not None:
+            expected_spec = self._admission_spec
         if expected_spec is None:
             # Binding precedes request admission: validate fixed structure now;
             # forward checks the request's exact geometry, history and text limits.
