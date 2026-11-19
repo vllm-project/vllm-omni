@@ -61,6 +61,7 @@ from vllm.entrypoints.pooling.pooling.serving import ServingPooling
 from vllm.entrypoints.pooling.scoring.serving import ServingScores
 from vllm.entrypoints.scale_out.token_in_token_out.serving import ServingTokens
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
+from vllm.entrypoints.serve.exception_handling.error_response import create_error_response
 
 # vLLM moved `base` from openai.basic.api_router to serve.instrumentator.basic.
 # Keep a fallback for older/newer upstream layouts during rebase windows.
@@ -976,19 +977,22 @@ class _UnsupportedAnthropicMessages:
 
     Upstream's router only falls back to ``serving_tokenization`` when the
     handler is ``None``; pure-diffusion servers do not have one, so provide a
-    handler that raises ``NotImplementedError`` and let the router translate it
-    into a 501 response instead of failing with ``AttributeError``.
+    handler that returns a 501 ``ErrorResponse`` instead of failing with
+    ``AttributeError``. Returning the error (rather than raising) also keeps the
+    router from logging a traceback for every unsupported request.
     """
 
-    @staticmethod
-    def _unsupported() -> None:
-        raise NotImplementedError("The Anthropic Messages API is not supported by diffusion-only models")
+    _UNSUPPORTED_MESSAGE = "The Anthropic Messages API is not supported by diffusion-only models"
 
-    async def create_messages(self, request: Any, raw_request: Any) -> None:
-        self._unsupported()
+    @classmethod
+    def _unsupported(cls) -> ErrorResponse:
+        return create_error_response(NotImplementedError(cls._UNSUPPORTED_MESSAGE))
 
-    async def count_tokens(self, request: Any, raw_request: Any) -> None:
-        self._unsupported()
+    async def create_messages(self, request: Any, raw_request: Any) -> ErrorResponse:
+        return self._unsupported()
+
+    async def count_tokens(self, request: Any, raw_request: Any) -> ErrorResponse:
+        return self._unsupported()
 
 
 async def omni_init_app_state(
