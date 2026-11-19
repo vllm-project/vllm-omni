@@ -199,10 +199,6 @@ async def test_initial_burst_buffering_holds_until_full(monkeypatch):
     been generated (the playback clock starts with N chunks of reserve)."""
     monkeypatch.setenv("VLLM_OMNI_SPEECH_INITIAL_BURST", "3")
     serving = _burst_serving()
-    # The delivery timeline only flows into observe_audio_streaming_finalize
-    # when the engine client carries mod_metrics — without it the finalize
-    # block is skipped entirely and captured stays empty (KeyError below).
-    serving.engine_client.mod_metrics = mocker.Mock()
     state = {"generated": 0}
 
     async def results():
@@ -304,6 +300,10 @@ async def test_initial_burst_continuity_timeline_follows_delivery(monkeypatch, m
     makes the reserve visible to audio_underrun_s / audio_continuity_ok."""
     monkeypatch.setenv("VLLM_OMNI_SPEECH_INITIAL_BURST", "3")
     serving = _burst_serving()
+    # The delivery timeline only flows into observe_audio_streaming_finalize
+    # when the engine client carries mod_metrics — without it the finalize
+    # block is skipped entirely and captured stays empty (KeyError below).
+    serving.engine_client.mod_metrics = mocker.Mock()
     # Deterministic clock: every perf_counter() call advances by 1 so the
     # relative ordering of generation stamps vs delivery stamps is readable
     # in the captured arrivals.
