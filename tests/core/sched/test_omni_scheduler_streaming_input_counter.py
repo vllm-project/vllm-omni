@@ -125,6 +125,7 @@ def test_ar_schedule_resyncs_before_delegating_upstream(monkeypatch: pytest.Monk
     real queue."""
     parked = _StubRequest("req-resumed", RequestStatus.RUNNING)
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
+    scheduler._model_input_streams = {}
     scheduler.chunk_transfer_adapter = None
     scheduler.input_coordinator = None
     scheduler.requests = {parked.request_id: parked}

@@ -380,6 +380,28 @@ Its default `buffered` mode synthesizes all text received before `input.done` as
 one request. For the supported Qwen3-TTS Chinese/English scope, M1
 `commitment` mode can instead start an independent request whenever the
 semantic-readiness policy marks a boundary after accumulated raw text.
+The separate `model_input_mode` selects complete or incremental model input;
+incremental input uses the commitment frontend and keeps one request alive for
+the utterance.
+
+In incremental mode, the adapter buffers any tokenizer-unstable suffix after
+frontend commitment. It submits the initial engine request only when stable text
+tokens are available, or flushes the remaining text at `input.done`. Subsequent
+releases may also be buffered without sending an engine update. The delivered
+token IDs match encoding the complete model text, regardless of text packet
+boundaries or delivery batching. Empty or whitespace-only utterances do not
+submit an engine request.
+
+The incremental-input scheduler enforces a fixed 10-second conditioning-starvation
+timeout that request payloads cannot override. It starts when the model cannot
+execute its next step because the required text conditioning is unavailable,
+not at every WebSocket message gap. The commitment frontend may still be
+withholding text during this wait. Normal model drain after text EOF is not
+subject to this timeout.
+
+Before the initial request is ready, the normal session idle timeout applies.
+The total generation deadline starts after initial input construction succeeds,
+including the time spent waiting for engine admission.
 
 !!! important
     Commitment mode is not a general sentence detector. Its strong-terminator
@@ -533,6 +555,10 @@ connection can return to idle. That event is only an utterance boundary; use
 disconnect and `session.close` abort active generation, discard unsubmitted or
 queued work, and do not emit `session.done`.
 
+In incremental mode, generation ending before text EOF is submitted is also
+reported as a failure. The error message includes the model's finish reason
+when available; `audio.done.error=true` and the same EOF/reuse rules apply.
+
 ### Flushing vs. Closing
 
 `input.done` is a flush, not a disconnect. The server synthesizes the buffered
@@ -566,6 +592,7 @@ All REST API parameters are supported, plus:
 | ----------- | ------ | --------- | ------------- |
 | `stream_audio` | bool | false | Stream one or more audio chunks for each synthesis request over WebSocket. Requires `response_format="pcm"` or `"wav"`. |
 | `text_input_mode` | `"buffered"` or `"commitment"` | `"buffered"` | Select whole-utterance buffering or M1 semantic-readiness commitment. Commitment requires Qwen3-TTS and explicit `language="Chinese"` or `"English"`. |
+| `model_input_mode` | `"complete"` or `"incremental"` | `"complete"` | Select one complete request per text segment or one incrementally fed request per utterance. Incremental input requires commitment, PCM streaming, and an opted-in model adapter (currently Qwen3-TTS CustomVoice with MRv2). |
 | `split_granularity` | string | `"none"` | `"none"`: one request per `input.done`. `"sentence"`: split on `.!?` plus CJK `。！？…`, Indic danda `।॥`, and Arabic `؟`. `"clause"`: also split on `,;，；،؛`. |
 | `seed` | integer | null | Forwarded to the speech engine for this session |
 

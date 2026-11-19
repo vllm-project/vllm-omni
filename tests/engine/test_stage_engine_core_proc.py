@@ -5,15 +5,17 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import msgspec
 import pytest
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.engine import EngineCoreRequestType, FinishReason
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.request import RequestStatus
 from vllm.v1.serial_utils import run_method
 
+from vllm_omni.engine import OmniEngineCoreOutputs
 from vllm_omni.engine.stage_engine_core_proc import (
     StageEngineCoreProc,
     _bind_first_audio_sink,
@@ -31,6 +33,65 @@ def test_ordered_abort_supports_scheduler_without_overflow_fences(mocker):
     engine._handle_client_request(EngineCoreRequestType.ABORT, ["request"])
 
     engine.scheduler.finish_requests.assert_called_once_with(["request"], RequestStatus.FINISHED_ABORTED)
+
+
+@pytest.mark.parametrize("unsupported_model", [False, True])
+def test_input_stream_admission_error_does_not_enter_the_scheduler(mocker, unsupported_model):
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    reason = (
+        "This model does not support text input append"
+        if unsupported_model
+        else "Text input exceeds its token capacity"
+    )
+    engine._input_stream_factory = None if unsupported_model else mocker.Mock(side_effect=ValueError(reason))
+    engine.vllm_config = SimpleNamespace()
+    engine.output_queue = mocker.Mock()
+    engine.scheduler = mocker.Mock()
+    request = SimpleNamespace(
+        request_id="invalid",
+        client_index=3,
+        additional_information={"input_stream": {"token_ids": [31, 32]}},
+        model_intermediate_buffer=None,
+    )
+
+    with patch.object(EngineCoreProc, "add_request") as add_request:
+        engine.add_request(request)
+
+    add_request.assert_not_called()
+    engine.scheduler.register_input_stream.assert_not_called()
+    output = engine.output_queue.put_nowait.call_args.args[0][1]
+    assert output.finished_requests == {"invalid"}
+    assert output.outputs[0].finish_reason == FinishReason.ERROR
+    assert output.outputs[0].stop_reason == reason
+    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(output), type=OmniEngineCoreOutputs)
+    assert decoded.finished_requests == {"invalid"}
+    assert decoded.outputs[0].stop_reason == reason
+
+
+def test_input_stream_is_registered_only_after_parent_admission(mocker):
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    stream = object()
+    engine._input_stream_factory = mocker.Mock(return_value=stream)
+    engine.vllm_config = SimpleNamespace()
+    engine.output_queue = mocker.Mock()
+    engine.scheduler = mocker.Mock()
+    request = SimpleNamespace(
+        request_id="valid",
+        client_index=0,
+        additional_information={"input_stream": {"token_ids": [31]}},
+        model_intermediate_buffer=None,
+        is_finished=lambda: False,
+    )
+
+    with patch.object(
+        EngineCoreProc,
+        "add_request",
+        side_effect=lambda *_args: engine.scheduler.register_input_stream.assert_not_called(),
+    ) as add_request:
+        engine.add_request(request, request_wave=4)
+
+    add_request.assert_called_once_with(request, 4)
+    engine.scheduler.register_input_stream.assert_called_once_with("valid", stream)
 
 
 def test_release_reaches_native_data_plane_runner(mocker):

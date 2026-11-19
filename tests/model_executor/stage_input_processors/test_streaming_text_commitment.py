@@ -9,6 +9,10 @@ from vllm_omni.model_executor.stage_input_processors.streaming_text_commitment i
     CommitmentState,
     StreamingTextCommitmentPolicy,
 )
+from vllm_omni.model_executor.stage_input_processors.streaming_text_frontend import (
+    StreamingTextFrontendConfig,
+    get_streaming_text_frontend_factory,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -434,3 +438,39 @@ def test_profile_is_explicit_and_unknown_profiles_are_rejected() -> None:
 
     with pytest.raises(ValueError, match="unsupported.*profile"):
         StreamingTextCommitmentPolicy(profile="all_languages")
+
+
+@pytest.mark.parametrize(
+    ("packets", "releases", "remaining"),
+    [
+        (("今天", "天气很好"), (("今天",), ("天气很好",)), ()),
+        (("good", "bye world "), ((), ("goodbye world ",)), ()),
+        (("金额为2026", "元", "，继续"), (("金额为",), (), ("2026元，继续",)), ()),
+        (("数量为3",), (("数量为",),), ("3",)),
+        (("Hello world. ", "Next part "), (("Hello world. ",), ("Next part ",)), ()),
+        ((" \t", "你好", " "), ((" \t",), ("你好",), (" ",)), ()),
+    ],
+)
+def test_unaggregated_frontend_delivers_policy_releases_without_waiting_for_a_boundary(
+    packets: tuple[str, ...], releases: tuple[tuple[str, ...], ...], remaining: tuple[str, ...]
+) -> None:
+    factory = get_streaming_text_frontend_factory("zh_en_special_v1")
+    frontend = factory(
+        StreamingTextFrontendConfig(language="English", max_pending_chars=4096, aggregate_segments=False)
+    )
+    delivered: list[str] = []
+    for packet, expected in zip(packets, releases, strict=True):
+        release = frontend.feed(packet)
+        assert release == expected
+        delivered.extend(release)
+    assert frontend.finish() == remaining
+    assert "".join(delivered + list(remaining)) == "".join(packets)
+
+
+def test_frontend_preserves_default_independent_segment_aggregation() -> None:
+    factory = get_streaming_text_frontend_factory("zh_en_special_v1")
+    frontend = factory(StreamingTextFrontendConfig(language="English", max_pending_chars=4096))
+
+    assert frontend.feed("Hello ") == ()
+    assert frontend.feed("world. Next ") == ("Hello world.",)
+    assert frontend.finish() == (" Next ",)

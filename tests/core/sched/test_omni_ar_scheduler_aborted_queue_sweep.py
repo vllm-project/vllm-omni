@@ -52,6 +52,7 @@ class _StubRequest:
 def _make_scheduler(policy: SchedulingPolicy, *, waiting=(), kv_holding_waiting=(), running=()):
     """Bare scheduler with just the surface the sweep reads."""
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
+    scheduler._model_input_streams = {}
     scheduler.waiting = create_request_queue(policy)
     for req in waiting:
         scheduler.waiting.add_request(req)

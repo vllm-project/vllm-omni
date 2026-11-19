@@ -12,7 +12,7 @@ from __future__ import annotations
 import inspect
 import os
 import socket
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlparse
 
 import vllm.v1.engine as _vllm_engine_module
@@ -30,8 +30,10 @@ from vllm_omni.distributed.omni_connectors.utils.initialization import (
 )
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import kv_zmq_port
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
+from vllm_omni.engine.messages import TextInputUpdate
 from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
+from vllm_omni.errors import OmniClientError
 
 if TYPE_CHECKING:
     from vllm.renderers import BaseRenderer
@@ -528,6 +530,12 @@ class StageEngineCoreClientBase(StageClientBase):
             self.requires_multimodal_data,
             **extra_kwargs,
         )
+
+    async def append_text_async(self, update: TextInputUpdate) -> None:
+        """Append through the existing FIFO EngineCore utility channel."""
+        result = await cast(AsyncMPClient, self).call_utility_async("omni_append_text", update)
+        if result.get("error"):
+            raise OmniClientError(str(result["error"]))
 
     async def collective_rpc_async(
         self,
