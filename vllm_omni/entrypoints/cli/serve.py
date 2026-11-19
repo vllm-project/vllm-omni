@@ -821,6 +821,25 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--ulysses-overlap-chunks",
+            type=int,
+            default=None,
+            help=(
+                "Overlap the strict Ulysses all-to-all with attention by exchanging each rank's heads in this "
+                "many chunks on a side CUDA stream (must divide num_heads / ulysses_degree; 0 disables). "
+                "Requires strict pure Ulysses without --ulysses-a2a-permute. Defaults to disabled."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--ulysses-overlap-int8",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "On the overlapped Ulysses path, send Q/K/V as int8 with per-(token, head) scales, roughly "
+                "halving the all-to-all volume (lossy). Requires --ulysses-overlap-chunks > 0."
+            ),
+        )
+        omni_config_group.add_argument(
             "--ring",
             "--ring-degree",
             dest="ring_degree",
