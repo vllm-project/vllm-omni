@@ -1,8 +1,11 @@
-# Invoker-Render 交互赛车
+# Invoker-Render Interactive Racing Demo
 
-用 [Invoker-Render 配方](../../../recipes/inclusionAI/Invoker-Render.md) 启动实时代理服务。准备与赛车场景起始相机匹配的 1344×768 参考图和冻结提示词。
+Start the live proxy service using the [Invoker-Render recipe](../../../recipes/inclusionAI/Invoker-Render.md).
+Prepare a 1344×768 reference image that matches the opening camera view of the racing scene, along with the frozen prompt.
 
-在仓库根目录运行以下命令。`CWM_SOURCE` 指向 [CodeWorldModel 源码](https://github.com/inclusionAI/CodeWorldModel/tree/86c952f6a37a82afbc391db2572b4d94ce332438) 的本地目录。页面直接使用该版本的赛车、相机和画布采集代码。
+Run the following commands from the repository root. Set `CWM_SOURCE` to a local checkout of the
+[CodeWorldModel source](https://github.com/inclusionAI/CodeWorldModel/tree/86c952f6a37a82afbc391db2572b4d94ce332438).
+The page uses the racing scene, camera, and canvas capture code from that revision.
 
 ```bash
 CWM_SOURCE=/path/to/CodeWorldModel
@@ -17,7 +20,11 @@ ln -s "$CWM_SOURCE/src/sglang/projects/minimax_h3/web/playable" "$DEMO_DIR/codew
 python -m http.server 18862 --bind 127.0.0.1 --directory "$DEMO_DIR"
 ```
 
-打开 `http://127.0.0.1:18862`，填写 WebSocket 地址、参考图与提示词。开局后点击代理画布，用 WASD 加速、转向、刹车。输入额度或待播放帧达到上限时，代理模拟等待播放器追上。点击「结束并排空」会在合法输入边界补采尾包。收到完成通知后可以重新开局。
+Open `http://127.0.0.1:18862` and provide the WebSocket address, reference image, and prompt.
+Start a session and click the proxy canvas. Press W to accelerate, A or D to steer, and S to brake.
+The simulation pauses when input credit runs out or the number of frames awaiting playback reaches its limit.
+Use the middle session button to finish and drain the stream. The client captures the final packet at a valid
+input boundary. You can start another session when the server reports completion.
 
 ```bash
 node --test tests/examples/test_invoker_render_proxy_capture.mjs
