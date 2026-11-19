@@ -638,6 +638,56 @@ def test_pipeline_load_weights_rejects_missing_fast_h3_compression_gate():
         pipeline.load_weights([("transformer.blocks.0.attn.qkv_proj.weight", torch.zeros(1))])
 
 
+class _GatedPipelineLoadTransformer(_PipelineLoadTransformer):
+    def __init__(self) -> None:
+        super().__init__(set())
+        self.blocks = nn.ModuleList([nn.Module()])
+        self.blocks[0].attn = nn.Module()
+        self.blocks[0].attn.to_gate_compress = nn.Linear(3, 1, bias=False)
+
+
+class _TextEncoderLoad(nn.Module):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        return {name for name, _ in weights}
+
+
+def _fast_h3_checkpoint_pipeline():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.transformer = _GatedPipelineLoadTransformer()
+    pipeline.text_encoder = _TextEncoderLoad()
+    pipeline.video_vae = None
+    pipeline.audio_vae = None
+    pipeline._fasth3 = None
+    pipeline._fasth3_checkpoint = FastH3CheckpointSpec.from_metadata(_fastvideo_metadata())
+    return pipeline
+
+
+def test_pipeline_load_weights_skips_gate_check_when_host_weight_plan_owns_transformer():
+    # #10441: with a DLO host-weight plan (e.g. a warm Host Weight Runtime
+    # restore) the loader drops the ``transformer.`` source before calling
+    # load_weights, so only the remaining components stream through here.
+    pipeline = _fast_h3_checkpoint_pipeline()
+
+    loaded = pipeline.load_weights([("text_encoder.layers.0.weight", torch.zeros(1))])
+
+    assert loaded == {"text_encoder.layers.0.weight"}
+
+
+def test_pipeline_load_weights_still_rejects_streamed_checkpoint_without_gates():
+    pipeline = _fast_h3_checkpoint_pipeline()
+
+    with pytest.raises(ValueError, match=r"missing compression gates: \['blocks.0.attn.to_gate_compress.weight'\]"):
+        pipeline.load_weights(
+            [
+                ("transformer.blocks.0.attn.qkv_proj.weight", torch.zeros(1)),
+                ("text_encoder.layers.0.weight", torch.zeros(1)),
+            ]
+        )
+
+
 def _load_fixture(
     *, diffusers_weights: bool
 ) -> tuple[MiniMaxH3DiTModel, list[tuple[str | None, torch.Tensor]], list[tuple[int, torch.Tensor]]]:

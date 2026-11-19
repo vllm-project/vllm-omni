@@ -1,9 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import contextlib
 import os
 import stat
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from tempfile import NamedTemporaryFile
 from typing import Generic, Literal, TypeVar
@@ -45,7 +49,7 @@ class StorageBaseManager(Generic[K], ABC):
     async def delete(self, *args, **kwargs) -> bool:
         pass
 
-    async def start(self, *args, **kwargs) -> None:
+    async def start(self, *, on_expire: Callable[[list[str]], Awaitable[None]] | None = None) -> None:
         pass
 
     async def stop(self, *args, **kwargs) -> None:
@@ -127,6 +131,7 @@ class LocalStorageTTLManager(LocalStorageManager):
         self._ttl_seconds = ttl_seconds
         self._sweep_interval_seconds = sweep_interval_seconds
         self._sweeper_task: asyncio.Task[None] | None = None
+        self._on_expire: Callable[[list[str]], Awaitable[None]] | None = None
 
         super().__init__(*args, **kwargs)
 
@@ -148,7 +153,7 @@ class LocalStorageTTLManager(LocalStorageManager):
             except OSError:
                 logger.warning("TTL sweep failed to inspect %s", entry.path, exc_info=True)
 
-        deleted = 0
+        deleted_keys: list[str] = []
         for path in expired:
             try:
                 async with self._io_semaphore:
@@ -158,13 +163,16 @@ class LocalStorageTTLManager(LocalStorageManager):
                     if st.st_mtime >= cutoff:
                         continue
                     await asyncio.to_thread(os.remove, path)
-                    deleted += 1
+                    deleted_keys.append(os.path.basename(path))
             except FileNotFoundError:
                 logger.debug("TTL sweep skipped %s; file already removed", path)
             except OSError:
                 logger.warning("TTL sweep failed to delete expired file %s", path, exc_info=True)
 
-        return deleted
+        if deleted_keys and self._on_expire is not None:
+            await self._on_expire(deleted_keys)
+
+        return len(deleted_keys)
 
     async def _sweep_loop(self) -> None:
         while True:
@@ -175,8 +183,9 @@ class LocalStorageTTLManager(LocalStorageManager):
                 logger.exception("TTL sweep failed for storage path %s", self.storage_path)
             await asyncio.sleep(self._sweep_interval_seconds)
 
-    async def start(self) -> None:
+    async def start(self, *, on_expire: Callable[[list[str]], Awaitable[None]] | None = None) -> None:
         if self._sweeper_task is None or self._sweeper_task.done():
+            self._on_expire = on_expire
             self._sweeper_task = asyncio.create_task(self._sweep_loop())
 
     async def stop(self) -> None:
@@ -189,6 +198,7 @@ class LocalStorageTTLManager(LocalStorageManager):
 
 
 def get_storage_manager(storage_config: FileBackend) -> StorageBaseManager[FileStorageHandle]:
+    manager: LocalStorageManager
     if isinstance(storage_config, FileBackend):
         if storage_config.file_ttl is not None and storage_config.ttl_sweep_interval is not None:
             manager = LocalStorageTTLManager(

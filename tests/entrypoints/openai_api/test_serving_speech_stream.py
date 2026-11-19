@@ -3,6 +3,7 @@
 
 import asyncio
 import base64
+import json
 import threading
 from dataclasses import replace
 from types import SimpleNamespace
@@ -16,7 +17,7 @@ from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from vllm_omni.entrypoints.openai import serving_speech_stream as streaming_speech_module
-from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech, _create_wav_header
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.tts_adapters.base import TTSModelAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter
@@ -1306,6 +1307,59 @@ class TestStreamingSpeechWebSocket:
                 assert ws.receive_bytes() == b"\x01\x02\x03\x04"
                 assert ws.receive_json()["type"] == "audio.done"
 
+    def test_streaming_wav_stream_starts_with_placeholder_header(self, mocker: MockerFixture):
+        """Binary frames concatenate into one WAV byte stream."""
+        first_chunk = b"\x01\x02\x03\x04"
+        second_chunk = b"\x05\x06\x07\x08"
+
+        async def mock_generate_pcm_chunks(_generator, _request_id, *, audio_format=None, **_kwargs):
+            _fill_audio_format(audio_format, sample_rate=48000, channels=2)
+            yield first_chunk
+            yield second_chunk
+
+        speech_service = self._stream_service(mocker, mock_generate_pcm_chunks)
+        app, _ = _build_test_app(speech_service)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "voice": "Vivian",
+                        "stream_audio": True,
+                        "response_format": "wav",
+                    }
+                )
+                ws.send_json({"type": "input.text", "text": "Hello world. "})
+                ws.send_json({"type": "input.done"})
+
+                start = ws.receive_json()
+                assert start["type"] == "audio.start"
+                assert start["format"] == "wav"
+                assert start["sample_rate"] == 48000
+                assert start["channels"] == 2
+
+                header = _create_wav_header(sample_rate=48000, num_channels=2, bits_per_sample=16)
+                binary_stream = bytearray()
+                while True:
+                    message = ws.receive()
+                    if message.get("bytes") is not None:
+                        binary_stream.extend(message["bytes"])
+                        continue
+                    done = json.loads(message["text"])
+                    assert done["type"] == "audio.done"
+                    break
+                assert binary_stream == header + first_chunk + second_chunk
+
+                assert done["total_bytes"] == len(header) + len(first_chunk) + len(second_chunk)
+                assert done["error"] is False
+                assert ws.receive_json()["type"] == "session.done"
+
+        request = speech_service._prepare_speech_generation.await_args.args[0]
+        assert request.stream is True
+        assert request.response_format == "wav"
+        speech_service._generate_audio_bytes.assert_not_awaited()
+
     def test_streaming_pcm_error_before_audio_keeps_start_done_pairing(self, mocker: MockerFixture):
         """No audio means no known format: audio.start omits it rather than guessing."""
 
@@ -1575,12 +1629,12 @@ class TestStreamingSpeechWebSocket:
                         "type": "session.config",
                         "voice": "Vivian",
                         "stream_audio": True,
-                        "response_format": "wav",
+                        "response_format": "mp3",
                     }
                 )
                 error = ws.receive_json()
                 assert error["type"] == "error"
-                assert "response_format='pcm'" in error["message"]
+                assert "response_format='pcm' or 'wav'" in error["message"]
 
     def test_empty_input_text_emits_no_audio(self, mocker: MockerFixture):
         app, speech_service = _build_test_app(mocker=mocker)

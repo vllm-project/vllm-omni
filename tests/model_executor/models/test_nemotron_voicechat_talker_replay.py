@@ -23,7 +23,7 @@ from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_talke
     NemotronVoiceChatTalkerForConditionalGeneration,
 )
 
-pytestmark = pytest.mark.core_model
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 INIT_LEN = 4
 HID = 4
@@ -132,3 +132,54 @@ def test_position_past_session_step_is_rejected():
     talker, _ = _make_talker(step=3, rows_through_step=2)
     with pytest.raises(RuntimeError, match="outpaced"):
         _preprocess(talker, offset=INIT_LEN + 3, span=1)
+
+
+def test_v2_payload_identity_commits_codes_before_the_next_timeline_step(monkeypatch):
+    import numpy as np
+
+    from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
+    from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+
+    talker, session = _make_talker(step=1, rows_through_step=0)
+    talker._hidden, talker._vocab = HID, 8
+    talker._mog_graph = SimpleNamespace(run=lambda hidden: torch.full((1, 1, Q), float(hidden.sum())))
+    session.update(prompt_len=0, generation_config={}, codec_request_id="req")
+    monkeypatch.setattr(talker, "_refresh_native_timeline", lambda *_: None)
+    buffer = OmniIntermediateBuffer(2)
+    buffer.add_request(
+        1,
+        SimpleNamespace(
+            req_id="req",
+            mm_features=[],
+            additional_information=None,
+            model_intermediate_buffer={"meta": {"request_id": "req"}},
+        ),
+    )
+    info = buffer.buffers[1]
+    assert "request_id" not in info and info["meta"]["request_id"] == "req"
+    state = object.__new__(OmniModelState)
+    state.model, state.have_multimodal_outputs, state.intermediate_buffer = talker, True, buffer
+    batch = SimpleNamespace(
+        num_reqs=1,
+        idx_mapping_np=np.array([1]),
+        query_start_loc_np=np.array([0, 1]),
+        num_scheduled_tokens=np.array([1]),
+        logits_indices=torch.tensor([0]),
+    )
+    for step in (1, 2):
+        # Use the same payload metadata as the actual V2 buffer. Preprocess
+        # resolves it, and output conversion must resolve the same session.
+        talker.preprocess(
+            torch.zeros(1, dtype=torch.long), None, **dict(info, _omni_num_computed_tokens=INIT_LEN + step - 1)
+        )
+        hidden = torch.full((1, HID), float(step))
+        state.postprocess_model_output(hidden, batch, None)
+        # Before the fix the first output silently skips this session; the
+        # next preprocess raises the actual timeline2/session1 CI exception.
+        if step == 2:
+            assert session["step"] == 3
+    assert len(session["codes_rows"]) == 2
+    assert [row.tolist() for row in session["codes_rows"]] == [[[4, 4]], [[8, 8]]]
+    assert session["pending_step"] is None
+    assert info["req_id"] == "req"
+    assert "request_id" not in info

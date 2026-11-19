@@ -130,7 +130,8 @@ def test_mrope_matches_hf_rotary(device: str, dtype: torch.dtype, positions_dim:
     else:
         positions = torch.stack([torch.arange(n), torch.arange(n) // 2, torch.arange(n) % 3]).to(device)
         hf_positions = positions[:, None, :]
-    hf_rope = Qwen3OmniMoeThinkerTextRotaryEmbedding(config, device=device)
+    with torch.device(device):
+        hf_rope = Qwen3OmniMoeThinkerTextRotaryEmbedding(config)
     cos, sin = hf_rope(q, hf_positions)
     q_ref, k_ref = apply_rotary_pos_emb(
         q.view(1, n, heads, d).transpose(1, 2), k.view(1, n, kv_heads, d).transpose(1, 2), cos, sin

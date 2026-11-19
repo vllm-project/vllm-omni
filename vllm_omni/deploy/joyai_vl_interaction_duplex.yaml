@@ -1,8 +1,14 @@
 # Text/video observations with the existing JoyAI -> Qwen3-TTS -> Code2Wav stages.
 base_config: joyai_vl_interaction.yaml
 session_mode: duplex
-# Stream Talker codec frames into Code2Wav so audio reaches the client per chunk.
-# JoyAI -> Talker stays orchestrator-fed through joyai_action_to_tts.
+# Single switch for this profile's streaming behaviors. true enables all of:
+#   - JoyAI action text projected to the client while it generates;
+#   - per-sentence Talker handoff (Talker runs DELTA so its 2150 park is visible);
+#   - Talker codec frames streamed into Code2Wav chunk by chunk.
+# false reverts the whole profile to the one-shot path in joyai_vl_interaction.yaml:
+# a single text projection at the action end, FINAL_ONLY JoyAI/Talker stages, and a
+# full-payload Code2Wav decode. Per-sentence handoff needs the prewarmed,
+# connector-fed Code2Wav that only this flag enables, so it is disabled with it.
 async_chunk: true
 duplex_session:
   max_sessions: 1

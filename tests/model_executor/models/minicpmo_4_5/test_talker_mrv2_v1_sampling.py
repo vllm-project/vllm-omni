@@ -9,10 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from vllm.v1.sample.logits_processor.state import LogitsProcessors
-from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops import topk_topp_sampler
-from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.states import SamplingStates
 
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_mrv2_sampling import draw_v1_codec_ids
@@ -61,26 +58,20 @@ def _v1_sample(
     generators: dict[int, torch.Generator],
 ) -> torch.Tensor:
     """The V1 sampler tail: temperature, top-k/top-p, seeded exponential draw."""
-    metadata = SamplingMetadata(
-        temperature=temperature,
-        all_greedy=bool(torch.all(temperature < 1e-5).item()),
-        all_random=bool(torch.all(temperature >= 1e-5).item()),
-        top_p=top_p,
-        top_k=top_k,
-        generators=generators,
-        max_num_logprobs=None,
-        no_penalties=True,
-        prompt_token_ids=None,
-        frequency_penalties=torch.zeros(logits.shape[0]),
-        presence_penalties=torch.zeros(logits.shape[0]),
-        repetition_penalties=torch.ones(logits.shape[0]),
-        output_token_ids=[[] for _ in range(logits.shape[0])],
-        allowed_token_ids_mask=None,
-        bad_words_token_ids={},
-        logitsprocs=LogitsProcessors(),
-    )
-    sampled, _ = Sampler().sample(logits.clone(), metadata)
-    return sampled
+    # The removed runner is not needed as an oracle: retain its model-domain
+    # Torch draw, using native filtering and explicit ordered generators.
+    greedy = temperature < 1e-5
+    if bool(greedy.all()):
+        return logits.argmax(dim=-1)
+    scaled = logits / torch.where(greedy, 1.0, temperature).unsqueeze(1)
+    filtered = topk_topp_sampler.apply_top_k_top_p(scaled, top_k, top_p)
+    probs = filtered.softmax(dim=-1, dtype=torch.float32)
+    noise = torch.empty_like(probs)
+    if len(generators) != logits.shape[0]:
+        noise.exponential_()
+    for row, generator in generators.items():
+        noise[row].exponential_(generator=generator)
+    return torch.where(greedy, logits.argmax(dim=-1), (probs / noise).argmax(dim=-1))
 
 
 def _mrv2_sample(

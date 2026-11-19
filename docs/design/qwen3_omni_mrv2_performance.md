@@ -22,7 +22,20 @@ First-frame delivery requires `talker_first_audio: true` in connector extra,
 a one-frame initial codec chunk, CUDA, a local single-rank Talker and prefix caching disabled.
 Other deployments retain the regular Code2Wav path.
 `codec_fused_snake` explicitly opts CUDA profiles into fused decoder blocks;
-the base V1 profile retains its original blocks and indexed text cache.
+profiles that do not opt in retain their original blocks and indexed text cache.
+
+## ROCm generation stages
+
+The default `qwen3_omni_moe.yaml` selects MRv2 for Thinker, Talker and
+Code2Wav on ROCm. It preserves the ROCm stage-0 prefix-cache disable and keeps
+Code2Wav eager because its MIOpen transposed convolutions are not safe inside
+the outer graph capture. Async chunks, sampling defaults and the three-stage
+payload contract are unchanged.
+
+This runner migration does not enable the H200 profile's CUDA graphs, fused
+sampling, cuDNN search, first-frame decoder or CUDA-only kernels on ROCm. It
+does not by itself establish ROCm performance or audio-quality qualification;
+the exact ROCm deployment remains subject to hardware CI.
 
 ## Ascend generation stage
 

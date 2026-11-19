@@ -215,7 +215,9 @@ def test_build_vllm_config_forwards_text_watermark_config(
     )
     forwarded: list[dict[str, object] | None] = []
 
-    with pytest.raises(_StopAfterEngineArgsError):
+    expected_error = _StopAfterEngineArgsError if use_v2_model_runner else ValueError
+    expected_match = None if use_v2_model_runner else "Model Runner V1 is not supported"
+    with pytest.raises(expected_error, match=expected_match):
         # start to build the vLLM config and ensure the Omni watermark config is properly parsed
         build_vllm_config(
             stage,
@@ -224,7 +226,7 @@ def test_build_vllm_config_forwards_text_watermark_config(
             watermark_config=WatermarkConfig({"text": {"key": 1234, "algorithm": "gumbel"}}),
         )
 
-    assert forwarded == [expected]
+    assert forwarded == ([expected] if use_v2_model_runner else [])
 
 
 def test_orchestrator_startup_timeout_warns_how_to_raise_limits(monkeypatch):
@@ -2661,7 +2663,7 @@ def test_engine_async_chunk_includes_downstream_stages(monkeypatch, stage_modes,
 
 
 @pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
-def test_dist_stage_runtime_applies_local_dp_to_stage_config(typed):
+def test_dist_stage_runtime_preserves_stage_total_when_local_dp_is_set(typed):
     from vllm_omni.config.omni_config import VllmOmniARStageConfig
     from vllm_omni.config.stage_config import StagePipelineConfig
     from vllm_omni.engine.stage_runtime import DistStageRuntime
@@ -2672,6 +2674,7 @@ def test_dist_stage_runtime_applies_local_dp_to_stage_config(typed):
     else:
         runtime_cfg = types.SimpleNamespace(num_replicas=1)
         stage = types.SimpleNamespace(stage_id=0, runtime=runtime_cfg)
+    runtime_cfg.num_replicas = 3
     runtime = DistStageRuntime(
         stage_configs=[stage],
         model="dummy-model",
@@ -2686,7 +2689,10 @@ def test_dist_stage_runtime_applies_local_dp_to_stage_config(typed):
 
     runtime._validate_single_stage_mode_replica_constraints()
 
-    assert runtime_cfg.num_replicas == 2
+    assert runtime_cfg.num_replicas == 3
+    assert runtime._get_replica_launch_mode(0, 0) == "local"
+    assert runtime._get_replica_launch_mode(0, 1) == "local"
+    assert runtime._get_replica_launch_mode(0, 2) == "remote"
 
 
 @pytest.mark.parametrize("num_replicas", [1, 2, 3])

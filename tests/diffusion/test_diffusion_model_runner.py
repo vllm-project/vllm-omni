@@ -302,9 +302,14 @@ def _make_runner(cache_backend, cache_backend_name: str | None, enable_cache_dit
     runner.state_cache = {}
     runner.prompt_embed_cache = None
     runner.od_config = SimpleNamespace(
+        kv_transfer_config=None,
+        cfg_kv_collect_func=None,
+        diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+        step_execution=False,
         cache_backend=cache_backend_name,
         enable_cache_dit_summary=enable_cache_dit_summary,
-        parallel_config=SimpleNamespace(use_hsdp=False),
+        diffusion_attention_schedule=None,
+        parallel_config=SimpleNamespace(cfg_parallel_size=1, use_hsdp=False),
         streaming_output=False,
         video_output_transport=VideoOutputTransportConfig(),
     )
@@ -414,6 +419,7 @@ def test_request_batch_binds_whether_its_requests_sent_their_schedule(explicit, 
         record_output_peak_memory=False,
     )
 
+    assert runner.pipeline.bound is not None
     schedule, from_request = runner.pipeline.bound
     assert schedule == runner.od_config.diffusion_attention_schedule.default
     assert from_request is explicit
@@ -429,6 +435,7 @@ def _make_compile_runner(
     runner = object.__new__(DiffusionModelRunner)
     runner.pipeline = SimpleNamespace(transformer=model or SimpleNamespace())
     runner.od_config = SimpleNamespace(
+        diffusion_use_graph=False,
         diffusion_compile_granularity=compile_granularity,
         diffusion_compile_dynamic=compile_dynamic,
         parallel_config=SimpleNamespace(use_hsdp=use_hsdp),
@@ -1477,8 +1484,11 @@ def _make_batch_runner(pipeline):
     runner.cache_backend = None
     runner.offload_backend = None
     runner.od_config = SimpleNamespace(
+        cfg_kv_collect_func=None,
+        diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
         cache_backend="none",
-        enable_cache_dit_summary=False,
+        streaming_output=False,
+        diffusion_attention_schedule=None,
         parallel_config=SimpleNamespace(use_hsdp=False),
         video_output_transport=VideoOutputTransportConfig(),
     )
@@ -1776,6 +1786,11 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch, e
     runner.cache_backend = None
     runner.offload_backend = None
     runner.od_config = SimpleNamespace(
+        step_execution=False,
+        diffusion_use_graph=False,
+        enable_prompt_embed_cache=False,
+        prompt_embed_cache_size=32,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
         cache_backend="cache_dit",
@@ -1783,6 +1798,7 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch, e
         model_class_name="NextStep11Pipeline",
         enforce_eager=True,
         streaming_output=False,
+        diffusion_attention_schedule=None,
     )
 
     monkeypatch.setattr(model_runner_module, "LoadConfig", lambda: object())
@@ -1829,11 +1845,7 @@ def test_load_model_rejects_env_prompt_cache_before_text_encoder_allgather(monke
         parallel_config=SimpleNamespace(data_parallel_size=2),
         enable_prompt_embed_cache=False,
         prompt_embed_cache_size=32,
-        cache_backend="none",
-        model_class_name="Wan22Pipeline",
-        enforce_eager=True,
-        streaming_output=False,
-        step_execution=False,
+        diffusion_attention_schedule=None,
     )
     monkeypatch.setenv("OMNI_DIFFUSION_PROMPT_EMBED_CACHE", "1")
     runtime_init = Mock(side_effect=pytest.fail)

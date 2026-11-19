@@ -129,7 +129,7 @@ python openai_chat_client.py --input input1.png input2.png --prompt "Combine the
     pip install 'vllm-omni[demo]'
     ```
 
-    For this 0.33 source checkout, follow the
+    For this 0.34 source checkout, follow the
     [source demo dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
     from the repository root. Build the temporary Gradio wheel and include it
     with `.[demo]` in the same normal install command.

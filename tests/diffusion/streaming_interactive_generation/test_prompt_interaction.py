@@ -22,6 +22,7 @@ from tests.engine.test_orchestrator import (
     _wait_for,
 )
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.inline_stage_diffusion_client import InlineStageDiffusionClient
 from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
 from vllm_omni.diffusion.interaction.modality_handlers.prompt import (
@@ -99,6 +100,10 @@ def _make_diffusion_model_runner(
         streaming_output=streaming_output,
         cache_backend=None,
         parallel_config=SimpleNamespace(use_hsdp=False),
+        diffusion_attention_schedule=None,
+        diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+        kv_transfer_config=None,
+        cfg_kv_collect_func=None,
     )
     runner.vllm_config = object()
     runner.device = torch.device("cpu")

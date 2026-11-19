@@ -89,6 +89,38 @@ MEAN_VIDEO_RTF = f"mean_{VIDEO_RTF}"
 MEDIAN_VIDEO_RTF = f"median_{VIDEO_RTF}"
 STD_VIDEO_RTF = f"std_{VIDEO_RTF}"
 PERCENTILES_VIDEO_RTF = f"percentiles_{VIDEO_RTF}"
+# Realtime video observations: TTFC/steady samples are seconds on request
+# outputs and milliseconds in aggregates; generated FPS is frames/second.
+VIDEO_TTFC = "video_ttfc"
+VIDEO_FPS = "video_fps"
+VIDEO_STEADY_INTERVAL = "video_steady_interval"
+VIDEO_STEADY_INTERVALS = "video_steady_intervals"
+MEAN_VIDEO_TTFC_MS = f"mean_{VIDEO_TTFC}_ms"
+MEDIAN_VIDEO_TTFC_MS = f"median_{VIDEO_TTFC}_ms"
+STD_VIDEO_TTFC_MS = f"std_{VIDEO_TTFC}_ms"
+PERCENTILES_VIDEO_TTFC_MS = f"percentiles_{VIDEO_TTFC}_ms"
+MIN_VIDEO_FPS = f"min_{VIDEO_FPS}"
+MEAN_VIDEO_FPS = f"mean_{VIDEO_FPS}"
+MEDIAN_VIDEO_FPS = f"median_{VIDEO_FPS}"
+STD_VIDEO_FPS = f"std_{VIDEO_FPS}"
+PERCENTILES_VIDEO_FPS = f"percentiles_{VIDEO_FPS}"
+MEAN_VIDEO_STEADY_INTERVAL_MS = f"mean_{VIDEO_STEADY_INTERVAL}_ms"
+MEDIAN_VIDEO_STEADY_INTERVAL_MS = f"median_{VIDEO_STEADY_INTERVAL}_ms"
+STD_VIDEO_STEADY_INTERVAL_MS = f"std_{VIDEO_STEADY_INTERVAL}_ms"
+PERCENTILES_VIDEO_STEADY_INTERVAL_MS = f"percentiles_{VIDEO_STEADY_INTERVAL}_ms"
+VIDEO_STREAM_METRIC_UNITS = {VIDEO_TTFC: "ms", VIDEO_FPS: "frames/s", VIDEO_STEADY_INTERVAL: "ms", VIDEO_RTF: "ratio"}
+VIDEO_RTF_CLIENT_SCOPE = {
+    "numerator": "client_session_wall_seconds",
+    "denominator": "frames / target_fps",
+    "timing_boundary": (
+        "after session.start send completes through session.done and keepalive cleanup; connection setup/close excluded"
+    ),
+}
+VIDEO_RTF_SERVER_SCOPE = {
+    "numerator": "server_generation_seconds; client_request_latency_seconds fallback",
+    "denominator": "resolved_video_content_duration_seconds",
+    "duration_resolution": "payload duration_s; payload num_frames/fps; request seconds; request num_frames/fps",
+}
 MEAN_VIDEO_GENERATION_MS = f"mean_{VIDEO_GENERATION}_ms"
 MEDIAN_VIDEO_GENERATION_MS = f"median_{VIDEO_GENERATION}_ms"
 STD_VIDEO_GENERATION_MS = f"std_{VIDEO_GENERATION}_ms"

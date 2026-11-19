@@ -389,3 +389,73 @@ def test_discarded_async_text_cannot_suppress_next_unit_eos(monkeypatch, deferre
     eos = TOKEN_IDS["turn_eos_token_id"]
     assert sample(eos, 29) == eos
     assert state.current_turn_ended
+
+
+def _policy_model_with_state(state):
+    """A bare LLM-stage model whose session ``s0`` resolves to ``state``."""
+    model = Model.__new__(Model)
+    model.model_stage = "llm"
+    model._minicpmo45_native_duplex_token_ids_cache = dict(TOKEN_IDS)
+    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={"s0": state})
+    return model
+
+
+def _policy_row(payload):
+    return SimpleNamespace(
+        row_idx=0,
+        request_id="r0",
+        seq=0,
+        session_id="s0",
+        payload=payload,
+        temperature=None,
+        top_k=None,
+        top_p=None,
+        max_tokens=None,
+    )
+
+
+def test_response_create_unit_releases_turn_ended_latch():
+    """A response.create unit opens the assistant turn despite the latch.
+
+    A truncated turn leaves ``current_turn_ended`` set; without the
+    ``open_assistant_turn`` marker the forced response's silent rows are
+    masked to listen-only and the listen -> tts_bos swap stays blocked, so
+    the forced response can only listen.
+    """
+    state = _MiniCPMO45Stage0SessionState(session_id="s0")
+    state.current_turn_ended = True
+    state.pending_speech_context = False
+    model = _policy_model_with_state(state)
+    logits = torch.zeros(1, VOCAB)
+    model.prepare_duplex_sampling(logits, None, rows=(_policy_row({"open_assistant_turn": True}),))
+    # The latch is released and the response is open: the silent row is not
+    # masked to listen-only and the listen -> tts_bos swap can fire.
+    assert state.current_turn_ended is False
+    assert state.pending_speech_response_open is True
+    assert bool(torch.isfinite(logits[0]).all())
+
+
+def test_latched_silent_row_still_masked_without_marker():
+    """Without the marker a latched silent row keeps the listen-only mask."""
+    state = _MiniCPMO45Stage0SessionState(session_id="s0")
+    state.current_turn_ended = True
+    state.pending_speech_context = False
+    model = _policy_model_with_state(state)
+    logits = torch.zeros(1, VOCAB)
+    model.prepare_duplex_sampling(logits, None, rows=(_policy_row({}),))
+    assert state.current_turn_ended is True
+    masked = torch.isneginf(logits[0])
+    assert int(masked.sum()) == VOCAB - 1
+    assert logits[0][LISTEN] == 0.0
+
+
+def test_marker_does_not_touch_already_open_turn():
+    """An unlatched turn keeps its state: the marker only releases the latch."""
+    state = _MiniCPMO45Stage0SessionState(session_id="s0")
+    state.current_turn_ended = False
+    state.pending_speech_response_open = False
+    model = _policy_model_with_state(state)
+    logits = torch.zeros(1, VOCAB)
+    model.prepare_duplex_sampling(logits, None, rows=(_policy_row({"open_assistant_turn": True}),))
+    assert state.current_turn_ended is False
+    assert state.pending_speech_response_open is False

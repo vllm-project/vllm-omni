@@ -2,10 +2,16 @@
 
 ## Status and target
 
-PersonaPlex (`nvidia/personaplex-7b-v1`, a Moshi finetune) is served by the
+**Historical V1 integration contract.** PersonaPlex is unavailable with vLLM
+0.34 and V2-only execution: its Talker requires the retired Model Runner V1.
+The retained default profile is rejected during configuration loading. The V2
+Code2Wav component does not make the complete workflow runnable; a model-owner
+V2 migration is still required.
+
+PersonaPlex (`nvidia/personaplex-7b-v1`, a Moshi finetune) was served by the
 [Unified Full-Duplex Framework](fullduplex.md) through one model plugin,
 `PersonaPlexDuplexPlugin` (`vllm_omni/model_executor/models/personaplex/duplex/plugin.py`),
-selected by `PipelineConfig.duplex_plugin`. The serving path is:
+selected by `PipelineConfig.duplex_plugin`. The historical serving path was:
 
 ```text
 /v1/realtime?duplex=1
@@ -260,12 +266,13 @@ conversational turn boundary.
   validation, fixed-frame buffer, cumulative data plane, request-output
   readers).
 
-### GPU validation
+### Historical GPU validation
 
 `tests/e2e/online_serving/personaplex_realtime_duplex.py` (wrapped by
 `tests/e2e/online_serving/test_personaplex_duplex.py` when
-`PERSONAPLEX_MODEL_PATH` is set) drives the default `personaplex.yaml`
-deployment and requires:
+`PERSONAPLEX_MODEL_PATH` is set) defined the earlier default `personaplex.yaml`
+validation contract below. It does not establish readiness with vLLM 0.34;
+the current profile is unavailable until its V1 Talker is migrated to V2.
 
 1. the server reaches ready without a local eager override; `/health` is 200;
 2. `/v1/realtime?duplex=1` reports `model_native_duplex`, `chunk_period_ms=80`

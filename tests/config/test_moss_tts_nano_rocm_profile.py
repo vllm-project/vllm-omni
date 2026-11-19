@@ -15,14 +15,14 @@ from vllm_omni.model_executor.models.moss_tts_nano.pipeline import MOSS_TTS_NANO
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_rocm_supplies_the_nested_gpt2_head_dimension() -> None:
+def test_rocm_supplies_the_nested_gpt2_head_dimension_on_v2() -> None:
     deploy = _apply_platform_overrides(
         load_deploy_config(get_deploy_config_path("moss_tts_nano.yaml")),
         platform="rocm",
     )
-    (stage,) = merge_pipeline_deploy(MOSS_TTS_NANO_PIPELINE, deploy)
-
-    assert stage.yaml_engine_args["hf_overrides"]["head_dim"] == 64
+    assert deploy.stages[0].engine_extras["hf_overrides"]["head_dim"] == 64
+    stages = merge_pipeline_deploy(MOSS_TTS_NANO_PIPELINE, deploy)
+    assert stages[0].yaml_engine_args["use_v2_model_runner"] is True
 
 
 def test_head_dimension_override_is_rocm_only() -> None:

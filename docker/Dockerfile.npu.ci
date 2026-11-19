@@ -1,6 +1,6 @@
-# vLLM-Ascend v0.33.0 runtime matching the vLLM v0.33.0 alignment. CI injects
-# the per-device tag suffix through VLLM_ASCEND_DEVICE_SUFFIX (-a3/-a5/-310p);
-# the unsuffixed tag is the generic image used for A2.
+# The published vLLM-Ascend baseline remains v0.33.0; its v0.34.0 release
+# is unavailable. This older NPU image is not qualified for Omni's vLLM 0.34.0
+# target. Device-specific suffixes select -a3/-a5/-310p; no suffix selects A2.
 ARG VLLM_ASCEND_IMAGE=quay.io/atlas-ci/vllm-ascend
 ARG VLLM_ASCEND_VERSION=v0.33.0
 ARG VLLM_ASCEND_DEVICE_SUFFIX=

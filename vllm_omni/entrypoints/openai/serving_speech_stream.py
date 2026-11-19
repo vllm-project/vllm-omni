@@ -33,8 +33,10 @@ Protocol:
         {"type": "audio.start", "utterance_index": 0, "sentence_index": 0,
          "sentence_text": "...", "format": "wav"}
         # With stream_audio=true, audio.start is sent with the first audio
-        # chunk; for format "pcm" it also carries that audio's "sample_rate"
-        # and "channels" (s16le, interleaved, model-native).
+        # chunk; for formats "pcm" and "wav" it also carries that audio's
+        # "sample_rate" and "channels". PCM frames are s16le, interleaved.
+        # Binary frames form one continuous byte stream. For WAV, that stream
+        # begins with one 44-byte placeholder header before the PCM samples.
         <binary frame: audio bytes>
         ...
         {"type": "audio.done", "utterance_index": 0, "sentence_index": 0}
@@ -75,7 +77,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     OpenAICreateSpeechRequest,
     StreamingSpeechSessionConfig,
 )
-from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech, _create_wav_header
 from vllm_omni.entrypoints.openai.speech_text_splitter import SpeechTextSplitter
 from vllm_omni.model_executor.stage_input_processors.streaming_text_frontend import (
     StreamingTextFrontend,
@@ -860,11 +862,11 @@ class OmniStreamingSpeechHandler:
         }
         if config.word_timestamps:
             start_payload["word_timestamps"] = True
-        # Streamed pcm is model-native s16le. Its rate and channel count are
-        # known once the first chunk is encoded, so for pcm audio.start is
+        # Streamed PCM/WAV uses the model-native format. Its rate and channel
+        # count are known once the first chunk is encoded, so audio.start is
         # deferred to that point and states them; it is sent bare if no audio
         # arrives. Non-streamed responses still send it before generation.
-        describe_pcm = config.stream_audio and response_format == "pcm"
+        describe_streamed_audio = config.stream_audio and response_format in ("pcm", "wav")
         audio_format: dict[str, int] = {}
         start_sent = False
 
@@ -873,12 +875,12 @@ class OmniStreamingSpeechHandler:
             if start_sent:
                 return
             start_sent = True
-            if describe_pcm and audio_format:
+            if describe_streamed_audio and audio_format:
                 start_payload["sample_rate"] = audio_format["sample_rate"]
                 start_payload["channels"] = audio_format["channels"]
             await websocket.send_json(start_payload)
 
-        if not describe_pcm:
+        if not describe_streamed_audio:
             await send_start()
 
         total_bytes = 0
@@ -915,6 +917,7 @@ class OmniStreamingSpeechHandler:
                         send_start=send_start,
                     )
                 else:
+                    wav_header_pending = response_format == "wav"
                     async with aclosing(
                         self._speech_service._generate_pcm_chunks(
                             generator,
@@ -927,6 +930,23 @@ class OmniStreamingSpeechHandler:
                     ) as stream:
                         async for chunk in stream:
                             await send_start()
+                            if wav_header_pending:
+                                sample_rate = audio_format.get("sample_rate")
+                                channels = audio_format.get("channels")
+                                if sample_rate is None or channels is None:
+                                    raise ValueError(
+                                        "First audio output must include sample rate and channel metadata "
+                                        "for WAV streaming"
+                                    )
+                                chunk = (
+                                    _create_wav_header(
+                                        sample_rate=sample_rate,
+                                        num_channels=channels,
+                                        bits_per_sample=16,
+                                    )
+                                    + chunk
+                                )
+                                wav_header_pending = False
                             total_bytes += len(chunk)
                             await websocket.send_bytes(chunk)
             else:

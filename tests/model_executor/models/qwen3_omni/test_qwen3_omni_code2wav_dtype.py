@@ -156,15 +156,17 @@ def test_deploy_option_reaches_both_decoder_placements(mocker, blackwell_cudnn, 
             ),
             stage_connector_spec=spec,
             async_chunk=True,
-            use_v2_model_runner=profile.endswith("mrv2.yaml"),
+            use_v2_model_runner=True,
         ).create_model_config()
         vllm_config = VllmConfig(
             model_config=model_config,
             device_config=DeviceConfig(device="cpu"),
             cache_config=CacheConfig(enable_prefix_caching=False),
         )
-        # Detection is simulated; no tensor or CUDA context is allocated.
+        # Simulate local CUDA eligibility after native CPU config selects MP.
+        # No tensor or CUDA context is allocated.
         vllm_config.device_config.device = torch.device("cuda")
+        vllm_config.parallel_config.distributed_executor_backend = "uni"
         with set_default_torch_dtype(model_config.dtype):
             if stage_id == 1:
                 first = Qwen3OmniMoeForConditionalGeneration._build_first_frame_decoder(

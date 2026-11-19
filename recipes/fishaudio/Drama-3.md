@@ -1,6 +1,11 @@
 # Fish Audio Drama 3
 
-> Online serving for TTS
+> **Unavailable with vLLM 0.34 / V2-only execution.** The DAC stage requires the retired Model Runner V1.
+> The commands, configurations, and measurements below are historical reference,
+> not installation or serving instructions for this version. Configuration loading
+> rejects the V1 profile; changing its runner flag does not add V2 support.
+>
+> Historical online serving for TTS
 
 ## Summary
 
@@ -10,9 +15,9 @@
 - Mode: Online serving with the OpenAI-compatible `/v1/audio/speech` API, or offline with `Omni`
 - Maintainer: Community
 
-## When to use this recipe
+## Historical integration
 
-Use this recipe as a baseline for running `fishaudio/drama-3`. Drama 3 is a
+This recipe records the earlier `fishaudio/drama-3` integration. Drama 3 is a
 35B-total / 3B-active MoE text backbone (Qwen3.5 MoE: hybrid gated-delta-net
 and full attention, block-FP8 routed experts) with a codebook tower that
 decodes 10 codebooks per frame. It outputs 44.1 kHz mono audio through the
@@ -37,7 +42,7 @@ Stage 1  dac_decoder (FishSpeechDACDecoder) → 44.1 kHz audio
 - Model card: <https://huggingface.co/fishaudio/drama-3>
 - Fish Speech S2 Pro recipe (same codec stage): [`Fish-Speech-S2-Pro.md`](./Fish-Speech-S2-Pro.md)
 
-## Hardware Support
+## Historical hardware results
 
 ## GPU
 
@@ -137,6 +142,19 @@ which returns the exact prompt row count.
 - The main token uses repetition-aware sampling: a semantic token that
   repeats one of the last 16 main tokens is re-drawn with temperature 1.0,
   top_k 30, top_p 0.95.
+- Reference sampling (off by default): `hf_overrides`
+  `{"fish_omni_reference_sampling": true}` on stage 0 samples each frame with
+  Fish Audio's reference rules for Drama 3 in PyTorch instead of the fused
+  kernels. The main token's first draw keeps only candidates whose probability
+  reaches the request's `epsilon_cutoff` (`extra_params`; 1e-3 when unset, 0
+  turns it off), with no top-k cap and the same candidates as the fused kernels.
+  A first draw that repeats one of the last 16 main tokens, end of speech
+  included, becomes the most probable candidate
+  (`fish_omni_reference_sampling_fallback: "ras"` re-draws at 1.0 / 0.95 / 30
+  instead). The codebook heads never return a code past the codec's 1024. The
+  recommended request parameters are temperature 1.0, top_p 1.0, top_k off and
+  epsilon_cutoff 1e-3. Without the override, a request with a non-zero
+  `epsilon_cutoff` is refused with a 400.
 - The default deploy keeps the gated-delta-net state in bfloat16 (the
   checkpoint's `mamba_ssm_dtype` is float32): +7% / +13% audio-s/s at 64 /
   128 streams with the same Seed-TTS-Eval WER and speaker similarity. Set

@@ -35,7 +35,8 @@ some GPUs.
 Asynchronous chunk streaming is **enabled by default** within the bundled configuration.
 On CUDA and NPU the same file selects model runner v2 for all three stages. The Thinker prefix cache is enabled on CUDA; NPU keeps it disabled by default (set `enable_prefix_caching: true` on stage 0 to opt in). Talker and Code2Wav keep it disabled.
 The NPU Thinker and Talker use an Ascend model state for attention metadata while retaining Omni request lifecycle and M-RoPE handling. Code2Wav uses Ascend input batches and forward context with the shared V2 chunk lifecycle. It runs without outer graph padding and copies audio to host synchronously before publishing each output. Code2Wav captures up to 32 exact-shape NPU graphs at startup for its streaming decode windows; other shapes run eagerly and nothing is captured while serving. Set `enforce_eager: true` on stage 2 to disable them.
-XPU, ROCm and MUSA stay on model runner v1. Set `model_runner: v1` in an overlay to opt out on CUDA or NPU.
+All AR and generation stages use Model Runner V2. `model_runner: v1` is rejected;
+backend and model-state support must be validated for the selected hardware.
 
 On B200/B300-class GPUs (SM100/SM103) with cuDNN 9.20.0, Qwen3-Omni
 automatically runs Code2Wav in FP32 when its configured precision resolves to
@@ -329,7 +330,7 @@ python openai_chat_completion_client_for_multimodal_generation.py \
     pip install 'vllm-omni[demo]'
     ```
 
-    For this 0.33 source checkout, follow the
+    For this 0.34 source checkout, follow the
     [source demo dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
     from the repository root. Build the temporary Gradio wheel and include it
     with `.[demo]` in the same normal install command.
@@ -397,38 +398,14 @@ The gradio script supports the following arguments:
 - `--port`: Port for Gradio server (default: 7861)
 - `--share`: Share the Gradio demo publicly (creates a public link)
 
-## Experimental DFlash Thinker decoding
+## DFlash Thinker decoding
 
-DFlash integration currently covers CUDA model runner v1 (MRv1), with an
-ordinary, non-speculative Talker and Code2Wav. The default deployment above
-uses MRv2 and is not the validated DFlash configuration. When configuring
-DFlash, explicitly select `model_runner: v1`, disable Thinker prefix caching
-(`enable_prefix_caching: false` on stage 0), and use non-resumable requests.
-Set stage 0 `pipeline_parallel_size: 1`: DFlash with pipeline parallelism is
-rejected before loading the Thinker weights because auxiliary captures are
-not configured on every pipeline rank. Tensor parallelism remains supported.
-
-For DFlash speech output, set stage 0 `enforce_eager: true` and
-`speculative_config.enforce_eager: true` so both the target Thinker and the
-DFlash drafter run eagerly. **CUDA Graph DFlash speech is outside the
-supported scope**, including with `disable_custom_all_reduce: true`: the
-graph experiment reported an unresolved generated-speech ASR regression.
-Disabling custom all-reduce addresses a startup failure, not speech quality.
-
-For text-only graph experiments, set stage 0
-`disable_custom_all_reduce: true`. With the pinned vLLM 0.33.0 runtime,
-DFlash with tensor parallelism and default custom all-reduce can fail during
-graph memory profiling before the service becomes ready. Eager execution
-of both target and drafter avoids that graph startup path. These settings
-are deployment requirements; the model does not enforce them at admission.
-
-Eager execution also does not establish strict greedy equivalence:
-baseline/DFlash token differences remain unexplained. Treat this integration
-as experimental, and do not infer speech quality or output equivalence from
-successful requests or throughput alone. See the
-[validation results and limitations](../../../design/qwen3_omni_dflash_validation.md)
-for the tested configuration, accuracy evidence, and separate eager/graph
-performance results.
+The earlier DFlash integration used Model Runner V1. This checkout supports
+only Model Runner V2, so the former `model_runner: v1` deployment is rejected.
+DFlash is not qualified on the current runtime. Use the ordinary V2 deployment
+above; the [historical validation report](../../../design/qwen3_omni_dflash_validation.md)
+records the vLLM 0.33 / MRv1 measurements and unresolved quality limitations.
+Those results do not establish DFlash support on vLLM 0.34.
 
 ## Example materials
 

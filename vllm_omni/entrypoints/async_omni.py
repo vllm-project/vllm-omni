@@ -1341,14 +1341,23 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         return all(self._coerce_stage_bool(result) for result in results)
 
     async def release_kv_cache_memory(
-        self, *, stage_ids: list[int] | None = None, timeout: float = CACHE_RESET_TIMEOUT_S
+        self,
+        reset_connector: bool = True,
+        *,
+        stage_ids: list[int] | None = None,
+        timeout: float = CACHE_RESET_TIMEOUT_S,
     ) -> None:
         """Discard AR-stage KV memory after a completed generation pause.
 
         EngineCore checks that the scheduler is paused and all executor
         memory is resident. Diffusion stages have no KV cache to release.
         Restore KV memory with ``wake_up(tags=["kv_cache"])`` before resuming.
+
+        ``reset_connector`` is accepted for upstream ``EngineClient``
+        compatibility; omni stages own their connector teardown inside the
+        stage-side release RPC.
         """
+        _ = reset_connector
         ar_stage_ids, _ = self._split_stage_ids_by_type(stage_ids)
         if not ar_stage_ids:
             return
@@ -1363,9 +1372,17 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         self._hold_admission_until_resume = True
 
     async def sleep(
-        self, stage_ids: list[int] | None = None, level: int = 2, mode: PauseMode = "abort"
+        self,
+        stage_ids: list[int] | None = None,
+        level: int = 2,
+        mode: PauseMode = "abort",
+        reset_connector: bool = True,
     ) -> list[OmniACK]:
         """Put stages to sleep.
+
+        ``reset_connector`` is accepted for upstream ``EngineClient``
+        compatibility; omni stages own their connector teardown inside the
+        stage-side sleep RPC.
 
         AR/LLM stages use EngineCore.sleep (pause scheduler, wait idle, then
         offload/discard memory) — matching vLLM AsyncLLM.sleep.

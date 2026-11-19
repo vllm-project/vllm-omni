@@ -231,7 +231,7 @@ def ref2va_turbo_spec() -> TurboSpec:
 def test_omni_rejects_distilled_adapter_schedule(adapter_kind, ref2va_turbo_spec):
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.od_config = SimpleNamespace()
+    pipeline.od_config = SimpleNamespace(step_execution=False)
     pipeline._fasth3_checkpoint = FastH3OmniCheckpointSpec()
     pipeline._turbo_lora_specs = {1: ref2va_turbo_spec} if adapter_kind == "turbo" else {}
     pipeline._native_distilled_lora_adapter_ids = {1} if adapter_kind == "distilled" else set()

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import io
+from fractions import Fraction
 from pathlib import Path
 
 import av
@@ -131,6 +132,8 @@ def _make_synthetic_ogg(duration: float = 1.0, sample_rate: int = 16000) -> byte
         stream = container.add_stream(codec_name, rate=sample_rate, layout="mono")
         frame = av.AudioFrame.from_ndarray(samples[np.newaxis, :], format="fltp", layout="mono")
         frame.sample_rate = sample_rate
+        frame.pts = 0
+        frame.time_base = Fraction(1, sample_rate)
         for pkt in stream.encode(frame):
             container.mux(pkt)
         for pkt in stream.encode():

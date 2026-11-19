@@ -144,6 +144,18 @@ The job is then re-read so a completed save is not orphaned.
 bytes. It is useful for benchmarks and simple scripts that do not need job
 storage or polling.
 
+### Storage Expiration
+
+Set `VLLM_OMNI_SERVER_STORAGE__FILE_TTL` to enable expiration of locally stored
+videos. `VLLM_OMNI_SERVER_STORAGE__TTL_SWEEP_INTERVAL` controls how often expired
+files are swept (default: 300 seconds).
+
+When a sweep successfully deletes a video file, it also removes the matching
+job record. The job then disappears from `GET /v1/videos`, and both its metadata
+and content endpoints return 404. A record may remain visible between its
+`expires_at` timestamp and the next sweep. If file deletion fails, its metadata
+is retained and deletion is retried on a later sweep.
+
 ## Examples
 
 ### Image-to-Video
@@ -236,9 +248,11 @@ URL access policy.
 ### MiniMax H3 Samplers
 
 Set `"sampler"` in `extra_params` to select the sampler. Supported values are
-`euler` (default) and `res_multistep`. Both request and step execution support
-them, and compatible requests share packed model evaluations. Fixed distilled
-schedules remain Euler-only.
+`euler` (default), `res_multistep`, and `heun`. Both request and step execution
+support them, and compatible requests share packed model evaluations, including
+Heun's correction stage. An N-step schedule ending at zero uses `2N - 1` model
+evaluations with Heun. Fixed distilled schedules remain Euler-only. Disable cache
+acceleration, including `quality=high`, when using Heun.
 
 ### MiniMax H3 control and inpainting
 

@@ -8,44 +8,63 @@ from __future__ import annotations
 import base64
 import time
 from io import BytesIO
-from pathlib import Path
 from typing import Any
 
 import pytest
 
 from tests.dfx.conftest import resolve_oom_device_spec
-from tests.dfx.reliability.helpers import FaultModel, inject_gpu_oom, scenario_params, stop_gpu_oom_hogs
+from tests.dfx.reliability.helpers import (
+    FaultModel,
+    _deploy_config_path,
+    extract_openai_error_contract_from_payload,
+    inject_gpu_oom,
+    launch_scenario_params,
+    scenario_params,
+    sigterm_serve_root_and_assert_cleanup,
+    stop_gpu_oom_hogs,
+)
 from tests.dfx.reliability.scenarios import (
-    GpuOomLarge,
-    GpuOomRecovery,
-    PartialStageIsolation,
+    FullCrashAtLaunch,
+    GpuOomAtLaunch,
+    GpuOomUnderLoad,
+    GracefulShutdown,
+    PartialCrashAtExit,
+    PartialCrashAtLaunch,
     ProcessKillServeRootNoLoad,
     ProcessKillServeRootWithLoad,
     ProcessKillTreeNoLoad,
     ProcessKillTreeWithLoad,
     ProcessKillWorkerNoLoad,
     ProcessKillWorkerWithLoad,
+    ServeRootCrashAtLaunch,
 )
+from tests.dfx.reliability.scenarios.oom import GPU_OOM_MARKERS, _looks_like_server_unreachable
 from tests.helpers.assertions import assert_http_error
 from tests.helpers.mark import hardware_marks
 from tests.helpers.media import generate_synthetic_image
 
 _VIDEO_FAST_FAIL_HTTP_TIMEOUT_SEC = 30
-_STAGE_CONFIGS_DIR = Path(__file__).resolve().parents[1] / "e2e" / "stage_configs"
 
 
-def _video_request_config() -> dict[str, Any]:
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(1280, 720)['base64']}"
+def _video_request_config(
+    *,
+    width: int = 512,
+    height: int = 512,
+    num_frames: int = 8,
+    num_inference_steps: int = 4,
+    reference_size: tuple[int, int] = (1280, 720),
+) -> dict[str, Any]:
+    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(*reference_size)['base64']}"
     return {
         "form_data": {
             "prompt": "Generate a realistic road-driving video with camera motion.",
-            "width": 512,
-            "height": 512,
+            "width": width,
+            "height": height,
             "fps": 8,
-            "num_frames": 8,
+            "num_frames": num_frames,
             "guidance_scale": 1.0,
             "flow_shift": 5.0,
-            "num_inference_steps": 4,
+            "num_inference_steps": num_inference_steps,
             "seed": 42,
         },
         "image_reference": image_data_url,
@@ -54,14 +73,15 @@ def _video_request_config() -> dict[str, Any]:
 
 
 def _i2v_create_request(prompt: str, *, timeout: float) -> dict[str, Any]:
-    image_bytes = base64.b64decode(generate_synthetic_image(1280, 720)["base64"])
+    """Larger OOM/recovery job: increase spatial and temporal allocation demand."""
+    image_bytes = base64.b64decode(generate_synthetic_image(768, 512)["base64"])
     return {
         "data": {
             "prompt": prompt,
-            "width": "512",
+            "width": "768",
             "height": "512",
             "fps": "8",
-            "num_frames": "8",
+            "num_frames": "33",
             "num_inference_steps": "4",
         },
         "files": {"input_reference": ("reference.jpeg", BytesIO(image_bytes), "image/jpeg")},
@@ -74,8 +94,8 @@ def _await_video_job(online_client: Any, video_id: str, *, timeout_sec: float) -
     last_job: dict[str, Any] | None = None
     while time.monotonic() < deadline:
         retrieved = online_client.send_video_retrieve_http_request(
-            {"video_id": video_id, "timeout": 10},
-            err_code=(200, 500),
+            {"video_id": video_id, "timeout": min(10, max(0.001, deadline - time.monotonic()))},
+            err_code=(200, 500, 503),
         )[0]
         job = retrieved.json_body
         if not isinstance(job, dict):
@@ -83,44 +103,74 @@ def _await_video_job(online_client: Any, video_id: str, *, timeout_sec: float) -
         last_job = job
         if job.get("status") in ("completed", "failed"):
             return retrieved
-        time.sleep(1.0)
+        assert retrieved.status_code == 200, f"job lookup failed without terminal status: {job!r}"
+        time.sleep(min(0.5, max(0, deadline - time.monotonic())))
     raise TimeoutError(f"video job {video_id} did not reach a terminal status: {last_job!r}")
 
 
-FAULT_ERROR_KEYWORDS = (
-    "oom",
-    "out of memory",
-    "cuda",
-    "connection",
-    "job failed",
-    "unknown error",
-    "internal server error",
-    "500 server error",
-)
+def _create_and_wait_video_job(
+    client: Any, request: dict[str, Any], *, timeout_sec: float, err_code: int | tuple[int, ...]
+) -> Any:
+    """Return admission errors or a terminal job under one overall deadline."""
+    deadline = time.monotonic() + timeout_sec
+    request = dict(request, timeout=min(30, timeout_sec))
+    response = client.send_videos_create_http_request(request, err_code=err_code)[0]
+    if response.status_code == 200:
+        body = response.json_body
+        video_id = body.get("id") if isinstance(body, dict) else None
+        assert isinstance(video_id, str) and video_id, f"video admission missing job id: {body!r}"
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, "video admission exceeded the job deadline"
+        try:
+            response = _await_video_job(client, video_id, timeout_sec=remaining)
+        except TimeoutError as exc:
+            raise AssertionError("video job did not reach terminal status within deadline") from exc
+    assert time.monotonic() < deadline, "video job exceeded its deadline"
+    return response
+
+
+def _assert_video_preflight(client: Any, request_config: dict[str, Any]) -> None:
+    """Create valid I2V input and require a completed job before injection."""
+    image_bytes = base64.b64decode(request_config["image_reference"].split(",", 1)[1])
+    result = _create_and_wait_video_job(
+        client,
+        {
+            "data": {key: str(value) for key, value in request_config["form_data"].items()},
+            "files": {"input_reference": ("reference.jpeg", BytesIO(image_bytes), "image/jpeg")},
+            "timeout": 30,
+        },
+        timeout_sec=180,
+        err_code=200,
+    )
+    assert result.status_code == 200, f"preflight video failed: {result.json_body!r}"
+    assert result.json_body.get("status") == "completed", f"preflight video did not complete: {result.json_body!r}"
 
 
 class Wan22(FaultModel):
     model_id = "wan22"
     res = {"cuda": "H100", "rocm": "MI325"}
-    num_cards = 1
+    num_cards = 2
     scenarios = [
         {
             "test_name": "wan22_i2v_reliability_default",
-            "server_params": {"model": "Wan-AI/Wan2.2-I2V-A14B-Diffusers"},
+            "server_params": {
+                "model": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+                "stage_init_timeout": 1800,
+                "init_timeout": 2100,
+                "server_args": ["--usp", "2", "--vae-patch-parallel-size", "2", "--use-hsdp", "--vae-use-slicing"],
+            },
         }
     ]
-    deploy_dir = _STAGE_CONFIGS_DIR
     worker_pattern = "vLLM-Omni::"
     isolation_pattern = "vLLM-Omni::"
     hard_oom_config = {
+        "device": "0,1",
         "target_mem_ratio": 0.95,
         "max_free_bytes": 256 * 1024 * 1024,
         "hold_seconds": 0,
-        "startup_timeout_sec": 20,
+        "startup_timeout_sec": 120,
         "strict": False,
     }
-    recover_oom_config = hard_oom_config
-    fault_error_keywords = FAULT_ERROR_KEYWORDS
     process_kill_error_keywords = (
         "timeout",
         "did not complete within",
@@ -132,197 +182,126 @@ class Wan22(FaultModel):
         "500",
         "503",
     )
-    health_miss_skip = "issue#8907"
-    oom_large_fail_message = "expected large /v1/videos request failure during GPU OOM injection"
 
     def warmup(self, client: Any, server: Any) -> None:
+        _assert_video_preflight(client, _video_request_config())
+
+    def submit_worker_load(self, client: Any, server: Any) -> None:
         client.send_video_diffusion_request(_video_request_config(), request_num=1)
+
+    def submit_serve_load(self, client: Any, server: Any) -> None:
+        self.submit_worker_load(client, server)
 
     def assert_fast_fail(self, client: Any, server: Any) -> None:
-        payload = {
-            "prompt": "post-fault fast-fail check",
-            "width": "512",
-            "height": "512",
-            "fps": "8",
-            "num_frames": "8",
-            "num_inference_steps": "4",
-        }
-        client.send_videos_create_http_request(
-            {"data": payload, "timeout": _VIDEO_FAST_FAIL_HTTP_TIMEOUT_SEC},
-            err_code=500,
-        )
+        _assert_video_worker_failure(client)
 
-    def oom_large_probe(self, client: Any, server: Any) -> None:
-        client.send_video_diffusion_request(_video_request_config(), request_num=1)
-
-    def run_oom_recovery(self, server: Any, client: Any) -> None:
-        _run_oom_recovery(server, client)
+    def submit_concurrent(self, client: Any, server: Any) -> Any:
+        return _assert_video_worker_failure(client)
 
 
-OOM_INJECTION_CONFIG = Wan22.hard_oom_config
-
-
-def _deploy_config_path(server: Any) -> str | None:
-    """Deploy YAML from the live server. ``OmniServer`` keeps it in ``serve_args``."""
-    stage_config_path = getattr(server, "stage_config_path", None)
-    if stage_config_path:
-        return str(stage_config_path)
-    args: list[str] = getattr(server, "serve_args", [])
-    for index, arg in enumerate(args):
-        if arg == "--deploy-config" and index + 1 < len(args):
-            return args[index + 1]
-        if arg.startswith("--deploy-config="):
-            return arg.split("=", 1)[1]
-    return None
-
-
-def _run_oom_recovery(omni_server_function: Any, online_client_function: Any) -> None:
-    """Black-box: under OOM pressure an async video job fails; after the hog stops, a new job completes.
-
-    Wan2.2 I2V requires ``input_reference``. ``POST /v1/videos`` returns HTTP 200
-    when the job is queued. A failed job's GET uses ``error.code`` as the HTTP
-    status, and ``assert_http_error(..., err_code=500)`` checks that status.
-    """
-    device_spec = resolve_oom_device_spec(OOM_INJECTION_CONFIG, _deploy_config_path(omni_server_function))
-    handle = inject_gpu_oom(
-        device=device_spec,
-        target_mem_ratio=OOM_INJECTION_CONFIG["target_mem_ratio"],
-        hold_seconds=OOM_INJECTION_CONFIG["hold_seconds"],
-        startup_timeout_sec=OOM_INJECTION_CONFIG["startup_timeout_sec"],
-        strict=OOM_INJECTION_CONFIG["strict"],
-        max_free_bytes=OOM_INJECTION_CONFIG["max_free_bytes"],
+def _assert_video_worker_failure(client: Any) -> Any:
+    """Validate a real I2V job fails, rather than mistaking admission for success."""
+    image_bytes = base64.b64decode(generate_synthetic_image(512, 512)["base64"])
+    response = _create_and_wait_video_job(
+        client,
+        {
+            "data": {
+                "prompt": "post-fault fast-fail check",
+                "width": "512",
+                "height": "512",
+                "fps": "8",
+                "num_frames": "8",
+                "num_inference_steps": "4",
+            },
+            "files": {"input_reference": ("reference.jpeg", BytesIO(image_bytes), "image/jpeg")},
+            "timeout": _VIDEO_FAST_FAIL_HTTP_TIMEOUT_SEC,
+        },
+        timeout_sec=_VIDEO_FAST_FAIL_HTTP_TIMEOUT_SEC,
+        err_code=(200, 500, 503),
     )
-    failure_observed = False
-    failure_detail = ""
+    assert_http_error(response, err_code=(500, 503))
+    contract = extract_openai_error_contract_from_payload(response.json_body)
+    assert contract is not None, f"missing video failure error contract: {response.json_body!r}"
+    error = str(contract).lower()
+    assert not any(marker in error for marker in ("no image", "input error", "invalid", "validation")), (
+        f"post-fault probe failed because of invalid input: {contract!r}"
+    )
+    # Public 5xx errors may hide engine details behind a generic message.
+    # The scenario proves worker death separately; do not require that detail
+    # to be exposed in the HTTP error text.
+    return response
+
+
+def _run_oom_at_load(server: Any, client: Any) -> None:
+    """One pressured async video job, actual OOM evidence, then recovery checks."""
+    # Prepare media before pressure, and prove normal I2V service first.
+    fault_request = _i2v_create_request("single OOM fault probe", timeout=30)
+    _assert_video_preflight(
+        client,
+        _video_request_config(width=256, height=256, num_frames=5, num_inference_steps=2, reference_size=(256, 256)),
+    )
+    stderr_before = set(getattr(server, "_server_error_lines", ()))
+    config = MODEL.hard_oom_config
+    handle = inject_gpu_oom(
+        device=resolve_oom_device_spec(config, _deploy_config_path(server)),
+        target_mem_ratio=config["target_mem_ratio"],
+        hold_seconds=config["hold_seconds"],
+        startup_timeout_sec=config["startup_timeout_sec"],
+        strict=config["strict"],
+        max_free_bytes=config.get("max_free_bytes"),
+    )
+    detail: Any = None
     try:
-        for _ in range(3):
-            try:
-                created_resp = online_client_function.send_videos_create_http_request(
-                    _i2v_create_request("oom recover probe", timeout=25)
-                )[0]
-            except Exception as exc:
-                failure_observed = True
-                failure_detail = repr(exc)
-                break
-            created = created_resp.json_body
-            video_id = created.get("id") if isinstance(created, dict) else None
-            if not isinstance(video_id, str) or not video_id:
-                failure_observed = True
-                failure_detail = f"create payload missing id: {created!r}"
-                break
-            try:
-                retrieved = _await_video_job(online_client_function, video_id, timeout_sec=120)
-            except Exception as exc:
-                failure_observed = True
-                failure_detail = f"video_id={video_id} poll error={exc!r}"
-                break
-            job = retrieved.json_body
-            if isinstance(job, dict) and job.get("status") == "failed":
-                assert_http_error(retrieved, err_code=500)
-                failure_observed = True
-                failure_detail = f"video_id={video_id} error={job.get('error')!r}"
-                break
-            time.sleep(1.0)
+        started = time.monotonic()
+        print("[wan-oom] preflight passed; pressure ready; submitting one fault job", flush=True)
+        try:
+            result = _create_and_wait_video_job(client, fault_request, timeout_sec=180, err_code=(200, 500, 503))
+        except Exception as exc:
+            assert _looks_like_server_unreachable(exc), f"unexpected OOM job failure: {exc!r}"
+            detail = repr(exc)
+        else:
+            detail = result.json_body
+            print(f"[wan-oom] fault status={result.status_code}, body={str(detail)[:4096]}", flush=True)
+            assert isinstance(detail, dict) and detail.get("status") != "completed", (
+                f"OOM fault job must fail, got {detail!r}"
+            )
+            assert_http_error(result, err_code=(500, 503))
+            assert extract_openai_error_contract_from_payload(detail) is not None, (
+                f"OOM response lacks an error object: {detail!r}"
+            )
+        assert time.monotonic() - started < 180, "OOM job did not fail within 180 seconds"
+        stderr_delta = "".join(line for line in getattr(server, "_server_error_lines", ()) if line not in stderr_before)
+        evidence = str(detail) + stderr_delta
+        assert any(marker in evidence.lower() for marker in GPU_OOM_MARKERS), (
+            f"video job failed without explicit GPU OOM evidence; detail={str(detail)[:4096]}, "
+            f"stderr_tail={stderr_delta[-4096:]!r}"
+        )
     finally:
         stop_gpu_oom_hogs(handle)
+        print("[wan-oom] memory pressure removed", flush=True)
 
-    assert failure_observed, (
-        f"expected at least one async video job to fail while OOM pressure is active; last_detail={failure_detail!r}"
-    )
-
-    recovery_deadline = time.monotonic() + 90.0
-    terminal_health: int | None = None
-    unreachable_streak = 0
-    last_health_exc: BaseException | None = None
-    while time.monotonic() < recovery_deadline:
-        try:
-            status = online_client_function.send_health_http_request({"timeout": 5}, err_code=(200, 503))[0].status_code
-            unreachable_streak = 0
-            if status in (200, 503):
-                terminal_health = status
-                break
-        except Exception as exc:  # noqa: BLE001
-            last_health_exc = exc
-            msg = str(exc).lower()
-            if "connection refused" in msg or "actively refused" in msg:
-                unreachable_streak += 1
-                if unreachable_streak >= 5:
-                    pytest.fail(
-                        "after OOM sidecar stopped, /health is unreachable repeatedly; "
-                        "the APIServer process likely exited unexpectedly "
-                        f"(last_exc={last_health_exc!r})"
-                    )
-            else:
-                unreachable_streak = 0
-        time.sleep(1.0)
-    else:
-        pytest.fail(
-            "wan22 server did not converge to terminal health (200/503) after OOM pressure was removed; "
-            f"last_health_exc={last_health_exc!r}"
-        )
-
-    assert terminal_health is not None
-    start = time.monotonic()
-    recovery_status: int | None = None
-    recovery_job: dict[str, Any] | None = None
-    recovery_resp: Any = None
-    recovery_error = ""
     try:
-        created_resp = online_client_function.send_videos_create_http_request(
-            _i2v_create_request("post-recovery admission check", timeout=30)
-        )[0]
-    except AssertionError as exc:
-        # The create helper requires HTTP 200. A non-200 create is the expected
-        # failure only while /health is still 503.
-        if terminal_health == 200:
-            raise
-        recovery_error = repr(exc)
-        created_resp = None
-    except Exception as exc:  # noqa: BLE001
-        recovery_error = repr(exc)
-        created_resp = None
-    if created_resp is not None:
-        create_elapsed = time.monotonic() - start
-        assert create_elapsed < 30, f"post-fault /v1/videos create should not hang: {create_elapsed:.2f}s"
-        recovery_status = created_resp.status_code
-        created = created_resp.json_body
-        video_id = created.get("id") if isinstance(created, dict) else None
-        if not isinstance(video_id, str) or not video_id:
-            recovery_error = f"create payload missing id: {created!r}"
-        else:
-            poll_timeout = 180.0 if terminal_health == 200 else 60.0
-            try:
-                recovery_resp = _await_video_job(online_client_function, video_id, timeout_sec=poll_timeout)
-            except Exception as exc:  # noqa: BLE001
-                recovery_error = repr(exc)
-            else:
-                recovery_job = recovery_resp.json_body if isinstance(recovery_resp.json_body, dict) else None
-    recovery_text_prefix = recovery_error or ("" if recovery_status is None else f"status={recovery_status}")
-
-    if terminal_health == 200:
-        assert recovery_status == 200, (
-            "health recovered but /v1/videos admission did not succeed; "
-            f"status={recovery_status}, body={recovery_text_prefix!r}"
-        )
-        assert recovery_job is not None, f"post-recovery video job was not polled: {recovery_text_prefix!r}"
-        assert recovery_job.get("status") == "completed", (
-            "health recovered but the async video job did not complete; "
-            f"status={recovery_job.get('status')} error={recovery_job.get('error')!r}"
-        )
-    else:
-        job_failed = False
-        if recovery_resp is not None and recovery_job is not None and recovery_job.get("status") == "failed":
-            assert_http_error(recovery_resp, err_code=500)
-            job_failed = True
-        assert recovery_error or job_failed, (
-            "unhealthy terminal state should fail the async video job, "
-            f"got health={terminal_health}, request_status={recovery_status}, "
-            f"job={recovery_job!r}, body={recovery_text_prefix!r}"
-        )
+        health = client.send_health_http_request({"timeout": 5}, err_code=(200, 503))[0].status_code
+    except Exception as exc:
+        assert _looks_like_server_unreachable(exc), f"unexpected post-OOM health failure: {exc!r}"
+        print("[wan-oom] API unreachable; whole-instance restart required", flush=True)
+        return
+    if health == 503:
+        # Later selected serial cases must start a fresh instance and pass their
+        # business preflight to provide suite-level restart coverage.
+        print("[wan-oom] health=503; whole-instance restart required", flush=True)
+        return
+    assert health == 200, f"unexpected post-OOM health: {health}"
+    recovered = _create_and_wait_video_job(
+        client, _i2v_create_request("post-OOM recovery", timeout=30), timeout_sec=180, err_code=200
+    )
+    job = recovered.json_body
+    assert recovered.status_code == 200 and isinstance(job, dict) and job.get("status") == "completed", (
+        f"recovery video did not complete: {job!r}"
+    )
 
 
 MODEL = Wan22()
-_WORKER_KILL_SKIP = "issue#8907"
 
 pytestmark = [
     pytest.mark.slow,
@@ -331,28 +310,28 @@ pytestmark = [
 ]
 
 
-@scenario_params(MODEL, GpuOomLarge)
-def test_reliability_fault_gpu_oom_large_request_failure(omni_server_function, online_client_function) -> None:
-    GpuOomLarge().run(MODEL, omni_server_function, online_client_function)
+@scenario_params(MODEL, GpuOomUnderLoad)
+def test_gpu_oom_at_load(omni_server_function, online_client_function) -> None:
+    """One OOM injection and fault job; health 200 requires a completed recovery job.
+
+    A 503/unreachable API requires restart; later serial cases cover recovery.
+    """
+    _run_oom_at_load(omni_server_function, online_client_function)
 
 
-@scenario_params(MODEL, GpuOomRecovery)
-def test_reliability_fault_gpu_oom_recovers_after_fault_removed(omni_server_function, online_client_function) -> None:
-    GpuOomRecovery().run(MODEL, omni_server_function, online_client_function)
-
-
-@scenario_params(MODEL, ProcessKillWorkerNoLoad, skip_reason=_WORKER_KILL_SKIP)
-def test_reliability_fault_process_kill_worker_no_load(
+@scenario_params(MODEL, ProcessKillWorkerNoLoad)
+def test_stage_crash_at_idle(
     omni_server_function,
     online_client_function,
     signal_name: str,
 ) -> None:
-    """After a quiet worker kill, the next request returns HTTP 500, then concurrent requests fail."""
+    """Kill a worker, check failed requests and health, then require SIGTERM cleanup."""
     ProcessKillWorkerNoLoad().run(MODEL, omni_server_function, online_client_function, signal_name)
+    sigterm_serve_root_and_assert_cleanup(omni_server_function, scenario="stage_crash_at_idle")
 
 
-@scenario_params(MODEL, ProcessKillWorkerWithLoad, skip_reason=_WORKER_KILL_SKIP)
-def test_reliability_fault_process_kill_worker_with_load_request_failure(
+@scenario_params(MODEL, ProcessKillWorkerWithLoad)
+def test_stage_crash_at_load(
     omni_server_function,
     online_client_function,
     signal_name: str,
@@ -361,7 +340,7 @@ def test_reliability_fault_process_kill_worker_with_load_request_failure(
 
 
 @scenario_params(MODEL, ProcessKillServeRootNoLoad)
-def test_reliability_fault_process_kill_serve_root_no_load_fast_fail_and_cleanup(
+def test_serve_root_crash_at_idle(
     omni_server_function,
     online_client_function,
     signal_name: str,
@@ -370,7 +349,7 @@ def test_reliability_fault_process_kill_serve_root_no_load_fast_fail_and_cleanup
 
 
 @scenario_params(MODEL, ProcessKillServeRootWithLoad)
-def test_reliability_fault_process_kill_serve_root_with_load_fast_fail_and_cleanup(
+def test_serve_root_crash_at_load(
     omni_server_function,
     online_client_function,
     signal_name: str,
@@ -379,7 +358,7 @@ def test_reliability_fault_process_kill_serve_root_with_load_fast_fail_and_clean
 
 
 @scenario_params(MODEL, ProcessKillTreeNoLoad)
-def test_reliability_fault_process_kill_tree_no_load_fast_fail_and_cleanup(
+def test_process_tree_crash_at_idle(
     omni_server_function,
     online_client_function,
     signal_name: str,
@@ -388,7 +367,7 @@ def test_reliability_fault_process_kill_tree_no_load_fast_fail_and_cleanup(
 
 
 @scenario_params(MODEL, ProcessKillTreeWithLoad)
-def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
+def test_process_tree_crash_at_load(
     omni_server_function,
     online_client_function,
     signal_name: str,
@@ -396,7 +375,51 @@ def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
     ProcessKillTreeWithLoad().run(MODEL, omni_server_function, online_client_function, signal_name)
 
 
-@scenario_params(MODEL, PartialStageIsolation, skip_reason=_WORKER_KILL_SKIP)
-def test_reliability_fault_partial_stage_isolation(omni_server_function, online_client_function) -> None:
-    """Kill one stage or one worker. Requests bound to it fail, and one SIGTERM still exits the API."""
-    PartialStageIsolation().run(MODEL, omni_server_function, online_client_function)
+@launch_scenario_params(MODEL, GpuOomAtLaunch)
+def test_gpu_oom_at_launch(launch_params) -> None:
+    """Exhaust GPU memory before startup. The failure is observable, and a later start serves."""
+    GpuOomAtLaunch().run(MODEL, launch_params)
+
+
+@launch_scenario_params(MODEL, PartialCrashAtLaunch)
+def test_stage_crash_at_launch(launch_params) -> None:
+    """Kill a stage before readiness; require failure and cleanup, with recovery covered by later serial cases."""
+    PartialCrashAtLaunch().run(MODEL, launch_params)
+
+
+@launch_scenario_params(MODEL, FullCrashAtLaunch)
+def test_process_tree_crash_at_launch(launch_params) -> None:
+    """Kill the startup process tree; later serial cases cover fresh startup and service.
+
+    This case alone does not verify restart recovery.
+    """
+    FullCrashAtLaunch().run(MODEL, launch_params)
+
+
+@scenario_params(MODEL, PartialCrashAtExit)
+def test_stage_crash_at_exit(omni_server_function, online_client_function) -> None:
+    """Begin shutdown, kill one stage, and require timely cleanup.
+
+    Later serial cases cover fresh startup and service; this case does not
+    independently verify restart recovery.
+    """
+    PartialCrashAtExit().run(MODEL, omni_server_function, online_client_function)
+
+
+@scenario_params(MODEL, GracefulShutdown)
+def test_graceful_shutdown(omni_server_function, online_client_function) -> None:
+    """SIGTERM the healthy root; all children and resources must clear within 60s."""
+    GracefulShutdown().run(MODEL, omni_server_function, online_client_function)
+
+
+@launch_scenario_params(
+    MODEL,
+    ServeRootCrashAtLaunch,
+)
+def test_serve_root_crash_at_launch(launch_params) -> None:
+    """SIGKILL only root before readiness, after a diffusion worker exists.
+
+    Require startup failure and orphan/resource cleanup before harness teardown.
+    Later successful serial cases provide fresh-start recovery coverage.
+    """
+    ServeRootCrashAtLaunch().run(MODEL, launch_params)

@@ -112,10 +112,8 @@ class BaseScheduler(ABC):
         self.od_config = od_config
         self._mixfusion_supported = supports_mixfusion(od_config)
         # Fixed for the stage's lifetime; admission drops request schedules on a stage without denoising.
-        stage_role = resolve_diffusion_stage_role(
-            getattr(od_config, "stage_role", None), getattr(od_config, "model_stage", None)
-        )
-        self._runs_denoising = stage_runs_denoising(getattr(od_config, "model_class_name", None), stage_role.value)
+        stage_role = resolve_diffusion_stage_role(od_config.stage_role, od_config.model_stage)
+        self._runs_denoising = stage_runs_denoising(od_config.model_class_name, stage_role.value)
         self._native_prefetch_enabled = native_prefetch_enabled(od_config)
         self._native_prefetch_request_id = None
         self._request_states.clear()
@@ -125,17 +123,14 @@ class BaseScheduler(ABC):
         self._running_sampling_params_key = None
         self._finished_req_ids.clear()
         self._reset_kv_transfer_state()
-        max_num_seqs = getattr(od_config, "max_num_seqs", 1)
+        max_num_seqs = od_config.max_num_seqs
         try:
             self.max_num_running_reqs = max(1, int(max_num_seqs))
         except (TypeError, ValueError):
             self.max_num_running_reqs = 1
-        omni_kv = getattr(od_config, "omni_kv_config", None) or {}
+        omni_kv = od_config.omni_kv_config or {}
         self._prefetch_enabled = bool(omni_kv.get("enable_kv_async_prefetch", False))
-        diffusion_kv_enabled = (
-            getattr(od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
-            is DiffusionKVCacheMode.PAGED_SCHEDULER
-        )
+        diffusion_kv_enabled = od_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
         if diffusion_kv_enabled:
             if kv_cache_config is None:
                 raise ValueError("paged_scheduler Diffusion KV requires a native Scheduler KVCacheConfig")
@@ -193,7 +188,7 @@ class BaseScheduler(ABC):
                 request.sampling_params.attention_sigma_schedule = None
             validate_request_attention_schedules(
                 request.sampling_params,
-                getattr(self.od_config, "diffusion_attention_schedule", None),
+                self.od_config.diffusion_attention_schedule,
             )
         except (TypeError, ValueError) as exc:
             raise InvalidAttentionScheduleError(str(exc)) from exc
@@ -799,11 +794,11 @@ class BaseScheduler(ABC):
             return None
         return StepBatchSamplingParamsKey(
             attention_schedule=resolve_request_attention_schedule(
-                sampling, getattr(self.od_config, "diffusion_attention_schedule", None)
+                sampling, self.od_config.diffusion_attention_schedule
             ),
             attention_schedule_explicit=sampling.attention_schedule is not None,
             attention_sigma_schedule=resolve_request_attention_sigma_schedule(
-                sampling, getattr(self.od_config, "diffusion_attention_schedule", None)
+                sampling, self.od_config.diffusion_attention_schedule
             ),
             condition_key=getattr(request, "batch_compatibility_key", None),
             lora_key=build_lora_batch_key(lora_request, getattr(sampling, "lora_scale", None)),

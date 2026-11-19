@@ -21,7 +21,7 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/depl
 ```
 
 Omni keeps soundfile as the first automatic audio decoder to preserve input
-waveforms when upgrading to vLLM 0.33. Switching decoders can change BF16 audio
+waveforms with vLLM 0.34. Switching decoders can change BF16 audio
 features and mixed-media answers. Formats unsupported by soundfile continue
 through upstream's torchcodec/PyAV fallback. To explicitly select a decoder,
 use `--media-io-kwargs '{"audio":{"audio_backend":"torchcodec"}}'` (or
@@ -166,7 +166,7 @@ python openai_chat_completion_client_for_multimodal_generation.py \
     pip install 'vllm-omni[demo]'
     ```
 
-    For this 0.33 source checkout, follow the
+    For this 0.34 source checkout, follow the
     [source demo dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
     from the repository root. Build the temporary Gradio wheel and include it
     with `.[demo]` in the same normal install command.

@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""The duplex MRv2 deploy profile resolves to the config keys the model relies on.
+"""PersonaPlex profiles still require a retired V1 Talker stage.
 
-Full-duplex Model Runner V2 serving for PersonaPlex is selected by
-``personaplex_duplex_mrv2.yaml``. Stage 0 (Talker) stays on V1 for lockstep
-post-sample depformer execution and batched appends; Stage 1 (Code2Wav)
-opts into MRv2 on CUDA while falling back to V1 on non-CUDA platforms.
+Keep the profile metadata checks and verify that full-workflow admission fails.
+The V2 Code2Wav component alone does not qualify the complete model.
 """
 
 import pytest
@@ -27,36 +25,40 @@ _DEPLOY = "personaplex_duplex_mrv2.yaml"
 def _resolve_cuda_stages(monkeypatch):
     monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
     config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform="cuda")
-    return config, merge_pipeline_deploy(PERSONAPLEX_PIPELINE, config)
+    return config
 
 
-def test_personaplex_duplex_mrv2_profile_requests_duplex_and_v2(monkeypatch) -> None:
-    config, stages = _resolve_cuda_stages(monkeypatch)
+def test_personaplex_duplex_mrv2_profile_rejects_v1_talker(monkeypatch) -> None:
+    config = _resolve_cuda_stages(monkeypatch)
     assert config.session_mode == "duplex"
-    # Stage 0 (Talker) stays on V1 for lockstep post-sample depformer execution;
-    # Stage 1 (Code2Wav) opts in to MRv2.
-    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [False, True]
+    assert config.stages[0].model_runner == "v1"
+    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
+        merge_pipeline_deploy(PERSONAPLEX_PIPELINE, config)
 
 
 @pytest.mark.parametrize("platform", ["npu", "xpu", "rocm", "musa"])
 def test_personaplex_duplex_mrv2_profile_keeps_non_cuda_on_v1(monkeypatch, platform) -> None:
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
     config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform=platform)
-    stages = merge_pipeline_deploy(PERSONAPLEX_PIPELINE, config)
-    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [False, False]
+    assert config.model_runner == "v1"
+    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
+        merge_pipeline_deploy(PERSONAPLEX_PIPELINE, config)
 
 
 def test_personaplex_duplex_mrv2_profile_preserves_pipeline_attributes(monkeypatch) -> None:
-    config, stages = _resolve_cuda_stages(monkeypatch)
+    config = _resolve_cuda_stages(monkeypatch)
     # Stage 0: synchronous scheduling for paced lockstep, 8 max seqs, perf switches
-    assert stages[0].yaml_engine_args["async_scheduling"] is False
-    assert stages[0].yaml_engine_args["max_num_seqs"] == 8
-    overrides = stages[0].yaml_engine_args["hf_overrides"]
+    assert config.stages[0].async_scheduling is False
+    assert config.stages[0].max_num_seqs == 8
+    overrides = config.stages[0].engine_extras["hf_overrides"]
     assert overrides["mimi_cuda_graphs"] is True
     assert overrides["depformer_cuda_graphs"] is True
 
     # Stage 1: async scheduling for chunk streaming, shared Mimi decode with TF32
-    assert stages[1].yaml_engine_args["async_scheduling"] is True
-    assert stages[1].yaml_engine_args["max_num_seqs"] == 10
-    assert stages[1].yaml_engine_args["hf_overrides"]["mimi_cuda_graphs"] is True
-    assert stages[1].yaml_engine_args["hf_overrides"]["mimi_decode_tf32"] is True
+    assert config.stages[1].async_scheduling is True
+    assert config.stages[1].max_num_seqs == 10
+    assert config.stages[1].engine_extras["hf_overrides"]["mimi_cuda_graphs"] is True
+    assert config.stages[1].engine_extras["hf_overrides"]["mimi_decode_tf32"] is True
+
+    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
+        merge_pipeline_deploy(PERSONAPLEX_PIPELINE, config)

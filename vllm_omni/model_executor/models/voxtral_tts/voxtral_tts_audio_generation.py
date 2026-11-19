@@ -962,7 +962,6 @@ class VoxtralTTSAudioGenerationForConditionalGeneration(nn.Module, SupportsMulti
         self.eos_tok_id = self.tokenizer.instruct.tokenizer.eos_id
         self.vocab_size = config.text_config.vocab_size
         self._end_audio_token_id = AudioSpecialTokens.id(AudioSpecialTokens.end_audio)
-        self._fake_eos_consts: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def get_language_model(self) -> torch.nn.Module:
         return self.language_model
@@ -1061,15 +1060,8 @@ class VoxtralTTSAudioGenerationForConditionalGeneration(nn.Module, SupportsMulti
             llm_hidden=hidden_states,
             cfg_alpha=cfg_alpha,
         )
-        # Cache device-resident 1.0/0.0 scalars to avoid a per-call H2D transfer.
-        consts = self._fake_eos_consts.get(audio_codes.device)
-        if consts is None:
-            consts = (
-                torch.tensor(1.0, dtype=torch.bfloat16, device=audio_codes.device),
-                torch.tensor(0.0, dtype=torch.bfloat16, device=audio_codes.device),
-            )
-            self._fake_eos_consts[audio_codes.device] = consts
-        fake_eos = torch.where(audio_codes[:, 0] == self._end_audio_token_id, consts[0], consts[1])
+        # Match hidden_states.dtype for the caller's indexed write-back into channel 0.
+        fake_eos = (audio_codes[:, 0] == self._end_audio_token_id).to(dtype=hidden_states.dtype)
         # BxC -> Bx1xC since this is per-step
         # Make it a list for vllm-omni processing
         audio_list = list(torch.split(audio_codes.unsqueeze(1), 1, dim=0))

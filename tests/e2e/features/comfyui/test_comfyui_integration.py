@@ -743,10 +743,13 @@ def api_server(server_case: ServerCase, mock_async_omni, tmp_path, single_thread
 
     # Wait for the server to be ready by polling the health endpoint.
     wait_time = 60
-    wait_poll_interval = 1
-    for _ in range(wait_time // wait_poll_interval):
+    # Each parametrized case starts a lightweight mocked server. Avoid adding
+    # a full second to every startup while keeping the same request timeout.
+    wait_poll_interval = 0.1
+    deadline = time.monotonic() + wait_time
+    while time.monotonic() < deadline:
         try:
-            response = requests.get(f"http://127.0.0.1:{port}/health", timeout=wait_poll_interval)
+            response = requests.get(f"http://127.0.0.1:{port}/health", timeout=1)
             if response.status_code == 200:
                 break
         except requests.RequestException:

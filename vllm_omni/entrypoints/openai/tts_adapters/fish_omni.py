@@ -32,6 +32,7 @@ class FishOmniAdapter(ARTTSAdapter):
     stage_keys = frozenset({"fish_omni"})
     name = "fish_omni_tts"
     supports_reference_codes = True
+    reports_length_truncation = True
 
     def __init__(self, ctx) -> None:
         super().__init__(ctx)
@@ -61,6 +62,24 @@ class FishOmniAdapter(ARTTSAdapter):
         if int(decoder.num_codebooks) != len(sizes):
             raise RuntimeError(f"fish_omni: the model has {decoder.num_codebooks} codebooks, its codec {len(sizes)}")
         return sizes
+
+    def _epsilon_cutoff_error(self, request: "OpenAICreateSpeechRequest") -> str | None:
+        """Why ``extra_params.epsilon_cutoff`` cannot be served, if it cannot."""
+        from vllm_omni.model_executor.models.fish_omni.reference_sampling import (
+            reference_sampling_enabled,
+            resolve_epsilon_cutoff,
+        )
+
+        if request.extra_params is None or "epsilon_cutoff" not in request.extra_params:
+            return None
+        try:
+            resolve_epsilon_cutoff(
+                request.extra_params["epsilon_cutoff"],
+                reference_sampling_enabled(self._model_config().hf_config),
+            )
+        except ValueError as exc:
+            return str(exc)
+        return None
 
     def _reference_codes_error(self, rows: list[list[int]]) -> str | None:
         """Why ``ref_audio_codes`` rows do not fit the codec (each codebook's size), if they do not."""
@@ -129,6 +148,9 @@ class FishOmniAdapter(ARTTSAdapter):
                 return fmt_err
             if not request.ref_text or not request.ref_text.strip():
                 return "Voice cloning requires 'ref_text' (transcript of the reference audio)"
+        err = self._epsilon_cutoff_error(request)
+        if err:
+            return err
         return self._validate_max_new_tokens(request)
 
     async def build(

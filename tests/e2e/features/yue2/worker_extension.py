@@ -5,11 +5,11 @@
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+    from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
 
 
 class Yue2LifecycleWorkerExtension:
-    model_runner: "GPUARModelRunner"
+    model_runner: "OmniARModelRunner"
 
     def start_yue2_probe(self):
         from unittest.mock import patch

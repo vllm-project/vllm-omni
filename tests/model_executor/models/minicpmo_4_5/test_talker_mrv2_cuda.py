@@ -36,6 +36,9 @@ def test_talker_sampler_supports_upstream_dummy_sampler_profiling():
     runner.sampler = wrapped
     runner.model = SimpleNamespace(compute_logits=lambda hidden: hidden)
     runner.input_buffers = InputBuffers(4, 64, device)
+    # Upstream _dummy_sampler_run now delegates to model_state.dummy_sampler_run;
+    # False is the documented ModelState default ("run the default passes").
+    runner.model_state = SimpleNamespace(dummy_sampler_run=lambda sampler, hidden: False)
     # Exercise both real upstream profiling passes, including add_request
     # with for_sampler_warmup() before any RequestState admission.
     runner._dummy_sampler_run(torch.randn(3, vocab, device=device))
@@ -117,7 +120,6 @@ def test_mrv2_talker_sampler_follows_v1_streams_across_preemption_without_host_s
 
     from vllm.config import VllmConfig
     from vllm.sampling_params import SamplingParams
-    from vllm.v1.sample.ops.topk_topp_sampler import random_sample
     from vllm.v1.worker.gpu.sample.sampler import Sampler
     from vllm.v1.worker.gpu.states import RequestState
 
@@ -163,7 +165,14 @@ def test_mrv2_talker_sampler_follows_v1_streams_across_preemption_without_host_s
         expected[:, eos].masked_fill_(torch.tensor(masked, device=device), float("-inf"))
         generators = {row: reference[req_id] for row, req_id in enumerate(req_ids) if req_id in reference}
         held = reference[unfinished].get_state() if unfinished is not None else None
-        expected_ids = random_sample(expected.softmax(dim=-1), generators, False).tolist()
+        # Keep the Torch-generator stream as an independent reference even
+        # though native MRv2 no longer exports the V1 random_sample helper.
+        noise = torch.empty_like(expected)
+        if len(generators) != len(req_ids):
+            noise.exponential_()
+        for row, generator in generators.items():
+            noise[row].exponential_(generator=generator)
+        expected_ids = (expected.softmax(dim=-1) / noise).argmax(dim=-1).tolist()
         if unfinished is not None:
             reference[unfinished].set_state(held)
         for row, req_id in enumerate(req_ids):

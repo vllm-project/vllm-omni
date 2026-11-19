@@ -289,11 +289,13 @@ Both gauges use the labels `{model_name, stage, replica}` and report bytes:
 | `vllm_omni:stage_post_warmup_memory_allocated_bytes` | Worker PyTorch allocator bytes allocated after decoder graph warmup |
 | `vllm_omni:stage_post_warmup_memory_reserved_bytes` | Worker PyTorch allocator bytes reserved after decoder graph warmup |
 
-#### Measurement happens during model loading
+#### Measurement happens at the worker's warmup step
 
-The decoder records the snapshot after successful graph warmup during model
-loading. Publication happens later, at stage readiness or remote replica
-attachment, when statistics are enabled and rank 0 supplies a snapshot.
+The decoder records the snapshot after successful graph warmup, which on CUDA
+and ROCm runs from the worker's `capture_auxiliary_graphs` hook once the model
+has loaded and before the stage serves. Publication happens later, at stage
+readiness or remote replica attachment, when statistics are enabled and rank 0
+supplies a snapshot.
 The saved values are reused without per-request or per-step sampling.
 
 The values are absolute allocator totals for the rank-0 worker on its device.
@@ -302,9 +304,8 @@ They do not isolate the decoder's allocation increase or include non-PyTorch
 device allocations. Values are not summed across tensor- or pipeline-parallel
 ranks.
 
-Capture precedes engine key-value (KV) cache allocation and later graph
-captures. The snapshot therefore does not represent the final stage memory
-footprint.
+Graphs captured lazily for request shapes seen later are not included, so the
+snapshot does not represent the final stage memory footprint.
 
 CUDA and ROCm decoder graphs can supply a snapshot. Eager decoders, unsuccessful
 graph warmup, models without the snapshot hook, and NPU workers emit no samples.
