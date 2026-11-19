@@ -79,6 +79,8 @@ def test_thinker_only_materializes_payloads_with_consumers(
     state.vllm_config.model_config = OmniModelConfig.__new__(OmniModelConfig)
     state.vllm_config.model_config.async_chunk = True
     state.vllm_config.cache_config = CacheConfig(enable_prefix_caching=prefix_caching)
+    state.vllm_config.kv_transfer_config = None
+    state.vllm_config.speculative_config = None
     state.intermediate_buffer = OmniIntermediateBuffer(len(final_stages))
     for idx, stage in enumerate(final_stages):
         if stage is not None:
