@@ -404,7 +404,8 @@ def test_reference_graphs_respect_selected_backend(tmp_path, monkeypatch, mocker
             "token2wav_spk_cuda_graph": True,
             "token2wav_s3_cuda_graph": True,
             "token2wav_device_spk": selection != "cpu",
-            "token2wav_trt": selection == "trt-config",
+            # The legacy env var applies only while the key is unset (#6232).
+            "token2wav_trt": None if selection == "trt-env" else selection == "trt-config",
             "token2wav_spk_cpu_reference": selection == "trt-speaker",
         },
     )
