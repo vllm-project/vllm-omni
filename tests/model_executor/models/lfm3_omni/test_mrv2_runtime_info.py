@@ -56,9 +56,38 @@ def test_profile_placeholder_rows_run_like_an_empty_batch():
         torch.arange(2),
         inputs_embeds=torch.zeros(2, 4),
         runtime_additional_information=[{}, {}],
+        seq_token_counts=[1, 1],
     )
     assert isinstance(hidden, torch.Tensor)
     assert model.model.language_model.requests == []
+
+
+def test_placeholder_rows_are_skipped_in_place():
+    model = make_model()
+    model.lm_head = nn.Linear(4, 16, bias=False)
+    model._placeholder_token_ids = []
+    state = RequestState()
+    model._states = {"a": state}
+    live = {"req_id": "a", "lfm3_span": 2, "sampling_params": SamplingParams(extra_args={"generation_mode": "text"})}
+    output = model(
+        torch.arange(6),
+        torch.arange(6),
+        inputs_embeds=torch.zeros(6, 4),
+        runtime_additional_information=[{}, live, {}],
+        seq_token_counts=[3, 2, 1],
+    )
+    assert model.model.language_model.requests == [(3, 5, state)]
+    assert [frame.shape for frame in output.multimodal_outputs["codes"]["audio"]] == [(0, 12)] * 3
+    logits = model.compute_logits(torch.zeros(3, 4))
+    masked = [model.config.audio_start_token_id, model.config.mixed_start_token_id]
+    assert torch.isinf(logits[1, masked]).all()
+    assert not torch.isinf(logits[[0, 2]]).any()
+
+
+def test_placeholder_rows_need_seq_token_counts():
+    model = make_model()
+    with pytest.raises(ValueError, match="seq_token_counts"):
+        model(torch.tensor([1]), torch.arange(1), inputs_embeds=torch.zeros(1, 4), runtime_additional_information=[{}])
 
 
 def test_rows_without_runner_extra_args_use_their_sampling_params():

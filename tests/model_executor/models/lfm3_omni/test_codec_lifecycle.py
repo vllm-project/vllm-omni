@@ -69,8 +69,17 @@ def test_codec_rejects_missing_payload_or_request_identity():
 def test_profile_placeholder_rows_decode_nothing():
     model = make_model()
     output = model(runtime_additional_information=[{}, {}])
-    assert output.multimodal_outputs["model_outputs"] == []
+    assert [audio.numel() for audio in output.multimodal_outputs["model_outputs"]] == [0, 0]
+    assert len(output.multimodal_outputs["sr"]) == 2
     model.codec.decode.assert_not_called()
+
+
+def test_placeholder_rows_keep_their_output_slot():
+    model = make_model()
+    output = model(runtime_additional_information=[{}, chunk("a"), {}])
+    assert [audio.numel() for audio in output.multimodal_outputs["model_outputs"]] == [0, 16, 0]
+    assert set(model._streams) == {"a"}
+    model.codec.decode.assert_called_once()
 
 
 def test_mrv2_req_id_identifies_the_stream():

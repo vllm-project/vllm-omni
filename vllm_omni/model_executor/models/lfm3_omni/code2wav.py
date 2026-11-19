@@ -52,16 +52,16 @@ class Lfm3OmniCode2Wav(nn.Module):
 
     def forward(self, input_ids=None, positions=None, **kwargs):
         infos = kwargs.get("runtime_additional_information") or []
-        # Model Runner V2 profiles memory with placeholder rows that carry
-        # neither a request nor a codec payload.
-        if infos and all(
-            (info.get("request_id") or info.get("req_id")) is None and "codes" not in info and "codes.audio" not in info
-            for info in infos
-        ):
-            infos = []
         device = self.codec.from_quantizer.weight.device
         audios = []
         for info in infos:
+            req_id = info.get("request_id") or info.get("req_id")
+            if req_id is None and "codes" not in info and "codes.audio" not in info:
+                # Model Runner V2 dummy batches have rows that carry neither a
+                # request nor a codec payload. Each still gets its own (empty)
+                # output, because outputs are matched to requests by position.
+                audios.append(torch.zeros(0, device=device))
+                continue
             codes = info.get("codes", {}).get("audio")
             if codes is None:
                 codes = info.get("codes.audio")
@@ -70,7 +70,6 @@ class Lfm3OmniCode2Wav(nn.Module):
             codes = torch.as_tensor(codes, device=device, dtype=torch.long).reshape(1, self.codec.config.n_q, -1)
             meta = info.get("meta", {})
             finished = bool(meta.get("stream_finished", meta.get("finished", not self.model_config.async_chunk)))
-            req_id = info.get("request_id") or info.get("req_id")
             if not isinstance(req_id, str):
                 raise ValueError("LiquidCodec streaming requires a scheduler request id")
             streaming = self.model_config.async_chunk
