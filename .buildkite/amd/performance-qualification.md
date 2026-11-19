@@ -65,6 +65,41 @@ Held out: [16170](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/16170),
 [16475](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/16475).
 Find `result_test_*.json` under the named jobs' `benchmark-results` artifacts.
 
+### November 19 current-runtime recalibration
+
+The early-November references above predate the current vLLM 0.34 runtime and
+do not describe the variance observed by the November 19 nightly. The revised
+MI300 entries use the conservative observed envelope from successful result
+artifacts in [16741](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/16741),
+[16817](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/16817),
+[16823](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/16823), and
+[16833](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/16833): minimum
+throughput and maximum latency or RTF for each revised metric. Missing result
+artifacts are excluded rather than treated as measurements; build 16817 has no
+Qwen3-Omni async or MiniCPM-o result JSONs.
+
+Only metrics that failed in the current-runtime window, or sat within a few
+percent of a repeated failure, are revised. All metric names, workload
+parameters and the 10% regression tolerance remain unchanged. CUDA and NPU
+references are untouched. Qwen3-Omni async values use the two PR runs with
+result artifacts (16823 and 16833), so improvements from restoring the default
+V2 profile are not hidden by the stalled main run in 16741. The no-async
+calibration uses the available result artifacts across 16741, 16817, 16823 and
+16833; its 0.1, 0.5 and 1.0 RPS latency or RTF references follow the same
+maximum-observed envelope rule.
+
+Voxtral's throughput-sweep TTFP is addressed in source configuration rather
+than normalized to the 892 ms outlier: the initial codec chunk is reduced from
+five frames to three while the steady-state 25-frame chunk and 25-frame left
+context remain unchanged. This directly shortens time to the first packet; the
+next exact-head AMD and CUDA runs must verify its throughput and runtime
+behavior.
+
+The next exact-head AMD run after this recalibration is the held-out
+qualification run. Record its Buildkite link and every job result in the PR
+qualification evidence before merge; do not promote these jobs to blocking on
+the calibration data alone.
+
 ## Buildkite validation and promotion criteria
 
 Maintainers should run these five exact jobs at the proposed head with the
