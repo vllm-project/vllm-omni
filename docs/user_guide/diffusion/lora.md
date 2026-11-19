@@ -174,9 +174,10 @@ adapter uses the same partitioning.
 
 For Qwen-Image and Wan pipelines, the distill backend calls `pipeline.load_lora_weights(...)` during worker initialization.
 
-| Pipeline | Supported distilled LoRA repo | Notes |
+| Pipeline | Example LoRA repo | Notes |
 | ---------- | -------------------------------- | ------- |
 | `QwenImagePipeline` | `lightx2v/Qwen-Image-2512-Lightning` | Used with Qwen-Image-2512 Lightning-style few-step inference. |
+| `QwenImage21Pipeline` | `ML-Intern-lab/Qwen-Image-2.1-doodle-in-LoRA` | Accepts separate `img_mlp.gate_layer` and `img_mlp.proj` weights or the fused `img_mlp.gate_up` layout with gate rows first. |
 | `Wan22Pipeline` | `lightx2v/Wan2.1-Distill-Loras`, `lightx2v/Wan2.2-Distill-Loras` | Wan2.1 uses one LoRA file. For dual-transformer Wan2.2 MoE, pass high-noise then low-noise LoRA files. |
 | `Wan22I2VPipeline` | `lightx2v/Wan2.2-Distill-Loras` | For dual-transformer Wan2.2 MoE, pass high-noise then low-noise LoRA files. |
 

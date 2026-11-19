@@ -458,6 +458,25 @@ class LoraLoaderMixin:
 
 
 class QwenImageLoraLoaderMixin(LoraLoaderMixin):
+    def _prepare_lora_state_dict(self, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        has_alpha = any(k.endswith(".alpha") for k in state_dict)
+        is_non_diffusers_format = any(k.startswith("diffusion_model.") for k in state_dict)
+        is_diffusers_lora_format = any(k.endswith(".lora_A.weight") for k in state_dict)
+        needs_conversion = has_alpha or is_non_diffusers_format
+        if has_alpha and is_diffusers_lora_format:
+            state_dict = _apply_diffusers_lora_alpha_scaling(state_dict)
+            # The converter adds the transformer prefix; canonical keys already have it.
+            needs_conversion = not all(k.startswith("transformer.") for k in state_dict)
+
+        if needs_conversion:
+            converter = get_converter_by_pipeline(self)
+            if converter is None:
+                raise ValueError(f"Converter for Lora weights not found for {self.__class__.__name__}")
+
+            state_dict = converter(state_dict)
+
+        return _remap_state_dict_keys(state_dict, [(".to_out.0.", ".to_out.")])
+
     def load_lora_weights(
         self,
         pretrained_model_name_or_path_or_dict: str | dict[str, torch.Tensor],
@@ -471,21 +490,7 @@ class QwenImageLoraLoaderMixin(LoraLoaderMixin):
         else:
             state_dict = _load_lora_state_dict(pretrained_model_name_or_path_or_dict)
 
-        has_alpha = any(k.endswith(".alpha") for k in state_dict)
-        is_non_diffusers_format = any(k.startswith("diffusion_model.") for k in state_dict)
-        is_diffusers_lora_format = any(k.endswith(".lora_A.weight") for k in state_dict)
-        if has_alpha and is_diffusers_lora_format:
-            state_dict = _apply_diffusers_lora_alpha_scaling(state_dict)
-
-        if has_alpha or is_non_diffusers_format:
-            converter = get_converter_by_pipeline(self)
-            if converter is None:
-                raise ValueError(f"Converter for Lora weights not found for {self.__class__.__name__}")
-
-            state_dict = converter(state_dict)
-
-        state_dict = _remap_state_dict_keys(state_dict, [(".to_out.0.", ".to_out.")])
-
+        state_dict = self._prepare_lora_state_dict(state_dict)
         self.load_lora_into_module(
             state_dict,
             self.transformer,
@@ -504,6 +509,30 @@ class QwenImageLoraLoaderMixin(LoraLoaderMixin):
         self.unload_module_lora(state_dict, transformer, prefix=self.transformer_name)
 
         del self.lora_loaded[adapter_name]
+
+
+class QwenImage21LoraLoaderMixin(QwenImageLoraLoaderMixin):
+    def _prepare_lora_state_dict(self, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        state_dict = super()._prepare_lora_state_dict(state_dict)
+        # Community adapters may store the two MLP projections as [gate; up].
+        # Split their global B rows before the regular loader shards either projection for TP.
+        suffix = ".img_mlp.gate_up."
+        mlps = {key.partition(suffix)[0] + ".img_mlp" for key in state_dict if suffix in key}
+        for mlp in sorted(mlps):
+            a = state_dict.pop(f"{mlp}.gate_up.lora_A.weight", None)
+            b = state_dict.pop(f"{mlp}.gate_up.lora_B.weight", None)
+            if a is None or b is None:
+                raise ValueError(f"{mlp}.gate_up requires both lora_A and lora_B weights.")
+            gate = self.transformer.get_submodule(mlp.removeprefix("transformer.") + ".gate_layer")
+            width = gate.output_size  # global size of the column-parallel projection
+            if a.ndim != 2 or a.shape[0] == 0 or a.shape[1] != gate.input_size or b.shape != (2 * width, a.shape[0]):
+                raise ValueError(f"Invalid {mlp}.gate_up LoRA shapes: A={tuple(a.shape)}, B={tuple(b.shape)}.")
+            for name, rows in zip(("gate_layer", "proj"), b.split(width), strict=True):
+                a_key, b_key = f"{mlp}.{name}.lora_A.weight", f"{mlp}.{name}.lora_B.weight"
+                if a_key in state_dict or b_key in state_dict:
+                    raise ValueError(f"Conflicting fused and split LoRA weights for {mlp}.{name}.")
+                state_dict[a_key], state_dict[b_key] = a, rows
+        return state_dict
 
 
 class WanLoraLoaderMixin(LoraLoaderMixin):
