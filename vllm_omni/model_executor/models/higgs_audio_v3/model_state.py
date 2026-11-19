@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Higgs delay-pattern sampling and owned audio output on Model Runner V2."""
 
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 from vllm.logger import init_logger
-from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
+from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import HiggsAudioSamplingParams
@@ -280,6 +281,26 @@ class HiggsModelState(OmniModelState):
         return self.model.finalize_multimodal_outputs_from_cpu_snapshot(payload)
 
 
+def _first_logit_batch(input_batch: InputBatch) -> InputBatch:
+    """The batch as seen by a sampler given only each request's first logit row.
+
+    A request that joins while others verify drafts falls back to the text
+    sampler, whose per-row parameters must match the logits it receives.
+    """
+    first = input_batch.cu_num_logits[:-1]
+    num_reqs = input_batch.num_reqs
+    return replace(
+        input_batch,
+        expanded_idx_mapping=input_batch.idx_mapping[:num_reqs],
+        expanded_local_pos=torch.zeros_like(input_batch.expanded_local_pos[:num_reqs]),
+        logits_indices=input_batch.logits_indices[first.long()],
+        cu_num_logits=torch.arange(num_reqs + 1, dtype=first.dtype, device=first.device),
+        cu_num_logits_np=np.arange(num_reqs + 1, dtype=input_batch.cu_num_logits_np.dtype),
+        num_draft_tokens=0,
+        num_draft_tokens_per_req=None,
+    )
+
+
 class HiggsSampler(OmniSampler):
     """Higgs audio sampling registered through the upstream sampler factory."""
 
@@ -301,10 +322,11 @@ class HiggsSampler(OmniSampler):
         meta = state.sampling_metadata(input_batch.req_ids, input_batch.idx_mapping[: input_batch.num_reqs])
         hidden = hidden_states[input_batch.logits_indices]
         stock_output = None
+        text_batch = _first_logit_batch(input_batch) if input_batch.num_draft_tokens else input_batch
 
         def sample_text(text_logits):
             nonlocal stock_output
-            stock_output = self.base_sampler(text_logits, input_batch)
+            stock_output = self.base_sampler(text_logits, text_batch)
             return stock_output.sampled_token_ids
 
         if input_batch.num_draft_tokens:

@@ -461,6 +461,58 @@ def test_registered_audio_sampler_preserves_rows_counts_and_owned_output(mocker,
     standard.assert_not_called()
 
 
+def test_prefill_joining_drafted_batch_samples_text_with_matching_rows(mocker):
+    """A new request can join a step that verifies another request's draft."""
+    from dataclasses import replace
+
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+
+    buffers = SimpleNamespace(
+        device=torch.device("cpu"),
+        seq_lens=torch.zeros(4, dtype=torch.int32),
+        query_start_loc=torch.zeros(5, dtype=torch.int32),
+        input_ids=torch.zeros(16, dtype=torch.int32),
+        positions=torch.zeros(16, dtype=torch.int64),
+        is_padding=torch.zeros(16, dtype=torch.bool),
+    )
+    # Request "a" verifies one draft (two logits); "new" is still prefilling.
+    batch = replace(
+        InputBatch.make_dummy(2, 10, buffers),
+        req_ids=["a", "new"],
+        expanded_idx_mapping=torch.tensor([0, 0, 1]),
+        expanded_local_pos=torch.tensor([0, 1, 0], dtype=torch.int32),
+        num_draft_tokens=1,
+        num_draft_tokens_per_req=np.array([1, 0]),
+        logits_indices=torch.tensor([3, 4, 9]),
+        cu_num_logits=torch.tensor([0, 2, 3], dtype=torch.int32),
+        cu_num_logits_np=np.array([0, 2, 3], dtype=np.int32),
+    )
+    state = make_state()
+    state.audio_speculator = speculator = Mock()
+    state.sampling_metadata = Mock(return_value=object())
+    state.model.compute_logits = Mock(side_effect=lambda hidden, meta: hidden)
+    state.model._step_audio_mode_rows = 1
+    state.model.post_sample_multimodal_outputs = Mock(return_value={})
+    state.model.sample = Mock(side_effect=lambda logits, meta, *, sample_text, draft_rows: sample_text(logits))
+    mocker.patch(
+        "vllm_omni.model_executor.models.higgs_audio_v3.model_state.get_num_sampled_and_rejected",
+        return_value=(torch.ones(2), torch.zeros(2)),
+    )
+
+    def base_sampler(logits, text_batch):
+        assert text_batch.expanded_idx_mapping.shape[0] == logits.shape[0] == text_batch.num_reqs
+        assert text_batch.logits_indices.tolist() == [3, 9]
+        assert text_batch.cu_num_logits_np.tolist() == [0, 1, 2]
+        return SamplerOutput(torch.tensor([[5], [6]]), None, None, torch.ones(2), torch.zeros(2))
+
+    sampler, _ = state.custom_sampler(Mock(side_effect=base_sampler))
+    hidden = torch.arange(16, dtype=torch.float32)[:, None]
+    result = sampler.sample_step(hidden, batch, SimpleNamespace(prefill_len=SimpleNamespace(gpu=None)), None, Mock())
+    assert result.sampler_output.sampled_token_ids.tolist() == [[5], [6]]
+    speculator.verify.assert_not_called()
+    assert speculator.batch is None
+
+
 @pytest.mark.parametrize("draft,grammar,message", [(1, None, "audio candidates"), (0, object(), "grammar sampling")])
 def test_registered_audio_sampler_rejects_unsupported_modes(draft, grammar, message):
     sampler, _ = make_state().custom_sampler(Mock())
