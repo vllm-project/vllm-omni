@@ -37,6 +37,7 @@ from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import eligible as pointwise_eligible
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import residual, rotary, silu_mul
 from vllm_omni.diffusion.layers.exact_bf16_qk_norm_rope import qk_rotary
+from vllm_omni.diffusion.layers.exact_bf16_rope_musa import musa_qk_rotary, musa_rotary
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
 from vllm_omni.diffusion.models.qwen_image_21.npu_attention import QwenImage21SDPAImpl
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
@@ -136,6 +137,17 @@ def _apply_qwen_image21_rotary_emb_npu(x: torch.Tensor, freqs: torch.Tensor) -> 
     rot_cos, rot_sin = _npu_rope_tables(freqs)
     rotated = torch_npu.npu_rotary_mul(x.float(), rot_cos, rot_sin, rotary_mode="interleave")
     return rotated.to(dtype=x.dtype)
+
+
+def _apply_qwen_image21_rotary_emb_musa(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """Interleaved RoPE through a Triton kernel with the native rotation's rounding.
+
+    Inputs the kernel does not take use ``_apply_qwen_image21_rotary_emb_native``.
+    """
+    rotated = musa_rotary(x, freqs)
+    if rotated is not None:
+        return rotated
+    return _apply_qwen_image21_rotary_emb_native(x, freqs)
 
 
 def _apply_qwen_image21_rotary_emb_native(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -580,6 +592,8 @@ class QwenImage21Attention(nn.Module):
             return _apply_qwen_image21_rotary_emb(x, freqs)
         if x.device.type == "npu":
             return _apply_qwen_image21_rotary_emb_npu(x, freqs)
+        if x.device.type == "musa":
+            return _apply_qwen_image21_rotary_emb_musa(x, freqs)
         # Platform fallback without complex-tensor kernels (the CustomOp rope layer
         # dispatches by platform, not tensor device, so it cannot serve CPU tensors).
         return _apply_qwen_image21_rotary_emb_native(x, freqs)
@@ -674,7 +688,10 @@ class QwenImage21Attention(nn.Module):
 
         fused_qk = None
         if self.norm_q.bias is None and self.norm_k.bias is None and self.norm_q.eps == self.norm_k.eps:
-            fused_qk = qk_rotary(query, key, self.norm_q.weight, self.norm_k.weight, freqs, self.norm_q.eps)
+            if query.device.type == "musa":
+                fused_qk = musa_qk_rotary(query, key, self.norm_q.weight, self.norm_k.weight, freqs, self.norm_q.eps)
+            else:
+                fused_qk = qk_rotary(query, key, self.norm_q.weight, self.norm_k.weight, freqs, self.norm_q.eps)
         if fused_qk is not None:
             query, key = fused_qk
         else:
@@ -1508,7 +1525,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         prepared_modulation = None
         pointwise_validated = False
         if (
-            joint_hidden_states.device.type in {"cuda", "npu"}
+            joint_hidden_states.device.type in {"cuda", "npu", "musa"}
             and not torch.is_grad_enabled()
             and not torch.compiler.is_compiling()
         ):
@@ -1518,7 +1535,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             # its token selection/scale/tanh once per step, using the same ops.
             scale1, gate1, scale2, gate2 = modulation.chunk(4, dim=-1)
             decode_broadcast = (
-                joint_hidden_states.device.type == "npu"
+                joint_hidden_states.device.type in ("npu", "musa")
                 and joint_hidden_states.dtype == torch.bfloat16
                 and batch_size == 1
                 and is_decode
