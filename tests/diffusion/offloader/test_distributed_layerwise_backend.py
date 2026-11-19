@@ -323,6 +323,8 @@ def test_independent_root_cannot_capture_a_streamed_block(
     )
     with pytest.raises(ValueError, match="whole block"):
         backend.enable(pipeline)
+
+
 def _install_flat_shards(hook: DistributedLayerwiseOffloadHook, source_block: nn.Module) -> None:
     """Replace chunk-packed shards with the legacy flat-shard layout."""
     params = dict(source_block.named_parameters())
