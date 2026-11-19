@@ -108,15 +108,15 @@ def test_empty_lifecycle_history_accepts_explicit_none_last_token(model):
     assert len(model._request_states["a"].history) == 0
 
 
-def test_sampling_metadata_opt_in_uses_shared_runner_interface(mocker):
-    from vllm_omni.model_executor.models import interfaces
+def test_mrv2_state_is_registered_through_the_model_factory(model, mocker):
+    from vllm_omni.worker_v2.model_states import init_omni_model_state
 
-    assert "requires_request_sampling_params" in interfaces.__all__
-    assert interfaces.requires_request_sampling_params(Zonos2TalkerForConditionalGeneration)
-    other = mocker.Mock(spec=nn.Module)
-    assert not interfaces.requires_request_sampling_params(other)
-    other.requires_request_sampling_params = False
-    assert not interfaces.requires_request_sampling_params(other)
+    state = mocker.patch("vllm_omni.model_executor.models.zonos2.model_state.Zonos2ModelState")
+    config = mocker.Mock()
+    device = torch.device("cpu")
+    result = init_omni_model_state(config, model, None, device)
+    state.assert_called_once_with(config, model, None, device)
+    assert result is state.return_value
 
 
 def test_request_id_controls_preprocess_forward_and_postprocess(model):
@@ -273,7 +273,7 @@ def test_unsupported_capture_or_scheduler_modes_fail_before_allocating_model(asy
         Zonos2TalkerForConditionalGeneration(vllm_config=cfg)
 
 
-def test_mrv2_is_rejected_before_model_allocation(mocker):
+def test_speculative_sampling_is_rejected_before_model_allocation(mocker):
     from vllm.config import VllmConfig
 
     cfg = mocker.Mock(
@@ -281,9 +281,10 @@ def test_mrv2_is_rejected_before_model_allocation(mocker):
         scheduler_config=mocker.Mock(async_scheduling=False),
         cache_config=mocker.Mock(enable_prefix_caching=False),
         model_config=mocker.Mock(enforce_eager=True, use_v2_model_runner=True),
+        speculative_config=mocker.Mock(),
     )
     allocate = mocker.patch("vllm_omni.model_executor.models.zonos2.zonos2_talker.Zonos2MultiEmbedder")
-    with pytest.raises(ValueError, match="ZONOS2.*V1.*use_v2_model_runner=False"):
+    with pytest.raises(ValueError, match="ZONOS2.*speculative"):
         Zonos2TalkerForConditionalGeneration(vllm_config=cfg)
     allocate.assert_not_called()
 

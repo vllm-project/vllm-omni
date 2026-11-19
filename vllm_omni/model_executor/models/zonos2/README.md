@@ -93,11 +93,12 @@ use the common serving encoders. Native sample rate is 44,100 Hz.
 
 ## State and validation
 
-The talker requires the V1 GPU runner (`model_runner: v1` in the deployment,
-`use_v2_model_runner=False` in the resolved model configuration). MRv2 is
-rejected at construction because it does not supply this model's lifecycle
-and sampling metadata. Eager execution, synchronous AR scheduling and no
-prefix cache are also required.
+The deployment selects Model Runner V2 on vLLM 0.34. ZONOS2 supplies its own
+ModelState and registered sampler for nine-codebook generation and uses the
+native MRv2 data plane for both stages. Eager execution, synchronous AR
+scheduling and no prefix cache are required; speculative decoding is rejected.
+The initial supported scope is single-request offline and SSE generation.
+Batch quality and the RFC C4/C16 performance matrix remain unqualified.
 
 For offline generation, omitting `sampling_params_list` selects the shipped
 deployment defaults: temperature 1.15, top-k 106, min-p 0.18, repetition

@@ -25,6 +25,7 @@ ZONOS2_PIPELINE = PipelineConfig(
             execution_type=StageExecutionType.LLM_AR,
             input_sources=(),
             owns_tokenizer=True,
+            supports_native_mrv2_data_plane=True,
             engine_output_type="latent",
             async_chunk_process_next_stage_input_func=f"{_PROC}.talker2dac_async_chunk",
             # EOS handling is owned by the model-side sampler (any codebook
@@ -45,6 +46,8 @@ ZONOS2_PIPELINE = PipelineConfig(
             engine_output_type="audio",
             model_arch="Zonos2Code2WavForConditionalGeneration",
             sync_process_input_func=f"{_PROC}.talker2dac",
+            supports_native_mrv2_data_plane=True,
+            requires_full_payload_input=True,
             sampling_constraints={"detokenize": True},
         ),
     ),

@@ -5,12 +5,15 @@ These tests use the production talker/sampler and DAC. The observers in
 replacing logits, weights or sampling. Only the GPU core test constructs a
 small random DAC checkpoint; it checks codec contracts rather than speech quality.
 
+Use vLLM 0.34.0 with the MRv2 deployment. Both stages use the native MRv2
+data plane; the initial supported profile is single-request eager execution.
+
 ## Local assets and a single GPU
 
 Provision the converted frozen safetensors model and DAC/speaker assets locally:
 
 ```bash
-export CUDA_VISIBLE_DEVICES=2  # Check this physical GPU is idle before each run.
+export CUDA_VISIBLE_DEVICES=0  # Select a GPU with enough free memory for both stages.
 export ZONOS2_TEST_MODEL_PATH=/path/to/zonos2-safetensors
 export VLLM_ZONOS2_DAC_PATH=/path/to/weights_44khz_8kbps_0.0.1.pth
 export VLLM_ZONOS2_SPEAKER_PATH=/path/to/local-qwen3-speaker-snapshot

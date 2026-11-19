@@ -1,3 +1,6 @@
+# Historical LFM3-Omni speech profile; unavailable with vLLM 0.34 / V2-only execution.
+# Configuration resolution rejects this profile because its autoregressive stage requires retired Model Runner V1.
+# Keep the V1 pin to fail explicitly; selecting V2 does not implement model support.
 # LFM3-Omni bring-up profile, verified on 1x Ascend 910B1 64 GiB and 1x RTX 4090 24 GB.
 # Eager execution owns per-request convolution state.
 async_chunk: false

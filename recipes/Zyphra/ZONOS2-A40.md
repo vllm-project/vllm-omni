@@ -16,7 +16,7 @@ uses an AR talker followed by DAC. Integration contributor:
 | Output | Mono 44100Hz PCM; float32 internally, 512 samples per frame |
 | Streaming | Raw PCM/WAV or OpenAI speech SSE; min16 frames, overlap4 OLA |
 | Budget | Default/maximum 1024 frames; budget termination is an incomplete-generation error |
-| Unsupported | CFG except 1, style instructions, MRv2, prefix cache, async AR scheduling, AR graph, quantization/distributed profiles |
+| Unsupported | CFG except 1, style instructions, prefix cache, async AR scheduling, AR graph, speculative/quantized/distributed profiles |
 
 ## Hardware and profiles
 
@@ -124,8 +124,10 @@ parameter set, including vLLM's default temperature 1.0, disabled top-k/min-p
 and repetition penalty 1.0. To retain the ZONOS2 profile while changing one
 setting, clone the entries in `engine.default_sampling_params_list`, then
 change the talker's budget. The benchmark explicitly supplies its full
-sampling profile. The supported talker runner is V1 (`model_runner: v1`);
-MRv2 is rejected before model allocation.
+sampling profile. The current deployment selects MRv2 (`model_runner: v2`)
+on vLLM 0.34. Single-request eager offline/SSE is the initial supported scope;
+the historical V1 numerical and performance records below retain their
+original revisions and do not qualify V2 batch quality or performance.
 
 ```bash
 export ZONOS2_TEST_MODEL_PATH=/owned/zonos2-safetensors

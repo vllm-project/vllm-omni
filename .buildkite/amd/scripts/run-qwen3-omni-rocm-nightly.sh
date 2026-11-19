@@ -159,6 +159,9 @@ if [[ -n "${QWEN3_OMNI_CONFIG_FILE:-}" ]]; then
     pytest_args+=(--test-config-file "${QWEN3_OMNI_CONFIG_FILE}")
     export BENCHMARK_DIR="${benchmark_dir}"
 fi
+if [[ "${QWEN3_OMNI_REQUIRE_BASELINE:-0}" == 1 ]]; then
+    pytest_args+=(--require-baseline)
+fi
 pytest_args+=(
     -m "${QWEN3_OMNI_MARK_EXPRESSION}"
     --run-level full_model

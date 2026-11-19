@@ -2,6 +2,7 @@
 #
 # Native codec chunks use synchronous eager talker scheduling.
 async_chunk: true
+model_runner: v2
 
 connectors:
   connector_of_shared_memory:

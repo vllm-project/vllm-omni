@@ -17,6 +17,7 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from vllm.config import LoadConfig
 
+from tests.diffusion.models.hy_nomas import conftest as hy_nomas_conftest
 from tests.diffusion.models.hy_nomas.test_native_runtime import _small_transformer
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig, resolve_model_class_name
 from vllm_omni.diffusion.executor.uniproc_executor import UniProcDiffusionExecutor
@@ -43,6 +44,51 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_extras import get_extra_body_params, get_video_generation_defaults
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+def test_single_rank_parallel_uses_file_rendezvous(monkeypatch, mocker):
+    get_file_store_init_method = mocker.patch.object(
+        hy_nomas_conftest,
+        "get_file_store_init_method",
+        return_value="file:///tmp/hy-nomas-rendezvous",
+    )
+    init_distributed_environment = mocker.patch.object(hy_nomas_conftest, "init_distributed_environment")
+    initialize_model_parallel = mocker.patch.object(hy_nomas_conftest, "initialize_model_parallel")
+    cleanup_dist_env_and_memory = mocker.patch.object(hy_nomas_conftest, "cleanup_dist_env_and_memory")
+
+    fixture = hy_nomas_conftest.single_rank_parallel.__wrapped__(monkeypatch)
+    next(fixture)
+    try:
+        get_file_store_init_method.assert_called_once_with()
+        init_distributed_environment.assert_called_once_with(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method="file:///tmp/hy-nomas-rendezvous",
+            backend="gloo",
+        )
+        initialize_model_parallel.assert_called_once_with(backend="gloo")
+    finally:
+        fixture.close()
+    cleanup_dist_env_and_memory.assert_called_once_with()
+
+
+def test_single_rank_parallel_cleans_up_after_initialization_failure(monkeypatch, mocker):
+    mocker.patch.object(hy_nomas_conftest, "get_file_store_init_method", return_value="file:///tmp/hy-nomas-failure")
+    mocker.patch.object(hy_nomas_conftest, "init_distributed_environment")
+    initialize_model_parallel = mocker.patch.object(
+        hy_nomas_conftest,
+        "initialize_model_parallel",
+        side_effect=RuntimeError("injected initialization failure"),
+    )
+    cleanup_dist_env_and_memory = mocker.patch.object(hy_nomas_conftest, "cleanup_dist_env_and_memory")
+
+    fixture = hy_nomas_conftest.single_rank_parallel.__wrapped__(monkeypatch)
+    with pytest.raises(RuntimeError, match="injected initialization failure"):
+        next(fixture)
+
+    initialize_model_parallel.assert_called_once_with(backend="gloo")
+    cleanup_dist_env_and_memory.assert_called_once_with()
 
 
 TRANSFORMER_CONFIG = {

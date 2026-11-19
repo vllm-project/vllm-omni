@@ -193,7 +193,7 @@ their keys only.
 ## Inherited vLLM variables
 
 vLLM-Omni also reads variables through its aligned vLLM dependency. Refer to
-the [vLLM 0.33 environment-variable reference](https://docs.vllm.ai/en/v0.33.0/configuration/env_vars/)
+the [vLLM 0.34 environment-variable reference](https://github.com/vllm-project/vllm/blob/v0.34.0/docs/configuration/env_vars.md)
 for their definitions. This includes vLLM launch, cache, logging, plugin, ROCm,
 XPU, ModelScope, and FlashInfer workspace settings.
 

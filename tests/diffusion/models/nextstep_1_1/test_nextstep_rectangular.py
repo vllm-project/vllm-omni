@@ -6,12 +6,36 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from transformers import LlamaConfig, StaticCache
 
 from vllm_omni.diffusion.models.nextstep_1_1 import pipeline_nextstep_1_1 as pipeline_module
 from vllm_omni.diffusion.models.nextstep_1_1.modeling_nextstep import NextStepModel
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+@pytest.mark.parametrize("capacity", [5, 8])
+def test_static_cache_mask_preserves_capacity_causality_and_padding(capacity):
+    config = LlamaConfig(hidden_size=16, num_attention_heads=2, num_key_value_heads=2, num_hidden_layers=1)
+    cache = StaticCache(config=config, max_cache_len=capacity)
+    model = NextStepModel.__new__(NextStepModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(_attn_implementation="sdpa")
+    inputs = torch.zeros(1, 2, 16)
+    mask = model._update_causal_mask(
+        attention_mask=torch.tensor([[1, 0, 1, 1]]),
+        input_tensor=inputs,
+        cache_position=torch.tensor([2, 3]),
+        past_key_values=cache,
+        output_attentions=False,
+    )
+    assert mask.shape == (1, 1, 2, capacity)
+    allowed = torch.zeros(2, capacity, dtype=torch.bool)
+    allowed[0, [0, 2]] = True
+    allowed[1, [0, 2, 3]] = True
+    torch.testing.assert_close(mask[0, 0] == 0, allowed)
+    assert (mask[0, 0][~allowed] == torch.finfo(inputs.dtype).min).all()
 
 
 @pytest.mark.parametrize("height,width", [(32, 32), (32, 48), (48, 32)])

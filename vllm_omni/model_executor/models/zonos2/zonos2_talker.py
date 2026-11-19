@@ -25,7 +25,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 import torch.nn.functional as F
@@ -37,7 +37,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.models.utils import make_layers
-from vllm.v1.outputs import SamplerOutput
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 from vllm_omni.data_entry_keys import (
     LAST_OUTPUT_TOKEN_KEY,
@@ -67,6 +67,11 @@ from vllm_omni.model_executor.models.zonos2.zonos2_sampler import (
     Zonos2SamplingParams,
     sample_frame,
 )
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+
+    from vllm_omni.model_executor.models.zonos2.model_state import Zonos2ModelState
 
 logger = init_logger(__name__)
 
@@ -496,11 +501,9 @@ class Zonos2TalkerForConditionalGeneration(nn.Module):
 
     # Runner hooks
     have_multimodal_outputs: bool = True
-    prefer_model_sampler: bool = True
-    has_postprocess: bool = True
+    mrv2_forward_returns_tensor: bool = True
+    has_postprocess: bool = False
     has_preprocess: bool = True
-    requires_request_sampling_params: bool = True
-    requires_request_sample_eligibility: bool = True
     postprocess_uses_hidden_states: bool = False
     postprocess_uses_multimodal_outputs: bool = False
     gpu_resident_buffer_keys = {(STATE, key) for key in ("history", "eos_frame", "countdown", "stopped")}
@@ -515,8 +518,8 @@ class Zonos2TalkerForConditionalGeneration(nn.Module):
             raise ValueError("ZONOS2 codec-history replay currently requires enable_prefix_caching=False")
         if not vllm_config.model_config.enforce_eager:
             raise ValueError("ZONOS2 request-local sampling currently requires enforce_eager=True")
-        if getattr(vllm_config.model_config, "use_v2_model_runner", False):
-            raise ValueError("ZONOS2 requires the V1 GPU runner (use_v2_model_runner=False); MRv2 is unsupported")
+        if getattr(vllm_config, "speculative_config", None) is not None:
+            raise ValueError("ZONOS2 request-local sampling does not support speculative decoding")
         hf_config = vllm_config.model_config.hf_config
         if isinstance(hf_config, Zonos2Config):
             self.config = hf_config
@@ -547,6 +550,13 @@ class Zonos2TalkerForConditionalGeneration(nn.Module):
         self._sampling_plan: list[tuple[str, bool, dict[str, Any]]] = []
         self._step_codes: dict[str, torch.Tensor] = {}
         self._step_payload: dict[str, Any] | None = None
+
+    def create_omni_model_state(
+        self, vllm_config: VllmConfig, encoder_cache: EncoderCache | None, device: torch.device
+    ) -> Zonos2ModelState:
+        from vllm_omni.model_executor.models.zonos2.model_state import Zonos2ModelState
+
+        return Zonos2ModelState(vllm_config, self, encoder_cache, device)
 
     # ------------------------------------------------------------------ embed
     def _embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -603,7 +613,7 @@ class Zonos2TalkerForConditionalGeneration(nn.Module):
             raise ValueError(
                 f"ZONOS2 requires runner lifecycle metadata: missing {', '.join(missing)}. "
                 "The model runner must supply the committed output-token count and last lifecycle token "
-                "(None for an empty history) for requires_request_sampling_params models."
+                "(None for an empty history) before ZONOS2 preprocessing."
             )
         key = str(info[REQUEST_ID_KEY])
         params = Zonos2SamplingParams.from_runtime(info[REQUEST_SAMPLING_PARAMS_KEY])
@@ -844,7 +854,13 @@ class Zonos2TalkerForConditionalGeneration(nn.Module):
                     self._step_payload["codes"]["audio"][index] = row.reshape(1, 9)
                     self._step_payload["meta"]["eos_frame"][index] = state.eos_frame.reshape(1)
                     self._step_payload["meta"]["is_final"][index] = state.stopped.reshape(1)
-            return SamplerOutput(sampled_token_ids=lifecycle, logprobs_tensors=None)
+            return SamplerOutput(
+                sampled_token_ids=lifecycle,
+                logprobs_tensors=None,
+                num_nans=None,
+                num_sampled=torch.tensor([eligible for _, eligible, _ in plan], device=fused.device, dtype=torch.int32),
+                num_rejected=torch.zeros(len(plan), device=fused.device, dtype=torch.int32),
+            )
         except Exception:
             self.on_requests_finished([p[0] for p in plan])
             raise

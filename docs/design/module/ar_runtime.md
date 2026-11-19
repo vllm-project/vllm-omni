@@ -31,6 +31,10 @@ last_reviewed: 2026-07-16
 
 The AR runtime extends vLLM scheduling and worker execution for omni-stage
 inputs and outputs while preserving vLLM scheduling and cache semantics.
+Omni workers use Model Runner V2; the retired GPU, NPU and XPU V1 runner
+implementations and their exclusive helpers are removed. Shared utilities under
+`worker/` remain in use by `worker_v2/`. The upstream `vllm.v1` package name
+does not select Model Runner V1.
 
 The experimental Mooncake KV/HS backend uses the existing MRv2 external-load
 state transitions for Qwen3-Omni turn requests and duplex utterances, which
@@ -57,6 +61,18 @@ native graph buffers; FULL replay restores the tree before postprocessing.
 Both paths therefore publish the same named hidden-state fields to prefix
 caching and downstream stages.
 
+Models such as Qwen3-TTS whose `forward()` returns a tensor and whose
+`make_omni_output()` builds the multimodal payload afterward declare
+`mrv2_forward_returns_tensor = True`. Their multimodal-output capability does
+not require excluding FULL capture.
+
+Request-batched MTP uses its own FULL graph wrapper. Capture and replay select
+the same FULL descriptor from the MTP capture sizes, bounded by
+`max_num_seqs`, independently of the backbone's graph mode. A backbone that
+uses PIECEWISE graphs must not make the MTP wrapper bypass its captured graph.
+This does not enable graphs for an eager or graph-unsafe MTP implementation;
+requests without a supported capture bucket retain eager execution.
+
 After applying sampled output, the AR scheduler publishes only completed KV
 blocks to upstream prefix caching, including on its plain-decode path. Async
 placeholders and speculative steps use `num_computed_tokens - num_in_flight_tokens`
@@ -64,12 +80,12 @@ as the materialized frontier. Stale output and requests that were not running
 before the update do not publish blocks. Publication precedes stop cleanup so
 the last completed blocks remain reusable after a request finishes.
 
-For Bagel image editing, the vLLM 0.33 prefix-range helper receives shallow
+For Bagel image editing, the vLLM 0.34 prefix-range helper receives shallow
 `image` views of the custom `img2img` features so both VAE and ViT embedding
 spans retain bidirectional attention. The original features keep their modality,
 encoder data, cache identifiers and placeholder masks. Upstream still computes
 the ranges and applies sliding-window and padding rules. This adapter is installed
-from `vllm_omni.patch` for both upstream runner implementations; it is unnecessary
+from `vllm_omni.patch` for the upstream V2 runner; it is unnecessary
 with vLLM versions that build the ranges inline.
 
 MOSS Local's fused and separate depth-attention paths share an explicitly
@@ -81,15 +97,15 @@ including SM89 code generation affected by LLVM SLP reduction reordering.
 
 The MRv2 Talker adapter follows the selected vLLM sampler's dispatch contract,
 including its `has_topp_only_rows` predicate. Seeded rows pass that predicate to
-top-k/top-p masking before drawing from their request-local V1 generators.
+top-k/top-p masking before the model's categorical draw with request-local Torch generators.
 Unseeded and greedy rows keep upstream sampling. When mixed rows have already
 been masked, their upstream call disables repeated masking and fused sampling.
 
 Custom samplers register their selected JIT kernels while the runner's startup
-registry is active. The Talker's seeded V1 stream uses native top-k/top-p
+registry is active. The Talker's seeded stream uses native top-k/top-p
 masking even when unseeded sampling selects FlashInfer, so it registers those
 native kernels explicitly. AR workers also warm the existing fused-MoE prefill
-batch sizes on both runner implementations before CUDA graph capture and JIT
+batch sizes on the V2 runner before CUDA graph capture and JIT
 monitoring. These startup passes leave EPLB load recording disabled.
 
 ## Full-payload input scheduling
@@ -127,18 +143,21 @@ adapter, not injected through unrelated scheduler state.
 
 ## Model-owned sampling metadata
 
-The V1 GPU runner supplies preprocessing snapshots to models selected by
-`models.interfaces.requires_request_sampling_params`. MRv2 does not implement
-this hook; ZONOS2 rejects MRv2 during construction.
+ZONOS2 supplies a model-owned MRv2 ModelState and sampler. Its eager adapter
+builds preprocessing snapshots from resolved request parameters and the
+synchronous input batch's progress. Chunked re-prefill retains the committed
+output count until replay reaches the end of the saved sequence.
 
 The existing `request_id` is the sole request identity across preprocess,
 forward and postprocess. `data_entry_keys.py` owns `REQUEST_ID_KEY`,
 `REQUEST_SAMPLING_PARAMS_KEY`, `OUTPUT_TOKEN_COUNT_KEY` and
 `LAST_OUTPUT_TOKEN_KEY`. The sampling fields are transient preprocessing
-metadata, not `OmniPayload`/`MetaStruct` wire fields: the runner injects them
-into a shallow copy and persists only model-returned updates. Other models
-retain the existing metadata path. The separate eligibility channel controls
-which scheduled rows may sample, including partial prefill; it is unchanged.
+metadata, not `OmniPayload`/`MetaStruct` wire fields. The ZONOS2 adapter maps
+the native buffer's `req_id` to this model identity in a shallow snapshot;
+only model-owned codec state persists. Its registered sampler emits owned
+current-step codes after forward, with zero sampled tokens for partial
+prefill. Scalar lifecycle feedback and codec history survive slot removal on
+preemption, keyed by request ID, and are released on finish or cancellation.
 
 Sampling snapshots contain resolved vLLM values. Omitting offline request
 parameters selects deployment defaults; supplying `SamplingParams` overrides

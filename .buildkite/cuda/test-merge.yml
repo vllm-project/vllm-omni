@@ -95,13 +95,7 @@ steps:
           - pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py tests/e2e/offline_inference/test_qwen3_tts_customvoice.py tests/e2e/features/prefill_phase/test_chunked_prefill_tail.py -m 'advanced_model and cuda' --run-level 'advanced_model'
         mirror_hardwares: l4_1
 
-      # Drama 3 moved to CUDA weekly (slow). Keep LFM3 from main.
-      - label: "TTS · LFM3 Test"
-        source_file_dependencies: tts_lfm3_function
-        timeout_in_minutes: 40
-        commands:
-          - pytest -s -v tests/e2e/online_serving/test_lfm3_omni.py tests/e2e/online_serving/test_lfm3_audio.py -m 'advanced_model and cuda' --run-level 'advanced_model'
-        mirror_hardwares: l4_1
+      # LFM3 and VibeVoice require ModelRunnerV1 and are outside this V2 matrix.
 
       - label: "TTS · Qwen3-TTS Base Test"
         source_file_dependencies: tts_qwen3_tts_cov
@@ -117,13 +111,6 @@ steps:
               --online tests/e2e/online_serving/test_qwen3_tts_base.py \
               -- -m 'advanced_model and cuda' --run-level 'advanced_model'
         mirror_hardwares: l4_1
-
-      - label: "TTS · VibeVoice Offline Eager Test"
-        source_file_dependencies: tts_vibevoice_function
-        timeout_in_minutes: 30
-        commands:
-          - pytest -s -v tests/e2e/offline_inference/test_vibevoice_tts.py -m 'advanced_model and cuda and H100' --run-level 'advanced_model'
-        mirror_hardwares: h100_1
 
       - label: "Omni · Qwen3-Omni Test"
         source_file_dependencies: omni_qwen3_omni_function

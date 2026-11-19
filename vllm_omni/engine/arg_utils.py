@@ -347,7 +347,7 @@ class OmniEngineArgs(EngineArgs):
     supports_pending_generation: bool = False
     supports_running_prefix_cache_reset: bool = True
     recompute_preemption: Literal["allow", "fail"] = "allow"
-    use_v2_model_runner: bool = False
+    use_v2_model_runner: bool = True
     supports_native_mrv2_data_plane: bool = False
     # WS-A: Stage-1 active stream slots. 0 = legacy preempt-everything.
     # Must be declared here so engine_args dict propagation does not silently
@@ -485,6 +485,8 @@ class OmniEngineArgs(EngineArgs):
     sampling_extra_args_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if not self.use_v2_model_runner:
+            raise ValueError("Model Runner V1 is not supported with vLLM 0.34; select model_runner: v2")
         if self.worker_cls in (None, "auto"):
             if self.worker_type == "ar":
                 self.worker_cls = current_omni_platform.get_omni_ar_worker_cls()
@@ -501,10 +503,6 @@ class OmniEngineArgs(EngineArgs):
         _map_offload_config(self)
         _set_lmcache_env(self)
         super().__post_init__()
-        # The NPU runner implements the auxiliary connector on its legacy
-        # execution path; CUDA/ROCm Omni stages use the V2 implementation.
-        if self.aux_output_config.enabled and not self.use_v2_model_runner and not current_omni_platform.is_npu():
-            raise ValueError("Auxiliary outputs require use_v2_model_runner=True for this Omni stage.")
 
     def _ensure_omni_models_registered(self):
         if hasattr(self, "_omni_models_registered"):

@@ -255,7 +255,6 @@ steps:
           - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_ready.json -m 'core_model and cuda'
         mirror_hardwares: h100_1
 
-      # Drama 3 moved to CUDA weekly (slow). Keep CosyVoice3 DSpark from main.
       - label: "TTS · CosyVoice3 DSpark Test"
         source_file_dependencies:
           - tts_cosyvoice3_function

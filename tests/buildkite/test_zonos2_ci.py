@@ -22,8 +22,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
     "changed",
     [
         "vllm_omni/model_executor/models/zonos2/zonos2_talker.py",
-        "vllm_omni/worker/gpu_model_runner.py",
-        "vllm_omni/worker/gpu_ar_model_runner.py",
+        "vllm_omni/worker_v2/omni_model_runner.py",
+        "vllm_omni/worker_v2/omni_ar_model_runner.py",
+        "vllm_omni/worker_v2/omni_sampler.py",
+        "vllm_omni/worker_v2/model_states/omni_model_state.py",
         "vllm_omni/model_executor/models/interfaces.py",
         "vllm_omni/data_entry_keys.py",
         "requirements/zonos2.txt",
