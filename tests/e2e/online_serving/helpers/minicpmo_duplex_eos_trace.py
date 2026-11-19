@@ -14,6 +14,7 @@ from torch.overrides import TorchFunctionMode
 
 ROOT = Path("tests/e2e/online_serving/results/minicpmo_duplex_recognition/eos_trace")
 EOS = 151717
+MAX_UNIT = 200  # The 180 s source, 8.2 s tail and initial forced-response decision.
 SAVED = set()
 
 
@@ -75,7 +76,7 @@ class MiniCPMDuplexEOSTrace:
                 history = getattr(sampling_metadata, "output_token_ids", None) or []
                 for row in rows:
                     state = sessions.get(row.session_id)
-                    if state is None:
+                    if state is None or state.audio_chunk_idx > MAX_UNIT:
                         continue
                     model._eos_trace_rows[row.row_idx] = {
                         "session": row.session_id,
@@ -103,7 +104,7 @@ class MiniCPMDuplexEOSTrace:
         @wraps(original_sample)
         def sample(model, logits, sampling_metadata, **kwargs):
             result = original_sample(model, logits, sampling_metadata, **kwargs)
-            if result is None:
+            if result is None or not getattr(model, "_eos_trace_rows", None):
                 return result
             final = result.sampled_token_ids[:, 0].tolist()
             pending = getattr(model, "_minicpmo45_duplex_pending_samples", None)
@@ -123,7 +124,7 @@ class MiniCPMDuplexEOSTrace:
         def prefill(helper, state, waveform, **kwargs):
             result = yield from original_prefill(helper, state, waveform, **kwargs)
             key = (state.session_id, kwargs.get("epoch"), kwargs.get("seq"))
-            if result and "inputs_embeds" in result and key not in SAVED:
+            if result and "inputs_embeds" in result and key not in SAVED and state.audio_chunk_idx <= MAX_UNIT:
                 SAVED.add(key)
                 folder = ROOT / state.session_id
                 folder.mkdir(parents=True, exist_ok=True)
