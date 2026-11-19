@@ -188,7 +188,13 @@ class RealizationPagedAttentionPlan:
                 denominator,
                 1,
                 q.shape[0],
+                # Pin the pipeline depth: the default (3 stages) asks for
+                # 137,728 B of shared memory at this tile shape, above the
+                # 101,376 B cap of Ada-class devices -- measured on A100 as
+                # 137728 B at the default vs 20480 B at one stage. Only the
+                # staged loads change; the arithmetic is identical.
                 num_warps=4,
+                num_stages=1,
             )
             merge_kv_partial[(end - start, q.shape[1])](
                 partial,
