@@ -1098,6 +1098,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     vae_use_tiling: bool = False
     vae_fast_path: Literal["off", "lossless", "channels_last"] = "lossless"
     vae_encode_fast_path: Literal["off", "lossless", "channels_last"] = "lossless"
+    vae_tile_per_rank: bool = True
     mask_strategy_file_path: str | None = None
     skip_time_steps: int = 15
     VSA_sparsity: float = 0.0

@@ -666,6 +666,7 @@ def initialize_model(
 
         if is_distributed_vae:
             model.vae.set_parallel_size(vae_pp_size, mode=vae_mode)
+            model.vae.vae_tile_per_rank = bool(getattr(od_config, "vae_tile_per_rank", True))
 
         # Apply sequence parallelism if enabled
         # This follows diffusers' pattern where enable_parallelism() is called

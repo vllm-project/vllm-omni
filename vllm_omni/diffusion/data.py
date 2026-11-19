@@ -1094,6 +1094,10 @@ class OmniDiffusionConfig:
     # Independent encoder fast path for the residual, patchified Wan VAE used
     # by Cosmos3. Levels have the same numerical contract as the decoder.
     vae_encode_fast_path: str = "lossless"
+    # Distributed Wan VAE tile decode: size the tile stride to the 2D rank grid (one tile per
+    # rank, same blend overlap) instead of diffusers' fixed 256-pixel tiles. Output then depends
+    # on the number of VAE ranks; False keeps the fixed tiles (card-count independent).
+    vae_tile_per_rank: bool = True
 
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None

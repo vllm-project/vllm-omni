@@ -703,6 +703,7 @@ class StageDeployConfig:
     vae_use_tiling: bool | None = None
     vae_fast_path: str | None = None
     vae_encode_fast_path: str | None = None
+    vae_tile_per_rank: bool | None = None
     boundary_ratio: float | None = None
     flow_shift: float | None = None
     diffusion_kv_cache_dtype: str | None = None

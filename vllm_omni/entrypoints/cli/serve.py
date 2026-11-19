@@ -1058,6 +1058,17 @@ class OmniServeCommand(CLISubcommand):
         )
 
         omni_config_group.add_argument(
+            "--vae-tile-per-rank",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "Distributed Wan VAE tile decode (--vae-parallel-mode tile with --vae-patch-parallel-size > 1): "
+                "one tile per rank on a 2D rank grid, same blend overlap (default). --no-vae-tile-per-rank keeps "
+                "diffusers' fixed 256-pixel tiles, whose output does not depend on the number of cards."
+            ),
+        )
+
+        omni_config_group.add_argument(
             "--vae-encode-fast-path",
             choices=("off", "lossless", "channels_last"),
             default="lossless",

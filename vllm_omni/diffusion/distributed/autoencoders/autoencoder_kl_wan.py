@@ -473,6 +473,43 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
         self.clear_cache()
 
     def tile_split(self, z: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
+        """Distributed tile split: one tile per rank on a 2D rank grid, same blend overlap and merge.
+
+        The fixed 256-pixel tiles at a 192-pixel stride decode about 1.65x the frame at 720p and
+        spread 28 uneven tiles over 8 ranks; sizing the stride to the rank grid (2 x 4 on 8 ranks,
+        53 x 48 latent tiles) decodes about 1.25x with equal work per rank. Only the distributed
+        executor calls this (single-rank tiling keeps diffusers' fixed tiles).
+        ``--no-vae-tile-per-rank`` (``OmniDiffusionConfig.vae_tile_per_rank=False``) keeps the fixed tiles.
+        """
+        per_rank = bool(getattr(self, "vae_tile_per_rank", True))
+        if not per_rank or self.config.patch_size is not None:
+            return self._tile_split_fixed(z)
+        ratio = self.spatial_compression_ratio
+        overlap = (self.tile_sample_min_height - self.tile_sample_stride_height) // ratio  # 8 latent (64 px)
+        _, _, _, height, width = z.shape
+        ranks = min(int(self.distributed_executor.parallel_size), int(self.distributed_executor.world_size))
+        rows, cols = self._crop_grid(height, width, ranks, overlap // 2)
+        stride_h, stride_w = -(-height // rows), -(-width // cols)
+        saved = (
+            self.tile_sample_min_height,
+            self.tile_sample_min_width,
+            self.tile_sample_stride_height,
+            self.tile_sample_stride_width,
+        )
+        self.tile_sample_stride_height, self.tile_sample_stride_width = stride_h * ratio, stride_w * ratio
+        self.tile_sample_min_height = (stride_h + overlap) * ratio
+        self.tile_sample_min_width = (stride_w + overlap) * ratio
+        try:
+            return self._tile_split_fixed(z)
+        finally:
+            (
+                self.tile_sample_min_height,
+                self.tile_sample_min_width,
+                self.tile_sample_stride_height,
+                self.tile_sample_stride_width,
+            ) = saved
+
+    def _tile_split_fixed(self, z: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
         _, _, num_frames, height, width = z.shape
         sample_height = height * self.spatial_compression_ratio
         sample_width = width * self.spatial_compression_ratio
