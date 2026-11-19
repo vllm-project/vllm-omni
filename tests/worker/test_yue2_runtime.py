@@ -14,10 +14,8 @@ from vllm.v1.request import RequestStatus
 from vllm_omni.core.sched.output import OmniSchedulerOutput
 from vllm_omni.model_executor.models.yue2.runtime import (
     Yue2ForCausalLM,
-    Yue2ModelRunner,
     Yue2ModelRunnerOutput,
     Yue2SchedulerBase,
-    Yue2SchedulerOutput,
 )
 from vllm_omni.model_executor.models.yue2.yue2 import (
     MUSIC_END,
@@ -26,7 +24,6 @@ from vllm_omni.model_executor.models.yue2.yue2 import (
     _SynthesisJob,
     _SynthesisQueue,
 )
-from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.request import OmniRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -44,25 +41,6 @@ def test_v2_is_rejected_before_backbone_initialization(mocker):
     with pytest.raises(ValueError, match="YuE2 requires model runner v1 without speculative decoding"):
         Yue2ForCausalLM(vllm_config=config)
     initialize.assert_not_called()
-
-
-def test_acoustic_detachment_is_only_visible_to_runner_bookkeeping(monkeypatch):
-    from vllm.v1.core.sched.output import SchedulerOutput
-
-    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
-
-    schedule = Yue2SchedulerOutput(
-        **vars(SchedulerOutput.make_empty()),
-        acoustic_req_ids={"synthesizing"},
-    )
-    schedule.finished_req_ids = {"aborted"}
-    observed = []
-    monkeypatch.setattr(GPUARModelRunner, "_update_states", lambda self, output: observed.append(output))
-    runner = object.__new__(Yue2ModelRunner)
-    runner._update_states(schedule)
-    assert observed[0].finished_req_ids == {"aborted", "synthesizing"}
-    assert schedule.finished_req_ids == {"aborted"}
-    assert observed[0] is not schedule
 
 
 def test_b1_output_owns_audio_after_job_release(mocker):
@@ -90,23 +68,10 @@ def test_b1_output_owns_audio_after_job_release(mocker):
     assert Yue2ForCausalLM.poll_audio(model) == {}
 
 
-def test_runner_drains_started_ids_through_model_wrapper(mocker):
-    model = mocker.Mock(spec=Yue2ForCausalLM, acoustic_started=[], poll_audio=lambda: {})
-
-    class Wrapper:
-        def __getattr__(self, name):
-            return getattr(model, name)
-
-    runner = object.__new__(Yue2ModelRunner)
-    runner.model = Wrapper()
-    for rid in ("first", "second"):
-        model.acoustic_started.append(rid)
-        result = runner._with_audio(OmniModelRunnerOutput(req_ids=[], req_id_to_index={}))
-        assert result.acoustic_started == [rid] and not model.acoustic_started
-
-
 @pytest.mark.parametrize("outcome", ["success", "error", "abort"])
 def test_detach_and_delayed_completion_with_coalesced_tokens(mocker, outcome):
+    from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+
     from tests.core.sched.test_omni_ar_scheduler_logprobs import _bind_request_lifecycle, _make_scheduler_stub
 
     request = OmniRequest("song", [1, 2, 3], SamplingParams(max_tokens=20, detokenize=False), None)
@@ -114,6 +79,7 @@ def test_detach_and_delayed_completion_with_coalesced_tokens(mocker, outcome):
     request.prefill_stats.set(num_prompt_tokens=3, num_local_cached_tokens=0, num_external_cached_tokens=0)
     scheduler = object.__new__(Yue2SchedulerBase)
     scheduler.__dict__.update(vars(_make_scheduler_stub([request])))
+    scheduler.async_kv_waiting = create_request_queue(SchedulingPolicy.FCFS)
     _bind_request_lifecycle(scheduler, update_request=lambda r, tokens: (tokens, False))
     del scheduler._update_request_with_output
     scheduler.max_model_len = 4096
@@ -140,7 +106,6 @@ def test_detach_and_delayed_completion_with_coalesced_tokens(mocker, outcome):
         )
         output = Yue2ModelRunnerOutput(
             req_ids=["song"] if scheduled else [],
-            req_id_to_index={"song": 0} if scheduled else {},
             sampled_token_ids=[[token]] if scheduled else [],
             multimodal_outputs=[{}] if scheduled else [],
             acoustic_started=["song"] if started else [],

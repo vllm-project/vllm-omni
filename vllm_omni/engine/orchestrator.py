@@ -27,6 +27,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, cast
 
 import janus
+import numpy as np
 import torch
 from opentelemetry.trace import Tracer
 from vllm.config import ModelConfig
@@ -193,6 +194,13 @@ def build_engine_core_request_from_tokens(
 
     prompt_token_ids = prompt.get("prompt_token_ids")
     prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
+    # vLLM 0.34 types EngineCoreRequest.prompt_token_ids as a 32-bit int
+    # ``np.ndarray`` at runtime (TokenBuffer asserts itemsize == 4); coerce
+    # list prompts so /v1/run stage inputs round-trip through
+    # ``msgspec.convert`` symmetrically (a decoded plain list fails the
+    # ndarray field check).
+    if isinstance(prompt_token_ids, list):
+        prompt_token_ids = np.asarray(prompt_token_ids, dtype=np.int32)
 
     sampling_params = None
     pooling_params = None
@@ -3230,7 +3238,7 @@ class OrchestratorBase:
                 already_submitted=already_submitted,
                 t_submit_start=_t_submit_start,
                 submit_kwargs=submit_kwargs,
-                params_override=self._diffusion_params_for_samples(
+                params_override=cast(Orchestrator, self)._diffusion_params_for_samples(
                     req_state, src_stage_id, self._maybe_clone_diffusion_params_for_cfg(req_id, params)
                 ),
                 pinned_replica_id=pinned_replica_id,
@@ -3555,6 +3563,13 @@ class OrchestratorBase:
             )
         )
 
+    def _prewarm_downstream_resumable(
+        self, stage_id: int, entry_request: Any, req_state: OrchestratorRequestState
+    ) -> bool:
+        """Keep the entry request's streaming lifetime on downstream stages."""
+        del stage_id
+        return bool(getattr(entry_request, "resumable", req_state.streaming.enabled))
+
     async def _prewarm_async_chunk_stages(
         self,
         request_id: str,
@@ -3693,13 +3708,7 @@ class OrchestratorBase:
                 base_input["prompt_token_ids"] = [0] * next_prompt_len
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
-                # Turn-commit duplex (JoyAI/AURA) submits a non-resumable Stage0,
-                # but Code2Wav must stay parked across Talker 2150 so later
-                # sentences can reuse this prewarmed request. MiniCPM-style
-                # Stage0 is already resumable; turn-based HTTP is not session-owned.
-                downstream_resumable = bool(
-                    getattr(entry_request, "resumable", req_state.streaming.enabled) or req_state.session_owned
-                )
+                downstream_resumable = self._prewarm_downstream_resumable(next_stage_id, entry_request, req_state)
                 # Session-owned and resumable requests keep their downstream
                 # request across turns, so they stay on the chunk-0 path.
                 if attach_prewarm_payload and not req_state.session_owned and not downstream_resumable:
@@ -4079,10 +4088,14 @@ class Orchestrator(OrchestratorBase):
         final_output_stage_ids = set(msg.final_output_stage_ids or [final_stage_id])
         sampling_params_list = [_without_per_sample_kv_count(params) for params in sampling_params_list]
 
+        # Before registration, only the submission message owns the artifact
+        # dirs; state-based failure cleanup cannot find them yet.
+        artifact_dirs = msg.request_artifact_dirs or []
         if msg.requested_replica_id is not None:
             try:
                 self.stage_pools[stage_id].reserve_requested_replica(request_id, msg.requested_replica_id)
             except OmniClientError as exc:
+                cleanup_request_artifact_dirs(artifact_dirs)
                 await self._fail_request_client_error(
                     request_id,
                     stage_id,
@@ -4092,6 +4105,7 @@ class Orchestrator(OrchestratorBase):
                 )
                 return
         if await self._fail_if_cannot_submit(request_id, stage_id, is_run_request=msg.yield_stage_id is not None):
+            cleanup_request_artifact_dirs(artifact_dirs)
             return
 
         if getattr(prompt, "resumable", False):
@@ -4105,6 +4119,7 @@ class Orchestrator(OrchestratorBase):
                     and spec_config is not None
                     and spec_config.use_dflash()
                 ):
+                    cleanup_request_artifact_dirs(artifact_dirs)
                     await self._fail_request_client_error(
                         request_id,
                         stage_id,
@@ -4116,11 +4131,12 @@ class Orchestrator(OrchestratorBase):
             if mrv2_stage_id is not None:
                 # Streaming-input sessions replace downstream prompts through
                 # the V1 chunk adapter, which MRv2's native data plane lacks.
+                cleanup_request_artifact_dirs(artifact_dirs)
                 await self._fail_request_client_error(
                     request_id,
                     stage_id,
                     f"streaming (resumable) input is not supported: stage {mrv2_stage_id} runs on "
-                    "model_runner v2, which supports turn-based requests only; use model_runner: v1 "
+                    "model_runner v2, which supports turn-based requests only; select a V2 duplex profile "
                     "for that stage",
                 )
                 return
@@ -4129,6 +4145,7 @@ class Orchestrator(OrchestratorBase):
         for later_stage_id in range(stage_id + 1, min(final_stage_id, len(sampling_params_list) - 1) + 1):
             later_n = getattr(sampling_params_list[later_stage_id], "n", 1) or 1
             if later_n > 1:
+                cleanup_request_artifact_dirs(artifact_dirs)
                 await self._fail_request_client_error(
                     request_id,
                     stage_id,
@@ -4157,6 +4174,7 @@ class Orchestrator(OrchestratorBase):
             elif self.stage_pools[stage_id].will_watermark(entry_params):
                 reason = f"n > 1 is not supported with output watermarking on stage {stage_id}"
             if reason is not None:
+                cleanup_request_artifact_dirs(artifact_dirs)
                 await self._fail_request_client_error(request_id, stage_id, reason)
                 return
 

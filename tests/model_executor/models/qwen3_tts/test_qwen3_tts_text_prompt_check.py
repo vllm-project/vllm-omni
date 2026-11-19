@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
@@ -15,7 +13,6 @@ from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     check_text_update,
     has_tts_text_conditioning,
 )
-from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -139,23 +136,14 @@ def _mrv2_talker_info(new_req):
     return buffer.buffers[0]
 
 
-def _mrv1_talker_info(new_req):
-    runner = object.__new__(OmniGPUModelRunner)
-    runner.model = SimpleNamespace()
-    runner.requests = {new_req.req_id: SimpleNamespace()}
-    runner.model_intermediate_buffer = {}
-    scheduler_output = SimpleNamespace(scheduled_new_reqs=[new_req], scheduled_cached_reqs=SimpleNamespace())
-    OmniGPUModelRunner._update_additional_information(runner, scheduler_output)
-    return runner.model_intermediate_buffer[new_req.req_id]
-
-
-@pytest.mark.parametrize("talker_info", [_mrv2_talker_info, _mrv1_talker_info], ids=["mrv2", "mrv1"])
+@pytest.mark.parametrize("talker_info", [_mrv2_talker_info], ids=["mrv2"])
 @pytest.mark.parametrize("prompt", list(_ACCEPTED.values()), ids=list(_ACCEPTED))
 def test_accepted_prompts_still_satisfy_the_talker_after_ipc(prompt, talker_info):
-    # Each runner merges the payloads its own way; the Talker must see usable text in both.
+    # The V2 intermediate buffer merges payloads before the Talker checks the text.
     new_req = OmniNewRequestData(
         req_id="r",
         prompt_token_ids=prompt["prompt_token_ids"],
+        prefill_token_ids=prompt["prompt_token_ids"],
         mm_features=[],
         sampling_params=None,
         pooling_params=None,

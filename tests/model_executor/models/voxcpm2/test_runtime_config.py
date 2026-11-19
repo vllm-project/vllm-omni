@@ -50,9 +50,9 @@ class _FakeOmniPlatform:
 def test_runner_specific_audio_defaults(monkeypatch, uses_v2, is_cuda, expected):
     # Incremental VAE is a CUDA-only per-patch feature: CUDA v2 gets the MRV2
     # audio profile (1/3); every other combination keeps the v1 cadence (2/1).
-    # The base deploy yaml no longer pins the audio cadence keys, so the
-    # (2, 1) dataclass defaults ARE the shipped v1 behavior — changing them
-    # silently changes every deployment that does not pin the keys itself.
+    # These are runtime defaults when no deploy YAML supplies cadence keys.
+    # The shipped base YAML explicitly pins its v1 cadence to (3, 1), so
+    # changing these defaults only affects configurations that leave them unset.
     import vllm_omni.platforms as platforms_mod
 
     # Patch the backing global, not the lazy attribute: assigning
@@ -110,14 +110,23 @@ def _runtime_config_from_deploy_yaml(yaml_path: Path, use_v2_model_runner: bool)
 
 
 def test_deploy_yaml_resolves_effective_audio_defaults():
-    # The base yaml does not pin the audio cadence keys; the dataclass
-    # defaults decide for v1 and the shipped MRV2 overlay re-pins them for v2.
+    # The base yaml pins the legacy cadence; CUDA's platform overlay selects
+    # the MRV2 cadence.
     deploy_dir = Path(vllm_omni.__file__).resolve().parent / "deploy"
-    v1 = _runtime_config_from_deploy_yaml(deploy_dir / "voxcpm2.yaml", use_v2_model_runner=False)
-    assert v1.vae_decode_every == 2
+    deploy_yaml = deploy_dir / "voxcpm2.yaml"
+    v1 = _runtime_config_from_deploy_yaml(deploy_yaml, use_v2_model_runner=False)
+    assert v1.vae_decode_every == 3
     assert v1.audio_emit_every == 1
 
-    v2 = _runtime_config_from_deploy_yaml(deploy_dir / "voxcpm2_mrv2.yaml", use_v2_model_runner=True)
+    merged = resolve_deploy_yaml(deploy_yaml)
+    cuda_runtime_dict = merged["platforms"]["cuda"]["stages"][0]["engine_extras"]["hf_overrides"][
+        "voxcpm2_runtime_config"
+    ]
+    v2 = _VoxCPM2RuntimeConfig.from_vllm_config(
+        SimpleNamespace(
+            model_config=SimpleNamespace(use_v2_model_runner=True, voxcpm2_runtime_config=cuda_runtime_dict)
+        )
+    )
     assert v2.vae_decode_every == 1
     assert v2.audio_emit_every == 3
 
@@ -125,14 +134,13 @@ def test_deploy_yaml_resolves_effective_audio_defaults():
 @pytest.mark.parametrize(
     ("is_cuda", "expected"),
     [
-        (False, (2, 1)),  # non-CUDA v2 keeps the v1 cadence (incremental VAE is CUDA-only)
-        (True, (1, 3)),  # CUDA v2 must not inherit v1 cadence values from the base yaml
+        (False, (3, 1)),  # non-CUDA v2 retains the base yaml's configured cadence
+        (True, (3, 1)),  # explicit base yaml cadence overrides runner defaults
     ],
 )
-def test_v2_overlay_on_base_yaml_uses_runner_defaults(monkeypatch, tmp_path, is_cuda, expected):
-    # A thin overlay built on the base yaml (base_config + model_runner: v2,
-    # no explicit cadence keys) must resolve the audio cadence through
-    # runtime_config.py per platform, not inherit stale base-yaml pins.
+def test_v2_overlay_on_base_yaml_preserves_explicit_audio_cadence(monkeypatch, tmp_path, is_cuda, expected):
+    # A thin overlay with no cadence keys inherits the explicit audio cadence
+    # from the base yaml, regardless of platform.
     import vllm_omni.platforms as platforms_mod
 
     # An earlier test in the same process may have resolved the real platform
