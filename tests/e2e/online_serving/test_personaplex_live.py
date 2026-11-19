@@ -4,12 +4,13 @@
 """GPU coverage for PersonaPlex on the OpenAI Live endpoint (``/v1/live/sessions``).
 
 Two servers, both ``personaplex_live.yaml`` (``max_sessions: 2``, which also
-sizes the Stage 0 Mimi encoder rows and the Code2Wav decoders) with Stage 0 at
-``max_model_len: 600`` frames, so a session overflows after about 41 s of audio
-(the voice and persona prefill takes the first 89 frames). The second also caps
-the Stage 0 KV cache at one full context, so two growing sessions run it out
-and stall. PersonaPlex streams audio for every 80 ms frame, so replies are
-checked for voiced output, not for audio events. The model is
+sizes the Stage 0 Mimi encoder rows and the Code2Wav decoders; Stage 0 attends
+to a sliding window of the last 3,000 frames and never trims). The first
+raises ``max_input_backlog_s`` so a session can be streamed unpaced. The
+second caps the Stage 0 KV cache at one session's window, so two growing
+sessions run it out and stall. PersonaPlex streams audio for every 80 ms
+frame, so replies are checked for voiced output, not for audio events. The
+model is
 ``PERSONAPLEX_MODEL_PATH`` when set, else the gated ``nvidia/personaplex-7b-v1``
 from Hugging Face.
 """
@@ -24,14 +25,12 @@ import pytest
 from tests.e2e.online_serving.helpers.live_sessions import (
     LiveSession,
     assert_ended_by_server,
-    context_trims,
     converse_until_server_ends_one,
     live_errors,
     live_url,
     load_speech,
     metrics_url,
     start_over_limit,
-    watch_context_trims,
 )
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
@@ -41,20 +40,26 @@ pytestmark = pytest.mark.omni
 
 MODEL = os.environ.get("PERSONAPLEX_MODEL_PATH") or "nvidia/personaplex-7b-v1"
 VOICE = "NATF2"
-STARVE_WINDOW_S = 120.0
+STARVE_WINDOW_S = 300.0
+# The long session goes past frame 3,000, where the window starts sliding.
+WINDOW_FRAMES = 3000
+LONG_SESSION_S = 260.0
+# An unpaced session queues its whole input at once.
 LIVE_DEPLOY = write_deploy_overlay(
     get_deploy_config_path("personaplex_live.yaml"),
-    {"stages": [{"stage_id": 0, "max_model_len": 600}]},
+    {"live_session_config": {"session_lifetime_s": 1800, "max_sessions": 2, "max_input_backlog_s": 600}},
 )
-# 40 blocks of 16 frames: one full 600-frame context (vLLM keeps two blocks
-# back here, so 38 would admit only 576 frames). Two growing sessions
-# run it out and stall (waiting Live requests keep their blocks and are not
-# preempted) until the backlog limit ends them.
+# 224 blocks of 16 frames: vLLM admits a sliding-window request only if the
+# cache holds its window plus one step's tokens (cdiv(2999 + 512, 16) + 1 =
+# 221 blocks), and one session's KV plateaus at its 3,000-frame window. Two
+# growing sessions run it out after about 135 s each and stall (waiting Live
+# requests keep their blocks and are not preempted) until the backlog limit
+# ends them.
 STARVE_DEPLOY = write_deploy_overlay(
     get_deploy_config_path("personaplex_live.yaml"),
     {
         "live_session_config": {"session_lifetime_s": 1800, "max_sessions": 2, "max_input_backlog_s": 10},
-        "stages": [{"stage_id": 0, "max_model_len": 600, "block_size": 16, "num_gpu_blocks_override": 40}],
+        "stages": [{"stage_id": 0, "block_size": 16, "num_gpu_blocks_override": 224}],
     },
 )
 
@@ -71,8 +76,8 @@ def _server(deploy: str, server_id: str):
     )
 
 
-SERVER_PARAMS = [_server(LIVE_DEPLOY, "live-600")]
-STARVE_SERVER_PARAMS = [_server(STARVE_DEPLOY, "live-600-kv-640")]
+SERVER_PARAMS = [_server(LIVE_DEPLOY, "live")]
+STARVE_SERVER_PARAMS = [_server(STARVE_DEPLOY, "live-kv-224-blocks")]
 
 
 def _assert_healthy(session: LiveSession) -> None:
@@ -111,32 +116,28 @@ def test_personaplex_live_conversation(omni_server) -> None:
 @pytest.mark.advanced_model
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
-def test_personaplex_live_context_trim(omni_server) -> None:
-    """A session past the 600-frame context is trimmed, resubmitted and keeps answering."""
+def test_personaplex_live_long_session(omni_server) -> None:
+    """An unpaced session past frame 3,000 keeps answering once the window slides."""
     speech = load_speech()
-    url = metrics_url(omni_server)
-    before = context_trims(url)
 
-    async def run() -> tuple[LiveSession, list[tuple[float, float]]]:
-        async with LiveSession(live_url(omni_server), MODEL, VOICE) as session:
-            stop = asyncio.Event()
-            watcher = asyncio.create_task(watch_context_trims(url, session, stop))
+    async def run() -> LiveSession:
+        async with LiveSession(live_url(omni_server), MODEL, VOICE, speed=0) as session:
             await session.silence(1.0)
-            for _ in range(6):
+            while session.media_s < LONG_SESSION_S:
                 await session.say(speech, gap_s=7.0)
-            stop.set()
-            changes = await watcher
+            await session.drain(timeout=LONG_SESSION_S * 2)
             await session.close()
-        return session, changes
+        return session
 
-    session, changes = asyncio.run(run())
+    session = asyncio.run(run())
 
-    trimmed = [t for t, value in changes if value > before]
-    assert trimmed, f"no context trim in {session.now():.0f} s at max_model_len 600: {changes}"
     _assert_healthy(session)
-    after_trim = [u for u in session.utterances if u.start > trimmed[0]]
-    assert after_trim, f"no utterance after the first trim at {trimmed[0]:.0f} s"
-    assert any(session.answered(u) for u in after_trim), f"no voiced reply after the trim at {trimmed[0]:.0f} s"
+    sliding = WINDOW_FRAMES * 0.08
+    late = [u for u in session.utterances if u.media_start > sliding]
+    assert late, f"no utterance past {sliding:.0f} s of input"
+    assert all(session.answered_media(u) for u in late), [
+        (u.media_start, session.voiced_blocks_media(u.media_start, u.media_window_end)) for u in late
+    ]
 
 
 @pytest.mark.advanced_model

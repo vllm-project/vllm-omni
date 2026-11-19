@@ -25,6 +25,7 @@ from vllm_omni.benchmarks.duplex.omni_duplex_eval_dataset import DEFAULT_DATASET
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_eval import evaluate_sample, summarize_scores
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_judge import DuplexJudge
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import (
+    BACKEND_LIVE,
     DEFAULT_INSTRUCTIONS,
     MIX_QUESTION,
     GenerateSampleResult,
@@ -108,6 +109,8 @@ def get_duplex_eval_samples(args: argparse.Namespace) -> list[SampleRequest]:
         )
     requests: list[SampleRequest] = []
     reference = PreparedReferenceAudio.from_path(args.duplex_eval_ref_audio) if args.duplex_eval_ref_audio else None
+    # Live sessions keep the model's own default prompt unless one is given.
+    default_instructions = None if getattr(args, "backend", None) == BACKEND_LIVE else DEFAULT_INSTRUCTIONS
     for index, sample in enumerate(samples):
         requests.append(
             OmniDuplexEvalSampleRequest(
@@ -122,7 +125,7 @@ def get_duplex_eval_samples(args: argparse.Namespace) -> list[SampleRequest]:
                 mix=args.duplex_eval_mix,
                 turn_detection=args.duplex_eval_turn_detection,
                 instructions=(
-                    DEFAULT_INSTRUCTIONS
+                    default_instructions
                     if args.duplex_eval_instructions is None
                     else args.duplex_eval_instructions or None
                 ),

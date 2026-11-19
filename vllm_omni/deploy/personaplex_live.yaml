@@ -12,3 +12,21 @@ live_session_config:
   # Input audio queued behind the model before the session is closed (a
   # server error to the client); a real-time client stays under 1 s.
   max_input_backlog_s: 10
+
+stages:
+  - stage_id: 0
+    # Stage 0 attends to the last 3000 frames (a sliding window, as in the
+    # reference model) and never trims, so a request must reach a whole
+    # session: 1800 s x 12.5 frames/s = 22,500 frames, plus the largest
+    # prefill (69-row voice prompt, 2 x 6 silence frames, 1,024 persona
+    # tokens) = 23,605. KV stays at one window per session. The server
+    # refuses to start if this can't hold session_lifetime_s.
+    max_model_len: 24000
+    # hf_overrides replaces the base stage's, so the CUDA-graph flags repeat.
+    # max_position_embeddings sizes the Helium RoPE cache and caps
+    # max_model_len.
+    hf_overrides:
+      mimi_cuda_graphs: true
+      depformer_cuda_graphs: true
+      temporal_config:
+        max_position_embeddings: 24000

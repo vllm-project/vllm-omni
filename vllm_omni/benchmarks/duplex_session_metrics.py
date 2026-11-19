@@ -56,6 +56,10 @@ _STREAM_MEASUREMENT_ORIGIN = {
         "includes concurrent realtime input"
     ),
 }
+_STREAM_PROCESSING_RTF_ORIGIN = (
+    "input stream start-to-last-audio receive time divided by input audio duration, with input sent "
+    "unpaced (as fast as possible); below 1 is faster than real time"
+)
 
 
 @dataclass(frozen=True)
@@ -109,12 +113,17 @@ def collect_duplex_session_metrics(
     *,
     stream_start: float,
     session_id: str | None,
+    stream_response_ids: Sequence[str] | None = None,
+    input_duration_s: float | None = None,
 ) -> DuplexSessionMetricBundle:
     """Build per-response and session/stream metrics for one duplex session.
 
     ``stream_start`` is the client monotonic time just before input media is
     pushed. Per-response TTFT/TTFP prefer server ``response_request_metrics``
     when present; RTF and the session ``stream_*`` window stay client-receive.
+    ``stream_response_ids`` names the output that makes up the stream window
+    (default: every response). ``input_duration_s`` is passed only for unpaced
+    input and adds ``stream_processing_rtf``.
     """
     from vllm_omni.clients.duplex import summarize_session_request_metrics
 
@@ -176,8 +185,12 @@ def collect_duplex_session_metrics(
     stream_metrics = collector.global_timing_summary(
         after_s=stream_start,
         window_started_at_s=stream_start,
-        response_ids=list(collector.response_ids),
-        measurement_origin=_STREAM_MEASUREMENT_ORIGIN,
+        response_ids=list(collector.response_ids if stream_response_ids is None else stream_response_ids),
+        measurement_origin=(
+            _STREAM_MEASUREMENT_ORIGIN
+            if input_duration_s is None
+            else {**_STREAM_MEASUREMENT_ORIGIN, "processing_rtf": _STREAM_PROCESSING_RTF_ORIGIN}
+        ),
     )
     if stream_metrics:
         session_metrics.update(
@@ -190,6 +203,13 @@ def collect_duplex_session_metrics(
                 "stream_measurement_origin": stream_metrics.get("measurement_origin"),
             }
         )
+        if input_duration_s is not None:
+            session_metrics["stream_processing_rtf"] = audio_rtf_from_raw_metric(
+                {
+                    "audio_generation_ms": stream_metrics.get("audio_generation_ms"),
+                    "audio_duration_ms": input_duration_s * 1000.0,
+                }
+            )
     return DuplexSessionMetricBundle(
         request_metrics=request_metrics,
         session_metrics=session_metrics,
@@ -246,6 +266,7 @@ def duplex_stream_metrics(session_metrics: Sequence[Mapping[str, object]]) -> di
         ("stream_ttft_ms", "duplex_stream_ttft_ms", 3),
         ("stream_ttfp_ms", "duplex_stream_ttfp_ms", 3),
         ("stream_rtf", "duplex_stream_rtf", 6),
+        ("stream_processing_rtf", "duplex_stream_processing_rtf", 6),
     ):
         values = [
             float(value)

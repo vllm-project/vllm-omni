@@ -19,6 +19,7 @@ from vllm_omni.config.live_session import (
     UnsupportedFeatures,
 )
 from vllm_omni.entrypoints.openai.live import protocol as proto
+from vllm_omni.entrypoints.openai.live import serving
 from vllm_omni.entrypoints.openai.live.handler import LiveSessionHandler, SessionSlots
 from vllm_omni.entrypoints.openai.live.processor import LiveSessionProcessor, ProcessorContext
 
@@ -120,6 +121,19 @@ class _UnitProcessor(LiveSessionProcessor):
     def unit_tokens(self, unit):
         return 100
 
+    def trim_context(self, state):
+        return self.trim_to_fraction(state)
+
+
+class _NoTrimProcessor(_UnitProcessor):
+    """Leaves the base ``trim_context``: a full context ends the session."""
+
+    trim_context = LiveSessionProcessor.trim_context
+
+    @classmethod
+    def max_prefix_tokens(cls, model_path):
+        return 50
+
 
 def _stage0(token_ids, finish_reason=None, text="", multimodal_output=None):
     completion = SimpleNamespace(
@@ -154,7 +168,7 @@ async def _until(predicate, timeout: float = 5.0) -> None:
 
 
 class _Session:
-    def __init__(self, slots: SessionSlots | None = None, unsupported=None) -> None:
+    def __init__(self, slots: SessionSlots | None = None, unsupported=None, processor_cls=_UnitProcessor) -> None:
         self.ws = _FakeWebSocket()
         self.engine = _FakeEngine()
         live_config = LiveSessionConfig("unused:Proc", unsupported_features=unsupported or UnsupportedFeatures())
@@ -166,7 +180,7 @@ class _Session:
             deploy_config=LiveSessionDeployConfig(
                 session_lifetime_s=1800, max_sessions=4, max_input_backlog_s=BACKLOG_S
             ),
-            processor_cls=_UnitProcessor,
+            processor_cls=processor_cls,
             processor_context=ProcessorContext(tokenizer=None, max_model_len=300, model_name=MODEL, model_path=MODEL),
             slots=slots,
         )
@@ -352,6 +366,49 @@ async def test_context_overflow_on_the_first_unit_fails_the_session():
         assert session.ws.close_code == proto.CLOSE_INTERNAL_ERROR
 
 
+async def test_context_overflow_without_a_trim_closes_with_try_again_later(mocker):
+    async with _Session(processor_cls=_NoTrimProcessor) as session:
+        await session.start()
+        errors = mocker.spy(session.handler.metrics, "error")
+        session.ws.send(_append_event(units=2))
+        await _until(lambda: session.engine.requests and session.engine.requests[0].inputs)
+        request = session.engine.requests[0]
+        request.emit(_stage0([7], finish_reason="stop"))
+        await _until(lambda: len(request.inputs) == 2)
+
+        request.emit(RuntimeError("context_length_exceeded: the next update does not fit"))
+        await session.finished()
+
+        assert session.errors() == ["internal_server_error"]
+        assert session.ws.close_code == proto.CLOSE_TRY_AGAIN_LATER
+        assert len(session.engine.requests) == 1
+        assert request.closed
+        errors.assert_called_once_with("context")
+
+
+async def test_units_sent_without_a_trim_keep_no_audio():
+    async with _Session(processor_cls=_NoTrimProcessor) as session:
+        await session.start()
+        session.ws.send(_append_event(units=2))
+        await _until(lambda: session.engine.requests and session.engine.requests[0].inputs)
+        request = session.engine.requests[0]
+        request.emit(_stage0([7], finish_reason="stop"))
+        await _until(lambda: len(request.inputs) == 2)
+
+        units = session.handler.state.units
+        assert [unit.start_ms for unit in units] == [0, UNIT_MS]
+        assert [unit.audio.size for unit in units] == [0, 0]
+
+
+async def test_units_sent_with_a_trim_keep_their_audio():
+    async with _Session() as session:
+        await session.start()
+        session.ws.send(_append_event())
+        await _until(lambda: session.engine.requests and session.engine.requests[0].inputs)
+
+        assert session.handler.state.units[0].audio.size == UNIT_SAMPLES
+
+
 async def test_engine_error_fails_the_session():
     async with _Session() as session:
         await session.start()
@@ -445,3 +502,53 @@ async def test_audio_output_is_sent_and_counted():
         delta = session.ws.of_type("session.output_audio.delta")[0]["delta"]
         assert np.frombuffer(base64.b64decode(delta), dtype="<i2").size == audio.size
         assert session.handler.state.output_audio_ms == pytest.approx(100.0)
+
+
+def _app_state(processor_cls, *, api_server_count=1, max_model_len=10_000, lifetime_s=60):
+    live = LiveSessionConfig("unused:Proc")
+    deploy = LiveSessionDeployConfig(session_lifetime_s=lifetime_s, max_sessions=2, max_input_backlog_s=BACKLOG_S)
+    engine_client = SimpleNamespace(
+        engine=SimpleNamespace(
+            pipeline_config=SimpleNamespace(live_session_config=live),
+            deploy_config=SimpleNamespace(live_session_config=deploy),
+        ),
+        model_config=SimpleNamespace(model=MODEL, max_model_len=max_model_len),
+    )
+    return engine_client, SimpleNamespace(api_server_count=api_server_count)
+
+
+@pytest.mark.parametrize("count", [2, 4])
+def test_live_refuses_to_start_with_several_api_servers(monkeypatch, count):
+    monkeypatch.setattr(serving, "load_processor_class", lambda path: _UnitProcessor)
+    engine_client, state = _app_state(_UnitProcessor, api_server_count=count)
+
+    with pytest.raises(ValueError, match=f"--api-server-count {count}"):
+        serving.init_live_app_state(engine_client, state)
+
+
+@pytest.mark.parametrize(
+    ("max_model_len", "ok"),
+    [
+        # 60 s of 100 ms units = 600 units of 1 token, plus a 50-token prefix
+        pytest.param(650, True, id="fits"),
+        pytest.param(649, False, id="one-short"),
+    ],
+)
+def test_live_without_a_trim_must_hold_a_whole_session(monkeypatch, max_model_len, ok):
+    monkeypatch.setattr(serving, "load_processor_class", lambda path: _NoTrimProcessor)
+    engine_client, state = _app_state(_NoTrimProcessor, max_model_len=max_model_len)
+
+    if ok:
+        serving.init_live_app_state(engine_client, state)
+        assert state.live_session_processor_cls is _NoTrimProcessor
+    else:
+        with pytest.raises(ValueError, match="max_model_len 649"):
+            serving.init_live_app_state(engine_client, state)
+
+
+def test_live_with_a_trim_skips_the_sizing_check(monkeypatch):
+    monkeypatch.setattr(serving, "load_processor_class", lambda path: _UnitProcessor)
+    engine_client, state = _app_state(_UnitProcessor, max_model_len=10)
+
+    serving.init_live_app_state(engine_client, state)
+    assert state.live_session_processor_cls is _UnitProcessor

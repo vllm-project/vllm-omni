@@ -19,6 +19,9 @@ from vllm_omni.benchmarks.duplex.omni_duplex_eval_dataset import DEFAULT_DATASET
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_eval import evaluate_sample, summarize_scores
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_judge import DuplexJudge
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import (
+    BACKEND_LIVE,
+    BACKEND_REALTIME,
+    BACKENDS,
     DEFAULT_INSTRUCTIONS,
     MIX_MODES,
     MIX_QUESTION,
@@ -67,16 +70,37 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     actions = parser.add_subparsers(dest="action", required=True)
     generate = actions.add_parser("generate")
     _common(generate)
-    generate.add_argument("--url", default="ws://localhost:8099/v1/realtime?duplex=1")
+    generate.add_argument(
+        "--backend",
+        choices=BACKENDS,
+        default=BACKEND_REALTIME,
+        help=(
+            "'openai-realtime-duplex' drives /v1/realtime?duplex=1; 'openai-live' drives the OpenAI Live "
+            "/v1/live/sessions endpoint (native full-duplex models, audio only: the clip's video is not sent)."
+        ),
+    )
+    generate.add_argument(
+        "--url",
+        help=(
+            "Server WebSocket URL. Defaults to ws://localhost:8099/v1/realtime?duplex=1, or "
+            "ws://localhost:8099/v1/live/sessions with --backend openai-live."
+        ),
+    )
     generate.add_argument("--model", required=True)
     generate.add_argument(
         "--ref-audio",
         help="Reference voice WAV for models that clone it (MiniCPM-o). Omit for models that refuse one (Qwen3-Omni).",
     )
     generate.add_argument(
+        "--voice",
+        help="Live output voice id (--backend openai-live), e.g. a PersonaPlex bundled voice. Omit for the default.",
+    )
+    generate.add_argument(
         "--instructions",
-        default=DEFAULT_INSTRUCTIONS,
-        help="Session system prompt. The default is MiniCPM-o's duplex prompt; pass '' to send none.",
+        help=(
+            "Session system prompt. With openai-realtime-duplex the default is MiniCPM-o's duplex prompt; "
+            "with openai-live it is the server's model default. Pass '' to send none."
+        ),
     )
     generate.add_argument(
         "--turn-detection",
@@ -160,6 +184,14 @@ def run(args: argparse.Namespace) -> int:
     if args.action == "generate":
         if args.concurrency < 1:
             raise ValueError("--concurrency must be at least 1")
+        live = args.backend == BACKEND_LIVE
+        url = args.url or (
+            "ws://localhost:8099/v1/live/sessions" if live else "ws://localhost:8099/v1/realtime?duplex=1"
+        )
+        if args.instructions is None:
+            instructions = None if live else DEFAULT_INSTRUCTIONS
+        else:
+            instructions = args.instructions or None
 
         async def generate() -> list[GenerateSampleResult]:
             semaphore = asyncio.Semaphore(args.concurrency)
@@ -168,7 +200,7 @@ def run(args: argparse.Namespace) -> int:
                 async with semaphore:
                     return await generate_sample(
                         sample,
-                        url=args.url,
+                        url=url,
                         model=args.model,
                         ref_audio=args.ref_audio,
                         output_root=args.response_root,
@@ -177,8 +209,10 @@ def run(args: argparse.Namespace) -> int:
                         pace=args.pace,
                         clock=args.clock,
                         overwrite=args.overwrite,
-                        instructions=args.instructions or None,
+                        instructions=instructions,
                         turn_detection=args.turn_detection,
+                        backend=args.backend,
+                        voice=args.voice,
                     )
 
             return list(await asyncio.gather(*(generate_one(sample) for sample in samples)))

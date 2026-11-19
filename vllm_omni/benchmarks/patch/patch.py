@@ -3007,7 +3007,9 @@ async def _async_request_omniinteract(
     return output
 
 
-async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | None) -> MixRequestFuncOutput:
+async def _async_request_duplex_eval(
+    request: RequestFuncInput, *, pbar: tqdm | None, backend: str = "openai-realtime-duplex"
+) -> MixRequestFuncOutput:
     from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import generate_sample
     from vllm_omni.clients.duplex import metric_mean
 
@@ -3041,6 +3043,7 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
                 instructions=sample.instructions,
                 additional_headers=headers or None,
                 extra_body=dict(request.extra_body or {}),
+                backend=backend,
             ),
             timeout=_omni_request_timeout_s(),
         )
@@ -3067,7 +3070,7 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
             setattr(output, "duplex_eval_result", result)
     except Exception:
         output.error = traceback.format_exc()
-        logger.error("Omni-DuplexEval Realtime request failed: %s", output.error)
+        logger.error("Omni-DuplexEval %s request failed: %s", backend, output.error)
     output.latency = time.perf_counter() - output.start_time
     if pbar:
         pbar.update(1)
@@ -3389,6 +3392,23 @@ async def async_request_openai_realtime_duplex(
     return output
 
 
+async def async_request_openai_live(
+    request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+) -> MixRequestFuncOutput:
+    """OpenAI Live ``/v1/live/sessions`` sessions; Omni-DuplexEval samples only."""
+    del session
+    if getattr(request_func_input, "duplex_eval_sample", None) is not None:
+        return await _async_request_duplex_eval(request_func_input, pbar=pbar, backend="openai-live")
+    output = MixRequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+    output.error = "--backend openai-live requires --dataset-name omni-duplex-eval"
+    if pbar:
+        pbar.update(1)
+    return output
+
+
 async def async_request_openai_realtime_chat(
     request_func_input: RequestFuncInput,
     session: aiohttp.ClientSession,
@@ -3446,6 +3466,9 @@ if "openai-audio-speech" not in OPENAI_COMPATIBLE_BACKENDS:
 ASYNC_REQUEST_FUNCS["openai-realtime-duplex"] = async_request_openai_realtime_duplex
 if "openai-realtime-duplex" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("openai-realtime-duplex")
+ASYNC_REQUEST_FUNCS["openai-live"] = async_request_openai_live
+if "openai-live" not in OPENAI_COMPATIBLE_BACKENDS:
+    OPENAI_COMPATIBLE_BACKENDS.append("openai-live")
 ASYNC_REQUEST_FUNCS["openai-realtime-tts"] = async_request_openai_realtime_duplex
 if "openai-realtime-tts" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("openai-realtime-tts")
@@ -3887,24 +3910,9 @@ async def benchmark(
     ]
     if duplex_session_metrics:
         result["duplex_session_metrics"] = duplex_session_metrics
-        from vllm_omni.clients.duplex import distribution_summary
+        from vllm_omni.benchmarks.duplex_session_metrics import duplex_stream_metrics
 
-        for session_key, result_key, digits in (
-            ("stream_ttft_ms", "duplex_stream_ttft_ms", 3),
-            ("stream_ttfp_ms", "duplex_stream_ttfp_ms", 3),
-            ("stream_rtf", "duplex_stream_rtf", 6),
-        ):
-            values = [
-                float(value)
-                for metric in duplex_session_metrics
-                if isinstance((value := metric.get(session_key)), int | float)
-                and not isinstance(value, bool)
-                and np.isfinite(value)
-                and value >= 0
-            ]
-            summary = distribution_summary(values, digits=digits)
-            if summary is not None:
-                result[result_key] = summary
+        result.update(duplex_stream_metrics(duplex_session_metrics))
     if omniinteract_summary is not None:
         result["omniinteract"] = omniinteract_summary
     if duplex_eval_summary is not None:

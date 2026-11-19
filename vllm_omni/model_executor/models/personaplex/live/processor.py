@@ -8,18 +8,16 @@ every later one carries the text token stage 0 sampled for the previous frame
 (``live/stage0.py`` runs that frame's depformer step with it).
 
 ``instructions`` and developer ``input`` messages form the persona; user and
-assistant ``input`` messages become a "Conversation so far" line in it. A
-resubmission after the context fills (stage-0 ``max_model_len`` frames) starts
-a fresh request with the persona and the newest frame only: agent codes of
-earlier frames are not kept, so the conversation memory resets.
+assistant ``input`` messages become a "Conversation so far" line in it, at
+most ``MAX_PERSONA_TOKENS`` tokens. The context is never trimmed: like the
+reference model, stage 0 attends to a sliding window of the last 3,000 frames,
+and the Live deploy sizes ``max_model_len`` for a whole session.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, ClassVar
-
-from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.live.processor import LiveSessionProcessor, ProcessorContext
 from vllm_omni.entrypoints.openai.live.protocol import LiveProtocolError
@@ -32,16 +30,21 @@ from vllm_omni.entrypoints.openai.live.session import (
 )
 from vllm_omni.model_executor.models.personaplex.live.stage0 import LIVE_KEY
 from vllm_omni.model_executor.models.personaplex.prompting import (
+    AUDIO_SILENCE_FRAME_CNT,
     CHUNK_PERIOD_MS,
     DEFAULT_PERSONA,
     DEFAULT_VOICE,
     SAMPLE_RATE,
     cached_personaplex_tokenizer,
+    personaplex_max_voice_rows,
     personaplex_model_dir,
+    personaplex_persona_tokens,
     personaplex_prefill_slots,
 )
 
-logger = init_logger(__name__)
+# Persona prefill frames a session may use; also bounds the prefill in the
+# startup check that stage 0 holds a whole session.
+MAX_PERSONA_TOKENS = 1024
 
 
 class PersonaPlexLiveSessionProcessor(LiveSessionProcessor):
@@ -52,6 +55,14 @@ class PersonaPlexLiveSessionProcessor(LiveSessionProcessor):
     @classmethod
     def preload(cls, model_path: str) -> None:
         cached_personaplex_tokenizer(personaplex_model_dir(model_path))
+
+    @classmethod
+    def max_prefix_tokens(cls, model_path: str) -> int:
+        return (
+            personaplex_max_voice_rows(personaplex_model_dir(model_path))
+            + 2 * AUDIO_SILENCE_FRAME_CNT
+            + MAX_PERSONA_TOKENS
+        )
 
     def __init__(self, context: ProcessorContext) -> None:
         super().__init__(context)
@@ -94,6 +105,14 @@ class PersonaPlexLiveSessionProcessor(LiveSessionProcessor):
         persona = "\n\n".join(developer) or DEFAULT_PERSONA
         if history:
             persona = f"{persona}\n\nConversation so far: {' '.join(history)}"
+        persona_tokens = len(personaplex_persona_tokens(self.model_dir, persona))
+        if persona_tokens > MAX_PERSONA_TOKENS:
+            raise LiveProtocolError(
+                "invalid_value",
+                f"The persona ('instructions' and 'input') is {persona_tokens} tokens; the limit is "
+                f"{MAX_PERSONA_TOKENS}.",
+                param="instructions",
+            )
         self.persona = persona
         try:
             self.prefill_slots = personaplex_prefill_slots(self.model_dir, self.voice, self.persona)
@@ -133,9 +152,6 @@ class PersonaPlexLiveSessionProcessor(LiveSessionProcessor):
     ) -> dict[str, Any]:
         return self._frame(unit, first=first, last_sampled_token=last_sampled_token)
 
-    def render_resume(self, state: LiveSessionState) -> dict[str, Any]:
-        return self._frame(state.units[-1], first=True, last_sampled_token=None)
-
     # ---- context -----------------------------------------------------------------
 
     def prefix_tokens(self, state: LiveSessionState) -> int:
@@ -143,21 +159,6 @@ class PersonaPlexLiveSessionProcessor(LiveSessionProcessor):
 
     def unit_tokens(self, unit: NativeUnitItem) -> int:
         return 1
-
-    def trim_context(self, state: LiveSessionState) -> int:
-        units = state.units
-        drop = {id(unit) for unit in units[:-1]}
-        logger.debug(
-            "Live session %s: context trim: max_model_len=%d prefill=%d; dropping %d frames, "
-            "restarting from the frame at %d ms",
-            state.id,
-            self.context.max_model_len,
-            self.prefill_slots,
-            len(drop),
-            units[-1].start_ms if units else 0,
-        )
-        state.history = [item for item in state.history if id(item) not in drop]
-        return len(drop)
 
     def spoken_text(self, token_ids: list[int], text: str) -> str:
         return ""

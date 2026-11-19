@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Context trimming of Live sessions on ``context_length_exceeded``."""
+"""Context trimming and sizing of Live sessions."""
 
 import numpy as np
 import pytest
 
 from vllm_omni.entrypoints.openai.live.audio import LiveAudioFormat
 from vllm_omni.entrypoints.openai.live.processor import LiveSessionProcessor, ProcessorContext
+from vllm_omni.entrypoints.openai.live.protocol import LiveProtocolError
 from vllm_omni.entrypoints.openai.live.session import LiveSessionState, NativeUnitItem, SystemItem, UserTextItem
 from vllm_omni.model_executor.models.minicpmo_4_5.live import processor as minicpmo_processor
 from vllm_omni.model_executor.models.minicpmo_4_5.live.processor import MiniCPMO45LiveSessionProcessor
+from vllm_omni.model_executor.models.personaplex.live import processor as personaplex_processor
 from vllm_omni.model_executor.models.personaplex.live.processor import PersonaPlexLiveSessionProcessor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -74,7 +76,7 @@ def test_trim_keeps_newest_units_within_half_the_context(costs, kept):
     state = _state(list(units))
     processor = _CostProcessor(max_model_len=1000, prefix=200)
 
-    dropped = processor.trim_context(state)
+    dropped = processor.trim_to_fraction(state)
 
     assert dropped == len(costs) - kept
     assert state.units == units[len(costs) - kept :]
@@ -86,7 +88,7 @@ def test_trim_keeps_non_unit_history_in_order():
     units = [_unit(i, 300) for i in range(3)]
     state = _state([system, units[0], user, units[1], units[2]])
 
-    assert _CostProcessor(max_model_len=1000, prefix=200).trim_context(state) == 2
+    assert _CostProcessor(max_model_len=1000, prefix=200).trim_to_fraction(state) == 2
     assert state.history == [system, user, units[2]]
 
 
@@ -94,32 +96,49 @@ def test_trim_without_units_drops_nothing():
     state = _state([SystemItem("be brief")])
     processor = _CostProcessor(max_model_len=1000, prefix=200)
 
-    assert processor.trim_context(state) == 0
+    assert processor.trim_to_fraction(state) == 0
     assert processor.dropped == []
 
 
-def _personaplex() -> PersonaPlexLiveSessionProcessor:
+def test_only_processors_that_override_trim_context_trim():
+    assert MiniCPMO45LiveSessionProcessor.trims_context()
+    assert not PersonaPlexLiveSessionProcessor.trims_context()
+    assert not _CostProcessor.trims_context()
+
+
+def _personaplex(monkeypatch, persona_tokens: int) -> PersonaPlexLiveSessionProcessor:
+    monkeypatch.setattr(personaplex_processor, "personaplex_persona_tokens", lambda path, persona: [0] * persona_tokens)
+    monkeypatch.setattr(personaplex_processor, "personaplex_prefill_slots", lambda path, voice, persona: 7)
     processor = object.__new__(PersonaPlexLiveSessionProcessor)
-    processor.context = ProcessorContext(tokenizer=None, max_model_len=600, model_name="m", model_path="m")
-    processor.prefill_slots = 100
+    processor.model_dir = "m"
+    processor.voice = "NATF2.pt"
     return processor
 
 
-def test_personaplex_trim_restarts_from_the_last_frame():
-    system = SystemItem("persona")
-    units = [_unit(i) for i in range(5)]
-    state = _state([system, *units])
+def test_personaplex_persona_at_the_limit_is_accepted(monkeypatch):
+    processor = _personaplex(monkeypatch, personaplex_processor.MAX_PERSONA_TOKENS)
 
-    assert _personaplex().trim_context(state) == 4
-    assert state.history == [system, units[-1]]
+    processor.configure(_state([SystemItem("be brief")]))
+
+    assert processor.persona == "be brief"
+    assert processor.prefill_slots == 7
 
 
-def test_personaplex_trim_single_frame_drops_nothing():
-    unit = _unit(0)
-    state = _state([unit])
+def test_personaplex_persona_over_the_limit_is_rejected(monkeypatch):
+    processor = _personaplex(monkeypatch, personaplex_processor.MAX_PERSONA_TOKENS + 1)
 
-    assert _personaplex().trim_context(state) == 0
-    assert state.history == [unit]
+    with pytest.raises(LiveProtocolError) as err:
+        processor.configure(_state([SystemItem("be brief")]))
+
+    assert (err.value.code, err.value.param) == ("invalid_value", "instructions")
+
+
+def test_personaplex_prefix_bound_covers_the_largest_voice_and_persona(monkeypatch):
+    monkeypatch.setattr(personaplex_processor, "personaplex_model_dir", lambda path: path)
+    monkeypatch.setattr(personaplex_processor, "personaplex_max_voice_rows", lambda path: 69)
+
+    assert PersonaPlexLiveSessionProcessor.max_prefix_tokens("m") == 69 + 12 + personaplex_processor.MAX_PERSONA_TOKENS
+    assert PersonaPlexLiveSessionProcessor.units_per_second() == 12.5
 
 
 def _minicpmo(tokenizer: _CharTokenizer) -> MiniCPMO45LiveSessionProcessor:

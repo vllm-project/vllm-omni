@@ -359,6 +359,9 @@ class MiniCPMO45LiveSessionProcessor(LiveSessionProcessor):
     def unit_tokens(self, unit: NativeUnitItem) -> int:
         return 2 + AUDIO_TOKENS_PER_UNIT + len(unit.token_ids)
 
+    def trim_context(self, state: LiveSessionState) -> int:
+        return self.trim_to_fraction(state)
+
     def on_units_dropped(self, state: LiveSessionState, units: list[NativeUnitItem]) -> None:
         text = "".join(self.decode(unit.token_ids) for unit in units).strip()
         if text:

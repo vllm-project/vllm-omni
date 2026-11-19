@@ -55,8 +55,8 @@ class LiveSessionProcessor(ABC):
     output_sample_rate: ClassVar[int] = 24_000
     # Fixed unit length for the default ``push_audio`` / ``next_unit``.
     unit_ms: ClassVar[int | None] = None
-    # On context_length_exceeded the units kept fill this share of the context
-    # left after the session prefix.
+    # ``trim_to_fraction`` keeps units filling this share of the context left
+    # after the session prefix.
     trim_fraction: ClassVar[float] = 0.5
 
     def __init__(self, context: ProcessorContext) -> None:
@@ -68,6 +68,25 @@ class LiveSessionProcessor(ABC):
     @classmethod
     def preload(cls, model_path: str) -> None:
         """Load per-model assets once at server startup (runs in a thread)."""
+
+    # ---- startup sizing (models that don't trim) ---------------------------------
+
+    @classmethod
+    def units_per_second(cls) -> float:
+        """Units per second of real-time input."""
+        if cls.unit_ms is None:
+            raise NotImplementedError(f"{cls.__name__} must set unit_ms or override units_per_second")
+        return 1000.0 / cls.unit_ms
+
+    @classmethod
+    def max_tokens_per_unit(cls) -> int:
+        """Upper bound on the engine tokens one unit occupies."""
+        return 1
+
+    @classmethod
+    def max_prefix_tokens(cls, model_path: str) -> int:
+        """Upper bound on the session prefix's engine tokens."""
+        raise NotImplementedError(f"{cls.__name__} must bound its prefix to run without trim_context")
 
     # ---- session configuration -------------------------------------------------
 
@@ -161,11 +180,12 @@ class LiveSessionProcessor(ABC):
         which also carries the session prefix unless ``render_prefix`` opened
         the request."""
 
-    @abstractmethod
     def render_resume(self, state: LiveSessionState) -> dict[str, Any]:
         """Every unit in the history, the last one open for generation, for a
         new request: its first prompt (with the session prefix), or the update
-        after ``render_prefix`` when the processor has one."""
+        after ``render_prefix`` when the processor has one. Only called after
+        ``trim_context``."""
+        raise NotImplementedError(f"{type(self).__name__} has trim_context but no render_resume")
 
     # ---- context ---------------------------------------------------------------
 
@@ -178,9 +198,19 @@ class LiveSessionProcessor(ABC):
         """Engine tokens one unit occupies, its output included."""
 
     def trim_context(self, state: LiveSessionState) -> int:
-        """Drop the oldest units so the rest fit ``trim_fraction`` of the
-        context after the prefix; the newest unit is always kept. Returns the
-        number of units dropped."""
+        """On context_length_exceeded: drop history units and return how many
+        were dropped, after which the handler resubmits. A processor that
+        doesn't override it doesn't trim, and a full context ends the session."""
+        raise NotImplementedError(f"{type(self).__name__} doesn't trim its context")
+
+    @classmethod
+    def trims_context(cls) -> bool:
+        return cls.trim_context is not LiveSessionProcessor.trim_context
+
+    def trim_to_fraction(self, state: LiveSessionState) -> int:
+        """A ``trim_context`` for processors to opt into: drop the oldest units
+        so the rest fit ``trim_fraction`` of the context after the prefix; the
+        newest unit is always kept. Returns the number of units dropped."""
         prefix = self.prefix_tokens(state)
         budget = (self.context.max_model_len - prefix) * self.trim_fraction
         units = state.units

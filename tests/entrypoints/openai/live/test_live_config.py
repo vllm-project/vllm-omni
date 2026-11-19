@@ -93,7 +93,7 @@ def test_bundled_pipelines_declare_a_loadable_live_processor(pipeline):
 
 @pytest.mark.parametrize(
     ("deploy", "max_sessions", "stage0_max_model_len"),
-    [("minicpmo_4_5_live.yaml", 8, 16384), ("personaplex_live.yaml", 2, 3000)],
+    [("minicpmo_4_5_live.yaml", 8, 16384), ("personaplex_live.yaml", 2, 24000)],
 )
 def test_bundled_live_deploy_configs(deploy, max_sessions, stage0_max_model_len):
     config = load_deploy_config(get_deploy_config_path(deploy))

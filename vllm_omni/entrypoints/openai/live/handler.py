@@ -50,6 +50,7 @@ USAGE_INTERVAL_MS = 60_000
 # Units queued behind the open segment before the session is reported as
 # falling behind real time.
 BACKLOG_WARNING_UNITS = 3
+_NO_AUDIO = np.zeros(0, dtype=np.float32)
 
 
 class SessionSlots:
@@ -148,8 +149,7 @@ class LiveSessionHandler:
             if not self._closing:
                 raise
         except Exception as exc:
-            logger.exception("Live session %s failed", self._session_id)
-            await self._fail(exc)
+            await self._fail("session loop raised", exc=exc)
         finally:
             await self._close("connection_lost", send_closed=False)
 
@@ -170,13 +170,16 @@ class LiveSessionHandler:
             raise
         except Exception as exc:
             if not self._closing:
-                logger.exception("Live session %s background task failed", self._session_id)
-                await self._fail(exc)
+                await self._fail("background task raised", exc=exc)
 
-    async def _fail(self, exc: BaseException, reason: str = "internal") -> None:
-        """Generic ``internal_server_error``, cleanup, close with 1011."""
+    async def _fail(self, message: str, reason: str = "internal", exc: BaseException | None = None) -> None:
+        """End the session for something unexpected, or a cause a new session
+        would hit again: generic ``internal_server_error``, then close with
+        1011. The cause goes to the log (with ``exc``'s traceback) and the
+        metric."""
         if self._closing:
             return
+        logger.error("Live session %s failed (%s): %s", self._session_id, reason, message, exc_info=exc)
         self.metrics.error(reason)
         await self._send_error(proto.internal_error())
         await self._close(None, send_closed=False, code=proto.CLOSE_INTERNAL_ERROR)
@@ -522,14 +525,17 @@ class LiveSessionHandler:
         state.history.append(unit)
         self._inflight = unit
         params = processor.stage0_sampling_params(state, driver.stage0_params)
-        if not driver.active:
-            await driver.start(processor.render_unit(state, unit, first=True, last_sampled_token=None), params)
-        elif self._after_prefix:
-            self._after_prefix = False
-            driver.append(processor.render_unit(state, unit, first=True, last_sampled_token=None), params)
-        else:
-            prompt = processor.render_unit(state, unit, first=False, last_sampled_token=driver.last_sampled_token)
+        first = not driver.active or self._after_prefix
+        self._after_prefix = False
+        last = None if first else driver.last_sampled_token
+        prompt = processor.render_unit(state, unit, first=first, last_sampled_token=last)
+        # Without a trim nothing resubmits the history, so its audio is dead weight.
+        if not processor.trims_context():
+            unit.audio = _NO_AUDIO
+        if driver.active:
             driver.append(prompt, params)
+        else:
+            await driver.start(prompt, params)
 
     async def _on_prefix_finished(self) -> None:
         self._prefix_open = False
@@ -546,12 +552,16 @@ class LiveSessionHandler:
         """The context is full: trim the history and resubmit it, the unit
         whose append overflowed included, as a new request."""
         state, processor, driver = self._started()
+        sizes = f"prefix {processor.prefix_tokens(state)} tokens, max_model_len {processor.context.max_model_len}"
         if self._inflight is None or len(state.units) <= 1:
-            await self._fail(RuntimeError("context_length_exceeded on the session's first unit"), "context")
+            await self._fail(f"context_length_exceeded on the session's first unit ({sizes})", "context")
+            return
+        if not processor.trims_context():
+            await self._abort("context", f"context_length_exceeded after {len(state.units)} units ({sizes})")
             return
         dropped = processor.trim_context(state)
         if not dropped:
-            await self._fail(RuntimeError("context_length_exceeded with nothing left to trim"), "context")
+            await self._fail(f"context_length_exceeded with nothing left to trim ({sizes})", "context")
             return
         self.metrics.context_trim()
         logger.info(
@@ -576,14 +586,13 @@ class LiveSessionHandler:
         if is_context_overflow(exc):
             await self._resubmit_after_overflow()
             return
-        logger.error("Live session %s: engine error: %s", self._session_id, exc)
-        await self._fail(exc)
+        await self._fail(f"engine error: {exc}")
 
     async def _on_engine_output(self, epoch: int, output: Any) -> None:
         if self._closing or self.driver is None or epoch != self.driver.epoch:
             return
         if getattr(output, "error", None):
-            await self._fail(RuntimeError(f"engine error: {output.error}"))
+            await self._fail(f"engine output error: {output.error}")
             return
         state, processor, _ = self._started()
         unit = self._inflight or (state.units[-1] if state.units else None)

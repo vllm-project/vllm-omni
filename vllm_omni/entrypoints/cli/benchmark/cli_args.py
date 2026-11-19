@@ -577,8 +577,16 @@ def add_omni_args(parser: argparse.ArgumentParser) -> None:
 def preprocess_serve_args(args: argparse.Namespace) -> None:
     """Apply serving benchmark CLI transformations after parsing."""
     if getattr(args, "dataset_name", None) == "omni-duplex-eval":
-        if args.backend != "openai-realtime-duplex" or args.endpoint != "/v1/realtime":
-            raise ValueError("Omni-DuplexEval requires --backend openai-realtime-duplex --endpoint /v1/realtime")
+        if (args.backend, args.endpoint) not in {
+            ("openai-realtime-duplex", "/v1/realtime"),
+            ("openai-live", "/v1/live/sessions"),
+        }:
+            raise ValueError(
+                "Omni-DuplexEval requires --backend openai-realtime-duplex --endpoint /v1/realtime "
+                "or --backend openai-live --endpoint /v1/live/sessions"
+            )
+        if args.backend == "openai-live" and (args.duplex_eval_ref_audio or args.duplex_eval_turn_detection != "none"):
+            raise ValueError("--backend openai-live does not support --duplex-eval-ref-audio or turn detection")
         if args.duplex_eval_evaluate and not args.duplex_eval_judge_model:
             raise ValueError("Omni-DuplexEval evaluation requires --duplex-eval-judge-model")
         for name in ("ignore_eos", "profile", "skip_tokenizer_init", "probe_request_rate"):

@@ -25,13 +25,16 @@ The endpoint is enabled only when the model declares a `live_session_config`
 in its pipeline and the deploy config carries a `live_session_config` object.
 Otherwise the WebSocket is accepted, answered with an `error`, and closed with
 code 1008. Live sessions need a single API server process
-(`--api-server-count 1`, the default). The Live overlays set
+(`--api-server-count 1`, the default): `max_sessions` is counted per process,
+so with a Live deploy config the server refuses to start with any other count.
+Live with several API server processes is unsupported and its behaviour
+undefined. The Live overlays set
 `session_mode: turn`, so the `/v1/realtime` full-duplex stack stays off.
 
 ```yaml
 live_session_config:
   session_lifetime_s: 1800   # hard limit; fills expires_at
-  max_sessions: 8            # concurrent Live sessions on this API server
+  max_sessions: 8            # concurrent Live sessions on the server
   max_input_backlog_s: 10    # input audio queued behind the model before the session closes
 ```
 
@@ -46,6 +49,10 @@ so the stalled sessions are ended by `max_input_backlog_s` (see below). The
 MiniCPM-o overlay admits 8 sessions with a 16,384-token Stage 0 context, about
 18 GiB of KV cache, for one 96 GB GPU; lower `max_sessions` or the Stage 0
 `max_model_len` on smaller GPUs.
+
+A model that doesn't trim its context (PersonaPlex) must hold a whole session
+in Stage 0: the server refuses to start when Stage 0's `max_model_len` is less
+than `session_lifetime_s` of real-time input plus the model's largest prefill.
 
 ## Protocol
 
@@ -68,8 +75,11 @@ models. Audio is base64 raw audio in the session format with no container:
 `session.instructions.append`, `session.thinking.append`,
 `response.item.create`, `response.create` and unknown events get `error` with
 `code: "unsupported_event"`. Events other than `session.start` before the
-session starts get `session_not_started`. Non-null `store`, `client` and
-`delegation` are `unsupported_session_config`.
+session starts get `session_not_started`. Non-null `store`, `client`,
+`delegation.client` and `delegation.responses.tools` are
+`unsupported_session_config`. A `delegation` of type `responses` that
+delegates nothing (as LiveKit's `GPTLiveModel` sends) is accepted and echoed;
+its `model` must be the served model.
 
 When `max_sessions` sessions are active, a `session.start` gets an `error`
 (`type: "server_error"`, `code: "session_limit_reached"`, `client_event_id`
@@ -80,10 +90,16 @@ A running session the server can't keep going is ended with an `error`
 (`type: "server_error"`, `code: "internal_server_error"`) and close 1013; the
 client may start a new session. This happens when more than
 `max_input_backlog_s` of input audio is queued behind the model (the client
-sends faster than real time, or the server falls behind), or when its stage 0
-request was preempted and lost its context. The cause is not sent to the
-client; the server logs it and counts it in `vllm_omni:live_errors{reason}`
-(`backlog`, `preempted`).
+sends faster than real time, or the server falls behind), when its stage 0
+request was preempted and lost its context, or when a model that doesn't trim
+fills its context. The cause is not sent to the client; the server logs it and
+counts it in `vllm_omni:live_errors{reason}` (`backlog`, `preempted`,
+`context`).
+
+A session that fails on something unexpected, or on a cause a new session
+would hit again, gets the same `error` and close 1011. That includes a context
+that can't hold the session prefix and one unit, and a trim that can't drop
+anything; both count as `live_errors{reason="context"}`.
 
 ### Server events
 
@@ -98,14 +114,19 @@ No input transcripts are produced.
 
 ## Context
 
-When the next unit no longer fits the stage-0 context, the server trims the
-history and resubmits it as a new request, the unit that did not fit included:
+Each model decides how it handles a full stage-0 context.
 
-- MiniCPM-o keeps the system prompt and reference voice plus the newest units
-  that fill half of the remaining context; the dropped units' text is carried
-  in the system prompt (`previous: ...`).
-- PersonaPlex restarts from the persona and the newest frame; its conversation
-  memory resets.
+- **MiniCPM-o** trims. When the next unit no longer fits, the server keeps the
+  system prompt and reference voice plus the newest units that fill half of
+  the remaining context, carries the dropped units' text in the system prompt
+  (`previous: ...`), and resubmits the history as a new request, the unit that
+  did not fit included.
+- **PersonaPlex** doesn't trim. As in the reference model, Stage 0 attends to
+  a sliding window of the last 3,000 frames (240 s), so a session runs for its
+  whole lifetime with about one window of KV cache; the persona and voice
+  prompt slide out of the window like the rest. The Live overlay sizes Stage 0
+  `max_model_len` for a whole session. A session that still overruns it (a
+  client sending faster than real time) ends with close 1013.
 
 ## Model notes
 
@@ -119,7 +140,10 @@ history and resubmits it as a new request, the unit that did not fit included:
   memory profiling does not count. The Live overlay sets Stage 0
   `max_model_len: 16384`.
 - **PersonaPlex**: voices are the bundled voice prompts (`NATF2`, ...);
-  `instructions` is the persona. Output audio trails the input by one extra
+  `instructions` is the persona, at most 1,024 tokens including the
+  `input` messages (`invalid_value` otherwise). The Live overlay sets Stage 0
+  `max_model_len` and the Helium `max_position_embeddings` to 24,000 frames:
+  1,800 s of input plus the largest prefill. Output audio trails the input by one extra
   frame (80 ms): a frame's agent codes are produced when the next frame
   arrives. No output transcripts.
 
@@ -133,4 +157,4 @@ agent (`GPTLiveModel`) against this endpoint.
 `vllm_omni:live_active_sessions`, `vllm_omni:live_rejected_sessions`,
 `vllm_omni:live_audio_seconds{direction}`, `vllm_omni:live_context_trims` and
 `vllm_omni:live_errors{reason}`, labelled by `model_name`. `live_errors`
-reasons include `backlog` and `preempted`.
+reasons include `backlog`, `preempted` and `context`.

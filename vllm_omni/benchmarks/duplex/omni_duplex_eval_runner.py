@@ -64,8 +64,15 @@ DEFAULT_INSTRUCTIONS = "Streaming Omni Conversation."
 MIX_QUESTION = "question"
 MIX_SOUNDTRACK = "soundtrack"
 MIX_MODES = (MIX_QUESTION, MIX_SOUNDTRACK)
+#: Session endpoints: ``/v1/realtime`` duplex, or OpenAI Live ``/v1/live/sessions``.
+BACKEND_REALTIME = "openai-realtime-duplex"
+BACKEND_LIVE = "openai-live"
+BACKENDS = (BACKEND_REALTIME, BACKEND_LIVE)
 _SERVER_TURN_SETTLE_S = 2.0
 _COMPLETION_SETTLE_S = 2.0
+# A Live session has no end-of-response event and MiniCPM-o emits nothing while
+# it listens, so output counts as drained after this much server silence.
+_LIVE_SETTLE_S = 5.0
 # Events that can still open or extend a response after the commit. Playback
 # acknowledgements are omitted: the runner sends one every 250 ms for any
 # response that produced audio, and the server echoes each one, so counting
@@ -369,6 +376,8 @@ async def generate_sample(
     extra_body: dict[str, object] | None = None,
     instructions: str | None = DEFAULT_INSTRUCTIONS,
     turn_detection: str = TURN_DETECTION_NONE,
+    backend: str = BACKEND_REALTIME,
+    voice: str | None = None,
 ) -> GenerateSampleResult:
     """Generate one sample's timed sentences and collect duplex session metrics.
 
@@ -388,6 +397,15 @@ async def generate_sample(
         raise ValueError(f"turn_detection must be one of {TURN_DETECTION_MODES}")
     if mix not in MIX_MODES:
         raise ValueError(f"mix must be one of {MIX_MODES}")
+    if backend not in BACKENDS:
+        raise ValueError(f"backend must be one of {BACKENDS}")
+    if backend == BACKEND_LIVE:
+        if turn_detection != TURN_DETECTION_NONE:
+            raise ValueError("Live sessions use the model's native turn-taking; turn_detection must be 'none'")
+        if ref_audio is not None or (prepared is not None and prepared.ref_audio is not None):
+            raise ValueError("Live sessions select a voice by name; ref_audio is not supported")
+    elif voice is not None:
+        raise ValueError("voice is only supported by the Live backend")
     server_turns = turn_detection == TURN_DETECTION_SERVER_VAD
     if server_turns and pace != "realtime":
         raise ValueError("server_vad requires pace='realtime' to preserve turn and playback timing")
@@ -414,6 +432,23 @@ async def generate_sample(
         prepared = await asyncio.to_thread(
             prepare_sample, sample, media_dir=output.parent / ".media", ref_audio=ref_audio, fps=fps, mix=mix
         )
+    if backend == BACKEND_LIVE:
+        return await _generate_live_sample(
+            sample,
+            output=output,
+            prepared=prepared,
+            url=url,
+            model=model,
+            voice=voice,
+            instructions=instructions,
+            fps=fps,
+            mix=mix,
+            pace=pace,
+            clock=clock,
+            unit_ms=unit_ms,
+            defer_artifacts=defer_artifacts,
+            additional_headers=additional_headers,
+        )
     pcm = prepared.pcm
     if server_turns:
         # No final commit: trailing silence lets the VAD close the last turn.
@@ -426,6 +461,7 @@ async def generate_sample(
     drain_timeout = None
     close_timeout = None
     stream_start: float | None = None
+    input_duration_s: float | None = None
     async with client:
         await client.configure(
             model,
@@ -450,6 +486,8 @@ async def generate_sample(
             else None
         )
         ack_task = asyncio.create_task(_ack_playback(client))
+        if not realtime:
+            input_duration_s = len(pcm) / (PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE)
         try:
             stream_start = time.monotonic()
             await client.stream_av_units(
@@ -531,6 +569,7 @@ async def generate_sample(
         collector,
         stream_start=stream_start if stream_start is not None else 0.0,
         session_id=sample.id,
+        input_duration_s=input_duration_s,
     )
     errors = []
     for event in client.events.errors():
@@ -564,6 +603,103 @@ async def generate_sample(
         output_tokens=bundle.output_tokens,
         audio_bytes=len(client.events.audio_bytes()),
         audio_sample_rate=client.events.output_sample_rate_hz,
+        error="; ".join(errors),
+    )
+    if not defer_artifacts:
+        write_sample_result(result)
+    return result
+
+
+async def _generate_live_sample(
+    sample: DuplexSample,
+    *,
+    output: Path,
+    prepared: PreparedSample,
+    url: str,
+    model: str,
+    voice: str | None,
+    instructions: str | None,
+    fps: float,
+    mix: str,
+    pace: str,
+    clock: str,
+    unit_ms: int,
+    defer_artifacts: bool,
+    additional_headers: dict[str, str] | None,
+) -> GenerateSampleResult:
+    """One sample over ``/v1/live/sessions``: the clip's audio in, no commit, drain on silence.
+
+    Live is audio-only, so the clip's video frames are not sent.
+    """
+    from vllm_omni.benchmarks.duplex_session_metrics import collect_duplex_session_metrics
+    from vllm_omni.clients.live import LiveClient
+
+    realtime = pace == "realtime"
+    pcm = prepared.pcm
+    input_duration_s = len(pcm) / (PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE)
+    client = LiveClient(url, sample_rate_hz=PCM16_SAMPLE_RATE, additional_headers=additional_headers)
+    drained = False
+    drain_timeout = None
+    close_timeout = None
+    stream_start: float | None = None
+    async with client:
+        await client.start(model, instructions=instructions, voice=voice)
+        stream_start = time.monotonic()
+        await client.stream_pcm16(pcm, chunk_ms=unit_ms, realtime=realtime)
+        try:
+            await client.wait_quiet(settle_s=_LIVE_SETTLE_S, timeout_s=max(20.0, prepared.duration + 20.0))
+            drained = not client.closed_by_server
+        except TimeoutError as exc:
+            drain_timeout = str(exc)
+        try:
+            await client.close(timeout_s=20.0)
+        except TimeoutError:
+            close_timeout = "Timed out waiting for session.closed"
+    events = list(client.events.events)
+    timed = [sentence.as_dict() for sentence in extract_timed_sentences(events, clock=clock)]
+    chunks = [chunk.as_dict() for chunk in extract_timed_chunks(events, clock=clock)]
+    meta = {
+        "id": sample.id,
+        "split": sample.split,
+        "clock": clock if realtime else "invalid",
+        "pace": pace,
+        "mix": mix,
+        "fps": fps,
+        "unit_ms": unit_ms,
+        "model": model,
+        "backend": BACKEND_LIVE,
+        "turn_detection": TURN_DETECTION_NONE,
+        "frame_transport": None,
+        "instructions": instructions,
+        "voice": voice,
+        "live_session_id": client.session_id,
+        "response_done": drained,
+        "drain_timeout": drain_timeout,
+        "close_timeout": close_timeout,
+        "close_code": client.close_code,
+        "ref_audio_sha256": None,
+    }
+    bundle = collect_duplex_session_metrics(
+        client.events,
+        stream_start=stream_start if stream_start is not None else 0.0,
+        session_id=sample.id,
+        stream_response_ids=[client.stream_id],
+        input_duration_s=None if realtime else input_duration_s,
+    )
+    errors = [str(event) for event in client.errors()]
+    if client.closed_by_server:
+        errors.append(f"Live session closed by the server (close code {client.close_code})")
+    errors.extend(str(error) for error in (drain_timeout, close_timeout) if error)
+    result = GenerateSampleResult(
+        output=output,
+        request_metrics=[_with_sample_identity(metric, sample) for metric in bundle.request_metrics],
+        session_metrics=_with_sample_identity(bundle.session_metrics, sample),
+        timed_sentences=timed,
+        timed_chunks=chunks,
+        metadata=meta,
+        output_tokens=bundle.output_tokens,
+        audio_bytes=len(client.audio_bytes()),
+        audio_sample_rate=client.sample_rate_hz,
         error="; ".join(errors),
     )
     if not defer_artifacts:

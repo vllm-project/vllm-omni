@@ -4,9 +4,10 @@
 """WebSocket client for the ``/v1/live/sessions`` E2E tests.
 
 Speaks the OpenAI Live protocol directly: 16 kHz PCM16 in both directions,
-input paced in real time in 100 ms chunks. Every server event is kept with its
-arrival time (seconds since the client started) so tests can check what
-arrived in a given window.
+input in 100 ms chunks paced at ``speed`` times real time (0: unpaced). Every
+server event is kept with its arrival time (seconds since the client started)
+so tests can check what arrived in a given window. Unpaced tests check output
+by media time instead: the models emit output audio in step with their input.
 """
 
 from __future__ import annotations
@@ -67,6 +68,9 @@ class Utterance:
     start: float
     end: float
     window_end: float
+    # Seconds of input sent before the utterance, and through its reply window.
+    media_start: float = 0.0
+    media_window_end: float = 0.0
 
 
 @dataclass
@@ -76,6 +80,7 @@ class LiveSession:
     url: str
     model: str
     voice: str
+    speed: float = 1.0
     clock: float = field(default_factory=time.monotonic)
     name: str = "session"
     events: list[dict[str, Any]] = field(default_factory=list)
@@ -83,6 +88,7 @@ class LiveSession:
     utterances: list[Utterance] = field(default_factory=list)
     close_code: int | None = None
     closed_by_server: bool = False
+    media_s: float = 0.0
 
     def now(self) -> float:
         return time.monotonic() - self.clock
@@ -137,21 +143,34 @@ class LiveSession:
                 chunk = np.pad(chunk, (0, CHUNK - chunk.size))
             payload = {"type": "session.input_audio.append", "audio": base64.b64encode(chunk.tobytes()).decode()}
             await self._ws.send(json.dumps(payload))
-            tick += CHUNK / RATE
-            await asyncio.sleep(max(0.0, tick - time.monotonic()))
+            self.media_s += CHUNK / RATE
+            if self.speed > 0:
+                tick += CHUNK / RATE / self.speed
+            await asyncio.sleep(max(0.0, tick - time.monotonic()) if self.speed > 0 else 0)
 
     async def silence(self, seconds: float) -> None:
         await self._stream(np.zeros(int(RATE * seconds), dtype="<i2"))
 
     async def say(self, pcm: np.ndarray, *, gap_s: float) -> Utterance:
         """Stream ``pcm`` then ``gap_s`` of silence; the reply window spans both."""
-        start = self.now()
+        start, media_start = self.now(), self.media_s
         await self._stream(pcm)
         end = self.now()
         await self.silence(gap_s)
-        utterance = Utterance(start, end, self.now())
+        utterance = Utterance(start, end, self.now(), media_start, self.media_s)
         self.utterances.append(utterance)
         return utterance
+
+    def output_s(self) -> float:
+        return sum(pcm.size for _, pcm in self.audio) / RATE
+
+    async def drain(self, timeout: float, slack_s: float = 1.0) -> None:
+        """Wait until the output audio has caught up with the input sent."""
+        deadline = time.monotonic() + timeout
+        while self.output_s() < self.media_s - slack_s and not self.closed_by_server:
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"{self.name}: {self.output_s():.1f} s of output for {self.media_s:.1f} s of input")
+            await asyncio.sleep(0.5)
 
     async def close(self) -> None:
         self._closing = True
@@ -175,6 +194,18 @@ class LiveSession:
 
     def answered(self, utterance: Utterance) -> bool:
         return self.voiced_blocks(utterance.start, utterance.window_end) >= MIN_VOICED_BLOCKS
+
+    def voiced_blocks_media(self, t0: float, t1: float) -> int:
+        """Voiced output blocks at output positions ``t0``..``t1`` s (media time)."""
+        if not self.audio:
+            return 0
+        pcm = np.concatenate([pcm for _, pcm in self.audio])[int(t0 * RATE) : int(t1 * RATE)]
+        pcm = pcm.astype(np.float32) / 32768.0
+        blocks = pcm[: pcm.size - pcm.size % VOICED_BLOCK].reshape(-1, VOICED_BLOCK)
+        return int(np.count_nonzero(np.sqrt(np.mean(np.square(blocks), axis=1)) >= VOICED_BLOCK_RMS))
+
+    def answered_media(self, utterance: Utterance) -> bool:
+        return self.voiced_blocks_media(utterance.media_start, utterance.media_window_end) >= MIN_VOICED_BLOCKS
 
     def transcript(self, t0: float, t1: float) -> str:
         return "".join(

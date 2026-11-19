@@ -135,8 +135,31 @@ def personaplex_prefill_slots(model_path: str, voice: str, persona: str) -> int:
     they are constant, and this runs on every session open.
     """
     voice_rows = _cached_voice_embedding_rows(model_path, voice)
-    persona_tokens = cached_personaplex_tokenizer(model_path)(wrap_with_system_tags(persona)) if persona else []
-    return voice_rows + 2 * AUDIO_SILENCE_FRAME_CNT + len(persona_tokens)
+    return voice_rows + 2 * AUDIO_SILENCE_FRAME_CNT + len(personaplex_persona_tokens(model_path, persona))
+
+
+def personaplex_persona_tokens(model_path: str, persona: str) -> list[int]:
+    """Prefill tokens of a persona, one frame each."""
+    return cached_personaplex_tokenizer(model_path)(wrap_with_system_tags(persona)) if persona else []
+
+
+def personaplex_voice_names(model_path: str) -> list[str]:
+    """Bundled voice prompts: ``voices/*.pt`` and the ``.pt`` members of ``voices.tgz``."""
+    root = Path(model_path)
+    names = {path.name for path in (root / "voices").glob("*.pt")}
+    archive = root / "voices.tgz"
+    if archive.is_file():
+        names.update(name for name in _voice_archive_members(str(archive)) if name.endswith(".pt"))
+    return sorted(names)
+
+
+@lru_cache(maxsize=4)
+def personaplex_max_voice_rows(model_path: str) -> int:
+    """Prefill rows of the largest bundled voice prompt."""
+    names = personaplex_voice_names(model_path)
+    if not names:
+        raise FileNotFoundError(f"PersonaPlex has no bundled voice prompts under {model_path!r}")
+    return max(_cached_voice_embedding_rows(model_path, name) for name in names)
 
 
 __all__ = [
@@ -157,7 +180,10 @@ __all__ = [
     "cached_personaplex_tokenizer",
     "load_personaplex_tokenizer",
     "load_personaplex_voice_state",
+    "personaplex_max_voice_rows",
     "personaplex_model_dir",
+    "personaplex_persona_tokens",
     "personaplex_prefill_slots",
+    "personaplex_voice_names",
     "wrap_with_system_tags",
 ]
