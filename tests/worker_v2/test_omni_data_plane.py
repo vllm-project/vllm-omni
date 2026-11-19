@@ -42,6 +42,22 @@ def _new_request(req_id="internal", external_req_id="external"):
     )
 
 
+def test_one_step_can_enqueue_two_ordered_chunks_for_one_request(raw_plane, monkeypatch):
+    request = _new_request()
+    request.is_finished = lambda: True
+    seen = []
+    first = {"codes": {"audio": [1]}, "meta": {"finished": False}}
+    last = {"codes": {"audio": [2]}, "meta": {"finished": True}}
+
+    def enqueue(request, payload, *, wait_for_delivery):
+        seen.append((request.req_id, payload))
+        return True, None
+
+    monkeypatch.setattr(raw_plane, "_enqueue_chunk_payload", enqueue)
+    assert raw_plane._publish_chunk_cohort([(request, (first, last))], wait_for_delivery=False) == 2
+    assert seen == [(request.req_id, first), (request.req_id, last)]
+
+
 def _bare_plane(*, delivery_timeout_s=1.0, shutdown_timeout_s=1.0):
     plane = object.__new__(OmniRunnerDataPlane)
     plane.__dict__.update(

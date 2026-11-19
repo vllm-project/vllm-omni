@@ -1731,7 +1731,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         # MRv2 request snapshots carry the serialized tags.
         entries = [
             (request, payload)
-            for request, payload in entries
+            for request, result in entries
+            for payload in (result if isinstance(result, tuple) else (result,))
             if not self._return_stage_payload(request.req_id, request.additional_information, payload)
         ]
         if not entries:

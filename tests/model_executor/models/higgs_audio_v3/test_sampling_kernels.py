@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Fused Higgs sampling kernels must be bit-identical to the eager code they replace."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -43,6 +45,52 @@ def test_batched_generator_noise_matches_per_request_exponential(numel):
     for got, want in zip(actual_gens, expected_gens):
         if want is not None:
             assert got.get_offset() == want.get_offset()
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_shared_noise_prefix_matches_higgs_sampler_and_generator_offsets():
+    from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+        HiggsAudioV3TalkerForConditionalGeneration,
+    )
+    from vllm_omni.utils.seeded_exponential import fill_exponential_steps
+
+    model = object.__new__(HiggsAudioV3TalkerForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    device = torch.device("cuda")
+    baseline = [torch.Generator(device=device).manual_seed(42 + i) for i in range(2)]
+    preview = [generator.clone_state() for generator in baseline]
+    temperature = torch.tensor([0.8, 0.0], device=device)
+    metadata = SimpleNamespace(
+        generators=dict(enumerate(baseline)),
+        temperature=temperature,
+        top_p=torch.tensor([0.95, 1.0], device=device),
+        top_k=torch.tensor([50, -1], device=device),
+        all_greedy=False,
+    )
+    logits = torch.randn((4, 16, 1026), device=device)
+    noise = torch.empty((4, 2, 8 * 1026), device=device)
+    offsets = [generator.get_offset() for generator in preview]
+    increment = fill_exponential_steps(noise, tuple(preview))
+    assert [generator.get_offset() for generator in preview] == offsets
+
+    torch_gens = [generator.clone_state() for generator in preview]
+    for step in range(4):
+        for i, generator in enumerate(torch_gens):
+            q = torch.empty_like(noise[step, i]).exponential_(generator=generator)
+            assert torch.equal(noise[step, i], q)
+    for step in range(2):
+        want = model._sample_audio_codes(logits[step].clone(), metadata)
+        got = model._sample_audio_codes(logits[step].clone(), metadata, noise=noise[step].view(-1, 1026))
+        assert torch.equal(want, got)
+    for generator, offset, expected in zip(preview, offsets, baseline, strict=True):
+        generator.set_offset(offset + 2 * increment)
+        assert generator.get_offset() == expected.get_offset()
+
+    # The next step must reuse the first uncommitted draw.
+    metadata.generators = dict(enumerate(preview))
+    want = model._sample_audio_codes(logits[2].clone(), metadata)
+    got = model._sample_audio_codes(logits[2].clone(), metadata, noise=noise[2].view(-1, 1026))
+    assert torch.equal(want, got)
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)

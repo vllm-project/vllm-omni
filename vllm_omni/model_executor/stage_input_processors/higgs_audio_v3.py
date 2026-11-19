@@ -168,33 +168,36 @@ def talker2code2wav(
 # ---------------------------------------------------------------------------
 
 
-def _extract_last_step_row(pooling_output: OmniPayload) -> torch.Tensor | None:
-    """Return the talker's emit row for this AR step as a flat ``[Q]`` tensor.
+def _extract_step_rows(pooling_output: OmniPayload) -> list[list[int]]:
+    codes = pooling_output.get("codes")
+    audio = codes.get("audio") if isinstance(codes, dict) else None
+    if not isinstance(audio, torch.Tensor) or not audio.numel():
+        return []
+    if audio.ndim not in (1, 2) or audio.shape[-1] != _NUM_CODEBOOKS:
+        raise ValueError(f"unexpected audio_codes shape for higgs_audio_v3 async_chunk: {tuple(audio.shape)}")
+    if audio.device.type != "cpu" or audio.is_floating_point():
+        audio = audio.to(device="cpu", dtype=torch.long)
+    return [audio.tolist()] if audio.ndim == 1 else audio.tolist()
 
-    The talker postprocess emits ``codes.audio`` as ``[1, Q]`` (most often) or
-    ``[N, Q]`` for multi-active stages. In the async-chunk path
-    ``pooling_output`` is already request-scoped so the typical shape is
-    ``[1, Q]``. Returns ``None`` if there is no row to append at this step.
 
-    Rows may carry BOC=1024 in trailing codebooks during the ramp-up phase
-    (AR steps 0..Q-2). Those are KEPT verbatim — the de-delay window
-    operation downstream slices them away by construction.
-    """
-    codes = pooling_output.get("codes", {}) if isinstance(pooling_output, dict) else {}
-    audio_codes = codes.get("audio") if isinstance(codes, dict) else None
-    if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
-        return None
-    if audio_codes.ndim == 2:
-        row = audio_codes[-1]
-    elif audio_codes.ndim == 1:
-        row = audio_codes
-    else:
-        raise ValueError(f"unexpected audio_codes shape for higgs_audio_v3 async_chunk: {tuple(audio_codes.shape)}")
-    if row.numel() != _NUM_CODEBOOKS:
-        raise ValueError(
-            f"talker emit row has {row.numel()} codebooks; expected {_NUM_CODEBOOKS} for higgs_audio_v3 async_chunk."
-        )
-    return row.to(torch.long).reshape(-1)
+def _append_step_rows(transfer_manager, request_id, rows, finished, config, emitted_frames):
+    buffered = transfer_manager.code_prompt_token_ids[request_id]
+    chunks = []
+    # Flush at the same row as in single-step decode, including when the
+    # last row of this batch also triggers the terminal flush.
+    for row in rows[:-1]:
+        buffered.append(row)
+        chunk = _flush_async_chunk(transfer_manager, request_id, False, config, emitted_frames)
+        if chunk is not None:
+            chunks.append(chunk)
+    if rows:
+        buffered.append(rows[-1])
+    chunk = _flush_async_chunk(transfer_manager, request_id, finished, config, emitted_frames)
+    if not chunks:
+        return chunk
+    if chunk is not None:
+        chunks.append(chunk)
+    return chunks[0] if len(chunks) == 1 else tuple(chunks)
 
 
 def talker2code2wav_async_chunk(
@@ -202,7 +205,7 @@ def talker2code2wav_async_chunk(
     multimodal_output: OmniPayload | None,
     request: Any,
     is_finished: bool = False,
-) -> OmniPayloadStruct | None:
+) -> OmniPayloadStruct | tuple[OmniPayloadStruct, ...] | None:
     """Streaming adapter: per-step accumulator + sliding-window de-delay flush.
 
     Algorithm:
@@ -241,15 +244,11 @@ def talker2code2wav_async_chunk(
         emitted_frames = {}
         transfer_manager.higgs_v3_emitted_frames = emitted_frames
 
-    if isinstance(pooling_output, dict):
-        row = _extract_last_step_row(pooling_output)
-        if row is not None:
-            transfer_manager.code_prompt_token_ids[request_id].append(row.cpu().tolist())
-    elif not finished:
+    if not isinstance(pooling_output, dict) and not finished:
         return None
-
-    return _flush_async_chunk(
-        transfer_manager, request_id, finished, _async_chunk_config(transfer_manager), emitted_frames
+    rows = _extract_step_rows(pooling_output) if isinstance(pooling_output, dict) else []
+    return _append_step_rows(
+        transfer_manager, request_id, rows, finished, _async_chunk_config(transfer_manager), emitted_frames
     )
 
 
@@ -392,14 +391,8 @@ def talker2code2wav_async_chunk_batch(
     pooling_outputs: list[OmniPayload | None],
     requests: list[Any],
     is_finished: list[bool],
-) -> list[OmniPayloadStruct | None]:
-    """One talker step of async-chunk payloads with one host conversion per row.
-
-    Same accumulation and flush semantics as ``talker2code2wav_async_chunk``;
-    the chunk config is resolved once per step and each emitted ``[1, Q]``
-    CPU row is converted with a single ``tolist`` instead of several small
-    tensor operations per request.
-    """
+) -> list[OmniPayloadStruct | tuple[OmniPayloadStruct, ...] | None]:
+    """Build streaming chunks with one host conversion per request."""
     if not (len(pooling_outputs) == len(requests) == len(is_finished)):
         raise ValueError("batch codec inputs must have identical lengths")
     emitted_frames = getattr(transfer_manager, "higgs_v3_emitted_frames", None)
@@ -407,33 +400,17 @@ def talker2code2wav_async_chunk_batch(
         emitted_frames = {}
         transfer_manager.higgs_v3_emitted_frames = emitted_frames
     config = None
-    rows_by_request = transfer_manager.code_prompt_token_ids
-    payloads: list[OmniPayloadStruct | None] = []
-    for pooling_output, request, finished_flag in zip(pooling_outputs, requests, is_finished):
+    payloads: list[OmniPayloadStruct | tuple[OmniPayloadStruct, ...] | None] = []
+    for pooling_output, request, finished_flag in zip(pooling_outputs, requests, is_finished, strict=True):
         request_id = request.external_req_id
         finished = bool(finished_flag or request.is_finished())
-        if isinstance(pooling_output, dict):
-            codes = pooling_output.get("codes")
-            audio = codes.get("audio") if isinstance(codes, dict) else None
-            if isinstance(audio, torch.Tensor) and audio.numel():
-                if audio.ndim == 2 and audio.device.type == "cpu" and not audio.is_floating_point():
-                    row = audio.tolist()[-1]
-                    if len(row) != _NUM_CODEBOOKS:
-                        raise ValueError(
-                            f"talker emit row has {len(row)} codebooks; expected {_NUM_CODEBOOKS} "
-                            "for higgs_audio_v3 async_chunk."
-                        )
-                else:
-                    row = _extract_last_step_row(pooling_output)
-                    row = None if row is None else row.cpu().tolist()
-                if row is not None:
-                    rows_by_request[request_id].append(row)
-        elif not finished:
+        if not isinstance(pooling_output, dict) and not finished:
             payloads.append(None)
             continue
         if config is None:
             config = _async_chunk_config(transfer_manager)
-        payloads.append(_flush_async_chunk(transfer_manager, request_id, finished, config, emitted_frames))
+        rows = _extract_step_rows(pooling_output) if isinstance(pooling_output, dict) else []
+        payloads.append(_append_step_rows(transfer_manager, request_id, rows, finished, config, emitted_frames))
     return payloads
 
 
