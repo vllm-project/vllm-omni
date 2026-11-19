@@ -95,7 +95,8 @@ steps:
 
       - label: "Tiny Model Tests · Diffusion (base)"
         commands:
-          - timeout 15m pytest -sv -n 4 tests/model_tests/diffusion -m 'core_model and cuda' --run-level "core_model"
+          # Capture worker output so server logs are attached to failed cases.
+          - timeout 15m pytest -v -n 4 tests/model_tests/diffusion -m 'core_model and cuda' --run-level "core_model"
         mirror_hardwares: l4_1
 
   - label: "Engine&Model Executor Test"
