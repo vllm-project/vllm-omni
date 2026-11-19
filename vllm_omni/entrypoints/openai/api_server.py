@@ -971,6 +971,26 @@ def _init_chat_services(
     state.online_renderer.warmup()
 
 
+class _UnsupportedAnthropicMessages:
+    """Reject Anthropic Messages API calls on servers without an LLM stage.
+
+    Upstream's router only falls back to ``serving_tokenization`` when the
+    handler is ``None``; pure-diffusion servers do not have one, so provide a
+    handler that raises ``NotImplementedError`` and let the router translate it
+    into a 501 response instead of failing with ``AttributeError``.
+    """
+
+    @staticmethod
+    def _unsupported() -> None:
+        raise NotImplementedError("The Anthropic Messages API is not supported by diffusion-only models")
+
+    async def create_messages(self, request: Any, raw_request: Any) -> None:
+        self._unsupported()
+
+    async def count_tokens(self, request: Any, raw_request: Any) -> None:
+        self._unsupported()
+
+
 async def omni_init_app_state(
     engine_client: EngineClient,
     state: State,
@@ -1043,6 +1063,10 @@ async def omni_init_app_state(
         state.openai_serving_models = openai_models_serving._DiffusionServingModels(base_model_paths)
         # OMNI: tokenization endpoints are not supported in pure diffusion mode.
         state.serving_tokenization = None
+        # OMNI: the Anthropic Messages API is LLM-only; reject it with a clear
+        # 501 instead of leaving the state key missing (the router otherwise
+        # falls back to the None tokenization handler).
+        state.anthropic_serving_messages = _UnsupportedAnthropicMessages()
 
         # Use for_diffusion method to create chat handler
         state.openai_serving_chat = OmniOpenAIServingChat.for_diffusion(

@@ -374,6 +374,7 @@ _DIFFUSION_APP_STATE_KEYS = {
     "openai_streaming_speech",
     "openai_streaming_video",
     "openai_serving_realtime_robot",
+    "anthropic_serving_messages",
     "rl_rollout_serving",
     "run_serving",
     "enable_server_load_tracking",
@@ -1653,6 +1654,16 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
         must_be_none=_DIFFUSION_MUST_BE_NONE,
     )
     assert state.diffusion_engine is engine
+    assert isinstance(state.anthropic_serving_messages, api_server._UnsupportedAnthropicMessages)
+
+
+@pytest.mark.asyncio
+async def test_pure_diffusion_anthropic_messages_is_not_supported() -> None:
+    handler = api_server._UnsupportedAnthropicMessages()
+    with pytest.raises(NotImplementedError, match="not supported"):
+        await handler.create_messages(None, None)
+    with pytest.raises(NotImplementedError, match="not supported"):
+        await handler.count_tokens(None, None)
 
 
 @pytest.mark.asyncio
