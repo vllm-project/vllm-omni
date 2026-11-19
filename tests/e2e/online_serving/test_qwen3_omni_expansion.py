@@ -181,7 +181,7 @@ def test_text_video_to_text_001(omni_server, online_client) -> None:
 
 
 @hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", test_params + reduced_token_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_audio_to_text_audio_002(omni_server, online_client) -> None:
     """
     Input Modal: text, long-duration audio (~LONG_AUDIO_DURATION_SEC s WAV)
