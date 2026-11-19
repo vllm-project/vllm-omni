@@ -47,7 +47,10 @@ LONG_SESSION_S = 260.0
 # An unpaced session queues its whole input at once.
 LIVE_DEPLOY = write_deploy_overlay(
     get_deploy_config_path("personaplex_live.yaml"),
-    {"live_session_config": {"session_lifetime_s": 1800, "max_sessions": 2, "max_input_backlog_s": 600}},
+    {
+        "live_session_config": {"session_lifetime_s": 1800, "max_sessions": 2, "max_input_backlog_s": 600},
+        "stages": [{"stage_id": 0}],
+    },
 )
 # 224 blocks of 16 frames: vLLM admits a sliding-window request only if the
 # cache holds its window plus one step's tokens (cdiv(2999 + 512, 16) + 1 =
