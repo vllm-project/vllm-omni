@@ -1057,6 +1057,66 @@ def test_ar_receiver_accumulates_rows_and_replaces_chunk_metadata():
     assert merged["meta"]["is_segment_finished"].ndim == 0
 
 
+@pytest.mark.parametrize("consume_each_chunk", [False, True])
+def test_nemotron_ar_receive_replaces_cumulative_timeline_through_eof(plane, consume_each_chunk):
+    from vllm_omni.data_entry_keys import to_dict
+    from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_talker import (
+        NemotronVoiceChatTalkerForConditionalGeneration,
+    )
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import thinker2talker_async_chunk
+
+    receiver = _bare_plane()
+    receiver.init_omni_connectors(SimpleNamespace(stage_id=1, async_chunk=True, worker_type="ar"))
+    connector = SharedMemoryConnector({})
+    receiver._omni_connector = connector
+    external_id = f"nemotron-{uuid.uuid4().hex}"
+    receiver.register_receivers([OmniChunkRecvHandle(request_id="talker", external_req_id=external_id)])
+    plane._custom_process_func = thinker2talker_async_chunk
+    plane._omni_connector = connector
+    plane.request_payload = {}
+    sent = []
+
+    def send_chunks(entries, **_kw):
+        for snapshot, model_output in entries:
+            payload = plane._build_custom_process_payload(
+                snapshot.external_req_id, snapshot, model_output, propagate_errors=True
+            )
+            assert payload is not None
+            chunk_id = plane._put_req_chunk[external_id]
+            assert connector.put("0", "1", f"{external_id}_0_{chunk_id}", to_dict(payload))[0]
+            plane._put_req_chunk[external_id] += 1
+            sent.append(payload)
+        return len(entries)
+
+    plane.send_chunks = send_chunks
+    request = _new_request(external_req_id=external_id)
+    request.resumable = False
+    plane.register_request(request)
+    # Exercise the Talker's real timeline reader without loading model weights.
+    talker = object.__new__(NemotronVoiceChatTalkerForConditionalGeneration)
+    consumed = []
+    try:
+        for token in (31, 32):
+            plane.reserve_outputs([request.req_id])
+            _complete(plane, [None], token=token)
+            assert receiver._poll_single_request("talker", publish_ready=False)
+            if consume_each_chunk:
+                payload = receiver.pop_local_stage_payload("talker")
+                consumed.append(talker._timeline(payload).tolist())
+        # Native EOF has no model output; the producer repeats the final prefix.
+        plane.request_terminal({request.req_id})
+        assert receiver._poll_single_request("talker", publish_ready=False)
+        payload = receiver.pop_local_stage_payload("talker")
+        consumed.append(talker._timeline(payload).tolist())
+        assert consumed == ([[12, 31], [12, 31, 32]] if consume_each_chunk else []) + [[12, 31, 32]]
+        assert talker._upstream_finished(payload)
+        assert [p.ids.all for p in sent] == [[12, 31], [12, 31, 32], [12, 31, 32]]
+        assert "talker" in receiver._chunk_stream_completed
+        assert "talker" not in receiver._pending_load_reqs
+    finally:
+        receiver.shutdown_omni_connectors()
+
+
 def test_terminal_without_processor_payload_still_sends_finish_marker(raw_plane, monkeypatch):
     # Qwen3-Omni's Talker processor returns None on the terminal call when the
     # last frames ended exactly on a chunk boundary; Code2Wav must still learn

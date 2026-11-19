@@ -245,6 +245,8 @@ def thinker2talker_async_chunk(
     return OmniPayloadStruct(
         ids=IdsStruct(all=timeline, prompt=[0]),
         meta=MetaStruct(
+            # Every chunk (including EOF) carries the full text timeline.
+            override_keys=[("ids", "all")],
             finished=torch.tensor(bool(is_finished and not is_duplex), dtype=torch.bool),
             num_processed_tokens=logical_prompt_len,
             # Vendored talker: one placeholder position per chunk (it drains
