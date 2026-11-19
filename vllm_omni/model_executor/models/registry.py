@@ -355,12 +355,6 @@ _OMNI_MODELS = {
         "haru",
         "HaruForConditionalGeneration",
     ),
-    ## Kokoro-82M (hexgrad)
-    "KokoroForConditionalGeneration": (
-        "kokoro",
-        "modeling_kokoro",
-        "KokoroForConditionalGeneration",
-    ),
     ## audio8_tts (Audio8 TTS Preview 0.6B)
     "Audio8TTSSlowARForConditionalGeneration": (
         "audio8_tts",
@@ -547,7 +541,7 @@ _OMNI_MODELS = {
     ## YuE2-3B (text-to-music; single-stage native-AR with terminal NAR/VAE)
     "Yue2ForCausalLM": (
         "yue2",
-        "yue2",
+        "runtime",
         "Yue2ForCausalLM",
     ),
 }
