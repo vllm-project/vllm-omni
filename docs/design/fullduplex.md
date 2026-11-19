@@ -52,6 +52,8 @@ assistant turn once during prefill, since text has no microphone silence
 marking the end of input. The runner creates its response before submission;
 an empty `<|chunk_eos|>` unit returns directly to the session to advance the
 normal continuation clock instead of waiting for nonexistent Talker output.
+The Talker handoff skips those completed control units in cumulative output
+before aligning the next speech unit's text and hidden states.
 Replayed prefill cannot reopen an ended reply. This does not change the separate
 conversation-item text-turn capability or replace assistant playback controls.
 

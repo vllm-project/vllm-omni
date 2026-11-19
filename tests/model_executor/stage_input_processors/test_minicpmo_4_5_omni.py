@@ -473,15 +473,16 @@ def test_native_duplex_turn_eos_row_is_handed_to_talker() -> None:
     assert info["meta"]["turn_end"] is False
 
 
-def test_native_duplex_ledger_anchors_on_unit_after_reinjected_listens() -> None:
-    """Listens from earlier units sit at the head of the segment delta but
+@pytest.mark.parametrize("previous_units", [[9303, 9303], [9303, 9308], [9308, 9309]])
+def test_native_duplex_ledger_anchors_on_unit_after_reinjected_controls(previous_units: list[int]) -> None:
+    """Listens and empty chunks sit at the head of the segment delta but
     were re-injected as prompt tokens, so they are not contiguous with this
     unit's decode rows in the ledger. Anchor on the unit, not the segment."""
     unit_end, unit, audio = 2, 1, 11
     source, latent = _native_source(
         prompt_ids=[101, 102],
-        output_ids=[9303, 9303, 9304, 21, 22, 9308],
-        row_ids=[9303, unit_end, unit, audio, 9303, unit_end, unit, audio, 9304, 21, 22],
+        output_ids=[*previous_units, 9304, 21, 22, 9308],
+        row_ids=[previous_units[0], unit_end, unit, audio, previous_units[1], unit_end, unit, audio, 9304, 21, 22],
     )
 
     info = _native_handoff(source)
