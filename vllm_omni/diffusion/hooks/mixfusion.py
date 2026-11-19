@@ -35,6 +35,7 @@ from vllm_omni.diffusion.mixfusion.plan import (
     MixFusionExpandRows,
     MixFusionReplaceOutput,
     MixFusionRoot,
+    MixFusionSequenceRequest,
 )
 
 # Fixed hook names, one per plan spec type (each target module owns its own
@@ -314,12 +315,21 @@ def plan_foreign_hooks(module: nn.Module, plan: dict | None) -> list[str]:
         for hook_name in getattr(registry, "_hooks", None) or {}:
             if hook_name not in MIXFUSION_HOOK_NAMES:
                 foreign.add(f"{name or '<root>'}:{hook_name}")
-        if getattr(module, "_forward_pre_hooks", None) or getattr(module, "_forward_hooks", None):
+        if any(
+            not getattr(hook, "_mixfusion_compatible", False)
+            for hooks in (getattr(module, "_forward_pre_hooks", {}), getattr(module, "_forward_hooks", {}))
+            for hook in hooks.values()
+        ):
             foreign.add(f"{name or '<root>'}:torch-native")
 
     # The root always sees the swapped-in packed batch, whether or not the
     # plan declares it explicitly.
     scan(module, "")
+    root = (plan or {}).get("")
+    if isinstance(root, MixFusionRoot) and isinstance(root.request, MixFusionSequenceRequest):
+        for name, child in module.named_modules():
+            if name:
+                scan(child, name)
     for name in plan or {}:
         for submodule in _iter_module_path(module, name):
             if submodule is module:

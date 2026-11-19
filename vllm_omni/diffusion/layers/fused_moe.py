@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from typing import Any
 
@@ -7,6 +7,7 @@ import torch
 import vllm.distributed.parallel_state as _vllm_ps
 import vllm.forward_context as _vllm_fc
 
+from vllm_omni.diffusion.mixfusion.plan import mixfusion_compatible_hook
 from vllm_omni.platforms import current_omni_platform
 
 
@@ -83,6 +84,7 @@ class FusedMoE:
         # vLLM 0.18.0 FusedMoE requires this; without it MoE routing is silently
         # incorrect. Previously done in the wrapper's forward(); now a pre-hook
         # on the runner so we can return the runner directly.
+        @mixfusion_compatible_hook
         def _num_tokens_pre_hook(module: Any, args: Any, kwargs: Any) -> None:
             hidden_states = kwargs.get("hidden_states")
             if hidden_states is None and args:

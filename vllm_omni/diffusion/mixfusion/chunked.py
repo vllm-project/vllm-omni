@@ -14,7 +14,7 @@ chunk-stacks its outputs, and the output is reassembled per request.
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
@@ -26,6 +26,9 @@ from vllm_omni.diffusion.mixfusion.execution_plan import (
     reassemble_chunk_rows,
 )
 from vllm_omni.diffusion.mixfusion.plan import MixFusionRoot
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.mixfusion.sequence import PackedSequencePlan
 
 #: Joint attention streams of a packed call, in per-request token order: the
 #: request-level text stream opens each request, the chunk-stacked image
@@ -44,6 +47,20 @@ class ChunkedJointAdapter:
         self.root = root
 
     def validate_inputs(self, module: nn.Module, input_batch: Any) -> None:
+        from vllm_omni.diffusion.mixfusion.scheduling import MixFusionRequestInfo
+
+        for request_id, latent, state in zip(
+            input_batch.request_ids, input_batch.latents, input_batch.states, strict=True
+        ):
+            info = state.mixfusion_info
+            if (
+                not isinstance(info, MixFusionRequestInfo)
+                or latent.ndim != 3
+                or tuple(latent.shape[:2]) != (info.num_images, info.image_tokens)
+            ):
+                raise ValueError(f"MixFusion request {request_id}: actual latents disagree with admitted token counts")
+        if any(latent.shape[2] != input_batch.latents[0].shape[2] for latent in input_batch.latents):
+            raise ValueError("MixFusion latents must share channels, dtype and device")
         for name in self.root.required_inputs:
             if getattr(input_batch, name, None) is None:
                 raise ValueError(f"Scheduled MixFusion batch is missing {name}")
@@ -79,7 +96,11 @@ class ChunkedJointAdapter:
             plan = _build_plan(latents, rows, real_lens, padded, chunk_size=chunk_size, device=text.device)
         return PackedInputs(args=tuple(bound.args), kwargs=dict(bound.kwargs), plan=plan, adapter_state=(key, plan))
 
-    def restore_output(self, module: nn.Module, output: Any, plan: PackedExecutionPlan) -> list[torch.Tensor]:
+    def restore_output(
+        self, module: nn.Module, output: Any, plan: PackedExecutionPlan | PackedSequencePlan
+    ) -> list[torch.Tensor]:
+        if not isinstance(plan, PackedExecutionPlan):
+            raise TypeError("Chunked joint output requires its matching execution plan")
         sample = output[0] if isinstance(output, (tuple, list)) else getattr(output, self.root.output_attr)
         return reassemble_chunk_rows(sample, plan.request_chunk_ranges, plan.image_row_counts)
 
@@ -114,12 +135,18 @@ def _build_plan(
 def resolve_mixfusion_adapter(module: nn.Module, plan: dict | None) -> MixFusionAdapter | None:
     """The adapter that packs ``module``: an explicit ``mixfusion_adapter`` wins.
 
-    Otherwise a plan whose root is a :class:`MixFusionRoot` gets the
-    framework's :class:`ChunkedJointAdapter`. ``None`` means the model is not
-    packable and requests retain dense admission.
+    Otherwise :class:`MixFusionRoot` selects the framework's layout family:
+    sequence requests use ``PrefixKVAdapter`` and other roots use
+    :class:`ChunkedJointAdapter`. ``None`` retains dense admission.
     """
     explicit = getattr(module, "mixfusion_adapter", None)
     if explicit is not None:
         return explicit
     root = (plan or {}).get("")
+    from vllm_omni.diffusion.mixfusion.plan import MixFusionSequenceRequest
+
+    if isinstance(root, MixFusionRoot) and isinstance(root.request, MixFusionSequenceRequest):
+        from vllm_omni.diffusion.mixfusion.sequence import PrefixKVAdapter
+
+        return PrefixKVAdapter()
     return ChunkedJointAdapter(root) if isinstance(root, MixFusionRoot) else None

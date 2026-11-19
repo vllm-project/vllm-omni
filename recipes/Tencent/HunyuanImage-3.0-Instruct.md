@@ -139,7 +139,7 @@ the same checkpoint, parallelism, and image settings.
 Start the DiT-only server with one of the following CLI-only configurations.
 These commands use explicit CLI flags for all parallelism and runtime settings.
 
-**TP=4 + FP8**
+##### TP=4 + FP8
 
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \
@@ -152,7 +152,7 @@ vllm serve tencent/HunyuanImage-3.0-Instruct \
   --enable-diffusion-pipeline-profiler
 ```
 
-**TP=2 + FP8 + SP=2**
+##### TP=2 + FP8 + SP=2
 
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \
@@ -166,7 +166,7 @@ vllm serve tencent/HunyuanImage-3.0-Instruct \
   --enable-diffusion-pipeline-profiler
 ```
 
-**TP=2 + FP8 + CFG=2**
+##### TP=2 + FP8 + CFG=2
 
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \
@@ -296,6 +296,42 @@ of:
 - If you see OOM on 80GB GPUs, reduce image size, request concurrency, or use
   the TP=4 configuration before increasing batch size. GPU memory utilization
   is not a useful primary tuning knob for this DiT-only recipe.
+
+### MixFusion for mixed-resolution text-to-image requests
+
+The standard (non-distilled) model supports MixFusion through the step
+scheduler with `diffusion_kv_mode: dense_legacy`. Start from the DiT-only
+deploy config, use TP with `sequence_parallel_size: 1`, `allgather_degree: 1`
+and `cfg_parallel_size: 1`, then set the diffusion stage options:
+
+```yaml
+step_execution: true
+enable_mixfusion: true
+max_num_seqs: 2
+diffusion_kv_mode: dense_legacy
+diffusion_attention_config:
+  default:
+    backend: FLASH_ATTN  # TORCH_SDPA uses attention-local dense buckets
+```
+
+MixFusion combines each request's CFG branches as independent decoder
+sequences. Image projection and output decoding retain each request's spatial
+shape; no GCD chunks are needed. `mixfusion_min_chunk_tokens` and
+`mixfusion_max_chunks` apply to chunked layouts such as Qwen-Image and do not
+control Hunyuan's flat sequence layout. Increase `max_num_seqs` only after
+checking peak memory for the intended resolutions and prompt lengths.
+
+Some prompts and seeds can exceed image similarity thresholds compared with
+serial execution, even with identical sampling settings. Validate accuracy
+and throughput together for the intended workload and hardware.
+
+Use one output per request. CFG on/off, variable supported resolutions and
+prompt lengths are supported. Image edits, distilled/MeanFlow, SP, CFG
+parallel, diffusion cache backends and KV step skipping retain the existing
+step-execution restrictions. Requests with attention step/sigma schedules
+retain ordinary dense admission. Scheduler-paged KV cannot be combined with
+MixFusion. See the [batching design](../../docs/design/feature/diffusion_continuous_batching.md#hunyuanimage3-prefix-kv-layout)
+for ownership and prefix-KV semantics.
 
 ### Scheduler-managed paged KV (request mode)
 

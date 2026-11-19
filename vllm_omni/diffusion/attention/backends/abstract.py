@@ -13,6 +13,8 @@ from vllm_omni.diffusion.attention.capabilities import (
 )
 from vllm_omni.platforms import current_omni_platform
 
+PACKED_CAUSAL_KEY = "packed_causal"
+
 
 class AttentionBackend(ABC):
     """Abstract class for diffusion attention backends."""
@@ -39,6 +41,11 @@ class AttentionBackend(ABC):
         entirely. Backends whose mask-free behavior is platform-dependent must
         check current_omni_platform.
         """
+        return False
+
+    @classmethod
+    def supports_packed_prefix_kv(cls, kv_cache_dtype: str | None = None) -> bool:
+        """Support independent Q/K lengths and per-call bottom-right causality."""
         return False
 
     @classmethod

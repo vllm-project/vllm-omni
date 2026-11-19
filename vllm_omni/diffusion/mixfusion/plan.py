@@ -37,7 +37,22 @@ step it passes the plan in ``AttentionMetadata.extra[MIXFUSION_PLAN_KEY]`` and
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TypeVar
+
+_Hook = TypeVar("_Hook", bound=Callable)
+
+
+def mixfusion_compatible_hook(hook: _Hook) -> _Hook:
+    """Declare a native hook safe for packed rows.
+
+    Only hooks independent of request layout, or deriving their geometry from
+    the actual input, may opt in. Unknown native hooks remain incompatible.
+    """
+    setattr(hook, "_mixfusion_compatible", True)
+    return hook
+
 
 # =============================================================================
 # MixFusion plan types
@@ -62,6 +77,13 @@ class MixFusionImageRequest:
 
 
 @dataclass(frozen=True)
+class MixFusionSequenceRequest:
+    """Read a trusted CPU sequence summary produced by existing preprocessing."""
+
+    metadata_attr: str = "prepared_layout.mixfusion_sequence"
+
+
+@dataclass(frozen=True)
 class MixFusionRoot:
     """Root (``""``) boundary: pack before forward, reassemble after it.
 
@@ -80,7 +102,7 @@ class MixFusionRoot:
     text_arg: str = "encoder_hidden_states"
     text_mask_arg: str | None = "encoder_hidden_states_mask"
     output_attr: str = "sample"
-    request: MixFusionImageRequest | None = None
+    request: MixFusionImageRequest | MixFusionSequenceRequest | None = None
     # Truthy transformer attributes disable packed admission at startup.
     disabled_if: tuple[str, ...] = ()
     # InputBatch fields checked by the common adapter before execution.

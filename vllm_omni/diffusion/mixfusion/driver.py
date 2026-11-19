@@ -43,21 +43,16 @@ class MixFusionDriver:
             info = state.mixfusion_info
             if state.request_id != request_id or info is None:
                 raise ValueError(f"MixFusion request {request_id}: missing or mismatched admission metadata")
-            if latent.ndim != 3 or tuple(latent.shape[:2]) != (info.num_images, info.image_tokens):
-                raise ValueError(f"MixFusion request {request_id}: actual latents disagree with admitted token counts")
         first = input_batch.latents[0]
-        if any(
-            latent.shape[2] != first.shape[2] or latent.dtype != first.dtype or latent.device != first.device
-            for latent in input_batch.latents
-        ):
-            raise ValueError("MixFusion latents must share channels, dtype and device")
+        if any(latent.dtype != first.dtype or latent.device != first.device for latent in input_batch.latents):
+            raise ValueError("MixFusion latents must share dtype and device")
         self.adapter.validate_inputs(self.transformer, input_batch)
 
     def run(self, input_batch: InputBatch, states: Sequence[Any], dense_step: Callable[..., Any]) -> Any:
         if not input_batch.use_mixfusion:
             self.validate(input_batch)
             return dense_step(input_batch, states=states)
-        if self.pipeline.interrupt:
+        if getattr(self.pipeline, "interrupt", False):
             return None
         error = None
         try:

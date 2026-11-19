@@ -59,6 +59,17 @@ def test_dense_execution_never_arms_packing():
     assert result[1] is None
 
 
+def test_packed_pipeline_need_not_define_optional_interrupt():
+    driver = _driver()
+    pipeline = nn.Module()
+    pipeline.mixfusion_driver = driver
+    driver.pipeline = pipeline
+    states = _states()
+    batch = InputBatch.make_batch(states, use_mixfusion=True)
+    with override_forward_context(ForwardContext()):
+        assert driver.run(batch, states, lambda *a, **kw: 7) == 7
+
+
 def test_approved_batch_arms_empty_context_and_restores_it_on_error():
     states = _states()
     batch = InputBatch.make_batch(states, use_mixfusion=True)

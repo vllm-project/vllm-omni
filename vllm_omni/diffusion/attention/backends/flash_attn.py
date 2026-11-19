@@ -11,7 +11,12 @@ import torch
 import torch.nn.functional as F
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionImpl, AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import (
+    PACKED_CAUSAL_KEY,
+    AttentionBackend,
+    AttentionImpl,
+    AttentionMetadata,
+)
 from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
@@ -213,6 +218,10 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
     @classmethod
+    def supports_packed_prefix_kv(cls, kv_cache_dtype: str | None = None) -> bool:
+        return cls.supports_multi_doc_packed_varlen(kv_cache_dtype=kv_cache_dtype)
+
+    @classmethod
     def supports_attention_mask(cls, attention_spec: object | None = None) -> bool:
         del attention_spec
         return True
@@ -313,7 +322,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             context,
             kernel_variant=self._kernel_variant,
             dtype=str(query.dtype).removeprefix("torch."),
-            causal=self.causal,
+            causal=metadata.extra.get(PACKED_CAUSAL_KEY, self.causal),
             mask_mode=metadata.mask_mode,
             packing_mode=metadata.packing_mode,
             piecewise=metadata.full_attn_spans is not None,
@@ -537,6 +546,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         cu_seqlens_k: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
+        causal: bool | None = None,
     ) -> torch.Tensor:
         """Run FlashAttention directly on an already packed sequence.
 
@@ -562,7 +572,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
-            causal=self.causal,
+            causal=self.causal if causal is None else causal,
             softmax_scale=self.softmax_scale,
             **vllm_varlen_version_kwargs(flash_attn_varlen_func),
         )
@@ -791,6 +801,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 cu_seqlens_k=extra["cu_seqlens_k"],
                 max_seqlen_q=extra["max_seqlen_q"],
                 max_seqlen_k=extra["max_seqlen_k"],
+                causal=extra.get(PACKED_CAUSAL_KEY),
             )
 
         use_masked_path = False
@@ -1055,6 +1066,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 cu_seqlens_k=metadata_plan.extra["cu_seqlens_k"],
                 max_seqlen_q=metadata_plan.extra["max_seqlen_q"],
                 max_seqlen_k=metadata_plan.extra["max_seqlen_k"],
+                causal=metadata_plan.extra.get(PACKED_CAUSAL_KEY),
             )
 
         if attention_mask is not None and torch.any(~attention_mask):

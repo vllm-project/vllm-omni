@@ -19,7 +19,7 @@ if TYPE_CHECKING:
         InteractionChunkMetadata,
         InteractionSession,
     )
-    from vllm_omni.diffusion.mixfusion.scheduling import MixFusionRequestInfo
+    from vllm_omni.diffusion.mixfusion.scheduling import MixFusionRequestInfo, MixFusionSequenceInfo
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 
@@ -90,7 +90,7 @@ class StepRequestState:
     prepared_layout: Any | None = None
     external_req_id: str | None = None
     # Admission metadata retained once per request for execution validation.
-    mixfusion_info: MixFusionRequestInfo | None = None
+    mixfusion_info: MixFusionRequestInfo | MixFusionSequenceInfo | None = None
     # Attention step ranges and sigma windows resolved against the service
     # default when the request reaches the runner; later steps reuse them.
     attention_schedule: AttentionSchedule = ()

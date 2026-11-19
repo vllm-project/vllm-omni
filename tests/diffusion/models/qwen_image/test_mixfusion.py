@@ -51,6 +51,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
     _reference_qk_norm_rope,
 )
+from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -95,7 +96,15 @@ def _transformer(blocks: list[nn.Module] | None = None) -> tuple[QwenImageTransf
 def test_validate_inputs_rejects_reference_images_and_missing_shapes():
     transformer, _ = _transformer()
     adapter = ChunkedJointAdapter(QwenImageTransformer2DModel._mixfusion_plan[""])
-    batch = SimpleNamespace(img_shapes=[(16, 2, 2)], txt_seq_lens=[4], image_latents=None)
+    state = StepRequestState(
+        request_id="a",
+        sampling=OmniDiffusionSamplingParams(),
+        latents=torch.zeros(1, 8, 16),
+        timesteps=torch.tensor([500.0]),
+        mixfusion_info=MixFusionRequestInfo(1, 8, 1, 8),
+    )
+    batch = InputBatch.make_batch([state], use_mixfusion=True)
+    batch.img_shapes, batch.txt_seq_lens = [(16, 2, 2)], [4]
     adapter.validate_inputs(transformer, batch)
     batch.img_shapes = None
     with pytest.raises(ValueError, match="missing img_shapes"):
