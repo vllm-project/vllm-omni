@@ -55,6 +55,7 @@ from vllm_omni.engine.orchestrator import (
     OrchestratorRequestState,
     _build_terminal_empty_output,
     build_engine_core_request_from_tokens,
+    stamp_downstream_stage_submit,
     stamp_stage_submit,
 )
 from vllm_omni.engine.stage_pool import StageUnavailableError
@@ -813,10 +814,13 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             pool = self.stage_pools[context.stage_id]
             if mark_submitting is not None:
                 mark_submitting()
-            # The first enqueue is stamped before submit_initial so scheduler wait
-            # stays inside the stage clock. A resumable append reuses the request
-            # id and refreshes both clocks for this segment only.
-            stamp_stage_submit(request_state, context.stage_id, refresh=submission.already_submitted)
+            stamp_downstream_stage_submit(
+                request_state,
+                context.stage_id,
+                pool,
+                already_submitted=submission.already_submitted,
+                after_submit=False,
+            )
             try:
                 if submission.already_submitted:
                     if not submission.resumable:
@@ -834,6 +838,13 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 if pinned_replica_id is not None:
                     await self._handle_dead_replica(context.stage_id, pinned_replica_id, exc)
                 raise
+            stamp_downstream_stage_submit(
+                request_state,
+                context.stage_id,
+                pool,
+                already_submitted=submission.already_submitted,
+                after_submit=True,
+            )
 
         # The current-stage send has completed. Downstream prewarm
         # must not hold up another session's use of this stage's sender cache.
