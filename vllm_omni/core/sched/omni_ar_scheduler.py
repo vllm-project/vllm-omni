@@ -2489,6 +2489,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # TODO(wzliu)! for offline mode, we should not end process until all data is transferred
         """Mark a request as finished and free its resources."""
         assert request.is_finished()
+        self._record_full_payload_discard(request)
 
         self._omits_kv_transfer_cache.pop(request.request_id, None)
 
