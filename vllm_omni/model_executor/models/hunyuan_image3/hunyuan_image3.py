@@ -82,7 +82,6 @@ from vllm.multimodal.processing import (
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import get_tokenizer
 from vllm.utils.tensor_schema import TensorSchema
-from vllm.v1.outputs import SamplerOutput
 
 from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
 from vllm_omni.model_executor.models.hunyuan_image3._hunyuan_v1_vendored import (
@@ -96,11 +95,10 @@ from vllm_omni.model_executor.models.hunyuan_image3.autoencoder_kl_3d import Aut
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import LightProjector, Siglip2VisionTransformer
 
 if TYPE_CHECKING:
-    from vllm.v1.sample.metadata import SamplingMetadata
-    from vllm.v1.sample.sampler import Sampler
+    from vllm.v1.worker.gpu.sample.sampler import Sampler as MRv2Sampler
 
-if TYPE_CHECKING:
     from vllm_omni.distributed.weight_sharing.adapters import WeightSharingAdapter
+    from vllm_omni.model_executor.models.hunyuan_image3.ar_sampler import HunyuanImage3ARSampler
 
 logger = init_logger(__name__)
 
@@ -1453,12 +1451,6 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
     HunyuanImage3Inputs: TypeAlias = HunyuanImage3PixelInputs
 
-    prefer_model_sampler = True
-    logitsprocs_need_output_token_ids = True
-    # Ask the AR model runner to pass each row's SamplingParams.extra_args to
-    # sample(), so per-request task modes (ar_task_mode) can reach the sampler.
-    model_sampler_wants_extra_args = True
-
     # Siglip2 ViT supports data-parallel encoding (mm_encoder_tp_mode="data"):
     # weights are replicated and the image batch is sharded across TP ranks.
     # Without this flag, vLLM silently falls back to "weights" (TP). See
@@ -1629,12 +1621,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                 self._size_token_id,
             ]
 
-        self._sampler: Sampler | None = None
         self._eos_token_id: int = tokenizer.eos_token_id
-        # Lazily built on first sample() call so we can pick up logits.device
-        # without guessing during init. See `sample()` for the comprehension
-        # fast path that uses this.
-        self._blocked_token_ids_tensor: torch.Tensor | None = None
 
         self._replace_rotary_embeddings()
         self._patch_moe_blocks()
@@ -2049,9 +2036,6 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        sampling_metadata: SamplingMetadata | None = None,
-        logits_index: int | None = None,
-        sampler=None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
         model_input_ids = None if inputs_embeds is not None else input_ids
@@ -2080,138 +2064,12 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
     #      restrict vocab to ratio tokens only (greedy).
     # ------------------------------------------------------------------
 
-    def sample(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-        per_req_extra_args: Sequence[Mapping[str, Any] | None] | None = None,
-    ) -> SamplerOutput | None:
-        from vllm.v1.sample.sampler import Sampler
+    def mrv2_custom_sampler(self, sampler: MRv2Sampler) -> tuple[HunyuanImage3ARSampler, None]:
+        from vllm_omni.model_executor.models.hunyuan_image3.ar_sampler import HunyuanImage3ARSampler
 
-        if logits is None or logits.numel() == 0:
-            return None
-
-        if self._sampler is None:
-            self._sampler = Sampler()
-
-        min_score = torch.finfo(logits.dtype).min
-
-        if self._blocked_token_ids_tensor is None and self._blocked_token_ids:
-            self._blocked_token_ids_tensor = torch.tensor(
-                sorted(self._blocked_token_ids),
-                dtype=torch.long,
-                device=logits.device,
-            )
-
-        if self._is_comprehension:
-            # Comprehension path is stateless: we only need to mask a fixed
-            # set of blocked token ids on every step. Do it in one batched
-            # index_fill_ instead of a per-(req, id) Python loop of scalar
-            # GPU writes, and skip reading `output_token_ids` from CPU
-            # (unused here) so this branch never forces a D2H sync.
-            if self._blocked_token_ids_tensor is not None:
-                logits.index_fill_(-1, self._blocked_token_ids_tensor, min_score)
-            return self._sampler(logits=logits, sampling_metadata=sampling_metadata)
-
-        # Generation-mode engine. Individual requests can still be
-        # comprehension (I2T/T2T chat served by an AR+DiT deployment); the
-        # serving layer marks those with extra_args["ar_task_mode"] ==
-        # "comprehension", and they get the stateless blocking above instead
-        # of stage-transition forcing (#6088).
-        for req_idx in range(logits.shape[0]):
-            if self._row_is_comprehension(per_req_extra_args, req_idx):
-                if self._blocked_token_ids_tensor is not None:
-                    logits[req_idx].index_fill_(-1, self._blocked_token_ids_tensor, min_score)
-                continue
-
-            decoded_tokens: list[int] = (
-                sampling_metadata.output_token_ids[req_idx] if req_idx < len(sampling_metadata.output_token_ids) else []
-            )
-            last_token = decoded_tokens[-1] if decoded_tokens else -1
-
-            forced = self._get_forced_token(decoded_tokens)
-            if forced is not None:
-                logits[req_idx].fill_(min_score)
-                logits[req_idx, forced] = 0
-            elif last_token == self._size_token_id:
-                self._apply_ratio_restriction(logits, req_idx, min_score)
-            elif last_token in self._all_ratio_ids:
-                logits[req_idx].fill_(min_score)
-                logits[req_idx, self._eos_token_id] = 0
-
-        return self._sampler(logits=logits, sampling_metadata=sampling_metadata)
-
-    @staticmethod
-    def _row_is_comprehension(
-        per_req_extra_args: Sequence[Mapping[str, Any] | None] | None,
-        req_idx: int,
-    ) -> bool:
-        """Whether this batch row is a per-request comprehension override.
-
-        Defaults to False (generation) when no extra_args reached the
-        sampler, so offline ``Omni.generate`` image-generation flows keep
-        the stage-transition behavior unchanged.
-        """
-        if per_req_extra_args is None or req_idx >= len(per_req_extra_args):
-            return False
-        extra_args = per_req_extra_args[req_idx]
-        if not extra_args:
-            return False
-        return extra_args.get("ar_task_mode") == "comprehension"
-
-    def _get_forced_token(self, decoded_tokens: list[int]) -> int | None:
-        """Derive the next forced token from output history (stateless).
-
-        Scans decoded_tokens backwards for the most recent trigger token,
-        then prefix-matches the forced sequence against what followed.
-        Returns the next token to force, or None if the sequence is complete
-        or history has diverged from the expected forced sequence.
-        """
-        for i in range(len(decoded_tokens) - 1, -1, -1):
-            trigger = decoded_tokens[i]
-            if trigger not in self._stage_transitions:
-                continue
-
-            forced_seq = self._stage_transitions[trigger]
-            emitted = decoded_tokens[i + 1 :]
-
-            matched = 0
-            for expected, actual in zip(forced_seq, emitted):
-                if actual != expected:
-                    # History diverged from the expected forced sequence.
-                    # Stop applying transition forcing for safety.
-                    return None
-                matched += 1
-
-            if matched < len(forced_seq):
-                return forced_seq[matched]
-            return None
-
-        return None
-
-    def _apply_ratio_restriction(
-        self,
-        logits: torch.Tensor,
-        req_idx: int,
-        min_score: float,
-    ) -> None:
-        """Port of official _ConditionalSliceVocabLogitsProcessor.__call__.
-
-        After the size token, only allow ratio tokens and pick greedily.
-        """
-        original = logits[req_idx].clone()
-        logits[req_idx].fill_(min_score)
-        # Allow primary ratio range.
-        logits[req_idx, self._start_ratio_id : self._end_ratio_id + 1] = original[
-            self._start_ratio_id : self._end_ratio_id + 1
-        ]
-        # Allow extra ratio slices.
-        for s, e in self._ratio_other_slices:
-            logits[req_idx, s:e] = original[s:e]
-        # Force greedy: keep only the argmax.
-        max_id = logits[req_idx].argmax().item()
-        logits[req_idx].fill_(min_score)
-        logits[req_idx, max_id] = 0
+        if self.vllm_config.speculative_config is not None:
+            raise NotImplementedError("HunyuanImage3 AR on MRv2 requires speculative decoding to be disabled")
+        return HunyuanImage3ARSampler(sampler, self), None
 
     def make_empty_intermediate_tensors(
         self, batch_size: int, dtype: torch.dtype, device: torch.device
