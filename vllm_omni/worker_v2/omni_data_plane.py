@@ -10,7 +10,7 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from queue import Full, Queue
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.logger import init_logger
@@ -26,6 +26,9 @@ from vllm_omni.worker_v2.delivery import (
     DeliveryTimeoutError,
     OmniDeliveryManager,
 )
+
+if TYPE_CHECKING:
+    from vllm_omni.outputs import OmniModelRunnerOutput
 
 
 @dataclass
@@ -69,7 +72,13 @@ class _NativeRequestState:
                 self.output_stopped = True
                 break
 
-    def snapshot(self, *, include_token_history: bool, sampled_token_ids: list[int] | None = None) -> SimpleNamespace:
+    def snapshot(
+        self,
+        *,
+        include_token_history: bool,
+        sampled_token_ids: list[int] | None = None,
+        perf_chunk: tuple[int, int] | None = None,
+    ) -> SimpleNamespace:
         prompt = list(self.prompt_token_ids) if include_token_history else []
         output = list(self.output_token_ids) if include_token_history else []
         finished = self.finished
@@ -87,6 +96,7 @@ class _NativeRequestState:
             sampled_token_ids=list(sampled_token_ids or ()),
             additional_information=self.additional_information,
             model_intermediate_buffer=self.model_intermediate_buffer,
+            _omni_duplex_perf_chunk=perf_chunk,
             sampling_params=self.sampling_params,
             num_computed_tokens=self.num_computed_tokens,
             resumable=self.resumable,
@@ -101,6 +111,7 @@ class _NativeOutputBatch:
     req_ids: list[str]
     inter_stage_outputs: list[Any | None] | None
     sampled_token_ids: list[list[int]] | None
+    perf_chunks: dict[str, tuple[int, int]] | None = None
 
 
 _NATIVE_OUTPUT_STOP = object()
@@ -202,11 +213,27 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                     req_ids=batch.req_ids,
                     inter_stage_outputs=batch.inter_stage_outputs,
                     sampled_token_ids=batch.sampled_token_ids,
+                    perf_chunks=batch.perf_chunks,
                 )
             except BaseException as error:
                 self._record_output_error(error)
             finally:
                 self._native_output_queue.task_done()
+
+    def publish_output(self, output: OmniModelRunnerOutput) -> None:
+        """Enqueue a materialized batch and remove transported output aliases."""
+        inter_stage_outputs = getattr(output, "inter_stage_outputs", None)
+        self.enqueue_outputs(
+            req_ids=list(output.req_ids),
+            inter_stage_outputs=inter_stage_outputs,
+            sampled_token_ids=getattr(output, "sampled_token_ids", None),
+            perf_chunks=output._duplex_perf_chunks,
+        )
+        # Clear only after enqueueing succeeds: the queue retains the payload.
+        # Keep independent pooling results and inline output without a send path.
+        if inter_stage_outputs is not None and output.pooler_output is inter_stage_outputs and self._can_send:
+            output.pooler_output = None
+        output.inter_stage_outputs = None
 
     def enqueue_outputs(
         self,
@@ -214,6 +241,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         req_ids: list[str],
         inter_stage_outputs: list[Any | None] | None,
         sampled_token_ids: list[list[int]] | None,
+        perf_chunks: dict[str, tuple[int, int]] | None = None,
     ) -> None:
         """Transfer one completed model batch to the ordered output worker."""
         self._raise_output_error()
@@ -223,6 +251,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             req_ids=req_ids,
             inter_stage_outputs=inter_stage_outputs,
             sampled_token_ids=sampled_token_ids,
+            perf_chunks=perf_chunks,
         )
         while True:
             try:
@@ -298,6 +327,10 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
     def reserve_outputs(self, req_ids: list[str]) -> None:
         """Keep request state alive until deferred runner outputs are consumed."""
         self._raise_output_error()
+        # Native TP executors materialize async output on the replying leader
+        # only. A peer rank never completes a deferred publication hold.
+        if not self.is_data_transfer_rank():
+            return
         with self._native_output_lock:
             for req_id in dict.fromkeys(req_ids):
                 if req_id in self._native_requests:
@@ -359,6 +392,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         req_ids: list[str],
         inter_stage_outputs: list[Any | None] | None,
         sampled_token_ids: list[list[int]] | None,
+        perf_chunks: dict[str, tuple[int, int]] | None = None,
     ) -> int:
         """Commit one deferred output batch, then release its lifecycle holds."""
         send_lock_held = False
@@ -368,6 +402,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 inter_stage_outputs=inter_stage_outputs,
                 sampled_token_ids=sampled_token_ids,
                 terminal_req_ids=set(),
+                perf_chunks=perf_chunks,
             )
             # Claim connector ordering before publishing the updated request
             # state. request_terminal() can still register a pending terminal
@@ -525,6 +560,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         inter_stage_outputs: list[Any | None] | None,
         sampled_token_ids: list[list[int]] | None,
         terminal_req_ids: set[str],
+        perf_chunks: dict[str, tuple[int, int]] | None = None,
     ) -> tuple[list[tuple[Any, Any | None]], list[str]]:
         if not getattr(self, "_can_send", True):
             receive_finished_ids = [req_id for req_id in sorted(terminal_req_ids) if req_id in self._native_requests]
@@ -582,6 +618,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                     state.snapshot(
                         include_token_history=include_token_history,
                         sampled_token_ids=sampled_by_req.get(req_id) if not state.finished else None,
+                        perf_chunk=(perf_chunks or {}).get(req_id),
                     ),
                     payload,
                 )

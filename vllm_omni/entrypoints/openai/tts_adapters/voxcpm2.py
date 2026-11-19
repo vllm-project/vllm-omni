@@ -3,7 +3,7 @@
 """VoxCPM2 serving adapter (AR base-LM + diffusion side-computation)."""
 
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from vllm.logger import init_logger
@@ -13,6 +13,9 @@ from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_precomputed_speakers
 from vllm_omni.utils.speaker_cache import validate_voxcpm2_profile
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 logger = init_logger(__name__)
 
@@ -35,7 +38,7 @@ class VoxCPM2Adapter(ARTTSAdapter):
 
     def __init__(self, ctx) -> None:
         super().__init__(ctx)
-        self._tokenizer = None
+        self._tokenizer: PreTrainedTokenizerBase | None = None
         self._split_map: dict[int, list[int]] = {}
 
     def _encode(self, text: str) -> list[int]:
@@ -47,11 +50,13 @@ class VoxCPM2Adapter(ARTTSAdapter):
         )
 
         if self._tokenizer is None:
+            assert self.ctx.engine_client is not None
             self._tokenizer = AutoTokenizer.from_pretrained(
                 self.ctx.engine_client.model_config.model, trust_remote_code=True
             )
             self._split_map = build_cjk_split_map(self._tokenizer)
             logger.info("VoxCPM2 serving: built multichar split map (%d entries)", len(self._split_map))
+        assert self._tokenizer is not None
         ids = self._tokenizer.encode(text, add_special_tokens=True)
         return split_multichar_chinese(ids, self._split_map)
 
@@ -68,6 +73,7 @@ class VoxCPM2Adapter(ARTTSAdapter):
         from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import build_voxcpm2_prompt
 
         server = self.ctx.server
+        assert self.ctx.engine_client is not None
         self._encode("")
         ref_audio = None
         ref_sr = None
@@ -96,6 +102,11 @@ class VoxCPM2Adapter(ARTTSAdapter):
         server = self.ctx.server
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
+
+        if request.ref_audio is not None:
+            fmt_err = server._validate_ref_audio_format(request.ref_audio)
+            if fmt_err:
+                return fmt_err
 
         if request.voice is not None:
             request.voice = request.voice.lower()

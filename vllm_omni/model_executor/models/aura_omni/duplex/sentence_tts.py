@@ -9,20 +9,9 @@ from typing import Any
 from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.plugin import PartialStageForward
+from vllm_omni.engine.duplex.sentence_tts import SentenceTtsOutput
 
 logger = init_logger(__name__)
-
-
-class SentenceTtsOutput:
-    """Stage1 view that exposes only the sentence Talker should speak."""
-
-    def __init__(self, request_id: str, text: str) -> None:
-        self.request_id = request_id
-        self.finished = False
-        self.text = text
-        self.cumulative_text = text
-        self.outputs = [self]
-        self.token_ids: list[int] = []
 
 
 def _call_decode(decode: Any, token_ids: list[int]) -> str:
