@@ -13,7 +13,6 @@
 x-qwen3-tts: &qwen3_tts
   - vllm_omni/engine/async_omni_engine.py
   - vllm_omni/entrypoints/omni_base.py
-  - vllm_omni/worker/gpu_model_runner.py
   - vllm_omni/model_executor/models/qwen3_tts/
   - vllm_omni/model_executor/models/common/qwen3_code_predictor.py
   - vllm_omni/model_executor/models/common/fused_sampling.py
@@ -199,7 +198,6 @@ x-qwen3-omni-evaluation: &qwen3_omni_evaluation
   - vllm_omni/distributed/omni_connectors/transfer_adapter/
   - vllm_omni/distributed/omni_connectors/utils/
   # Shared runner/data contracts also consumed by NPU workers.
-  - vllm_omni/worker/gpu_model_runner.py
   - vllm_omni/worker/mixins.py
   - vllm_omni/worker/sampling_utils.py
   - vllm_omni/worker/output/
@@ -302,9 +300,7 @@ x-qwen3-omni-evaluation: &qwen3_omni_evaluation
 x-gpu-v1-workers: &gpu_v1_workers
   - vllm_omni/worker/base.py
   - vllm_omni/worker/encoder_cudagraph.py
-  - vllm_omni/worker/gpu_ar_model_runner.py
   - vllm_omni/worker/gpu_ar_worker.py
-  - vllm_omni/worker/gpu_generation_model_runner.py
   - vllm_omni/worker/gpu_generation_worker.py
   - vllm_omni/worker/gpu_memory_utils.py
   - vllm_omni/worker/memory_utils.py
@@ -416,6 +412,71 @@ x-lingbot-world: &lingbot_world
 
 
 source_file_dependencies:
+  lingbot_world_perf:
+    - tests/dfx/perf/tests/test_lingbot_world_realtime.json
+    - tests/e2e/accuracy/lingbot_world/configs/
+    - tests/dfx/perf/scripts/run_benchmark.py
+    - tests/dfx/conftest.py
+    - vllm_omni/benchmarks/realtime_video/
+    - vllm_omni/benchmarks/serve.py
+    - vllm_omni/benchmarks/patch/patch.py
+    - vllm_omni/benchmarks/metrics/
+    - vllm_omni/metrics/
+    - vllm_omni/diffusion/offloader/
+    - vllm_omni/entrypoints/cli/benchmark/cli_args.py
+    - vllm_omni/entrypoints/cli/benchmark/serve.py
+    - tests/benchmarks/test_realtime_video_serve.py
+    - tests/benchmarks/test_serve_cli.py
+    - tests/benchmarks/test_lingbot_world_cases.py
+    - tests/benchmarks/test_lingbot_world_ci.py
+    - tests/benchmarks/test_lingbot_world_encoder_inference.py
+    - tests/benchmarks/test_lingbot_world_media.py
+    - tests/benchmarks/test_lingbot_world_precision.py
+    - tests/benchmarks/test_lingbot_world_provenance.py
+    - tests/benchmarks/test_lingbot_world_realtime.py
+    - tests/benchmarks/test_lingbot_world_regression.py
+    - tests/benchmarks/test_lingbot_world_video_quality.py
+    - tests/diffusion/models/lingbot_world/
+    - tests/e2e/online_serving/test_lingbot_world_v2_stepwise.py
+    - tests/helpers/runtime.py
+    - vllm_omni/diffusion/models/lingbot_world/
+    - vllm_omni/experimental/ar_diffusion/
+    - vllm_omni/entrypoints/openai/serving_video_output_stream.py
+    - vllm_omni/entrypoints/openai/video_stream_base.py
+    - vllm_omni/diffusion/distributed/autoencoders/
+  lingbot_world_accuracy:
+    - tests/e2e/accuracy/lingbot_world/
+    - pyproject.toml
+    - requirements/video-quality.txt
+    - requirements/video-quality.in
+    - vllm_omni/benchmarks/realtime_video/
+    - vllm_omni/benchmarks/serve.py
+    - vllm_omni/benchmarks/patch/patch.py
+    - vllm_omni/benchmarks/metrics/
+    - vllm_omni/metrics/
+    - vllm_omni/diffusion/offloader/
+    - vllm_omni/entrypoints/cli/benchmark/cli_args.py
+    - vllm_omni/entrypoints/cli/benchmark/serve.py
+    - tests/benchmarks/test_realtime_video_serve.py
+    - tests/benchmarks/test_realtime_video_eval.py
+    - tests/benchmarks/test_serve_cli.py
+    - tests/benchmarks/test_lingbot_world_cases.py
+    - tests/benchmarks/test_lingbot_world_ci.py
+    - tests/benchmarks/test_lingbot_world_encoder_inference.py
+    - tests/benchmarks/test_lingbot_world_media.py
+    - tests/benchmarks/test_lingbot_world_precision.py
+    - tests/benchmarks/test_lingbot_world_provenance.py
+    - tests/benchmarks/test_lingbot_world_realtime.py
+    - tests/benchmarks/test_lingbot_world_regression.py
+    - tests/benchmarks/test_lingbot_world_video_quality.py
+    - tests/diffusion/models/lingbot_world/
+    - tests/e2e/online_serving/test_lingbot_world_v2_stepwise.py
+    - tests/helpers/runtime.py
+    - vllm_omni/diffusion/models/lingbot_world/
+    - vllm_omni/experimental/ar_diffusion/
+    - vllm_omni/entrypoints/openai/serving_video_output_stream.py
+    - vllm_omni/entrypoints/openai/video_stream_base.py
+    - vllm_omni/diffusion/distributed/autoencoders/
   # Hardware presets and shared test helpers. Not a job key — do not attach this
   # to a step. Fallback-only diffs keep every job, even when a job lists a shared
   # path. Mixed diffs use normal job dependencies when any job-key prefix matches.
@@ -460,6 +521,7 @@ source_file_dependencies:
 
   # Tiny-model diffusion jobs (shared across many model trees under models/).
   diffusion_tiny_model:
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
     - tests/model_tests/diffusion/
     - vllm_omni/diffusion/models/
 
@@ -657,7 +719,8 @@ source_file_dependencies:
     - docker/Dockerfile.ci
     - docker/Dockerfile.ci.dockerignore
     - requirements/cuda.txt
-    - requirements/cuda-bootstrap.txt
+    - requirements/cuda-runtime.txt
+    - requirements/cuda-telemetry-overrides.txt
     - requirements/cudnn-runtime.txt
     - tools/prepare_ci_telemetry.py
     - .buildkite/cuda/scripts/build-ci-image.sh
@@ -670,11 +733,8 @@ source_file_dependencies:
     - vllm_omni/platforms/npu/attention/
     - vllm_omni/platforms/npu/native_rejection_sampler.py
     - vllm_omni/platforms/npu/worker/base.py
-    - vllm_omni/platforms/npu/worker/npu_ar_model_runner.py
     - vllm_omni/platforms/npu/worker/npu_ar_worker.py
-    - vllm_omni/platforms/npu/worker/npu_generation_model_runner.py
     - vllm_omni/platforms/npu/worker/npu_generation_worker.py
-    - vllm_omni/platforms/npu/worker/npu_model_runner.py
     - vllm_omni/platforms/npu/worker/talker_narrow_replay.py
     - vllm_omni/worker/talker_multiframe.py
     - docker/Dockerfile.npu.ci
@@ -820,6 +880,7 @@ source_file_dependencies:
     - vllm_omni/deploy/minicpmo_4_5_3gpu_stage1_replicas.yaml
 
   omni_minicpmo_4_5_accuracy:
+    - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
     - *minicpmo_4_5
     - tests/e2e/accuracy/minicpmo_4_5/
 
@@ -1276,6 +1337,25 @@ source_file_dependencies:
     - vllm_omni/worker_v2/
     - vllm_omni/platforms/npu/worker/npu_omni_v2_model_runner.py
 
+  # CosyVoice3 cross-request voice isolation (nightly TTS L4 step, listed next to
+  # tts_qwen3_tts_function). Covers the model, its stage processor, the deploy
+  # yaml the test uses, the speech adapter that sets voice_name for registered
+  # voices, the voice upload/delete routes, the speaker cache keyed by voice name,
+  # and the shared payload/batching path that carries per-request conditioning
+  # to the model.
+  tts_cosyvoice3_voice_isolation:
+    - vllm_omni/model_executor/models/cosyvoice3/
+    - vllm_omni/model_executor/stage_input_processors/cosyvoice3.py
+    - vllm_omni/deploy/cosyvoice3.yaml
+    - vllm_omni/entrypoints/openai/tts_adapters/cosyvoice3.py
+    - vllm_omni/entrypoints/openai/api_server.py
+    - vllm_omni/utils/mm_outputs.py
+    - vllm_omni/utils/speaker_cache.py
+    - vllm_omni/worker_v2/
+    - vllm_omni/entrypoints/openai/serving_speech.py
+    - tests/e2e/online_serving/test_cosyvoice3_voice_isolation.py
+    - tests/helpers/speaker_similarity.py
+
   tts_lfm3_function:
     - *lfm3
     - tests/e2e/online_serving/test_lfm3_omni.py
@@ -1334,7 +1414,6 @@ source_file_dependencies:
     - vllm_omni/model_executor/stage_input_processors/voxtral_tts.py
     - vllm_omni/transformers_utils/configs/voxtral_tts.py
     - vllm_omni/transformers_utils/parsers/voxtral_tts.py
-    - vllm_omni/worker/gpu_model_runner.py
     - vllm_omni/worker_v2/
 
   tts_qwen3_tts_cov:
@@ -1351,8 +1430,6 @@ source_file_dependencies:
     - vllm_omni/model_executor/models/registry.py
     - vllm_omni/model_executor/models/model_local_kv.py
     - vllm_omni/transformers_utils/configs/
-    - vllm_omni/worker/gpu_ar_model_runner.py
-    - vllm_omni/worker/gpu_model_runner.py
     - vllm_omni/worker/sparse_audio.py
     - vllm_omni/outputs/output_processor.py
     - vllm_omni/deploy/vibevoice.yaml
@@ -1476,7 +1553,6 @@ source_file_dependencies:
     - vllm_omni/config/
     - vllm_omni/engine/
     - vllm_omni/worker/gpu_ar_worker.py
-    - vllm_omni/worker/gpu_ar_model_runner.py
     - vllm_omni/worker_v2/
     - vllm_omni/diffusion/worker/
     - vllm_omni/diffusion/stage_diffusion_proc.py
@@ -1523,6 +1599,8 @@ source_file_dependencies:
     - vllm_omni/entrypoints/openai/
 
   diffusion_minimax_h3_accuracy:
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
     - *minimax_h3
     - tests/e2e/accuracy/minimax_h3/
 

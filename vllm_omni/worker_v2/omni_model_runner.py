@@ -36,15 +36,18 @@ from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
+from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     uses_native_mrv2_data_plane,
 )
+from vllm_omni.model_executor.mm_request_rng import supports_mm_request_rng
 from vllm_omni.model_executor.models.interfaces import SupportsMRv2MultiFrameDecode, supports_multi_frame_decode
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import sanitize_sampling_params_min_tokens_stop_ids
 from vllm_omni.worker_v2 import staged_writes
+from vllm_omni.worker_v2.mm_request_rng import MMRequestRNGState
 from vllm_omni.worker_v2.model_states import init_omni_model_state
 from vllm_omni.worker_v2.model_states.intermediate_buffer import (
     _resolve_additional_information,
@@ -58,6 +61,7 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 
     from vllm_omni.distributed.weight_sharing.adapters import WeightSharingAdapter
+    from vllm_omni.outputs import OmniModelRunnerOutput
     from vllm_omni.worker_v2.native_output_worker import NativeOutputWorker
 
 logger = init_logger(__name__)
@@ -81,6 +85,9 @@ def _runner_assisted_batch_descriptor(
 def _needs_capture_tensor_unwrap(model: Any) -> bool:
     if getattr(model, "_returns_tuple", False):
         return True
+    # Native drafters own their (hidden states, target layers) tuple.
+    if getattr(model, "mrv2_forward_returns_native_aux", False) is True:
+        return False
     # Some models build multimodal outputs from the live batch after replay.
     return bool(getattr(model, "have_multimodal_outputs", False)) and (
         getattr(model, "mrv2_forward_returns_tensor", False) is not True
@@ -104,6 +111,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     encoder_cache: EncoderCache | None
     _native_output_materializer: NativeOutputWorker | None
     model_state: OmniModelState
+    _mm_rng_state: MMRequestRNGState | None = None
     vocab_size: int
     # Speculative decoding state; the upstream __init__ sets the real values.
     use_aux_hidden_state_outputs: bool = False
@@ -193,11 +201,17 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         input_batch: Any,
     ) -> torch.Tensor:
         """Call the native vLLM multimodal embedding contract."""
-        return self.model_state.prepare_inputs_embeds(
-            scheduled_encoder_inputs,
-            input_batch,
-            self.req_states,
+        rng_scope = (
+            self._mm_rng_state.tagged_inputs(scheduled_encoder_inputs, self.encoder_cache)
+            if self._mm_rng_state is not None and self.encoder_cache is not None
+            else nullcontext()
         )
+        with rng_scope:
+            return self.model_state.prepare_inputs_embeds(
+                scheduled_encoder_inputs,
+                input_batch,
+                self.req_states,
+            )
 
     def _prepare_mm_inputs(
         self,
@@ -255,13 +269,11 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         parallel_config = self.vllm_config.parallel_config
         if parallel_config.pipeline_parallel_size > 1:
             raise NotImplementedError(
-                "Omni Model Runner V2 does not support pipeline parallel; "
-                "use model_runner: v1 when pipeline_parallel_size > 1"
+                "Omni Model Runner V2 does not support pipeline parallel; set pipeline_parallel_size=1"
             )
         if getattr(parallel_config, "prefill_context_parallel_size", 1) > 1:
             raise NotImplementedError(
-                "Omni Model Runner V2 does not support prefill context parallelism; "
-                "use model_runner: v1 when prefill_context_parallel_size > 1"
+                "Omni Model Runner V2 does not support prefill context parallelism; set prefill_context_parallel_size=1"
             )
 
     @staged_writes.runner_context
@@ -276,6 +288,9 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         ] == [LogitBiasState, PenaltiesState, BadWordsState]
         if not scheduler_output.scheduled_new_reqs and static_staged_writes:
             return
+        if self._mm_rng_state is not None:
+            for request_data in scheduler_output.scheduled_new_reqs:
+                self._mm_rng_state.add_request(request_data.req_id, request_data.mm_features)
         logits_processor = getattr(self.model, "logits_processor", None)
         logits_vocab = getattr(logits_processor, "vocab_size", None)
         if logits_vocab is None:
@@ -295,6 +310,8 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             super().add_requests(scheduler_output)
 
     def shutdown(self) -> None:
+        if self._mm_rng_state is not None:
+            self._mm_rng_state.clear()
         # Every owner must release its resources even if an earlier drain fails.
         try:
             state = getattr(self, "model_state", None)
@@ -385,10 +402,19 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         plane = getattr(self, "_omni_data_plane", None)
         return 0 if plane is None else plane.release_shm_resources(request_ids)
 
-    def _reserve_native_data_plane_outputs(self, req_ids: list[str]) -> None:
+    def _reserve_native_data_plane_outputs(self, output: OmniModelRunnerOutput) -> None:
         plane = getattr(self, "_omni_data_plane", None)
         if plane is not None:
-            plane.reserve_outputs(req_ids)
+            # The materializer and transport can run after the next scheduler
+            # update. Bind each tag to this output while its model step is live.
+            buffers = self.model_state.intermediate_buffer.buffers
+            output._duplex_perf_chunks = {
+                req_id: chunk
+                for req_id in output.req_ids
+                if (req_idx := self.req_states.req_id_to_index.get(req_id)) is not None
+                and (chunk := perf_chunk_from_buffer(buffers[req_idx])) is not None
+            }
+            plane.reserve_outputs(output.req_ids)
 
     def _attach_native_data_plane_signals(self, output: Any) -> Any:
         plane = getattr(self, "_omni_data_plane", None)
@@ -443,6 +469,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         ):
             self.supports_mm_inputs = False
             self.encoder_cache = None
+        self._mm_rng_state = MMRequestRNGState(self.model) if supports_mm_request_rng(self.model) else None
 
         self._publish_shared_backbone_if_configured()
         # After model ``__init__`` (which may set cudagraph_specialize_moe_routing).
@@ -528,10 +555,12 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     # ------------------------------------------------------------------
 
     def _exclude_unsupported_full_graphs(self) -> None:
-        # vLLM 0.29 keys dispatch candidates by (uniform token count, LoRA count).
+        # Keep both native token- and request-keyed dispatch tables aligned
+        # with the capture plan. Uniform decode tables contain FULL graphs.
         manager = self.cudagraph_manager
         assert manager is not None
         manager._capture_descs.pop(CUDAGraphMode.FULL, None)
+        manager._decode_descs.clear()
         manager._candidates = {
             key: [desc for desc in candidates if desc.cg_mode != CUDAGraphMode.FULL]
             for key, candidates in manager._candidates.items()
@@ -614,7 +643,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         torch.accelerator.synchronize()
         return max(free_before - torch.accelerator.get_memory_info()[0], 0)
 
-    def _dispatch_mtp_batch_descriptor(self, num_mtp_reqs: int) -> Any:
+    def _dispatch_mtp_batch_descriptor(self, num_mtp_reqs: int) -> BatchExecutionDescriptor:
         capture_sizes = self.model_state._get_mtp_capture_sizes()
         captured_bucket = next(
             (size for size in sorted(capture_sizes) if num_mtp_reqs <= size <= self.scheduler_config.max_num_seqs),
@@ -626,11 +655,14 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                 num_tokens=num_mtp_reqs,
                 num_reqs=num_mtp_reqs,
             )
-        return self.cudagraph_manager.dispatch(
-            captured_bucket,
-            captured_bucket,
-            1,
-            0,
+        # MTP owns a FULL graph wrapper and capture buckets independently of
+        # the backbone. Its replay must use the same mode as capture even when
+        # the backbone excludes FULL graphs for structured outputs.
+        return BatchExecutionDescriptor(
+            cg_mode=CUDAGraphMode.FULL,
+            num_tokens=captured_bucket,
+            num_reqs=captured_bucket,
+            uniform_token_count=1,
         )
 
     def _make_dummy_input_batch(
@@ -1090,7 +1122,8 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         else:
             batch_descriptor = BatchDescriptor(
                 num_tokens=input_batch.num_tokens_after_padding,
-                has_lora=self.lora_config is not None,
+                # vLLM 0.34 dropped BatchDescriptor.has_lora; num_active_loras
+                # carries the lora state.
                 num_active_loras=batch_desc.num_active_loras,
             )
             try:
@@ -1226,6 +1259,9 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         # because super() calls req_states.remove_request(req_id) which pops the
         # mapping and returns the slot index to free_indices.
         finished = scheduler_output.finished_req_ids
+        if self._mm_rng_state is not None:
+            for req_id in finished:
+                self._mm_rng_state.discard(req_id)
         on_finished = getattr(self.model, "on_requests_finished", None)
         if finished and callable(on_finished):
             # Request-owned state outlives generation slots and chunk boundaries.

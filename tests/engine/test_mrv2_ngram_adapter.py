@@ -61,7 +61,7 @@ def test_ascend_mrv1_thinker_keeps_worker_drafts_with_duplex_guard(thinker_confi
 def test_ascend_mrv2_thinker_rejects_ngram_gpu(thinker_config):
     thinker_config.speculative_config.method = "ngram_gpu"
 
-    with pytest.raises(ValueError, match="ngram_gpu on Ascend requires model_runner: v1"):
+    with pytest.raises(ValueError, match="ngram_gpu is unsupported on Ascend MRv2"):
         use_scheduler_ngram(thinker_config)
 
 
