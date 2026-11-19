@@ -10,10 +10,13 @@ import threading
 import time
 import weakref
 from collections import OrderedDict
+from contextlib import ExitStack
+from multiprocessing import shared_memory
 from multiprocessing.process import BaseProcess
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
+import numpy as np
 import pytest
 import torch
 import zmq
@@ -23,7 +26,7 @@ import vllm_omni.diffusion.worker.diffusion_worker as diffusion_worker_module
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
-from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE
+from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, _unlink_shm_name, pack_diffusion_output_shm
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import RequestScheduler
 from vllm_omni.diffusion.sched.interface import (
@@ -226,6 +229,82 @@ def _make_sched_output(*request_ids: str) -> DiffusionSchedulerOutput:
 
 
 class TestStepModeTimeout:
+    def test_stale_inline_fallback_does_not_block_next_reply(self):
+        executor, _, res_q = _make_executor()
+        inline: dict[str, object] = {}
+        inline["self"] = inline
+        res_q.put({"wave_id": 0, "dp_rank": 0, "output": DiffusionOutput(output=inline)})
+        res_q.put({"type": DIFFUSION_RPC_RESULT_ENVELOPE, "wave_id": 1, "result": True})
+
+        assert executor.collective_rpc("check_health") == [True]
+
+    def test_late_rpc_result_releases_shared_memory(self, monkeypatch):
+        executor, req_q, res_q = _make_executor()
+        with pytest.raises(TimeoutError):
+            executor.collective_rpc("execute_model", timeout=0)
+        wave_id = req_q.get_nowait()["wave_id"]
+
+        monkeypatch.setattr("vllm_omni.diffusion.ipc._SHM_TENSOR_THRESHOLD", 1)
+        output = DiffusionOutput(output={"frames": [np.arange(4)]}, trajectory_latents=torch.arange(4))
+        late = {"type": DIFFUSION_RPC_RESULT_ENVELOPE, "wave_id": wave_id, "result": output}
+        late = pack_diffusion_output_shm(late, record_rpc_allocations=True)
+        handles = [output.output["frames"][0], output.trajectory_latents]
+        try:
+            res_q.put(late)
+            res_q.put({"type": DIFFUSION_RPC_RESULT_ENVELOPE, "wave_id": wave_id + 1, "result": True})
+            assert executor.collective_rpc("check_health") == [True]
+            for handle in handles:
+                with pytest.raises(FileNotFoundError):
+                    shared_memory.SharedMemory(name=handle["name"]).close()
+        finally:
+            for handle in handles:
+                _unlink_shm_name(handle["name"])
+
+    def test_stale_legacy_output_preserves_independent_metadata_segment(self, monkeypatch):
+        executor, _, res_q = _make_executor()
+        monkeypatch.setattr("vllm_omni.diffusion.ipc._SHM_TENSOR_THRESHOLD", 1)
+        worker = object.__new__(WorkerProc)
+        worker.od_config = executor.od_config
+        worker.result_mq = SimpleNamespace(enqueue=res_q.put)
+        worker._result_mq_lock = threading.Lock()
+        with ExitStack() as cleanup:
+            external = shared_memory.SharedMemory(create=True, size=1)
+            cleanup.callback(external.close)
+            cleanup.callback(_unlink_shm_name, external.name)
+            output = DiffusionOutput(
+                output={
+                    "payload": {"frames": np.arange(4)},
+                    "metadata": {"reference": {"__ndarray_shm__": True, "name": external.name}},
+                }
+            )
+            late = {"wave_id": 0, "dp_rank": 0, "output": output}
+            worker._return_result(late)
+            owned = output.output["payload"]["frames"]
+            cleanup.callback(_unlink_shm_name, owned["name"])
+            frames = np.arange(4) + 10
+            current = DiffusionOutput(output={"frames": frames})
+            worker._return_result({"type": DIFFUSION_RPC_RESULT_ENVELOPE, "wave_id": 1, "result": current})
+            current_name = current.output["frames"]["name"]
+            cleanup.callback(_unlink_shm_name, current_name)
+
+            (result,) = executor.collective_rpc("execute_model")
+            np.testing.assert_array_equal(result.output["frames"], frames)
+            for name in (owned["name"], current_name):
+                with pytest.raises(FileNotFoundError):
+                    shared_memory.SharedMemory(name=name).close()
+            shared_memory.SharedMemory(name=external.name).close()
+
+    def test_stale_discard_limit_leaves_next_reply_queued(self, monkeypatch):
+        executor, _, res_q = _make_executor()
+        monkeypatch.setattr(executor, "_MAX_STALE_DISCARDS", 1)
+        res_q.put({"wave_id": 0})
+        next_reply = {"wave_id": 1}
+        res_q.put(next_reply)
+
+        with pytest.raises(TimeoutError, match="Discarded 1 stale"):
+            executor.collective_rpc("check_health")
+        assert res_q.get_nowait() is next_reply
+
     def test_missing_reply_closes_executor_and_prevents_dispatch(self, monkeypatch):
         from vllm_omni.diffusion.executor import multiproc_executor as executor_module
 

@@ -345,6 +345,12 @@ event support finish the producer before returning the output.
 5. applies rank-aware reply rules so only expected ranks respond; and
 6. monitors worker process sentinels and fails the executor if a worker dies.
 
+When a synchronous RPC times out, its reply may arrive during a later call.
+The worker records the names of the shared-memory segments it allocated
+while packing that reply. If the executor discards an old wave ID, it
+unlinks those segments. References in model output metadata retain their
+original ownership.
+
 In request mode on this backend, each async output produces two correlated
 messages keyed by `async_output_id`:
 

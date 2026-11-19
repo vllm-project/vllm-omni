@@ -11,7 +11,8 @@ serialised through the queue.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from typing import Any, TypeGuard
 
 import numpy as np
@@ -188,13 +189,10 @@ def _cuda_registered_shm_copy(tensor: torch.Tensor, d2h_stream: torch.Stream) ->
             shm.unlink()
 
 
-def _unlink_shm_handle(handle: dict[str, Any]) -> None:
+def _unlink_shm_name(name: str) -> None:
     """Best-effort removal of a shared-memory segment created during packing."""
     from multiprocessing import shared_memory
 
-    name = handle.get("name")
-    if not name:
-        return
     try:
         shm = shared_memory.SharedMemory(name=name)
     except FileNotFoundError:
@@ -208,13 +206,12 @@ def _unlink_shm_handle(handle: dict[str, Any]) -> None:
             pass
 
 
-def _unlink_shm_handles(handles: list[dict[str, Any]]) -> None:
-    for handle in handles:
+def _unlink_shm_names(names: Iterable[str]) -> None:
+    for name in names:
         try:
-            _unlink_shm_handle(handle)
-        except Exception:
-            # Cleanup is best-effort; never mask the original packing failure.
-            pass
+            _unlink_shm_name(name)
+        except Exception as exc:
+            logger.warning("Failed to unlink diffusion SHM segment %s: %s", name, exc)
 
 
 def _tensor_to_shm(
@@ -516,11 +513,23 @@ def _is_rpc_result_envelope(output: object) -> TypeGuard[dict[str, Any]]:
     return isinstance(output, dict) and output.get("type") == DIFFUSION_RPC_RESULT_ENVELOPE
 
 
+@dataclass
+class PackedDiffusionRPCReply:
+    """Wire-only record of the segments allocated for a wave-tagged reply."""
+
+    reply: dict[str, Any]
+    shm_names: tuple[str, ...]
+
+    def discard(self) -> None:
+        _unlink_shm_names(self.shm_names)
+
+
 def pack_diffusion_output_shm(
     output: object,
     d2h_stream: torch.Stream | None = None,
     *,
     enable_registered_shm: bool = False,
+    record_rpc_allocations: bool = False,
 ) -> object:
     """Replace large tensors in diffusion worker outputs with SHM handles.
 
@@ -543,6 +552,9 @@ def pack_diffusion_output_shm(
     Packing is failure-atomic: every SHM segment created during the call is
     tracked and unlinked if any part of the payload fails to pack, and field
     mutations are committed only after the complete payload succeeds.
+
+    With ``record_rpc_allocations``, a wave-tagged reply that allocated SHM
+    returns a wire wrapper with the names from this packing transaction.
     """
     created: list[dict[str, Any]] = []
     pending_updates: list[tuple[DiffusionOutput, str, object]] = []
@@ -554,8 +566,10 @@ def pack_diffusion_output_shm(
             pending_updates=pending_updates,
             enable_registered_shm=enable_registered_shm,
         )
+        if record_rpc_allocations and created and isinstance(packed, dict) and packed.get("wave_id") is not None:
+            packed = PackedDiffusionRPCReply(packed, tuple(handle["name"] for handle in created))
     except BaseException:
-        _unlink_shm_handles(created)
+        _unlink_shm_names(handle["name"] for handle in created)
         raise
 
     # Commit mutations only after every field and batch entry packed. Until

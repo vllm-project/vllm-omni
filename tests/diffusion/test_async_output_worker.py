@@ -188,11 +188,12 @@ class TestReturnResultSyncPath:
 
         mock_pack = mocker.patch(
             "vllm_omni.diffusion.worker.diffusion_worker.pack_diffusion_output_shm",
+            wraps=diffusion_ipc.pack_diffusion_output_shm,
         )
         output = DiffusionOutput(output="data")
         proc._return_result(output)
 
-        mock_pack.assert_called_once_with(output)
+        mock_pack.assert_called_once_with(output, record_rpc_allocations=True)
         proc.result_mq.enqueue.assert_called_once_with(output)
 
     def test_media_contract_error_is_not_sent_as_an_unpacked_result(self, mocker):
@@ -261,12 +262,13 @@ class TestReturnResultSyncPath:
 
         mock_pack = mocker.patch(
             "vllm_omni.diffusion.worker.diffusion_worker.pack_diffusion_output_shm",
+            wraps=diffusion_ipc.pack_diffusion_output_shm,
         )
         # A plain dict is neither DiffusionOutput nor BatchRunnerOutput
         output = {"type": "other"}
         proc._return_result(output)
 
-        mock_pack.assert_called_once_with(output)
+        mock_pack.assert_called_once_with(output, record_rpc_allocations=True)
         proc.result_mq.enqueue.assert_called_once_with(output)
 
 

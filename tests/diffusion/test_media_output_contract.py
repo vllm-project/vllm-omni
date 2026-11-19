@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
+from multiprocessing import shared_memory
+
 import numpy as np
 import pytest
 import torch
@@ -52,6 +55,32 @@ def _video(
 
 def _prepared_media(video: VideoMediaOutput) -> DiffusionMediaOutput:
     return DiffusionMediaOutput(video=video, prepared_for_transport=True)
+
+
+def test_discard_packed_media_releases_only_video(monkeypatch):
+    monkeypatch.setattr(diffusion_ipc, "_SHM_TENSOR_THRESHOLD", 1)
+    video = _video(
+        torch.zeros(1, 1, 2, 2, 3, dtype=torch.uint8),
+        encoding=VideoTensorEncoding.UINT8_FRAMES,
+        value_range=VideoValueRange.ZERO_TO_255,
+    )
+    media = _prepared_media(video)
+    with ExitStack() as cleanup:
+        other = shared_memory.SharedMemory(create=True, size=1)
+        cleanup.callback(other.close)
+        cleanup.callback(diffusion_ipc._unlink_shm_name, other.name)
+        media.metadata["reference"] = {"__tensor_shm__": True, "name": other.name}
+        output = DiffusionOutput(media=media)
+        reply = {"type": diffusion_ipc.DIFFUSION_RPC_RESULT_ENVELOPE, "wave_id": 1, "result": output}
+        packed = pack_diffusion_output_shm(reply, record_rpc_allocations=True)
+        handle = output.media["video"]["tensor"]
+        cleanup.callback(diffusion_ipc._unlink_shm_name, handle["name"])
+
+        assert isinstance(packed, diffusion_ipc.PackedDiffusionRPCReply)
+        packed.discard()
+        with pytest.raises(FileNotFoundError):
+            shared_memory.SharedMemory(name=handle["name"]).close()
+        shared_memory.SharedMemory(name=other.name).close()
 
 
 def _od_config(*, enabled: bool = False) -> OmniDiffusionConfig:
