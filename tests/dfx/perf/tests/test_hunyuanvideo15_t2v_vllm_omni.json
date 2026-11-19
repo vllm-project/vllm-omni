@@ -50,7 +50,7 @@
           "H100": {
             "request_throughput": 0.1247,
             "mean_e2el_ms": 8016.2097,
-            "mean_peak_memory_mb": 77912.0
+            "mean_peak_memory_mb": 77902.0
           }
         }
       }
@@ -112,8 +112,8 @@
             "mean_peak_memory_mb": 44251.2
           },
           "H100": {
-            "request_throughput": 0.2413,
-            "mean_e2el_ms": 4153.3162,
+            "request_throughput": 0.2495,
+            "mean_e2el_ms": 4007.936,
             "mean_peak_memory_mb": 42470.2
           }
         }
