@@ -11,6 +11,7 @@ import torch
 from pytest_mock import MockerFixture
 from vllm.sampling_params import SamplingParams
 from vllm.utils.import_utils import resolve_obj_by_qualname
+from vllm.v1.engine.core_client import _with_packed_prompt
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 from vllm_omni.engine import OmniEngineCoreRequest
@@ -261,7 +262,7 @@ def test_passes_usable_or_unchecked_prompt(prompt):
 
 
 def _ipc_request(info, buffer=None):
-    # The engine-core path: serialize, then the msgpack round trip of the core request.
+    # The engine-core path: serialize, pack, then the msgpack round trip of the core request.
     request = OmniEngineCoreRequest(
         request_id="r",
         prompt_token_ids=[0],
@@ -275,7 +276,11 @@ def _ipc_request(info, buffer=None):
         additional_information=serialize_additional_information(info),
         model_intermediate_buffer=buffer,
     )
-    return MsgpackDecoder(OmniEngineCoreRequest).decode(MsgpackEncoder().encode(request))
+    # v0.34 sends prompt token ids as a packed int32 ndarray (the decoder cannot
+    # materialize a plain list into it); the real clients pack via
+    # `_with_packed_prompt` in `add_request(_async)`.
+    packed = _with_packed_prompt(request)
+    return MsgpackDecoder(OmniEngineCoreRequest).decode(MsgpackEncoder().encode(packed))
 
 
 def _ipc(info):
