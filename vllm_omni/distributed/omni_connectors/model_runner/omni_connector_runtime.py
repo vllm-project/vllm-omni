@@ -377,7 +377,7 @@ class _OmniConnectorRuntimeMixin:
             except Exception:
                 pass
 
-    def cleanup_finished_request(self, req_id: str, *, discard_payload: bool = False) -> None:
+    def cleanup_finished_request(self, req_id: str) -> None:
         """Clean up per-request state after a request is fully finished.
 
         Call this when a request is freed from the model runner to prevent
@@ -392,12 +392,8 @@ class _OmniConnectorRuntimeMixin:
         saves is added to ``_deferred_send_cleanup`` so the bg save's
         decrement path drains it without leaving orphans.
         """
-        # Failed requests must never publish partial payloads as completed output.
-        # Normal cleanup still flushes an entry the scheduler-driven path did
-        # not send, so a text-only request cannot leave stale accumulator state
-        # for the next request that reuses the id.
-        if discard_payload:
-            self._pending_full_payload_send.pop(req_id, None)
+        # Normal cleanup flushes an entry the scheduler-driven path did not send,
+        # so a text-only request cannot leave stale state across request ID reuse.
         if req_id in self._pending_full_payload_send:
             try:
                 self.flush_full_payload_outputs({req_id})

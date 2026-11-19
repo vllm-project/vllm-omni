@@ -390,10 +390,8 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             # Receivers are registered before requests acquire model slots.
             # Cancelling during that interval must still stop recv polling.
             for req_id in req_ids - active_req_ids:
-                # Drop before cleanup. The real cleanup flushes whatever is
-                # still pending, and test doubles only accept the request id.
+                # Drop the pending payload before cleanup can flush it.
                 self._pending_full_payload_send.pop(req_id, None)
-                self._drop_full_payload_token_end(req_id)
                 self.cleanup_finished_request(req_id)
             if not active_req_ids:
                 return 0

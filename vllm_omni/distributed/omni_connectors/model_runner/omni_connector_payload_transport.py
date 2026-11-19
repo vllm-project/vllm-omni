@@ -831,12 +831,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         finished_req_ids: set[str],
         *,
         finished_req_output_token_ids: Mapping[str, list[int]] | None = None,
-        discarded_req_ids: set[str] | None = None,
     ) -> None:
-        """Discard failed accumulators and send normally finished payloads."""
-        for req_id in discarded_req_ids or ():
-            self._pending_full_payload_send.pop(req_id, None)
-            self._drop_full_payload_token_end(req_id)
+        """Send accumulated full-payload outputs for finished requests."""
         pending_req_ids = set(self._pending_full_payload_send.keys())
         if not (finished_req_ids & pending_req_ids):
             return
