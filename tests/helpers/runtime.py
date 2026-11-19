@@ -57,6 +57,11 @@ SERVER_SHUTDOWN_TIMEOUT_S = 60
 # Auto-port OmniServer launches can lose the reserved TCP port between the
 # parent's probe close and the child bind under xdist; retry a few times.
 SERVER_PORT_IN_USE_RETRIES = 3
+# A listening TCP socket is not proof that the app can serve. The API server
+# binds its port before the engine is built, accepts until an errored engine
+# tears it down, and drops in-flight connections on the way out. Ask the
+# app-level endpoint too, so "accepting" is never mistaken for "serving".
+SERVER_HEALTH_PROBE_TIMEOUT_S = 5.0
 
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
@@ -262,6 +267,35 @@ class OmniServer:
             # A child can exit between enumeration and inspecting its sockets.
             return False
 
+    def _probe_server_health(self, timeout: float = SERVER_HEALTH_PROBE_TIMEOUT_S) -> tuple[bool, str]:
+        """Return ``(healthy, detail)`` for ``GET /health`` on the reserved port.
+
+        ``connect_ex`` only proves that *something* listens: the API server
+        binds before the engine is built and keeps accepting while an errored
+        engine shuts it down, so the first real request can still be dropped.
+        The app-level endpoint is what separates "accepting" from "serving".
+        """
+        request = (
+            f"GET /health HTTP/1.1\r\nHost: {self.host}:{self.port}\r\n"
+            "Accept: application/json\r\nConnection: close\r\n\r\n"
+        )
+        try:
+            with socket.create_connection((self.host, self.port), timeout=timeout) as sock:
+                sock.settimeout(timeout)
+                sock.sendall(request.encode("ascii"))
+                raw = b""
+                # Only the status line matters; stop at the header terminator so
+                # a keep-alive response cannot stall the probe.
+                while b"\r\n\r\n" not in raw and len(raw) < 65536:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    raw += chunk
+        except OSError as error:
+            return False, f"/health probe failed: {error}"
+        status_line = raw.split(b"\r\n", 1)[0].decode("latin-1").strip() if raw else ""
+        return " 200 " in f" {status_line} ", status_line or "<no HTTP response>"
+
     @staticmethod
     def _is_address_in_use_failure(message: str) -> bool:
         """Return True when *message* looks like a TCP bind collision."""
@@ -378,6 +412,7 @@ class OmniServer:
         max_wait = self.startup_timeout
         # System clock corrections must not shorten or extend startup waits.
         start_time = time.monotonic()
+        last_detail = "no TCP connection yet"
         while time.monotonic() - start_time < max_wait:
             ret = self.proc.poll()
             if ret is not None:
@@ -386,7 +421,10 @@ class OmniServer:
                 )
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(1)
-                if sock.connect_ex((self.host, self.port)) == 0 and self._owns_listening_port():
+                connectable = sock.connect_ex((self.host, self.port)) == 0
+            if connectable and self._owns_listening_port():
+                healthy, last_detail = self._probe_server_health()
+                if healthy:
                     ret = self.proc.poll()
                     if ret is not None:
                         raise RuntimeError(
@@ -399,8 +437,15 @@ class OmniServer:
                             flush=True,
                         )
                     return
+                # A 503 here means the engine died right after it started
+                # accepting; a refused probe means a listener that is already
+                # closing. Neither is ready — keep polling until the budget or
+                # the child exit makes the real cause visible.
             time.sleep(2)
-        raise RuntimeError(f"Server failed to start within {max_wait} seconds{self._server_error_tail()}")
+        raise RuntimeError(
+            f"Server failed to start within {max_wait} seconds (last /health: {last_detail})"
+            f"{self._server_error_tail()}"
+        )
 
     @staticmethod
     def _reap_zombie(proc: "psutil.Process") -> bool:
@@ -547,6 +592,24 @@ class OmniServer:
             return ""
         return "\n=== OmniServer stderr ===\n{}".format("".join(self._server_error_lines))
 
+    def _report_unexpected_server_exit(self) -> str:
+        """Describe a server that died while the test was running.
+
+        The client only sees ``APIConnectionError: Server disconnected without
+        sending a response``; the reason lives in the captured stderr of the
+        child. ``poll()`` also reaps the exit so teardown cannot block on a
+        zombie that never changes state.
+        """
+        if self.proc is None:
+            return ""
+        code = self.proc.poll()
+        if code is None:
+            return ""
+        return (
+            f"\n=== OmniServer exited during the test (code {code}) "
+            f"on {self.host}:{self.port}{self._server_error_tail()}\n"
+        )
+
     def _stop_stderr_reader(self) -> None:
         """Join the drain thread; close stderr only if the reader has stopped.
 
@@ -578,6 +641,12 @@ class OmniServer:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         try:
+            # A pytest failure must carry the server's own last words: without
+            # this the CI report is only the client-side disconnect.
+            if exc_type is not None:
+                report = self._report_unexpected_server_exit()
+                if report:
+                    print(report, flush=True)
             if self.proc:
                 self._kill_process_tree(self.proc.pid)
         finally:
