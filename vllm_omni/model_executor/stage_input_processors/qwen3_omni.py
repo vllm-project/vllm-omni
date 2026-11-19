@@ -36,13 +36,9 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
 
 logger = logging.getLogger(__name__)
 
-# Pooling output layer indices (semantic names for clarity)
-# Actual layer indices are integers; these functions provide semantic access
-# Per-model REPLACE-keys for the full-payload accumulator.  Keys in this
-# set use REPLACE semantics (subsequent emissions discard prior chunks)
-# instead of CONCAT.  qwen3-omni currently has none — model_outputs is
-# not emitted by the thinker/talker forward.
-_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset()
+# The Thinker emits one request-scoped embedding for each TTS special token.
+# Keep a single value per key when replaying or appending Thinker outputs.
+_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset({"embed.tts_bos", "embed.tts_eos", "embed.tts_pad"})
 
 _QWEN3_CODEC_CODEBOOK_SIZE = 2048
 _QWEN3_CODEC_PAD_TOKEN_ID = 4196

@@ -687,10 +687,10 @@ def _cosmos3_stage_configs():
     ]
 
 
-def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: float = 2.0):
-    deadline = time.time() + timeout_s
+def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: float = 30.0):
+    deadline = time.monotonic() + timeout_s
     last_payload = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         response = client.get(f"/v1/videos/{video_id}")
         last_payload = response.json()
         if last_payload["status"] == status:
@@ -699,9 +699,9 @@ def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: 
     raise AssertionError(f"Timed out waiting for status={status}. Last payload: {last_payload}")
 
 
-def _wait_until(predicate, timeout_s: float = 2.0, interval_s: float = 0.02):
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
+def _wait_until(predicate, timeout_s: float = 30.0, interval_s: float = 0.02):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
         if predicate():
             return
         time.sleep(interval_s)

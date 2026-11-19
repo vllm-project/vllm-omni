@@ -423,12 +423,17 @@ def test_interleaved_token_only_requests_keep_conditioning_and_eof_separate():
     assert final_a.codes.audio.tolist() == [8, 9, 10, 11]
     assert final_a.meta.left_context_size == 2
     assert final_a.meta.finished.item() is True
-    assert final_a.embed is None
     assert pending_b is None
     assert final_b.codes.audio.tolist() == [18, 19, 20]
     assert final_b.meta.left_context_size == 2
     assert final_b.meta.finished.item() is True
-    assert final_b.embed is None
+    # MRv2 recycles Code2Wav's slot between chunks, so each chunk must carry
+    # its own conditioning. Reuse the cached tensors without copying them.
+    for first, final in zip(first_chunks, (final_a, final_b)):
+        assert final.embed is not None
+        assert final.embed.embedding is first.embed.embedding
+        assert final.embed.speech_token is first.embed.speech_token
+        assert final.embed.speech_feat is first.embed.speech_feat
     for request in requests:
         assert talker2code2wav_async_chunk(transfer_manager, None, request, is_finished=True) is None
 

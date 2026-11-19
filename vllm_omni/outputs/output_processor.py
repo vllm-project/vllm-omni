@@ -706,6 +706,13 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             self._update_streaming_request_state(req_state, request, prompt)
             return
 
+        # vLLM 0.34 transports EngineCoreRequest.prompt_token_ids as an int32
+        # ndarray. Its detokenizer evaluates this field with ``or`` before the
+        # OmniRequestState constructor can normalize it, which is ambiguous for
+        # multi-token NumPy arrays. Convert at the output-processor boundary.
+        if isinstance(request.prompt_token_ids, np.ndarray):
+            request.prompt_token_ids = request.prompt_token_ids.tolist()
+
         req_state = OmniRequestState.from_new_request(
             tokenizer=self.tokenizer,
             request=request,

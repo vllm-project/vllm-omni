@@ -71,8 +71,10 @@ stages:
       to_stage_1: connector_of_shared_memory
     default_sampling_params:
       temperature: 1.0
-      top_k: 30
-      top_p: 0.9
+      top_k: -1  # Uncapped main token; codebook heads keep at most 30 candidates.
+      top_p: 1.0  # Quiet frames can put speech continuations and EOS outside a 0.9 nucleus.
+      extra_args:
+        fish_omni_reference_top_p: 0.9  # Keep the voice-cloning default when a reference is present.
       max_tokens: 500
       repetition_penalty: 1.0
 
