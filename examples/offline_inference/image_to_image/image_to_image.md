@@ -49,7 +49,7 @@ Key arguments:
 - `--output`: path to save the generated PNG.
 - `--vae-use-slicing`: enable VAE slicing for memory optimization.
 - `--vae-use-tiling`: enable VAE tiling for memory optimization.
-- `--cfg-parallel-size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](../../../docs/user_guide/diffusion/parallelism_acceleration.md#cfg-parallel).
+- `--cfg-parallel-size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](../../../docs/user_guide/diffusion/parallelism/cfg_parallel.md).
 - `--enable-cpu-offload`: enable CPU offloading for diffusion models.
 - `--strength`: **Z-Image only** - controls the denoising start timestep for I2I (default: 0.6). Range: [0.0, 1.0]. Lower values preserve more of the original image; higher values allow more creative changes.
 
