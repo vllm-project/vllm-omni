@@ -540,12 +540,11 @@ steps:
       - label: "Diffusion · SANA-Video · H100 · Single-GPU"
         timeout_in_minutes: 180
         commands:
-          # Re-enable test_sana_video_golden.py after the v2 assets are published (#8236).
+          - export SANA_VIDEO_GOLDEN_BASE_URL=https://vllm-public-assets.s3.us-west-2.amazonaws.com/omni-assets/sana-video/v2
           - >-
             pytest -sv
             tests/e2e/online_serving/test_sana_video_expansion.py
-            tests/e2e/accuracy/sana_video/test_sana_video_pipeline_alignment.py
-            tests/e2e/accuracy/sana_video/test_sana_video_i2v_alignment.py
+            tests/e2e/accuracy/sana_video/
             -m "slow and diffusion and H100 and cards_1"
             --run-level "full_model"
         mirror_hardwares: h100_1
