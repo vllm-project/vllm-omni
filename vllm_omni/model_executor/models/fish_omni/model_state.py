@@ -31,6 +31,8 @@ from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
+from vllm_omni.model_executor.models.fish_omni.reference_sampling import resolve_epsilon_cutoff
+from vllm_omni.model_executor.models.fish_omni.sampling import DEFAULT_REFERENCE_TOP_P, parse_reference_top_p
 from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.warmup import is_warmup_request
@@ -110,9 +112,13 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
     padding-aware prefill mask the GDN kernels need.
     """
 
+    # Set from the model: hf_overrides fish_omni_reference_sampling.
+    reference_sampling = False
+
     def __init__(self, vllm_config, model, encoder_cache, device):
         super().__init__(vllm_config, model, encoder_cache, device)
         self.buffers = model.buffers
+        self.reference_sampling = model.reference_sampling
         self.max_num_seqs = self.scheduler_config.max_num_seqs
         self.frame_width = model.frame_width
         self.prompts: dict[int, np.ndarray] = {}
@@ -124,6 +130,8 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
         # the step keeps only its newest request's values (index_copy_ with
         # repeated indices would pick one of them arbitrarily).
         self._pending_slots: dict[int, tuple[list[float], list[int], list[int]]] = {}
+        # The same for epsilon_cutoff, written only under reference sampling.
+        self._pending_epsilon_cutoffs: dict[int, float] = {}
         self._pending_history: dict[int, torch.Tensor] = {}
         self._valid_rows: list[bool] = []
         self._partitioned = bool(getattr(vllm_config.model_config, "async_chunk", False))
@@ -144,6 +152,7 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
         self._decode_pool = pool((max_tokens, 1))
         self._sample_pool = pool((self.max_num_seqs, 3))
         self._slot_pool = pool((self.max_num_seqs, 5 + model.buffers.slot_ras.shape[1]))
+        self._epsilon_pool = pool((self.max_num_seqs, 2))
         self._last_decode_key: tuple[int, ...] | None = None
         if not is_uva_available():
             logger.warning("fish_omni: UVA is unavailable; per-step uploads use staged copies")
@@ -164,12 +173,14 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
         req_id = str(new_req_data.req_id)
         prompt_ids = list(new_req_data.prompt_token_ids or [])
         token_ids = list(new_req_data.prefill_token_ids or prompt_ids)
+        info = {}
         if is_warmup_request(req_id):
             # Warmup requests: text rows with zero codes.
             rows = torch.zeros((len(prompt_ids), self.frame_width), dtype=torch.int64)
             rows[:, 0] = torch.tensor(prompt_ids, dtype=torch.int64)
         else:
-            rows = self.model.build_frames(self._request_info(req_index), self.device)
+            info = self._request_info(req_index)
+            rows = self.model.build_frames(info, self.device)
         if rows.shape[0] != len(prompt_ids):
             raise ValueError(
                 f"fish_omni prompt has {rows.shape[0]} rows but request {req_id} reserved {len(prompt_ids)} "
@@ -197,18 +208,29 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
 
         params = new_req_data.sampling_params
         temperature = float(params.temperature) if params is not None else 1.0
-        top_k = int(params.top_k) if params is not None and params.top_k and params.top_k > 0 else 1 << 20
-        if top_k > self.model.max_top_k:
-            if not self._warned_top_k:
-                logger.warning(
-                    "fish_omni fused sampling caps top_k at %d (request asked for %s); "
-                    "set hf_overrides fish_omni_max_top_k to raise it",
-                    self.model.max_top_k,
-                    params.top_k if params is not None else None,
-                )
-                self._warned_top_k = True
-            top_k = self.model.max_top_k
+        if self.reference_sampling:
+            # Reference sampling has no top-k cap; top_k < 1 turns the rule off.
+            top_k = int(params.top_k) if params is not None and params.top_k else 0
+        else:
+            top_k = (
+                int(params.top_k) if params is not None and params.top_k and params.top_k > 0 else self.model.max_top_k
+            )
+            if top_k > self.model.max_top_k:
+                if not self._warned_top_k:
+                    logger.warning(
+                        "fish_omni main-token sampling caps top_k at %d (request asked for %s)",
+                        self.model.max_top_k,
+                        params.top_k if params is not None else None,
+                    )
+                    self._warned_top_k = True
+                top_k = self.model.max_top_k
         top_p = float(params.top_p) if params is not None else 1.0
+        extra_args = getattr(params, "extra_args", None) or {}
+        has_reference = info.get("ref_codes") is not None or info.get("ref_audio_wav") is not None
+        if has_reference and top_p == 1.0 and extra_args.get("top_p") is None:
+            reference_top_p = parse_reference_top_p(extra_args.get("fish_omni_reference_top_p", top_p))
+            top_p = reference_top_p if reference_top_p is not None else DEFAULT_REFERENCE_TOP_P
+        epsilon_cutoff = resolve_epsilon_cutoff(extra_args.get("epsilon_cutoff"), self.reference_sampling)
         seed = getattr(params, "seed", None) if params is not None else None
         if seed is not None:
             self._seeds[req_id] = int(seed) & _MASK64
@@ -216,11 +238,17 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
         tail = rows[-window:, 0].tolist()
         ras = [-1] * (window - len(tail)) + tail
         self._pending_slots[req_index] = ([temperature, top_p], [top_k, generated], ras)
+        if self.reference_sampling:
+            self._pending_epsilon_cutoffs[req_index] = epsilon_cutoff
 
     def remove_request(self, req_index_or_id) -> None:
         index = self._resolve_req_index(req_index_or_id)
         if index is not None:
             self.prompts.pop(index, None)
+            # A request removed before the next step must not write to its freed slot.
+            self._pending_slots.pop(index, None)
+            self._pending_history.pop(index, None)
+            self._pending_epsilon_cutoffs.pop(index, None)
         super().remove_request(req_index_or_id)
 
     def on_request_preempted(self, req_id: str, req_index: int) -> None:
@@ -275,11 +303,46 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
         for slot, history in self._pending_history.items():
             buffers.slot_history[slot, : history.shape[0]].copy_(history, non_blocking=True)
         self._pending_history.clear()
+        if self.reference_sampling:
+            self._flush_epsilon_cutoffs()
         self._last_decode_key = None
+
+    def _flush_epsilon_cutoffs(self) -> None:
+        # [slot, epsilon_cutoff bits] as int64, staged like the other slot writes.
+        packed = np.zeros((len(self._pending_epsilon_cutoffs), 2), dtype=np.int64)
+        packed[:, 0] = list(self._pending_epsilon_cutoffs)
+        packed[:, 1] = np.asarray(list(self._pending_epsilon_cutoffs.values()), dtype=np.float64).view(np.int64)
+        self._pending_epsilon_cutoffs.clear()
+        device = self._epsilon_pool.copy_to_uva(packed).to(self.device, non_blocking=True)
+        self.buffers.slot_epsilon_cutoff.index_copy_(
+            0, device[:, 0], device[:, 1:].view(torch.float64)[:, 0].to(torch.float32)
+        )
 
     # ------------------------------------------------------------------
     # Step inputs
     # ------------------------------------------------------------------
+
+    def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
+        model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
+        # Dummy runs skip run_preprocess, retaining the last step's buffers.
+        # vLLM 0.34's new extensible-KV sizing warmup can leave full-budget
+        # mixed prefill/decode rows immediately before CUDA graph capture.
+        # The compiled forward gathers hidden states by sample_rows, so a
+        # prefill row can exceed a later dummy run's num_tokens and trip the
+        # gather's bounds assert. Stage this dummy size's pure decode layout;
+        # the next real step rewrites every buffer before the model runs.
+        buffers = self.buffers
+        num_samples = min(num_tokens, self.max_num_seqs)
+        rows = torch.arange(num_tokens, device=self.device)
+        sampling = rows < min(num_reqs, num_samples)
+        buffers.token_slots[:num_tokens].fill_(buffers.dummy_slot)
+        buffers.token_from_slot[:num_tokens].fill_(True)
+        buffers.sample_token_rows[:num_tokens].copy_(sampling)
+        buffers.token_sample_index[:num_tokens].copy_(torch.where(sampling, rows, torch.zeros_like(rows)))
+        buffers.sample_rows[:num_samples].copy_(rows[:num_samples])
+        buffers.sample_valid[:num_samples].copy_(rows[:num_samples] < num_reqs)
+        buffers.sample_slots[:num_samples].fill_(buffers.dummy_slot)
+        return model_inputs
 
     def run_preprocess(self, input_batch, model_inputs, req_states=None, mtp_batch_descriptor_dispatcher=None):
         self._flush_slot_writes()

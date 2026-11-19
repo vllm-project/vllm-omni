@@ -31,6 +31,10 @@ last_reviewed: 2026-07-16
 
 The AR runtime extends vLLM scheduling and worker execution for omni-stage
 inputs and outputs while preserving vLLM scheduling and cache semantics.
+Omni workers use Model Runner V2; the retired GPU, NPU and XPU V1 runner
+implementations and their exclusive helpers are removed. Shared utilities under
+`worker/` remain in use by `worker_v2/`. The upstream `vllm.v1` package name
+does not select Model Runner V1.
 
 The experimental Mooncake KV/HS backend uses the existing MRv2 external-load
 state transitions for Qwen3-Omni turn requests and duplex utterances, which
@@ -62,6 +66,13 @@ Models such as Qwen3-TTS whose `forward()` returns a tensor and whose
 `mrv2_forward_returns_tensor = True`. Their multimodal-output capability does
 not require excluding FULL capture.
 
+MRv2 computes prompt logprobs after sampling and may split prompt hidden states
+into arbitrary row chunks. A model whose sampling logits depend on request-local
+state or full-batch row spans can expose `compute_prompt_logits(hidden_states)`
+for stateless prompt chunks and the startup sampler profiling pass. The runner
+otherwise falls back to `compute_logits`; real sampling keeps the model's normal
+request-state validation and updates.
+
 Request-batched MTP uses its own FULL graph wrapper. Capture and replay select
 the same FULL descriptor from the MTP capture sizes, bounded by
 `max_num_seqs`, independently of the backbone's graph mode. A backbone that
@@ -76,12 +87,12 @@ as the materialized frontier. Stale output and requests that were not running
 before the update do not publish blocks. Publication precedes stop cleanup so
 the last completed blocks remain reusable after a request finishes.
 
-For Bagel image editing, the vLLM 0.33 prefix-range helper receives shallow
+For Bagel image editing, the vLLM 0.34 prefix-range helper receives shallow
 `image` views of the custom `img2img` features so both VAE and ViT embedding
 spans retain bidirectional attention. The original features keep their modality,
 encoder data, cache identifiers and placeholder masks. Upstream still computes
 the ranges and applies sliding-window and padding rules. This adapter is installed
-from `vllm_omni.patch` for both upstream runner implementations; it is unnecessary
+from `vllm_omni.patch` for the upstream V2 runner; it is unnecessary
 with vLLM versions that build the ranges inline.
 
 MOSS Local's fused and separate depth-attention paths share an explicitly
@@ -93,15 +104,15 @@ including SM89 code generation affected by LLVM SLP reduction reordering.
 
 The MRv2 Talker adapter follows the selected vLLM sampler's dispatch contract,
 including its `has_topp_only_rows` predicate. Seeded rows pass that predicate to
-top-k/top-p masking before drawing from their request-local V1 generators.
+top-k/top-p masking before the model's categorical draw with request-local Torch generators.
 Unseeded and greedy rows keep upstream sampling. When mixed rows have already
 been masked, their upstream call disables repeated masking and fused sampling.
 
 Custom samplers register their selected JIT kernels while the runner's startup
-registry is active. The Talker's seeded V1 stream uses native top-k/top-p
+registry is active. The Talker's seeded stream uses native top-k/top-p
 masking even when unseeded sampling selects FlashInfer, so it registers those
 native kernels explicitly. AR workers also warm the existing fused-MoE prefill
-batch sizes on both runner implementations before CUDA graph capture and JIT
+batch sizes on the V2 runner before CUDA graph capture and JIT
 monitoring. These startup passes leave EPLB load recording disabled.
 
 ## Full-payload input scheduling

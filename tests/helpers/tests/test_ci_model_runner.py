@@ -51,7 +51,8 @@ def test_ci_model_runner_env_rewrites_deploy_choice(tmp_path: Path, monkeypatch:
 
     deploy = _apply_platform_overrides(load_deploy_config(rewritten), "cuda")
     assert resolve_stage_model_runner(deploy, deploy.stages[0]) == "v2"
-    assert resolve_stage_model_runner(deploy, deploy.stages[1]) == "v1"
+    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
+        resolve_stage_model_runner(deploy, deploy.stages[1])
 
 
 def test_ci_model_runner_env_overrides_inherited_cuda_platform(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
