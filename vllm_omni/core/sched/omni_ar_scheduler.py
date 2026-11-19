@@ -1104,7 +1104,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         )
         if reserved_running_slots:
             limit = min(limit, max(0, original_max_num_active_reqs - reserved_running_slots))
-        self.max_num_active_reqs = limit
         return _SeededIsolationStep(
             limit=limit,
             deferred=deferred,
