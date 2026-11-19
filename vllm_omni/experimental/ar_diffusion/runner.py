@@ -179,8 +179,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         )
         if self.pipeline is None:
             return
-        self._available_memory_budget = self._available_memory_bytes()
-        self._preallocate_kv_cache(available_bytes=self._available_memory_budget)
+        self._preallocate_kv_cache()
         # The rollout warmup exists for CUDA graph capture, but a pipeline may
         # also want it in eager mode (first-request kernel selection, lazy
         # allocations); ``ar_diffusion_warmup_eager`` opts in.
@@ -201,6 +200,10 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 
         group = get_sp_group()
+        return ARDiffusionModelRunner._group_min(value, group)
+
+    @staticmethod
+    def _group_min(value: int, group) -> int:
         if group.world_size == 1:
             return value
         vote = torch.tensor(value, dtype=torch.int64, device="cpu")
@@ -360,7 +363,12 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             )
 
         budget = self._available_memory_bytes() if available_bytes is None else int(available_bytes)
-        if getattr(self, "_available_memory_budget", None) is None:
+        if spec_override is None:
+            if isinstance(capability, SupportsDynamicARDiffusion) and torch.distributed.is_initialized():
+                from vllm.distributed.parallel_state import get_tp_group
+
+                # Every TP rank must admit the same geometry before entering model collectives.
+                budget = self._group_min(budget, get_tp_group())
             self._available_memory_budget = budget
         spec, config = self._effective_spec(capability, raw_spec)
         if isinstance(capability, SupportsDynamicARDiffusion) and not getattr(

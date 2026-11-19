@@ -45,6 +45,9 @@ class DynamicPipeline:
         self.closed = []
         self.reset = []
 
+    def ar_diffusion_kv_cache_spec(self):
+        return self.spec
+
     def ar_diffusion_default_request_spec(self):
         return ARDiffusionRequestKVSpec(self.spec, "small")
 
@@ -301,3 +304,23 @@ def test_rejected_replacement_can_resume_original_session(runner, monkeypatch):
     runner.execute_model(request(runner))
     original.release_history.assert_not_called()
     original.finish_request.assert_called_once_with("s1")
+
+
+def test_dynamic_admission_uses_smallest_tp_budget(runner, monkeypatch):
+    from vllm.distributed import parallel_state
+
+    group = SimpleNamespace(world_size=2, cpu_group=object())
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: group)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+    def reduce_to_smallest(vote, op, group):
+        assert op == torch.distributed.ReduceOp.MIN
+        assert group is parallel_state.get_tp_group().cpu_group
+        vote.fill_(1)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce_to_smallest)
+    runner.od_config = SimpleNamespace(dtype=torch.float32)
+    monkeypatch.setattr(runner_module, "paging_block_size", lambda tokens: 1)
+    with pytest.raises(ValueError, match="cannot fit one complete"):
+        runner._preallocate_kv_cache(available_bytes=1 << 30)
+    assert runner._available_memory_budget == 1
