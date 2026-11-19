@@ -165,10 +165,12 @@ def test_follow_up_waits_until_the_tool_response_is_done() -> None:
 
 
 def test_latest_frame_is_kept_and_passed_only_when_the_executor_asks() -> None:
-    state = {"gen": 0, "count": 0, "awaiting_done": False, "ready": False, "last_frame": ""}
+    state = {"gen": 0, "count": 0, "awaiting_done": False, "ready": False, "last_frame": "", "turn_frame": ""}
     server._note_client_event(state, {"type": "input_audio_buffer.append", "video_frames": ["frame-a", "frame-b"]})
     server._note_client_event(state, {"type": "input_audio_buffer.append", "audio": "pcm"})
     assert state["last_frame"] == "frame-b"
+    server._note_client_event(state, {"type": "input_audio_buffer.commit"})
+    assert state["turn_frame"] == "frame-b"
 
     seen: dict[str, str] = {}
 
@@ -186,7 +188,11 @@ def test_latest_frame_is_kept_and_passed_only_when_the_executor_asks() -> None:
             sent.append(json.loads(message))
 
     call = {"type": "function_call", "call_id": "call_1", "name": "calculator", "arguments": "{}"}
-    asyncio.run(server._answer_function_call(_Backend(), _FrameTools(), call, follow_up=False, follow_state=state))
+    asyncio.run(
+        server._answer_function_call(
+            _Backend(), _FrameTools(), call, follow_up=False, follow_state=state, frame_b64=state["turn_frame"]
+        )
+    )
     assert seen["frame"] == "frame-b"
     asyncio.run(server._answer_function_call(_Backend(), _Tools(), call, follow_up=False, follow_state=state))
     assert sent[-1]["item"]["output"]
@@ -308,3 +314,154 @@ async def test_backend_close_cancels_outstanding_tool_tasks() -> None:
     with pytest.raises(asyncio.CancelledError):
         await task
     assert cancelled.is_set()
+
+
+class _QueueBackend:
+    """Backend stub: yields pushed events and records what the proxy sends."""
+
+    def __init__(self) -> None:
+        self.inbox: asyncio.Queue[str] = asyncio.Queue()
+        self.sent: list[dict] = []
+
+    def push(self, event: dict) -> None:
+        self.inbox.put_nowait(json.dumps(event))
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> str:
+        return await self.inbox.get()
+
+    async def send(self, message: str) -> None:
+        self.sent.append(json.loads(message))
+
+    def types(self) -> list[str]:
+        return [message["type"] for message in self.sent]
+
+
+class _NullClient:
+    async def send_text(self, message: str) -> None:
+        del message
+
+    async def send_bytes(self, message: bytes) -> None:
+        del message
+
+
+def _call_event(call_id: str, response_id: str | None) -> dict:
+    event: dict = {
+        "type": "response.output_item.done",
+        "item": {"type": "function_call", "call_id": call_id, "name": "calculator", "arguments": "{}"},
+    }
+    if response_id is not None:
+        event["response_id"] = response_id
+    return event
+
+
+def _proxy_state() -> dict:
+    return {
+        "count": 0,
+        "gen": 0,
+        "pending_gen": 0,
+        "awaiting_done": False,
+        "ready": False,
+        "final_answer": False,
+        "inflight": 0,
+        "inflight_gen": None,
+        "last_frame": "",
+        "turn_frame": "",
+        "pending_response_id": None,
+    }
+
+
+async def _settle() -> None:
+    for _ in range(5):
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result_before_other_done", [False, True])
+async def test_follow_up_waits_for_the_response_that_owns_the_call(result_before_other_done: bool) -> None:
+    # A is still draining when B publishes a call. A finishes first.
+    gate = asyncio.Event()
+
+    class _GatedTools(_Tools):
+        async def run(self, name: str, arguments: str) -> str:
+            await gate.wait()
+            return await super().run(name, arguments)
+
+    backend = _QueueBackend()
+    state = _proxy_state()
+    server._note_client_event(state, {"type": "input_audio_buffer.commit"})
+    pump = asyncio.create_task(server._pump_backend_to_client(_NullClient(), backend, _GatedTools(), state))
+    try:
+        backend.push(_call_event("call_b", "resp_B"))
+        await _settle()
+        if result_before_other_done:
+            gate.set()
+            await _settle()
+            assert backend.types() == ["conversation.item.create"]
+        backend.push({"type": "response.done", "response_id": "resp_A"})
+        await _settle()
+        if not result_before_other_done:
+            gate.set()
+            await _settle()
+        # A's completion must not release B's follow-up: B is still active.
+        assert "response.create" not in backend.types()
+        backend.push({"type": "response.done", "response_id": "resp_B"})
+        await _settle()
+        assert backend.types().count("response.create") == 1
+        assert backend.types()[-1] == "response.create"
+    finally:
+        pump.cancel()
+        await asyncio.gather(pump, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_follow_up_keeps_the_old_release_when_the_response_id_is_missing() -> None:
+    backend = _QueueBackend()
+    state = _proxy_state()
+    server._note_client_event(state, {"type": "input_audio_buffer.commit"})
+    pump = asyncio.create_task(server._pump_backend_to_client(_NullClient(), backend, _Tools(), state))
+    try:
+        backend.push(_call_event("call_x", None))
+        await _settle()
+        backend.push({"type": "response.done"})
+        await _settle()
+        assert backend.types() == ["conversation.item.create", "response.create"]
+    finally:
+        pump.cancel()
+        await asyncio.gather(pump, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_tool_frame_belongs_to_the_turn_that_made_the_call() -> None:
+    seen: list[str] = []
+
+    class _FrameTools(_Tools):
+        uses_latest_frame = True
+
+        async def run(self, name: str, arguments: str, frame_b64: str = "") -> str:
+            seen.append(frame_b64)
+            return await super().run(name, arguments)
+
+    backend = _QueueBackend()
+    state = _proxy_state()
+    pump = asyncio.create_task(server._pump_backend_to_client(_NullClient(), backend, _FrameTools(), state))
+    try:
+        # Turn 1: camera on.
+        server._note_client_event(state, {"type": "input_audio_buffer.append", "video_frames": ["frame-1"]})
+        server._note_client_event(state, {"type": "input_audio_buffer.commit"})
+        backend.push(_call_event("call_1", "resp_1"))
+        await _settle()
+        # A second call in the same turn keeps that turn's frame.
+        backend.push(_call_event("call_1b", "resp_1"))
+        await _settle()
+        # Turn 2: camera turned off, audio only.
+        server._note_client_event(state, {"type": "input_audio_buffer.append", "audio": "pcm"})
+        server._note_client_event(state, {"type": "input_audio_buffer.commit"})
+        backend.push(_call_event("call_2", "resp_2"))
+        await _settle()
+    finally:
+        pump.cancel()
+        await asyncio.gather(pump, return_exceptions=True)
+    assert seen == ["frame-1", "frame-1", ""]

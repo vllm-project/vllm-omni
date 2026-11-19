@@ -35,8 +35,10 @@ class ToolExecutor(Protocol):
     """Runs the client side of function calling on the browser's behalf.
 
     An executor that sets ``uses_latest_frame`` also receives the newest
-    camera frame from ``input_audio_buffer.append``. Executors that do not
-    set it keep the two-argument ``run`` and never see the frame.
+    camera frame the user sent for the turn that made the call (frames from
+    ``input_audio_buffer.append`` since the previous commit). It gets an empty
+    string when that turn had none. Executors that do not set it keep the
+    two-argument ``run`` and never see the frame.
     """
 
     @property
@@ -73,8 +75,15 @@ def _with_session_tools(text: str, tools: ToolExecutor) -> str:
 
 
 def _note_client_event(state: dict[str, Any], event: dict[str, Any]) -> None:
-    """Reset a follow-up on a user commit, and keep the newest camera frame."""
+    """Reset a follow-up on a user commit, and keep the newest camera frame.
+
+    Frames seen since the previous commit belong to the turn this commit closes:
+    they move to ``turn_frame`` and ``last_frame`` starts empty, so a later
+    audio-only turn never reuses a frame from before the camera was turned off.
+    """
     if event.get("type") == "input_audio_buffer.commit":
+        state["turn_frame"] = str(state.get("last_frame") or "")
+        state["last_frame"] = ""
         state["gen"] += 1
         state["count"] = 0
         state["awaiting_done"] = False
@@ -126,14 +135,22 @@ def _is_user_commit(text: str) -> bool:
     return event is not None and event.get("type") == "input_audio_buffer.commit"
 
 
-def _hold_follow_up_for_response_done(state: dict[str, Any]) -> None:
+def _event_response_id(event: dict[str, Any]) -> str | None:
+    response_id = event.get("response_id")
+    return response_id if isinstance(response_id, str) and response_id else None
+
+
+def _hold_follow_up_for_response_done(state: dict[str, Any], response_id: str | None = None) -> None:
     """The function-call item is published before ``response.done``.
 
     A follow-up ``response.create`` in that gap is rejected with
-    ``response_already_active``.
+    ``response_already_active``. ``response_id`` names the response that owns the
+    call: with overlapping turns another response can finish first, and only the
+    owner's ``response.done`` frees the follow-up.
     """
     state["awaiting_done"] = True
     state["pending_gen"] = state["gen"]
+    state["pending_response_id"] = response_id
 
 
 def _calls_still_running(state: dict[str, Any]) -> bool:
@@ -157,8 +174,16 @@ def _follow_up_ready(state: dict[str, Any], generation: int) -> bool:
     return True
 
 
-def _take_deferred_follow_up(state: dict[str, Any]) -> bool:
-    """Call on ``response.done``. True when every tool result for this turn is in."""
+def _take_deferred_follow_up(state: dict[str, Any], response_id: str | None = None) -> bool:
+    """Call on ``response.done``. True when every tool result for this turn is in.
+
+    A ``response.done`` for a different response than the one that owns the
+    call does not release the wait. When either id is unknown the wait is
+    released as before.
+    """
+    owner = state.get("pending_response_id")
+    if owner is not None and response_id is not None and owner != response_id:
+        return False
     state["awaiting_done"] = False
     if state["ready"] and state["pending_gen"] == state["gen"] and not _calls_still_running(state):
         state["ready"] = False
@@ -173,13 +198,13 @@ async def _answer_function_call(
     *,
     follow_up: bool = True,
     follow_state: dict[str, Any] | None = None,
+    frame_b64: str = "",
 ) -> None:
     generation = follow_state["gen"] if follow_state is not None else None
     name = str(call.get("name") or "")
     arguments = str(call.get("arguments") or "")
     if _executor_uses_latest_frame(tools):
-        frame = str(follow_state.get("last_frame") or "") if follow_state is not None else ""
-        output = await tools.run(name, arguments, frame_b64=frame)
+        output = await tools.run(name, arguments, frame_b64=frame_b64)
     else:
         output = await tools.run(name, arguments)
     item = {"type": "function_call_output", "call_id": call["call_id"], "output": output}
@@ -239,7 +264,11 @@ async def _pump_backend_to_client(
             if event is None:
                 continue
             kind = event.get("type")
-            if tool_followups is not None and kind == "response.done" and _take_deferred_follow_up(tool_followups):
+            if (
+                tool_followups is not None
+                and kind == "response.done"
+                and _take_deferred_follow_up(tool_followups, _event_response_id(event))
+            ):
                 await backend.send(json.dumps({"type": "response.create"}))
             call = _finished_function_call(event) if event is not None else None
             if call is not None:
@@ -251,7 +280,7 @@ async def _pump_backend_to_client(
                         tool_followups["count"] = count + 1
                     else:
                         tool_followups["final_answer"] = True
-                    _hold_follow_up_for_response_done(tool_followups)
+                    _hold_follow_up_for_response_done(tool_followups, _event_response_id(event))
                     _begin_tool_call(tool_followups)
                 task = asyncio.create_task(
                     _answer_function_call(
@@ -260,6 +289,9 @@ async def _pump_backend_to_client(
                         call,
                         follow_up=follow_up or final_answer,
                         follow_state=tool_followups,
+                        # The frame of the turn that made this call, read now: a
+                        # commit while the call is queued starts a new turn.
+                        frame_b64=str(tool_followups.get("turn_frame") or "") if tool_followups is not None else "",
                     )
                 )
                 calls.add(task)
@@ -382,6 +414,8 @@ def build_app(
                     "inflight": 0,
                     "inflight_gen": None,
                     "last_frame": "",
+                    "turn_frame": "",
+                    "pending_response_id": None,
                 }
                 tasks = {
                     asyncio.create_task(_pump_client_to_backend(websocket, backend, tool_executor, tool_followups)),

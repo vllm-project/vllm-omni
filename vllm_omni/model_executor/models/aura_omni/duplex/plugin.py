@@ -169,6 +169,9 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         # Empty sampling defaults stay on v1. A stage that already lists the
         # v2 silent or im_end id switches this before the first request.
         self._profile = AURA_V1
+        # Tool-result history writes planned by ``plan_append`` and applied by
+        # ``commit_append_plan``: request_id -> (session_id, outputs, nudge).
+        self._staged_tool_history: dict[str, tuple[str, tuple[str, ...], bool]] = {}
 
     def startup_warmup_turn(self) -> dict[str, object] | None:
         # A missing clip (e.g. a build without package data) keeps the shared tone.
@@ -249,7 +252,7 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         final: bool,
         sampling_params: object,
     ) -> DuplexAppendPlan:
-        del request_id, session_config, seq, turn_seq, sampling_params
+        del session_config, seq, turn_seq, sampling_params
 
         def _skip() -> DuplexAppendPlan:
             return DuplexAppendPlan(
@@ -273,7 +276,7 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         if payload.get("type") == "conversation" and len(payload) == 1:
             # A bare response.create answering an accepted tool result
             # (``has_pending_tool_followup``): no new audio/video this turn.
-            return self._plan_tool_followup(fence=fence, runtime_config=runtime_config)
+            return self._plan_tool_followup(request_id=request_id, fence=fence, runtime_config=runtime_config)
 
         mm = _video_frames_to_mm(payload.get("video_frames"))
         audio_b64 = payload.get("audio")
@@ -351,27 +354,29 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             prompt["_aura_tool_rounds"] = 0
         return DuplexAppendPlan(prompt=prompt)
 
-    def _plan_tool_followup(self, *, fence: DuplexFence, runtime_config: dict[str, object]) -> DuplexAppendPlan:
+    def _plan_tool_followup(
+        self, *, request_id: str, fence: DuplexFence, runtime_config: dict[str, object]
+    ) -> DuplexAppendPlan:
         """Answer an accepted tool result: no new user audio/video this turn.
 
-        Splices the result into this session's history right here, not in
-        ``asr2aura``: this is the one place with both ``fence.session_id`` and
-        the plugin's own ``runtime_config``. Stage0 still needs *some* audio
+        Splices the result into this session's history, not in ``asr2aura``:
+        this is the one place with both ``fence.session_id`` and the plugin's
+        own ``runtime_config``. The splice is staged here and written by
+        ``commit_append_plan`` once the stage accepts the request, so a failed
+        submit leaves ``aura_tool_pending`` and the history untouched and a
+        retry does not append the same result twice. Stage0 still needs *some* audio
         (a near-silent pad, same trick as a vision-follow commit); ``is_speech
         =False`` drops whatever it ASRs into noise.
         """
         if not self.has_pending_tool_followup(runtime_config):
             raise ValueError("AURA duplex tool followup has no pending result")
-        from vllm_omni.model_executor.models.aura_omni.duplex.history import get_or_create_session_history
-
-        history = get_or_create_session_history(fence.session_id)
-        for pending in runtime_config["aura_tool_pending"]:
-            history.append_tool_response(pending["output"])
+        outputs = tuple(pending["output"] for pending in runtime_config["aura_tool_pending"])
         rounds = int(runtime_config.get("aura_tool_rounds") or 0) + 1
+        # A plan that never reached commit (failed submit) is replaced, not stacked.
+        for staged_id in [k for k, v in self._staged_tool_history.items() if v[0] == fence.session_id]:
+            del self._staged_tool_history[staged_id]
         # Native's last chat after MAX_TOOL_ROUNDS: silent assistant + nudge user.
-        if rounds > _NATIVE_MAX_TOOL_ROUNDS:
-            history.messages.append({"role": "assistant", "content": "<|silent|>"})
-            history.messages.append({"role": "user", "content": _TOOL_FOLLOWUP_NUDGE, "video": None})
+        self._staged_tool_history[request_id] = (fence.session_id, outputs, rounds > _NATIVE_MAX_TOOL_ROUNDS)
         system_prompt = runtime_config.get("aura_system_prompt", self._default_system_prompt())
         two_token = bool(runtime_config.get("aura_two_token", self._profile is AURA_V2))
         sample_rate_hz = 16000
@@ -414,6 +419,21 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             "_aura_tool_rounds": rounds,
         }
         return DuplexAppendPlan(prompt=prompt)
+
+    def commit_append_plan(self, request_id: str) -> None:
+        """Write the tool-result history staged for this request, once accepted."""
+        staged = self._staged_tool_history.pop(request_id, None)
+        if staged is None:
+            return
+        session_id, outputs, nudge = staged
+        from vllm_omni.model_executor.models.aura_omni.duplex.history import get_or_create_session_history
+
+        history = get_or_create_session_history(session_id)
+        for output in outputs:
+            history.append_tool_response(output)
+        if nudge:
+            history.messages.append({"role": "assistant", "content": "<|silent|>"})
+            history.messages.append({"role": "user", "content": _TOOL_FOLLOWUP_NUDGE, "video": None})
 
     def project_intermediate_output(
         self,

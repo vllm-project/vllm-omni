@@ -44,7 +44,7 @@ def test_extract_finished_tool_calls_single_parameter() -> None:
         "<tool_call>\n<function=calculator>\n<parameter=expression>\n17 * 23\n"
         "</parameter>\n</function>\n</tool_call>"
     )
-    [call] = extract_finished_tool_calls(text)
+    [call] = extract_finished_tool_calls(text, request_id="req-0")
     assert call is not None
     assert call["name"] == "calculator"
     assert json.loads(call["arguments"]) == {"expression": "17 * 23"}
@@ -59,14 +59,14 @@ def test_extract_finished_tool_calls_multiple_parameters_and_json_coercion() -> 
         "<parameter=to_currency>\nTWD\n</parameter>\n"
         "</function>\n</tool_call>"
     )
-    [call] = extract_finished_tool_calls(text)
+    [call] = extract_finished_tool_calls(text, request_id="req-0")
     assert call is not None
     assert json.loads(call["arguments"]) == {"amount": 100, "from_currency": "USD", "to_currency": "TWD"}
 
 
 def test_extract_finished_tool_calls_rejects_nan_literal() -> None:
     text = "<tool_call>\n<function=calculator>\n<parameter=expression>\nNaN\n</parameter>\n</function>\n</tool_call>"
-    [call] = extract_finished_tool_calls(text)
+    [call] = extract_finished_tool_calls(text, request_id="req-0")
     assert call is not None
     # "NaN" is not valid JSON by strict rules; kept as the raw string, not
     # coerced into a float that ``json.dumps`` could not even re-encode.
@@ -77,15 +77,44 @@ def test_extract_finished_tool_calls_keeps_the_same_id_when_text_grows() -> None
     body = (
         "<tool_call>\n<function=calculator>\n<parameter=expression>\n17 * 23\n</parameter>\n</function>\n</tool_call>"
     )
-    first = extract_finished_tool_calls(body)
-    second = extract_finished_tool_calls(body + "<|im_end|>")
+    first = extract_finished_tool_calls(body, request_id="req-0")
+    second = extract_finished_tool_calls(body + "<|im_end|>", request_id="req-0")
     assert first[0]["call_id"] == second[0]["call_id"]
     assert first[0]["call_id"].startswith("call_")
 
 
+def test_extract_finished_tool_calls_scopes_the_id_to_the_request() -> None:
+    body = "<tool_call>\n<function=get_current_datetime>\n</function>\n</tool_call>"
+    [first] = extract_finished_tool_calls(body, request_id="req-turn-1")
+    [second] = extract_finished_tool_calls(body, request_id="req-turn-2")
+    [again] = extract_finished_tool_calls(body, request_id="req-turn-1")
+    assert first["call_id"] != second["call_id"]
+    assert first["call_id"] == again["call_id"]
+
+
+def test_same_call_in_two_turns_registers_in_the_session_ledger() -> None:
+    from vllm_omni.engine.duplex.session.tool_calls import ToolCallLedger, ToolCallOrigin
+
+    body = "<tool_call>\n<function=get_current_datetime>\n</function>\n</tool_call>"
+    ledger = ToolCallLedger(max_calls=8, clock=lambda: 0.0)
+    for turn_id in (1, 2):
+        [call] = extract_finished_tool_calls(body, request_id=f"req-turn-{turn_id}")
+        # The ledger refuses a repeated id, even after the first call settles.
+        ledger.register(
+            ToolCallOrigin(
+                call_id=call["call_id"],
+                epoch=0,
+                turn_id=turn_id,
+                response_id=f"resp_{turn_id}",
+                item_id=f"item_{turn_id}",
+            )
+        )
+    assert len(ledger) == 2
+
+
 def test_extract_finished_tool_calls_empty_without_a_closed_tag() -> None:
-    assert extract_finished_tool_calls("just a normal spoken reply") == []
-    assert extract_finished_tool_calls("<tool_call>still open, no close tag") == []
+    assert extract_finished_tool_calls("just a normal spoken reply", request_id="req-0") == []
+    assert extract_finished_tool_calls("<tool_call>still open, no close tag", request_id="req-0") == []
 
 
 def test_extract_finished_tool_calls_returns_every_call_in_order() -> None:
@@ -95,7 +124,7 @@ def test_extract_finished_tool_calls_returns_every_call_in_order() -> None:
         "<tool_call>\n<function=get_current_location>\n</function>\n</tool_call>\n"
         "<tool_call>\n<function=still_open>"
     )
-    calls = extract_finished_tool_calls(text)
+    calls = extract_finished_tool_calls(text, request_id="req-0")
     assert [call["name"] for call in calls] == ["get_current_datetime", "get_current_location"]
     assert calls[0]["call_id"] != calls[1]["call_id"]
 
@@ -323,6 +352,9 @@ def test_plan_append_tool_followup_builds_pad_and_appends_history() -> None:
     assert info["is_speech"] is False
     assert "audio" in plan.prompt["multi_modal_data"]
     assert plan.prompt["_aura_tool_pending_consumed"] is True
+    # Planning alone leaves the history alone; the stage accepting the request writes it.
+    assert "<tool_response>" not in history.render_prefix()
+    plugin.commit_append_plan("req")
     assert "<tool_response>\n18C sunny\n</tool_response>" in history.render_prefix()
     drop_session_history("sess-followup")
 
@@ -354,6 +386,8 @@ def test_plan_append_tool_followup_nudges_after_native_round_cap() -> None:
         sampling_params=SamplingParams(max_tokens=8),
     )
     assert plan.prompt["_aura_tool_rounds"] == 6
+    assert "<|silent|>" not in history.render_prefix()
+    plugin.commit_append_plan("req")
     rendered = history.render_prefix()
     assert "<|im_start|>assistant\n<|silent|><|im_end|>\n" in rendered
     assert "请根据当前工具结果，直接回答用户的问题。" in rendered
@@ -363,6 +397,41 @@ def test_plan_append_tool_followup_nudges_after_native_round_cap() -> None:
         "aura_tool_rounds": 6,
     }
     drop_session_history("sess-nudge")
+
+
+def test_failed_submit_then_retry_writes_the_tool_result_once() -> None:
+    drop_session_history("sess-retry")
+    history = get_or_create_session_history("sess-retry")
+    history.begin_user_turn("台北天氣如何？")
+    history.commit_turn("<|respond|><tool_call>...</tool_call>")
+    plugin = AuraDuplexPlugin(_encode_audio)
+    fence = DuplexFence("sess-retry", epoch=0, turn_id=2)
+    runtime_config = {"aura_tool_pending": [{"call_id": "call_1", "name": "w", "arguments": "{}", "output": "18C"}]}
+
+    def plan(request_id: str) -> None:
+        plugin.plan_append(
+            request_id=request_id,
+            fence=fence,
+            session_config={},
+            runtime_config=runtime_config,
+            seq=1,
+            turn_seq=1,
+            payload={"type": "conversation"},
+            final=True,
+            sampling_params=SamplingParams(max_tokens=8),
+        )
+
+    # First submit fails after planning: the platform never calls commit_append_plan,
+    # and the runtime patch is not applied, so aura_tool_pending is still there.
+    plan("req-1")
+    assert "<tool_response>" not in history.render_prefix()
+    # The retry plans again and this one is accepted.
+    plan("req-2")
+    plugin.commit_append_plan("req-2")
+    # A late commit for the abandoned request writes nothing.
+    plugin.commit_append_plan("req-1")
+    assert history.render_prefix().count("<tool_response>") == 1
+    drop_session_history("sess-retry")
 
 
 def test_plan_append_tool_followup_without_pending_raises() -> None:

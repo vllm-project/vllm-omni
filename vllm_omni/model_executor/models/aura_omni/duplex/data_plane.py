@@ -353,7 +353,7 @@ class AuraDataPlaneSession(DuplexDataPlane):
             )
             calls = [
                 call
-                for call in extract_finished_tool_calls(state.text_sent)
+                for call in extract_finished_tool_calls(state.text_sent, request_id=request_id)
                 if isinstance(call.get("call_id"), str) and call["call_id"] not in state.emitted_tool_call_ids
             ]
             for call in calls:

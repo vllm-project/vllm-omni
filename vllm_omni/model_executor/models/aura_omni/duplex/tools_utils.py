@@ -121,8 +121,9 @@ def _stable_call_id(anchor: str, name: str, arguments: str) -> str:
 def parse_completed_tool_call(inner: str, *, anchor: str | None = None) -> dict[str, str] | None:
     """Return one call from a finished ``<tool_call>`` body, or None.
 
-    ``anchor`` is the span's offset in the cumulative text. Re-parsing the same
-    span keeps ``call_id``; two identical calls at different offsets stay distinct.
+    ``anchor`` names the span (request id plus its offset in the cumulative
+    text). Re-parsing the same span keeps ``call_id``; identical calls at
+    different anchors stay distinct.
     """
     match = _FUNCTION_RE.search(inner)
     if match is None:
@@ -145,12 +146,16 @@ def parse_completed_tool_call(inner: str, *, anchor: str | None = None) -> dict[
     }
 
 
-def extract_finished_tool_calls(cumulative_text: str) -> list[dict[str, str]]:
+def extract_finished_tool_calls(cumulative_text: str, *, request_id: str) -> list[dict[str, str]]:
     """Return every completed ``<tool_call>`` in finished cumulative Stage1 text, in order.
 
     AURA Stage1 requests cumulative (not DELTA) text, so by the time a segment
     finishes the whole turn is in one string. The model may emit several
     calls back to back in one turn; a block that does not parse is skipped.
+
+    ``call_id`` is scoped to ``request_id``: the session ledger keeps every id it
+    has published, so the same name and arguments at the same offset in a later
+    turn must not reuse an earlier turn's id.
     """
     calls: list[dict[str, str]] = []
     start = cumulative_text.find(TOOL_CALL_START)
@@ -160,7 +165,7 @@ def extract_finished_tool_calls(cumulative_text: str) -> list[dict[str, str]]:
             break
         call = parse_completed_tool_call(
             cumulative_text[start + len(TOOL_CALL_START) : end],
-            anchor=str(start),
+            anchor=f"{request_id}:{start}",
         )
         if call is not None:
             calls.append(call)
