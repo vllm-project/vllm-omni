@@ -206,7 +206,7 @@ class _LazyWeightMixin:
     supports_offload_after_quant: bool = True
     _offload_after_quant: bool = False
 
-    def enable_offload_after_quant(self) -> None:
+    def enable_offload_after_quant(self, _layer: torch.nn.Module | None = None) -> None:
         """Return each layer to host memory as soon as it has been quantized.
 
         Caps the load-time device footprint at one layer instead of the whole

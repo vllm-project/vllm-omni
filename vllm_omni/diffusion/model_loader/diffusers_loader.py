@@ -1007,7 +1007,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             quant_method = getattr(module, "quant_method", None)
             if quant_method is None or not getattr(quant_method, "supports_offload_after_quant", False):
                 continue
-            quant_method.enable_offload_after_quant()
+            quant_method.enable_offload_after_quant(module)
             marked += 1
         return marked
 

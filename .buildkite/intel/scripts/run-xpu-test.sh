@@ -126,6 +126,7 @@ time timeout -k 30 30m docker run \
     XPU_TEST_PATHS="tests/diffusion tests/dfx tests/e2e tests/platforms"
     pytest -v -s $XPU_TEST_PATHS -m "core_model and xpu and B60"
     pytest -v -s tests/diffusion/quantization/test_mxfp8_config.py
+    pytest -v -s tests/diffusion/quantization/test_convrot_config.py
     pytest -v -s $XPU_TEST_PATHS -m "advanced_model and xpu and B60"
     pytest -v -s $XPU_TEST_PATHS -m "omni and xpu and B60"
 '

@@ -68,7 +68,7 @@ nav:
       - FP8 W8A8: user_guide/quantization/fp8.md
       - Online FP8 Block Scaling (ROCm): user_guide/quantization/rocm_online_fp8.md
       - Int8 W8A8: user_guide/quantization/int8.md
-      - ConvRot W8A8/W4A4: user_guide/quantization/convrot.md
+      - ConvRot W8A8/W4A4/MXFP8/MXFP4: user_guide/quantization/convrot.md
       - BitsAndBytes W4: user_guide/quantization/bitsandbytes.md
       - MXFP8 W8A8: user_guide/quantization/mxfp8.md
       - MXFP4 W4A4: user_guide/quantization/mxfp4.md
