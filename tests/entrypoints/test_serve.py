@@ -977,6 +977,35 @@ def test_parse_stage_overrides_preserves_arbitrary_override_fields() -> None:
     }
 
 
+def test_serve_warns_once_per_ignored_stage_override(caplog: pytest.LogCaptureFixture, mocker: MockerFixture) -> None:
+    mocker.patch.dict("os.environ", {"VLLM_DISABLE_LOG_LOGO": "1"})
+    launch = mocker.patch("vllm_omni.entrypoints.cli.serve.run_multi_api_server_omni")
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subparser")
+    OmniServeCommand().subparser_init(subparsers)
+
+    with caplog.at_level(logging.WARNING):
+        args = parser.parse_args(
+            [
+                "serve",
+                "fake-model",
+                "--omni",
+                "--api-server-count",
+                "2",
+                "--stage-overrides",
+                '{"0": {"session_mode": "duplex", "duplex_session.idle_ttl_s": 60, "env": {"TEST_ENV": "1"}}}',
+            ]
+        )
+        OmniServeCommand.cmd(args)
+
+    assert [message for message in caplog.messages if "Ignoring --stage-overrides" in message] == [
+        "Ignoring --stage-overrides['0']['session_mode']: set 'session_mode' in the deploy config instead.",
+        "Ignoring --stage-overrides['0']['duplex_session.idle_ttl_s']: set 'duplex_session' in the deploy config instead.",
+    ]
+    launch.assert_called_once_with(args)
+    assert args.get_explicit_kwargs_dict()["stage_overrides"] == {"0": {"env": {"TEST_ENV": "1"}}}
+
+
 def test_parse_stage_overrides_warns_and_skips_non_stage_fields(caplog) -> None:
     with caplog.at_level(logging.WARNING, logger="vllm_omni.entrypoints.utils"):
         parsed = parse_stage_overrides(

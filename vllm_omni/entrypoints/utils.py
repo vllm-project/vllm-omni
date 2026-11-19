@@ -58,8 +58,8 @@ def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: 
         logger.error(f"Failed to inject omni connector config into stage: {e}")
 
 
-def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
-    """Parse per-stage JSON overrides and drop known deploy-only fields."""
+def parse_stage_overrides(value: Any, *, filter_deploy_fields: bool = True) -> dict[str, dict[str, Any]] | None:
+    """Validate per-stage overrides and optionally drop known deploy-only fields."""
     if value is None:
         return None
     if isinstance(value, str):
@@ -87,6 +87,9 @@ def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
             raise ValueError(
                 f"--stage-overrides[{stage_id!r}] must be an object, got {type(overrides).__name__}: {overrides!r}"
             )
+        if not filter_deploy_fields:
+            filtered[stage_id] = overrides
+            continue
         kept_overrides = {}
         for key, override in overrides.items():
             config_key = str(key).partition(".")[0]
