@@ -58,8 +58,9 @@ def test_online_block_fp8_builds_matching_quant_specs(rocm_platform, block_size)
     assert spec == {"method": "fp8", "online_block_size": block_size, "ignored_layers": ["*proj_out*"]}
 
 
-def test_online_block_fp8_routes_real_linear_and_preserves_skips(rocm_platform):
-    config = build_quant_config({"method": "fp8", "online_block_size": 64, "ignored_layers": ["*proj_out*"]})
+@pytest.mark.parametrize("block_size", [32, 64, 128])
+def test_online_block_fp8_routes_real_linear_and_preserves_skips(rocm_platform, block_size):
+    config = build_quant_config({"method": "fp8", "online_block_size": block_size, "ignored_layers": ["*proj_out*"]})
     layer = _linear_stub()
     od_config = OmniDiffusionConfig(model="test", dtype=torch.bfloat16, quantization_config=config)
     vllm_config = create_diffusion_vllm_config(torch.device("cpu"), od_config)
@@ -67,20 +68,31 @@ def test_online_block_fp8_routes_real_linear_and_preserves_skips(rocm_platform):
     with set_current_vllm_config(vllm_config):
         method = config.get_quant_method(layer, "transformer.blocks.0.attn.to_q")
         assert isinstance(method, fp8_config.OnlineBlockFp8LinearMethod)
-        assert method.weight_block_size == [64, 64]
+        assert method.weight_block_size == [block_size, block_size]
         assert method.activation_quant_key == create_fp8_quant_key(
             static=False,
-            group_shape=GroupShape(1, 64),
+            group_shape=GroupShape(1, block_size),
         )
         assert method.weight_quant_key == create_fp8_quant_key(
             static=True,
-            group_shape=GroupShape(64, 64),
+            group_shape=GroupShape(block_size, block_size),
         )
         assert "transformer.blocks.0.attn.to_q" in config.quantized_layers
 
         skipped = config.get_quant_method(layer, "transformer.proj_out")
         assert isinstance(skipped, UnquantizedLinearMethod)
         assert config.get_quant_method(nn.Module(), "transformer.norm") is None
+
+
+def test_online_block_fp8_rejects_mismatched_activation_groups(rocm_platform):
+    config = build_quant_config({"method": "fp8", "online_block_size": 64})
+    config.args.linear.activation = create_fp8_quant_key(
+        static=False,
+        group_shape=GroupShape(1, 128),
+    )
+
+    with pytest.raises(ValueError, match="requires matching dynamic activation groups"):
+        config.get_quant_method(_linear_stub(), "transformer.blocks.0.attn.to_q")
 
 
 @pytest.mark.parametrize("invalid", [True, 16, 48, 64.0, [64, 64]])

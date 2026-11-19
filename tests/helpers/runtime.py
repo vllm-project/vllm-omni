@@ -96,20 +96,6 @@ def get_open_port(host: str = "127.0.0.1", *, max_attempts: int = 128) -> int:
     ) from last_exc
 
 
-def assign_ephemeral_master_port() -> int:
-    """Point ``MASTER_ADDR`` / ``MASTER_PORT`` at a free local port.
-
-    A literal port is shared by every xdist worker, so concurrent
-    ``init_process_group(env://)`` calls fail with ``EADDRINUSE``.
-    ``setdefault`` does not help: the first test on a worker leaves
-    ``MASTER_PORT`` set, and every later test keeps that occupied port.
-    """
-    port = get_open_port()
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    return port
-
-
 def dummy_messages_from_mix_data(
     system_prompt: dict[str, Any] | None = None,
     video_data_url: Any = None,
@@ -196,8 +182,13 @@ class OmniServer:
         env_dict: dict[str, str] | None = None,
         use_omni: bool = True,
         startup_timeout: int = SERVER_STARTUP_TIMEOUT_S,
+        wait_for_device_memory: bool = True,
     ) -> None:
-        cleanup_test_environment()
+        self.wait_for_device_memory = wait_for_device_memory
+        if self.wait_for_device_memory:
+            cleanup_test_environment()
+        else:
+            cleanup_test_environment(wait_for_device_memory=False)
         self.startup_timeout = startup_timeout
         self.model = model
         self.serve_args = list(serve_args)
@@ -580,7 +571,10 @@ class OmniServer:
             if self._port_lock is not None:
                 self._port_lock.release()
                 self._port_lock = None
-            cleanup_test_environment()
+            if self.wait_for_device_memory:
+                cleanup_test_environment()
+            else:
+                cleanup_test_environment(wait_for_device_memory=False)
 
 
 class OmniServerStageCli(OmniServer):

@@ -154,6 +154,9 @@ class Qwen3TTSAdapter(ARTTSAdapter):
     """Adapter for Qwen3-TTS (AR ``engine_client`` backend)."""
 
     validates_generation = True
+    # Length finishes that validate_generation lets through (an explicit
+    # caller budget on non-Base tasks) still return audio; flag it.
+    reports_length_truncation = True
     stage_keys = frozenset({"qwen3_tts"})
     name = "qwen3_tts"
     text_commitment = TextCommitmentCapabilities(

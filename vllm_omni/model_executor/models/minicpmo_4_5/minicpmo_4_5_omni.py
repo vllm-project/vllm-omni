@@ -17,11 +17,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -34,7 +36,6 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
@@ -48,6 +49,9 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 logger = init_logger(__name__)
 
@@ -327,9 +331,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
     @cached_property
     def sampler(self):
+        from vllm.v1.sample.sampler import Sampler
+
         if hasattr(self.model, "sampler"):
             return self.model.sampler
-        from vllm.v1.sample.sampler import Sampler
 
         return Sampler()
 
@@ -414,6 +419,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                             state.last_terminator_token = None
                 else:
                     turn_ended = bool(getattr(state, "current_turn_ended", True)) if state is not None else False
+                    if payload.get("open_assistant_turn") is True and state is not None and turn_ended:
+                        # A response.create-owned unit opens the assistant
+                        # turn. Release the turn-ended latch the same way the
+                        # seeded opening turn does (duplex stage0 prefill):
+                        # otherwise the latch forces this row's silent input
+                        # clock to keep listening, and the listen -> tts_bos
+                        # swap stays blocked while the response waits for the
+                        # model to answer.
+                        with suppress(Exception):
+                            state.current_turn_ended = False
+                            state.pending_speech_response_open = True
+                        turn_ended = False
                     if turn_ended and not pending_speech_context:
                         force_listen = True
 
@@ -1039,6 +1056,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         return self._use_v2_model_runner and (
             self.model_stage == "tts" or (self.model_stage == "llm" and not self._returns_aux_hidden_states)
         )
+
+    @property
+    def mrv2_forward_returns_native_aux(self) -> bool:
+        # Target layers belong to the native drafter, not Omni's auxiliary slot.
+        return self._use_v2_model_runner and self.model_stage == "llm" and self._returns_aux_hidden_states
 
     def make_omni_output_mrv2(self, model_outputs, *, input_batch, req_states, model_intermediate_buffer):
         """Attach the Thinker row identities used by the llm2tts bridge."""
