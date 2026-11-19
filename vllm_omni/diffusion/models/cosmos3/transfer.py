@@ -25,7 +25,7 @@ import PIL.Image
 import torch
 import torch.nn.functional as F
 
-from vllm_omni.diffusion.utils.video_decode import decode_path_video_frames
+from vllm_omni.diffusion.utils.video_decode import RequestVideoDecodeContext, decode_path_video_frames
 
 TRANSFER_HINT_KEYS: tuple[str, ...] = ("edge", "blur", "depth", "seg", "wsm")
 _TRANSFER_HINT_COMMON_FIELDS = frozenset({"control_path", "control", "control_weight"})
@@ -537,7 +537,11 @@ def resize_center_crop_uint8_cthw(frames: torch.Tensor, height: int, width: int)
     return cropped.round().clamp(0, 255).to(torch.uint8).permute(1, 0, 2, 3).contiguous()
 
 
-def _path_media_to_uint8_cthw(path: str | Path, max_frames: int | None) -> torch.Tensor:
+def _path_media_to_uint8_cthw(
+    path: str | Path,
+    max_frames: int | None,
+    decode_context: RequestVideoDecodeContext | None = None,
+) -> torch.Tensor:
     media_path = Path(path)
     if not media_path.exists():
         raise FileNotFoundError(f"Missing Cosmos3 transfer control_path: {media_path}")
@@ -545,14 +549,25 @@ def _path_media_to_uint8_cthw(path: str | Path, max_frames: int | None) -> torch
         array = _pil_to_uint8_rgb(media_path)
         return torch.from_numpy(array).permute(2, 0, 1).unsqueeze(1).contiguous()
 
-    rgb_frames = decode_path_video_frames(media_path, max_frames=max_frames, keep="first")
+    rgb_frames = (
+        decode_context.decode_path_video_frames(media_path, max_frames=max_frames, keep="first")
+        if decode_context is not None
+        else decode_path_video_frames(media_path, max_frames=max_frames, keep="first")
+    )
     stacked = [torch.from_numpy(frame).permute(2, 0, 1) for frame in rgb_frames]
     return torch.stack(stacked, dim=1).contiguous()
 
 
-def media_to_uint8_cthw(value: Any, *, height: int, width: int, max_frames: int | None = None) -> torch.Tensor:
+def media_to_uint8_cthw(
+    value: Any,
+    *,
+    height: int,
+    width: int,
+    max_frames: int | None = None,
+    decode_context: RequestVideoDecodeContext | None = None,
+) -> torch.Tensor:
     if isinstance(value, str | Path):
-        frames = _path_media_to_uint8_cthw(value, max_frames=max_frames)
+        frames = _path_media_to_uint8_cthw(value, max_frames=max_frames, decode_context=decode_context)
     elif isinstance(value, torch.Tensor):
         frames = normalized_video_to_uint8_cthw(value)
     elif isinstance(value, np.ndarray):
@@ -641,11 +656,24 @@ def load_or_compute_control_frames(
     width: int,
     max_frames: int,
     input_frames: torch.Tensor | None,
+    decode_context: RequestVideoDecodeContext | None = None,
 ) -> torch.Tensor:
     if hint.control is not None:
-        return media_to_uint8_cthw(hint.control, height=height, width=width, max_frames=max_frames)
+        return media_to_uint8_cthw(
+            hint.control,
+            height=height,
+            width=width,
+            max_frames=max_frames,
+            decode_context=decode_context,
+        )
     if hint.control_path is not None:
-        return media_to_uint8_cthw(hint.control_path, height=height, width=width, max_frames=max_frames)
+        return media_to_uint8_cthw(
+            hint.control_path,
+            height=height,
+            width=width,
+            max_frames=max_frames,
+            decode_context=decode_context,
+        )
     if hint.key == "edge":
         if input_frames is None:
             raise ValueError(

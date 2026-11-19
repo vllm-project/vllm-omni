@@ -1265,6 +1265,159 @@ def test_decode_path_video_frames_honors_max_frames_and_keep(tmp_path, monkeypat
     assert last[-1][0, 0, 0] == 19
 
 
+def test_request_video_decode_context_reuses_only_exact_decode_specs(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.utils import video_decode
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"placeholder")
+    calls: list[tuple[int | None, str]] = []
+
+    def fake_decode(_path, *, max_frames=None, keep="first"):
+        calls.append((max_frames, keep))
+        return [np.full((2, 2, 3), len(calls), dtype=np.uint8)]
+
+    monkeypatch.setattr(video_decode, "decode_path_video_frames", fake_decode)
+    with video_decode.RequestVideoDecodeContext() as context:
+        single_consumer = context.decode_path_video_frames(source, max_frames=2, keep="first")
+        assert calls == [(2, "first")]
+        repeated = context.decode_path_video_frames(source, max_frames=2, keep="first")
+        different_limit = context.decode_path_video_frames(source, max_frames=3, keep="first")
+        different_keep = context.decode_path_video_frames(source, max_frames=2, keep="last")
+
+        assert single_consumer[0][0, 0, 0] == repeated[0][0, 0, 0]
+        assert different_limit[0][0, 0, 0] != single_consumer[0][0, 0, 0]
+        assert different_keep[0][0, 0, 0] != single_consumer[0][0, 0, 0]
+        assert calls == [(2, "first"), (3, "first"), (2, "last")]
+        assert context.decode_count == 3
+        assert context.cache_hit_count == 1
+        assert context.retained_bytes == 3 * 2 * 2 * 3
+
+    assert context.retained_bytes == 0
+    with pytest.raises(RuntimeError, match="closed request context"):
+        context.decode_path_video_frames(source, max_frames=2)
+
+
+def test_transfer_input_and_repeated_control_paths_share_request_decode(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+    from vllm_omni.diffusion.utils import video_decode
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"placeholder")
+    calls = 0
+
+    def fake_decode(_path, *, max_frames=None, keep="first"):
+        nonlocal calls
+        calls += 1
+        count = max_frames or 2
+        return [np.full((2, 2, 3), idx, dtype=np.uint8) for idx in range(count)]
+
+    monkeypatch.setattr(video_decode, "decode_path_video_frames", fake_decode)
+    with video_decode.RequestVideoDecodeContext() as context:
+        transfer.media_to_uint8_cthw(
+            source,
+            height=2,
+            width=2,
+            max_frames=2,
+            decode_context=context,
+        )
+        for key in ("depth", "seg"):
+            transfer.load_or_compute_control_frames(
+                SimpleNamespace(key=key, control=None, control_path=source),
+                height=2,
+                width=2,
+                max_frames=2,
+                input_frames=None,
+                decode_context=context,
+            )
+
+        assert calls == 1
+        assert context.decode_count == 1
+        assert context.cache_hit_count == 2
+
+
+def test_request_video_decode_context_skips_cache_when_over_byte_cap(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.utils import video_decode
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"placeholder")
+    calls = 0
+
+    def fake_decode(_path, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return [np.zeros((2, 2, 3), dtype=np.uint8)]
+
+    monkeypatch.setattr(video_decode, "decode_path_video_frames", fake_decode)
+    context = video_decode.RequestVideoDecodeContext(max_bytes=11)
+    context.decode_path_video_frames(source)
+    context.decode_path_video_frames(source)
+
+    assert calls == 2
+    assert context.retained_bytes == 0
+    context.close()
+
+
+def test_request_video_decode_context_clears_on_cancellation(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.utils import video_decode
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"placeholder")
+    checks = 0
+
+    def fake_decode(_path, **_kwargs):
+        return [np.zeros((2, 2, 3), dtype=np.uint8)]
+
+    def cancel_on_second_access():
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise RuntimeError("cancelled")
+
+    monkeypatch.setattr(video_decode, "decode_path_video_frames", fake_decode)
+    context = video_decode.RequestVideoDecodeContext(after_access=cancel_on_second_access)
+    with pytest.raises(RuntimeError, match="cancelled"):
+        with context:
+            context.decode_path_video_frames(source)
+            assert context.retained_bytes == 2 * 2 * 3
+            context.decode_path_video_frames(source)
+
+    assert context.retained_bytes == 0
+    with pytest.raises(RuntimeError, match="closed request context"):
+        context.decode_path_video_frames(source)
+
+
+def test_transfer_preprocess_defers_full_decode_for_single_video_path(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3 as cosmos_pipeline
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+
+    source = tmp_path / "transfer.mp4"
+    source.write_bytes(b"placeholder")
+    monkeypatch.setattr(cosmos_pipeline, "media_hw", lambda _path: (16, 32))
+
+    def unexpected_full_decode(*_args, **_kwargs):
+        raise AssertionError("transfer input path should be decoded during forward, not preprocessing")
+
+    monkeypatch.setattr(cosmos_pipeline, "decode_path_video_frames", unexpected_full_decode)
+    preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
+    request = SimpleNamespace(
+        prompt={"prompt": "transfer", "multi_modal_data": {"video": [str(source)]}},
+        sampling_params=make_sampling_params(
+            height=16,
+            width=32,
+            extra_args={"edge": True, "resolution": "256"},
+        ),
+    )
+
+    additional = preprocess(request).prompt["additional_information"]
+    assert additional["transfer_video_path"] == str(source)
+    assert additional["transfer_video_source_hw"] == (16, 32)
+    assert "preprocessed_transfer_video" not in additional
+
+
 def test_preprocess_v2v_video_path_honors_prompt_level_keep_and_indexes(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

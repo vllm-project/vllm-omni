@@ -49,6 +49,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader, is_pp_missing_parameter
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -88,7 +89,11 @@ from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep impor
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.utils.video_decode import decode_path_video_frames, is_video_file_path
+from vllm_omni.diffusion.utils.video_decode import (
+    RequestVideoDecodeContext,
+    decode_path_video_frames,
+    is_video_file_path,
+)
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.entrypoints.openai.video_api_utils import positive_float
 from vllm_omni.experimental.world_models.adapters.state_cosmos3_adapter import (
@@ -525,6 +530,14 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig, *, crop_action_
                     return nested
         return video
 
+    def _single_video_file_path(video: Any) -> str | os.PathLike | None:
+        video = _unwrap_video_payload(video)
+        if isinstance(video, list):
+            if len(video) != 1:
+                return None
+            video = video[0]
+        return video if is_video_file_path(video) else None
+
     def _decode_video_file_to_frames(
         path: str | os.PathLike,
         *,
@@ -640,6 +653,8 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig, *, crop_action_
 
         raw_video_frames: list[Any] | None = None
         transfer_input_fps: float | None = None
+        transfer_video_path: str | os.PathLike | None = None
+        deferred_video_hw: tuple[int, int] | None = None
         if raw_video is not None:
             transfer_input_fps = _video_payload_fps(raw_video)
             decode_extra = dict(extra)
@@ -649,17 +664,25 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig, *, crop_action_
                 num_frames=getattr(request.sampling_params, "num_frames", None),
                 extra_args=decode_extra,
             )
-            raw_video_frames = _video_payload_to_frames(
-                raw_video,
-                max_frames=decode_spec.max_frames,
-                keep=decode_spec.keep,
-            )
-            if not raw_video_frames:
-                raise TypeError("Cosmos3 video input must be a non-empty list of PIL images or image paths.")
+            if transfer_requested:
+                transfer_video_path = _single_video_file_path(raw_video)
+                if transfer_video_path is not None:
+                    deferred_video_hw = media_hw(transfer_video_path)
+            if deferred_video_hw is None:
+                raw_video_frames = _video_payload_to_frames(
+                    raw_video,
+                    max_frames=decode_spec.max_frames,
+                    keep=decode_spec.keep,
+                )
+                if not raw_video_frames:
+                    raise TypeError("Cosmos3 video input must be a non-empty list of PIL images or image paths.")
 
         if raw_image is None:
-            assert raw_video_frames is not None  # raw_image and raw_video can't both be None here
-            image = _pil_to_rgb(raw_video_frames[0])
+            if raw_video_frames is not None:
+                image = _pil_to_rgb(raw_video_frames[0])
+            else:
+                assert deferred_video_hw is not None
+                image = PIL.Image.new("RGB", (deferred_video_hw[1], deferred_video_hw[0]))
         else:
             image = _pil_to_rgb(raw_image)
 
@@ -720,20 +743,25 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig, *, crop_action_
                 int(target_w),
             )
         else:
-            assert raw_video_frames is not None
             if transfer_requested:
                 if transfer_input_fps is not None:
                     prompt["additional_information"]["transfer_input_fps"] = transfer_input_fps
-                transfer_frames = media_to_uint8_cthw(
-                    raw_video_frames,
-                    height=int(target_h),
-                    width=int(target_w),
-                    max_frames=transfer_max_frames_from_extra_args(extra),
-                )
-                prompt["additional_information"]["preprocessed_transfer_video"] = uint8_cthw_to_normalized_5d(
-                    transfer_frames,
-                    dtype=torch.float32,
-                )
+                if transfer_video_path is not None and deferred_video_hw is not None:
+                    prompt["additional_information"]["transfer_video_path"] = os.fspath(transfer_video_path)
+                    prompt["additional_information"]["transfer_video_max_frames"] = decode_spec.max_frames
+                    prompt["additional_information"]["transfer_video_source_hw"] = deferred_video_hw
+                else:
+                    assert raw_video_frames is not None
+                    transfer_frames = media_to_uint8_cthw(
+                        raw_video_frames,
+                        height=int(target_h),
+                        width=int(target_w),
+                        max_frames=transfer_max_frames_from_extra_args(extra),
+                    )
+                    prompt["additional_information"]["preprocessed_transfer_video"] = uint8_cthw_to_normalized_5d(
+                        transfer_frames,
+                        dtype=torch.float32,
+                    )
             else:
                 max_frames = condition_pixel_frame_count(condition_frame_indexes_vision)
                 prompt["additional_information"]["preprocessed_video"] = _preprocess_condition_video(
@@ -3777,7 +3805,11 @@ class Cosmos3OmniDiffusersPipeline(
         sp: OmniDiffusionSamplingParams,
         transfer_config: Cosmos3TransferConfig,
         transfer_video_tensor: torch.Tensor | None,
-        transfer_input_fps: float | None,
+        transfer_video_path: str | os.PathLike | None = None,
+        transfer_video_max_frames: int | None = None,
+        transfer_video_source_hw: tuple[int, int] | None = None,
+        transfer_input_fps: float | None = None,
+        decode_context: RequestVideoDecodeContext | None = None,
     ) -> DiffusionOutput:
         if self.is_distilled_model:
             raise self._distilled_unsupported_error("transfer requests are unsupported.")
@@ -3789,6 +3821,10 @@ class Cosmos3OmniDiffusersPipeline(
         if transfer_video_tensor is not None:
             input_frames = normalized_video_to_uint8_cthw(transfer_video_tensor)
             source_hw = (int(input_frames.shape[-2]), int(input_frames.shape[-1]))
+        elif transfer_video_path is not None:
+            source_hw = transfer_video_source_hw or media_hw(transfer_video_path)
+            if source_hw is None:
+                raise ValueError(f"Could not read video dimensions from transfer input: {transfer_video_path}")
         else:
             source_hw = self._first_transfer_control_hw(transfer_config)
         height, width, transfer_aspect_ratio = self._transfer_bucket_size(sp, source_hw)
@@ -3805,6 +3841,16 @@ class Cosmos3OmniDiffusersPipeline(
             if tuple(input_frames.shape[-2:]) != (height, width):
                 input_frames = resize_center_crop_uint8_cthw(input_frames, height, width)
             input_frames = input_frames[:, : transfer_config.max_frames]
+        elif transfer_video_path is not None:
+            input_frames = media_to_uint8_cthw(
+                transfer_video_path,
+                height=height,
+                width=width,
+                max_frames=(
+                    transfer_config.max_frames if transfer_video_max_frames is None else transfer_video_max_frames
+                ),
+                decode_context=decode_context,
+            )
 
         per_hint_frames: dict[str, torch.Tensor] = {}
         for hint in transfer_config.ordered_hints:
@@ -3814,6 +3860,7 @@ class Cosmos3OmniDiffusersPipeline(
                 width=width,
                 max_frames=transfer_config.max_frames,
                 input_frames=input_frames,
+                decode_context=decode_context,
             )
             if frames.shape[1] < 1:
                 raise ValueError(f"Cosmos3 transfer hint '{hint.key}' produced no frames.")
@@ -4091,6 +4138,9 @@ class Cosmos3OmniDiffusersPipeline(
             image_tensor = None
             video_tensor = None
             transfer_video_tensor = None
+            transfer_video_path = None
+            transfer_video_max_frames = None
+            transfer_video_source_hw = None
             transfer_input_fps = None
         else:
             prompt = prompt_data.get("prompt", "")
@@ -4099,6 +4149,9 @@ class Cosmos3OmniDiffusersPipeline(
             image_tensor = additional_info.get("preprocessed_image")
             video_tensor = additional_info.get("preprocessed_video")
             transfer_video_tensor = additional_info.get("preprocessed_transfer_video")
+            transfer_video_path = additional_info.get("transfer_video_path")
+            transfer_video_max_frames = additional_info.get("transfer_video_max_frames")
+            transfer_video_source_hw = additional_info.get("transfer_video_source_hw")
             transfer_input_fps = positive_float(additional_info.get("transfer_input_fps"))
 
         is_t2i = self._is_t2i_request(req)
@@ -4156,14 +4209,23 @@ class Cosmos3OmniDiffusersPipeline(
                 raise ValueError("Cosmos3 transfer inference accepts video inputs or control_path values, not images.")
             if transfer_video_tensor is None and video_tensor is not None:
                 transfer_video_tensor = video_tensor
-            return self._forward_transfer(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                sp=sp,
-                transfer_config=transfer_config,
-                transfer_video_tensor=transfer_video_tensor,
-                transfer_input_fps=transfer_input_fps,
-            )
+            with RequestVideoDecodeContext(
+                before_access=check_request_cancellation,
+                after_access=check_request_cancellation,
+            ) as decode_context:
+                check_request_cancellation()
+                return self._forward_transfer(
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    sp=sp,
+                    transfer_config=transfer_config,
+                    transfer_video_tensor=transfer_video_tensor,
+                    transfer_video_path=transfer_video_path,
+                    transfer_video_max_frames=transfer_video_max_frames,
+                    transfer_video_source_hw=transfer_video_source_hw,
+                    transfer_input_fps=transfer_input_fps,
+                    decode_context=decode_context,
+                )
         if image_tensor is not None and video_tensor is not None and not action_enabled:
             raise ValueError("Cosmos3 non-action generation accepts either image or video input, not both.")
         if video_tensor is not None and is_t2i:
