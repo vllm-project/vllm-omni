@@ -28,6 +28,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import (
+    ImageTokenSpan,
     VideoTokenLayout,
     VideoTokenSpan,
 )
@@ -134,7 +135,19 @@ def _compact_reference_video_layout(
         targets.append(VideoTokenSpan(start=compact_start, latent_grid=grid, role="target"))
     if len(targets) != 1:
         return None
-    return VideoTokenLayout(used_len=used_length, video_spans=tuple(targets))
+    images = []
+    for span in layout.image_spans:
+        removed = bisect_left(positions, span.start + span.length) - bisect_left(positions, span.start)
+        if removed == 0:
+            images.append(
+                ImageTokenSpan(
+                    start=span.start - bisect_left(positions, span.start),
+                    latent_grid=span.latent_grid,
+                )
+            )
+        elif removed != span.length:
+            return None
+    return VideoTokenLayout(used_len=used_length, video_spans=tuple(targets), image_spans=tuple(images))
 
 
 def _reference_kv_video_layout(
@@ -144,8 +157,8 @@ def _reference_kv_video_layout(
 ) -> VideoTokenLayout | None:
     """Keep complete reference-video spans in the cached K/V prefix.
 
-    Q has only target rows. Track images separately so RBS can select their
-    complete blocks while mixed context and partial video spans remain protected.
+    Q has only target rows. Complete images retain separate image geometry;
+    partial video spans and other context retain dense protection.
     """
     if compact is None:
         return None
@@ -164,14 +177,19 @@ def _reference_kv_video_layout(
         VideoTokenSpan(start=span.start + reference_rows, latent_grid=span.latent_grid, role=span.role)
         for span in compact.video_spans
     )
-    image_positions = []
-    for start, stop in original.reference_image_spans:
-        owned = tuple(i for i, position in enumerate(positions) if start <= position < stop)
-        if len(owned) != stop - start:
+    images = []
+    for span in original.image_spans:
+        first = bisect_left(positions, span.start)
+        last = bisect_left(positions, span.start + span.length)
+        if 0 < last - first < span.length:
             raise ValueError("reference image not fully represented in cached prefix")
-        image_positions.append(owned)
+        if last - first == span.length:
+            images.append(ImageTokenSpan(start=first, latent_grid=span.latent_grid))
+    images.extend(
+        ImageTokenSpan(start=span.start + reference_rows, latent_grid=span.latent_grid) for span in compact.image_spans
+    )
     return VideoTokenLayout(
-        reference_image_positions=tuple(image_positions),
+        image_spans=tuple(sorted(images, key=lambda span: span.start)),
         used_len=compact.used_len + reference_rows,
         video_spans=tuple(sorted(spans, key=lambda span: span.start)),
     )

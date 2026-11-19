@@ -1,10 +1,10 @@
 # LQ-Slim
 
 The recommended LQ-Slim configuration combines eight-step MiniMax-H3 Ref2VA
-LoRA, NPU-resident reference KV, rectangular mixed-precision attention and
-per-image reference block selection.
+LoRA, NPU-resident reference KV, mixed-precision attention and independent
+reference-image sparsity.
 The target sparsity is 0.8 for steps 0–1 and 0.85 for steps 2–7; reference-image
-candidate blocks use a 0.1 keep ratio. These are approximate optimizations;
+candidate blocks use an image deletion ratio of 0.9. These are approximate optimizations;
 output quality must be evaluated for the intended inputs.
 
 The complete eight-step recipe pairs the Larry v4-step600 EMA adapter with
@@ -21,13 +21,14 @@ require the fixed adapter or the eight-step preset below.
 ## Install
 
 Use the project's normal [Ascend installation](../../docs/getting_started/installation/npu.md)
-and a MindIE-SD build containing [reference block selection PR #842](https://gitcode.com/Ascend/MindIE-SD/pull/842/discuss).
-The dependency revision used for this port is `98fd99717182623bbfa952dd676f6865f2729f9d`.
-It includes the full-keep boundary correction; this PR is a separate dependency
-and is not installed automatically with vLLM-Omni.
+and a MindIE-SD build exposing the public `image_spans/image_sparsity` API.
+The dependency source checked for this port is
+[MindIE-SD `6965ff2`](https://gitcode.com/Ascend/MindIE-SD/tree/6965ff2f397c3370ef50d06b6564067d3205fccb).
+Install its matching Python and native components using MindIE-SD's normal
+installation instructions; the old RBS helper patch is insufficient.
 
 ```bash
-git clone --branch lq-slim-main --single-branch https://github.com/march7th-26/vllm-omni.git
+git clone --branch feat/lq-slim-upstream --single-branch https://github.com/march7th-26/vllm-omni.git
 cd vllm-omni
 VLLM_OMNI_TARGET_DEVICE=npu pip install -e . --no-build-isolation
 ```
@@ -56,13 +57,13 @@ vllm serve "$MODEL" --omni --task-type ref2va \
     --vae-parallel-mode tile --vae-use-tiling --vae-patch-parallel-size 4 \
     --lora-path "$LORA" --lora-backend distill --lora-scale 1 \
     --diffusion-quantization-config '{"transformer":{"method":"mxfp8"}}' \
-    --diffusion-attention-config '{"default":{"backend":"RAINFUSION_ATTN","block_sparse":{"sparsity":0.8,"precision":"mix"},"rainfusion":{"ref_keep_ratio":0.1}}}' \
-    --diffusion-attention-schedule '{"profiles":{"late":{"default":{"backend":"RAINFUSION_ATTN","block_sparse":{"sparsity":0.85,"precision":"mix"},"rainfusion":{"ref_keep_ratio":0.1}}}},"default":[{"start":2,"end":null,"profile":"late"}]}' \
+    --diffusion-attention-config '{"default":{"backend":"RAINFUSION_ATTN","block_sparse":{"sparsity":0.8,"precision":"mix"},"rainfusion":{"image_sparsity":0.9}}}' \
+    --diffusion-attention-schedule '{"profiles":{"late":{"default":{"backend":"RAINFUSION_ATTN","block_sparse":{"sparsity":0.85,"precision":"mix"},"rainfusion":{"image_sparsity":0.9}}}},"default":[{"start":2,"end":null,"profile":"late"}]}' \
     --kv-offload-config '{"mode":"on","kv_refresh_interval":8,"kv_host_quantization":"none","kv_storage":"npu"}'
 ```
 
 This uses the existing [attention schedule](../../docs/user_guide/diffusion/attention_backends/schedules.md)
-interface. Profile options are complete configurations; include `rainfusion.ref_keep_ratio`
+interface. Profile options are complete configurations; include `rainfusion.image_sparsity`
 and `precision` in each profile. The immutable adapter is applied as a BF16
 forward delta after each base projection, including quantized projections. It
 requires DiT TP=1, resident DiT weights, eight denoising steps and scale 1;
@@ -100,27 +101,25 @@ Repeat `input_references` in prompt order to supply several references.
 
 | Control | Meaning |
 | --- | --- |
-| `rainfusion.ref_keep_ratio` | Per image, head and eligible target query block, keep `max(1, ceil(N * ratio))` of the image's N candidate key blocks. Default 1 preserves the original mask. |
+| `rainfusion.image_sparsity` | Fraction of candidate image blocks dropped per image, head and eligible video query. Range `[0, 1]`; default 0 disables image selection. At least one candidate is kept. |
 | `sparsity` | Nominal fraction of pooled key blocks dropped. Protected blocks and reference selection change the realized mask. |
 | `kv_storage` | `host` retains the existing layerwise host cache; `npu` keeps unquantized reference KV on the device and avoids host copies. Default `host`. |
 | `kv_refresh_interval` | With eight-step inference, 8 refreshes at the first step and reuses references for seven steps. It is unrelated to INT8 cache storage. |
 | `precision=mix` | Q/K are quantized to INT8 and V to FP8 inside attention. Inputs, cached reference KV and outputs remain BF16. |
 
-Reference selection changes eligible attention connections. It does not shrink
-the reference KV pool or remove reference keys from attention. Mixed/partial
-image blocks, reference videos/audio, protected query rows and boundary blocks
-retain their protection. Compact SP padding is removed before attention and
-restored only for reverse communication. A5 rectangular execution supports
-BF16 or mix with unquantized cached KV; ring parallelism is unsupported.
-
-To compare with the earlier RBS working point, remove the attention schedule,
-keep target sparsity at 0.8 and set `rainfusion.ref_keep_ratio=0.2`. Other settings should
-match across both runs.
+Image selection applies independently to eligible reference-video and target-video
+query blocks; protected queries and image boundary blocks remain protected.
+It changes attention connections, without shrinking the reference KV pool.
+When image selection is active, compact reuse pads dummy reference queries after
+Ulysses to satisfy MindIE-SD's equal-length Q/K/V interface, then discards their
+outputs. Reference projections and KV are still reused. Without image selection,
+A5 resident KV uses rectangular BF16/mix attention. Compact SP transport padding
+is excluded from attention and restored for reverse exchange. Ring is unsupported.
 
 ## Validation
 
 This branch ports the complete scheme onto official main
-`4bc340899368f817c1c481b9c5a060c705270304`. Earlier results from the separate
+`62d0e880a2c7c42903cc384d3b805af4c21a3326`. Earlier results from the separate
 `lq-slim` branch do not validate this revision. NPU end-to-end execution,
 performance and output quality for this port remain unverified.
 
@@ -129,15 +128,18 @@ resident/host KV values and cleanup, transport padding and LoRA
 arithmetic/binding. Native attention calls in routing tests
 are spies; no device operator or distributed execution is simulated.
 
+For the optional dependency-source tests, set `MINDIE_SD_SOURCE` to the checked
+MindIE-SD checkout; otherwise those tests skip.
+
 For a minimal CPU environment, install PyTorch, safetensors, pytest,
-pytest-mock and pytest-asyncio, then run:
+pytest-mock, pytest-asyncio and einops, then run:
 
 ```bash
-python -m pytest --noconftest -o addopts='' tests/diffusion/models/minimax_h3/test_reference_block_selection.py tests/diffusion/models/minimax_h3/test_reference_kv_resident.py tests/diffusion/models/minimax_h3/test_ref2va_lora.py -q
+python -m pytest --noconftest -o addopts='' tests/diffusion/models/minimax_h3/test_reference_block_selection.py tests/diffusion/models/minimax_h3/test_reference_kv_resident.py tests/diffusion/models/minimax_h3/test_ref2va_lora.py tests/diffusion/models/minimax_h3/test_image_sparse_mask.py -q
 ```
 
 With the full repository test dependencies, the CI-aligned command is:
 
 ```bash
-python -m pytest tests/diffusion/models/minimax_h3/test_reference_block_selection.py tests/diffusion/models/minimax_h3/test_reference_kv_resident.py tests/diffusion/models/minimax_h3/test_ref2va_lora.py -m 'core_model and cpu' --run-level core_model -q
+python -m pytest tests/diffusion/models/minimax_h3/test_reference_block_selection.py tests/diffusion/models/minimax_h3/test_reference_kv_resident.py tests/diffusion/models/minimax_h3/test_ref2va_lora.py tests/diffusion/models/minimax_h3/test_image_sparse_mask.py -m 'core_model and cpu' --run-level core_model -q
 ```

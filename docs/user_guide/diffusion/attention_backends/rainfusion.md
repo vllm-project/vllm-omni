@@ -113,36 +113,39 @@ than an automatic fallback. See
 [quantized attention](../../quantization/quantized_kvcache.md#wan22-t2v-quantized-attention-on-ascend)
 for the shared configuration structure and index semantics.
 
-## Reference-image block selection
+## Independent reference-image sparsity
 
-Set `rainfusion.ref_keep_ratio` alongside `block_sparse` in an attention spec:
+Set `rainfusion.image_sparsity` alongside `block_sparse` in an attention spec:
 
 ```json
 {
   "default": {
     "backend": "RAINFUSION_ATTN",
     "block_sparse": {"sparsity": 0.8, "precision": "mix"},
-    "rainfusion": {"ref_keep_ratio": 0.1}
+    "rainfusion": {"image_sparsity": 0.9}
   }
 }
 ```
 
-The ratio must be in `(0, 1]`; default 1 preserves the original mask. Values
-below 1 require positive block sparsity and a MindIE-SD build containing
-[PR #842](https://gitcode.com/Ascend/MindIE-SD/pull/842/discuss). For each image,
-head and eligible target query block, selection keeps `max(1, ceil(N * ratio))`
-of that image's N candidate key blocks, independently of global top-k. Selected
-connections can be restored even when global top-k removed them. Mixed image
-blocks and protected rows/blocks retain their protection. Models must supply
-exact reference-image ownership; the backend does not infer it from a prefix.
+The deletion ratio is in `[0, 1]`; default 0 preserves the original image mask.
+For each image, head and eligible video query block, selection keeps
+`max(1, ceil(N * (1 - image_sparsity)))` of that image's N candidate key blocks.
+Reference-video and target-video queries both participate. Selection is
+independent of global top-k and can restore connections it removed. Protected
+query rows and image boundary blocks retain their protection.
 
-MiniMax-H3 supplies this metadata for full and compact reference-KV attention.
-On A5, its rectangular path supports BF16 and mix with unquantized cached KV.
-An explicit floating-point KV precision override also selects BF16 rectangular
-execution. Ring parallelism is unsupported. Reference selection changes the
-attention mask and does not reduce the reference KV allocation.
+Models supply independent `ImageTokenSpan(start, latent_grid)` metadata;
+the backend does not infer image geometry from a prefix. MindIE-SD must expose
+`image_spans/image_sparsity` and matching rf_v2/rf_v3 behavior; old RBS helper
+builds are insufficient and missing public parameters cause an explicit error.
 
-Use the existing attention schedule to vary target sparsity across steps. Each
-profile must include its own RainFusion options. See the complete
-[reference optimization recipe](../../../../recipes/h3_ref_optimizations/README.md) for configuration,
-dependency revision and validation limits.
+With selected images, compact MiniMax-H3 reference reuse pads dummy reference
+queries after Ulysses, executes equal-length Q/K/V attention and discards their
+outputs. Reference projection and KV reuse remain active. Without image
+selection, A5 resident reuse supports rectangular BF16/mix with unquantized KV.
+Image sparsity does not reduce the reference KV allocation; Ring is unsupported.
+
+Use the existing attention schedule to vary video sparsity across steps. Each
+profile must include its own RainFusion options. See the
+[reference optimization recipe](../../../../recipes/h3_ref_optimizations/README.md)
+for dependency revision, configuration and validation limits.

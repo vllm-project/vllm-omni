@@ -163,8 +163,11 @@ stream in layer order and released when the request closes.
 Reference reuse does not install an adapter or change weight loading. A request
 keeps its model and adapter fixed for the denoise run; its cache closes before
 another request can reuse storage. Refresh intervals are independent of the
-step count. Per-image reference selection is a separate RainFusion option and
-requires exact image ownership metadata. See the
+step count. Independent image sparsity is a separate RainFusion option and
+requires `ImageTokenSpan` geometry preserved through packing and compaction.
+Its public MindIE-SD ABI requires equal-length Q/K/V: selected-image reuse adds
+dummy reference queries after Ulysses and discards their outputs. With image
+selection off, resident A5 reuse retains rectangular attention. See the
 [reference optimization recipe](../../../../recipes/h3_ref_optimizations/README.md)
 for configuration, its independent MindIE-SD dependency and validation limits.
 

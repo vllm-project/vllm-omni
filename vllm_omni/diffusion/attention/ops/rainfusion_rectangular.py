@@ -122,8 +122,6 @@ def run(
     scale: float,
     *,
     precision: str = "bf16",
-    ref_selection: tuple[tuple[tuple[int, ...], ...], tuple[int, ...]] | None = None,
-    ref_keep_ratio: float = 1.0,
 ) -> torch.Tensor:
     if precision not in ("bf16", "mix"):
         raise ValueError("unsupported rectangular precision")
@@ -155,12 +153,6 @@ def run(
         mask = probs >= threshold
         if plan.protected_keys.numel():
             mask[:, :, :, plan.protected_keys] = True
-        if ref_keep_ratio < 1.0:
-            from mindiesd.layers.flash_attn.ref_sparse_mask import apply_ref_mask
-
-            if ref_selection is None:
-                raise ValueError("reference selection requires an image/query ownership plan")
-            mask = apply_ref_mask(mask, scores, ref_selection, ref_keep_ratio)
         ys = native(qs, kr, vr, mask.to(torch.int8), scale)
         out.index_copy_(1, plan.sparse_indices, ys)
     if plan.dense_rows:

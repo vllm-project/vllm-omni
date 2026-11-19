@@ -191,6 +191,18 @@ class QueryRange:
 
 
 @dataclass(frozen=True, slots=True)
+class ImageTokenSpan:
+    """Physical reference-image rows, independent of video geometry."""
+
+    start: int
+    latent_grid: tuple[int, int]
+
+    @property
+    def length(self) -> int:
+        return self.latent_grid[0] * self.latent_grid[1]
+
+
+@dataclass(frozen=True, slots=True)
 class VideoTokenSpan:
     """One physical video-grid slice in packed document 0."""
 
@@ -224,9 +236,7 @@ class VideoTokenLayout:
     latent_grid: tuple[int, int, int] | None = None
     used_len: int | None = None
     video_spans: tuple[VideoTokenSpan, ...] = ()
-    # Original image ranges, or exact positions after cached-reference packing.
-    reference_image_spans: tuple[tuple[int, int], ...] = ()
-    reference_image_positions: tuple[tuple[int, ...], ...] = ()
+    image_spans: tuple[ImageTokenSpan, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
