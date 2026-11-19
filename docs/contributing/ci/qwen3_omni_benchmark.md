@@ -50,8 +50,8 @@ Invalid Daily answers count as wrong answers; they do not become missing
 requests. Shared AMD and legacy accuracy helpers retain their behavior.
 
 Quality thresholds are Daily accuracy >= 0.69; Seed-TTS WER <= 0.05 and
-SIM >= 0.75. CUDA additionally retains UTMOS >= 3.10. NPU UTMOS is disabled.
-WER/SIM/UTMOS scoring follows the request measurement window. Performance-only
+SIM >= 0.75. UTMOS scoring is disabled on both platforms.
+WER/SIM scoring follows the request measurement window. Performance-only
 Seed-TTS cases explicitly disable these evaluators. The two existing
 verbatim-reading cases belong to the online function expansion suite.
 
@@ -97,7 +97,7 @@ With matching vLLM/Omni dependencies, model, media and evaluators cached:
 
 ```bash
 BENCHMARK_DIR=tests/dfx/perf/results \
-SEED_TTS_EVAL_DEVICE=cuda:1 SEED_TTS_UTMOS_DEVICE=cuda:1 \
+SEED_TTS_EVAL_DEVICE=cuda:1 \
 pytest -sv tests/dfx/perf/scripts/run_benchmark.py \
   --test-config-file tests/dfx/perf/tests/test_qwen3_omni_datasets.json \
   -m 'full_model and cuda and cards_2' --run-level full_model

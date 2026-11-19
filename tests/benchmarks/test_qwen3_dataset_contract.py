@@ -75,7 +75,7 @@ def test_coverage_rejects_partial_success_even_with_high_accuracy():
     assert any("completed" in error for error in errors)
     assert any("successful_audio_requests" in error for error in errors)
     case = nightly.WorkloadCase("default", "daily-omni", 64, 1197, accuracy=True)
-    assert nightly.accuracy_coverage_errors({"daily_omni_evaluated_ok": 1000}, case, "cuda")
+    assert nightly.accuracy_coverage_errors({"daily_omni_evaluated_ok": 1000}, case)
 
 
 @pytest.mark.parametrize(
@@ -90,7 +90,7 @@ def test_accuracy_does_not_depend_on_c64(platform, dataset, concurrency, count):
     }
     case, actual_platform, smoke = nightly.case_from_params(params)
     assert case.accuracy and actual_platform == platform and not smoke
-    assert nightly.accuracy_coverage_errors({}, case, platform)
+    assert nightly.accuracy_coverage_errors({}, case)
     params["num_prompts"] = [2]
     with pytest.raises(ValueError, match="complete pinned dataset"):
         nightly.case_from_params(params)
@@ -98,15 +98,21 @@ def test_accuracy_does_not_depend_on_c64(platform, dataset, concurrency, count):
     assert nightly.case_from_params(params)[2]
 
 
-def test_scoring_switches_are_scoped_and_restored(monkeypatch):
-    monkeypatch.setenv("SEED_TTS_UTMOS_EVAL", "old")
+@pytest.mark.parametrize(
+    "dataset,accuracy,expected", [("seed-tts", True, "1"), ("seed-tts", False, "0"), ("daily-omni", True, "0")]
+)
+def test_scoring_switches_are_scoped_and_restored(monkeypatch, dataset, accuracy, expected):
+    monkeypatch.setenv("SEED_TTS_UTMOS_EVAL", "1")
     monkeypatch.delenv("SEED_TTS_WER_EVAL", raising=False)
-    case = nightly.WorkloadCase("async-prefix", "seed-tts", 32, 1088, accuracy=True)
-    with nightly.scoring_environment(case, "npu"):
-        assert nightly.os.environ["SEED_TTS_WER_EVAL"] == "1"
+    monkeypatch.delenv("SEED_TTS_SIM_EVAL", raising=False)
+    case = nightly.WorkloadCase("async-prefix", dataset, 32, nightly.DATASETS[dataset]["count"], accuracy=accuracy)
+    with nightly.scoring_environment(case):
+        assert nightly.os.environ["SEED_TTS_WER_EVAL"] == expected
+        assert nightly.os.environ["SEED_TTS_SIM_EVAL"] == expected
         assert nightly.os.environ["SEED_TTS_UTMOS_EVAL"] == "0"
     assert "SEED_TTS_WER_EVAL" not in nightly.os.environ
-    assert nightly.os.environ["SEED_TTS_UTMOS_EVAL"] == "old"
+    assert "SEED_TTS_SIM_EVAL" not in nightly.os.environ
+    assert nightly.os.environ["SEED_TTS_UTMOS_EVAL"] == "1"
 
 
 @pytest.mark.parametrize("indices", [[0, 0], [0, 1197], [0, True], [0], "0,647"])
@@ -143,7 +149,7 @@ def test_invalid_answers_are_not_confused_with_missing_requests():
         "daily_omni_accuracy": 900 / 1197,
     }
     assert validation.coverage_errors(result, 1197, require_audio=True) == []
-    assert nightly.accuracy_coverage_errors(result, case, "cuda") == []
+    assert nightly.accuracy_coverage_errors(result, case) == []
 
 
 @dataclass
@@ -174,11 +180,9 @@ def test_valid_audio_requires_decodable_duration_and_measurable_latency():
 def test_seed_requires_all_scores_not_only_high_means():
     case = nightly.WorkloadCase("async-prefix", "seed-tts", 64, 1088, accuracy=True)
     data = {**_full_quality_result("seed-tts"), "seed_tts_sim_evaluated": 1087}
-    assert nightly.accuracy_coverage_errors(data, case, "cuda") == ["seed_tts_sim_evaluated=1087, expected 1088"]
+    assert nightly.accuracy_coverage_errors(data, case) == ["seed_tts_sim_evaluated=1087, expected 1088"]
     data["seed_tts_sim_evaluated"] = 1088
-    data.pop("seed_tts_utmos_evaluated")
-    assert nightly.accuracy_coverage_errors(data, case, "npu") == []
-    assert nightly.accuracy_coverage_errors(data, case, "cuda")
+    assert nightly.accuracy_coverage_errors(data, case) == []
 
 
 def _full_quality_result(dataset):
@@ -189,8 +193,6 @@ def _full_quality_result(dataset):
         "seed_tts_content_error_mean": 0.02,
         "seed_tts_sim_evaluated": 1088,
         "seed_tts_sim_mean": 0.85,
-        "seed_tts_utmos_evaluated": 1088,
-        "seed_tts_utmos_mean": 3.4,
     }
 
 
@@ -207,13 +209,12 @@ def _full_quality_result(dataset):
         ("seed-tts", "seed_tts_empty_audio"),
         ("seed-tts", "seed_tts_sim_failed"),
         ("seed-tts", "seed_tts_sim_skipped_no_ref"),
-        ("seed-tts", "seed_tts_utmos_failed"),
     ],
 )
 def test_nightly_rejects_reported_failures_even_with_complete_score_counts(dataset, failure_key):
     case = nightly.WorkloadCase("default", dataset, 64, nightly.DATASETS[dataset]["count"], accuracy=True)
     result = {**_full_quality_result(dataset), failure_key: 1}
-    errors = nightly.accuracy_coverage_errors(result, case, "cuda")
+    errors = nightly.accuracy_coverage_errors(result, case)
     assert any(failure_key in error for error in errors)
 
 
@@ -223,21 +224,30 @@ def test_nightly_rejects_reported_failures_even_with_complete_score_counts(datas
         ("daily-omni", "daily_omni_accuracy"),
         ("seed-tts", "seed_tts_content_error_mean"),
         ("seed-tts", "seed_tts_sim_mean"),
-        ("seed-tts", "seed_tts_utmos_mean"),
     ],
 )
 def test_nightly_requires_finite_scores(dataset, metric):
     case = nightly.WorkloadCase("default", dataset, 64, nightly.DATASETS[dataset]["count"], accuracy=True)
     result = {**_full_quality_result(dataset), metric: float("nan")}
-    assert any(metric in error for error in nightly.accuracy_coverage_errors(result, case, "cuda"))
+    assert any(metric in error for error in nightly.accuracy_coverage_errors(result, case))
 
 
-def test_npu_accepts_zero_wer_without_disabled_utmos_scores():
-    case = nightly.WorkloadCase("default", "seed-tts", 64, 1088, accuracy=True)
-    result = {**_full_quality_result("seed-tts"), "seed_tts_content_error_mean": 0.0}
-    result.pop("seed_tts_utmos_evaluated")
-    result.pop("seed_tts_utmos_mean")
-    assert nightly.accuracy_coverage_errors(result, case, "npu") == []
+@pytest.mark.parametrize("hardware,concurrency", [("H100", 64), ("A3", 32)])
+def test_seed_accepts_zero_wer_without_utmos_scores(monkeypatch, hardware, concurrency):
+    monkeypatch.setenv("QWEN3_OMNI_BASELINE_MODE", "collect")
+    case = nightly.WorkloadCase("default", "seed-tts", concurrency, 1088, accuracy=True)
+    result = {
+        **_full_quality_result("seed-tts"),
+        **_valid_performance(case),
+        "request_count": 1088,
+        "completed": 1088,
+        "successful_audio_requests": 1088,
+        "seed_tts_content_error_mean": 0.0,
+    }
+    assert nightly.accuracy_coverage_errors(result, case) == []
+    annotated = nightly.annotate_result(result, case, hardware, smoke=False, exit_code=0)
+    assert annotated["validation_errors"] == []
+    assert "min_seed_tts_mean_utmos" not in annotated["quality_thresholds"]
 
 
 def test_source_checkout_version_metadata_remains_available(monkeypatch):

@@ -92,7 +92,6 @@ steps:
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - export SEED_TTS_EVAL_DEVICE=cuda:1
-          - export SEED_TTS_UTMOS_DEVICE=cuda:1
           - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_datasets.json -k "cuda_default" -m "full_model and cuda and H100 and B200 and cards_2" --run-level full_model
 
       - label: ":full_moon: Omni · Qwen3-Omni Accuracy + Perf · async-prefix"
@@ -108,7 +107,6 @@ steps:
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - export SEED_TTS_EVAL_DEVICE=cuda:1
-          - export SEED_TTS_UTMOS_DEVICE=cuda:1
           - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_datasets.json -k "cuda_async_daily or cuda_async_seed" -m "full_model and cuda and H100 and B200 and cards_2" --run-level full_model
 
       - label: ":full_moon: Omni · Qwen3-Omni · Duplex OmniInteract Accuracy and Perf Test"

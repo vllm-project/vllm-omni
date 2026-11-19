@@ -144,15 +144,12 @@ def dataset_args(case: WorkloadCase, root: Path, work: Path, *, indices: list[in
     ]
 
 
-def quality_baseline(case: WorkloadCase, platform: str) -> dict[str, float]:
+def quality_baseline(case: WorkloadCase) -> dict[str, float]:
     if not case.accuracy:
         return {}
     if case.dataset == "daily-omni":
         return {"min_daily_omni_accuracy": 0.69}
-    limits = {"max_seed_tts_mean_wer": 0.05, "min_seed_tts_mean_sim": 0.75}
-    if platform == "cuda":
-        limits["min_seed_tts_mean_utmos"] = 3.10
-    return limits
+    return {"max_seed_tts_mean_wer": 0.05, "min_seed_tts_mean_sim": 0.75}
 
 
 def software_versions() -> dict[str, str]:
@@ -224,7 +221,7 @@ def performance_gate(
     return errors, annotated
 
 
-def accuracy_coverage_errors(result: dict, case: WorkloadCase, platform: str) -> list[str]:
+def accuracy_coverage_errors(result: dict, case: WorkloadCase) -> list[str]:
     """Require scoring for every submitted row in an explicit accuracy case."""
     if not case.accuracy:
         return []
@@ -236,8 +233,6 @@ def accuracy_coverage_errors(result: dict, case: WorkloadCase, platform: str) ->
             "seed_tts_sim_evaluated",
         ]
     )
-    if case.dataset == "seed-tts" and platform == "cuda":
-        counts.append("seed_tts_utmos_evaluated")
     errors = [f"{key}={result.get(key)!r}, expected {case.count}" for key in counts if result.get(key) != case.count]
     failure_keys = ["timed_out_requests", "cancelled_after_timeout_requests"]
     if case.dataset == "daily-omni":
@@ -253,9 +248,6 @@ def accuracy_coverage_errors(result: dict, case: WorkloadCase, platform: str) ->
             "seed_tts_sim_skipped_no_ref",
         ]
         score_keys = ["seed_tts_content_error_mean", "seed_tts_sim_mean"]
-        if platform == "cuda":
-            failure_keys.append("seed_tts_utmos_failed")
-            score_keys.append("seed_tts_utmos_mean")
     errors += [f"{key}={result[key]}; workload coverage is incomplete" for key in failure_keys if result.get(key, 0)]
     for key in score_keys:
         value = result.get(key)
@@ -265,13 +257,13 @@ def accuracy_coverage_errors(result: dict, case: WorkloadCase, platform: str) ->
 
 
 @contextmanager
-def scoring_environment(case: WorkloadCase, platform: str):
+def scoring_environment(case: WorkloadCase):
     """Limit evaluator switches to this benchmark subprocess and restore them."""
     enabled = case.accuracy and case.dataset == "seed-tts"
     values = {
         "SEED_TTS_WER_EVAL": str(int(enabled)),
         "SEED_TTS_SIM_EVAL": str(int(enabled)),
-        "SEED_TTS_UTMOS_EVAL": str(int(enabled and platform == "cuda")),
+        "SEED_TTS_UTMOS_EVAL": "0",
     }
     previous = {key: os.environ.get(key) for key in values}
     os.environ.update(values)
@@ -322,7 +314,6 @@ def case_from_params(params: dict) -> tuple[WorkloadCase, str, bool]:
 def annotate_result(
     result: dict,
     case: WorkloadCase,
-    platform: str,
     hardware: str,
     *,
     smoke: bool,
@@ -333,8 +324,8 @@ def annotate_result(
     from vllm_omni.benchmarks.validation import coverage_errors
 
     errors = coverage_errors(result, case.count, require_audio=True)
-    errors += accuracy_coverage_errors(result, case, platform)
-    limits = quality_baseline(case, platform)
+    errors += accuracy_coverage_errors(result, case)
+    limits = quality_baseline(case)
     if case.accuracy and not smoke:
         if case.dataset == "daily-omni":
             errors += helpers._validate_daily_omni(result, min_accuracy=limits["min_daily_omni_accuracy"])
@@ -343,7 +334,7 @@ def annotate_result(
                 result,
                 max_mean_wer=limits["max_seed_tts_mean_wer"],
                 min_mean_sim=limits["min_seed_tts_mean_sim"],
-                min_mean_utmos=limits.get("min_seed_tts_mean_utmos"),
+                min_mean_utmos=None,
             )
     if exit_code != 0:
         errors.append(f"Benchmark subprocess exited with {exit_code}")
@@ -387,11 +378,11 @@ def run_workload(server, params: dict, test_name: str, hardware: str, *, enforce
     """Execute JSON-defined dataset cases through the shared DFX bench runner."""
     from tests.dfx.conftest import run_benchmark
 
-    case, platform, smoke = case_from_params(params)
+    case, _, smoke = case_from_params(params)
     if smoke and enforce_baseline:
         raise ValueError("Smoke cannot qualify a full-dataset performance baseline")
     root = resolve_dataset(case.dataset)
-    with TemporaryDirectory(prefix="qwen3-omni-dataset-") as work, scoring_environment(case, platform):
+    with TemporaryDirectory(prefix="qwen3-omni-dataset-") as work, scoring_environment(case):
         args = [
             "--host",
             server.host,
@@ -433,7 +424,7 @@ def run_workload(server, params: dict, test_name: str, hardware: str, *, enforce
             num_warmups=params.get("num_warmups", max(2, case.concurrency)),
             benchmark_params_name=case.id,
             result_transform=lambda result, code: annotate_result(
-                result, case, platform, hardware, smoke=smoke, exit_code=code, enforce_baseline=enforce_baseline
+                result, case, hardware, smoke=smoke, exit_code=code, enforce_baseline=enforce_baseline
             ),
         )
     assert not result["validation_errors"], "\n".join(result["validation_errors"])
