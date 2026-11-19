@@ -1,8 +1,5 @@
-# The published vLLM-Ascend baseline remains v0.33.0; its v0.34.0 release
-# is unavailable. This older NPU image is not qualified for Omni's vLLM 0.34.0
-# target. Device-specific suffixes select -a3/-a5/-310p; no suffix selects A2.
 ARG VLLM_ASCEND_IMAGE=quay.io/atlas-ci/vllm-ascend
-ARG VLLM_ASCEND_VERSION=v0.33.0
+ARG VLLM_ASCEND_VERSION=v0.34.0
 ARG VLLM_ASCEND_DEVICE_SUFFIX=
 FROM ${VLLM_ASCEND_IMAGE}:${VLLM_ASCEND_VERSION}${VLLM_ASCEND_DEVICE_SUFFIX}
 
