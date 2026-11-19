@@ -1639,3 +1639,31 @@ def test_rejected_user_sources_preserve_new_input_and_ignore_deleted_or_recreate
     assert session.unanswered_user_items() == 1
     session.reset_unanswered_user_items()
     assert session.unanswered_user_items() == 0
+
+
+def test_reserved_child_request_is_distinguishable_from_a_foreign_request():
+    # Duo's H50 block handoff forks the next Intent block onto its own request
+    # id, reserved by the session that forked it. The output mailbox has to
+    # accept such a child while still rejecting output belonging to any other
+    # session, so the check must be session-scoped rather than id-shaped.
+    session = _session()
+    fence = session.fence
+
+    session.reserve_stage_request(1, "parent", fence=fence)
+    session.reserve_stage_request(1, "parent-block0", fence=fence)
+
+    assert session.is_reserved_request("parent")
+    assert session.is_reserved_request("parent-block0"), (
+        "a forked child must be recognised as reserved by its own session, "
+        "otherwise its stage output is dropped before the data plane runs"
+    )
+    # A request that belongs to another session, or one that never went through
+    # this session's reservation, must not become eligible by accident.
+    assert not session.is_reserved_request("someone-elses-request")
+    assert not session.is_reserved_request(None)
+
+    other = _session(session_id="other-session")
+    other.reserve_stage_request(1, "foreign", fence=other.fence)
+    assert not session.is_reserved_request("foreign"), (
+        "another session's reservation must not make a request eligible here"
+    )

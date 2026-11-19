@@ -845,6 +845,18 @@ class DuplexEngineSession:
             return None
         return self._response.draining_response_by_request.pop(request_id, None)
 
+    def is_reserved_request(self, request_id: str | None) -> bool:
+        """True when this session itself reserved a stage request for *request_id*.
+
+        A forked child is reserved on the session that forked it, under that
+        session's fence. That is what lets the output mailbox accept the
+        child's stage output while still rejecting a request that belongs to
+        another session or generation.
+        """
+        if not isinstance(request_id, str):
+            return False
+        return any(resource.request_id == request_id for resource in self.request_resources.values())
+
     def is_draining_request(self, request_id: str | None) -> bool:
         return isinstance(request_id, str) and request_id in self._response.draining_response_by_request
 

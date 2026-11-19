@@ -802,9 +802,19 @@ class ModelChannel:
         if self._out.auto_responds():
             active_request_id = session.active_request_id
             if active_request_id is not None and active_request_id != item.request_id:
+                # A forked child (Duo's H50 block handoff) produces Realization
+                # and Codec output under its own request id while the parent
+                # stays `active_request_id`, so an id comparison alone drops
+                # every child output before the data plane sees it. Admit a
+                # child only when this session reserved it itself -- under the
+                # fence already validated above -- and keep its id so the data
+                # plane can still resolve the block it belongs to.
                 if not (
-                    session.capabilities.supports_concurrent_turn_requests
-                    and session.is_draining_request(item.request_id)
+                    session.is_reserved_request(item.request_id)
+                    or (
+                        session.capabilities.supports_concurrent_turn_requests
+                        and session.is_draining_request(item.request_id)
+                    )
                 ):
                     return None
         if item.input_transcript:

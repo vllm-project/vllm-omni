@@ -515,3 +515,44 @@ def test_formatter_keeps_both_packed_latents_of_an_av_snapshot(
     )
     assert result.multimodal_output["audio_latent"] is payload["audio_latent"]
     assert result.multimodal_output["video_latent"] is payload["video_latent"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({"packets": [{"payload": b"jpeg", "metadata": {"block": 0}}]}, id="duo_5_17"),
+        pytest.param(
+            {"rgb": torch.zeros(1, 3, 4, 4), "waveform": torch.zeros(1, 2, 16)},
+            id="legacy_modes",
+        ),
+    ],
+)
+def test_formatter_keeps_the_codec_payload_the_projector_reads(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict,
+) -> None:
+    # The Codec stage returns `packets` for duo_5_17 and `rgb`/`waveform` for the
+    # legacy modes, and DuoDataPlane.project reads those keys off the output
+    # envelope. The formatter used to keep only a fixed key list, so a
+    # successfully decoded block reached projection without its fields and
+    # raised KeyError, which stopped AV delivery entirely.
+    monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    postprocess_output = normalize_diffusion_postprocess_output(
+        {"payload": payload, "metadata": {"session_id": "s", "fence": 0, "block": 0}}
+    )
+
+    [result] = format_diffusion_outputs(
+        request=_request("prompt-0"),
+        od_config=_config(),
+        diffusion_output=DiffusionOutput(output=None, finished=True),
+        output_data=payload,
+        postprocess_output=postprocess_output,
+    )
+
+    missing = set(payload) - set(result.multimodal_output)
+    assert not missing, (
+        f"the codec payload keys must survive formatting; missing {sorted(missing)} "
+        "would make the projector raise KeyError instead of publishing AV"
+    )
+    for key, value in payload.items():
+        assert result.multimodal_output[key] is value

@@ -91,10 +91,13 @@ def _metadata_from_legacy_payload(payload: dict[str, DiffusionPayloadValue]) -> 
     return metadata
 
 
-# Structured (non-media) payloads travel in ``multimodal_output`` under their own key.
-# ``video_latent``/``audio_latent`` are the packed AV latents a downstream stage
-# consumes (Duo's Realization -> codec handoff reads both); keeping only one of
-# them would silently hand over half a snapshot.
+# Structured (non-media) payloads travel in ``multimodal_output`` under their own
+# key. These are the keys this module must treat as payload rather than as the
+# rendered response: the packed AV latents of a Realization snapshot, and the
+# Codec stage's decoded `packets` / `rgb` / `waveform`. A key missing here is
+# not merely absent from ``multimodal_output`` -- ``_infer_primary_payload_key``
+# would also promote it to the primary payload and the formatter would put it in
+# ``images``, which no downstream stage reads.
 STRUCTURED_PAYLOAD_KEYS = frozenset(
     {
         "actions",
@@ -104,8 +107,18 @@ STRUCTURED_PAYLOAD_KEYS = frozenset(
         "video_depth",
         "video_latent",
         "audio_latent",
+        "packets",
+        "rgb",
+        "waveform",
     }
 )
+
+# Keys the formatter already renders into the response body itself: `video` and
+# `image` become ``images``, and `text` becomes the text payload. `audio` is
+# deliberately excluded from this set because it stays in ``multimodal_output``
+# as well. Every key that is not listed here is a structured handoff that must
+# survive the trip for a downstream stage or client.
+MEDIA_RENDER_KEYS = frozenset({"video", "image", "text"})
 
 
 def _infer_primary_payload_key(payload: DiffusionPayload) -> str | None:
@@ -288,9 +301,16 @@ def _build_multimodal_output(
     mm_output: DiffusionMultimodalOutput = {}
     if postprocess_output.metadata:
         mm_output["metadata"] = postprocess_output.metadata
+    # Everything that is not a rendering key is a structured payload a
+    # downstream stage may consume: packed latents, codec `packets`, decoded
+    # `rgb`/`waveform`, and the keys recognised above. Enumerating them instead
+    # of enumerating by exclusion silently dropped payload fields no one had
+    # added to a list yet (the Codec stage then raised KeyError on `packets`
+    # after a successful decode), so the rule is expressed by exclusion.
     for key, value in postprocess_output.outputs.items():
-        if key == "audio" or key in STRUCTURED_PAYLOAD_KEYS:
-            mm_output[key] = value
+        if key in MEDIA_RENDER_KEYS:
+            continue
+        mm_output[key] = value
     if audio_sample_rate is not None:
         mm_output["audio_sample_rate"] = audio_sample_rate
     if (fps := _metadata_video_fps(postprocess_output.metadata)) is not None:
