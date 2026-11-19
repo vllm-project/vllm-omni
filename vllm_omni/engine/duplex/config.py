@@ -161,6 +161,9 @@ class DuplexCapabilities:
     #: (RFC #8325). Set by the engine from ``duplex_session.collect_stats``, never by
     #: a plugin; see :func:`apply_session_stats_capability`.
     supports_session_stats: bool = False
+    #: Plugin-declared: the sampler can emit per-action records with
+    #: exact-distribution logprobs (compose via :func:`apply_action_capture_capability`).
+    supports_action_capture: bool = False
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -211,6 +214,7 @@ class DuplexCapabilities:
             "chunk_period_ms": self.chunk_period_ms,
             "target_barge_in_latency_ms": self.target_barge_in_latency_ms,
             "supports_session_stats": self.supports_session_stats,
+            "supports_action_capture": self.supports_action_capture,
         }
 
     def accepts_input_modality(self, modality: str) -> bool:
@@ -267,6 +271,14 @@ def apply_session_stats_capability(capabilities: DuplexCapabilities, collect_sta
     if capabilities.supports_session_stats == bool(collect_stats):
         return capabilities
     return replace(capabilities, supports_session_stats=bool(collect_stats))
+
+
+def apply_action_capture_capability(capabilities: DuplexCapabilities, allow_action_capture: bool) -> DuplexCapabilities:
+    """Advertise ``supports_action_capture`` only when plugin AND deployment allow
+    it; the gate is a veto (default true) — the opt-in is the session knob."""
+    if capabilities.supports_action_capture and not allow_action_capture:
+        return replace(capabilities, supports_action_capture=False)
+    return capabilities
 
 
 @dataclass
@@ -411,6 +423,11 @@ class DuplexSessionConfig:
     response_format: str = "wav"
     temperature: float | None = None
     max_tokens: int | None = None
+    #: Record per-unit policy actions with exact-distribution logprobs;
+    #: patchable via ``session.update`` like ``temperature``.
+    action_capture: bool = False
+    #: Seeds the per-request generators; the derived effective seed rides each record.
+    seed: int | None = None
     speed: float | None = None
     use_tts_template: bool = True
     idle_timeout_s: float = 300.0
@@ -440,6 +457,8 @@ class DuplexSessionConfig:
             "response_format": self.response_format,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
+            "action_capture": self.action_capture,
+            "seed": self.seed,
             "speed": self.speed,
             "use_tts_template": self.use_tts_template,
             "idle_timeout_s": self.idle_timeout_s,
@@ -483,6 +502,13 @@ class DuplexSessionConfig:
             config.temperature = float(source["temperature"])
         if isinstance(source.get("max_tokens"), int):
             config.max_tokens = int(source["max_tokens"])
+        if isinstance(source.get("action_capture"), bool):
+            config.action_capture = bool(source["action_capture"])
+        seed = source.get("seed")
+        if isinstance(seed, bool) or (seed is not None and not isinstance(seed, int)):
+            raise DuplexConfigError("session seed must be an integer or null", code="invalid_seed", param="seed")
+        if "seed" in source:
+            config.seed = seed
         if isinstance(source.get("speed"), int | float):
             config.speed = float(source["speed"])
         if isinstance(source.get("idle_timeout_s"), int | float):
@@ -630,6 +656,8 @@ class DuplexSessionConfig:
                 or payload.get("max_output_tokens")
                 or payload.get("max_tokens")
             ),
+            "action_capture": payload.get("action_capture"),
+            "seed": payload.get("seed"),
             "speed": speed,
             "idle_timeout_s": payload.get("idle_timeout_s") or 300.0,
             "watermarking": payload.get("watermarking"),
@@ -735,6 +763,16 @@ class DuplexSessionConfig:
             self.response_format = duplex_response_format(response_format)
         if isinstance(payload.get("temperature"), int | float):
             self.temperature = float(payload["temperature"])
+        # Turning capture off mid-response seals the in-flight set.
+        if isinstance(payload.get("action_capture"), bool):
+            self.action_capture = bool(payload["action_capture"])
+        seed_patch = payload.get("seed")
+        if isinstance(seed_patch, bool) or (
+            "seed" in payload and seed_patch is not None and not isinstance(seed_patch, int)
+        ):
+            raise DuplexConfigError("session.update seed must be an integer or null", code="invalid_seed", param="seed")
+        if "seed" in payload:
+            self.seed = seed_patch
         speed = payload.get("speed")
         if not isinstance(speed, int | float) and isinstance(audio_output, dict):
             speed = audio_output.get("speed")

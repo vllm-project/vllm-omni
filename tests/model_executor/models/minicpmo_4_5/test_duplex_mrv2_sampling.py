@@ -285,3 +285,27 @@ def test_thinker_policy_reads_logits_in_place_when_every_row_is_duplex(mocker, a
         assert policy_logits is not logits
         torch.testing.assert_close(policy_logits, logits[:1])
     assert base.call_args.args[0] is logits
+
+
+@pytest.mark.cpu
+def test_mrv2_sample_step_publishes_capture_payloads_on_the_dedicated_field():
+    # Capture payloads ride the dedicated field — never ``multimodal_outputs``,
+    # whose non-None value replaces the forward's Thinker latent payload.
+    model = SimpleNamespace()
+    sampler = MiniCPMO45DuplexSampler(object(), model)
+    tokens = torch.tensor([[7]])
+    standard = (SimpleNamespace(sampled_token_ids=tokens), torch.ones(1), torch.zeros(1))
+
+    output = sampler.sample_step(None, None, None, None, lambda *_args: standard)
+    assert output.action_capture is None
+    assert output.multimodal_outputs is None
+    assert output.include_hidden_states is False
+    assert output.finalize_multimodal is not None
+
+    model._minicpmo45_duplex_capture_step = {"req-1": {"schema_version": 1, "token_ids": [3]}}
+    output = sampler.sample_step(None, None, None, None, lambda *_args: standard)
+    assert output.action_capture == {"req-1": {"schema_version": 1, "token_ids": [3]}}
+    assert output.multimodal_outputs is None
+    assert output.include_hidden_states is False
+    assert output.finalize_multimodal is not None
+    assert getattr(model, "_minicpmo45_duplex_capture_step", None) is None

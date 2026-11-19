@@ -217,6 +217,7 @@ class Harness:
         metrics: Any = None,
         stage_work: Sequence[tuple[int, int, int, int, int]] = (),
         output_chunk: tuple[int, int] | None = None,
+        capture_payload: bytes | None = None,
     ) -> bool:
         session = self.session
         fence = session.fence if epoch is None else session.fence.__class__(SESSION_ID, epoch=epoch)
@@ -227,6 +228,7 @@ class Harness:
             segment_token_ids=tuple(segment_token_ids),
             segment_output_metadata=dict(segment_output_metadata or {}),
             perf_chunks={(row[1], row[2]) for row in stage_work} | ({output_chunk} if output_chunk else set()),
+            segment_capture_payload=capture_payload,
         )
         request_id = getattr(output, "request_id", None)
         if not isinstance(request_id, str):
@@ -255,6 +257,8 @@ async def open_harness(
     log_stats: bool = False,
     plugin: DuplexModelPlugin | None = None,
     model: str = "openbmb/MiniCPM-o-4_5",
+    action_capture: bool = False,
+    seed: int | None = None,
 ) -> Harness:
     if plugin is None:
         plugin = MiniCPMO45DuplexPlugin(_fake_encode_audio)
@@ -282,6 +286,8 @@ async def open_harness(
         modalities=list(modalities),
         instructions="You are a concise assistant.",
         extra_body=body,
+        action_capture=action_capture,
+        seed=seed,
     )
     await manager.handle(
         OpenDuplexSessionMessage(

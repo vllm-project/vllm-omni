@@ -137,6 +137,17 @@ class MiniCPMO45DuplexSampler(OmniSampler):
         # mirrors it into multimodal_output too, so every llm2tts row would be
         # accumulated twice and the per-unit ledger lookup would fail.
         output = super().sample_step(hidden_states, input_batch, req_states, grammar_output, standard_sample)
+        # Capture payloads ride the dedicated field; the runner serializes
+        # it onto the engine's bytes carrier.
+        stash = getattr(self.model, "_minicpmo45_duplex_capture_step", None)
+        if stash:
+            self.model._minicpmo45_duplex_capture_step = None
+            return replace(
+                output,
+                include_hidden_states=False,
+                finalize_multimodal=_keep_thinker_payload,
+                action_capture=dict(stash),
+            )
         return replace(output, include_hidden_states=False, finalize_multimodal=_keep_thinker_payload)
 
     def __call__(self, logits: torch.Tensor, input_batch: Any) -> SamplerOutput:

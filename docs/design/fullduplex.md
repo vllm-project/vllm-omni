@@ -1613,3 +1613,65 @@ cancels its tasks and releases its recordings.
   during playback; `--inline` drives the same scenario through
   `InlineDuplexClient`), `tests/e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py`
   (admission, resume, takeover, expiry).
+
+## Action capture and policy log-probabilities
+
+Full-duplex sessions are policy rollouts: every model unit, the runtime decides
+whether to speak and what to emit. On-policy training over those decisions needs
+the engine to answer *what exactly was sampled, from what distribution, under
+what forcing* — the two surfaces this contract adds.
+
+- **Capability and opt-in.** `DuplexCapabilities.supports_action_capture` is
+  plugin-declared (MiniCPM-o 4.5 sets it; models whose sampler has not gained
+  emission do not), AND-ed with the deployment gate
+  `duplex_session.allow_action_capture` (default true — the per-session
+  `action_capture` knob is the real opt-in, patchable via `session.update`
+  alongside `seed`). A capture request against a non-capable effective
+  capability is rejected at admission (`action_capture_unsupported`).
+- **Transport.** With capture on, the duplex sampler attaches one
+  self-describing, versioned payload per sampled unit on the dedicated
+  `OmniSamplingOutput.action_capture` field — never `multimodal_outputs`,
+  whose non-None value would replace the forward's multimodal payload.
+  The runner serializes it onto the `OmniEngineCoreOutput.action_capture_payload`
+  bytes carrier; orchestrator-side decode and strict schema validation happen
+  at ledger ingest, and the terminal poll recovers the final unit's payload.
+  With capture off, no field is set, nothing is packed, no bytes cross the
+  wire: generation behavior and hot-loop work are unchanged.
+- **Semantics.** The session ledger (`engine/duplex/session/action_ledger.py`)
+  assembles units into sealed, columnar `DuplexActionRecordSet`s — one per
+  response, or per listening period (model-native sessions sample the units
+  where they keep listening too; those actions are as much policy as the
+  spoken ones). Records carry the exact-distribution joint log-probability of
+  each emitted action (`log P(chunk_eos)` for a boundary hit; `log(1-P) +
+  stage-2 logprob` for content), per-stage quantities and every
+  non-`SamplingParams` distribution input (repetition penalty and window,
+  forbidden-set identity) in the namespaced `model` extension, the forcing
+  taxonomy (`sampled` / `forced` with reason / `reemit`), input origins
+  (`client` / engine-injected silence), effective sampling parameters, and
+  the derived seed `f(session_seed, epoch, response_index)`. Validation
+  failure is session-fatal (`action_capture_invalid`); retention is one open
+  plus one sealed scope, collection is draining
+  (`action_capture_retention_overflow` on a consumer that falls behind);
+  close/interrupt/cancel seal partial sets (`truncated_close` /
+  `truncated_interruption` / `truncated_cancel`), retrievable for a bounded
+  window after close through the manager's terminal cache.
+- **Retrieval.** In-process: `DuplexSessionHandle.collect_action_records()`
+  (request/reply on the session's outbox, so a concurrent `events()` consumer
+  is unaffected) and `DuplexOmni.collect_action_records(session_id)` after
+  close. Wire: `session.action_records.get` → `session.action.records`
+  (Tier 3; see the [serving guide](../serving/realtime_duplex_api.md)).
+- **Weight-sync fence.** A session that appended data depends on the weights
+  it sampled under: `DuplexOmni.start_weight_update` / `add_lora` reject with
+  `weight_sync_sessions_open` while any such session is open (session open
+  alone performs no forward, so pre-warmed sessions may stay open).
+
+MiniCPM-o 4.5 is the first implementation: the stage-0 policy functions are
+shared by the duplex deployments and sampled through the worker_v2 duplex
+sampler (ModelRunner V1 is removed upstream and gets no implementation);
+capture rows force the synchronous sampling path so each record publishes on
+its own unit's delivery, and per-stage log-probabilities are proven against
+an independent recomputation at CPU scale
+(`tests/model_executor/models/minicpmo_4_5/test_duplex_action_capture.py`) and
+at engine scale on GPU CI
+(`tests/e2e/online_serving/test_minicpmo_4_5_duplex_action_capture.py`).
+Other duplex models adopt through per-model follow-ups without engine changes.

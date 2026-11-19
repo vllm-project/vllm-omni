@@ -77,6 +77,16 @@ class TouchDuplexSessionMessage(EngineQueueMessage, kw_only=True):
     expected_lease_generation: int | None = None
 
 
+class CollectActionRecordsMessage(EngineQueueMessage, kw_only=True):
+    """Post-close retrieval via the manager's terminal cache (open sessions use
+    the ``session.action_records.get`` command instead)."""
+
+    type: Literal["collect_action_records"] = "collect_action_records"
+    control_id: str
+    session_id: str
+    response_id: str | None = None
+
+
 class DuplexSessionCommandMessage(EngineQueueMessage, kw_only=True):
     """One-way session command; rejections come back as ``ErrorEvent``."""
 
@@ -98,6 +108,8 @@ class DuplexControlResultMessage(EngineQueueMessage, kw_only=True):
     error_code: str | None = None
     error_message: str | None = None
     error_retryable: bool = False
+    # Wire form of one ``DuplexActionRecordSet`` (``collect_action_records``).
+    action_records: dict | None = None
 
     @property
     def rpc_correlation_key(self) -> tuple[str, str]:

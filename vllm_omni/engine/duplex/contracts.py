@@ -116,6 +116,9 @@ class DuplexOutputContext:
     # Session stats (RFC #8325): the (epoch, seq) chunks this output finishes
     # handling for. Their spans reach the ledger directly (``on_stage_work``).
     perf_chunks: frozenset[tuple[int, int]] = frozenset()
+    # Serialized per-unit capture payload (validated at ledger ingest);
+    # ``None`` on deliveries from non-capture stages.
+    segment_capture_payload: bytes | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "segment_token_ids", tuple(self.segment_token_ids))

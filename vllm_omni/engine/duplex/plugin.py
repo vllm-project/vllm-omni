@@ -550,6 +550,19 @@ class DuplexModelPlugin(ABC):
             "sample_rate_hz": int(self.silence_continuation_sample_rate_hz),
         }
 
+    def action_capture_stage_ids(self) -> frozenset[int]:
+        """Stages whose per-unit segment deliveries carry action-capture payloads.
+
+        With per-session ``action_capture`` on, every segment
+        delivery of these stages must carry a capture payload; a delivery
+        without one is the session-fatal ``action_capture_invalid``. Models
+        that never set ``supports_action_capture`` keep the empty default.
+        The guarantee is per delivery: a model whose unit spans multiple
+        segment polls must emit one payload per unit keyed by the model-side
+        ``seq``, or the mid-segment polls surface as missing-payload failures.
+        """
+        return frozenset()
+
     # ---- engine policy (was DuplexRuntimeExtension) ----
 
     @abstractmethod

@@ -123,6 +123,33 @@ def _generator_rewind(generator: torch.Generator) -> Callable[[], None]:
         return lambda: generator.set_state(state)
 
 
+def _capture_log(probability: float) -> float:
+    """``log(p)`` clamped away from ``-inf`` for a hit probability that is nonzero by construction."""
+    import math
+
+    return math.log(max(float(probability), torch.finfo(torch.float32).tiny))
+
+
+def _capture_log1m(probability: float) -> float:
+    """``log(1 - p)`` clamped away from ``-inf`` (a miss has positive probability)."""
+    import math
+
+    return math.log(max(1.0 - float(probability), torch.finfo(torch.float32).tiny))
+
+
+def _minicpmo45_capture_seed(session_seed: int, epoch: int, response_index: int) -> int:
+    """The derived per-request capture seed: a splitmix64 mix of
+    ``(session_seed, epoch, response_index)`` — deterministic, no hash-seed dependence."""
+    value = (int(session_seed) & 0xFFFFFFFFFFFFFFFF) + 0x9E3779B97F4A7C15
+    value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9 & 0xFFFFFFFFFFFFFFFF
+    value = (value ^ (value >> 27)) * 0x94D049BB133111EB & 0xFFFFFFFFFFFFFFFF
+    for mix in (int(epoch), int(response_index)):
+        value = (value ^ (mix & 0xFFFFFFFF) ^ ((mix >> 32) & 0xFFFFFFFF)) & 0xFFFFFFFFFFFFFFFF
+        value = ((value << 17) | (value >> 47)) & 0xFFFFFFFFFFFFFFFF
+        value = (value ^ (value >> 22)) * 0x2545F4914F6CDD1D & 0xFFFFFFFFFFFFFFFF
+    return value & 0x7FFFFFFFFFFFFFFF
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     MiniCPMO45OmniLLMMultiModalProcessor,
     info=MiniCPMO45OmniLLMProcessingInfo,
@@ -378,6 +405,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self._minicpmo45_duplex_row_max_tokens = {
             row.row_idx: row.max_tokens for row in rows if row.max_tokens is not None
         }
+        # Per-row capture context and the derived per-request generators.
+        self._minicpmo45_duplex_row_request_ids = {row.row_idx: row.request_id for row in rows}
+        self._minicpmo45_duplex_row_identity = {
+            row.row_idx: (row.session_id, self._minicpmo45_duplex_row_epoch(row), row.seq) for row in rows
+        }
+        self._minicpmo45_duplex_row_capture = self._minicpmo45_duplex_row_capture_configs(rows)
+        self._minicpmo45_duplex_capture_generators = self._minicpmo45_duplex_make_capture_generators(rows)
         if self.model_stage != "llm" or not rows or logits.ndim != 2:
             return
 
@@ -1207,11 +1241,21 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         request_sessions = getattr(self, "_minicpmo45_duplex_request_sessions", None)
         helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
         sessions = getattr(helper, "sessions", None) if helper is not None else None
+        finished_sessions: set[str] = set()
         if isinstance(request_sessions, dict):
             for request_id in finished_req_ids:
                 session_key = request_sessions.pop(request_id, None)
                 if session_key is not None and isinstance(sessions, dict):
                     sessions.pop(session_key, None)
+                    finished_sessions.add(session_key)
+        for session_key in finished_sessions:
+            # The session's derived capture generators die with it.
+            state = getattr(self, "_minicpmo45_duplex_capture_generator_state", None)
+            if state:
+                prefix = f"{session_key}:"
+                for key in [key for key in state if key.startswith(prefix)]:
+                    state.pop(key, None)
+                    getattr(self, "_minicpmo45_duplex_capture_seed_by_key", {}).pop(key, None)
         forced_segments = getattr(self, "_minicpmo45_force_listen_applied_segments", None)
         if isinstance(forced_segments, set):
             finished = set(finished_req_ids)
@@ -1240,6 +1284,78 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if self.model_stage == "tts":
             return self.model.sample(logits, sampling_metadata, per_req_sampling_params=per_req_sampling_params)
         return None
+
+    def _minicpmo45_duplex_row_epoch(self, row: DuplexSamplingRow) -> int | None:
+        """The row's duplex envelope epoch, when the framework stamped one."""
+        return row.epoch
+
+    @staticmethod
+    def _minicpmo45_duplex_row_capture_configs(
+        rows: tuple[DuplexSamplingRow, ...],
+    ) -> dict[int, dict[str, Any]]:
+        """Per-row capture envelope, enabled rows only; empty = capture off
+        (no logprob computed, nothing packed or published)."""
+        configs: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            if row.action_capture is not None:
+                configs[row.row_idx] = dict(row.action_capture)
+        return configs
+
+    def _minicpmo45_duplex_make_capture_generators(
+        self, rows: tuple[DuplexSamplingRow, ...]
+    ) -> dict[int, tuple[str, torch.Generator]]:
+        """Derived per-request generators, one per (session, epoch, response_index):
+        a new response re-derives the seed; a fixed seed replays identically."""
+        capture_rows = self._minicpmo45_duplex_row_capture
+        if not capture_rows:
+            return {}
+        device = getattr(self, "device", None)
+        generators: dict[int, tuple[str, torch.Generator]] = {}
+        existing = getattr(self, "_minicpmo45_duplex_capture_generator_state", None) or {}
+        if not hasattr(self, "_minicpmo45_duplex_capture_seed_by_key"):
+            self._minicpmo45_duplex_capture_seed_by_key = {}
+        for row in rows:
+            capture = capture_rows.get(row.row_idx)
+            if capture is None:
+                continue
+            seed = capture.get("seed")
+            if not isinstance(seed, int) or isinstance(seed, bool):
+                continue
+            epoch = self._minicpmo45_duplex_row_epoch(row) or 0
+            response_index = capture.get("response_index")
+            response_index = response_index if isinstance(response_index, int) else 0
+            key = f"{row.session_id}:{epoch}:{response_index}"
+            generator = existing.get(key)
+            if generator is None:
+                effective = _minicpmo45_capture_seed(seed, epoch, response_index)
+                generator = torch.Generator(device=device)
+                generator.manual_seed(effective)
+                existing[key] = generator
+                self._minicpmo45_duplex_capture_seed_by_key[key] = effective
+            generators[row.row_idx] = (key, generator)
+        self._minicpmo45_duplex_capture_generator_state = existing
+        return generators
+
+    def _minicpmo45_duplex_effective_generators(self, sampling_metadata: SamplingMetadata) -> dict[int, Any]:
+        """The generator map this step's draws consume: capture-derived rows override."""
+        capture = getattr(self, "_minicpmo45_duplex_capture_generators", None)
+        if not capture:
+            return getattr(sampling_metadata, "generators", {}) or {}
+        merged: dict[int, Any] = dict(getattr(sampling_metadata, "generators", {}) or {})
+        merged.update({row_idx: generator for row_idx, (_, generator) in capture.items()})
+        return merged
+
+    def _minicpmo45_duplex_capture_stash(self, row_idx: int, payload: dict[str, Any]) -> None:
+        """Queue one row's unit payload for the same step's post-sample publish."""
+        request_ids = getattr(self, "_minicpmo45_duplex_row_request_ids", None) or {}
+        request_id = request_ids.get(row_idx)
+        if not isinstance(request_id, str):
+            return
+        stash = getattr(self, "_minicpmo45_duplex_capture_step", None)
+        if stash is None:
+            stash = {}
+            self._minicpmo45_duplex_capture_step = stash
+        stash[request_id] = payload
 
     def _sample_minicpmo45_native_duplex_stage0(
         self,
@@ -1272,11 +1388,16 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # Lookahead after a chunk terminator: re-emit it and skip sampling.
         sampled_ids: list[int] = [-1] * num_rows
         pending_rows: list[int] = []
+        capture_rows = self._minicpmo45_duplex_capture_targets(list(range(num_rows)))
         for row_idx in range(num_rows):
             accepted = output_token_ids[row_idx] if row_idx < len(output_token_ids) else []
             last_accepted = next((int(t) for t in reversed(accepted) if isinstance(t, int) and t >= 0), None)
             if last_accepted in chunk_terminators:
                 sampled_ids[row_idx] = last_accepted
+                if row_idx in capture_rows:
+                    # Re-emission without a draw: a record implying a draw
+                    # breaks fixed-seed replay.
+                    self._minicpmo45_duplex_capture_reemit(row_idx, last_accepted, token_ids)
             else:
                 pending_rows.append(row_idx)
 
@@ -1344,8 +1465,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
     def _minicpmo45_duplex_capped_rows(
         self, row_idxs: list[int], recent: dict[int, list[int]], token_ids: dict[str, int]
-    ) -> set[int]:
+    ) -> dict[int, str]:
         """End an exhausted chunk before sampling, without discarding a sampled token.
+
+        Returns the capped rows with the forcing reason each: the
+        token/request cap and the soft character target are distinct forced
+        classes, and rows resolved here record no draw.
 
         The character budget is a soft chunk target: a whole token may cross
         it. Only a complete accepted prefix ends the next step; a trailing
@@ -1358,7 +1483,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         )
         request_max = {row_idx: self._minicpmo45_duplex_row_request_max_tokens(row_idx) for row_idx in row_idxs}
         row_limit = {row: limit if request is None else min(limit, request) for row, request in request_max.items()}
-        capped = {row for row, row_cap in row_limit.items() if len(recent[row]) >= max(1, row_cap - 1)}
+        capped: dict[int, str] = {
+            row: (
+                "request_token_cap" if request_max[row] is not None and request_max[row] <= limit else "chunk_token_cap"
+            )
+            for row, row_cap in row_limit.items()
+            if len(recent[row]) >= max(1, row_cap - 1)
+        }
         max_chars = self._minicpmo45_policy_limit(
             "max_speak_chars_per_chunk", MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK
         )
@@ -1384,7 +1515,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 continue
             # Invalid UTF-8 may also leave U+FFFD; hard token/request caps bound this fallback.
             if isinstance(text, str) and not text.endswith("\ufffd") and len(text) >= max_chars:
-                capped.add(row)
+                capped[row] = "chunk_char_cap"
         return capped
 
     def _minicpmo45_duplex_boundary_hits(
@@ -1396,12 +1527,23 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         ``P(sample == chunk_eos)`` drawn with the row's generator is the same
         decision, using a batched softmax without a multinomial per row.
         """
+        return self._minicpmo45_duplex_boundary_draws(logits, rows, chunk_eos_id, sampling_metadata)[0]
+
+    def _minicpmo45_duplex_boundary_draws(
+        self, logits: torch.Tensor, rows: list[int], chunk_eos_id: int, sampling_metadata: SamplingMetadata
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The boundary decision and, per row, ``P(chunk_eos)`` on the raw softmax.
+
+        The probability is the exact Bernoulli parameter the runtime sampled
+        : no mask, no repetition penalty, no temperature.
+        """
         rows_logits = logits[index_to_device(rows, logits.device)]
+        probs = self._duplex_boundary_chunk_eos_probs(rows_logits, chunk_eos_id)
         if getattr(sampling_metadata, "all_greedy", False):
-            return torch.argmax(rows_logits, dim=-1) == chunk_eos_id
-        generators = getattr(sampling_metadata, "generators", {}) or {}
+            return torch.argmax(rows_logits, dim=-1) == chunk_eos_id, probs
+        generators = self._minicpmo45_duplex_effective_generators(sampling_metadata)
         draws = [torch.rand((), generator=generators.get(row_idx), device=logits.device) for row_idx in rows]
-        return torch.stack(draws) < self._duplex_boundary_chunk_eos_probs(rows_logits, chunk_eos_id)
+        return torch.stack(draws) < probs, probs
 
     def _minicpmo45_duplex_stage2_draws(
         self,
@@ -1412,14 +1554,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         row_params: list[tuple[float, float, float]],
         sampling_metadata: SamplingMetadata,
         rewinds: dict[int, Callable[[], None]] | None = None,
+        logprobs_out: dict[int, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Each row's stage-2 token: forbidden ids masked, repetition penalty, then greedy or a candidate draw.
 
         ``rewinds`` receives, per row position, a call undoing that row's draw.
+        ``logprobs_out`` (capture only, ) receives, per row
+        position, the log-probability of the drawn/argmax token under the
+        exact post-truncation renormalized distribution.
         """
         device, vocab = logits.device, logits.shape[-1]
         all_greedy = bool(getattr(sampling_metadata, "all_greedy", False))
-        generators = getattr(sampling_metadata, "generators", {}) or {}
+        generators = self._minicpmo45_duplex_effective_generators(sampling_metadata)
         stage2_logits = logits[index_to_device(rows, device)].clone()
         forbidden_index = self._minicpmo45_duplex_forbidden_index(token_ids, vocab, device)
         if forbidden_index is not None:
@@ -1441,7 +1587,24 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         samples: list[torch.Tensor | None] = [None] * len(rows)
         greedy = [local for local, row_idx in enumerate(rows) if all_greedy or float(row_params[row_idx][0]) <= 0]
         if greedy:
-            greedy_sample = torch.argmax(stage2_logits[index_to_device(greedy, device)], dim=-1)
+            greedy_logits = stage2_logits[index_to_device(greedy, device)]
+            greedy_sample = torch.argmax(greedy_logits, dim=-1)
+            if logprobs_out is not None:
+                # Same truncation rule as sampled rows; temperature 0 is the
+                # identity, so the masked + penalized logits filter as-is.
+                greedy_filtered = greedy_logits.clone()
+                for pos, local_idx in enumerate(greedy):
+                    _temperature, top_k, top_p = row_params[rows[local_idx]]
+                    greedy_filtered[pos : pos + 1] = self._top_k_top_p_filter(
+                        greedy_filtered[pos : pos + 1], top_k=int(top_k), top_p=top_p
+                    )
+                greedy_logprobs = (
+                    torch.log_softmax(greedy_filtered.float(), dim=-1)
+                    .gather(1, greedy_sample.unsqueeze(-1))
+                    .squeeze(-1)
+                )
+                for pos, local_idx in enumerate(greedy):
+                    logprobs_out[local_idx] = greedy_logprobs[pos : pos + 1]
             for pos, local_idx in enumerate(greedy):
                 samples[local_idx] = greedy_sample[pos : pos + 1]
         drawn = [local_idx for local_idx in range(len(rows)) if samples[local_idx] is None]
@@ -1466,6 +1629,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 candidates = self._duplex_top_k_top_p_candidates(group_logits, top_k=top_k, top_p=top_p)
                 group_uniforms = torch.stack([uniforms[local_idx] for local_idx in members])
                 draws = self._duplex_draw_candidates(group_logits, candidates, group_uniforms)
+                if logprobs_out is not None:
+                    # The drawn token's renormalized mass: its regular slot, or
+                    # one tie share when it sits at the k-th value.
+                    probs, indices, kth, ties = candidates
+                    drawn_t = draws.view(-1, 1)
+                    regular = (indices == drawn_t).float() * probs
+                    per_tie = probs[..., -1:] / ties.clamp(min=1).to(probs.dtype)
+                    tied_hit = (group_logits.gather(1, drawn_t) == kth).to(probs.dtype)
+                    mass = regular.sum(dim=-1, keepdim=True) + tied_hit * per_tie
+                    group_logprobs = mass.clamp(min=torch.finfo(probs.dtype).tiny).log().squeeze(-1)
+                    for i, local_idx in enumerate(members):
+                        logprobs_out[local_idx] = group_logprobs[i : i + 1]
                 for i, local_idx in enumerate(members):
                     samples[local_idx] = draws[i : i + 1]
         return torch.cat(samples)  # type: ignore[arg-type]
@@ -1488,24 +1663,229 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         """
         chunk_eos_id = token_ids.get("chunk_eos_token_id", -1)
         recent = self._minicpmo45_duplex_recent_tokens(sampling_metadata, row_idxs)
+        capture_rows = self._minicpmo45_duplex_capture_targets(row_idxs)
         resolved: dict[int, int] = {}
+        capped_reasons: dict[int, str] = {}
+        boundary_probs: dict[int, float] = {}
+        stage2_logprobs: dict[int, float] = {}
         if 0 <= chunk_eos_id < logits.shape[-1]:
-            resolved = dict.fromkeys(self._minicpmo45_duplex_capped_rows(row_idxs, recent, token_ids), chunk_eos_id)
+            capped_reasons = self._minicpmo45_duplex_capped_rows(row_idxs, recent, token_ids)
+            resolved = dict.fromkeys(capped_reasons, chunk_eos_id)
             boundary = [row_idx for row_idx in row_idxs if row_idx not in resolved]
             if boundary:
-                hits = self._minicpmo45_duplex_boundary_hits(logits, boundary, chunk_eos_id, sampling_metadata)
+                hits, probs = self._minicpmo45_duplex_boundary_draws(logits, boundary, chunk_eos_id, sampling_metadata)
+                if capture_rows:
+                    boundary_probs.update(
+                        {row_idx: float(prob) for row_idx, prob in zip(boundary, probs.tolist(), strict=True)}
+                    )
                 resolved.update(
                     (row_idx, chunk_eos_id) for row_idx, hit in zip(boundary, hits.tolist(), strict=True) if hit
                 )
         stage2_rows = [row_idx for row_idx in row_idxs if row_idx not in resolved]
+        stage2_logprob_tensors: dict[int, torch.Tensor] = {} if capture_rows else None
+        raw_sampled: dict[int, int] = {}
         if stage2_rows:
             draws = self._minicpmo45_duplex_stage2_draws(
-                logits, stage2_rows, recent, token_ids, row_params, sampling_metadata
+                logits,
+                stage2_rows,
+                recent,
+                token_ids,
+                row_params,
+                sampling_metadata,
+                logprobs_out=stage2_logprob_tensors,
             )
+            if stage2_logprob_tensors:
+                stage2_logprobs.update(
+                    {stage2_rows[local_idx]: float(value.item()) for local_idx, value in stage2_logprob_tensors.items()}
+                )
             for row_idx, sampled in zip(stage2_rows, draws.tolist(), strict=True):
+                if capture_rows:
+                    raw_sampled[row_idx] = int(sampled)
                 self._record_minicpmo45_duplex_generation_token(row_idx, sampled)
                 resolved[row_idx] = self._finalize_minicpmo45_native_duplex_sample(row_idx, sampled, token_ids)
+        if capture_rows:
+            for row_idx in capture_rows:
+                self._minicpmo45_duplex_capture_row(
+                    row_idx,
+                    resolved[row_idx],
+                    token_ids,
+                    row_params,
+                    reason=capped_reasons.get(row_idx),
+                    boundary_prob=boundary_probs.get(row_idx),
+                    stage2_logprob=stage2_logprobs.get(row_idx),
+                    raw_sampled=raw_sampled.get(row_idx),
+                )
         return [int(resolved[row_idx]) for row_idx in row_idxs]
+
+    def _minicpmo45_duplex_capture_reemit(self, row_idx: int, token: int, token_ids: dict[str, int]) -> None:
+        """Stash the terminator lookahead's re-emission: same action, no draw."""
+        from vllm_omni.protocol.duplex.action_records import ACTION_REEMIT, build_unit_payload
+
+        identity = (getattr(self, "_minicpmo45_duplex_row_identity", None) or {}).get(row_idx)
+        if identity is None:
+            return
+        session_id, epoch, seq = identity
+        if not session_id or seq is None:
+            return
+        self._minicpmo45_duplex_capture_stash(
+            row_idx,
+            build_unit_payload(
+                session_id=session_id,
+                stage_id=0,
+                unit_index=0,
+                seq=seq,
+                epoch=epoch if epoch is not None else 0,
+                token_ids=[int(token)],
+                logprobs=[None],
+                action_kinds=[ACTION_REEMIT],
+                reason_codes=["terminator_reemit"],
+                stream_names=["boundary"],
+                terminators=[{"token_id": int(token), "kind": self._minicpmo45_terminator_kind(token, token_ids)}],
+                model={"minicpmo_duplex": {"repetition_penalty": 1.05}},
+            ),
+        )
+
+    def _minicpmo45_duplex_capture_targets(self, row_idxs: list[int]) -> list[int]:
+        """The rows whose sessions have capture on this step (fast empty when off)."""
+        capture = getattr(self, "_minicpmo45_duplex_row_capture", None)
+        if not capture:
+            return []
+        return [row_idx for row_idx in row_idxs if row_idx in capture]
+
+    def _minicpmo45_duplex_capture_effective_seed(self, row_idx: int) -> int | None:
+        """The derived generator seed of a capture row, when the session set one."""
+        generators = getattr(self, "_minicpmo45_duplex_capture_generators", None) or {}
+        entry = generators.get(row_idx)
+        if entry is None:
+            return None
+        seeds = getattr(self, "_minicpmo45_duplex_capture_seed_by_key", None) or {}
+        return seeds.get(entry[0])
+
+    def _minicpmo45_duplex_capture_row(
+        self,
+        row_idx: int,
+        token: int,
+        token_ids: dict[str, int],
+        row_params: list[tuple[float, float, float]],
+        *,
+        reason: str | None,
+        boundary_prob: float | None,
+        stage2_logprob: float | None,
+        raw_sampled: int | None = None,
+    ) -> None:
+        """Stash the synchronous path's unit capture payload for one row."""
+        identity = (getattr(self, "_minicpmo45_duplex_row_identity", None) or {}).get(row_idx)
+        if identity is None:
+            return
+        params = row_params[row_idx] if row_idx < len(row_params) else (0.7, 100, 0.8)
+        payload = self._minicpmo45_duplex_build_capture_payload(
+            identity,
+            params,
+            self._minicpmo45_duplex_capture_effective_seed(row_idx),
+            token,
+            token_ids,
+            reason=reason,
+            boundary_prob=boundary_prob,
+            stage2_logprob=stage2_logprob,
+            raw_sampled=raw_sampled,
+        )
+        if payload is not None:
+            self._minicpmo45_duplex_capture_stash(row_idx, payload)
+
+    def _minicpmo45_duplex_build_capture_payload(
+        self,
+        identity: tuple[str | None, int | None, int | None],
+        params: tuple[float, float, float],
+        effective_seed: int | None,
+        token: int,
+        token_ids: dict[str, int],
+        *,
+        reason: str | None,
+        boundary_prob: float | None,
+        stage2_logprob: float | None,
+        raw_sampled: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Assemble one row's unit payload. The universal ``logprob`` is the joint
+        (``log P(chunk_eos)`` for a boundary hit, else ``log(1-P) + stage-2``) —
+        per-stage quantities ride the ``model`` extension; capped rows record no draw."""
+        from vllm_omni.protocol.duplex.action_records import ACTION_FORCED, ACTION_SAMPLED, build_unit_payload
+
+        session_id, epoch, seq = identity
+        if not session_id or seq is None:
+            return None
+        chunk_eos_id = int(token_ids.get("chunk_eos_token_id", -1))
+        temperature, top_k, top_p = params
+
+        kind = ACTION_SAMPLED
+        action_reason: str | None = None
+        logprob: float | None = None
+        stream = "content"
+        model_extension: dict[str, Any] = {
+            "repetition_penalty": 1.05,
+            "repetition_history_tokens": MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE,
+            "forbidden_tokens": "tts_pad+bad_token_ids+chunk_eos",
+        }
+        if boundary_prob is not None:
+            model_extension["stage0_prob_chunk_eos"] = float(boundary_prob)
+        if reason is not None:
+            # Cap-resolved before any draw: no RNG consumed.
+            kind = ACTION_FORCED
+            action_reason = reason
+            stream = "boundary"
+        elif boundary_prob is not None and token == chunk_eos_id:
+            logprob = _capture_log(boundary_prob)
+            stream = "boundary"
+        elif stage2_logprob is not None:
+            logprob = _capture_log1m(boundary_prob) + stage2_logprob if boundary_prob is not None else stage2_logprob
+            model_extension["stage2_logprob"] = float(stage2_logprob)
+        if raw_sampled is not None and raw_sampled != token:
+            # The engine rewrote the sampled token (mid-turn listen -> tts_bos):
+            # still the policy's draw, but a forced emission.
+            kind = ACTION_FORCED
+            action_reason = "mid_turn_listen_rewrite"
+            model_extension["sampled_token"] = int(raw_sampled)
+
+        terminators: list[dict[str, Any]] = []
+        if token in self._minicpmo45_chunk_terminator_token_ids(token_ids):
+            terminators = [{"token_id": int(token), "kind": self._minicpmo45_terminator_kind(token, token_ids)}]
+
+        return dict(
+            build_unit_payload(
+                session_id=session_id,
+                stage_id=0,
+                unit_index=0,
+                seq=seq,
+                epoch=epoch if epoch is not None else 0,
+                token_ids=[int(token)],
+                logprobs=[logprob],
+                action_kinds=[kind],
+                reason_codes=[action_reason],
+                stream_names=[stream],
+                streams=[
+                    {"name": "boundary", "stage": 0, "modality": "audio"},
+                    {"name": "content", "stage": 0, "modality": "audio"},
+                ],
+                terminators=terminators,
+                sampling_params={
+                    "temperature": float(temperature),
+                    "top_k": int(top_k),
+                    "top_p": float(top_p),
+                },
+                effective_seed=effective_seed,
+                model={"minicpmo_duplex": model_extension},
+            )
+        )
+
+    def _minicpmo45_terminator_kind(self, token: int, token_ids: dict[str, int]) -> str:
+        for name, key in (
+            ("listen", "listen_token_id"),
+            ("chunk_eos", "chunk_eos_token_id"),
+            ("chunk_tts_eos", "chunk_tts_eos_token_id"),
+            ("turn_eos", "turn_eos_token_id"),
+        ):
+            if token_ids.get(key) == token:
+                return name
+        return "unknown"
 
     def _sample_minicpmo45_native_duplex_rows_deferred(
         self,
@@ -1522,14 +1902,24 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         is drawn for every uncapped row; a row the boundary resolves has its generator rewound at
         commit, so generators advance as on the synchronous path. Process-wide generator rows can not
         be rewound alone and keep the step synchronous.
+
+        Capture rows never take this path — records must arrive per unit
+        at unit time. The deferred commit runs one sampling step later, so a
+        deferred capture payload would ride the *next* unit's delivery, and
+        the response-terminal unit's record would seal into the wrong scope
+        or surface as a missing-payload failure. Capture sessions pay the
+        synchronous host read instead.
         """
+        if self._minicpmo45_duplex_capture_targets(row_idxs):
+            return None
         device, vocab = logits.device, logits.shape[-1]
         chunk_eos_id = token_ids.get("chunk_eos_token_id", -1)
         has_chunk_eos = 0 <= chunk_eos_id < vocab
         all_greedy = bool(getattr(sampling_metadata, "all_greedy", False))
-        generators = getattr(sampling_metadata, "generators", {}) or {}
+        generators = self._minicpmo45_duplex_effective_generators(sampling_metadata)
         recent = self._minicpmo45_duplex_recent_tokens(sampling_metadata, row_idxs)
-        capped = self._minicpmo45_duplex_capped_rows(row_idxs, recent, token_ids) if has_chunk_eos else set()
+        capped_reasons = self._minicpmo45_duplex_capped_rows(row_idxs, recent, token_ids) if has_chunk_eos else {}
+        capped = set(capped_reasons)
         stage2_rows = [row_idx for row_idx in row_idxs if row_idx not in capped]
         drawn_rows = [row_idx for row_idx in stage2_rows if not (all_greedy or float(row_params[row_idx][0]) <= 0)]
         if any(generators.get(row_idx) is None for row_idx in drawn_rows):
@@ -1539,11 +1929,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         rewinds: dict[int, Callable[[], None]] = {}
         if stage2_rows:
             positions_t = index_to_device([position[row_idx] for row_idx in stage2_rows], device)
-            hit = (
-                self._minicpmo45_duplex_boundary_hits(logits, stage2_rows, chunk_eos_id, sampling_metadata)
-                if has_chunk_eos
-                else torch.zeros(len(stage2_rows), dtype=torch.bool, device=device)
-            )
+            if has_chunk_eos:
+                hit = self._minicpmo45_duplex_boundary_hits(logits, stage2_rows, chunk_eos_id, sampling_metadata)
+            else:
+                hit = torch.zeros(len(stage2_rows), dtype=torch.bool, device=device)
             rewinds_into = rewinds if has_chunk_eos else None
             raw = self._minicpmo45_duplex_stage2_draws(
                 logits, stage2_rows, recent, token_ids, row_params, sampling_metadata, rewinds_into

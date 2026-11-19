@@ -53,6 +53,9 @@ def minicpmo45_native_capabilities(*, max_sessions: int = 1) -> DuplexCapabiliti
         # Barge-in latency depends on client chunking and lacks hardware E2E
         # measurement, so do not advertise an invented target.
         target_barge_in_latency_ms=None,
+        # the duplex stage-0 sampler emits per-unit action records
+        # with exact-distribution log-probabilities on demand.
+        supports_action_capture=True,
     )
 
 

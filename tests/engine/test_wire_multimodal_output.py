@@ -86,3 +86,20 @@ def test_non_tensor_value_fails_decode():
     decoder = MsgpackDecoder(OmniEngineCoreOutputs)
     with pytest.raises(Exception):
         decoder.decode(encoded)
+
+
+def test_action_capture_payload_roundtrip():
+    """The capture bytes carrier survives msgpack like stage_payload."""
+    eco = OmniEngineCoreOutput(
+        request_id="req-1",
+        new_token_ids=[7],
+        finish_reason=None,
+        action_capture_payload=b'{"schema_version":1,"token_ids":[7]}',
+    )
+    decoded = _roundtrip(OmniEngineCoreOutputs(outputs=[eco]))
+    out = decoded.outputs[0]
+    assert out.action_capture_payload == b'{"schema_version":1,"token_ids":[7]}'
+    # Capture-off outputs carry no bytes on the wire.
+    plain = OmniEngineCoreOutput(request_id="req-2", new_token_ids=[1], finish_reason=None)
+    decoded = _roundtrip(OmniEngineCoreOutputs(outputs=[plain]))
+    assert decoded.outputs[0].action_capture_payload is None

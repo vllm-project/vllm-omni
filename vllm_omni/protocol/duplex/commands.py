@@ -148,6 +148,20 @@ class GetSessionStats(RealtimeCommand):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class GetSessionActionRecords(RealtimeCommand):
+    """Collect the session's captured action records.
+
+    Answered by ``session.action_records``. ``response_id`` selects one
+    response's retained set; omitting it collects the most recent (complete,
+    in progress, or sealed-truncated) and clears it, per the draining
+    retention rules of
+    """
+
+    wire_type: ClassVar[str] = "session.action_records.get"
+    response_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class CloseSession(RealtimeCommand):
     """Graceful close requested through the command stream (``session.close``)."""
 
@@ -181,6 +195,7 @@ __all__ = [
     "CancelInput",
     "CancelFunctionCall",
     "CloseSession",
+    "GetSessionActionRecords",
     "GetSessionStats",
     "Heartbeat",
     "SignalTurn",

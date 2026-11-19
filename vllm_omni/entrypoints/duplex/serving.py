@@ -31,6 +31,7 @@ from vllm_omni.engine.duplex.commands import DuplexCommand, DuplexCommandError, 
 from vllm_omni.engine.duplex.events import (
     DuplexEvent,
     ErrorEvent,
+    SessionActionRecords,
     SessionClosed,
     SessionCreated,
     SessionReplaced,
@@ -72,7 +73,7 @@ _DEFAULT_IDLE_TIMEOUT_S = 300.0
 _PUMP_DRAIN_TIMEOUT_S = 5.0
 #: session.created is journaled by the registry when it hands out the resume credential.
 #: session.stats is a point-in-time answer and must not be replayed on resume.
-_UNJOURNALED_EVENTS = (SessionCreated, SessionStats)
+_UNJOURNALED_EVENTS = (SessionCreated, SessionActionRecords, SessionStats)
 
 
 def _log_rollback_failure(done: asyncio.Task[None]) -> None:

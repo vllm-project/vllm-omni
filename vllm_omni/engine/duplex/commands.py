@@ -256,6 +256,11 @@ class GetSessionStats(DuplexCommand, _duplex_wire.GetSessionStats):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class GetSessionActionRecords(DuplexCommand, _duplex_wire.GetSessionActionRecords):
+    type: ClassVar[str] = "session.action_records.get"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class CloseSession(DuplexCommand, _duplex_wire.CloseSession):
     type: ClassVar[str] = "session.close"
 
@@ -275,6 +280,7 @@ REALTIME_COMMAND_TYPES: frozenset[str] = frozenset(
         "playback.ack",
         "session.heartbeat",
         "session.stats.get",
+        "session.action_records.get",
         "session.close",
         "turn.signal",
         "input.text.append",
@@ -321,6 +327,7 @@ __all__ = [
     "DeleteItem",
     "DuplexCommand",
     "DuplexCommandError",
+    "GetSessionActionRecords",
     "GetSessionStats",
     "Heartbeat",
     "REALTIME_COMMAND_TYPES",

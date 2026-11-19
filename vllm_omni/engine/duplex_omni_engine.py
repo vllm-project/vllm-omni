@@ -21,9 +21,15 @@ from vllm.logger import init_logger
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
-from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig, apply_session_stats_capability
+from vllm_omni.engine.duplex.config import (
+    DuplexCapabilities,
+    DuplexSessionConfig,
+    apply_action_capture_capability,
+    apply_session_stats_capability,
+)
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
+    CollectActionRecordsMessage,
     DuplexControlResultMessage,
     DuplexSessionCommandMessage,
     DuplexSessionError,
@@ -39,6 +45,7 @@ from vllm_omni.engine.duplex.plugin import (
 )
 from vllm_omni.engine.messages import EngineQueueMessage
 from vllm_omni.engine.orchestrator import OrchestratorBase
+from vllm_omni.protocol.duplex.action_records import DuplexActionRecordSet
 from vllm_omni.tracing import capture_trace_headers
 
 if TYPE_CHECKING:
@@ -125,6 +132,8 @@ class DuplexOmniEngine(AsyncOmniEngine):
             frontend_index=int(client_config.get("client_index", 0)),
             **orchestrator_kwargs,
         )
+        # The fence reads manager state cross-thread; its fields are guarded.
+        self._duplex_session_manager = orchestrator.session_manager
         placement = orchestrator.replica_placement
         self.duplex_frontend_group_count = placement.owned_group_count if placement is not None else 1
         self.duplex_frontend_max_sessions = orchestrator.session_manager.admission_limit
@@ -137,7 +146,10 @@ class DuplexOmniEngine(AsyncOmniEngine):
         if self.plugin is None:
             raise RuntimeError("duplex plugin is not loaded")
         return apply_session_stats_capability(
-            self.plugin.capabilities(max_sessions=self.duplex_session_config.max_sessions),
+            apply_action_capture_capability(
+                self.plugin.capabilities(max_sessions=self.duplex_session_config.max_sessions),
+                bool(getattr(self.duplex_session_config, "allow_action_capture", True)),
+            ),
             bool(getattr(self.duplex_session_config, "collect_stats", False)),
         )
 
@@ -256,6 +268,53 @@ class DuplexOmniEngine(AsyncOmniEngine):
             None,
             lambda: self._close_session(session_id, reason=reason, timeout=timeout),
         )
+
+    def duplex_sessions_with_appended_data(self) -> list[str]:
+        """Open duplex sessions that appended data (weight-sync fence, )."""
+        manager = getattr(self, "_duplex_session_manager", None)
+        return list(manager.open_sessions_with_appended_data()) if manager is not None else []
+
+    def collect_terminal_action_records(
+        self,
+        session_id: str,
+        response_id: str | None = None,
+        *,
+        timeout: float | None = _DEFAULT_CONTROL_TIMEOUT_S,
+    ) -> DuplexActionRecordSet:
+        """Collect a closed session's sealed records from the terminal cache.
+
+        Args:
+            session_id: The closed session.
+            response_id: Select one response's set; ``None`` takes the most recent.
+            timeout: Control-RPC timeout in seconds.
+
+        Returns:
+            The sealed ``DuplexActionRecordSet``.
+
+        Raises:
+            DuplexSessionError: ``action_capture_not_retained`` when already
+                collected or past the terminal cache's deadline.
+        """
+        control_id = uuid.uuid4().hex
+        result = self._execute_control(
+            CollectActionRecordsMessage(
+                control_id=control_id,
+                session_id=session_id,
+                response_id=response_id,
+            ),
+            control_id=control_id,
+            operation="collect_action_records",
+            session_id=session_id,
+            timeout=timeout,
+        )
+        records = result.action_records
+        if not isinstance(records, dict):
+            raise DuplexSessionError(
+                f"collect_action_records returned no records for {session_id}",
+                code="internal_error",
+                session_id=session_id,
+            )
+        return DuplexActionRecordSet.from_wire(records)
 
     def _resume_session(
         self,

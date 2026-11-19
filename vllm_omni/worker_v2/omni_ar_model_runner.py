@@ -42,6 +42,7 @@ from vllm_omni.model_executor.models.interfaces import SupportsMRv2MultiFrameDec
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import partition_flat_payload
+from vllm_omni.worker.action_capture import encode_action_capture_entries
 from vllm_omni.worker.sparse_audio import resolve_sparse_mm_routing
 from vllm_omni.worker_v2.mooncake_capture import snapshot_mooncake_output
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
@@ -316,6 +317,8 @@ class OmniARModelRunner(OmniGPUModelRunner):
         num_sampled, num_rejected = sampling_output.num_sampled, sampling_output.num_rejected
         if sampling_output.multimodal_outputs is not None:
             multimodal_outputs = sampling_output.multimodal_outputs
+        if sampling_output.action_capture is not None:
+            self._action_capture_step = encode_action_capture_entries(sampling_output.action_capture)
         post_sample = getattr(self.model_state, "post_sample", None)
         if post_sample is not None:
             post_sample(
@@ -381,6 +384,11 @@ class OmniARModelRunner(OmniGPUModelRunner):
         )
         model_runner_output.kv_extracted_req_ids = kv_extracted
         model_runner_output._async_chunk = bool(getattr(self.model_config, "async_chunk", False))
+        if getattr(self, "_action_capture_step", None):
+            model_runner_output.action_capture_payloads = [
+                self._action_capture_step.get(req_id) for req_id in input_batch.req_ids
+            ]
+            self._action_capture_step = {}
 
         prepare_streaming = getattr(self.model_state, "prepare_streaming_audio_output", None)
         streaming_audio = (

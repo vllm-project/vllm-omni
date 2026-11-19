@@ -44,11 +44,14 @@ from bisect import bisect_left, bisect_right, insort
 from collections.abc import AsyncIterator, Awaitable, Callable, Container, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TypedDict
+from typing import TYPE_CHECKING, TypedDict
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
 import pybase64 as base64
+
+if TYPE_CHECKING:
+    from vllm_omni.protocol.duplex.action_records import DuplexActionRecordSet
 
 from vllm_omni.clients.utils import (
     _finite_metric_values,
@@ -985,6 +988,63 @@ class DuplexClientBase(ABC):
                 if item.type == "session.stats" and item.raw.get("request_event_id") == request_id:
                     stats = item.raw.get("stats")
                     return stats if isinstance(stats, dict) else {}
+        finally:
+            self._remove_subscriber(queue)
+
+    async def collect_action_records(
+        self,
+        response_id: str | None = None,
+        *,
+        timeout_s: float = 30.0,
+        event_id: str | None = None,
+    ) -> DuplexActionRecordSet:
+        """Collect and clear this session's retained action records.
+
+        Args:
+            response_id: Select one response's retained set; ``None`` selects the
+                most recent (complete, in progress, or sealed-truncated).
+            timeout_s: Seconds to wait for the server's reply.
+            event_id: Explicit correlation id for the request event.
+
+        Returns:
+            The drained ``DuplexActionRecordSet``.
+
+        Raises:
+            DuplexSessionClosedError: The session closed before the reply.
+            DuplexProtocolError: The server's typed error (e.g.
+                ``action_capture_not_retained``) answering this request.
+        """
+        from vllm_omni.protocol.duplex.action_records import DuplexActionRecordSet
+
+        request_id = event_id or f"evt_{uuid4().hex}"
+        queue = self._add_subscriber()
+        try:
+            deadline = time.monotonic() + timeout_s
+            try:
+                await asyncio.wait_for(
+                    self.send(
+                        {
+                            "type": "session.action_records.get",
+                            "event_id": request_id,
+                            **({"response_id": response_id} if response_id is not None else {}),
+                        }
+                    ),
+                    timeout=timeout_s,
+                )
+            except TimeoutError as exc:
+                raise asyncio.TimeoutError("timed out sending session.action_records.get") from exc
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError("timed out waiting for session.action.records")
+                item = await asyncio.wait_for(queue.get(), remaining)
+                if isinstance(item, _ClosedMarker):
+                    raise DuplexSessionClosedError(item.reason)
+                if isinstance(item, ErrorEvent) and item.related_event_id == request_id:
+                    raise item.to_exception()
+                if item.type == "session.action.records" and item.raw.get("request_event_id") == request_id:
+                    records = item.raw.get("records")
+                    return DuplexActionRecordSet.from_wire(records if isinstance(records, dict) else {})
         finally:
             self._remove_subscriber(queue)
 

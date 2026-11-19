@@ -751,6 +751,10 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
     def capabilities(self, *, max_sessions: int) -> DuplexCapabilities:
         return minicpmo45_native_capabilities(max_sessions=max_sessions)
 
+    def action_capture_stage_ids(self) -> frozenset[int]:
+        """Stage 0 (the duplex Thinker) is where per-unit actions are sampled."""
+        return frozenset({0})
+
     def validate_client_extra_body(self, extra_body: object) -> None:
         reject_private_runtime_keys(
             extra_body,

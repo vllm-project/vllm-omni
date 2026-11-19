@@ -49,6 +49,7 @@ from vllm_omni.engine.duplex.commands import (
     CreateResponse,
     DeleteItem,
     DuplexCommand,
+    GetSessionActionRecords,
     GetSessionStats,
     Heartbeat,
     SignalTurn,
@@ -76,6 +77,7 @@ from vllm_omni.engine.duplex.events import (
     InputCleared,
     PlaybackAcknowledged,
     ResponseDone,
+    SessionActionRecords,
     SessionExpired,
     SessionHeartbeatAck,
     SessionStats,
@@ -101,6 +103,7 @@ from vllm_omni.engine.duplex.realtime_events import (
     retrieve_item_events,
 )
 from vllm_omni.engine.duplex.session import helpers, overlap_policy, playback_ledger
+from vllm_omni.engine.duplex.session.action_ledger import ActionLedgerError
 from vllm_omni.engine.duplex.session.append_task import AppendAttempt
 from vllm_omni.engine.duplex.session.commit_policy import CommitAction, CommitSnapshot, decide_commit_action
 from vllm_omni.engine.duplex.session.context import (
@@ -587,6 +590,8 @@ class DuplexSessionRunner:
             active_response_task.cancel()
             await asyncio.gather(active_response_task, return_exceptions=True)
         self.session.close()
+        # shutdown clears runners without the normal close path; stash first.
+        self.manager._stash_terminal_action_records(self.session)
         await self._stop_worker()
 
     # ------------------------------------------------------------------ #
@@ -677,6 +682,8 @@ class DuplexSessionRunner:
                 # Still answered, so the client need not time out: final turns
                 # keep their numbers and the rest read as cancelled.
                 self._on_get_session_stats(item)
+            elif isinstance(item, GetSessionActionRecords):
+                self._on_get_session_action_records(item)
             return
         await self._on_command(item)
 
@@ -835,6 +842,9 @@ class DuplexSessionRunner:
                 normalized: dict[str, object] = dict(inner) if isinstance(inner, Mapping) else {}
                 normalized.update(payload)
                 normalized["type"] = command.event
+                # Cancels seal ``truncated_cancel``; other epoch advances interrupt.
+                if command.event == "response.cancel":
+                    self.session.capture_epoch_cause = "truncated_cancel"
                 await self._on_cancel(normalized)
             else:
                 await self.control.on_turn_signal(payload)
@@ -867,6 +877,8 @@ class DuplexSessionRunner:
             self._on_heartbeat(command)
         elif isinstance(command, GetSessionStats):
             self._on_get_session_stats(command)
+        elif isinstance(command, GetSessionActionRecords):
+            self._on_get_session_action_records(command)
         elif isinstance(command, CreateItem):
             previous_user_items = session.unanswered_user_items()
             control = resolve_create_item(projector, command)
@@ -936,6 +948,32 @@ class DuplexSessionRunner:
             )
             return
         self._emit_events([SessionStats(request_event_id=command.event_id, stats=perf.snapshot())])
+
+    def _on_get_session_action_records(self, command: GetSessionActionRecords) -> None:
+        """Answer ``session.action_records.get``; collection is draining."""
+        actions = self.session.actions
+        if actions is None or not self.session.config.action_capture:
+            self._emit_error(
+                "action_capture_unsupported",
+                "This session does not capture action records (session action_capture)",
+                event_id=command.event_id,
+            )
+            return
+        try:
+            record_set = actions.collect(command.response_id)
+        except ActionLedgerError as exc:
+            # Not-retained and retention overflow are both loud, typed answers.
+            self._emit_error(exc.code, str(exc), event_id=command.event_id)
+            return
+        self._emit_events(
+            [
+                SessionActionRecords(
+                    request_event_id=command.event_id,
+                    response_id=record_set.response_id,
+                    records=record_set.to_wire(),
+                )
+            ]
+        )
 
     def _on_heartbeat(self, command: Heartbeat) -> None:
         try:
@@ -1386,8 +1424,9 @@ class DuplexSessionRunner:
             for segment, _ in detected:
                 # Turn detection hands back base64 segments; audio it did not split
                 # (no detector) is still the decoded bytes, encoded here for the plugin.
-                if isinstance(segment.get("audio"), bytes):
-                    segment["audio"] = base64.b64encode(segment["audio"]).decode("ascii")
+                segment_audio = segment.get("audio")
+                if isinstance(segment_audio, bytes):
+                    segment["audio"] = base64.b64encode(segment_audio).decode("ascii")
         with ExitStack() as unprocessed:
             releases: list[Callable[[], None] | None] = [None] * len(detected)
             charges = [0] * len(detected)
