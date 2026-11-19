@@ -543,7 +543,7 @@ async def test_partial_handoff_submits_a_resumable_request_and_ends_it_on_finish
         ("submit_update", False),
     ]
     assert stage1.script == []
-    assert [call[0].prompt_token_ids for call in stage1.add_request_calls] == [[0] * 11, [0] * 11, [0] * 4, [0] * 4]
+    assert [list(call[0].prompt_token_ids) for call in stage1.add_request_calls] == [[0] * 11, [0] * 11, [0] * 4, [0] * 4]
 
 
 @pytest.mark.asyncio
