@@ -269,6 +269,7 @@ def test_real_vllm_scheduler_contract():
         block_ids=([2, 3, 4],),
         num_computed_tokens=8,
         lora_request=None,
+        prefill_token_ids=list(range(12)),
     )
 
     def real_output(*, new_reqs=(), cached=None, scheduled=None, finished=()):
@@ -280,7 +281,6 @@ def test_real_vllm_scheduler_contract():
             total_num_scheduled_tokens=sum(counts.values()),
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[],
             finished_req_ids=set(finished),
             free_encoder_mm_hashes=[],
         )
@@ -293,25 +293,25 @@ def test_real_vllm_scheduler_contract():
     )
     cached = sched.CachedRequestData(
         req_ids=["r"],
-        resumed_req_ids=set(),
         new_token_ids=[],
-        all_token_ids={},
         new_block_ids=[None],
         num_computed_tokens=[12],
         num_output_tokens=[1],
     )
     step = adapter.translate_step(real_output(cached=cached, scheduled={"r": 1}))
     assert step.events == () and step.extended_req_ids == ("r",)
-    cached.resumed_req_ids = {"r"}
-    cached.num_computed_tokens = [8]
-    cached.new_block_ids = [([5, 6, 7],)]
-    step = adapter.translate_step(real_output(cached=cached, scheduled={"r": 1}))
-    assert step.events[0].kind is PrefixCacheEventKind.RESUMED
-    assert step.events[0].block_ids == ((5, 6, 7),) and step.events[0].hit_end == 8
+    # Native 0.34 resends preempted requests in scheduled_new_reqs, with
+    # complete request data and replacement block ids. It has no cached resume
+    # membership/history fields. This is a re-entry, not a second prefix hit.
+    from dataclasses import replace
+
+    resumed = replace(new, num_computed_tokens=8, block_ids=([5, 6, 7],))
+    step = adapter.translate_step(real_output(new_reqs=[resumed], scheduled={"r": 1}))
+    assert step.events == () and step.extended_req_ids == ("r",)
     step = adapter.translate_step(real_output(new_reqs=[new], scheduled={"r": 4}, finished={"r"}))
     assert [e.kind for e in step.events] == [PrefixCacheEventKind.FINISHED, PrefixCacheEventKind.STARTED]
-    step = adapter.translate_step(real_output(cached=cached, scheduled={"r": 1}))
-    assert step.events[0].kind is PrefixCacheEventKind.RESUMED
+    step = adapter.translate_step(real_output(new_reqs=[resumed], scheduled={"r": 1}))
+    assert step.events == () and step.extended_req_ids == ("r",)
 
 
 def test_extended_ids_are_deduplicated_immutable_and_need_no_payload():

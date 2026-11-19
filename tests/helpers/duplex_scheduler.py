@@ -134,7 +134,6 @@ def engine_step(sched: OmniARScheduler) -> tuple[dict[str, int], dict[str, Engin
         sampled_token_ids.append([3])
     model_runner_output = ModelRunnerOutput(
         req_ids=req_ids,
-        req_id_to_index={req_id: index for index, req_id in enumerate(req_ids)},
         sampled_token_ids=sampled_token_ids,
         logprobs=None,
         prompt_logprobs_dict={},

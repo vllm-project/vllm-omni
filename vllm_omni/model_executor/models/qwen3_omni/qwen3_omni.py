@@ -3,6 +3,8 @@
 # Copyright 2025 The Qwen team.
 """Inference-only Qwen3-Omni-Moe unified model (thinker + talker + code2wav)."""
 
+from __future__ import annotations
+
 import asyncio
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from functools import cached_property
@@ -45,8 +47,6 @@ from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.transformers_utils.processor import cached_processor_from_config
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import Embeddings, HiddenStates, Ids, OmniPayload, OmniPayloadMeta
 from vllm_omni.metrics import definitions as defs
@@ -75,6 +75,9 @@ from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, 
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp, ramp_decode_windows
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import to_device_nonblocking
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 # Voice used when a request names no speaker. Matches the reference
 # ``Qwen3OmniMoeForConditionalGeneration.generate(speaker="Ethan")``; the
@@ -203,8 +206,8 @@ class Qwen3OmniMoeForConditionalGeneration(
     eager_frames_need_postprocess = False
 
     def create_omni_model_state(
-        self, vllm_config: VllmConfig, encoder_cache: "EncoderCache | None", device: torch.device
-    ) -> "OmniModelState":
+        self, vllm_config: VllmConfig, encoder_cache: EncoderCache | None, device: torch.device
+    ) -> OmniModelState:
         from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
         if current_omni_platform.is_npu() and self.model_stage in ("thinker", "talker"):
@@ -318,6 +321,8 @@ class Qwen3OmniMoeForConditionalGeneration(
                 dtype=torch.long,
             )
         elif self.model_stage == "talker":
+            # forward returns a tensor; multimodal outputs are attached after replay.
+            self.mrv2_forward_returns_tensor = True
             # The outer wrapper exposes talker_mtp for every stage, but only
             # the talker stage owns the module that the method invokes.
             self.talker_mtp_graph_safe = current_omni_platform.supports_talker_mtp_graph_capture()
@@ -576,6 +581,8 @@ class Qwen3OmniMoeForConditionalGeneration(
     @cached_property
     def sampler(self):
         """Get sampler from active model."""
+        from vllm.v1.sample.sampler import Sampler
+
         if hasattr(self.model, "sampler"):
             return self.model.sampler
         return Sampler()
@@ -1882,6 +1889,40 @@ class Qwen3OmniMoeForConditionalGeneration(
             return []
         return ramp_decode_windows(ramp, int(extra.get("codec_left_context_frames", 25) or 0))
 
+    # load_weights defers the first Code2Wav capture to capture_auxiliary_graphs.
+    # A weight reload after that recaptures at once: it rebinds the SnakeBeta
+    # caches the graphs read.
+    _code2wav_capture_pending: bool = False
+    _code2wav_warmup_done: bool = False
+
+    def capture_auxiliary_graphs(self) -> None:
+        """Capture the Code2Wav CUDA graphs the stage's load deferred.
+
+        The worker calls this once ``load_model`` has returned, before the stage
+        serves. vLLM's ``load_model`` limits the caching allocator to
+        ``max_split_size_mb:20``; graphs captured under it cannot reuse the
+        blocks an earlier capture freed in their shared pool, so each capture
+        grows the pool. Stages without Code2Wav have nothing to capture.
+        """
+        self._code2wav_warmup_done = True
+        if self._code2wav_capture_pending:
+            self._code2wav_capture_pending = False
+            self._capture_code2wav_graphs()
+
+    def _capture_code2wav_graphs(self) -> None:
+        """Capture the Code2Wav graphs, or fall back to eager outside NPU."""
+        try:
+            self._maybe_enable_code2wav_cudagraph()
+        except Exception:
+            if current_omni_platform.is_npu():
+                # A failed NPUGraph capture can leave torch-npu allocator
+                # state invalid, so eager fallback in this process is unsafe.
+                raise
+            logger.warning(
+                "Failed to enable CUDA Graph for Code2Wav; falling back to eager.",
+                exc_info=True,
+            )
+
     def _maybe_enable_code2wav_cudagraph(self) -> None:
         """Enable the inner Code2Wav CUDA graph unless this stage runs in eager mode."""
         if not self.code2wav or not hasattr(self.code2wav, "enable_cudagraph"):
@@ -1969,20 +2010,22 @@ class Qwen3OmniMoeForConditionalGeneration(
             code2wav_loaded = add_prefix_to_loaded_weights(code2wav_loaded, "code2wav")
             loaded_weights.update(code2wav_loaded)
 
-            # Precompute SnakeBeta caches; Code2Wav CUDA graph follows the stage's
-            # enforce_eager setting, the same switch vLLM uses for outer graphs.
             try:
                 self.code2wav.precompute_snake_caches()
-                self._maybe_enable_code2wav_cudagraph()
             except Exception:
                 if current_omni_platform.is_npu():
-                    # A failed NPUGraph capture can leave torch-npu allocator
-                    # state invalid, so eager fallback in this process is unsafe.
                     raise
                 logger.warning(
-                    "Failed to enable CUDA Graph for Code2Wav; falling back to eager.",
+                    "Failed to precompute Code2Wav SnakeBeta caches; not capturing Code2Wav CUDA graphs.",
                     exc_info=True,
                 )
+            else:
+                # NPU keeps capturing while the stage loads; vLLM's allocator
+                # split limit does not apply there.
+                if current_omni_platform.is_npu() or self._code2wav_warmup_done:
+                    self._capture_code2wav_graphs()
+                else:
+                    self._code2wav_capture_pending = True
 
         if first_frame_decoder is not None and code2wav_weights:
             decoder_loaded = first_frame_decoder.load_weights(code2wav_weights)
