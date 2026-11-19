@@ -38,8 +38,10 @@ from vllm_omni.worker_v2.prefix_cache import PrefixCacheRewrite
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _host(replace_keys: frozenset[str] = frozenset()) -> OmniConnectorModelRunnerMixin:
-    host = OmniConnectorModelRunnerMixin.__new__(OmniConnectorModelRunnerMixin)
+def _host(replace_keys: frozenset[str] = frozenset()) -> OmniRunnerDataPlane:
+    host = OmniRunnerDataPlane.__new__(OmniRunnerDataPlane)
+    host._native_requests = {}
+    host._native_output_lock = threading.RLock()
     host._pending_full_payload_send = {}
     host._full_payload_token_ends = {}
     host._full_payload_replace_keys_cached = replace_keys
@@ -220,12 +222,13 @@ def test_codec_validity_mask_is_reconciled_with_its_rows():
     assert torch.equal(payload["meta.codec_frame_valid"], torch.tensor([1, 1, 1, 1, 1]))
 
 
-def test_flush_discards_failed_payload_and_still_sends_completion():
+def test_data_plane_abort_discards_pending_payload_without_affecting_completion():
     host = _host()
     _accumulate(host, "cancel", {"codes": torch.tensor([[1], [2]])})
     _accumulate(host, "done", {"codes": torch.tensor([[3], [4]])})
     _accumulate(host, "active", {"codes": torch.tensor([[5]])})
-    host.flush_full_payload_outputs({"cancel", "done"}, discarded_req_ids={"cancel"})
+    host.abort_requests({"cancel"})
+    host.flush_full_payload_outputs({"done"})
     sent = host.send_full_payload_outputs.call_args.kwargs["outputs"]
     assert set(sent) == {"done"}
     assert torch.equal(sent["done"][0]["codes"], torch.tensor([[3], [4]]))
@@ -233,21 +236,19 @@ def test_flush_discards_failed_payload_and_still_sends_completion():
     assert "cancel" not in host._full_payload_token_ends
 
 
-@pytest.mark.parametrize("aborted", [False, True])
-def test_cleanup_fallback_discards_only_aborted_payload(aborted):
+def test_cleanup_fallback_flushes_normal_completion():
     host = _host()
     _accumulate(host, "cancel", {"codes": torch.tensor([[1]])}, token_range=(0, 1))
-    host.cleanup_finished_request("cancel", discard_payload=aborted)
+    host.cleanup_finished_request("cancel")
     assert not host._full_payload_token_ends
     assert not host._pending_full_payload_send
-    assert host.send_full_payload_outputs.call_count == (0 if aborted else 1)
+    host.send_full_payload_outputs.assert_called_once()
 
 
 def test_request_id_reuse_starts_empty_after_discard():
     host = _host()
     _accumulate(host, "failed", {"hidden": torch.ones(3, 2)}, token_range=(0, 3))
-    host.flush_full_payload_outputs({"failed"}, discarded_req_ids={"failed"})
-    host.cleanup_finished_request("failed", discard_payload=True)
+    host.abort_requests({"failed"})
     _accumulate(host, "failed", {"hidden": torch.zeros(1, 2)}, token_range=(0, 1))
     assert torch.equal(_payload(host, "failed")["hidden"], torch.zeros(1, 2))
 
