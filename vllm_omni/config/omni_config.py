@@ -32,6 +32,7 @@ from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
 from vllm.config import SpeculativeConfig as VllmSpeculativeConfig
 from vllm.config.utils import config
+from vllm.config.weight_transfer import WeightTransferConfig as VllmWeightTransferConfig
 from vllm.engine.arg_utils import EngineArgs as VllmEngineArgs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -40,6 +41,7 @@ from vllm.pooling_params import PoolingParams
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
     _STAGE_DEPLOY_FIELDS,
+    NON_STAGE_OVERRIDE_FIELDS,
     PIPELINE_WIDE_ENGINE_FIELDS,
     DeployConfig,
     PipelineConfig,
@@ -81,6 +83,7 @@ _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
     {
         "async_chunk",
         "disable_log_stats",
+        "disable_websocket_compression",
         "command",
         "headless",
         "model",
@@ -92,6 +95,8 @@ _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
         "stage_id",
         "subparser",
         "tokenizer",
+        "video_output_warmup",
+        "video_output_warmup_timeout",
     }
 )
 
@@ -283,6 +288,7 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     vae_parallel_mode: str
     text_encoder_tp_size: int
     use_hsdp: bool
+    hsdp_data_parallel: bool
     mask_sp_padding: bool
     hsdp_shard_size: int
     hsdp_replicate_size: int
@@ -317,7 +323,7 @@ class _StageEngineValues:
     kernel_config: Mapping[str, Any] | KernelConfig | None
     profiler_config: Mapping[str, Any] | VllmProfilerConfig | None
     speculative_config: Mapping[str, Any] | VllmSpeculativeConfig | None
-    weight_transfer_config: dict[str, Any] | None
+    weight_transfer_config: Mapping[str, Any] | VllmWeightTransferConfig | None
 
 
 @dataclass(frozen=True)
@@ -394,7 +400,11 @@ def _stage_cli_overrides(
         # Filter global LoRA inputs before merging stage-scoped values so a
         # diffusion cache size cannot overwrite an LLM stage's explicit value.
         cli_overrides = {name: value for name, value in cli_overrides.items() if name not in _LLM_LORA_ENGINE_FIELDS}
-    runtime_overrides = build_stage_runtime_overrides(stage_id, dict(cli_overrides))
+    runtime_overrides = build_stage_runtime_overrides(
+        stage_id,
+        dict(cli_overrides),
+        warn_dropped=execution_type is not StageExecutionType.DIFFUSION,
+    )
     global_stage_fields = _global_stage_cli_fields() | _OWNER_ONLY_GLOBAL_STAGE_CLI_FIELDS
     owned_fields = None if execution_type is None else _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[execution_type]
     result: dict[str, Any] = {}
@@ -426,6 +436,13 @@ def _stage_cli_overrides(
                         f"Diffusion stage {stage_id} cannot override shared engine field {field_name!r}; "
                         "it has no diffusion stage-config consumer."
                     )
+                if field_name in NON_STAGE_OVERRIDE_FIELDS or field_name == "default_sampling_params":
+                    logger.warning(
+                        "Ignoring --stage-overrides[%s].%s: this field is not a per-stage override.",
+                        stage_id,
+                        field_name,
+                    )
+                    continue
                 result.setdefault(field_name, _copy_value(value))
     return result
 
@@ -535,7 +552,7 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     active_stream_window: int = Field(default=0, ge=0)
     session_mode: str = "turn"
     duplex_max_sessions: int = Field(default=1, ge=1)
-    use_v2_model_runner: bool = False
+    use_v2_model_runner: bool = True
     supports_native_mrv2_data_plane: bool = False
     enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None
@@ -784,6 +801,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     text_encoder_tp_size: int = Field(default=1, ge=1)
     vae_parallel_mode: str = "tile"
     use_hsdp: bool = False
+    hsdp_data_parallel: bool = False
     mask_sp_padding: bool = False
     hsdp_shard_size: int = -1
     hsdp_replicate_size: int = Field(default=1, ge=1)
@@ -804,14 +822,10 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
                 "vae_parallel_mode must be one of {'tile', 'batch', 'spatial_shard_height', 'spatial_shard_width'}, "
                 f"but got {self.vae_parallel_mode!r}."
             )
-        if self.vae_parallel_mode == "batch" and (
-            self.data_parallel_size != 1 or self.pipeline_parallel_size != 1 or self.cfg_parallel_size != 1
-        ):
-            raise ValueError("VAE batch parallel decode requires DP, PP, and CFG parallel sizes to be 1")
-
+        world_size_dp_factor = 1 if self.use_hsdp and self.hsdp_data_parallel else self.data_parallel_size
         other_parallel_world_size = (
             self.pipeline_parallel_size
-            * self.data_parallel_size
+            * world_size_dp_factor
             * self.tensor_parallel_size
             * self.sequence_parallel_size
             * self.cfg_parallel_size
@@ -820,7 +834,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
             incompatible = []
             if self.tensor_parallel_size > 1:
                 incompatible.append("TP")
-            if self.data_parallel_size > 1:
+            if self.data_parallel_size > 1 and not self.hsdp_data_parallel:
                 incompatible.append("DP")
             if self.pipeline_parallel_size > 1:
                 incompatible.append("PP")
@@ -828,6 +842,24 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
                 incompatible.append("EP")
             if incompatible:
                 raise ValueError("HSDP (FSDP2) is not compatible with " + ", ".join(incompatible))
+            if self.hsdp_data_parallel and (
+                self.tensor_parallel_size
+                * self.sequence_parallel_size
+                * self.pipeline_parallel_size
+                * self.cfg_parallel_size
+                != 1
+            ):
+                raise ValueError(
+                    "hsdp_data_parallel requires tensor, sequence, pipeline, and CFG parallel sizes to all be 1"
+                )
+            if self.hsdp_data_parallel and self.text_encoder_tp_size > 1:
+                # Encoder TP collectives require every encoder rank to process
+                # the same input, while HSDP request ranks own different prompts.
+                raise ValueError("hsdp_data_parallel requires text_encoder_tp_size to be 1")
+            if self.hsdp_data_parallel and self.vae_patch_parallel_size > 1:
+                # Patch-parallel VAE decode splits and stitches tiles across WORLD,
+                # which would mix latents from the different requests on each rank.
+                raise ValueError("hsdp_data_parallel requires vae_patch_parallel_size to be 1")
             if self.hsdp_shard_size == -1:
                 if other_parallel_world_size == 1:
                     raise ValueError("Cannot auto-calculate hsdp_shard_size when other parallelism is all 1")
@@ -852,8 +884,22 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
                             f"({other_parallel_world_size})"
                         )
                     self.world_size = other_parallel_world_size
+            if self.hsdp_data_parallel:
+                if self.data_parallel_size not in (1, self.world_size):
+                    raise ValueError(
+                        f"hsdp_data_parallel data_parallel_size must be 1 or HSDP world size "
+                        f"({self.world_size}), but got {self.data_parallel_size}"
+                    )
+                self.data_parallel_size = self.world_size
         else:
+            if self.hsdp_data_parallel:
+                raise ValueError("hsdp_data_parallel requires use_hsdp=True")
             self.world_size = other_parallel_world_size
+
+        if self.vae_parallel_mode == "batch" and (
+            self.data_parallel_size != 1 or self.pipeline_parallel_size != 1 or self.cfg_parallel_size != 1
+        ):
+            raise ValueError("VAE batch parallel decode requires DP, PP, and CFG parallel sizes to be 1")
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True, extra="forbid"))
@@ -871,7 +917,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     model_class_name: str | None = None
     engine_backend: str | type = "default"
     diffusion_model_runner_cls: str | type | None = None
-    request_batch_max_wait_ms: float = 0.0
+    request_batch_max_wait_ms: float | None = None
     streaming_output: bool = False
     model_arch: str | None = None
     task_type: str | None = None
@@ -956,7 +1002,11 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     moe_backend: str = "auto"
     linear_backend: str = "auto"
     force_cutlass_fp8: bool = False
+    diffusion_flashinfer_autotune: bool | None = None
     enable_diffusion_pipeline_profiler: bool = False
+    enable_mixfusion: bool = False
+    mixfusion_min_chunk_tokens: int = 256
+    mixfusion_max_chunks: int = 128
     step_execution: bool = False
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
@@ -1812,7 +1862,7 @@ class BaseVllmOmniStageConfig:
     # dict early and break that step with "SpeculativeConfig object has no
     # attribute 'items'". Keep the Mapping shape and let vLLM do the conversion.
     speculative_config: Mapping[str, Any] | None = None
-    weight_transfer_config: Mapping[str, Any] | None = None
+    weight_transfer_config: Mapping[str, Any] | VllmWeightTransferConfig | None = None
     quantization_config: _QuantizationConfigType = None
 
     @property
@@ -1988,8 +2038,10 @@ def _build_common_stage_config_kwargs(
             "kernel_config": _copy_value(engine.kernel_config),
             "profiler_config": _copy_value(engine.profiler_config),
             "speculative_config": _copy_value(engine.speculative_config),
+            "weight_transfer_config": _copy_value(
+                _first_defined(engine.weight_transfer_config, deploy.weight_transfer_config)
+            ),
             "quantization_config": _copy_value(quantization_config),
-            "weight_transfer_config": _first_defined(engine.weight_transfer_config, deploy.weight_transfer_config),
         },
         input_proc,
         next_stage_proc,
@@ -2176,7 +2228,10 @@ def _build_model_config(
         kwargs["custom_voice_dir"] = _copy_value(deploy.custom_voice_dir)
     stage_runner = resolve_stage_model_runner(deploy, stage_deploy)
     validate_native_mrv2_session(deploy, topology, stage_runner)
-    kwargs.setdefault("use_v2_model_runner", stage_runner == "v2")
+    kwargs.setdefault(
+        "use_v2_model_runner",
+        stage_runner == "v2" and topology.execution_type is not StageExecutionType.DIFFUSION,
+    )
     kwargs.setdefault(
         "supports_native_mrv2_data_plane",
         topology.supports_native_mrv2_data_plane,
@@ -2457,7 +2512,8 @@ class VllmOmniConfig:
             from vllm_omni.config.composable_parallel import apply_strategy_specs
 
             strategy_stages = merge_pipeline_deploy(pipeline_cfg, copy.deepcopy(deploy))
-            strategy_result = apply_strategy_specs(strategy_stages, strategy_specs)
+            # Device counts are checked below, once CLI overrides are applied.
+            strategy_result = apply_strategy_specs(strategy_stages, strategy_specs, check_devices=False)
             strategy_overrides: dict[str, Any] = {}
             axis_fields = {
                 "tp": "tensor_parallel_size",
@@ -2466,7 +2522,7 @@ class VllmOmniConfig:
             }
             for stage_id, parallel in strategy_result.per_stage_config.items():
                 declared = set(parallel.l1_owners)
-                explicit = build_stage_runtime_overrides(stage_id, cli_overrides)
+                explicit = build_stage_runtime_overrides(stage_id, cli_overrides, warn_dropped=False)
                 for axis, field_name in axis_fields.items():
                     if axis not in declared:
                         continue

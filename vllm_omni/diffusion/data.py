@@ -7,7 +7,7 @@ import math
 import os
 import random
 import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, fields
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -33,9 +33,12 @@ from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
 )
 from vllm_omni.diffusion.attention.schedule import (
     AttentionSchedule,
+    AttentionSigmaSchedule,
     parse_attention_schedule,
+    parse_attention_sigma_schedule,
     validate_attention_profile_name,
     validate_attention_schedule,
+    validate_attention_sigma_schedule,
 )
 from vllm_omni.diffusion.diffusion_kv.config import (
     DiffusionKVCacheMode,
@@ -58,6 +61,28 @@ logger = init_logger(__name__)
 
 # Accepted values for ``OmniDiffusionConfig.vae_fast_path``.
 VAE_FAST_PATH_LEVELS: tuple[str, ...] = ("off", "lossless", "channels_last")
+
+
+# Cache backends that synchronize their skip decision across the FSDP shard
+# group, so ranks serving different requests still issue identical collectives.
+HSDP_DATA_PARALLEL_CACHE_BACKENDS: frozenset[str] = frozenset({"sea_cache"})
+
+# Default admission wait for hsdp_data_parallel. Without it, the first request
+# of a burst is dispatched alone and the rest wait a full generation for the
+# next wave.
+HSDP_DATA_PARALLEL_DEFAULT_BATCH_WAIT_MS = 500.0
+
+
+def uses_rank_local_dp_concurrency(od_config: object) -> bool:
+    """Whether sharded weights serve different requests on each rank."""
+    from vllm_omni.diffusion.offloader.config import any_selected_component_uses_allgather
+
+    parallel_config = getattr(od_config, "parallel_config", None)
+    if (getattr(parallel_config, "data_parallel_size", 1) or 1) <= 1:
+        return False
+    return bool(
+        getattr(parallel_config, "hsdp_data_parallel", False) or any_selected_component_uses_allgather(od_config)
+    )
 
 
 def _move_diffusion_alias(
@@ -295,11 +320,12 @@ class DiffusionParallelConfig:
     """
 
     ulysses_a2a_permute: bool = False
-    """Use fused permute-free all-to-all for eligible strict Ulysses exchanges.
+    """Use platform symmetric memory for eligible strict Ulysses exchanges.
 
-    Uses platform symmetric memory on CUDA and NPU. NPU currently requires
-    eager inference and pure Ulysses over WORLD in one HCCS domain, with
-    TorchNPU's NPUSHMEM allocator, Triton-Ascend and a symmetric-memory runtime.
+    On CUDA, enables CE (copy engines) on a single NVLink-connected node;
+    when disabled, Ulysses uses NCCL. NPU retains its eager, pure Ulysses
+    implementation over WORLD in one HCCS domain, using TorchNPU's NPUSHMEM
+    allocator, Triton-Ascend and a symmetric-memory runtime.
     """
 
     cfg_parallel_size: int = 1
@@ -342,6 +368,14 @@ class DiffusionParallelConfig:
 
     use_hsdp: bool = False
     """Enable Hybrid Sharded Data Parallel (HSDP) for model weight sharding."""
+
+    hsdp_data_parallel: bool = False
+    """Run one independent request per HSDP rank.
+
+    HSDP still gathers sharded parameters collectively, but each rank computes
+    different activations. This requires all other model-parallel dimensions
+    to be one and compatible requests to execute in lockstep.
+    """
 
     mask_sp_padding: bool = False
     """If True, generate a boolean attention mask for zero-padded SP tokens
@@ -407,9 +441,10 @@ class DiffusionParallelConfig:
         # Until the runtime WORLD size is known, an omitted DP dimension means
         # one replica. OmniDiffusionConfig resolves it against num_gpus below.
         data_parallel_size = self.data_parallel_size or 1
+        world_size_dp_factor = 1 if self.use_hsdp and self.hsdp_data_parallel else data_parallel_size
         other_parallel_world_size = (
             self.pipeline_parallel_size
-            * data_parallel_size
+            * world_size_dp_factor
             * self.tensor_parallel_size
             * self.sequence_parallel_size
             * self.cfg_parallel_size
@@ -423,7 +458,7 @@ class DiffusionParallelConfig:
             incompatible = []
             if self.tensor_parallel_size > 1:
                 incompatible.append("TP")
-            if data_parallel_size > 1:
+            if data_parallel_size > 1 and not self.hsdp_data_parallel:
                 incompatible.append("DP")
             if self.pipeline_parallel_size > 1:
                 incompatible.append("PP")
@@ -431,6 +466,24 @@ class DiffusionParallelConfig:
                 incompatible.append("EP")
             if incompatible:
                 raise ValueError("HSDP (FSDP2) is not compatible with " + ", ".join(incompatible))
+            if self.hsdp_data_parallel and (
+                self.tensor_parallel_size
+                * self.sequence_parallel_size
+                * self.pipeline_parallel_size
+                * self.cfg_parallel_size
+                != 1
+            ):
+                raise ValueError(
+                    "hsdp_data_parallel requires tensor, sequence, pipeline, and CFG parallel sizes to all be 1"
+                )
+            if self.hsdp_data_parallel and self.text_encoder_tp_size > 1:
+                # Encoder TP collectives require every encoder rank to process
+                # the same input, while HSDP request ranks own different prompts.
+                raise ValueError("hsdp_data_parallel requires text_encoder_tp_size to be 1")
+            if self.hsdp_data_parallel and self.vae_patch_parallel_size > 1:
+                # Patch-parallel VAE decode splits and stitches tiles across WORLD,
+                # which would mix latents from the different requests on each rank.
+                raise ValueError("hsdp_data_parallel requires vae_patch_parallel_size to be 1")
             if self.hsdp_shard_size == -1:
                 # Auto-calculate: use other_parallel_world_size as shard_size
                 if self.hsdp_replicate_size <= 0:
@@ -462,7 +515,16 @@ class DiffusionParallelConfig:
                             f"must equal world_size from other parallelism ({other_parallel_world_size})"
                         )
                     self.world_size = other_parallel_world_size
+            if self.hsdp_data_parallel:
+                if data_parallel_size not in (1, self.world_size):
+                    raise ValueError(
+                        f"hsdp_data_parallel data_parallel_size must be 1 or HSDP world size "
+                        f"({self.world_size}), but got {data_parallel_size}"
+                    )
+                self.data_parallel_size = self.world_size
         else:
+            if self.hsdp_data_parallel:
+                raise ValueError("hsdp_data_parallel requires use_hsdp=True")
             self.world_size = other_parallel_world_size
 
     def resolve_data_parallel_size(self, world_size: int) -> int:
@@ -471,17 +533,22 @@ class DiffusionParallelConfig:
             raise ValueError(f"WORLD size must be > 0, but got {world_size}")
 
         if self.use_hsdp:
-            if self.data_parallel_size not in (None, 1):
-                raise ValueError("HSDP (FSDP2) requires data_parallel_size to be 1")
+            allowed_dp_sizes = (None, 1, world_size) if self.hsdp_data_parallel else (None, 1)
+            if self.data_parallel_size not in allowed_dp_sizes:
+                expected = f"1 or WORLD size ({world_size})" if self.hsdp_data_parallel else "1"
+                raise ValueError(f"HSDP (FSDP2) requires data_parallel_size to be {expected}")
             expected_world_size = self.hsdp_replicate_size * self.hsdp_shard_size
             if world_size != expected_world_size:
                 raise ValueError(
                     f"WORLD size ({world_size}) must equal HSDP size "
                     f"({self.hsdp_replicate_size} x {self.hsdp_shard_size} = {expected_world_size})"
                 )
-            self.data_parallel_size = 1
+            inferred_data_parallel_size = world_size if self.hsdp_data_parallel else 1
+            if self.vae_parallel_mode == "batch" and inferred_data_parallel_size != 1:
+                raise ValueError("VAE batch parallel decode requires DP, PP, and CFG parallel sizes to be 1")
+            self.data_parallel_size = inferred_data_parallel_size
             self.world_size = world_size
-            return 1
+            return self.data_parallel_size
 
         assert self.sequence_parallel_size is not None
         non_dp_size = (
@@ -776,6 +843,8 @@ def resolve_model_class_name(
 
     from vllm_omni.diffusion.utils.hf_utils import _looks_like_flux3, _looks_like_hidream_o1
 
+    if model_type == "praxis":
+        return "Praxis1Pipeline"
     if _looks_like_hidream_o1(model, cfg):
         return "HiDreamO1ImagePipeline"
     if _looks_like_flux3(model, cfg):
@@ -796,6 +865,13 @@ def resolve_model_class_name(
         "ming_flash_omni",
         "ming_flash_omni_thinker",
     ):
+        try:
+            transformer_config = get_hf_file_to_dict("transformer/config.json", model, revision=revision)
+        except (OSError, ValueError) as exc:
+            logger.warning("Could not read Ming transformer metadata for %s: %s", model, exc)
+            transformer_config = None
+        if isinstance(transformer_config, Mapping) and transformer_config.get("_class_name") == "DiffusionTransformer":
+            return "MingImageDiffusionPipeline"
         return "MingImagePipeline"
     if model_type == "nextstep":
         return "NextStep11Pipeline"
@@ -1170,6 +1246,11 @@ class OmniDiffusionConfig:
     # does not enable FP8 by itself; it only selects CUTLASS once the checkpoint
     # has already resolved to vLLM's ModelOpt FP8 linear method.
     force_cutlass_fp8: bool = False
+    # FlashInfer autotune for diffusion GEMMs: the first request of each new shape runs in FlashInfer's tune mode
+    # and later ones reuse the tactics, cached per rank across restarts. Without it the stage keeps FlashInfer's
+    # heuristic tactics, because vLLM autotunes FlashInfer only in its LLM worker warm-up. None (default) = auto:
+    # on for CUDA SM100+ with FlashInfer installed; True / False force it. The first request of a new shape is slower.
+    diffusion_flashinfer_autotune: bool | None = None
 
     # Runtime diffusion attention method (not vLLM's --kv-cache-dtype for AR models).
     # None/"auto" keeps native dtype; other values are validated by the selected backend.
@@ -1183,6 +1264,13 @@ class OmniDiffusionConfig:
 
     # Diffusion pipeline Profiling config
     enable_diffusion_pipeline_profiler: bool = False
+
+    # Mixed-resolution batch packing (MixFusion). Server-level default for the
+    # scheduler shape-relaxation and the pipeline ragged-latent pass; requests
+    # can still opt in/out per-request via extra_args.
+    enable_mixfusion: bool = False
+    mixfusion_min_chunk_tokens: int = 256
+    mixfusion_max_chunks: int = 128
 
     # Step mode settings
     step_execution: bool = False
@@ -1204,8 +1292,9 @@ class OmniDiffusionConfig:
     # Request-mode batch admission: wait briefly for compatible requests to
     # accumulate in the scheduler waiting queue before the first schedule() of
     # a wave.  Improves fused forward batch sizes under bursty HTTP ingress.
-    # 0 disables admission (default; no added latency).
-    request_batch_max_wait_ms: float = 0.0
+    # 0 disables admission. None resolves to
+    # HSDP_DATA_PARALLEL_DEFAULT_BATCH_WAIT_MS with hsdp_data_parallel, else 0.
+    request_batch_max_wait_ms: float | None = None
 
     # Supplementary model specific parameters
     extras: dict[str, Any] = field(default_factory=dict)
@@ -1386,11 +1475,13 @@ class OmniDiffusionConfig:
                 raise ValueError("Native KV transfer does not support sleep mode: registered pages must remain mapped")
 
         self.master_port = self._resolve_master_port()
-        self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)
-        if not math.isfinite(self.request_batch_max_wait_ms) or self.request_batch_max_wait_ms < 0:
-            raise ValueError(
-                f"request_batch_max_wait_ms must be a finite non-negative number, got {self.request_batch_max_wait_ms}."
-            )
+        if self.request_batch_max_wait_ms is not None:
+            self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms)
+            if not math.isfinite(self.request_batch_max_wait_ms) or self.request_batch_max_wait_ms < 0:
+                raise ValueError(
+                    "request_batch_max_wait_ms must be a finite non-negative number, "
+                    f"got {self.request_batch_max_wait_ms}."
+                )
 
         if isinstance(self.profiler_config, dict):
             from vllm.config import ProfilerConfig
@@ -1418,6 +1509,20 @@ class OmniDiffusionConfig:
                 self.num_gpus = 1
 
         self.parallel_config.resolve_data_parallel_size(self.num_gpus)
+        if (
+            self.parallel_config.hsdp_data_parallel
+            and self.cache_backend not in (None, "none")
+            and self.cache_backend not in HSDP_DATA_PARALLEL_CACHE_BACKENDS
+        ):
+            raise ValueError(
+                f"cache_backend={self.cache_backend!r} cannot be combined with hsdp_data_parallel: "
+                "rank-local cache decisions can skip different FSDP weight collectives. "
+                f"Use one of {sorted(HSDP_DATA_PARALLEL_CACHE_BACKENDS)} or disable cache_backend."
+            )
+        if self.request_batch_max_wait_ms is None:
+            self.request_batch_max_wait_ms = (
+                HSDP_DATA_PARALLEL_DEFAULT_BATCH_WAIT_MS if self.parallel_config.hsdp_data_parallel else 0.0
+            )
         # Resolve offload only after DP/SP normalization so cached policy
         # validation observes the actual execution topology.
         offload_strategy = materialize_legacy_offload_flags(self)
@@ -1631,11 +1736,11 @@ class OmniDiffusionConfig:
         self._propagate_skip_softmax_calibration(tf_config)
 
     def _propagate_skip_softmax_calibration(self, tf_config: "TransformerConfig") -> None:
-        cfg = getattr(self, "diffusion_attention_config", None)
+        cfg = self.diffusion_attention_config
         # The baseline plus every schedule profile, so a profile the service default never
         # references still has its calibration discovered. The loader uses the same helper.
         baseline = cfg if isinstance(cfg, AttentionConfig) else None
-        specs = collect_calibration_specs(baseline, getattr(self, "diffusion_attention_schedule", None))
+        specs = collect_calibration_specs(baseline, self.diffusion_attention_schedule)
         if not specs:
             return
 
@@ -1818,6 +1923,11 @@ class OmniDiffusionConfig:
                 model_type = cfg.get("model_type")
                 architectures = cfg.get("architectures") or []
 
+                if model_type == "praxis":
+                    self.model_class_name = "Praxis1Pipeline"
+                    self.update_multimodal_support()
+                    return
+
                 from vllm_omni.diffusion.utils.hf_utils import _looks_like_hidream_o1
 
                 assert self.model is not None
@@ -1869,11 +1979,19 @@ class OmniDiffusionConfig:
                     "ming_flash_omni",
                     "ming_flash_omni_thinker",
                 ):
-                    # Ming-flash-omni-2.0 — imagegen stage uses the custom
-                    # ``MingImagePipeline`` (ZImage DiT + Qwen2 connector). See
-                    # vllm_omni/diffusion/models/ming_flash_omni/pipeline_ming_imagegen.py.
-                    self.model_class_name = "MingImagePipeline"
-                    self.tf_model_config = TransformerConfig()
+                    # Shared Bailing metadata also appears on Ming-Image checkpoints.
+                    if self.model_class_name is None:
+                        self.model_class_name = resolve_model_class_name(self.model, revision=self.revision)
+                    from vllm_omni.model_executor.models.ming_image.pipeline import MING_IMAGE_PIPELINE
+
+                    if self.model_class_name in (
+                        MING_IMAGE_PIPELINE.diffusers_class_name,
+                        *MING_IMAGE_PIPELINE.diffusers_class_aliases,
+                    ):
+                        if not self._load_component_transformer_config():
+                            self.set_tf_model_config(TransformerConfig())
+                    else:
+                        self.tf_model_config = TransformerConfig()
                     self.update_multimodal_support()
                 elif model_type == "nextstep":
                     if self.model_class_name is None:
@@ -2026,6 +2144,55 @@ class DiffusionOutput:
     # Host-side playback diagnostics; carried through the existing output metadata.
     streaming_metrics: dict[str, float | int] = field(default_factory=dict)
 
+    # In-process ownership only; never part of the pipeline constructor contract.
+    _ready_event: torch.Event | None = field(default=None, init=False, repr=False, compare=False)
+    _ready_tensors: tuple[torch.Tensor, ...] = field(default=(), init=False, repr=False, compare=False)
+
+    def _record_device_ready(self) -> None:
+        """Capture the producer stream before UNI hands output to another thread."""
+
+        def tensors(value: object) -> Iterator[torch.Tensor]:
+            if isinstance(value, torch.Tensor):
+                if value.device.type not in ("cpu", "meta"):
+                    yield value
+            elif isinstance(value, dict):
+                for item in value.values():
+                    yield from tensors(item)
+            elif isinstance(value, (tuple, list)):
+                for item in value:
+                    yield from tensors(item)
+
+        self._ready_tensors = tuple(
+            tensor
+            for value in (
+                self.output,
+                self.media.video.tensor if self.media is not None else None,
+                self.trajectory_timesteps,
+                self.trajectory_latents,
+                self.trajectory_log_probs,
+                self.custom_output,
+            )
+            for tensor in tensors(value)
+        )
+        if not self._ready_tensors:
+            return
+
+        from vllm_omni.platforms import current_omni_platform
+
+        self._ready_event = current_omni_platform.record_device_event()
+        if self._ready_event is None:
+            # Backends without events must still finish producing the output.
+            current_omni_platform.synchronize()
+
+    def _wait_device_ready(self) -> None:
+        """Order consumer reads and keep storage alive on the consuming stream."""
+        if self._ready_event is not None:
+            self._ready_event.wait()
+        for tensor in self._ready_tensors:
+            tensor.record_stream(torch.accelerator.current_stream(tensor.device))
+        self._ready_event = None
+        self._ready_tensors = ()
+
     def output_nbytes(self) -> int:
         """Payload bytes retained by one decoded output, excluding model workspace."""
 
@@ -2103,11 +2270,16 @@ class AsyncOutputKind(Enum):
     * ``COMPUTE_DONE`` — worker forward finished, GPU can start next request
     * ``OUTPUT_READY`` — background D2H/SHM packing finished, final output
       is available via ``async_output_id``
+    * ``CHUNK_READY`` — one in-order decoded chunk from a still-running
+      request forward. Does not complete the RPC future and does not mark
+      compute done. The final ``COMPUTE_DONE`` / ``OUTPUT_READY`` pair is
+      still the execution return.
     """
 
     RPC_RESULT = "rpc_result"
     COMPUTE_DONE = "compute_done"
     OUTPUT_READY = "output_ready"
+    CHUNK_READY = "chunk_ready"
 
 
 @dataclass
@@ -2117,6 +2289,11 @@ class AsyncDiffusionOutput:
     In request-mode (``step_execution=False``), all ``result_mq``
     messages use this envelope.  The ``kind`` field routes the message
     to the correct consumer.
+
+    ``CHUNK_READY`` carries the active request id
+    plus ``chunk_index``. The executor caches the
+    unpacked payload under ``async_output_id`` and notifies the engine.
+    It must not resolve ``_rpc_futures``.
     """
 
     kind: AsyncOutputKind
@@ -2125,6 +2302,8 @@ class AsyncDiffusionOutput:
     result: Any | None = None
     output: DiffusionOutput | None = None
     error: str | None = None
+    request_id: str | None = None
+    chunk_index: int | None = None
 
 
 class DiffusionRequestAbortedError(RuntimeError):
@@ -2518,7 +2697,7 @@ class AttentionConfig:
 
 @dataclass
 class AttentionScheduleConfig:
-    """Startup-owned attention profiles and the default integer-step schedule.
+    """Startup-owned profiles with default integer-step ranges or sigma windows.
 
     Profiles resolve their own roles, without merging the baseline or its
     environment fallback. Candidate construction and hardware validation happen
@@ -2527,6 +2706,8 @@ class AttentionScheduleConfig:
 
     profiles: dict[str, AttentionConfig] = field(default_factory=dict)
     default: AttentionSchedule = ()
+    # Ascending [low, high) windows; high=1 also includes 1. Cannot coexist with default ranges.
+    sigma: AttentionSigmaSchedule = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.profiles, Mapping):
@@ -2543,6 +2724,16 @@ class AttentionScheduleConfig:
             raise TypeError("diffusion_attention_schedule.default must be a list of ranges, not None")
         validate_attention_schedule(default, profiles=self.profiles)
         self.default = default
+        sigma = parse_attention_sigma_schedule(self.sigma)
+        if sigma is None:
+            raise TypeError("diffusion_attention_schedule.sigma must be a list of windows, not None")
+        validate_attention_sigma_schedule(sigma, profiles=self.profiles)
+        if self.default and sigma:
+            raise ValueError(
+                "diffusion_attention_schedule cannot combine default step ranges with sigma windows; "
+                "leave one of them empty"
+            )
+        self.sigma = sigma
 
 
 def parse_attention_schedule_config(
@@ -2550,7 +2741,7 @@ def parse_attention_schedule_config(
 ) -> AttentionScheduleConfig | None:
     """Normalize service config without initializing backends or reading env vars.
 
-    A config without profiles can never select a candidate (its default must then be empty), so it
+    A config without profiles can never select a candidate (its default and sigma must then be empty), so it
     is returned as None: no schedule, and no compile boundary on the attention layers.
     """
     if value is None:
@@ -2558,7 +2749,7 @@ def parse_attention_schedule_config(
     if isinstance(value, str):
         value = json.loads(value)
     if isinstance(value, AttentionScheduleConfig):
-        config = AttentionScheduleConfig(profiles=value.profiles, default=value.default)
+        config = AttentionScheduleConfig(profiles=value.profiles, default=value.default, sigma=value.sigma)
     elif isinstance(value, Mapping):
         config = AttentionScheduleConfig(**dict(value))
     else:
