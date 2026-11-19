@@ -22,6 +22,7 @@ def baseline_functions():
     path = Path("tests/dfx/conftest.py")
     names = {
         "BASELINE_REGRESSION_TOLERANCE",
+        "PerformanceBaselineRegressionError",
         "_LOWER_IS_BETTER_TOKENS",
         "_HIGHER_IS_BETTER_TOKENS",
         "metric_lower_is_better",
@@ -37,6 +38,8 @@ def baseline_functions():
     nodes: list[ast.stmt] = []
     for node in ast.parse(path.read_text(encoding="utf-8")).body:
         if isinstance(node, ast.FunctionDef) and node.name in names:
+            nodes.append(node)
+        elif isinstance(node, ast.ClassDef) and node.name in names:
             nodes.append(node)
         elif isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in names for t in node.targets):
             nodes.append(node)

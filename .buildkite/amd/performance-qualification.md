@@ -122,12 +122,43 @@ but completes every configured sweep before raising the combined baseline
 regressions. The next exact-head AMD diagnostic must publish all five results;
 only repeated measured values may update the remaining envelope.
 
-The next exact-head AMD run after this recalibration is held out for Voxtral and
-collects the complete MiniCPM-o diagnostic sweep. If that evidence requires a
-further baseline update, the following exact-head AMD and CUDA runs become the
-final held-out qualification. Record each Buildkite link and every job result
-in the PR qualification evidence before merge; do not promote these jobs to
-blocking on calibration data alone.
+Build
+[16842](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/16842) is the
+declared exact-head diagnostic after that recalibration. Qwen3-Omni no-async
+and Qwen3-TTS passed. Qwen3-Omni async, Voxtral and MiniCPM-o completed every
+configured sweep and published all 6, 3 and 5 expected result JSONs,
+respectively, before soft-failing their baseline checks.
+
+The additional calibration changes use only repeated current-runtime evidence:
+
+- Qwen3-Omni async low-rate text-only TTFT increased across builds 16823,
+  16833 and 16842 (253, 278 and 300 ms). Its reference becomes the maximum
+  observed 299.9557153088972 ms.
+- Voxtral throughput-sweep median TTFP increased across builds 16833, 16838
+  and 16842 (892, 908 and 1040 ms). Its reference becomes the maximum observed
+  1039.8084034677595 ms. RTF and throughput both improved in 16842.
+- MiniCPM-o C4 repeated the same envelope in builds 16838 and 16842. The
+  reference uses their minimum request throughput (2.0818495563247166 req/s),
+  maximum E2EL (1882.572358037578 ms), and maximum audio RTF
+  (0.45620219311308396). The C8 and C16 misses in 16842 remain unchanged
+  because this is their only current-runtime full-sweep observation; the next
+  exact-head run must repeat or clear them before any further calibration.
+
+The hard failure in `Simple · Other Test · Shard 1/2` is not a runtime
+failure. The dependency-light AST fixture extracted functions and assignments
+from `tests/dfx/conftest.py` but not the newly named
+`PerformanceBaselineRegressionError` class, so four negative-path tests raised
+`NameError` instead of the expected assertion. The follow-up extracts the
+class definition as well. The identical failure appeared in CUDA build
+[20375](https://buildkite.com/vllm/vllm-omni/builds/20375), while the local
+dependency-light file passes all 18 tests after the fix.
+
+The next exact-head AMD and CUDA runs are held out for the revised references
+and fixture fix. They are also the confirmation run for the retained MiniCPM-o
+C8/C16 references. If a retained miss repeats and justifies another reference
+change, one further exact-head held-out run is required. Record each Buildkite
+link and every target job result in the PR qualification evidence before
+merge; do not promote these jobs to blocking on calibration data alone.
 
 ## Buildkite validation and promotion criteria
 
