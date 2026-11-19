@@ -241,7 +241,7 @@
           "res": {
             "npu": "A3"
           },
-          "num_cards": 3
+          "num_cards": 4
         }
       },
       "full_model",
@@ -272,12 +272,7 @@
           }
         },
         "platforms.npu.model_runner": "v2",
-        "platforms.npu.stages.0.tensor_parallel_size": 1,
-        "platforms.npu.stages.0.devices": "0",
-        "platforms.npu.stages.0.enable_prefix_caching": false,
-        "platforms.npu.stages.0.gpu_memory_utilization": 0.95,
-        "platforms.npu.stages.1.devices": "1",
-        "platforms.npu.stages.2.devices": "1"
+        "platforms.npu.stages.0.enable_prefix_caching": false
       }
     },
     "benchmark_params": [
@@ -307,7 +302,7 @@
           "res": {
             "npu": "A3"
           },
-          "num_cards": 3
+          "num_cards": 4
         }
       },
       "full_model",
@@ -338,12 +333,7 @@
           }
         },
         "platforms.npu.model_runner": "v2",
-        "platforms.npu.stages.0.tensor_parallel_size": 1,
-        "platforms.npu.stages.0.devices": "0",
-        "platforms.npu.stages.0.enable_prefix_caching": true,
-        "platforms.npu.stages.0.gpu_memory_utilization": 0.95,
-        "platforms.npu.stages.1.devices": "1",
-        "platforms.npu.stages.2.devices": "1"
+        "platforms.npu.stages.0.enable_prefix_caching": true
       }
     },
     "benchmark_params": [

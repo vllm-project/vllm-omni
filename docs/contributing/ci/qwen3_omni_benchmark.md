@@ -25,12 +25,16 @@ must match the checksums.
 
 Both deployments use MRv2. Default disables async chunk and all stage prefix
 caches. Async-prefix enables async chunk and Thinker prefix caching only.
-The serving topology uses two inference devices: Thinker TP1 on device 0,
-Talker and Code2Wav share device 1. CUDA Seed-TTS evaluators reuse device 1
-after request measurement. NPU reserves a third device for the evaluators.
+CUDA uses two inference devices: Thinker TP1 on device 0, Talker and Code2Wav
+share device 1. CUDA Seed-TTS evaluators reuse device 1 after measurement.
+NPU inherits the production topology and memory limits: Thinker TP2 on devices
+0 and 1, Talker and Code2Wav share device 2, and device 3 runs the evaluators.
+These IDs identify software Devices. Each A3 physical NPU contains two Devices
+(Dies); selecting one ID does not select both Dies or combine their memory.
 Production deploy YAMLs are not changed; JSON applies temporary test overrides.
-NPU topology overrides retain the production PIECEWISE graph mode, per-stage
-token budgets and memory limits outside the explicit Thinker TP1 adjustment.
+NPU scenarios retain production PIECEWISE graph mode, per-stage token budgets,
+tensor parallelism, placement and memory limits, while selecting the requested
+async-chunk and prefix-cache policies.
 Benchmark servers allow 1200 seconds per stage and 1800 seconds for overall
 initialization, covering cold compilation before requests are measured.
 Daily-Omni and Seed-TTS use separate server groups. A failed media engine therefore
@@ -39,7 +43,7 @@ does not get reused for Seed's concurrency sweep; Seed tiers share one lifetime.
 The full-duplex JSON configurations use the same shared runner. CUDA covers
 Omni-DuplexEval `PR_correction` (120 selected IDs, c8) and OmniInteract
 `1q1a_math` (60 sessions, c8). The NPU DuplexEval candidate covers the same
-120 IDs at c8. A dedicated third device runs the judge. Candidate NPU profiles
+120 IDs at c8. CUDA uses device 2 for the judge; NPU uses device 3. Candidate NPU profiles
 require qualification before replacing scheduled A3 jobs. A2/H200 supporting
 results identify their actual hardware and do not establish A3/H100 results.
 
@@ -105,11 +109,11 @@ pytest -sv tests/dfx/perf/scripts/run_benchmark.py \
   -m 'full_model and cuda and cards_2' --run-level full_model
 ```
 
-For the NPU candidate, use `SEED_TTS_EVAL_DEVICE=npu:2`,
-`SEED_TTS_SIM_DEVICE=npu:2`, and `-m 'full_model and npu and cards_3'`.
+For the NPU candidate, use `SEED_TTS_EVAL_DEVICE=npu:3`,
+`SEED_TTS_SIM_DEVICE=npu:3`, and `-m 'full_model and npu and cards_4'`.
 Run inside the host's GPU/NPU scheduler. Full-duplex uses
-`test_qwen3_omni_duplex_omni_duplex_eval.json` with `cards_3`; select `cuda`
-or `npu` explicitly. CPU contracts run without loading model dependencies:
+`test_qwen3_omni_duplex_omni_duplex_eval.json` with `cuda and cards_3` or
+`npu and cards_4`. CPU contracts run without loading model dependencies:
 
 ```bash
 pytest --noconftest -o addopts='' tests/benchmarks/test_qwen3_dataset_contract.py

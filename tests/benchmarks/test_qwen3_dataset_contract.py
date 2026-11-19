@@ -84,7 +84,8 @@ def test_npu_matrix_preserves_platform_runtime_guards(config_file, test_name, pr
     from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config
 
     configs = json.loads((ROOT / "tests/dfx/perf/tests" / config_file).read_text())
-    params = next(config["server_params"] for config in configs if config["test_name"] == test_name)
+    config = next(config for config in configs if config["test_name"] == test_name)
+    params = config["server_params"]
     args = params["extra_cli_args"]
     source = str(ROOT / args[args.index("--deploy-config") + 1])
     original = _apply_platform_overrides(load_deploy_config(source), "npu")
@@ -93,17 +94,16 @@ def test_npu_matrix_preserves_platform_runtime_guards(config_file, test_name, pr
     stages = {stage.stage_id: stage for stage in actual.stages}
 
     assert actual.model_runner == "v2"
-    assert {stage_id: stage.devices for stage_id, stage in stages.items()} == {0: "0", 1: "1", 2: "1"}
-    assert stages[0].tensor_parallel_size == 1
+    assert {stage_id: stage.devices for stage_id, stage in stages.items()} == {0: "0,1", 1: "2", 2: "2"}
+    assert stages[0].tensor_parallel_size == 2
+    assert config["mark"][0]["hardware_marks"]["num_cards"] == 4
+    if "judge_server_params" in config:
+        assert config["judge_server_params"]["device_index"] == "3"
     assert stages[0].engine_extras["enable_prefix_caching"] is prefix
     for stage in original.stages:
         expected = asdict(stage)
         effective = asdict(stages[stage.stage_id])
         assert expected["compilation_config"]["cudagraph_mode"] == "PIECEWISE"
-        for key in ("devices", "tensor_parallel_size", "gpu_memory_utilization"):
-            if key == "devices" or stage.stage_id == 0:
-                expected.pop(key)
-                effective.pop(key)
         if stage.stage_id == 0:
             expected["engine_extras"].pop("enable_prefix_caching", None)
             effective["engine_extras"].pop("enable_prefix_caching", None)

@@ -215,7 +215,7 @@
           "res": {
             "npu": "A3"
           },
-          "num_cards": 3
+          "num_cards": 4
         }
       },
       "full_model",
@@ -242,12 +242,7 @@
         "duplex_session.max_sessions": 8,
         "duplex_session.collect_stats": true,
         "platforms.npu.model_runner": "v2",
-        "platforms.npu.stages.0.tensor_parallel_size": 1,
-        "platforms.npu.stages.0.devices": "0",
-        "platforms.npu.stages.0.gpu_memory_utilization": 0.95,
-        "platforms.npu.stages.0.enable_prefix_caching": true,
-        "platforms.npu.stages.1.devices": "1",
-        "platforms.npu.stages.2.devices": "1"
+        "platforms.npu.stages.0.enable_prefix_caching": true
       }
     },
     "benchmark_params": [
@@ -412,7 +407,7 @@
     "judge_server_params": {
       "model": "Qwen/Qwen2.5-7B-Instruct",
       "use_omni": false,
-      "device_index": "2",
+      "device_index": "3",
       "extra_cli_args": [
         "--served-model-name",
         "Qwen2.5-7B-Instruct"
