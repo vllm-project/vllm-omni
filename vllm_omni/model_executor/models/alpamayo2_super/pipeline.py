@@ -7,8 +7,15 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.serving_capabilities import (
+    declare_capabilities,
+)
 
 ALPAMAYO2_SUPER_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        unsupported_reason="outside_standard_operations",
+        sources=("vllm_omni/model_executor/models/alpamayo2_super/pipeline.py",),
+    ),
     model_type="alpamayo2_super",
     default_deploy_config_name="alpamayo2_super.yaml",
     # Not the checkpoint's own architecture name (Alpamayo2Super): vLLM-Omni registers its models

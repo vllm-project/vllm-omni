@@ -5,7 +5,7 @@
 from typing import TYPE_CHECKING
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, speech_inputs
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -13,6 +13,10 @@ if TYPE_CHECKING:
 
 @register_tts_adapter
 class CovoAudioAdapter(ARTTSAdapter):
+    # The HTTP voice placeholder (including "default") is accepted and ignored.
+    # Leave voice selection undeclared so clients can submit ordinary speech.
+    request_constraints = speech_inputs(unsupported=("reference_audio", "reference_text", "instructions"))
+
     stage_keys = frozenset({"fused_thinker_talker"})
     name = "covo_audio"
 

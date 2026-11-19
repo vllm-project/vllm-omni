@@ -1115,6 +1115,25 @@ def test_is_sleeping_for_given_stages():
 
 
 @pytest.mark.cpu
+def test_execution_observation_tracks_gate_and_remaining_sleep_tags():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion"])
+        assert await omni.get_execution_state() == "unpaused"
+        await omni.sleep(level=1)
+        assert await omni.get_execution_state() == "paused"
+        await omni.wake_up(tags=["weights"])
+        # A partially awake engine still parks new generation at admission.
+        assert await omni.get_execution_state() == "paused"
+        await omni.wake_up(tags=["kv_cache"])
+        assert await omni.get_execution_state() == "unpaused"
+        calls_before = list(omni.collective_rpc.await_args_list)
+        assert await omni.get_execution_state() == "unpaused"
+        assert omni.collective_rpc.await_args_list == calls_before
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_pause_abort_cancels_pending_submits():
     """pause_generation(mode="abort") cancels generate() submits stuck on a
     full request queue, so their admission slots release (#8678)."""

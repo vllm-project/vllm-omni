@@ -6,10 +6,17 @@ Stage 0: ``audio8_tts_slow_ar``       -- text -> semantic tokens + codec codes.
 Stage 1: ``audio8_tts_codec_decoder`` -- codec codes -> 44.1 kHz waveform.
 """
 
+from dataclasses import replace
+
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
     StagePipelineConfig,
+)
+from vllm_omni.serving_capabilities import (
+    AUDIO_RESPONSE,
+    TEXT_TO_SPEECH,
+    declare_capabilities,
 )
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.audio8_tts"
@@ -18,6 +25,12 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.audio8_tts"
 AUDIO8_TTS_EOS_TOKEN_ID = 151645
 
 AUDIO8_TTS_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_TO_SPEECH,
+        replace(AUDIO_RESPONSE, support="unknown", reason_code="chat_prompt_contract_undeclared"),
+        unknown_reason="chat_prompt_contract_undeclared",
+        sources=("vllm_omni/model_executor/models/audio8_tts/pipeline.py", "docs/serving/speech_api.md"),
+    ),
     model_type="arktts",
     default_deploy_config_name="audio8_tts.yaml",
     model_arch="Audio8TTSSlowARForConditionalGeneration",

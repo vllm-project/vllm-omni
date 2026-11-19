@@ -22,6 +22,13 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.serving_capabilities import (
+    IMAGE_RESPONSE,
+    IMAGE_TO_IMAGE,
+    TEXT_RESPONSE,
+    TEXT_TO_IMAGE,
+    declare_capabilities,
+)
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.bagel"
 
@@ -48,6 +55,13 @@ BAGEL_CHAT_TEMPLATE = (
 )
 
 BAGEL_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_RESPONSE,
+        IMAGE_RESPONSE,
+        TEXT_TO_IMAGE,
+        IMAGE_TO_IMAGE,
+        sources=("vllm_omni/model_executor/models/bagel/pipeline.py",),
+    ),
     model_type="bagel",
     default_deploy_config_name="bagel.yaml",
     chat_template=BAGEL_CHAT_TEMPLATE,
@@ -87,6 +101,13 @@ BAGEL_PIPELINE = PipelineConfig(
 )
 
 BAGEL_THINK_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_RESPONSE,
+        IMAGE_RESPONSE,
+        TEXT_TO_IMAGE,
+        IMAGE_TO_IMAGE,
+        sources=("vllm_omni/model_executor/models/bagel/pipeline.py",),
+    ),
     model_type="bagel_think",
     default_deploy_config_name="bagel_think.yaml",
     chat_template=BAGEL_CHAT_TEMPLATE,
@@ -123,6 +144,13 @@ BAGEL_THINK_PIPELINE = PipelineConfig(
 )
 
 BAGEL_SINGLE_STAGE_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_RESPONSE,
+        IMAGE_RESPONSE,
+        TEXT_TO_IMAGE,
+        IMAGE_TO_IMAGE,
+        sources=("vllm_omni/model_executor/models/bagel/pipeline.py",),
+    ),
     model_type="bagel_single_stage",
     default_deploy_config_name="bagel_single_stage.yaml",
     model_arch="BagelForConditionalGeneration",

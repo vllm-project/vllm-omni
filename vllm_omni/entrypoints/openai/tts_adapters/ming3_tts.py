@@ -20,7 +20,7 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, speech_inputs
 from vllm_omni.model_executor.models.ming3_tts.constants import (
     AUDIO_END_TOKEN_ID,
     KEY_CFG,
@@ -92,6 +92,8 @@ def _extract_speaker_embeddings(
 
 @register_tts_adapter
 class Ming3TTSAdapter(ARTTSAdapter):
+    request_constraints = speech_inputs("reference_audio", "reference_text", "voice", "instructions")
+
     name = "ming3_tts"
     model_archs = frozenset({"Ming3TTSForConditionalGeneration", "LingV3TTSForConditionalGeneration"})
     arch_identifies_entry_stage = True

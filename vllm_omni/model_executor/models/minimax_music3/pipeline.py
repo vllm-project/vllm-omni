@@ -19,10 +19,17 @@ that ``has_sampling_extra_args`` is on for the stage and per-row extra args
 reach the model's forward.
 """
 
+from dataclasses import replace
+
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
     StagePipelineConfig,
+)
+from vllm_omni.serving_capabilities import (
+    AUDIO_RESPONSE,
+    LYRICS_TO_MUSIC,
+    declare_capabilities,
 )
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.minimax_music3"
@@ -40,6 +47,12 @@ MINIMAX_MUSIC3_AUDIO_END_TOKEN_ID = 151670
 _MAX_INSTRUCTIONS_LENGTH = 20_000
 
 MINIMAX_MUSIC3_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        LYRICS_TO_MUSIC,
+        replace(AUDIO_RESPONSE, support="unknown", reason_code="chat_prompt_contract_undeclared"),
+        unknown_reason="chat_prompt_contract_undeclared",
+        sources=("vllm_omni/model_executor/models/minimax_music3/pipeline.py",),
+    ),
     model_type="minimax_music3",
     model_arch="MiniMaxMusic3TalkerForConditionalGeneration",
     hf_architectures=("MiniMaxMusic3ForConditionalGeneration",),

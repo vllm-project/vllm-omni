@@ -23,11 +23,18 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.serving_capabilities import (
+    declare_capabilities,
+)
 
 # Talker<->Code2Wav input processors (built by lead; coupled to talker output).
 _PROC = "vllm_omni.model_executor.stage_input_processors.personaplex"
 
 PERSONAPLEX_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        unsupported_reason="realtime_session_contract_only",
+        sources=("vllm_omni/model_executor/models/personaplex/pipeline.py",),
+    ),
     model_type="personaplex",
     # Pipeline-level default; the code2wav stage overrides per-stage below.
     model_arch="PersonaPlexTalkerForConditionalGeneration",

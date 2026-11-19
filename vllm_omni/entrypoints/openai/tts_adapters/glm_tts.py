@@ -8,7 +8,7 @@ import numpy as np
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, speech_inputs
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -18,6 +18,13 @@ logger = init_logger(__name__)
 
 @register_tts_adapter
 class GlmTTSAdapter(ARTTSAdapter):
+    request_constraints = speech_inputs(
+        "reference_audio",
+        "reference_text",
+        "voice",
+        required_any_of=(("voice", "reference_audio"), ("voice", "reference_text")),
+    )
+
     stage_keys = frozenset({"glm_tts"})
     name = "glm_tts"
 

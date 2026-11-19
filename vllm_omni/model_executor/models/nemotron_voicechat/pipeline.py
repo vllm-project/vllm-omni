@@ -20,15 +20,27 @@ The STT->TTS coupling is one-directional and token-ids-only (verified against
 the NeMo reference), which is what makes the offline cascade exact.
 """
 
+from dataclasses import replace
+
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.serving_capabilities import (
+    AUDIO_RESPONSE,
+    TEXT_RESPONSE,
+    declare_capabilities,
+)
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.nemotron_voicechat"
 
 NEMOTRON_VOICECHAT_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        replace(TEXT_RESPONSE, required_inputs=("audio",)),
+        replace(AUDIO_RESPONSE, required_inputs=("audio",)),
+        sources=("vllm_omni/model_executor/models/nemotron_voicechat/pipeline.py",),
+    ),
     model_type="nemotron_voicechat",
     model_arch="NemotronVoiceChatThinkerForConditionalGeneration",
     duplex_plugin=("vllm_omni.model_executor.models.nemotron_voicechat.duplex.plugin.NemotronVoiceChatDuplexPlugin"),

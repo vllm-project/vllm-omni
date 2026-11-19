@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax Music 3 serving adapter for ``/v1/audio/speech``.
 
 This is a text-to-music model on a speech endpoint, so most of the speech
@@ -24,6 +24,7 @@ from vllm_omni.model_executor.models.minimax_music3.prompt import (
     build_prompt,
     validate_tokenizer_ids,
 )
+from vllm_omni.request_capabilities import RequestConstraints
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -53,6 +54,11 @@ class MiniMaxMusic3Adapter(ARTTSAdapter):
     # 9,000 frames at 25 fps is six minutes, the checkpoint's own ceiling.
     max_new_tokens_min = 1
     max_new_tokens_max = MAX_AUDIO_FRAMES
+
+    def get_request_constraints(self) -> RequestConstraints:
+        from vllm_omni.entrypoints.openai.tts_adapters.base import lyrics_request_constraints
+
+        return lyrics_request_constraints(min_tokens=self.max_new_tokens_min, max_tokens=self.max_new_tokens_max)
 
     def __init__(self, ctx: Any) -> None:
         super().__init__(ctx)

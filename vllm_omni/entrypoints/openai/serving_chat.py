@@ -424,6 +424,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         diffusion_engine: AsyncOmni,
         model_name: str,
         enable_force_include_usage: bool = False,
+        served_model_names: list[str] | None = None,
     ) -> "OmniOpenAIServingChat":
         """Create a chat serving instance for diffusion models.
 
@@ -431,6 +432,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             diffusion_engine: The async diffusion engine
             model_name: Name of the model being served
             enable_force_include_usage: Always send a usage chunk on streams
+            served_model_names: Public aliases accepted by this deployment
 
         Returns:
             OmniOpenAIServingChat instance configured for diffusion mode
@@ -443,6 +445,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         instance._diffusion_mode = True
         instance._diffusion_engine = diffusion_engine
         instance._diffusion_model_name = model_name
+        instance._diffusion_model_names = frozenset(served_model_names or [model_name])
         instance._diffusion_extra_body_params = None
         instance._diffusion_extra_output_params = None
         instance.enable_force_include_usage = enable_force_include_usage
@@ -673,6 +676,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        if self._diffusion_mode and request.model is not None and request.model not in self._diffusion_model_names:
+            return self._create_error_response(
+                f"The model `{request.model}` does not exist.", err_type="NotFoundError", status_code=404
+            )
         stage_configs = getattr(self.engine_client, "stage_configs", ()) or ()
         serves_diffusion = self._diffusion_mode or any(
             get_stage_type(stage_config) == "diffusion" for stage_config in stage_configs

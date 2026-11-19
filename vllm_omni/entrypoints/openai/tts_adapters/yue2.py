@@ -40,6 +40,7 @@ from vllm_omni.model_executor.models.yue2.yue2 import (
     SEMANTIC_SAMPLING,
     STOP_TOKEN_IDS,
 )
+from vllm_omni.request_capabilities import RequestConstraints
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -64,6 +65,13 @@ class Yue2Adapter(ARTTSAdapter):
     model_archs = frozenset({"Yue2ForCausalLM"})
     max_new_tokens_min = int(SEMANTIC_SAMPLING["min_tokens"])
     max_new_tokens_max = int(SEMANTIC_SAMPLING["max_tokens"])
+
+    def get_request_constraints(self) -> RequestConstraints:
+        from vllm_omni.entrypoints.openai.tts_adapters.base import lyrics_request_constraints
+
+        return lyrics_request_constraints(
+            min_tokens=self.max_new_tokens_min, max_tokens=self.max_new_tokens_max, streaming=False
+        )
 
     def __init__(self, ctx: Any) -> None:
         super().__init__(ctx)

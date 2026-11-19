@@ -13,7 +13,7 @@ import numpy as np
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, speech_inputs
 from vllm_omni.model_extras.auk import DEFAULT_SWAY, auk_prompt
 
 logger = init_logger(__name__)
@@ -25,6 +25,10 @@ if TYPE_CHECKING:
 @register_tts_adapter
 class AuKAdapter(ARTTSAdapter):
     """Translate Speech API fields into the existing AuK encoder/DiT prompt."""
+
+    request_constraints = speech_inputs(
+        "text", "reference_audio", "instructions", required_any_of=(("text", "instructions"),)
+    )
 
     name = "auk"
     # AuK's entry stage uses the generic ``model_stage="encoder"``, which other

@@ -69,6 +69,12 @@ class InlineStageDiffusionClient(StageClientBase):
 
         self._enrich_config()
         self._engine = DiffusionEngine.make_engine(self.od_config)
+        from vllm_omni.request_capabilities import RuntimeServingMetadata
+
+        runtime_metadata = getattr(self._engine, "serving_metadata", None)
+        self.serving_metadata = (
+            runtime_metadata if isinstance(runtime_metadata, RuntimeServingMetadata) else RuntimeServingMetadata()
+        )
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="inline-diffusion")
 
         self._output_queue: asyncio.Queue[OmniRequestOutput] = asyncio.Queue()

@@ -19,8 +19,16 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.serving_capabilities import (
+    IMAGE_TO_VIDEO,
+    declare_capabilities,
+)
 
 LINGBOT_WORLD_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        IMAGE_TO_VIDEO,
+        sources=("vllm_omni/model_executor/models/lingbot_world/pipeline.py",),
+    ),
     model_type="lingbot_world",
     model_arch="LingBotWorldCausalDMDPipeline",
     stages=(

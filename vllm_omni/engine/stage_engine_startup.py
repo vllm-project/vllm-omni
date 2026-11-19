@@ -48,6 +48,7 @@ from vllm_omni.engine.stage_init_utils import (
 )
 from vllm_omni.entrypoints.utils import inject_omni_kv_config
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.request_capabilities import RuntimeServingMetadata
 
 logger = init_logger(__name__)
 
@@ -142,6 +143,7 @@ class StageReplicaResources:
     coordinator: Any | None = None
     addresses: EngineZmqAddresses | None = None
     lock_fds: list[int] = field(default_factory=list)
+    serving_metadata: RuntimeServingMetadata | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -871,6 +873,8 @@ def connect_remote_diffusion_proc(
     replica_id: int = 0,
 ) -> Iterator[StageReplicaResources]:
     """Wait for a remote headless diffusion proc to connect to head-owned sockets."""
+    from vllm_omni.diffusion.startup_metadata import DiffusionStartupSocket
+
     addresses = omni_master_server.get_zmq_addresses(stage_id, replica_id=replica_id)
     handshake_bind_address = omni_master_server.get_allocation(
         stage_id,
@@ -885,8 +889,10 @@ def connect_remote_diffusion_proc(
         data=False,
     )
     try:
-        with zmq_socket_ctx(handshake_bind_address, zmq.ROUTER, bind=True) as handshake_socket:
-            yield StageReplicaResources(addresses=addresses)
+        with zmq_socket_ctx(handshake_bind_address, zmq.ROUTER, bind=True) as original_socket:
+            handshake_socket = DiffusionStartupSocket.shadow(original_socket)
+            resources = StageReplicaResources(addresses=addresses)
+            yield resources
             wait_for_engine_startup(
                 handshake_socket,
                 [CoreEngine(index=0, local=False)],
@@ -900,6 +906,7 @@ def connect_remote_diffusion_proc(
                     tensor_queue=None,
                 ),
             )
+            resources.serving_metadata = handshake_socket.serving_metadata
     finally:
         omni_master_server.release_route_port_reservations(
             stage_id,

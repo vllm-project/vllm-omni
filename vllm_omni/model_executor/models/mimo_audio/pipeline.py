@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiMo Audio pipeline topology (frozen).
 
 Stage 0: fused thinker+talker — multimodal understanding + text + RVQ codes.
@@ -11,17 +11,29 @@ disambiguate. ``hf_architectures`` lets ``StageConfigFactory`` fall back to
 matching ``hf_config.architectures`` instead.
 """
 
+from dataclasses import replace
+
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
     StagePipelineConfig,
 )
 from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import NO_INTERLEAVE_NEXT_TOKEN_ID
+from vllm_omni.serving_capabilities import (
+    AUDIO_RESPONSE,
+    TEXT_RESPONSE,
+    declare_capabilities,
+)
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.mimo_audio"
 _IM_END_TOKEN_ID = 151645
 
 MIMO_AUDIO_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_RESPONSE,
+        replace(AUDIO_RESPONSE, support="unknown", reason_code="checkpoint_specific_audio_output"),
+        sources=("vllm_omni/model_executor/models/mimo_audio/pipeline.py",),
+    ),
     model_type="mimo_audio",
     default_deploy_config_name="mimo_audio.yaml",
     # HF ``architectures: ["MiMoAudioModel"]`` is also the registry key in

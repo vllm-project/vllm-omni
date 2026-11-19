@@ -28,6 +28,11 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def mock_engine():
     with patch("vllm_omni.diffusion.inline_stage_diffusion_client.DiffusionEngine") as mock:
         engine_instance = MagicMock()
+        from vllm_omni.request_capabilities import ImageGeometry, RuntimeServingMetadata
+
+        engine_instance.serving_metadata = RuntimeServingMetadata(
+            image_geometry=ImageGeometry(state="known", multiple_of=24)
+        )
         engine_instance.executor = SimpleNamespace(
             register_failure_callback=MagicMock(),
             check_health=MagicMock(),
@@ -63,6 +68,7 @@ def client(mock_engine):
 def test_inline_client_implements_shared_prompt_hook_protocol(client):
     assert client.prompt_transform_func is None
     assert client.prompt_expand_func is None
+    assert client.serving_metadata.image_geometry.multiple_of == 24
 
 
 @pytest.mark.asyncio

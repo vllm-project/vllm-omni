@@ -6,15 +6,28 @@ Two-stage non-streaming pipeline. S2Mel flow matching (25 Euler steps) requires
 the full mel code sequence, so async_chunk is not applicable.
 """
 
+from dataclasses import replace
+
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.serving_capabilities import (
+    AUDIO_RESPONSE,
+    TEXT_TO_SPEECH,
+    declare_capabilities,
+)
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.indextts2"
 
 INDEXTTS2_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_TO_SPEECH,
+        replace(AUDIO_RESPONSE, support="unknown", reason_code="chat_prompt_contract_undeclared"),
+        unknown_reason="chat_prompt_contract_undeclared",
+        sources=("vllm_omni/model_executor/models/indextts2/pipeline.py", "docs/serving/speech_api.md"),
+    ),
     model_type="indextts2",
     default_deploy_config_name="indextts2.yaml",
     model_arch="IndexTTS2TalkerForConditionalGeneration",
@@ -52,6 +65,12 @@ INDEXTTS2_PIPELINE = PipelineConfig(
 
 
 INDEXTTS25_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_TO_SPEECH,
+        replace(AUDIO_RESPONSE, support="unknown", reason_code="chat_prompt_contract_undeclared"),
+        unknown_reason="chat_prompt_contract_undeclared",
+        sources=("vllm_omni/model_executor/models/indextts2/pipeline.py", "docs/serving/speech_api.md"),
+    ),
     model_type="indextts2_5",
     default_deploy_config_name="indextts2_5.yaml",
     model_arch="IndexTTS25TalkerForConditionalGeneration",

@@ -16,6 +16,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     PreparedRequest,
     apply_max_new_tokens,
     conditioning_cache_salt,
+    speech_inputs,
 )
 from vllm_omni.model_executor.models.audio8_tts.codec_utils import (
     estimate_reference_code_frames,
@@ -33,6 +34,8 @@ if TYPE_CHECKING:
 @register_tts_adapter
 class Audio8TTSAdapter(ARTTSAdapter):
     """Audio8 TTS Preview 0.6B: text-only synthesis and zero-shot voice cloning."""
+
+    request_constraints = speech_inputs("reference_audio", "reference_text", "voice")
 
     stage_keys = frozenset({"audio8_tts_slow_ar"})
     name = "audio8_tts"

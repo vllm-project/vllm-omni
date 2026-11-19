@@ -161,7 +161,14 @@ def get_flux2_klein_post_process_func(
     def post_process_func(images: torch.Tensor):
         return image_processor.postprocess(images)
 
-    return post_process_func
+    from vllm_omni.request_capabilities import ImageGeometry, RuntimeServingMetadata, ServingPostProcess
+
+    return ServingPostProcess(
+        post_process_func,
+        RuntimeServingMetadata(
+            image_geometry=ImageGeometry(state="known", multiple_of=vae_scale_factor * 2),
+        ),
+    )
 
 
 # Copied from diffusers.pipelines.flux2.pipeline_flux2.compute_empirical_mu

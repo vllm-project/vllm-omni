@@ -98,6 +98,20 @@ Diffusion keeps its existing engine-field ownership and projection surface.
 Shared Python inheritance must not be treated as evidence that an LLM-only
 parallel input is effective for a diffusion stage.
 
+## Serving capability declarations
+
+`PipelineConfig.serving_capabilities` owns the selected topology's public
+request contracts. Generic diffusion construction copies the same declaration
+and optional `serving_capabilities_resolver` from `DiffusionModelMetadata`.
+The engine retains the final resolver-selected topology's declaration.
+
+The optional dotted resolver runs once over the final in-memory stage configs.
+It may refine a contract from fields already resolved by existing deployment
+parsing; it must not perform checkpoint I/O or model initialization. Unknown
+worker-only facts remain explicitly unknown. Model-owned declarations do not
+alter endpoint initialization, which the serving projection observes separately.
+See [capability discovery](../../serving/capabilities.md) for the public schema.
+
 ## Safe-change guide while deferred
 
 Changes should trace every affected producer to its runtime consumer and test

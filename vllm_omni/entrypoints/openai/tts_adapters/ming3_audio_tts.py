@@ -9,7 +9,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.reference_audio import reference_audio_uri
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, speech_inputs
 from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import parse_ming_instruction_fields
 from vllm_omni.model_executor.models.ming_flash_omni.reference_audio import (
     pack_reference_audio,
@@ -26,6 +26,10 @@ logger = init_logger(__name__)
 @register_tts_adapter
 class Ming3AudioTTSAdapter(ARTTSAdapter):
     # IP names are caption controls; clone references arrive with each request.
+    request_constraints = speech_inputs(
+        "reference_audio", "reference_text", "voice", "instructions", "speaker_embedding"
+    )
+
     stage_keys = frozenset({"ming3_tts"})
     name = "ming3_audio_tts"
 

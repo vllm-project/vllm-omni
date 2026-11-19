@@ -3,11 +3,23 @@
 """Two-stage Ming-Image topology."""
 
 from vllm_omni.config.stage_config import PipelineConfig, StageExecutionType, StagePipelineConfig
+from vllm_omni.serving_capabilities import (
+    IMAGE_RESPONSE,
+    IMAGE_TO_IMAGE,
+    TEXT_TO_IMAGE,
+    declare_capabilities,
+)
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.ming_image"
 _CHECKPOINT = "vllm_omni.model_executor.models.ming_image.checkpoint"
 
 MING_IMAGE_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        IMAGE_RESPONSE,
+        TEXT_TO_IMAGE,
+        IMAGE_TO_IMAGE,
+        sources=("vllm_omni/model_executor/models/ming_image/pipeline.py",),
+    ),
     model_type="ming_image",
     default_deploy_config_name="ming_image.yaml",
     model_arch="MingImageForConditionalGeneration",

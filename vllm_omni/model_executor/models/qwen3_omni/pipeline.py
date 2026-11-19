@@ -16,10 +16,20 @@ from vllm_omni.config.stage_config import (
     StagePipelineConfig,
     pipeline_cfg_resolver,
 )
+from vllm_omni.serving_capabilities import (
+    AUDIO_RESPONSE,
+    TEXT_RESPONSE,
+    declare_capabilities,
+)
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.qwen3_omni"
 
 QWEN3_OMNI_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_RESPONSE,
+        AUDIO_RESPONSE,
+        sources=("vllm_omni/model_executor/models/qwen3_omni/pipeline.py",),
+    ),
     model_type="qwen3_omni_moe",
     default_session_mode="turn",
     duplex_plugin="vllm_omni.model_executor.models.qwen3_omni.duplex.plugin.Qwen3OmniDuplexPlugin",
@@ -96,6 +106,10 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
 )
 
 QWEN3_OMNI_THINKER_ONLY_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_RESPONSE,
+        sources=("vllm_omni/model_executor/models/qwen3_omni/pipeline.py",),
+    ),
     model_type="qwen3_omni_moe_thinker_only",
     model_arch="Qwen3OmniMoeForConditionalGeneration",
     stages=(

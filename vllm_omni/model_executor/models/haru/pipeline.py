@@ -14,8 +14,13 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.serving_capabilities import declare_capabilities
 
 HARU_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        unsupported_reason="realtime_session_contract_only",
+        sources=("vllm_omni/model_executor/models/haru/pipeline.py",),
+    ),
     model_type="haru",
     model_arch="HaruForConditionalGeneration",
     default_deploy_config_name="haru.yaml",

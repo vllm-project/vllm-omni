@@ -7,13 +7,26 @@ Uses the native MiniCPM4 base_lm with a per-request StaticKVCache that the
 talker restores into the paged attention layer at step boundaries.
 """
 
+from dataclasses import replace
+
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.serving_capabilities import (
+    AUDIO_RESPONSE,
+    TEXT_TO_SPEECH,
+    declare_capabilities,
+)
 
 VOXCPM2_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_TO_SPEECH,
+        replace(AUDIO_RESPONSE, support="unknown", reason_code="chat_prompt_contract_undeclared"),
+        unknown_reason="chat_prompt_contract_undeclared",
+        sources=("vllm_omni/model_executor/models/voxcpm2/pipeline.py", "docs/serving/speech_api.md"),
+    ),
     model_type="voxcpm2",
     default_deploy_config_name="voxcpm2.yaml",
     model_arch="VoxCPM2TalkerForConditionalGeneration",

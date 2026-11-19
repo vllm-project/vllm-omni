@@ -5,10 +5,17 @@
 from dataclasses import replace
 
 from vllm_omni.config.stage_config import PipelineConfig, StageExecutionType, StagePipelineConfig
+from vllm_omni.serving_capabilities import AUDIO_RESPONSE, TEXT_RESPONSE, TEXT_TO_SPEECH, declare_capabilities
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.lfm3_omni"
 
 LFM3_OMNI_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_RESPONSE,
+        TEXT_TO_SPEECH,
+        replace(AUDIO_RESPONSE, support="unknown", reason_code="chat_prompt_contract_undeclared"),
+        sources=("vllm_omni/model_executor/models/lfm3_omni/pipeline.py", "recipes/LiquidAI/LFM3-Omni-2B.md"),
+    ),
     model_type="lfm3_omni",
     model_arch="Lfm3OmniForConditionalGeneration",
     default_deploy_config_name="lfm3_omni.yaml",
@@ -46,6 +53,10 @@ LFM3_OMNI_PIPELINE = PipelineConfig(
 
 LFM3_OMNI_TEXT_PIPELINE = replace(
     LFM3_OMNI_PIPELINE,
+    serving_capabilities=declare_capabilities(
+        TEXT_RESPONSE,
+        sources=("vllm_omni/model_executor/models/lfm3_omni/pipeline.py",),
+    ),
     model_type="lfm3_omni_text",
     default_deploy_config_name="lfm3_omni_text.yaml",
     stages=(
