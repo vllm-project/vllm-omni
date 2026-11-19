@@ -83,6 +83,9 @@ def _runner_assisted_batch_descriptor(
 def _needs_capture_tensor_unwrap(model: Any) -> bool:
     if getattr(model, "_returns_tuple", False):
         return True
+    # Native drafters own their (hidden states, target layers) tuple.
+    if getattr(model, "mrv2_forward_returns_native_aux", False) is True:
+        return False
     # Some models build multimodal outputs from the live batch after replay.
     return bool(getattr(model, "have_multimodal_outputs", False)) and (
         getattr(model, "mrv2_forward_returns_tensor", False) is not True
@@ -257,13 +260,11 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         parallel_config = self.vllm_config.parallel_config
         if parallel_config.pipeline_parallel_size > 1:
             raise NotImplementedError(
-                "Omni Model Runner V2 does not support pipeline parallel; "
-                "use model_runner: v1 when pipeline_parallel_size > 1"
+                "Omni Model Runner V2 does not support pipeline parallel; set pipeline_parallel_size=1"
             )
         if getattr(parallel_config, "prefill_context_parallel_size", 1) > 1:
             raise NotImplementedError(
-                "Omni Model Runner V2 does not support prefill context parallelism; "
-                "use model_runner: v1 when prefill_context_parallel_size > 1"
+                "Omni Model Runner V2 does not support prefill context parallelism; set prefill_context_parallel_size=1"
             )
 
     @staged_writes.runner_context
@@ -539,10 +540,12 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     # ------------------------------------------------------------------
 
     def _exclude_unsupported_full_graphs(self) -> None:
-        # vLLM 0.29 keys dispatch candidates by (uniform token count, LoRA count).
+        # Keep both native token- and request-keyed dispatch tables aligned
+        # with the capture plan. Uniform decode tables contain FULL graphs.
         manager = self.cudagraph_manager
         assert manager is not None
         manager._capture_descs.pop(CUDAGraphMode.FULL, None)
+        manager._decode_descs.clear()
         manager._candidates = {
             key: [desc for desc in candidates if desc.cg_mode != CUDAGraphMode.FULL]
             for key, candidates in manager._candidates.items()
@@ -1104,7 +1107,8 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         else:
             batch_descriptor = BatchDescriptor(
                 num_tokens=input_batch.num_tokens_after_padding,
-                has_lora=self.lora_config is not None,
+                # vLLM 0.34 dropped BatchDescriptor.has_lora; num_active_loras
+                # carries the lora state.
                 num_active_loras=batch_desc.num_active_loras,
             )
             try:

@@ -56,7 +56,6 @@ def _output(*, aliased=True):
     payloads = [_payload(1.0), _payload(3.0)]
     return OmniModelRunnerOutput(
         req_ids=["a", "b"],
-        req_id_to_index={"a": 0, "b": 1},
         inter_stage_outputs=payloads,
         pooler_output=payloads if aliased else [dict(p) for p in payloads],
         multimodal_outputs=[dict(p) for p in payloads],
