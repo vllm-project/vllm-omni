@@ -49,9 +49,10 @@ from vllm_omni.diffusion.distributed.sp_sharding import sp_shard, sp_gather
 
 On NPU, `--ulysses-a2a-permute` uses Python and Triton-Ascend to read peer
 symmetric memory directly into the final attention layout. It requires
-TorchNPU's NPUSHMEM allocator and an installed `libshmem.so` on the loader
-search path. This backend does not build a repository C++/AscendC extension;
-Triton uses its normal JIT toolchain.
+TorchNPU's NPUSHMEM allocator and the native SHMEM runtime. The backend
+loads the runtime from the installed `cann-shmem` wheel, or from the loader
+search path for a separately installed `libshmem.so`. Triton uses its normal
+JIT toolchain; no repository C++/AscendC extension is built.
 
 The backend requires eager execution, strict Ulysses, `ulysses_degree > 1`,
 `ring_degree = 1`, `allgather_degree = 1`, and a Ulysses group containing all
@@ -114,6 +115,8 @@ The `_sp_plan` mechanism allows SP **without modifying `forward()` logic**. The 
 - Predictable sharding/gathering patterns
 
 This is the ideal approach for integrating sequence parallelism into new models, as it is easier to maintain and ensure compatibility with other types of acceleration.
+
+MixFusion's packed-layout hooks reuse this mechanism: a model declares `_mixfusion_plan` instead of `_sp_plan`, and the framework applies the hooks at initialization in the same way (see [MixFusion layout abstraction](diffusion_continuous_batching.md#layout-abstraction)).
 
 **How it works:**
 1. Declare `_sp_plan` dict in your transformer class

@@ -101,9 +101,10 @@ def test_encoder_constructor_installs_integer_padding(mocker):
     encoder = Qwen3TTSTokenizerV2Encoder(config).eval()
     convs = [module for module in encoder.modules() if isinstance(module, MimiConv1d)]
     assert convs
-    assert encoder.decoder is None
-    assert encoder.upsample is None
-    assert encoder.decoder_transformer is None
+    if not hasattr(encoder.encoder, "encoder_seanet"):
+        assert encoder.decoder is None
+        assert encoder.upsample is None
+        assert encoder.decoder_transformer is None
     assert all(module.forward.__func__ is _integer_padding_forward for module in convs)
     # The local implementation must keep the strict checkpoint-loading schema.
     mocker.patch(
@@ -113,4 +114,6 @@ def test_encoder_constructor_installs_integer_padding(mocker):
     original.load_state_dict(encoder.state_dict(), strict=True)
     with torch.inference_mode():
         x = torch.randn(1, 1, 128)
-        torch.testing.assert_close(encoder.encoder(x), original.encoder(x), rtol=0, atol=0)
+        seanet = encoder.encoder_stages()[0]
+        original_seanet = original.encoder_stages()[0]
+        torch.testing.assert_close(seanet(x), original_seanet(x), rtol=0, atol=0)

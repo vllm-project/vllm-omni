@@ -858,11 +858,63 @@ def test_single_stage_generate_forwards_layers(test_client, mock_async_diffusion
     assert captured[0].layers == 7
 
 
+def test_single_stage_generate_forwards_num_frames(test_client, mock_async_diffusion):
+    """Single-stage /v1/images/generations must honor model_extra num_frames.
+
+    ``ImageGenerationRequest`` has no first-class ``num_frames`` field (extras
+    are allowed). Video-backed T2I smokes (e.g. LingBot) post ``num_frames=1``
+    to override a shared video default of 81; without forwarding model_extra,
+    the request keeps 81 and returns HTTP 400.
+    """
+    mock_async_diffusion.default_sampling_params_list = [
+        OmniDiffusionSamplingParams(
+            num_inference_steps=4,
+            guidance_scale=7.5,
+            generator_device="cpu",
+            num_frames=81,
+        )
+    ]
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a robotic arm picks up a red block",
+            "num_frames": 1,
+        },
+    )
+    assert response.status_code == 200
+
+    captured = mock_async_diffusion.captured_sampling_params_list
+    assert captured is not None
+    assert captured[0].num_frames == 1
+
+
+def test_single_stage_generate_without_num_frames_keeps_default(test_client, mock_async_diffusion):
+    """Omitting num_frames must leave the inherited server default untouched."""
+    mock_async_diffusion.default_sampling_params_list = [
+        OmniDiffusionSamplingParams(
+            num_inference_steps=4,
+            guidance_scale=7.5,
+            generator_device="cpu",
+            num_frames=81,
+        )
+    ]
+    response = test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a robotic arm picks up a red block"},
+    )
+    assert response.status_code == 200
+
+    captured = mock_async_diffusion.captured_sampling_params_list
+    assert captured is not None
+    assert captured[0].num_frames == 81
+
+
 def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
     """GLM-Image multistage: stage-0 gets target_h/w from requested size.
 
-    max_tokens comes from the deploy YAML default (upper-bound ceiling),
-    NOT computed dynamically from height/width.
+    max_tokens is capped at the model's grid-token budget for the
+    requested size (1024x1024 t2i: 1281), not left at the deploy-YAML
+    ceiling (4353, the 2048x2048 upper bound).
     """
 
     class FakeAsyncOmniClass(AsyncOmni):
@@ -871,7 +923,7 @@ def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
                 SimpleNamespace(stage_type="llm", is_comprehension=True, model_arch="GlmImageForConditionalGeneration"),
                 SimpleNamespace(stage_type="diffusion", is_comprehension=False, model_arch="GlmImagePipeline"),
             ]
-            # YAML default max_tokens for GLM-Image AR stage (upper bound for 2048x2048 t2i)
+            # YAML default: 2048x2048 t2i ceiling; the AR cap must replace this with 1281
             default_sampling_params_list = [
                 SamplingParams(temperature=0.1, seed=42, max_tokens=4353),
                 OmniDiffusionSamplingParams(height=1024, width=1024),
@@ -934,8 +986,8 @@ def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
     captured = engine.captured_sampling_params_list
     assert captured is not None
     assert len(captured) == 2
-    # max_tokens comes from YAML default, not computed dynamically
-    assert captured[0].max_tokens == 4353
+    # AR cap writes the 1024x1024 t2i grid budget, not the YAML ceiling.
+    assert captured[0].max_tokens == 1281
     assert captured[0].extra_args["target_h"] == 1024
     assert captured[0].extra_args["target_w"] == 1024
     assert captured[1].height == 1024
@@ -1744,6 +1796,48 @@ def test_image_edit_rejects_model_mismatch(test_client):
     )
     assert response.status_code == 400
     assert "model mismatch" in response.json()["detail"].lower()
+
+
+@pytest.mark.parametrize("num_images", [4, 5, 10])
+def test_image_edit_accepts_qwen_image_21_references(async_omni_test_client, num_images):
+    from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+
+    engine = async_omni_test_client.app.state.engine_client
+    engine.od_config = get_diffusion_model_metadata("QwenImage21Pipeline")
+    sizes = [(16 + i, 16 + i) for i in range(num_images)]
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", make_test_image_bytes(size)) for size in sizes],
+        data={"prompt": "Combine all reference images into one scene."},
+    )
+
+    assert response.status_code == 200
+    images = engine.captured_prompt["multi_modal_data"]["image"]
+    assert [image.size for image in images] == sizes
+
+
+def test_image_edit_rejects_eleven_qwen_image_21_references_before_loading(async_omni_test_client, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    import vllm_omni.entrypoints.openai.api_server as api_server_module
+    from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+
+    engine = async_omni_test_client.app.state.engine_client
+    engine.od_config = get_diffusion_model_metadata("QwenImage21Pipeline")
+    load = AsyncMock(side_effect=AssertionError("Over-limit images must not be loaded"))
+    monkeypatch.setattr(api_server_module, "_load_input_images", load)
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", make_test_image_bytes((16, 16))) for _ in range(11)],
+        data={"prompt": "Combine all reference images into one scene."},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Received 11 input images. At most 10 images are supported by this model."
+    assert engine.captured_prompt is None
+    load.assert_not_called()
 
 
 def test_image_edit_rejects_too_many_images_for_qwen_image_edit_2511(async_omni_test_client):

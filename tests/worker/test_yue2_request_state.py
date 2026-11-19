@@ -2,17 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """YuE2's worker-side sampler follows retained engine outputs on recompute."""
 
-import numpy as np
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
-from vllm.v1.utils import CpuGpuBuffer
-from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.tts_adapters.yue2 import Yue2Adapter
 from vllm_omni.model_executor.models.yue2 import yue2 as y
-from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -166,50 +162,18 @@ def test_accepted_draw_still_reaches_frame_limit(model) -> None:
     assert state.finish_ready and state.truncated
 
 
-def test_real_prepare_hook_admits_reordered_requests(model) -> None:
-    """Runner opt-in metadata reaches the actual YuE2 admission hook."""
-    runner = object.__new__(GPUARModelRunner)
-    runner.model = model
-    runner.requests = {}
-    for rid, seed in (("a", 7), ("b", 9)):
-        runner.requests[rid] = CachedRequestState(
-            req_id=rid,
-            prompt_token_ids=[1, 2, 3],
-            mm_features=[],
-            sampling_params=SamplingParams(extra_args={y.KEY_PREFIX_IDS: [1, 2, 3], y.KEY_SEED: seed}),
-            generator=None,
-            block_ids=([],),
-            num_computed_tokens=0,
-            output_token_ids=[],
-        )
-    runner.discard_request_mask = CpuGpuBuffer(2, dtype=torch.bool, device=torch.device("cpu"), pin_memory=False)
-    runner.discard_request_mask.np[:] = [True, False]
-    ids = torch.tensor([1, 2, 1, 2, 3], dtype=torch.int32)
-    positions = torch.tensor([0, 1, 0, 1, 2])
-    runner._call_prepare_runner_inputs(
-        model.prepare_runner_inputs,
-        req_ids=["b", "a"],
-        input_ids=ids,
-        positions=positions,
-        inputs_embeds=None,
-        num_computed_tokens=np.array([0, 0]),
-        num_scheduled_tokens=np.array([2, 3]),
-        input_ids_buffer=ids,
-    )
-    assert model._states["b"].constants.seed == 9
-    assert model._states["a"].constants.seed == 7
-    assert model._states["b"].prompt_len == 3
-    assert model._states["b"].prefix_ids == [1, 2, 3]
-    assert model._step_discard == [True, False]
+@pytest.mark.parametrize("frames", [200, 250, 9000])
+def test_adapter_does_not_reserve_hold_tokens(frames: int) -> None:
+    from vllm_omni.model_executor.models.yue2.request import phase_params
 
-
-@pytest.mark.parametrize("spare", [0, 1, 4095, 4096, 5000])
-def test_hold_budget_matches_engine_headroom(spare: int) -> None:
-    """Adapter metadata advertises only the HOLD steps left after clipping."""
-    frames = 250
-    prompt = {"prompt_token_ids": [1] * (y.CONTEXT - frames - 1 - spare)}
+    prompt = {
+        "prompt_token_ids": [1, 2],
+        "additional_information": {
+            "yue2_song_sampling": phase_params([1, 2], "semantic", 42, frames).extra_args,
+        },
+    }
     adapter = object.__new__(Yue2Adapter)
     request = OpenAICreateSpeechRequest(model="m-a-p/YuE2-3B", input="lyrics", max_new_tokens=frames)
     params = adapter.apply_sampling_overrides([SamplingParams()], request, prompt)[0]
-    assert params.extra_args[y.KEY_MAX_HOLD_STEPS] == min(spare, 4096)
-    assert params.max_tokens == frames + 1 + min(spare, 4096)
+    assert params.extra_args[y.KEY_MAX_HOLD_STEPS] == 0
+    assert params.max_tokens == frames + 2

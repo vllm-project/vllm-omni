@@ -136,10 +136,12 @@ filter_test_specs_by_skip_ci() {
 }
 
 upload_pipeline() {
+    local base_nightly_yaml=""
     local combined_test_yaml=""
     local filtered_test_yaml=""
     local has_nightly_suite=0
     local minijinja_asset_url
+    local nightly_pipeline_changed=0
     local suite_spec
     local -a filter_args=()
 
@@ -212,6 +214,12 @@ upload_pipeline() {
         fi
     done
     if [[ $has_nightly_suite -eq 1 ]]; then
+        while IFS= read -r changed_file; do
+            if [[ "$changed_file" == ".buildkite/amd/test-amd-nightly.yml" ]]; then
+                nightly_pipeline_changed=1
+                break
+            fi
+        done <<< "$file_diff"
         filtered_test_yaml=$(mktemp "${TMPDIR:-/tmp}/amd-filtered-tests.XXXXXX.yml")
         filter_args=(
             python3 scripts/filter_test_suite.py
@@ -223,6 +231,20 @@ upload_pipeline() {
             --debug-test-yaml "${DEBUG_TEST_YAML:-}"
             --scheduled-nightly "$NIGHTLY"
         )
+        if [[ $nightly_pipeline_changed -eq 1 \
+            && -n "$DIFF_BASE" \
+            && "${BUILDKITE_PULL_REQUEST:-false}" != "false" \
+            && -z "${DEBUG_TEST_YAML:-}" \
+            && "$NIGHTLY" == "0" ]]; then
+            base_nightly_yaml=$(mktemp "${TMPDIR:-/tmp}/amd-base-nightly.XXXXXX.yml")
+            if git show "$DIFF_BASE:.buildkite/amd/test-amd-nightly.yml" > "$base_nightly_yaml"; then
+                filter_args+=(--base-pipeline-path "$base_nightly_yaml")
+            else
+                echo "AMD nightly base pipeline is unavailable; keeping the full nightly suite." >&2
+                rm -f -- "$base_nightly_yaml"
+                base_nightly_yaml=""
+            fi
+        fi
         if [[ ${#TEST_SPECS[@]} -gt 1 ]]; then
             filter_args+=(--group-name NIGHTLY_TESTS)
         fi
@@ -252,6 +274,9 @@ upload_pipeline() {
     cat pipeline.yaml
     if [[ -n "$filtered_test_yaml" ]]; then
         rm -f -- "$filtered_test_yaml"
+    fi
+    if [[ -n "$base_nightly_yaml" ]]; then
+        rm -f -- "$base_nightly_yaml"
     fi
     if [[ -n "$combined_test_yaml" ]]; then
         rm -f -- "$combined_test_yaml"

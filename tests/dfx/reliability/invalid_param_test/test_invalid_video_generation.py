@@ -21,7 +21,7 @@ _WAN_T2V = [
     pytest.param(
         OmniServerParams(model="Wan-AI/Wan2.2-T2V-A14B-Diffusers"),
         id="wan22_t2v",
-        marks=hardware_marks(res={"cuda": "H100"}),
+        marks=hardware_marks(res={"cuda": "H100", "rocm": "MI325"}),
     ),
 ]
 
