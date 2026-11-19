@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Pytest fixtures for tests/examples."""
 
-from tests.examples.helpers import example_runner  # noqa: F401
-from tests.examples.model_scope import doc_item_models, doc_models_allowed
+from tests.examples.helpers import (
+    doc_item_models,
+    doc_models_allowed,
+    example_runner,  # noqa: F401
+)
 
 
 def pytest_collection_modifyitems(config, items):
