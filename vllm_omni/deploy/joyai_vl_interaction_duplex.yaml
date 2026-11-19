@@ -15,3 +15,18 @@ duplex_session:
   # A full 4096-frame TTS response is ~22 MiB of base64 PCM16 at normal
   # playback speed; allow it to queue behind a slow client.
   max_pending_output_bytes_per_session: 33554432
+
+platforms:
+  cuda:
+    connectors:
+      connector_of_shared_memory:
+        extra:
+          # Qwen3-TTS residual predictor (CUDA BF16): frame-local K/V across the
+          # 15 residual steps, fused top-k sampling and fused predictor kernels.
+          code_predictor_kv_cache: true
+          code_predictor_fused_sampling: true
+          code_predictor_fused: true
+          # Code2Wav: select cuDNN convolution algorithms during warmup and
+          # keep activations time-major between codec convolutions.
+          decode_cudnn_benchmark: true
+          decode_time_major_conv: true

@@ -1965,7 +1965,7 @@ steps:
       - label: "BAGEL Sleep Mode"
         agent_pool: mi300_2
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: omni_bagel_sleep_function
         env:
@@ -2028,6 +2028,24 @@ steps:
 
   - group: ":full_moon: Wan2.2 Function 1 GPU Group"
     steps:
+      - label: "Wan2.2 Device-Postprocess Equivalence"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 60
+        source_file_dependencies: diffusion_wan22_device_postprocess
+        env:
+          VLLM_OMNI_DEVICE_POSTPROCESS_MODEL: Wan-AI/Wan2.2-TI2V-5B-Diffusers
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-wan22-device-postprocess/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 1 40m rocm-wan22-device-postprocess
+            tests/e2e/offline_inference/test_device_postprocess_equivalence.py::test_device_postprocess_produces_equivalent_frames
+            -m "full_model and diffusion and rocm and MI325 and cards_1"
+
       - label: "Wan2.2 Function 1 GPU"
         agent_pool: mi300_1
         mirror_hardwares: [amdproduction]
