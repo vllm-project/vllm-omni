@@ -147,3 +147,38 @@ def test_fa4_ring_native_p2p_fullgraph(tmp_path):
     if torch.accelerator.device_count() < 4:
         pytest.skip("Requires four GPUs")
     mp.spawn(_ring_worker, args=(f"file://{tmp_path / 'ring-init'}",), nprocs=4, join=True)
+
+
+def _bundled_worker(rank, rendezvous):
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.attention.backends.utils.fa import resolve_vllm_flash_attn_version
+    from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
+
+    torch.accelerator.set_device_index(rank)
+    dist.init_process_group("nccl", init_method=rendezvous, rank=rank, world_size=4, timeout=timedelta(minutes=10))
+    try:
+        strategy = RingParallelAttention(SimpleNamespace(ring_group=dist.group.WORLD))
+        with torch._dynamo.config.patch(enable_p2p_compilation=True), torch.inference_mode():
+            torch.manual_seed(42 + rank)
+            q, k, v = torch.randn(3, 2, 128, 4, 128, dtype=torch.bfloat16, device="cuda").unbind()
+            compiled = torch.compile(strategy.run_attention, dynamic=True, fullgraph=True)
+            actual = compiled(q, k, v, None)
+            assert resolve_vllm_flash_attn_version() == 4
+            torch.testing.assert_close(actual, strategy.run_attention(q, k, v, None), atol=1e-2, rtol=1e-2)
+            keys, values = ([torch.empty_like(k) for _ in range(4)] for _ in range(2))
+            dist.all_gather(keys, k)
+            dist.all_gather(values, v)
+            reference = torch.nn.functional.scaled_dot_product_attention(
+                q.transpose(1, 2).float(),
+                torch.cat(keys, 1).transpose(1, 2).float(),
+                torch.cat(values, 1).transpose(1, 2).float(),
+            )
+            torch.testing.assert_close(actual.float(), reference.transpose(1, 2), atol=1e-2, rtol=1e-2)
+    finally:
+        dist.destroy_process_group()
+
+
+@hardware_test(res={"cuda": "B200"}, num_cards=4)
+def test_bundled_fa4_ring_native_p2p_fullgraph(tmp_path):
+    mp.spawn(_bundled_worker, args=(f"file://{tmp_path / 'bundled-init'}",), nprocs=4, join=True)

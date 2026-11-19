@@ -268,11 +268,12 @@ On NPU, the flag retains the existing
 
 ## Compiling FA4 Ring attention
 
-Standalone FA4 Ring attention compilation requires PyTorch 2.14 or newer, CuTe
-FlashAttention-4, and `torch.compile` enabled. The vLLM 0.33.0 CUDA runtime
-already includes PyTorch 2.14; no separate PyTorch upgrade is needed with that
-runtime. Set the following before starting the application or workers to enable
-experimental native P2P compilation and avoid graph breaks at Ring communication:
+On Blackwell, Ring prefers vLLM's bundled FlashAttention dispatcher. When it
+selects FA4, compiled Ring uses the bundled FA4 kernel. Ring can also use
+standalone CuTe FA4 when the bundled dispatcher is unavailable.
+
+With `torch.compile` enabled and PyTorch 2.14 or newer, set the following before
+starting workers to enable experimental native P2P compilation:
 
 ```bash
 export TORCHDYNAMO_ENABLE_P2P_COMPILATION=1
