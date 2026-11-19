@@ -3598,12 +3598,27 @@ class TestPlatformOverrides:
         assert compilation["cudagraph_mode"] == "FULL"
         assert max(compilation["cudagraph_capture_sizes"]) == 128
         assert "inductor_compile_config" not in compilation
-        assert not any(
-            stage.supports_native_mrv2_data_plane for stage in resolve_pipeline_config("moss_tts_delay").stages
-        )
+        assert all(stage.supports_native_mrv2_data_plane for stage in resolve_pipeline_config("moss_tts_delay").stages)
         assert all(
             stage.supports_native_mrv2_data_plane for stage in resolve_pipeline_config("moss_tts_realtime").stages
         )
+
+    @pytest.mark.parametrize(
+        "pipeline_key,filename,native_stages",
+        [
+            ("aura_omni", "aura_omni.yaml", (2, 3)),
+            ("nemotron_voicechat", "nemotron_labs_voicechat_duplex.yaml", (0, 1, 2)),
+            ("personaplex", "personaplex.yaml", (0, 1)),
+        ],
+    )
+    def test_native_transport_preserves_duplex_deploy(self, pipeline_key, filename, native_stages):
+        pipeline = resolve_pipeline_config(pipeline_key)
+        deploy = load_deploy_config(get_deploy_config_path(filename))
+        assert deploy.session_mode == "duplex"
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        for stage in stages:
+            if stage.stage_id in native_stages:
+                assert stage.yaml_engine_args["supports_native_mrv2_data_plane"]
 
     def test_platform_mps_rejects_non_boolean(self):
         deploy = load_deploy_config(get_deploy_config_path("moss_tts_local.yaml"))
