@@ -1973,6 +1973,35 @@ class TestTTSMethods:
             ):
                 pass
 
+    @pytest.mark.asyncio
+    async def test_sse_audio_synthesis_error_after_audio_discards_partial(self, speech_server) -> None:
+        """A later failed output must reject the stream without emitting its audio."""
+        speech_server._tts_model_type = "yue2"
+
+        async def mock_generate():
+            yield create_mock_audio_output_for_test(audio_sample_rate=24000)
+            failed_output = create_mock_audio_output_for_test(audio_sample_rate=24000)
+            assert failed_output.multimodal_output is not None
+            failed_output.multimodal_output["meta.error"] = torch.tensor(1)
+            yield failed_output
+
+        events = [
+            json.loads(event.split("data: ", 1)[1])
+            async for event in speech_server._generate_audio_sse_events(
+                generator=mock_generate(),
+                request_id="speech-sse-synth-err",
+                response_format="pcm",
+            )
+        ]
+
+        # Only the healthy chunk is emitted: no failed audio or success event.
+        assert [event["type"] for event in events] == ["speech.audio.delta", "speech.audio.error"]
+        assert events[0]["audio"]
+        assert events[1]["error"]["partial_audio"] is True
+        assert events[1]["error"]["action"] == "discard"
+        assert events[1]["error"]["code"] == HTTPStatus.INTERNAL_SERVER_ERROR
+        assert "failed to synthesize audio" in events[1]["error"]["message"]
+
     def test_is_tts_detection_with_tts_stage(self, mocker: MockerFixture):
         """Test TTS model detection when TTS stage exists."""
         mock_engine_client = mocker.MagicMock()
