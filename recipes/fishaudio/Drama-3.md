@@ -1,6 +1,11 @@
 # Fish Audio Drama 3
 
-> Online serving for TTS
+> **Unavailable with vLLM 0.34 / V2-only execution.** The DAC stage requires the retired Model Runner V1.
+> The commands, configurations, and measurements below are historical reference,
+> not installation or serving instructions for this version. Configuration loading
+> rejects the V1 profile; changing its runner flag does not add V2 support.
+>
+> Historical online serving for TTS
 
 ## Summary
 
@@ -10,9 +15,9 @@
 - Mode: Online serving with the OpenAI-compatible `/v1/audio/speech` API, or offline with `Omni`
 - Maintainer: Community
 
-## When to use this recipe
+## Historical integration
 
-Use this recipe as a baseline for running `fishaudio/drama-3`. Drama 3 is a
+This recipe records the earlier `fishaudio/drama-3` integration. Drama 3 is a
 35B-total / 3B-active MoE text backbone (Qwen3.5 MoE: hybrid gated-delta-net
 and full attention, block-FP8 routed experts) with a codebook tower that
 decodes 10 codebooks per frame. It outputs 44.1 kHz mono audio through the
@@ -37,7 +42,7 @@ Stage 1  dac_decoder (FishSpeechDACDecoder) → 44.1 kHz audio
 - Model card: <https://huggingface.co/fishaudio/drama-3>
 - Fish Speech S2 Pro recipe (same codec stage): [`Fish-Speech-S2-Pro.md`](./Fish-Speech-S2-Pro.md)
 
-## Hardware Support
+## Historical hardware results
 
 ## GPU
 

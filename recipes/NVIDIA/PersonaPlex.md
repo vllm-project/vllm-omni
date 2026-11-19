@@ -1,6 +1,11 @@
 # PersonaPlex
 
-> Live full-duplex speech-to-speech (the model listens while it speaks) with
+> **Unavailable with vLLM 0.34 / V2-only execution.** The Talker requires the retired Model Runner V1; V2 Code2Wav alone does not make the workflow runnable.
+> The commands, configurations, and measurements below are historical reference,
+> not installation or serving instructions for this version. Configuration loading
+> rejects the V1 profile; changing its runner flag does not add V2 support.
+>
+> Historical full-duplex speech-to-speech (the model listens while it speaks) with
 > persona and voice control, on the native vLLM-Omni engine.
 
 ## Summary
@@ -15,9 +20,9 @@
   (`/v1/duplex` and `/v1/realtime?duplex=1`)
 - Maintainer: [`@linyueqian`](https://github.com/linyueqian)
 
-## When to use this recipe
+## Historical integration
 
-Use this recipe to run `nvidia/personaplex-7b-v1` as a live voice agent on one GPU.
+This recipe records the earlier `nvidia/personaplex-7b-v1` live voice agent integration on one GPU.
 The integration is **moshi-free**: the temporal transformer, depformer, and
 streaming Mimi codec are all native vLLM-Omni modules (Mimi runs on
 `transformers.MimiModel`), so no vendored fork is installed. Decoding is greedy,
@@ -156,5 +161,7 @@ python tests/e2e/online_serving/personaplex_realtime_duplex.py \
 - Run the client near the server. The 80 ms cadence is sensitive to
   network jitter; over a high-latency link playback can stutter regardless of
   engine speed. On localhost it is smooth.
-- Sliding window is 3000 frames (~4 min). The ring KV recycles beyond that;
-  very long sessions keep running with a rolling context.
+- Sliding window is 3000 frames (~4 min). Stage 0 frees the KV behind the
+  window, so a call keeps running with a rolling context, up to one hour by
+  default; the comment in `vllm_omni/deploy/personaplex.yaml` shows how to
+  change the cap.

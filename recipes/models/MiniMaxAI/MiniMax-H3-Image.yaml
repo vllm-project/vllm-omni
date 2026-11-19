@@ -3,9 +3,9 @@ meta:
   title: "MiniMax-H3-Image"
   slug: "minimax-h3-image"
   provider: "MiniMax"
-  description: "Open-weight text-to-image and reference-image editing on the MiniMax-H3 DiT — six CFG-distilled steps per image, up to nine reference images, 2K-class canvases, served via vLLM-Omni"
+  description: "Open-weight text-to-image and reference-image editing on the MiniMax-H3 DiT — six CFG-distilled steps per image, up to 16 reference images, 2K-class canvases, served via vLLM-Omni"
   date_added: 2026-11-10
-  date_updated: 2026-11-10
+  date_updated: 2026-11-12
   tasks:
     - omni
   performance_headline: "A 2720×1536 image in about 0.8 s and a 2048² edit in 1.35 s end to end on 4×H200"
@@ -17,6 +17,8 @@ meta:
   # picker.
   hardware:
     h200: verified
+    # Single-GPU DLO: public image mirrored unchanged to a private registry.
+    rtx_4090: verified
     rtx_pro_6000_2x: verified
     rtx_pro_6000_4x: verified
     mi325x: verified
@@ -74,7 +76,7 @@ omni:
             "response_format": "b64_json"
           }' | jq -r '.data[0].b64_json' | base64 -d > t2i.png
     - id: i2i
-      description: "Reference-image editing. One to nine references, presented to the model as Picture 1, Picture 2, … in upload order. 1.35 s for a 2048² edit on 4×H200."
+      description: "Reference-image editing. One to 16 references, presented to the model as Picture 1, Picture 2, … in upload order. 1.35 s for a 2048² edit on 4×H200."
       curl: |
         curl -s http://localhost:8000/v1/images/edits \
           -F model=MiniMaxAI/MiniMax-H3-Image \
@@ -133,6 +135,12 @@ variants:
       - "--diffusion-offload-config"
       - '{"mode":"layer","components":["dit","text_encoder"]}'
 
+    hardware_overrides:
+      rtx_4090:
+        extra_args:
+          - "--tensor-parallel-size"
+          - "1"
+
 compatible_strategies: []
 
 hardware_overrides:
@@ -156,6 +164,27 @@ hardware_overrides:
     install_note: "Use the vllm/vllm-omni:minimax-h3-image-rocm image; the pip command installs CUDA wheels."
 
 strategy_overrides: {}
+
+notes:
+  - title: "Single RTX 4090: community DLO configuration"
+    when:
+      hardware: [rtx_4090]
+      variants: [dlo]
+    body: |
+      This 24 GB profile offloads both the DiT and text encoder. Allow host
+      memory for about 124 GiB of pinned weights plus runtime overhead; the
+      16 GB VRAM estimate and H200 latency are not RTX 4090 measurements.
+      The community deployment used vLLM 0.33.0 and vLLM-Omni
+      `0.1.dev4171+gc958c8f5f`. The contributor confirmed that the tested
+      private-registry image was the public `vllm/vllm-omni:minimax-h3-image`
+      image retagged and pushed without modification. It completed text-to-image
+      requests at 1024x1024 and 6272x2688, and a 1024x1024 edit with two
+      reference images. Verification covers this DLO configuration; resident
+      BF16, concurrent requests, and performance were not validated on RTX 4090.
+
+      For older images rejecting a local encoder alongside remote-source
+      metadata, follow the [local model preparation and workaround](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3-Image-4090.md#prepare-the-downloaded-model).
+      Current upstream handles the local encoder without editing the index.
 
 guide: |
   ## Overview
@@ -191,7 +220,8 @@ guide: |
 
   ## Deployment profiles
 
-  All rows were run on H200; the RTX PRO 6000 recipe has its own measurements.
+  All rows below were run on H200; the RTX PRO 6000 recipe has its own measurements.
+  A single RTX 4090 community deployment is documented below.
   Other accelerators reuse these commands sized from the H200 peaks
   (configuration-only). DLO is `--diffusion-offload-config` with
   `mode: layer`.
@@ -214,6 +244,26 @@ guide: |
   24 resident blocks ran at about 15 s per step on H200. CFG parallel and HSDP
   are rejected; model CPU offload, quantization and cache acceleration are not
   qualified.
+
+  ## Single RTX 4090 (community deployment)
+
+  One RTX 4090 (24 GB) successfully served `1024x1024` and `6272x2688` (21:9)
+  text-to-image requests with layerwise offload of both `dit` and `text_encoder`.
+  A `1024x1024` edit with two reference images also completed successfully.
+  The report used vLLM 0.33.0 and vLLM-Omni `0.1.dev4171+gc958c8f5f` in a
+  private-registry mirror of `vllm/vllm-omni:minimax-h3-image`. The contributor
+  confirmed that it was retagged and pushed without modification. Verification
+  covers DLO; it does not establish RTX 4090 peak memory, throughput, or
+  concurrent-request capacity.
+
+  For older images that reject a local `text_encoder/` alongside a remote
+  source, download the complete encoder, back up `model_index.json`, and
+  manually remove the third `text_encoder` array entry containing
+  `pretrained_model_name_or_path`, `subfolder`, `variant`, and `revision`.
+  Keep the first two entries unchanged; do not leave an empty object.
+  Current upstream code handles the local encoder without this edit.
+  See the [RTX 4090 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3-Image-4090.md)
+  for the launch command, host/container paths, and request example.
 
   ## Measured latency (4×H200, SP 4)
 

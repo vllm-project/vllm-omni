@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 
 from vllm_omni.diffusion.diffusion_kv.metadata import (
@@ -78,6 +80,7 @@ def test_scheduler_copies_opaque_params_to_sequence_requests() -> None:
         kv_transfer_params=params,
     )
     scheduler = _MetadataScheduler()
+    scheduler.od_config = SimpleNamespace(diffusion_attention_schedule=None)
     scheduler._diffusion_kv_manager = object()
 
     state = scheduler._make_request_state("req-0", request)

@@ -21,6 +21,13 @@ from vllm_omni.lora.layers import (
     OmniRowParallelLinearWithLoRA,
 )
 
+MOE_LORA_UNAVAILABLE_ERROR = (
+    "MoE LoRA is unavailable because its token capacity was not configured. "
+    "Online MXFP4 disables MoE LoRA when no startup `lora_path` is set so it can "
+    "use the native expert kernel. Set `lora_path` at startup to enable MoE "
+    "adapters; request-time MoE adapters cannot use the native MXFP4 path."
+)
+
 
 def _select_moe_lora_wrapper_cls() -> type:
     """Select the vLLM or Ascend MoE LoRA wrapper for the current platform."""
@@ -162,7 +169,7 @@ def from_layer(
     # MoE wrappers own the whole runner and do not use dense packed-layer mapping.
     if isinstance(layer, MoERunner):
         if max_num_batched_tokens is None:
-            raise RuntimeError("MoE LoRA token capacity was not configured")
+            raise RuntimeError(MOE_LORA_UNAVAILABLE_ERROR)
         wrapper_cls = _select_moe_lora_wrapper_cls()
         instance = wrapper_cls(layer)
         publish_to_runner = getattr(layer, "set_lora_context", None)
@@ -240,6 +247,21 @@ def from_layer(
         instance.suspend_lora = _suspend_lora  # type: ignore[method-assign]
         instance.resume_lora = _resume_lora  # type: ignore[method-assign]
         return instance
+
+    # Model-owned linear subclasses can preserve forward signatures or routing
+    # semantics that the generic vLLM wrappers intentionally reject. Let such
+    # layers provide a narrowly scoped wrapper before trying the standard
+    # exact-type dispatch below.
+    custom_factory = getattr(layer, "_create_omni_lora_layer", None)
+    if callable(custom_factory):
+        instance = custom_factory(
+            max_loras=max_loras,
+            lora_config=lora_config,
+            packed_modules_list=packed_modules_list,
+            model_config=model_config,
+        )
+        if instance is not None:
+            return instance
 
     lora_classes = [
         OmniMergedQKVParallelLinearWithLoRA,
