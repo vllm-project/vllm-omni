@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_marks
+from vllm_omni.model_executor.models.fish_omni.kernels import draw_top_k_top_p
 from vllm_omni.model_executor.models.fish_omni.sampling import FusedFrameSampler
 
 pytestmark = [pytest.mark.core_model]
@@ -75,3 +76,20 @@ def test_eos_at_top_p_boundary_can_end_first_or_repeated_draw(device):
     assert tokens.tolist() == [0, 0, 11]
     codes = sampler.code(logits, temperature, top_k, top_p, noise, 0)
     assert codes.tolist() == [0, 0, 0]
+
+
+def test_semantic_nucleus_keeps_first_rank_past_exact_threshold(device):
+    # Four equal probabilities have exactly representable cumulative masses.
+    # Supply a fixed tie order and favor the last rank the filter admits.
+    logits = torch.zeros((1, 4), device=device)
+    ranks = torch.arange(4, device=device).unsqueeze(0)
+    args = (
+        logits,
+        torch.ones(1, device=device),
+        torch.tensor([4], device=device),
+        torch.tensor([0.5], device=device),
+        torch.tensor([[0.1, 0.5, 0.9, 0.99]], device=device),
+        4,
+    )
+    assert draw_top_k_top_p(*args, top=(logits, ranks), keep_top_p_crossing=True).item() == 2
+    assert draw_top_k_top_p(*args, top=(logits, ranks)).item() == 1
