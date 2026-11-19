@@ -69,7 +69,7 @@ else:
             f"skipped {skipped} remaining diffusion case(s) (chat completions / custom jsonl)"
         )
 
-DEPLOY_CONFIGS_DIR = Path(__file__).parent.parent / "deploy"
+DEPLOY_CONFIGS_DIR = Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy"
 server_to_benchmark_mapping = create_test_parameter_mapping(BENCHMARK_CONFIGS)
 paired_benchmark_params = create_paired_omni_benchmark_pytest_params(BENCHMARK_CONFIGS, DEPLOY_CONFIGS_DIR)
 

@@ -2159,6 +2159,7 @@ def test_inline_deploy_modifications_require_a_deploy_path(tmp_path, field):
 def test_qwen3_omni_async_perf_resolves_mrv2_and_preserves_cold_start_timeout():
     from tests.dfx.conftest import _create_unique_server_params
     from tests.dfx.perf.scripts.run_benchmark import (
+        DEPLOY_CONFIGS_DIR,
         _cli_flag_value,
         _merge_omni_default_server_args,
     )
@@ -2166,8 +2167,9 @@ def test_qwen3_omni_async_perf_resolves_mrv2_and_preserves_cold_start_timeout():
     config_path = Path(__file__).with_name("test_qwen3_omni_async_chunk.json")
     config = json.loads(config_path.read_text(encoding="utf-8"))[0]
     deploy_dir = Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy"
+    assert DEPLOY_CONFIGS_DIR == deploy_dir
 
-    row = _create_unique_server_params([config], deploy_dir)[0]
+    row = _create_unique_server_params([config], DEPLOY_CONFIGS_DIR)[0]
     assert Path(row[2] or "") == deploy_dir / "qwen3_omni_moe_mrv2.yaml"
 
     extra_cli_args = list(row[4])
