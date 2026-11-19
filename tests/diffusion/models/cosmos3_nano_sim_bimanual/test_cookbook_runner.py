@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 import io
 import json
 import sys
@@ -17,22 +16,13 @@ import pytest
 import torch
 from test_cookbook import action_record, manifest
 
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual import offline_bimanual as runner
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import (
     COSMOS3_NANO_SIM_BIMANUAL_ARTIFACT_FIELDS,
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.cookbook import resolve_asset
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-ROOT = Path(__file__).resolve().parents[4]
-
-
-@pytest.fixture
-def runner():
-    path = ROOT / "examples/offline_inference/cosmos3_nano_sim_bimanual/cosmos3_nano_sim_bimanual.py"
-    spec = importlib.util.spec_from_file_location("bimanual_cookbook_runner", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def install_module(monkeypatch, name: str, **attributes: object) -> None:
@@ -65,7 +55,7 @@ def test_asset_downloads_use_hf_cache_and_http_cache(tmp_path: Path, monkeypatch
 
 
 @pytest.mark.parametrize("kind", ["legacy", "cookbook"])
-def test_runner_batch_status_and_camera_poses(tmp_path: Path, monkeypatch, runner, kind: str) -> None:
+def test_runner_batch_status_and_camera_poses(tmp_path: Path, monkeypatch, kind: str) -> None:
     imageio = pytest.importorskip("imageio.v2")
     pytest.importorskip("imageio_ffmpeg")
     artifact = manifest(kind)
@@ -184,13 +174,13 @@ def test_runner_batch_status_and_camera_poses(tmp_path: Path, monkeypatch, runne
     assert "simulated decoder failure" in statuses[3]["error"]
 
 
-def test_runner_bfloat16_video_conversion(runner) -> None:
+def test_runner_bfloat16_video_conversion() -> None:
     frames = runner._video_frames(torch.full((1, 3, 5, 32, 32), -1, dtype=torch.bfloat16))
     assert len(frames) == 5 and frames[0].shape == (32, 32, 3)
     assert np.count_nonzero(frames) == 0
 
 
-def test_frustum_pose_source_camera_request(runner):
+def test_frustum_pose_source_camera_request():
     poses = np.repeat(np.eye(4)[None], 5, axis=0)
     params = {"frame_rate": 30, "num_frames": 5, "extra_args": {}}
     runner._resolve_request_frustum({"pose_source": "camera_batch"}, params, None, "unused", poses)
@@ -199,7 +189,7 @@ def test_frustum_pose_source_camera_request(runner):
         runner._resolve_request_frustum({"pose_source": "camera_batch", "fps": 30}, params, None, "unused", poses)
 
 
-def test_frustum_pose_source_bundled_statistics(runner, tmp_path):
+def test_frustum_pose_source_bundled_statistics(tmp_path):
     import hashlib
     import math
 

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Run Cosmos3-Nano-Sim-Bimanual from reference JSONL/NPZ or action-sidecar and camera JSONL inputs."""
 
 from __future__ import annotations
@@ -6,13 +7,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import re
 import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
+import regex as re
 import torch
 from PIL import Image, UnidentifiedImageError
 
@@ -138,7 +139,10 @@ def parse_args() -> argparse.Namespace:
     selection.add_argument("--all-samples", action="store_true")
     parser.add_argument("--input-format", choices=("reference", "cookbook"), default="reference")
     parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--deploy-config", default="vllm_omni/deploy/cosmos3_nano_sim_bimanual.yaml")
+    parser.add_argument(
+        "--deploy-config",
+        default=str(Path(__file__).resolve().parents[3] / "deploy" / "cosmos3_nano_sim_bimanual.yaml"),
+    )
     parser.add_argument("--output", type=Path, default=Path("cosmos3_nano_sim_bimanual.mp4"))
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--height", type=int, default=None)
@@ -242,9 +246,9 @@ def _resolve_request_frustum(geometry, params, artifact, model, camera_poses=Non
         if Path(model).exists():
             stats_path = Path(model) / source["artifact_path"]
         else:
-            from huggingface_hub import hf_hub_download
+            from vllm_omni.transformers_utils.repo_utils import hf_api
 
-            stats_path = Path(hf_hub_download(model, source["artifact_path"]))
+            stats_path = Path(hf_api().hf_hub_download(repo_id=model, filename=source["artifact_path"]))
         content = stats_path.read_bytes()
         if hashlib.sha256(content).hexdigest() != source["sha256"]:
             raise ValueError("Frustum normalization statistics hash mismatch")
@@ -274,9 +278,9 @@ def main() -> None:
 
     config_path = Path(args.model) / "transformer" / "config.json"
     if not config_path.is_file() and not Path(args.model).exists():
-        from huggingface_hub import hf_hub_download
+        from vllm_omni.transformers_utils.repo_utils import hf_api
 
-        config_path = Path(hf_hub_download(args.model, "transformer/config.json"))
+        config_path = Path(hf_api().hf_hub_download(repo_id=args.model, filename="transformer/config.json"))
     artifact = Cosmos3NanoSimBimanualManifest.from_od_config(
         SimpleNamespace(tf_model_config=json.loads(config_path.read_text(encoding="utf-8")))
     )
