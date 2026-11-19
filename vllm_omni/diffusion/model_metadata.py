@@ -977,6 +977,13 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "Cosmos3NanoSimBimanualPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=1,
+        # Video synthesis requires action conditioning beyond the standard
+        # video profiles. Do not inherit ordinary Cosmos3 generation support.
+        serving_capabilities=declare_capabilities(
+            unknown_operations=("video_generation",),
+            unknown_reason="requires_action_conditioning",
+            sources=("vllm_omni/diffusion/models/cosmos3_nano_sim_bimanual/pipeline_cosmos3_nano_sim_bimanual.py",),
+        ),
     ),
 }
 

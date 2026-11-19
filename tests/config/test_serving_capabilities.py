@@ -129,6 +129,16 @@ def test_declarations_preserve_existing_metadata_overrides_and_defaults():
     )
 
 
+def test_sim_bimanual_does_not_inherit_standard_cosmos_generation():
+    declaration = get_diffusion_model_metadata("Cosmos3NanoSimBimanualPipeline").serving_capabilities
+    assert resolve_pipeline_config("cosmos3_nano_sim_bimanual").serving_capabilities is declaration
+    video = declaration.get("video_generation")
+    assert video.support == "unknown"
+    assert video.reason_code == "requires_action_conditioning"
+    assert all(profile.support == "unknown" for profile in video.profiles)
+    assert all(operation.support == "unsupported" for operation in declaration.operations if operation.id != video.id)
+
+
 def test_selected_pipeline_variant_controls_speech_support():
     assert AUDEX_THINKER_ONLY_PIPELINE.serving_capabilities.get("speech").support == "unsupported"
     assert AUDEX_TTS_PIPELINE.serving_capabilities.get("speech").support == "supported"
