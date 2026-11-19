@@ -632,9 +632,9 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
                 request = self.requests.get(req_id)
                 if request is None or not request.resumable:
                     continue
-                waiting_for_prompt = (
-                    getattr(request, "_omni_waiting_native_prompt", False) or request.num_computed_tokens == 0
-                )
+                # A delivered replacement may still be waiting for admission.
+                # Its explicit False survives until the prompt is consumed.
+                waiting_for_prompt = getattr(request, "_omni_waiting_native_prompt", request.num_computed_tokens == 0)
                 if update.replace_prompt and update.resize_prompt_to is not None:
                     self._release_replaced_streaming_prompt_cache(request)
                     self._reset_streaming_session_replacement_state(request)

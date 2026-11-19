@@ -144,7 +144,8 @@ def test_native_input_gate_preserves_upstream_blocked_waits(async_chunk, status)
     assert not scheduler.input_coordinator.pending_input_registrations
 
 
-def test_native_resume_prompt_replacement_clears_token_buffer(mocker):
+@pytest.mark.parametrize("input_terminal", [False, True])
+def test_native_resume_prompt_replacement_clears_token_buffer(mocker, input_terminal):
     scheduler = OmniSchedulerMixin()
     request = Request("r", [1, 2, 3], SamplingParams(max_tokens=16), pooling_params=None)
     request.resumable = True
@@ -155,6 +156,9 @@ def test_native_resume_prompt_replacement_clears_token_buffer(mocker):
     scheduler.requests = {"r": request}
     scheduler.waiting, scheduler.running, scheduler.kv_holding_waiting = [], [], []
     scheduler._native_resumable = True
+    scheduler._resume_chunk_receivers = set()
+    scheduler._pending_data_plane_terminal_req_ids = set()
+    scheduler.finish_requests = mocker.Mock()
     scheduler._outputs_awaiting_stage_payload = {}
     scheduler._release_replaced_streaming_prompt_cache = mocker.Mock()
     scheduler._reset_streaming_session_replacement_state = mocker.Mock()
@@ -181,3 +185,18 @@ def test_native_resume_prompt_replacement_clears_token_buffer(mocker):
     assert request.num_computed_tokens == 0
     assert request.prompt_token_ids == []
     scheduler._release_replaced_streaming_prompt_cache.assert_called_once_with(request)
+
+    # A complete segment can arrive while this request waits behind another
+    # request. Zero computed tokens do not mean the delivered prompt is absent.
+    scheduler.enqueue_omni_connector_output(
+        OmniConnectorOutput(
+            request_metadata={
+                "r": SchedulingMetadataUpdate(segment_finished=not input_terminal, input_terminal=input_terminal)
+            },
+        )
+    )
+    scheduler._consume_pending_connector_output(model_mode="ar")
+
+    assert scheduler.input_coordinator.update_request_metadata.call_count == 2
+    scheduler.finish_requests.assert_not_called()
+    assert not scheduler._resume_chunk_receivers
