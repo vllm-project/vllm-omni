@@ -16,6 +16,7 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 
 from vllm_omni.diffusion.attention.backends.abstract import (
@@ -40,6 +41,7 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.offloader.module_residency import BoundedAllocatorCache, PinnedModuleStager
 
 from .adaln_cache import MiniMaxH3RuntimeAdalnCache
+from .ops.fc1_swiglu import fc1_swiglu, fc1_swiglu_supported
 from .vdnh3 import VDNConfig, VDNH3HybridAttention
 
 if TYPE_CHECKING:
@@ -616,10 +618,22 @@ class MiniMaxH3MLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        hidden, _ = self.fc1(x)
-        hidden = self.act_fn(hidden)
+        if self._fuse_fc1_swiglu(x):
+            hidden = fc1_swiglu(x, self.fc1.weight)
+        else:
+            hidden, _ = self.fc1(x)
+            hidden = self.act_fn(hidden)
         out, _ = self.fc2(hidden)
         return out
+
+    def _fuse_fc1_swiglu(self, x: torch.Tensor) -> bool:
+        # The fused kernel replaces only the unquantized, bias-free fc1.
+        fc1 = self.fc1
+        return (
+            type(getattr(fc1, "quant_method", None)) is UnquantizedLinearMethod
+            and getattr(fc1, "bias", None) is None
+            and fc1_swiglu_supported(x, fc1.weight)
+        )
 
 
 class MiniMaxH3AdalnProj(nn.Module):

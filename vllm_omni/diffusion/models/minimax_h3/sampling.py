@@ -23,6 +23,14 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _assign_rows(rows: torch.Tensor, index: torch.Tensor, mask: torch.Tensor, values: torch.Tensor) -> None:
+    """``rows[mask] = values`` through the mask's precomputed row ``index``, which needs no host sync."""
+    if tuple(values.shape) == (index.shape[0], *rows.shape[1:]):
+        rows.index_copy_(0, index, values)
+    else:  # broadcast assignment keeps the boolean-mask form
+        rows[mask] = values
+
+
 class MiniMaxH3Model:
     """Translate sampler evaluations into H3 inputs and raw velocity into x0."""
 
@@ -48,15 +56,21 @@ class MiniMaxH3Model:
     def rows_for(self, latents):
         """Fill reusable model inputs; valid until this request's next prediction."""
         rows = self.model_rows
-        for row, mask, latent in zip(rows, self.masks, latents, strict=True):
-            row[mask] = latent
+        for row, mask, index, latent in zip(rows, self.masks, self.indices, latents, strict=True):
+            _assign_rows(row, index, mask, latent)
         if self.branch.locked_audio_rows is not None:
-            rows[1][self.masks[1]] = self.branch.locked_audio_rows
+            _assign_rows(rows[1], self.indices[1], self.masks[1], self.branch.locked_audio_rows)
         return tuple(rows)
 
     @property
     def masks(self):
         return self.branch.update_mask_dev, self.branch.audio_update_mask_dev
+
+    @property
+    def indices(self):
+        # Row indices of the masks, built once per branch: boolean-mask indexing on the device runs nonzero and
+        # blocks the host on its size every step.
+        return self.branch.update_idx_dev, self.branch.audio_update_idx_dev
 
     def prepare(self, evaluation: ModelEvaluation):
         rows = self.rows_for(evaluation.latents)
@@ -75,11 +89,16 @@ class MiniMaxH3Model:
     def to_denoised(self, prepared, velocities):
         rows, model_rows, times, _ = prepared
         return tuple(
-            minimax_h3_rf_v_to_x0(row[mask], v.float()[mask], row.new_tensor(t))
+            # ``torch.full`` builds the timestep scalar on the device instead of copying it from the host.
+            minimax_h3_rf_v_to_x0(
+                row.index_select(0, index),
+                v.float().index_select(0, index),
+                torch.full((), t, dtype=row.dtype, device=row.device),
+            )
             if edit is None
             else edit.x0(model_row[0][mask], v.float()[mask], t)
-            for row, model_row, mask, edit, t, v in zip(
-                rows, model_rows, self.masks, self.edits, times, velocities, strict=True
+            for row, model_row, mask, index, edit, t, v in zip(
+                rows, model_rows, self.masks, self.indices, self.edits, times, velocities, strict=True
             )
         )
 
@@ -87,17 +106,18 @@ class MiniMaxH3Model:
         """Check both streams before any request's full rows are updated."""
         if self.branch.locked_audio_rows is not None:
             state.latents = (state.latents[0], self.branch.locked_audio_rows)
-        for row, mask, latent in zip(self.rows, self.masks, state.latents, strict=True):
-            shape = (int(mask.count_nonzero().item()), *row.shape[1:])
+        for row, index, latent in zip(self.rows, self.indices, state.latents, strict=True):
+            shape = (index.shape[0], *row.shape[1:])
             if latent.shape != shape or latent.dtype != row.dtype or latent.device != row.device:
                 raise ValueError("Sampled latents must match the target rows' shape, dtype, and device")
-            if not bool(torch.isfinite(latent).all().item()):
-                raise ValueError("Sampled latents must be finite before writing rows")
+        # One host read covers both streams.
+        if not bool(torch.stack([torch.isfinite(latent).all() for latent in state.latents]).all().item()):
+            raise ValueError("Sampled latents must be finite before writing rows")
 
     def write_back(self, state: SamplingState):
         """Write checked latents into the existing full video/audio rows."""
-        for row, mask, latent in zip(self.rows, self.masks, state.latents, strict=True):
-            row[mask] = latent
+        for row, mask, index, latent in zip(self.rows, self.masks, self.indices, state.latents, strict=True):
+            _assign_rows(row, index, mask, latent)
         return self.rows
 
 

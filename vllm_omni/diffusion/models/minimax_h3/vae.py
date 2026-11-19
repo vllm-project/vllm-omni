@@ -1240,8 +1240,31 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 num_tiles,
                 self.parallel_size,
             )
-            return self._rank_local_tiling()
-        return nullcontext()
+            return self._stacked_decode_tiles(self._rank_local_tiling())
+        return self._stacked_decode_tiles(nullcontext())
+
+    @contextmanager
+    def _stacked_decode_tiles(self, tiling: AbstractContextManager) -> Iterator[None]:
+        """Decode a rank's spatial tiles as one batch (the checkpoint's ``stack_tiling``).
+
+        Per-tile decode launches ~110k small kernels for a 124-frame 768x1344
+        clip and leaves the GPU idle between them; batching the 28 tiles of
+        each temporal clip cuts that to ~7k and decode from 2.97 s to 2.57 s
+        on one B200, with bit-identical frames, for ~2.5 GiB more peak memory.
+        The checkpoint flag also batches encoder tiles, so it is set only for
+        the duration of a decode. Models without the flag decode unchanged.
+        """
+        if not hasattr(self.model, "stack_tiling"):
+            with tiling:
+                yield
+            return
+        saved = self.model.stack_tiling
+        self.model.stack_tiling = True
+        try:
+            with tiling:
+                yield
+        finally:
+            self.model.stack_tiling = saved
 
     @torch.inference_mode()
     def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
