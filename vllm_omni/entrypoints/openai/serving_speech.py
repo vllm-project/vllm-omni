@@ -1957,6 +1957,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         collect["aligner_res"] = res
                     continue
                 audio_output = cast(dict, audio_output)
+                meta_collect = collect if collect is not None else {}
+                if adapter is not None:
+                    adapter.collect_response_metadata(audio_output, meta_collect)
+                if meta_collect.get("audio_synthesis_error"):
+                    raise TTSGenerationError(
+                        "The model failed to synthesize audio for this request",
+                        retryable=False,
+                    )
 
                 reported_sample_rate = _coerce_sample_rate(audio_output.get("sr"))
                 if reported_sample_rate is not None:
@@ -2634,19 +2642,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Let the adapter fold engine-side metadata (e.g. YuE2's
         # meta.truncated) into ``collect`` for response headers.
-        if collect is not None and (adapter := self._get_tts_adapter()) is not None:
-            adapter.collect_response_metadata(audio_output, collect)
+        meta_collect = collect if collect is not None else {}
+        if (adapter := self._get_tts_adapter()) is not None:
+            adapter.collect_response_metadata(audio_output, meta_collect)
             truncated = self._length_truncated(usage_acc)
             if truncated is not None:
                 # Keep a flag the adapter set itself.
-                collect["audio_truncated"] = collect.get("audio_truncated", False) or truncated
+                meta_collect["audio_truncated"] = meta_collect.get("audio_truncated", False) or truncated
 
         # A model can flag a per-request synthesis failure through the
         # adapter (e.g. YuE2's terminal NAR/VAE pass OOMing on one
         # request); answer 500 instead of shipping a zero-length WAV.
         # Raising (not returning a Response) keeps this function's
         # tuple contract; create_speech maps TTSGenerationError to 500.
-        if collect is not None and collect.get("audio_synthesis_error"):
+        if meta_collect.get("audio_synthesis_error"):
             raise TTSGenerationError(
                 "The model failed to synthesize audio for this request",
                 retryable=False,
