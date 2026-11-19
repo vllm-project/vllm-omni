@@ -1004,6 +1004,24 @@ source_file_dependencies:
     - vllm_omni/model_executor/stage_input_processors/audex.py
     - vllm_omni/outputs/
 
+  tts_fish_speech_weekly:
+    - tests/e2e/online_serving/test_fish_speech_tts.py
+    - tests/helpers/assertions.py
+    - tests/helpers/media.py
+    - tests/helpers/runtime.py
+    - tests/helpers/stage_config.py
+    - tests/helpers/client.py
+    - vllm_omni/config/
+    - vllm_omni/deploy/fish_qwen3_omni.yaml
+    - vllm_omni/engine/
+    - vllm_omni/entrypoints/omni_base.py
+    - vllm_omni/entrypoints/openai/tts_adapters/fish_speech.py
+    - vllm_omni/metrics/utils.py
+    - vllm_omni/model_executor/models/fish_speech/
+    - vllm_omni/model_executor/stage_input_processors/fish_speech.py
+    - vllm_omni/outputs/
+    - vllm_omni/attention/fish_kvcache_attn.py
+
   tts_voxcpm2_weekly:
     - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
     - tests/e2e/offline_inference/test_voxcpm2_tts.py
