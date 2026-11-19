@@ -1080,7 +1080,6 @@ def test_fish_kvcache_native_op_matches_reference(seq_len, dtype, batch_size):
     torch.testing.assert_close(out, expected, atol=3e-2, rtol=3e-2)
 
 
-@pytest.mark.cuda
 @pytest.mark.parametrize("seq_len", [512, 2048])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.skipif(
