@@ -417,6 +417,14 @@ results require revalidation on the updated runtime. See the
 [validation report](../../../design/qwen3_omni_dflash_validation.md)
 for the measured configurations and quality limitations.
 
+For audiovisual speech requests, the Talker context must accommodate the
+user-turn rows transferred from the Thinker. A 60-second Daily-Omni video can
+produce roughly 14,000 prompt tokens. Set stage 1 `max_model_len: 32768`
+when testing the full dataset. The `max_num_batched_tokens` setting controls
+prefill chunk size, while `max_model_len` bounds each request's total context.
+A ready stage input exceeding that stage's context limit ends with a
+request-local error containing the prompt length and configured limit.
+
 ## Example materials
 
 ??? abstract "gradio_demo.py"

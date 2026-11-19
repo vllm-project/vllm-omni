@@ -627,6 +627,23 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         chunk_ready_req_ids.intersection_update(live_request_ids)
         chunk_finished_req_ids.intersection_update(live_request_ids)
         stage_recv_req_ids.intersection_update(live_request_ids)
+        max_model_len = getattr(self, "max_model_len", 0)
+        if model_mode == "ar" and max_model_len:
+            for req_id in chunk_ready_req_ids | stage_recv_req_ids:
+                request = self.requests[req_id]
+                input_update = request_metadata.get(req_id)
+                prompt_length = request.num_prompt_tokens
+                if input_update is not None:
+                    if input_update.prompt_token_ids is not None:
+                        prompt_length = len(input_update.prompt_token_ids)
+                    elif input_update.resize_prompt_to is not None:
+                        prompt_length = input_update.resize_prompt_to
+                if prompt_length > max_model_len:
+                    self._finish_oversized_prompt(request, prompt_length)
+                    request_metadata.pop(req_id, None)
+                    chunk_ready_req_ids.discard(req_id)
+                    chunk_finished_req_ids.discard(req_id)
+                    stage_recv_req_ids.discard(req_id)
         if getattr(self, "_native_resumable", False) and input_coordinator.receives_chunks:
             for req_id, update in list(request_metadata.items()):
                 request = self.requests.get(req_id)
@@ -1153,6 +1170,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         return (
             bool(self._outputs_awaiting_stage_payload)
             or bool(getattr(self, "_pending_chunk_commits", ()))
+            or bool(getattr(self, "_pending_input_timeout_outputs", ()))
             or bool(getattr(self, "_resume_chunk_receivers", ()))
             or super().has_requests()
         )
@@ -1463,6 +1481,28 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
                     self.finish_requests(existing.request_id, RequestStatus.FINISHED_STOPPED)
                     return
         super().add_request(request)
+
+    def _finish_oversized_prompt(self, request: Request, prompt_length: int) -> None:
+        """Emit a request-local error when a stage cannot accommodate its input."""
+        reason = (
+            f"Stage input prompt has {prompt_length} tokens, exceeding max_model_len={self.max_model_len}. "
+            "Increase this stage's max_model_len to accommodate the upstream payload."
+        )
+        logger.error("Rejecting request %s: %s", request.request_id, reason)
+        request.stop_reason = reason
+        pending = getattr(self, "_pending_input_timeout_outputs", None)
+        if pending is None:
+            pending = self._pending_input_timeout_outputs = {}
+        pending[request.request_id] = (
+            request.client_index,
+            OmniEngineCoreOutput(
+                request_id=request.request_id,
+                new_token_ids=[],
+                finish_reason=FinishReason.ERROR,
+                stop_reason=reason,
+            ),
+        )
+        self.finish_requests([request.request_id], RequestStatus.FINISHED_ERROR)
 
     def _take_async_chunk_prewarm(self, request: Request) -> None:
         """Pop the ``ASYNC_CHUNK_PREWARM_NS.*`` entries off a new request.

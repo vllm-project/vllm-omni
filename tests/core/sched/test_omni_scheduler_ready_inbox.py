@@ -200,3 +200,107 @@ def test_native_resume_prompt_replacement_clears_token_buffer(mocker, input_term
     assert scheduler.input_coordinator.update_request_metadata.call_count == 2
     scheduler.finish_requests.assert_not_called()
     assert not scheduler._resume_chunk_receivers
+
+
+@pytest.mark.parametrize("prompt_length", [8192, 8193])
+def test_ready_connector_prompt_respects_stage_context_limit(monkeypatch, mocker, prompt_length):
+    from collections import defaultdict
+
+    from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
+    from vllm.v1.engine import EngineCoreOutputs, FinishReason
+
+    scheduler = OmniARScheduler.__new__(OmniARScheduler)
+    request = Request("long-prompt", [1] * prompt_length, SamplingParams(max_tokens=1), pooling_params=None)
+    scheduler.requests = {request.request_id: request}
+    scheduler.max_model_len = 8192
+    scheduler.waiting, scheduler.running = [], []
+    scheduler.requests_needing_kv_transfer = {}
+    scheduler.active_kv_transfers = set()
+    scheduler.waiting_for_transfer_free = set()
+    scheduler._outputs_awaiting_stage_payload = {}
+    scheduler.finished_req_ids_dict = defaultdict(set)
+    scheduler.input_coordinator = SimpleNamespace(
+        _async_chunk=True,
+        receives_chunks=True,
+        update_request_metadata=mocker.Mock(),
+        process_pending_chunks=mocker.Mock(),
+    )
+
+    def finish(ids, status):
+        for req_id in ids:
+            scheduler.requests.pop(req_id).status = status
+
+    monkeypatch.setattr(VLLMScheduler, "has_requests", lambda _: False)
+    scheduler.finish_requests = mocker.Mock(side_effect=finish)
+    scheduler._init_omni_connector_output_inbox()
+
+    # A prewarm placeholder can be resized when its real payload arrives.
+    scheduler._consume_pending_connector_output(model_mode="ar")
+    scheduler.finish_requests.assert_not_called()
+
+    scheduler.enqueue_omni_connector_output(
+        OmniConnectorOutput(
+            chunk_ready_req_ids={request.request_id},
+        )
+    )
+    scheduler._consume_pending_connector_output(model_mode="ar")
+
+    if prompt_length == scheduler.max_model_len:
+        assert request.request_id in scheduler.requests
+        scheduler.finish_requests.assert_not_called()
+        return
+    scheduler.finish_requests.assert_called_once_with([request.request_id], RequestStatus.FINISHED_ERROR)
+    assert scheduler.has_requests()
+    outputs: dict[int, EngineCoreOutputs] = {}
+    scheduler._attach_finished_request_sets(outputs, synthesize_abort_outputs=False)
+    [error] = outputs[request.client_index].outputs
+    assert error.finish_reason == FinishReason.ERROR
+    assert "8193" in error.stop_reason and "8192" in error.stop_reason
+    assert not scheduler.has_requests()
+
+
+@pytest.mark.parametrize("replace_ids", [False, True])
+def test_connector_metadata_rejects_oversized_prompt_without_blocking_peer(mocker, replace_ids):
+    scheduler = OmniSchedulerMixin()
+    request = Request("large", [1], SamplingParams(max_tokens=1), pooling_params=None)
+    peer = Request("peer", [1], SamplingParams(max_tokens=1), pooling_params=None)
+    scheduler.requests = {"large": request, "peer": peer}
+    scheduler.max_model_len = 8192
+    scheduler.waiting, scheduler.running = [], []
+    scheduler._outputs_awaiting_stage_payload = {}
+    scheduler.input_coordinator = SimpleNamespace(
+        _async_chunk=True,
+        receives_chunks=True,
+        update_request_metadata=mocker.Mock(),
+        process_pending_chunks=mocker.Mock(),
+    )
+
+    def finish(ids, status):
+        for req_id in ids:
+            scheduler.requests.pop(req_id).status = status
+
+    scheduler.finish_requests = mocker.Mock(side_effect=finish)
+    invalid = (
+        SchedulingMetadataUpdate(prompt_token_ids=(1,) * 8193)
+        if replace_ids
+        else SchedulingMetadataUpdate(resize_prompt_to=8193)
+    )
+    valid = SchedulingMetadataUpdate(resize_prompt_to=2)
+    scheduler._init_omni_connector_output_inbox()
+    scheduler.enqueue_omni_connector_output(
+        OmniConnectorOutput(
+            request_metadata={"large": invalid, "peer": valid},
+            chunk_ready_req_ids={"large", "peer"},
+            chunk_finished_req_ids={"large"},
+        )
+    )
+
+    scheduler._consume_pending_connector_output(model_mode="ar")
+
+    assert scheduler.requests == {"peer": peer}
+    assert request.num_prompt_tokens == 1
+    scheduler.finish_requests.assert_called_once_with(["large"], RequestStatus.FINISHED_ERROR)
+    scheduler.input_coordinator.update_request_metadata.assert_called_once_with(scheduler.requests, {"peer": valid})
+    args = scheduler.input_coordinator.process_pending_chunks.call_args.args
+    assert args[2:] == ({"peer"}, set())
+    assert "8193" in scheduler._pending_input_timeout_outputs["large"][1].stop_reason
