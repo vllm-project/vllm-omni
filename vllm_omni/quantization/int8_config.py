@@ -524,7 +524,7 @@ class Int8LinearMethod(BaseInt8LinearMethod):
         super().__init__(quant_config)
 
         self.int8_linear = init_int8_linear_kernel(
-            is_channelwise=False,
+            is_channelwise=quant_config.is_checkpoint_int8_serialized,
             is_static_input_scheme=False,
             input_symmetric=True,
             module_name=self.__class__.__name__,

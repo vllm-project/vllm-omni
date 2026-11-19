@@ -485,6 +485,9 @@ steps:
       commands:
         - pytest -s -v tests/diffusion/distributed/test_tensor_parallel.py
         - >-
+          pytest -s -v tests/diffusion/quantization/test_int8_config.py
+          -m 'core_model and rocm' --run-level "core_model"
+        - >-
           timeout 20m pytest -s -v
           tests/diffusion/attention/test_ulysses_uaa.py::test_ulysses_uaa_2d_mask_layout_matches_baseline
           -m 'core_model and cards_2'

@@ -226,7 +226,7 @@ def test_get_quant_method(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
     assert type(method) is expected_method
     assert method.int8_linear is kernel
     init_kernel.assert_called_once_with(
-        is_channelwise=False,
+        is_channelwise=serialized,
         is_static_input_scheme=False,
         input_symmetric=True,
         module_name=expected_method.__name__,
@@ -512,7 +512,7 @@ class TestOffloadAfterQuant:
 class TestInt8LinearMethod:
     @pytest.fixture
     def mock_quant_config(self, mocker):
-        return mocker.Mock()
+        return mocker.Mock(is_checkpoint_int8_serialized=True)
 
     @pytest.fixture
     def mock_kernel(self, mocker):
@@ -537,7 +537,7 @@ class TestInt8LinearMethod:
 
         assert method.quant_config == mock_quant_config
         init_int8_linear_kernel.assert_called_once_with(
-            is_channelwise=False, is_static_input_scheme=False, input_symmetric=True, module_name="Int8LinearMethod"
+            is_channelwise=True, is_static_input_scheme=False, input_symmetric=True, module_name="Int8LinearMethod"
         )
         assert method.int8_linear == patch_deps
 
@@ -999,6 +999,34 @@ class TestGPUInt8Smoke:
         assert real_layer.weight.shape == (64, 128)
         assert real_layer.weight.dtype == torch.int8
         assert hasattr(real_layer, "weight_scale")
+
+    def test_serialized_fused_triton_scales_and_forward(self, mocker):
+        from vllm.model_executor.kernels.linear.scaled_mm.triton import TritonInt8ScaledMMLinearKernel
+
+        # Exercise the ROCm fallback on both GPU backends, regardless of the
+        # host's default kernel selection.
+        mocker.patch(
+            "vllm.model_executor.kernels.linear.choose_scaled_mm_linear_kernel",
+            return_value=TritonInt8ScaledMMLinearKernel,
+        )
+        config = int8_config.DiffusionInt8Config(is_checkpoint_int8_serialized=True)
+        method = int8_config.Int8LinearMethod(config)
+        device = current_omni_platform.device_type
+        weight = torch.ones(128, 64, dtype=torch.int8, device=device)
+        scales = torch.arange(1, 129, dtype=torch.float32, device=device).reshape(-1, 1) / 128
+        layer = _make_int8_layer(weight)
+        layer.logical_widths = [64, 32, 32]
+        layer.weight_scale = Parameter(scales.clone(), requires_grad=False)
+
+        method.process_weights_after_loading(layer)
+        torch.testing.assert_close(layer.weight_scale, scales, rtol=0, atol=0)
+
+        # Each token quantizes exactly. Its dot product with every weight row
+        # equals the sum of its entries before the per-channel scale is applied.
+        x = torch.ones(2, 16, 64, dtype=torch.float16, device=device)
+        x[1].neg_()
+        expected = x.sum(dim=-1, keepdim=True) * scales.view(-1)
+        torch.testing.assert_close(method.apply(layer, x), expected.half())
 
     def test_real_gpu_int8_apply_forward(self, quant_config):
         """Smoke test: batched forward pass with the real GPU INT8 kernel."""

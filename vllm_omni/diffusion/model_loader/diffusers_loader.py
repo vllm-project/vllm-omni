@@ -381,6 +381,18 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
         return str(hf_folder), hf_weights_files, use_safetensors
 
+    @staticmethod
+    def _has_int8_scale_collectives(model: nn.Module) -> bool:
+        from vllm_omni.quantization.int8_config import Int8OnlineLinearMethod, NPUInt8OnlineLinearMethod
+
+        # Use the quantized owners and their actual partitions. A root source
+        # can feed several components, and an encoder can use its own TP group.
+        return any(
+            isinstance(getattr(module, "quant_method", None), (Int8OnlineLinearMethod, NPUInt8OnlineLinearMethod))
+            and module.input_size != module.input_size_per_partition
+            for module in model.modules()
+        )
+
     def _get_weights_iterator(
         self,
         source: "ComponentSource",
@@ -394,31 +406,44 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
         )
+        # Break natural-sort ties (e.g. shard-2 and shard-02) independently
+        # of the order returned by the filesystem.
+        hf_weights_files = sorted(hf_weights_files, key=lambda path: (_natural_sort_key(path), path))
+        strategy = self.load_config.safetensors_load_strategy
         use_multithread = (
             use_safetensors
             and source.weight_name_patterns is None
             and self.od_config.enable_multithread_weight_load
-            and self.load_config.safetensors_load_strategy != "torchao"
+            and strategy != "torchao"
         )
+        if (
+            use_safetensors
+            and (use_multithread or strategy == "eager")
+            and model is not None
+            and self._has_int8_scale_collectives(model)
+        ):
+            # Online INT8 reduces scales as each layer finishes loading.
+            # Threads yield shards in completion order and eager decoding
+            # yields keys in hash order, both of which can differ by rank.
+            use_multithread = False
+            if strategy == "eager":
+                strategy = "lazy"
         if use_multithread:
             num_threads = self.od_config.num_weight_load_threads
-            # Keep deterministic shard order before passing to vLLM helper.
-            sorted_hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
             weights_iterator = multi_thread_safetensors_weights_iterator(
-                sorted_hf_weights_files,
+                hf_weights_files,
                 self.load_config.use_tqdm_on_load,
                 max_workers=num_threads,
             )
         elif not use_safetensors:
             # PyTorch pickles (.bin/.pt/.pth); torchao-serialized checkpoints take this path too.
-            sorted_hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
             weights_iterator = pt_weights_iterator(
-                sorted_hf_weights_files,
+                hf_weights_files,
                 self.load_config.use_tqdm_on_load,
                 self.load_config.pt_load_map_location,
             )
         elif use_safetensors and source.weight_name_patterns is not None:
-            if self.load_config.safetensors_load_strategy == "torchao":
+            if strategy == "torchao":
                 raise ValueError("Tensor-name filtered loading does not support safetensors_load_strategy='torchao'.")
 
             from safetensors import safe_open
@@ -426,7 +451,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             patterns = source.weight_name_patterns
 
             def filtered_safetensors_iterator():
-                for filename in sorted(hf_weights_files, key=_natural_sort_key):
+                for filename in hf_weights_files:
                     with safe_open(filename, framework="pt") as handle:
                         for name in handle.keys():  # noqa: SIM118
                             if any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns):
@@ -437,7 +462,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             weights_iterator = safetensors_weights_iterator(
                 hf_weights_files,
                 self.load_config.use_tqdm_on_load,
-                self.load_config.safetensors_load_strategy,
+                strategy,
             )
 
         if self.counter_before_loading_weights == 0.0:

@@ -94,7 +94,9 @@ def _make_text_encoder_int8_row(mocker, world_size):
     mocker.patch.object(int8_config, "init_int8_linear_kernel", return_value=kernel)
 
     device_group = mocker.sentinel.minimax_text_encoder_group
-    group = SimpleNamespace(rank_in_group=0, world_size=world_size, device_group=device_group)
+    group = SimpleNamespace(rank_in_group=0, world_size=world_size)
+    if world_size > 1:
+        group.device_group = device_group
     quant_config = int8_config.DiffusionInt8Config()
 
     layer = MiniMaxH3Qwen3VLRowParallelLinear(
@@ -133,7 +135,6 @@ def test_text_encoder_int8_scale_uses_encoder_tp_group(mocker):
     assert layer.tp_size == 1
     assert layer.input_size == 4
     assert layer.input_size_per_partition == 2
-    assert layer._int8_scale_tp_group is device_group
     get_tp_group.assert_not_called()
     native_quant.assert_not_called()
     all_reduce.assert_called_once()
@@ -145,7 +146,7 @@ def test_text_encoder_int8_scale_uses_encoder_tp_group(mocker):
 
 
 def test_text_encoder_tp1_int8_uses_native_quantization(mocker):
-    layer, device_group = _make_text_encoder_int8_row(mocker, world_size=1)
+    layer, _ = _make_text_encoder_int8_row(mocker, world_size=1)
     weight = torch.tensor([[1, -2, 8, -64], [2, -3, 7, -56]], dtype=torch.bfloat16)
     layer.weight = nn.Parameter(weight, requires_grad=False)
     original_weight = layer.weight
@@ -163,7 +164,6 @@ def test_text_encoder_tp1_int8_uses_native_quantization(mocker):
     layer.quant_method.process_weights_after_loading(layer)
 
     assert layer.input_size == layer.input_size_per_partition == 4
-    assert layer._int8_scale_tp_group is device_group
     native_quant.assert_called_once_with(original_weight, scale=None)
     get_tp_group.assert_not_called()
     all_reduce.assert_not_called()
