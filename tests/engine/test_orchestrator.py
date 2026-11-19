@@ -3306,7 +3306,7 @@ async def test_submit_to_stage_excludes_llm_replica_wait(monkeypatch) -> None:
     await orchestrator._submit_to_stage(
         "req-clock",
         req_state,
-        [SimpleNamespace()],
+        [object()],
         source_stage_id=0,
         source_replica_id=0,
         receiver_stage_id=1,
