@@ -158,10 +158,10 @@ torch.manual_seed(0)
 config = Qwen3OmniMoeTextConfig(hidden_size=32, num_attention_heads=4, num_key_value_heads=2, head_dim=16,
     rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "mrope_section": [3, 3, 2]})
 n, heads, kv_heads, d = 64, 4, 2, 16
-q = torch.randn(n, heads * d, dtype=torch.bfloat16, device=DEVICE_TYPE)
-k = torch.randn(n, kv_heads * d, dtype=torch.bfloat16, device=DEVICE_TYPE)
-positions = torch.arange(3000, 3000 + n, device=DEVICE_TYPE)
-rope = HFNumericsRotaryEmbedding(config).to(DEVICE_TYPE)
+q = torch.randn(n, heads * d, dtype=torch.bfloat16, device="cuda")
+k = torch.randn(n, kv_heads * d, dtype=torch.bfloat16, device="cuda")
+positions = torch.arange(3000, 3000 + n, device="cuda")
+rope = HFNumericsRotaryEmbedding(config).cuda()
 freqs = positions[:, None].float() * rope.inv_freq
 freqs = torch.cat((freqs, freqs), dim=-1)
 cos, sin = freqs.cos().to(q.dtype)[None], freqs.sin().to(q.dtype)[None]
@@ -195,7 +195,7 @@ def test_rotary_inv_freq_matches_hf_when_built_on_cuda():
         head_dim=128,
         rope_parameters={"rope_type": "default", "rope_theta": 1000000.0, "mrope_section": [24, 20, 20]},
     )
-    with torch.device(DEVICE_TYPE):
+    with torch.device("cuda"):
         rope = HFNumericsRotaryEmbedding(config)
     hf_inv_freq = Qwen3OmniMoeThinkerTextRotaryEmbedding(config).inv_freq
     assert rope.inv_freq.device.type == "cuda"
