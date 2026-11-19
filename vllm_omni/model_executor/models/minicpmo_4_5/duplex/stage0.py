@@ -74,12 +74,11 @@ class _MiniCPMO45CarriedWindow:
     unit_sizes: list[int]
     token_ids: list[list[int]]
     device: torch.device | str | None
-    time: float
     #: Units whose embeds could not be packed; kept as they are.
     units: list[_MiniCPMO45WindowUnit] | None = None
 
     @classmethod
-    def pack(cls, units: list[_MiniCPMO45WindowUnit], now: float) -> _MiniCPMO45CarriedWindow:
+    def pack(cls, units: list[_MiniCPMO45WindowUnit]) -> _MiniCPMO45CarriedWindow:
         import torch
 
         tensors = [embed for unit in units for embed in unit.embeds]
@@ -96,7 +95,7 @@ class _MiniCPMO45CarriedWindow:
                 logger.warning_once(
                     "MiniCPM-o carried window embeds are not uniform 2-D tensors; keeping them in place"
                 )
-            return cls(None, [], [], [], None, now, units=list(units))
+            return cls(None, [], [], [], None, units=list(units))
         packed = torch.cat(tensors)
         # A pinned, stream-ordered copy: the step does not wait for it, and unpack's copy back runs after it.
         host = torch.empty(packed.shape, dtype=packed.dtype, pin_memory=packed.is_cuda)
@@ -107,7 +106,6 @@ class _MiniCPMO45CarriedWindow:
             unit_sizes=[len(unit.embeds) for unit in units],
             token_ids=[list(unit.token_ids) for unit in units],
             device=first.device,
-            time=now,
         )
 
     def unpack(self) -> list[_MiniCPMO45WindowUnit]:
@@ -143,8 +141,6 @@ class _MiniCPMO45Stage0SessionState:
     #: Completed units of the session's previous Stage-0 request (a barge-in
     #: ended it), waiting for the scheduler's first window plan of this one.
     carried_window_units: list[_MiniCPMO45WindowUnit] = field(default_factory=list)
-    #: The context holds units carried over from the session's previous request.
-    carried_context: bool = False
     current_turn_ended: bool = True
     prepared_append_identity: tuple[int | None, int] | None = None
     prepared_inputs_embeds: torch.Tensor | None = None
@@ -272,7 +268,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                         session_id,
                     )
                     continue
-                self._carried_window_units[session_id] = _MiniCPMO45CarriedWindow.pack(units, time.monotonic())
+                self._carried_window_units[session_id] = _MiniCPMO45CarriedWindow.pack(units)
             elif op == "drop":
                 self._carried_window_units.pop(session_id, None)
             elif op == "hand":
@@ -946,7 +942,6 @@ class MiniCPMO45Stage0DuplexRuntime:
             placed = self._filler_units(lengths if isinstance(lengths, list) else [], carried_units)
         elif placed:
             self._end_carried_speech_with_listen(placed[-1])
-            state.carried_context = True
         state.window_units[:0] = placed
         if drop_units > len(state.window_units):
             raise RuntimeError(

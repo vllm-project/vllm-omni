@@ -6,7 +6,7 @@ The barge-in aborts the epoch's Stage-0 request and the next append opens a new
 one. The scheduler and the worker each keep the aborted request's completed
 window units, and the new request's first window plan puts them back. These
 tests check that both sides keep the same units and agree on the rebuilt
-prompt length, and the greedy answer decision after the user's input.
+prompt length, and native sampling after the user's input.
 """
 
 from __future__ import annotations
@@ -534,7 +534,6 @@ def test_worker_fills_carried_units_it_does_not_have_instead_of_failing(kept: li
 
     assert len(token_ids) == 14
     assert token_ids[3:14] == [LISTEN] * 11
-    assert state.carried_context is False
 
 
 def test_worker_keeps_the_stashed_window_in_host_memory() -> None:
@@ -620,42 +619,10 @@ def test_worker_without_a_window_keeps_nothing() -> None:
     helper.restore_window_units(state)
     assert state.carried_window_units == []
 
-    helper._handed_window_units["s"] = _MiniCPMO45CarriedWindow.pack([_unit(100, 5)], time.monotonic())
+    helper._handed_window_units["s"] = _MiniCPMO45CarriedWindow.pack([_unit(100, 5)])
     state = _state(window_enabled=False)
     helper.restore_window_units(state)
     assert state.carried_window_units == []
-
-
-def test_answer_decision_keeps_listen_only_when_it_is_the_most_likely_token() -> None:
-    listen_id = 3
-    logits = torch.tensor(
-        [
-            [0.0, 1.0, 6.0, 5.0, 0.0],  # another token leads: listen is masked
-            [0.0, 1.0, 6.0, 7.0, 0.0],  # listen leads: unchanged
-        ]
-    )
-
-    MiniCPMO45OmniForConditionalGeneration._minicpmo45_answer_unless_listen_wins(logits, 0, listen_id)
-    MiniCPMO45OmniForConditionalGeneration._minicpmo45_answer_unless_listen_wins(logits, 1, listen_id)
-
-    assert logits[0, listen_id] == float("-inf")
-    assert logits[0, 2] == 6.0
-    assert logits[1].tolist() == [0.0, 1.0, 6.0, 7.0, 0.0]
-
-
-def test_placing_carried_units_marks_the_state() -> None:
-    helper = _worker()
-    state = _state(carried_window_units=[_unit(100, 5)], window_units=[_unit(300, 9)])
-    plan = {"replace": True, "mode": "basic", "drop_units": 0, "carried_units": 1, "replacement_prompt_len": 17}
-
-    helper._window_replacement_parts(state, plan)
-
-    assert state.carried_context is True
-    fresh = _state(window_units=[_unit(300, 9)])
-    helper._window_replacement_parts(
-        fresh, {"replace": True, "mode": "basic", "drop_units": 0, "replacement_prompt_len": 12}
-    )
-    assert fresh.carried_context is False
 
 
 def _upstream(cls: type, name: str) -> type:
@@ -718,37 +685,44 @@ def test_scheduler_round_trip_carries_only_an_aborted_window(
     assert plan.get("carried_units", 0) == carried
 
 
-def test_answer_rule_applies_only_to_a_request_that_carries_units() -> None:
-    listen_id, turn_eos_id = 3, 9
+@pytest.mark.parametrize("raw_leader", ["repeated", "forbidden"])
+def test_restored_window_preserves_native_listen_sampling(raw_leader: str) -> None:
+    listen, leader, boundary = 3, 2, 4
+    token_ids = {"listen_token_id": listen, "turn_eos_token_id": 9, "chunk_eos_token_id": boundary}
     model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
     model.model_stage = "llm"
-    model._minicpmo45_native_duplex_token_ids_cache = {"listen_token_id": listen_id, "turn_eos_token_id": turn_eos_id}
-
-    def state(carried: bool) -> SimpleNamespace:
-        return SimpleNamespace(current_turn_ended=True, pending_speech_context=True, carried_context=carried)
-
-    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={"a": state(True), "b": state(False)})
-    rows = tuple(
-        SimpleNamespace(
-            row_idx=i,
-            request_id=f"req-{sid}",
-            session_id=sid,
-            seq=3,
-            payload={"is_speech": False},
-            temperature=None,
-            top_k=None,
-            top_p=None,
-            max_tokens=None,
-        )
-        for i, sid in enumerate(("a", "b"))
+    model._minicpmo45_native_duplex_token_ids_cache = token_ids
+    model._minicpmo45_tokenizer_cache = SimpleNamespace(bad_token_ids=[leader] if raw_leader == "forbidden" else [])
+    state = _state(carried_window_units=[_unit(100, 5)], current_turn_ended=True, pending_speech_context=True)
+    _worker()._window_replacement_parts(
+        state, {"replace": True, "mode": "basic", "drop_units": 0, "carried_units": 1, "replacement_prompt_len": 8}
     )
-    # <|speak|> (id 2) leads <|listen|> on both rows.
-    logits = torch.tensor([[0.0, 1.0, 6.0, 5.0, 0.0] + [0.0] * 5] * 2)
-
-    model.prepare_duplex_sampling(logits, None, rows)
-
-    assert logits[0, listen_id] == float("-inf")
-    assert logits[1, listen_id] == 5.0
+    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={"s": state})
+    row = SimpleNamespace(
+        row_idx=0,
+        request_id="new",
+        session_id="s",
+        seq=3,
+        payload={"is_speech": False},
+        temperature=0.0,
+        top_k=1,
+        top_p=1.0,
+        max_tokens=None,
+    )
+    logits = torch.tensor([[0.0, 0.0, 6.0, 5.9, 5.8] + [0.0] * 5])
+    reference = logits.clone()
+    model.prepare_duplex_sampling(logits, None, (row,))
+    draw = model._minicpmo45_duplex_stage2_draws(
+        logits,
+        [0],
+        {0: [leader] if raw_leader == "repeated" else []},
+        token_ids,
+        [(0.0, 1, 1.0)],
+        SimpleNamespace(all_greedy=True),
+    )
+    assert draw.tolist() == [listen]
+    assert torch.equal(logits, reference)
+    assert torch.equal(model._duplex_boundary_chunk_eos_probs(logits, boundary), reference.softmax(-1)[:, boundary])
 
 
 def test_an_abort_with_nothing_to_keep_drops_the_sessions_earlier_window() -> None:
