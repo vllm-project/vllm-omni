@@ -59,8 +59,7 @@ def _get_stage_post_warmup_memory_families(registry: CollectorRegistry) -> tuple
                 Gauge(
                     defs.STAGE_POST_WARMUP_MEMORY_ALLOCATED_BYTES,
                     "Rank-0 worker process PyTorch allocator bytes allocated on its device "
-                    "after decoder graph warmup during model loading, before KV-cache allocation "
-                    "and later graph captures.",
+                    "after decoder graph warmup, before the stage serves requests.",
                     labelnames=labels,
                     multiprocess_mode="mostrecent",
                     registry=registry,
@@ -68,8 +67,7 @@ def _get_stage_post_warmup_memory_families(registry: CollectorRegistry) -> tuple
                 Gauge(
                     defs.STAGE_POST_WARMUP_MEMORY_RESERVED_BYTES,
                     "Rank-0 worker process PyTorch allocator bytes reserved on its device "
-                    "after decoder graph warmup during model loading, before KV-cache allocation "
-                    "and later graph captures.",
+                    "after decoder graph warmup, before the stage serves requests.",
                     labelnames=labels,
                     multiprocess_mode="mostrecent",
                     registry=registry,
