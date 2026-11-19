@@ -14,7 +14,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
-    TextAudioBlockMask,
+    ConditioningBlockMask,
 )
 from vllm_omni.diffusion.attention.backends.cudnn_attn import CuDNNAttentionImpl
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
@@ -31,8 +31,7 @@ from vllm_omni.diffusion.attention.capabilities import (
 from vllm_omni.diffusion.attention.ops import sol_attn as sol_ops
 from vllm_omni.diffusion.attention.sol_config import parse_sol_block_ranges, parse_sol_tau_profile, sol_block_selected
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
-from vllm_omni.diffusion.data import SolAttnSpec, parse_kv_cache_skip_selector
-from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.data import SolAttnSpec
 from vllm_omni.platforms import current_omni_platform
 
 
@@ -89,6 +88,7 @@ class SolAttnImpl(AttentionImpl):
         backend_kwargs: dict | None = None,
         computation: AttentionComputation | str = AttentionComputation.SELF,
         layer_count: int | None = None,
+        requires_conditioning_mask: bool = False,
         **extra_impl_args,
     ) -> None:
         if head_size != 128:
@@ -104,9 +104,8 @@ class SolAttnImpl(AttentionImpl):
             raise ValueError(f"Unknown SOL_ATTN backend options: {sorted(set(options) - {'sol_attn'})}")
         settings = options.get("sol_attn")
         self.config = SolAttnSpec(**({} if settings is None else settings))
+        self.requires_conditioning_mask = requires_conditioning_mask
         self.softmax_scale = softmax_scale
-        selector = self.config.dense_layers
-        self.dense_layers = parse_kv_cache_skip_selector([selector] if isinstance(selector, int) else selector) or set()
         try:
             self.layer_idx = extract_layer_index(prefix) if prefix else None
         except (AssertionError, ValueError):
@@ -128,35 +127,21 @@ class SolAttnImpl(AttentionImpl):
         if getattr(parallel, "ring_degree", 1) > 1 or getattr(parallel, "allgather_degree", 1) > 1:
             raise ValueError("SOL_ATTN needs full Q/K/V sequences; use local attention or Ulysses with ring_degree=1.")
         capability = current_omni_platform.get_device_capability()
-        self.kv_splits = 1 if isinstance(self.config.kv_splits, str) else self.config.kv_splits
-        if self.config.kv_splits != 1:
-            if capability is None or tuple(capability) != (9, 0):
-                if self.config.kv_splits != "auto":
-                    raise ValueError("SOL_ATTN kv_splits=2/4 requires SM90; use kv_splits=1 or 'auto'.")
+        self.kv_splits = 1
+        if capability is not None and tuple(capability) == (9, 0):
+            try:
+                import cuda.bindings.driver  # noqa: F401
+                import cutlass.cute  # noqa: F401
+            except ImportError:
+                # The upstream Triton path uses one split when CuTe is absent.
+                pass
             else:
-                try:
-                    import cuda.bindings.driver  # noqa: F401
-                    import cutlass.cute  # noqa: F401
-                except ImportError as error:
-                    if self.config.kv_splits != "auto":
-                        raise ImportError(
-                            "SOL_ATTN kv_splits=2/4 requires the CuTe DSL runtime; use kv_splits=1."
-                        ) from error
-                else:
-                    if self.config.kv_splits == "auto":
-                        self.kv_splits = 4
+                self.kv_splits = 4
         dense_impl = CuDNNAttentionImpl if capability is not None and capability.major == 12 else SDPAImpl
         self.dense_attention = dense_impl(num_heads, head_size, softmax_scale, num_kv_heads=num_kv_heads)
 
     def _should_use_dense(self, used: int) -> bool:
-        if used < self.config.min_tokens or self.dense_block:
-            return True
-        if self.layer_idx is None and self.dense_layers:
-            return True
-        if self.layer_idx in self.dense_layers:
-            return True
-        step = get_forward_context().denoise_step_idx if is_forward_context_available() else None
-        return self.config.dense_steps > 0 and (step is None or step < self.config.dense_steps)
+        return used < self.config.min_tokens or self.dense_block
 
     @staticmethod
     def _used_length(
@@ -204,44 +189,27 @@ class SolAttnImpl(AttentionImpl):
             raise ValueError("SOL_ATTN valid length must be a positive host integer within the sequence.")
         return used
 
-    def _sink_range(self, metadata: AttentionMetadata | None, used: int) -> tuple[int, int]:
-        if self.config.sink_mode == "text_audio":
-            return 0, 0
-        tokens = min(self.config.sink_tokens, used)
-        start = used - tokens if self.config.sink_start is None else min(self.config.sink_start, used)
-        end = min(start + tokens, used)
-        layout = metadata.video_layout if metadata is not None else None
-        if self.config.prefix_sink and layout is not None:
-            if layout.used_len is not None and layout.used_len != used:
-                raise ValueError("SOL_ATTN video layout and valid sequence length disagree.")
-            prefix = layout.prefix_len
-            if layout.video_spans:
-                targets = [span for span in layout.video_spans if span.role == "target"]
-                if len(targets) != 1:
-                    raise ValueError("SOL_ATTN prefix_sink requires exactly one target-video span.")
-                prefix = targets[0].start
-            if type(prefix) is not int or not 0 <= prefix <= used:
-                raise ValueError("SOL_ATTN prefix_sink requires a valid video prefix length.")
-            if prefix:
-                end = max(end if end > start else 0, prefix)
-                start = 0
-        return start, end - start
-
     def _sink_block_mask(
         self, metadata: AttentionMetadata | None, used: int, device: torch.device
     ) -> torch.Tensor | None:
-        if self.config.sink_mode != "text_audio":
+        if self.config.sink_conditioning == "off":
             return None
-        protection = metadata.text_audio_block_mask if metadata is not None else None
-        if not isinstance(protection, TextAudioBlockMask):
-            raise ValueError("SOL_ATTN text_audio requires producer-owned text_audio_block_mask metadata.")
+        protection = metadata.conditioning_block_mask if metadata is not None else None
+        if protection is None and not self.requires_conditioning_mask:
+            return None
+        if not isinstance(protection, ConditioningBlockMask):
+            raise ValueError(
+                "SOL_ATTN requires producer-owned conditioning_block_mask metadata for this attention stack."
+            )
         if (
             type(protection.used_len) is not int
             or protection.used_len != used
             or type(protection.block_size) is not int
             or protection.block_size != 64
         ):
-            raise ValueError("SOL_ATTN text_audio requires block64 metadata matching the valid sequence length.")
+            raise ValueError(
+                "SOL_ATTN conditioning protection requires block64 metadata matching the valid sequence length."
+            )
         mask = protection.blocks
         if (
             not isinstance(mask, torch.Tensor)
@@ -250,7 +218,9 @@ class SolAttnImpl(AttentionImpl):
             or mask.shape != ((used + 63) // 64,)
             or not mask.is_contiguous()
         ):
-            raise ValueError("SOL_ATTN text_audio requires a contiguous bool block mask on the Q/K/V device.")
+            raise ValueError(
+                "SOL_ATTN conditioning protection requires a contiguous bool block mask on the Q/K/V device."
+            )
         return mask
 
     def resolve_execution_path(
@@ -288,12 +258,9 @@ class SolAttnImpl(AttentionImpl):
         else:
             try:
                 used = self._used_length(query, key, value, attn_metadata)
-                _, sink_tokens = self._sink_range(attn_metadata, used)
                 self._sink_block_mask(attn_metadata, used, query.device)
-                if self._should_use_dense(used) or sink_tokens == used:
+                if self._should_use_dense(used):
                     result = replace(result, path="dense_guard", kernel_variant=None)
-                if result.path == "sol_sparse":
-                    self._resolve_kv_splits(used)
             except (TypeError, ValueError) as error:
                 reason = str(error)
             else:
@@ -307,10 +274,7 @@ class SolAttnImpl(AttentionImpl):
         return replace(result, support=CapabilityResult.unsupported(reason))
 
     def _resolve_kv_splits(self, used: int) -> int:
-        splits = 1 if self.config.kv_splits == "auto" and used < 65536 else self.kv_splits
-        if splits > (used + 4095) // 4096:
-            raise ValueError("SOL_ATTN needs at least one 4096-token route group per KV split; use kv_splits=1.")
-        return splits
+        return 1 if used < 65536 else self.kv_splits
 
     def forward_cuda(
         self,
@@ -320,10 +284,9 @@ class SolAttnImpl(AttentionImpl):
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         used = self._used_length(query, key, value, attn_metadata)
-        sink_start, sink_tokens = self._sink_range(attn_metadata, used)
         sink_block_mask = self._sink_block_mask(attn_metadata, used, query.device)
         query_used, key_used, value_used = (tensor[:, :used].contiguous() for tensor in (query, key, value))
-        if self._should_use_dense(used) or sink_tokens == used:
+        if self._should_use_dense(used):
             output = self.dense_attention.forward_cuda(query_used, key_used, value_used)
         else:
             kv_splits = self._resolve_kv_splits(used)
@@ -333,16 +296,9 @@ class SolAttnImpl(AttentionImpl):
                 value_used,
                 self.softmax_scale,
                 self.tau,
-                self.config.thresh_type,
                 kv_splits,
-                sink_start,
-                sink_tokens,
                 sink_block_mask,
             )
-            if sink_tokens:
-                output[:, sink_start : sink_start + sink_tokens] = self.dense_attention.forward_cuda(
-                    query_used[:, sink_start : sink_start + sink_tokens], key_used, value_used
-                )
         if used == query.shape[1]:
             return output
         return torch.cat((output, torch.zeros_like(query[:, used:])), dim=1)

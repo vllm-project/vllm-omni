@@ -242,19 +242,33 @@ class PackedPaddingMetadata:
 
 
 @dataclass(frozen=True, slots=True)
-class TextAudioBlockMask:
-    """Producer-owned protection for text/audio in one global packed sequence.
+class ConditioningBlockMask:
+    """Producer-owned conditioning protection in one global sequence.
 
     ``blocks`` is a contiguous Boolean vector on the attention device. Each
     element protects both the Q rows and KV columns of a token block. The
-    producer validates nonempty text/audio indices against ``used_len`` and
-    builds this once per request, before sequence sharding. Visual references
-    are not protected except where they share a block with text or audio.
+    producer chooses the protected tokens and builds this once per request,
+    before sequence sharding. No modality or model-specific ordering is assumed.
     """
 
     used_len: int
     block_size: int
     blocks: torch.Tensor
+
+    @classmethod
+    def from_token_mask(cls, token_mask: torch.Tensor, block_size: int = 64) -> "ConditioningBlockMask":
+        """Protect blocks touching marked tokens, before sequence sharding.
+
+        ``token_mask`` covers valid tokens without structural padding. Construct
+        once during request preparation, outside the denoising loop.
+        """
+        if token_mask.ndim != 1 or token_mask.dtype != torch.bool or token_mask.numel() == 0:
+            raise ValueError("Conditioning token mask must be a nonempty one-dimensional Boolean tensor.")
+        if type(block_size) is not int or block_size <= 0:
+            raise ValueError("Conditioning block_size must be a positive integer.")
+        used_len = token_mask.shape[0]
+        padded = torch.nn.functional.pad(token_mask, (0, -used_len % block_size))
+        return cls(used_len, block_size, padded.reshape(-1, block_size).any(dim=1))
 
 
 @dataclass
@@ -308,7 +322,7 @@ class AttentionMetadata:
     # locality (block-sparse selection, tiled masks). Dense backends ignore it.
     video_layout: VideoTokenLayout | None = None
 
-    text_audio_block_mask: TextAudioBlockMask | None = None
+    conditioning_block_mask: ConditioningBlockMask | None = None
 
     # Canonical mask-free view of structural suffix padding. Backends that do
     # not advertise supports_packed_mask_free ignore it.

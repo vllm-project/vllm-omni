@@ -2388,62 +2388,25 @@ class BlockSparseSpec:
 
 @dataclass
 class SolAttnSpec:
-    """SOL routing and execution settings; no VSA-trained weights are required.
-
-    ``tau`` controls sparsity; ``thresh_type`` selects the threshold estimator,
-    not attention precision. Upstream Sol-Attn protects text/audio tiles on
-    both Q and KV axes using model-owned metadata. Dense guards are opt-in.
-    """
+    """SOL quality controls; kernel selection and KV splitting are automatic."""
 
     tau: float = 1.0
-    thresh_type: str = "diag"
-    sink_tokens: int = 0
-    sink_start: int | None = 0
-    prefix_sink: bool = True
-    sink_mode: str = "text_audio"
-    dense_steps: int = 0
-    dense_layers: str | int | list[int] | None = field(default_factory=list)
-    kv_splits: int | str = "auto"
     min_tokens: int = 0
     dense_blocks: str = ""
     tau_profile: str = ""
-
-    _VALID_THRESH_TYPES = frozenset({"diag", "exact"})
+    sink_conditioning: str = "exact_kv_and_rows"
 
     def __post_init__(self) -> None:
-        if self.sink_mode not in ("prefix", "text_audio"):
-            raise ValueError("sol_attn.sink_mode must be prefix or text_audio.")
-        if self.sink_mode == "text_audio":
-            if self.sink_tokens != 0 or self.sink_start not in (0, None):
-                raise ValueError("sol_attn.sink_mode=text_audio cannot be combined with an explicit sink range.")
         self.tau = _in_range(self.tau, "sol_attn.tau", 0.0, None) or 0.0
-        if self.thresh_type not in self._VALID_THRESH_TYPES:
-            raise ValueError(
-                f"sol_attn.thresh_type={self.thresh_type!r} unsupported; use one of {sorted(self._VALID_THRESH_TYPES)}."
-            )
-        for name in ("sink_tokens", "sink_start", "dense_steps", "min_tokens"):
-            value = getattr(self, name)
-            if name == "sink_start" and value is None:
-                continue
-            if type(value) is not int or value < 0:
-                raise ValueError(f"sol_attn.{name} must be a non-negative integer; got {value!r}.")
-        if type(self.prefix_sink) is not bool:
-            raise ValueError("sol_attn.prefix_sink must be a boolean.")
-        if isinstance(self.dense_layers, bool):
-            raise ValueError("sol_attn.dense_layers must be a layer selector, not a boolean.")
-        if isinstance(self.dense_layers, int):
-            self.dense_layers = [self.dense_layers]
-        dense_layers = parse_kv_cache_skip_selector(self.dense_layers)
-        if parse_sol_block_ranges(self.dense_blocks) and dense_layers:
-            raise ValueError("Specify only one of sol_attn.dense_blocks and sol_attn.dense_layers.")
+        if type(self.min_tokens) is not int or self.min_tokens < 0:
+            raise ValueError(f"sol_attn.min_tokens must be a non-negative integer; got {self.min_tokens!r}.")
+        parse_sol_block_ranges(self.dense_blocks)
         parse_sol_tau_profile(self.tau_profile)
-        if type(self.kv_splits) is int:
-            if self.kv_splits not in (1, 2, 4):
-                raise ValueError(f"sol_attn.kv_splits must be 1, 2, or 4; got {self.kv_splits!r}.")
-        elif isinstance(self.kv_splits, str) and self.kv_splits.lower() == "auto":
-            self.kv_splits = "auto"
-        else:
-            raise ValueError(f"sol_attn.kv_splits must be an int or 'auto'; got {self.kv_splits!r}.")
+        if self.sink_conditioning not in ("exact_kv_and_rows", "off"):
+            raise ValueError(
+                "sol_attn.sink_conditioning must be 'exact_kv_and_rows' or 'off'. "
+                "The current kernel cannot protect only KV columns; 'exact_kv' is unsupported."
+            )
 
 
 @dataclass
@@ -2573,17 +2536,10 @@ class AttentionSpec:
             sol = self.sol_attn
             kw["sol_attn"] = {
                 "tau": sol.tau,
-                "thresh_type": sol.thresh_type,
-                "sink_tokens": sol.sink_tokens,
-                "sink_start": sol.sink_start,
-                "prefix_sink": sol.prefix_sink,
-                "sink_mode": sol.sink_mode,
-                "dense_steps": sol.dense_steps,
-                "dense_layers": sol.dense_layers,
-                "kv_splits": sol.kv_splits,
                 "min_tokens": sol.min_tokens,
                 "dense_blocks": sol.dense_blocks,
                 "tau_profile": sol.tau_profile,
+                "sink_conditioning": sol.sink_conditioning,
             }
         return kw or None
 

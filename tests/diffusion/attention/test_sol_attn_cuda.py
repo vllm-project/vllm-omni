@@ -9,8 +9,8 @@ import torch
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
+    ConditioningBlockMask,
     PackedPaddingMetadata,
-    TextAudioBlockMask,
     VideoTokenLayout,
 )
 from vllm_omni.diffusion.attention.backends.sol_attn import SolAttnImpl
@@ -18,7 +18,7 @@ from vllm_omni.diffusion.attention.capabilities import ExecutionContext, Support
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
-from vllm_omni.diffusion.forward_context import set_forward_context
+from vllm_omni.diffusion.forward_context import bind_attention_schedule, get_forward_context, set_forward_context
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -33,7 +33,7 @@ sol_attn = pytest.importorskip("sol_attn").sol_attn
 @pytest.mark.parametrize("guard", ["none", "dense_blocks", "min_tokens"])
 def test_real_sol_layer_tuning_and_short_sequence_guard(compiled, guard):
     used = 257
-    settings: dict[str, str | int] = {"sink_mode": "prefix", "tau_profile": "0-4=1.5;-1=0.6"}
+    settings: dict[str, str | int] = {"sink_conditioning": "off", "tau_profile": "0-4=1.5;-1=0.6"}
     if guard == "dense_blocks":
         settings["dense_blocks"] = "-1"
     elif guard == "min_tokens":
@@ -71,31 +71,22 @@ def test_real_sol_layer_tuning_and_short_sequence_guard(compiled, guard):
 
 
 @hardware_test(res={"cuda": ["L4", "H100", "B200", "RTX5090"]}, num_cards=1)
-@pytest.mark.parametrize("used,sink_tokens", [(63, 5), (64, 5), (257, 5), (4097, 951)])
+@pytest.mark.parametrize("used", [63, 64, 257, 4097])
 @pytest.mark.parametrize("compiled", [False, True])
-@pytest.mark.parametrize("thresh_type", ["diag", "exact"])
-def test_real_sol_kernel_padding_and_sink(used, sink_tokens, compiled, thresh_type):
+@pytest.mark.parametrize("sink_conditioning", ["off", "exact_kv_and_rows"])
+def test_real_sol_kernel_padding_and_conditioning(used, compiled, sink_conditioning):
     generator = torch.Generator(device="cuda").manual_seed(17)
     query, key, value = (
         torch.randn(1, used + 17, 2, 128, device="cuda", dtype=torch.bfloat16, generator=generator) for _ in range(3)
     )
     lengths = torch.tensor([0, used], dtype=torch.int32, device="cuda")
-    metadata = AttentionMetadata(packed_padding=PackedPaddingMetadata(used, used, lengths, lengths))
-    impl = SolAttnImpl(
-        2,
-        128,
-        0.125,
-        backend_kwargs={
-            "sol_attn": {
-                "sink_mode": "prefix",
-                "dense_steps": 0,
-                "dense_layers": "",
-                "sink_tokens": sink_tokens,
-                "tau": 1.5,
-                "thresh_type": thresh_type,
-            }
-        },
+    blocks = torch.zeros((used + 63) // 64, device="cuda", dtype=torch.bool)
+    blocks[0] = blocks[-1] = True
+    metadata = AttentionMetadata(
+        packed_padding=PackedPaddingMetadata(used, used, lengths, lengths),
+        conditioning_block_mask=ConditioningBlockMask(used, 64, blocks),
     )
+    impl = SolAttnImpl(2, 128, 0.125, backend_kwargs={"sol_attn": {"tau": 1.5, "sink_conditioning": sink_conditioning}})
     forward = torch.compile(impl.forward_cuda, fullgraph=True) if compiled else impl.forward_cuda
     with torch.inference_mode():
         actual = forward(query, key, value, metadata)
@@ -105,10 +96,8 @@ def test_real_sol_kernel_padding_and_sink(used, sink_tokens, compiled, thresh_ty
             value[:, :used].contiguous(),
             scale=0.125,
             tau=1.5,
-            thresh_type=thresh_type,
             kv_splits=1,
-            sink_start=0,
-            sink_tokens=sink_tokens,
+            exact_block_mask=blocks if sink_conditioning == "exact_kv_and_rows" else None,
         )
         reference = torch.nn.functional.scaled_dot_product_attention(
             query[:, :used].transpose(1, 2).float(),
@@ -116,12 +105,14 @@ def test_real_sol_kernel_padding_and_sink(used, sink_tokens, compiled, thresh_ty
             value[:, :used].transpose(1, 2).float(),
             scale=0.125,
         ).transpose(1, 2)
-    assert actual.shape == query.shape
-    assert torch.isfinite(actual).all()
+    assert actual.shape == query.shape and torch.isfinite(actual).all()
     assert torch.count_nonzero(actual[:, used:]) == 0
-    torch.testing.assert_close(actual[:, sink_tokens:used], upstream[:, sink_tokens:], rtol=0, atol=0)
-    compared_rows = used if used <= 64 else sink_tokens
-    torch.testing.assert_close(actual[:, :compared_rows].float(), reference[:, :compared_rows], rtol=0.02, atol=0.02)
+    torch.testing.assert_close(actual[:, :used], upstream, rtol=0, atol=0)
+    if sink_conditioning == "exact_kv_and_rows":
+        rows = blocks.repeat_interleave(64)[:used]
+        torch.testing.assert_close(actual[:, :used][:, rows].float(), reference[:, rows], rtol=0.02, atol=0.02)
+    elif used <= 64:
+        torch.testing.assert_close(actual[:, :used].float(), reference, rtol=0.02, atol=0.02)
     torch.compiler.reset()
 
 
@@ -129,7 +120,7 @@ def test_real_sol_kernel_padding_and_sink(used, sink_tokens, compiled, thresh_ty
 def test_real_sol_production_attention_entry():
     config = OmniDiffusionConfig(
         diffusion_attention_config={
-            "default": {"backend": "SOL_ATTN", "sol_attn": {"sink_mode": "prefix"}},
+            "default": {"backend": "SOL_ATTN", "sol_attn": {"sink_conditioning": "off"}},
             "per_role": {"minimax_h3.token_refiner": {"backend": "TORCH_SDPA"}},
         }
     )
@@ -159,7 +150,7 @@ def test_real_sol_production_attention_entry():
 
 @hardware_test(res={"cuda": ["L4", "H100", "B200", "RTX5090"]}, num_cards=1)
 def test_real_sol_compile_dynamic_sequence_without_explicit_length():
-    impl = SolAttnImpl(2, 128, 0.125, backend_kwargs={"sol_attn": {"sink_mode": "prefix"}})
+    impl = SolAttnImpl(2, 128, 0.125, backend_kwargs={"sol_attn": {"sink_conditioning": "off"}})
     forward = torch.compile(impl.forward_cuda, fullgraph=True, dynamic=True)
     metadata = AttentionMetadata()
     generator = torch.Generator(device="cuda").manual_seed(31)
@@ -176,14 +167,13 @@ def test_real_sol_compile_dynamic_sequence_without_explicit_length():
 
 
 @hardware_test(res={"cuda": ["L4", "H100", "B200", "RTX5090"]}, num_cards=1)
-@pytest.mark.parametrize("thresh_type", ["diag", "exact"])
+@pytest.mark.parametrize("sink_conditioning", ["off", "exact_kv_and_rows"])
 @pytest.mark.parametrize(
     "used,compiled,tau",
     [(63, False, 1e6), (257, False, 1e6), (513, True, 1e6), (513, False, 0.0), (513, True, 1.0), (513, False, 1.5)],
 )
 @torch.inference_mode()
-def test_real_sol_matches_hybrid_oracle(thresh_type, used, compiled, tau):
-    sink_mode = "text_audio"
+def test_real_sol_matches_hybrid_oracle(sink_conditioning, used, compiled, tau):
     from sol_attn.triton_ref.preprocess import prepare
 
     generator = torch.Generator(device="cuda").manual_seed(71)
@@ -195,13 +185,11 @@ def test_real_sol_matches_hybrid_oracle(thresh_type, used, compiled, tau):
     lengths = torch.tensor([0, used], device="cuda", dtype=torch.int32)
     metadata = AttentionMetadata(packed_padding=PackedPaddingMetadata(used, used, lengths, lengths))
     scale = 128**-0.5
-    sink_start, sink_tokens = min(70, used - 1), min(11, used - min(70, used - 1))
     blocks = (used + 63) // 64
     protected = [False] * blocks
-    if sink_mode == "text_audio":
-        sink_start, sink_tokens = 0, 0
+    if sink_conditioning == "exact_kv_and_rows":
         protected[0] = protected[-1] = True
-        metadata.text_audio_block_mask = TextAudioBlockMask(
+        metadata.conditioning_block_mask = ConditioningBlockMask(
             used, 64, torch.tensor(protected, device=query.device, dtype=torch.bool)
         )
         metadata.video_layout = VideoTokenLayout(prefix_len=used - 1, latent_grid=(1, 1, 1))
@@ -210,14 +198,8 @@ def test_real_sol_matches_hybrid_oracle(thresh_type, used, compiled, tau):
             "default": {
                 "backend": "SOL_ATTN",
                 "sol_attn": {
-                    "dense_steps": 0,
-                    "dense_layers": "",
-                    "prefix_sink": True,
-                    "sink_mode": sink_mode,
-                    "sink_start": sink_start,
-                    "sink_tokens": sink_tokens,
+                    "sink_conditioning": sink_conditioning,
                     "tau": tau,
-                    "thresh_type": thresh_type,
                 },
             }
         }
@@ -232,13 +214,12 @@ def test_real_sol_matches_hybrid_oracle(thresh_type, used, compiled, tau):
         value[:, :used].contiguous(),
         tau=tau,
         scale=scale,
-        thresh_type=thresh_type,
+        thresh_type="diag",
         tokens=used,
     )
     blocks = (used + 63) // 64
     assert torch.isfinite(threshold).all()
     expected = torch.empty_like(actual[:, :used], dtype=torch.float32)
-    first, last = sink_start // 64, (sink_start + sink_tokens + 63) // 64
     for query_block in range(blocks):
         query_start, query_stop = query_block * 64, min((query_block + 1) * 64, used)
         query_mean = query[:, query_start:query_stop].float().mean(1)
@@ -247,13 +228,7 @@ def test_real_sol_matches_hybrid_oracle(thresh_type, used, compiled, tau):
             start, stop = key_block * 64, min((key_block + 1) * 64, used)
             score = (query_mean * key_centroids[:, key_block].float()).sum(-1) * (scale * math.log2(math.e))
             exact = score > threshold[:, query_block]
-            if (
-                abs(query_block - key_block) <= 1
-                or first <= key_block < last
-                or first <= query_block < last
-                or protected[query_block]
-                or protected[key_block]
-            ):
+            if abs(query_block - key_block) <= 1 or protected[query_block] or protected[key_block]:
                 exact = torch.ones_like(exact)
             exact = exact[:, None, :, None]
             hybrid_keys.append(
@@ -286,7 +261,7 @@ def test_real_sol_defaults_match_explicit_text_audio_profile():
         torch.randn(1, 257, 2, 128, device="cuda", dtype=torch.bfloat16, generator=generator) for _ in range(3)
     )
     metadata = AttentionMetadata(
-        text_audio_block_mask=TextAudioBlockMask(
+        conditioning_block_mask=ConditioningBlockMask(
             257, 64, torch.tensor([True, False, False, False, True], device="cuda", dtype=torch.bool)
         )
     )
@@ -295,14 +270,14 @@ def test_real_sol_defaults_match_explicit_text_audio_profile():
         2,
         128,
         128**-0.5,
-        backend_kwargs={"sol_attn": {"sink_mode": "text_audio", "dense_steps": 0, "dense_layers": []}},
+        backend_kwargs={"sol_attn": {"sink_conditioning": "exact_kv_and_rows"}},
     )
     actual = default.forward_cuda(query, key, value, metadata)
     expected = explicit.forward_cuda(query, key, value, metadata)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
-def _ulysses_worker(rank, init_method, sink_mode, world_size=2):
+def _ulysses_worker(rank, init_method, sink_conditioning, world_size=2):
     from vllm_omni.diffusion.distributed.parallel_state import (
         destroy_distributed_env,
         init_distributed_environment,
@@ -320,9 +295,7 @@ def _ulysses_worker(rank, init_method, sink_mode, world_size=2):
                 "default": {
                     "backend": "SOL_ATTN",
                     "sol_attn": {
-                        "dense_steps": 0,
-                        "dense_layers": [],
-                        "sink_mode": sink_mode,
+                        "sink_conditioning": sink_conditioning,
                     },
                 }
             },
@@ -339,7 +312,7 @@ def _ulysses_worker(rank, init_method, sink_mode, world_size=2):
             metadata = AttentionMetadata(
                 packed_padding=PackedPaddingMetadata(257, 257, lengths, lengths),
                 video_layout=VideoTokenLayout(prefix_len=5, latent_grid=(1, 12, 21)),
-                text_audio_block_mask=TextAudioBlockMask(
+                conditioning_block_mask=ConditioningBlockMask(
                     257, 64, torch.tensor([True, False, False, False, True], device=device, dtype=torch.bool)
                 ),
             )
@@ -355,18 +328,22 @@ def _ulysses_worker(rank, init_method, sink_mode, world_size=2):
 
 
 @hardware_test(res={"cuda": ["L4", "H100", "B200", "RTX5090"]}, num_cards=2)
-@pytest.mark.parametrize("sink_mode", ["prefix", "text_audio"])
-def test_real_sol_ulysses_matches_local(tmp_path, sink_mode):
+@pytest.mark.parametrize("sink_conditioning", ["off", "exact_kv_and_rows"])
+def test_real_sol_ulysses_matches_local(tmp_path, sink_conditioning):
     if torch.accelerator.device_count() < 2:
         pytest.skip("Requires two CUDA GPUs")
-    torch.multiprocessing.spawn(_ulysses_worker, args=(f"file://{tmp_path / 'rendezvous'}", sink_mode), nprocs=2)
+    torch.multiprocessing.spawn(
+        _ulysses_worker, args=(f"file://{tmp_path / 'rendezvous'}", sink_conditioning), nprocs=2
+    )
 
 
 @hardware_test(res={"cuda": ["H100", "B200", "RTX5090"]}, num_cards=4)
 def test_real_text_audio_sol_sp4_matches_local(tmp_path):
     if torch.accelerator.device_count() < 4:
         pytest.skip("Requires four CUDA GPUs")
-    torch.multiprocessing.spawn(_ulysses_worker, args=(f"file://{tmp_path / 'rendezvous'}", "text_audio", 4), nprocs=4)
+    torch.multiprocessing.spawn(
+        _ulysses_worker, args=(f"file://{tmp_path / 'rendezvous'}", "exact_kv_and_rows", 4), nprocs=4
+    )
 
 
 @hardware_test(res={"cuda": ["H100", "B200", "RTX5090"]}, num_cards=1)
@@ -411,7 +388,8 @@ def test_real_sol_h3_simple_selection_and_forward(tmp_path, selection):
             assert isinstance(main.attn.attention.attention, SolAttnImpl)
             assert refiner.attn.attention.attn_backend.get_name() == "SDPA"
             assert refiner.attn.attention.skip_sequence_parallel
-            assert main.attn.attention.attention.config.sink_mode == "text_audio"
+            assert main.attn.attention.attention.config.sink_conditioning == "exact_kv_and_rows"
+            assert main.attn.attention.attention.requires_conditioning_mask
             models.append((main.eval(), refiner.eval()))
         with torch.inference_mode():
             generator = torch.Generator(device="cuda").manual_seed(79)
@@ -422,14 +400,16 @@ def test_real_sol_h3_simple_selection_and_forward(tmp_path, selection):
                 manual.load_state_dict(automatic.state_dict())
             inputs = torch.randn(257, 256, device="cuda", dtype=torch.bfloat16, generator=generator)
             lengths = torch.tensor([0, 257], device="cuda", dtype=torch.int32)
-            mask = TextAudioBlockMask(257, 64, torch.tensor([True, False, False, False, False], device="cuda"))
+            mask = ConditioningBlockMask(257, 64, torch.tensor([True, False, False, False, False], device="cuda"))
             outputs = []
             for settings, (main, refiner) in zip((config, explicit), models):
                 with set_forward_context(omni_diffusion_config=settings):
                     main_output = main.attn(
-                        inputs, rope_table=None, cu_seqlens=lengths, max_seqlen=257, text_audio_block_mask=mask
+                        inputs, rope_table=None, cu_seqlens=lengths, max_seqlen=257, conditioning_block_mask=mask
                     )
                     refiner_output = refiner(inputs, cu_seqlens=lengths, max_seqlen=257)
+                    with pytest.raises(ValueError, match="conditioning_block_mask"):
+                        main.attn(inputs, rope_table=None, cu_seqlens=lengths, max_seqlen=257)
                 assert torch.isfinite(main_output).all() and torch.isfinite(refiner_output).all()
                 outputs.append((main_output, refiner_output))
             for automatic, manual in zip(outputs[0], outputs[1]):
@@ -455,30 +435,32 @@ def test_real_sol_wan_transformer_forward(tmp_path, monkeypatch):
     initialize_model_parallel()
     try:
         dense_backend = "CUDNN_ATTN" if current_omni_platform.get_device_capability().major == 12 else "TORCH_SDPA"
-        configs = {
-            backend: OmniDiffusionConfig(
+        configs = {}
+        for backend in (dense_backend, "SOL_ATTN"):
+            configs[backend] = OmniDiffusionConfig(
                 diffusion_attention_config={
                     "default": {"backend": "TORCH_SDPA"},
-                    "per_role": {
-                        "self": {
-                            "backend": backend,
-                            **(
-                                {
+                    "per_role": {"self": {"backend": dense_backend}},
+                },
+                diffusion_attention_schedule={
+                    "profiles": {
+                        "sparse": {
+                            "default": {"backend": "TORCH_SDPA"},
+                            "per_role": {
+                                "self": {
+                                    "backend": "SOL_ATTN",
                                     "sol_attn": {
-                                        "sink_mode": "prefix",
-                                        "dense_steps": 10,
-                                        "dense_layers": "0,1",
-                                    }
+                                        "dense_blocks": "0,1",
+                                    },
                                 }
-                                if backend == "SOL_ATTN"
-                                else {}
-                            ),
+                            },
                         }
                     },
+                    "default": [{"start": 10, "end": None, "profile": "sparse"}],
                 }
+                if backend == "SOL_ATTN"
+                else None,
             )
-            for backend in (dense_backend, "SOL_ATTN")
-        }
         models = {}
         for backend, config in configs.items():
             with set_current_diffusion_config(config), set_forward_context(omni_diffusion_config=config):
@@ -522,7 +504,11 @@ def test_real_sol_wan_transformer_forward(tmp_path, monkeypatch):
                 with (
                     torch.inference_mode(),
                     set_forward_context(omni_diffusion_config=configs[backend], denoise_step_idx=step),
+                    bind_attention_schedule(
+                        configs[backend].diffusion_attention_schedule.default if backend == "SOL_ATTN" else None
+                    ),
                 ):
+                    get_forward_context().total_denoise_steps = 11
                     output = model(latents, timestep, text, return_dict=False)[0]
                 assert output.shape == latents.shape and torch.isfinite(output).all()
                 outputs[backend, step] = output

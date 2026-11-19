@@ -15,10 +15,7 @@ if not hasattr(torch.ops.vllm_omni, "sol_attention"):
         value: torch.Tensor,
         scale: float,
         tau: float,
-        thresh_type: str,
         kv_splits: int,
-        sink_start: int,
-        sink_tokens: int,
         exact_block_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         from sol_attn import sol_attn
@@ -29,10 +26,8 @@ if not hasattr(torch.ops.vllm_omni, "sol_attention"):
             value,
             scale=scale,
             tau=tau,
-            thresh_type=thresh_type,
+            thresh_type="diag",
             kv_splits=kv_splits,
-            sink_start=sink_start,
-            sink_tokens=sink_tokens,
             exact_block_mask=exact_block_mask,
         )
 
@@ -43,10 +38,7 @@ if not hasattr(torch.ops.vllm_omni, "sol_attention"):
         value: torch.Tensor,
         scale: float,
         tau: float,
-        thresh_type: str,
         kv_splits: int,
-        sink_start: int,
-        sink_tokens: int,
         exact_block_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         return torch.empty_like(query)

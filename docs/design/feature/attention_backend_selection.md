@@ -138,11 +138,11 @@ the model's top-k policy. Startup checks and execution use the same provider
 resolution path.
 
 SOL delegates routing and omitted-block approximation directly to the upstream
-Sol-Attn kernel. H3 supplies a global block64 `TextAudioBlockMask`
+Sol-Attn kernel. H3 supplies a global block64 `ConditioningBlockMask`
 matching the valid sequence length; it is passed as upstream `exact_block_mask`
 so marked Q rows and KV columns stay exact in the fused kernel. There is no SOL
 provider switch or separate BSA/residual composition in Omni.
-Missing or stale metadata fails explicitly. `PackedPaddingMetadata` excludes
+Missing required conditioning metadata or stale supplied metadata fails explicitly. `PackedPaddingMetadata` excludes
 structural suffix padding before attention. See the
 [SOL guide](../../user_guide/diffusion/attention_backends/sol_attn.md) for defaults,
 supported execution modes, and limitations.
@@ -151,10 +151,24 @@ SOL resolves `dense_blocks` and ordered `tau_profile` rules once at layer
 construction. Relative block indices require the model-owned `layer_count` of
 that attention stack; they are never inferred from checkpoint names. H3's DiT
 and token-refiner stacks supply their own counts. Base and scheduled
-implementations receive the same count. The legacy `dense_layers` selector
-retains its non-negative-index contract and cannot be combined with non-empty
-`dense_blocks`. `min_tokens` compares the valid sequence length after removing
+implementations receive the same count. `min_tokens` compares the valid sequence length after removing
 structural padding; capability reporting and execution use the same guard.
+SOL exposes only `tau`, `tau_profile`, `dense_blocks`, `min_tokens`, and
+`sink_conditioning`. The latter defaults to `exact_kv_and_rows`; `off` is an
+explicit opt-out of model-owned conditioning protection. `exact_kv` is rejected
+because the current kernel cannot protect KV columns without also protecting
+Q rows. Threshold selection and KV splitting are internal; denoising windows
+use the shared schedule owner, with no SOL-specific step counter.
+
+SOL consumes the model-independent `ConditioningBlockMask`, optionally built
+from a valid-token Boolean mask by `from_token_mask`. An ordinary stack with
+no conditioning metadata uses SOL without protection. A model declares
+`requires_conditioning_mask=True` when omitting that metadata would change its
+protection contract; this declaration and `layer_count` reach both base and
+scheduled implementations. H3 is the only adapter added in this change and
+requires its text/audio protection by default. Protection does not express
+causal or pairwise visibility; existing attention masks retain their separate
+semantics and SOL capability restrictions.
 
 Qwen-Image-2.1 publishes a zero-based denoising index in
 `ForwardContext.denoise_step_idx` before running the transformer. Both CFG

@@ -12,10 +12,8 @@ from vllm.platforms.interface import DeviceCapability
 import vllm_omni.diffusion.attention.backends.sol_attn as sol_module
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
+    ConditioningBlockMask,
     PackedPaddingMetadata,
-    TextAudioBlockMask,
-    VideoTokenLayout,
-    VideoTokenSpan,
 )
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.diffusion.attention.backends.sol_attn import SolAttnBackend, SolAttnImpl
@@ -61,9 +59,16 @@ def kernel(monkeypatch):
     return calls
 
 
-def make_impl(**options):
-    settings = {"sink_mode": "prefix", "dense_steps": 0, "dense_layers": "", **options}
-    return SolAttnImpl(2, 128, 0.125, prefix="blocks.4.attention", backend_kwargs={"sol_attn": settings})
+def make_impl(*, requires_conditioning_mask=False, **options):
+    settings = {"sink_conditioning": "off", **options}
+    return SolAttnImpl(
+        2,
+        128,
+        0.125,
+        prefix="blocks.4.attention",
+        requires_conditioning_mask=requires_conditioning_mask,
+        backend_kwargs={"sol_attn": settings},
+    )
 
 
 def tensors():
@@ -104,16 +109,23 @@ def test_old_upstream_package_fails_dependency_preflight(kernel, monkeypatch):
 
 def test_per_role_configuration_round_trip(kernel):
     config = AttentionConfig(
-        per_role={"self": {"backend": "SOL_ATTN", "sol_attn": {"tau": 1.5, "dense_layers": "0-2,5"}}}
+        per_role={"self": {"backend": "SOL_ATTN", "sol_attn": {"tau": 1.5, "dense_blocks": "0-2,4"}}}
     )
     spec, _ = config.resolve_with_source("self")
     restored = SolAttnSpec(**spec.backend_kwargs()["sol_attn"])
-    assert restored.tau == 1.5 and restored.prefix_sink
-    assert make_impl(**spec.backend_kwargs()["sol_attn"]).dense_layers == {0, 1, 2, 5}
+    assert restored.tau == 1.5 and restored.sink_conditioning == "exact_kv_and_rows"
+    assert make_impl(**spec.backend_kwargs()["sol_attn"]).dense_block
+    assert set(spec.backend_kwargs()["sol_attn"]) == {
+        "tau",
+        "tau_profile",
+        "dense_blocks",
+        "min_tokens",
+        "sink_conditioning",
+    }
     nested = AttentionConfig(
-        per_role={"minimax_h3": {"token_refiner": {"backend": "SOL_ATTN", "sol_attn": {"dense_layers": 0}}}}
+        per_role={"minimax_h3": {"token_refiner": {"backend": "SOL_ATTN", "sol_attn": {"dense_blocks": "0"}}}}
     )
-    assert nested.per_role["minimax_h3.token_refiner"].sol_attn.dense_layers == [0]
+    assert nested.per_role["minimax_h3.token_refiner"].sol_attn.dense_blocks == "0"
     with pytest.raises(ValueError, match="only supported"):
         AttentionSpec(backend="FLASH_ATTN", sol_attn={})
 
@@ -188,7 +200,7 @@ def test_layer_tuning_round_trip_and_last_rule_wins(kernel):
         "min_tokens": 10,
         "dense_blocks": "0-2,-1",
         "tau_profile": "0-4=2.0;3-4=0.8 # sensitive layers\n4=0.6",
-        "sink_mode": "prefix",
+        "sink_conditioning": "off",
     }
     spec = AttentionSpec(backend="SOL_ATTN", sol_attn=settings)
     restored = SolAttnSpec(**spec.backend_kwargs()["sol_attn"])
@@ -261,54 +273,34 @@ def test_partial_sequence_parallelism_fails_at_construction(monkeypatch, attribu
         make_impl()
 
 
-@pytest.mark.parametrize("capability", [DeviceCapability(8, 0), DeviceCapability(10, 0), DeviceCapability(12, 0)])
-@pytest.mark.parametrize("kv_splits", [2, 4])
-def test_split_kv_is_rejected_outside_hopper(monkeypatch, capability, kv_splits):
-    monkeypatch.setattr(sol_module.current_omni_platform, "get_device_capability", lambda: capability)
-    with pytest.raises(ValueError, match="SM90"):
-        make_impl(kv_splits=kv_splits)
-
-
-@pytest.mark.parametrize("capability", [DeviceCapability(9, 0), DeviceCapability(10, 0), DeviceCapability(12, 0)])
-@pytest.mark.parametrize("kv_splits", ["auto", 1])
-def test_hopper_and_blackwell_single_split_configuration(monkeypatch, capability, kv_splits):
+@pytest.mark.parametrize(
+    "capability", [DeviceCapability(8, 0), DeviceCapability(9, 0), DeviceCapability(10, 0), DeviceCapability(12, 0)]
+)
+def test_missing_cute_or_non_hopper_uses_one_split(monkeypatch, capability):
     monkeypatch.setattr(sol_module.current_omni_platform, "get_device_capability", lambda: capability)
     monkeypatch.setitem(sys.modules, "cutlass.cute", None)
-    impl = make_impl(kv_splits=kv_splits)
-    assert impl.kv_splits == 1
-    assert impl._resolve_kv_splits(65536) == 1
+    impl = make_impl()
+    assert impl._resolve_kv_splits(65535) == impl._resolve_kv_splits(65536) == 1
     expected_dense = sol_module.CuDNNAttentionImpl if capability.major == 12 else sol_module.SDPAImpl
     assert isinstance(impl.dense_attention, expected_dense)
 
 
-@pytest.mark.parametrize("kv_splits", ["auto", 1, 2, 4])
-def test_hopper_split_resolution_matches_upstream_policy(monkeypatch, kernel, kv_splits):
+def test_hopper_split_resolution_is_automatic(monkeypatch, kernel):
     monkeypatch.setattr(sol_module.current_omni_platform, "get_device_capability", lambda: DeviceCapability(9, 0))
     for name in ("cuda", "cuda.bindings", "cuda.bindings.driver", "cutlass", "cutlass.cute"):
         monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
-    impl = make_impl(kv_splits=kv_splits)
+    impl = make_impl()
     for used in (65535, 65536):
-        expected = (4 if used >= 65536 else 1) if kv_splits == "auto" else kv_splits
+        expected = 4 if used >= 65536 else 1
         assert impl._resolve_kv_splits(used) == expected
         query, key, value = (torch.zeros(1, used, 1, 128, dtype=torch.bfloat16) for _ in range(3))
         impl.forward_cuda(query, key, value)
         assert kernel[-1][3]["kv_splits"] == expected
-    if kv_splits in (2, 4):
-        with pytest.raises(ValueError, match="route group"):
-            impl._resolve_kv_splits(64)
 
 
-@pytest.mark.parametrize("kv_splits", [2, 4])
-def test_explicit_hopper_splits_require_cute(monkeypatch, kv_splits):
-    monkeypatch.setattr(sol_module.current_omni_platform, "get_device_capability", lambda: DeviceCapability(9, 0))
-    monkeypatch.setitem(sys.modules, "cutlass.cute", None)
-    with pytest.raises(ImportError, match="CuTe"):
-        make_impl(kv_splits=kv_splits)
-
-
-def test_sparse_forward_trims_padding_and_keeps_sink_queries_dense(kernel):
+def test_sparse_forward_trims_padding_and_uses_internal_kernel_policy(kernel):
     query, key, value = tensors()
-    output = make_impl(sink_tokens=3, sink_start=2).forward_cuda(query, key, value, packed())
+    output = make_impl().forward_cuda(query, key, value, packed())
     assert len(kernel) == 1
     called_query, called_key, called_value, options = kernel[0]
     assert called_query.shape == (1, 9, 2, 128)
@@ -319,20 +311,17 @@ def test_sparse_forward_trims_padding_and_keeps_sink_queries_dense(kernel):
         "tau": 1.0,
         "thresh_type": "diag",
         "kv_splits": 1,
-        "sink_start": 2,
-        "sink_tokens": 3,
         "exact_block_mask": None,
     }
-    torch.testing.assert_close(output[:, 2:5], dense(query[:, 2:5], key[:, :9], value[:, :9]))
-    assert torch.all(output[:, :2] == 37) and torch.all(output[:, 5:9] == 37)
+    assert torch.all(output[:, :9] == 37)
     assert torch.count_nonzero(output[:, 9:]) == 0
 
 
-@pytest.mark.parametrize("dense_steps", [0, 10])
-def test_batch_dimension_is_never_flattened_into_one_document(kernel, dense_steps):
+@pytest.mark.parametrize("min_tokens", [0, 100])
+def test_batch_dimension_is_never_flattened_into_one_document(kernel, min_tokens):
     query, key, value = (tensor.repeat(2, 1, 1, 1) for tensor in tensors())
     with pytest.raises(ValueError, match="single nonempty sequence"):
-        make_impl(dense_steps=dense_steps).forward_cuda(query, key, value)
+        make_impl(min_tokens=min_tokens).forward_cuda(query, key, value)
     assert kernel == []
 
 
@@ -378,52 +367,9 @@ def test_incompatible_kernel_cannot_silently_drop_sink_options(kernel, monkeypat
         return torch.empty_like(query)
 
     monkeypatch.setattr(sys.modules["sol_attn"], "sol_attn", legacy_kernel)
-    with pytest.raises(TypeError, match="sink_start"):
-        make_impl(sink_tokens=3).forward_cuda(*tensors())
+    with pytest.raises(TypeError, match="exact_block_mask"):
+        make_impl().forward_cuda(*tensors())
     assert calls == []
-
-
-@pytest.mark.parametrize(
-    "video_layout,prefix",
-    [
-        (VideoTokenLayout(prefix_len=3, latent_grid=(1, 2, 3)), 3),
-        (
-            VideoTokenLayout(
-                used_len=9,
-                video_spans=(VideoTokenSpan(2, (1, 1, 2), "reference"), VideoTokenSpan(6, (1, 1, 3), "target")),
-            ),
-            6,
-        ),
-    ],
-)
-def test_model_owned_prefix_protects_audio_and_references(kernel, video_layout, prefix):
-    query, key, value = tensors()
-    metadata = replace(packed(), video_layout=video_layout)
-    output = make_impl().forward_cuda(query, key, value, metadata)
-    assert kernel[0][3]["sink_tokens"] == prefix
-    torch.testing.assert_close(output[:, :prefix], dense(query[:, :prefix], key[:, :9], value[:, :9]))
-
-
-@pytest.mark.parametrize("start,tokens,expected", [(None, 3, (6, 3)), (99, 4, (9, 0)), (7, 9, (7, 2))])
-def test_sink_range_clamps_without_changing_tail_semantics(kernel, start, tokens, expected):
-    query, key, value = tensors()
-    make_impl(sink_start=start, sink_tokens=tokens).forward_cuda(query, key, value, packed())
-    options = kernel[0][3]
-    assert (options["sink_start"], options["sink_tokens"]) == expected
-
-
-def test_out_of_bounds_sink_does_not_expand_video_prefix(kernel):
-    query, key, value = tensors()
-    metadata = replace(packed(), video_layout=VideoTokenLayout(prefix_len=3, latent_grid=(1, 2, 3)))
-    impl = make_impl(sink_start=999, sink_tokens=4)
-    result = impl.resolve_execution_path(ExecutionContext(platform="cuda"), query, key, value, metadata)
-    assert result.path == "sol_sparse"
-    output = impl.forward_cuda(query, key, value, metadata)
-    assert kernel[0][3]["sink_start"] == 0
-    assert kernel[0][3]["sink_tokens"] == 3
-    torch.testing.assert_close(output[:, :3], dense(query[:, :3], key[:, :9], value[:, :9]))
-    assert torch.all(output[:, 3:9] == 37)
-    assert torch.count_nonzero(output[:, 9:]) == 0
 
 
 @pytest.mark.parametrize("metadata", [None, AttentionMetadata()])
@@ -439,7 +385,7 @@ def test_compile_dynamic_sequence_without_explicit_length(kernel, metadata):
     torch.compiler.reset()
 
 
-@pytest.mark.parametrize("options", [{"dense_steps": 10}, {"dense_layers": "4"}, {"sink_tokens": 999}])
+@pytest.mark.parametrize("options", [{"min_tokens": 10}, {"dense_blocks": "4"}])
 def test_dense_guard_uses_only_valid_rows(kernel, options):
     query, key, value = tensors()
     output = make_impl(**options).forward_cuda(query, key, value, packed())
@@ -449,13 +395,31 @@ def test_dense_guard_uses_only_valid_rows(kernel, options):
 
 
 @pytest.mark.parametrize("compiled", [False, True])
-def test_denoise_step_switches_actual_execution(kernel, compiled):
+def test_shared_schedule_switches_sol_without_backend_step_knobs(kernel, monkeypatch, compiled):
+    import vllm_omni.diffusion.attention.layer as layer_module
+    from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.forward_context import bind_attention_schedule, get_forward_context
+
+    monkeypatch.setattr(layer_module, "build_parallel_attention_strategy", lambda **kwargs: NoParallelAttention())
+    config = OmniDiffusionConfig(
+        diffusion_attention_config={"default": {"backend": "TORCH_SDPA"}},
+        diffusion_attention_schedule={
+            "profiles": {"sparse": {"default": {"backend": "SOL_ATTN", "sol_attn": {"sink_conditioning": "off"}}}},
+            "default": [{"start": 2, "end": None, "profile": "sparse"}],
+        },
+    )
     torch.compiler.reset()
+    with set_current_diffusion_config(config):
+        attention = layer_module.Attention(2, 128, False, 0.125, prefix="blocks.4.attention")
+    forward = torch.compile(attention, backend="aot_eager", fullgraph=True) if compiled else attention
     query, key, value = tensors()
-    impl = make_impl(dense_steps=2)
-    forward = torch.compile(impl.forward_cuda, backend="aot_eager", fullgraph=True) if compiled else impl.forward_cuda
-    with set_forward_context(omni_diffusion_config=None):
-        context = sol_module.get_forward_context()
+    with (
+        set_forward_context(omni_diffusion_config=config),
+        bind_attention_schedule(config.diffusion_attention_schedule.default),
+    ):
+        context = get_forward_context()
+        context.total_denoise_steps = 3
         for step in (1, 2, 0):
             context.denoise_step_idx = step
             output = forward(query, key, value)
@@ -482,15 +446,15 @@ def test_denoise_step_switches_actual_execution(kernel, compiled):
 )
 def test_invalid_metadata_fails_before_dense_or_sparse(kernel, metadata):
     with pytest.raises(ValueError, match="SOL_ATTN"):
-        make_impl(dense_steps=10).forward_cuda(*tensors(), metadata)
+        make_impl(min_tokens=100).forward_cuda(*tensors(), metadata)
     assert kernel == []
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
-def test_wrong_dtype_is_rejected_during_dense_warmup(dtype):
+def test_wrong_dtype_is_rejected_during_dense_guard(dtype):
     query, key, value = (tensor.to(dtype) for tensor in tensors())
     with pytest.raises(TypeError, match="BF16"):
-        make_impl(dense_steps=10).forward_cuda(query, key, value)
+        make_impl(min_tokens=100).forward_cuda(query, key, value)
 
 
 @pytest.mark.parametrize("strategy", list(ParallelStrategy))
@@ -516,10 +480,10 @@ def test_capability_rejects_masked_and_multidocument_contexts():
         )
 
 
-def test_compile_captures_sparse_op_padding_and_dense_sink(kernel):
+def test_compile_captures_sparse_op_and_padding(kernel):
     torch.compiler.reset()
     query, key, value = tensors()
-    impl = make_impl(sink_tokens=3)
+    impl = make_impl()
     expected = impl.forward_cuda(query, key, value, packed())
     compiled = torch.compile(impl.forward_cuda, backend="aot_eager", fullgraph=True)
     torch.testing.assert_close(compiled(query, key, value, packed()), expected)
@@ -548,45 +512,80 @@ def test_sol_defaults_use_upstream_text_audio(kernel, options):
     spec, _ = config.resolve_with_source("self")
     impl = SolAttnImpl(2, 128, 0.125, backend_kwargs=spec.backend_kwargs())
     assert "provider" not in vars(impl.config)
-    assert impl.config.sink_mode == "text_audio"
-    assert impl.config.tau == 1.0 and impl.config.thresh_type == "diag"
-    assert impl.config.dense_steps == 0 and impl.dense_layers == set()
+    assert impl.config.sink_conditioning == "exact_kv_and_rows"
+    assert impl.config.tau == 1.0
+    assert impl.config.min_tokens == 0 and not impl.dense_block
     assert impl._resolve_kv_splits(65536) == 1
     refiner, _ = config.resolve_with_source("minimax_h3.token_refiner")
     assert refiner.backend == "TORCH_SDPA"
-    with pytest.raises(ValueError, match="text_audio_block_mask"):
-        impl.forward_cuda(*tensors(), packed())
+    output = impl.forward_cuda(*tensors(), packed())
+    assert torch.all(output[:, :9] == 37)
+    assert kernel[-1][3]["exact_block_mask"] is None
+    required = SolAttnImpl(2, 128, 0.125, requires_conditioning_mask=True, backend_kwargs=spec.backend_kwargs())
+    with pytest.raises(ValueError, match="conditioning_block_mask"):
+        required.forward_cuda(*tensors(), packed())
 
 
-def test_sol_default_layer_selectors_are_independent():
-    first, second = SolAttnSpec(), SolAttnSpec()
-    assert isinstance(first.dense_layers, list)
-    first.dense_layers.append(1)
-    assert second.dense_layers == []
+@pytest.mark.parametrize(
+    "option,value",
+    [
+        ("thresh_type", "diag"),
+        ("kv_splits", "auto"),
+        ("dense_steps", 0),
+        ("dense_layers", "0,1"),
+        ("sink_mode", "text_audio"),
+        ("sink_tokens", 0),
+        ("sink_start", 0),
+        ("prefix_sink", True),
+    ],
+)
+def test_removed_public_options_are_rejected(option, value):
+    with pytest.raises(TypeError, match=option):
+        AttentionSpec(backend="SOL_ATTN", sol_attn={option: value})
 
 
-@pytest.mark.parametrize("dense_steps", [0, 10])
+@pytest.mark.parametrize("mode", ["exact_kv", "text_audio", "prefix", True, None])
+def test_unsupported_conditioning_modes_fail_at_startup(mode):
+    with pytest.raises(ValueError, match="sink_conditioning"):
+        AttentionSpec(backend="SOL_ATTN", sol_attn={"sink_conditioning": mode})
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_conditioning_off_does_not_forward_model_protection(kernel, compiled):
+    torch.compiler.reset()
+    metadata = packed()
+    metadata.conditioning_block_mask = ConditioningBlockMask(9, 64, torch.ones(1, dtype=torch.bool))
+    impl = make_impl(sink_conditioning="off")
+    forward = torch.compile(impl.forward_cuda, backend="aot_eager", fullgraph=True) if compiled else impl.forward_cuda
+    result = forward(*tensors(), metadata)
+    assert torch.all(result[:, :9] == 37)
+    assert kernel[-1][3]["exact_block_mask"] is None
+    assert torch.count_nonzero(result[:, 9:]) == 0
+    torch.compiler.reset()
+
+
+@pytest.mark.parametrize("min_tokens", [0, 100])
 @pytest.mark.parametrize(
     "protection",
     [
         None,
-        TextAudioBlockMask(8, 64, torch.ones(1, dtype=torch.bool)),
-        TextAudioBlockMask(9, 32, torch.ones(1, dtype=torch.bool)),
-        TextAudioBlockMask(9, 64, torch.ones(2, dtype=torch.bool)),
-        TextAudioBlockMask(9, 64, torch.ones(1)),
-        TextAudioBlockMask(9, 64, torch.ones(1, 1, dtype=torch.bool)),
-        TextAudioBlockMask(9, 64, torch.ones(1, dtype=torch.bool, device="meta")),
-        TextAudioBlockMask(9.0, 64, torch.ones(1, dtype=torch.bool)),
-        TextAudioBlockMask(9, 64.0, torch.ones(1, dtype=torch.bool)),
+        ConditioningBlockMask(8, 64, torch.ones(1, dtype=torch.bool)),
+        ConditioningBlockMask(9, 32, torch.ones(1, dtype=torch.bool)),
+        ConditioningBlockMask(9, 64, torch.ones(2, dtype=torch.bool)),
+        ConditioningBlockMask(9, 64, torch.ones(1)),
+        ConditioningBlockMask(9, 64, torch.ones(1, 1, dtype=torch.bool)),
+        ConditioningBlockMask(9, 64, torch.ones(1, dtype=torch.bool, device="meta")),
+        ConditioningBlockMask(9.0, 64, torch.ones(1, dtype=torch.bool)),
+        ConditioningBlockMask(9, 64.0, torch.ones(1, dtype=torch.bool)),
     ],
 )
-def test_text_audio_rejects_missing_or_stale_metadata(kernel, protection, dense_steps):
+def test_text_audio_rejects_missing_or_stale_metadata(kernel, protection, min_tokens):
     metadata = packed()
-    metadata.text_audio_block_mask = protection
-    impl = make_impl(sink_mode="text_audio", dense_steps=dense_steps)
+    metadata.conditioning_block_mask = protection
+    impl = make_impl(sink_conditioning="exact_kv_and_rows", min_tokens=min_tokens, requires_conditioning_mask=True)
     result = impl.resolve_execution_path(ExecutionContext(platform="cuda"), *tensors(), metadata)
     assert result.support.status is SupportStatus.UNSUPPORTED
-    with pytest.raises(ValueError, match="text_audio"):
+    with pytest.raises(ValueError, match="conditioning"):
         impl.forward_cuda(*tensors(), metadata)
     assert kernel == []
 
@@ -600,7 +599,7 @@ def test_text_audio_runs_upstream_for_all_fifty_steps(kernel, monkeypatch, layer
         prefix=f"blocks.{layer_index}.attention",
     )
     metadata = packed()
-    metadata.text_audio_block_mask = TextAudioBlockMask(9, 64, torch.ones(1, dtype=torch.bool))
+    metadata.conditioning_block_mask = ConditioningBlockMask(9, 64, torch.ones(1, dtype=torch.bool))
 
     def unexpected_dense(*args):
         pytest.fail("Explicit all-step/all-layer profile must not invoke a dense guard")
@@ -613,14 +612,14 @@ def test_text_audio_runs_upstream_for_all_fifty_steps(kernel, monkeypatch, layer
             assert result.path == "sol_sparse"
             impl.forward_cuda(*tensors(), metadata)
     assert len(kernel) == 50
-    assert all(call[3]["exact_block_mask"] is metadata.text_audio_block_mask.blocks for call in kernel)
+    assert all(call[3]["exact_block_mask"] is metadata.conditioning_block_mask.blocks for call in kernel)
 
 
 def test_text_audio_rejects_noncontiguous_block_mask(kernel):
     query = torch.zeros(1, 129, 2, 128, dtype=torch.bfloat16)
     metadata = packed(129)
-    metadata.text_audio_block_mask = TextAudioBlockMask(129, 64, torch.ones(6, dtype=torch.bool)[::2])
-    impl = make_impl(sink_mode="text_audio")
+    metadata.conditioning_block_mask = ConditioningBlockMask(129, 64, torch.ones(6, dtype=torch.bool)[::2])
+    impl = make_impl(sink_conditioning="exact_kv_and_rows")
     with pytest.raises(ValueError, match="contiguous"):
         impl.forward_cuda(query, query, query, metadata)
 
@@ -631,7 +630,7 @@ def test_disjoint_text_audio_mask_is_forwarded_without_dense_recomputation(kerne
     used = 513
     query, key, value = (torch.randn(1, used + 17, 2, 128, dtype=torch.bfloat16) for _ in range(3))
     blocks = torch.tensor([True, False, False, False, True, False, False, False, True])
-    metadata = replace(packed(used), text_audio_block_mask=TextAudioBlockMask(used, 64, blocks))
+    metadata = replace(packed(used), conditioning_block_mask=ConditioningBlockMask(used, 64, blocks))
     impl = SolAttnImpl(2, 128, 0.125)
 
     def unexpected_dense(*args):
@@ -647,6 +646,34 @@ def test_disjoint_text_audio_mask_is_forwarded_without_dense_recomputation(kerne
         assert actual[:, used:].count_nonzero() == 0
         options = kernel[-1][3]
         assert options["exact_block_mask"] is blocks
-        assert options["sink_start"] == options["sink_tokens"] == 0
+        assert "sink_start" not in options and "sink_tokens" not in options
         assert kernel[-1][0].shape[1] == used
     torch.compiler.reset()
+
+
+@pytest.mark.parametrize(
+    "positions,expected",
+    [([], [False, False, False]), ([0, 63], [True, False, False]), ([64, 128], [False, True, True])],
+)
+def test_generic_conditioning_builder_handles_disjoint_and_partial_blocks(positions, expected):
+    tokens = torch.zeros(129, dtype=torch.bool)
+    tokens[positions] = True
+    protection = ConditioningBlockMask.from_token_mask(tokens)
+    assert protection.used_len == 129 and protection.block_size == 64
+    assert protection.blocks.tolist() == expected
+    assert protection.blocks.is_contiguous()
+    assert protection.blocks.device == tokens.device
+
+
+@pytest.mark.parametrize(
+    "tokens", [torch.zeros(0, dtype=torch.bool), torch.zeros(2), torch.zeros(1, 2, dtype=torch.bool)]
+)
+def test_generic_conditioning_builder_rejects_invalid_token_masks(tokens):
+    with pytest.raises(ValueError, match="token mask"):
+        ConditioningBlockMask.from_token_mask(tokens)
+
+
+@pytest.mark.parametrize("block_size", [0, -1, True, 1.5])
+def test_generic_conditioning_builder_rejects_invalid_block_size(block_size):
+    with pytest.raises(ValueError, match="block_size"):
+        ConditioningBlockMask.from_token_mask(torch.zeros(2, dtype=torch.bool), block_size)

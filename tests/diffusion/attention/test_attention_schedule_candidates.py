@@ -205,9 +205,12 @@ def test_model_layer_count_reaches_base_and_scheduled_implementations(attention_
         profiles={"sparse": AttentionConfig(default=AttentionSpec(backend="SOL_ATTN"))},
         default=[{"start": 1, "end": None, "profile": "sparse"}],
     )
-    attention = attention_env.build(_make_config(schedule=schedule), layer_count=50, prefix="blocks.49.attention")
+    attention = attention_env.build(
+        _make_config(schedule=schedule), layer_count=50, requires_conditioning_mask=True, prefix="blocks.49.attention"
+    )
     for impl in (attention.attention, attention._schedule_candidates["sparse"].impl):
         assert impl.kwargs["layer_count"] == 50
+        assert impl.kwargs["requires_conditioning_mask"] is True
         assert impl.kwargs["prefix"] == "blocks.49.attention"
 
 

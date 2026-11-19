@@ -488,6 +488,9 @@ class Attention(nn.Module):
         # Number of blocks in this model-owned attention stack. Used to resolve
         # relative layer selectors; unrelated stacks (e.g. refiners) own counts.
         layer_count: int | None = None,
+        # Model contract, not a user tuning knob. Conditioned stacks can require
+        # producer-owned protection metadata when SOL is selected.
+        requires_conditioning_mask: bool = False,
     ):
         super().__init__()
 
@@ -625,6 +628,8 @@ class Attention(nn.Module):
             )
             if layer_count is not None:
                 impl_kwargs["layer_count"] = layer_count
+            if requires_conditioning_mask:
+                impl_kwargs["requires_conditioning_mask"] = True
             self.attention = self.attn_impl_cls(
                 **impl_kwargs, backend_kwargs=backend_kwargs, backend_explicit=self.backend_explicit
             )

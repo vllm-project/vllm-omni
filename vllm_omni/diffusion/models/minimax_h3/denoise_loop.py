@@ -15,7 +15,7 @@ from typing import Any
 
 import torch
 
-from vllm_omni.diffusion.attention.backends.abstract import TextAudioBlockMask, VideoTokenLayout, VideoTokenSpan
+from vllm_omni.diffusion.attention.backends.abstract import ConditioningBlockMask, VideoTokenLayout, VideoTokenSpan
 from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.forward_context import (
     set_forward_context_denoise_sigma,
@@ -99,13 +99,13 @@ class MiniMaxH3DenoiseBranch:
         protection_positions = torch.cat((packed["text_pos"].view(-1), self.audio_pos)).to(
             device="cpu", dtype=torch.long
         )
-        text_audio_block_mask = None
+        conditioning_block_mask = None
         if protection_positions.numel():
             if protection_positions.min().item() < 0 or protection_positions.max().item() >= self.used_len:
                 raise ValueError("MiniMax H3 text/audio positions must be within the used sequence.")
             protection_blocks = torch.zeros((self.used_len + 63) // 64, dtype=torch.bool)
             protection_blocks[protection_positions // 64] = True
-            text_audio_block_mask = TextAudioBlockMask(self.used_len, 64, protection_blocks.to(device))
+            conditioning_block_mask = ConditioningBlockMask(self.used_len, 64, protection_blocks.to(device))
         self.img_pos_dev = self.img_pos.to(device)
         self.audio_pos_dev = self.audio_pos.to(device)
         self.update_mask_dev = self.update_mask.to(device)
@@ -133,7 +133,7 @@ class MiniMaxH3DenoiseBranch:
                 # KV prefix length or a 1-D pad mask. See batched_packing for the
                 # co-batched layout, where neither can describe the valid rows.
                 "num_requests": 1,
-                "text_audio_block_mask": text_audio_block_mask,
+                "conditioning_block_mask": conditioning_block_mask,
             },
             "refiner_packed_seq_params": {
                 "cu_seqlens_q": torch.tensor([0, text_len, text_len], dtype=torch.int32, device=device),

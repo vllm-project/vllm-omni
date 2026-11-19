@@ -116,7 +116,7 @@ def test_denoise_branch_protects_only_text_and_all_audio_blocks(text_len):
         token_tags=packed["token_tags"],
         device=torch.device("cpu"),
     )
-    protection = branch.static_kwargs["packed_seq_params"]["text_audio_block_mask"]
+    protection = branch.static_kwargs["packed_seq_params"]["conditioning_block_mask"]
     assert protection.used_len == int(packed["cu_seqlens"][1])
     assert protection.block_size == 64
     assert protection.blocks.dtype == torch.bool and protection.blocks.is_contiguous()
@@ -139,7 +139,7 @@ def test_denoise_branch_protects_only_text_and_all_audio_blocks(text_len):
             imgvid_cond_timestep=0.999,
             audio_ref_cond_timestep=1.0,
         )
-        assert kwargs["packed_seq_params"]["text_audio_block_mask"] is protection
+        assert kwargs["packed_seq_params"]["conditioning_block_mask"] is protection
 
 
 def test_h3_fused_rope_matches_reference_and_preserves_unrotated_dims():
