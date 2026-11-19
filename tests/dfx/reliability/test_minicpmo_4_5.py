@@ -306,9 +306,6 @@ def test_stage_crash_at_idle_002(omni_server_function, online_client_function) -
     PartialStageIsolation().run(MODEL, omni_server_function, online_client_function)
 
 
-@pytest.mark.skip(
-    reason="Stage1 wakeup FIFO remains after normal shutdown: https://github.com/vllm-project/vllm-omni/issues/10391"
-)
 @scenario_params(MODEL, GracefulShutdown)
 def test_graceful_shutdown(omni_server_function, online_client_function) -> None:
     """SIGTERM the healthy root; all children and resources must clear within 60s."""
