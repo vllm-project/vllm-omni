@@ -72,6 +72,7 @@ class _ParallelStub:
     vae_patch_parallel_size: int = 1
     text_encoder_tp_size: int = 1
     enable_expert_parallel: bool = False
+    expert_parallel_size: int | None = None
     use_hsdp: bool = False
 
 
@@ -385,6 +386,27 @@ def test_native_topology_rejects_nondivisible_tensor_parallelism():
     config = _topology_config(tensor_parallel_size=3)
     with pytest.raises(ValueError, match="does not divide"):
         _validate_native_topology(config)
+
+
+def test_native_topology_accepts_head_expert_parallel():
+    # Head-EP is a supported MAGI-2 layout, so it must not be reduced to a
+    # blanket unsupported option. ``expert_parallel_size`` may be smaller than
+    # the sequence-parallel degree.
+    _validate_native_topology(_topology_config(enable_expert_parallel=True, sequence_parallel_size=4, ulysses_degree=4))
+    _validate_native_topology(
+        _topology_config(
+            enable_expert_parallel=True, expert_parallel_size=2, sequence_parallel_size=4, ulysses_degree=4
+        )
+    )
+
+
+def test_native_topology_rejects_head_expert_parallel_with_tensor_parallelism():
+    with pytest.raises(ValueError, match="requires tensor_parallel_size=1"):
+        _validate_native_topology(
+            _topology_config(
+                enable_expert_parallel=True, tensor_parallel_size=2, sequence_parallel_size=2, ulysses_degree=2
+            )
+        )
 
 
 def test_native_topology_accepts_single_device_layerwise_with_cpu_staging():
