@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """AURA Omni pipeline topology.
 
 Semantic modules:
@@ -57,6 +57,8 @@ AURA_OMNI_PIPELINE = PipelineConfig(
             stage_id=2,
             model_stage="qwen3_tts",
             execution_type=StageExecutionType.LLM_AR,
+            supports_native_mrv2_data_plane=True,
+            supports_duplex_mrv2=True,
             input_sources=(1,),
             owns_tokenizer=True,
             engine_output_type="latent",
@@ -73,6 +75,8 @@ AURA_OMNI_PIPELINE = PipelineConfig(
             stage_id=3,
             model_stage="code2wav",
             execution_type=StageExecutionType.LLM_GENERATION,
+            supports_native_mrv2_data_plane=True,
+            supports_duplex_mrv2=True,
             input_sources=(2,),
             final_output=True,
             final_output_type="audio",
