@@ -696,17 +696,77 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         )
         return self._full_payload_replace_keys_cached
 
+    def _full_payload_token_ends_map(self) -> dict[str, dict[str, int]]:
+        ends = getattr(self, "_full_payload_token_ends", None)
+        if ends is None:
+            ends = {}
+            self._full_payload_token_ends = ends
+        return ends
+
+    def _drop_full_payload_token_end(self, req_id: str) -> None:
+        ends = getattr(self, "_full_payload_token_ends", None)
+        if ends is not None:
+            ends.pop(req_id, None)
+
+    def _reconcile_full_payload_output(
+        self,
+        req_id: str,
+        output: dict[str, Any],
+        token_range: tuple[int, int],
+        replace_keys: frozenset[str],
+        prefix_cache_keys: frozenset[str],
+    ) -> dict[str, Any]:
+        """Keep previously emitted positions when an AR step replays a prefix."""
+        start, end = token_range
+        token_ends = self._full_payload_token_ends_map().setdefault(req_id, {})
+        reconciled: dict[str, Any] = {}
+        for key, value in output.items():
+            if value is None:
+                continue
+            previous_end = token_ends.get(key)
+            if previous_end is not None:
+                if end <= previous_end:
+                    continue
+                if _is_full_payload_row_tensor(key, value) and key not in replace_keys:
+                    num_rows = int(value.shape[0])
+                    # Only cache-merged token-aligned tensors carry rows before this step.
+                    row_start = end - num_rows if key in prefix_cache_keys else start
+                    overlap = previous_end - row_start
+                    if overlap > 0:
+                        if num_rows != end - row_start:
+                            raise ValueError(
+                                f"Cannot reconcile replayed full payload {key!r} for {req_id!r}: "
+                                f"{num_rows} rows do not align with token range [{row_start}, {end})."
+                            )
+                        # Drop the replayed prefix so the accumulator retains only the new suffix.
+                        value = value[overlap:].clone()
+            reconciled[key] = value
+        token_ends.update({key: end for key in reconciled})
+        return reconciled
+
     def accumulate_full_payload_output(
         self,
         req_id: str,
         pooler_output: Any,
         request: Any,
+        *,
+        token_range: tuple[int, int] | None = None,
+        prefix_cache_keys: frozenset[str] = frozenset(),
     ) -> None:
         """Accumulate pooler_output for a request across steps (full_payload_mode).
 
         Per-token tensors (2-D+, matching trailing dims) and the 1-D codec
         validity mask are concatenated along dim-0. Scalar / global tensors
         are replaced with the latest value.
+
+        AR callers provide the executed input-token range [start, end).
+        ``prefix_cache_keys`` identifies token-aligned tensors that the prefix
+        cache merged, which may include rows before this step. Previously
+        emitted positions survive preemption: replayed prefixes are skipped
+        and only a new suffix is appended. A partially overlapping
+        non-token-aligned tensor raises, because its rows cannot be sliced by
+        token position. One-shot generation outputs omit ``token_range`` and
+        keep the append/replace policy below.
 
         Note: codec rows are NOT filtered for zero placeholders here. The
         downstream consumer ``_extract_qwen3_full_payload_codec_rows`` crops
@@ -720,6 +780,14 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         """
         replace_keys = self._resolve_full_payload_replace_keys()
         existing = self._pending_full_payload_send.get(req_id)
+        if token_range is not None:
+            if existing is None:
+                self._drop_full_payload_token_end(req_id)
+            pooler_output = self._reconcile_full_payload_output(
+                req_id, pooler_output, token_range, replace_keys, prefix_cache_keys
+            )
+            if not pooler_output:
+                return
 
         if existing is None:
             chunks, latest, rows = self._new_full_payload_accumulator(pooler_output)
@@ -768,7 +836,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         *,
         finished_req_output_token_ids: Mapping[str, list[int]] | None = None,
     ) -> None:
-        """Send accumulated full_payload outputs for requests that just finished."""
+        """Send accumulated full-payload outputs for finished requests."""
         pending_req_ids = set(self._pending_full_payload_send.keys())
         if not (finished_req_ids & pending_req_ids):
             return
@@ -782,6 +850,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         to_send: dict[str, tuple[Any, Any]] = {}
         for req_id in finished_req_ids:
             entry = self._pending_full_payload_send.pop(req_id, None)
+            self._drop_full_payload_token_end(req_id)
             if entry is not None:
                 output, request = self._materialize_full_payload_entry(entry)
                 if finished_req_output_token_ids is not None and req_id in finished_req_output_token_ids:
