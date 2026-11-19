@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Host request preparation and scheduler admission, without model weights."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pytest
 
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.mixfusion.request import MixFusionImageRequestConfig
 from vllm_omni.diffusion.mixfusion.scheduling import MixFusionCapability, MixFusionRequestInfo, fits_chunk_budget
 from vllm_omni.diffusion.mixfusion.setup import prepare_mixfusion_admission
@@ -24,6 +25,11 @@ class _Config:
     mixfusion_max_chunks: int = 128
     max_num_seqs: int = 4
     model_class_name: str = "QwenImagePipeline"
+    diffusion_attention_schedule: None = None
+    stage_role: str | None = None
+    model_stage: None = None
+    omni_kv_config: dict = field(default_factory=dict)
+    diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
 
 
 @dataclass

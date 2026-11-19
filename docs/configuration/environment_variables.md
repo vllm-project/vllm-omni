@@ -193,7 +193,7 @@ their keys only.
 ## Inherited vLLM variables
 
 vLLM-Omni also reads variables through its aligned vLLM dependency. Refer to
-the [vLLM 0.33 environment-variable reference](https://docs.vllm.ai/en/v0.33.0/configuration/env_vars/)
+the [vLLM 0.34 environment-variable reference](https://github.com/vllm-project/vllm/blob/v0.34.0/docs/configuration/env_vars.md)
 for their definitions. This includes vLLM launch, cache, logging, plugin, ROCm,
 XPU, ModelScope, and FlashInfer workspace settings.
 
@@ -221,7 +221,7 @@ collection, examples, bug reports, or logs.
 
 ## Model-specific variables
 
-The inventory includes 103 variables read by a single model or pipeline family. They are
+The inventory includes 104 variables read by a single model or pipeline family. They are
 not listed as public usage options here because doing so would turn implementation
 escape hatches into an accidental compatibility contract.
 
@@ -230,7 +230,7 @@ Every audited model-specific name has a migration disposition in the
 
 | Disposition | Count | Required outcome |
 | --- | ---: | --- |
-| Promote | 71 | Move a stable setting into typed stage or model configuration. |
+| Promote | 72 | Move a stable setting into typed stage or model configuration. |
 | Request scope | 5 | Move request-varying behavior into a declared request-option schema. |
 | External | 0 | Retain only when a supported third-party library owns the contract. |
 | Internalize | 17 | Keep a debug or diagnostic switch out of public documentation and configuration. |
