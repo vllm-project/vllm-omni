@@ -70,6 +70,19 @@ python examples/offline_inference/x_to_text/x_to_text.py \
 The AR-only default uses four GPUs. Pass `--deploy-config` to override the
 layout.
 
+### AR Model Runner V2
+
+HunyuanImage3 AR follows the repository's Model Runner V2 default, including
+the AR-only, AR+DiT and Mooncake KV connector deployments and accuracy tests.
+
+The AR sampler preserves comprehension token blocking, image-generation stage
+transitions, and greedy aspect-ratio selection using MRv2's device-side
+token history. Speculative decoding must be disabled for this stage.
+
+The adapter uses the existing generic Omni model states and does not change
+attention. NPU execution requires an Ascend runtime matching the repository's
+vLLM version; the retained v0.33 NPU image is not qualified for vLLM 0.34.
+
 ### Shared T2I/IT2I offline examples
 
 Text-to-image and image-editing route through the shared task examples, with

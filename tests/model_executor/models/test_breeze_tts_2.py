@@ -3,6 +3,7 @@
 """Check depth attention against HF Llama and request-local sampling state."""
 
 from collections import defaultdict
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -11,6 +12,8 @@ import torch.nn.functional as F
 from transformers import LlamaConfig, MimiConfig
 from transformers.models.llama.modeling_llama import LlamaModel
 from transformers.models.mimi.modeling_mimi import MimiConv1d
+from vllm.config import LoadConfig
+from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 
 from tests.model_executor.models.breeze_tts_2_helpers import _request_info, _small_talker
 from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
@@ -20,7 +23,13 @@ from vllm_omni.model_executor.models.breeze_tts_2.depth_decoder import (
     sample_logits,
 )
 from vllm_omni.model_executor.models.breeze_tts_2.prompt import CFG_UNCOND_SUFFIX, build_breeze_prompt
-from vllm_omni.model_executor.models.breeze_tts_2.reference_encoder import BreezeReferenceConv
+from vllm_omni.model_executor.models.breeze_tts_2.reference_encoder import BreezeReferenceConv, BreezeReferenceEncoder
+from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
+    Qwen3TTSTokenizerV2Config,
+)
+from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
+    Qwen3TTSTokenizerV2Encoder,
+)
 from vllm_omni.model_executor.stage_input_processors.breeze_tts_2 import expand_cfg_prompts, talker2code2wav_async_chunk
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -50,6 +59,97 @@ def test_reference_convolution_batch_preserves_partial_final_frames(stride):
         expected = last(first(waveform))
         torch.testing.assert_close(actual[row : row + 1, :, : expected.shape[-1]], expected)
         assert not actual[row, :, expected.shape[-1] :].count_nonzero()
+
+
+def _flat_codec_name(name: str) -> str:
+    # Breeze's audio_tokenizer checkpoint keeps Mimi's flat Transformers 5.19 names.
+    for nested, flat in (
+        ("encoder.encoder_seanet.", "encoder."),
+        ("encoder.encoder_transformer.", "encoder_transformer."),
+        ("encoder.downsample.", "downsample."),
+    ):
+        if name.startswith(nested):
+            return flat + name.removeprefix(nested)
+    return name
+
+
+@pytest.fixture
+def reference_codec(mocker):
+    """A Breeze reference encoder, a random flat checkpoint and the codec that produced it."""
+    config = Qwen3TTSTokenizerV2Config(
+        encoder_config=dict(
+            hidden_size=16,
+            num_filters=4,
+            upsampling_ratios=[8, 6, 5, 4],
+            num_residual_layers=1,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=8,
+            intermediate_size=32,
+            codebook_size=8,
+            codebook_dim=8,
+            vector_quantization_hidden_dimension=8,
+            num_quantizers=4,
+            upsample_groups=16,
+        ),
+        encoder_valid_num_quantizers=3,
+    )
+    mocker.patch.object(Qwen3TTSTokenizerV2Config, "from_pretrained", return_value=config)
+    vllm_config = SimpleNamespace(model_config=SimpleNamespace(model="unused", revision=None), load_config=LoadConfig())
+    breeze = BreezeReferenceEncoder(vllm_config)
+    torch.manual_seed(0)
+    codec = Qwen3TTSTokenizerV2Encoder._from_config(config.encoder_config, dtype=torch.float32).eval()
+    with torch.no_grad():
+        for parameter in codec.parameters():
+            parameter.normal_(std=0.3)
+        for name, buffer in codec.named_buffers():
+            if name.endswith("embed_sum"):
+                buffer.normal_()
+            elif name.endswith("cluster_usage"):
+                buffer.uniform_(0.5, 1.5)
+    checkpoint = {f"encoder.{_flat_codec_name(name)}": value for name, value in codec.state_dict().items()}
+    assert {"encoder.encoder.layers.0.conv.weight", "encoder.downsample.conv.weight"} <= checkpoint.keys()
+    checkpoint["decoder.x"] = torch.zeros(1)
+    mocker.patch.object(DefaultModelLoader, "_get_weights_iterator", side_effect=lambda source: checkpoint.items())
+    return breeze, vllm_config, checkpoint, codec
+
+
+def test_reference_encoder_loads_flat_codec_checkpoint_and_matches_its_codes(reference_codec) -> None:
+    breeze, vllm_config, _, codec = reference_codec
+    loaded = breeze.load_weights(vllm_config)
+    quantizer_buffers = {name for name, _ in breeze.named_buffers() if name.startswith("encoder.quantizer.")}
+    assert loaded == {name for name, _ in breeze.named_parameters()} | quantizer_buffers
+    torch.manual_seed(1)
+    waves = [torch.randn(length) * 0.1 for length in (4 * 1920, 3 * 1920 - 500)]
+    frames = torch.nn.utils.rnn.pad_sequence(waves, batch_first=True).reshape(2, -1, 1920)
+    lengths = torch.tensor([wave.numel() for wave in waves])
+    with torch.no_grad():
+        expected = [codec.encode(wave[None, None], num_quantizers=3).audio_codes[0] for wave in waves]
+        eager = breeze._encode_impl(frames, lengths)
+        compiled = torch.compile(breeze._encode_impl, fullgraph=True, dynamic=True, backend="eager")(frames, lengths)
+    assert expected[0].unique().numel() > 1
+    for row, codes in enumerate(expected):
+        assert torch.equal(eager[row, :, : codes.shape[-1]], codes)
+        assert torch.equal(compiled[row, :, : codes.shape[-1]], codes)
+
+
+@pytest.mark.parametrize(
+    ("corrupt", "error"),
+    [
+        (lambda weights: weights.update({"encoder.unknown.weight": torch.zeros(1)}), "Unexpected"),
+        (lambda weights: weights.update({"quantizer.x": torch.zeros(1)}), "Unexpected"),
+        (
+            lambda weights: weights.pop(next(name for name in weights if name.endswith("codebook.embed_sum"))),
+            "Uninitialized",
+        ),
+    ],
+)
+def test_reference_encoder_rejects_unknown_or_missing_codec_weights(reference_codec, corrupt, error) -> None:
+    breeze, vllm_config, checkpoint, _ = reference_codec
+    corrupt(checkpoint)
+    with pytest.raises(ValueError, match=f"{error} reference codec weight"):
+        breeze.load_weights(vllm_config)
 
 
 def test_reference_conditioning_survives_transport_and_cfg_keeps_true_prompt_lengths(mocker) -> None:

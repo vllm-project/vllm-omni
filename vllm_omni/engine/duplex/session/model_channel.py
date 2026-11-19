@@ -1957,6 +1957,20 @@ class ModelChannel:
         payload = self.silence_unit_payload()
         if auto_response and count + 1 == continuation_limit:
             payload["force_listen"] = True
+        explicit_create_id = model_state.explicit_response_create_id if response_owned else None
+        if (
+            response_owned
+            and count == 0
+            and explicit_create_id is not None
+            and owner_id == f"response:{explicit_create_id}"
+        ):
+            # response.create opens the assistant turn. The duplex model may
+            # still hold the previous turn's turn-ended latch -- left set when
+            # a truncated turn was told to stop -- and that latch forces the
+            # new response's silent units to keep listening before the model
+            # can answer. The first unit of the response releases it, the same
+            # way the seeded opening turn does in the stage prefill.
+            payload["open_assistant_turn"] = True
         payload["duplex_turn_id"] = payload_turn_id_value
         try:
             scheduled = await self._schedule_silence_continuation(
