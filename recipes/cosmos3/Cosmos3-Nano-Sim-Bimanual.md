@@ -1,8 +1,9 @@
 # Cosmos3-Nano-Sim-Bimanual
 
 Cosmos3-Nano-Sim-Bimanual is the causal action-conditioned Cosmos3 world model.
-The runtime supports distilled four-step SDE checkpoints with `[1, 4, 4, ...]`
-latent chunks and per-frame interleaved action/video tokens. The original
+The checkpoint manifest defines the distilled SDE schedule, latent chunk size,
+history policy, and action contract. Generation interleaves action and video
+tokens per latent frame. The original
 reference artifact is `interact_8b_tfdcm_chunk4_agibot` at `iter_000001600`.
 Camera-conditioned generation requires a compatible checkpoint export and the
 camera inference profile described below.
@@ -93,12 +94,35 @@ missing tensors from surviving as random initialization. Stage 2 then compares
 the serialized tensor names, shapes, and dtypes against its strict remap
 inventory. Keep `cosmos3_nano_sim_bimanual_artifact.json` with the model directory.
 
+## Unified actions
+
+For a schema-v5 checkpoint, provide one prepared 59-value
+`normalized_unified_v1` action row per video-frame transition. Supply one
+`domain_id` for the rollout or one per action row. Camera rows use the first
+nine values and set the other slots to zero. The pipeline pads each row to
+64 values. Prepare and normalize these inputs before submitting the request.
+
+An AgiBot tick for a schema-v5 checkpoint uses `robot_action.v2`. A checkpoint
+with two latent frames per chunk expects eight action rows per tick. Legacy
+AgiBot checkpoints use `robot_action.v1` with raw actions.
+
+## Reference images
+
+With height and width omitted, the preprocessor uses the image aspect ratio
+and `resolution` (480 by default) to choose a canvas. It pads the image on the
+bottom and right for VAE encoding, then crops the latent to the aligned content
+dimensions. A 640×360 input produces 640×352 output. Callers that supply
+their own padded canvas can pass
+`conditioning_image_size=[padded_h, padded_w, content_h, content_w]`.
+
 ## Deployment
 
 Start from [`cosmos3_nano_sim_bimanual.yaml`](../../vllm_omni/deploy/cosmos3_nano_sim_bimanual.yaml).
-The default is eager, batch size one, 720×1280, one resident session, and a
-96-latent-frame window. Each request resolves an aligned canvas and selects a
-matching paged KV pool; the maximum permitted geometry is validated at load.
+The default deployment uses eager execution, batch size one, a 720×1280
+fallback resolution, and paged KV. Each request resolves an aligned canvas
+and selects a matching pool. Startup validates the largest admitted geometry.
+Select `engine_backend: default` on the diffusion stage to use dense KV.
+Omit `num_inference_steps` to use the checkpoint schedule.
 
 Tick video supports the shared device-side transport optimization. Add
 `video_output_transport: {enable_device_postprocess: true}` to the diffusion
@@ -127,17 +151,16 @@ Checkpoint identity, hash, domain map, and normalizer data are deliberately not
 template defaults: they must be read from `transformer/config.json`. Startup
 rejects a deploy override that contradicts those embedded artifact fields.
 
-The KV startup allocation is a hard floor. At TP=1/BF16, one 720p frame across
-36 layers is about 133 MiB; the configured window, scratch reservation, and
-the 512-token text pool are all counted before model
-execution. If the manager reports an insufficient memory budget, use a
-checkpoint artifact exported with a smaller `window_frames`; runtime overrides
-are rejected. The physical window does not cap the logical session at that
-length: evicted positions remain logical placeholders while generation rolls
-forward. A sliding window changes long-horizon semantics relative to the
-unbounded reference and needs a separate quality evaluation. Engine-level
-window/sink/reset overrides would make the paged path diverge from the
-manifest-driven dense oracle.
+The paged KV startup budget includes the history window, scratch storage,
+and text pool. Set `kv_cache_inference_size` and `attention_sink_size` in
+`model_config` to override Bimanual history capacity. With a capacity of 64
+and eight sinks, the model retains eight initial frames and up to 55 recent
+past frames and reserves one position for the current frame.
+
+Schema-v5 checkpoints express `window_frames` as total cache capacity.
+Legacy checkpoints express it as recent past frames, with sinks counted
+separately. `window_frames: null` with `sink_frames: 0` retains full history,
+with the paged pool sized for the requested rollout.
 
 ## Request modes
 
@@ -149,9 +172,9 @@ manifest-driven dense oracle.
   occupies host memory proportional to its length. Latent output retains its
   existing path.
 - Tick session: use `ARDiffusionSession` with an `ARDiffusionOmniTickConsumer`
-  and carry AgiBot actions as a `robot_action.v1` control inside the typed
+  and attach the checkpoint's action control to the typed
   `ARDiffusionTickRequest`. The first tick covers the singleton prefix and one
-  four-frame chunk; later ticks commit one four-frame chunk. Request, event,
+  checkpoint-sized chunk. Later ticks commit one chunk. Request, event,
   session, and chunk identities are validated against the returned
   `metadata.ar_diffusion` envelope. Reset, close, and disconnect release the
   owning worker through `ARDiffusionWorkerLifecycle`; no inference request is
@@ -163,8 +186,8 @@ manifest-driven dense oracle.
 Attention runs one joint softmax over `[real text | committed history |
 current]`. The paged path uses the fused `paged_write_attn` operator and carries
 the real text K/V in the auxiliary scratch slots; the dense path concatenates the
-same three spans. Compile/CUDA graphs, RF/CFG checkpoints, and multi-session
-serving remain follow-up work.
+same three spans. Regional compilation and Inductor CUDA graphs can be enabled
+for supported deployments with `use_cuda_graphs: true` and `enforce_eager: false`.
 
 See the [offline runner](../../examples/offline_inference/cosmos3_nano_sim_bimanual/README.md)
 for reference JSONL/NPZ input, action-sidecar and camera inputs, and validation

@@ -27,6 +27,10 @@ conversation content without authorization.
 
 ## Purpose
 
+<!-- Describe the behavior before and after this change. Link the affected
+module/feature contract and user guide/example, or explain why unchanged.
+Use existing pages; a draft invariant is not an automatic blocker. -->
+
 ## Test Plan
 
 **vLLM Version:**
@@ -34,6 +38,9 @@ conversation content without authorization.
 **vLLM-Omni Commit:**
 
 ## Test Result
+
+<!-- Name the regression test or other supporting evidence, commands and actual
+results at the reported commit. Explicitly list relevant checks not run. -->
 
 **BEFORE SUBMITTING:** read [CONTRIBUTING.md](https://github.com/vllm-project/vllm-omni/blob/main/CONTRIBUTING.md) and run the [precheck-pr skill](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/precheck-pr/SKILL.md) with the code agent for a self-check against project conventions.
 

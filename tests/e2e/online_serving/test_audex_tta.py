@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """E2E online tests for Audex (Nemotron-Labs-Audex-2B) text-to-audio.
 
 Covers /v1/audio/speech through the ``audex_tta`` deployment:
@@ -49,7 +49,7 @@ if os.environ.get("AUDEX_E2E_30B") == "1":
     )
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", audex_tta_server_params, indirect=True)
 def test_audex_tta_online_smoke(omni_server, openai_client, run_level) -> None:
     """A caption returns a valid finite non-silent WAV at the default cfg 3.0."""

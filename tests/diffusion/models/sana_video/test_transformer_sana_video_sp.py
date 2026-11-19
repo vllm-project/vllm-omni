@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """SP unit tests for SANA-Video: balanced frame split sizes, linear-attention
 state reduction and the uneven frame gather.
@@ -8,13 +8,13 @@ CPU-only. The SP world size, rank and the collectives are mocked so a single
 process simulates the shard/reduce logic a real multi-rank run depends on.
 """
 
-import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import torch
 from torch import nn
+from vllm.utils.network_utils import get_file_store_init_method
 
 from vllm_omni.diffusion.models.sana_video.transformer_sana_video import (
     GLUMBTempConv,
@@ -39,12 +39,19 @@ def tp1_group():
         initialize_model_parallel,
     )
 
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29501")
-    init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://", backend="gloo")
-    initialize_model_parallel(backend="gloo")
-    yield
-    cleanup_dist_env_and_memory()
+    # A fresh file store avoids the free-port probe/bind race of env://.
+    init_distributed_environment(
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        distributed_init_method=get_file_store_init_method(),
+        backend="gloo",
+    )
+    try:
+        initialize_model_parallel(backend="gloo")
+        yield
+    finally:
+        cleanup_dist_env_and_memory()
 
 
 @pytest.fixture
@@ -422,11 +429,15 @@ class _LockstepSpGroup:
     def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
         self.slots[self.tls.rank] = tensor
         self.barrier.wait(timeout=60)
-        total = self.slots[0].clone()
-        for part in self.slots[1:]:
+        parts: list[torch.Tensor] = []
+        for part in self.slots:
+            assert part is not None
+            parts.append(part)
+        total = parts[0].clone()
+        for part in parts[1:]:
             total = total + part
         if self.tls.rank == 0:
-            self.reduce_inputs.append([part.clone() for part in self.slots])
+            self.reduce_inputs.append([part.clone() for part in parts])
         self.barrier.wait(timeout=60)
         return total
 
@@ -434,8 +445,11 @@ class _LockstepSpGroup:
         assert separate_tensors
         self.slots[self.tls.rank] = tensor
         self.barrier.wait(timeout=60)
-        assert all(part.shape == tensor.shape for part in self.slots), "all_gather requires equal shards"
-        parts = [part.clone() for part in self.slots]
+        parts: list[torch.Tensor] = []
+        for part in self.slots:
+            assert part is not None
+            assert part.shape == tensor.shape, "all_gather requires equal shards"
+            parts.append(part.clone())
         if self.tls.rank == 0:
             with self.lock:
                 self.gather_calls += 1
@@ -535,6 +549,7 @@ def test_tiny_transformer_sp2_lockstep_matches_dense(tp1_group, force_default_ge
         outs = list(pool.map(run_rank, range(world_size)))
 
     num_layers = _TINY_SP_CONFIG["num_layers"]
+    assert isinstance(num_layers, int)
     # One attn1 state reduce per block, its inputs distinct per rank (the ranks
     # really processed different frames), one neighbour halo exchange per block
     # per rank, and only the final frame gather is a full collective.

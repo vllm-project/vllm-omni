@@ -14,9 +14,14 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class MiniCPMO45DuplexWindowConfig:
-    """Stage-0 window settings matching the released checkpoint defaults."""
+    """Stage-0 window settings.
 
-    sliding_window_mode: str = "off"
+    Sizes match the released checkpoint defaults. The checkpoint's mode is
+    ``off``; serving defaults to ``basic`` to bound long-session context
+    (#8879). Clients can explicitly select ``off`` to retain full history.
+    """
+
+    sliding_window_mode: str = "basic"
     basic_window_high_tokens: int = 8000
     basic_window_low_tokens: int = 6000
     context_previous_max_tokens: int = 500
@@ -38,7 +43,7 @@ class MiniCPMO45DuplexWindowConfig:
                 raise ValueError(f"{name} must be greater than zero")
             return parsed
 
-        mode = source.get("sliding_window_mode", "off")
+        mode = source.get("sliding_window_mode", "basic")
         if mode not in {"off", "basic", "context"}:
             raise ValueError("sliding_window_mode must be one of: off, basic, context")
         config = cls(
@@ -91,8 +96,24 @@ class MiniCPMO45DuplexPolicy:
     VISION_EMBEDS_PER_FRAME = 64
     VISION_TOKENS_PER_FRAME = VISION_EMBEDS_PER_FRAME + 2  # <image> + embeds + </image>
     DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK = 20
-    DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK = 28
+    # Official streaming_generate uses this token budget as its length limit;
+    # sampled terminators can close the chunk earlier.
+    # A 28-character cap fired earlier (16 tokens into "……数字") and the next
+    # unit then sampled <|turn_eos|>, so the number never followed. 0 disables
+    # the character cap; a positive max_speak_chars_per_chunk still opts in.
+    DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK = 0
     REPETITION_HISTORY_SIZE = 512
+    # Talker handoff. A tail that still ends with one of these, after closing
+    # quotes and brackets, has finished a sentence.
+    SENTENCE_END_PUNCTUATION = "。！？.!?…"
+    CLOSING_PUNCTUATION = "\"'”’」』）)】"
+    TURN_TEXT_TAIL_CHARS = 16
+
+    @staticmethod
+    def turn_text_ends_sentence(text: str) -> bool:
+        """Whether ``text`` ends a sentence, ignoring trailing closing punctuation."""
+        tail = text.rstrip().rstrip(MiniCPMO45DuplexPolicy.CLOSING_PUNCTUATION)
+        return bool(tail) and tail[-1] in MiniCPMO45DuplexPolicy.SENTENCE_END_PUNCTUATION
 
     @staticmethod
     def speech_unit_closed_by_listen(token_ids: Sequence[int], special_token_ids: Mapping[str, int]) -> bool:
@@ -125,11 +146,14 @@ class MiniCPMO45DuplexPolicy:
     def audio_token_count(cls, sample_count: int) -> int:
         """Audio embedding count for a clip of ``sample_count`` samples.
 
-        Matches the whole-clip encoder math (hop 160 mel frames -> CNN stride 2
-        -> avg-pool 5) for any multiple of ``SAMPLES_PER_AUDIO_TOKEN``; serving
-        normalizes clips to that boundary before this is used for budgets.
+        The feature extractor's attention mask counts a partial 160-sample
+        frame. The stride-2 CNN rounds up again, then stride-5 pooling rounds
+        down. Keeping these boundaries avoids cropping reference audio just
+        to make the scheduler's token budget exact.
         """
-        return max(0, int(sample_count) // cls.SAMPLES_PER_AUDIO_TOKEN)
+        mel_frames = (max(0, int(sample_count)) + 159) // 160
+        cnn_frames = (mel_frames + 1) // 2
+        return cnn_frames // 5
 
     @staticmethod
     def session_context_texts(

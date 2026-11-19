@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -67,19 +67,22 @@ class NPUTorchProfilerWrapper(OmniTorchProfilerWrapper):
         os.makedirs(npu_trace_dir, exist_ok=True)
         self._trace_path = npu_trace_dir
 
-        return torch_npu.profiler.profile(
+        kwargs = dict(
             activities=npu_activities,
-            with_stack=False,
+            with_stack=profiler_config.torch_profiler_with_stack,
             profile_memory=profiler_config.torch_profiler_with_memory,
-            # NOTE: torch_npu.profiler.with_modules is equivalent to
-            # torch.profiler.with_stack. The with_stack option in
-            # torch_npu.profiler introduces significant time overhead.
+            # Forward the shape-recording flag; without it the NPU profiler
+            # silently ignores ``torch_profiler_record_shapes=True``.
+            record_shapes=profiler_config.torch_profiler_record_shapes,
+            # Also collect the module hierarchy when stack profiling is enabled.
             with_modules=profiler_config.torch_profiler_with_stack,
             experimental_config=experimental_config,
             # Use tensorboard_trace_handler directly - NPU profiler expects
             # this specific handler format
             on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(npu_trace_dir),
         )
+        kwargs.update(self._profiler_kwargs)
+        return torch_npu.profiler.profile(**kwargs)
 
     @override
     def _on_stop_hook(self) -> None:

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The vLLM-Omni team.
 # Copyright (c) Ant Group. All rights reserved.
 # Adapted from:
@@ -8,9 +9,10 @@
 
 from __future__ import annotations
 
-import re
 import string
+from collections.abc import Callable
 
+import regex as re
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -418,22 +420,50 @@ def normalize_numbers(text: str) -> str:
 def segment_and_normalize(
     text: str,
     max_length: int = _DEFAULT_MAX_SEMANTIC_LENGTH,
+    tn_mode: str = "legacy",
+    normalizer: Callable[[str], str] | None = None,
 ) -> list[str]:
-    """Segment text into fragments and expand English numbers for Ming TTS.
+    """Segment text into fragments and normalize numbers for Ming TTS.
 
     This function cuts text by semantic length directly rather than following
     the streaming algorithm to detect sentence boundaries in the upstream
     Ming repo (which is more aggressively splitting at commas). It produces
     fewer and larger segments at natural sentence boundaries.
+
+    ``tn_mode`` selects the normalization pipeline applied per segment:
+
+    * ``"legacy"`` (default): English fragments get ``normalize_numbers``
+      from ``front/number_en.py``; Chinese fragments pass through unchanged.
+      Preserves the pre-port vLLM-Omni behavior.
+    * ``"upstream"``: additionally applies the upstream Ming talker TN stack
+      ported from ``origin_master/ming_flash`` — ``TalkerTN`` (pynini fst
+      zh/en TN followed by regex rules) and ``normalize_text_kit`` (front/
+      toolkit.py), matching ``instruct_audio_generation_ming3p0``'s per-
+      fragment order. The caller supplies the normalizer loaded from its
+      model snapshot; missing resources must not change the selected mode.
     """
     if not text or not text.strip():
         return []
 
     segments = cut_text_by_semantic_length(text.strip(), max_length)
 
+    use_upstream = tn_mode == "upstream"
+    if use_upstream and normalizer is None:
+        raise ValueError("tn_mode='upstream' requires a normalizer loaded from the Talker checkpoint")
+    if use_upstream:
+        from .front_toolkit import normalize_text_kit
+
     normalized: list[str] = []
     for seg in segments:
-        if not is_chinese(seg):
+        if use_upstream:
+            # Upstream order (modeling_bailing_talker.py:2009-2012):
+            # English pre-expansion -> TalkerTN (zh+en fst) -> text kit.
+            if not is_chinese(seg):
+                seg = normalize_numbers(seg)
+            if normalizer is not None:
+                seg = normalizer(seg)
+            seg = normalize_text_kit(seg)
+        elif not is_chinese(seg):
             seg = normalize_numbers(seg)
         if seg and seg[0] == "，":
             seg = seg[1:]

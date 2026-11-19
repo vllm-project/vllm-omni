@@ -17,6 +17,7 @@ from tests.model_tests.diffusion.task_runners import (
     run_and_validate_image_to_image_request,
     run_and_validate_image_to_video_request,
     run_and_validate_multi_output,
+    run_and_validate_text_to_audio_request,
     run_and_validate_text_to_image_request,
     run_and_validate_text_to_video_request,
 )
@@ -55,6 +56,8 @@ def test_pipeline_on_supported_tasks(
     if settings.checkpoint_filename is not None:
         model_path = str(Path(model_path) / settings.checkpoint_filename)
         model_kwargs["model_class_name"] = model_name
+    if settings.offline_init_timeout_s is not None:
+        model_kwargs["init_timeout"] = settings.offline_init_timeout_s
     omni = build_omni_from_diff_accelerations(
         accelerations=accelerations,
         model=model_path,
@@ -72,6 +75,8 @@ def test_pipeline_on_supported_tasks(
                     run_and_validate_text_to_video_request(omni)
                 elif task_type == DiffusionTasks.IMAGE_TO_VIDEO:
                     run_and_validate_image_to_video_request(omni, check_t2v_divergence=check_i2v_t2v_divergence)
+                elif task_type == DiffusionTasks.TEXT_TO_AUDIO:
+                    run_and_validate_text_to_audio_request(omni)
                 else:
                     raise ValueError(f"Task type {task_type} is not yet supported")
 

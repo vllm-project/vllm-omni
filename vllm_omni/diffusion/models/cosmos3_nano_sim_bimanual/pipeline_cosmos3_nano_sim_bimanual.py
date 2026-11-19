@@ -58,8 +58,11 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.state_cosmos3_nano_sim
     Cosmos3NanoSimBimanualSessionState,
     append_dense_kv_history,
 )
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.streaming_vae import decode_wan_causal_chunk
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.tick_adapter import parse_cosmos3_nano_sim_bimanual_tick
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.tick_adapter import (
+    COSMOS3_NANO_SIM_BIMANUAL_ACTION_SCHEMA,
+    COSMOS3_NANO_SIM_BIMANUAL_UNIFIED_ACTION_SCHEMA,
+    parse_cosmos3_nano_sim_bimanual_tick,
+)
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.transformer_cosmos3_nano_sim_bimanual import (
     Cosmos3NanoSimBimanualTransformer,
     Cosmos3NanoSimBimanualTransformerOutput,
@@ -77,6 +80,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionRequestKVSpec,
     ARDiffusionRequestRejectedError,
 )
+from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionChunkMetadata,
     ARDiffusionTickRequest,
@@ -152,14 +156,23 @@ def get_cosmos3_nano_sim_bimanual_pre_process_func(od_config: OmniDiffusionConfi
 
     manifest = Cosmos3NanoSimBimanualManifest.from_od_config(od_config)
     policy = _resolution_policy(od_config, manifest)
-    cosmos3_pre_process = get_cosmos3_pre_process_func(od_config)
+    cosmos3_pre_process = get_cosmos3_pre_process_func(od_config, crop_action_image=True)
 
     def pre_process_func(request):
         sp = request.sampling_params
         prompt = request.prompt
         media = _request_media(prompt)
-        geometry = resolve_cosmos3_nano_sim_bimanual_geometry(sp, media, policy)
         image_size = conditioning_image_size(sp)
+        multimodal = (prompt.get("multi_modal_data") or {}) if isinstance(prompt, Mapping) else {}
+        if image_size is None and multimodal.get("image") is not None and sp.height is None and sp.width is None:
+            result = cosmos3_pre_process(request)
+            image = result.prompt.get("additional_information", {}).get("preprocessed_image")
+            if image is not None:
+                policy.resolve(*image.shape[-2:])
+            geometry = resolve_cosmos3_nano_sim_bimanual_geometry(result.sampling_params, None, policy)
+            result.sampling_params.height, result.sampling_params.width = geometry.session_key
+            return result
+        geometry = resolve_cosmos3_nano_sim_bimanual_geometry(sp, media, policy)
         if image_size is not None:
             from vllm_omni.diffusion.models.cosmos3.transfer import media_hw
 
@@ -218,6 +231,8 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     clean_commit_mode: str = "batched"
     overlap_vae_decode: bool = True
     _decode_queue: CausalDecodeQueue | None = None
+    _request_session_id: str | None = None
+    _streaming_decoder: WanStreamingDecoder | None = None
     _vae_decode_stream: torch.cuda.Stream | None = None
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
@@ -527,8 +542,6 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     def _drop_session(self, session_id: str) -> None:
         state = self._states.pop(str(session_id or "default"), None)
         if state is not None:
-            if state.vae_decoder_initialized:
-                self.vae.clear_cache()
             state.reset()
 
     def _sync_for_tick_timing(self, enabled: bool) -> None:
@@ -577,7 +590,9 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     def _parse_tick(self, tick: ARDiffusionTickRequest):
         """Parse the Humanoid-owned typed action track."""
 
-        return parse_cosmos3_nano_sim_bimanual_tick(tick)
+        unified = self.manifest.require_action_schema().schema_version == 5
+        schema = COSMOS3_NANO_SIM_BIMANUAL_UNIFIED_ACTION_SCHEMA if unified else COSMOS3_NANO_SIM_BIMANUAL_ACTION_SCHEMA
+        return parse_cosmos3_nano_sim_bimanual_tick(tick, schema=schema, chunk_size=self.manifest.chunk_size)
 
     def _resolve_request_fps(self, sp: Any, prompt_data: Any) -> float:
         """Resolve the request FPS used by prompts, mRoPE, and fingerprints."""
@@ -659,12 +674,12 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             embodiment = self.manifest.resolve_embodiment(domain_name, domain_id)
         except ValueError as exc:
             raise ARDiffusionRequestRejectedError(str(exc)) from exc
-        action_space = self._get_sp_param(sp, "action_space", "raw")
-        if action_space not in ("raw", "model", "normalized_unified_v1") or (
-            typed_inputs is not None and action_space != "raw"
-        ):
+        unified = self.manifest.require_action_schema().schema_version == 5
+        allowed = ("normalized_unified_v1",) if unified else ("raw", "model")
+        action_space = self._get_sp_param(sp, "action_space", allowed[0])
+        if action_space not in allowed or (typed_inputs is not None and action_space != typed_inputs.action_space):
             raise ARDiffusionRequestRejectedError(
-                "action_space must be 'raw' or 'model'; typed ticks require raw actions."
+                f"action_space must match the checkpoint and tick contract: {allowed}."
             )
         action = typed_inputs.action if typed_inputs is not None else self._get_sp_param(sp, "action", None)
         if self._get_sp_param(sp, "action_mode", None) == "forward_dynamics" and action is None:
@@ -755,6 +770,9 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         return state
 
     def _prompt_token_limit(self, sp: Any, prompt_data: Any) -> int:
+        schema = self.manifest.require_action_schema()
+        if schema.schema_version == 5 and self._ar_diffusion_kv_state is None:
+            return 1 << 30
         return self.manifest.text_cache_max_len
 
     def _ensure_text_kv(
@@ -1064,6 +1082,8 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             if tuple(image.shape[-2:]) != image_size[:2]:
                 raise ValueError("Preprocessed conditioning image no longer matches its padded canvas.")
             latent = self._crop_latent_to_image_size(latent, image_size)
+        else:
+            latent = latent[..., : geometry.latent_height, : geometry.latent_width].contiguous()
         expected = (
             1,
             self.transformer.latent_channel_size,
@@ -1391,17 +1411,13 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     ) -> torch.Tensor:
         """Decode a new causal block with session-owned Wan features."""
 
-        result = decode_wan_causal_chunk(
-            self.vae,
-            self._denormalize_vae_latents(latents),
-            feature_cache=state.vae_decoder_feat_cache,
-            initialized=state.vae_decoder_initialized,
-        )
-        state.record_incremental_decode(
-            input_frames=int(latents.shape[2]),
-            feature_cache=result.feature_cache,
-        )
-        return result.video
+        if self._streaming_decoder is None:
+            self._streaming_decoder = WanStreamingDecoder(self.vae)
+        if state.vae_decode is None:
+            state.vae_decode = self._streaming_decoder.new_decode_state(state.session_id)
+        video = self._streaming_decoder.decode_chunk(self._denormalize_vae_latents(latents), state.vae_decode)
+        state.record_incremental_decode(input_frames=int(latents.shape[2]))
+        return video
 
     # -- Generation --------------------------------------------------------
 
@@ -1413,7 +1429,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         typed_tick: ARDiffusionTickRequest | None,
         stage_durations: dict[str, float],
     ) -> DiffusionOutput:
-        from vllm_omni.diffusion.models.cosmos3.guardrails import is_guardrails_enabled
+        from vllm_omni.diffusion.utils.guardrail_utils import is_guardrails_enabled
 
         metadata = {"ar_diffusion": ARDiffusionChunkMetadata.from_tick(typed_tick).to_dict()} if typed_tick else {}
         # The Cosmos3 postprocessor owns video guardrails. Keep that
@@ -1491,10 +1507,11 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             # survives for a corrected retry or an explicit reset.
             raise
         except Exception:
-            extra = req.sampling_params.extra_args or {}
-            session_id = str(extra.get("session_id") or self._bound_session_id or "default")
-            self._drop_session(session_id)
+            if self._request_session_id is not None:
+                self._drop_session(self._request_session_id)
             raise
+        finally:
+            self._request_session_id = None
 
     def _forward_impl(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         # ---- Admission (pure) ------------------------------------------------
@@ -1733,6 +1750,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 raise ARDiffusionRequestRejectedError(str(exc)) from exc
 
         # ---- Side effects begin ---------------------------------------------
+        self._request_session_id = session_id
         tick_durations: dict[str, float] = {}
         self._sync_for_tick_timing(measure_tick_latency)
         tick_total_started = time.perf_counter() if measure_tick_latency else 0.0

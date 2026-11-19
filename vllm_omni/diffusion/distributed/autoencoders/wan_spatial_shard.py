@@ -35,6 +35,7 @@ from diffusers.models.autoencoders.vae import DecoderOutput
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.autoencoders.wan_decoder_utils import _persistent_input_buffer
+from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath.families import is_role
 from vllm_omni.diffusion.models.interface import DecodedChunkConsumer
 
 logger = init_logger(__name__)
@@ -767,7 +768,7 @@ def _replace_child(
     group: dist.ProcessGroup,
     split_dim: str,
 ) -> None:
-    if child.__class__.__name__ == "WanCausalConv3d":
+    if is_role(child, "causal_conv3d"):
         setattr(
             parent,
             name,
@@ -829,12 +830,12 @@ def _patch_decoder_modules(
     split_dim: str,
     inside_attention: bool = False,
 ) -> None:
-    if module.__class__.__name__ == "WanAttentionBlock":
+    if is_role(module, "attention_block"):
         _patch_attention_block(module, group, split_dim)
         inside_attention = True
 
     for name, child in list(module.named_children()):
-        if child.__class__.__name__ == "WanCausalConv3d":
+        if is_role(child, "causal_conv3d"):
             _replace_child(module, name, child, group, split_dim)
             continue
         if isinstance(child, nn.Conv2d) and not inside_attention:
@@ -932,6 +933,20 @@ def install_wan_spatial_shard_decode(
             out = orig_forward(x, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk)
         finally:
             _SPATIAL_SHARD_CONTEXT.reset(token)
+        from vllm_omni.diffusion.models.lingbot_world.pixel_output import (
+            current_pixel_output_policy,
+            gather_final_pixels,
+        )
+
+        pixel_policy = current_pixel_output_policy()
+        if pixel_policy is not None:
+            if pixel_policy.group is not group or (pixel_policy.rank, pixel_policy.world_size) != (rank, world_size):
+                raise RuntimeError("Pixel output policy owner/group changed during VAE execution")
+            if pixel_policy.planar_uint8:
+                return gather_final_pixels(
+                    out, policy=pixel_policy, split_dim=split_dim, expected_extent=expected_extent
+                )
+            return gather_and_trim_extent(out, expected_extent=expected_extent, split_dim=split_dim, group=group, dst=0)
         return gather_and_trim_extent(out, expected_extent=expected_extent, split_dim=split_dim, group=group, dst=dst)
 
     decoder.forward = MethodType(_forward, decoder)

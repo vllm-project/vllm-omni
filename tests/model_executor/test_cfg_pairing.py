@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for the model-neutral CFG request-pairing scheduler patches.
 
 The patches keep a cond/uncond request pair step-locked inside one engine:
@@ -427,3 +427,122 @@ def test_sampling_extra_args_keys_are_derived_from_stage_defaults() -> None:
     )
     assert _sampling_extra_args_keys({"temperature": 0.1}) == ()
     assert _sampling_extra_args_keys(None) == ()
+
+
+def _logits_context(slots, tokens=None, positions=None):
+    import numpy as np
+    import torch
+    from vllm.v1.worker.gpu.sample.logits_processor import LogitsContext
+
+    n = len(slots)
+    return LogitsContext(
+        expanded_idx_mapping=torch.tensor(slots),
+        idx_mapping=torch.tensor(slots),
+        idx_mapping_np=np.array(slots),
+        expanded_local_pos=torch.zeros(n, dtype=torch.int64),
+        input_ids=torch.tensor(tokens or [0] * n),
+        pos=torch.tensor(positions or [0] * n),
+        seq_lens_upper_bound_np=np.array(positions or [0] * n) + 1,
+    )
+
+
+def test_audex_cfg_uses_active_slot_mapping_and_synchronizes_tokens():
+    import torch
+    from vllm.sampling_params import SamplingParams
+
+    from vllm_omni.model_executor.models.audex.cfg import AudexCFGLogitsProcessor, AudexCFGSampler
+
+    proc = AudexCFGLogitsProcessor(SimpleNamespace(speculative_config=None), None)
+    for slot, role in [(7, "cond"), (2, "uncond")]:
+        assert proc.add_request(
+            slot, SamplingParams(extra_args={"cfg_role": role, "cfg_pair_id": "p", "cfg_scale": 2.0})
+        )
+    logits = torch.tensor([[1.0, 3.0], [4.0, 2.0], [8.0, 9.0]])
+    proc.apply(logits, _logits_context([2, 7, 1]))
+    torch.testing.assert_close(logits, torch.tensor([[7.0, 1.0], [7.0, 1.0], [8.0, 9.0]]))
+    output = SimpleNamespace(sampled_token_ids=torch.tensor([[8], [3], [5]]))
+    base = SimpleNamespace(logits_processors=[proc])
+
+    class Base:
+        logits_processors = base.logits_processors
+
+        def __call__(self, logits, input_batch):
+            return output
+
+    assert AudexCFGSampler(Base())(logits, SimpleNamespace(idx_mapping_np=[2, 7, 1])) is output
+    assert output.sampled_token_ids.tolist() == [[3], [3], [5]]
+    # Only active slots pair; reusing a slot with a plain request erases its role.
+    assert proc.pairs([7, 1]) == []
+    assert not proc.add_request(2, SamplingParams())
+    assert proc.pairs([2, 7]) == []
+
+
+@pytest.mark.parametrize("resumed,start_in_prompt", [(False, True), (False, False), (True, False)])
+def test_audex_tta_native_history_phase_resume_and_slot_reuse(resumed, start_in_prompt):
+    import numpy as np
+    import torch
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.worker.gpu.sample.logits_processor import LogitsProcRequestState
+
+    from vllm_omni.model_executor.models.audex.tta import TTARVQPhaseMaskLogitsProcessor
+
+    history = torch.zeros((8, 16), dtype=torch.int64)
+    history[6, :7] = torch.tensor([8, 8, 9, 1, 2, 3, 4])
+    prompt_len = np.full(8, 3 if start_in_prompt else 2)
+    prefill_len = np.full(8, 7 if resumed else int(prompt_len[6]))
+    state = LogitsProcRequestState(
+        torch.device("cpu"),
+        8,
+        10,
+        SimpleNamespace(gpu=history),
+        SimpleNamespace(np=prompt_len),
+        SimpleNamespace(np=prefill_len),
+        SimpleNamespace(gpu=torch.tensor(prefill_len)),
+    )
+    proc = TTARVQPhaseMaskLogitsProcessor(SimpleNamespace(speculative_config=None), state)
+    params = SamplingParams(
+        extra_args={
+            "tta_rvq": {
+                "phase_token_ids": [[1], [2], [3], [4]],
+                "start_tid": 9,
+                "end_tid": 5,
+                "start_in_prompt": start_in_prompt,
+                "codec_cap": 4,
+            }
+        }
+    )
+    assert proc.add_request(6, params)
+    proc.apply_staged_writes()
+    # Current input marker may not yet occur in committed history. Reordered
+    # slot6 is row1; unrelated slot0 must keep all logits.
+    begin = 6 if resumed else int(prompt_len[6]) - int(start_in_prompt)
+    for offset in range(5):
+        pos = begin + offset
+        logits = torch.zeros((2, 10))
+        token = 9 if not start_in_prompt and not resumed and offset == 0 else 1
+        proc.apply(logits, _logits_context([0, 6], [0, token], [0, pos]))
+        assert torch.isfinite(logits[0]).all()
+        generated_position = pos - (2 if start_in_prompt or resumed else begin)
+        expected = {5} if generated_position >= 4 else {1 + generated_position % 4}
+        if generated_position > 0 and generated_position % 4 == 0:
+            expected.add(5)
+        assert set(torch.where(torch.isfinite(logits[1]))[0].tolist()) == expected
+    assert not proc.add_request(6, SamplingParams())
+    assert torch.isfinite(proc.apply(torch.zeros((1, 10)), _logits_context([6]))).all()
+
+
+def test_audex_custom_processors_reject_speculative_requests():
+    import torch
+    from vllm.sampling_params import SamplingParams
+
+    from vllm_omni.model_executor.models.audex.cfg import AudexCFGLogitsProcessor
+    from vllm_omni.model_executor.models.audex.tta import TTARVQPhaseMaskLogitsProcessor
+
+    config = SimpleNamespace(speculative_config=object())
+    cfg = AudexCFGLogitsProcessor(config, None)
+    with pytest.raises(ValueError, match="non-speculative"):
+        cfg.add_request(0, SamplingParams(extra_args={"cfg_role": "cond"}))
+    state = SimpleNamespace(device=torch.device("cpu"), max_num_reqs=1)
+    tta = TTARVQPhaseMaskLogitsProcessor(config, state)
+    with pytest.raises(ValueError, match="non-speculative"):
+        tta.add_request(0, SamplingParams(extra_args={"tta_rvq": {"start_tid": 9}}))

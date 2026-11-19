@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """PersonaPlex depformer: the per-step audio code predictor.
 
 The depformer is the small autoregressive head that, conditioned on one temporal
@@ -26,11 +26,12 @@ Faithful-port details (all measured from ``nvidia/personaplex-7b-v1``):
 * **ScaledEmbedding** with ``zero_idx = -1`` (the special token maps to the zero
   vector); audio table is ``card + 1`` rows, text table ``text_card + 1``.
 
-The checkpoint ships ``dep_q = 8`` weight sets; the production loader (Moshi's
-``get_moshi_lm``) overrides ``dep_q = 16`` and fills sets 8..15 by copying 0..7.
-:meth:`PersonaPlexDepformer.load_weights` replicates that expansion so the module
-loads directly from the raw ``model.safetensors`` as well as from an
-already-expanded Moshi instance.
+``nvidia/personaplex-7b-v1`` ships all 16 weight sets (15 ``depformer_emb``
+tables). For an 8-set checkpoint, the production loader (Moshi's
+``get_moshi_lm``) overrides ``dep_q = 16`` and fills sets 8..15 by copying 0..7;
+:meth:`PersonaPlexDepformer.load_weights` replicates that expansion. A module
+built with fewer steps (the duplex talker only runs the 8 agent steps) loads
+the leading sets.
 """
 
 from __future__ import annotations
@@ -83,8 +84,7 @@ class _ScaledEmbedding(nn.Embedding):
     def forward(self, idx: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
         is_zero = idx == self.zero_idx
         y = super().forward(idx.clamp(min=0))
-        zero = torch.zeros(1, dtype=y.dtype, device=y.device)
-        return torch.where(is_zero[..., None], zero, y)
+        return y.masked_fill(is_zero[..., None], 0.0)
 
 
 class _DepformerLayer(nn.Module):
@@ -243,7 +243,7 @@ class PersonaPlexDepformer(nn.Module):
             for li, layer in enumerate(self.layers):
                 x = layer(x, step, kv[li])
             logits = self.linears[step](x).squeeze(1)  # [B, card]
-            sampled = logits.float().argmax(dim=-1)  # greedy [B]
+            sampled = logits.argmax(dim=-1)  # greedy [B]; the exact fp32 upcast gives the same index
             codes.append(sampled)
             if return_logits:
                 logits_all.append(logits.float())
@@ -320,7 +320,7 @@ class PersonaPlexDepformer(nn.Module):
                 if steps < self.dep_q:
                     reps = (self.dep_q + steps - 1) // steps
                     t = t.repeat(reps, 1)[: self.dep_q * per_step_rows]
-                return t
+                return t[: self.dep_q * per_step_rows]
 
             return build
 

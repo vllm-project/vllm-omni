@@ -46,7 +46,7 @@ class FakeStageClient:
         self.next_inputs = list(next_inputs or [])
         self.add_request_calls: list[tuple[Any, ...]] = []
         self.decoded_source_tokens: str | None = None
-        self._engine_core_outputs = queue.Queue()
+        self._engine_core_outputs: queue.Queue[Any] = queue.Queue()
 
     async def add_request_async(self, *args, **_kwargs) -> None:
         self.add_request_calls.append(args)
@@ -56,6 +56,9 @@ class FakeStageClient:
             return self._engine_core_outputs.get_nowait()
         except queue.Empty:
             return SimpleNamespace(outputs=[])
+
+    def get_payload_sender_info(self) -> dict[str, Any] | None:
+        return None
 
     def process_engine_inputs(self, _source_outputs, prompt=None, streaming_context=None):
         decoder = getattr(streaming_context, "source_token_decoder", None)
@@ -87,6 +90,7 @@ class FakeOutputProcessor:
 class FakeInputProcessor:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.renderer = SimpleNamespace(mm_processor_cache=None)
 
     def process_inputs(self, **kwargs):
         self.calls.append(kwargs)
@@ -102,9 +106,11 @@ class FakePrewarmPool:
     """Single-replica pool double that binds requests only on submission."""
 
     stage_type = "llm"
+    get_payload_sender_info = StagePool.get_payload_sender_info
 
     def __init__(self, role: str) -> None:
-        self.stage_client = SimpleNamespace()
+        self.stage_client = SimpleNamespace(get_payload_sender_info=lambda: None)
+        self._stage_payloads: dict[str, bytes] = {}
         self._bound_request_ids: set[str] = set()
         self.stage_vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(
@@ -192,6 +198,7 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
         sampling_params_list=[SamplingParams(max_tokens=1), SamplingParams(max_tokens=1)],
         final_stage_id=1,
     )
+    orchestrator.request_states[req_state.request_id] = req_state
 
     await orchestrator._forward_to_next_stage("req-text", 0, _request_output("req-text"), req_state)
 
@@ -273,9 +280,12 @@ async def test_async_prewarm_skips_stage_with_custom_process_input_func() -> Non
     the turn-based Orchestrator base.
     """
     orchestrator = object.__new__(DuplexOrchestrator)
+    orchestrator.replica_placement = None
     stage0 = FakePrewarmPool("sender")
     stage1 = FakePrewarmPool("receiver")  # would receive chunks if role alone decided
-    stage1.stage_client = SimpleNamespace(custom_process_input_func=lambda *a, **k: None)
+    stage1.stage_client = SimpleNamespace(
+        custom_process_input_func=lambda *a, **k: None, get_payload_sender_info=lambda: None
+    )
     stage2 = FakePrewarmPool("receiver")
     orchestrator.stage_pools = [stage0, stage1, stage2]
     orchestrator._emit_tx_edge = lambda **_kwargs: None

@@ -1,5 +1,8 @@
 # Bimanual CPU fixtures
 
+`unified_action_schema.json` records the schema-v5 normalized 59-value inputs,
+scalar or per-row domain routing, and zero padding to the 64-value model width.
+
 `legacy_action_schema.json` and `cookbook_action_schema.json` contain v3 and
 v4 action contracts and normalizer data, without model weights. The v4 fixture
 records the statistics declaration, effective pose convention, and inference
@@ -42,7 +45,7 @@ conditioning only; it does not establish model or VAE output equivalence.
 Run the checked-in vectors with:
 
 ```bash
-python tools/run_bimanual_cpu_tests.py -q
+pytest -q tests/diffusion/models/cosmos3_nano_sim_bimanual
 ```
 
 Changes to these vectors require independent numerical validation and review of
