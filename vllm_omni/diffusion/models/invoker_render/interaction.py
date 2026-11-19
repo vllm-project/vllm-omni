@@ -65,5 +65,5 @@ class InvokerProxyInteraction(InteractionHandler):
         fps: float | None = None,
         num_latent_frames: int | None = None,
     ) -> InteractionChunkMetadata | None:
-        # 包按源帧顺序入队，模型在下一次需要代理数据时消费。
+        # Proxy packets are queued in source-frame order and consumed when the model needs more input.
         return None

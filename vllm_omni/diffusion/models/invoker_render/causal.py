@@ -56,7 +56,7 @@ def generator(device: torch.device | str, *parts: int | str) -> torch.Generator:
 def euler_step(
     state: torch.Tensor, velocity: torch.Tensor, sigma: torch.Tensor, next_sigma: torch.Tensor
 ) -> torch.Tensor:
-    # X0 使用 BF16 输入投影的值，残差保留 FP32 状态。
+    # Compute x0 from the BF16-rounded input and keep the FP32 state for the residual.
     time = 1.0 - sigma.float()
     x0 = state.to(torch.bfloat16).float() + (1.0 - time) * velocity
     current = sigma.reshape((1,) * state.ndim)

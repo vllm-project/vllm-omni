@@ -52,7 +52,7 @@ class DecodeState:
 
 
 class CausalVideoDecoder(nn.Module):
-    # 与 CodeWorldModel 的 Apache-2.0 因果 ViT decoder 使用相同的窗口和 checkpoint 布局。
+    # Reuse the window and checkpoint layout of CodeWorldModel's Apache-2.0 causal ViT decoder.
     def __init__(self, config_file: Path, weights_file: Path, vae: MiniMaxH3VideoVAE, device: torch.device):
         super().__init__()
         with config_file.open() as source:

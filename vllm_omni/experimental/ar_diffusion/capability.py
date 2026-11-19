@@ -77,7 +77,8 @@ class ARDiffusionSegmentedKVSpec:
         for name in self.__dataclass_fields__:
             if getattr(self, name) <= 0:
                 raise ValueError(f"AR-Diffusion segmented {name} must be positive, got {getattr(self, name)}")
-        # 页池分别使用保留和待提交的上限，初始连续缓冲按模型实际同时读取的行数分配。
+        # The page pool budgets retained and pending tokens separately.
+        # Size the initial staging buffer for the rows the model reads together.
         if self.initial_staging_tokens < max(self.max_retained_tokens, self.max_pending_tokens):
             raise ValueError("AR-Diffusion segmented staging must fit each retained or pending token bound")
 

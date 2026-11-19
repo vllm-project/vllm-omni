@@ -248,12 +248,12 @@ class InvokerRenderPipeline(nn.Module, InteractionMixin):
     def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
         width, height = VIDEO_SIZE
         rows = width // 32 * (height // 32)
-        # 前缀包含文本、参考图和首帧的 proxy 与目标。历史最多保留 12 对。
+        # The prefix holds text, the reference image, and the first proxy/target pair. History holds up to 12 pairs.
         prefix = 3 * rows + self.text_rows
         history = 24 * rows
         retained = prefix + history + 5 * rows
         pending = 19 * rows + self.text_rows
-        # 去噪使用当前最多 5 个目标帧。更新 RoPE 时，新旧前缀同时驻留。
+        # Denoising uses up to five current target frames. RoPE refresh holds both prefixes at once.
         staging = max(retained + 5 * rows, 2 * prefix + history)
         latent_pixels = width // 16 * (height // 16)
         decoder_bytes = (
