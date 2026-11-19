@@ -437,6 +437,26 @@ async def test_append_submits_the_resumable_stage0_request_and_counts_it_running
     assert counter.value == 0
 
 
+@pytest.mark.asyncio
+async def test_resumable_append_refreshes_stage_submit_ts(monkeypatch) -> None:
+    """A later append on the same request id must not keep the first segment's clock."""
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr("vllm_omni.engine.duplex_orchestrator._time.time", lambda: clock["now"])
+    orchestrator, _, rpc_q, _ = _build()
+    await _open(orchestrator, rpc_q)
+    request_id = _stage0_request_id()
+
+    await _submit(orchestrator, _append_audio())
+    request_state = orchestrator.request_states[request_id]
+    assert request_state.stage_submit_ts[0] == pytest.approx(1_000.0)
+
+    clock["now"] = 5_000.0
+    await _submit(orchestrator, _append_audio())
+    assert request_state.stage_submit_ts[0] == pytest.approx(5_000.0)
+
+    await orchestrator.session_manager.shutdown()
+
+
 @pytest.fixture
 def ephemeral_submissions(mocker):
     orchestrator, clients, _, _ = _build(stages=2)

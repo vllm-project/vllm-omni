@@ -812,7 +812,14 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             pool = self.stage_pools[context.stage_id]
             if mark_submitting is not None:
                 mark_submitting()
-            request_state.stage_submit_ts.setdefault(context.stage_id, _time.time())
+            # The first enqueue must be stamped before submit_initial so diffusion
+            # scheduler wait stays inside the stage clock. A resumable append reuses
+            # the request id; refreshing here keeps this segment from counting the
+            # previous one and the idle gap between them.
+            if submission.already_submitted:
+                request_state.stage_submit_ts[context.stage_id] = _time.time()
+            else:
+                request_state.stage_submit_ts.setdefault(context.stage_id, _time.time())
             try:
                 if submission.already_submitted:
                     if not submission.resumable:
