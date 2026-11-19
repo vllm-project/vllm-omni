@@ -296,7 +296,7 @@
   },
   {
     "test_name": "test_minicpmo_4_5_nightly_async_prefix",
-    "description": "CUDA nightly async_chunk + Thinker prefix cache on turn serving. Seed-TTS C1/C16/C32 are perf-only; C64 also gates WER 0.05 / SIM 0.80 on all 1088 English utterances. max_num_seqs is 64; drop to 32 if C64 OOMs. Stage-0 ngram is removed because omni prefix cache refuses speculative decoding. Performance baselines start empty until a measured H100/B200 window is collected.",
+    "description": "CUDA nightly async_chunk + Thinker prefix cache on turn serving. Seed-TTS C16/C32 are perf-only on all 1088 English utterances; C64 also gates WER 0.05 / SIM 0.80. C1 1088 is a separate nightly case. max_num_seqs is 64; drop to 32 if C64 OOMs. Stage-0 ngram is removed because omni prefix cache refuses speculative decoding. Performance baselines start empty until a measured H100/B200 window is collected.",
     "mark": [
       {
         "hardware_marks": {
@@ -343,8 +343,8 @@
         "dataset_path": "zhaochenyang20/seed-tts-eval",
         "backend": "openai-chat-omni",
         "endpoint": "/v1/chat/completions",
-        "num_prompts": [32, 256, 512],
-        "max_concurrency": [1, 16, 32],
+        "num_prompts": [1088, 1088],
+        "max_concurrency": [16, 32],
         "no_oversample": true,
         "disable_shuffle": true,
         "trust_remote_code": true,
@@ -376,6 +376,74 @@
         "omni_fail_fast_on_timeout": true,
         "max_seed_tts_mean_wer": 0.05,
         "min_seed_tts_mean_sim": 0.80,
+        "extra_body": {
+          "modalities": ["text", "audio"],
+          "chat_template_kwargs": {
+            "enable_thinking": false,
+            "use_tts_template": true
+          }
+        },
+        "percentile-metrics": "ttft,tpot,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "baseline": {}
+      }
+    ]
+  },
+  {
+    "test_name": "test_minicpmo_4_5_nightly_seed_c1",
+    "description": "CUDA nightly async_chunk + Thinker prefix cache on turn serving. Isolated C1 English Seed-TTS pass of all 1088 utterances, perf-only. Same deploy as the async-prefix Seed sweep; kept in its own job so C1 wall time does not share the Daily-Omni + C16/C32/C64 timeout. Performance baselines start empty until a measured H100/B200 window is collected.",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": ["H100", "B200"]
+          },
+          "num_cards": 2
+        }
+      },
+      "full_model",
+      "omni"
+    ],
+    "server_params": {
+      "model": "openbmb/MiniCPM-o-4_5",
+      "extra_cli_args": [
+        "--deploy-config",
+        "vllm_omni/deploy/minicpmo_4_5_turn.yaml",
+        "--trust-remote-code"
+      ],
+      "update": {
+        "async_chunk": true,
+        "session_mode": "turn",
+        "stages": {
+          "0": {
+            "enable_prefix_caching": true,
+            "max_num_seqs": 64
+          },
+          "1": {"max_num_seqs": 64},
+          "2": {"max_num_seqs": 64}
+        },
+        "platforms.cuda.stages.0.enable_prefix_caching": true,
+        "platforms.cuda.stages.2.max_num_seqs": 64
+      },
+      "delete": {
+        "stages": {
+          "0": ["speculative_config"]
+        },
+        "platforms.cuda.stages.0.speculative_config": null
+      }
+    },
+    "benchmark_params": [
+      {
+        "dataset_name": "seed-tts",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "backend": "openai-chat-omni",
+        "endpoint": "/v1/chat/completions",
+        "num_prompts": [1088],
+        "max_concurrency": [1],
+        "no_oversample": true,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "seed_tts_locale": "en",
+        "omni_fail_fast_on_timeout": true,
         "extra_body": {
           "modalities": ["text", "audio"],
           "chat_template_kwargs": {

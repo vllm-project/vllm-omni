@@ -2216,12 +2216,22 @@ def test_minicpmo_nightly_default_and_async_prefix_seed_tts_matrix():
     assert "tpot" in default_params["percentile-metrics"]
     assert prefix["server_params"]["extra_cli_args"][1] == "vllm_omni/deploy/minicpmo_4_5_turn.yaml"
     assert prefix["server_params"]["update"]["stages"]["0"]["enable_prefix_caching"] is True
-    assert prefix_perf["max_concurrency"] == [1, 16, 32]
+    assert prefix_perf["max_concurrency"] == [16, 32]
+    assert prefix_perf["num_prompts"] == [1088, 1088]
     assert "seed_tts_wer_eval" not in prefix_perf
     assert prefix_acc["max_concurrency"] == [64]
     assert prefix_acc["num_prompts"] == [1088]
     assert prefix_acc["seed_tts_wer_eval"] is True
     assert prefix_acc["min_seed_tts_mean_sim"] == 0.80
+    seed_c1 = by_name["test_minicpmo_4_5_nightly_seed_c1"]
+    seed_c1_params = seed_c1["benchmark_params"][0]
+    assert seed_c1["server_params"]["extra_cli_args"][1] == "vllm_omni/deploy/minicpmo_4_5_turn.yaml"
+    assert seed_c1["server_params"]["update"]["stages"]["0"]["enable_prefix_caching"] is True
+    assert seed_c1["server_params"]["update"]["session_mode"] == "turn"
+    assert seed_c1_params["max_concurrency"] == [1]
+    assert seed_c1_params["num_prompts"] == [1088]
+    assert "seed_tts_wer_eval" not in seed_c1_params
+    assert "test_minicpmo_4_5_nightly_async_prefix" not in seed_c1["test_name"]
     daily = by_name["test_minicpmo_4_5_nightly_async_prefix_daily_omni"]
     daily_params = daily["benchmark_params"][0]
     assert daily["mark"][0]["hardware_marks"]["num_cards"] == 2
