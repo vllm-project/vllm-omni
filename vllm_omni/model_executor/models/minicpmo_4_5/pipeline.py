@@ -125,6 +125,7 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
 MINICPMO_4_5_TURN_CHUNKED_PIPELINE = dataclasses.replace(
     MINICPMO_4_5_PIPELINE,
     model_type="minicpmo_4_5_turn_chunked",
+    default_deploy_config_name="minicpmo_4_5_turn_chunked.yaml",
     # Selected by the deploy profile only, for turn serving; architecture
     # inference and native duplex keep the default pipeline.
     duplex_plugin=None,

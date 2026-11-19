@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import warnings
+from copy import deepcopy
 from dataclasses import asdict, fields, replace
 from inspect import Parameter, signature
 from multiprocessing.reduction import ForkingPickler
@@ -59,6 +60,7 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
     resolve_deploy_yaml,
+    resolve_stage_model_runner,
     update_deploy_config_async_chunk_enabled,
 )
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -107,6 +109,16 @@ def _load_default_deploy(pipeline: PipelineConfig) -> DeployConfig:
     if pipeline.default_deploy_config_name is not None:
         return load_deploy_config(_DEPLOY_DIR / pipeline.default_deploy_config_name)
     return DeployConfig()
+
+
+def _needs_mrv2_on_v1(pipeline: PipelineConfig, deploy: DeployConfig) -> bool:
+    """Whether a stage that requires MRv2 resolves to V1 on this platform."""
+    resolved = _apply_platform_overrides(deepcopy(deploy))
+    deploy_stages = {stage.stage_id: stage for stage in resolved.stages}
+    return any(
+        stage.requires_mrv2 and resolve_stage_model_runner(resolved, deploy_stages.get(stage.stage_id)) != "v2"
+        for stage in pipeline.stages
+    )
 
 
 def _resolve_pipeline_or_skip(model_type: str, hf_config=None) -> PipelineConfig:
@@ -317,6 +329,13 @@ def _build_single_diffusion_config(
 def test_vllm_omni_config_from_pipeline_config_matches_merge_pipeline_deploy(model_type: str):
     pipeline = _resolve_pipeline_or_skip(model_type)
     legacy_deploy = _load_default_deploy(pipeline)
+    if _needs_mrv2_on_v1(pipeline, legacy_deploy):
+        # Such a pipeline only builds where its default deploy selects MRv2.
+        with pytest.raises(ValueError, match="needs model_runner v2"):
+            merge_pipeline_deploy(pipeline, legacy_deploy)
+        with pytest.raises(ValueError, match="needs model_runner v2"):
+            VllmOmniConfig.from_pipeline_config(pipeline)
+        return
 
     legacy_stages = merge_pipeline_deploy(pipeline, legacy_deploy)
     omni_config = VllmOmniConfig.from_pipeline_config(pipeline)

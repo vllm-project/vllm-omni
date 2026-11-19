@@ -398,6 +398,7 @@ class TestTurnChunkedProfile:
         # Selected by its deploy profile only, never by architecture inference.
         assert variant.hf_architectures == ()
         assert variant.duplex_plugin is None
+        assert variant.default_deploy_config_name == "minicpmo_4_5_turn_chunked.yaml"
 
     @pytest.mark.parametrize("platform", ["cuda", "npu"])
     def test_deploy_profile_resolves_to_the_variant(self, platform: str, monkeypatch: pytest.MonkeyPatch) -> None:
