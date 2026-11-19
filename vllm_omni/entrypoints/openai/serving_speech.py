@@ -1974,7 +1974,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     first_packet_ts=first_audio_packet_ts,
                 )
 
-        def record_client_delivery(audio_bytes: bytes) -> None:
+        def record_client_delivery(audio_bytes: bytes, arrival_s: float | None = None) -> None:
             """Client-side continuity timeline: stamped at the YIELD site.
 
             `audio_chunk_arrivals_s`/`audio_chunk_bytes` feed
@@ -1986,7 +1986,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             Called immediately before every audio yield site: burst release,
             pass-through, end-of-stream flush, resampler tail.
             """
-            audio_chunk_arrivals_s.append(max(time.perf_counter() - stream_start_s, 0.0))
+            if arrival_s is None:
+                arrival_s = time.perf_counter() - stream_start_s
+            audio_chunk_arrivals_s.append(max(arrival_s, 0.0))
             audio_chunk_bytes.append(len(audio_bytes))
 
         # SSE supplies an accumulator for usage output. Raw-audio and WebSocket
@@ -2096,11 +2098,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                             pending_wav_header = wav_header
                         burst_buf.append((audio_bytes, output_sample_rate))
                         if len(burst_buf) >= burst_n:
+                            # One stamp for the whole release: every held byte
+                            # leaves for the client at the same instant, and
+                            # the delivery timeline must show exactly that.
+                            release_ts = time.perf_counter() - stream_start_s
                             if pending_wav_header is not None:
                                 yield pending_wav_header
                                 pending_wav_header = None
                             for held, held_sr in burst_buf:
-                                record_client_delivery(held)
+                                record_client_delivery(held, release_ts)
                                 if include_sample_rate:
                                     yield held, held_sr
                                 else:
@@ -2122,11 +2128,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # ran for every held chunk, so without this flush a short
             # utterance would finish with no audio on the wire.
             if not burst_released:
+                flush_ts = time.perf_counter() - stream_start_s
                 if pending_wav_header is not None:
                     yield pending_wav_header
                     pending_wav_header = None
                 for held, held_sr in burst_buf:
-                    record_client_delivery(held)
+                    record_client_delivery(held, flush_ts)
                     if include_sample_rate:
                         yield held, held_sr
                     else:
