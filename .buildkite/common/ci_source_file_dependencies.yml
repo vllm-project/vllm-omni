@@ -482,6 +482,7 @@ source_file_dependencies:
   # path. Mixed diffs use normal job dependencies when any job-key prefix matches.
   source_filter_fallback:
     - .buildkite/common/ci_mirror_hardwares.yml
+    - docker/Dockerfile.npu.ci
     - tests/helpers/
 
   # --- features ---
