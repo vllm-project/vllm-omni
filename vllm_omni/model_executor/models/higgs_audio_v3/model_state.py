@@ -322,10 +322,10 @@ class HiggsSampler(OmniSampler):
         meta = state.sampling_metadata(input_batch.req_ids, input_batch.idx_mapping[: input_batch.num_reqs])
         hidden = hidden_states[input_batch.logits_indices]
         stock_output = None
-        text_batch = _first_logit_batch(input_batch) if input_batch.num_draft_tokens else input_batch
 
         def sample_text(text_logits):
             nonlocal stock_output
+            text_batch = _first_logit_batch(input_batch) if input_batch.num_draft_tokens else input_batch
             stock_output = self.base_sampler(text_logits, text_batch)
             return stock_output.sampled_token_ids
 
