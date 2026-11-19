@@ -277,8 +277,8 @@ def test_nightly_requires_finite_scores(dataset, metric):
     assert any(metric in error for error in nightly.accuracy_coverage_errors(result, case))
 
 
-@pytest.mark.parametrize("hardware,concurrency", [("H100", 64), ("A3", 32)])
-def test_seed_accepts_zero_wer_without_utmos_scores(monkeypatch, hardware, concurrency):
+@pytest.mark.parametrize("hardware,platform,concurrency", [("H100", "cuda", 64), ("A3", "npu", 32)])
+def test_seed_accepts_zero_wer_without_utmos_scores(monkeypatch, hardware, platform, concurrency):
     monkeypatch.setenv("QWEN3_OMNI_BASELINE_MODE", "collect")
     case = nightly.WorkloadCase("default", "seed-tts", concurrency, 1088, accuracy=True)
     result = {
@@ -290,8 +290,9 @@ def test_seed_accepts_zero_wer_without_utmos_scores(monkeypatch, hardware, concu
         "seed_tts_content_error_mean": 0.0,
     }
     assert nightly.accuracy_coverage_errors(result, case) == []
-    annotated = nightly.annotate_result(result, case, hardware, smoke=False, exit_code=0)
+    annotated = nightly.annotate_result(result, case, hardware, platform=platform, smoke=False, exit_code=0)
     assert annotated["validation_errors"] == []
+    assert annotated["inference_devices"] == (3 if platform == "npu" else 2)
     assert "min_seed_tts_mean_utmos" not in annotated["quality_thresholds"]
 
 
@@ -346,13 +347,16 @@ def test_performance_subset_is_qualified_without_accuracy_scoring(platform, conc
         "completed": count,
         "successful_audio_requests": count,
     }
-    annotated = nightly.annotate_result(result, case, platform, smoke=smoke, exit_code=0)
+    annotated = nightly.annotate_result(result, case, platform, platform=platform, smoke=smoke, exit_code=0)
     assert annotated["validation_errors"] == []
     assert annotated["qualification_scope"] == "performance-subset"
     assert annotated["accuracy_evaluated"] is False
+    assert annotated["inference_devices"] == (3 if platform == "npu" else 2)
     assert annotated["quality_thresholds"] == {}
     result["completed"] -= 1
-    assert nightly.annotate_result(result, case, platform, smoke=smoke, exit_code=0)["validation_errors"]
+    assert nightly.annotate_result(result, case, platform, platform=platform, smoke=smoke, exit_code=0)[
+        "validation_errors"
+    ]
     workload["accuracy"] = True
     with pytest.raises(ValueError, match="complete pinned dataset"):
         nightly.case_from_params(params)

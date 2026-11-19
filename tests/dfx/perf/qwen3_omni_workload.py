@@ -318,6 +318,7 @@ def annotate_result(
     case: WorkloadCase,
     hardware: str,
     *,
+    platform: str,
     smoke: bool,
     exit_code: int,
     enforce_baseline: bool = False,
@@ -363,7 +364,7 @@ def annotate_result(
             "async_chunk": case.config == "async-prefix",
             "thinker_prefix_caching": case.config == "async-prefix",
             "model_runner": "v2",
-            "inference_devices": 2,
+            "inference_devices": 3 if platform == "npu" else 2,
             "dataset": case.dataset.replace("-", "_"),
             "dataset_revision": DATASETS[case.dataset]["revision"],
             "dataset_manifest_sha256": DATASETS[case.dataset]["sha256"],
@@ -386,7 +387,7 @@ def run_workload(server, params: dict, test_name: str, hardware: str, *, enforce
     """Execute JSON-defined dataset cases through the shared DFX bench runner."""
     from tests.dfx.conftest import run_benchmark
 
-    case, _, smoke = case_from_params(params)
+    case, platform, smoke = case_from_params(params)
     if smoke and enforce_baseline:
         raise ValueError("Smoke cannot qualify a full-dataset performance baseline")
     root = resolve_dataset(case.dataset)
@@ -432,7 +433,13 @@ def run_workload(server, params: dict, test_name: str, hardware: str, *, enforce
             num_warmups=params.get("num_warmups", max(2, case.concurrency)),
             benchmark_params_name=case.id,
             result_transform=lambda result, code: annotate_result(
-                result, case, hardware, smoke=smoke, exit_code=code, enforce_baseline=enforce_baseline
+                result,
+                case,
+                hardware,
+                platform=platform,
+                smoke=smoke,
+                exit_code=code,
+                enforce_baseline=enforce_baseline,
             ),
         )
     assert not result["validation_errors"], "\n".join(result["validation_errors"])
