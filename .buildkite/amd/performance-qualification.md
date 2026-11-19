@@ -160,6 +160,43 @@ change, one further exact-head held-out run is required. Record each Buildkite
 link and every target job result in the PR qualification evidence before
 merge; do not promote these jobs to blocking on calibration data alone.
 
+### November 19 source-level follow-up
+
+The held-out runs exposed a source-level measurement perturbation after the
+base advanced to `cb718fd70` rather than evidence for another broad baseline
+increase. CUDA builds
+[20375](https://buildkite.com/vllm/vllm-omni/builds/20375) and
+[20376](https://buildkite.com/vllm/vllm-omni/builds/20376) failed the 2-GPU
+Qwen3-TTS job on different H100 nodes. The VoiceDesign concurrency-64 median
+audio TTFP repeated at 139.66 ms and 141.89 ms, while the same job passed at
+118.80 ms in build
+[20367](https://buildkite.com/vllm/vllm-omni/builds/20367). All three used the
+same vLLM `62d4bc3c7`, PyTorch 2.14.0, CUDA 13.0 and driver 580.95.05. The last
+passing run used base `862d35130`; both failures used `cb718fd70`.
+
+The relevant base delta is the live OmniServer stderr tee added by `cb718fd70`:
+the drain thread wrote and flushed every child line into pytest while requests
+were being measured. This follow-up keeps the bounded stderr tail but replays it
+once during teardown, preserving post-readiness diagnostics without synchronous
+CI log I/O in the benchmark hot path. H100 baselines remain unchanged.
+
+AMD build
+[16843](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/16843) showed a
+broad, node-dependent slowdown rather than a narrow envelope miss: its MiniCPM
+job shared physical node `gpu8ffd` with Voxtral and regressed from C4 through
+C32, while C1 remained within the held-out envelope. Qwen3-Omni async and
+Qwen3-TTS also crossed multiple latency or RTF limits on separate nodes. Those
+results are not used to widen baselines; the deferred stderr replay must receive
+a fresh exact-head AMD run.
+
+NPU build
+[12275](https://buildkite.com/vllm/vllm-omni-npu-ci/builds/12275) separately
+exposed the Qwen-Image-2.1 non-CUDA mixed-length guard during the synthetic
+concurrency sweep: 24 of 40 requests completed and 16 returned HTTP 500. The
+NPU workload now retains an eight-token prompt but generates it entirely as a
+shared random prefix, making concurrent prompts homogeneous without weakening
+the production guard.
+
 ## Buildkite validation and promotion criteria
 
 Maintainers should run these five exact jobs at the proposed head with the
