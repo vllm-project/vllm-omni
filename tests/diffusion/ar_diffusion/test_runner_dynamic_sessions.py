@@ -7,7 +7,7 @@ allocating device KV pools. Pool allocation is covered by test_kv_cache.py.
 """
 
 from collections import OrderedDict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -146,8 +146,16 @@ def test_request_geometry_rejection_preserves_existing_session(runner, monkeypat
     original = runner._get_or_create_session("s1", "small")
     forward = Mock(return_value=object())
     monkeypatch.setattr(runner_module.DiffusionModelRunner, "execute_model", forward)
-    with pytest.raises(ARDiffusionRequestRejectedError, match="reset is required"):
-        runner.execute_model(request(runner, geometry="wide"))
+    from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+
+    worker = object.__new__(DiffusionWorker)
+    worker.model_runner = runner
+    worker.lora_manager = None
+    monkeypatch.setattr(worker, "_flashinfer_autotune_context", lambda _: nullcontext())
+    result = worker.execute_model(request(runner, geometry="wide"), od_config=SimpleNamespace())
+    assert "reset is required" in result.error
+    assert result.error_status_code == 400
+    assert result.error_type == "ARDiffusionRequestRejectedError"
     assert runner._sessions["s1"] is original
     original.release_history.assert_not_called()
     forward.assert_not_called()
@@ -157,8 +165,9 @@ def test_request_geometry_rejection_preserves_existing_session(runner, monkeypat
 def test_request_reset_validates_before_releasing_history(runner, monkeypatch):
     original = runner._get_or_create_session("s1", "small")
     monkeypatch.setattr(runner.pipeline, "ar_diffusion_request_spec", Mock(side_effect=ValueError("bad geometry")))
-    with pytest.raises(ARDiffusionRequestRejectedError, match="bad geometry"):
-        runner.execute_model(request(runner, reset=True))
+    result = runner.execute_model(request(runner, reset=True))
+    assert result.error == "bad geometry"
+    assert result.error_status_code == 400
     assert runner._sessions["s1"] is original
     assert not runner.pipeline.reset
 
