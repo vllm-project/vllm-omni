@@ -1464,11 +1464,11 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
         "Reliability Test · Invalid parameters · MI300 · Single-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-single/**/*",
             "artifact_env": "ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR",
-            "expected_nodes": 76,
+            "expected_nodes": 66,
             "expected_skipped": 5,
             "timeout": "75m",
-            "collection_message": "Expected exactly 76 single-GPU invalid-parameter nodes",
-            "junit_message": "Expected exactly 76 single-GPU invalid-parameter tests with 5 known skips",
+            "collection_message": "Expected exactly 66 single-GPU invalid-parameter nodes",
+            "junit_message": "Expected exactly 66 single-GPU invalid-parameter tests with 5 known skips",
         },
         "Reliability Test · Invalid parameters · MI300 · 2-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-reliability/**/*",
@@ -1575,9 +1575,9 @@ def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
             "Reliability Test · Invalid parameters · MI300 · Single-GPU",
             "ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR",
             "invalid-parameters-single-reliability-guard",
-            76,
+            66,
             5,
-            "Expected exactly 76 single-GPU invalid-parameter tests with 5 known skips",
+            "Expected exactly 66 single-GPU invalid-parameter tests with 5 known skips",
         ),
         (
             "Reliability Test · Invalid parameters · MI300 · 2-GPU",
@@ -3237,30 +3237,50 @@ def test_minicpmo_accuracy_keeps_daily_nonblocking_and_promotes_seed_tts() -> No
             assert label not in text
 
 
-def test_qwen_image_21_accuracy_is_one_nonblocking_nightly_job() -> None:
-    step = _find_step("Qwen-Image 2.1 Accuracy", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
+@pytest.mark.parametrize(("case", "grade"), [("T2I", "Blocking"), ("IT2I", "NonBlocking")])
+def test_qwen_image_21_accuracy_nightly_splits_the_qualified_case(case: str, grade: str) -> None:
+    step = _find_step(f"Qwen-Image 2.1 {case} Accuracy", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == grade
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
+    assert step["source_file_dependencies"] == "diffusion_qwen_image_21_accuracy"
     commands = "\n".join(step["commands"])
     assert "full_model and diffusion and rocm and MI325 and cards_1" in commands
-    assert "--run-level full_model" in commands
-    assert "--collect-only" in commands
-    assert "exit 5" in commands
-    assert "pytest.xml" in commands
     assert step["env"]["QWEN_IMAGE_21_CALIBRATE"] == "0"
     assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
     assert "setup_reference.sh" in commands
-    assert "test_qwen_image_21_matches_reference[it2i]" in commands
-    assert "test_qwen_image_21_matches_reference[t2i]" in commands
-    assert "Expected exactly $${#nodes[@]} Qwen-Image 2.1 accuracy nodes" in commands
+    assert f"test_qwen_image_21_matches_reference[{case.lower()}]" in commands
+    other_case = "it2i" if case == "T2I" else "t2i"
+    assert f"test_qwen_image_21_matches_reference[{other_case}]" not in commands
+    assert 'exit "$$status"' in commands
+    assert "cp -a tests/e2e/accuracy/artifacts/." in commands
     accuracy_test = Path("tests/e2e/accuracy/qwen_image_21/test_qwen_image_21.py").read_text(encoding="utf-8")
     assert "write_accuracy_result" in accuracy_test
     assert "write_json_artifact" not in accuracy_test
+    if case == "T2I":
+        assert "run-rocm-diffusion-nightly.sh" in commands
+        assert "1 1 165m rocm-qwen-image-21-t2i" in commands
+        assert "status=$$?" in commands
+        assert step["artifact_paths"] == ["artifacts/rocm-qwen-image-21-t2i/**/*"]
+        assert step["env"]["ACC_BENCH_RESULT_DIR"] == (
+            "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen-image-21-t2i/accuracy-results"
+        )
+        dependencies = yaml.safe_load(AMD_SOURCE_DEPENDENCIES.read_text(encoding="utf-8"))["source_file_dependencies"]
+        for script in ("run-rocm-diffusion-nightly.sh", "assert-pytest-collection.sh"):
+            assert f".buildkite/amd/scripts/{script}" in dependencies["diffusion_qwen_image_21_accuracy"]
+        policy = json.loads(Path("tests/e2e/accuracy/qwen_image_21/thresholds.json").read_text(encoding="utf-8"))
+        assert policy["status"] == "selected"
+        assert policy["t2i"]["default"] == {"ssim": 0.99, "psnr": 40.0}
+        assert not policy.get("expected_xfail", {}).get("t2i")
+    else:
+        assert "--run-level full_model" in commands
+        assert "--collect-only" in commands
+        assert "exit 5" in commands
+        assert "pytest.xml" in commands
+        assert "Expected exactly $${#nodes[@]} Qwen-Image 2.1 accuracy nodes" in commands
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
-        text = pipeline_path.read_text(encoding="utf-8")
-        assert "Qwen-Image 2.1 Accuracy" not in text
+        assert f"Qwen-Image 2.1 {case} Accuracy" not in pipeline_path.read_text(encoding="utf-8")
 
 
 def test_minicpmo_4_5_perf_is_one_nonblocking_nightly_job() -> None:
@@ -4330,7 +4350,7 @@ def test_entrypoints_full_nightly_splits_qwen_and_bagel_without_skips() -> None:
         step = _find_step(label, AMD_NIGHTLY_PIPELINE)
         assert step["agent_pool"] == "mi300_2"
         assert step["mirror_hardwares"] == ["amdproduction"]
-        assert step["grade"] == ("Blocking" if label == "Qwen3-Omni Duplex Playback" else "NonBlocking")
+        assert step["grade"] == "Blocking"
         assert step["timeout_in_minutes"] == 180
         assert step["source_file_dependencies"] == dependency_key
         assert step["artifact_paths"] == [artifacts]

@@ -185,6 +185,7 @@ class Harness:
             busy = (
                 drained
                 or not self.runner._mailbox.empty()
+                or self.runner._pending_input_appends > 0
                 or any(not task.done() for task in self.runner.tasks.append_tasks)
                 or any(not task.done() for task in self.runner._background_tasks)
             )
@@ -1005,6 +1006,41 @@ async def test_clear_input_drops_buffered_audio() -> None:
         assert not h.runner.model_state.audio_buffer.has_pending()
         assert h.session.pending_input_bytes == 0
     finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_settle_waits_for_inflight_audio_preprocessing(monkeypatch) -> None:
+    h = await open_harness(auto_response=False)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    run_turn_detection = h.runner.control.run_turn_detection
+    settling: asyncio.Task[list[DuplexEvent]] | None = None
+
+    async def blocked_turn_detection(event):
+        started.set()
+        await release.wait()
+        return await run_turn_detection(event)
+
+    monkeypatch.setattr(h.runner.control, "run_turn_detection", blocked_turn_detection)
+    try:
+        h.submit(append_audio(samples=8000))
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+        assert h.runner._mailbox.empty()
+
+        settling = asyncio.create_task(h.settle(idle_s=0.0))
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(settling), timeout=0.1)
+
+        release.set()
+        await asyncio.wait_for(settling, timeout=2.0)
+        assert h.runner._pending_input_appends == 0
+        assert h.runner.model_state.audio_buffer.pending_byte_count == 32_000
+    finally:
+        release.set()
+        if settling is not None:
+            settling.cancel()
+            await asyncio.gather(settling, return_exceptions=True)
         await close_harness(h)
 
 
@@ -4720,5 +4756,41 @@ async def test_response_create_waits_while_a_held_prefix_is_still_submitting() -
         finally:
             release.set()
             await task
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.parametrize("input_clock", [False, True])
+@pytest.mark.parametrize("retained_request", [False, True])
+@pytest.mark.parametrize("interrupt", ["vad", "client"])
+@pytest.mark.asyncio
+async def test_barge_in_clears_completed_response_on_retained_stream(
+    monkeypatch: pytest.MonkeyPatch, retained_request: bool, interrupt: str, input_clock: bool
+) -> None:
+    if input_clock:
+        # Opt in only the harness model, as in the input-clock runner tests.
+        monkeypatch.setattr(MiniCPMO45DuplexPlugin, "supports_input_clock", True)
+    h = await open_harness(extra_body={"clock": "input"} if input_clock else None)
+    try:
+        h.session.config.playback_commit_policy = "ack_only"
+        request_id = await _open_active_response(h)
+        response_id = h.session.active_response_id
+        events = await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello", turn_end=True))
+        assert find(events, "response.done").status == "completed"
+        assert h.session.active_response_id is None
+        assert h.session.playback.sent_ms > h.session.playback.committed_ms
+        h.runner.run.stream_request_id = request_id
+        if not retained_request:
+            h.session.clear_request()
+        if interrupt == "vad":
+            assert await h.runner._barge_in_for_overlap({}, {"cancel_reason": "turn_detected"})
+            events = await h.settle()
+        else:
+            events = await h.run(commands.BargeIn())
+        cleared = [event for event in events if event.type == "output_audio_buffer.cleared"]
+        assert len(cleared) == 1, types(events)
+        assert cleared[0].response_id == response_id
+        assert "response.done" not in types(events)
+        assert h.session.epoch == 1
     finally:
         await close_harness(h)
