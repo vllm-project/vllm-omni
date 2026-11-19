@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Transfer request geometry, prompt, and sliding-history contracts."""
 
-import importlib.util
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -414,18 +413,12 @@ def test_dense_long_text_override_does_not_mutate_artifact() -> None:
 
 
 def test_prompt_file_relative_to_record_and_cli_override(tmp_path: Path) -> None:
-    script = (
-        Path(__file__).resolve().parents[4]
-        / "examples/offline_inference/cosmos3_nano_sim_bimanual/cosmos3_nano_sim_transfer.py"
-    )
-    spec = importlib.util.spec_from_file_location("transfer_example", script)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.offline_transfer import _load_prompt
+
     caption = {"scene": "robot", "objects": ["arm", "cube"]}
     (tmp_path / "caption.json").write_text(json.dumps(caption, indent=2))
     record = {"prompt_path": "caption.json"}
-    assert module._load_prompt(record, tmp_path) == json.dumps(caption)
+    assert _load_prompt(record, tmp_path) == json.dumps(caption)
     override = tmp_path / "caption.txt"
     override.write_text("A different scene.\n")
-    assert module._load_prompt(record, tmp_path, override) == "A different scene."
+    assert _load_prompt(record, tmp_path, override) == "A different scene."

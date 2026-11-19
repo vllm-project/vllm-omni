@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Run Cosmos3-Nano-Sim-Transfer from a Transfer JSON record."""
 
 from __future__ import annotations
@@ -132,7 +133,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Converted Cosmos3-Nano-Sim-Transfer Diffusers directory.")
     parser.add_argument("--input-json", type=Path, required=True, help="Transfer JSON record.")
-    parser.add_argument("--deploy-config", default="vllm_omni/deploy/cosmos3_nano_sim_transfer.yaml")
+    parser.add_argument(
+        "--deploy-config",
+        default=str(Path(__file__).resolve().parents[3] / "deploy" / "cosmos3_nano_sim_transfer.yaml"),
+    )
     parser.add_argument("--output", type=Path, default=Path("cosmos3_nano_sim_transfer.mp4"))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(

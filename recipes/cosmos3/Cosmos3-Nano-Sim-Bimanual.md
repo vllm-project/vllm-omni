@@ -189,7 +189,7 @@ the real text K/V in the auxiliary scratch slots; the dense path concatenates th
 same three spans. Regional compilation and Inductor CUDA graphs can be enabled
 for supported deployments with `use_cuda_graphs: true` and `enforce_eager: false`.
 
-See the [offline runner](../../examples/offline_inference/cosmos3_nano_sim_bimanual/README.md)
+See the [offline runner](sim_bimanual/README.md)
 for reference JSONL/NPZ input, action-sidecar and camera inputs, and validation
 commands. CPU tests do not establish checkpoint quality, GPU memory usage, or
 equivalence between one-shot and incremental VAE decoding.

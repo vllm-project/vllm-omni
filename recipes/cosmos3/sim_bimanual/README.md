@@ -16,7 +16,7 @@ For checkpoints containing multiple YAM datasets, select `abc_yam`,
 retaining distinct normalizers.
 
 ```bash
-python examples/offline_inference/cosmos3_nano_sim_bimanual/cosmos3_nano_sim_bimanual.py \
+python -m vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.offline_bimanual \
   --model /checkpoints/cosmos3-nano-sim-bimanual-diffusers \
   --jsonl /data/reference_samples.jsonl \
   --sample-index 0 \
@@ -48,7 +48,7 @@ with an explicit camera-geometry sidecar.
 For the preprocessed AgiBot NPZ example:
 
 ```bash
-python examples/offline_inference/cosmos3_nano_sim_bimanual/cosmos3_nano_sim_bimanual.py \
+python -m vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.offline_bimanual \
   --model /checkpoints/cosmos3-nano-sim-bimanual-diffusers \
   --jsonl agibot_eval_257f_npz/samples.jsonl \
   --sample-index 0 \
@@ -62,7 +62,7 @@ raw-action NPZ path. This also formats the action prompt and selects the
 action-conditioned image preprocessing:
 
 ```bash
-python examples/offline_inference/cosmos3_nano_sim_bimanual/cosmos3_nano_sim_bimanual.py \
+python -m vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.offline_bimanual \
   --model /checkpoints/cosmos3-nano-sim-bimanual-diffusers \
   --jsonl /data/agibot.jsonl --input-format cookbook --sample-index 0 \
   --deploy-config vllm_omni/deploy/cosmos3_nano_sim_bimanual.yaml \
@@ -78,7 +78,7 @@ to avoid reflection padding in the generated video.
 Use `--input-format cookbook` with one JSON object per line. For a checkpoint
 supporting both robot and camera conditioning, export both embodiments and the
 `cookbook` camera profile following the
-[artifact recipe](../../../recipes/cosmos3/Cosmos3-Nano-Sim-Bimanual.md#action-and-camera-export).
+[artifact recipe](../Cosmos3-Nano-Sim-Bimanual.md#action-and-camera-export).
 The `--model` argument must point to the local Stage 2 Diffusers directory.
 
 For action conditioning, create `/data/humanoid.jsonl` with a record such as:
@@ -90,7 +90,7 @@ For action conditioning, create `/data/humanoid.jsonl` with a record such as:
 Place the conditioning image and action sidecar beside the JSONL, then run:
 
 ```bash
-python examples/offline_inference/cosmos3_nano_sim_bimanual/cosmos3_nano_sim_bimanual.py \
+python -m vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.offline_bimanual \
   --model /exports/bimanual-cookbook-diffusers \
   --input-format cookbook \
   --jsonl /data/humanoid.jsonl \
@@ -115,7 +115,7 @@ For camera conditioning, create `/data/camera.jsonl` with a record such as:
 Place the conditioning image beside the JSONL, then run:
 
 ```bash
-python examples/offline_inference/cosmos3_nano_sim_bimanual/cosmos3_nano_sim_bimanual.py \
+python -m vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.offline_bimanual \
   --model /exports/bimanual-cookbook-diffusers \
   --input-format cookbook \
   --jsonl /data/camera.jsonl \
@@ -235,7 +235,7 @@ sidecars use `action_space: normalized_unified_v1`, 59D `action` rows and
 
 ## Cosmos3-Nano-Sim-Transfer
 
-`cosmos3_nano_sim_transfer.py` accepts Transfer JSON records: `prompt` or
+The Transfer adapter accepts Transfer JSON records: `prompt` or
 `prompt_path`, optional `vision_path`, `num_frames`, and exactly one of `edge`,
 `blur`, `depth`, or `seg`. Edge and blur can be computed from `vision_path`;
 depth and segmentation records normally provide `control_path` inside the
@@ -250,7 +250,7 @@ the fallback is 480. The resulting dimensions
 are validated by the same Cosmos3-Nano-Sim-Bimanual policy used during model execution.
 
 ```bash
-python examples/offline_inference/cosmos3_nano_sim_bimanual/cosmos3_nano_sim_transfer.py \
+python -m vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.offline_transfer \
   --model nvidia/Cosmos3-Nano-Sim-Transfer \
   --input-json /data/sim_transfer_depth.json \
   --resolution 480 \
@@ -294,7 +294,7 @@ clean commits remain framewise. Control hints are VAE-encoded up front, then
 consumed in chunks sized by the checkpoint configuration.
 
 Export Transfer through the two conversion stages described in the
-[Bimanual recipe](../../../recipes/cosmos3/Cosmos3-Nano-Sim-Bimanual.md), using
+[Bimanual recipe](../Cosmos3-Nano-Sim-Bimanual.md), using
 `--cosmos3-nano-sim-bimanual` with the Transfer experiment and checkpoint.
 The exporter detects `conditioning.mode="control_video"` and writes
 `Cosmos3NanoSimTransferPipeline` into the model indexes. Shared manifests and

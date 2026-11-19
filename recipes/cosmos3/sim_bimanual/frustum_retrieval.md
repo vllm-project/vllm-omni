@@ -64,7 +64,7 @@ Use the normal deployment YAML with a full-history checkpoint
 overrides: eviction would destroy the retrieval archive.
 
 ```bash
-python examples/offline_inference/cosmos3_nano_sim_bimanual/cosmos3_nano_sim_bimanual.py \
+python -m vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.offline_bimanual \
   --model /path/to/diffusers_format --jsonl /path/to/mixed.jsonl --sample-index 0 \
   --deploy-config vllm_omni/deploy/cosmos3_nano_sim_bimanual.yaml \
   --num-frames 901 --height 480 --width 832 --fps 30 --seed 42 \
