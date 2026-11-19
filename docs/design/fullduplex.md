@@ -35,6 +35,10 @@ the model plugins.
 
 ## Playback completion ownership
 
+Cancellation of a retained model stream identifies the response owning its
+queued audio, even after generation completes. The Realtime projection clears
+that playback without emitting a second terminal for the completed response.
+
 `DuplexEngineSession` owns response snapshots and playback cursors. Output
 completion and a client's full `playback.ack` can arrive in either order.
 `finalize_response_playback` is the shared check used by ACK processing,
