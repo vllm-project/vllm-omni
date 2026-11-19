@@ -363,8 +363,6 @@ def _assert_accuracy(
     *,
     reference_path: Path | None = None,
 ) -> None:
-    from tabulate import tabulate  # type: ignore[import-untyped]
-
     ref_path = reference_path or HUNYUAN_IMAGE_REF_PATH
     device_profile = resolve_device_profile(profiles=similarity_thresholds)
     thresholds = resolve_similarity_thresholds(similarity_thresholds, device_profile)
@@ -420,14 +418,8 @@ def _assert_accuracy(
             "metric_profiles": metric_profiles,
         },
     )
-    print(
-        f"[{label}] "
-        + tabulate(
-            [[name, value, resolved[name]] for name, value in metrics.items()],
-            headers=["Metric", "Value", "Threshold"],
-            tablefmt="grid",
-        )
-    )
+    for name, value in metrics.items():
+        print(f"[{label}] {name}: {value:.6f} (threshold >= {resolved[name]})")
     if cot is not None:
         _assert_cot_structural_markers(cot, label)
         for metric in ("clip_score", "cot_semantic_sim", "text_prefix_match_count"):

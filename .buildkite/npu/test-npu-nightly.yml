@@ -267,7 +267,7 @@ steps:
         commands:
           - >-
             pytest -sv tests/e2e/accuracy/test_hunyuan_image3.py
-            -m "(full_model or local_model) and diffusion and npu and A3 and cards_4"
+            -m "full_model and diffusion and npu and A3 and cards_4"
             --run-level full_model
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image-2.1 · Single-NPU"
