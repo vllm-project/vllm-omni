@@ -18,6 +18,7 @@ from vllm.forward_context import (
     set_forward_context,
 )
 from vllm.logger import init_logger
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, set_dummy_context
@@ -40,12 +41,14 @@ from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     uses_native_mrv2_data_plane,
 )
+from vllm_omni.model_executor.mm_request_rng import supports_mm_request_rng
 from vllm_omni.model_executor.models.interfaces import SupportsMRv2MultiFrameDecode, supports_multi_frame_decode
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import sanitize_sampling_params_min_tokens_stop_ids
 from vllm_omni.worker_v2 import staged_writes
+from vllm_omni.worker_v2.mm_request_rng import MMRequestRNGState
 from vllm_omni.worker_v2.model_states import init_omni_model_state
 from vllm_omni.worker_v2.model_states.intermediate_buffer import (
     _resolve_additional_information,
@@ -109,6 +112,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     encoder_cache: EncoderCache | None
     _native_output_materializer: NativeOutputWorker | None
     model_state: OmniModelState
+    _mm_rng_state: MMRequestRNGState | None = None
     vocab_size: int
     # Speculative decoding state; the upstream __init__ sets the real values.
     use_aux_hidden_state_outputs: bool = False
@@ -198,11 +202,17 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         input_batch: Any,
     ) -> torch.Tensor:
         """Call the native vLLM multimodal embedding contract."""
-        return self.model_state.prepare_inputs_embeds(
-            scheduled_encoder_inputs,
-            input_batch,
-            self.req_states,
+        rng_scope = (
+            self._mm_rng_state.tagged_inputs(scheduled_encoder_inputs, self.encoder_cache)
+            if self._mm_rng_state is not None and self.encoder_cache is not None
+            else nullcontext()
         )
+        with rng_scope:
+            return self.model_state.prepare_inputs_embeds(
+                scheduled_encoder_inputs,
+                input_batch,
+                self.req_states,
+            )
 
     def _prepare_mm_inputs(
         self,
@@ -279,6 +289,9 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         ] == [LogitBiasState, PenaltiesState, BadWordsState]
         if not scheduler_output.scheduled_new_reqs and static_staged_writes:
             return
+        if self._mm_rng_state is not None:
+            for request_data in scheduler_output.scheduled_new_reqs:
+                self._mm_rng_state.add_request(request_data.req_id, request_data.mm_features)
         logits_processor = getattr(self.model, "logits_processor", None)
         logits_vocab = getattr(logits_processor, "vocab_size", None)
         if logits_vocab is None:
@@ -298,6 +311,8 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             super().add_requests(scheduler_output)
 
     def shutdown(self) -> None:
+        if self._mm_rng_state is not None:
+            self._mm_rng_state.clear()
         # Every owner must release its resources even if an earlier drain fails.
         try:
             state = getattr(self, "model_state", None)
@@ -328,7 +343,10 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         plane.register_receivers(list(getattr(scheduler_output, "pending_input_registrations", [])))
         if not getattr(self.model_config, "async_chunk", False):
             plane.recv_full_payload_inputs(scheduler_output)
-        natural_terminal_req_ids = set(getattr(scheduler_output, "data_plane_terminal_req_ids", set()))
+        discarded_req_ids = set(getattr(scheduler_output, "discarded_req_ids", set()) or ())
+        natural_terminal_req_ids = set(getattr(scheduler_output, "data_plane_terminal_req_ids", set())).difference(
+            discarded_req_ids
+        )
         aborted_req_ids = set(getattr(scheduler_output, "finished_req_ids", set())).difference(natural_terminal_req_ids)
         if natural_terminal_req_ids:
             plane.request_terminal(natural_terminal_req_ids)
@@ -455,6 +473,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         ):
             self.supports_mm_inputs = False
             self.encoder_cache = None
+        self._mm_rng_state = MMRequestRNGState(self.model) if supports_mm_request_rng(self.model) else None
 
         self._publish_shared_backbone_if_configured()
         # After model ``__init__`` (which may set cudagraph_specialize_moe_routing).
@@ -745,11 +764,40 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         supports_multi_frame_decode(self.model, mrv2=frames > 1)
         return frames
 
+    def _prompt_logits_fn(self) -> Any:
+        """Resolve stateless logits for prompt chunks and sampler warmup."""
+        prompt_logits_fn = getattr(self.model, "compute_prompt_logits", None)
+        return prompt_logits_fn if callable(prompt_logits_fn) else self.model.compute_logits
+
+    @torch.inference_mode()
     def _dummy_sampler_run(self, hidden_states: Any) -> Any:
-        """The Talker's two control logits cannot satisfy profiling's top-k request."""
+        """Warm the sampler without consuming request-local model state."""
         if self._kstep_frames > 1:
             return None
-        return super()._dummy_sampler_run(hidden_states)
+        prompt_logits_fn = getattr(self.model, "compute_prompt_logits", None)
+        if not callable(prompt_logits_fn):
+            return super()._dummy_sampler_run(hidden_states)
+
+        assert self.sampler is not None
+        if self.model_state.dummy_sampler_run(self.sampler, hidden_states):
+            return None
+
+        num_reqs = hidden_states.shape[0]
+        logits = prompt_logits_fn(hidden_states)
+        dummy_input_batch = InputBatch.make_dummy(num_reqs, num_reqs, self.input_buffers)
+
+        # Mirror vLLM 0.34's default sampler profiling passes. Only the logits
+        # projection differs: dummy rows have no request-local sampling state.
+        self.sampler(logits, dummy_input_batch)
+        if current_omni_platform.is_cpu():
+            return None
+
+        warmup_params = SamplingParams.for_sampler_warmup()
+        for req_idx in range(num_reqs):
+            self.sampler.add_request(req_idx, warmup_params)
+        self.sampler.apply_staged_writes()
+        self.sampler(logits, dummy_input_batch)
+        return None
 
     def _build_kstep_model_kwargs_extra(self, model_inputs: dict[str, Any], input_batch: InputBatch) -> dict[str, Any]:
         """Build per-request spans and codec state for the multi-frame loop."""
@@ -1244,6 +1292,9 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         # because super() calls req_states.remove_request(req_id) which pops the
         # mapping and returns the slot index to free_indices.
         finished = scheduler_output.finished_req_ids
+        if self._mm_rng_state is not None:
+            for req_id in finished:
+                self._mm_rng_state.discard(req_id)
         on_finished = getattr(self.model, "on_requests_finished", None)
         if finished and callable(on_finished):
             # Request-owned state outlives generation slots and chunk boundaries.

@@ -19,6 +19,7 @@ AMD_READY_PIPELINE = Path(".buildkite/amd/test-amd-ready.yml")
 TINY_DIFFUSION_LABELS = {
     "ROCm · Tiny Diffusion Multi-GPU · 2-GPU",
     "ROCm · Tiny Diffusion Multi-GPU · 4-GPU",
+    "ROCm · Tiny Diffusion Multi-GPU · 4-GPU Stable",
 }
 
 
