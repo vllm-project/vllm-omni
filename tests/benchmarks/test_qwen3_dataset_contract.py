@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import shlex
+import subprocess
 import sys
 from collections import Counter
 from dataclasses import dataclass, replace
@@ -18,6 +20,10 @@ from _pytest.mark.expression import Expression
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
 ROOT = Path(__file__).resolve().parents[2]
+CUDA_COMBINED_JOB_KEYS = (
+    "nightly-omni-performance-no-async-chunk",
+    "nightly-omni-performance-async-chunk",
+)
 
 
 def _load(name, path):
@@ -442,14 +448,69 @@ def test_seed_subset_is_trimmed_before_loader_can_skip_rows(tmp_path, monkeypatc
 def test_cuda_pipeline_uses_json_runner_and_function_regression():
     pipeline = yaml.safe_load((ROOT / ".buildkite/cuda/test-nightly.yml").read_text())
     steps = [s for group in pipeline["steps"] if "steps" in group for s in group["steps"]]
-    combined = [s for s in steps if "Qwen3-Omni Accuracy + Perf" in s.get("label", "")]
+    combined = [s for s in steps if s.get("key") in CUDA_COMBINED_JOB_KEYS]
     assert len(combined) == 2
     for step in combined:
+        assert 0 < step["timeout_in_minutes"] <= 120
         commands = "\n".join(step["commands"])
         assert "run_benchmark.py" in commands and "test_qwen3_omni_datasets.json" in commands
     assert not any("Verbatim Reading Regression" in s.get("label", "") for s in steps)
     expansion = (ROOT / "tests/e2e/online_serving/test_qwen3_omni_expansion.py").read_text(encoding="utf-8")
     assert "def test_qwen3_omni_seed_tts_reads_questions_verbatim" in expansion
+
+
+@pytest.fixture
+def nightly_generated_jobs(tmp_path):
+    # Run the real generator's main(), stopping before the shell executes jobs.
+    runner = (ROOT / "tools/nightly/run_nightly_jobs.sh").read_text(encoding="utf-8")
+    generator = runner.split("python3 - <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+
+    def generate(test_type: str) -> Path:
+        log_dir = tmp_path / test_type.replace(",", "-")
+        env = {
+            **os.environ,
+            "REPO_ROOT": str(ROOT),
+            "LOG_DIR": str(log_dir),
+            "YML": str(ROOT / ".buildkite/cuda/test-nightly.yml"),
+            "LABEL_SUBSTR": "",
+            "TEST_TYPE": test_type,
+            "MODEL_TYPE": "omni",
+            "PYTEST_MARK": "",
+            "DRY_RUN": "0",
+            "PYTHONUTF8": "1",
+        }
+        subprocess.run(
+            [sys.executable, "-"],
+            input=generator,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            check=True,
+            timeout=30,
+        )
+        return log_dir / "jobs"
+
+    return generate
+
+
+@pytest.mark.parametrize("test_type", ["perf", "acc", "perf,acc", "all"])
+def test_qwen3_combined_jobs_enter_requested_filters_and_perf_manifest(nightly_generated_jobs, test_type):
+    jobs = nightly_generated_jobs(test_type)
+    perf_keys = (jobs / ".perf_job_keys").read_text(encoding="utf-8").splitlines()
+    timeouts = dict(line.split("=", 1) for line in (jobs / ".job_timeouts").read_text(encoding="utf-8").splitlines())
+    for key in CUDA_COMBINED_JOB_KEYS:
+        assert perf_keys.count(key) == 1
+        script = (jobs / f"{key}.sh").read_text(encoding="utf-8")
+        assert "--test-config-file tests/dfx/perf/tests/test_qwen3_omni_datasets.json" in script
+        assert 0 < int(timeouts[key]) <= 120
+        assert f"{timeouts[key]}m pytest " in script
+
+
+def test_qwen3_combined_jobs_do_not_enter_function_filter(nightly_generated_jobs):
+    jobs = nightly_generated_jobs("function")
+    assert any("Function Test" in path.read_text(encoding="utf-8") for path in jobs.glob("*.sh"))
+    assert all(not (jobs / f"{key}.sh").exists() for key in CUDA_COMBINED_JOB_KEYS)
 
 
 def test_cuda_pipeline_selects_each_matrix_case_once():

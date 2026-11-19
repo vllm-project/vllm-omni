@@ -5,6 +5,11 @@ with `tests/dfx/perf/tests/test_qwen3_omni_datasets.json`. Explicit accuracy
 cases reuse their inference requests for performance and scoring. Accuracy
 is independent of concurrency. Every non-duplex request generates text and audio.
 
+The two combined CUDA jobs have 120-minute timeouts. Their labels include both
+`Accuracy Test` and `Perf Test`, so `tools/nightly/run_nightly_jobs.sh` selects
+them with either the `acc` or `perf` filter and schedules them before performance
+report generation. The `function` filter excludes these benchmark jobs.
+
 ## Scenario matrix
 
 | Platform | Deployment | Dataset | Concurrency | Measured requests | Accuracy |
