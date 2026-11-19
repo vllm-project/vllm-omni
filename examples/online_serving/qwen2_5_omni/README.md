@@ -36,7 +36,7 @@ python examples/online_serving/openai_chat_completion_client_for_multimodal_gene
 
 The Python client supports the following command-line arguments:
 
-- `--query-type` (or `-q`): Query type (default: `mixed_modalities`). Options: `mixed_modalities`, `use_audio_in_video`, `multi_audios`, `text`
+- `--query-type` (or `-q`): Query type (default: `use_audio_in_video`). Options: `text`, `use_audio`, `use_image`, `use_video`, `use_mixed_modalities`, `use_multi_audios`, `use_audio_in_video`
 - `--video-path` (or `-v`): Path to local video file or URL. If not provided and query-type uses video, uses default video URL. Supports local file paths (automatically encoded to base64) or HTTP/HTTPS URLs. Example: `--video-path /path/to/video.mp4` or `--video-path https://example.com/video.mp4`
 - `--image-path` (or `-i`): Path to local image file or URL. If not provided and query-type uses image, uses default image URL. Supports local file paths (automatically encoded to base64) or HTTP/HTTPS URLs and common image formats: JPEG, PNG, GIF, WebP. Example: `--image-path /path/to/image.jpg` or `--image-path https://example.com/image.png`
 - `--audio-path` (or `-a`): Path to local audio file or URL. If not provided and query-type uses audio, uses default audio URL. Supports local file paths (automatically encoded to base64) or HTTP/HTTPS URLs and common audio formats: MP3, WAV, OGG, FLAC, M4A. Example: `--audio-path /path/to/audio.wav` or `--audio-path https://example.com/audio.mp3`
@@ -69,7 +69,7 @@ You can control output modalities to specify which types of output the model sho
 | Modalities | Output |
 | ------------ | -------- |
 | `["text"]` | Text only |
-| `["audio"]` | Text + Audio |
+| `["audio"]` | Audio only; the text output is filtered out |
 | `["text", "audio"]` | Text + Audio |
 | Not specified | Text + Audio (default) |
 
@@ -95,7 +95,7 @@ curl http://localhost:8091/v1/chat/completions \
   -d '{
     "model": "Qwen/Qwen2.5-Omni-7B",
     "messages": [{"role": "user", "content": "Describe vLLM in brief."}],
-    "modalities": ["audio"]
+    "modalities": ["text", "audio"]
   }'
 ```
 
@@ -135,7 +135,7 @@ client = OpenAI(base_url="http://localhost:8091/v1", api_key="EMPTY")
 response = client.chat.completions.create(
     model="Qwen/Qwen2.5-Omni-7B",
     messages=[{"role": "user", "content": "Describe vLLM in brief."}],
-    modalities=["audio"]
+    modalities=["text", "audio"]
 )
 # Response contains two choices: one with text, one with audio
 print(response.choices[0].message.content)  # Text response

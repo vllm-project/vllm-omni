@@ -43,7 +43,8 @@ bundled deploy**, with CI e2e coverage on 2x L4.
 | Output | Notes |
 | --- | --- |
 | `["text"]` | Thinker only; Talker and Code2Wav are skipped |
-| `["audio"]` or `["text", "audio"]` | Text plus 24 kHz speech from Code2Wav |
+| `["audio"]` | 24 kHz speech only from Code2Wav; the text output is filtered out |
+| `["text", "audio"]` | Text plus 24 kHz speech from Code2Wav |
 | Unspecified modalities | Text + audio (pipeline default) |
 
 | Profile on this recipe | Devices | Qualification |
@@ -157,7 +158,7 @@ python examples/online_serving/openai_chat_completion_client_for_multimodal_gene
 ```
 
 Expect a non-empty assistant message. For mixed image/audio/video input, use
-`--query-type mixed_modalities` (see the online example README).
+`--query-type use_mixed_modalities` (see the online example README).
 
 Text + audio:
 
