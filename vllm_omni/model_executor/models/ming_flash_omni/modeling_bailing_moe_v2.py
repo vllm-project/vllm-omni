@@ -22,7 +22,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -59,10 +62,12 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.transformers_utils.configs.ming_flash_omni import BailingMoeV2Config
+
+if TYPE_CHECKING:
+    pass
 
 logger = init_logger(__name__)
 
@@ -810,7 +815,6 @@ class BailingMoeV2ForCausalLM(nn.Module, CustomProcessMixin):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.sampler = Sampler()
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -850,6 +854,9 @@ class BailingMoeV2ForCausalLM(nn.Module, CustomProcessMixin):
         logits: torch.Tensor,
         sampling_metadata,
     ) -> SamplerOutput | None:
+        from vllm.v1.sample.sampler import Sampler
+
+        self.sampler = Sampler()
         next_tokens = self.sampler(logits, sampling_metadata)
         return next_tokens
 
