@@ -1541,6 +1541,8 @@ def test_mammoth_fp8_routes_shared_image_changes_to_cpu(
     rendered = _render_test_pipeline(doc, [changed_path], pipeline_path=NIGHTLY_YAML)
     selected = {labels[step["label"]] for step in _iter_steps(rendered) if step.get("label") in labels}
     assert selected == {expected_group}
+
+    
 @pytest.mark.parametrize("platform", ["cuda", "npu"])
 @pytest.mark.parametrize(
     "changed_path,roles",
