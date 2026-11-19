@@ -180,6 +180,10 @@ class TestDeployTopology:
         monkeypatch.setattr(current_omni_platform, "device_name", platform)
         deploy = load_deploy_config(_DEPLOY_DIR / filename)
         pipeline = OMNI_PIPELINES[deploy.pipeline]
+        if platform == "cpu" and deploy.model_runner == "v1":
+            with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
+                merge_pipeline_deploy(pipeline, deploy)
+            return
         stages = merge_pipeline_deploy(pipeline, deploy)
 
         # The NPU two-card profile also inherits the base CUDA overrides
@@ -415,15 +419,3 @@ class TestTurnChunkedProfile:
         turn_stages = merge_pipeline_deploy(OMNI_PIPELINES[turn.pipeline], turn)
         assert turn_stages[1].custom_process_input_func.endswith(".llm2tts")
         assert turn_stages[1].yaml_extras["default_sampling_params"]["min_tokens"] == 50
-
-    @pytest.mark.parametrize("platform", ["cpu", "rocm", "xpu"])
-    def test_deploy_profile_rejects_model_runner_v1(self, platform: str, monkeypatch: pytest.MonkeyPatch) -> None:
-        # Only the CUDA and NPU sections switch MiniCPM-o to MRv2; the V1 chunk
-        # adapter would reject the Talker's second block.
-        monkeypatch.setattr(current_omni_platform, "device_name", platform)
-        deploy = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5_turn_chunked.yaml")
-        assert deploy.model_runner == "v1"
-        with pytest.raises(ValueError, match="stage 1: this pipeline needs model_runner v2"):
-            merge_pipeline_deploy(OMNI_PIPELINES[deploy.pipeline], deploy)
-        turn = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5_turn.yaml")
-        merge_pipeline_deploy(OMNI_PIPELINES[turn.pipeline], turn)

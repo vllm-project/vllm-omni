@@ -47,17 +47,23 @@ _TOPOLOGY_OWNED_ENGINE_FIELDS = frozenset(
     }
 )
 
-SKIP_STREAMING_UPDATES_ATTR = "_omni_skip_streaming_updates"
+STREAMING_UPDATE_TRANSFORM_ATTR = "_omni_streaming_update_transform"
 
 
-def skip_on_streaming_updates(func: Callable[..., Any]) -> Callable[..., Any]:
-    """Mark a ``prompt_transform_func`` to run only when a request is first submitted.
+def on_streaming_updates(
+    transform: Callable[..., Any] | None,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Mark a ``prompt_transform_func`` to run ``transform`` on streaming-input updates instead.
 
-    The engine then does not call it on streaming-input updates, which carry
-    the later chunks of a request that already passed the transform.
+    Those updates carry the later chunks of a request that already passed the
+    transform. ``None`` skips them.
     """
-    setattr(func, SKIP_STREAMING_UPDATES_ATTR, True)
-    return func
+
+    def mark(func: Callable[..., Any]) -> Callable[..., Any]:
+        setattr(func, STREAMING_UPDATE_TRANSFORM_ATTR, transform)
+        return func
+
+    return mark
 
 
 def _normalize_stage_backend_fields(stage: StageDeployConfig) -> None:
@@ -405,13 +411,11 @@ class StagePipelineConfig:
     sync_process_input_func: str | None = None
     supports_native_mrv2_data_plane: bool = False
     supports_duplex_mrv2: bool = False
-    # Rejects ``model_runner: v1`` for this stage: its input bridge relies on
-    # MRv2-only handling (e.g. MiniCPM-o's turn-chunked Talker conditions).
-    requires_mrv2: bool = False
     # Rewrites the Stage-0 view of a raw prompt before vLLM input processing.
     # The callable receives ``(prompt, sampling_params_list)``; downstream
     # stages continue to receive the original prompt. It also runs on
-    # streaming-input updates unless marked with ``skip_on_streaming_updates``.
+    # streaming-input updates unless ``on_streaming_updates`` names another
+    # transform (or none) for them.
     prompt_transform_func: str | None = None
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
@@ -508,6 +512,7 @@ class PipelineConfig:
     # Bundled deploy defaults for this concrete pipeline topology. The file is
     # loaded from vllm_omni/deploy; None uses DeployConfig defaults.
     default_deploy_config_name: str | None = None
+    chat_template: str | None = None
     # Global CLI spelling -> (stage id, stage-local spelling).
     stage_cli_aliases: dict[str, tuple[int, str]] = field(default_factory=dict)
 
@@ -741,6 +746,7 @@ class DuplexSessionRuntimeConfig:
     max_tool_calls_per_session: int = 4096
     replica_policy: Literal["legacy", "least_sessions"] = "legacy"
     max_sessions_per_replica: int | None = None
+    # Omitted groups join every replica combination across the pipeline stages.
     replica_groups: list[dict[int, int]] | None = None
     # Unread by the plugin framework. It used to bound the per-session
     # completed-append table that made a retried append RPC submit once; the
@@ -901,7 +907,7 @@ class DeployConfig:
     async_chunk: bool | None = None
     weight_sharing: WeightSharingConfig | None = None
     session_mode: str = "turn"
-    model_runner: Literal["v1", "v2"] = "v1"
+    model_runner: Literal["v1", "v2"] = "v2"
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
     active_stream_window: int = 0
     # Experimental local NVIDIA MPS; disabled unless a deploy explicitly opts in.
@@ -1159,7 +1165,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         raise ValueError("speech_cache must be a mapping")
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
 
-    model_runner = raw_dict.get("model_runner", "v1")
+    model_runner = raw_dict.get("model_runner", "v2")
     if model_runner not in ("v1", "v2"):
         raise ValueError(f"model_runner must be one of ('v1', 'v2'), got {model_runner!r}")
 
@@ -1326,7 +1332,10 @@ def _resolve_execution_mode(
 def resolve_stage_model_runner(deploy: DeployConfig, stage: StageDeployConfig | None) -> str:
     """The stage's own ``model_runner`` if set, else the deploy-level one."""
     runner = getattr(stage, "model_runner", None) if stage is not None else None
-    return runner or deploy.model_runner
+    selected = runner or deploy.model_runner
+    if selected != "v2":
+        raise ValueError("Model Runner V1 is not supported with vLLM 0.34; select model_runner: v2")
+    return selected
 
 
 def validate_native_mrv2_session(deploy: DeployConfig, ps: StagePipelineConfig, stage_runner: str) -> None:
@@ -1335,12 +1344,7 @@ def validate_native_mrv2_session(deploy: DeployConfig, ps: StagePipelineConfig, 
     Streaming-session prompt replacement exists only in the V1 chunk adapter,
     so a stage that receives from an upstream stage on MRv2 supports
     turn-based sessions only unless it explicitly declares supports_duplex_mrv2.
-    A stage that declares requires_mrv2 is rejected on any other runner.
     """
-    if ps.requires_mrv2 and stage_runner != "v2":
-        raise ValueError(
-            f"stage {ps.stage_id}: this pipeline needs model_runner v2 for this stage, got {stage_runner!r}."
-        )
     if stage_runner != "v2" or not ps.supports_native_mrv2_data_plane or not ps.input_sources:
         return
     if deploy.session_mode == "duplex" and ps.supports_duplex_mrv2:
@@ -1348,7 +1352,7 @@ def validate_native_mrv2_session(deploy: DeployConfig, ps: StagePipelineConfig, 
     if deploy.session_mode != "turn":
         raise ValueError(
             f"stage {ps.stage_id}: model_runner v2 supports session_mode 'turn' only, got "
-            f"{deploy.session_mode!r}; run this stage with model_runner: v1 for streaming sessions."
+            f"{deploy.session_mode!r}; this stage does not support streaming sessions with Model Runner V2."
         )
 
 
@@ -1446,14 +1450,15 @@ def _build_engine_args(
                 )
     stage_runner = resolve_stage_model_runner(deploy, ds)
     validate_native_mrv2_session(deploy, ps, stage_runner)
-    engine_args["use_v2_model_runner"] = stage_runner == "v2"
+    # This flag selects the LLM runner; diffusion stages own their runner.
+    engine_args["use_v2_model_runner"] = stage_runner == "v2" and ps.execution_type is not StageExecutionType.DIFFUSION
     engine_args["supports_native_mrv2_data_plane"] = bool(ps.supports_native_mrv2_data_plane)
-    if stage_runner == "v2" and not ps.supports_native_mrv2_data_plane:
+    if engine_args["use_v2_model_runner"] and not ps.supports_native_mrv2_data_plane:
         logger.warning(
             "Stage %s (%s) selects model_runner=v2 without declaring "
             "supports_native_mrv2_data_plane. It will use the legacy transport path; "
-            "MRV2 support for this pipeline has not been validated. Use model_runner=v1 "
-            "unless you are validating a new MRV2 integration.",
+            "MRV2 support for this pipeline has not been validated. "
+            "Validate its V2 hooks before deployment.",
             ps.stage_id,
             ps.model_arch or pipeline.model_arch or pipeline.model_type,
         )

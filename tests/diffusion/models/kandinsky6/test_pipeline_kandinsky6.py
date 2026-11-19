@@ -295,8 +295,10 @@ def test_checkpoint_steps_resolve_before_step_scheduler_admission(
         sampling.sigmas = [1.0, 0.5, 0.1]
         expected_steps = 3
     request = OmniDiffusionRequest(prompt={"prompt": "A fox in snow"}, sampling_params=sampling, request_id="k6")
-    pre_process = get_kandinsky6_pre_process_func(OmniDiffusionConfig(model=str(tmp_path), step_execution=True))
+    od_config = OmniDiffusionConfig(model=str(tmp_path), step_execution=True)
+    pre_process = get_kandinsky6_pre_process_func(od_config)
     scheduler = StepScheduler()
+    scheduler.initialize(od_config)
     assert pre_process(request) is request
     assert scheduler.add_request(request) == "k6"
     assert scheduler._request_progress["k6"].total_steps == expected_steps

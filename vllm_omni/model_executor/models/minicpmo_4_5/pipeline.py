@@ -136,9 +136,6 @@ MINICPMO_4_5_TURN_CHUNKED_PIPELINE = dataclasses.replace(
         dataclasses.replace(
             MINICPMO_4_5_PIPELINE.stages[1],
             custom_process_input_func=f"{_PROC}.llm2tts_chunked",
-            # The V1 chunk adapter seeds the sender-side condition sequence for
-            # native duplex requests only, so it would reject the second block.
-            requires_mrv2=True,
         ),
         *MINICPMO_4_5_PIPELINE.stages[2:],
     ),

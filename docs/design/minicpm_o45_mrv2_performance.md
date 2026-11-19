@@ -1,10 +1,12 @@
 # MiniCPM-o 4.5 MRv2 profiles
 
-The default `minicpmo_4_5.yaml` selects MRv2 for all three CUDA stages
-and FlashAttention for the Talker. All three duplex stages keep
-`async_chunk: true`. CUDA turn serving sends the completed Thinker payload
-to the Talker. Turn profiles inherit Thinker ngram speculation and disabled
-prefix caching. Both V1 and MRv2 can restore cached Thinker outputs when an
+The default `minicpmo_4_5.yaml` selects MRv2 for all three stages on CUDA,
+ROCm and NPU. CUDA additionally selects FlashAttention for the Talker. All
+three duplex stages keep `async_chunk: true`. CUDA turn serving sends the
+completed Thinker payload to the Talker. Turn profiles inherit Thinker ngram
+speculation and disabled prefix caching. XPU and MUSA retain the deferred V1
+default and are rejected by vLLM 0.34 rather than being implicitly qualified
+for V2. Both V1 and MRv2 can restore cached Thinker outputs when an
 overlay disables speculation and enables caching. MRv2 restores `latent`,
 `latent_input_ids` and `latent_positions` together. Duplex profiles keep
 caching disabled for their mutable KV window.
@@ -184,8 +186,9 @@ vLLM 0.33 resolves a draft config with `architectures: ["DSparkDraftModel"]`
 and `model_type: qwen3` to `Qwen3DSparkModel`. Drafters that read Thinker
 layers require the Thinker on MRv2; the V1 Thinker rejects them at load.
 Validation covers CUDA turn sessions with greedy text and speech output.
-Duplex sessions keep their own sampler and are not covered, and platforms
-whose profiles fall back to V1 (NPU, XPU, ROCm, MUSA) do not run this path.
+Duplex sessions keep their own sampler and are not covered. NPU and ROCm use
+MRv2 but do not inherit this CUDA drafter configuration; XPU and MUSA retain
+the deferred V1 default and cannot run it with vLLM 0.34.
 Greedy text can differ from decoding without drafts at near-tied tokens.
 
 The default single-card and two-card Ascend profiles use synchronous MRv2
@@ -323,9 +326,12 @@ or reference normalization policy.
 
 ## Full-duplex MRv2
 
-`minicpmo_4_5.yaml` selects MRv2 for the CUDA Thinker, Talker and Code2Wav.
-The Thinker has no async producer, so the orchestrator hands each finished
-segment to `llm2tts`.
+`minicpmo_4_5.yaml` selects MRv2 for the Thinker, Talker and Code2Wav on CUDA,
+ROCm and NPU. ROCm keeps the shared duplex topology, async chunks, devices and
+connector contract; it does not inherit the CUDA-only attention, speculation,
+graph or fused-kernel settings. This runner selection alone does not establish
+ROCm performance or quality qualification. The Thinker has no async producer,
+so the orchestrator hands each finished segment to `llm2tts`.
 The Talker reuses the streaming prompt recipe (full attention extends its KV
 prefix until capacity; sliding recompute rebuilds the previous condition,
 confirmed codec ids and current condition) and keeps the 16-frame codec
