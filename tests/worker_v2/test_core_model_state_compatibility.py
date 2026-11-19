@@ -4,27 +4,33 @@
 """Core ModelState compatibility through the production MRv2 AR runner."""
 
 from contextlib import nullcontext
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Any
 
 import numpy as np
 import pytest
 import torch
-from vllm.config import LoadConfig
+from vllm.config import LoadConfig, VllmConfig
 from vllm.config.compilation import CompilationConfig, CompilationMode, CUDAGraphMode
 from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.worker.gpu import model_runner as core_module
+from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.core.sched.omni_scheduling_coordinator import uses_native_mrv2_data_plane
+from vllm_omni.core.sched.output import OmniCachedRequestData
+from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker_v2 import omni_ar_model_runner as ar_module
 from vllm_omni.worker_v2 import omni_model_runner as base_module
 from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
+from vllm_omni.worker_v2.model_states.omni_mamba_hybrid import OmniMambaHybridModelState
+from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
 from vllm_omni.worker_v2.staged_writes import StagedWrites
 
@@ -38,6 +44,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 class FixtureOmniConfig(OmniModelConfig):
     is_hybrid = False
     is_attention_free = False
+    uses_mrope = False
 
     def get_inputs_embeds_size(self):
         return 2
@@ -49,7 +56,6 @@ def make_config(*, native=False, kv=None, eager=True):
         dtype=torch.float32,
         max_model_len=32,
         enable_prompt_embeds=False,
-        uses_mrope=False,
         async_chunk=False,
         engine_output_type="text",
         logits_processors=None,
@@ -73,7 +79,7 @@ def make_config(*, native=False, kv=None, eager=True):
     return SimpleNamespace(
         model_config=mc,
         scheduler_config=SimpleNamespace(max_num_seqs=2, max_num_batched_tokens=16),
-        cache_config=SimpleNamespace(mamba_cache_mode="none", use_kda_recoverssm=False),
+        cache_config=SimpleNamespace(mamba_cache_mode="none", mamba_block_size=16, use_kda_recoverssm=False),
         parallel_config=parallel,
         load_config=LoadConfig(load_format="dummy"),
         compilation_config=CompilationConfig(mode=CompilationMode.NONE, cudagraph_mode=CUDAGraphMode.NONE),
@@ -81,6 +87,7 @@ def make_config(*, native=False, kv=None, eager=True):
         speculative_config=None,
         watermark_config=None,
         kv_transfer_config=None,
+        use_flashinfer_replayssm=False,
     )
 
 
@@ -228,7 +235,7 @@ class CPUCopy:
 
 
 class PayloadPlane:
-    """Observable I/O boundary used only in unsupported capability probes."""
+    """Observable connector I/O boundary for capability tests."""
 
     def __init__(self):
         self.payload = {"A": {"sentinel": "must-not-be-consumed"}}
@@ -313,20 +320,25 @@ def loaded_runner(monkeypatch, *, config=None, model=None, runner_cls=AR):
     monkeypatch.setattr(core_module, "build_custom_logits_processors", lambda *a: [])
     model.loading_runner = runner
     runner.load_model(model=model)
-    assert runner.model_state is model.created_states[-1]
+    assert runner.model_state.model is model
+    if model.created_states:
+        assert runner.model_state is model.created_states[-1]
     return runner, model
 
 
 def configure_step(monkeypatch, runner, model, mode=CUDAGraphMode.NONE):
     for req_id in ("B", "A"):
         runner.req_states.add_request(req_id, 2, [2, 5], 0, 3)
-        runner.model_state.add_request(runner.req_states.req_id_to_index[req_id], SimpleNamespace(req_id=req_id))
+        runner.model_state.add_request(
+            runner.req_states.req_id_to_index[req_id],
+            SimpleNamespace(req_id=req_id, mm_features=[], num_computed_tokens=0),
+        )
     runner.req_states.apply_staged_writes = lambda: model.events.append(("request_apply",))
     runner.kv_cache_config = SimpleNamespace(kv_cache_groups=[], num_blocks=2)
     runner.attn_groups = []
     runner.block_tables = SimpleNamespace(apply_staged_writes=lambda: None, append_block_ids=lambda *a, **kw: None)
     runner.kv_connector = SimpleNamespace(pre_forward=lambda *a: None, post_forward=lambda ids: None)
-    runner.ec_connector = SimpleNamespace()
+    runner.ec_connector = SimpleNamespace(no_forward=lambda output: EMPTY_MODEL_RUNNER_OUTPUT)
     batch = SimpleNamespace(
         req_ids=["A"],
         num_reqs=1,
@@ -400,11 +412,16 @@ def scheduled(*, finished=()):
     return result
 
 
-def test_core_state_runs_ar_step_sampling_and_parent_teardown(monkeypatch):
+@pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL])
+def test_core_state_runs_ar_step_sampling_and_parent_teardown(monkeypatch, mode):
     runner, model = loaded_runner(monkeypatch)
     assert runner._omni_data_plane is None
     assert type(runner.model_state) is CoreState
-    configure_step(monkeypatch, runner, model)
+    batch = configure_step(monkeypatch, runner, model, mode)
+    runner.cudagraph_manager = SimpleNamespace(
+        run_pw_graph=lambda model, inputs: model(**inputs),
+        run_fullgraph=lambda descriptor: model(input_ids=batch.input_ids, positions=batch.positions),
+    )
 
     assert runner.execute_model(scheduled()) is None
     hidden = runner.execute_model_state.hidden_states
@@ -430,6 +447,120 @@ def test_core_state_runs_ar_step_sampling_and_parent_teardown(monkeypatch):
     )
     assert tags.index("model_finished") < tags.index("state_remove")
     assert [event for event in model.events if event[0] == "state_remove"] == [("state_remove", "A")]
+
+
+@pytest.mark.parametrize("hook", ["run_preprocess", "run_postprocess"])
+@pytest.mark.parametrize("behavior", ["not-callable", "raises"])
+def test_optional_execution_hook_errors_are_reported(monkeypatch, hook, behavior):
+    runner, model = loaded_runner(monkeypatch)
+    configure_step(monkeypatch, runner, model)
+
+    def fail(*args):
+        raise AttributeError("error inside the hook")
+
+    if behavior == "not-callable":
+        setattr(runner.model_state, hook, 33)
+        with pytest.raises(TypeError, match=rf"CoreState\.{hook} must be callable"):
+            runner.execute_model(scheduled())
+    else:
+        setattr(runner.model_state, hook, fail)
+        with pytest.raises(AttributeError, match="error inside the hook"):
+            runner.execute_model(scheduled())
+    assert any(event[0] == "forward" for event in model.events) == (hook == "run_postprocess")
+    assert runner.execute_model_state is None
+
+
+@pytest.mark.parametrize("dummy_run", [False, True], ids=["empty-step", "dummy-step"])
+def test_inactive_execution_does_not_call_optional_hooks(monkeypatch, dummy_run):
+    runner, model = loaded_runner(monkeypatch)
+    batch = configure_step(monkeypatch, runner, model)
+    runner.model_state.run_preprocess = runner.model_state.run_postprocess = 33
+    monkeypatch.setattr(runner, "_make_dummy_input_batch", lambda *args, **kwargs: batch)
+    runner.kv_connector.no_forward = lambda output: EMPTY_MODEL_RUNNER_OUTPUT
+
+    if dummy_run:
+        runner.execute_model(scheduled(), dummy_run=True, skip_attn_for_dummy_run=True)
+        assert any(event[0] == "forward" for event in model.events)
+    else:
+        assert runner.execute_model(SchedulerOutput.make_empty()) is EMPTY_MODEL_RUNNER_OUTPUT
+        assert not any(event[0] == "forward" for event in model.events)
+
+
+@pytest.mark.parametrize("state_cls", [CoreState, OmniModelState, OmniMambaHybridModelState])
+@pytest.mark.parametrize(
+    "finished,preempted",
+    [(set(), set()), ({"A"}, set()), (set(), {"A"}), ({"A"}, {"A"}), ({"unknown"}, set())],
+    ids=["no-requests", "finished", "preempted", "overlap", "unknown"],
+)
+def test_finish_requests_cleans_each_id_once(monkeypatch, mocker, state_cls, finished, preempted):
+    runner, model = loaded_runner(monkeypatch, model=TinyModel(state_cls))
+    configure_step(monkeypatch, runner, model)
+    state_remove = mocker.spy(runner.model_state, "remove_request")
+    request_remove = mocker.spy(runner.req_states, "remove_request")
+    output = scheduled(finished=finished)
+    output.preempted_req_ids = preempted
+
+    runner.finish_requests(output)
+
+    ended = sorted(finished | preempted)
+    assert [call.args for call in state_remove.call_args_list] == [(req_id,) for req_id in ended]
+    assert [call.args for call in request_remove.call_args_list] == [(req_id,) for req_id in ended]
+    released = "A" in ended
+    expected = {"B": 1} if released else {"B": 1, "A": 0}
+    assert runner.req_states.req_id_to_index == expected
+    assert runner.req_states.free_indices == ([0] if released else [])
+    if isinstance(runner.model_state, OmniModelState):
+        assert runner.model_state.intermediate_buffer.req_id_to_index == expected
+    else:
+        assert runner.model_state.live == expected
+
+
+@pytest.mark.parametrize("mode", ["none", "align"])
+def test_cached_chunk_reset_preserves_peer_and_hybrid_slot(monkeypatch, mocker, mode):
+    config = make_config()
+    config.cache_config.mamba_cache_mode = mode
+    runner, model = loaded_runner(
+        monkeypatch, config=config, model=TinyModel(OmniMambaHybridModelState), runner_cls=OmniGenerationModelRunner
+    )
+    configure_step(monkeypatch, runner, model)
+    state = runner.model_state
+    state.num_accepted_tokens_gpu.copy_(torch.tensor([9, 7], dtype=torch.int32))
+    if mode == "align":
+        state._mamba_state_idx_gpu.copy_(torch.tensor([5, 6], dtype=torch.int32))
+    state.intermediate_buffer.buffers[0]["old"] = True
+    state.intermediate_buffer.buffers[1]["peer"] = True
+    state_remove = mocker.spy(state, "remove_request")
+    state_add = mocker.spy(state, "add_request")
+    state_flush = mocker.spy(state, "apply_staged_writes")
+    output = scheduled()
+    output.scheduled_cached_reqs = OmniCachedRequestData(
+        req_ids=["A", "unknown"],
+        new_token_ids=[[], []],
+        new_block_ids=[(), ()],
+        num_computed_tokens=[0, 0],
+        num_output_tokens=[0, 0],
+        prompt_token_ids={"A": None, "unknown": None},
+        additional_information={},
+    )
+
+    runner._handle_async_chunk_updates(output)
+    state_remove.assert_not_called()
+    state_add.assert_not_called()
+    state_flush.assert_not_called()
+    output.scheduled_cached_reqs.prompt_token_ids["A"] = []
+    runner._handle_async_chunk_updates(output)
+
+    state_remove.assert_called_once_with("A")
+    state_add.assert_called_once()
+    assert state_add.call_args.args[0] == 0
+    state_flush.assert_called_once_with()
+    assert runner.req_states.req_id_to_index == {"B": 1, "A": 0}
+    assert runner.req_states.free_indices == []
+    assert runner.req_states.prompt_len.np.tolist() == [0, 2]
+    assert state.intermediate_buffer.buffers == [{"req_id": "A"}, {"req_id": "B", "peer": True}]
+    assert state.num_accepted_tokens_gpu.tolist() == [1, 7]
+    if mode == "align":
+        assert state._mamba_state_idx_gpu.tolist() == [-1, 6]
 
 
 @pytest.mark.parametrize("capability", ["native", "kv-send", "kv-receive", "stream-capture", "ar-structured"])
@@ -467,12 +598,20 @@ def test_required_capability_fails_during_real_load(monkeypatch, capability):
         assert runner._omni_data_plane.popped == []
 
 
-def test_optional_configurations_admit_core_state(monkeypatch):
-    config = make_config(kv={}, eager=True)
-    config.kv_transfer_config = SimpleNamespace(omni_connector_config={"type": "fallback"})
+@pytest.mark.parametrize("primary", [{}, None], ids=["empty-primary", "fallback"])
+def test_optional_configurations_admit_core_state(monkeypatch, primary):
+    config = make_config(kv=primary, eager=True)
+    connector = {"type": "fallback"}
+    config.kv_transfer_config = SimpleNamespace(omni_connector_config=connector)
     runner, model = loaded_runner(monkeypatch, config=config, model=TinyModel(capture=True))
     assert runner.model_state is model.created_states[0]
     assert runner.kv_transfer_manager is None
+    manager = runner._ensure_kv_transfer_manager()
+    assert not manager.config.need_send_cache and not manager.config.need_recv_cache
+    if primary is None:
+        assert manager.config.connector_config == connector
+    else:
+        assert not manager.config.connector_config
 
 
 def test_capable_state_passes_native_kv_and_capture_validation(monkeypatch):
@@ -483,15 +622,108 @@ def test_capable_state_passes_native_kv_and_capture_validation(monkeypatch):
     assert runner.kv_transfer_manager is None
 
 
+@pytest.mark.parametrize("missing", ["update", "buffers"])
+def test_native_plane_rejects_partial_buffer_before_receiving(monkeypatch, missing):
+    class PartialBufferState(CoreState):
+        def __init__(self, *args):
+            super().__init__(*args)
+            buffer = {"update": lambda *args: None, "buffers": [{}]}
+            del buffer[missing]
+            self.intermediate_buffer = SimpleNamespace(**buffer)
+
+    model = TinyModel(PartialBufferState)
+    with pytest.raises(NotImplementedError, match=rf"Native MRv2 data plane.*\.{missing} on PartialBufferState"):
+        loaded_runner(monkeypatch, model=model, config=make_config(native=True))
+    assert model.loading_runner._omni_data_plane.popped == []
+    assert ("sampler_constructed",) not in model.events
+
+
+@pytest.mark.parametrize("value", ["external-A", b"external-A", ["external-A"]])
+def test_kv_resolver_preserves_global_id(monkeypatch, value):
+    runner, model = loaded_runner(monkeypatch, model=TinyModel(CapabilityControlState))
+    configure_step(monkeypatch, runner, model)
+    runner.model_state.intermediate_buffer.buffers[0]["global_request_id"] = value
+    assert runner._resolve_global_request_id("A") == "external-A"
+    assert runner._resolve_global_request_id("unknown") == "unknown"
+
+
+def test_kv_resolver_rejects_mapped_request_without_buffer(monkeypatch):
+    runner, model = loaded_runner(monkeypatch)
+    configure_step(monkeypatch, runner, model)
+    with pytest.raises(NotImplementedError, match=r"Omni KV transfer.*\.buffers on CoreState"):
+        runner._resolve_global_request_id("A")
+
+
+def test_kv_send_pre_hook_uses_orchestrator_request_id(monkeypatch):
+    config = make_config(kv={"need_send_cache": True})
+    runner, model = loaded_runner(monkeypatch, config=config, model=TinyModel(CapabilityControlState))
+    configure_step(monkeypatch, runner, model)
+    runner.model_state.intermediate_buffer.buffers[0]["global_request_id"] = "external-A"
+    runner.kv_caches = [torch.empty(1)]
+    runner.cache_config.block_size = 16
+    runner.cache_config.cache_dtype = "auto"
+    output = scheduled()
+    output.finished_requests_needing_kv_transfer = {"A": {}}
+    sent: list[str] = []
+
+    def send(*, finished_reqs, kv_caches, block_size, cache_dtype, request_id_resolver):
+        assert kv_caches is runner.kv_caches
+        assert block_size == 16 and cache_dtype == "auto"
+        sent.extend(request_id_resolver(req_id) for req_id in finished_reqs)
+        return list(finished_reqs)
+
+    runner.kv_transfer_manager = SimpleNamespace(handle_finished_requests_kv_transfer=send)
+    runner._handle_kv_transfer_pre(output)
+    assert sent == ["external-A"]
+    assert runner._kv_extracted_req_ids == ["A"]
+
+
+@pytest.mark.parametrize("profile_only", [False, True])
+def test_model_owned_capture_uses_state_sizes_and_original_buckets(monkeypatch, profile_only):
+    class CaptureState(CapabilityControlState):
+        def _get_mtp_capture_sizes(self):
+            return [4, 2, 2]
+
+    config = make_config(eager=False)
+    config.scheduler_config.max_num_seqs = 4
+    runner, model = loaded_runner(monkeypatch, config=config, model=TinyModel(CaptureState, capture=True))
+    parent_calls = []
+
+    def parent_capture(self, *, profile_only):
+        parent_calls.append(profile_only)
+        return 7
+
+    monkeypatch.setattr(CoreRunner, "capture_model", parent_capture)
+    assert runner.capture_model(profile_only=profile_only) == 7
+    assert parent_calls == [profile_only]
+    assert [event for event in model.events if event[0] == "capture"] == (
+        [] if profile_only else [("capture", [1, 2, 4])]
+    )
+    descriptor = runner._dispatch_mtp_batch_descriptor(3)
+    assert descriptor.cg_mode == CUDAGraphMode.FULL
+    assert descriptor.num_tokens == descriptor.num_reqs == 4
+    fallback = runner._dispatch_mtp_batch_descriptor(5)
+    assert fallback.cg_mode == CUDAGraphMode.NONE and fallback.num_tokens == 5
+
+
+def test_profile_capture_with_no_sizing_does_not_call_model_hook(monkeypatch):
+    runner, model = loaded_runner(monkeypatch, model=TinyModel(capture=True), config=make_config(eager=True))
+    monkeypatch.setattr(CoreRunner, "capture_model", lambda self, *, profile_only: 7)
+    assert runner.capture_model(profile_only=True) == 7
+    assert not any(event[0] == "capture" for event in model.events)
+
+
 @pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL])
-@pytest.mark.parametrize("kind", ["empty-omni-output", "empty-aux-tuple"])
+@pytest.mark.parametrize("kind", ["empty-omni-output", "empty-aux-tuple", "dict"])
 def test_rejects_unconverted_outputs_before_unpack(monkeypatch, mode, kind):
     runner, model = loaded_runner(monkeypatch)
     configure_step(monkeypatch, runner, model, mode)
     hidden = torch.zeros(2, 2)
-    raw = (
-        OmniOutput(text_hidden_states=hidden, multimodal_outputs={}) if kind == "empty-omni-output" else (hidden, None)
-    )
+    raw = {
+        "empty-omni-output": OmniOutput(text_hidden_states=hidden, multimodal_outputs={}),
+        "empty-aux-tuple": (hidden, None),
+        "dict": {"hidden": hidden},
+    }[kind]
     monkeypatch.setattr(model, "forward", lambda **kwargs: raw)
     runner.cudagraph_manager = SimpleNamespace(
         run_pw_graph=lambda model, inputs: model(**inputs),
@@ -517,6 +749,46 @@ def test_cached_payload_fails_before_core_request_update(monkeypatch):
     assert calls == ["core_update"]
 
 
+def test_cached_payload_merges_serialized_info_once_after_core_update(monkeypatch, mocker):
+    runner, model = loaded_runner(monkeypatch, model=TinyModel(CapabilityControlState))
+    configure_step(monkeypatch, runner, model)
+    buffer = runner.model_state.intermediate_buffer
+    buffer.update(0, {"embed": {"keep": 7}})
+    buffer.update(1, {"peer": True})
+    encoded = serialize_additional_information({"embed": {"decode": torch.tensor([[3.0, 4.0]])}})
+    output = scheduled()
+    output.scheduled_cached_reqs = OmniCachedRequestData(
+        req_ids=["A"],
+        new_token_ids=[[]],
+        new_block_ids=[None],
+        num_computed_tokens=[1],
+        num_output_tokens=[0],
+        prompt_token_ids={},
+        additional_information={"A": encoded, "B": None, "unknown": "unused"},
+    )
+    resolver = mocker.spy(base_module, "_resolve_additional_information")
+    original_update = CoreRunner.update_requests
+
+    def core_update(self, scheduler_output):
+        assert "decode" not in buffer.buffers[0]["embed"]
+        original_update(self, scheduler_output)
+        model.events.append(("core_update", int(self.req_states.num_computed_tokens_np[0])))
+
+    monkeypatch.setattr(CoreRunner, "update_requests", core_update)
+    runner.update_requests(output)
+    resolver.assert_called_once_with(encoded)
+    assert model.events.count(("core_update", 1)) == 1
+    assert buffer.buffers[0]["embed"]["keep"] == 7
+    torch.testing.assert_close(buffer.buffers[0]["embed"]["decode"], torch.tensor([[3.0, 4.0]]))
+    assert buffer.buffers[1] == {"peer": True}
+
+    output.scheduled_cached_reqs.additional_information = {"A": "malformed"}
+    with pytest.raises(ValueError, match="Failed to decode additional_information"):
+        runner.update_requests(output)
+    assert model.events.count(("core_update", 1)) == 1
+    torch.testing.assert_close(buffer.buffers[0]["embed"]["decode"], torch.tensor([[3.0, 4.0]]))
+
+
 def test_existing_multimodal_hook_runs_after_output_conversion(monkeypatch):
     class State(CoreState):
         def postprocess_model_output(self, output, batch, states):
@@ -537,19 +809,45 @@ def test_existing_multimodal_hook_runs_after_output_conversion(monkeypatch):
     assert model.events.index(("converted",)) < model.events.index(("feedback", [1.0]))
 
 
-def test_ar_rejects_pending_aux_without_consuming_the_step(monkeypatch):
+def test_missing_multimodal_feedback_hook_fails_during_load(monkeypatch):
+    class ConverterOnlyState(CoreState):
+        def postprocess_model_output(self, output, batch, states):
+            return output, {}
+
+    model = TinyModel(ConverterOnlyState)
+    model.postprocess_requires_multimodal_outputs = True
+
+    with pytest.raises(NotImplementedError, match="multimodal feedback requires run_postprocess on ConverterOnlyState"):
+        loaded_runner(monkeypatch, model=model)
+
+    assert len(model.created_states) == 1
+    assert not hasattr(model.loading_runner, "model_state")
+    assert ("sampler_constructed",) not in model.events
+
+
+@pytest.mark.parametrize("kind", ["omni-output", "drafter-state"])
+def test_ar_rejects_pending_aux_without_consuming_the_step(monkeypatch, kind):
     runner, model = loaded_runner(monkeypatch)
     configure_step(monkeypatch, runner, model)
     runner.execute_model(scheduled())
     step = runner.execute_model_state
     aux = {"existing": torch.ones(2)}
-    runner._last_aux_output = aux
+    if kind == "omni-output":
+        runner._last_aux_output = aux
+        error = "structured output"
+    else:
+        step = step._replace(aux_hidden_states=[aux["existing"]])
+        runner.execute_model_state = step
+        error = "AR auxiliary output"
 
-    with pytest.raises(NotImplementedError, match="structured output.*CoreState"):
+    with pytest.raises(NotImplementedError, match=f"{error}.*CoreState"):
         runner.sample_tokens(None)
 
     assert runner.execute_model_state is step
-    assert runner._last_aux_output is aux
+    if kind == "omni-output":
+        assert runner._last_aux_output is aux
+    else:
+        assert step.aux_hidden_states[0] is aux["existing"]
     assert not any(event[0] == "sample" for event in model.events)
 
 
@@ -592,9 +890,77 @@ def test_generation_output_uses_existing_stage_contract(monkeypatch, kind):
         assert runner.execute_model_state is None
 
 
-def test_declared_generation_converter_capability_fails_during_load(monkeypatch):
-    model = TinyModel()
+@pytest.mark.parametrize("has_buffer", [False, True])
+def test_declared_generation_converter_capability_fails_during_load(monkeypatch, has_buffer):
+    model = TinyModel(CapabilityControlState if has_buffer else CoreState)
     model.mrv2_forward_returns_tensor = True
-    with pytest.raises(NotImplementedError, match="generation output.*gather.*CoreState"):
+    detail = r"model\.make_omni_output.*CapabilityControlState" if has_buffer else "gather.*CoreState"
+    with pytest.raises(NotImplementedError, match=f"generation output.*{detail}"):
         loaded_runner(monkeypatch, model=model, runner_cls=OmniGenerationModelRunner)
     assert ("sampler_constructed",) not in model.events
+
+
+@pytest.mark.parametrize("dummy_run", [False, True], ids=["real", "dummy"])
+def test_generation_converter_gets_buffers_in_batch_order(monkeypatch, dummy_run):
+    model = TinyModel(CapabilityControlState)
+    runner, model = loaded_runner(monkeypatch, model=model, runner_cls=OmniGenerationModelRunner)
+    batch = configure_step(monkeypatch, runner, model)
+    batch.req_ids = ["B", "A"]
+    batch.num_reqs = batch.num_reqs_after_padding = 2
+    batch.idx_mapping = torch.tensor([1, 0])
+    batch.idx_mapping_np = batch.idx_mapping.numpy()
+    batch.num_scheduled_tokens = np.array([1, 1])
+    batch.query_start_loc = torch.tensor([0, 1, 2])
+    batch.query_start_loc_np = batch.query_start_loc.numpy()
+    runner._prev_step_idle = False
+    runner._dummy_hidden = torch.empty(1)
+    state = runner.model_state
+    state.intermediate_buffer.buffers[:] = [{"sentinel": "A"}, {"sentinel": "B"}]
+    seen = []
+
+    def convert(output, *, model_intermediate_buffer, runtime_additional_information):
+        assert model_intermediate_buffer is runtime_additional_information
+        seen.extend(model_intermediate_buffer)
+        return OmniOutput(text_hidden_states=output, multimodal_outputs={})
+
+    monkeypatch.setattr(model, "make_omni_output", convert, raising=False)
+    monkeypatch.setattr(runner, "_make_dummy_input_batch", lambda *args, **kwargs: batch)
+    output = scheduled()
+    output.num_scheduled_tokens = {"B": 1, "A": 1}
+    runner.execute_model(output, dummy_run=dummy_run)
+
+    assert seen == [{"sentinel": "B"}, {"sentinel": "A"}]
+    assert isinstance(runner._gen_model_output, OmniOutput)
+    assert not {"prepare_attn", "preprocess_state", "postprocess_state"}.intersection(e[0] for e in model.events)
+
+
+@pytest.mark.parametrize("specialized", [False, True])
+def test_real_factory_wraps_only_exact_default_for_omni_stage(specialized):
+    created = []
+
+    class SpecializedState(DefaultModelState):
+        def __init__(self, *args):
+            super().__init__(*args)
+            created.append(self)
+
+    model = TinyModel(SpecializedState if specialized else DefaultModelState)
+    # These classes do not record construction in TinyModel.created_states.
+    state = base_module.init_omni_model_state(make_config(), model, None, torch.device("cpu"))
+    assert type(state) is (SpecializedState if specialized else OmniModelState)
+    assert created == ([state] if specialized else [])
+
+
+def test_factory_preserves_core_state_sampler_override(monkeypatch):
+    class CustomSamplerState(CoreState):
+        def custom_sampler(self, sampler):
+            self.events.append(("state_sampler", self, sampler))
+            return sampler, None
+
+    config = make_config()
+    config._check_supports_watermarking = MethodType(VllmConfig._check_supports_watermarking, config)
+    runner, model = loaded_runner(monkeypatch, config=config, model=TinyModel(CustomSamplerState))
+    assert runner.model_state is model.created_states[0]
+    assert type(runner.model_state) is CustomSamplerState
+    assert model.events.index(("sampler_constructed",)) < model.events.index(
+        ("state_sampler", runner.model_state, runner.sampler)
+    )
