@@ -194,15 +194,31 @@ def test_empty_reply_hands_over_an_empty_closing_condition() -> None:
     assert meta["next_stage_prompt_len"] == 2
 
 
-def test_reply_without_tts_bos_is_spoken_from_its_first_token() -> None:
+def test_reply_without_tts_bos_is_spoken_whole_from_its_first_token() -> None:
+    # The marker could still come later, so the reply waits for the finish.
     thinker = _Thinker([5, 6])
     context = _context()
-    reply = list(range(100, 112))
+    reply = list(range(100, 125))
     emitted, _ = _speak(thinker, context, reply)
 
     blocks = [_handoff(tts_input) for tts_input in emitted]
-    assert [ids for ids, _, _ in blocks] == [reply[:10], reply[10:]]
-    assert blocks[0][1][:, 0].tolist() == list(range(2, 12))
+    assert [ids for ids, _, _ in blocks] == [reply]
+    assert blocks[0][1][:, 0].tolist() == list(range(2, 27))
+    assert blocks[0][2]["turn_chunk_close"] is True
+
+
+def test_preamble_before_a_late_tts_bos_is_not_spoken() -> None:
+    thinker = _Thinker([5, 6])
+    context = _context()
+    preamble = list(range(200, 215))
+    speech = list(range(100, 125))
+    emitted, _ = _speak(thinker, context, [*preamble, TTS_BOS, *speech])
+
+    blocks = [_handoff(tts_input) for tts_input in emitted]
+    assert [ids for ids, _, _ in blocks] == [speech[:10], speech[10:20], speech[20:]]
+    first_position = 2 + len(preamble) + 1
+    assert blocks[0][1][:, 0].tolist() == list(range(first_position, first_position + 10))
+    assert [meta["streaming_condition_seq"] for _, _, meta in blocks] == [0, 1, 2]
 
 
 def test_final_only_output_hands_over_the_whole_reply_once() -> None:

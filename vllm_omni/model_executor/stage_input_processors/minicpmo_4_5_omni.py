@@ -1448,11 +1448,15 @@ def _next_turn_chunk(
         tts_end_ids = set(tts_end_ids) | {151704, 151645}
     start = state.get("start")
     if start is None:
-        for index, token_id in enumerate(full_token_ids):
-            if token_id == tts_bos_id:
+        # Only the ids not searched on an earlier output.
+        for index in range(int(state.get("searched", 0)), len(full_token_ids)):
+            if full_token_ids[index] == tts_bos_id:
                 start = index + 1
-        if start is None and output_ids:
-            # Plain chat templates carry no <|tts_bos|>: speak the reply.
+        state["searched"] = len(full_token_ids)
+        if start is None and finished and output_ids:
+            # Plain chat templates carry no <|tts_bos|>: speak the reply. A
+            # template may still emit the marker after a preamble, so no block
+            # goes out before it shows up or the Thinker finishes.
             start = len(prompt_token_ids)
         if start is not None:
             state["start"] = start
