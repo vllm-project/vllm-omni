@@ -9,6 +9,13 @@ reads the raw robot observation from
 realtime serving layer), builds model inputs, runs flow-matching denoising, and
 returns ``DiffusionOutput(output={"actions": ndarray})``.
 
+With ``max_num_seqs > 1`` the engine forms batches of requests that share
+their ``num_inference_steps`` and hands them over as one
+``DiffusionRequestBatch``: every observation is preprocessed on its own, the
+batch runs ``sample_actions`` once, and each request gets its own rows back as
+its own ``DiffusionOutput``. The optimized path captures its CUDA graphs for
+batch 1, the powers of two below ``max_num_seqs`` and ``max_num_seqs``.
+
 π0.5 is stateless across calls (no KV reuse, first-order Markov), so
 ``session_id`` / ``reset`` from the OpenPI protocol are accepted but ignored.
 
@@ -24,6 +31,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from contextlib import nullcontext
 from dataclasses import fields as dataclass_fields
 
 import numpy as np
@@ -33,10 +42,14 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.pi05.config import SUPPORTED_DTYPE_NAMES, Pi05Config
+from vllm_omni.diffusion.models.pi05.cuda_graph_pi05 import Pi05CUDAGraphs
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import Pi05ForActionPrediction
 from vllm_omni.diffusion.models.pi05.processor_pi05 import Pi05Processor
+from vllm_omni.diffusion.models.pi05.runtime_pi05 import Pi05RuntimeOptions
+from vllm_omni.diffusion.models.pi05.vision_pi05 import Pi05VisionOptions
 from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE as PI05_PIPELINE
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 logger = init_logger(__name__)
 
@@ -117,11 +130,30 @@ def _set_inference_dtype(model: Pi05ForActionPrediction, dtype: torch.dtype) -> 
         raise ValueError(f"Unsupported π0.5 inference dtype: {dtype!r}.")
 
 
+def graph_batch_sizes(max_num_seqs: int) -> tuple[int, ...]:
+    """The batch sizes the three ``sample_actions`` regions are captured for:
+    1, every power of two below ``max_num_seqs``, and ``max_num_seqs`` itself.
+    Each size holds a KV cache of its own, so every size up to a large
+    ``max_num_seqs`` would not fit; a batch of an undeclared size runs its
+    prefix regions without a graph and its steps on the next larger size's."""
+    max_num_seqs = max(1, int(max_num_seqs))
+    sizes = {1, max_num_seqs}
+    size = 2
+    while size < max_num_seqs:
+        sizes.add(size)
+        size *= 2
+    return tuple(sorted(sizes))
+
+
 class Pi05Pipeline(nn.Module):
     """π0.5 VLA pipeline: raw robot obs → continuous action chunk.
 
     Registered as ``"Pi05Pipeline"`` in the diffusion registry.
     """
+
+    # The engine may hand ``forward`` a ``DiffusionRequestBatch`` of up to
+    # ``max_num_seqs`` requests; each gets its own ``DiffusionOutput`` back.
+    supports_request_batch = True
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
@@ -131,6 +163,8 @@ class Pi05Pipeline(nn.Module):
         self.config = self._build_config(od_config)
 
         custom_args = od_config.custom_pipeline_args or {}
+        self.vision_options = Pi05VisionOptions.from_pipeline_args(custom_args)
+        self.runtime_options = Pi05RuntimeOptions.from_pipeline_args(custom_args)
         self.tokenizer_source = str(custom_args.get("tokenizer", self._resolve_tokenizer_source()))
 
         self._torch_dtype = self._resolve_dtype(od_config)
@@ -138,8 +172,34 @@ class Pi05Pipeline(nn.Module):
 
         self.tokenizer = self._load_tokenizer()
         self.model = self._initialize_model()
+        # OpenPI serving is one observation per call (``max_num_seqs: 1``).
+        # Reusable buffers must also accept writes from ordinary no_grad callers
+        # after an outer inference_mode initialization scope has ended.
+        with torch.inference_mode(False), torch.no_grad():
+            self.model.kv_cache = self.model.new_kv_cache(batch_size=1)
+            self._install_cuda_graphs(od_config)
 
         self.processor = Pi05Processor(self.config, self.tokenizer, self._device)
+
+    def to(self, *args, **kwargs):
+        # The custom-pipeline loader repeats device placement after construction.
+        # Our graphs are already captured, so only an actual no-op is safe.
+        model = getattr(self, "model", None)
+        if model is None or model.cuda_graphs is None:
+            return super().to(*args, **kwargs)
+        device, dtype, _non_blocking, memory_format = torch._C._nn._parse_to(*args, **kwargs)
+        if device is not None and device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.accelerator.current_device_index())
+        if (
+            dtype is not None
+            or memory_format is not None
+            or (device is not None and any(tensor.device != device for tensor in self.parameters()))
+            or (device is not None and any(tensor.device != device for tensor in self.buffers()))
+        ):
+            raise RuntimeError(
+                "Pi0.5 device/dtype/memory-format changes after CUDA Graph capture require a new pipeline."
+            )
+        return self
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -234,12 +294,65 @@ class Pi05Pipeline(nn.Module):
         if not self.has_real_checkpoint():
             expected = os.path.join(self.model_dir or "<missing-model-dir>", "model.safetensors")
             raise FileNotFoundError(f"π0.5 serving requires checkpoint weights at {expected}.")
-        model = Pi05ForActionPrediction(self.config)
-        _set_inference_dtype(model, self._torch_dtype)
-        model.to(device=self._device)
-        self._load_checkpoint(model)
-        model.eval()
+        # Cached projections use parameter version counters for invalidation.
+        # Serving may construct us inside inference_mode; keep these weights
+        # and tables as ordinary tensors, without recording gradients.
+        init_context = torch.inference_mode(False) if self.runtime_options.precompute_adarms else nullcontext()
+        with init_context, torch.no_grad():
+            model = Pi05ForActionPrediction(self.config)
+            _set_inference_dtype(model, self._torch_dtype)
+            model.configure_vision(self.vision_options)
+            model.configure_runtime(self.runtime_options)
+            model.to(device=self._device)
+            self._load_checkpoint(model)
+            model.eval()
+            model.prepare_runtime_caches()
+        logger.info(
+            "Pi05Pipeline: vision precision=%s, camera batching=%s, runtime=%s (experimental options).",
+            self.vision_options.precision,
+            self.vision_options.batch_cameras,
+            self.runtime_options,
+        )
         return model
+
+    def _install_cuda_graphs(self, od_config: OmniDiffusionConfig) -> None:
+        """Pick the ``sample_actions`` execution path.
+
+        The stage's ``enforce_eager`` (deploy yaml, or ``--enforce-eager`` on the
+        CLI, which takes precedence) keeps the eager baseline. Otherwise the
+        optimized path is set up here, at init: the fused Triton kernels are
+        enabled, and the CUDA graphs are captured over them and installed. A
+        failure of either raises rather than silently serving eagerly.
+        """
+        if od_config.enforce_eager:
+            logger.info("Pi05Pipeline: enforce_eager is set; sample_actions runs eagerly.")
+            return
+        if self._device.type != "cuda":
+            logger.warning(
+                "Pi05Pipeline: CUDA graphs need a CUDA device, got %s; sample_actions runs eagerly.",
+                self._device,
+            )
+            return
+        try:
+            self.model.enable_fused_kernels()
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "π0.5's optimized path needs its fused kernels. Set `enforce_eager: true` in the deploy "
+                "config, or pass --enforce-eager, to serve eagerly."
+            ) from exc
+        batch_sizes = graph_batch_sizes(getattr(od_config, "max_num_seqs", 1))
+        graphs = Pi05CUDAGraphs(self.model, batch_sizes=batch_sizes)
+        start = time.perf_counter()
+        allocated = torch.accelerator.memory_allocated()
+        graphs.capture()
+        self.model.cuda_graphs = graphs
+        logger.info(
+            "Pi05Pipeline: captured the sample_actions CUDA graphs over the fused kernels in %.2f s "
+            "(every region at batch sizes %s, %.2f GB); sample_actions runs its optimized path.",
+            time.perf_counter() - start,
+            list(batch_sizes),
+            (torch.accelerator.memory_allocated() - allocated) / 2**30,
+        )
 
     def _load_checkpoint(self, model: Pi05ForActionPrediction) -> None:
         import safetensors.torch
@@ -265,47 +378,69 @@ class Pi05Pipeline(nn.Module):
     # Inference
     # ------------------------------------------------------------------
     @torch.inference_mode()
-    def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
-        extra_args = getattr(req.sampling_params, "extra_args", None) or {}
-        robot_obs = extra_args.get("robot_obs")
+    def forward(
+        self, req: OmniDiffusionRequest | DiffusionRequestBatch, **kwargs
+    ) -> DiffusionOutput | list[DiffusionOutput]:
+        """One request's chunk, or every request's of a formed batch (a list, in
+        the batch's order). The requests with an observation run ``sample_actions``
+        together; one without gets the dummy-warmup zeros or an error on its own."""
+        batched = isinstance(req, DiffusionRequestBatch)
+        requests = req.requests if batched else [req]
+        observations = [(getattr(r.sampling_params, "extra_args", None) or {}).get("robot_obs") for r in requests]
+        outputs: list[DiffusionOutput | None] = [
+            None if obs is not None else self._without_observation(r) for r, obs in zip(requests, observations)
+        ]
+        live = [index for index, obs in enumerate(observations) if obs is not None]
+        if live:
+            chunks = self._sample([requests[i] for i in live], [observations[i] for i in live])
+            for index, chunk in zip(live, chunks):
+                outputs[index] = chunk
+        return outputs if batched else outputs[0]
 
-        if robot_obs is None:
-            # Dummy warmup path (no obs): return zeros so engine warmup/capture
-            # doesn't crash. Mirrors DreamZero's dummy-run handling.
-            first_prompt = req.prompts[0] if req.prompts else ""
-            prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
-            num_steps = getattr(req.sampling_params, "num_inference_steps", None)
-            if prompt == "dummy run" or num_steps == 1:
-                logger.info("Pi05Pipeline: dummy warmup request without robot_obs — returning zeros.")
-                return DiffusionOutput(
-                    output={
-                        "actions": np.zeros(
-                            (self.config.chunk_size, self.config.action_dim),
-                            dtype=np.float32,
-                        )
-                    },
-                )
+    def _without_observation(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+        # Dummy warmup path (no obs): return zeros so engine warmup/capture
+        # doesn't crash. Mirrors DreamZero's dummy-run handling.
+        prompt = getattr(req, "prompt", None) or ""
+        if not isinstance(prompt, str):
+            prompt = prompt.get("prompt") or ""
+        num_steps = getattr(req.sampling_params, "num_inference_steps", None)
+        if prompt == "dummy run" or num_steps == 1:
+            logger.info("Pi05Pipeline: dummy warmup request without robot_obs — returning zeros.")
             return DiffusionOutput(
-                error="Pi05Pipeline.forward requires sampling_params.extra_args['robot_obs'].",
+                output={"actions": np.zeros((self.config.chunk_size, self.config.action_dim), dtype=np.float32)},
             )
+        return DiffusionOutput(error="Pi05Pipeline.forward requires sampling_params.extra_args['robot_obs'].")
 
-        images, image_masks, lang_tokens, lang_masks = self.processor.build_model_inputs(robot_obs)
-
+    @staticmethod
+    def _num_steps(req: OmniDiffusionRequest) -> int | None:
         num_steps = getattr(req.sampling_params, "num_inference_steps", None)
         if num_steps is not None and (
             isinstance(num_steps, bool) or not isinstance(num_steps, (int, np.integer)) or int(num_steps) < 1
         ):
             raise ValueError(f"num_inference_steps must be a positive integer, got {num_steps!r}.")
-        if num_steps is not None:
-            num_steps = int(num_steps)
+        return None if num_steps is None else int(num_steps)
 
+    def _sample(self, requests: list[OmniDiffusionRequest], observations: list[dict]) -> list[DiffusionOutput]:
+        """The chunks of ``requests``, run as one batch: their observations
+        preprocessed one by one and stacked (the processor gives every request
+        the deployed shapes: ``max_cameras`` slots, ``tokenizer_max_length``
+        tokens), the denoising steps shared, the noise drawn per request."""
+        steps = [self._num_steps(req) for req in requests]
+        if any(num_steps != steps[0] for num_steps in steps):
+            raise ValueError(f"The requests of a batch must share num_inference_steps, got {steps}.")
+        parts = [self.processor.build_model_inputs(obs) for obs in observations]
+        generators = [req.sampling_params.generator for req in requests]
         actions = self.model.sample_actions(
-            images=images,
-            image_masks=image_masks,
-            lang_tokens=lang_tokens,
-            lang_masks=lang_masks,
-            num_steps=num_steps,
-            generator=req.sampling_params.generator,
+            images=[torch.cat([part[0][cam] for part in parts]) for cam in range(len(parts[0][0]))],
+            image_masks=[torch.cat([part[1][cam] for part in parts]) for cam in range(len(parts[0][1]))],
+            lang_tokens=torch.cat([part[2] for part in parts]),
+            lang_masks=torch.cat([part[3] for part in parts]),
+            num_steps=steps[0],
+            # One request's generator as it is; a batch's as a list, so that each
+            # request draws its own noise (``None`` entries draw from the default).
+            generator=generators[0] if len(requests) == 1 else generators,
         )
-
-        return DiffusionOutput(output={"actions": self.processor.build_model_outputs(actions, robot_obs)})
+        return [
+            DiffusionOutput(output={"actions": self.processor.build_model_outputs(actions[index : index + 1], obs)})
+            for index, obs in enumerate(observations)
+        ]

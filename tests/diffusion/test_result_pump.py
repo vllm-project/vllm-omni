@@ -376,6 +376,47 @@ class TestBatchSplitDelivery:
         assert executor._batch_split_map == {}
         assert executor._completed_outputs == {}
 
+    def test_split_map_registered_while_the_pump_unpacks(self, mocker):
+        """Regression: the pump looks for the split map, finds none, and unpacks the
+        output without the lock; execute_batch registers the map in that window. The
+        pump then cached the whole batch output under the batch id, next to a split
+        map nothing consumed, and every request of the batch waited for the 600 s
+        async-output timeout (seen serving pi0.5 request batches)."""
+        executor = _make_executor()
+        executor.od_config.parallel_config.data_parallel_size = 1
+        executor.od_config.enable_distributed_layerwise_offload = False
+        executor._ensure_open = lambda: None
+        req_ids = ["r0", "r1", "r2"]
+        batch_id = "batch-3"
+        outputs = {rid: DiffusionOutput(output=f"img-{rid}") for rid in req_ids}
+        ready = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id=batch_id,
+            output=_FakeBatchOutput(outputs),
+        )
+        executor.collective_rpc = lambda *args, **kwargs: AsyncDiffusionOutput(
+            kind=AsyncOutputKind.COMPUTE_DONE, rpc_id="1", async_output_id=batch_id
+        )
+
+        def unpack_while_execute_batch_returns(output):
+            # execute_batch's bookkeeping lands after the pump's split-map lookup
+            # and before it files the output.
+            assert executor._batch_split_map == {}
+            executor.execute_batch(_make_scheduler_output(req_ids))
+            assert batch_id in executor._batch_split_map
+
+        mocker.patch.object(
+            executor_module, "unpack_diffusion_output_shm", side_effect=unpack_while_execute_batch_returns
+        )
+        _feed_one_msg_to_pump(executor, ready)
+
+        for rid in req_ids:
+            fut = executor.wait_output_ready(f"{batch_id}/{rid}")
+            assert fut.done(), f"request {rid} never resolved"
+            assert fut.result(timeout=1.0) is outputs[rid]
+        assert executor._batch_split_map == {}
+        assert executor._completed_outputs == {}
+
     def test_engine_waiter_before_output_is_resolved(self):
         """Consumers already blocked in wait_output_ready must be woken."""
         executor = _make_executor()
