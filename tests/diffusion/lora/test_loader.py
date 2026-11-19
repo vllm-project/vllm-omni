@@ -352,6 +352,47 @@ class TestQwenImageLoraLoaderMixin:
         pipeline.load_lora_weights(state_dict, "adapter0")
         assert_close(to_out.weight, original_weight + delta)
 
+    @pytest.mark.parametrize("unprefixed_bias", [False, True], ids=["prefixed_bias", "both_biases"])
+    def test_load_mixed_prefix_adapter_keeps_bias_delta(self, mocker: MockerFixture, unprefixed_bias: bool):
+        pipeline = DummyQwenImagePipeline(2, HEAD_DIM, bias=True)
+        prefixed_out = pipeline.transformer.blocks[0].attn.to_out
+        unprefixed_out = pipeline.transformer.blocks[1].attn.to_out
+        original_weight = prefixed_out.weight.detach().clone()
+        original_bias = prefixed_out.bias.detach().clone()
+        original_unprefixed_weight = unprefixed_out.weight.detach().clone()
+        original_unprefixed_bias = unprefixed_out.bias.detach().clone()
+        state_dict, weight_delta = make_dummy_lora_state_dict("transformer.blocks.0.attn.to_out.0")
+        bias_delta = torch.randn(HEAD_DIM)
+        state_dict["transformer.blocks.0.attn.to_out.0.bias"] = bias_delta
+        unprefixed_state_dict, unprefixed_delta = make_dummy_lora_state_dict(
+            "blocks.1.attn.to_out.0",
+            lora_a_suffix="lora_A.default.weight",
+            lora_b_suffix="lora_B.default.weight",
+        )
+        state_dict.update(unprefixed_state_dict)
+        unprefixed_bias_delta = torch.full((HEAD_DIM,), 0.5 if unprefixed_bias else 0.0)
+        if unprefixed_bias:
+            state_dict["blocks.1.attn.to_out.0.bias"] = unprefixed_bias_delta
+        mocker.patch(
+            "vllm_omni.diffusion.lora.loader.get_converter_by_pipeline",
+            return_value=_convert_non_diffusers_qwen_lora_to_diffusers,
+        )
+
+        pipeline.load_lora_weights(state_dict, "adapter0")
+
+        assert_close(prefixed_out.weight, original_weight + weight_delta)
+        assert_close(prefixed_out.bias, original_bias + bias_delta)
+        assert_close(unprefixed_out.weight, original_unprefixed_weight + unprefixed_delta)
+        assert_close(unprefixed_out.bias, original_unprefixed_bias + unprefixed_bias_delta)
+
+        pipeline.unload_lora_weights("adapter0")
+
+        assert_close(prefixed_out.weight, original_weight)
+        assert_close(prefixed_out.bias, original_bias)
+        assert_close(unprefixed_out.weight, original_unprefixed_weight)
+        assert_close(unprefixed_out.bias, original_unprefixed_bias)
+        assert "adapter0" not in pipeline.lora_loaded
+
     def test_load_lora_rejects_zero_matches(self):
         pipeline = DummyQwenImagePipeline(1, HEAD_DIM)
         original_params = {name: param.detach().clone() for name, param in pipeline.transformer.named_parameters()}
@@ -390,20 +431,24 @@ class TestQwenImageLoraLoaderMixin:
         assert "adapter0" not in pipeline.lora_loaded
 
     @pytest.mark.parametrize(
-        ("prefix", "adapter_suffix"), [("", ""), ("transformer.", ".default")], ids=["unprefixed", "prefixed"]
+        ("prefix", "adapter_suffix", "alpha_prefix"),
+        [("", "", ""), ("transformer.", ".default", "transformer."), ("diffusion_model.", ".default", "")],
+        ids=["unprefixed", "prefixed", "diffusion_model_bare_alpha"],
     )
-    def test_load_diffusers_lora_applies_non_unit_alpha(self, mocker: MockerFixture, prefix: str, adapter_suffix: str):
+    def test_load_diffusers_lora_applies_non_unit_alpha(
+        self, mocker: MockerFixture, prefix: str, adapter_suffix: str, alpha_prefix: str
+    ):
         pipeline = DummyQwenImagePipeline(1, HEAD_DIM)
         to_out = pipeline.transformer.blocks[0].attn.to_out
         original_weight = to_out.weight.detach().clone()
-        base_key = f"{prefix}blocks.0.attn.to_out.0"
+        module = "blocks.0.attn.to_out.0"
         lora_a = torch.randn(RANK, HEAD_DIM)
         lora_b = torch.randn(HEAD_DIM, RANK)
         alpha = torch.tensor(6.0)
         state_dict = {
-            f"{base_key}.lora_A{adapter_suffix}.weight": lora_a,
-            f"{base_key}.lora_B{adapter_suffix}.weight": lora_b,
-            f"{base_key}.alpha": alpha,
+            f"{prefix}{module}.lora_A{adapter_suffix}.weight": lora_a,
+            f"{prefix}{module}.lora_B{adapter_suffix}.weight": lora_b,
+            f"{alpha_prefix}{module}.alpha": alpha,
         }
         mocker.patch(
             "vllm_omni.diffusion.lora.loader.get_converter_by_pipeline",
