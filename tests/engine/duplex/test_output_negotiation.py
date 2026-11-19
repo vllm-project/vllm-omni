@@ -371,6 +371,62 @@ def test_text_history_keeps_position_while_input_continues():
     assert not session._conversation.history_item_placeholders
 
 
+def test_text_history_places_current_input_before_its_response():
+    session = DuplexEngineSession(session_id="text", config=DuplexSessionConfig(), capabilities=_caps())
+    session.mark_user_input_activity()
+    response = session.begin_response()
+    session.append_assistant_text("reply")
+    current = session.commit_audio_input(transcript="current input")
+    later = session.commit_audio_input(transcript="later input")
+    session.register_history_item(f"item_{response}", session.end_response(playback_commit_policy="ack_only"))
+    session.finalize_response_playback(response)
+    assert session.history == (current.message, {"role": "assistant", "content": "reply"}, later.message)
+    assert not session._conversation.history_item_placeholders
+
+
+def test_text_history_appends_input_when_response_placeholder_is_missing():
+    session = DuplexEngineSession(session_id="text", config=DuplexSessionConfig(), capabilities=_caps())
+    earlier = session.commit_audio_input(transcript="earlier input")
+    session.mark_user_input_activity()
+    response = session.begin_response()
+    session.append_assistant_text("reply")
+    placeholder = session._conversation.history_item_placeholders[f"item_{response}"]
+    session._conversation.messages.remove(placeholder)
+    current = session.commit_audio_input(transcript="current input")
+    assert session.history == (earlier.message, current.message)
+    assert session._conversation.messages[-1] is current.message
+
+
+@pytest.mark.parametrize("policy", ["ack_only", "commit_all_on_done"])
+@pytest.mark.parametrize("conversation", ["auto", "none"])
+@pytest.mark.asyncio
+async def test_terminal_native_listen_preserves_text_without_waiting_for_audio_ack(policy, conversation):
+    h = await open_harness(plugin=_text_plugin(), stage_count=1)
+    try:
+        h.session.replace_config(replace(h.session.config, playback_commit_policy=policy))
+        h.session.reserve_response_options(ResponseCreateOptions.from_realtime({"conversation": conversation}))
+        await h.runner.model._send_one_model_output_event({"text": "emitted reply", "model_turn_id": 0})
+        first = await h.settle()
+        response = h.session.active_response_id
+        assert response is not None
+        assert any(event.type == "response.output_text.delta" for event in first)
+        await h.runner.model._send_one_model_output_event({"is_listen": True, "end_of_turn": True, "model_turn_id": 0})
+        terminal = await h.settle()
+        assert not any(event.type == "error" for event in first + terminal)
+        assert any(event.type == "response.listen" for event in terminal)
+        done = [event for event in terminal if event.type == "response.done"]
+        assert len(done) == 1 and done[0].response_id == response
+        expected = ({"role": "assistant", "content": "emitted reply"},) if conversation != "none" else ()
+        assert h.session.history == expected
+        assert h.session.active_response_id is None
+        assert not h.session.pending_history_item_ids
+        assert not h.session._conversation.history_item_placeholders
+        assert not h.session._conversation.assistant_response_snapshots
+        assert not h.session._playback.by_response
+    finally:
+        await close_harness(h)
+
+
 @pytest.mark.asyncio
 async def test_text_sessions_resume_without_generation_and_expire_independently():
     async with Harness.create(plugin=_text_plugin(), stage_port=FakeStagePort(stage_count=1), idle_ttl_s=2.0) as h:
