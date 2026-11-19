@@ -1289,8 +1289,10 @@ class OmniDiffusionConfig:
                 f"hsdp_weight_load_strategy must be 'full' or 'pre_sharded', got {self.hsdp_weight_load_strategy!r}"
             )
         from vllm_omni.diffusion.offloader.config import (
+            DIT_COMPONENT,
             OffloadStrategy,
             materialize_legacy_offload_flags,
+            resolve_offload,
         )
 
         self.stage_input_payload_keys = tuple(self.stage_input_payload_keys)
@@ -1514,8 +1516,8 @@ class OmniDiffusionConfig:
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 
-        if self.lora_application not in ("runtime", "merged"):
-            raise ValueError("lora_application must be 'runtime' or 'merged'")
+        if self.lora_application not in ("runtime", "merged", "startup-merge"):
+            raise ValueError("lora_application must be runtime, merged, or startup-merge")
         if self.lora_application == "merged":
             if self.lora_backend != LoRABackend.PEFT:
                 raise ValueError("Merged LoRA requires lora_backend='peft'")
@@ -1532,6 +1534,30 @@ class OmniDiffusionConfig:
                 raise ValueError("Merged LoRA weight updates require backend='omni_lora_ipc'")
         elif self.weight_transfer_config is not None and self.weight_transfer_config.get("backend") == "omni_lora_ipc":
             raise ValueError("omni_lora_ipc requires lora_application='merged'")
+        if self.lora_application == "startup-merge":
+            if self.lora_backend != LoRABackend.PEFT:
+                raise ValueError("startup-merge requires lora_backend='peft'")
+            if isinstance(self.lora_path, list) and len(self.lora_path) == 1:
+                self.lora_path = self.lora_path[0]
+            if not isinstance(self.lora_path, str) or not self.lora_path:
+                raise ValueError("startup-merge requires exactly one startup lora_path")
+            if isinstance(self.lora_scale, list) and len(self.lora_scale) == 1:
+                self.lora_scale = self.lora_scale[0]
+            if isinstance(self.lora_scale, list) or not math.isfinite(self.lora_scale):
+                raise ValueError("startup-merge requires one finite lora_scale")
+            if self.parallel_config.use_hsdp or self.enable_sleep_mode:
+                raise ValueError("startup-merge does not support HSDP or sleep mode")
+            if (
+                offload_strategy in (OffloadStrategy.MODEL_LEVEL, OffloadStrategy.LAYER_WISE)
+                and resolve_offload(self).offloads(DIT_COMPONENT)
+            ):
+                raise ValueError("startup-merge only supports distributed layerwise offload (DLO) for the DiT")
+            if offload_strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE and (
+                self.step_execution or self.streaming_output
+            ):
+                raise ValueError("startup-merge with DLO requires request-mode generation")
+            if self.weight_transfer_config is not None or self.host_weight_runtime_mode != "disabled":
+                raise ValueError("startup-merge does not support weight transfer or host weight artifacts")
         if self.max_cpu_loras is None:
             self.max_cpu_loras = 1
         elif self.max_cpu_loras < 1:

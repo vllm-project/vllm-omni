@@ -147,6 +147,15 @@ This prevents a model from interpreting serialized weights with an online
 loader or silently applying the wrong method to one transformer in a
 multi-transformer pipeline.
 
+For MiniMax-H3 `startup-merge`, LoRA fusion consumes original floating
+checkpoint matrices before TP slicing and before any online quantization.
+On NPU, the final fused floating tensor remains on its layer's load device and
+enters the existing online quantizer directly, without a floating-weight D2H
+round trip. The same parameter loaders retain TP slicing and quantization
+completion tracking. The quantizer computes its scales from the fused policy. This mode
+rejects pre-quantized checkpoints and never reconstructs quantized base weights.
+See the [LoRA guide](../../user_guide/diffusion/lora.md#fixed-startup-fusion-before-quantization-minimax-h3).
+
 ## Model and layer integration
 
 Diffusion model constructors receive the resolved configuration and pass it to

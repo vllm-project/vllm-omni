@@ -910,7 +910,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     lora_path: str | list[str] | None = None
     lora_scale: float = 1.0
     lora_backend: str = "peft"
-    lora_application: Literal["runtime", "merged"] = "runtime"
+    lora_application: Literal["runtime", "merged", "startup-merge"] = "runtime"
     max_cpu_loras: int | None = None
     output_type: str = "pil"
     diffusion_offload_config: dict[str, Any] | None = None

@@ -13,6 +13,7 @@ import math
 from bisect import bisect_left
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -66,6 +67,8 @@ if TYPE_CHECKING:
 
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache import MiniMaxH3ReferenceKVTier2State
+
+    from .startup_lora import MiniMaxH3StartupLoRA
 
 logger = init_logger(__name__)
 
@@ -1059,6 +1062,8 @@ class MiniMaxH3DiTModel(nn.Module):
     def load_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
+        *,
+        startup_lora: MiniMaxH3StartupLoRA | None = None,
     ) -> set[str]:
         """Load native or Diffusers H3 weights with the existing TP-aware loaders."""
         if getattr(self, "adaln_cache", None) is not None:
@@ -1070,6 +1075,10 @@ class MiniMaxH3DiTModel(nn.Module):
         qkv_parts: dict[str, set[str]] = {}
         source_names: set[str] = set()
         for name, loaded_weight in weights:
+            if startup_lora is not None and name.endswith(
+                (".weight_scale", ".weight_scale_inv", ".input_scale", ".qweight", ".wscales", ".wcscales", ".proj_up")
+            ):
+                raise ValueError("startup-merge requires original floating checkpoint weights")
             layout = "plain"
             if diffusers_weights:
                 if name in source_names:
@@ -1077,6 +1086,8 @@ class MiniMaxH3DiTModel(nn.Module):
                 source_names.add(name)
                 serialized_target = self._serialized_weight_map.get(name)
                 if serialized_target is not None:
+                    if startup_lora is not None:
+                        raise ValueError("startup-merge does not support serialized quantized checkpoints")
                     param = params[serialized_target]
                     param.weight_loader(param, loaded_weight)
                     loaded.add(serialized_target)
@@ -1097,6 +1108,13 @@ class MiniMaxH3DiTModel(nn.Module):
                 logger.warning("Skipping MiniMax H3 weight not present in model: %s", name)
                 continue
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            if startup_lora is not None:
+                module_name, _, parameter_name = name.rpartition(".")
+                module = self.get_submodule(module_name)
+                current_parameter = getattr(module, parameter_name)
+                load_device = getattr(module, "_load_device", current_parameter.device)
+                weight_loader = partial(startup_lora.load_weight, name, weight_loader, device=load_device)
+
             if layout in {"q", "k", "v"}:
                 # vLLM can load each projection directly into its packed QKV
                 # parameter, including TP slicing and online quantization.

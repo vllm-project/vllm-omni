@@ -524,6 +524,9 @@ class DiffusionWorker:
                 custom_pipeline_name=custom_pipeline_name,
                 initialize_lora=self.init_lora_manager,
             )
+            if self.od_config.lora_application == "startup-merge" and load_format != "dummy":
+                assert self.model_runner.pipeline is not None
+                self.model_runner.pipeline.warmup_startup_adaln_cache()
             current_omni_platform.synchronize()
             gc.collect()
         process_memory = get_process_gpu_memory(self.local_rank)
@@ -695,6 +698,9 @@ class DiffusionWorker:
         if getattr(pipeline, "lora_is_fused", False):
             logger.info("LoRA was fused into the checkpoint at load time; skipping the dynamic LoRA manager.")
             return
+
+        if self.od_config.lora_application == "startup-merge":
+            raise ValueError("startup-merge requires the native MiniMax-H3 loader")
 
         lora_path = self.od_config.lora_path
         if isinstance(lora_path, list) and len(lora_path) == 1:

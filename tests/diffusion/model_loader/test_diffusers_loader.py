@@ -1257,13 +1257,15 @@ def test_dlo_plan_loads_component_sources_outside_planned_dit(monkeypatch):
     assert loader.take_host_weight_plan() is plan
 
 
-def test_dlo_plan_fallback_runs_ordinary_loader(monkeypatch):
+@pytest.mark.parametrize("application", ["runtime", "startup-merge"])
+def test_dlo_ordinary_loader_preserves_startup_fusion(monkeypatch, application):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
 
     od_config = SimpleNamespace(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(use_hsdp=False, tensor_parallel_size=1),
         quantization_config=None,
+        lora_application=application,
         enable_distributed_layerwise_offload=True,
         dlo_use_allgather=False,
         model="unused",
@@ -1277,14 +1279,14 @@ def test_dlo_plan_fallback_runs_ordinary_loader(monkeypatch):
     loader.load_weights = lambda _model: calls.append("load")  # type: ignore[method-assign]
     loader._process_weights_after_loading = lambda *_args: calls.append("process")  # type: ignore[method-assign]
     loader._apply_skip_softmax_calibration = lambda _model: None  # type: ignore[method-assign]
-    monkeypatch.setattr(
-        loader_mod,
-        "build_checkpoint_mmap_plan",
-        lambda *_args, **_kwargs: HostWeightPlanResult(None, "not direct-compatible"),
-    )
+    def plan_direct_weights(*_args, **_kwargs):
+        calls.append("plan")
+        return HostWeightPlanResult(None, "not direct-compatible")
+
+    monkeypatch.setattr(loader_mod, "build_checkpoint_mmap_plan", plan_direct_weights)
 
     assert loader.load_model(load_device="cpu") is model
-    assert calls == ["load", "process"]
+    assert calls == (["load", "process"] if application == "startup-merge" else ["plan", "load", "process"])
     assert loader.take_host_weight_plan() is None
 
 

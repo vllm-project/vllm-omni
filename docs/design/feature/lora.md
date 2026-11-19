@@ -92,6 +92,43 @@ the [Diffusion LoRA guide](../../user_guide/diffusion/lora.md) for formats,
 supported pipelines and checkpoint name mapping
 ([#8001](https://github.com/vllm-project/vllm-omni/issues/8001)).
 
+### Fixed startup fusion
+
+`startup-merge` is a separate, opt-in MiniMax-H3 loading path. It resolves one
+PEFT/Turbo/FlashGen adapter, normalizes each original floating checkpoint
+matrix, accumulates its delta in FP32, and passes the result in the target parameter
+dtype (retaining FP32 target precision) to the
+existing TP/online-quantization loader. No quantized base is reconstructed.
+The NPU loader selects the layer's pending load device even while its weight
+is on meta. Adapted matrices and FP32 factors transfer to that device once;
+4096-row FP32 updates stay on the device for the original loader and quantizer.
+A combined finite check synchronizes only a scalar. Fusion temporarily disables
+HF32 and suspends any explicit reduced-precision cube policy, restoring the
+original precision settings before the loader processes the fused tensor.
+Unadapted slices of packed projections are copied to the same device before
+concatenation. CPU and other accelerator backends retain CPU fusion.
+All adapter targets must be consumed; invalid shapes, non-finite values and
+serialized quantization tensors fail startup. Request selection is fixed and
+the pipeline retains the adapter's task and sampler metadata.
+After the worker finishes loading, quantization, device placement and kernel
+selection, the pipeline evaluates each supported conditioning timestep plan with
+the final time embedder and AdaLN modules. The blocks and final output layer
+populate the bounded exact runtime projection cache. The initial fixed-adapter
+identity is recorded so request admission does not evict the startup results.
+Weight versions, exact embeddings and numerical settings retain the runtime
+cache's invalidation rules; disabling that cache also disables this warmup.
+
+The mode leaves the live module tree unwrapped and releases factors after the
+transformer loads. Request-mode DLO materializes the fused policy through the
+ordinary loader before constructing offload storage. Direct checkpoint mmap
+would read the unfused policy and is bypassed. When offload is enabled, the
+exact AdaLN cache populates during requests after weight placement.
+Model-level and standard layerwise offload may select the text encoder alone.
+The mode requires a single H3 checkpoint partition and excludes sleep, HSDP,
+weight transfer, and reusable host artifacts. Additional request adapters are
+rejected. The
+`runtime` default keeps its existing adapter-selection semantics.
+
 ## Not supported
 
 - One request applying different adapters to different LLM stages, or any

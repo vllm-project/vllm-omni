@@ -447,6 +447,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         if model is not None:
             checkpoint_adapter = self._get_checkpoint_adapter(model, source, use_safetensors)
             if checkpoint_adapter is not None:
+                if getattr(self.od_config, "lora_application", "runtime") == "startup-merge":
+                    raise ValueError("startup-merge requires original floating checkpoints without quantized adapters")
                 return checkpoint_adapter.adapt(prefixed_weights_iterator)
         return prefixed_weights_iterator
 
@@ -795,6 +797,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=False)
 
                 resolved_offload = resolve_offload(self.od_config)
+                startup_merge = getattr(self.od_config, "lora_application", "runtime") == "startup-merge"
                 distributed_offload = resolved_offload.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
                 dit_distributed_offload = distributed_offload and resolved_offload.offloads(DIT_COMPONENT)
                 dit_uses_allgather = dit_distributed_offload and resolved_offload.uses_allgather(DIT_COMPONENT)
@@ -870,7 +873,13 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 hwr_active = hwr_state is not None
                 if hwr_active and hwr_state is not None:
                     self.host_weight_plan = cast(HostWeightPlan | None, hwr_state.get("plan"))
-                if dit_distributed_offload and not hwr_active and not self._force_canonical_load:
+                # Direct checkpoint mmap reads the unfused base and bypasses load_weights.
+                if (
+                    dit_distributed_offload
+                    and not hwr_active
+                    and not self._force_canonical_load
+                    and not startup_merge
+                ):
                     lora_backend = getattr(self.od_config, "lora_backend", None)
                     has_distilled_lora = lora_backend in (LoRABackend.DISTILL, "distill") and bool(
                         getattr(self.od_config, "lora_path", None)
@@ -917,6 +926,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                             "DLO direct checkpoint mmap unavailable; using ordinary loader: %s",
                             plan_result.fallback_reason,
                         )
+                    if dit_distributed_offload and startup_merge:
+                        logger.info("DLO startup LoRA uses the ordinary loader to fuse weights before offload")
                     logger.debug("Loading weights on %s ...", load_device)
                     if offload_after_quant:
                         marked = self._request_offload_after_quant(model)
@@ -1214,6 +1225,11 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         weight_name_filter: Callable[[str], bool] | None = None,
         disallow_weights: Iterable[str] = (),
     ) -> None:
+        if getattr(self.od_config, "lora_application", "runtime") == "startup-merge":
+            prepare = getattr(model, "prepare_startup_lora", None)
+            if not callable(prepare):
+                raise ValueError("startup-merge is currently supported only by the native MiniMax-H3 pipeline")
+            prepare()
         weights_to_load = self._get_expected_parameter_names(model)
         weights = self.get_all_weights(model) if sources is None else self.get_all_weights(model, sources=sources)
         if weight_name_filter is not None:
@@ -1394,7 +1410,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             raise ValueError("shared-backbone loading does not support quantization in v1")
         if self.parallel_config.use_hsdp:
             raise ValueError("shared-backbone loading does not support HSDP in v1")
-        if getattr(self.od_config, "lora_application", None) == "merged":
+        if getattr(self.od_config, "lora_application", None) in ("merged", "startup-merge"):
             # Merged adapters copy adapted values into the base parameter in
             # place, which would write into provider-backed IPC views.
             raise ValueError("shared-backbone loading does not support merged LoRA adapters")

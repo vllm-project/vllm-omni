@@ -21,6 +21,78 @@ not supported by this generic path.
 For adapter-only RL updates and memory/validation requirements, see
 [engine-side LoRA merge](../weight_transfer.md#engine-side-lora-merge).
 
+### Fixed startup fusion before quantization (MiniMax-H3)
+
+Select `--lora-backend peft --lora-application startup-merge` and provide
+exactly one `--lora-path` and a finite `--lora-scale`. This opt-in mode is
+supported by the native MiniMax-H3 pipeline for ordinary PEFT directories,
+LightX2V Turbo, and native FlashGen adapters. Select a single checkpoint
+partition with `--task-type fl2va` or `--task-type ref2va`. `runtime` remains the default
+and preserves request-level adapter switching.
+
+Startup fusion follows this order:
+
+1. Read the original FP16/BF16/FP32 checkpoint and normalize its QKV/MLP layout.
+2. Accumulate `lora_scale * (lora_alpha / r) * B @ A` into each target in FP32,
+   then cast once to the loader's floating parameter dtype. FP32 target layers
+   retain their FP32 delta even for a BF16 source checkpoint.
+3. Pass the fused matrix to the existing TP loader and optional online quantizer.
+
+On NPU, the loader uploads each original floating matrix and its LoRA factors
+once, performs FP32 fusion on that layer's target NPU in 4096-row tiles, and
+passes the device tensor directly to the existing TP/online-quantization loader.
+Fused weights are not downloaded to CPU. Finite checks synchronize one combined
+scalar per matrix; their FP32 workspace is bounded by the tile size. The serving
+matmul precision policy is restored after fusion, including failure paths.
+CPU and other backends perform the fusion on CPU. This
+optimization activates with the same `startup-merge` option; no new option is
+required. Each USP worker currently fuses on its own local NPU.
+
+For example, add these options to an existing MiniMax-H3 serving command:
+
+```bash
+--lora-backend peft \
+--lora-application startup-merge \
+--lora-path /path/to/minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors \
+--lora-scale 1.0 \
+--diffusion-quantization-config '{"transformer":{"method":"mxfp8"}}'
+```
+
+Requests omit the `lora` field. The configured adapter and scale are fixed
+for that server lifetime. FlashGen sigma schedules and Turbo task/step
+constraints still apply without a request-level adapter. To switch adapters,
+restart with another fixed adapter or use `--lora-application runtime`.
+Fixed startup fusion does not stack additional request adapters. Offline AdaLN
+sidecars are skipped because they describe the original policy. Without weight
+offload, startup precomputes the blocks' and final layer's AdaLN projections
+after fusion, quantization, placement, and kernel selection. With weight
+offload, requests populate the cache after the offloader places the weights. FlashGen uses its adapter-defined sigma
+schedule; Turbo uses its required step count and video/audio shifts. Ordinary
+PEFT adapters warm the checkpoint schedule, or the default 50-step schedule.
+The first request keeps these entries and reuses matching timestep embeddings.
+Changed inputs, weights or numerical settings still compute exact cache misses.
+The existing 256 MiB cache budget bounds retained results; longer schedules may
+retain only a subset. Setting `minimax_h3_adaln_cache=false` disables both startup
+precomputation and runtime reuse.
+
+Like MiniMax-H3's runtime native/Turbo adapters, fixed startup fusion supports
+distributed layerwise offload (DLO) in request mode. Rank-local and AllGather DiT
+transfers use the ordinary weight loader, so every fused weight is materialized
+before offload. Direct checkpoint mmap skips that loader and is unavailable
+with startup fusion.
+
+Model-level and standard layerwise offload can select the text encoder alone;
+offloading the DiT requires DLO. HSDP, sleep mode, weight transfer, and Host
+Weight Runtime artifacts are unsupported. Startup fusion
+also requires original floating checkpoints and does not support pre-quantized
+or already fused/distilled checkpoints or adapters with `modules_to_save`.
+Fusion streams one matrix at a time with bounded FP32 row tiles and retains
+neither a pristine full-model copy nor runtime LoRA buffers.
+
+Using original floating weights avoids a dequantize/merge/requantize round trip.
+It does not guarantee higher accuracy than a quantized base with a floating LoRA
+branch. Validate output quality for the selected adapter and quantization method.
+
 ## LoRA Adapter Format
 
 ### PEFT (Parameter-Efficient Fine-Tuning) format (default)
