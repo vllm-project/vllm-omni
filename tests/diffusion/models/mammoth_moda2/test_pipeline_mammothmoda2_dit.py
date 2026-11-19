@@ -888,7 +888,7 @@ def test_nested_image_embedder_compacts_unequal_text_lengths() -> None:
 
     compacted_text = res[1]
     compacted_mask = res[2]
-    encoder_seq_lengths = res[9]
+    encoder_seq_lengths = res[8]
 
     assert encoder_seq_lengths == [5, 7]
     assert compacted_text.shape == (2, 7, dim)

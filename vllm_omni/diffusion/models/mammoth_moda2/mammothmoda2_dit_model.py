@@ -576,7 +576,7 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
+        attention_mask: torch.Tensor | None,
         image_rotary_emb: RotaryEmbedding,
         temb: torch.Tensor | None = None,
         *,
@@ -855,7 +855,6 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         img_tokens = self.x_embedder(img_tokens)
 
         img_len = (height // p) * (width // p)
-        img_mask = torch.ones((batch_size, img_len), dtype=torch.bool, device=device)
         l_effective_img_len = [img_len for _ in range(batch_size)]
         img_sizes = [(height, width) for _ in range(batch_size)]
 
@@ -884,7 +883,6 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             text_hidden_states,
             text_attention_mask,
             img_tokens,
-            img_mask,
             img_len,
             context_rotary_emb,
             noise_rotary_emb,
@@ -893,13 +891,19 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             seq_lengths,
         )
 
+    @staticmethod
+    def _mask_mode_from_lengths(lengths: list[int], width: int) -> str:
+        # ``lengths`` must count the valid entries in each row of a mask ``width``
+        # wide. These host-side counts give the mode without reading the mask
+        # on the device.
+        return "none" if all(length == width for length in lengths) else "padding"
+
     def _apply_refiners(
         self,
         text_hidden_states: torch.Tensor,
         text_attention_mask: torch.Tensor,
         context_rotary_emb: RotaryEmbedding,
         img_tokens: torch.Tensor,
-        img_mask: torch.Tensor,
         noise_rotary_emb: RotaryEmbedding,
         temb: torch.Tensor,
         *,
@@ -917,14 +921,10 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     attention_mask_mode=context_attention_mask_mode,
                 )
 
+        # Every image in the batch has the same latent size, so the noise
+        # refiner has no padding to mask.
         for layer in self.noise_refiner:
-            img_tokens = layer(
-                img_tokens,
-                img_mask,
-                noise_rotary_emb,
-                temb,
-                attention_mask_mode="none",
-            )
+            img_tokens = layer(img_tokens, None, noise_rotary_emb, temb)
 
         return text_hidden_states, img_tokens
 
@@ -975,7 +975,6 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             text_hidden_states,
             text_attention_mask,
             img_tokens,
-            img_mask,
             img_len,
             context_rotary_emb,
             noise_rotary_emb,
@@ -1009,15 +1008,12 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         noise_rotary_emb = _with_packed_rope_table(noise_rotary_emb, min_tokens)
         rotary_emb = _with_packed_rope_table(rotary_emb, min_tokens)
 
-        context_attention_mask_mode = (
-            "none" if all(seq_len == text_attention_mask.shape[1] for seq_len in encoder_seq_lengths) else "padding"
-        )
+        context_attention_mask_mode = self._mask_mode_from_lengths(encoder_seq_lengths, text_attention_mask.shape[1])
         text_hidden_states, img_tokens = self._apply_refiners(
             text_hidden_states,
             text_attention_mask,
             context_rotary_emb,
             img_tokens,
-            img_mask,
             noise_rotary_emb,
             temb,
             context_attention_mask_mode=context_attention_mask_mode,
@@ -1030,7 +1026,8 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             attention_mask[i, :seq_len] = True
             joint_hidden_states[i, :encoder_seq_len] = text_hidden_states[i, :encoder_seq_len]
             joint_hidden_states[i, encoder_seq_len : encoder_seq_len + img_len] = img_tokens[i, :img_len]
-        attention_mask_mode = "none" if all(seq_len == max_seq_len for seq_len in seq_lengths) else "padding"
+
+        attention_mask_mode = self._mask_mode_from_lengths(seq_lengths, max_seq_len)
         hidden_states = self._apply_transformer_layers(
             joint_hidden_states,
             attention_mask,

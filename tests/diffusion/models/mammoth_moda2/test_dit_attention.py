@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+from vllm_omni.diffusion.cache.teacache.extractors import extract_mammoth_moda2_context
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import (
@@ -21,6 +22,7 @@ from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import (
     TransformerBlock,
     apply_real_rotary_emb,
 )
+from vllm_omni.diffusion.models.mammoth_moda2.rope_real import RotaryPosEmbedReal
 
 from .helpers import initialize_block_weights
 
@@ -141,6 +143,63 @@ def test_block_forward_hands_native_kv_heads_to_shared_layer(monkeypatch, modula
     assert metadata.extra["attention_mask_mode"] == "padding"
 
 
+@pytest.mark.parametrize("path", ["forward", "teacache_extractor"])
+@pytest.mark.parametrize(
+    ("with_padding", "mode"), [(False, "none"), (True, "padding")], ids=["all_valid", "right_padded"]
+)
+def test_forward_and_teacache_publish_attention_mask_modes(monkeypatch, path, with_padding, mode):
+    """The plain forward and the TeaCache extractor publish the same modes: the
+    text and joint masks follow their lengths, and the noise refiner, whose
+    image tokens are never padded, gets no mask at all."""
+    torch.manual_seed(0)
+    with set_current_diffusion_config(_SDPA_CONFIG):
+        model = Transformer2DModel(
+            patch_size=2,
+            in_channels=4,
+            hidden_size=DIM,
+            num_layers=1,
+            num_refiner_layers=1,
+            num_attention_heads=HEADS,
+            num_kv_heads=2,
+            multiple_of=8,
+            ffn_dim_multiplier=1.0,
+            axes_dim_rope=(2, 2, 4),
+            axes_lens=(8, 8, 8),
+            text_feat_dim=32,
+        )
+    initialize_block_weights(model)
+    model.eval()
+
+    published: dict[str, list[str | None]] = {"context_refiner": [], "noise_refiner": [], "layers": []}
+    for name, modes in published.items():
+        for block in getattr(model, name):
+            original = block.attn.omni_attn.forward
+
+            def spy(query, key, value, attn_metadata=None, *, _original=original, _modes=modes):
+                _modes.append(None if attn_metadata is None else attn_metadata.extra["attention_mask_mode"])
+                return _original(query, key, value, attn_metadata)
+
+            monkeypatch.setattr(block.attn.omni_attn, "forward", spy)
+
+    text_attention_mask = torch.ones(BATCH, 4, dtype=torch.bool)
+    if with_padding:
+        text_attention_mask[1, -1] = False
+    inputs = {
+        "hidden_states": torch.randn(BATCH, 4, 4, 4),
+        "timestep": torch.ones(BATCH),
+        "text_hidden_states": torch.randn(BATCH, 4, 32),
+        "freqs_cis": RotaryPosEmbedReal.get_freqs_real((2, 2, 4), (8, 8, 8), 10000),
+        "text_attention_mask": text_attention_mask,
+    }
+    with torch.no_grad():
+        if path == "forward":
+            model(**inputs)
+        else:
+            extract_mammoth_moda2_context(model, **inputs).run_transformer_blocks()
+
+    assert published == {"context_refiner": [mode], "noise_refiner": [None], "layers": [mode]}
+
+
 def test_empty_text_stream_skips_the_entire_context_refiner():
     class FailOnCall(torch.nn.Module):
         def forward(self, *args, **kwargs):
@@ -163,7 +222,6 @@ def test_empty_text_stream_skips_the_entire_context_refiner():
         text_mask,
         torch.empty(1, 0, DIM),
         image,
-        None,
         None,
         None,
         context_attention_mask_mode="none",
@@ -289,4 +347,4 @@ def test_embedding_preparation_preserves_stubbed_rope_tables(monkeypatch):
         4,
         4,
     )
-    assert prepared[6:9] == (None, None, None)
+    assert prepared[5:8] == (None, None, None)

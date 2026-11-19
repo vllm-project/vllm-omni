@@ -13,6 +13,7 @@ from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
 from vllm_omni.diffusion.cache.teacache.extractors import extract_mammoth_moda2_context
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.mammoth_moda2 import pipeline_mammothmoda2_dit as mammoth_pipeline_module
+from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import Transformer2DModel
 from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import MammothModa2DiTPipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -209,7 +210,6 @@ def test_mammoth_moda2_teacache_forwards_ar_image_conditioning():
     prepared_text_hidden_states = torch.randn(1, 3, hidden_size)
     prepared_text_attention_mask = torch.ones(1, 3, dtype=torch.bool)
     img_tokens = torch.randn(1, 1, hidden_size)
-    img_mask = torch.ones(1, 1, dtype=torch.bool)
     context_rotary_emb = object()
     noise_rotary_emb = object()
     rotary_emb = object()
@@ -227,7 +227,6 @@ def test_mammoth_moda2_teacache_forwards_ar_image_conditioning():
                 prepared_text_hidden_states,
                 prepared_text_attention_mask,
                 img_tokens,
-                img_mask,
                 1,
                 context_rotary_emb,
                 noise_rotary_emb,
@@ -236,6 +235,7 @@ def test_mammoth_moda2_teacache_forwards_ar_image_conditioning():
                 [4],
             )
         ),
+        _mask_mode_from_lengths=Transformer2DModel._mask_mode_from_lengths,
         _apply_refiners=Mock(return_value=(prepared_text_hidden_states, img_tokens)),
     )
 
@@ -269,7 +269,6 @@ def test_mammoth_moda2_teacache_forwards_ar_image_conditioning():
         prepared_text_attention_mask,
         context_rotary_emb,
         img_tokens,
-        img_mask,
         noise_rotary_emb,
         temb,
         context_attention_mask_mode="none",
