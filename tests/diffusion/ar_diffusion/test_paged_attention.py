@@ -539,10 +539,24 @@ def test_layer_inputs_preserve_static_staging_tensors(monkeypatch, window_chunks
 @pytest.mark.parametrize("history_chunks", [1, 3])
 @pytest.mark.parametrize("action_len", [0, 3])
 @pytest.mark.parametrize("commit_current", [False, True])
-def test_paged_attention_matches_dense_reference_gpu(history_chunks, action_len, commit_current):
+@pytest.mark.parametrize("flashinfer_paged", [False, True])
+def test_paged_attention_matches_dense_reference_gpu(
+    monkeypatch, history_chunks, action_len, commit_current, flashinfer_paged
+):
     _require_gpu_flash_attn()
+    if flashinfer_paged:
+        pytest.importorskip("flashinfer")
     torch.manual_seed(0)
     device = torch.device("cuda")
+    # Pin the kernel choice: FlashInfer's paged prefill is the default on SM12x
+    # only, but runs on any CUDA GPU, so both kernels are covered on every card.
+    # The contiguous-gather switch would route both parametrizations elsewhere.
+    monkeypatch.delenv(KV_GATHER_ENV, raising=False)
+    monkeypatch.setitem(
+        paged_attention_module._FLASHINFER_PAGED_BY_DEVICE,
+        torch.device("cuda", torch.accelerator.current_device_index()),
+        flashinfer_paged,
+    )
     dtype = torch.float16
     kv, st = make_state(dtype=dtype, device=device, window_chunks=2)
 
@@ -605,6 +619,85 @@ def test_paged_attention_matches_dense_reference_gpu(history_chunks, action_len,
     ref = _dense_attention(query, new_k, new_v)
 
     torch.testing.assert_close(paged, ref, rtol=2e-2, atol=2e-2)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(("head_size", "num_kv_heads"), [(64, 4), (128, 2), (256, 1)])
+def test_flashinfer_paged_plan_follows_metadata_rewritten_in_place(monkeypatch, dtype, head_size, num_kv_heads):
+    """Noisy-KV preparation rewrites ``block_table`` and ``seq_lens`` in place between tasks: the plan must follow."""
+    if not torch.cuda.is_available() or torch.version.hip is not None:
+        pytest.skip("FlashInfer paged prefill needs a CUDA GPU")
+    flashinfer = pytest.importorskip("flashinfer")
+    plans: list[int] = []
+    original_plan = flashinfer.BatchPrefillWithPagedKVCacheWrapper.plan
+
+    def counting_plan(self, *args, **kwargs):
+        plans.append(int(args[1][-1]))
+        return original_plan(self, *args, **kwargs)
+
+    monkeypatch.setattr(flashinfer.BatchPrefillWithPagedKVCacheWrapper, "plan", counting_plan)
+    monkeypatch.setattr(paged_attention_module, "_FLASHINFER_PAGED_PLANS", {})
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    page, num_heads = 16, 4
+    key_cache = torch.randn(32, page, num_kv_heads, head_size, dtype=dtype, device=device)
+    value_cache = torch.randn_like(key_cache)
+    block_table = torch.zeros(1, 12, dtype=torch.int32, device=device)
+    seq_lens = torch.zeros(1, dtype=torch.int32, device=device)
+    query = torch.randn(40, num_heads, head_size, dtype=dtype, device=device)
+
+    def attend(pages: list[int], kv_len: int, table: torch.Tensor, lens: torch.Tensor) -> None:
+        out = paged_attention_module._flashinfer_paged_attention(
+            query, key_cache, value_cache, table, lens, head_size**-0.5
+        )
+        key = key_cache[pages].flatten(0, 1)[:kv_len].repeat_interleave(num_heads // num_kv_heads, dim=1)
+        value = value_cache[pages].flatten(0, 1)[:kv_len].repeat_interleave(num_heads // num_kv_heads, dim=1)
+        scores = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * head_size**-0.5
+        ref = torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), value.float()).to(dtype)
+        torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+
+    # Same tensors throughout, as noisy.py does for a single task: a new length, then new
+    # page ids at the same length (no new plan: FlashInfer reads the ids from block_table).
+    for pages, kv_len in (([3, 7, 1], 40), ([9, 2, 5, 11, 4], 77), ([6, 8, 10, 12, 14], 77)):
+        block_table.zero_()
+        block_table[0, : len(pages)] = torch.tensor(pages, dtype=torch.int32)
+        seq_lens.fill_(kv_len)
+        attend(pages, kv_len, block_table, seq_lens)
+    # New tensors with the same contents, as the AR-Diffusion window builds per block.
+    attend(pages, kv_len, block_table.clone(), seq_lens.clone())
+    assert plans == [3, 5, 5]
+
+
+@pytest.mark.cpu
+def test_flashinfer_paged_is_used_only_where_it_was_measured(monkeypatch):
+    from vllm.platforms.interface import DeviceCapability
+
+    import vllm_omni.platforms as platforms_mod
+
+    capability = DeviceCapability(12, 0)
+    monkeypatch.setattr(
+        platforms_mod, "_current_omni_platform", SimpleNamespace(get_device_capability=lambda index: capability)
+    )
+    monkeypatch.setitem(sys.modules, "flashinfer", ModuleType("flashinfer"))
+    capturing = False
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    monkeypatch.setattr(paged_attention_module, "_FLASHINFER_PAGED_BY_DEVICE", {})
+    use = paged_attention_module._use_flashinfer_paged
+    query = torch.empty(8, 4, 128)
+    one_seq = torch.zeros(1, 4, dtype=torch.int32)
+
+    assert use(query, one_seq, causal=False)
+    assert not use(query, one_seq, causal=True)
+    assert not use(query, torch.zeros(2, 4, dtype=torch.int32), causal=False)
+    assert not use(torch.empty(8, 4, 96), one_seq, causal=False)
+    capturing = True
+    assert not use(query, one_seq, causal=False)
+
+    capturing = False
+    capability = DeviceCapability(9, 0)
+    monkeypatch.setattr(paged_attention_module, "_FLASHINFER_PAGED_BY_DEVICE", {})
+    assert not use(query, one_seq, causal=False)
 
 
 @pytest.mark.cpu
