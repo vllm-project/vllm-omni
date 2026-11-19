@@ -186,10 +186,10 @@ def test_qwen3_omni_perf_counts_and_existing_baselines_are_preserved() -> None:
         assert all("MI325" not in keys for keys in baseline_keys)
 
 
-def test_qwen3_omni_async_perf_uses_mrv2_profile_and_cold_start_timeout() -> None:
+def test_qwen3_omni_async_perf_uses_default_v2_profile_and_cold_start_timeout() -> None:
     async_config = json.loads(PERF_CONFIGS["Qwen3-Omni Async-Chunk Perf"].read_text(encoding="utf-8"))[0]
     async_server = async_config["server_params"]
-    assert async_server["stage_config_name"] == "qwen3_omni_moe_mrv2.yaml"
+    assert "stage_config_name" not in async_server
     assert async_server["extra_cli_args"] == [
         "--async-chunk",
         "--stage-init-timeout",
