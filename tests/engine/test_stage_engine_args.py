@@ -959,6 +959,10 @@ def test_typed_engine_args_match_current_registry_backend_semantics(model_type, 
         if pipeline.default_deploy_config_name is not None
         else DeployConfig()
     )
+    if any(stage.requires_mrv2 for stage in pipeline.stages):
+        # The fixture pins the CPU platform, which keeps such a profile on V1;
+        # compare the arguments on the runner the pipeline requires.
+        deploy.model_runner = "v2"
     model = _fake_model_root(pipeline, tmp_path)
     legacy_stages, omni_config = _legacy_and_typed_stages(
         pipeline,
