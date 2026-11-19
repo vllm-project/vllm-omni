@@ -22,13 +22,15 @@ def output_path(tmp_path, name):
 
 @pytest.mark.advanced_model
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
-def test_real_offline_audio(tmp_path):
+@pytest.mark.parametrize("streaming", [True, False], ids=["chunked", "sync"])
+def test_real_offline_audio(tmp_path, streaming):
     directory = output_path(tmp_path, "offline")
-    run_offline(directory, concurrent=False)
+    run_offline(directory, concurrent=False, streaming=streaming)
     report = json.loads((directory / "summary.json").read_text())
     assert report["real_weights"] and report["cases"][0]["sample_rate"] == 44100
     assert report["deployment_profile"] == "shipped_b1"
     assert report["sampling_source"] == "deployment_defaults"
+    assert report["transport"] == ("chunked" if streaming else "sync")
 
 
 @pytest.mark.full_model

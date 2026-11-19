@@ -10,6 +10,9 @@ Both stages require eager execution and synchronous scheduling. Codec chunk
 transport is separate from vLLM asynchronous scheduling. For a synchronous
 whole-request handoff, set `async_chunk: false` and connector
 `codec_streaming: false` in a deployment copy.
+The synchronous producer sends the complete raw code sequence through the
+native connector. The orchestrator admits a token-only DAC placeholder;
+the scheduler releases it after receiving that payload.
 
 The talker requires BF16 (`dtype: bfloat16` / `--dtype bfloat16`); FP16 and
 FP32 talker runs are rejected by the strict checkpoint dtype check. DAC stays

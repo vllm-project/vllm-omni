@@ -17,7 +17,7 @@ if os.environ.get("ZONOS2_E2E_TRACE_DIR"):
     install_trace()
 
 
-async def offline(directory: Path, concurrent: bool):
+async def offline(directory: Path, concurrent: bool, streaming: bool = True):
     import numpy as np
     import soundfile as sf
     import torch
@@ -60,7 +60,7 @@ async def offline(directory: Path, concurrent: bool):
     ]
     engine = AsyncOmni(
         model=model_path(),
-        deploy_config=str(deployment(directory, use_shipped_profile=not concurrent)),
+        deploy_config=str(deployment(directory, streaming=streaming, use_shipped_profile=not concurrent)),
         stage_init_timeout=900,
     )
     reports = []
@@ -167,7 +167,7 @@ async def offline(directory: Path, concurrent: bool):
             await asyncio.wait_for(one(0, "offline"), 600)
     finally:
         engine.close()
-    if concurrent:
+    if concurrent or not streaming:
         from vllm_omni.model_executor.models.zonos2.zonos2_codec import DACStreamDecoder, LocalDAC
 
         rows = read_trace(directory / "trace")
@@ -188,9 +188,12 @@ async def offline(directory: Path, concurrent: bool):
                 return hashlib.sha256(tensor.detach().cpu().contiguous().numpy().tobytes()).hexdigest()
 
             assert conditioning[0]["prompt_sha"] == digest(info["zonos2_frames"])
-            assert conditioning[0]["speaker_sha"] == digest(info["zonos2_speaker_embedding"])
+            if concurrent:
+                assert conditioning[0]["speaker_sha"] == digest(info["zonos2_speaker_embedding"])
             codes = torch.load(directory / "trace" / f"{key}.pt", weights_only=True).long()
             chunks = [row for row in rows if row["kind"] == "decode" and row["request"] == key]
+            if not streaming:
+                assert len(chunks) == 1 and chunks[0]["last_chunk"]
             stream = DACStreamDecoder(reference.decode)
             reconstructed = []
             for sequence, row in enumerate(chunks):
@@ -216,6 +219,7 @@ async def offline(directory: Path, concurrent: bool):
                 "concurrency": 4 if concurrent else 1,
                 "deployment_profile": "stress_b4" if concurrent else "shipped_b1",
                 "sampling_source": "request_override" if concurrent else "deployment_defaults",
+                "transport": "chunked" if streaming else "sync",
                 "cases": reports,
                 "solo_vs_batch_diagnostics": comparison,
             },
@@ -232,7 +236,7 @@ def main():
         serve()
     else:
         directory = Path(sys.argv[2])
-        asyncio.run(offline(directory, concurrent=sys.argv[1] == "--concurrent"))
+        asyncio.run(offline(directory, concurrent=sys.argv[1] == "--concurrent", streaming=sys.argv[1] != "--sync"))
 
 
 if __name__ == "__main__":

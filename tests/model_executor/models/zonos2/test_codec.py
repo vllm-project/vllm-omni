@@ -13,7 +13,7 @@ import torch
 
 from vllm_omni.model_executor.models.zonos2.zonos2_codec import DACStreamDecoder, LocalDAC, eos_boundary, shear
 from vllm_omni.model_executor.models.zonos2.zonos2_speaker import Zonos2SpeakerEncoder
-from vllm_omni.model_executor.stage_input_processors.zonos2 import talker2dac, talker2dac_async_chunk
+from vllm_omni.model_executor.stage_input_processors.zonos2 import talker2dac_async_chunk, talker2dac_full_payload
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -149,22 +149,9 @@ def test_async_handoff_accepts_empty_eos_boundary(final):
 
 def test_sync_handoff_keeps_raw_frames_without_arbitrary_edge_trim():
     _, raw = delayed(17)
-    source = SimpleNamespace(
-        finished=True,
-        outputs=[
-            SimpleNamespace(
-                multimodal_output={
-                    "codes": {"audio": raw},
-                    "meta": {"eos_frame": torch.tensor([17])},
-                }
-            )
-        ],
-    )
-    prompt = talker2dac([source])[0]
-    assert prompt["prompt_token_ids"] == [0]
-    info = prompt["additional_information"]
-    assert info["zonos2_target"] == 17
-    assert torch.equal(info["codes"]["audio"], raw.T)
+    payload = talker2dac_full_payload(None, {"codes.audio": raw, "meta.eos_frame": torch.tensor([17])}, None)
+    assert payload.meta.num_processed_tokens == 17
+    assert torch.equal(payload.codes.audio, raw.T)
 
 
 def test_imports_and_constructors_are_offline_and_lazy(monkeypatch):

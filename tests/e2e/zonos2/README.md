@@ -68,7 +68,11 @@ jobs, selected through model-specific source dependencies.
 The offline and HTTP tests use the shipped B1 deployment profile, including
 its memory ratios and 4096-token prefill budget. The offline request omits
 sampling overrides to exercise deployment defaults and concatenates every
-yielded DELTA audio chunk before checking the complete sample count. Only the concurrency
+yielded DELTA audio chunk before checking the complete sample count. Offline
+acceptance runs both the default chunked transport and a synchronous copy
+with `async_chunk: false` and `codec_streaming: false`. The latter must finish
+with one full-payload DAC call and match an independent reconstruction.
+Only the concurrency
 stress test opts into B4 with a 128-token prefill budget; it does not replace
 the recommended B1 coverage or establish B4 speech-quality qualification.
 

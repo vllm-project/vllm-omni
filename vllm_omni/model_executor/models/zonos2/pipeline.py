@@ -28,6 +28,7 @@ ZONOS2_PIPELINE = PipelineConfig(
             supports_native_mrv2_data_plane=True,
             engine_output_type="latent",
             async_chunk_process_next_stage_input_func=f"{_PROC}.talker2dac_async_chunk",
+            custom_process_next_stage_input_func=f"{_PROC}.talker2dac_full_payload",
             # EOS handling is owned by the model-side sampler (any codebook
             # hitting eoa starts the n_codebooks+1 countdown); the LM token
             # stream is a lifecycle channel only.
@@ -45,7 +46,9 @@ ZONOS2_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             model_arch="Zonos2Code2WavForConditionalGeneration",
-            sync_process_input_func=f"{_PROC}.talker2dac",
+            # Only admit a placeholder here; the native connector delivers
+            # codes and releases the full-payload input gate in sync mode.
+            sync_process_input_func=f"{_PROC}.talker2dac_token_only",
             supports_native_mrv2_data_plane=True,
             requires_full_payload_input=True,
             sampling_constraints={"detokenize": True},

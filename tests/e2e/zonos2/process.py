@@ -43,11 +43,11 @@ def check_gpu_cleanup(directory: Path):
     raise AssertionError(f"Test GPU processes were not released: {owned.intersection(active)}")
 
 
-def run_offline(directory: Path, *, concurrent: bool):
+def run_offline(directory: Path, *, concurrent: bool, streaming: bool = True):
     directory.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env.update(environment(directory))
-    mode = "--concurrent" if concurrent else "--offline"
+    mode = "--concurrent" if concurrent else ("--offline" if streaming else "--sync")
     with (directory / "run.log").open("w") as log:
         process = subprocess.Popen(
             [sys.executable, "-m", "tests.e2e.zonos2.worker", mode, str(directory)],

@@ -117,6 +117,11 @@ in its local cache and uses `SchedulingMetadataAdapter` to translate
 model-specific fields into `SchedulingMetadataUpdate`. The Scheduler consumes
 only the typed update and readiness signal; it does not inspect payload fields.
 
+ZONOS2 registers a synchronous full-payload producer alongside its chunk
+producer. With codec chunking disabled, the orchestrator admits a token-only
+DAC prompt and the native connector carries the raw codes and terminal frame
+boundary. Inline prompt metadata does not bypass the input readiness gate.
+
 The receive flow is
 `process_pending_full_payload_inputs()` -> `register_chunk_recv()` ->
 `recv_full_payload_inputs()` -> `SchedulingMetadataAdapter.extract()` ->

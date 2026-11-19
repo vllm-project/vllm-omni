@@ -8,9 +8,8 @@ from typing import Any
 
 import torch
 
-from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
+from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct, unflatten_payload
 from vllm_omni.model_executor.models.zonos2.zonos2_codec import eos_boundary, shear
-from vllm_omni.model_executor.models.zonos2.zonos2_keys import TARGET_FRAMES
 
 
 def _frames(audio: torch.Tensor) -> torch.Tensor:
@@ -39,30 +38,36 @@ def _target(frame_count: int, eos: int | None, final: bool) -> int:
     return min(target, max(0, int(eos))) if eos is not None and int(eos) >= 0 else target
 
 
-def talker2dac(source_outputs: list[Any], prompt: Any = None, _requires_multimodal_data: bool = False) -> list[Any]:
+def talker2dac_token_only(
+    source_outputs: list[Any], prompt: Any = None, _requires_multimodal_data: bool = False
+) -> list[Any]:
+    """Admit sync DAC requests; the worker connector owns their codec data."""
     from vllm_omni.inputs.data import OmniTokensPrompt
 
-    inputs = []
-    for source in source_outputs:
-        if not source.finished:
-            continue
-        mm = source.outputs[0].multimodal_output or {}
-        audio = mm.get("codes", {}).get("audio")
-        frames = _frames(audio) if isinstance(audio, torch.Tensor) else torch.empty((0, 9), dtype=torch.long)
-        eos = _eos_frame(mm.get("meta", {}))
-        if eos is None:
-            eos = eos_boundary(frames)
-        inputs.append(
-            OmniTokensPrompt(
-                prompt_token_ids=[0],
-                additional_information={
-                    "codes": {"audio": frames.T.contiguous()},
-                    TARGET_FRAMES: _target(len(frames), eos, True),
-                    "meta": {"finished": True, "chunk_seq": 0},
-                },
-            )
-        )
-    return inputs
+    return [OmniTokensPrompt(prompt_token_ids=[0]) for source in source_outputs if source.finished]
+
+
+def talker2dac_full_payload(transfer_manager: Any, pooling_output: dict[str, Any], request: Any) -> OmniPayloadStruct:
+    """Send accumulated raw frames once, without de-shearing or edge trims."""
+    del transfer_manager, request
+    mm = unflatten_payload(pooling_output)
+    audio = mm.get("codes", {}).get("audio")
+    if not isinstance(audio, torch.Tensor):
+        raise ValueError("ZONOS2 sync transport requires accumulated audio codes")
+    frames = _frames(audio)
+    eos = _eos_frame(mm.get("meta", {}))
+    if eos is None:
+        eos = eos_boundary(frames)
+    return OmniPayloadStruct(
+        codes=CodesStruct(audio=frames.T.contiguous()),
+        meta=MetaStruct(
+            finished=torch.tensor(True),
+            last_chunk=True,
+            num_processed_tokens=_target(len(frames), eos, True),
+            chunk_seq=0,
+            replace_runtime_additional_information=True,
+        ),
+    )
 
 
 def talker2dac_async_chunk(
