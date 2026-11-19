@@ -1318,6 +1318,11 @@ content and terminator for the next append, including with sliding windows off.
 Sentence-ending punctuation remains a Talker drain hint; it does not decide
 whether the Thinker may end a turn.
 
+An explicit `response.create` may open a latched assistant turn on its first
+silence unit. The sampler consumes that opening marker once per request/unit,
+even if the turn was already open, so repeated decode steps cannot undo a later
+`<|turn_eos|>` decision. The consumed identity lives in the session state.
+
 `<|turn_eos|>` does not terminate the input unit. The Thinker continues until
 a chunk terminator, and the Talker receives all forwarded tokens and their
 hidden states before that boundary, including any text after an intermediate

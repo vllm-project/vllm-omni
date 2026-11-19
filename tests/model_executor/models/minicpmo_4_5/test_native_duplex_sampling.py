@@ -459,3 +459,20 @@ def test_marker_does_not_touch_already_open_turn():
     model.prepare_duplex_sampling(logits, None, rows=(_policy_row({"open_assistant_turn": True}),))
     assert state.current_turn_ended is False
     assert state.pending_speech_response_open is False
+
+
+@pytest.mark.parametrize("initially_ended", [True, False])
+def test_response_create_marker_is_consumed_once_per_unit(initially_ended):
+    state = _MiniCPMO45Stage0SessionState(session_id="s0", current_turn_ended=initially_ended)
+    model = _policy_model_with_state(state)
+    row = _policy_row({"open_assistant_turn": True})
+    model.prepare_duplex_sampling(torch.zeros(1, VOCAB), None, rows=(row,))
+    model._record_minicpmo45_duplex_terminator(0, TOKEN_IDS["turn_eos_token_id"], TOKEN_IDS)
+    logits = torch.zeros(1, VOCAB)
+    model.prepare_duplex_sampling(logits, None, rows=(row,))
+    assert state.current_turn_ended is True
+    assert torch.isneginf(logits[0, :LISTEN]).all()
+    assert model._finalize_minicpmo45_native_duplex_sample(0, LISTEN, TOKEN_IDS) == LISTEN
+    row.seq = 1
+    model.prepare_duplex_sampling(torch.zeros(1, VOCAB), None, rows=(row,))
+    assert state.current_turn_ended is False

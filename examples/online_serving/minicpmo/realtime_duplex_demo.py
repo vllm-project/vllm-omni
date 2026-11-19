@@ -238,6 +238,8 @@ def _post_commit_definitive_refusal(
 def _post_commit_refusal_indexes(
     events: list[dict[str, object]],
     committed_index: int | None,
+    *,
+    end_index: int | None = None,
 ) -> frozenset[int]:
     """Positions of the refusal errors that answered the forced create.
 
@@ -249,7 +251,7 @@ def _post_commit_refusal_indexes(
         return frozenset()
     return frozenset(
         index
-        for index in range(committed_index + 1, len(events))
+        for index in range(committed_index + 1, len(events) if end_index is None else end_index)
         if events[index].get("type") == "error" and ErrorEvent(events[index]).code in DEFINITIVE_REFUSAL_CODES
     )
 
@@ -912,6 +914,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
     if input_wav is not None and not input_pcm16:
         raise ValueError("input WAV has no audio")
 
+    source_pcm16 = input_pcm16
     collector = _StreamingEventCollector(stream_writer)
     client = _TimedInputClient(
         args.url,
@@ -1086,6 +1089,9 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         except TimeoutError as exc:
             wait_error = str(exc)
         forced_response_fallback_sent = forced_response_fallback_sent or fallback_progress["sent"]
+        forced_response_windows: list[tuple[int, int]] = []
+        if final_create_response and committed_index is not None:
+            forced_response_windows.append((committed_index, len(collector.events)))
         # Native duplex can end the model's own answer mid-sentence: the
         # model samples <|turn_eos|> between units and the sentence never
         # finishes, and the forced post-commit response then answers the
@@ -1120,7 +1126,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             SENTENCE_FINAL_MARKS = ".!?;。！？；…"
             if transcript_so_far and transcript_so_far[-1] not in SENTENCE_FINAL_MARKS:
                 replay_window = _replay_tail_window(
-                    len(input_pcm16) // PCM16_BYTES_PER_SAMPLE,
+                    len(source_pcm16) // PCM16_BYTES_PER_SAMPLE,
                     len(video_frames),
                     post_commit_replay_seconds,
                     PCM16_SAMPLE_RATE,
@@ -1132,13 +1138,12 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                     # whole stream; skip instead of misaligned windows.
                     post_commit_replay_error = f"replay window rounds to zero for {post_commit_replay_seconds}s"
                 else:
+                    replay_committed_index = None
                     try:
-                        input_format = client.config.input_audio
                         replay_samples = replay_window[0]
-                        # Keep the last N seconds of audio -- the same tail
-                        # window as video_frames[-replay_frame_count:] below,
-                        # so the replayed audio and video stay in sync.
-                        replay_pcm = input_pcm16[-replay_samples * PCM16_BYTES_PER_SAMPLE :]
+                        # Slice audio and frames from the original clip, before
+                        # synthetic tail silence was appended to the input stream.
+                        replay_pcm = source_pcm16[-replay_samples * PCM16_BYTES_PER_SAMPLE :]
                         replay_frames = None
                         replay_stacked = None
                         if video_frames:
@@ -1152,12 +1157,8 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                             realtime=not args.no_realtime_pacing,
                             video_frames=replay_frames,
                             stacked_video_frames=replay_stacked,
-                            # Continue the media clock after every appended
-                            # audio (input plus tail), but restart the frame
-                            # index so the replayed window shows its own first
-                            # frame on the first appended unit.
-                            media_origin_ms=input_format.duration_ms(len(input_pcm16)),
-                            unit_index=0,
+                            # Frame selection restarts locally; append_audio
+                            # keeps the session's wire media clock monotonic.
                         )
                         replay_commit_cursor = len(collector.events)
                         await _commit_input_after_playback_checkpoint(client, collector, create_response=True)
@@ -1180,6 +1181,10 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                         )
                     except TimeoutError as exc:
                         post_commit_replay_error = str(exc)
+                        wait_error = f"Post-commit replay failed: {exc}"
+                    finally:
+                        if replay_committed_index is not None:
+                            forced_response_windows.append((replay_committed_index, len(collector.events)))
         await acknowledge_collected_playback(client, collector)
         close_error: str | None = None
         await client.close(timeout_s=args.timeout_s)
@@ -1239,10 +1244,10 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         # refusals that arrived after the commit are forgiven: an earlier one
         # came from some other ask and still fails the run, as does every
         # other error.
-        forgiven_indexes = (
-            _post_commit_refusal_indexes(collector.events, committed_index)
-            if final_create_response and committed_index is not None
-            else frozenset()
+        forgiven_indexes = frozenset(
+            index
+            for start, end in forced_response_windows
+            for index in _post_commit_refusal_indexes(collector.events, start, end_index=end)
         )
         errors = collector.errors(exclude_indexes=forgiven_indexes)
         if wait_error:
@@ -1285,6 +1290,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             "tail_video_frames_sent": tail_frames_sent,
             "post_commit": {
                 "input_committed_event_index": committed_index,
+                "forced_response_windows": forced_response_windows,
                 "decision": post_commit_decision,
                 "decision_required": wait_for_post_commit_decision,
                 "final_create_response": final_create_response,
