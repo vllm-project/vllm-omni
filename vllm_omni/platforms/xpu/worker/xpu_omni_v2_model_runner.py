@@ -3,8 +3,8 @@
 """Omni Model Runner V2 runners on XPU.
 
 The omni V2 runners built under ``torch_cuda_wrapper``, the same way vLLM's
-``XPUModelRunnerV2`` wraps ``GPUModelRunnerV2``. The XPU workers import this
-module only when a stage selects ``model_runner: v2``.
+``XPUModelRunner`` wraps the V2 ``GPUModelRunner``. Model Runner V1 is gone
+in vLLM 0.34, so these are the only runners the XPU workers build.
 """
 
 from vllm_omni.platforms.xpu.utils import torch_cuda_wrapper

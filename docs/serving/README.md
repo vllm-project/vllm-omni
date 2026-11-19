@@ -54,6 +54,47 @@ An unconfigured name is rejected before generation. In particular, pure
 diffusion Chat Completions return a model-not-found error (HTTP 404), matching
 the other Chat Completions serving paths.
 
+## Browser Access (CORS)
+
+A web page calling the server directly from another origin needs CORS
+permission. vLLM-Omni inherits vLLM's CORS middleware and CLI options. By
+default, `--allowed-origins` is an empty list: no cross-origin browser access
+is allowed. Server-to-server clients, including Python SDKs, do not require
+CORS configuration.
+
+For a local web page served on port 8000 and an API server on port 8091:
+
+```bash
+vllm serve <model> --omni --host 127.0.0.1 --port 8091 \
+  --allowed-origins '["http://localhost:8000", "http://127.0.0.1:8000"]' \
+  --allowed-methods '["GET", "POST"]' \
+  --allowed-headers '["Content-Type", "Authorization"]'
+```
+
+An origin is a scheme, hostname, and port, with no path or trailing slash.
+`localhost` and `127.0.0.1` are different origins, as are different ports or
+schemes. The options above accept JSON lists. `--allowed-methods` and
+`--allowed-headers` default to `["*"]`; this example restricts both.
+`--allow-credentials` is disabled by default. Enable it only when the browser
+needs credentialed requests, such as cookies, and use explicit allowed origins.
+
+Check a browser-style preflight request before sending a generation request:
+
+```bash
+curl -i -X OPTIONS http://127.0.0.1:8091/v1/models \
+  -H 'Origin: http://localhost:8000' \
+  -H 'Access-Control-Request-Method: GET' \
+  -H 'Access-Control-Request-Headers: authorization'
+```
+
+With the configuration above, this returns HTTP 200 and
+`Access-Control-Allow-Origin: http://localhost:8000`. An unlisted origin,
+method, or header fails preflight with HTTP 400. An ordinary request from an
+unlisted origin can still execute and return HTTP 200 without an allow-origin
+header; the browser prevents the page from reading that response. CORS is not
+authentication or network access control. Keep a local-only server bound to
+loopback, and configure authentication separately when exposing it.
+
 ## Choose a Core HTTP Endpoint
 
 Prefer a task-specific endpoint when one matches your workload. Use Chat
