@@ -335,7 +335,9 @@ def _duplex_fixture_pcm(path: Path, *, duration_s: float | None = None) -> bytes
     return np.interp(positions, np.arange(len(pcm)), pcm).astype("<i2").tobytes()
 
 
-async def _duplex_receive_until(ws, events: list[dict], predicate, *, timeout_s: float = 180) -> None:
+async def _duplex_receive_until(
+    ws, events: list[dict], predicate, *, timeout_s: float = 180, expected_error_code: str | None = None
+) -> None:
     # One deadline covers the whole operation, including an endless stream that
     # would otherwise reset a per-recv timeout forever.
     async def receive() -> None:
@@ -344,7 +346,10 @@ async def _duplex_receive_until(ws, events: list[dict], predicate, *, timeout_s:
             assert isinstance(raw, str), "Expected JSON Realtime events"
             event = json.loads(raw)
             events.append(event)
-            assert event.get("type") != "error", event
+            if event.get("type") == "error":
+                error = event.get("error")
+                assert isinstance(error, dict), event
+                assert expected_error_code is not None and error.get("code") == expected_error_code, event
 
     await asyncio.wait_for(receive(), timeout=timeout_s)
 

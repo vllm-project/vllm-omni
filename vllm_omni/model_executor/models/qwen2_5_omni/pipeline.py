@@ -39,6 +39,7 @@ QWEN2_5_OMNI_PIPELINE = PipelineConfig(
             final_output_type="text",
             owns_tokenizer=True,
             requires_multimodal_data=True,
+            supports_native_mrv2_data_plane=True,
             hf_config_name="thinker_config",
             engine_output_type="latent",
             sampling_constraints={"detokenize": True},
@@ -58,6 +59,7 @@ QWEN2_5_OMNI_PIPELINE = PipelineConfig(
                 "stop_token_ids": [8294],
             },
             requires_full_payload_input=True,
+            supports_native_mrv2_data_plane=True,
         ),
         StagePipelineConfig(
             stage_id=2,
@@ -71,6 +73,7 @@ QWEN2_5_OMNI_PIPELINE = PipelineConfig(
             sync_process_input_func=f"{_PROC}.talker2code2wav_token_only",
             sampling_constraints={"detokenize": True},
             requires_full_payload_input=True,
+            supports_native_mrv2_data_plane=True,
         ),
     ),
 )

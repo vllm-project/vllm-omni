@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 class VoxtralTTSAdapter(ARTTSAdapter):
     stage_keys = frozenset({"audio_generation"})
     name = "voxtral_tts"
+    reports_length_truncation = True
 
     def get_request_constraints(self) -> RequestConstraints:
         from vllm_omni.request_capabilities import InputConstraint

@@ -23,6 +23,7 @@ from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from torch import nn
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.models.diffusers_adapter.dduf import cleanup_dduf_pipeline, load_diffusers_pipeline
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import (
     BasePipelineUtils,
     get_pipeline_utils_for_config,
@@ -123,7 +124,16 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
     def load_weights(self) -> None:
         """Load the diffusers pipeline via ``DiffusionPipeline.from_pretrained()``."""
+        previous_pipeline = getattr(self, "_pipeline", None)
+        try:
+            self._load_weights()
+        except BaseException:
+            current_pipeline = getattr(self, "_pipeline", None)
+            if current_pipeline is not previous_pipeline:
+                cleanup_dduf_pipeline(current_pipeline)
+            raise
 
+    def _load_weights(self) -> None:
         model_id = self.od_config.model
         dtype = self.od_config.dtype
 
@@ -192,7 +202,7 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             else DiffusionPipeline
         )
         logger.info("Loading Diffusers pipeline class %s", loader_class.__name__)
-        return loader_class.from_pretrained(model_id, **load_kwargs)
+        return load_diffusers_pipeline(loader_class, model_id, load_kwargs)
 
     # ------------------------------------------------------------------
     # Step-wise execution — explicitly rejected

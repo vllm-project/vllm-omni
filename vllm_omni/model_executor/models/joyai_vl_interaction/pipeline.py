@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""JoyAI-VL-Interaction -> Qwen3-TTS native pipelines (all-sync, or async-chunk Talker -> Code2Wav)."""
+"""JoyAI-VL-Interaction -> Qwen3-TTS native pipelines (all-sync, or async-chunk Talker -> Code2Wav).
+
+The Talker declares both a full-payload and an async-chunk producer hook, so turn
+serving keeps the one-shot path while the duplex overlay streams codec frames into
+Code2Wav. JoyAI stays orchestrator-fed through ``joyai_action_to_tts``; the duplex
+plugin additionally streams its action text to the client as it is generated.
+"""
 
 from dataclasses import replace
 

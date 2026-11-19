@@ -20,7 +20,7 @@ import socket
 import time
 from argparse import Namespace
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, suppress
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from http import HTTPStatus
 from pathlib import Path
 from typing import Annotated, Any, Literal, cast
@@ -423,10 +423,14 @@ async def omni_run_server_worker(
     if getattr(args, "disable_websocket_compression", False):
         uvicorn_kwargs["ws_per_message_deflate"] = False
 
-    async with build_async_omni(
-        args,
-        client_config=client_config,
-    ) as engine_client:
+    async with (
+        build_async_omni(
+            args,
+            client_config=client_config,
+        ) as engine_client,
+        AsyncExitStack() as server_lifecycle,
+    ):
+        server_lifecycle.callback(sock.close)
         supported_tasks: tuple[str, ...]
         if hasattr(engine_client, "get_supported_tasks"):
             supported_tasks = tuple(await engine_client.get_supported_tasks())
@@ -516,7 +520,8 @@ async def omni_run_server_worker(
         shutdown_unsupported_routes(app, run_endpoint_restrictions())
 
         # Start background processes
-        await STORAGE_MANAGER.start()
+        await STORAGE_MANAGER.start(on_expire=VIDEO_STORE.remove_many)
+        server_lifecycle.push_async_callback(STORAGE_MANAGER.stop)
 
         # Conditionally register profiler endpoints based on stage YAML configs
         stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
@@ -647,7 +652,6 @@ async def omni_run_server_worker(
             serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
             if serving_speech is not None:
                 serving_speech.shutdown()
-            sock.close()
 
 
 @asynccontextmanager
@@ -897,6 +901,10 @@ async def _init_duplex_chat(
 
 async def _resolve_chat_template(engine_client: EngineClient, args: Namespace) -> str | None:
     resolved_chat_template = load_chat_template(args.chat_template)
+    if resolved_chat_template is None:
+        # Reuse the selected topology, including deploy-config overrides.
+        pipeline = getattr(getattr(engine_client, "engine", None), "pipeline_config", None)
+        resolved_chat_template = getattr(pipeline, "chat_template", None)
     if resolved_chat_template is None:
         try:
             tokenizer = await engine_client.get_tokenizer()

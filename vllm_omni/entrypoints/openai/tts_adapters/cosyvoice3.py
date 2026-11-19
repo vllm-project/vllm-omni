@@ -31,6 +31,10 @@ _PROMPT_PREFIX = f"You are a helpful assistant.{_PROMPT_DELIMITER}"
 class CosyVoice3Adapter(ARTTSAdapter):
     stage_keys = frozenset({"cosyvoice3_talker"})
     name = "cosyvoice3"
+    # The default budget is sized from the text (see apply_sampling_overrides),
+    # so a length finish under it means the model did not end the speech.
+    # Flag it rather than reject it, so the audio is still returned as before.
+    reports_length_truncation = True
 
     def __init__(self, ctx) -> None:
         super().__init__(ctx)

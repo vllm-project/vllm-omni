@@ -789,7 +789,6 @@ class MTPState:
             logger.warning("Skipping mtp graph capture because this model requires per-request req_infos.")
             return
 
-        from vllm.compilation import monitor
         from vllm.distributed.parallel_state import graph_capture
         from vllm.forward_context import set_forward_context
 
@@ -799,10 +798,9 @@ class MTPState:
         capture_kwargs = self._get_mtp_base_sampling_kwargs()
         logger.info("Capturing MRv2 mtp graphs for sizes %s", capture_sizes)
 
-        # The profiling pass runs this before the decoder's real capture, which
-        # needs capturing to stay enabled, so it restores what was set.
-        capturing_enabled = monitor.cudagraph_capturing_enabled and restore_capturing
-        monitor.set_cudagraph_capturing_enabled(True)
+        # Native V2 selects capture through each forward context below; v0.34
+        # removed the process-global capture flag. Retain the caller keyword.
+        _ = restore_capturing
         try:
             with torch.inference_mode(), graph_capture(device=self.owner.device):
                 for bsz in capture_sizes:
@@ -845,8 +843,6 @@ class MTPState:
             logger.info("Captured MRv2 mtp graphs for %d sizes", len(capture_sizes))
         except RuntimeError as e:
             raise RuntimeError(f"MRv2 mtp graph capture failed: {e}") from e
-        finally:
-            monitor.set_cudagraph_capturing_enabled(capturing_enabled)
 
     def _get_mtp_capture_sizes(self) -> list[int]:
         """Return graph buckets that a request-batched Talker can reach."""

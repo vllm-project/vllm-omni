@@ -974,6 +974,10 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "Wan22VACEPipeline": DiffusionModelMetadata(
         serving_capabilities=_WAN_VACE_CAPABILITIES,
     ),
+    "Cosmos3NanoSimBimanualPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+    ),
 }
 
 _DIFFUSION_MODEL_METADATA_ALIASES = {

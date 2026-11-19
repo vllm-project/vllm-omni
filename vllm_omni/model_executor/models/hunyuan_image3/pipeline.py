@@ -47,6 +47,7 @@ HUNYUAN_IMAGE3_PIPELINE = PipelineConfig(
             requires_multimodal_data=True,
             model_arch=_HUNYUAN_IMAGE3_MODEL_ARCH,
             engine_output_type="latent",
+            supports_native_mrv2_data_plane=True,
         ),
         StagePipelineConfig(
             stage_id=1,
@@ -84,6 +85,7 @@ HUNYUAN_IMAGE3_AR_PIPELINE = PipelineConfig(
             requires_multimodal_data=True,
             model_arch=_HUNYUAN_IMAGE3_MODEL_ARCH,
             engine_output_type="latent",
+            supports_native_mrv2_data_plane=True,
         ),
     ),
 )

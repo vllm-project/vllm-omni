@@ -20,9 +20,9 @@ def test_rocm_supplies_the_nested_gpt2_head_dimension() -> None:
         load_deploy_config(get_deploy_config_path("moss_tts_nano.yaml")),
         platform="rocm",
     )
-    (stage,) = merge_pipeline_deploy(MOSS_TTS_NANO_PIPELINE, deploy)
-
-    assert stage.yaml_engine_args["hf_overrides"]["head_dim"] == 64
+    assert deploy.stages[0].engine_extras["hf_overrides"]["head_dim"] == 64
+    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
+        merge_pipeline_deploy(MOSS_TTS_NANO_PIPELINE, deploy)
 
 
 def test_head_dimension_override_is_rocm_only() -> None:

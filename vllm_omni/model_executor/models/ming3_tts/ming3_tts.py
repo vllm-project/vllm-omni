@@ -9,7 +9,7 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -18,7 +18,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.bailing_moe_v3 import BailingMoeV3ForCausalLM
 from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid, SupportsPP
 from vllm.model_executor.models.utils import init_vllm_registered_model
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.model_loader.weight_utils import resolve_model_to_local_path
@@ -63,6 +62,9 @@ from .speaker_extractor import (
 )
 from .step_vae_decoder import StepVAEDecoder
 from .weight_accounting import validate_ming3_checkpoint_keys
+
+if TYPE_CHECKING:
+    pass
 
 logger = init_logger(__name__)
 
@@ -164,6 +166,8 @@ class Ming3TTSForConditionalGeneration(
 
     @cached_property
     def sampler(self):
+        from vllm.v1.sample.sampler import Sampler
+
         if hasattr(self.model, "sample"):
             return _ModelSampleAdapter(self.model)
         if hasattr(self.model, "sampler"):
