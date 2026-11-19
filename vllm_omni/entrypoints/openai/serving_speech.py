@@ -3047,6 +3047,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         tts_params=raw_tts_params,
                         target_sample_rate=request.sample_rate,
                         audio_format=audio_format,
+                        # The client's own stream flag: stream=false with
+                        # stream_format=audio still routes here (raw-audio
+                        # delivery), and the E2E log must not label it true.
+                        stream_flag="true" if request.stream else "false",
                     )
                 )
                 return _SpeechStreamingResponse(

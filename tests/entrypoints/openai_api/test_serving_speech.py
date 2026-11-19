@@ -163,10 +163,13 @@ async def test_moss_empty_stream_is_an_error(sse, payload):
 
 @pytest.mark.asyncio
 async def test_speech_e2e_log_reports_real_stream_flag(caplog):
-    """[SpeechE2E] must log the caller's own stream flag: with
+    """[SpeechE2E] must log the caller's own stream flag. With
     stream=false + stream_format=audio the raw-audio branch still serves
-    the request, and a hardcoded stream=true hides non-streaming traffic
-    from anyone grepping the log (delivery-site triage needs both)."""
+    the request; a hardcoded stream=true hides non-streaming traffic from
+    delivery-site triage. Capture mechanics: _log_request logs at DEBUG
+    unless request_logger is set, and vLLM sets propagate=False on the
+    `vllm` logger parent chain — so caplog.handler must be attached to the
+    module logger at DEBUG level (same pattern as the missing-file test)."""
     import logging as _logging
 
     serving = OmniOpenAIServingSpeech.__new__(OmniOpenAIServingSpeech)
@@ -175,27 +178,31 @@ async def test_speech_e2e_log_reports_real_stream_flag(caplog):
         model_config=SimpleNamespace(model="OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5")
     )
     serving._adapter = MossTTSAdapter(SpeechServingContext(server=serving, engine_client=serving.engine_client))
+    serving.request_logger = None  # force the DEBUG path
 
     async def results():
         for _ in range(2):
             yield SimpleNamespace(multimodal_output={"model_outputs": torch.zeros(320), "sr": 24000})
 
-    async def run(flag):
-        with caplog.at_level(_logging.INFO, logger="vllm_omni.entrypoints.openai.serving_speech"):
-            chunks = serving._generate_audio_chunks(
-                results(), f"stream-flag-{flag}", response_format="pcm", stream_flag=flag
-            )
-            _ = [chunk async for chunk in chunks]
-        return [
-            r.getMessage()
-            for r in caplog.records
-            if "[SpeechE2E]" in r.getMessage() and f"stream-flag-{flag}" in r.getMessage()
-        ]
+    target_logger = _logging.getLogger("vllm_omni.entrypoints.openai.serving_speech")
+    target_logger.addHandler(caplog.handler)
+    prev_level = target_logger.level
+    target_logger.setLevel(_logging.DEBUG)
 
-    explicit = await run("false")
-    assert explicit and "stream=false" in explicit[-1], explicit
-    default = await run("true")
-    assert default and "stream=true" in default[-1], default
+    def e2e_lines():
+        return [r.getMessage() for r in caplog.records if "[SpeechE2E]" in r.getMessage()]
+
+    try:
+        chunks = serving._generate_audio_chunks(results(), "flag-false", response_format="pcm", stream_flag="false")
+        _ = [c async for c in chunks]
+        assert any("stream=false" in m for m in e2e_lines()), e2e_lines()
+
+        chunks = serving._generate_audio_chunks(results(), "flag-true", response_format="pcm", stream_flag="true")
+        _ = [c async for c in chunks]
+        assert any("stream=true" in m for m in e2e_lines()), e2e_lines()
+    finally:
+        target_logger.removeHandler(caplog.handler)
+        target_logger.setLevel(prev_level)
 
 
 class TestAudioMixin:
@@ -1886,6 +1893,55 @@ class TestTTSMethods:
         assert isinstance(response, ErrorResponse)
         assert response.error.code == HTTPStatus.INTERNAL_SERVER_ERROR
         assert response.error.type == "InternalServerError"
+
+    @pytest.mark.asyncio
+    async def test_create_speech_passes_real_stream_flag_to_chunks(self, speech_server, mocker, caplog):
+        """The raw-audio branch must forward the caller's own stream flag:
+        stream=false + stream_format=audio routes here, and the [SpeechE2E]
+        line must say stream=false (not the hardcoded true). Driven through
+        create_speech so the call-site wiring is covered, not just formatting."""
+        import logging as _logging
+
+        mocker.patch.object(speech_server, "_check_model", new=mocker.AsyncMock(return_value=None))
+
+        async def fake_gen():
+            for _ in range(2):
+                yield SimpleNamespace(multimodal_output={"model_outputs": torch.zeros(320), "sr": 24000})
+
+        mocker.patch.object(
+            speech_server,
+            "_prepare_speech_generation",
+            new=mocker.AsyncMock(return_value=(None, fake_gen(), {})),
+        )
+
+        recorded = {}
+        real_chunks = speech_server._generate_audio_chunks
+
+        def recording_chunks(generator, request_id, response_format="pcm", **kwargs):
+            recorded["stream_flag"] = kwargs.get("stream_flag")
+            return real_chunks(generator, request_id, response_format, **kwargs)
+
+        mocker.patch.object(speech_server, "_generate_audio_chunks", side_effect=recording_chunks)
+
+        target_logger = _logging.getLogger("vllm_omni.entrypoints.openai.serving_speech")
+        target_logger.addHandler(caplog.handler)
+        prev_level = target_logger.level
+        target_logger.setLevel(_logging.DEBUG)
+        try:
+            response = await speech_server.create_speech(
+                OpenAICreateSpeechRequest(input="Hello", stream=False, stream_format="audio", response_format="wav")
+            )
+            assert recorded["stream_flag"] == "false", recorded
+            body = b""
+            async for chunk in response.body_iterator:
+                body += chunk
+            assert body.startswith(b"RIFF")
+        finally:
+            target_logger.removeHandler(caplog.handler)
+            target_logger.setLevel(prev_level)
+
+        e2e = [r.getMessage() for r in caplog.records if "[SpeechE2E]" in r.getMessage()]
+        assert any("stream=false" in m for m in e2e), e2e
 
     def test_is_tts_detection_no_stage(self, speech_server):
         """Test TTS model detection when no TTS stage exists."""
