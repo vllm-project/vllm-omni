@@ -28,7 +28,7 @@ def test_longcat_video_avatar_bsa_matches_dense_reference(dtype, chunk_shape, sp
     q, k, v = [torch.randn(2, 2, seq_len, head_dim, device="cuda", dtype=dtype, generator=generator) for _ in range(3)]
     q, k = q * 0.1, k * 0.1
 
-    # Assign block IDs in THW order independently of the kernel's rearrange helpers.
+    # Assign block IDs in time, height, width order independently of the kernel's rearrange helpers.
     t, h, w = torch.meshgrid(*(torch.arange(size, device="cuda") for size in latent_shape), indexing="ij")
     ct, ch, cw = chunk_shape
     block_ids = ((t // ct * (latent_shape[1] // ch) + h // ch) * (latent_shape[2] // cw) + w // cw).flatten()
