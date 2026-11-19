@@ -266,6 +266,13 @@ def test_intel_pipeline_runs_intel_l2() -> None:
     assert not decision.is_run("cuda", "l2")
 
 
+def test_intel_ready_pipeline_runs_intel_l2() -> None:
+    decision = _decision([".buildkite/intel/test-ready.yml"])
+    assert _is_yaml_gated(decision)
+    assert decision.is_run("intel", "l2")
+    assert not decision.is_run("cuda", "l2")
+
+
 def test_cuda_and_amd_ready_runs_both_l2() -> None:
     decision = _decision(
         [
