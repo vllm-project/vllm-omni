@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import concurrent.futures
-import inspect
 import multiprocessing as mp
 import multiprocessing.connection
 import os
@@ -18,7 +17,6 @@ from dataclasses import dataclass, field
 from multiprocessing.synchronize import Event
 from typing import TYPE_CHECKING, Any, cast
 
-import torch
 import zmq
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 from vllm.logger import init_logger
@@ -354,25 +352,11 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
         logger.info("Starting server...")
 
         num_gpus = cast(int, od_config.num_gpus)
-        # Give each spawned worker a share of host threads, including with older vLLM.
-        try:
-            _params = inspect.signature(set_multiprocessing_worker_envs).parameters
-        except (TypeError, ValueError):  # C-implemented callable: assume the old API
-            _params = {}
-
-        if "local_world_size" in _params:
-            set_multiprocessing_worker_envs(local_world_size=num_gpus)
-        else:
-            if "OMP_NUM_THREADS" not in os.environ:
-                per_worker_threads = max(1, torch.get_num_threads() // max(1, num_gpus))
-                os.environ["OMP_NUM_THREADS"] = str(per_worker_threads)
-                logger.info(
-                    "Diffusion workers: OMP_NUM_THREADS=%d (%d Torch threads / %d worker(s))",
-                    per_worker_threads,
-                    torch.get_num_threads(),
-                    num_gpus,
-                )
-            set_multiprocessing_worker_envs()
+        # Without this, every worker inherits one Torch thread per core, so an
+        # N-GPU run oversubscribes the host by N x core_count. Honours a
+        # user-provided OMP_NUM_THREADS.
+        # Fix the per-worker thread count: core_count -> core_count / N.
+        set_multiprocessing_worker_envs(local_world_size=num_gpus)
         mp.set_start_method("spawn", force=True)
         mp_context = getattr(self, "_mp_context", mp.get_context("spawn"))
         processes = []
