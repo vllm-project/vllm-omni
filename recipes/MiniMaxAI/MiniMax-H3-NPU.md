@@ -256,10 +256,17 @@ set `1` to disable SP8. The startup log reports `text_encoder_vision_sp_size`.
 The former `VLLM_OMNI_H3_VISION_SP_SIZE` environment variable is no longer read.
 
 **Validation:** original-row alignment passes 35 bytewise checks on the real
-case01 input and full 27-block vision checkpoint on one Ascend 910B4 NPU.
-Eight-card full-model accuracy and current-version E2E acceptance remain
-required; this single-card result establishes neither. Earlier performance
-measurements do not qualify the aligned implementation; see
+case01 input and the full 27-block vision checkpoint on one Ascend 910B4 NPU.
+On eight cards the whole model is also bit-identical to SP1: 720 tensor pairs
+across five strict comparisons with zero differences, and identical media bytes
+for both settings in every measured request. Because the encoder output is
+unchanged, DiT and VAE work is unchanged by construction.
+
+The encoder itself is faster: the vision tower drops from 229.2 ms to 167.4 ms
+and 228.4 ms to 167.0 ms in two independent windows (about 27%, 61-66 ms), with
+the full encoder span falling from 545 ms to 479 ms. That saving is about 0.1%
+of a 61.6 s case01 request, which is below the run-to-run noise of this
+end-to-end measurement, so no end-to-end speedup is claimed here. See
 [PR #10168](https://github.com/vllm-project/vllm-omni/pull/10168).
 
 #### Cache-DiT
