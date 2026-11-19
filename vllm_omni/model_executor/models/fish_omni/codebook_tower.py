@@ -35,7 +35,6 @@ from vllm.platforms import current_platform
 
 from vllm_omni.model_executor.models.fish_omni.configuration_fish_omni import FishOmniAudioDecoderConfig
 from vllm_omni.model_executor.models.fish_omni.kernels import (
-    eager_qk_rmsnorm_rope_gate,
     gemma_rms_norm,
     gemma_rms_norm_table,
     sigmoid_gate,
@@ -166,15 +165,23 @@ class TowerLayer(nn.Module):
         extra_embedding: torch.Tensor | None,
         positions: torch.Tensor,
     ) -> torch.Tensor:
+        gemma_rms_norm_fn = gemma_rms_norm
+        tower_mix_norm_fn = tower_mix_norm
+        if current_platform.device_type == "npu":
+            from vllm_omni.platforms.npu.models import fish_omni_tower
+
+            gemma_rms_norm_fn = fish_omni_tower.gemma_rms_norm
+            tower_mix_norm_fn = fish_omni_tower.tower_mix_norm
+
         eps = self.eps
         if self.code_table is not None:
-            partial = self.eh_proj(gemma_rms_norm(hidden_states, self.hnorm.weight, eps))
+            partial = self.eh_proj(gemma_rms_norm_fn(hidden_states, self.hnorm.weight, eps))
             normed, mixed = gemma_rms_norm_table(
                 partial, code_ids, code_is_semantic, self.code_table, self.input_layernorm.weight, eps
             )
         else:
             mixed = self.eh_proj(
-                tower_mix_norm(
+                tower_mix_norm_fn(
                     hidden_states,
                     code_ids,
                     code_is_semantic,
@@ -185,10 +192,12 @@ class TowerLayer(nn.Module):
                     eps,
                 )
             )
-            normed = gemma_rms_norm(mixed, self.input_layernorm.weight, eps)
+            normed = gemma_rms_norm_fn(mixed, self.input_layernorm.weight, eps)
         qkv = self.qkv_proj(normed)
         q_gate, k, v = qkv.split([2 * self.q_size, self.kv_size, self.kv_size], dim=-1)
-        qk_rope = eager_qk_rmsnorm_rope_gate if current_platform.device_type == "npu" else fused_qk_rmsnorm_rope_gate
+        qk_rope = fused_qk_rmsnorm_rope_gate
+        if current_platform.device_type == "npu":
+            qk_rope = fish_omni_tower.qk_rmsnorm_rope_gate
         q, k, gate = qk_rope(
             q_gate,
             k,
@@ -204,10 +213,10 @@ class TowerLayer(nn.Module):
             norm_beta=1.0,
         )
         attn_out = self.attn(q, k, v.contiguous())
-        ff_input, residual = gemma_rms_norm(
+        ff_input, residual = gemma_rms_norm_fn(
             self.o_proj(sigmoid_gate(attn_out, gate)), self.post_attention_layernorm.weight, eps, residual=mixed
         )
-        normed, _ = gemma_rms_norm(
+        normed, _ = gemma_rms_norm_fn(
             self.down_proj(self.act(self.gate_up_proj(ff_input))), self.final_layernorm.weight, eps, residual=residual
         )
         return normed
