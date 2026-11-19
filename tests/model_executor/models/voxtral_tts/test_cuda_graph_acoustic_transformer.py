@@ -13,7 +13,10 @@ to exercise the wrapper mechanism while keeping the test lightweight.
 """
 
 import functools
+from types import SimpleNamespace
+from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -402,3 +405,111 @@ def test_eager_fallback_forwards_explicit_noise(model, wrapper, fallback, monkey
 
     torch.testing.assert_close(graph_eos, eager_eos, atol=0, rtol=0)
     torch.testing.assert_close(graph_codes, eager_codes, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+@pytest.mark.parametrize("temperature", [0.0, 0.7])
+@pytest.mark.parametrize("seeded_neighbor", [False, True])
+@torch.inference_mode()
+def test_acoustic_noise_is_independent_of_native_token_sampling(
+    model, wrapper, monkeypatch, use_cuda_graph, temperature, seeded_neighbor
+):
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.worker.gpu.sample.sampler import Sampler
+    from vllm.v1.worker.gpu.states import RequestState
+
+    from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts import (
+        VoxtralTTSForConditionalGeneration,
+    )
+
+    vocab_size = 64
+    num_frames = 4
+    params = {
+        "target": SamplingParams(temperature=temperature, seed=42, extra_args={"tts_local_seed": 42}),
+        "neighbor": SamplingParams(temperature=1.0, seed=17 if seeded_neighbor else None),
+    }
+
+    def run_frames(req_ids, interleave):
+        batch_size = len(req_ids)
+        voxtral = VoxtralTTSForConditionalGeneration.__new__(VoxtralTTSForConditionalGeneration)
+        nn.Module.__init__(voxtral)
+        voxtral.model_stage = "audio_generation"
+        voxtral.model = model
+        voxtral._tts_local_generators = {}
+        voxtral._cudagraph_acoustic_transformer = None
+
+        req_states = RequestState(
+            max_num_reqs=batch_size,
+            max_model_len=16,
+            max_num_batched_tokens=16,
+            num_speculative_steps=0,
+            vocab_size=vocab_size,
+            device=DEVICE,
+        )
+        sampler = Sampler(SimpleNamespace(reasoning_config=None), batch_size, vocab_size, DEVICE, req_states)
+        for req_id in req_ids:
+            req_states.add_request(req_id, prompt_len=1, all_token_ids=[0], num_computed_tokens=0, max_tokens=8)
+            sampler.add_request(req_states.req_id_to_index[req_id], params[req_id])
+        req_states.apply_staged_writes()
+        sampler.apply_staged_writes()
+
+        target_row = req_ids.index("target")
+        idx_mapping_np = np.asarray([req_states.req_id_to_index[req_id] for req_id in req_ids], dtype=np.int32)
+        idx_mapping = torch.as_tensor(idx_mapping_np, device=DEVICE)
+        logits_index = torch.arange(batch_size, device=DEVICE)
+        buffers = [{"req_id": req_id, "sampling_params": params[req_id]} for req_id in req_ids]
+        logits = torch.linspace(0.0, 1.0, vocab_size, device=DEVICE).repeat(batch_size, 1)
+        token_ids = torch.zeros(batch_size, dtype=torch.int32, device=DEVICE)
+
+        def sample_token(position):
+            sampled, _ = sampler.sample(
+                logits=logits,
+                expanded_idx_mapping=idx_mapping,
+                idx_mapping=idx_mapping,
+                idx_mapping_np=idx_mapping_np,
+                pos=torch.full((batch_size,), position, dtype=torch.int64, device=DEVICE),
+                input_ids=token_ids,
+                expanded_local_pos=token_ids,
+                seq_lens_upper_bound_np=np.full(batch_size, position + 1, dtype=np.int32),
+            )
+            return sampled[target_row]
+
+        if use_cuda_graph:
+            assert wrapper.enabled and wrapper._warmed_up
+            assert batch_size in wrapper.graphs
+        capture = Mock(wraps=wrapper if use_cuda_graph else model.compute_mm_logits)
+        with monkeypatch.context() as patch:
+            if use_cuda_graph:
+                voxtral._cudagraph_acoustic_transformer = capture
+            else:
+                patch.setattr(model, "compute_mm_logits", capture)
+
+            sampled_tokens = [] if interleave else [sample_token(i) for i in range(num_frames)]
+            for position in range(num_frames):
+                voxtral.make_omni_output(
+                    torch.zeros((batch_size, HIDDEN_DIM), device=DEVICE, dtype=torch.bfloat16),
+                    logits_index=logits_index,
+                    model_intermediate_buffer=buffers,
+                )
+                if interleave:
+                    sampled_tokens.append(sample_token(position))
+
+        noises = [call.kwargs["noise"][target_row] for call in capture.call_args_list]
+        return torch.stack(noises).cpu(), torch.stack(sampled_tokens).cpu()
+
+    solo_noise, solo_tokens = run_frames(["target"], interleave=False)
+    mixed_noise, mixed_tokens = run_frames(["neighbor", "target"], interleave=True)
+    reference_rng = torch.Generator(device=DEVICE).manual_seed(42)
+    expected = torch.stack(
+        [
+            torch.empty(N_ACOUSTIC_CODEBOOK, device=DEVICE, dtype=torch.bfloat16).normal_(generator=reference_rng)
+            for _ in range(num_frames)
+        ]
+    ).cpu()
+    torch.testing.assert_close(solo_noise, expected, atol=0, rtol=0)
+    torch.testing.assert_close(mixed_noise, expected, atol=0, rtol=0)
+    torch.testing.assert_close(solo_tokens, mixed_tokens, atol=0, rtol=0)
+    if temperature == 0.0:
+        assert torch.all(solo_tokens == vocab_size - 1)
+    else:
+        assert torch.unique(solo_tokens).numel() > 1

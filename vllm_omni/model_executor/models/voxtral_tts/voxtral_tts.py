@@ -7,7 +7,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import regex as re
 import torch
@@ -32,6 +32,7 @@ from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts_audio_generation im
     VoxtralTTSProcessingInfo,
 )
 from vllm_omni.transformers_utils.repo_utils import hf_api
+from vllm_omni.worker.sampling_utils import get_tts_local_seed
 
 if TYPE_CHECKING:
     from vllm.v1.sample.metadata import SamplingMetadata
@@ -107,10 +108,6 @@ class VoxtralTTSForConditionalGeneration(
     SupportsMultiModal,
     CustomProcessMixin,
 ):
-    # Acoustic randomness must have its own request-local stream, independent
-    # of the vLLM token sampler even when stage-0 token sampling is greedy.
-    requires_tts_local_generator = True
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -122,6 +119,7 @@ class VoxtralTTSForConditionalGeneration(
         self.repo_id = vllm_config.model_config.model
         self.is_hf_model = not Path(self.repo_id).is_dir()
         self.model_stage = vllm_config.model_config.model_stage
+        self._tts_local_generators: dict[str, torch.Generator] = {}
         if self.model_stage == "audio_generation":
             self.has_preprocess = True
             self.has_postprocess = True
@@ -370,6 +368,31 @@ class VoxtralTTSForConditionalGeneration(
             dtype=input_hidden_states.dtype,
         )
 
+    def on_requests_finished(self, req_ids: set[str]) -> None:
+        for req_id in req_ids:
+            self._tts_local_generators.pop(req_id, None)
+
+    def _get_tts_local_generators(
+        self, device: torch.device, request_info: list[dict[str, Any]] | None
+    ) -> dict[int, torch.Generator] | None:
+        """Map current batch rows to acoustic RNGs keyed by request ID."""
+        if not request_info:
+            return None
+
+        generators: dict[int, torch.Generator] = {}
+        for row, info in enumerate(request_info):
+            seed = get_tts_local_seed(info.get("sampling_params"))
+            if seed is None:
+                continue
+
+            req_id = info["req_id"]
+            generator = self._tts_local_generators.get(req_id)
+            if generator is None:
+                generator = torch.Generator(device=device).manual_seed(seed)
+                self._tts_local_generators[req_id] = generator
+            generators[row] = generator
+        return generators
+
     def _make_acoustic_noise(
         self,
         input_hidden_states: torch.Tensor,
@@ -419,7 +442,7 @@ class VoxtralTTSForConditionalGeneration(
         self,
         model_outputs: torch.Tensor | OmniOutput | tuple,
         logits_index: torch.Tensor | int | None = None,
-        tts_local_generators: Mapping[int, torch.Generator] | None = None,
+        model_intermediate_buffer: list[dict[str, Any]] | None = None,
         **kwargs,
     ) -> OmniOutput:
         if isinstance(model_outputs, torch.Tensor):
@@ -428,10 +451,8 @@ class VoxtralTTSForConditionalGeneration(
                 assert logits_index is not None
                 input_hidden_states = hidden_states[logits_index]
                 cfg_alpha = self._extract_cfg_alpha(input_hidden_states, **kwargs)
-                noise = self._make_acoustic_noise(
-                    input_hidden_states,
-                    tts_local_generators,
-                )
+                generators = self._get_tts_local_generators(input_hidden_states.device, model_intermediate_buffer)
+                noise = self._make_acoustic_noise(input_hidden_states, generators)
                 if self._cudagraph_acoustic_transformer is not None:
                     fake_eos, multimodal_outputs = self._cudagraph_acoustic_transformer(
                         input_hidden_states,

@@ -6559,6 +6559,7 @@ class TestTTSAsyncOffloading:
         stage0_params = voxtral_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
         assert stage0_params.seed == 42
         assert stage0_params.extra_args["tts_local_seed"] == 42
+        assert stage0_params.extra_args["omni_user_seed"] is True
         assert voxtral_server.engine_client.default_sampling_params_list[0].extra_args is None
 
     def test_prepare_speech_generation_awaits_qwen3_tts_async(self, qwen3_tts_server, mocker: MockerFixture):

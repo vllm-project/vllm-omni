@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import functools
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -112,11 +113,83 @@ def _make_voxtral_model():
     model.model_stage = "audio_generation"
     model.model = _CaptureAudioGeneration()
     model._cudagraph_acoustic_transformer = None
+    model._tts_local_generators = {}
     return model
 
 
 def _generator(seed: int) -> torch.Generator:
     return torch.Generator(device="cpu").manual_seed(seed)
+
+
+def _request_info(req_id, acoustic_seed=None, *, token_seed=None):
+    extra_args = {"tts_local_seed": acoustic_seed} if acoustic_seed is not None else None
+    return {"req_id": req_id, "sampling_params": SimpleNamespace(extra_args=extra_args, seed=token_seed)}
+
+
+def test_request_acoustic_stream_follows_request_across_batch_changes():
+    from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
+    from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+
+    model = _make_voxtral_model()
+    model.postprocess_requires_multimodal_outputs = True
+    state = object.__new__(OmniModelState)
+    state.model = model
+    state.have_multimodal_outputs = True
+    state.intermediate_buffer = OmniIntermediateBuffer(2)
+
+    request_a = SimpleNamespace(**_request_info("a", 31), mm_features=[])
+    request_b = SimpleNamespace(**_request_info("b", 47), mm_features=[])
+    state.intermediate_buffer.add_request(0, request_a)
+    state.intermediate_buffer.add_request(1, request_b)
+    expected_a, expected_b = _generator(31), _generator(47)
+
+    def run_rows(*indices):
+        size = len(indices)
+        batch = SimpleNamespace(
+            idx_mapping_np=indices,
+            num_reqs=size,
+            logits_indices=torch.arange(size),
+            query_start_loc_np=range(size),
+            num_scheduled_tokens=[1] * size,
+        )
+        state.postprocess_model_output(torch.zeros((size, 4)), batch, SimpleNamespace())
+        return model.model.calls[-1]["noise"]
+
+    def check_rows(indices, expected_generators):
+        noise = run_rows(*indices)
+        assert noise is not None
+        for row, generator in enumerate(expected_generators):
+            expected = torch.empty(N_ACOUSTIC_CODEBOOK).normal_(generator=generator)
+            torch.testing.assert_close(noise[row], expected, atol=0, rtol=0)
+        return noise
+
+    first = check_rows((0, 1), (expected_a, expected_b))
+    state.intermediate_buffer.remove_request(0)
+    check_rows((1,), (expected_b,))
+
+    state.intermediate_buffer.add_request(0, request_a)
+    check_rows((1, 0), (expected_b, expected_a))
+
+    model.on_requests_finished({"a", "unknown"})
+    state.intermediate_buffer.remove_request(0)
+    assert "a" not in model._tts_local_generators
+    assert "b" in model._tts_local_generators
+
+    state.intermediate_buffer.add_request(0, request_a)
+    restarted = run_rows(0)
+    assert restarted is not None
+    torch.testing.assert_close(restarted[0], first[0], atol=0, rtol=0)
+
+
+def test_default_token_seed_does_not_create_an_acoustic_generator():
+    model = _make_voxtral_model()
+    model.make_omni_output(
+        torch.zeros((1, 4)),
+        logits_index=torch.arange(1),
+        model_intermediate_buffer=[_request_info("unmarked", token_seed=42)],
+    )
+    assert model.model.calls[-1]["noise"] is None
+    assert not model._tts_local_generators
 
 
 def test_same_seed_produces_identical_multi_frame_noise_streams():
@@ -182,73 +255,6 @@ def test_seeded_row_is_independent_of_unseeded_batch_rows():
     torch.testing.assert_close(standalone[0], batched[1], atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("use_cuda_graph", [False, True])
-@pytest.mark.parametrize("temperature", [0.0, 0.7])
-@pytest.mark.parametrize("seeded_neighbor", [False, True])
-def test_acoustic_noise_is_independent_of_interleaved_token_sampling(use_cuda_graph, temperature, seeded_neighbor):
-    from vllm.v1.sample.logits_processor import LogitsProcessors
-    from vllm.v1.sample.metadata import SamplingMetadata
-    from vllm.v1.sample.sampler import Sampler
-
-    def frames(batched):
-        model = _make_voxtral_model()
-        graph = _CaptureAcousticGraph() if use_cuda_graph else None
-        model._cudagraph_acoustic_transformer = graph
-        sampler = Sampler()
-        acoustic_generator = _generator(42)
-        token_generator = _generator(42)
-        # Keep A's generator in the token metadata even when A is greedy:
-        # mixed sampling must not be able to advance its acoustic stream.
-        token_generators = {0: token_generator}
-        if batched and seeded_neighbor:
-            token_generators[1] = _generator(17)
-        batch_size = 2 if batched else 1
-        temperatures = torch.tensor([temperature, 1.0] if batched else [temperature])
-        metadata = SamplingMetadata(
-            temperature=temperatures,
-            all_greedy=not batched and temperature == 0,
-            all_random=temperature > 0,
-            top_p=None,
-            top_k=None,
-            generators=token_generators,
-            max_num_logprobs=None,
-            no_penalties=True,
-            prompt_token_ids=None,
-            frequency_penalties=torch.zeros(batch_size),
-            presence_penalties=torch.zeros(batch_size),
-            repetition_penalties=torch.ones(batch_size),
-            output_token_ids=[[] for _ in range(batch_size)],
-            allowed_token_ids_mask=None,
-            bad_words_token_ids={},
-            logitsprocs=LogitsProcessors(),
-        )
-        initial_token_state = token_generator.get_state().clone()
-        for _ in range(3):
-            token_state = token_generator.get_state().clone()
-            model.make_omni_output(
-                torch.zeros((batch_size, 4)),
-                logits_index=torch.arange(batch_size),
-                sampling_metadata=metadata,
-                tts_local_generators={0: acoustic_generator},
-            )
-            torch.testing.assert_close(token_generator.get_state(), token_state, atol=0, rtol=0)
-            acoustic_state = acoustic_generator.get_state().clone()
-            sampled, _ = sampler.sample(torch.tensor([[0.0, 1.0, 2.0, 3.0]]).repeat(batch_size, 1), metadata)
-            if temperature == 0:
-                assert sampled[0].item() == 3
-            torch.testing.assert_close(acoustic_generator.get_state(), acoustic_state, atol=0, rtol=0)
-        if batched or temperature > 0:
-            assert not torch.equal(token_generator.get_state(), initial_token_state)
-        calls = graph.calls if graph is not None else model.model.calls
-        return [call["noise"][0] for call in calls]
-
-    standalone = frames(False)
-    mixed_batch = frames(True)
-    for alone, batched in zip(standalone, mixed_batch, strict=True):
-        torch.testing.assert_close(alone, batched, atol=0, rtol=0)
-    assert not torch.equal(standalone[0], standalone[1])
-
-
 def test_missing_active_generator_uses_legacy_noise_path():
     model = _make_voxtral_model()
 
@@ -276,12 +282,10 @@ def test_make_omni_output_maps_generators_to_selected_rows(use_cuda_graph):
     hidden_states = torch.arange(20, dtype=torch.float32).view(5, 4)
     original_hidden_states = hidden_states.clone()
     logits_index = torch.tensor([1, 4])
-    generators = {0: _generator(31), 1: _generator(47)}
-
     model.make_omni_output(
         hidden_states,
         logits_index=logits_index,
-        tts_local_generators=generators,
+        model_intermediate_buffer=[_request_info("a", 31), _request_info("b", 47)],
         sampling_extra_args=[{}, {}],
     )
 
@@ -299,7 +303,6 @@ def test_compute_mm_logits_forwards_explicit_noise():
     model = audio_generation_cls.__new__(audio_generation_cls)
     nn.Module.__init__(model)
     model.acoustic_transformer = _CaptureAcousticTransformer()
-    model._fake_eos_consts = {}
     model._end_audio_token_id = -1
     hidden = torch.zeros((2, 4))
     cfg_alpha = torch.tensor([1.1, 1.3])
