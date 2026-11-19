@@ -226,7 +226,8 @@ async def _run_streaming_text_input(
     (output_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2))
     assert result["response_statuses"] == ["completed"], result
     assert len(waveform) > 0, result
-    assert "blue whale" in answer.lower() and re.search(r"\b(?:seven|7)\b", answer.lower()), result
+    # Native transcript chunks may omit whitespace at their boundaries.
+    assert re.search(r"blue\s*whale", answer.lower()) and re.search(r"\b(?:seven|7)\b", answer.lower()), result
     return result
 
 
