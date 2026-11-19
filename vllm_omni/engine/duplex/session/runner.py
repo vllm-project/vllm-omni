@@ -38,6 +38,7 @@ from vllm_omni.engine.duplex.commands import (
     AppendAudio,
     AppendText,
     BargeIn,
+    CancelFunctionCall,
     CancelInput,
     CancelResponse,
     ClearInput,
@@ -55,11 +56,14 @@ from vllm_omni.engine.duplex.commands import (
     UpdateSession,
 )
 from vllm_omni.engine.duplex.config import (
+    FUNCTION_CALL_INTERRUPT_POLICY_KEY,
     DuplexConfigError,
     DuplexOverlapPolicy,
     DuplexPlaybackCommitPolicy,
     DuplexSessionState,
     ResponseCreateOptions,
+    effective_function_call_retry_policy,
+    resolve_function_call_policy,
     resolve_tool_result_timeout_s,
 )
 from vllm_omni.engine.duplex.contracts import (
@@ -114,6 +118,7 @@ from vllm_omni.engine.duplex.session.memory_runtime import SessionMemoryRuntime
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
 from vllm_omni.engine.duplex.session.tool_calls import (
     LoopTimerScheduler,
+    ToolCallAbandonment,
     ToolCallLedger,
     ToolCallSettlement,
     ToolCallState,
@@ -253,6 +258,14 @@ class DuplexSessionRunner:
             timeout_s=resolve_tool_result_timeout_s(session.config.extra_body),
             on_expire=self._enqueue_tool_call_expiry,
             on_settle=self._enqueue_tool_call_settlement,
+            keep_on_epoch_advance=(
+                resolve_function_call_policy(session.config.extra_body, FUNCTION_CALL_INTERRUPT_POLICY_KEY) == "keep"
+            ),
+            user_turn_seq=(
+                session.user_turn_seq
+                if effective_function_call_retry_policy(session.capabilities, session.config.extra_body) == "user_turn"
+                else None
+            ),
         )
         self.ctx = DuplexSessionContext(
             session=session,
@@ -802,6 +815,8 @@ class DuplexSessionRunner:
                 await self._on_cancel(payload)
         elif isinstance(command, CancelInput | BargeIn):
             await self._on_cancel(command.payload())
+        elif isinstance(command, CancelFunctionCall):
+            self.control.on_function_call_cancel(command)
         elif isinstance(command, SignalTurn):
             if command.event == "conversation.item.retrieve":
                 self._emit_events(
@@ -861,12 +876,17 @@ class DuplexSessionRunner:
             if session.unanswered_user_items() > previous_user_items:
                 self.memory.note_user_item(command.payload(), str(command.item["id"]))
         elif isinstance(command, DeleteItem):
+            deleted_user_source = bool(session.user_source_ids_for_items((command.item_id,)))
             control = resolve_delete_item(projector, command)
             self._emit_events(control.events)
             for payload in control.payloads:
                 await self.control.on_turn_signal(payload)
             if control.payloads:
                 self.memory.forget_user_item(command.item_id)
+                if deleted_user_source and not session.user_source_ids_for_items((command.item_id,)):
+                    session.release_input_bytes(
+                        self.plugin.on_history_item_deleted(state=self.model_state, item_id=command.item_id)
+                    )
         elif isinstance(command, TruncateItem):
             control = resolve_truncate_item(
                 projector, command, has_audio=self.session.history_item_has_audio(command.item_id)
@@ -1065,7 +1085,7 @@ class DuplexSessionRunner:
         call = self.tool_calls.record(call_id)
         if call is None or not call.is_terminal or call.settled_epoch is None:
             return False
-        return self._finalize_tool_call(ToolCallSettlement(call.origin, call.state, call.settled_epoch))
+        return self._finalize_tool_call(ToolCallSettlement(call.origin, call.state, call.settled_epoch, call.reason))
 
     def _finalize_tool_call(self, settlement: ToolCallSettlement) -> bool:
         call_id = settlement.origin.call_id
@@ -1102,12 +1122,23 @@ class DuplexSessionRunner:
                 f"no function_call_output for {call_id} arrived before tool_result_timeout_s; "
                 "the call expired in the session ledger and a late result is refused",
             )
+        reason = settlement.reason
+        if reason is not None and call_id not in self._applied_tool_call_settlements:
+            self.emit(
+                {
+                    "type": "function_call.settled",
+                    "session_id": session.session_id,
+                    "epoch": settlement.settled_epoch,
+                    "call_id": call_id,
+                    "state": settlement.state.value,
+                    "reason": reason.value,
+                }
+            )
         if not self._finalize_tool_call(settlement):
             return
-        # Acceptance installs only its prepared candidate; cancellation already
-        # has an epoch-wide retirement path. Neither can reconfigure through
-        # the deferred timeout-recovery hook after an acknowledgement.
-        if settlement.state is not ToolCallState.TIMED_OUT:
+        # Acceptance installs only its prepared candidate, so it cannot
+        # reconfigure through the deferred recovery hook after an acknowledgement.
+        if reason is None:
             return
         if call_id in self._applied_tool_call_settlements:
             return
@@ -1116,8 +1147,11 @@ class DuplexSessionRunner:
             if settlement.settled_epoch != session.epoch:
                 # Finalize old metadata, but never change the new epoch's input.
                 return
-            candidate = self.plugin.runtime_config_for_tool_call_timeout(
-                session.config, deepcopy(dict(session.runtime_config)), settlement
+            candidate = self.plugin.runtime_config_for_abandoned_tool_call(
+                session.config,
+                deepcopy(dict(session.runtime_config)),
+                ToolCallAbandonment(settlement.origin, reason),
+                history_len=len(session.history),
             )
             if candidate is not None:
                 session.replace_runtime_config(deepcopy(candidate))
@@ -1614,6 +1648,7 @@ class DuplexSessionRunner:
         on_append_accepted: Callable[[float], None] | None = None,
         before_append: Callable[[], bool] | None = None,
         input_audio_parts: dict[str, dict[str, object] | None] | None = None,
+        unanswered_source_ids: tuple[int, ...] = (),
     ) -> asyncio.Task[bool]:
         session = self.session
         model_state = self.model_state
@@ -1656,6 +1691,10 @@ class DuplexSessionRunner:
             session.bind_response_turn(append_turn_id)
         if precreate_response and session.active_response_id is None:
             response_id = session.begin_response(turn_id=append_turn_id)
+            # Remember this response was opened by an explicit response.create
+            # (vs an engine-owned auto response): its first silence unit must
+            # be able to release a stale turn-ended latch in the model.
+            model_state.explicit_response_create_id = response_id
             self.emit(self.model.response_created_payload(response_id, epoch=append_epoch))
         if final and not session.capabilities.supports_core_resumable_request:
             logger.info(
@@ -1673,6 +1712,20 @@ class DuplexSessionRunner:
                 for segment in segments
                 if isinstance(segment, dict) and isinstance(segment.get("item_id"), str)
             }
+        if final:
+            # Automatic speech commits need the same retry eligibility as an
+            # explicit response.create, even without a new text-item counter.
+            item_ids = {input_item_id} if isinstance(input_item_id, str) else set()
+            if isinstance(segments, list):
+                item_ids.update(
+                    segment["item_id"]
+                    for segment in segments
+                    if isinstance(segment, dict) and isinstance(segment.get("item_id"), str)
+                )
+            if item_ids:
+                unanswered_source_ids = tuple(
+                    dict.fromkeys((*unanswered_source_ids, *session.user_source_ids_for_items(item_ids)))
+                )
         attempt = AppendAttempt(
             ctx=self.ctx,
             out=self.out,
@@ -1689,6 +1742,7 @@ class DuplexSessionRunner:
             owns_request=final or precreate_response,
             input_audio_part=session.input_audio_part(input_item_id) if isinstance(input_item_id, str) else None,
             input_audio_parts=input_audio_parts,
+            unanswered_source_ids=unanswered_source_ids,
             on_append_accepted=on_append_accepted,
             on_append_prepared=self.memory.preempt_for_submission if interactive else None,
             before_append=before_append,
@@ -2376,9 +2430,9 @@ class DuplexSessionRunner:
         commit has its own prefixes, or when that retained payload is a VISION
         unit the model replays separately. Merging either of those into the
         terminal would reorder or collapse separate units. A single-terminal
-        model leaves a retained camera observation in place, so the newer
-        commit replaces it and a promotion queued for the old payload no
-        longer matches. A vision-only terminal still merges into retained
+        model coalesces retained camera frames into the newer terminal, so a
+        promotion queued for the old payload no longer matches. A vision-only
+        terminal still merges into retained
         speech, which keeps that speech's transcript owner and accumulates
         the frames. Returns False if the model state cannot hold prefixes;
         the caller then rolls the commit back.
@@ -2577,6 +2631,7 @@ class DuplexSessionRunner:
             if operation_id is None:
                 operation_id = uuid.uuid4().hex
                 model_state.committed_audio_operation_id = operation_id
+            unanswered_source_ids = session.pending_user_source_ids()
             session.reset_unanswered_user_items()
             await self._start_append(
                 committed_payload,
@@ -2584,11 +2639,18 @@ class DuplexSessionRunner:
                 precreate_response=True,
                 operation_id=operation_id,
                 retained_committed_payload=committed_payload,
+                unanswered_source_ids=unanswered_source_ids,
             )
             return
         if session.unanswered_user_items() and session.capabilities.supports_text_only_turn:
+            unanswered_source_ids = session.pending_user_source_ids()
             session.reset_unanswered_user_items()
-            await self._start_append({"type": "conversation"}, final=True, precreate_response=True)
+            await self._start_append(
+                {"type": "conversation"},
+                final=True,
+                precreate_response=True,
+                unanswered_source_ids=unanswered_source_ids,
+            )
             return
         if session.capabilities.supports_text_only_turn and self.plugin.has_pending_tool_followup(
             session.runtime_config

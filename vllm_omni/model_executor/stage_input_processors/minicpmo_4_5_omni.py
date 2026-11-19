@@ -20,6 +20,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
     MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
     MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
 from vllm_omni.model_executor.models.minicpmo_4_5.handoff import pack_handoff_tensor, unpack_handoff_tensor
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
 
@@ -694,11 +695,9 @@ def _decode_native_duplex_token_ids(
         return ""
 
 
-# A turn whose text ends with one of these (after closing quotes and brackets)
-# is treated as having ended a sentence; anything else as cut off mid-sentence.
-_SENTENCE_END_PUNCTUATION = "。！？.!?…"
-_CLOSING_PUNCTUATION = "\"'”’」』）)】"
-_TURN_TEXT_TAIL_CHARS = 16
+# Talker handoff sentence boundary. A finished sentence closes the turn-end
+# condition with <text_eos>; a cut-off tail keeps the boundary mask.
+_TURN_TEXT_TAIL_CHARS = MiniCPMO45DuplexPolicy.TURN_TEXT_TAIL_CHARS
 
 
 def _native_duplex_segment_output_ids(
@@ -786,8 +785,7 @@ def _native_duplex_turn_text_ends_sentence(streaming_context, *, request_id: str
     state = bridge_states.get("minicpmo45_tts_handoff") if isinstance(bridge_states, dict) else None
     if not isinstance(state, dict) or state.get("request_id") != request_id:
         return False
-    tail = str(state.get("turn_text_tail") or "").rstrip().rstrip(_CLOSING_PUNCTUATION)
-    return bool(tail) and tail[-1] in _SENTENCE_END_PUNCTUATION
+    return MiniCPMO45DuplexPolicy.turn_text_ends_sentence(str(state.get("turn_text_tail") or ""))
 
 
 def _native_duplex_forwarded_hidden_rows(
@@ -1120,12 +1118,11 @@ def llm2tts(
             # the first text token when no marker is emitted) is fed back but
             # is not part of total_hidden_in_unit; TTS conditions on the
             # tokens after it, up to the chunk terminator. <|turn_eos|> is not
-            # a chunk terminator: it is fed like text, its hidden state is
-            # handed to the Talker, and anything sampled after it is a stale
-            # tail that must not enter TTS.
+            # a chunk terminator: it and any subsequent tokens in this unit
+            # are forwarded and handed to the Talker. Later text or speak
+            # decisions reopen the turn, just as in streaming_generate.
             out_ids = llm_output_ids
             listen_id = special_token_ids.get("listen_token_id")
-            turn_eos_id = special_token_ids.get("turn_eos_token_id")
             unit_start = 0
             while unit_start < len(out_ids) and out_ids[unit_start] == listen_id:
                 unit_start += 1
@@ -1147,9 +1144,6 @@ def llm2tts(
                 out_end = len(out_ids)
                 for idx_t in range(out_start, len(out_ids)):
                     token_id = out_ids[idx_t]
-                    if turn_eos_id is not None and token_id == turn_eos_id:
-                        out_end = idx_t + 1
-                        break
                     if token_id in tts_end_ids:
                         out_end = idx_t
                         native_segment_end = token_id in {
@@ -1167,6 +1161,15 @@ def llm2tts(
                         slice_end=out_end - unit_start,
                         request_id=str(llm_output.request_id),
                     )
+                elif native_segment_end:
+                    # A speech unit can contain just speak + chunk_eos. This
+                    # still owns a segment boundary: dropping it would leave
+                    # the runtime waiting for TTS before the next silence unit.
+                    # Talker's empty-condition path emits no audio and closes
+                    # the segment through the normal downstream transport.
+                    tts_token_ids_slice = torch.empty(0, dtype=torch.long)
+                    tts_hidden_slice = thinker_hidden_states[:0]
+                    thinker_text = ""
         handoff_ids = _coerce_token_id_list(tts_token_ids_slice) if tts_token_ids_slice is not None else None
         if is_native_duplex_handoff and handoff_ids:
             handoff_text = _decode_native_duplex_token_ids(
@@ -1179,8 +1182,7 @@ def llm2tts(
                 # text comes from total_ids_in_unit, the same slice that
                 # conditions the Talker.
                 thinker_text = handoff_text
-                # The sentence-end check reads the same slice, so text sampled
-                # after <|turn_eos|> (dropped above) does not decide it.
+                # The sentence-end check reads the same complete unit slice.
                 _native_duplex_append_turn_text(
                     _streaming_context, request_id=str(llm_output.request_id), text=handoff_text
                 )
@@ -1208,8 +1210,8 @@ def llm2tts(
                 ]
             )
             if turn_eos_id is not None:
-                # The talker detects turn end from <|turn_eos|> inside the
-                # handed condition (official conditions on its embedding).
+                # The Talker retains the EOS embedding in its condition, but
+                # only a condition ending in EOS closes the turn.
                 meta["turn_eos_token_id"] = int(turn_eos_id)
             meta["turn_start"] = native_turn_start
             if native_segment_end:
@@ -1231,8 +1233,8 @@ def llm2tts(
         turn_text_ends_sentence = False
         if is_native_duplex_handoff:
             turn_eos_id = special_token_ids.get("turn_eos_token_id")
-            native_turn_end_handoff = turn_eos_id is not None and handoff_ids is not None and turn_eos_id in handoff_ids
-            if not handoff_ids:
+            native_turn_end_handoff = bool(handoff_ids and handoff_ids[-1] == turn_eos_id)
+            if handoff_ids is None:
                 continue
         set_tts_handoff(
             model_intermediate_buffer,
@@ -1258,9 +1260,10 @@ def llm2tts(
         if handoff_ids is not None and handoff_hidden is not None:
             # The condition ends with <audio_bos>; offline and closed turn-end
             # conditions put <text_eos> before it.
-            if is_native_duplex_handoff:
+            if is_native_duplex_handoff and handoff_ids:
                 condition_suffix_length = 2 if turn_text_ends_sentence else 1
             else:
+                # Empty conditions use Talker's two boundary embeddings.
                 condition_suffix_length = 2
             condition_length = max(len(handoff_ids), len(handoff_hidden)) + condition_suffix_length
             # Dummy ids only reserve scheduler slots; prefill overwrites the

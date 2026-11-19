@@ -56,6 +56,7 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     entry_stage_id: int = 0
     lora_request: LoRARequest | None = None
     requested_replica_id: int | None = None
+    cfg_companion_ids: dict[str, str] | None = None
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):
