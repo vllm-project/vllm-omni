@@ -394,19 +394,25 @@ def _replay_tail_window(
     sample_rate: int,
     video_fps: float,
 ) -> tuple[int, int] | None:
-    """Convert a replay duration into (audio samples, video frames) tail sizes.
+    """Return tail sizes aligned to a common source frame boundary.
 
-    Returns ``None`` when either requested window would round to zero while
-    its input is nonempty: slicing with ``seq[-0:]`` keeps the *whole*
-    sequence, so a positive-but-tiny duration would otherwise pair a short
-    audio tail (or no audio at all) with every video frame. Skipping the
-    replay keeps the audio and video windows aligned or absent together.
+    Skip windows rounding to zero, which would otherwise slice with ``[-0:]``.
+    For video, round the start back to the preceding sampled frame so the
+    first audio unit and frame share the same source timestamp.
     """
-    samples = min(int(round(replay_seconds * sample_rate)), total_samples)
-    frames = min(int(round(replay_seconds * video_fps)), total_frames) if total_frames > 0 else 0
-    if samples <= 0 or (total_frames > 0 and frames <= 0):
+    if not math.isfinite(replay_seconds) or replay_seconds <= 0:
         return None
-    return samples, frames
+    replay_seconds = min(replay_seconds, total_samples / sample_rate)
+    samples = int(round(replay_seconds * sample_rate))
+    if samples <= 0:
+        return None
+    if total_frames <= 0:
+        return samples, 0
+    if round(min(replay_seconds, total_frames / video_fps) * video_fps) <= 0:
+        return None
+    start_frame = min(math.floor((total_samples - samples) * video_fps / sample_rate), total_frames - 1)
+    start_sample = round(start_frame * sample_rate / video_fps)
+    return total_samples - start_sample, total_frames - start_frame
 
 
 #: How long a forced final commit may take to open its response before the
@@ -1459,15 +1465,16 @@ def parse_args() -> argparse.Namespace:
             "When the post-commit forced response stays silent and the "
             "transcript stops mid-sentence, replay this many seconds of the "
             "input (audio plus the matching video frames), commit again and "
-            "drain one more forced response. 0 disables the replay."
+            "drain one more forced response. Video replay starts at the preceding "
+            "sampled-frame boundary. 0 disables the replay."
         ),
     )
     parser.add_argument("--require-audio", action="store_true")
     args = parser.parse_args()
     if args.tail_silence_s < 0:
         parser.error("--tail-silence-s must be nonnegative")
-    if args.post_commit_replay_seconds < 0:
-        parser.error("--post-commit-replay-seconds must be nonnegative")
+    if not math.isfinite(args.post_commit_replay_seconds) or args.post_commit_replay_seconds < 0:
+        parser.error("--post-commit-replay-seconds must be finite and nonnegative")
     if not 0 < args.basic_window_low_tokens < args.basic_window_high_tokens:
         parser.error("window watermarks must satisfy 0 < low < high")
     if args.context_max_units <= 0 or args.context_previous_max_tokens <= 0:
