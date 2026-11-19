@@ -223,7 +223,9 @@ def _omni_server_env() -> dict[str, str]:
 
 
 def _cli_flag_value(args: tuple[str, ...] | list[str], flag: str) -> str | None:
-    for index, arg in enumerate(args):
+    # Match argparse when extra_cli_args overrides a serve_args default.
+    for index in range(len(args) - 1, -1, -1):
+        arg = args[index]
         if arg == flag and index + 1 < len(args):
             return args[index + 1]
         if arg.startswith(f"{flag}="):

@@ -63,7 +63,18 @@ def test_server_vad_preflight_checks_only_enabled_vad_workloads(monkeypatch, ena
         assert calls == []
 
 
-def test_server_vad_preflight_fails_before_model_resolution_or_server_start(monkeypatch):
+@pytest.mark.parametrize(
+    "deploy_args",
+    [
+        ("--deploy-config", "offline.yaml"),
+        ("--deploy-config=offline.yaml",),
+        ("--deploy-config", "unused.yaml", "--deploy-config", "offline.yaml"),
+        ("--deploy-config=unused.yaml", "--deploy-config=offline.yaml"),
+        ("--deploy-config", "unused.yaml", "--deploy-config=offline.yaml"),
+        ("--deploy-config=unused.yaml", "--deploy-config", "offline.yaml"),
+    ],
+)
+def test_server_vad_preflight_fails_before_model_resolution_or_server_start(monkeypatch, deploy_args):
     from tests.dfx.perf.scripts import run_benchmark
     from vllm_omni.config import stage_config
     from vllm_omni.engine.duplex.vad import ServerVADUnavailableError, SileroVADBackendProvider
@@ -78,13 +89,13 @@ def test_server_vad_preflight_fails_before_model_resolution_or_server_start(monk
             }
         ],
     )
-    monkeypatch.setattr(
-        stage_config,
-        "resolve_deploy_yaml",
-        lambda path: {
-            "duplex_session": {"server_vad_model_path": "/models/silero.onnx"},
-        },
-    )
+    deploy_paths = []
+
+    def resolve_deploy(path):
+        deploy_paths.append(path)
+        return {"duplex_session": {"server_vad_model_path": f"/models/{Path(path).stem}/silero.onnx"}}
+
+    monkeypatch.setattr(stage_config, "resolve_deploy_yaml", resolve_deploy)
     selected = []
 
     def unavailable(self):
@@ -97,11 +108,13 @@ def test_server_vad_preflight_fails_before_model_resolution_or_server_start(monk
     monkeypatch.setattr(SileroVADBackendProvider, "get", unavailable)
     monkeypatch.setattr(run_benchmark, "_resolve_offline_model", must_not_start)
     monkeypatch.setattr(run_benchmark, "OmniServer", must_not_start)
-    server = ("offline-vad", "model", None, None, ("--deploy-config", "offline.yaml"), True)
+    server = ("offline-vad", "model", None, None, deploy_args, True)
     with pytest.raises(ServerVADUnavailableError, match="does not exist"):
         with run_benchmark._start_omni_server(server):
             pytest.fail("unavailable VAD yielded a server")
-    assert selected == ["/models/silero.onnx"]
+    # Match the serving CLI: the final flag overrides any earlier default.
+    assert deploy_paths == ["offline.yaml"]
+    assert selected == ["/models/offline/silero.onnx"]
 
 
 def test_task_excluded_from_cli_args():
