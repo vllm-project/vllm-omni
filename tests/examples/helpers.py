@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Shared fixtures, helpers, and path constants for tests/examples/.
 """
@@ -17,6 +19,8 @@ from typing import Any, NamedTuple, cast
 import pytest
 import torch
 from safetensors.torch import save_file
+
+from tests.examples.model_scope import doc_models_allowed, models_in_snippet
 
 # ---------------------------------------------------------------------------
 # Path constants and fixtures
@@ -101,6 +105,10 @@ class ReadmeSnippet(NamedTuple):
             key = h2_title
             section_counts[key] += 1
             code = token.get("raw", "")
+            # Filter before normalization can create LoRA assets or prepare
+            # model-specific commands. Headings are not a model identity.
+            if not doc_models_allowed(models_in_snippet(language, code)):
+                continue
             output_file_path = None
             if language == "bash":
                 argv = ReadmeSnippet._normalize_bash_command(code, Path(readme_path.parent))
