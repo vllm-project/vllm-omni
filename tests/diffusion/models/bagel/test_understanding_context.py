@@ -37,7 +37,6 @@ def _pipeline(mocker: MockerFixture) -> BagelPipeline:
     pipeline.tokenizer = mocker.sentinel.tokenizer
     pipeline.new_token_ids = {}
     pipeline.language_model = mocker.Mock(vocab_size=10)
-    pipeline.image_processor = mocker.Mock()
     pipeline.vae = mocker.Mock()
 
     bagel = mocker.MagicMock()

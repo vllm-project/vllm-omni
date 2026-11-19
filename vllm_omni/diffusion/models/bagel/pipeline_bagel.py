@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torch import nn
-from transformers import AutoTokenizer, SiglipImageProcessor, SiglipVisionConfig, SiglipVisionModel
+from transformers import AutoTokenizer, SiglipVisionConfig, SiglipVisionModel
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.transformers_utils.configs.bagel import BagelConfig
@@ -425,7 +425,6 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             vit_conf.num_hidden_layers = 26
         vit_conf.vision_use_head = False
         self.vit_model = SiglipVisionModel(vit_conf)
-        self.image_processor = SiglipImageProcessor.from_pretrained(model_path, local_files_only=True)
 
         if self.vit_model:
             self.vit_model = SiglipNaViTWrapper(self.vit_model)
@@ -702,7 +701,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             understanding = not isinstance(first_prompt, str) and "text" in (first_prompt.get("modalities") or [])
             if image_input:
                 # If we have an image, we prefill with it
-                if self.image_processor and self.vae:
+                if self.vae:
                     stride = self.bagel.latent_downsample
                     max_img_size = int(self.bagel.max_latent_size * stride)
                     vit_stride = self.bagel.vit_patch_size
