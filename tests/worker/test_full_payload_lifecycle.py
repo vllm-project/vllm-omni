@@ -13,6 +13,7 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -23,9 +24,11 @@ from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.request import RequestStatus
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+from vllm_omni.model_executor.stage_input_processors.qwen3_omni import thinker2talker_full_payload
 from vllm_omni.model_executor.stage_input_processors.qwen3_tts import talker2code2wav_full_payload
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
+from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
 from vllm_omni.worker_v2.omni_data_plane import OmniRunnerDataPlane
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 from vllm_omni.worker_v2.prefix_cache import PrefixCacheRewrite
@@ -111,6 +114,32 @@ def test_replay_keeps_existing_rows_and_appends_only_the_new_suffix():
     host.cleanup_finished_request("preempt")
     _accumulate(host, "preempt", {"hidden": torch.ones(1, 2)}, token_range=(0, 1))
     assert _payload(host, "preempt")["hidden"].shape == (1, 2)
+
+
+def test_qwen3_omni_replay_keeps_request_scoped_tts_embeddings():
+    host = _host()
+    del host._full_payload_replace_keys_cached
+    host._custom_process_func = thinker2talker_full_payload
+    original_hidden = torch.arange(10).reshape(5, 2)
+    replay_hidden = torch.cat([torch.full_like(original_hidden, -1), torch.tensor([[10, 11]])])
+    fields = ("tts_bos", "tts_eos", "tts_pad")
+    for step, hidden in enumerate((original_hidden, replay_hidden)):
+        rows = len(hidden)
+        embeddings = {key: [torch.full((1, 1, 2), 3 * step + index)] for index, key in enumerate(fields)}
+        [payload] = OmniARModelRunner._build_pooler_output_from_cpu(
+            hidden_cpu=hidden,
+            mm_cpu={"embed": embeddings},
+            query_start_loc_np=np.array([0, rows]),
+            num_scheduled_tokens=np.array([rows]),
+            num_reqs=1,
+        )
+        _accumulate(host, "thinker", payload, token_range=(0, rows))
+
+    result = _payload(host, "thinker")
+    assert torch.equal(result["hidden"], torch.arange(12).reshape(6, 2))
+    for key in fields:
+        assert torch.equal(result[f"embed.{key}"], payload[f"embed.{key}"])
+        assert result[f"embed.{key}"].shape == (1, 1, 2)
 
 
 def test_replay_preserves_snapshot_metadata_and_recovered_prefix():
