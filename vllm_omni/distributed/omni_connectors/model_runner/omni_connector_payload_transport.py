@@ -11,13 +11,14 @@ import os
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
+from copy import copy
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.distributed.parallel_state import get_tp_group
 
-from vllm_omni.data_entry_keys import OmniPayload, returns_stage_payload
+from vllm_omni.data_entry_keys import OmniPayload, OmniPayloadStruct, returns_stage_payload, to_dict
 from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime import (
     _OmniConnectorRuntimeMixin,
     logger,
@@ -757,7 +758,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
         self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
 
-    def flush_full_payload_outputs(self, finished_req_ids: set[str]) -> None:
+    def flush_full_payload_outputs(
+        self,
+        finished_req_ids: set[str],
+        *,
+        finished_req_output_token_ids: Mapping[str, list[int]] | None = None,
+    ) -> None:
         """Send accumulated full_payload outputs for requests that just finished."""
         pending_req_ids = set(self._pending_full_payload_send.keys())
         if not (finished_req_ids & pending_req_ids):
@@ -773,7 +779,14 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         for req_id in finished_req_ids:
             entry = self._pending_full_payload_send.pop(req_id, None)
             if entry is not None:
-                to_send[req_id] = self._materialize_full_payload_entry(entry)
+                output, request = self._materialize_full_payload_entry(entry)
+                if finished_req_output_token_ids is not None and req_id in finished_req_output_token_ids:
+                    # Give the processor authoritative terminal IDs without
+                    # modifying the runner's live cached request or its lists.
+                    request = copy(request)
+                    request.output_token_ids = list(finished_req_output_token_ids[req_id])
+                    request.all_token_ids = list(request.prompt_token_ids or []) + request.output_token_ids
+                to_send[req_id] = (output, request)
         logger.debug("[Stage-%s] flush_full_payload_outputs: to_send=%s", self._stage_id, list(to_send.keys()))
         if to_send:
             self.send_full_payload_outputs(scheduler_output=None, outputs=to_send)
@@ -1726,6 +1739,14 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         emitted = 0
         completions: list[Any] = []
         for request, payload in entries:
+            # Read only the tag frozen with this output, not a request buffer
+            # that may already describe the next chunk. Builders can reuse
+            # payloads, so keep request-specific metadata off shared objects.
+            perf_chunk = getattr(request, "_omni_duplex_perf_chunk", None)
+            if perf_chunk is not None:
+                if isinstance(payload, OmniPayloadStruct):
+                    payload = to_dict(payload)
+                payload = {**payload, "meta": {**(payload.get("meta") or {}), "duplex_perf_chunk": list(perf_chunk)}}
             enqueued, completion = self._enqueue_chunk_payload(request, payload, wait_for_delivery=wait_for_delivery)
             if enqueued:
                 emitted += 1

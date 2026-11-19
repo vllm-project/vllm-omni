@@ -16,6 +16,7 @@ from typing import Any, NamedTuple, TypeGuard
 import pytest
 
 from tests.dfx.conftest import (
+    assert_baseline_within_tolerance,
     create_paired_omni_benchmark_pytest_params,
     create_test_parameter_mapping,
     get_benchmark_params_for_server,
@@ -164,6 +165,9 @@ def _start_judge_server(judge_params: dict[str, object]):
         [str(item) for item in extra],
         use_omni=bool(judge_params.get("use_omni", False)),
         env_dict={device_env: visible},
+        # The primary model is alive on another visible device. Its outer
+        # OmniServer owns the final device-memory wait after both servers exit.
+        wait_for_device_memory=False,
     ) as judge:
         print(f"Benchmark judge started on {judge.host}:{judge.port}")
         yield judge
@@ -218,7 +222,16 @@ def _omni_server_env() -> dict[str, str]:
     return {"VLLM_OMNI_STORAGE_PATH": str(storage_path)}
 
 
-def _resolve_offline_model(model: str) -> str:
+def _cli_flag_value(args: tuple[str, ...] | list[str], flag: str) -> str | None:
+    for index, arg in enumerate(args):
+        if arg == flag and index + 1 < len(args):
+            return args[index + 1]
+        if arg.startswith(f"{flag}="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def _resolve_offline_model(model: str, revision: str | None = None) -> str:
     """Resolve HF ids / MiniMax env overrides the same way as the diffusion runner."""
     import huggingface_hub
 
@@ -251,14 +264,15 @@ def _resolve_offline_model(model: str) -> str:
 
     if not huggingface_hub.constants.HF_HUB_OFFLINE:
         return model
-    return hf_api().snapshot_download(model, local_files_only=True)
+    # A pinned download (``hf download --revision <sha>``) caches no refs/main.
+    return hf_api().snapshot_download(model, revision=revision, local_files_only=True)
 
 
 @contextmanager
 def _start_omni_server(server_param):
     test_name, model, stage_config_path, stage_overrides, extra_cli_args, use_omni = server_param
     extra = tuple(extra_cli_args or ())
-    model = _resolve_offline_model(model)
+    model = _resolve_offline_model(model, revision=_cli_flag_value(extra, "--revision"))
 
     print(f"Starting OmniServer with test: {test_name}, model: {model}")
 
@@ -587,6 +601,7 @@ def _maybe_write_omniinteract_aggregate_accuracy_result(
         when=when,
     )
     subsets = params.get(_OMNIINTERACT_AGGREGATE_SUBSETS)
+    max_concurrency = result.get("max_concurrency")
     min_ia_qtf1 = params.get(_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1)
     passed = not _is_finite_number(min_ia_qtf1) or pooled.ia_qtf1 >= float(min_ia_qtf1)
     write_dfx_accuracy_result(
@@ -608,7 +623,7 @@ def _maybe_write_omniinteract_aggregate_accuracy_result(
         },
         branch=str(result.get("branch") or os.environ.get("BUILDKITE_BRANCH", "")),
         num_prompts=pooled.num_prompts,
-        max_concurrency=int(result["max_concurrency"]) if isinstance(result.get("max_concurrency"), int) else None,
+        max_concurrency=max_concurrency if isinstance(max_concurrency, int) else None,
         benchmark_exit_code=0 if passed else 1,
         generation={
             "completed": pooled.completed,
@@ -642,7 +657,9 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
         # close-boundary responses. Preserve its eligibility policy; missing
         # client measurements and unfinished counts remain visible in artifacts.
         config = load_accuracy_config(path, params)
-        selected = select_duplex_eval_baseline(config, result.get("Hardware"))
+        selected = select_duplex_eval_baseline(
+            config, result.get("Hardware"), required=params.get("duplex_eval_require_score_floors", False)
+        )
         assert_accuracy_result(
             result,
             {**config, "baseline": selected},
@@ -685,8 +702,32 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
             assert _is_finite_number(score) and 0 <= score <= 1, "Omni-DuplexEval correction score is invalid"
 
 
-def assert_result(result, params, num_prompt) -> None:
+def assert_result(result, params, num_prompt, *, check_baseline: bool = False, require_baseline: bool = False) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
+    if params.get("dataset_name") == "realtime-video":
+        video = result.get("realtime_video")
+        assert isinstance(video, dict) and video.get("passed") is True, "Realtime video measurement is incomplete"
+        assert not video.get("finalization_errors"), "Realtime video finalization failed"
+        sessions = video.get("sessions")
+        assert isinstance(sessions, list) and len(sessions) == num_prompt, "Realtime video sessions are missing"
+        warmups = video.get("warmups")
+        assert isinstance(warmups, list) and len(warmups) == _resolve_num_warmups(params, default=2), (
+            "Realtime video warmups are missing"
+        )
+        assert all(row.get("success") is True and not row.get("error") for row in [*sessions, *warmups]), (
+            "Realtime video session or warmup failed"
+        )
+        for name in (
+            "mean_e2el_ms",
+            "request_throughput",
+            "mean_video_ttfc_ms",
+            "min_video_fps",
+            "mean_video_steady_interval_ms",
+            "p95_video_steady_interval_ms",
+            "mean_video_rtf",
+        ):
+            value = result.get(name)
+            assert _is_finite_number(value) and value >= 0, f"Realtime video has no valid {name} measurement"
     _assert_fixed_stage_workloads(result, params, num_prompt)
     assert_duplex_artifact_publication(result, params, num_prompt)
     for metric in params.get("required_duplex_metrics", []):
@@ -704,6 +745,15 @@ def assert_result(result, params, num_prompt) -> None:
                 assert _is_finite_number(result.get(f"p{percentile}_{metric}{suffix}")), (
                     f"Missing or invalid P{percentile} {metric}"
                 )
+    hardware = result.get("Hardware")
+    if check_baseline or require_baseline:
+        baseline = result.get("baseline")
+        assert_baseline_within_tolerance(
+            result,
+            baseline if isinstance(baseline, dict) else None,
+            hardware if isinstance(hardware, str) else None,
+            required=require_baseline,
+        )
     if params.get("duplex_performance_only"):
         return
     if params.get("dataset_name") == "omni-duplex-eval":
@@ -768,7 +818,7 @@ def assert_result(result, params, num_prompt) -> None:
     paired_benchmark_params,
     indirect=["omni_server", "benchmark_params"],
 )
-def test_performance_benchmark(omni_server, benchmark_params):
+def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pytest.Config):
     test_name = benchmark_params["test_name"]
     params = dict(benchmark_params["params"])
     dataset_name = params.get("dataset_name", "")
@@ -777,8 +827,13 @@ def test_performance_benchmark(omni_server, benchmark_params):
     if path := params.get("duplex_eval_accuracy_config"):
         from tests.e2e.accuracy.omni_duplex_eval.validation import load_accuracy_config, select_duplex_eval_baseline
 
+        params["duplex_eval_require_score_floors"] = params.get(
+            "duplex_eval_require_score_floors", False
+        ) or pytestconfig.getoption("require_duplex_eval_score_floors")
         accuracy_config = load_accuracy_config(path, params)
-        accuracy_baseline = select_duplex_eval_baseline(accuracy_config, resource_label)
+        accuracy_baseline = select_duplex_eval_baseline(
+            accuracy_config, resource_label, required=params.get("duplex_eval_require_score_floors", False)
+        )
     elif params.get("omniinteract_evaluate"):
         accuracy_baseline = _omniinteract_accuracy_baseline(params, test_name)
     for dataset_prefix in ("omniinteract", "duplex_eval"):
@@ -839,9 +894,11 @@ def test_performance_benchmark(omni_server, benchmark_params):
         _OMNIINTERACT_PERSIST_ARTIFACTS,
         "judge_server_params",
         "duplex_eval_accuracy_config",
+        "duplex_eval_require_score_floors",
         "duplex_eval_score_floor_hardware",
         "duplex_performance_only",
         "required_duplex_metrics",
+        "require_speculative_stage",
         "name",
         "enable_negative_prompt",
         "random_request_config",
@@ -902,7 +959,13 @@ def test_performance_benchmark(omni_server, benchmark_params):
             )
             assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
             try:
-                assert_result(result, assert_params, num_prompt)
+                assert_result(
+                    result,
+                    assert_params,
+                    num_prompt,
+                    check_baseline=pytestconfig.getoption("assert_baseline"),
+                    require_baseline=pytestconfig.getoption("require_baseline"),
+                )
             finally:
                 _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)
 
@@ -938,9 +1001,28 @@ def test_performance_benchmark(omni_server, benchmark_params):
             )
             assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
             try:
-                assert_result(result, assert_params, num_prompt)
+                assert_result(
+                    result,
+                    assert_params,
+                    num_prompt,
+                    check_baseline=pytestconfig.getoption("assert_baseline"),
+                    require_baseline=pytestconfig.getoption("require_baseline"),
+                )
             finally:
                 _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)
+        if (stage_id := params.get("require_speculative_stage")) is not None:
+            import httpx
+            from prometheus_client.parser import text_string_to_metric_families
+
+            response = httpx.get(f"http://{host}:{port}/metrics", timeout=10)
+            response.raise_for_status()
+            assert any(
+                sample.name == "vllm:spec_decode_num_accepted_tokens_total"
+                and sample.labels.get("stage") == str(stage_id)
+                and sample.value > 0
+                for family in text_string_to_metric_families(response.text)
+                for sample in family.samples
+            ), f"Stage {stage_id} accepted no speculative tokens"
     finally:
         if artifact_root is not None:
             artifact_root.cleanup()

@@ -20,11 +20,12 @@ import numpy as np
 import torch
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
-from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, random_sample, register_top_k_top_p_warmups
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, register_top_k_top_p_warmups
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
+from vllm_omni.utils.seeded_exponential import categorical_sample as random_sample
 from vllm_omni.worker_v2.omni_sampler import OmniSampler
 
 logger = init_logger(__name__)

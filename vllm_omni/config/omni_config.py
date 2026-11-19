@@ -82,6 +82,7 @@ _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
     {
         "async_chunk",
         "disable_log_stats",
+        "disable_websocket_compression",
         "command",
         "headless",
         "model",
@@ -93,6 +94,8 @@ _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
         "stage_id",
         "subparser",
         "tokenizer",
+        "video_output_warmup",
+        "video_output_warmup_timeout",
     }
 )
 
@@ -536,7 +539,7 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     active_stream_window: int = Field(default=0, ge=0)
     session_mode: str = "turn"
     duplex_max_sessions: int = Field(default=1, ge=1)
-    use_v2_model_runner: bool = False
+    use_v2_model_runner: bool = True
     supports_native_mrv2_data_plane: bool = False
     enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None
@@ -2183,7 +2186,10 @@ def _build_model_config(
         kwargs["custom_voice_dir"] = _copy_value(deploy.custom_voice_dir)
     stage_runner = resolve_stage_model_runner(deploy, stage_deploy)
     validate_native_mrv2_session(deploy, topology, stage_runner)
-    kwargs.setdefault("use_v2_model_runner", stage_runner == "v2")
+    kwargs.setdefault(
+        "use_v2_model_runner",
+        stage_runner == "v2" and topology.execution_type is not StageExecutionType.DIFFUSION,
+    )
     kwargs.setdefault(
         "supports_native_mrv2_data_plane",
         topology.supports_native_mrv2_data_plane,
@@ -2464,7 +2470,8 @@ class VllmOmniConfig:
             from vllm_omni.config.composable_parallel import apply_strategy_specs
 
             strategy_stages = merge_pipeline_deploy(pipeline_cfg, copy.deepcopy(deploy))
-            strategy_result = apply_strategy_specs(strategy_stages, strategy_specs)
+            # Device counts are checked below, once CLI overrides are applied.
+            strategy_result = apply_strategy_specs(strategy_stages, strategy_specs, check_devices=False)
             strategy_overrides: dict[str, Any] = {}
             axis_fields = {
                 "tp": "tensor_parallel_size",
