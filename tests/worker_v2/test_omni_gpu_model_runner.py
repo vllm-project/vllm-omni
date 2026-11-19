@@ -969,3 +969,79 @@ def test_drafter_target_layers_reach_execute_state(cg_mode, monkeypatch):
     assert runner.execute_model_state.aux_hidden_states is current_aux
     assert runner._last_aux_output is None
     assert previous_state.aux_hidden_states is aux
+
+
+class _FixedSignatureModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def forward(self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None):
+        self.calls += 1
+        return input_ids.float() + positions
+
+
+class _VarKwargsModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.seen: dict[str, Any] | None = None
+
+    def forward(self, input_ids, positions, **kwargs):
+        self.seen = kwargs
+        return input_ids
+
+
+def _legacy_runner(model: torch.nn.Module, *, native: bool) -> OmniGPUModelRunner:
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = model
+    runner.sampler = object()
+    runner._omni_data_plane = object() if native else None
+    return runner
+
+
+def _legacy_inputs() -> tuple[dict[str, Any], SimpleNamespace]:
+    batch = SimpleNamespace(logits_indices=torch.tensor([1]))
+    model_inputs = {
+        "input_ids": torch.tensor([2, 5]),
+        "positions": torch.tensor([0, 1]),
+        "inputs_embeds": None,
+        "intermediate_tensors": None,
+    }
+    return model_inputs, batch
+
+
+def test_call_model_filters_legacy_inputs_for_fixed_signature():
+    model = _FixedSignatureModel()
+    runner = _legacy_runner(model, native=False)
+    model_inputs, batch = _legacy_inputs()
+    runner._add_legacy_forward_inputs(model_inputs, batch)
+    assert {"sampling_metadata", "logits_index", "sampler"} <= set(model_inputs)
+
+    output = runner._call_model(model_inputs, input_batch=batch, batch_desc=None)
+
+    torch.testing.assert_close(output, torch.tensor([2.0, 6.0]))
+    assert model.calls == 1
+
+
+def test_call_model_keeps_legacy_inputs_for_var_kwargs_model():
+    model = _VarKwargsModel()
+    runner = _legacy_runner(model, native=False)
+    model_inputs, batch = _legacy_inputs()
+    runner._add_legacy_forward_inputs(model_inputs, batch)
+
+    runner._call_model(model_inputs, input_batch=batch, batch_desc=None)
+
+    assert model.seen is not None
+    assert {"sampling_metadata", "logits_index", "sampler"} <= set(model.seen)
+
+
+def test_call_model_native_plane_never_adds_legacy_inputs():
+    model = _VarKwargsModel()
+    runner = _legacy_runner(model, native=True)
+    model_inputs, batch = _legacy_inputs()
+    runner._add_legacy_forward_inputs(model_inputs, batch)
+
+    runner._call_model(model_inputs, input_batch=batch, batch_desc=None)
+
+    assert model.seen is not None
+    assert not ({"sampling_metadata", "logits_index", "sampler"} & set(model.seen))
