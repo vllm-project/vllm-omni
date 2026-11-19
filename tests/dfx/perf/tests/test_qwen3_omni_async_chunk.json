@@ -17,8 +17,11 @@
     ],
     "server_params": {
       "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+      "stage_config_name": "qwen3_omni_moe_mrv2.yaml",
       "extra_cli_args": [
-        "--async-chunk"
+        "--async-chunk",
+        "--stage-init-timeout",
+        "900"
       ]
     },
     "benchmark_params": [

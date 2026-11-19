@@ -2156,6 +2156,30 @@ def test_inline_deploy_modifications_require_a_deploy_path(tmp_path, field):
         _create_unique_server_params([config], tmp_path)
 
 
+def test_qwen3_omni_async_perf_resolves_mrv2_and_preserves_cold_start_timeout():
+    from tests.dfx.conftest import _create_unique_server_params
+    from tests.dfx.perf.scripts.run_benchmark import (
+        _cli_flag_value,
+        _merge_omni_default_server_args,
+    )
+
+    config_path = Path(__file__).with_name("test_qwen3_omni_async_chunk.json")
+    config = json.loads(config_path.read_text(encoding="utf-8"))[0]
+    deploy_dir = Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy"
+
+    row = _create_unique_server_params([config], deploy_dir)[0]
+    assert Path(row[2] or "") == deploy_dir / "qwen3_omni_moe_mrv2.yaml"
+
+    extra_cli_args = list(row[4])
+    effective_args = extra_cli_args + _merge_omni_default_server_args(
+        extra_cli_args,
+        use_omni=row[5],
+    )
+    assert effective_args.count("--stage-init-timeout") == 1
+    assert _cli_flag_value(effective_args, "--stage-init-timeout") == "900"
+    assert _cli_flag_value(effective_args, "--init-timeout") == "900"
+
+
 @pytest.mark.parametrize("extra", [("--revision", "a" * 40), (f"--revision={'a' * 40}",), ()])
 def test_offline_model_resolution_uses_the_pinned_revision(monkeypatch, extra):
     import huggingface_hub
