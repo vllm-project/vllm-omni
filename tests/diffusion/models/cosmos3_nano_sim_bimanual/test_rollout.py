@@ -144,6 +144,8 @@ def fake_pipeline(*, prefix: bool = True, unified: bool = False) -> tuple[Any, A
     pipe.manifest = manifest()
     pipe._states = {}
     pipe._bound_session_id = None
+    pipe._admission_spec = None
+    pipe._bind_admitted_session = None
     pipe._ar_diffusion_kv_state = None
     pipe._decode_queue = None
     pipe._request_session_id = None
@@ -346,16 +348,19 @@ def test_action_space_change_rejects_continuation_without_mutation() -> None:
 @pytest.mark.parametrize(
     "extra,match",
     [
+        ({"guidance_scale": 2.0}, "guidance_scale"),
         ({"action_space": "unknown"}, "action_space"),
         ({"action_mode": "forward_dynamics"}, "requires action"),
         ({"action": [[True] * 29] * 60}, "booleans"),
         ({"action": [[0.0] * 29] * 16}, "action length"),
     ],
 )
-def test_invalid_actions_do_not_mutate_session(extra: dict, match: str) -> None:
+def test_invalid_inputs_do_not_activate_session(extra: dict, match: str) -> None:
     pipe, _ = fake_pipeline()
+    pipe._bind_admitted_session = Mock()
     with pytest.raises(ARDiffusionRequestRejectedError, match=match):
         pipe.forward(request(**extra))
+    pipe._bind_admitted_session.assert_not_called()
     assert pipe._states == {}
     pipe._drop_session.assert_not_called()
     pipe._sample_distilled.assert_not_called()

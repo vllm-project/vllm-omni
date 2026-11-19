@@ -7,7 +7,7 @@ import gc
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
@@ -583,14 +583,14 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             return tick.session_id, extra_args, tick
         return str(extra_args.get("session_id") or "default"), extra_args, None
 
-    def _prepare_ar_request(
+    def _resolve_ar_request(
         self,
         req: OmniDiffusionRequest,
         session_id: str,
         *,
         reset: bool = False,
-    ) -> object | None:
-        """Validate request geometry before resetting sessions or replacing pools."""
+    ) -> tuple[ARDiffusionKVCacheSpec, object | None]:
+        """Resolve admission geometry without changing resident sessions."""
         capability = self._ar_diffusion_capability
         geometry_key: object | None = None
         requested_spec = self._ar_diffusion_kv_cache_spec
@@ -628,11 +628,13 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
 
         if requested_spec is None:
             raise RuntimeError("AR-Diffusion request specification is unavailable")
+        return requested_spec, geometry_key
+
+    def _activate_ar_request(self, requested_spec: ARDiffusionKVCacheSpec, session_id: str, reset: bool) -> None:
         if requested_spec != self._ar_diffusion_kv_cache_spec:
             self._rebuild_for_spec(requested_spec)
         elif reset:
             self.reset_session(session_id)
-        return geometry_key
 
     @contextmanager
     def _bound_ar_session(
@@ -835,14 +837,26 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         session_id, extra_args, tick = self._request_session(req)
         reset = tick.reset if tick is not None else bool(extra_args.get("reset", False))
         close_session = tick.close_session if tick is not None else bool(extra_args.get("close_session", False))
-        geometry_key = self._prepare_ar_request(req, session_id, reset=reset)
+        spec, geometry_key = self._resolve_ar_request(req, session_id, reset=reset)
         started = time.perf_counter()
-        with self._bound_ar_session(
-            session_id,
-            description="forward",
-            geometry_key=geometry_key,
-            preserve_rejected_session=True,
-        ):
+        bound = False
+        with ExitStack() as stack:
+
+            def bind() -> None:
+                nonlocal bound
+                self._activate_ar_request(spec, session_id, reset)
+                stack.enter_context(
+                    self._bound_ar_session(
+                        session_id, description="forward", geometry_key=geometry_key, preserve_rejected_session=True
+                    )
+                )
+                bound = True
+
+            defer_binding = getattr(self._ar_diffusion_capability, "defer_ar_diffusion_binding", None)
+            if callable(defer_binding):
+                stack.enter_context(defer_binding(session_id, spec, bind))
+            else:
+                bind()
             output = super().execute_model(
                 req, kv_prefetch_job=kv_prefetch_job, diffusion_kv_metadata=diffusion_kv_metadata
             )
@@ -850,9 +864,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         if getattr(output, "error", None):
             # The base runner serializes OmniClientError into DiffusionOutput,
             # so _bound_ar_session cannot observe it as a failed forward.
-            if getattr(output, "error_type", None) != AR_DIFFUSION_REQUEST_REJECTED_ERROR_TYPE:
+            if bound and getattr(output, "error_type", None) != AR_DIFFUSION_REQUEST_REJECTED_ERROR_TYPE:
                 self._release_session(session_id, reset_model=False, reason="forward_error", suppress_errors=True)
-        elif close_session:
+        elif bound and close_session:
             self.close_session(session_id)
         return output
 
@@ -1019,7 +1033,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 None,
             )
             if new_req is not None:
-                geometry_key = self._prepare_ar_request(new_req, session_id)
+                spec, geometry_key = self._resolve_ar_request(new_req, session_id)
+                self._activate_ar_request(spec, session_id, reset=False)
             elif session_id not in self._sessions:
                 raise RuntimeError(f"AR-Diffusion cached request {request_id!r} has no resident KV session")
         chunk_started = self._stepwise_chunk_started.setdefault(request_id, time.perf_counter())

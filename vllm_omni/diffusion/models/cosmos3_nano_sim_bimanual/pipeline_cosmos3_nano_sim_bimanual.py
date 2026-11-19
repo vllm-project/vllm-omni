@@ -228,6 +228,8 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     _SESSION_CAPACITY = 1
     _ar_diffusion_kv_state = None
     _bound_session_id: str | None = None
+    _admission_spec: ARDiffusionKVCacheSpec | None = None
+    _bind_admitted_session: Callable[[], None] | None = None
     clean_commit_mode: str = "batched"
     overlap_vae_decode: bool = True
     _decode_queue: CausalDecodeQueue | None = None
@@ -495,6 +497,19 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 "Cosmos3-Nano-Sim-Bimanual bound AR-Diffusion KV cache violates the "
                 f"resolved model specification ({details})."
             )
+
+    @contextmanager
+    def defer_ar_diffusion_binding(self, session_id: str, spec: ARDiffusionKVCacheSpec, bind: Callable[[], None]):
+        """Let forward validate and prepare conditioning before replacing resident history."""
+        self._bound_session_id = session_id
+        self._admission_spec = spec
+        self._bind_admitted_session = bind
+        try:
+            yield
+        finally:
+            self._bound_session_id = None
+            self._admission_spec = None
+            self._bind_admitted_session = None
 
     @contextmanager
     def bind_ar_diffusion_state(self, session_id, state):
@@ -771,7 +786,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
 
     def _prompt_token_limit(self, sp: Any, prompt_data: Any) -> int:
         schema = self.manifest.require_action_schema()
-        if schema.schema_version == 5 and self._ar_diffusion_kv_state is None:
+        if schema.schema_version == 5 and self._ar_diffusion_kv_state is None and self._admission_spec is None:
             return 1 << 30
         return self.manifest.text_cache_max_len
 
@@ -1544,7 +1559,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         except ValueError as exc:
             raise ARDiffusionRequestRejectedError(str(exc)) from exc
         if typed_tick is not None:
-            if self._ar_diffusion_kv_state is None:
+            if self._ar_diffusion_kv_state is None and self._admission_spec is None:
                 raise ARDiffusionRequestRejectedError(
                     "Cosmos3-Nano-Sim-Bimanual typed ticks require ARDiffusionEngine session binding."
                 )
@@ -1703,9 +1718,13 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                     "Cosmos3-Nano-Sim-Bimanual full rollout target precedes existing "
                     "session state; session reset required."
                 )
-        if self.manifest.window_frames is None and self._ar_diffusion_kv_state is not None:
-            capacity = self._ar_diffusion_kv_state.kv_cache.spec.window_chunks
-            if target_frame > capacity:
+        if self.manifest.window_frames is None:
+            capacity = None
+            if self._admission_spec is not None:
+                capacity = self._admission_spec.window_frames
+            elif self._ar_diffusion_kv_state is not None:
+                capacity = self._ar_diffusion_kv_state.kv_cache.spec.window_chunks
+            if capacity is not None and target_frame > capacity:
                 raise ARDiffusionRequestRejectedError(
                     f"Full-history rollout needs {target_frame} latent frames; allocated capacity is {capacity}. "
                     "Set num_frames to the complete session length before starting the rollout."
@@ -1750,6 +1769,9 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 raise ARDiffusionRequestRejectedError(str(exc)) from exc
 
         # ---- Side effects begin ---------------------------------------------
+        if self._bind_admitted_session is not None:
+            self._bind_admitted_session()
+            self._validate_bound_kv_geometry(self._ar_diffusion_kv_state, geometry)
         self._request_session_id = session_id
         tick_durations: dict[str, float] = {}
         self._sync_for_tick_timing(measure_tick_latency)
