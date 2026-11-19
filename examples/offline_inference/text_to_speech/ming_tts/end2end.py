@@ -85,7 +85,6 @@ def _build_parser() -> FlexibleArgumentParser:
     p.add_argument("--stage-init-timeout", type=int, default=300, help="Per-stage init timeout (s)")
     p.add_argument("--init-timeout", type=int, default=600, help="Total init timeout (s)")
     p.add_argument("--batch-timeout", type=int, default=5, help="Batch timeout (s)")
-    p.add_argument("--shm-threshold-bytes", type=int, default=65536)
     p.add_argument("--worker-backend", default="multi_process", choices=["multi_process", "ray"])
     p.add_argument("--ray-address", default=None, help="Ray cluster address (--worker-backend ray)")
     return p

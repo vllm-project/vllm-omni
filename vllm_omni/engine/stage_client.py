@@ -6,11 +6,12 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict
 
 if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest
 
+    from vllm_omni.engine import PayloadSenderInfo
     from vllm_omni.inputs.data import (
         OmniDiffusionSamplingParams,
         OmniInteractionPrompt,
@@ -100,6 +101,14 @@ class StagePoolLLMClient(StagePoolClient, Protocol):
     def get_payload_sender_info(self) -> dict[str, Any] | None: ...
 
 
+class DiffusionSubmitKwargs(TypedDict, total=False):
+    """Kwargs the orchestrator passes to `StagePoolDiffusionClient.add_request_async`."""
+
+    kv_sender_info: dict[int, dict[str, Any]] | None
+    kv_transfer_params: dict[str, Any] | None
+    payload_sender_info: PayloadSenderInfo | None
+
+
 class StagePoolDiffusionClient(StagePoolClient, Protocol):
     """Pool-facing API for diffusion stages."""
 
@@ -110,6 +119,7 @@ class StagePoolDiffusionClient(StagePoolClient, Protocol):
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
         kv_transfer_params: dict[str, Any] | None = None,
+        payload_sender_info: PayloadSenderInfo | None = None,
     ) -> None: ...
 
     def get_diffusion_output_nowait(self) -> OmniRequestOutput | None: ...

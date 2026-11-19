@@ -193,45 +193,6 @@ class Cosmos3NanoSimBimanualJointAttention(Cosmos3CrossAttention):
 class Cosmos3NanoSimBimanualGenDecoderLayer(Cosmos3GenDecoderLayer):
     """Cosmos3 GEN layer with causal joint attention and unchanged weight names."""
 
-    def __init__(
-        self,
-        *,
-        layer_idx: int | None = None,
-        hidden_size: int,
-        intermediate_size: int,
-        num_attention_heads: int,
-        num_key_value_heads: int,
-        head_dim: int,
-        rms_norm_eps: float,
-        quant_config=None,
-        mlp_cls,
-        qk_norm: bool = True,
-        prefix: str = "",
-    ) -> None:
-        super().__init__(
-            layer_idx=layer_idx,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_attention_heads=num_attention_heads,
-            num_key_value_heads=num_key_value_heads,
-            head_dim=head_dim,
-            rms_norm_eps=rms_norm_eps,
-            quant_config=quant_config,
-            mlp_cls=mlp_cls,
-            qk_norm=qk_norm,
-            prefix=prefix,
-        )
-        self.cross_attention = Cosmos3NanoSimBimanualJointAttention(
-            hidden_size=hidden_size,
-            num_attention_heads=num_attention_heads,
-            num_key_value_heads=num_key_value_heads,
-            head_dim=head_dim,
-            rms_norm_eps=rms_norm_eps,
-            quant_config=quant_config,
-            qk_norm=qk_norm,
-            prefix=f"{prefix}.cross_attention",
-        )
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -255,6 +216,7 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
     _hsdp_forward_methods = ("encode_und_kv",)
     _inductor_cudagraphs = False
     _gen_layer_cls = Cosmos3NanoSimBimanualGenDecoderLayer
+    _cross_attention_cls = Cosmos3NanoSimBimanualJointAttention
     _repeated_blocks = ["Cosmos3NanoSimBimanualGenDecoderLayer"]
 
     def _language_model_kwargs(self) -> dict[str, Any]:

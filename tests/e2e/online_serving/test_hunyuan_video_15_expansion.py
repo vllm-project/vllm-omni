@@ -5,7 +5,7 @@ Tests of common diffusion feature combinations in online serving mode
 for HunyuanVideo-1.5-T2V (480p).
 
 Coverage:
-- Default single-card deployment (H100, B200, or Ascend A2) — ``full_model``
+- Default single-card deployment (H100, B200, MI325, or Ascend A2) — ``full_model``
 - CPU offloading (1 H100 or Ascend A2) — ``core_model`` + ``advanced_model``
 - CacheDiT + Layerwise CPU offloading (1 H100, B200, or Ascend A2) — ``full_model``
 - CacheDiT + TP=2 + VAE patch parallel=2 (2 H100s, B200s, or Ascend A2s) — ``full_model``
@@ -129,14 +129,17 @@ def _run_hunyuan_video_15_t2v(
     online_client.send_video_diffusion_request(request_config)
 
 
-@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A2"}, num_cards=1)
+@hardware_test(
+    res={"cuda": ["H100", "B200"], "npu": "A2", "rocm": "MI325"},
+    num_cards=1,
+)
 @pytest.mark.full_model
 @pytest.mark.parametrize("omni_server", DEFAULT_TEST_PARAMS, indirect=True)
 def test_hunyuan_video_15_t2v_default(
     omni_server: OmniServer,
     online_client: OnlineOmniClient,
 ) -> None:
-    """Generate a short video with the shared default GPU/NPU configuration."""
+    """Generate a short video with the shared default GPU, ROCm, or NPU configuration."""
     _run_hunyuan_video_15_t2v(omni_server, online_client)
 
 

@@ -10,6 +10,7 @@ from typing import Any
 import torch
 
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.dense_attention import CosmosSimDenseAttentionCache
+from vllm_omni.experimental.ar_diffusion.streaming_decode import StreamingDecodeState
 
 
 def append_dense_kv_history(
@@ -175,8 +176,7 @@ class Cosmos3NanoSimBimanualSessionState:
     dense_attention: CosmosSimDenseAttentionCache | None = None
     frustum_archive: Any = None
     latents: list[torch.Tensor] = field(default_factory=list)
-    vae_decoder_feat_cache: list[Any] | None = None
-    vae_decoder_initialized: bool = False
+    vae_decode: StreamingDecodeState | None = None
     last_vae_decode_input_frames: int = 0
     max_vae_decode_input_frames: int = 0
 
@@ -245,16 +245,9 @@ class Cosmos3NanoSimBimanualSessionState:
             self.latents.append(chunk.detach())
         self.next_frame_idx += int(chunk.shape[2])
 
-    def record_incremental_decode(
-        self,
-        *,
-        input_frames: int,
-        feature_cache: list[Any],
-    ) -> None:
+    def record_incremental_decode(self, *, input_frames: int) -> None:
         if input_frames <= 0:
             raise ValueError(f"Cosmos3-Nano-Sim-Bimanual decode input_frames must be positive, got {input_frames}")
-        self.vae_decoder_feat_cache = feature_cache
-        self.vae_decoder_initialized = True
         self.last_vae_decode_input_frames = int(input_frames)
         self.max_vae_decode_input_frames = max(self.max_vae_decode_input_frames, int(input_frames))
 
@@ -268,8 +261,9 @@ class Cosmos3NanoSimBimanualSessionState:
         self.dense_attention = None
         self.frustum_archive = None
         self.latents.clear()
-        self.vae_decoder_feat_cache = None
-        self.vae_decoder_initialized = False
+        if self.vae_decode is not None:
+            self.vae_decode.release()
+            self.vae_decode = None
         self.last_vae_decode_input_frames = 0
         self.max_vae_decode_input_frames = 0
 

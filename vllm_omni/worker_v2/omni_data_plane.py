@@ -10,12 +10,13 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from queue import Full, Queue
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import OmniPayload, flatten_payload, unflatten_payload
+from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     should_accumulate_full_payload_output,
@@ -25,6 +26,9 @@ from vllm_omni.worker_v2.delivery import (
     DeliveryTimeoutError,
     OmniDeliveryManager,
 )
+
+if TYPE_CHECKING:
+    from vllm_omni.outputs import OmniModelRunnerOutput
 
 
 @dataclass
@@ -68,7 +72,13 @@ class _NativeRequestState:
                 self.output_stopped = True
                 break
 
-    def snapshot(self, *, include_token_history: bool, sampled_token_ids: list[int] | None = None) -> SimpleNamespace:
+    def snapshot(
+        self,
+        *,
+        include_token_history: bool,
+        sampled_token_ids: list[int] | None = None,
+        perf_chunk: tuple[int, int] | None = None,
+    ) -> SimpleNamespace:
         prompt = list(self.prompt_token_ids) if include_token_history else []
         output = list(self.output_token_ids) if include_token_history else []
         finished = self.finished
@@ -86,6 +96,7 @@ class _NativeRequestState:
             sampled_token_ids=list(sampled_token_ids or ()),
             additional_information=self.additional_information,
             model_intermediate_buffer=self.model_intermediate_buffer,
+            _omni_duplex_perf_chunk=perf_chunk,
             sampling_params=self.sampling_params,
             num_computed_tokens=self.num_computed_tokens,
             resumable=self.resumable,
@@ -100,6 +111,9 @@ class _NativeOutputBatch:
     req_ids: list[str]
     inter_stage_outputs: list[Any | None] | None
     sampled_token_ids: list[list[int]] | None
+    perf_chunks: dict[str, tuple[int, int]] | None = None
+    full_payload_token_ranges: dict[str, tuple[int, int]] | None = None
+    full_payload_prefix_cache_keys: dict[str, frozenset[str]] | None = None
 
 
 _NATIVE_OUTPUT_STOP = object()
@@ -118,6 +132,8 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         self._native_send_lock = threading.Lock()
         self._native_outputs_in_flight: dict[str, int] = defaultdict(int)
         self._native_terminal_pending: set[str] = set()
+        # External ids released by the orchestrator while still live here.
+        self._deferred_shm_releases: set[str] = set()
         # Stage payload builders read the stage config through
         # ``_get_model_config()`` (e.g. Qwen3-Omni's Thinker reads
         # ``hf_config.talker_config.accept_hidden_layer``).
@@ -199,11 +215,31 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                     req_ids=batch.req_ids,
                     inter_stage_outputs=batch.inter_stage_outputs,
                     sampled_token_ids=batch.sampled_token_ids,
+                    perf_chunks=batch.perf_chunks,
+                    full_payload_token_ranges=batch.full_payload_token_ranges,
+                    full_payload_prefix_cache_keys=batch.full_payload_prefix_cache_keys,
                 )
             except BaseException as error:
                 self._record_output_error(error)
             finally:
                 self._native_output_queue.task_done()
+
+    def publish_output(self, output: OmniModelRunnerOutput) -> None:
+        """Enqueue a materialized batch and remove transported output aliases."""
+        inter_stage_outputs = getattr(output, "inter_stage_outputs", None)
+        self.enqueue_outputs(
+            req_ids=list(output.req_ids),
+            inter_stage_outputs=inter_stage_outputs,
+            sampled_token_ids=getattr(output, "sampled_token_ids", None),
+            perf_chunks=output._duplex_perf_chunks,
+            full_payload_token_ranges=getattr(output, "full_payload_token_ranges", None),
+            full_payload_prefix_cache_keys=getattr(output, "full_payload_prefix_cache_keys", None),
+        )
+        # Clear only after enqueueing succeeds: the queue retains the payload.
+        # Keep independent pooling results and inline output without a send path.
+        if inter_stage_outputs is not None and output.pooler_output is inter_stage_outputs and self._can_send:
+            output.pooler_output = None
+        output.inter_stage_outputs = None
 
     def enqueue_outputs(
         self,
@@ -211,6 +247,9 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         req_ids: list[str],
         inter_stage_outputs: list[Any | None] | None,
         sampled_token_ids: list[list[int]] | None,
+        perf_chunks: dict[str, tuple[int, int]] | None = None,
+        full_payload_token_ranges: dict[str, tuple[int, int]] | None = None,
+        full_payload_prefix_cache_keys: dict[str, frozenset[str]] | None = None,
     ) -> None:
         """Transfer one completed model batch to the ordered output worker."""
         self._raise_output_error()
@@ -220,6 +259,15 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             req_ids=req_ids,
             inter_stage_outputs=inter_stage_outputs,
             sampled_token_ids=sampled_token_ids,
+            perf_chunks=perf_chunks,
+            full_payload_token_ranges=(
+                dict(full_payload_token_ranges) if full_payload_token_ranges is not None else None
+            ),
+            full_payload_prefix_cache_keys=(
+                {req_id: frozenset(keys) for req_id, keys in full_payload_prefix_cache_keys.items()}
+                if full_payload_prefix_cache_keys is not None
+                else None
+            ),
         )
         while True:
             try:
@@ -279,6 +327,10 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         req_id = str(request_data.req_id)
         external_req_id = str(getattr(request_data, "external_req_id", None) or req_id)
         with self._native_output_lock:
+            # MRv2 admits preempted requests through scheduled_new_reqs again.
+            # Keep the live token history and deferred output holds until terminal cleanup.
+            if req_id in self._native_requests:
+                return
             self._native_outputs_in_flight.pop(req_id, None)
             self._native_terminal_pending.discard(req_id)
             self._native_requests[req_id] = _NativeRequestState(
@@ -295,6 +347,10 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
     def reserve_outputs(self, req_ids: list[str]) -> None:
         """Keep request state alive until deferred runner outputs are consumed."""
         self._raise_output_error()
+        # Native TP executors materialize async output on the replying leader
+        # only. A peer rank never completes a deferred publication hold.
+        if not self.is_data_transfer_rank():
+            return
         with self._native_output_lock:
             for req_id in dict.fromkeys(req_ids):
                 if req_id in self._native_requests:
@@ -334,6 +390,8 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             # Receivers are registered before requests acquire model slots.
             # Cancelling during that interval must still stop recv polling.
             for req_id in req_ids - active_req_ids:
+                # Drop the pending payload before cleanup can flush it.
+                self._pending_full_payload_send.pop(req_id, None)
                 self.cleanup_finished_request(req_id)
             if not active_req_ids:
                 return 0
@@ -343,6 +401,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 self._native_terminal_pending.discard(req_id)
                 # Cancellation must not flush a partially accumulated utterance.
                 self._pending_full_payload_send.pop(req_id, None)
+                self._drop_full_payload_token_end(req_id)
             return self.emit_chunks(
                 req_ids=[],
                 inter_stage_outputs=None,
@@ -356,6 +415,9 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         req_ids: list[str],
         inter_stage_outputs: list[Any | None] | None,
         sampled_token_ids: list[list[int]] | None,
+        perf_chunks: dict[str, tuple[int, int]] | None = None,
+        full_payload_token_ranges: dict[str, tuple[int, int]] | None = None,
+        full_payload_prefix_cache_keys: dict[str, frozenset[str]] | None = None,
     ) -> int:
         """Commit one deferred output batch, then release its lifecycle holds."""
         send_lock_held = False
@@ -365,6 +427,9 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 inter_stage_outputs=inter_stage_outputs,
                 sampled_token_ids=sampled_token_ids,
                 terminal_req_ids=set(),
+                perf_chunks=perf_chunks,
+                full_payload_token_ranges=full_payload_token_ranges,
+                full_payload_prefix_cache_keys=full_payload_prefix_cache_keys,
             )
             # Claim connector ordering before publishing the updated request
             # state. request_terminal() can still register a pending terminal
@@ -522,6 +587,9 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         inter_stage_outputs: list[Any | None] | None,
         sampled_token_ids: list[list[int]] | None,
         terminal_req_ids: set[str],
+        perf_chunks: dict[str, tuple[int, int]] | None = None,
+        full_payload_token_ranges: dict[str, tuple[int, int]] | None = None,
+        full_payload_prefix_cache_keys: dict[str, frozenset[str]] | None = None,
     ) -> tuple[list[tuple[Any, Any | None]], list[str]]:
         if not getattr(self, "_can_send", True):
             receive_finished_ids = [req_id for req_id in sorted(terminal_req_ids) if req_id in self._native_requests]
@@ -556,23 +624,43 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 # finished. Reuse V1's concat/replace contract for flat outputs
                 # and retain the final token history for codec-row cropping.
                 if isinstance(payload, dict):
-                    self.accumulate_full_payload_output(req_id, flatten_payload(payload), state)
+                    token_range = None if full_payload_token_ranges is None else full_payload_token_ranges.get(req_id)
+                    cache_keys = (
+                        frozenset()
+                        if full_payload_prefix_cache_keys is None
+                        else full_payload_prefix_cache_keys.get(req_id, frozenset())
+                    )
+                    self.accumulate_full_payload_output(
+                        req_id,
+                        flatten_payload(payload),
+                        state,
+                        token_range=token_range,
+                        prefix_cache_keys=cache_keys,
+                    )
                 if not state.finished:
                     continue
                 accumulated = self._pending_full_payload_send.pop(req_id, None)
+                self._drop_full_payload_token_end(req_id)
                 payload = self._materialize_full_payload_entry(accumulated)[0] if accumulated is not None else None
             if self._async_chunk and isinstance(payload, dict):
                 payload = unflatten_payload(payload)
-            if payload is None and not state.finished:
+            token_only_producer = bool(
+                getattr(getattr(self, "_custom_process_func", None), "_requires_full_token_history", False)
+            )
+            if payload is None and not state.finished and not token_only_producer:
                 continue
             include_token_history = bool(
-                not self._async_chunk or state.resumable or self._put_req_chunk.get(state.external_req_id, 0) == 0
+                token_only_producer
+                or not self._async_chunk
+                or state.resumable
+                or self._put_req_chunk.get(state.external_req_id, 0) == 0
             )
             entries.append(
                 (
                     state.snapshot(
                         include_token_history=include_token_history,
                         sampled_token_ids=sampled_by_req.get(req_id) if not state.finished else None,
+                        perf_chunk=(perf_chunks or {}).get(req_id),
                     ),
                     payload,
                 )
@@ -599,8 +687,44 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
 
     def _cleanup_finished_entries(self, finished_req_ids: list[str]) -> None:
         for req_id in finished_req_ids:
-            self._native_requests.pop(req_id, None)
+            state = self._native_requests.pop(req_id, None)
             self.cleanup_finished_request(req_id)
+            if state is not None and state.external_req_id in self._deferred_shm_releases:
+                self._deferred_shm_releases.discard(state.external_req_id)
+                self._unlink_unconsumed(state.external_req_id)
+
+    def _unlink_unconsumed(self, external_req_id: str) -> int:
+        connector = getattr(self, "_omni_connector", None)
+        if not isinstance(connector, SharedMemoryConnector):
+            return 0
+        return connector.cleanup_prefix(f"{external_req_id}_{self._stage_id}_")
+
+    def release_shm_resources(self, request_ids: list[str]) -> int:
+        """Unlink segments these requests left unconsumed; return the count.
+
+        Safe only once every stage has finished with the request: a consumer
+        that stopped early (or never ran, e.g. a text-only request's Talker)
+        never unlinks what this stage put. The orchestrator drives this, and
+        can do so before this stage's terminal put lands, so a request still
+        live here is reclaimed when its terminal delivery is cleaned up.
+        """
+        if not isinstance(getattr(self, "_omni_connector", None), SharedMemoryConnector):
+            return 0
+        reclaimed = 0
+        with self._native_output_lock:
+            live = {state.external_req_id for state in self._native_requests.values()}
+            for request_id in request_ids:
+                state = self._native_requests.get(request_id)
+                external_req_id = (
+                    state.external_req_id
+                    if state is not None
+                    else self._request_ids_mapping.get(request_id, request_id)
+                )
+                if external_req_id in live:
+                    self._deferred_shm_releases.add(external_req_id)
+                else:
+                    reclaimed += self._unlink_unconsumed(external_req_id)
+        return reclaimed
 
     def shutdown_omni_connectors(self) -> None:
         """Bound MRv2 shutdown even if a connector call cannot be cancelled.

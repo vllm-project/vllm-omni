@@ -22,7 +22,7 @@ from __future__ import annotations
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
-from ._utils import _pick_block_width, suggests_channels_last
+from ._utils import _pick_block_width, on_kernel_device, suggests_channels_last
 
 _MAX_INT32 = 2**31 - 1
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -546,7 +546,7 @@ def cat_pad_5d(
     the same dense layout that the reference ``cat``/``pad`` path selects, or
     ``channels_last_3d`` when ``channels_last_output`` is set (a fused transpose
     for channels-first ``x``; the cache refresh still follows ``x``'s layout).
-    With ``keep_cache_frames > 0`` the last frames of the assembled input
+    With ``keep_cache_frames > 0`` the last non-padding frames of the assembled input
     (without spatial padding) are also written to a second tensor that
     replaces the reference ``x[:, :, -CACHE_T:].clone()`` cache refresh.
     ``cache_x`` may use either layout. Unsupported inputs return ``None`` so
@@ -559,7 +559,7 @@ def cat_pad_5d(
         return None
     if pad_width_left != pad_width_right or pad_height_top != pad_height_bottom or pad_back != 0:
         return None
-    if x.dim() != 5 or not x.is_cuda or x.dtype not in _SUPPORTED_DTYPES:
+    if x.dim() != 5 or not on_kernel_device(x) or x.dtype not in _SUPPORTED_DTYPES:
         return None
     if keep_cache_frames < 0:
         return None
@@ -590,7 +590,8 @@ def cat_pad_5d(
     out_frames = pad_front + frames
     out_height = height + 2 * pad_height_top
     out_width = width + 2 * pad_width_left
-    keep_frames = min(keep_cache_frames, out_frames)
+    # Never keep the zero front frames (as upstream caches ``x[:, :, -CACHE_T:]``): the next call pads them again.
+    keep_frames = min(keep_cache_frames, cache_frames + frames)
     out = torch.empty(
         (batch, channels, out_frames, out_height, out_width),
         device=x.device,
@@ -713,14 +714,14 @@ def cat_time_5d(
     """Assemble ``[zeros(pad_front - Tc) | cache | x]`` along time, without spatial padding.
 
     Returns the assembled tensor (in the memory format upstream's ``torch.cat``
-    would allocate) and, with ``keep_cache_frames > 0``, its last frames as the
-    next feature-cache entry.
+    would allocate) and, with ``keep_cache_frames > 0``, its last cache/``x`` frames as
+    the next feature-cache entry.
     Because only whole aligned planes move, this runs at memory bandwidth in
     both layouts; the spatial zero padding is left to the convolution
     (``padding=(0, ph, pw)``), whose bitwise agreement with a pre-padded input
     the caller verifies. Unsupported inputs return ``None``.
     """
-    if not HAS_TRITON or x.dim() != 5 or not x.is_cuda or x.dtype not in _SUPPORTED_DTYPES:
+    if not HAS_TRITON or x.dim() != 5 or not on_kernel_device(x) or x.dtype not in _SUPPORTED_DTYPES:
         return None
     if pad_front < 0 or keep_cache_frames < 0:
         return None
@@ -755,7 +756,8 @@ def cat_time_5d(
 
     batch, channels, frames, height, width = x.shape
     out_frames = pad_front + frames
-    keep_frames = min(keep_cache_frames, out_frames)
+    # Never keep the zero front frames (as upstream caches ``x[:, :, -CACHE_T:]``): the next call pads them again.
+    keep_frames = min(keep_cache_frames, cache_frames + frames)
     memory_format = torch.channels_last_3d if channels_last else torch.contiguous_format
     out = torch.empty(
         (batch, channels, out_frames, height, width), device=x.device, dtype=x.dtype, memory_format=memory_format
@@ -840,7 +842,7 @@ def dup_up3d_add(
         return None
     if factor_temporal & (factor_temporal - 1) or repeats & (repeats - 1) or repeats < factor_spatial:
         return None
-    if not main.is_cuda or not source.is_cuda:
+    if not on_kernel_device(main) or not on_kernel_device(source):
         return None
     if main.dtype != source.dtype or main.dtype not in _SUPPORTED_DTYPES or main.device != source.device:
         return None
@@ -958,7 +960,7 @@ def add_bias_residual(
     or both channels-last); either bias may be ``None`` when that operand
     already carries its bias.
     """
-    if not HAS_TRITON or not x.is_cuda or x.dim() not in (4, 5) or x.dtype not in _SUPPORTED_DTYPES:
+    if not HAS_TRITON or not on_kernel_device(x) or x.dim() not in (4, 5) or x.dtype not in _SUPPORTED_DTYPES:
         return None
     if h.shape != x.shape or h.dtype != x.dtype or h.device != x.device:
         return None

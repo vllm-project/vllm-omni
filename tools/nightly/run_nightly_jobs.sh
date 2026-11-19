@@ -19,7 +19,8 @@
 #   perf     — label contains "Perf Test" (throughput / benchmark jobs)
 #   acc      — label contains "Accuracy Test" (incl. GEBench / GEdit-Bench style)
 #   function — label has neither "Perf Test" nor "Accuracy Test" (incl. Doc, Multi-Replica, etc.)
-#   stability— fixed dfx stability scripts under tests/dfx/stability/scripts/ (see below)
+#   stability— fixed dfx stability JSON configs under tests/dfx/stability/tests/ driven by
+#              tests/dfx/stability/scripts/run_stability_benchmark.py (see below)
 #              Uses --pytest-mark / PYTEST_MARK for pytest -m (hardware via JSON marks).
 #              When unset, -m defaults to H800 (CUDA stability fleet; use --pytest-mark A3 on NPU).
 #   local    — pytest -sv -m "<MODEL_TYPE markers> and local_model" from repo root (no YAML step extract)
@@ -44,14 +45,15 @@
 #                   whose filename contains the substring (benchmark runner via is_diffusion_perf_config).
 #
 #   stability (when included in TEST_TYPE):
-#     From repo root: pytest -s -v --run-level full_model -m "<mark>" tests/dfx/stability/scripts/...
+#     From repo root: pytest -s -v --run-level=full_model \
+#       tests/dfx/stability/scripts/run_stability_benchmark.py --test-config-file tests/dfx/stability/tests/<model>.json -m "<mark>"
 #     -m comes from --pytest-mark / PYTEST_MARK when set (e.g. H800 or A3).
 #     Otherwise -m defaults to H800. PYTEST_MARK is rejected unless stability is enabled.
 #     model_type: omni → qwen3_omni + minicpmo_4_5; tts → qwen3_tts;
-#                 diffusion → qwen_image + wan22 + hunyuan_image + minimax_h3 + hunyuanvideo15; all → all eight
+#                 diffusion → qwen_image + wan22 + hunyuan_image + minimax_h3 + hunyuanvideo15 + cosmos3 + lingbot_video + lingbot_world
 #     stability_minimax_h3: download FastH3 LoRA only when VLLM_TEST_MINIMAX_H3_FASTH3_LORA is unset,
 #     then export before pytest (collection skipif needs the path).
-#     LABEL_SUBSTR: if set, script path / job key / filename must contain it
+#     LABEL_SUBSTR: if set, config path / job key / filename must contain it
 #
 # Requirements: bash, python3, PyYAML (pip install pyyaml)
 #
@@ -78,7 +80,7 @@
 #                   perf JSON from tests/dfx/perf/results/ (produced this run) -> $LOG_DIR/perf_results/
 #   TEST_TYPE     - comma-separated and/or repeated flags (default: all); see above
 #   MODEL_TYPE    - comma-separated and/or repeated flags (default: all); see above
-#   LABEL_SUBSTR  - YAML mode: substring of Buildkite step label; stability: substring of path/key/filename;
+#   LABEL_SUBSTR  - YAML mode: substring of Buildkite step label; stability: substring of config path/key/filename;
 #                   local: substring of test_*.py basename or tests/dfx/perf/tests/*.json filename
 #   PYTEST_MARK   - pytest -m expression for stability jobs only (also --pytest-mark)
 #   DRY_RUN=1     - print extracted commands only; do not write scripts or run pytest
@@ -597,16 +599,20 @@ def _write_job_timeouts_manifest(jobs_dir: Path, job_timeouts: dict[str, int]) -
         manifest_path.unlink()
 
 
-# Fixed stability scripts (when stability is selected); MODEL_TYPES narrows which run.
+# Fixed stability cases (when stability is selected); MODEL_TYPES narrows which run.
+STABILITY_RUNNER = "tests/dfx/stability/scripts/run_stability_benchmark.py"
 STABILITY_CASES: list[tuple[str, str, tuple[str, ...]]] = [
-    ("stability_qwen3_omni", "tests/dfx/stability/scripts/run_stability_qwen3_omni.py", ("omni",)),
-    ("stability_qwen3_tts", "tests/dfx/stability/scripts/run_stability_qwen3_tts.py", ("tts",)),
-    ("stability_minicpmo_4_5", "tests/dfx/stability/scripts/run_stability_minicpmo_4_5.py", ("omni",)),
-    ("stability_qwen_image", "tests/dfx/stability/scripts/run_stability_qwen_image.py", ("diffusion",)),
-    ("stability_wan22", "tests/dfx/stability/scripts/run_stability_wan22.py", ("diffusion",)),
-    ("stability_hunyuan_image", "tests/dfx/stability/scripts/run_stability_hunyuan_image.py", ("diffusion",)),
-    ("stability_minimax_h3", "tests/dfx/stability/scripts/run_stability_minimax_h3.py", ("diffusion",)),
-    ("stability_hunyuanvideo15", "tests/dfx/stability/scripts/run_stability_hunyuanvideo15.py", ("diffusion",)),
+    ("stability_qwen3_omni", "tests/dfx/stability/tests/test_qwen3_omni.json", ("omni",)),
+    ("stability_qwen3_tts", "tests/dfx/stability/tests/test_qwen3_tts.json", ("tts",)),
+    ("stability_minicpmo_4_5", "tests/dfx/stability/tests/test_minicpmo_4_5.json", ("omni",)),
+    ("stability_qwen_image", "tests/dfx/stability/tests/test_qwen_image.json", ("diffusion",)),
+    ("stability_wan22", "tests/dfx/stability/tests/test_wan22.json", ("diffusion",)),
+    ("stability_hunyuan_image", "tests/dfx/stability/tests/test_hunyuan_image.json", ("diffusion",)),
+    ("stability_minimax_h3", "tests/dfx/stability/tests/test_minimax_h3.json", ("diffusion",)),
+    ("stability_hunyuanvideo15", "tests/dfx/stability/tests/test_hunyuanvideo15.json", ("diffusion",)),
+    ("stability_cosmos3", "tests/dfx/stability/tests/test_cosmos3.json", ("diffusion",)),
+    ("stability_lingbot_video", "tests/dfx/stability/tests/test_lingbot_video.json", ("diffusion",)),
+    ("stability_lingbot_world", "tests/dfx/stability/tests/test_lingbot_world.json", ("diffusion",)),
 ]
 
 
@@ -863,9 +869,10 @@ def run_stability_mode(jobs_dir: Path, model_types: list[str]) -> int:
             print(f"# skip (missing file): {rel_path}", file=sys.stderr)
             continue
         pytest_line = (
-            f"pytest -s -v --run-level full_model "
-            f"-m {_shell_quote_pytest_mark(marker_expr)} "
-            f"{shlex.quote(rel_posix)}"
+            f"pytest -s -v --run-level=full_model "
+            f"{shlex.quote(STABILITY_RUNNER)} "
+            f"--test-config-file {shlex.quote(rel_posix)} "
+            f"-m {_shell_quote_pytest_mark(marker_expr)}"
         )
         matched += 1
         script_lines = [

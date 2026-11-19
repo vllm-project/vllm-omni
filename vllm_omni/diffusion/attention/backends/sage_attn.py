@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
 from collections.abc import Callable
@@ -37,16 +37,24 @@ if current_omni_platform.is_xpu():
     try:
         import inspect
 
-        from auto_round_kernel import ARK
+        try:
+            # auto-round-lib <= 0.14: singleton class
+            from auto_round_kernel import ARK
 
-        _ark = ARK()
-        xpu_sageattn = _ark.sagev1
+            xpu_sageattn = ARK().sagev1
+        except ImportError:
+            # auto-round-lib >= 0.15: ARK removed, kernels are module-level
+            import auto_round_kernel as _ark_mod
+
+            if getattr(_ark_mod, "xpu_lib", None) is None:
+                raise ImportError("auto_round_kernel XPU extension failed to load")
+            xpu_sageattn = _ark_mod.sagev1
         _sagev1_params = inspect.signature(xpu_sageattn).parameters
         _sagev1_has_tensor_layout = "tensor_layout" in _sagev1_params
         _sagev1_scale_param = "sm_scale" if "sm_scale" in _sagev1_params else "scale"
     except ImportError:
         logger.warning(
-            "XPU SageAttention (auto_round_kernel.ARK.sagev1) is not available. "
+            "XPU SageAttention (auto_round_kernel sagev1) is not available. "
             "Install auto-round-lib for XPU sage attention support."
         )
         xpu_sageattn = None
@@ -96,6 +104,39 @@ def _validate_sage_metadata(attn_metadata: AttentionMetadata | None) -> None:
         raise ValueError("SAGE_ATTN does not support attn_mask. Select a mask-capable backend.")
 
 
+def _valid_kv_prefix_length(attn_metadata: AttentionMetadata | None, kv_len: int, causal: bool) -> int | None:
+    """Return the K/V prefix to keep for ``valid_kv_length``, or None to keep all rows.
+
+    Keeping a contiguous valid K/V prefix is equivalent to masking the padded
+    tail keys, so models need not build a padding mask that Sage cannot consume.
+    """
+    valid_kv_length = attn_metadata.extra.get("valid_kv_length") if attn_metadata is not None else None
+    if valid_kv_length is None:
+        return None
+    if isinstance(valid_kv_length, bool) or not isinstance(valid_kv_length, int):
+        raise ValueError("valid_kv_length must be a Python integer")
+    if not 0 < valid_kv_length <= kv_len:
+        raise ValueError(f"valid_kv_length must be within the K/V sequence, got {valid_kv_length} for length {kv_len}")
+    if valid_kv_length == kv_len:
+        return None
+    if causal:
+        # Sage's causal alignment for unequal Q/K lengths is not validated.
+        raise ValueError("SAGE_ATTN does not support valid_kv_length with causal attention")
+    return valid_kv_length
+
+
+def _slice_valid_kv_prefix(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_metadata: AttentionMetadata | None,
+    causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    keep = _valid_kv_prefix_length(attn_metadata, key.shape[1], causal)
+    if keep is None:
+        return key, value
+    return key[:, :keep], value[:, :keep]
+
+
 def _sage_cuda_kernel_variant(query: torch.Tensor) -> str | None:
     # Resolution is eager; never move this architecture query inside forward.
     if query.device.type != "cuda" or not current_omni_platform.is_cuda():
@@ -108,6 +149,8 @@ def _sage_cuda_kernel_variant(query: torch.Tensor) -> str | None:
 
 class SageAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
+    # Contiguous K/V tail padding is sliced away (see _slice_valid_kv_prefix).
+    supports_prefix_kv_slicing: bool = True
 
     @classmethod
     def resolve_capabilities(cls, context: ExecutionContext) -> ExecutionPathResult:
@@ -158,6 +201,10 @@ class SageAttentionImpl(AttentionImpl):
         result = ExecutionPathResult.unmigrated("SAGE_ATTN", replace(context, kernel_variant=None), path="unverified")
         if attn_metadata is not None and attn_metadata.attn_mask is not None:
             return replace(result, support=CapabilityResult.unsupported("SAGE_ATTN: attn_mask is not supported"))
+        try:
+            _valid_kv_prefix_length(attn_metadata, key.shape[1], self.causal)
+        except ValueError as exc:
+            return replace(result, support=CapabilityResult.unsupported(f"SAGE_ATTN: {exc}"))
         if self.dropout != 0.0:
             return replace(
                 result,
@@ -259,6 +306,7 @@ class SageAttentionImpl(AttentionImpl):
                 "SAGE_ATTN requires sageattention. Install with: "
                 "pip install git+https://github.com/thu-ml/SageAttention.git"
             )
+        key, value = _slice_valid_kv_prefix(key, value, attn_metadata, self.causal)
         output = _sage_attention_op(
             query,
             key,
@@ -280,6 +328,7 @@ class SageAttentionImpl(AttentionImpl):
             raise ValueError(f"SAGE_ATTN: does not support dropout (dropout_p={self.dropout}).")
         if xpu_sageattn is None:
             raise ImportError("XPU SageAttention requires auto-round-lib. Install with: pip install auto-round-lib")
+        key, value = _slice_valid_kv_prefix(key, value, attn_metadata, self.causal)
         orig_dtype = query.dtype
         q = query.to(torch.float16) if orig_dtype != torch.float16 else query
         k = key.to(torch.float16) if orig_dtype != torch.float16 else key

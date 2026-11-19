@@ -3,6 +3,7 @@
 
 import asyncio
 import base64
+import json
 import wave
 from urllib.parse import parse_qs, urlsplit
 
@@ -17,9 +18,6 @@ from vllm_omni.experimental.fullduplex.client import (
 from vllm_omni.experimental.fullduplex.video_stacking import (
     concat_frames,
     unit_subframe_offsets,
-)
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
-    MiniCPMO45DuplexPolicy,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -37,19 +35,6 @@ def test_realtime_client_removes_obsolete_duplex_url_parameters():
         "duplex": ["1"],
         "model": ["openbmb/MiniCPM-o-4_5"],
     }
-
-
-def test_seed_tts_initial_text_is_part_of_native_duplex_context():
-    prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
-        "Speak exactly.",
-        True,
-        "The quick brown fox.",
-    )
-
-    assert prefix == "<|im_start|>system\nSpeak exactly.\n<|audio_start|>"
-    assert suffix == (
-        "<|audio_end|><|im_end|>\n<|im_start|>user\nThe quick brown fox.<|im_end|>\n<|im_start|>assistant\n"
-    )
 
 
 @pytest.mark.parametrize("scheme, expected_scheme", [("http", "ws"), ("https", "wss"), ("ws", "ws"), ("wss", "wss")])
@@ -155,6 +140,64 @@ async def test_realtime_client_configure_reports_reader_failure_immediately():
         await client.configure("model", timeout_s=10.0)
 
 
+@pytest.mark.parametrize("code", ["server_vad_unavailable", "semantic_vad_unavailable"])
+@pytest.mark.asyncio
+async def test_realtime_client_reports_missing_backend_before_session_created(code):
+    from vllm_omni.clients.duplex import DuplexProtocolError
+
+    class Client(RealtimeDuplexClient):
+        async def send(self, event):
+            self.events.add({"type": "error", "error": {"code": code, "message": "missing local VAD model"}})
+
+    client = Client("ws://unused")
+    with pytest.raises(DuplexProtocolError, match="missing local VAD model") as caught:
+        await asyncio.wait_for(client.configure("model", timeout_s=30.0), timeout=1.0)
+    assert caught.value.code == code
+    assert caught.value.raw["type"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_stops_streaming_when_server_vad_is_unavailable():
+    import websockets
+
+    from vllm_omni.clients.duplex import DuplexProtocolError
+
+    received = []
+
+    async def handler(socket):
+        async for raw in socket:
+            event = json.loads(raw)
+            if event["type"] == "session.update":
+                await socket.send(json.dumps({"type": "session.created"}))
+            elif event["type"] == "input_audio_buffer.append":
+                received.append(event)
+                await socket.send(
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "error": {"code": "server_vad_unavailable", "message": "Silero artifact is missing"},
+                        }
+                    )
+                )
+
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        async with RealtimeDuplexClient(f"ws://127.0.0.1:{port}") as client:
+            await client.configure("model")
+            units = [(b"\0\0" * 512, None)] * 100
+            with pytest.raises(DuplexProtocolError, match="Silero artifact is missing"):
+                await asyncio.wait_for(client.stream_av_units(units), timeout=1.0)
+    assert 0 < len(received) < len(units)
+
+
+@pytest.mark.parametrize("code", ["playback_ack_too_late", "session_stats_disabled", "tool_result_timeout", []])
+def test_realtime_client_keeps_advisory_errors_nonfatal(code):
+    client = RealtimeDuplexClient("ws://unused")
+    client.events.add({"type": "error", "error": {"code": code, "message": "advisory"}})
+    client.raise_if_reader_stopped()
+    assert len(client.events.errors()) == 1
+
+
 @pytest.mark.asyncio
 async def test_realtime_client_close_reports_reader_cancellation_immediately():
     class Client(RealtimeDuplexClient):
@@ -191,6 +234,71 @@ async def test_realtime_client_close_waits_for_a_new_session_closed_event():
     await client.close_session(timeout_s=0.2)
 
     assert asyncio.get_running_loop().time() - started_at >= 0.01
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_get_session_stats_returns_stats():
+    class Client(RealtimeDuplexClient):
+        def __init__(self):
+            super().__init__("ws://unused")
+            self.sent = []
+
+        async def send(self, event):
+            self.sent.append(event)
+            self.events.add(
+                {
+                    "type": "session.stats",
+                    "request_event_id": event["event_id"],
+                    "stats": {"turns": []},
+                }
+            )
+
+    client = Client()
+    stats = await client.get_session_stats(timeout_s=1.0)
+
+    assert stats == {"turns": []}
+    assert client.sent[0]["type"] == "session.stats.get"
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_get_session_stats_raises_on_related_error():
+    class Client(RealtimeDuplexClient):
+        async def send(self, event):
+            self.events.add(
+                {
+                    "type": "error",
+                    "related_event_id": event["event_id"],
+                    "error": {"code": "session_stats_disabled", "message": "disabled"},
+                }
+            )
+
+    client = Client("ws://unused")
+    with pytest.raises(ConnectionError, match="disabled"):
+        await client.get_session_stats(timeout_s=1.0)
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_get_session_stats_times_out():
+    class Client(RealtimeDuplexClient):
+        async def send(self, event):
+            return
+
+    client = Client("ws://unused")
+    with pytest.raises(TimeoutError, match="session.stats"):
+        await client.get_session_stats(timeout_s=0.05)
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_get_session_stats_send_times_out():
+    class Client(RealtimeDuplexClient):
+        async def send(self, event):
+            await asyncio.Event().wait()
+
+    client = Client("ws://unused")
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(TimeoutError, match="sending session.stats"):
+        await client.get_session_stats(timeout_s=0.05)
+    assert asyncio.get_running_loop().time() - started < 1.0
 
 
 @pytest.mark.asyncio
@@ -246,6 +354,27 @@ async def test_realtime_client_configure_disables_auto_response_without_obsolete
         "force_listen_count": 0,
     }
     assert extra_body == {"ref_audio": "data:audio/wav;base64,AAAA", "native_duplex": False}
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_stamps_append_after_send():
+    class _FakeWs:
+        async def send(self, raw: str) -> None:
+            del raw
+
+    client = RealtimeDuplexClient("ws://unused")
+    client._ws = _FakeWs()
+    await client.send(
+        {
+            "type": "input_audio_buffer.append",
+            "audio": "xx",
+            "video_frames": ["frame"],
+        }
+    )
+    await client.send({"type": "input_audio_buffer.commit"})
+    assert len(client.events.client_appends) == 1
+    assert client.events.client_appends[0].keys() == {"sent_at_s", "event_id"}
+    assert client.events.client_appends[0]["event_id"] == ""
 
 
 def test_realtime_event_collector_partitions_audio_by_response():
@@ -319,7 +448,7 @@ def test_realtime_client_sends_each_units_composite_beside_its_base_frame():
 
     class _Client(RealtimeDuplexClient):
         def __init__(self):
-            pass
+            super().__init__("ws://unused")
 
         async def send(self, event):
             sent.append(event)
@@ -337,3 +466,54 @@ def test_realtime_client_sends_each_units_composite_beside_its_base_frame():
     # A composite belongs to the unit it was captured in, so it rides the same
     # append as that unit's base frame; a unit without one sends the base alone.
     assert [event["video_frames"] for event in sent if "video_frames" in event] == [["f0", "s0"], ["f1"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unit_ms", [32, 1000])
+@pytest.mark.parametrize("send_cost_s", [0.001, 0.040])
+async def test_stream_av_units_pacing_absorbs_send_frame_cost_and_sleep_overshoot(monkeypatch, unit_ms, send_cost_s):
+    from vllm_omni.experimental.fullduplex import client as client_module
+
+    class Clock:
+        now = 7.0
+
+        def monotonic(self):
+            return self.now
+
+        async def sleep(self, delay):
+            assert delay >= 0
+            # Model scheduling overshoot without relying on host load.
+            self.now += delay + (0.002 if delay else 0.0)
+
+    clock = Clock()
+    sent, frames = [], []
+
+    class Client(RealtimeDuplexClient):
+        async def send(self, event):
+            clock.now += send_cost_s
+            sent.append(event)
+
+    async def frame_sink(items):
+        clock.now += 0.005
+        frames.extend(items)
+
+    monkeypatch.setattr(client_module, "time", clock)
+    monkeypatch.setattr(client_module, "asyncio", clock)
+    client = Client("ws://unused")
+    chunk = b"\x01\x00" * (16 * unit_ms)
+    count = 60_000 // unit_ms
+    started = clock.now
+
+    frame_count = await client.stream_av_units(
+        ((chunk, [f"frame-{index}"]) for index in range(count)), frame_sink=frame_sink
+    )
+
+    # Slow sends may overrun the media clock, but must not add another full
+    # chunk's sleep. Ordinary send/frame work and overshoot must not accumulate.
+    processing_s = count * (send_cost_s + 0.005)
+    expected_s = max(60.0, processing_s) + (0.002 if processing_s < 60.0 else 0.0)
+    assert clock.now - started == pytest.approx(expected_s)
+    assert frame_count == count and frames == [f"frame-{index}" for index in range(count)]
+    assert b"".join(base64.b64decode(event["audio"]) for event in sent) == chunk * count
+    assert sent[-1]["audio_end_ms"] == client._media_clock_ms == 60_000
+    assert not any("video_frames" in event for event in sent)

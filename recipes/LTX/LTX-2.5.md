@@ -31,6 +31,41 @@ with the model license before downloading or using the weights.
 | `LTX2DistilledOneStagePipeline` | Distilled one-stage | 960x544 | 8 steps |
 | `LTX2DistilledTwoStagePipeline` | Distilled two-stage | 1920x1088 | 8 + 3 steps |
 
+For text-to-audio, select `LTX2TextToAudioPipeline`. It emits stereo audio at
+48 kHz and is available through both the offline API and `/v1/audio/generate`.
+The audio pipeline does not require a video output or a `--task-type` flag.
+
+```bash
+python examples/offline_inference/text_to_audio/text_to_audio.py \
+  --model Lightricks/LTX-2.5-Diffusers \
+  --model-class-name LTX2TextToAudioPipeline \
+  --prompt "A close-up recording of a concert grand piano" \
+  --audio-length 2 \
+  --num-inference-steps 30 \
+  --sample-rate 48000 \
+  --output ltx25_audio.wav
+```
+
+To use the registered pipeline through the OpenAI-compatible endpoint:
+
+```bash
+vllm serve Lightricks/LTX-2.5-Diffusers \
+  --omni \
+  --model-class-name LTX2TextToAudioPipeline \
+  --port 8098
+
+curl http://localhost:8098/v1/audio/generate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Lightricks/LTX-2.5-Diffusers",
+    "input": "A close-up recording of a concert grand piano",
+    "audio_length": 2,
+    "num_inference_steps": 30,
+    "response_format": "wav"
+  }' \
+  --output ltx25_audio_api.wav
+```
+
 Both two-stage pipelines generate at half resolution, apply the official x2
 latent upsampler, and run a three-step refinement stage. Select the class with
 `--model-class-name`; no `--task-type` flag is required. Supplying one initial

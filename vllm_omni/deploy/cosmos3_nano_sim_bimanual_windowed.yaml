@@ -4,8 +4,6 @@ pipeline: cosmos3_nano_sim_bimanual
 async_chunk: false
 distributed_executor_backend: mp
 dtype: bfloat16
-default_resolution: [720, 1280]
-max_pixels: 921600
 
 stages:
   - stage_id: 0
@@ -19,6 +17,8 @@ stages:
       action_dim: 64
       num_embodiment_domains: 32
       default_fps: 15.0
+      default_resolution: [720, 1280]
+      max_pixels: 921600
       clean_commit_mode: batched
       overlap_vae_decode: true
       kv_cache_inference_size: 64

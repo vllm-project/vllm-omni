@@ -385,17 +385,15 @@ class TestSamplerMethods:
 
     @staticmethod
     def _sampling_metadata(temperature=1.0, top_k=50, top_p=0.95, generators=None):
-        return type(
-            "SamplingMetadata",
-            (),
-            {
-                "temperature": temperature,
-                "top_k": top_k,
-                "top_p": top_p,
-                "all_greedy": temperature is None,
-                "generators": generators or {},
-            },
-        )()
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import HiggsAudioSamplingParams
+
+        return HiggsAudioSamplingParams(
+            temperature=None if temperature is None else torch.as_tensor(temperature),
+            top_k=None if top_k is None else torch.as_tensor(top_k),
+            top_p=None if top_p is None else torch.as_tensor(top_p),
+            all_greedy=temperature is None,
+            generators=generators or {},
+        )
 
     @staticmethod
     def _seeded_generator(seed):
@@ -696,7 +694,7 @@ class TestSamplerMethods:
         assert not getattr(
             mod.HiggsAudioV3TalkerForConditionalGeneration, "supports_sampled_token_ids_cpu_override", False
         )
-        assert sampler_output.sampled_token_ids.tolist() == [[99999], [151671]]
+        assert sampler_output.tolist() == [[99999], [151671]]
 
     def test_direct_audio_sampler_uses_gpu_tokens_for_active_rows(self):
         """Direct audio sampling leaves scheduler-visible tokens to the GPU tensor."""
@@ -726,7 +724,60 @@ class TestSamplerMethods:
 
         sampler_output = t.sample(torch.zeros(2, 200000), sampling_metadata=object())
 
-        assert sampler_output.sampled_token_ids.tolist() == [[99999], [99999]]
+        assert sampler_output.tolist() == [[99999], [99999]]
+
+    def test_text_sampling_uses_current_sampler_callback(self, mocker):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3TalkerForConditionalGeneration as C,
+        )
+
+        t = SimpleNamespace(
+            _resolve_token_ids=lambda: None,
+            _audio_continuation_id=5,
+            _last_logits_hidden=None,
+            _clear_last_audio_outputs=mocker.Mock(),
+        )
+        logits = torch.randn(2, 7)
+        tokens = torch.tensor([[2], [3]], dtype=torch.int32)
+        current_sampler = mocker.Mock(return_value=tokens)
+
+        result = C.sample(t, logits, self._sampling_metadata(), sample_text=current_sampler)
+
+        assert result is tokens
+        current_sampler.assert_called_once_with(logits)
+        t._clear_last_audio_outputs.assert_called_once_with()
+
+    def test_mixed_sampling_keeps_text_row_and_updates_only_audio_row(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3TalkerForConditionalGeneration as C,
+        )
+
+        t = self._make_batched_sampler_talker(num_rows=2)
+        t._resolve_token_ids = lambda: None
+        t._audio_continuation_id, t._eos_token_id = 5, 6
+        t._last_logits_hidden = torch.zeros(2, 16)
+        t._last_step_input_ids = torch.tensor([5, 2])
+        t._last_step_query_start_loc = None
+        t._fast_audio_direct_rows = 0
+        t._fast_audio_sampler_gpu_fallback_reason = C._fast_audio_sampler_gpu_fallback_reason.__get__(t)
+        t._apply_audio_mode_bias_batched = C._apply_audio_mode_bias_batched.__get__(t)
+        t._audio_codebook_logits_from_rows = lambda hidden, rows, all_rows=False: torch.zeros(2, 8, 1026)
+        t._sample_audio_codes = lambda logits, *args: torch.zeros(logits.shape[0], dtype=torch.long)
+        logits = torch.zeros(2, 7)
+        logits[:, 2] = 2
+        seen = []
+
+        def sample_text(biased_logits):
+            seen.append(biased_logits.clone())
+            return biased_logits.argmax(-1, keepdim=True).to(torch.int32)
+
+        tokens = C.sample(t, logits, self._sampling_metadata(), sample_text=sample_text)
+
+        assert tokens.tolist() == [[5], [2]]
+        assert len(seen) == 1 and torch.isneginf(seen[0][0, 2])
+        assert seen[0][1, 2] == 2
+        assert t._decode_has_codes.tolist() == [True, False]
+        assert t._last_audio_host_staging[:, 8].tolist() == [1, 0]
 
     def test_terminal_rampdown_frame_is_emitted_before_done(self):
         """The final ramp-down frame must be emitted, not replaced by a done marker."""
@@ -1481,9 +1532,9 @@ class TestStageInputProcessor:
         assert len(result) == 1
         assert result[0]["prompt_token_ids"] == []
 
-    def test_filter_real_code_frames(self):
+    def test_valid_code_prefix(self):
         from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
-            _filter_real_code_frames,
+            _valid_code_prefix,
         )
 
         # 8 codebooks, 4 frames
@@ -1499,12 +1550,11 @@ class TestStageInputProcessor:
                 [107, 207, 1024, 307],
             ]
         )
-        result = _filter_real_code_frames(codes)
-        # Frame 2 (column 2) has BOC in all codebooks -> filtered out
-        assert result.shape == (8, 3)
+        result = _valid_code_prefix(codes)
+        # Stop at the first invalid frame; do not compact the timeline.
+        assert result.shape == (8, 2)
         assert result[0, 0].item() == 100
         assert result[0, 1].item() == 200
-        assert result[0, 2].item() == 300
 
     def test_async_chunk_accepts_multimodal_output_keyword(self):
         from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
@@ -1564,7 +1614,7 @@ class TestRegistry:
             assert os.path.isfile(yaml_path), f"Deploy YAML not found at {yaml_path}"
             deploy_config = load_deploy_config(yaml_path)
             stage_0 = next(stage for stage in deploy_config.stages if stage.stage_id == 0)
-            assert stage_0.engine_extras["attention_backend"] == "FLASHINFER"
+            assert stage_0.attention_backend == "FLASHINFER"
             assert stage_0.engine_extras["attention_config"] == {"use_trtllm_attention": False}
 
 
@@ -1774,3 +1824,30 @@ class TestVoiceCloneReferenceCache:
         assert cache_hit is True
         assert inflight_wait is False
         assert torch.equal(cached, torch.arange(16, dtype=torch.long).reshape(2, 8) + 1)
+
+
+def test_released_sample_graphs_are_captured_again():
+    """The worker captures the sampler graphs once while profiling to measure
+    them, releases them, and warmup captures them for real."""
+    import vllm_omni.model_executor.models.higgs_audio_v3.full_sample_graph as full_sample_graph
+    from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+        HiggsAudioV3TalkerForConditionalGeneration,
+    )
+
+    model = SimpleNamespace(
+        _sample_graph_enabled=True,
+        _sample_graphs_ready=True,
+        _dense_sample_graphs={"key": object()},
+        _dense_sample_metadata_sources={"key": object()},
+    )
+    # Ready graphs are kept: capture returns before touching the model.
+    full_sample_graph.capture_sample_graphs(model, max_num_reqs=1)
+
+    HiggsAudioV3TalkerForConditionalGeneration.release_auxiliary_graphs(model)
+
+    assert model._dense_sample_graphs == {}
+    assert model._dense_sample_metadata_sources == {}
+    assert model._sample_graphs_ready is False
+    # Released graphs are captured again: capture now reads the model.
+    with pytest.raises(AttributeError, match="model"):
+        full_sample_graph.capture_sample_graphs(model, max_num_reqs=1)

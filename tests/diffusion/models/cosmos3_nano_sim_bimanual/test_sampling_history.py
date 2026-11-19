@@ -39,6 +39,8 @@ def methods():
     cls = next(node for node in tree.body if getattr(node, "name", "") == "Cosmos3NanoSimBimanualPipeline")
     selected = {
         "_sample_distilled",
+        "_ensure_text_kv",
+        "_prompt_token_limit",
         "_kv_spec_for_geometry",
         "_append_dense_kv",
         "_transformer_forward",
@@ -159,3 +161,23 @@ def test_full_history_allocation_follows_request(pixels, expected):
     assert spec.geometry_key == ((32, 32), expected)
     pipe.manifest = replace(pipe.manifest, window_frames=96)
     assert pipe.ar_diffusion_request_spec(req).kv_spec.window_frames == 96
+
+
+def test_dense_text_kv_is_not_capped_by_manifest_cache_length():
+    pipe = methods()()
+    from test_action_schema import manifest as unified_manifest
+
+    pipe.manifest = unified_manifest()
+    pipe._ar_diffusion_kv_state = None
+    pipe._MAIN_BRANCH = "main"
+    cached = [(torch.ones(1, 513, 1), torch.ones(1, 513, 1))]
+    pipe.transformer = Mock()
+    pipe.transformer.encode_und_kv.return_value = (cached, 513)
+    state = SimpleNamespace(text_kv_by_branch={})
+
+    actual = pipe._ensure_text_kv(
+        state, torch.ones(1, 513), torch.ones(1, 513), max_length=pipe._prompt_token_limit(None, None)
+    )
+
+    assert actual is cached
+    assert state.text_kv_by_branch["main"] is cached

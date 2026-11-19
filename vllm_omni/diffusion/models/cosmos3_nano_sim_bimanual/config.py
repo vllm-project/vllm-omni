@@ -171,6 +171,13 @@ def _strict_float(value: Any, name: str) -> float:
     return float(value)
 
 
+def _recent_past_frames(cache_size: int, sinks: int, name: str) -> int:
+    """Convert a cache capacity that includes the sink prefix and current frame."""
+    if not 0 <= sinks < cache_size - 1:
+        raise ValueError(f"{name} must leave at least one recent past frame in the cache")
+    return cache_size - sinks - 1
+
+
 def _parse_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
     fixed_step = artifact["fixed_step_sampler_config"]
     if not isinstance(fixed_step, dict):
@@ -180,13 +187,18 @@ def _parse_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Cosmos3-Nano-Sim-Bimanual artifact fixed_step_sampler_config.t_list must be a list")
     t_list = tuple(_strict_float(value, "fixed_step_sampler_config.t_list entry") for value in raw_t_list)
     base_fps = _strict_float(artifact["base_fps"], "base_fps")
+    conditioning = parse_cosmos3_nano_sim_bimanual_conditioning(artifact["conditioning"])
+    sink_frames = _strict_int(artifact["sink_frames"], "sink_frames", positive=False)
+    window_frames = artifact["window_frames"]
+    if window_frames is not None:
+        window_frames = _strict_int(window_frames, "window_frames")
+        if isinstance(conditioning, UnifiedActionConditioning):
+            window_frames = _recent_past_frames(window_frames, sink_frames, "Artifact sink_frames")
     return {
         "schema_version": _strict_int(artifact["schema_version"], "schema_version"),
         "chunk_size": _strict_int(artifact["chunk_size"], "chunk_size"),
-        "window_frames": None
-        if artifact["window_frames"] is None
-        else _strict_int(artifact["window_frames"], "window_frames"),
-        "sink_frames": _strict_int(artifact["sink_frames"], "sink_frames", positive=False),
+        "window_frames": window_frames,
+        "sink_frames": sink_frames,
         "text_cache_max_len": _strict_int(artifact["text_cache_max_len"], "text_cache_max_len"),
         "latent_patch_size": _strict_int(artifact["latent_patch_size"], "latent_patch_size"),
         "vae_spatial_compression_factor": _strict_int(
@@ -209,7 +221,7 @@ def _parse_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "checkpoint_id": artifact["checkpoint_id"],
         "checkpoint_iteration": _strict_int(artifact["checkpoint_iteration"], "checkpoint_iteration"),
         "checkpoint_hash": artifact["checkpoint_hash"],
-        "conditioning": parse_cosmos3_nano_sim_bimanual_conditioning(artifact["conditioning"]),
+        "conditioning": conditioning,
     }
 
 
@@ -408,12 +420,10 @@ class Cosmos3NanoSimBimanualManifest:
         if isinstance(cache_size, bool) or not isinstance(cache_size, int) or cache_size < 2:
             raise ValueError("kv_cache_inference_size must be an integer >= 2")
         sinks = 0 if sinks is None else sinks
-        if isinstance(sinks, bool) or not isinstance(sinks, int) or not 0 <= sinks < cache_size - 1:
-            raise ValueError("attention_sink_size must leave at least one recent past frame in the cache")
-        # Reference capacity includes the sinks and current frame; Omni's
-        # window_frames counts only recent past frames, separately from sinks.
-        # The effective manifest digest also separates session/cache identities.
-        return replace(manifest, window_frames=cache_size - sinks - 1, sink_frames=sinks)
+        if isinstance(sinks, bool) or not isinstance(sinks, int):
+            raise ValueError("attention_sink_size must be an integer")
+        window_frames = _recent_past_frames(cache_size, sinks, "attention_sink_size")
+        return replace(manifest, window_frames=window_frames, sink_frames=sinks)
 
     def require_exported_artifact(self) -> None:
         missing: list[str] = []

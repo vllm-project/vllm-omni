@@ -33,9 +33,9 @@ documentation and regression coverage; no hot-path allocation is added.
 
 ```text
 Scheduler / current input batch
-  prompt_token_ids + num_computed_tokens_cpu (before this step)
+  prompt length + computed-token count (before this step)
                          |
-            OmniGPUModelRunner._preprocess
+            OmniModelState.run_preprocess
                          |
             per-request phase metadata
                   /                 \
@@ -48,12 +48,11 @@ Scheduler / current input batch
                     model forward
 ```
 
-The producer is `OmniGPUModelRunner._preprocess` in
-`vllm_omni/worker/gpu_model_runner.py`. `GPUARModelRunner` and
-`GPUGenerationModelRunner` inherit it. The current `OmniNPUModelRunner` also
-inherits this method; device-specific execution still needs its own hardware
-validation. A plugin runner that overrides preprocessing is responsible for
-preserving this interface.
+The producer is `OmniModelState.run_preprocess` in
+`vllm_omni/worker_v2/model_states/omni_model_state.py`, called by the V2 runner.
+The model state gathers current prompt lengths and computed-token counts from
+native request state and the input batch. Platform-specific model states must
+preserve this interface; device-specific execution needs its own validation.
 
 ### Stable model-facing fields
 
@@ -93,6 +92,11 @@ entry contains the same fields, aligned with its corresponding input row.
 Every such row has `_omni_is_prefill == False`. The optional earlier
 `preprocess_batch` hook is a separate whole-batch preparation hook; these freshly
 computed per-row fields are not promised at that earlier boundary.
+
+Models retaining request-owned prompt tensors across prefill chunks must release
+them in `on_requests_finished`, including cancellation before the final prompt
+chunk. A wrapper owning such tensors must clean them before forwarding completion
+to its inner model; model-specific MRV2 state should reuse that cleanup entry.
 
 ### Routing guarantee
 
@@ -168,11 +172,20 @@ run with the same real input, greedy sampling, and `VLLM_BATCH_INVARIANT=1`.
 Greedy sampling alone does not guarantee identical codes across different
 prefill shapes: floating-point reduction differences can change an argmax and
 diverge in subsequent autoregressive steps. Invariant kernels keep this exact
-comparison focused on the phase contract. The two engines must be initialized
-separately because their chunking settings and token budgets differ. GPU tests belong under
-`tests/e2e/features/`; existing model tests remain useful adjacent regression
-coverage. Functional audio checks do not establish throughput or all-model
-semantic parity; this change makes no performance claim.
+generated-code comparison focused on the phase contract. The two engines must
+be initialized separately because their chunking settings and token budgets
+differ. For this regression on ROCm, the code2wav stage uses FP32 because
+independent BF16 decoders can exceed the waveform bounds for identical codec
+tokens. The talker retains its deployment dtype, and exact generated codes
+remain mandatory. Waveforms must retain the same shape and satisfy the existing
+maximum-error and signal-to-noise bounds; the test records its decoder dtype
+override in the evidence artifact. This test-specific precision setting does
+not change deployment defaults or the separate BF16 CustomVoice E2E coverage.
+CUDA retains its deployment dtype and strict waveform comparison.
+GPU tests belong under `tests/e2e/features/`; existing model tests
+remain useful adjacent regression coverage. Functional audio checks do not
+establish throughput or all-model semantic parity; this change makes no
+performance claim.
 
 ## Open questions and discussions
 
