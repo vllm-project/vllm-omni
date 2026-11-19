@@ -35,4 +35,4 @@ class PhononConfig(PretrainedConfig):
         self.architectures = ["PhononTalkerForConditionalGeneration"]
 
 
-AutoConfig.register(PhononConfig.model_type, PhononConfig)
+AutoConfig.register(PhononConfig.model_type, PhononConfig, exist_ok=True)
