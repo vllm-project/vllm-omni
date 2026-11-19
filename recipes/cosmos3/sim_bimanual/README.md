@@ -75,11 +75,11 @@ to avoid reflection padding in the generated video.
 
 ## Action-sidecar and camera inputs
 
-Use `--input-format cookbook` with one JSON object per line. For a checkpoint
-supporting both robot and camera conditioning, export both embodiments and the
-`cookbook` camera profile following the
-[artifact recipe](../Cosmos3-Nano-Sim-Bimanual.md#action-and-camera-export).
-The `--model` argument must point to the local Stage 2 Diffusers directory.
+Use `--input-format cookbook` with one JSON object per line. Point `--model`
+to a local Diffusers checkpoint that meets the
+[artifact contract](../Cosmos3-Nano-Sim-Bimanual.md#artifact-contract).
+To run both examples below with one checkpoint, use one that supports both
+`agibotworld` and `camera_pose` and includes the `cookbook` camera profile.
 
 For action conditioning, create `/data/humanoid.jsonl` with a record such as:
 
@@ -293,12 +293,10 @@ Decode overlap is enabled by default for full-video CUDA requests; set
 clean commits remain framewise. Control hints are VAE-encoded up front, then
 consumed in chunks sized by the checkpoint configuration.
 
-Export Transfer through the two conversion stages described in the
-[Bimanual recipe](../Cosmos3-Nano-Sim-Bimanual.md), using
-`--cosmos3-nano-sim-bimanual` with the Transfer experiment and checkpoint.
-The exporter detects `conditioning.mode="control_video"` and writes
-`Cosmos3NanoSimTransferPipeline` into the model indexes. Shared manifests and
-metadata retain the `cosmos3_nano_sim_bimanual` prefix. The deployment is
+Local Transfer checkpoints use the `Cosmos3NanoSimTransferPipeline` model
+class and a `cosmos3_nano_sim_bimanual` manifest with
+`conditioning.mode="control_video"` in `transformer/config.json`.
+The deployment is
 [`cosmos3_nano_sim_transfer.yaml`](../../../vllm_omni/deploy/cosmos3_nano_sim_transfer.yaml).
 
 ## Padded conditioning images
