@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for MOSS-TTS talker logits processing."""
 
 from __future__ import annotations
@@ -20,7 +20,9 @@ class _RecordingLogitsProcessor:
     def __call__(self, *args: object, **kwargs: object) -> torch.Tensor:
         self.args = args
         self.kwargs = kwargs
-        return torch.zeros((1, 4))
+        hidden_states = args[1]
+        assert isinstance(hidden_states, torch.Tensor)
+        return hidden_states.new_zeros((hidden_states.shape[0], 4))
 
 
 class _EmbeddingBackbone(nn.Module):
@@ -46,6 +48,61 @@ def test_moss_tts_delay_compute_logits_does_not_forward_sampling_metadata() -> N
     assert logits.shape == (1, 4)
     assert model.logits_processor.args == (model.text_lm_head, hidden_states)
     assert model.logits_processor.kwargs == {}
+
+
+def test_moss_tts_delay_prompt_logits_ignore_request_sampling_spans() -> None:
+    from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import (
+        MossTTSDelayTalkerForGeneration,
+    )
+
+    model = MossTTSDelayTalkerForGeneration.__new__(MossTTSDelayTalkerForGeneration)
+    nn.Module.__init__(model)
+    model.text_lm_head = object()
+    model.logits_processor = _RecordingLogitsProcessor()
+    model.n_vq = 4
+    model._batch_state = [{}, {}]
+    model._batch_state_spans = [(0, 1024), (1024, 1025)]
+    hidden_states = torch.randn(1024, 4)
+
+    with pytest.raises(RuntimeError, match="current logits have 1024 rows for 2 states"):
+        model.compute_logits(hidden_states)
+
+    logits = model.compute_prompt_logits(hidden_states)
+
+    assert logits is not None
+    assert logits.shape == (1024, 4)
+
+
+@pytest.mark.parametrize(
+    ("talker_name", "continuation_token_attr"),
+    [
+        ("MossTTSRealtimeTalkerForGeneration", "text_pad_id"),
+        ("MossTTSLocalTalkerForGeneration", "audio_assistant_slot_token_id"),
+    ],
+)
+def test_moss_tts_synthetic_prompt_logits_ignore_request_sampling_spans(
+    talker_name: str,
+    continuation_token_attr: str,
+) -> None:
+    from vllm_omni.model_executor.models.moss_tts import modeling_moss_tts_talker
+
+    talker_cls = getattr(modeling_moss_tts_talker, talker_name)
+    model = talker_cls.__new__(talker_cls)
+    nn.Module.__init__(model)
+    model.text_vocab_size = 8
+    setattr(model, continuation_token_attr, 2)
+    model._batch_state = [{}, {}]
+    model._batch_state_spans = [(0, 1024), (1024, 1025)]
+    model._batch_should_continue = None
+    hidden_states = torch.randn(1024, 4)
+
+    with pytest.raises(RuntimeError, match="current logits have 1024 rows for 2 states"):
+        model.compute_logits(hidden_states)
+
+    logits = model.compute_prompt_logits(hidden_states)
+
+    assert logits.shape == (1024, 8)
+    assert logits.argmax(dim=-1).tolist() == [2] * 1024
 
 
 def test_moss_tts_local_keeps_fixed_shape_rows_and_routes_stop_logits() -> None:
@@ -84,6 +141,7 @@ def test_moss_tts_local_keeps_fixed_shape_rows_and_routes_stop_logits() -> None:
     # Keeping this row avoids CUDA boolean-index shape discovery; the
     # talker2codec raw async-chunk processor drops all-pad rows on CPU.
     torch.testing.assert_close(audio[1], stopped)
+    assert model._batch_should_continue is not None
     assert model._batch_should_continue.tolist() == [True, False]
 
     logits = model.compute_logits(torch.randn(4, 8))
