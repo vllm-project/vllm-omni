@@ -419,6 +419,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                             state.last_terminator_token = None
                 else:
                     turn_ended = bool(getattr(state, "current_turn_ended", True)) if state is not None else False
+                    if payload.get("open_assistant_turn") is True and state is not None and turn_ended:
+                        # A response.create-owned unit opens the assistant
+                        # turn. Release the turn-ended latch the same way the
+                        # seeded opening turn does (duplex stage0 prefill):
+                        # otherwise the latch forces this row's silent input
+                        # clock to keep listening, and the listen -> tts_bos
+                        # swap stays blocked while the response waits for the
+                        # model to answer.
+                        with suppress(Exception):
+                            state.current_turn_ended = False
+                            state.pending_speech_response_open = True
+                        turn_ended = False
                     if turn_ended and not pending_speech_context:
                         force_listen = True
                     elif turn_ended and not force_listen and getattr(state, "carried_context", False):

@@ -637,21 +637,24 @@ def test_finish_requests_notifies_model_and_cleans_only_known_slots(monkeypatch)
 
 def test_finish_requests_passes_scheduler_decisions_before_freeing_finished_requests(monkeypatch):
     """The model reads the step's scheduler decisions while finished requests' state still exists."""
+    from vllm_omni.core.sched.window_policy import WindowOperation
+
     runner = _make_runner()
     calls = []
     runner.model = SimpleNamespace(
         on_scheduler_output=lambda output: calls.append(("decisions", output.duplex_carry_ops)),
         on_requests_finished=lambda ids: calls.append(("finished", set(ids))),
     )
+    keep = WindowOperation("keep", "s", "r")
+    hand = WindowOperation("hand", "s", "next")
+    runner._mm_rng_state = SimpleNamespace(discard=lambda rid: calls.append(("discard_rng", rid)))
     runner.model_state = MagicMock()
     monkeypatch.setattr(GPUModelRunner, "finish_requests", lambda *args: None)
 
-    runner.finish_requests(
-        SimpleNamespace(finished_req_ids={"r"}, preempted_req_ids=set(), duplex_carry_ops=[("keep", "s", "r")])
-    )
-    runner.finish_requests(SimpleNamespace(finished_req_ids=set(), preempted_req_ids=set(), duplex_carry_ops=[]))
+    runner.finish_requests(SimpleNamespace(finished_req_ids={"r"}, preempted_req_ids=set(), duplex_carry_ops=[keep]))
+    runner.finish_requests(SimpleNamespace(finished_req_ids=set(), preempted_req_ids=set(), duplex_carry_ops=[hand]))
 
-    assert calls == [("decisions", [("keep", "s", "r")]), ("finished", {"r"}), ("decisions", [])]
+    assert calls == [("decisions", [keep]), ("discard_rng", "r"), ("finished", {"r"}), ("decisions", [hand])]
 
 
 def test_aux_hidden_state_contract_uses_tuple_slot_not_structured_output():
