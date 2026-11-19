@@ -740,6 +740,69 @@ def test_minicpmo_capture_contract(stage, use_mrv2, returns_aux, exclude_full):
     assert runner._exclude_full_graph is exclude_full
 
 
+def _make_graph_contract_model(architecture, stage):
+    from vllm_omni.model_executor.models.registry import OmniModelRegistry
+
+    model_cls = OmniModelRegistry.models[architecture].load_model_cls()
+    model = model_cls.__new__(model_cls)
+    torch.nn.Module.__init__(model)
+    model.have_multimodal_outputs = True
+    if stage is not None:
+        model.model_stage = stage
+    return model
+
+
+@pytest.mark.parametrize(
+    ("architecture", "stage"),
+    [
+        ("BreezeForConditionalGeneration", None),
+        ("HiggsAudioV3TalkerForConditionalGeneration", None),
+        ("Ming3TTSForConditionalGeneration", "llm"),
+        ("MossTTSDelayModel", None),
+        ("MossTTSLocalModel", None),
+        ("VoxtralTTSForConditionalGeneration", "audio_generation"),
+    ],
+)
+def test_tensor_returning_model_preserves_mrv2_full_capture(architecture, stage, monkeypatch):
+    model = _make_graph_contract_model(architecture, stage)
+
+    runner = _make_runner()
+    runner.model = model
+    runner._configure_cudagraph_output_contract()
+    full = BatchExecutionDescriptor(CUDAGraphMode.FULL, 1, 1)
+    runner.cudagraph_manager = SimpleNamespace(
+        _capture_descs={CUDAGraphMode.FULL: [full]},
+        _candidates={(1, 0): [full]},
+        _decode_descs={1: full},
+    )
+
+    def capture(self, *, profile_only):
+        assert self.cudagraph_manager._capture_descs[CUDAGraphMode.FULL] == [full]
+        assert self.cudagraph_manager._candidates[(1, 0)] == [full]
+        assert self.cudagraph_manager._decode_descs[1] == full
+        return 0
+
+    monkeypatch.setattr(GPUModelRunner, "capture_model", capture)
+    assert runner.capture_model(profile_only=True) == 0
+
+
+@pytest.mark.parametrize(
+    ("architecture", "stage"),
+    [
+        ("Ming3TTSForConditionalGeneration", "audio_vae"),
+        ("VoxtralTTSForConditionalGeneration", "audio_tokenizer"),
+    ],
+)
+def test_tensor_return_contract_excludes_structured_decoder_stages(architecture, stage):
+    model = _make_graph_contract_model(architecture, stage)
+
+    runner = _make_runner()
+    runner.model = model
+    runner._configure_cudagraph_output_contract()
+
+    assert runner._exclude_full_graph
+
+
 def _aux_output(num_tokens):
     hidden = torch.arange(num_tokens * 2, dtype=torch.float32).reshape(num_tokens, 2)
     return hidden, {"hidden_states": {"layers": {0: hidden + 1, 24: hidden + 2}}}
