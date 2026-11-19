@@ -1,0 +1,43 @@
+--- pr9197/vllm_omni/diffusion/models/sensenova_u1/pipeline_sensenova_u1.py
++++ benchmark-copy/vllm_omni/diffusion/models/sensenova_u1/pipeline_sensenova_u1.py
+@@ -19,6 +19,7 @@
+
+ import math
+ import os
++import time
+ from collections.abc import Iterable
+ from dataclasses import dataclass
+ from types import SimpleNamespace
+@@ -34,6 +35,7 @@
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
++from vllm_omni.platforms import current_omni_platform
+ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+ from vllm_omni.diffusion.distributed.utils import get_local_device
+@@ -1561,6 +1563,11 @@
+                 p.batch_size, ns.token_h * ns.token_w, -1
+             )
+
++        # Benchmark-only: time the complete iterative loop, excluding setup/PIL.
++        if self.enable_diffusion_pipeline_profiler:
++            current_omni_platform.synchronize()
++            benchmark_loop_start = time.perf_counter()
++
+         for step_i in range(p.num_steps):
+             t = ns.timesteps[step_i]
+             t_next = ns.timesteps[step_i + 1]
+@@ -1589,6 +1596,12 @@
+             )
+             z = z + (t_next - t) * v_pred
+             image_prediction = _unpatchify(z, self.patch_size * merge_size, p.image_size[1], p.image_size[0])
++
++        if self.enable_diffusion_pipeline_profiler:
++            current_omni_platform.synchronize()
++            benchmark_loop_seconds = time.perf_counter() - benchmark_loop_start
++            with self._profiler_lock:
++                self._stage_durations["SenseNovaU1Pipeline.denoise_loop_only"] = benchmark_loop_seconds
+
+         # Cleanup KV caches
+         for key in ("cond", "uncond", "img_cond"):

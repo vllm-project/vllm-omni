@@ -117,3 +117,32 @@ def test_npu_bottom_right_causal_composes_explicit_keep_mask():
 
     assert torch.isfinite(output_cpu).all()
     torch.testing.assert_close(output_cpu, expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not current_omni_platform.is_npu(), reason="Native GQA attention requires Ascend NPU")
+@pytest.mark.parametrize("q_len,kv_len", [(1, 17), (5, 17), (17, 5)])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("mask_kind", ["none", "keep", "bias"])
+def test_npu_gqa_matches_independent_reference(q_len, kv_len, causal, mask_kind):
+    # Independent CPU float64 reference; the backend executes on the real NPU.
+    from tests.diffusion.attention.test_flash_attn_npu_fallback import _reference
+
+    torch.manual_seed(92)
+    q = torch.randn(1, q_len, 8, 128).to(torch.bfloat16)
+    k = torch.randn(1, kv_len, 2, 128).to(torch.bfloat16)
+    v = torch.randn_like(k)
+    mask = None
+    if mask_kind == "keep":
+        mask = torch.ones(1, kv_len, dtype=torch.bool)
+        mask[:, 1] = False
+    elif mask_kind == "bias":
+        mask = torch.zeros(1, 1, q_len, kv_len, dtype=torch.bfloat16)
+        mask[..., 1] = -torch.inf
+        mask[..., -1] = 0.375
+    scale = 0.23
+    expected = _reference(q, k, v, mask, causal, scale)
+    device = torch.device(current_omni_platform.device_type)
+    impl = FlashAttentionImpl(num_heads=8, num_kv_heads=2, head_size=128, softmax_scale=scale, causal=causal)
+    metadata = AttentionMetadata(attn_mask=mask.to(device)) if mask is not None else None
+    got = impl.forward_fa_npu(q.to(device), k.to(device), v.to(device), metadata)
+    torch.testing.assert_close(got.cpu().double(), expected, atol=3e-2, rtol=3e-2)
