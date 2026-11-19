@@ -272,6 +272,11 @@ def talker2code2wav_async_chunk(
         return payload
 
 
+# The processor derives new codec tokens from each complete generated prefix,
+# including decode steps without a multimodal payload and the terminal step.
+setattr(talker2code2wav_async_chunk, "_requires_full_token_history", True)
+
+
 # ============================================================================
 # Worker-connector data plane (non-async-chunk path).
 # cosyvoice3 talker emits `multimodal_outputs={"embed": {"speech_token": t,

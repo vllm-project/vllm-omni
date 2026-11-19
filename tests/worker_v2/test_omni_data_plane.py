@@ -365,10 +365,16 @@ def test_emit_cohort_one_batch_and_trims_non_resumable_history(plane):
     assert request.output_token_count == 1025 and request.all_token_ids == []
 
 
-def test_async_text_producer_opts_into_full_token_history(plane):
+@pytest.mark.parametrize("model_type", ["ming3", "cosyvoice3"])
+@pytest.mark.parametrize("terminal", [False, True])
+def test_async_token_producer_opts_into_full_token_history(plane, model_type, terminal):
+    from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2code2wav_async_chunk
     from vllm_omni.model_executor.stage_input_processors.ming3_audio import thinker2talker_async_chunk
 
-    plane._custom_process_func = thinker2talker_async_chunk
+    plane._custom_process_func = {
+        "ming3": thinker2talker_async_chunk,
+        "cosyvoice3": talker2code2wav_async_chunk,
+    }[model_type]
     request = _new_request()
     request.resumable = False
     plane.register_request(request)
@@ -378,11 +384,12 @@ def test_async_text_producer_opts_into_full_token_history(plane):
         req_ids=["internal"],
         inter_stage_outputs=None,
         sampled_token_ids=[[21]],
-        terminal_req_ids=set(),
+        terminal_req_ids={"internal"} if terminal else set(),
     )
     [(snapshot, payload)] = plane.record.batches[0]
     assert payload is None
     assert snapshot.all_token_ids == [10, 11, 21]
+    assert snapshot.is_finished() is terminal
 
 
 def test_terminal_reserved_abort_and_cleanup_lifecycle(plane):
