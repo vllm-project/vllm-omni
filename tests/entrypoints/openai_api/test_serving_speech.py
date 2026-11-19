@@ -199,6 +199,10 @@ async def test_initial_burst_buffering_holds_until_full(monkeypatch):
     been generated (the playback clock starts with N chunks of reserve)."""
     monkeypatch.setenv("VLLM_OMNI_SPEECH_INITIAL_BURST", "3")
     serving = _burst_serving()
+    # The delivery timeline only flows into observe_audio_streaming_finalize
+    # when the engine client carries mod_metrics — without it the finalize
+    # block is skipped entirely and captured stays empty (KeyError below).
+    serving.engine_client.mod_metrics = mocker.Mock()
     state = {"generated": 0}
 
     async def results():
@@ -310,7 +314,7 @@ async def test_initial_burst_continuity_timeline_follows_delivery(monkeypatch, m
     serving._observe_speech_audio_ttfp = lambda **kwargs: (0, 0, True)
 
     captured = {}
-    mocker.patch(
+    finalize_mock = mocker.patch(
         "vllm_omni.entrypoints.openai.serving_speech.observe_audio_streaming_finalize",
         side_effect=lambda *args, **kwargs: captured.update(kwargs),
     )
@@ -325,6 +329,7 @@ async def test_initial_burst_continuity_timeline_follows_delivery(monkeypatch, m
     output = [c async for c in chunks]
     assert len(output) == 4
 
+    finalize_mock.assert_called_once()
     arrivals = captured["chunk_arrival_times_s"]
     sizes = captured["chunk_bytes"]
     assert len(arrivals) == 4 and len(sizes) == 4
