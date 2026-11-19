@@ -182,6 +182,14 @@ class OmniARModelRunner(OmniGPUModelRunner):
         ):
             raise NotImplementedError(f"MRv2 multimodal feedback requires run_postprocess on {type(state).__name__}")
 
+    def _dummy_run(self, num_tokens: int, *args: Any, **kwargs: Any) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        # Upstream autotuning uses the batch token budget even when one dummy
+        # request would exceed the context-sized attention block table.
+        # This also bounds activation profiling to a schedulable batch. Remove
+        # the override once upstream caps dummy requests at max_model_len.
+        num_tokens = min(num_tokens, self.max_num_reqs * self.max_model_len)
+        return super()._dummy_run(num_tokens, *args, **kwargs)
+
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         super().load_model(*args, **kwargs)
         if (
