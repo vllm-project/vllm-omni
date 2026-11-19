@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING
 from opentelemetry import trace
 from vllm.logger import init_logger
 
-from vllm_omni.engine.duplex.commands import AppendAudio, Commit, DuplexCommand
+from vllm_omni.engine.duplex.commands import AppendAudio, AppendText, Commit, DuplexCommand
 from vllm_omni.engine.duplex.config import apply_input_clock_capabilities, apply_session_stats_capability
 from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
@@ -338,6 +338,20 @@ class DuplexSessionManager:
             # inputs that arrived before it began closing (its teardown
             # acknowledgement covers them).
             return
+        if isinstance(command, AppendText):
+            if not session.capabilities.accepts_input_modality("text"):
+                self.emit(
+                    session,
+                    [
+                        self._error_event(
+                            "native_text_append_unsupported", "This model does not accept text appends", command=command
+                        )
+                    ],
+                )
+                return
+            if not command.text:
+                self.emit(session, [self._error_event("bad_event", "Text must be non-empty", command=command)])
+                return
         if isinstance(command, AppendAudio):
             has_audio = bool(command.audio)
             has_video = bool(command.video_frames)
@@ -349,8 +363,13 @@ class DuplexSessionManager:
                 )
                 runner.input_refused(command, "invalid_input_modality")
                 return
+        if isinstance(command, AppendAudio | AppendText):
             limit = int(self.runtime_config.max_pending_input_bytes_per_session)
-            pending_bytes = len(command.audio) + sum(len(frame) for frame in command.video_frames)
+            pending_bytes = (
+                len(command.text.encode("utf-8"))
+                if isinstance(command, AppendText)
+                else len(command.audio) + sum(len(frame) for frame in command.video_frames)
+            )
             if not session.reserve_input_bytes(pending_bytes, limit=limit, queued=True):
                 self.emit(
                     session,
