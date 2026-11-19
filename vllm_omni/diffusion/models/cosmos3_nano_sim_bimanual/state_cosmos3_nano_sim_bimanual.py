@@ -174,7 +174,6 @@ class Cosmos3NanoSimBimanualSessionState:
     text_kv_by_branch: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = field(default_factory=dict)
     dense_kv_by_branch: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = field(default_factory=dict)
     dense_attention: CosmosSimDenseAttentionCache | None = None
-    frustum_archive: Any = None
     latents: list[torch.Tensor] = field(default_factory=list)
     vae_decode: StreamingDecodeState | None = None
     last_vae_decode_input_frames: int = 0
@@ -259,7 +258,6 @@ class Cosmos3NanoSimBimanualSessionState:
         self.text_kv_by_branch.clear()
         self.dense_kv_by_branch.clear()
         self.dense_attention = None
-        self.frustum_archive = None
         self.latents.clear()
         if self.vae_decode is not None:
             self.vae_decode.release()
