@@ -17,6 +17,7 @@ import torch
 from PIL import Image
 from torch import nn
 from transformers import Qwen3VLProcessor
+from vllm.distributed import get_tp_group
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -178,14 +179,19 @@ class InvokerRenderPipeline(nn.Module, InteractionMixin):
         self.assets = InvokerRenderAssets.read(od_config.model)
         parallel = od_config.parallel_config
         self.ulysses = parallel.ulysses_degree
-        if parallel.tensor_parallel_size != 1 or parallel.ring_degree != 1 or od_config.quantization_config is not None:
-            raise ValueError("Invoker-Render requires TP1 with pure Ulysses and unquantized weights")
+        if parallel.ring_degree != 1 or od_config.quantization_config is not None:
+            raise ValueError("Invoker-Render requires unquantized weights and ring_degree=1")
         self.transformer = MiniMaxH3DiTModel(od_config, diffusers_weights=True, attention_cls=InvokerRenderAttention)
         for index, block in enumerate(self.transformer.blocks):
             block.attn.layer_name = f"blocks.{index}.attn"
             block.attn.layer_index = index
         self.processor = Qwen3VLProcessor.from_pretrained(self.assets.processor, local_files_only=True)
-        self.text_encoder = MiniMaxH3Qwen3VLEncoder(self.assets.text_encoder, device=self.device, load_model=True)
+        self.text_encoder = MiniMaxH3Qwen3VLEncoder(
+            self.assets.text_encoder,
+            device=self.device,
+            load_model=True,
+            encoder_group=get_tp_group() if parallel.tensor_parallel_size > 1 else None,
+        )
         self.vae = MiniMaxH3VideoVAE(
             self.assets.video_vae,
             device=self.device,
@@ -242,9 +248,13 @@ class InvokerRenderPipeline(nn.Module, InteractionMixin):
     def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
         width, height = VIDEO_SIZE
         rows = width // 32 * (height // 32)
-        # 固定前缀、最近 12 对历史以及当前最多 5 个 proxy 同时可见。
-        retained = 32 * rows + self.text_rows
+        # 前缀包含文本、参考图和首帧的 proxy 与目标。历史最多保留 12 对。
+        prefix = 3 * rows + self.text_rows
+        history = 24 * rows
+        retained = prefix + history + 5 * rows
         pending = 19 * rows + self.text_rows
+        # 去噪使用当前最多 5 个目标帧。更新 RoPE 时，新旧前缀同时驻留。
+        staging = max(retained + 5 * rows, 2 * prefix + history)
         latent_pixels = width // 16 * (height // 16)
         decoder_bytes = (
             2 * len(self.decoder.blocks) * 4 * latent_pixels * self.decoder.heads * self.decoder.head_dim * 2
@@ -265,7 +275,7 @@ class InvokerRenderPipeline(nn.Module, InteractionMixin):
                 max_retained_segments=30,
                 max_pending_tokens=pending,
                 max_pending_segments=9,
-                initial_staging_tokens=retained + pending,
+                initial_staging_tokens=staging,
             ),
             model_owned_state_bytes_per_session=decoder_bytes + recent_latent_bytes,
         )
@@ -328,12 +338,14 @@ class InvokerRenderPipeline(nn.Module, InteractionMixin):
             return
         session.active = session.windows.popleft()
         state.latents = session.causal.prepare(self._cache(), session.active)
+        state.step_index = 0
         state.step_in_chunk = 0
 
     def ar_diffusion_step_wait(self, state: StepRequestState) -> StepWait | None:
         session: _Session = state.extra["invoker_session"]
         return StepWait() if session.active is None else None
 
+    @torch.inference_mode()
     def ar_diffusion_resume_step(self, state: StepRequestState, reason: str) -> None:
         if reason != "interaction":
             raise RuntimeError("Invoker-Render proxy stream ended while waiting for input")

@@ -3,15 +3,20 @@
 
 import asyncio
 import io
+from collections import deque
 from types import SimpleNamespace
 
 import av
 import numpy as np
 import pytest
+import torch
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
+from vllm_omni.diffusion.models.invoker_render.interaction import ProxyQueue
+from vllm_omni.diffusion.models.invoker_render.pipeline import InvokerRenderPipeline
 from vllm_omni.diffusion.models.invoker_render.proxy import BOOTSTRAP_KEY, PROXY_MODALITY
+from vllm_omni.diffusion.models.invoker_render.schedule import Window
 from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler
 from vllm_omni.entrypoints.openai.video.proxy_ingress import ProxyIngress
@@ -55,6 +60,38 @@ def test_credit_wait_and_unknown_length():
     assert not state.request_denoise_completed
     state.stream_input_drained = True
     assert state.request_denoise_completed
+
+
+def test_resume_starts_each_window_at_first_timestep(monkeypatch):
+    pipeline = object.__new__(InvokerRenderPipeline)
+    torch.nn.Module.__init__(pipeline)
+    cache = object()
+    window = Window(9, 14, False)
+    latents = torch.ones(1, 5, 2, 2)
+
+    def prepare(active_cache, active_window):
+        assert torch.is_inference_mode_enabled()
+        assert active_cache is cache and active_window is window
+        return latents
+
+    monkeypatch.setattr(pipeline, "_cache", lambda: cache)
+    monkeypatch.setattr(pipeline, "apply_interaction_at_chunk_boundary", lambda state: None)
+    state = StepRequestState(
+        request_id="live",
+        sampling=OmniDiffusionSamplingParams(),
+        timesteps=torch.arange(4),
+        step_index=4,
+        step_in_chunk=4,
+        chunk_num_steps=4,
+    )
+    state.extra[PROXY_MODALITY] = ProxyQueue((32, 32))
+    state.extra["invoker_session"] = SimpleNamespace(windows=deque([window]), causal=SimpleNamespace(prepare=prepare))
+
+    pipeline.ar_diffusion_resume_step(state, "interaction")
+
+    assert state.current_timestep.item() == 0
+    assert state.step_index == state.step_in_chunk == 0
+    assert state.latents is latents
 
 
 def test_websocket_uses_bootstrap_and_muxes_eos(monkeypatch):

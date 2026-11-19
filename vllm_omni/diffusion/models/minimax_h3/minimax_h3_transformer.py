@@ -524,6 +524,8 @@ class MiniMaxH3TokenRefiner(nn.Module):
         max_seqlen: int,
         num_requests: int = 1,
     ) -> torch.Tensor:
+        if x.shape[0] == 0:
+            return x
         for block in self.blocks:
             x = block(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, num_requests=num_requests)
         return self.final_norm(x)
