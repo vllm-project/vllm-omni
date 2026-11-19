@@ -55,9 +55,11 @@ not create the model engine or a duplex session.
 The Realtime benchmark client treats `server_vad_unavailable` and
 `semantic_vad_unavailable` as terminal backend configuration errors. It stops
 streaming and waiting while preserving the protocol error code and message.
-An unavailable VAD backend stops readiness retries and prevents warmup from
-proceeding to the measured workload. Ordinary transport retries and advisory
-errors keep their existing behavior.
+Omni-DuplexEval and OmniInteract preserve unavailable VAD error codes and stop
+readiness retries. Any unsuccessful warmup prevents the measured workload
+from starting. The realtime-video backend retains its failed-warmup artifact
+finalization. Ordinary transport retries and advisory errors keep their
+existing behavior.
 Request failures are logged with their cause, and the DFX assertion includes
 the completed count and the first recorded request error.
 

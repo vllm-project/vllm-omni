@@ -139,6 +139,7 @@ _IMAGE_STAGE_METRICS_BACKENDS = frozenset(
 )
 _PRINT_STAGE = False
 _DUPLEX_METRIC_AGGREGATION = "session"
+_DUPLEX_BACKEND_UNAVAILABLE_CODES = frozenset({"server_vad_unavailable", "semantic_vad_unavailable"})
 
 
 def maybe_enable_stage_metrics(extra_body: dict[str, Any] | None, *, enabled: bool) -> dict[str, Any] | None:
@@ -3133,6 +3134,8 @@ async def _async_request_omniinteract(
     *,
     pbar: tqdm | None,
 ) -> MixRequestFuncOutput:
+    from vllm_omni.clients.duplex import DuplexProtocolError
+
     case = getattr(request_func_input, "omniinteract_case", None)
     options = getattr(request_func_input, "omniinteract_options", None)
     output = MixRequestFuncOutput()
@@ -3193,11 +3196,20 @@ async def _async_request_omniinteract(
         output.duplex_session_metrics = session_metrics
         output.success = case_result.success
         output.error = case_result.error
+        if case_result.error_code in _DUPLEX_BACKEND_UNAVAILABLE_CODES:
+            output.duplex_fatal_error_code = case_result.error_code
+        if output.error:
+            logger.error("OmniInteract Realtime request failed: %s", output.error)
         setattr(output, "omniinteract_case", case)
         setattr(output, "omniinteract_case_result", case_result)
-    except Exception:
+    except Exception as exc:
         output.success = False
-        output.error = traceback.format_exc()
+        if isinstance(exc, DuplexProtocolError):
+            if exc.code in _DUPLEX_BACKEND_UNAVAILABLE_CODES:
+                output.duplex_fatal_error_code = exc.code
+            output.error = f"{exc.code}: {exc}"
+        else:
+            output.error = traceback.format_exc()
         logger.error("OmniInteract Realtime request failed: %s", output.error)
         if case is not None:
             case_result = OmniInteractCaseResult(
@@ -3205,6 +3217,7 @@ async def _async_request_omniinteract(
                 video=str(case.video_path),
                 output_dir="",
                 error=output.error,
+                error_code=exc.code if isinstance(exc, DuplexProtocolError) else None,
             )
             setattr(output, "omniinteract_case", case)
             setattr(output, "omniinteract_case_result", case_result)
@@ -3321,7 +3334,7 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
         if request.request_id is not None:
             setattr(output, "duplex_eval_result", result)
     except DuplexProtocolError as exc:
-        if exc.code in {"server_vad_unavailable", "semantic_vad_unavailable"}:
+        if exc.code in _DUPLEX_BACKEND_UNAVAILABLE_CODES:
             output.duplex_fatal_error_code = exc.code
         output.error = f"{exc.code}: {exc}"
         logger.error("Omni-DuplexEval Realtime request failed: %s", output.error)
@@ -4051,25 +4064,25 @@ async def benchmark(
             warmup_pbar.close()
         print("Warmup run completed.")
 
-    fatal_warmup = next((output for output in warmup_outputs if getattr(output, "duplex_fatal_error_code", None)), None)
-    if fatal_warmup is not None:
+    failed_warmups = [output for output in warmup_outputs if not output.success]
+    if failed_warmups:
         await session.close()
+        if endpoint_type == "realtime-video":
+            return await asyncio.to_thread(
+                finalize_realtime_video,
+                input_requests,
+                [],
+                warmup_outputs,
+                duration=0.0,
+                endpoint=api_url,
+                model=model_id,
+                selected_percentile_metrics=selected_percentile_metrics,
+                selected_percentiles=selected_percentiles,
+            )
+        first_error = next((output.error for output in failed_warmups if output.error), "No request error recorded")
         raise ValueError(
-            f"Duplex warmup rejected the server configuration; measured requests were not sent: {fatal_warmup.error}"
-        )
-
-    if endpoint_type == "realtime-video" and any(not output.success for output in warmup_outputs):
-        await session.close()
-        return await asyncio.to_thread(
-            finalize_realtime_video,
-            input_requests,
-            [],
-            warmup_outputs,
-            duration=0.0,
-            endpoint=api_url,
-            model=model_id,
-            selected_percentile_metrics=selected_percentile_metrics,
-            selected_percentiles=selected_percentiles,
+            f"{len(failed_warmups)}/{len(warmup_outputs)} warmup requests failed; "
+            f"measured requests were not sent: {first_error}"
         )
 
     print("Starting main benchmark run...")

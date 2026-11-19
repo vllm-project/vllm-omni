@@ -136,26 +136,39 @@ async def test_protocol_error_is_reported_without_retry(monkeypatch, caplog, cod
     assert code in caplog.text
 
 
-@pytest.mark.parametrize(("ready_check_timeout_sec", "expected_calls"), [(0, 2), (60, 1)])
-async def test_unavailable_vad_stops_before_measured_requests(
-    monkeypatch, ready_check_timeout_sec, expected_calls
+@pytest.mark.parametrize(
+    ("endpoint_type", "error_code", "ready_check_timeout_sec", "failed_indexes", "expected_calls"),
+    [
+        ("openai-realtime-duplex", "server_vad_unavailable", 0, (0, 1), 2),
+        ("openai-realtime-duplex", "server_vad_unavailable", 60, (0,), 1),
+        ("openai-realtime-duplex", None, 0, (0,), 2),
+        ("openai-realtime-duplex", None, 0, (1,), 2),
+        ("openai-realtime-duplex", None, 0, (0, 1), 2),
+        ("openai-chat-omni", None, 0, (1,), 2),
+    ],
+)
+async def test_failed_probe_or_warmup_stops_before_measured_requests(
+    monkeypatch, endpoint_type, error_code, ready_check_timeout_sec, failed_indexes, expected_calls
 ) -> None:
-    calls = []
+    calls: list[RequestFuncInput] = []
     sessions = []
+    error = f"{error_code}: missing local Silero artifact" if error_code else "model rejected request"
 
     async def unavailable(request_func_input, session, pbar=None):
+        failed = len(calls) in failed_indexes
         calls.append(request_func_input)
         sessions.append(session)
         return patch.MixRequestFuncOutput(
-            error="server_vad_unavailable: missing local Silero artifact",
-            duplex_fatal_error_code="server_vad_unavailable",
+            success=not failed,
+            error=error if failed else "",
+            duplex_fatal_error_code=error_code if failed else None,
         )
 
-    monkeypatch.setitem(patch.ASYNC_REQUEST_FUNCS, "openai-realtime-duplex", unavailable)
-    with pytest.raises(ValueError, match="measured requests were not sent: server_vad_unavailable"):
+    monkeypatch.setitem(patch.ASYNC_REQUEST_FUNCS, endpoint_type, unavailable)
+    with pytest.raises(ValueError, match=f"measured requests were not sent: {error}"):
         await patch.benchmark(
             task_type=patch.TaskType.GENERATION,
-            endpoint_type="openai-realtime-duplex",
+            endpoint_type=endpoint_type,
             api_url="http://127.0.0.1:8000/v1/realtime",
             base_url="http://127.0.0.1:8000",
             model_id="model",
