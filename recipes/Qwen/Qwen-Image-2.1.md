@@ -540,6 +540,27 @@ unless noted; 4× NVIDIA H200):
   (keeping 25% overlap) and decoding retried, down to 128px tiles. Tile sizes
   are not yet exposed as engine arguments.
 
+## Optional NPU FlexAttention
+
+Qwen-Image-2.1 integrates the shared
+[MindIE-SD NPU FlexAttention adapter](../../docs/user_guide/diffusion/attention_backends/npu_flex_attention.md).
+FlexAttention is most useful for long attention sequences, typically when more
+than five images participate. This recipe accepts at most four condition images
+plus the generated image, so that larger workload is outside its current input
+limit.
+
+With a Flex-enabled Ascend 950 image, set
+`QwenImage21Pipeline._DEFAULT_ATTN_PATH = "flex"` in
+`vllm_omni/diffusion/models/qwen_image_21/pipeline_qwen_image_21.py` and use the
+`FLASH_ATTN` backend. This setting applies to full-pipeline and step execution.
+The default `auto` path uses piecewise attention when supported and a dense mask
+otherwise.
+
+Flex handles prefill for one BF16 sample with head dimension 128, without
+attention quantization or sequence parallelism. Set
+`ulysses_degree=ring_degree=allgather_degree=1`; cached-prefix decode keeps its
+existing attention path.
+
 ## NPU performance defaults
 
 Qwen-Image-2.1 enables the following optimizations automatically on eligible

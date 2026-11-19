@@ -119,6 +119,13 @@ default, not a measured compiler limitation. Existing execution is unchanged.
 | Packed inputs | Opt-in `[real, pad]` contract; choose varlen or prefix-KV slicing from the environment | Forward complete packed-document boundaries to varlen attention |
 | Incomplete packing | Rebuild a mask when possible; otherwise reject before the kernel | Shared CUDA-like normalization rejects incomplete metadata |
 | Unpublished mask semantics | Route to the masked wrapper | Keep resolution runtime-dependent without reading mask values |
+| Explicit NPU FlexAttention metadata | `npu_flex`, kernel variant `catlass_dsl_flex` | Unavailable |
+
+The opt-in [NPU FlexAttention path](../../user_guide/diffusion/attention_backends/npu_flex_attention.md)
+calls MindIE-SD's local `flex_attention` API using block-causal metadata
+provided by model integrations. The current Omni adapter accepts single-sample
+BF16 inputs and rejects sequence parallelism. It keeps `UNMIGRATED` support
+status; CPU routing coverage does not establish device numerics or compiler support.
 
 NPU resolution reuses `_resolve_packed_seq_npu`; ROCm reuses the metadata
 normalization used by dispatch. AITER identity comes from initialization rather

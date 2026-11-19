@@ -388,9 +388,9 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         incomplete packed metadata can fall back to a mask, so CUDA metadata
         normalization must not run here. No tensor values are inspected.
         """
+        extra = attn_metadata.extra if attn_metadata else {}
         context = replace(context, kernel_variant="mindiesd")
         result = ExecutionPathResult.unmigrated("FLASH_ATTN", context, path="npu_unverified")
-        extra = attn_metadata.extra if attn_metadata else {}
         if (
             context.parallel_strategy is not ParallelStrategy.NONE
             or context.outer_boundaries
@@ -401,6 +401,15 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
 
         # Match forward_fa_npu: spans take precedence over the global causal flag.
         if attn_metadata is not None and attn_metadata.full_attn_spans is not None:
+            if extra.get("npu_flex_attention", False):
+                return replace(
+                    result,
+                    path="npu_flex",
+                    kernel_variant="catlass_dsl_flex",
+                    support=CapabilityResult.unmigrated(
+                        "NPU FlexAttention routing only; execution validation requires Ascend"
+                    ),
+                )
             return replace(
                 result,
                 path="npu_piecewise",
@@ -1081,6 +1090,13 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         """NPU attention implementation using mindiesd."""
 
         extra = attn_metadata.extra if attn_metadata else {}
+        if extra.get("npu_flex_attention", False):
+            from vllm_omni.diffusion.attention.backends.utils.npu_flex_attention import run_npu_flex_attention
+
+            assert attn_metadata is not None
+            output = run_npu_flex_attention(query, key, value, attn_metadata, self.softmax_scale)
+            logger.info_once("NPU attention is using MindIE-SD CATLASS DSL FlexAttention.")
+            return output
         method = extra.get("kv_cache_dtype")
         if method not in (None, "float", "auto"):
             return self.forward_fa_quant_npu(query, key, value, attn_metadata)
