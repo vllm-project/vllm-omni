@@ -782,7 +782,6 @@ source_file_dependencies:
     - tests/examples/qwen3_omni_audio_artifacts.py
     - tests/examples/online_serving/test_qwen3_omni.py
     - tests/examples/helpers.py
-    - tests/examples/model_scope.py
     - tests/examples/conftest.py
 
   omni_qwen2_5_omni_expansion:
@@ -1470,7 +1469,6 @@ source_file_dependencies:
     - *wan22
     - *hunyuan_video
     - tests/examples/helpers.py
-    - tests/examples/model_scope.py
     - tests/examples/conftest.py
     - examples/offline_inference/image_to_video/
     - tests/examples/offline_inference/test_image_to_video.py
@@ -1529,7 +1527,6 @@ source_file_dependencies:
     - tests/examples/offline_inference/test_text_to_image.py
     - tests/examples/online_serving/test_text_to_image.py
     - tests/examples/helpers.py
-    - tests/examples/model_scope.py
     - tests/examples/conftest.py
 
   diffusion_hunyuan_image3_function:
