@@ -137,6 +137,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`Qwen/Qwen-Image-2.1-NPU.md`](./Qwen/Qwen-Image-2.1-NPU.md) | Low-latency text-to-image and image-conditioned generation (editing) serving with Ulysses sequence parallelism | 1x Ascend 910B1 64GB / up to 8x data parallel |
 | [`Qwen/Qwen-Image-2512.md`](./Qwen/Qwen-Image-2512.md) | Text-to-image serving with step-wise continuous batching replay and ModelOpt FP8 / mixed FP8/NVFP4 | 1x A800 80GB / 2x B200 |
 | [`Qwen/Qwen-Image-Edit.md`](./Qwen/Qwen-Image-Edit.md) | Text-guided single-image editing | 1x or 2x H200 141GB |
+| [`Qwen/Qwen2.5-Omni.md`](./Qwen/Qwen2.5-Omni.md) | Online multimodal chat (text/image/audio/video → text + speech) | 2x NVIDIA H100 80GB (bundled deploy; configuration from in-tree YAML) |
 | [`Qwen/Qwen3-Omni.md`](./Qwen/Qwen3-Omni.md) | Online serving for multimodal chat; offline end-to-end text-to-speech on XPU | 1x A100 80GB / 5x Intel Arc Pro B70 32GB |
 | [`Qwen/Qwen3-TTS.md`](./Qwen/Qwen3-TTS.md) | Text-to-speech serving (CustomVoice / VoiceDesign / Base) | 1x H100/A100 80GB / 1x AMD MI300X |
 | [`Qwen/Qwen3-TTS-RTX4070TiSUPER.md`](./Qwen/Qwen3-TTS-RTX4070TiSUPER.md) | Text-to-speech serving on a 16 GB consumer card (0.6B CustomVoice) | 1x RTX 4070 Ti SUPER 16GB |
