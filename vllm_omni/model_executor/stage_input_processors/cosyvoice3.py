@@ -99,7 +99,11 @@ def talker2code2wav_async_chunk(
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
-    """CosyVoice3 async_chunk processor: talker token stream -> code2wav chunks."""
+    """CosyVoice3 async_chunk processor: talker token stream -> code2wav chunks.
+
+    Every chunk carries the cached reference conditioning because MRv2
+    releases Code2Wav's request slot between chunks.
+    """
     with nullcontext():
         request_id = request.external_req_id
         finished = bool(is_finished or request.is_finished())
@@ -167,7 +171,6 @@ def talker2code2wav_async_chunk(
             request_state = {
                 "_cosyvoice3_async_state": {
                     "seen_len": 0,
-                    "sent_prompt": False,
                     "emitted_chunks": 0,
                     "emitted_token_len": 0,
                     "token_hop_len": chunk_size,
@@ -203,10 +206,7 @@ def talker2code2wav_async_chunk(
         if length <= 0:
             if not finished:
                 return None
-            embed_struct = None
-            if not state.get("sent_prompt", False):
-                embed_struct = _build_prompt_embed_struct(state.get("prompt_payload", {}))
-                state["sent_prompt"] = True
+            embed_struct = _build_prompt_embed_struct(state.get("prompt_payload", {}))
             state["terminal_sent"] = True
             return OmniPayloadStruct(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
@@ -216,10 +216,7 @@ def talker2code2wav_async_chunk(
 
         emitted_token_len = int(state.get("emitted_token_len", 0))
         if finished and length <= emitted_token_len:
-            embed_struct = None
-            if not state.get("sent_prompt", False):
-                embed_struct = _build_prompt_embed_struct(state.get("prompt_payload", {}))
-                state["sent_prompt"] = True
+            embed_struct = _build_prompt_embed_struct(state.get("prompt_payload", {}))
             state["terminal_sent"] = True
             return OmniPayloadStruct(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
@@ -249,10 +246,7 @@ def talker2code2wav_async_chunk(
         with nullcontext():
             code_predictor_codes = [int(frame[0]) for frame in token_frames[:prefix_len]]
 
-        embed_struct = None
-        if not state.get("sent_prompt", False):
-            embed_struct = _build_prompt_embed_struct(state.get("prompt_payload", {}))
-            state["sent_prompt"] = True
+        embed_struct = _build_prompt_embed_struct(state.get("prompt_payload", {}))
 
         payload = OmniPayloadStruct(
             codes=CodesStruct(audio=torch.tensor(code_predictor_codes, dtype=torch.long)),
