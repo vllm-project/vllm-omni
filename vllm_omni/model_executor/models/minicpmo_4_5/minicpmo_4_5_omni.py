@@ -17,11 +17,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -34,7 +36,6 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
@@ -48,6 +49,9 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 logger = init_logger(__name__)
 
@@ -264,9 +268,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 getattr(self.talker, "mrv2_decode_preprocess_is_identity", False)
             )
             self.logits_vocab_size = int(self.talker.logits_vocab_size)
-            # CUDA K-step fused graph hooks live on the Talker; the runner sees
-            # this wrapper (after cudagraph unwrapping), so delegate them here.
+            # The runner sees this wrapper. The Talker owns codec state and CUDA K-step hooks.
             for hook_name in (
+                "kstep_rows_ready",
+                "prepare_kstep_inputs",
+                "rewrite_kstep_initial_embeds",
+                "flush_cuda_kstep_feedback",
                 "prepare_cuda_kstep",
                 "cuda_kstep_frame",
                 "commit_cuda_kstep",
@@ -324,9 +331,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
     @cached_property
     def sampler(self):
+        from vllm.v1.sample.sampler import Sampler
+
         if hasattr(self.model, "sampler"):
             return self.model.sampler
-        from vllm.v1.sample.sampler import Sampler
 
         return Sampler()
 
@@ -411,6 +419,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                             state.last_terminator_token = None
                 else:
                     turn_ended = bool(getattr(state, "current_turn_ended", True)) if state is not None else False
+                    if payload.get("open_assistant_turn") is True and state is not None and turn_ended:
+                        # A response.create-owned unit opens the assistant
+                        # turn. Release the turn-ended latch the same way the
+                        # seeded opening turn does (duplex stage0 prefill):
+                        # otherwise the latch forces this row's silent input
+                        # clock to keep listening, and the listen -> tts_bos
+                        # swap stays blocked while the response waits for the
+                        # model to answer.
+                        with suppress(Exception):
+                            state.current_turn_ended = False
+                            state.pending_speech_response_open = True
+                        turn_ended = False
                     if turn_ended and not pending_speech_context:
                         force_listen = True
 
@@ -860,13 +880,19 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self._minicpmo45_duplex_data_plane_helper = helper
         return helper
 
-    def get_language_model(self) -> torch.nn.Module:
-        """The Thinker's text decoder; drafters share its embedding and lm_head."""
+    def get_language_model(self) -> Any:
+        """The stage's decoder: drafters share the Thinker's embedding and lm_head, or the Talker's codec table."""
         if self.thinker is not None:
             return self.thinker.get_language_model()
+        if self.talker is not None and hasattr(self.talker, "get_language_model"):
+            return self.talker.get_language_model()
         return self.model
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        if self.model_stage == "tts":
+            # The Talker decoder returns them with its hidden states.
+            self.talker.set_aux_hidden_state_layers(layers)
+            return
         # Only the MRv2 Thinker forward hands target layers to the drafter.
         if self.model_stage != "llm" or not self._use_v2_model_runner:
             raise NotImplementedError(
@@ -1024,6 +1050,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         raise ValueError(f"Unsupported model stage: {self.model_stage}")
 
+    @property
+    def mrv2_forward_returns_tensor(self) -> bool:
+        # The runner attaches multimodal outputs from the live batch after replay.
+        return self._use_v2_model_runner and (
+            self.model_stage == "tts" or (self.model_stage == "llm" and not self._returns_aux_hidden_states)
+        )
+
+    @property
+    def mrv2_forward_returns_native_aux(self) -> bool:
+        # Target layers belong to the native drafter, not Omni's auxiliary slot.
+        return self._use_v2_model_runner and self.model_stage == "llm" and self._returns_aux_hidden_states
+
     def make_omni_output_mrv2(self, model_outputs, *, input_batch, req_states, model_intermediate_buffer):
         """Attach the Thinker row identities used by the llm2tts bridge."""
         if self.model_stage != "llm":
@@ -1064,7 +1102,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         """MRv2 Talker outputs are allocated per step by ``make_omni_output_mrv2``."""
         return self.model_stage == "tts" and self._use_v2_model_runner
 
-    def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, None] | None:
+    def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
         if self.model_stage == "tts":
             return self.talker.mrv2_custom_sampler(sampler)
         if self.model_stage == "llm" and getattr(self.vllm_config.model_config, "session_mode", "turn") == "duplex":
@@ -1072,7 +1110,16 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 MiniCPMO45DuplexSampler,
             )
 
-            return MiniCPMO45DuplexSampler(sampler, self), None
+            # Keep the duplex wrapper's output contract. The rejection sampler
+            # verifies ordinary requests using the underlying token sampler.
+            duplex_sampler = MiniCPMO45DuplexSampler(sampler, self)
+            spec = self.vllm_config.speculative_config
+            if spec is None:
+                return duplex_sampler, None
+
+            from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
+
+            return duplex_sampler, RejectionSampler(sampler, spec, sampler.req_states.draft_tokens.device)
         # Keep the runner's defaults, including the rejection sampler that
         # verifies draft tokens.
         return None
@@ -1119,6 +1166,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # a step actually runs it is decided per deployment by stage 1's
         # speculative_config (the runner checks its num_spec_tokens for that).
         return self.model_stage == "tts"
+
+    @property
+    def kstep_continue_token_id(self) -> int:
+        return self.talker.kstep_continue_token_id
 
     @property
     def batch_stop_logits(self):
@@ -1431,7 +1482,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         """Sample duplex rows with at most two host reads: the boundary decisions, then the stage-2 tokens.
 
         Per row: chunk_eos at the speak-length cap, else the boundary draw, else
-        the stage-2 draw, the chunk cut and the listen->tts_bos rewrite. Each
+        the stage-2 draw and the listen->tts_bos rewrite. Each
         row's own generator draws as it would one row at a time; rows sharing
         the process-wide generator draw every boundary before any stage-2 token.
         """
@@ -1443,7 +1494,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             boundary = [row_idx for row_idx in row_idxs if row_idx not in resolved]
             if boundary:
                 hits = self._minicpmo45_duplex_boundary_hits(logits, boundary, chunk_eos_id, sampling_metadata)
-                resolved.update((row_idx, chunk_eos_id) for row_idx, hit in zip(boundary, hits.tolist()) if hit)
+                resolved.update(
+                    (row_idx, chunk_eos_id) for row_idx, hit in zip(boundary, hits.tolist(), strict=True) if hit
+                )
         stage2_rows = [row_idx for row_idx in row_idxs if row_idx not in resolved]
         if stage2_rows:
             draws = self._minicpmo45_duplex_stage2_draws(

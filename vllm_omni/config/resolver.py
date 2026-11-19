@@ -14,7 +14,8 @@ from vllm_omni.config.composable_parallel.strategy_loader import load_strategy_s
 from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
 from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.omni_config import VllmOmniConfig
-from vllm_omni.config.stage_config import PipelineConfig
+from vllm_omni.config.stage_config import NON_STAGE_OVERRIDE_FIELDS, PipelineConfig
+from vllm_omni.config.weight_sharing import WeightSharingConfig
 from vllm_omni.diffusion.data import resolve_model_class_name
 from vllm_omni.diffusion.registry import DiffusionModelRegistry, resolve_native_single_file
 from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
@@ -30,6 +31,7 @@ class OmniConfigResolution:
     stage_configs: tuple[Any, ...]
     pipeline_config: PipelineConfig | None = None
     omni_lb_policy: str | None = None
+    weight_sharing: WeightSharingConfig | None = None
 
     @property
     def endpoint_restrictions(self) -> tuple[EndpointRestriction, ...]:
@@ -131,15 +133,29 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
 def _flatten_stage_overrides(
     cli_overrides: dict[str, Any],
     stage_overrides: Mapping[str, Mapping[str, Any]] | None,
-) -> None:
-    """Translate per-stage mappings to the factory's flat CLI override ABI."""
+) -> dict[str, dict[str, Any]] | None:
+    """Filter per-stage overrides and populate the factory's flat CLI overrides."""
     if not stage_overrides:
-        return
+        return None
+    filtered: dict[str, dict[str, Any]] = {}
     for stage_id, overrides in stage_overrides.items():
         if not isinstance(overrides, Mapping):
             raise TypeError(f"stage override {stage_id!r} must be a mapping, got {type(overrides).__name__}")
+        kept_overrides: dict[str, Any] = {}
         for key, value in overrides.items():
+            config_key = str(key).partition(".")[0]
+            if config_key in NON_STAGE_OVERRIDE_FIELDS:
+                logger.warning(
+                    "Ignoring --stage-overrides[%r][%r]: set %r in the deploy config instead.",
+                    stage_id,
+                    key,
+                    config_key,
+                )
+                continue
             cli_overrides[f"stage_{stage_id}_{key}"] = value
+            kept_overrides[key] = value
+        filtered[stage_id] = kept_overrides
+    return filtered
 
 
 def _apply_generic_stage_overrides(
@@ -174,6 +190,9 @@ def _build_registered_resolution(
         stage_configs=tuple(structured_config.stage_configs),
         pipeline_config=structured_config.pipeline_config,
         omni_lb_policy=getattr(structured_config, "strategy_omni_lb_policy", None),
+        # Optional: callers may build partial structured views (and older
+        # configs predate the field), exactly like strategy provenance above.
+        weight_sharing=getattr(structured_config, "weight_sharing", None),
     )
 
 
@@ -210,7 +229,7 @@ def resolve_omni_config(
     if is_native_single_file:
         normalized_overrides["model_class_name"] = native_single_file_model
     registry_overrides = dict(normalized_overrides)
-    _flatten_stage_overrides(registry_overrides, stage_overrides)
+    filtered_stage_overrides = _flatten_stage_overrides(registry_overrides, stage_overrides)
 
     strategy_specs = _load_strategy_specs(strategy_config_path)
     structured_config = None
@@ -226,7 +245,7 @@ def resolve_omni_config(
     if structured_config is not None:
         return _build_registered_resolution(structured_config)
 
-    _apply_generic_stage_overrides(normalized_overrides, stage_overrides)
+    _apply_generic_stage_overrides(normalized_overrides, filtered_stage_overrides)
     supported, model_class_name = _resolve_generic_diffusion_model_class(model, normalized_overrides)
     if not supported:
         raise ValueError(

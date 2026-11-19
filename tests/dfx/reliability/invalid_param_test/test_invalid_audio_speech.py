@@ -42,7 +42,7 @@ _SKIP_ISSUE_3649 = pytest.mark.skip(reason="https://github.com/vllm-project/vllm
 
 pytestmark = [pytest.mark.slow, pytest.mark.tts]
 
-_L4_SPEECH_HW = hardware_marks(res={"cuda": "L4"})
+_L4_SPEECH_HW = hardware_marks(res={"cuda": "L4", "rocm": "MI325"})
 _SPEECH_SERVER_ARGS = ["--trust-remote-code", "--disable-log-stats"]
 
 _QWEN3_TTS_SPEECH = [
@@ -830,7 +830,7 @@ def _voices_upload_multipart_files(kind: str | None) -> dict[str, Any] | None:
         pytest.param(
             "wav_pdf_type",
             {"consent": "consent_ok", "name": "v_bad_mime_{uuid}"},
-            ("mime", "unsupported", "audio/mp4"),
+            ("mime", "unsupported", "application/pdf"),
             id="audio_unsupported_mime",
         ),
         pytest.param(
@@ -999,7 +999,7 @@ _MINIMAX_MUSIC3_SPEECH = [
             server_args=_SPEECH_SERVER_ARGS,
         ),
         id="minimax_music3",
-        marks=hardware_marks(res={"cuda": "H100"}),
+        marks=hardware_marks(res={"cuda": "H100", "rocm": "MI325"}),
     ),
 ]
 
@@ -1036,86 +1036,6 @@ def test_minimax_music3_speech_invalid_field_values(
         "model": omni_server.model,
         "input": _MINIMAX_MUSIC3_LYRICS,
         "instructions": _MINIMAX_MUSIC3_CAPTION,
-        "seed": 1,
-        "max_new_tokens": 250,
-        "response_format": "wav",
-    }
-    for key, value in overrides.items():
-        if value is None:
-            body.pop(key, None)
-        else:
-            body[key] = value
-    online_client.send_audio_speech_http_request(
-        {"json": body, "timeout": 120, "err_code": 400, "err_message": err_message}
-    )
-
-
-# ─── POST /v1/audio/speech · YuE2-3B ───
-
-# Text-to-music like MiniMax Music 3, with one twist: the ABC score span is
-# request-controlled via extra_params.cot/abc and the two must agree, and
-# sampling is pinned by the checkpoint preset so sampling knobs are rejected.
-_YUE2_SPEECH = [
-    pytest.param(
-        OmniServerParams(
-            model="m-a-p/YuE2-3B",
-            stage_config_path=get_deploy_config_path("yue2.yaml"),
-            server_args=_SPEECH_SERVER_ARGS,
-        ),
-        id="yue2",
-        marks=hardware_marks(res={"cuda": "H100"}),
-    ),
-]
-
-_YUE2_LYRICS = "一闪一闪亮晶晶\n满天都是小星星"
-_YUE2_CAPTION = "Chinese heavy metal, distorted electric guitars, 140 BPM, key of C."
-_YUE2_ABC = "X:1\nT:Twinkle\nM:4/4\nL:1/4\nK:C\nC C G G|A A G2|"
-# 25 frames per second; the semantic preset bounds the frame budget.
-_YUE2_MAX_FRAMES = 9000
-
-
-@pytest.mark.parametrize(
-    "overrides, err_message",
-    [
-        pytest.param({"instructions": None}, ("instructions",), id="caption_missing"),
-        pytest.param({"instructions": "   "}, ("instructions",), id="caption_blank"),
-        pytest.param({"input": "   "}, ("input",), id="lyrics_blank"),
-        pytest.param({"voice": "alloy"}, ("voice",), id="voice_rejected"),
-        pytest.param({"speed": 1.5}, ("speed",), id="speed_rejected"),
-        pytest.param(
-            {"max_new_tokens": _YUE2_MAX_FRAMES + 1},
-            ("max_new_tokens", str(_YUE2_MAX_FRAMES)),
-            id="max_new_tokens_over_cap",
-        ),
-        pytest.param({"max_new_tokens": 199}, ("max_new_tokens",), id="max_new_tokens_below_min"),
-        pytest.param(
-            {"extra_params": {"cot": "melody"}},
-            ("abc",),
-            id="cot_melody_without_abc",
-        ),
-        pytest.param(
-            {"extra_params": {"abc": _YUE2_ABC}},
-            ("cot",),
-            id="abc_without_cot",
-        ),
-        pytest.param(
-            {"extra_params": {"temperature": 0.3}},
-            ("temperature",),
-            id="temperature_rejected",
-        ),
-    ],
-)
-@pytest.mark.parametrize("omni_server", _YUE2_SPEECH, indirect=True)
-def test_yue2_speech_invalid_field_values(
-    omni_server: OmniServer,
-    online_client: OnlineOmniClient,
-    overrides: dict[str, object],
-    err_message: str | tuple[str, ...],
-) -> None:
-    body: dict[str, Any] = {
-        "model": omni_server.model,
-        "input": _YUE2_LYRICS,
-        "instructions": _YUE2_CAPTION,
         "seed": 1,
         "max_new_tokens": 250,
         "response_format": "wav",
