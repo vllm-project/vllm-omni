@@ -121,10 +121,11 @@ should happen:
 - The reference clip also shapes delivery implicitly (an expressive or pause-heavy
   reference carries over), but it is not a targeted control.
 - For scripts that start with an event such as `[sighs]` and have no voice
-  reference or explicit speaker tags, a later sentence that starts with an
-  event is introduced as another turn for speaker 0. This helps the model
-  resume speaking after the event. Use explicit speaker tags to specify your
-  own turn boundaries.
+  reference or explicit speaker tags, whitespace between sentence-ending
+  punctuation and the next event starts another turn for speaker 0. This helps
+  the model resume speaking after the event. Adjacent events such as
+  `散步。[叹气] 记得带伞。` stay in the same turn to preserve the voice.
+  Use explicit speaker tags to specify your own turn boundaries.
 
 Offline (`Omni`): pass `additional_information` with `text`, `ref_text`,
 `ref_audio_wav`, `ref_audio_sr` (and optionally `voice_name` to cache the

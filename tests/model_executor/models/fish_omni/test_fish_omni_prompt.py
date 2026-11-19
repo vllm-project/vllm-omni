@@ -134,7 +134,8 @@ def test_inline_event_tags_pass_through():
     ("text", "expected"),
     [
         ("[sighs] Fine. [laughs] Well.", "[sighs] Fine.\n<|speaker:0|> [laughs] Well."),
-        ("[轻声] 好。[叹气] 回来了。", "[轻声] 好。\n<|speaker:0|> [叹气] 回来了。"),
+        ("[轻声] 好。[叹气] 回来了。", "[轻声] 好。[叹气] 回来了。"),
+        ("[轻声] 好。 [叹气] 回来了。", "[轻声] 好。\n<|speaker:0|> [叹气] 回来了。"),
         ("[sighs] Fine, [laughs] really. [pause]", "[sighs] Fine, [laughs] really. [pause]"),
         ("[sighs] Fine. <|speaker:3|> [laughs] Well.", "[sighs] Fine. <|speaker:3|> [laughs] Well."),
         ("See the table. [1] This row.", "See the table. [1] This row."),
