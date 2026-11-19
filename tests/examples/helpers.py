@@ -63,6 +63,8 @@ def models_in_snippet(language: str, code: str) -> tuple[str, ...]:
                 if index + 1 == len(argv):
                     return ()
                 models.append(argv[index + 1])
+        if any(re.fullmatch(r"[A-Za-z0-9_./-]+", model) is None for model in models):
+            return ()
     elif language == "python":
         try:
             tree = ast.parse(code)
@@ -70,7 +72,7 @@ def models_in_snippet(language: str, code: str) -> tuple[str, ...]:
             return ()
         # Resolve only a single module-level literal assignment. Count all
         # writes, including annotated/augmented assignments, tuple unpacking,
-        # loop targets and named expressions, before trusting a binding.
+        # loop targets, named expressions and pattern captures.
         writes: defaultdict[str, int] = defaultdict(int)
         for node in ast.walk(tree):
             if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
@@ -81,6 +83,10 @@ def models_in_snippet(language: str, code: str) -> tuple[str, ...]:
                 writes[node.name] += 1
             elif isinstance(node, ast.alias):
                 writes[node.asname or node.name.split(".")[0]] += 1
+            elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None:
+                writes[node.name] += 1
+            elif isinstance(node, ast.MatchMapping) and node.rest is not None:
+                writes[node.rest] += 1
         bindings: dict[str, str] = {}
         for node in tree.body:
             if (
