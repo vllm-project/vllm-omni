@@ -146,3 +146,18 @@ def test_adapters_without_codes_support_reject_them():
     assert "not supported by qwen3_tts" in validate_tts_request(plain, request)
     assert validate_tts_request(plain, _request()) is None
     assert validate_tts_request(_adapter(), request) is None
+
+
+def test_adapter_refuses_an_epsilon_cutoff_the_deployment_cannot_serve():
+    """Without reference sampling a non-zero cutoff is a 400 naming the switch, not a silent
+    no-op; with it, the cutoff must lie in [0, 1) like top_p in (0, 1]."""
+    adapter = _adapter()
+    assert adapter.validate(_request(extra_params={"epsilon_cutoff": 0})) is None
+    error = adapter.validate(_request(extra_params={"epsilon_cutoff": 0.002}))
+    assert error is not None and "hf_overrides fish_omni_reference_sampling: true" in error
+
+    adapter.ctx.engine_client.model_config.hf_config.fish_omni_reference_sampling = True
+    assert adapter.validate(_request(extra_params={"epsilon_cutoff": 0.002})) is None
+    assert (
+        adapter.validate(_request(extra_params={"epsilon_cutoff": 1.5})) == "epsilon_cutoff must be in [0, 1), got 1.5."
+    )
