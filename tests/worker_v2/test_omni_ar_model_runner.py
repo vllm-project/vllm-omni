@@ -414,8 +414,13 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
     # Exercise the deferred structured-output branch in one existing matrix
     # case without doubling the full orchestration parametrization.
     requires_multimodal_postprocess = not needs_history and include_hidden is None and engine_output_type == "text"
+
+    def compute_prompt_logits(hidden):
+        return hidden
+
     runner.model = SimpleNamespace(
         compute_logits=lambda hidden: hidden,
+        compute_prompt_logits=compute_prompt_logits,
         logitsprocs_need_output_token_ids=needs_history,
         postprocess_requires_multimodal_outputs=requires_multimodal_postprocess,
     )
@@ -445,6 +450,7 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
     monkeypatch.setattr(omni_ar_model_runner, "OmniAsyncOutput", MagicMock(return_value=mock_out))
 
     assert runner.sample_tokens(None) is mock_out
+    assert logprobs_mock.call_args.args[0] is compute_prompt_logits
     if requires_multimodal_postprocess:
         runner.model_state.run_postprocess.assert_called_once_with(text_hidden, input_batch, multimodal_outputs)
     else:

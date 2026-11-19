@@ -73,7 +73,7 @@ _WATERMARK_CONFIG_HELP = f"JSON watermark configuration. Example: {WATERMARK_CON
 def _parse_stage_overrides(value: str) -> dict[str, dict[str, Any]]:
     """Adapt shared stage-override validation to argparse's error type."""
     try:
-        parsed = parse_stage_overrides(value)
+        parsed = parse_stage_overrides(value, filter_deploy_fields=False)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
     if parsed is None:
@@ -178,6 +178,11 @@ class OmniServeCommand(CLISubcommand):
         # If model is specified in CLI (as positional arg), it takes precedence
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag
+
+        # Argument converters can run more than once in the tracking parser.
+        # Filter and warn once before any API workers receive the overrides.
+        if (stage_overrides := getattr(args, "stage_overrides", None)) is not None:
+            args.stage_overrides = parse_stage_overrides(stage_overrides)
 
         if getattr(args, "no_guardrails", False):
             existing = getattr(args, "model_config", None)
