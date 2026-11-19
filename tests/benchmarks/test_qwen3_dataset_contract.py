@@ -69,6 +69,47 @@ def test_dataset_server_groups_do_not_share_a_failed_media_engine():
     assert len(seed["benchmark_params"]) == 4
 
 
+@pytest.mark.parametrize(
+    "config_file,test_name,prefix",
+    [
+        ("test_qwen3_omni_datasets.json", "test_qwen3_omni_datasets_npu_default", False),
+        ("test_qwen3_omni_datasets.json", "test_qwen3_omni_datasets_npu_async_prefix", True),
+        ("test_qwen3_omni_duplex_omni_duplex_eval.json", "test_qwen3_omni_duplex_omni_duplex_eval_npu", True),
+    ],
+)
+def test_npu_matrix_preserves_platform_runtime_guards(config_file, test_name, prefix):
+    from dataclasses import asdict
+
+    from tests.helpers.stage_config import modify_stage_config
+    from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config
+
+    configs = json.loads((ROOT / "tests/dfx/perf/tests" / config_file).read_text())
+    params = next(config["server_params"] for config in configs if config["test_name"] == test_name)
+    args = params["extra_cli_args"]
+    source = str(ROOT / args[args.index("--deploy-config") + 1])
+    original = _apply_platform_overrides(load_deploy_config(source), "npu")
+    modified = modify_stage_config(source, updates=params["update"])
+    actual = _apply_platform_overrides(load_deploy_config(modified), "npu")
+    stages = {stage.stage_id: stage for stage in actual.stages}
+
+    assert actual.model_runner == "v2"
+    assert {stage_id: stage.devices for stage_id, stage in stages.items()} == {0: "0", 1: "1", 2: "1"}
+    assert stages[0].tensor_parallel_size == 1
+    assert stages[0].engine_extras["enable_prefix_caching"] is prefix
+    for stage in original.stages:
+        expected = asdict(stage)
+        effective = asdict(stages[stage.stage_id])
+        assert expected["compilation_config"]["cudagraph_mode"] == "PIECEWISE"
+        for key in ("devices", "tensor_parallel_size", "gpu_memory_utilization"):
+            if key == "devices" or stage.stage_id == 0:
+                expected.pop(key)
+                effective.pop(key)
+        if stage.stage_id == 0:
+            expected["engine_extras"].pop("enable_prefix_caching", None)
+            effective["engine_extras"].pop("enable_prefix_caching", None)
+        assert effective == expected, f"{test_name}: stage {stage.stage_id} changed unrelated platform settings"
+
+
 def test_coverage_rejects_partial_success_even_with_high_accuracy():
     result = {"request_count": 1197, "completed": 1000, "successful_audio_requests": 1000, "daily_omni_accuracy": 0.70}
     errors = validation.coverage_errors(result, 1197, require_audio=True)

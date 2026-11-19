@@ -29,6 +29,8 @@ The serving topology uses two inference devices: Thinker TP1 on device 0,
 Talker and Code2Wav share device 1. CUDA Seed-TTS evaluators reuse device 1
 after request measurement. NPU reserves a third device for the evaluators.
 Production deploy YAMLs are not changed; JSON applies temporary test overrides.
+NPU topology overrides retain the production PIECEWISE graph mode, per-stage
+token budgets and memory limits outside the explicit Thinker TP1 adjustment.
 Benchmark servers allow 1200 seconds per stage and 1800 seconds for overall
 initialization, covering cold compilation before requests are measured.
 Daily-Omni and Seed-TTS use separate server groups. A failed media engine therefore

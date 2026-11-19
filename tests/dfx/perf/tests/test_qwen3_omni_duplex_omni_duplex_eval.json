@@ -241,28 +241,13 @@
         },
         "duplex_session.max_sessions": 8,
         "duplex_session.collect_stats": true,
-        "platforms": {
-          "npu": {
-            "model_runner": "v2",
-            "stages": [
-              {
-                "stage_id": 0,
-                "tensor_parallel_size": 1,
-                "devices": "0",
-                "gpu_memory_utilization": 0.95,
-                "enable_prefix_caching": true
-              },
-              {
-                "stage_id": 1,
-                "devices": "1"
-              },
-              {
-                "stage_id": 2,
-                "devices": "1"
-              }
-            ]
-          }
-        }
+        "platforms.npu.model_runner": "v2",
+        "platforms.npu.stages.0.tensor_parallel_size": 1,
+        "platforms.npu.stages.0.devices": "0",
+        "platforms.npu.stages.0.gpu_memory_utilization": 0.95,
+        "platforms.npu.stages.0.enable_prefix_caching": true,
+        "platforms.npu.stages.1.devices": "1",
+        "platforms.npu.stages.2.devices": "1"
       }
     },
     "benchmark_params": [
