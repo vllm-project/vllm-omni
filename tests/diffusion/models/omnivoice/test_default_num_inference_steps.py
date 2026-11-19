@@ -2,23 +2,27 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """OmniVoice fills its default step count before step-scheduler admission (#9475)."""
 
-import json
 from types import SimpleNamespace
 
 import pytest
 
+from vllm_omni.diffusion.data import TransformerConfig
 from vllm_omni.diffusion.models.omnivoice.pipeline_omnivoice import get_omnivoice_pre_process_func
 from vllm_omni.diffusion.registry import _DIFFUSION_PRE_PROCESS_FUNCS
 from vllm_omni.diffusion.sched import StepScheduler
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
+def _od_config(**model_config):
+    return SimpleNamespace(tf_model_config=TransformerConfig.from_dict(model_config))
+
+
 @pytest.fixture
-def pre_process(tmp_path):
-    (tmp_path / "config.json").write_text(json.dumps({"num_step": 16}))
-    return get_omnivoice_pre_process_func(SimpleNamespace(model=str(tmp_path)))
+def pre_process():
+    return get_omnivoice_pre_process_func(_od_config(num_step=16))
 
 
 def _request(**sampling_kwargs):
@@ -35,6 +39,19 @@ def test_unset_steps_default_to_model_num_step(pre_process):
 
     assert request.sampling_params.num_inference_steps == 16
     assert StepScheduler._get_total_steps(None, request) == 16
+
+
+def test_missing_num_step_falls_back_to_config_default():
+    request = get_omnivoice_pre_process_func(_od_config())(_request())
+
+    assert request.sampling_params.num_inference_steps == OmniVoiceConfig().num_step
+
+
+def test_default_is_resolved_at_hook_creation_without_model_path():
+    # od_config has no ``model``: the hook must not touch disk or the Hub at admission.
+    request = get_omnivoice_pre_process_func(_od_config(num_step=8))(_request())
+
+    assert request.sampling_params.num_inference_steps == 8
 
 
 def test_explicit_steps_are_preserved(pre_process):
