@@ -560,7 +560,12 @@ upstream LLM) pays the WebSocket handshake once instead of once per utterance.
 
 ### Session Config Parameters
 
-All REST API parameters are supported, plus:
+All REST API parameters are supported and validated when `session.config`
+arrives, except `input` (sent as `input.text`) and `stream` / `stream_format`
+(replaced by `stream_audio`). `ref_audio` takes a single string and
+`speaker_embedding` a flat list. `duration_seconds` and `token_count` set the
+length of a whole request, so they require `split_granularity="none"` and
+`text_input_mode="buffered"`. Session parameters:
 
 | Parameter | Type | Default | Description |
 | ----------- | ------ | --------- | ------------- |
