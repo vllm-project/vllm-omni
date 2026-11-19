@@ -46,6 +46,8 @@ class FakeStageClient:
         self.next_inputs = list(next_inputs or [])
         self.add_request_calls: list[tuple[Any, ...]] = []
         self.decoded_source_tokens: str | None = None
+        self.received_source_model_config: Any = None
+        self.bridge_error: Exception | None = None
         self._engine_core_outputs: queue.Queue[Any] = queue.Queue()
 
     async def add_request_async(self, *args, **_kwargs) -> None:
@@ -61,9 +63,12 @@ class FakeStageClient:
         return None
 
     def process_engine_inputs(self, _source_outputs, prompt=None, streaming_context=None):
+        self.received_source_model_config = getattr(streaming_context, "source_model_config", None)
         decoder = getattr(streaming_context, "source_token_decoder", None)
         if callable(decoder):
             self.decoded_source_tokens = decoder([11, 12], skip_special_tokens=True)
+        if self.bridge_error is not None:
+            raise self.bridge_error
         return list(self.next_inputs)
 
     async def abort_requests_async(self, _request_ids: list[str]) -> None:
@@ -155,7 +160,9 @@ def _request_output(request_id: str) -> RequestOutput:
 
 
 @pytest.mark.asyncio
-async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
+@pytest.mark.parametrize("bridge_fails", [False, True])
+@pytest.mark.parametrize("source_stage_id", [0, 2])
+async def test_forward_text_prompt_uses_target_stage_input_processor(bridge_fails, source_stage_id) -> None:
     class SourceTokenizer:
         def decode(self, token_ids, *, skip_special_tokens):
             assert skip_special_tokens is True
@@ -166,15 +173,15 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
         final_output=True,
         next_inputs=[{"prompt": "hello", "multi_modal_data": {"video": ["frame"]}}],
     )
-    stage_pools = [
+    stage_pools = [StagePool(i, [FakeStageClient()]) for i in range(source_stage_id)] + [
         StagePool(
-            0,
+            source_stage_id,
             [stage0],
             output_processor=FakeOutputProcessor(tokenizer=SourceTokenizer()),
             stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
         ),
         StagePool(
-            1,
+            source_stage_id + 1,
             [stage1],
             output_processor=FakeOutputProcessor(),
             stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
@@ -191,17 +198,30 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
         async_chunk=False,
     )
     input_processor = FakeInputProcessor()
-    orchestrator._stage_input_processors[1] = input_processor
+    orchestrator._stage_input_processors[source_stage_id + 1] = input_processor
+    orchestrator._handle_forward_failure = AsyncMock(return_value=True)
     req_state = OrchestratorRequestState(
         request_id="req-text",
         prompt={"prompt": "original"},
-        sampling_params_list=[SamplingParams(max_tokens=1), SamplingParams(max_tokens=1)],
-        final_stage_id=1,
+        sampling_params_list=[SamplingParams(max_tokens=1) for _ in stage_pools],
+        final_stage_id=source_stage_id + 1,
     )
     orchestrator.request_states[req_state.request_id] = req_state
+    previous_model_config = object()
+    req_state.streaming.source_model_config = previous_model_config
+    if bridge_fails:
+        stage1.bridge_error = ValueError("postprocessor failed")
 
-    await orchestrator._forward_to_next_stage("req-text", 0, _request_output("req-text"), req_state)
+    await orchestrator._forward_to_next_stage("req-text", source_stage_id, _request_output("req-text"), req_state)
 
+    assert stage1.received_source_model_config is stage_pools[source_stage_id].stage_vllm_config.model_config
+    assert req_state.streaming.source_model_config is previous_model_config
+    assert req_state.streaming.source_token_decoder is None
+    if bridge_fails:
+        orchestrator._handle_forward_failure.assert_awaited_once()
+        assert input_processor.calls == []
+        assert stage1.add_request_calls == []
+        return
     assert input_processor.calls
     assert input_processor.calls[0]["prompt"] == {"prompt": "hello", "multi_modal_data": {"video": ["frame"]}}
     assert stage1.decoded_source_tokens == "11:12"

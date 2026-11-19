@@ -92,6 +92,7 @@ the default wrapper for every generation task.
 | ------ | ---------- | --------- | ---------- | --------- |
 | Conversation or multimodal understanding/generation | `POST /v1/chat/completions` | JSON | OpenAI-style JSON or SSE | [Chat Completions](chat_completions_api.md) |
 | Text-to-speech | `POST /v1/audio/speech` | JSON | Audio bytes or SSE | [Speech](speech_api.md) |
+| Speech-to-text with optional word timestamps | `POST /v1/audio/transcriptions` | Multipart form | JSON, plain text, or text SSE | [Transcription](transcription_api.md) |
 | Sound, music, or ambient audio generation | `POST /v1/audio/generate` | JSON | Audio bytes | [Audio Generation](audio_generate_api.md) |
 | Text-to-image | `POST /v1/images/generations` | JSON | Base64 JSON or an image file | [Image Generation](image_generation_api.md) |
 | Image editing | `POST /v1/images/edits` | Multipart form | Base64 JSON or SSE | [Image Edit](image_edit_api.md) |

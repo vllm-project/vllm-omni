@@ -1772,3 +1772,19 @@ def test_omni_generate_dead_orchestrator_closes_engine(monkeypatch: pytest.Monke
         assert not app.request_states
     finally:
         app.shutdown()
+
+
+@pytest.mark.parametrize("extra_modality", ["audio", "image"])
+@pytest.mark.parametrize("align", [False, True])
+def test_transcription_modality_selection_stops_before_unrelated_stages(extra_modality, align):
+    app = object.__new__(OmniBase)
+    app._stage_meta_list = [
+        _stage_meta(stage_type="llm", final_output=True, final_output_type="text"),
+        _stage_meta(stage_type="llm", final_output=True, final_output_type="timestamps"),
+        _stage_meta(stage_type="llm", final_output=True, final_output_type=extra_modality),
+    ]
+    app.output_modalities = ["text", "timestamps", extra_modality]
+    requested = ["text", "timestamps"] if align else ["text"]
+
+    assert app._compute_final_stage_id(requested) == (1 if align else 0)
+    assert app._compute_final_output_stage_ids(requested) == ([0, 1] if align else [0])

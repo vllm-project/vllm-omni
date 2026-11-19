@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""stage input processor for a forced-aligner stage.
+"""Stage input processors for a forced-aligner stage.
 
 Bridges a Code2Wav (audio) stage to a pooling forced-aligner stage:
 
@@ -10,21 +10,24 @@ Bridges a Code2Wav (audio) stage to a pooling forced-aligner stage:
 shape as ``qwen3_tts.talker2code2wav``). It runs in the orchestrator process,
 reads the synthesized waveform from the upstream Code2Wav output and the
 ground-truth text from the original request, then builds the aligner prompt
-(``<timestamp>`` markers per word) + audio multimodal input.
+(``<timestamp>`` markers per word) + audio multimodal input. ``asr2aligner``
+instead aligns a completed ASR transcript against the original input audio.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
 from vllm.logger import init_logger
+from vllm.multimodal.audio import MONO_AUDIO_SPEC, get_audio_duration, normalize_audio
 
+from vllm_omni.model_executor.models.interfaces import get_transcription_language
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_language_from_prompt,
 )
-from vllm_omni.utils.qwen3_force_align_processor import build_prompt, segment_words
+from vllm_omni.utils.qwen3_force_align_processor import AUDIO_PLACEHOLDER, build_prompt, segment_words
 
 logger = init_logger(__name__)
 
@@ -120,6 +123,89 @@ def _extract_text(prompt: Any, index: int = 0) -> str:
     if isinstance(text, list):
         return str(text[index]) if index < len(text) else ""
     return str(text) if text else ""
+
+
+def parse_asr_output(raw_text: str, *, model_config: Any, model_cls: Any | None = None) -> tuple[str, str | None]:
+    """Normalize ASR text with its source model's transcription contract.
+
+    A supplied model class takes precedence over config-based resolution.
+    Language metadata comes from the model's optional language hook. Missing
+    source configuration is an error rather than an implicit model choice.
+    """
+    if model_config is None:
+        raise ValueError("ASR forced alignment requires the source model configuration")
+    if model_cls is None:
+        from vllm.model_executor.model_loader import get_model_cls
+
+        model_cls = get_model_cls(model_config)
+    text = model_cls.post_process_output(raw_text)
+    if not isinstance(text, str):
+        raise TypeError("ASR post_process_output must return a transcript string")
+    return text, get_transcription_language(model_cls, raw_text)
+
+
+def asr2aligner(
+    source_outputs: list[Any],
+    prompt: Any = None,
+    _requires_multimodal_data: bool = False,
+    _streaming_context: Any | None = None,
+) -> list[Any]:
+    """Align completed ASR text to the original waveform, preserving language.
+
+    A silent transcript still produces a pooling request with no timestamp
+    markers, so the downstream stage terminates with an empty alignment.
+    """
+    from vllm_omni.inputs.data import OmniTextPrompt
+
+    aligner_inputs: list[OmniTextPrompt] = []
+    for i, src in enumerate(source_outputs):
+        if not getattr(src, "finished", False):
+            continue
+        source_prompt = prompt[i] if isinstance(prompt, list) else prompt
+        if not isinstance(source_prompt, dict):
+            raise ValueError("ASR forced alignment requires the original audio prompt")
+        audio = (source_prompt.get("multi_modal_data") or {}).get("audio")
+        if audio is None and isinstance(source_prompt.get("encoder_prompt"), dict):
+            audio = (source_prompt["encoder_prompt"].get("multi_modal_data") or {}).get("audio")
+        if isinstance(audio, list) and len(audio) == 1:
+            audio = audio[0]
+        if not isinstance(audio, tuple) or len(audio) != 2:
+            raise ValueError("ASR forced alignment requires decoded audio as (waveform, sample_rate)")
+        waveform, sample_rate = audio
+        if isinstance(waveform, torch.Tensor):
+            waveform = waveform.detach().cpu().to(torch.float32).numpy()
+        waveform = np.asarray(waveform, dtype=np.float32)
+        sample_rate = int(sample_rate)
+        if sample_rate <= 0:
+            raise ValueError("ASR forced alignment requires a positive audio sample rate")
+        waveform = cast(np.ndarray, normalize_audio(waveform, MONO_AUDIO_SPEC))
+
+        output = src.outputs[0]
+        raw_text = getattr(output, "cumulative_text", None) or getattr(output, "text", "")
+        if not isinstance(raw_text, str):
+            raise TypeError("ASR output must contain a transcript string")
+        text, detected_language = parse_asr_output(
+            raw_text, model_config=getattr(_streaming_context, "source_model_config", None)
+        )
+        language_list = extract_language_from_prompt(source_prompt)
+        if not language_list and detected_language:
+            language_list = [detected_language]
+        words = segment_words(text, language_list[0] if language_list else None)
+        info: dict[str, Any] = {
+            "text": [text],
+            ALIGNER_WORDS_KEY: [words],
+            ALIGNER_DURATION_MS_KEY: [get_audio_duration(y=waveform, sr=sample_rate) * 1000.0],
+        }
+        if language_list:
+            info["language"] = language_list
+        aligner_inputs.append(
+            OmniTextPrompt(
+                prompt=build_prompt(words) if words else AUDIO_PLACEHOLDER,
+                multi_modal_data={"audio": (waveform, sample_rate)},
+                additional_information=info,
+            )
+        )
+    return aligner_inputs
 
 
 def code2wav2aligner(

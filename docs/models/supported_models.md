@@ -6,7 +6,7 @@ vLLM-Omni supports unified multimodal comprehension and generation models across
 
 If vLLM-Omni natively supports a model, its implementation can be found in <gh-file:vllm_omni/model_executor/models> and <gh-file:vllm_omni/diffusion/models>.
 
-For deployment recipes (TTS and multimodal), see [recipes.vllm.ai](https://recipes.vllm.ai) and the in-repo [`recipes/`](https://github.com/vllm-project/vllm-omni/tree/main/recipes) directory.
+For deployment recipes (ASR, TTS and multimodal), see [recipes.vllm.ai](https://recipes.vllm.ai) and the in-repo [`recipes/`](https://github.com/vllm-project/vllm-omni/tree/main/recipes) directory.
 
 ## List of Supported Models
 
@@ -114,6 +114,7 @@ th {
 | `MiniMaxMusic3ForConditionalGeneration` | MiniMax Music 3 (text-to-music) | `MiniMaxAI/MiniMax-Music3` | ✅︎ | | | ✅︎ | — |
 | `Yue2ForCausalLM` | YuE2-3B (text-to-music with ABC plan) | `m-a-p/YuE2-3B` | ✅︎ | | | ✅︎ | [Recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/m-a-p/YuE2-3B.md) / [Audio-to-score](https://github.com/vllm-project/vllm-omni/blob/main/recipes/m-a-p/SheetSage2-H200.md) |
 | `Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-CustomVoice | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | ✅︎ | | | ✅︎ | [Published](https://recipes.vllm.ai/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) |
+| `Qwen3ASRForConditionalGeneration` | Qwen3-ASR (optional Qwen3-ForcedAligner word timestamps) | `Qwen/Qwen3-ASR-0.6B`, `Qwen/Qwen3-ASR-1.7B`; aligner: `Qwen/Qwen3-ForcedAligner-0.6B` | Experimental; H20 (1.7B, eager) | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen3-ASR-CUDA.md) |
 | `Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-VoiceDesign | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-Base | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `MingTTSForConditionalGeneration` | Ming-omni-tts dense 0.5B | `inclusionAI/Ming-omni-tts-0.5B` | ✅︎ | | | ✅︎ | — |

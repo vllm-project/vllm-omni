@@ -74,9 +74,6 @@ from vllm.entrypoints.serve.utils.api_utils import (
 from vllm.entrypoints.serve.utils.fingerprint import set_default_fingerprint_mode
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
-from vllm.entrypoints.speech_to_text.transcription.serving import (
-    OpenAIServingTranscription,
-)
 from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
 )
@@ -190,6 +187,8 @@ from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
 from vllm_omni.entrypoints.openai.serving_run import ServingRun, run_endpoint_restrictions
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
+from vllm_omni.entrypoints.openai.serving_transcription import OmniOpenAIServingTranscription, TextOnlyEngineClient
+from vllm_omni.entrypoints.openai.serving_transcription import router as transcription_router
 from vllm_omni.entrypoints.openai.serving_video import (
     LatentEditInput,
     OmniOpenAIServingVideo,
@@ -471,6 +470,9 @@ async def omni_run_server_worker(
                 "untrusted environments."
             )
             app.include_router(weight_transfer_api.router)
+        if "transcription" in supported_tasks:
+            remove_route_from_app(app, "/v1/audio/transcriptions", {"POST"})
+            app.include_router(transcription_router)
 
         # OMNI: Override upstream exception handlers with Omni-aware versions
         # that understand the multi-stage orchestrator lifecycle.
@@ -1296,18 +1298,19 @@ async def omni_init_app_state(
         trust_request_chat_template=args.trust_request_chat_template,
     )
     state.openai_serving_transcription = (
-        OpenAIServingTranscription(
+        OmniOpenAIServingTranscription(
             engine_client,
             state.openai_serving_models,
             request_logger=request_logger,
             enable_force_include_usage=args.enable_force_include_usage,
+            has_asr_aligner=getattr(getattr(engine_client, "engine", None), "has_asr_aligner", False),
         )
         if "transcription" in supported_tasks
         else None
     )
     state.openai_serving_translation = (
         OpenAIServingTranslation(
-            engine_client,
+            TextOnlyEngineClient(engine_client),
             state.openai_serving_models,
             request_logger=request_logger,
             enable_force_include_usage=args.enable_force_include_usage,

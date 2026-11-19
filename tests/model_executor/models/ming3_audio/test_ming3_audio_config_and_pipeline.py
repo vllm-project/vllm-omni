@@ -394,14 +394,21 @@ def test_asr_generation_prompt_uses_checkpoint_chat_template(
 
 
 @pytest.mark.parametrize(
-    ("text", "expected"),
+    ("text", "expected", "language"),
     [
-        ("English\thello world", "hello world"),
-        ("hello world", "hello world"),
+        ("English\thello world", "hello world", "English"),
+        ("Chinese\t你好", "你好", "Chinese"),
+        ("English", "English", None),
+        ("hello world", "hello world", None),
+        ("\thello world", "hello world", None),
+        ("None\t", "", None),
+        ("unknown\thello world", "hello world", None),
+        ("auto\thello world", "hello world", None),
     ],
 )
-def test_language_prefix_post_processing(text: str, expected: str):
+def test_language_prefix_post_processing(text: str, expected: str, language: str | None):
     assert BailingMoeV3AudioForConditionalGeneration.post_process_output(text) == expected
+    assert BailingMoeV3AudioForConditionalGeneration.get_transcription_language(text) == language
 
 
 def test_streaming_language_prefix_post_processing():

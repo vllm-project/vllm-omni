@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Forced-aligner config + word-timestamp decoding for TTS.
+"""Forced-aligner config + word-timestamp decoding for TTS and ASR.
 
 The aligner runs as a pooling stage appended to the pipeline by
 ``--forced-aligner`` (see :func:`inject_forced_aligner_stage`). Qwen-specific
@@ -90,8 +90,8 @@ def inject_forced_aligner_stage(
     """Append a forced-aligner pooling stage to the pipeline tail when
     ``--forced-aligner`` or ``--forced-aligner-config`` resolves an aligner
     model; no-op otherwise. The stage runs the aligner model with
-    ``runner="pooling"``, consuming the previous stage's audio and emitting a
-    terminal word-timestamps side-output.
+    ``runner="pooling"``, consuming the TTS stage's generated audio or the
+    original ASR audio plus its transcript, and emitting word timestamps.
     """
     if not (cli_overrides.get("forced_aligner") or cli_overrides.get("forced_aligner_config")):
         return pipeline, deploy
@@ -101,6 +101,7 @@ def inject_forced_aligner_stage(
         StageExecutionType,
         StagePipelineConfig,
     )
+    from vllm_omni.config.transcription import ASR_ALIGNER_INPUT_PROCESSOR
     from vllm_omni.model_executor.stage_input_processors.forced_aligner import (
         POOLING_OUTPUT_DECODER_PATH,
         TIMESTAMPS_MODALITY,
@@ -113,7 +114,15 @@ def inject_forced_aligner_stage(
     if fa is None:
         return pipeline, deploy
 
-    _FA = "vllm_omni.model_executor.stage_input_processors.forced_aligner"
+    source = pipeline.stages[-1]
+    if source.final_output and source.final_output_type == "audio":
+        input_processor = "vllm_omni.model_executor.stage_input_processors.forced_aligner.code2wav2aligner"
+    elif source.final_output and source.final_output_type == "text":
+        # Select the text/audio bridge here; validate the actual source model's
+        # transcription capability once stage-specific runtime configs resolve.
+        input_processor = ASR_ALIGNER_INPUT_PROCESSOR
+    else:
+        raise ValueError("Forced alignment requires a terminal audio or transcription output.")
     new_id = len(pipeline.stages)
     aligner_ps = StagePipelineConfig(
         stage_id=new_id,
@@ -127,7 +136,7 @@ def inject_forced_aligner_stage(
         owns_tokenizer=True,
         requires_multimodal_data=True,
         model_arch=fa.architecture,
-        custom_process_input_func=f"{_FA}.code2wav2aligner",
+        custom_process_input_func=input_processor,
     )
     extended = replace(pipeline, stages=pipeline.stages + (aligner_ps,))
 

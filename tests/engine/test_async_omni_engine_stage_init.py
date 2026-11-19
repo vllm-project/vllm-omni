@@ -405,7 +405,10 @@ def test_stage_engine_core_client_module_reload_keeps_forward_refs_deferred():
         client_mod.__dict__.update(saved)
 
 
-def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_to_runtime(monkeypatch):
+@pytest.mark.parametrize("transcription_supported", [False, True])
+def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_to_runtime(
+    monkeypatch, transcription_supported
+):
     import vllm_omni.engine.omni_engine_base as engine_mod
 
     engine = object.__new__(AsyncOmniEngine)
@@ -435,6 +438,13 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_
         return runtime
 
     monkeypatch.setattr(engine_mod, "create_stage_runtime", _capture_create_stage_runtime)
+    probe_inputs = []
+
+    def _probe_transcription(stage_configs, stage_metadata, stage_vllm_configs):
+        probe_inputs.append((stage_configs, stage_metadata, stage_vllm_configs))
+        return transcription_supported
+
+    monkeypatch.setattr(engine_mod, "supports_transcription_pipeline", _probe_transcription)
 
     engine._initialize_stages(stage_init_timeout=7)
 
@@ -442,6 +452,8 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_
     assert captured["log_stats"] is True
     assert captured["client_config"] is engine._client_config
     assert captured["watermark_config"] is engine._watermark_config
+    assert probe_inputs == [(engine.stage_configs, engine.stage_metadata, engine.stage_vllm_configs)]
+    assert ("transcription" in engine.supported_tasks) == transcription_supported
 
 
 def test_async_omni_engine_initialize_stages_retains_stage0_prompt_transform(monkeypatch):

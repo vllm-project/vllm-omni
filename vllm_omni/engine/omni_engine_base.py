@@ -32,6 +32,11 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
     load_deploy_config,
 )
+from vllm_omni.config.transcription import (
+    has_transcription_aligner,
+    supports_transcription_pipeline,
+    validate_asr_aligner_stages,
+)
 from vllm_omni.config.weight_sharing import WeightSharingConfig
 from vllm_omni.engine.arg_utils import is_frontend_only
 from vllm_omni.engine.async_engine_utils import (
@@ -478,6 +483,13 @@ class OmniEngineBase:
             supported_tasks.add("generate")
         if any(meta.final_output_type == "audio" for meta in self.stage_metadata):
             supported_tasks.add("speech")
+        validate_asr_aligner_stages(self.stage_configs, self.stage_vllm_configs)
+        self.has_asr_aligner = False
+        if supports_transcription_pipeline(self.stage_configs, self.stage_metadata, self.stage_vllm_configs):
+            supported_tasks.add("transcription")
+            self.has_asr_aligner = has_transcription_aligner(
+                self.stage_configs, self.stage_metadata, self.stage_vllm_configs
+            )
         self.supported_tasks = tuple(supported_tasks) if supported_tasks else ("generate",)
 
     def _bootstrap_orchestrator(

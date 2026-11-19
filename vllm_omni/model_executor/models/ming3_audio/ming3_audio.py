@@ -42,6 +42,7 @@ from vllm_omni.model_executor.models.common.ming.audio_projector import (
 from vllm_omni.model_executor.models.common.ming.whisper_encoder import (
     WhisperAudioEncoder,
 )
+from vllm_omni.model_executor.models.interfaces import TranscriptionLanguageMixin
 from vllm_omni.transformers_utils.configs.ming3_audio import (
     BailingMoeV3AudioConfig,
 )
@@ -91,6 +92,7 @@ class BailingMoeV3AudioForConditionalGeneration(
     SupportsMultiModal,
     SupportsPP,
     SupportsTranscription,
+    TranscriptionLanguageMixin,
     HasInnerState,
     IsHybrid,
 ):
@@ -359,6 +361,14 @@ class BailingMoeV3AudioForConditionalGeneration(
     @classmethod
     def post_process_output(cls, text: str) -> str:
         return text.split("\t", 1)[1] if "\t" in text else text
+
+    @classmethod
+    def get_transcription_language(cls, raw_text: str) -> str | None:
+        language, separator, _ = raw_text.partition("\t")
+        language = language.strip()
+        if not separator or not language or language.lower() in {"none", "unknown", "auto"}:
+            return None
+        return language
 
     @classmethod
     def get_streaming_post_processor_cls(
