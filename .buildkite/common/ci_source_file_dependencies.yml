@@ -1497,6 +1497,8 @@ source_file_dependencies:
     - tests/e2e/accuracy/test_diffusers_backend_similarity.py
 
   diffusion_qwen_image_21_accuracy:
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
     - *qwen_image_21
     - tests/e2e/accuracy/qwen_image_21/
     - tests/e2e/accuracy/helpers.py

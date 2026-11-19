@@ -49,6 +49,7 @@ class BreezeState(TypedDict):
 
 class BreezeForConditionalGeneration(nn.Module):
     have_multimodal_outputs = True
+    mrv2_forward_returns_tensor = True
     has_preprocess = True
     has_postprocess = False
     requires_full_prefix_cached_hidden_states = False

@@ -16,9 +16,6 @@ echo "Dockerfile: ${dockerfile}"
 if ! command -v buildctl &> /dev/null; then
   mkdir -p /tmp/buildkit
   buildkit_version=v0.29.0
-  # curl, not wget: the default Buildkite agent image is Alpine, whose wget is
-  # a BusyBox applet that cannot fetch https through an HTTP proxy (it never
-  # sends CONNECT). curl handles the proxy tunnel and follows redirects (-L).
   curl -fsSL \
     "https://github.com/moby/buildkit/releases/download/${buildkit_version}/buildkit-${buildkit_version}.linux-arm64.tar.gz" \
     -o /tmp/buildkit.tar.gz
