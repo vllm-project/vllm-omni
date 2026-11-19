@@ -51,6 +51,7 @@ from vllm_omni.config.stage_config import (
     _STAGE_DEPLOY_FIELDS,
     NON_STAGE_OVERRIDE_FIELDS,
     PIPELINE_WIDE_ENGINE_FIELDS,
+    SERVE_CLI_SCOPE_KEY,
     DeployConfig,
     DuplexSessionRuntimeConfig,
     PipelineConfig,
@@ -304,6 +305,51 @@ def test_minimax_h3_text_encoder_tp_targets_only_structured_stage_zero() -> None
     assert diffusion.parallel_config.tensor_parallel_size == 1
     assert diffusion.parallel_config.text_encoder_tp_size == 1
     assert diffusion.model_config.use_v2_model_runner is False
+
+
+def test_serve_allows_minimax_h3_tp_when_encoder_has_its_own_flag() -> None:
+    config = _from_pipeline_key(
+        "minimax_h3_disaggregated",
+        cli_overrides={
+            SERVE_CLI_SCOPE_KEY: True,
+            "text_encoder_tp_size": 2,
+            "tensor_parallel_size": 4,
+        },
+    )
+
+    assert [stage.parallel_config.tensor_parallel_size for stage in config.stage_configs] == [2, 4]
+
+
+def test_direct_pipeline_config_keeps_global_stage_overrides() -> None:
+    config = _from_pipeline_key("qwen2_5_omni", cli_overrides={"gpu_memory_utilization": 0.25})
+
+    assert [stage.cache_config.gpu_memory_utilization for stage in config.stage_configs] == [0.25] * 3
+
+
+def test_serve_counts_diffusion_flag_after_alias_normalization() -> None:
+    pipeline = PipelineConfig(
+        model_type="two_diffusion_stages",
+        stages=(
+            StagePipelineConfig(stage_id=0, model_stage="first", execution_type=StageExecutionType.DIFFUSION),
+            StagePipelineConfig(
+                stage_id=1,
+                model_stage="second",
+                execution_type=StageExecutionType.DIFFUSION,
+                input_sources=(0,),
+                final_output=True,
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match=r"--diffusion-attention-backend .*\[0, 1\].*--stage-overrides"):
+        VllmOmniConfig.from_pipeline_config(
+            pipeline,
+            cli_overrides={
+                SERVE_CLI_SCOPE_KEY: True,
+                "diffusion_attention_backend": "FLASH_ATTN",
+                "stage_0_fastvideo_vsa_topk": 0.5,
+            },
+        )
 
 
 def test_duplex_session_capacity_propagates_to_every_structured_stage() -> None:

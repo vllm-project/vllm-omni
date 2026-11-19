@@ -32,7 +32,8 @@ For offline inference of any of these models, see the [offline TTS hub](https://
 
 ## Common Quick Start
 
-Launch the server (defaults shown — adjust `--port`, `--gpu-memory-utilization`, etc. as needed):
+Launch the server with the desired port. For multi-stage models, tune each
+stage's memory budget in the deploy YAML or via `--stage-overrides`.
 
 ```bash
 vllm serve <hf-repo-or-local-path> --omni --port 8091

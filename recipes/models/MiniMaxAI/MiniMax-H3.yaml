@@ -659,7 +659,8 @@ variants:
           - "fp8"
           - "--init-timeout"
           - "3600"
-          - "--enforce-eager"
+          - "--stage-overrides"
+          - '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}'
           - "--diffusion-attention-backend"
           - "CUDNN_ATTN"
         extra_env:
@@ -737,7 +738,8 @@ variants:
           - "--dlo-no-use-allgather"
           - "--dlo-resident-layers"
           - "20"
-          - "--enforce-eager"
+          - "--stage-overrides"
+          - '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}'
         extra_env:
           VLLM_OMNI_VIDEO_SYNC_TIMEOUT: "14400"
       rtx_4090_2x:
@@ -760,7 +762,8 @@ variants:
           - "--dlo-no-use-allgather"
           - "--dlo-resident-layers"
           - "12"
-          - "--enforce-eager"
+          - "--stage-overrides"
+          - '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}'
         extra_env:
           VLLM_OMNI_VIDEO_SYNC_TIMEOUT: "14400"
 
@@ -956,7 +959,7 @@ guide: |
     --enable-distributed-layerwise-offload \
     --dlo-no-use-allgather \
     --dlo-resident-layers "${DLO_RESIDENT_LAYERS}" \
-    --enforce-eager \
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}' \
     --diffusion-attention-backend CUDNN_ATTN
   ```
 
@@ -1588,7 +1591,7 @@ guide: |
     --vae-patch-parallel-size 1 \
     --vae-parallel-mode tile \
     --vae-use-tiling \
-    --enforce-eager \
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}' \
     --diffusion-attention-backend CUDNN_ATTN
   ```
 

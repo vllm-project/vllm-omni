@@ -159,7 +159,7 @@ vllm serve "${MODEL}" \
   --num-gpus 1 \
   --diffusion-offload-config \
   '{"mode":"layer","components":["dit","text_encoder"]}' \
-  --enforce-eager \
+  --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}' \
   --diffusion-attention-backend FLASH_ATTN
 ```
 
@@ -214,7 +214,7 @@ vllm serve "${MODEL}" \
   --enable-distributed-layerwise-offload \
   --dlo-no-use-allgather \
   --dlo-resident-layers 20 \
-  --enforce-eager \
+  --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}' \
   --diffusion-attention-backend CUDNN_ATTN
 ```
 
@@ -905,7 +905,8 @@ vllm serve "$MODEL" --omni --task-type fl2va --trust-remote-code \
   --served-model-name MiniMaxAI/MiniMax-H3 --host 127.0.0.1 --port 8092 \
   --controlnet-model-path "$CONTROL_MODEL" \
   --num-gpus 2 --tensor-parallel-size 2 --text-encoder-tp-size 2 \
-  --usp 1 --ring 1 --enforce-eager --diffusion-attention-backend TORCH_SDPA \
+  --usp 1 --ring 1 --diffusion-attention-backend TORCH_SDPA \
+  --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}' \
   --vae-patch-parallel-size 2 --vae-parallel-mode tile --vae-use-tiling
 ```
 

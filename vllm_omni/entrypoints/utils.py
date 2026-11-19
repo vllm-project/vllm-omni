@@ -6,16 +6,26 @@ import os
 import types
 from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
-from typing import Any, get_args, get_origin
+from typing import TYPE_CHECKING, Any, get_args, get_origin
 
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.config.config_factory import with_trust_remote_code_override
+from vllm_omni.config.stage_config import SERVE_CLI_SCOPE_KEY
 from vllm_omni.entrypoints.stage_utils import _to_dict
 from vllm_omni.inputs.data import OmniSamplingParams
 
+if TYPE_CHECKING:
+    from vllm_omni.utils.tracking_parser import TrackingNamespace
+
 logger = init_logger(__name__)
+
+
+def mark_serve_cli_args(args: "TrackingNamespace") -> None:
+    """Carry serving CLI provenance through the same namespace as explicit flags."""
+    setattr(args, SERVE_CLI_SCOPE_KEY, True)
+    args.explicit_keys = args.explicit_keys | {SERVE_CLI_SCOPE_KEY}
 
 
 def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: str, omni_to: str) -> None:

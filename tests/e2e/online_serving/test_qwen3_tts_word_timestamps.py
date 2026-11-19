@@ -44,10 +44,8 @@ _PARAMS = [
             "Qwen/Qwen3-ForcedAligner-0.6B",
             "--kv-cache-memory-bytes",
             str(512 * 1024**2),
-            "--max-num-seqs",
-            "4",
-            "--max-num-batched-tokens",
-            "2048",
+            "--stage-overrides",
+            json.dumps({stage_id: {"max_num_seqs": 4, "max_num_batched_tokens": 2048} for stage_id in (0, 1, 2)}),
         ],
     )
 ]

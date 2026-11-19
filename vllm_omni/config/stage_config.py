@@ -31,6 +31,7 @@ logger = init_logger(__name__)
 _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
+SERVE_CLI_SCOPE_KEY = "_scope_serve_stage_flags"
 
 _RUNTIME_ONLY_OVERRIDE_FIELDS = frozenset(
     {

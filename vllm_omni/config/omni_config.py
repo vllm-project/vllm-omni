@@ -41,8 +41,10 @@ from vllm.pooling_params import PoolingParams
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
     _STAGE_DEPLOY_FIELDS,
+    _STAGE_OVERRIDE_PATTERN,
     NON_STAGE_OVERRIDE_FIELDS,
     PIPELINE_WIDE_ENGINE_FIELDS,
+    SERVE_CLI_SCOPE_KEY,
     DeployConfig,
     PipelineConfig,
     StageDeployConfig,
@@ -97,6 +99,7 @@ _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
         "tokenizer",
         "video_output_warmup",
         "video_output_warmup_timeout",
+        SERVE_CLI_SCOPE_KEY,
     }
 )
 
@@ -118,6 +121,11 @@ _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS = frozenset({"kv_cache_dtype", "seed"})
 # stages that own them (``--no-guardrails`` rides on ``model_config``). Stages
 # that do not own them skip them silently instead of rejecting the flag.
 _OWNER_ONLY_GLOBAL_STAGE_CLI_FIELDS = frozenset({"model_config"})
+_DIFFUSION_STAGE_CLI_ALIASES = {
+    "diffusion_attention_backend": "diffusion_attention_config",
+    "fastvideo_vsa_topk": "diffusion_attention_config",
+    "diffusion_quantization_config": "quantization_config",
+}
 
 
 class _QuantizationEngineOverrides(TypedDict, total=False):
@@ -445,6 +453,66 @@ def _stage_cli_overrides(
                     continue
                 result.setdefault(field_name, _copy_value(value))
     return result
+
+
+def _scope_serve_stage_flags(pipeline: PipelineConfig, cli_overrides: dict[str, Any]) -> None:
+    """Prevent a flat serve flag from silently overriding multiple stage configs."""
+    if len(pipeline.stages) <= 1:
+        return
+
+    cli_fields = _global_stage_cli_fields() | _DIFFUSION_STAGE_CLI_ALIASES.keys()
+    stage_fields = (_STAGE_DEPLOY_FIELDS.keys() & cli_fields) - set(_PIPELINE_DEPLOY_CLI_FIELDS)
+    explicit_flags = {
+        name: value for name, value in cli_overrides.items() if name in stage_fields and value is not None
+    }
+    if not explicit_flags:
+        return
+
+    scoped_by_stage: dict[int, set[str]] = {}
+    for name, value in cli_overrides.items():
+        if value is not None and (match := _STAGE_OVERRIDE_PATTERN.fullmatch(name)) is not None:
+            scoped_by_stage.setdefault(int(match[1]), set()).add(match[2])
+
+    selected_id = cli_overrides.get("stage_id")
+    selected = next((stage for stage in pipeline.stages if stage.stage_id == selected_id), None)
+    ambiguous = []
+    for name, value in explicit_flags.items():
+        recipients = []
+        owners = []
+        for stage in pipeline.stages:
+            aliases = _DIFFUSION_STAGE_CLI_ALIASES if stage.execution_type == StageExecutionType.DIFFUSION else {}
+            field = aliases.get(name, name)
+            if field not in _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[stage.execution_type]:
+                continue
+            owners.append(stage.stage_id)
+            # Diffusion globals are normalized before they are merged with raw
+            # stage-scoped inputs. Only the same resulting key masks a global.
+            if field not in scoped_by_stage.get(stage.stage_id, ()):
+                recipients.append(stage.stage_id)
+
+        # Frontend controls can be represented on StageDeployConfig even though
+        # their consumers are outside the stage engines.
+        if not owners:
+            continue
+        flag = "--" + name.replace("_", "-")
+        if selected is not None:
+            if selected.stage_id not in owners:
+                raise ValueError(
+                    f"{flag} is not used by stage {selected.stage_id} of pipeline {pipeline.model_type!r}; "
+                    "use --stage-overrides or set it in the owning stage's deploy YAML entry."
+                )
+            del cli_overrides[name]
+            if selected.stage_id in recipients and name not in scoped_by_stage.get(selected.stage_id, ()):
+                cli_overrides[f"stage_{selected.stage_id}_{name}"] = value
+        elif len(recipients) > 1:
+            ambiguous.append(f"{flag} (stages {recipients})")
+
+    if ambiguous:
+        flags = ", ".join(ambiguous)
+        raise ValueError(
+            f"Pipeline {pipeline.model_type!r} has stage-specific flags targeting multiple stages: {flags}. "
+            "Use --stage-overrides or set the values in the corresponding deploy YAML stages."
+        )
 
 
 def _validate_global_stage_cli_ownership(
@@ -2489,6 +2557,8 @@ class VllmOmniConfig:
         if cli_overrides is None:
             cli_overrides = {}
         cli_overrides = normalize_pipeline_cli_overrides(pipeline_cfg, cli_overrides)
+        if cli_overrides.pop(SERVE_CLI_SCOPE_KEY, False):
+            _scope_serve_stage_flags(pipeline_cfg, cli_overrides)
         _validate_global_stage_cli_ownership(pipeline_cfg, cli_overrides)
 
         deploy, loaded_deploy_config_path = _get_deploy_config(

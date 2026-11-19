@@ -47,7 +47,8 @@ CUDA_VISIBLE_DEVICES=0,1 vllm serve /path/to/MiniMax-H3/FL2VA \
   --usp 1 --ring 1 --vae-patch-parallel-size 2 \
   --vae-parallel-mode tile --vae-use-tiling \
   --enable-distributed-layerwise-offload --dlo-no-use-allgather \
-  --dlo-resident-layers 12 --enforce-eager \
+  --dlo-resident-layers 12 \
+  --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}' \
   --diffusion-attention-backend CUDNN_ATTN
 ```
 
@@ -76,7 +77,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve /path/to/MiniMax-H3/FL2VA \
   --usp 2 --ring 1 --vae-patch-parallel-size 4 \
   --vae-parallel-mode tile --vae-use-tiling \
   --enable-distributed-layerwise-offload --dlo-no-use-allgather \
-  --dlo-resident-layers 12 --enforce-eager \
+  --dlo-resident-layers 12 \
+  --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}' \
   --diffusion-attention-backend CUDNN_ATTN
 ```
 
