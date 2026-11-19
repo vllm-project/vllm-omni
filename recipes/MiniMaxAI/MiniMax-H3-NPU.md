@@ -256,7 +256,8 @@ The former `VLLM_OMNI_H3_VISION_SP_SIZE` environment variable is no longer read.
 **Validation:** eight Ascend 910B4 NPUs, TP8, Ref2VA case01 pass HCCL execution,
 media integrity, and repeatability within each setting. SP1/SP8 full-model
 bitwise comparison fails, so SP8 is not yet a qualified lossless replacement;
-formal performance acceptance is gated on resolving this difference. Earlier
+real-input single-NPU probes reproduce Conv3D/linear projection differences
+before communication. Formal performance acceptance is gated on resolving this difference. Earlier
 measurements predate the configuration migration; see
 [PR #10168](https://github.com/vllm-project/vllm-omni/pull/10168).
 
