@@ -340,36 +340,30 @@ def get_cosmos3_nano_sim_transfer_pre_process_func(od_config: OmniDiffusionConfi
         geometry = resolve_cosmos3_nano_sim_transfer_geometry(sp, prompt_data, policy)
         sp.height, sp.width = geometry.height, geometry.width
 
-        def request_param(key: str) -> Any:
-            if extra.get(key) is not None:
-                return extra[key]
-            value = getattr(sp, key, None)
-            if value is not None:
-                return value
-            return _prompt_value(prompt_data, key)
+        generic_hint = _request_value(sp, prompt_data, "control_hint")
+        named = [key for key in (*TRANSFER_HINTS, "wsm") if _request_value(sp, prompt_data, key) is not None]
+        hint = None
+        value = True
+        if generic_hint is not None and not named:
+            hint = str(generic_hint).strip().lower()
+        elif generic_hint is None and len(named) == 1:
+            hint = named[0]
+            value = _request_value(sp, prompt_data, hint)
 
-        generic_hint = request_param("control_hint")
-        named_hints = [hint for hint in (*TRANSFER_HINTS, "wsm") if request_param(hint) is not None]
-        injected_hint: str | None = None
-        injected_hint_was_present = False
-        injected_hint_previous: Any = None
-        if generic_hint is not None and not named_hints:
-            normalized_hint = str(generic_hint).strip().lower()
-            if normalized_hint in TRANSFER_HINTS:
-                injected_hint = normalized_hint
-                injected_hint_was_present = injected_hint in extra
-                injected_hint_previous = extra.get(injected_hint)
-                # Cosmos3 preprocessing detects named hints. Temporarily expose
-                # the generic contract so a vision video enters the Transfer slot.
-                extra[injected_hint] = True
-        try:
-            processed = cosmos3_pre_process(request)
-        finally:
-            if injected_hint is not None:
-                if injected_hint_was_present:
-                    extra[injected_hint] = injected_hint_previous
+        # The shared video decoder selects its frame budget and output slot
+        # from extra_args. Expose the resolved hint only for that call.
+        if hint in TRANSFER_HINTS and extra.get(hint) is None:
+            present = hint in extra
+            extra[hint] = value
+            try:
+                processed = cosmos3_pre_process(request)
+            finally:
+                if present:
+                    extra[hint] = None
                 else:
-                    extra.pop(injected_hint, None)
+                    del extra[hint]
+        else:
+            processed = cosmos3_pre_process(request)
         final_sp = processed.sampling_params
         final_geometry = resolve_cosmos3_nano_sim_transfer_geometry(final_sp, processed.prompt, policy)
         final_sp.height, final_sp.width = final_geometry.height, final_geometry.width

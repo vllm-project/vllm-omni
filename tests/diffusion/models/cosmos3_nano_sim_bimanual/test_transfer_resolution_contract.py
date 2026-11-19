@@ -59,6 +59,31 @@ def test_transfer_input_video_drives_bucket_before_hint_control() -> None:
     assert geometry.session_key == (480, 832)
 
 
+@pytest.mark.parametrize("source", ["prompt", "additional_information"])
+def test_named_prompt_hint_preprocesses_source_video(monkeypatch, source):
+    from PIL import Image
+
+    from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import Cosmos3NanoSimBimanualManifest
+    from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.pipeline_cosmos3_nano_sim_transfer import (
+        get_cosmos3_nano_sim_transfer_pre_process_func,
+    )
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    manifest = pipeline().manifest
+    manifest.vae_spatial_compression_factor = 16
+    manifest.latent_patch_size = 2
+    monkeypatch.setattr(Cosmos3NanoSimBimanualManifest, "from_od_config", lambda _: manifest)
+    preprocess = get_cosmos3_nano_sim_transfer_pre_process_func(SimpleNamespace(model_config={"guardrails": False}))
+    prompt = {"prompt": "test", "multi_modal_data": {"video": [Image.new("RGB", (32, 32))]}}
+    (prompt if source == "prompt" else prompt.setdefault(source, {}))["edge"] = True
+    sp = OmniDiffusionSamplingParams(height=None, width=None, num_frames=1, extra_args={"resolution": "256"})
+    request = OmniDiffusionRequest(request_id="edge", prompt=prompt, sampling_params=sp)
+    additional = preprocess(request).prompt["additional_information"]
+    assert additional["preprocessed_transfer_video"].shape == (1, 3, 1, 256, 256)
+    assert "edge" not in sp.extra_args
+
+
 def test_transfer_hint_control_drives_bucket_without_input_video() -> None:
     params = _sampling_params(depth={"control": {"height": 832, "width": 480}})
 
