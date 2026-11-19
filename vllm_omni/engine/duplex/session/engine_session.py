@@ -986,12 +986,29 @@ class DuplexEngineSession:
         }
         if transcript:
             input_audio_part["transcript"] = transcript
+        text_slot = (
+            self._conversation.history_item_placeholders.get(f"item_{self.active_response_id}")
+            if not self.capabilities.emits_audio and self._response.active_response_awaits_input_commit
+            else None
+        )
         self._bind_active_response_to_input_commit(self._input.commit_seq + 1)
         self._input.commit_seq += 1
         message = _object_dict(role="user", content=[input_audio_part])
         if transcript:
             message["transcript"] = transcript
-        self.append_history_message(message)
+        messages = self._conversation.messages
+        # The slot was reserved when the response opened, so search from the newest message.
+        index = (
+            next((i for i in range(len(messages) - 1, -1, -1) if messages[i] is text_slot), None)
+            if text_slot is not None
+            else None
+        )
+        if index is None:
+            self.append_history_message(message)
+        else:
+            # This is the input that opened the response, not a later user turn.
+            self._conversation.messages.insert(index, message)
+            self._track_history_message(message)
         self._conversation.user_turn_seq += 1
         self.turn_state = DuplexTurnState.USER_COMMITTED
         return DuplexCommittedInput(
