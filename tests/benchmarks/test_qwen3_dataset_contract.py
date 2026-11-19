@@ -6,12 +6,15 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shlex
 import sys
+from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
 import yaml
+from _pytest.mark.expression import Expression
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
 ROOT = Path(__file__).resolve().parents[2]
@@ -52,6 +55,7 @@ def test_json_matrix_matches_scenario_v2(platform):
         }
     )
     assert {(c.config, c.dataset, c.concurrency, c.accuracy) for c in cases} == expected
+    assert len(cases) == len(expected)
     assert all(c.count == nightly.DATASETS[c.dataset]["count"] for c in cases)
 
 
@@ -358,6 +362,54 @@ def test_cuda_pipeline_uses_json_runner_and_function_regression():
     assert not any("Verbatim Reading Regression" in s.get("label", "") for s in steps)
     expansion = (ROOT / "tests/e2e/online_serving/test_qwen3_omni_expansion.py").read_text(encoding="utf-8")
     assert "def test_qwen3_omni_seed_tts_reads_questions_verbatim" in expansion
+
+
+def test_cuda_pipeline_selects_each_matrix_case_once():
+    pipeline = yaml.safe_load((ROOT / ".buildkite/cuda/test-nightly.yml").read_text(encoding="utf-8"))
+    steps = [s for group in pipeline["steps"] if "steps" in group for s in group["steps"]]
+    configs = {
+        f"tests/dfx/perf/tests/{name}.json"
+        for name in (
+            "test_qwen3_omni_datasets",
+            "test_qwen3_omni_duplex_omni_duplex_eval",
+            "test_qwen3_omni_duplex_omniinteract",
+        )
+    }
+    selected: Counter[tuple[str, str]] = Counter()
+    for step in steps:
+        for command in step.get("commands", []):
+            args = shlex.split(command)
+            if "--test-config-file" not in args:
+                continue
+            path = args[args.index("--test-config-file") + 1]
+            if path not in configs:
+                continue
+            mark_filter = Expression.compile(args[args.index("-m") + 1])
+            keyword_filter = Expression.compile(args[args.index("-k") + 1]) if "-k" in args else None
+            for config in json.loads((ROOT / path).read_text(encoding="utf-8")):
+                hardware = config["mark"][0]["hardware_marks"]
+                marks = {mark for mark in config["mark"] if isinstance(mark, str)}
+                marks.add(f"cards_{hardware['num_cards']}")
+                for platform, names in hardware["res"].items():
+                    marks.add(platform)
+                    marks.update([names] if isinstance(names, str) else names)
+                if not mark_filter.evaluate(lambda name, **_: name in marks):
+                    continue
+                for params in config["benchmark_params"]:
+                    assert len(params["num_prompts"]) == len(params["max_concurrency"]) == 1
+                    node = f"test_performance_benchmark[{config['test_name']}-{params['name']}]"
+                    if keyword_filter is None or keyword_filter.evaluate(
+                        lambda name, **_: name.lower() in node.lower()
+                    ):
+                        selected[(config["test_name"], params["name"])] += 1
+    expected = {
+        ("test_qwen3_omni_datasets_cuda_default", "default-seed-tts-c64"),
+        ("test_qwen3_omni_datasets_cuda_async_daily", "async-prefix-daily-omni-c8"),
+        *{("test_qwen3_omni_datasets_cuda_async_seed", f"async-prefix-seed-tts-c{c}") for c in (1, 16, 32, 64)},
+        ("test_qwen3_omni_duplex_omni_duplex_eval", "c8_accuracy_response_stats_v5"),
+        ("test_qwen3_omni_duplex_omniinteract", "c8_accuracy_response_stats_v5"),
+    }
+    assert selected == Counter({case: 1 for case in expected})
 
 
 def test_a3_keeps_existing_jobs_until_full_matrix_qualification():
