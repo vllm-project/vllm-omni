@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import importlib
 import sys
@@ -225,3 +225,110 @@ def test_sage_rejects_dropout_during_inspection_and_forward(sage_contract, platf
     for forward in (impl.forward_cuda, impl.forward_xpu):
         with pytest.raises(ValueError, match="does not support dropout"):
             forward(*inputs)
+
+
+def _reference_attention_nhd(q, k, v, *, is_causal, scale, attn_mask=None):
+    out = torch.nn.functional.scaled_dot_product_attention(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        attn_mask=attn_mask,
+        is_causal=is_causal,
+        scale=scale,
+    )
+    return out.transpose(1, 2)
+
+
+def _install_reference_kernels(backend, package, monkeypatch, seen):
+    """Route the CUDA and XPU Sage entry points to SDPA and record K/V lengths."""
+
+    def cuda_kernel(q, k, v, *, tensor_layout, is_causal, sm_scale):
+        assert tensor_layout == "NHD"
+        seen.append(("cuda", k.shape[1], v.shape[1]))
+        return _reference_attention_nhd(q, k, v, is_causal=is_causal, scale=sm_scale)
+
+    def xpu_kernel(q, k, v, *, tensor_layout, is_causal, sm_scale):
+        assert tensor_layout == "NHD"
+        seen.append(("xpu", k.shape[1], v.shape[1]))
+        return _reference_attention_nhd(q, k, v, is_causal=is_causal, scale=sm_scale)
+
+    package.sageattn = cuda_kernel
+    monkeypatch.setattr(backend, "xpu_sageattn", xpu_kernel, raising=False)
+    monkeypatch.setattr(backend, "_sagev1_has_tensor_layout", True, raising=False)
+    monkeypatch.setattr(backend, "_SAGE_ATTN_TENSOR_LAYOUT", "NHD")
+    monkeypatch.setattr(backend, "_sagev1_scale_param", "sm_scale", raising=False)
+
+
+def test_sage_backend_advertises_prefix_kv_slicing(sage_backend):
+    backend, _ = sage_backend
+    # Models such as MiniMax-H3 skip building a tail-padding attn_mask only for
+    # backends that advertise this; Sage cannot consume a mask at all.
+    assert backend.SageAttentionBackend.supports_prefix_kv_slicing is True
+
+
+@pytest.mark.parametrize("path", ["cuda", "xpu"])
+def test_sage_valid_kv_prefix_matches_key_padding_mask(sage_backend, monkeypatch, path):
+    backend, package = sage_backend
+    seen: list[tuple[str, int, int]] = []
+    _install_reference_kernels(backend, package, monkeypatch, seen)
+    torch.manual_seed(0)
+    q, k, v = [torch.randn(1, 12, 4, 64) for _ in range(3)]
+    scale = 0.125
+    impl = backend.SageAttentionImpl(4, 64, scale)
+    forward = impl.forward_cuda if path == "cuda" else impl.forward_xpu
+
+    output = forward(q, k, v, AttentionMetadata(extra={"valid_kv_length": 9}))
+
+    assert seen == [(path, 9, 9)]
+    assert output.shape == q.shape
+    key_padding_mask = (torch.arange(12) < 9)[None, None, None, :]
+    expected = _reference_attention_nhd(q, k, v, is_causal=False, scale=scale, attn_mask=key_padding_mask)
+    # The XPU path runs the kernel in FP16.
+    tolerance = {"atol": 2e-3, "rtol": 2e-3} if path == "xpu" else {}
+    torch.testing.assert_close(output, expected, **tolerance)
+
+
+def test_sage_valid_kv_prefix_under_fullgraph_compile(sage_backend, monkeypatch):
+    backend, package = sage_backend
+    seen: list[tuple[str, int, int]] = []
+    _install_reference_kernels(backend, package, monkeypatch, seen)
+    q, k, v = [torch.randn(1, 12, 4, 64) for _ in range(3)]
+    impl = backend.SageAttentionImpl(4, 64, 0.125)
+    metadata = AttentionMetadata(extra={"valid_kv_length": 9})
+
+    expected = impl.forward_cuda(q, k, v, metadata)
+    actual = torch.compile(impl.forward_cuda, fullgraph=True)(q, k, v, metadata)
+
+    torch.testing.assert_close(actual, expected)
+    assert seen == [("cuda", 9, 9)] * 2
+
+
+@pytest.mark.parametrize(
+    ("causal", "valid_kv_length"),
+    [(False, 12), (True, 9)],
+    ids=["no_padding", "causal_hides_tail"],
+)
+def test_sage_keeps_full_kv_when_nothing_to_slice(sage_backend, monkeypatch, causal, valid_kv_length):
+    backend, package = sage_backend
+    seen: list[tuple[str, int, int]] = []
+    _install_reference_kernels(backend, package, monkeypatch, seen)
+    q, k, v = [torch.randn(1, 12, 4, 64) for _ in range(3)]
+    impl = backend.SageAttentionImpl(4, 64, 0.125, causal=causal)
+
+    impl.forward_cuda(q, k, v, AttentionMetadata(extra={"valid_kv_length": valid_kv_length}))
+
+    assert seen == [("cuda", 12, 12)]
+
+
+@pytest.mark.parametrize("valid_kv_length", [0, 13])
+def test_sage_rejects_out_of_range_valid_kv_length(sage_backend, monkeypatch, valid_kv_length):
+    backend, _ = sage_backend
+    monkeypatch.setattr(
+        backend, "xpu_sageattn", lambda *args, **kwargs: pytest.fail("unexpected XPU Sage kernel call"), raising=False
+    )
+    impl = backend.SageAttentionImpl(4, 64, 0.125)
+    q = torch.randn(1, 12, 4, 64)
+    metadata = AttentionMetadata(extra={"valid_kv_length": valid_kv_length})
+    for forward in (impl.forward_cuda, impl.forward_xpu):
+        with pytest.raises(ValueError, match="valid_kv_length"):
+            forward(q, q, q, metadata)

@@ -104,6 +104,30 @@ def _validate_sage_metadata(attn_metadata: AttentionMetadata | None) -> None:
         raise ValueError("SAGE_ATTN does not support attn_mask. Select a mask-capable backend.")
 
 
+def _slice_valid_kv_prefix(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_metadata: AttentionMetadata | None,
+    causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Drop structural K/V tail padding described by ``valid_kv_length``.
+
+    Keeping only a contiguous valid K/V prefix is equivalent to masking the
+    padded tail keys, so models need not build a padding mask that Sage cannot
+    consume. Causal attention already hides tail keys from every valid query.
+    """
+    valid_kv_length = attn_metadata.extra.get("valid_kv_length") if attn_metadata is not None else None
+    if not isinstance(valid_kv_length, int):
+        return key, value
+    if not 0 < valid_kv_length <= key.shape[1]:
+        raise ValueError(
+            f"valid_kv_length must be within the K/V sequence, got {valid_kv_length} for length {key.shape[1]}"
+        )
+    if causal or valid_kv_length == key.shape[1]:
+        return key, value
+    return key[:, :valid_kv_length], value[:, :valid_kv_length]
+
+
 def _sage_cuda_kernel_variant(query: torch.Tensor) -> str | None:
     # Resolution is eager; never move this architecture query inside forward.
     if query.device.type != "cuda" or not current_omni_platform.is_cuda():
@@ -116,6 +140,8 @@ def _sage_cuda_kernel_variant(query: torch.Tensor) -> str | None:
 
 class SageAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
+    # Contiguous K/V tail padding is sliced away (see _slice_valid_kv_prefix).
+    supports_prefix_kv_slicing: bool = True
 
     @classmethod
     def resolve_capabilities(cls, context: ExecutionContext) -> ExecutionPathResult:
@@ -267,6 +293,7 @@ class SageAttentionImpl(AttentionImpl):
                 "SAGE_ATTN requires sageattention. Install with: "
                 "pip install git+https://github.com/thu-ml/SageAttention.git"
             )
+        key, value = _slice_valid_kv_prefix(key, value, attn_metadata, self.causal)
         output = _sage_attention_op(
             query,
             key,
@@ -288,6 +315,7 @@ class SageAttentionImpl(AttentionImpl):
             raise ValueError(f"SAGE_ATTN: does not support dropout (dropout_p={self.dropout}).")
         if xpu_sageattn is None:
             raise ImportError("XPU SageAttention requires auto-round-lib. Install with: pip install auto-round-lib")
+        key, value = _slice_valid_kv_prefix(key, value, attn_metadata, self.causal)
         orig_dtype = query.dtype
         q = query.to(torch.float16) if orig_dtype != torch.float16 else query
         k = key.to(torch.float16) if orig_dtype != torch.float16 else key
