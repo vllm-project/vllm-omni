@@ -306,8 +306,10 @@ def case_from_params(params: dict) -> tuple[WorkloadCase, str, bool]:
         or len(set(indices)) != case.count
     ):
         raise ValueError("Explicit sample indices require a matching Daily-Omni smoke subset")
-    if case.count > DATASETS[case.dataset]["count"] or (not smoke and case.count != DATASETS[case.dataset]["count"]):
-        raise ValueError("Qualification requires the complete pinned dataset; mark subsets as smoke")
+    if case.count > DATASETS[case.dataset]["count"]:
+        raise ValueError("Request count exceeds the pinned dataset")
+    if case.accuracy and not smoke and case.count != DATASETS[case.dataset]["count"]:
+        raise ValueError("Accuracy qualification requires the complete pinned dataset; mark subsets as smoke")
     return case, platform, smoke
 
 
@@ -351,7 +353,13 @@ def annotate_result(
             "benchmark_suite": "qwen3-omni-datasets",
             "configuration": case.config,
             "accuracy_evaluated": case.accuracy,
-            "qualification_scope": "smoke" if smoke else "full-dataset",
+            "qualification_scope": (
+                "smoke"
+                if smoke
+                else "full-dataset"
+                if case.count == DATASETS[case.dataset]["count"]
+                else "performance-subset"
+            ),
             "async_chunk": case.config == "async-prefix",
             "thinker_prefix_caching": case.config == "async-prefix",
             "model_runner": "v2",

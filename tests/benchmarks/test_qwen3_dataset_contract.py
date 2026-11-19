@@ -56,7 +56,11 @@ def test_json_matrix_matches_scenario_v2(platform):
     )
     assert {(c.config, c.dataset, c.concurrency, c.accuracy) for c in cases} == expected
     assert len(cases) == len(expected)
-    assert all(c.count == nightly.DATASETS[c.dataset]["count"] for c in cases)
+    for case in cases:
+        expected_count = (
+            nightly.DATASETS[case.dataset]["count"] if case.accuracy else {1: 32, 16: 256, 32: 512}[case.concurrency]
+        )
+        assert case.count == expected_count
 
 
 def test_dataset_server_groups_do_not_share_a_failed_media_engine():
@@ -323,6 +327,35 @@ def _valid_performance(case, value=10.0):
         **dict.fromkeys(case.metrics, value),
         **dict.fromkeys(("num_ttft_samples", "num_audio_rtf_samples", "num_audio_ttfp_samples"), case.count),
     }
+
+
+@pytest.mark.parametrize("platform,concurrency,count", [("cuda", 1, 32), ("cuda", 32, 512), ("npu", 16, 256)])
+def test_performance_subset_is_qualified_without_accuracy_scoring(platform, concurrency, count):
+    workload = {"platform": platform, "configuration": "async-prefix", "accuracy": False}
+    params = {
+        "dataset_name": "seed-tts",
+        "num_prompts": [count],
+        "max_concurrency": [concurrency],
+        "qwen3_omni_workload": workload,
+    }
+    case, _, smoke = nightly.case_from_params(params)
+    assert not smoke
+    result = {
+        **_valid_performance(case),
+        "request_count": count,
+        "completed": count,
+        "successful_audio_requests": count,
+    }
+    annotated = nightly.annotate_result(result, case, platform, smoke=smoke, exit_code=0)
+    assert annotated["validation_errors"] == []
+    assert annotated["qualification_scope"] == "performance-subset"
+    assert annotated["accuracy_evaluated"] is False
+    assert annotated["quality_thresholds"] == {}
+    result["completed"] -= 1
+    assert nightly.annotate_result(result, case, platform, smoke=smoke, exit_code=0)["validation_errors"]
+    workload["accuracy"] = True
+    with pytest.raises(ValueError, match="complete pinned dataset"):
+        nightly.case_from_params(params)
 
 
 @pytest.mark.parametrize("mode", ["collect", "enforce"])

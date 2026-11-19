@@ -171,7 +171,7 @@
         "name": "async-prefix-seed-tts-c1",
         "dataset_name": "seed-tts",
         "num_prompts": [
-          1088
+          32
         ],
         "max_concurrency": [
           1
@@ -187,7 +187,7 @@
         "name": "async-prefix-seed-tts-c16",
         "dataset_name": "seed-tts",
         "num_prompts": [
-          1088
+          256
         ],
         "max_concurrency": [
           16
@@ -203,7 +203,7 @@
         "name": "async-prefix-seed-tts-c32",
         "dataset_name": "seed-tts",
         "num_prompts": [
-          1088
+          512
         ],
         "max_concurrency": [
           32
@@ -341,7 +341,7 @@
         "name": "async-prefix-seed-tts-c1",
         "dataset_name": "seed-tts",
         "num_prompts": [
-          1088
+          32
         ],
         "max_concurrency": [
           1
@@ -357,7 +357,7 @@
         "name": "async-prefix-seed-tts-c16",
         "dataset_name": "seed-tts",
         "num_prompts": [
-          1088
+          256
         ],
         "max_concurrency": [
           16

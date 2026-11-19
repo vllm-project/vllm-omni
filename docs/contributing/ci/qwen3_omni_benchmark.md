@@ -7,17 +7,19 @@ is independent of concurrency. Every non-duplex request generates text and audio
 
 ## Scenario matrix
 
-| Platform | Deployment | Dataset | Concurrency | Accuracy |
-| --- | --- | --- | --- | --- |
-| CUDA | default | English Seed-TTS | 64 | yes |
-| CUDA | async-prefix | Daily-Omni | 8 | yes |
-| CUDA | async-prefix | English Seed-TTS | 1 / 16 / 32 / 64 | at 64 |
-| NPU | default | English Seed-TTS | 32 | yes |
-| NPU | async-prefix | English Seed-TTS | 1 / 16 / 32 | at 32 |
+| Platform | Deployment | Dataset | Concurrency | Measured requests | Accuracy |
+| --- | --- | --- | --- | --- | --- |
+| CUDA | default | English Seed-TTS | 64 | 1088 | yes |
+| CUDA | async-prefix | Daily-Omni | 8 | 1197 | yes |
+| CUDA | async-prefix | English Seed-TTS | 1 / 16 / 32 / 64 | 32 / 256 / 512 / 1088 | at 64 |
+| NPU | default | English Seed-TTS | 32 | 1088 | yes |
+| NPU | async-prefix | English Seed-TTS | 1 / 16 / 32 | 32 / 256 / 1088 | at 32 |
 
-CUDA has six runs; NPU has four. Every Seed-TTS run uses the same 1088
-utterances, including the performance-only concurrency sweep. Daily-Omni uses
-all 1197 questions, including both 30-second and 60-second videos. Sources are
+CUDA has six runs; NPU has four. Seed-TTS accuracy cases use all 1088
+utterances. Performance-only tiers use fixed prefixes of the pinned manifest:
+32 utterances at c1, 256 at c16 and 512 at CUDA c32. Every tier requires
+complete request/audio/metric coverage for its configured sample count.
+Daily-Omni uses all 1197 questions, including both 30-second and 60-second videos. Sources are
 pinned by revision and manifest SHA256 in `tests/dfx/perf/qwen3_omni_workload.py`.
 Shuffling and oversampling are disabled. Offline mirrors can be selected with
 `QWEN3_OMNI_DAILY_ROOT` and `QWEN3_OMNI_SEED_ROOT`; their original manifests
@@ -80,7 +82,10 @@ measurements, metric values and relative tolerances. Set
 The shared runner persists one `result_test_*.json` for each dataset case,
 including quality, performance, software/data revisions, qualification scope
 and validation errors, before asserting success. HTML/Excel readers consume
-these ordinary performance artifacts. Unmeasurable TPOT is null.
+these ordinary performance artifacts. Performance subsets are marked
+`qualification_scope: performance-subset`; accuracy cases are `full-dataset`.
+Performance references must match the exact request count; subset and
+full-dataset measurements are separate workloads. Unmeasurable TPOT is null.
 
 ## Small smoke runs before full experiments
 
@@ -93,8 +98,10 @@ are marked `qualification_scope: smoke` and cannot qualify a full dataset.
 Daily smoke can use explicit `smoke_indices`, for example `[0, 647]`, to
 exercise both clip durations. Other runs use the source manifest order.
 
-The full configuration rejects truncated request counts. A successful smoke
-must precede each deployment's full experiment. Do not continue after startup,
+Accuracy qualification rejects truncated request counts. Performance subsets
+are regular measured cases, with their own sample counts and performance
+references. A successful smoke must precede each deployment's scheduled
+experiment. Do not continue after startup,
 audio, scoring or result-publication errors without resolving the failure.
 
 ## Running
