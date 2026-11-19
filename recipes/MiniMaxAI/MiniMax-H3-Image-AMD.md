@@ -17,6 +17,12 @@ path; neither was measured.
 
 ## Runtime and model preparation
 
+The environments and commands below record the original vLLM 0.33 validation.
+For this source checkout, build the vLLM 0.34 image using the
+[ROCm installation guide](../../docs/getting_started/installation/gpu/rocm.inc.md).
+Do not mount the current source into the older runtimes below. Their measured
+results do not qualify this checkout on ROCm.
+
 Set `VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS=1` to run the shared diffusion
 `RMSNorm` and `SiluAndMul` in PyTorch on ROCm. This avoids precompiled vLLM
 kernels that failed with `hipErrorInvalidImage` in the tested runtime. The
@@ -36,13 +42,13 @@ The tested runtime was the locally available image
 | AMD AITER | `0.1.26` |
 
 The older `vllm/vllm-omni-rocm:minimax-h3` video image contains vLLM 0.26 and
-cannot import this checkout's vLLM 0.33 APIs. The commands below mount the
-current source into the matching runtime. `PYTHONPATH` and the working
+could not import the recipe's vLLM 0.33 APIs. The historical commands below
+mounted the recipe's matching source into that runtime. `PYTHONPATH` and the working
 directory both select that source, avoiding the image's older Omni checkout.
 An equivalent source-built ROCm runtime must be qualified separately; see the
 [ROCm installation guide](../../docs/getting_started/installation/gpu/rocm.inc.md).
 
-### Runtime per GPU architecture
+### Historical runtime per GPU architecture
 
 The per-commit `rocm/vllm-omni:<commit>` CI images build vLLM with
 `PYTORCH_ROCM_ARCH=gfx942`, so their vLLM extensions contain `gfx942` code
@@ -56,15 +62,17 @@ docker run --rm --entrypoint bash "$SERVER_IMAGE" -c \
 
 | GPU | Runtime | Validated |
 | --- | --- | --- |
-| MI300X, MI325X (`gfx942`) | A `rocm/vllm-omni:<commit>` CI image with this checkout mounted, as below | MI325X: `rocm/vllm-omni:90eeebbd173c2c3cceac75fe299fb98e06813500` |
+| MI300X, MI325X (`gfx942`) | A `rocm/vllm-omni:<commit>` CI image with the recorded Omni source mounted, as below | MI325X: `rocm/vllm-omni:90eeebbd173c2c3cceac75fe299fb98e06813500` |
 | MI350X, MI355X (`gfx950`) | The CI image profile below, which works around its `gfx942`-only kernels with `VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS=1` and `VLLM_ROCM_USE_SKINNY_GEMM=0` | MI350X, four GPUs, text-to-image |
-| MI350X, MI355X (`gfx950`) | The multi-arch `vllm/vllm-openai-rocm:v0.33.0` image (`gfx90a`, `gfx942`, `gfx950`, the base used by `docker/Dockerfile.rocm`) with this checkout installed | MI350X, 1–8 GPUs, text-to-image and editing |
+| MI350X, MI355X (`gfx950`) | The multi-arch `vllm/vllm-openai-rocm:v0.33.0` image (`gfx90a`, `gfx942`, `gfx950`, the base used for the recorded validation) with the recorded Omni source installed | MI350X, 1–8 GPUs, text-to-image and editing |
 
 With a CI image on `gfx950`, startup fails with `hipErrorInvalidKernelFile` /
 `hipErrorInvalidImage` in any vLLM kernel that has no `gfx950` code object.
 The multi-arch image provides those kernels and needs neither
 `VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS` nor the skinny-GEMM override.
-Install this checkout into it without replacing its PyTorch or vLLM:
+The historical container setup installed the recorded Omni source without
+replacing its PyTorch or vLLM; it is not an installation command for the current
+checkout:
 
 ```bash
 docker run -d --name minimax-h3-image-amd \
@@ -88,7 +96,7 @@ The excluded packages are not used by MiniMax-H3-Image. Pip installs
 Transformers 5.19.0, matching the recorded versions above. Then start the
 server with `docker exec` and the `vllm serve` arguments shown below.
 
-From the repository root, set the host paths:
+From the recorded source checkout root, set the host paths:
 
 ```bash
 export SOURCE_DIR="$PWD"
@@ -292,7 +300,7 @@ resolved offline from the local Hugging Face cache.
 | GPU | Runtime | Extra server flags |
 | --- | --- | --- |
 | MI325X (`gfx942`) | `rocm/vllm-omni:90eeebbd173c2c3cceac75fe299fb98e06813500` | none (VAE graph decode on) |
-| MI350X (`gfx950`) | `vllm/vllm-openai-rocm:v0.33.0` with this checkout installed | `--no-enable-cuda-graph-decode` (measured before the single-replica fix; no longer needed) |
+| MI350X (`gfx950`) | `vllm/vllm-openai-rocm:v0.33.0` with the recorded Omni source installed | `--no-enable-cuda-graph-decode` (measured before the single-replica fix; no longer needed) |
 
 Both used vLLM `0.33.0+rocm100`, PyTorch `2.13.0+rocm10.0.0`, Transformers
 5.19.0 and Diffusers 0.40.0, with `--diffusion-attention-backend FLASH_ATTN`
