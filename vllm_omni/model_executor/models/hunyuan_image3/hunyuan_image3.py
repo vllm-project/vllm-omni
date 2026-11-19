@@ -2080,6 +2080,14 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
     #      restrict vocab to ratio tokens only (greedy).
     # ------------------------------------------------------------------
 
+    def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, None]:
+        """Register HunyuanImage3 forced-token and comprehension rules in MRv2."""
+        from vllm_omni.model_executor.models.hunyuan_image3.mrv2_sampling import (
+            HunyuanImage3MRv2Sampler,
+        )
+
+        return HunyuanImage3MRv2Sampler(sampler, self), None
+
     def sample(
         self,
         logits: torch.Tensor,
