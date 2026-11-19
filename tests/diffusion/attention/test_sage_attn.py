@@ -303,32 +303,45 @@ def test_sage_valid_kv_prefix_under_fullgraph_compile(sage_backend, monkeypatch)
     assert seen == [("cuda", 9, 9)] * 2
 
 
-@pytest.mark.parametrize(
-    ("causal", "valid_kv_length"),
-    [(False, 12), (True, 9)],
-    ids=["no_padding", "causal_hides_tail"],
-)
-def test_sage_keeps_full_kv_when_nothing_to_slice(sage_backend, monkeypatch, causal, valid_kv_length):
+@pytest.mark.parametrize("causal", [False, True])
+def test_sage_keeps_full_kv_without_tail_padding(sage_backend, monkeypatch, causal):
     backend, package = sage_backend
     seen: list[tuple[str, int, int]] = []
     _install_reference_kernels(backend, package, monkeypatch, seen)
     q, k, v = [torch.randn(1, 12, 4, 64) for _ in range(3)]
     impl = backend.SageAttentionImpl(4, 64, 0.125, causal=causal)
 
-    impl.forward_cuda(q, k, v, AttentionMetadata(extra={"valid_kv_length": valid_kv_length}))
+    impl.forward_cuda(q, k, v, AttentionMetadata(extra={"valid_kv_length": 12}))
 
     assert seen == [("cuda", 12, 12)]
 
 
-@pytest.mark.parametrize("valid_kv_length", [0, 13])
-def test_sage_rejects_out_of_range_valid_kv_length(sage_backend, monkeypatch, valid_kv_length):
-    backend, _ = sage_backend
+@pytest.mark.parametrize(
+    ("valid_kv_length", "causal", "match"),
+    [
+        (0, False, "within the K/V sequence"),
+        (13, False, "within the K/V sequence"),
+        (True, False, "Python integer"),
+        (torch.tensor(9), False, "Python integer"),
+        (9, True, "causal"),
+    ],
+    ids=["zero", "too_long", "bool", "tensor", "causal_padding"],
+)
+def test_sage_rejects_unusable_valid_kv_length(sage_contract, monkeypatch, valid_kv_length, causal, match):
     monkeypatch.setattr(
-        backend, "xpu_sageattn", lambda *args, **kwargs: pytest.fail("unexpected XPU Sage kernel call"), raising=False
+        sage_contract,
+        "xpu_sageattn",
+        lambda *args, **kwargs: pytest.fail("unexpected XPU Sage kernel call"),
+        raising=False,
     )
-    impl = backend.SageAttentionImpl(4, 64, 0.125)
-    q = torch.randn(1, 12, 4, 64)
+    impl = sage_contract.SageAttentionImpl(4, 64, 0.125, causal=causal)
+    inputs = _contract_inputs()
     metadata = AttentionMetadata(extra={"valid_kv_length": valid_kv_length})
+
+    # Planning reports the path as unsupported instead of failing in forward.
+    result = impl.resolve_execution_path(ExecutionContext(platform="cuda"), *inputs, metadata)
+    assert result.support.status is SupportStatus.UNSUPPORTED
+    assert match in result.support.reason
     for forward in (impl.forward_cuda, impl.forward_xpu):
-        with pytest.raises(ValueError, match="valid_kv_length"):
-            forward(q, q, q, metadata)
+        with pytest.raises(ValueError, match=match):
+            forward(*inputs, metadata)

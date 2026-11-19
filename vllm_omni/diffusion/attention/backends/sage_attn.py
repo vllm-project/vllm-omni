@@ -104,28 +104,37 @@ def _validate_sage_metadata(attn_metadata: AttentionMetadata | None) -> None:
         raise ValueError("SAGE_ATTN does not support attn_mask. Select a mask-capable backend.")
 
 
+def _valid_kv_prefix_length(attn_metadata: AttentionMetadata | None, kv_len: int, causal: bool) -> int | None:
+    """Return the K/V prefix to keep for ``valid_kv_length``, or None to keep all rows.
+
+    Keeping a contiguous valid K/V prefix is equivalent to masking the padded
+    tail keys, so models need not build a padding mask that Sage cannot consume.
+    """
+    valid_kv_length = attn_metadata.extra.get("valid_kv_length") if attn_metadata is not None else None
+    if valid_kv_length is None:
+        return None
+    if isinstance(valid_kv_length, bool) or not isinstance(valid_kv_length, int):
+        raise ValueError("valid_kv_length must be a Python integer")
+    if not 0 < valid_kv_length <= kv_len:
+        raise ValueError(f"valid_kv_length must be within the K/V sequence, got {valid_kv_length} for length {kv_len}")
+    if valid_kv_length == kv_len:
+        return None
+    if causal:
+        # Sage's causal alignment for unequal Q/K lengths is not validated.
+        raise ValueError("SAGE_ATTN does not support valid_kv_length with causal attention")
+    return valid_kv_length
+
+
 def _slice_valid_kv_prefix(
     key: torch.Tensor,
     value: torch.Tensor,
     attn_metadata: AttentionMetadata | None,
     causal: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Drop structural K/V tail padding described by ``valid_kv_length``.
-
-    Keeping only a contiguous valid K/V prefix is equivalent to masking the
-    padded tail keys, so models need not build a padding mask that Sage cannot
-    consume. Causal attention already hides tail keys from every valid query.
-    """
-    valid_kv_length = attn_metadata.extra.get("valid_kv_length") if attn_metadata is not None else None
-    if not isinstance(valid_kv_length, int):
+    keep = _valid_kv_prefix_length(attn_metadata, key.shape[1], causal)
+    if keep is None:
         return key, value
-    if not 0 < valid_kv_length <= key.shape[1]:
-        raise ValueError(
-            f"valid_kv_length must be within the K/V sequence, got {valid_kv_length} for length {key.shape[1]}"
-        )
-    if causal or valid_kv_length == key.shape[1]:
-        return key, value
-    return key[:, :valid_kv_length], value[:, :valid_kv_length]
+    return key[:, :keep], value[:, :keep]
 
 
 def _sage_cuda_kernel_variant(query: torch.Tensor) -> str | None:
@@ -192,6 +201,10 @@ class SageAttentionImpl(AttentionImpl):
         result = ExecutionPathResult.unmigrated("SAGE_ATTN", replace(context, kernel_variant=None), path="unverified")
         if attn_metadata is not None and attn_metadata.attn_mask is not None:
             return replace(result, support=CapabilityResult.unsupported("SAGE_ATTN: attn_mask is not supported"))
+        try:
+            _valid_kv_prefix_length(attn_metadata, key.shape[1], self.causal)
+        except ValueError as exc:
+            return replace(result, support=CapabilityResult.unsupported(f"SAGE_ATTN: {exc}"))
         if self.dropout != 0.0:
             return replace(
                 result,
