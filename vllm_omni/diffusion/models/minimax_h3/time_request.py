@@ -70,7 +70,9 @@ def _time_shift_sigmas(
         dtype=torch.float32,
     )
     shifted = float(shift_scale) * base / (1 + (float(shift_scale) - 1) * base)
-    return [float(value) for value in shifted.tolist()]
+    # In float32 the first sigma can round one ulp above 1 (flow_shift 2.14, for example), which the
+    # sampler rejects. The last sigma is exactly 0 and the others are positive, so only 1 needs a clamp.
+    return shifted.clamp(max=1.0).tolist()
 
 
 class MiniMaxH3ShapePlanner:

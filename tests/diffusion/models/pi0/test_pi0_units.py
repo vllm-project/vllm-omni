@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU unit tests for the π0 (Pi-Zero) VLA model.
 
 Deliberately lightweight: pure utility code (config plumbing, mask building,
@@ -273,24 +273,38 @@ def test_gemma_unknown_variant_raises():
 
 
 # ----------------------------------------------------------------------------
-# load_weights remap rules (tiny model; needs torch + transformers)
+# load_weights remap rules (full parameter layout; needs torch + transformers)
 # ----------------------------------------------------------------------------
-def _tiny_pi0_model():
-    """Construct a tiny π0 model for remap tests (full Gemma depth but small
-    action/state dims — the PaliGemma backbone is always full-size)."""
-    cfg = Pi0Config(max_action_dim=8, max_state_dim=8, chunk_size=2)
-    return Pi0ForActionPrediction(cfg)
-
-
 @pytest.fixture(scope="module")
 def remap_model():
-    """One shared model for the weight-remap tests below.
+    """Keep the real hierarchy, but allocate only the weights these tests load.
 
-    The full-size PaliGemma backbone costs ~40s to construct on CPU, but each
-    remap test loads a single weight into its own parameter (distinct targets,
-    distinct payload constants) and asserts only that parameter, so the three
-    tests can share one construction between them."""
-    return _tiny_pi0_model()
+    These tests check key remapping, not inference. Their target tensors retain
+    the original shapes and dtypes; unrelated backbone weights stay on meta.
+    Each test overwrites its target with a distinct constant before asserting,
+    so sharing the fixture does not require a particular execution order.
+    """
+    with torch.device("meta"):
+        model = Pi0ForActionPrediction(Pi0Config(max_action_dim=8, max_state_dim=8, chunk_size=2))
+    params = dict(model.named_parameters())
+    vision_prefix = "paligemma_with_expert.paligemma.model.vision_tower."
+    targets = {
+        next(name for name in params if name.startswith(vision_prefix)),
+        next(name for name in params if name.startswith(vision_prefix) and "patch_embedding.weight" in name),
+        "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight",
+    }
+    replacements = {
+        id(params[name]): torch.nn.Parameter(
+            torch.zeros_like(params[name], device="cpu"), requires_grad=params[name].requires_grad
+        )
+        for name in targets
+    }
+    # Replace every alias together, preserving tied lm_head/embed_tokens weights.
+    for name, parameter in list(model.named_parameters(remove_duplicate=False)):
+        if id(parameter) in replacements:
+            parent, _, leaf = name.rpartition(".")
+            model.get_submodule(parent).register_parameter(leaf, replacements[id(parameter)])
+    return model
 
 
 @pytest.fixture(autouse=True)
@@ -546,6 +560,7 @@ def _selfconsist_model(device):
     model = Pi0ForActionPrediction(
         Pi0Config(max_action_dim=32, max_state_dim=32, chunk_size=50, num_inference_steps=10, dtype="float32")
     )
+    assert _SELFCONSIST_CKPT is not None
     state = safetensors.torch.load_file(os.path.join(_SELFCONSIST_CKPT, "model.safetensors"))
     filled = model.load_weights(list(state.items()))
     expected = {n for n, _ in model.named_parameters() if "rotary_emb" not in n and not n.endswith(".inv_freq")}

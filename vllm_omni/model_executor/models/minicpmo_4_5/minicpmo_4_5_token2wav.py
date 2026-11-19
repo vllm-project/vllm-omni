@@ -21,11 +21,15 @@ from typing import Any
 
 import numpy as np
 import torch
+from vllm.config import VllmConfig
+from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.step_audio2.step_audio2_token2wav import (
     StepAudio2Token2WavCore,
     _StreamState,
 )
+
+logger = init_logger(__name__)
 
 
 def _resolve_device(device: str | torch.device | None) -> str:
@@ -118,9 +122,12 @@ class MiniCPMO45Token2wav:
     def speech_window(self) -> torch.Tensor:
         return self._core.speech_window
 
-    def _prepare_prompt(self, prompt_wav: str):
+    def _prepare_prompt_cpu(self, prompt_wav: str):
+        return self._core._prepare_prompt_cpu(prompt_wav)
+
+    def _prepare_prompt(self, prompt_wav: str, *, cpu_features=None):
         """Delegate prompt feature extraction to the wrapped core."""
-        return self._core._prepare_prompt(prompt_wav)
+        return self._core._prepare_prompt(prompt_wav, cpu_features=cpu_features)
 
     def enable_trt_spk_embedding(self, *, cpu_reference: bool = False) -> None:
         """Run the campplus speaker-embedding model on TensorRT."""
@@ -130,15 +137,31 @@ class MiniCPMO45Token2wav:
         """Run CAM++ on device, optionally without TensorRT on CUDA."""
         self._core.enable_device_spk_embedding(use_trt=use_trt)
 
-    def enable_speaker_cuda_graph(self, vllm_config) -> None:
+    def enable_speaker_cuda_graph(self, vllm_config: VllmConfig) -> bool:
         """Replay the current Torch speaker forward without changing its math."""
         from vllm_omni.model_executor.models.cosyvoice3.speaker_embedding_torch import CampplusTorch
         from vllm_omni.model_executor.models.minicpmo_4_5.speaker_cuda_graph import SpeakerCudaGraph
 
         speaker = self._core._spk_model
         if not isinstance(speaker, CampplusTorch) or speaker.device.type != "cuda":
-            raise ValueError("Speaker CUDA graphs require the CUDA Torch speaker model")
+            logger.info("MiniCPM-o: skipping speaker CUDA graphs; selected speaker is not CUDA Torch CAM++")
+            return False
         self._core._spk_model = SpeakerCudaGraph(speaker, vllm_config)
+        return True
+
+    def enable_s3_cuda_graph(self, vllm_config: VllmConfig) -> bool:
+        """Replay short reference tokenization with unchanged S3 weights/math."""
+        from .s3_cuda_graph import S3CudaGraph
+
+        if self._core.device.type != "cuda":
+            logger.info("MiniCPM-o: skipping S3 CUDA graphs off CUDA")
+            return False
+        tokenizer = self._core.audio_tokenizer
+        if next(tokenizer.parameters()).device.type != "cuda":
+            logger.info("MiniCPM-o: skipping S3 CUDA graphs; selected tokenizer is not on CUDA")
+            return False
+        self._core._s3_cuda_graph = S3CudaGraph(tokenizer, vllm_config)
+        return True
 
     def __call__(self, generated_speech_tokens, prompt_wav) -> bytes:
         """One-shot tokens → 24 kHz WAV bytes."""

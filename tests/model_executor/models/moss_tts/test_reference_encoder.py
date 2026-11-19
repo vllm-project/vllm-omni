@@ -117,6 +117,93 @@ async def test_cpu_reference_encoder_does_not_add_autocast(make_encoder, monkeyp
     assert result[0].dtype == torch.long
 
 
+@pytest.mark.parametrize(
+    "variant,shared,supported,enabled,expected",
+    [
+        ("local", False, True, True, True),
+        ("local", False, True, False, False),
+        ("local", True, True, True, False),
+        ("local", False, False, True, False),
+        ("tts", False, True, True, False),
+        ("realtime", False, True, True, False),
+    ],
+)
+async def test_npu_reference_graph_eligibility(
+    make_encoder, monkeypatch, variant, shared, supported, enabled, expected
+):
+    from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
+
+    class Tokenizer(torch.nn.Module):
+        def parameters(self, recurse=True):
+            return iter([SimpleNamespace(device=SimpleNamespace(type="npu", index=3))])
+
+        def _codec_inference_autocast(self):
+            raise AssertionError("Eligibility must not execute the tokenizer")
+
+    monkeypatch.setattr(NPUExactGraphRunner, "is_supported", staticmethod(lambda: supported))
+    monkeypatch.setenv("VLLM_OMNI_MOSS_REF_SHARED_ENCODER", "1")
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("NPU must not install CUDA FlashAttention")
+
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.moss_tts.reference_encoder.install_windowed_attention", unexpected
+    )
+    proc = _FakeProcessor()
+    proc.audio_tokenizer = Tokenizer()
+    enc = make_encoder(proc, variant=variant)
+    enc._graphs_enabled = enabled
+    enc._shares_encoder = shared
+    assert enc._graph_capable() is expected
+
+
+async def test_npu_reference_graph_capture_failure_retains_failed_runner(make_encoder, monkeypatch):
+    from vllm_omni.platforms.npu.models import moss_tts_reference_encoder_graphs as backend
+
+    class Tokenizer(torch.nn.Module):
+        def parameters(self, recurse=True):
+            return iter([SimpleNamespace(device=SimpleNamespace(type="npu", index=3))])
+
+    class FailedGraphs:
+        calls = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def capture(self):
+            self.calls += 1
+            raise RuntimeError("capture failed")
+
+    proc = _FakeProcessor()
+    proc.audio_tokenizer = Tokenizer()
+    enc = make_encoder(proc)
+    monkeypatch.setattr(enc, "_graph_capable", lambda: True)
+    monkeypatch.setattr(backend, "MossNPUReferenceEncoderGraphs", FailedGraphs)
+    with pytest.raises(RuntimeError, match="capture failed"):
+        enc._reference_graphs()
+    failed = enc._graphs
+    assert failed is not None
+    assert enc._reference_graphs() is failed
+    assert failed.calls == 1
+
+
+async def test_npu_reference_graph_miss_uses_original_prepared_clip(make_encoder, monkeypatch):
+    proc = _FakeProcessor()
+    enc = make_encoder(proc)
+    hit = torch.full((2, _N_VQ), 9, dtype=torch.long)
+
+    class Graphs:
+        def encode(self, wavs):
+            assert torch.equal(wavs[0], torch.full((1, 10), 101.0))
+            return [None, hit]
+
+    monkeypatch.setattr(enc, "_finish_prepare", lambda wav: wav + 100)
+    outputs = enc._encode_prepared([torch.ones(1, 10), torch.full((1, 10), 2.0)], Graphs())
+    assert torch.equal(outputs[0], torch.ones((3, _N_VQ), dtype=torch.long))
+    assert outputs[1] is hit
+    assert proc.total_items == 1
+
+
 _SR = 24000
 _N_VQ = 4
 

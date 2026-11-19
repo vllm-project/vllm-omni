@@ -6,28 +6,24 @@ from __future__ import annotations
 from collections import OrderedDict
 from threading import Lock
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+import msgspec
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.sampling_params import SamplingParams
-from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.logits_processor.state import LogitsProcessors
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.ops.topk_topp_sampler import random_sample
-from vllm.v1.worker.gpu_input_batch import InputBatch
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.data_entry_keys import to_struct
+from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.model_executor.models.cosyvoice3 import cosyvoice3, cosyvoice3_talker
 from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model, _normalize_request_conditioning
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
-from vllm_omni.worker import gpu_ar_model_runner
-from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
-from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -141,7 +137,14 @@ def _make_sampling_metadata(
     *,
     output_token_ids: list[list[int]],
     repetition_penalty: float = 2.0,
-) -> SamplingMetadata:
+):
+    pytest.importorskip(
+        "vllm.v1.sample.sampler",
+        reason="Retired V1 sampler/runner contract; native V2 and model-domain tests remain separate",
+    )
+    from vllm.v1.sample.logits_processor.state import LogitsProcessors
+    from vllm.v1.sample.metadata import SamplingMetadata
+
     batch_size = len(output_token_ids)
     return SamplingMetadata(
         temperature=torch.ones(batch_size, dtype=torch.float32),
@@ -200,114 +203,6 @@ def output_payload_talker(monkeypatch, output_payload_vllm_config):
     monkeypatch.setattr(CosyVoice3Model, "_create_llm_vllm_config", lambda self, config: config)
 
     return CosyVoice3Model(vllm_config=output_payload_vllm_config)
-
-
-@pytest.mark.parametrize(
-    "output_payload_vllm_config", [True, False], indirect=True, ids=["async_chunks", "sync_chunks"]
-)
-@pytest.mark.parametrize("async_scheduling", [True, False], ids=["async_scheduling", "sync_scheduling"])
-def test_talker_skips_unused_hidden_payload_without_async_materialization(
-    output_payload_talker, output_payload_vllm_config, async_scheduling
-):
-    runner = object.__new__(GPUARModelRunner)
-    runner.use_async_scheduling = async_scheduling
-    runner.omni_prefix_cache = None
-    runner.speculative_config = None
-    runner.model_config = output_payload_vllm_config.model_config
-    runner.model = output_payload_talker
-    # load_model caches this policy before the output path runs.
-    runner._pooler_payload_include_hidden_flag = bool(getattr(runner.model, "omni_pooler_payload_include_hidden", True))
-
-    assert runner._model_omni_pooler_payload_include_hidden() is (not runner.model_config.async_chunk)
-    assert runner._should_use_async_omni_output() is False
-
-
-@pytest.mark.parametrize("is_prefill", [True, False], ids=["prefill", "decode"])
-@pytest.mark.parametrize(
-    "output_payload_vllm_config", [True, False], indirect=True, ids=["async_chunks", "sync_chunks"]
-)
-def test_talker_inline_output_preserves_conditioning_and_tokens(
-    output_payload_talker, output_payload_vllm_config, monkeypatch, mocker, is_prefill
-):
-    """Token-only output retains prefill conditioning and sampled codec IDs."""
-
-    runner = object.__new__(GPUARModelRunner)
-    runner.model = output_payload_talker
-    runner._pooler_payload_include_hidden_flag = bool(getattr(runner.model, "omni_pooler_payload_include_hidden", True))
-    runner.vllm_config = output_payload_vllm_config
-    runner.model_config = output_payload_vllm_config.model_config
-    runner._async_chunk = runner.model_config.async_chunk
-    runner.omni_prefix_cache = None
-    runner.supports_mm_inputs = False
-    runner.routed_experts_initialized = False
-    runner.model_intermediate_buffer = {}
-    runner.input_batch = object.__new__(InputBatch)
-    runner.input_batch._req_ids = ["r1", "r2"]
-    runner.input_batch.req_id_to_index = {"r1": 0, "r2": 1}
-    monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("latent", req_ids))
-    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
-
-    conditioning = {
-        "speech_token": torch.tensor([[11, 12], [21, 0]], dtype=torch.long),
-        "speech_token_len": torch.tensor([2, 1], dtype=torch.long),
-        "speech_feat": torch.arange(16, dtype=torch.float32).reshape(2, 4, 2),
-        "embedding": torch.tensor([[0.1, 0.2], [0.3, 0.4]]),
-    }
-    expected = {key: value.clone() for key, value in conditioning.items()}
-    hidden_states = output_payload_talker.forward(
-        input_ids=torch.tensor([1, 2, 3]),
-        positions=torch.arange(3),
-        inputs_embeds=torch.ones(3, 16),
-        **(conditioning if is_prefill else {}),
-    )
-    model_output = output_payload_talker.make_omni_output(hidden_states, **(conditioning if is_prefill else {}))
-
-    cpu_materialization = mocker.spy(gpu_ar_model_runner, "_to_cpu_contiguous")
-    scheduler_output = object.__new__(SchedulerOutput)
-    scheduler_output.total_num_scheduled_tokens = 3
-    scheduler_output.num_scheduled_tokens = {"r1": 2, "r2": 1}
-    output = runner._build_omni_model_runner_output_from_snapshot(
-        scheduler_output=scheduler_output,
-        hidden_states=model_output.text_hidden_states,
-        staged_hidden_states_cpu=None,
-        multimodal_outputs=model_output.multimodal_outputs,
-        req_ids_output_copy=["r1", "r2"],
-        req_id_to_index_output_copy={"r1": 0, "r2": 1},
-        valid_sampled_token_ids=[[101], [102]],
-        logprobs_lists=None,
-        prompt_logprobs_dict={},
-        num_nans_in_logits=None,
-        kv_connector_output=None,
-        ec_connector_output=None,
-        cudagraph_stats=None,
-        kv_extracted_req_ids=None,
-        num_scheduled_tokens_np=torch.tensor([2, 1], dtype=torch.int32).numpy(),
-        query_start_loc_cpu=torch.tensor([0, 2], dtype=torch.long),
-    )
-    assert output.req_ids == ["r1", "r2"]
-    assert output.sampled_token_ids == [[101], [102]]
-    hidden_storage = model_output.text_hidden_states.untyped_storage().data_ptr()
-    hidden_copied = any(
-        call.args[0].untyped_storage().data_ptr() == hidden_storage for call in cpu_materialization.call_args_list
-    )
-    assert hidden_copied is (not runner._async_chunk)
-    if runner._async_chunk:
-        assert output.multimodal_outputs is None
-    if not is_prefill and runner._async_chunk:
-        assert not output.inter_stage_outputs or all(not item for item in output.inter_stage_outputs)
-        return
-
-    assert len(output.inter_stage_outputs) == 2
-    for idx, prompt_len in enumerate([2, 1]):
-        item = output.inter_stage_outputs[idx]
-        assert ("hidden" not in item) is runner._async_chunk
-        if not is_prefill:
-            continue
-        # The downstream processor removes padding using speech_token_len.
-        torch.testing.assert_close(item["embed.speech_token"], expected["speech_token"][idx : idx + 1])
-        torch.testing.assert_close(item["embed.speech_feat"], expected["speech_feat"][idx : idx + 1])
-        assert item["embed.speech_token_len"].item() == prompt_len
-        torch.testing.assert_close(item["embed.embedding"], expected["embedding"][idx : idx + 1])
 
 
 def test_talker_preserves_packed_payload_policy(output_payload_talker, output_payload_vllm_config, monkeypatch):
@@ -679,6 +574,12 @@ def _reference_param(param, row, default):
 
 def _reference_ras_one(weighted_scores, history, *, top_p, top_k, win_size, tau_r, generator):
     """Serial RAS oracle from the pre-B1 implementation, including RNG draws."""
+    pytest.importorskip(
+        "vllm.v1.sample.sampler",
+        reason="Retired V1 sampler/runner contract; native V2 and model-domain tests remain separate",
+    )
+    from vllm.v1.sample.ops.topk_topp_sampler import random_sample
+
     native_sample = getattr(random_sample, "__wrapped__", random_sample)
     probs, ids = weighted_scores.softmax(dim=0).sort(descending=True, stable=True)
     keep = probs.cumsum(dim=0) - probs < top_p
@@ -857,134 +758,6 @@ def test_mixed_ras_applies_processors_before_greedy_and_random_selection():
     assert out.sampled_token_ids.tolist() == [[1], [1]]
 
 
-def test_gpu_ar_model_runner_prefers_model_sampler_when_opted_in():
-    metadata = _make_sampling_metadata(output_token_ids=[[1, 2, 3]])
-    expected = SamplerOutput(
-        sampled_token_ids=torch.tensor([[7]], dtype=torch.int32),
-        logprobs_tensors=None,
-    )
-    calls: list[torch.Tensor] = []
-
-    class _DummyInputBatch:
-        def __init__(self):
-            self.sampling_metadata = metadata
-            self.updated = False
-
-        def update_async_output_token_ids(self):
-            # After PR 3681 fix, update_async_output_token_ids is called
-            # BEFORE model sampler path to ensure async placeholder repair
-            # runs for all sampling paths
-            self.updated = True
-
-    runner = object.__new__(GPUARModelRunner)
-    runner.input_batch = _DummyInputBatch()
-    runner.requests = {}
-
-    def model_sample(logits, sampling_metadata):
-        calls.append(logits.clone())
-        return expected
-
-    runner.model = SimpleNamespace(
-        prefer_model_sampler=True,
-        sample=model_sample,
-    )
-    runner.sampler = lambda **_: (_ for _ in ()).throw(AssertionError("fallback sampler should not be used"))
-
-    out = runner._sample(torch.tensor([[0.1, 0.2]], dtype=torch.float32), spec_decode_metadata=None)
-
-    assert out is expected
-    assert runner.input_batch.updated is True
-    assert len(calls) == 1
-
-
-def test_gpu_ar_model_runner_supplies_req_output_history_to_model_sampler():
-    metadata = _make_sampling_metadata(output_token_ids=[])
-    seen_histories: list[list[list[int]]] = []
-
-    class _DummyInputBatch:
-        def __init__(self):
-            self.sampling_metadata = metadata
-            self.req_output_token_ids = [[1, 2, 3]]
-            self.req_ids = ["rid-1"]
-            self.sampled_token_ids_cpu = None
-            self.async_copy_ready_event = None
-            self.prev_req_id_to_index = None
-            self.update_async_called = False
-
-        def update_async_output_token_ids(self):
-            # After PR 3681 fix, update_async_output_token_ids is called
-            # BEFORE model sampler path to ensure async placeholder repair
-            # runs for all sampling paths
-            self.update_async_called = True
-
-    runner = object.__new__(GPUARModelRunner)
-    runner.input_batch = _DummyInputBatch()
-    runner.requests = {}
-
-    def model_sample(logits, sampling_metadata):
-        seen_histories.append([list(x) for x in sampling_metadata.output_token_ids])
-        return SamplerOutput(sampled_token_ids=torch.tensor([[7]], dtype=torch.int32), logprobs_tensors=None)
-
-    runner.model = SimpleNamespace(
-        prefer_model_sampler=True,
-        sample=model_sample,
-    )
-    runner.sampler = lambda **_: (_ for _ in ()).throw(AssertionError("fallback sampler should not be used"))
-
-    runner._sample(torch.tensor([[0.1, 0.2]], dtype=torch.float32), spec_decode_metadata=None)
-
-    assert runner.input_batch.update_async_called is True
-    assert seen_histories == [[[1, 2, 3]]]
-
-
-def test_gpu_ar_model_runner_repairs_async_placeholders_for_model_sampler():
-    metadata = _make_sampling_metadata(output_token_ids=[])
-    seen_histories: list[list[list[int]]] = []
-
-    class _ReadyEvent:
-        def __init__(self):
-            self.synced = False
-
-        def synchronize(self):
-            self.synced = True
-
-    class _DummyInputBatch:
-        def __init__(self):
-            self.sampling_metadata = metadata
-            self.req_output_token_ids = [[11, -1]]
-            self.req_ids = ["rid-1"]
-            self.sampled_token_ids_cpu = torch.tensor([[29]], dtype=torch.int32)
-            self.async_copy_ready_event = _ReadyEvent()
-            self.prev_req_id_to_index = {"rid-1": 0}
-            self.update_async_called = False
-
-        def update_async_output_token_ids(self):
-            # After PR 3681 fix, update_async_output_token_ids is called
-            # BEFORE model sampler path to ensure async placeholder repair
-            # runs for all sampling paths (model sampler + fallback sampler)
-            self.update_async_called = True
-
-    runner = object.__new__(GPUARModelRunner)
-    runner.input_batch = _DummyInputBatch()
-    runner.requests = {}
-
-    def model_sample(logits, sampling_metadata):
-        seen_histories.append([list(x) for x in sampling_metadata.output_token_ids])
-        return SamplerOutput(sampled_token_ids=torch.tensor([[7]], dtype=torch.int32), logprobs_tensors=None)
-
-    runner.model = SimpleNamespace(
-        prefer_model_sampler=True,
-        sample=model_sample,
-    )
-    runner.sampler = lambda **_: (_ for _ in ()).throw(AssertionError("fallback sampler should not be used"))
-
-    runner._sample(torch.tensor([[0.1, 0.2]], dtype=torch.float32), spec_decode_metadata=None)
-
-    assert runner.input_batch.async_copy_ready_event.synced is True
-    assert runner.input_batch.update_async_called is True
-    assert seen_histories == [[[11, 29]]]
-
-
 @pytest.mark.parametrize(
     "order",
     [("decode", "short", "decode", "long"), ("short", "decode", "long", "decode"), ("long", "short", "decode")],
@@ -1126,26 +899,6 @@ def test_full_response_singleton_uses_the_optimized_batch_path(monkeypatch):
     assert model.code2wav.forward_streaming_batch_calls[0][0]["finalize"]
 
 
-def test_full_response_adapter_uses_live_prefill_then_empty_decode(monkeypatch):
-    model = _make_talker_model()
-    hidden = torch.ones(2, 4)
-    runner = object.__new__(OmniGPUModelRunner)
-    runner.model = model
-    runner._build_model_kwargs_extra = lambda: {}
-    # Replay the same graph tensor while the live conditioning changes.
-    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *_args, **_kwargs: hidden)
-    model._conditioning_request_rows = [1]
-    model._conditioning_request_count = 2
-    prompt = torch.tensor([[7, 8]])
-    output = runner._model_forward(speech_token=prompt)
-    values = output.multimodal_outputs["embed"]["speech_token"]
-    assert values[0] is None
-    torch.testing.assert_close(values[1], prompt)
-    decode = runner._model_forward()
-    assert decode.text_hidden_states is hidden
-    assert decode.multimodal_outputs == {}
-
-
 def test_packed_flow_preserves_torch_estimator_when_speaker_trt_is_enabled(monkeypatch):
     model = _make_code2wav_model()
     model._code2wav_trt_done = False
@@ -1159,6 +912,42 @@ def test_packed_flow_preserves_torch_estimator_when_speaker_trt_is_enabled(monke
     monkeypatch.setattr(model, "_resolve_flow_estimator_onnx", unexpected_estimator_resolution)
     model._maybe_enable_code2wav_trt()
     assert model._code2wav_trt_done
+
+
+@pytest.mark.parametrize("compile_dit", [None, False, True], ids=["missing", "disabled", "enabled"])
+def test_dit_compile_selection_controls_only_the_flow_trt_swap(monkeypatch, compile_dit):
+    from vllm_omni.model_executor.models.cosyvoice3 import flow_estimator_trt
+
+    model = _make_code2wav_model()
+    if compile_dit is not None:
+        model.config.cosyvoice3_compile_dit = compile_dit
+    model._code2wav_trt_done = False
+    decoder = nn.Module()
+    estimator = nn.Linear(2, 2)
+    decoder.estimator = estimator
+    model.code2wav.flow_model = SimpleNamespace(decoder=decoder)
+    resolver = Mock(return_value="flow.decoder.estimator.fp32.onnx")
+    wrapper = object()
+    builder = Mock(return_value=wrapper)
+    monkeypatch.setattr(model, "_resolve_flow_estimator_onnx", resolver)
+    monkeypatch.setattr(flow_estimator_trt, "build_flow_estimator_trt", builder)
+    monkeypatch.setattr(cosyvoice3, "cosyvoice3_packed_inference_enabled", lambda: False)
+    monkeypatch.setattr(cosyvoice3.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setenv("COSYVOICE3_TRT", "1")
+
+    model._maybe_enable_code2wav_trt()
+    model._maybe_enable_code2wav_trt()
+
+    assert model._code2wav_trt_done
+    assert cosyvoice3._cosyvoice3_trt_enabled()
+    if compile_dit:
+        assert decoder.estimator is estimator
+        resolver.assert_not_called()
+        builder.assert_not_called()
+    else:
+        assert decoder.estimator is wrapper
+        resolver.assert_called_once_with()
+        builder.assert_called_once_with("flow.decoder.estimator.fp32.onnx", device="cuda")
 
 
 def test_standard_sampling_preserves_parameters_and_excludes_prompt_penalties(monkeypatch):
@@ -1275,6 +1064,75 @@ def test_request_conditioning_reaches_code2wav_with_true_prompt_length():
     assert output.multimodal_outputs
 
 
+def test_code2wav_consumes_v2_conditioning_without_mutating_runner_state():
+    model = _make_code2wav_model()
+    buffers = OmniIntermediateBuffer(2)
+    params = [SamplingParams(seed=11), SamplingParams(seed=22)]
+    for i in range(2):
+        payload = {
+            "embed": {
+                "speech_token": torch.tensor([[3, 2, 0, 0]], dtype=torch.int32),
+                "speech_feat": torch.full((1, 8, 80), float(i + 1)),
+                "embedding": torch.full((1, 192), float(i + 1)),
+                "speech_token_len": torch.tensor([[2]], dtype=torch.int32),
+            },
+            "meta": {"req_id": [f"voice-{i}"], "talker_prefill_offset": i},
+            "request_id": f"upstream-{i}",
+        }
+        buffers.add_request(
+            i,
+            SimpleNamespace(
+                req_id=f"runner-{i}",
+                additional_information=payload if i == 0 else serialize_additional_information(payload),
+                sampling_params=params[i],
+                mm_features=["feature-0"] if i == 0 else [],
+                prompt_embeds=torch.ones(1, 2) if i == 0 else None,
+            ),
+        )
+    # The payload's own request identity and conditioning follow batch order,
+    # independently of the runner's slot and sampling metadata.
+    runtime_info = buffers.gather(SimpleNamespace(idx_mapping_np=np.array([1, 0])))
+    output = model.forward(
+        torch.tensor([1, 2, 3]),
+        torch.arange(3),
+        seq_token_counts=[1, 2],
+        model_intermediate_buffer=runtime_info,
+    )
+    for row, index in enumerate((1, 0)):
+        info = runtime_info[row]
+        assert info is buffers.buffers[index]
+        assert info["sampling_params"] is params[index]
+        assert info["sampling_params"].seed == (11, 22)[index]
+        assert info["req_id"] == f"runner-{index}"
+        if index == 0:
+            assert info["mm_features"] == ["feature-0"]
+            assert info["prompt_embeds_cpu"].shape == (1, 2)
+        else:
+            assert "mm_features" not in info and "prompt_embeds_cpu" not in info
+        conditioning = to_struct(_normalize_request_conditioning(info))
+        assert conditioning.request_id == f"upstream-{index}"
+        assert conditioning.meta.req_id == [f"voice-{index}"]
+        call = model.code2wav.forward_calls[row]
+        assert call["token"].tolist() == [([1], [2, 3])[row]]
+        assert call["token_offset_tokens"] == index
+        assert call["prompt_token"].tolist() == [[3, 2]]
+        assert call["prompt_feat"].shape == (1, 4, 80)
+        torch.testing.assert_close(call["embedding"], torch.full((1, 192), float(index + 1)))
+        torch.testing.assert_close(output.multimodal_outputs["audio"][row], torch.linspace(-1, 1, row + 1))
+
+
+@pytest.mark.parametrize(
+    "payload,unknown_field",
+    [
+        ({"unknown_runner_option": None}, "unknown_runner_option"),
+        ({"embed": {"unknown_conditioning": torch.ones(1, 192)}}, "unknown_conditioning"),
+    ],
+)
+def test_request_conditioning_keeps_unknown_fields_strict(payload, unknown_field):
+    with pytest.raises(msgspec.ValidationError, match=f"unknown field `{unknown_field}`"):
+        to_struct(_normalize_request_conditioning({"sampling_params": SamplingParams(), **payload}))
+
+
 @pytest.mark.parametrize("stage", ["cosyvoice3_talker", "cosyvoice3_code2wav"])
 @pytest.mark.parametrize("owned", [False, True])
 def test_generation_output_ownership_is_exposed_only_for_owned_codec(stage, owned):
@@ -1284,52 +1142,3 @@ def test_generation_output_ownership_is_exposed_only_for_owned_codec(stage, owne
     if stage == "cosyvoice3_code2wav":
         model.code2wav = SimpleNamespace(owns_generation_output_storage=owned)
     assert model.owns_generation_output_storage is (stage == "cosyvoice3_code2wav" and owned)
-
-
-@pytest.mark.parametrize(
-    "route,has_commit",
-    [("custom", True), ("decline", True), ("default", True), ("speculative", True), ("default", False)],
-)
-def test_runner_commits_deferred_rng_once_before_sampling(mocker, route, has_commit):
-    events = []
-    expected = object()
-    metadata = SimpleNamespace()
-    runner = object.__new__(GPUARModelRunner)
-    runner.requests = {}
-    runner.input_batch = SimpleNamespace(
-        sampling_metadata=metadata,
-        update_async_output_token_ids=lambda: events.append("history"),
-    )
-
-    def custom(logits, sampling_metadata):
-        events.append("custom")
-        return None if route == "decline" else expected
-
-    runner.model = SimpleNamespace(prefer_model_sampler=route in ("custom", "decline"), sample=custom)
-    if has_commit:
-        runner.model.commit_deferred_sampling = lambda: events.append("commit")
-
-    def fallback(**kwargs):
-        events.append("default")
-        return expected
-
-    def speculative(*args):
-        events.append("speculative")
-        return expected
-
-    runner.sampler = fallback
-    runner._sampling_metadata_for_model_sampler = lambda smd: smd
-    runner._apply_duplex_sampling = lambda *args: events.append("duplex")
-    mocker.patch.object(GPUModelRunner, "_sample", side_effect=speculative)
-    result = runner._sample(torch.zeros(1, 2), object() if route == "speculative" else None)
-    expected_events = ["commit"] if has_commit else []
-    if route == "speculative":
-        expected_events += ["speculative"]
-    else:
-        expected_events += ["history"]
-        if route in ("custom", "decline"):
-            expected_events += ["duplex", "custom"]
-        if route in ("default", "decline"):
-            expected_events += ["default"]
-    assert result is expected
-    assert events == expected_events

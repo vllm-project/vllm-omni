@@ -93,6 +93,7 @@ config = build_quant_config({
 | `ignored_layers` | FP8, Int8, MXFP8, MXFP4 | Layer name patterns to keep in BF16/FP16 |
 | `activation_scheme` | FP8, Int8 | The runtime value `"dynamic"` selects online activation scaling |
 | `weight_block_size` | FP8 | Optional block-wise FP8 weight quantization size |
+| `online_block_size` | FP8 | ROCm-only configurable online FP8 groups (`32`, `64`, or `128`); see [Online FP8 Block Scaling](rocm_online_fp8.md) |
 | `num_bf16_fallback_layers` | MXFP4 DualScale | Leading transformer blocks to keep in BF16 for online `mxfp4_dualscale`; defaults to `5` |
 
 ## Validation and Notes

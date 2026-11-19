@@ -22,7 +22,8 @@ Weight loading maps from the HF checkpoint's prefixes:
 from __future__ import annotations
 
 import copy
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -34,8 +35,6 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.platforms import current_platform
-from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -51,6 +50,18 @@ logger = init_logger(__name__)
 # Delay pattern constants
 BOC_ID = 1024  # beginning of codebook
 EOC_ID = 1025  # end of codebook
+
+
+@dataclass
+class HiggsAudioSamplingParams:
+    """Request-owned controls for Higgs codebook sampling, separate from text sampling."""
+
+    temperature: torch.Tensor | None
+    top_k: torch.Tensor | None
+    top_p: torch.Tensor | None
+    all_greedy: bool
+    generators: dict[int, torch.Generator]
+
 
 # Checkpoint prefix mapping
 _BACKBONE_PREFIX_MAP = {
@@ -714,7 +725,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         if (
             self._audio_continuation_id is not None
             and sampling_metadata is not None
-            and getattr(sampling_metadata, "no_penalties", False)
+            and getattr(sampling_metadata, "no_penalties", True)
             and (
                 (isinstance(ids, torch.Tensor) and ids.numel() == rows and self._fast_audio_direct_rows == rows)
                 or getattr(self, "_step_audio_tail_rows", 0) == rows
@@ -1137,7 +1148,13 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         logits.scatter_(1, target, target_values)
 
     # ------------------------------------------------------------------ sampling
-    def sample(self, logits: torch.Tensor, sampling_metadata: Any) -> Any:
+    def sample(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: HiggsAudioSamplingParams,
+        *,
+        sample_text: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         """Model-owned sampler with delay-pattern audio dispatch.
 
         Mirrors v2's pattern: bias LM logits to force audio continuation,
@@ -1149,14 +1166,10 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
 
         audio_id = self._audio_continuation_id
 
-        def run_stock_sampler() -> Any:
-            sampler = getattr(self, "_stock_sampler", None)
-            if sampler is None:
-                from vllm.v1.sample.sampler import Sampler
-
-                sampler = Sampler()
-                self._stock_sampler = sampler
-            return sampler(logits=logits, sampling_metadata=sampling_metadata)
+        def run_stock_sampler() -> torch.Tensor:
+            if sample_text is None:
+                raise RuntimeError("Higgs text sampling requires the current V2 sampler callback")
+            return sample_text(logits)
 
         hidden = self._last_logits_hidden
         self._last_logits_hidden = None
@@ -1176,7 +1189,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             and not getattr(self, "_in_audio_sample_graph", False)
             and hidden.is_cuda
             and (graph_forced_audio or (decode_only and self._fast_audio_direct_rows == num_rows))
-            and getattr(sampling_metadata, "no_penalties", False)
+            and getattr(sampling_metadata, "no_penalties", True)
             and self._fast_audio_sampler_gpu_fallback_reason(
                 logits=logits, sampling_metadata=sampling_metadata, num_rows=num_rows
             )
@@ -1244,7 +1257,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             mixed_direct = (
                 getattr(self, "_step_audio_tail_rows", 0) == num_rows
                 or getattr(self, "_step_audio_mode_rows", 0) == num_rows
-            ) and getattr(sampling_metadata, "no_penalties", False)
+            ) and getattr(sampling_metadata, "no_penalties", True)
             if mixed_direct:
                 # Guard the CPU classification against runner/device drift.
                 torch._assert_async(
@@ -1260,22 +1273,16 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                     eos_tokens = torch.full_like(audio_tokens, int(self._eos_token_id))
                     audio_tokens = torch.where(done_mask, eos_tokens, audio_tokens)
                 sampled = audio_tokens.unsqueeze(-1)
-                sampler_output = SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
+                sampler_output = sampled
             else:
                 self._apply_audio_mode_bias_batched(logits, audio_mask, done_mask)
                 sampler_output = run_stock_sampler()
-                sampled = getattr(sampler_output, "sampled_token_ids", None)
-                if sampled is None:
-                    self._clear_last_audio_outputs()
-                    return sampler_output
+                sampled = sampler_output
         elif use_gpu_audio_mode:
             self._fast_audio_direct_rows = 0
             self._apply_audio_mode_bias_batched(logits, audio_mask, done_mask)
             sampler_output = run_stock_sampler()
-            sampled = getattr(sampler_output, "sampled_token_ids", None)
-            if sampled is None:
-                self._clear_last_audio_outputs()
-                return sampler_output
+            sampled = sampler_output
         else:
             self._fast_audio_direct_rows = 0
             sampler_output = run_stock_sampler()
@@ -1753,7 +1760,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
 
     @staticmethod
     def _expand_audio_sampling_params(
-        sampling_metadata: SamplingMetadata, logits_2d: torch.Tensor, num_codebooks: int
+        sampling_metadata: HiggsAudioSamplingParams, logits_2d: torch.Tensor, num_codebooks: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, remainder = divmod(int(logits_2d.shape[0]), num_codebooks)
         if remainder:
@@ -1773,7 +1780,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         )
 
     def _sample_audio_codes(
-        self, logits_2d: torch.Tensor, sampling_metadata: SamplingMetadata, num_codebooks: int = 8
+        self, logits_2d: torch.Tensor, sampling_metadata: HiggsAudioSamplingParams, num_codebooks: int = 8
     ) -> torch.Tensor:
         """Replicate upstream sampling: temperature → top-k → top-p → multinomial."""
         x = logits_2d.float()

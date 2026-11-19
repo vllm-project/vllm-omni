@@ -24,11 +24,13 @@ from tests.e2e.accuracy.helpers import (
     CLIPScorer,
     SemanticSimilarityScorer,
     assert_similarity,
-    compute_image_ssim_psnr,
+    assert_similarity_metrics,
     download_images,
+    measure_image_similarity,
     model_output_dir,
+    write_accuracy_result,
 )
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks
 from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniRunner, OmniServer
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
@@ -72,19 +74,23 @@ def _assert_cot_structural_markers(cot_text: str, label: str) -> None:
     )
 
 
-os.environ["DIFFUSION_ATTENTION_BACKEND"] = "TORCH_SDPA"
-os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
-
 pytestmark = [pytest.mark.local_model, pytest.mark.diffusion]
+
+
+@pytest.fixture(autouse=True)
+def _accuracy_env(monkeypatch):
+    monkeypatch.setenv("DIFFUSION_ATTENTION_BACKEND", "TORCH_SDPA")
+    monkeypatch.setenv("VLLM_LOGGING_LEVEL", "DEBUG")
+
 
 # ============================================================================
 # Configurable Parameters
 # ============================================================================
-# Comma-separated logical CUDA device ids per stage: split visible GPUs (0..n-1), first half -> AR, second -> DiT.
+# Comma-separated logical device IDs per stage, split between AR and DiT.
 
 
 def _default_ar_dit_devices() -> tuple[str, str]:
-    """First floor(n/2) logical devices -> AR, rest -> DiT. ``device_count`` respects ``CUDA_VISIBLE_DEVICES``."""
+    """First floor(n/2) devices -> AR, rest -> DiT. ``device_count`` respects ``CUDA_VISIBLE_DEVICES``."""
     n = torch.accelerator.device_count()
     if n < 2:
         return "0,1", "2,3"
@@ -286,8 +292,13 @@ def _quant_accuracy_cases() -> list[pytest.ParameterSet]:
     return params
 
 
-def _make_config(enable_kv_reuse: bool, path: Path) -> None:
+def _make_config(enable_kv_reuse: bool, path: Path, *, tensor_parallel_size: int | None = None) -> None:
     config = cast(dict[str, Any], copy.deepcopy(_DEPLOY_CONFIG))
+    if tensor_parallel_size is not None:
+        config["stages"][0]["devices"] = ",".join(str(i) for i in range(tensor_parallel_size))
+        config["stages"][0]["tensor_parallel_size"] = tensor_parallel_size
+        config["stages"][1]["devices"] = ",".join(str(i) for i in range(tensor_parallel_size, tensor_parallel_size * 2))
+        config["stages"][1]["parallel_config"]["tensor_parallel_size"] = tensor_parallel_size
     config["stages"][0]["omni_kv_config"] = {"need_send_cache": enable_kv_reuse}
     config["stages"][1]["omni_kv_config"] = {"need_recv_cache": enable_kv_reuse}
     path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
@@ -352,7 +363,7 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
         elapsed = time.perf_counter() - t0
 
     assert outputs, "Pipeline produced no outputs"
-    images = None
+    output_images = None
     cot_text = ""
     for out in outputs:
         ro = out
@@ -372,12 +383,12 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
         if not imgs and ro and hasattr(ro, "images"):
             imgs = ro.images
         if imgs:
-            images = imgs
+            output_images = imgs
 
-    assert images, "Pipeline output had no images"
+    assert output_images, "Pipeline output had no images"
     cot_text = cot_text.lstrip("\n")
 
-    image = images[0].convert("RGB")
+    image = output_images[0].convert("RGB")
     image.save(output_path / "image_offline.png")
     (output_path / "cot_offline.txt").write_text(cot_text, encoding="utf-8")
     gc.collect()
@@ -467,7 +478,13 @@ def test_image_to_image_alignment_online(accuracy_artifact_root: Path) -> None:
     cot_results = scorer.text_similarity(online_cot, cot_ref)
     image_ref = Image.open(HUNYUAN_IMAGE_REF_PATH).convert("RGB")
     image_clip_score = clip_scorer.image_image_score(online_image, image_ref)
-    ssim_value, psnr_value = compute_image_ssim_psnr(prediction=online_image, reference=image_ref, compare_mode="RGB")
+    model_label = f"{MODEL_NAME} [ONLINE] vs reference"
+    ssim_value, psnr_value = measure_image_similarity(
+        model_name=model_label,
+        vllm_image=online_image,
+        diffusers_image=image_ref,
+        compare_mode="RGB",
+    )
 
     thresholds = _get_thresholds()
     table = [
@@ -478,6 +495,26 @@ def test_image_to_image_alignment_online(accuracy_artifact_root: Path) -> None:
         ["PSNR (dB)", f"{psnr_value:.2f}", thresholds["psnr"]],
     ]
     print("[ONLINE] " + tabulate(table, headers=["Metric", "Value", "Threshold"], tablefmt="grid"))
+
+    write_accuracy_result(
+        model_id=MODEL_NAME,
+        dataset="image_similarity",
+        metrics={
+            "ssim": ssim_value,
+            "psnr": psnr_value,
+            "clip_score": image_clip_score,
+            "cot_semantic_sim": cot_results["cot_semantic_sim"],
+            "text_prefix_match_count": cot_results["text_prefix_match_count"],
+        },
+        baseline={
+            "ssim": thresholds["ssim"],
+            "psnr": thresholds["psnr"],
+            "clip_score": thresholds["clip_score"],
+            "cot_semantic_sim": thresholds["cot_semantic_sim"],
+            "text_prefix_match_count": thresholds["text_prefix_match"],
+        },
+        extra={"label": "online_vs_reference"},
+    )
 
     _assert_cot_structural_markers(online_cot, "ONLINE")
 
@@ -490,9 +527,12 @@ def test_image_to_image_alignment_online(accuracy_artifact_root: Path) -> None:
     assert image_clip_score >= thresholds["clip_score"], (
         f"[ONLINE] Image-Image similarity {image_clip_score:.4f} below threshold {thresholds['clip_score']}"
     )
-    assert ssim_value >= thresholds["ssim"], f"[ONLINE] SSIM {ssim_value:.4f} below threshold {thresholds['ssim']}"
-    assert psnr_value >= thresholds["psnr"], (
-        f"[ONLINE] PSNR {psnr_value:.2f} dB below threshold {thresholds['psnr']} dB"
+    assert_similarity_metrics(
+        model_name=model_label,
+        ssim_score=ssim_value,
+        psnr_score=psnr_value,
+        ssim_threshold=thresholds["ssim"],
+        psnr_threshold=thresholds["psnr"],
     )
 
 
@@ -559,22 +599,24 @@ def _run_dit_model(
             torch.accelerator.empty_cache()
 
 
-@hardware_test(res={"cuda": "H200"}, num_cards=8)
-@pytest.mark.skipif(
-    torch.accelerator.device_count() < AR_TP_SIZE + DIT_TP_SIZE,
-    reason=f"Needs {AR_TP_SIZE + DIT_TP_SIZE}+ GPUs ({AR_TP_SIZE} AR + {DIT_TP_SIZE} DiT)",
+@pytest.mark.parametrize(
+    "tensor_parallel_size",
+    [
+        pytest.param(4, id="tp4", marks=hardware_marks(res={"cuda": "H200"}, num_cards=8)),
+        pytest.param(2, id="tp2", marks=hardware_marks(res={"cuda": "H200"}, num_cards=4)),
+    ],
 )
-def test_image_to_image_alignment(accuracy_artifact_root: Path) -> None:
+def test_image_to_image_alignment(accuracy_artifact_root: Path, tensor_parallel_size: int) -> None:
+    """Compare IT2I image and CoT against references at the selected AR/DiT TP size."""
     if importlib.util.find_spec("FlagEmbedding") is None:
         raise ImportError("Missing dependency: FlagEmbedding\nInstall with: pip install FlagEmbedding")
     from tabulate import tabulate  # type: ignore[import-untyped]
 
-    """KV reuse ON vs OFF: same pipeline, same seed → PSNR >= 10 dB."""
-    output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME + "-offline-kv-reuse")
+    output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME + f"-offline-kv-reuse-tp{tensor_parallel_size}")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        _make_config(True, tmp / "on.yaml")
+        _make_config(True, tmp / "on.yaml", tensor_parallel_size=tensor_parallel_size)
         omni_image, omni_cot, time_reuse = _run_offline(str(tmp / "on.yaml"), output_dir)
 
     scorer = SemanticSimilarityScorer()
@@ -583,7 +625,13 @@ def test_image_to_image_alignment(accuracy_artifact_root: Path) -> None:
     cot_results = scorer.text_similarity(omni_cot, cot_ref)
     image_ref = Image.open(HUNYUAN_IMAGE_REF_PATH).convert("RGB")
     image_clip_score = clip_scorer.image_image_score(omni_image, image_ref)
-    ssim_value, psnr_value = compute_image_ssim_psnr(prediction=omni_image, reference=image_ref, compare_mode="RGB")
+    model_label = f"{MODEL_NAME} [OFFLINE] vs reference"
+    ssim_value, psnr_value = measure_image_similarity(
+        model_name=model_label,
+        vllm_image=omni_image,
+        diffusers_image=image_ref,
+        compare_mode="RGB",
+    )
 
     thresholds = _get_thresholds()
     table = [
@@ -596,6 +644,26 @@ def test_image_to_image_alignment(accuracy_artifact_root: Path) -> None:
 
     print(tabulate(table, headers=["Metric", "Value", "Threshold"], tablefmt="grid"))
 
+    write_accuracy_result(
+        model_id=MODEL_NAME,
+        dataset="image_similarity",
+        metrics={
+            "ssim": ssim_value,
+            "psnr": psnr_value,
+            "clip_score": image_clip_score,
+            "cot_semantic_sim": cot_results["cot_semantic_sim"],
+            "text_prefix_match_count": cot_results["text_prefix_match_count"],
+        },
+        baseline={
+            "ssim": thresholds["ssim"],
+            "psnr": thresholds["psnr"],
+            "clip_score": thresholds["clip_score"],
+            "cot_semantic_sim": thresholds["cot_semantic_sim"],
+            "text_prefix_match_count": thresholds["text_prefix_match"],
+        },
+        extra={"label": "offline_vs_reference", "ar_tp": tensor_parallel_size, "dit_tp": tensor_parallel_size},
+    )
+
     _assert_cot_structural_markers(omni_cot, "OFFLINE")
 
     assert cot_results["cot_semantic_sim"] >= thresholds["cot_semantic_sim"], (
@@ -607,8 +675,13 @@ def test_image_to_image_alignment(accuracy_artifact_root: Path) -> None:
     assert image_clip_score >= thresholds["clip_score"], (
         f"Image-Image similarity{image_clip_score:.4f} is below threshold {thresholds['clip_score']}"
     )
-    assert ssim_value >= thresholds["ssim"], f"SSIM {ssim_value:.4f} is below threshold {thresholds['ssim']}"
-    assert psnr_value >= thresholds["psnr"], f"PSNR {psnr_value:.2f} dB is below threshold {thresholds['psnr']} dB"
+    assert_similarity_metrics(
+        model_name=model_label,
+        ssim_score=ssim_value,
+        psnr_score=psnr_value,
+        ssim_threshold=thresholds["ssim"],
+        psnr_threshold=thresholds["psnr"],
+    )
 
 
 @pytest.mark.parametrize("case", _quant_accuracy_cases())
@@ -638,19 +711,32 @@ def test_quantized_dit_matches_bf16_accuracy(
             nvfp4_backend=case.nvfp4_backend,
         )
 
-    ssim_score, psnr_score = compute_image_ssim_psnr(
-        prediction=quant_image,
-        reference=bf16_image,
-    )
     quant_thresholds = _get_quant_thresholds()
+    model_label = f"{MODEL_NAME} {case.name} vs bf16"
+    ssim, psnr = measure_image_similarity(
+        model_name=model_label,
+        vllm_image=quant_image,
+        diffusers_image=bf16_image,
+        width=QUANT_WIDTH,
+        height=QUANT_HEIGHT,
+    )
+    write_accuracy_result(
+        model_id=MODEL_NAME,
+        dataset="image_similarity",
+        metrics={"ssim": ssim, "psnr": psnr},
+        baseline={"ssim": quant_thresholds["ssim"], "psnr": quant_thresholds["psnr"]},
+        extra={"label": case.name},
+    )
     assert_similarity(
-        model_name=f"{MODEL_NAME} {case.name} vs bf16",
+        model_name=model_label,
         vllm_image=quant_image,
         diffusers_image=bf16_image,
         ssim_threshold=quant_thresholds["ssim"],
         psnr_threshold=quant_thresholds["psnr"],
         width=QUANT_WIDTH,
         height=QUANT_HEIGHT,
+        ssim_score=ssim,
+        psnr_score=psnr,
     )
 
     clip_scorer = CLIPScorer()
@@ -670,14 +756,24 @@ def test_quantized_dit_matches_bf16_accuracy(
         "guidance_scale": 4.0,
         "bf16_elapsed_s": bf16_time,
         "quant_elapsed_s": quant_time,
-        "ssim": ssim_score,
-        "psnr": psnr_score,
+        "ssim": ssim,
+        "psnr": psnr,
         "bf16_clip_score": bf16_clip_score,
         "quant_clip_score": quant_clip_score,
         "clip_score_drop": clip_score_drop,
     }
     metrics_path = output_dir / f"{case.name}_metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
+    write_accuracy_result(
+        model_id=MODEL_NAME,
+        dataset="quant_clip",
+        metrics=metrics,
+        baseline={
+            "clip_score": quant_thresholds["clip_score"],
+            "clip_score_drop": quant_thresholds["clip_score_drop"],
+        },
+        extra={"label": case.name, "metrics_json": str(metrics_path)},
+    )
 
     print(f"\nHunyuanImage3 quant accuracy ({case.name})")
     print(f"  bf16 model:       {bf16_model}")
