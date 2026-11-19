@@ -200,6 +200,44 @@ def test_project_box_only_turn_keeps_the_tokens_and_ends_without_audio() -> None
     assert all(not event.get("audio") for event in events)
 
 
+def test_project_box_plus_tool_keeps_the_box_and_ends_the_turn() -> None:
+    plane = AuraDataPlaneSession(_encode_audio)
+    request_id = "duplex-s.abc.e.0.r.stage1-turn9"
+    plane.begin_request(request_id)
+    box = "<|box_start|>(712.0,531.0),(888.0,662.0)<|box_end|>"
+    text = f"<|respond|>{box}<tool_call>\n<function=get_city_weather>\n</function>\n</tool_call>"
+    final = SimpleNamespace(
+        request_id=request_id,
+        finished=True,
+        stage_id=1,
+        outputs=[SimpleNamespace(text=text, cumulative_text=text, finished=True)],
+    )
+    events = list(plane.project({"data_plane_outputs": [final]}))
+    assert any(event.get("text") == box for event in events)
+    calls = [event for event in events if event.get("aura_function_call")]
+    assert len(calls) == 1
+    assert calls[0]["aura_tool_call_ends_turn"] is True
+    assert calls[0]["aura_function_call"]["name"] == "get_city_weather"
+
+
+def test_project_prose_with_a_box_and_a_tool_call_keeps_the_turn_open() -> None:
+    plane = AuraDataPlaneSession(_encode_audio)
+    request_id = "duplex-s.abc.e.0.r.stage1-turn10"
+    plane.begin_request(request_id)
+    box = "<|box_start|>(1,2),(3,4)<|box_end|>"
+    text = f"<|respond|>在這裡。{box}<tool_call>\n<function=get_city_weather>\n</function>\n</tool_call>"
+    final = SimpleNamespace(
+        request_id=request_id,
+        finished=True,
+        stage_id=1,
+        outputs=[SimpleNamespace(text=text, cumulative_text=text, finished=True)],
+    )
+    events = list(plane.project({"data_plane_outputs": [final]}))
+    assert any("在這裡。" in str(event.get("text") or "") and box in str(event.get("text") or "") for event in events)
+    calls = [event for event in events if event.get("aura_function_call")]
+    assert [event["aura_tool_call_ends_turn"] for event in calls] == [False]
+
+
 def test_project_emits_every_tool_call_and_only_the_last_releases_the_turn() -> None:
     plane = AuraDataPlaneSession(_encode_audio)
     request_id = "duplex-s.abc.e.0.r.stage1-turn7"

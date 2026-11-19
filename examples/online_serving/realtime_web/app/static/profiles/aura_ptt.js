@@ -33,10 +33,9 @@
     cameraIntervalMs: 500,
     visionFollowWhileSpeaking: true,
     // Pitch-preserving time-stretch. 1 keeps the shared worklet's 1:1 copy.
-    playbackSpeed: 1.3,
-    // First codec packet is 8 frames (0.64s). At 1.3x that runs out before the
-    // next packet and the worklet cuts. Wait for a second packet unless the
-    // turn already finished inside the first one (drain starts immediately).
+    playbackSpeed: 1,
+    // First codec packet is 8 frames (0.64s). Wait for a second packet unless
+    // the turn already finished inside the first one (drain starts immediately).
     holdPlaybackUntilSecondChunk: true,
     // Grounding boxes are 0–1000 on the frame the model saw. The page draws
     // them; Talker never receives the tokens.

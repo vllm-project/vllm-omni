@@ -363,7 +363,11 @@ class AuraDataPlaneSession(DuplexDataPlane):
                 # continues, so every call in this batch is published. Only the
                 # last call may release the turn: releasing aborts the request,
                 # and a later event on an aborted request is dropped.
-                spoken = safe_streaming_prefix(_spoken_text(state.text_sent))
+                # ``_speech_text`` is what Talker would receive: boxes and the
+                # tool call are gone. A grounding box is not speech, so a
+                # box-plus-tool turn ends here. The client transcript above
+                # still carries the box tokens.
+                speech = _speech_text(state.text_sent)
                 for index, call in enumerate(calls):
                     yield _event(
                         stage_role="thinker",
@@ -372,7 +376,7 @@ class AuraDataPlaneSession(DuplexDataPlane):
                         text="",
                         end_of_turn=False,
                         aura_function_call=call,
-                        aura_tool_call_ends_turn=not spoken and index == len(calls) - 1,
+                        aura_tool_call_ends_turn=not speech and index == len(calls) - 1,
                     )
             elif not _speech_text(state.text_sent):
                 # Grounding box only. The client already has the tokens to
