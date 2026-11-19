@@ -61,9 +61,11 @@ def test_longcat_video_avatar_ai2v_dimensions_reach_image_masks_and_continuation
     pipeline.audio_stride = 1
     pipeline.use_distill = True
     pipeline.video_processor = VideoProcessor(vae_scale_factor=8)
+    pipeline.vae = SimpleNamespace(config=SimpleNamespace(scale_factor_spatial=8))
     pipeline.transformer = Mock(
         dtype=torch.float32,
         config=SimpleNamespace(in_channels=1),
+        patch_size=(1, 2, 2),
         side_effect=lambda **kwargs: torch.zeros_like(kwargs["hidden_states"]),
     )
     pipeline.scheduler = Mock(timesteps=[torch.tensor(1.0)])
@@ -111,9 +113,11 @@ def test_longcat_video_avatar_ai2v_dimensions_reach_image_masks_and_continuation
 
 
 @pytest.mark.parametrize("stage", ["at2v", "ai2v"])
-@pytest.mark.parametrize("dimensions", [(512, None), (None, 768), (0, 768), (512, -1)])
+@pytest.mark.parametrize("dimensions", [(512, None), (None, 768), (0, 768), (512, -1), (520, 768), (512, 776)])
 def test_longcat_video_avatar_rejects_invalid_dimensions_before_audio_preparation(stage, dimensions):
     pipeline = Mock()
+    pipeline.vae.config.scale_factor_spatial = 8
+    pipeline.transformer.patch_size = (1, 2, 2)
     pipeline._resolve_request_inputs.return_value = {"stage": stage, "resolution": "480p"}
     req = SimpleNamespace(
         is_dummy_run=lambda: False,

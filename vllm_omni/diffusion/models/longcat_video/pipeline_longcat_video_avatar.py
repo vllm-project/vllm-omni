@@ -1786,6 +1786,15 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
             height, width = int(height), int(width)
             if height <= 0 or width <= 0:
                 raise ValueError("LongCat-Video-Avatar height and width must be positive.")
+            spatial_scale = self.vae.config.scale_factor_spatial
+            height_multiple = spatial_scale * self.transformer.patch_size[1]
+            width_multiple = spatial_scale * self.transformer.patch_size[2]
+            if height % height_multiple != 0 or width % width_multiple != 0:
+                raise ValueError(
+                    "LongCat-Video-Avatar height and width must be multiples of "
+                    f"{height_multiple} and {width_multiple}, respectively, based on the VAE spatial scale "
+                    f"and transformer patch size; got {height}x{width}."
+                )
 
         num_frames = _adjust_num_frames(int(extra.get("num_frames") or req.sampling_params.num_frames or 93))
         save_fps = int(extra.get("save_fps") or req.sampling_params.fps or self.save_fps)

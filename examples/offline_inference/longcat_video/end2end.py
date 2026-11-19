@@ -40,6 +40,7 @@ def parse_args(argv=None):
         type=int,
         default=None,
         help="Pixel height override for AT2V/AI2V; requires --width. "
+        "Dimensions must align with the VAE and transformer patches (multiples of 16 for Avatar 1.5). "
         "Use --height 512 --width 768 for a BSA-compatible 480p spatial grid. "
         "The default 480p AT2V size 480x832 falls back to dense attention.",
     )
