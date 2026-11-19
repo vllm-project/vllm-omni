@@ -137,9 +137,9 @@ response = client.chat.completions.create(
     messages=[{"role": "user", "content": "Describe vLLM in brief."}],
     modalities=["text", "audio"]
 )
-# Response contains two choices: one with text, one with audio
+# Text and audio are merged into a single choice
 print(response.choices[0].message.content)  # Text response
-print(response.choices[1].message.audio)    # Audio response
+print(response.choices[0].message.audio)    # Audio response
 ```
 
 ## Speaker selection
