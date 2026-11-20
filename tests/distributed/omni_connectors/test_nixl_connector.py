@@ -21,6 +21,7 @@ import zmq
 
 from tests.helpers.runtime import get_open_port
 from vllm_omni.data_entry_keys import HiddenStatesStruct, MetaStruct, OmniPayloadStruct
+from vllm_omni.distributed.omni_connectors.connectors.base import PermanentTransferError
 
 pytestmark = [pytest.mark.cpu, pytest.mark.parallel, pytest.mark.core_model]
 
@@ -1399,6 +1400,7 @@ def test_zero_byte_leaves_roundtrip_without_native_descriptors(
         "float_shape",
         "bad_dtype",
         "bad_spec",
+        "missing_specs",
     ],
 )
 @pytest.mark.usefixtures("reliable_claim_queries")
@@ -1449,13 +1451,15 @@ def test_invalid_empty_tensor_metadata_rejected_before_native_calls(producer, co
         metadata["tensor_specs"][0]["dtype"] = "torch.not_a_dtype"
     elif defect == "bad_spec":
         metadata["tensor_specs"][0] = None
-    assert consumer.get("0", "1", "req-invalid-empty", metadata) is None
+    elif defect == "missing_specs":
+        metadata.pop("tensor_specs")
+    with pytest.raises(PermanentTransferError):
+        consumer.get("0", "1", "req-invalid-empty", metadata)
     assert copying_native_agent == {"agents": [], "descs": [], "transfers": [], "released": []}
     assert consumer._agent.registered == []
-    # Metadata acquisition now claims the source before validation. With no
-    # submitted DMA, failure safely completes that claim instead of leaking it;
-    # it must still report no successful payload receive.
+    # Metadata acquisition claims the source before validation. With no
+    # submitted DMA, the permanent failure still completes that claim.
     assert producer._pending == producer._published == {}
     assert producer._registered_descs == producer._agent.registered == []
     assert consumer._metrics["gets"] == 0
-    assert consumer._metrics["errors"] == 1
+    assert consumer._metrics["errors"] == 0

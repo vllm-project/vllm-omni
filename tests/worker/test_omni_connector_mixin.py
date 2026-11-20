@@ -261,7 +261,11 @@ def test_split_request_endpoint_retry_completion_and_cleanup(async_chunk, rank, 
             host.register_chunk_recv(replacement)
             assert not host._poll_single_request("r1")
             if rank == 0:
-                get.assert_called_once_with("0", "1", "external-new_0_0")
+                if async_chunk:
+                    get.assert_called_once_with("0", "1", "external-new_0_0")
+                else:
+                    # Full payload takes the deadline-aware get, which forwards metadata (None here).
+                    get.assert_called_once_with("0", "1", "external-new_0_0", None)
             else:
                 get.assert_not_called()
             assert connector.sender_host == "configured-host"
