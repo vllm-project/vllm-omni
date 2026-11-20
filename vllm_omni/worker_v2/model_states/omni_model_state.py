@@ -17,7 +17,7 @@ import inspect
 import threading
 import types
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import Any, cast
 
 import numpy as np
@@ -26,8 +26,9 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
-from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
@@ -95,6 +96,20 @@ def _make_safe_get_rope(orig_get_rope):
     return _safe_get_rope
 
 
+@dataclass
+class RequestLifecycleUpdate:
+    """Runner transitions before admitting the step's new requests.
+
+    Reset clears both model-owned state and the native slot, allowing the same
+    ID to enter a new phase. Release only frees the native slot; model-owned
+    work remains alive until the scheduler reports a real finish or abort.
+    Neither transition completes the scheduler's request.
+    """
+
+    reset_req_ids: set[str] = field(default_factory=set)
+    release_req_ids: set[str] = field(default_factory=set)
+
+
 class OmniModelState(DefaultModelState):
     """Generic Omni ``ModelState`` — works for **all** Omni model stages.
 
@@ -106,6 +121,21 @@ class OmniModelState(DefaultModelState):
     _has_mtp = False
     preprocess_keeps_mm_inputs = False
     _supports_prefill_token_mask = False
+
+    def get_request_lifecycle(self, scheduler_output: SchedulerOutput) -> RequestLifecycleUpdate | None:
+        """Translate model-specific scheduling metadata without accessing the runner."""
+        return None
+
+    def finalize_runner_output(
+        self, output: ModelRunnerOutput | AsyncModelRunnerOutput, *, idle: bool
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        """Finalize one AR step on the worker thread, including no-forward steps.
+
+        Called in inference mode after sampling or on a no-forward return,
+        never during dummy execution. Implementations may publish work that outlives
+        native slots. Preserve deferred output unless synchronization is needed.
+        """
+        return output
 
     def __init__(
         self,
