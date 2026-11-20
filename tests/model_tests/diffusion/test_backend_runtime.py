@@ -14,7 +14,7 @@ from typing import cast
 
 import pytest
 import yaml
-from vllm.model_executor.layers.utils import default_unquantized_gemm
+from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
 from vllm.platforms import current_platform
 
 from tests.helpers.client import send_async_image_diffusion_request
@@ -76,7 +76,8 @@ async def test_tiny_flux_deploy_backends_execute(
     async_omni_runner_function: AsyncOmniRunner, executor_backend: str
 ) -> None:
     engine = async_omni_runner_function.engine
-    expected_gemm = f"{default_unquantized_gemm.__module__}.{default_unquantized_gemm.__qualname__}"
+    gemm = dispatch_unquantized_gemm("torch")
+    expected_gemm = f"{gemm.__module__}.{gemm.__qualname__}"
     expected_attention = f"{SDPAImpl.__module__}.{SDPAImpl.__qualname__}"
 
     try:

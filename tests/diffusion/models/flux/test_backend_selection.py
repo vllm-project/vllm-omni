@@ -12,7 +12,6 @@ import torch
 from vllm.config import set_current_vllm_config
 from vllm.model_executor.layers import linear
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-from vllm.model_executor.layers.utils import default_unquantized_gemm
 from vllm.platforms import current_platform
 
 from tests.helpers.mark import hardware_test
@@ -69,6 +68,7 @@ def test_tiny_flux_runs_requested_backends(tmp_path, mocker):
         initialize_model_parallel(sequence_parallel_size=1)
         # Observe inputs to the real selector without replacing its behavior.
         # On Ampere, "torch" and "auto" can resolve to the same callable.
+        expected_gemm = linear.dispatch_unquantized_gemm("torch")
         dispatch = mocker.spy(linear, "dispatch_unquantized_gemm")
         with set_current_vllm_config(config), set_current_diffusion_config(od_config):
             model = (
@@ -96,7 +96,7 @@ def test_tiny_flux_runs_requested_backends(tmp_path, mocker):
         attentions = []
         for name, layer in model.named_modules():
             if isinstance(getattr(layer, "quant_method", None), UnquantizedLinearMethod):
-                assert layer.quant_method._gemm_impl is default_unquantized_gemm
+                assert layer.quant_method._gemm_impl is expected_gemm
                 linears.append(name)
                 handles.append(layer.register_forward_hook(lambda module, inputs, output: calls.append(module)))
             if isinstance(layer, Attention):
@@ -125,7 +125,7 @@ def test_tiny_flux_runs_requested_backends(tmp_path, mocker):
         assert output.shape == (1, 4, 64)
         assert torch.isfinite(output).all()
         print(
-            f"Tiny FLUX: {len(linears)} real linear layers executed; GEMM=default_unquantized_gemm; "
+            f"Tiny FLUX: {len(linears)} real linear layers executed; GEMM={expected_gemm.__name__}; "
             f"{len(attentions)} attention layers=SDPAImpl; output={tuple(output.shape)} finite"
         )
     finally:

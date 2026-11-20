@@ -41,6 +41,12 @@ class CPUAttention(nn.Module):
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask
         ).transpose(1, 2)
 
+    def add_schedule_candidate_check(self, check):
+        del check
+
+    def effective_attention(self):
+        return self, self.attn_backend, None
+
 
 @pytest.fixture
 def cpu_layers(monkeypatch):
@@ -68,10 +74,18 @@ def control_startup(tmp_path, monkeypatch):
         model="/unused/FL2VA",
         task_type="fl2va",
         model_loaded={"text_encoder": True},
-        parallel_config=SimpleNamespace(cfg_parallel_size=1, ulysses_degree=1, ring_degree=1, allgather_degree=1),
+        parallel_config=SimpleNamespace(
+            cfg_parallel_size=1, ulysses_degree=1, ring_degree=1, allgather_degree=1, use_hsdp=False
+        ),
+        additional_config=None,
+        step_execution=False,
+        quantization_config=None,
+        host_weight_runtime_mode="disabled",
+        cache_backend="none",
         controlnet_model_path=str(path),
         diffusion_offload_config=None,
         revision=None,
+        diffusion_attention_schedule=None,
     )
     return pipeline_module, config
 
@@ -667,8 +681,10 @@ def test_encoder_conditioning_keeps_control_separate_from_latent_edit(monkeypatc
     nn.Module.__init__(pipeline)
     pipeline.device = torch.device("cpu")
     pipeline.od_config = SimpleNamespace(
+        additional_config={},
         controlnet_model_path="/control.safetensors",
         step_execution=False,
+        diffusion_attention_schedule=None,
     )
     pipeline.load_vae_encoder = True
     pipeline.video_vae = nn.Module()
@@ -715,6 +731,10 @@ def test_encoder_conditioning_keeps_control_separate_from_latent_edit(monkeypatc
         quality="lossless",
         seed=7,
         num_outputs_per_prompt=1,
+        lora_request=None,
+        lora_scale=1.0,
+        attention_schedule=None,
+        attention_sigma_schedule=None,
     )
     pixels = torch.ones(1, 3, num_frames, 32, 32)
     rows = torch.ones(planner.video_latent_t(num_frames) * 4, 196)

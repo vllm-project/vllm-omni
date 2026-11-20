@@ -577,7 +577,9 @@ class StageConfigFactory:
             return None
         from vllm_omni.config.composable_parallel import apply_strategy_specs
 
-        applied = apply_strategy_specs(stages, strategy_specs)
+        # Device counts are checked in _reconcile_strategy_with_cli, after CLI
+        # overrides (e.g. --stage-overrides devices) are merged.
+        applied = apply_strategy_specs(stages, strategy_specs, check_devices=False)
         if applied.omni_lb_policy is not None:
             logger.info(
                 "[composable_parallel] strategy derived omni_lb_policy=%r; it will be applied "
@@ -674,11 +676,7 @@ class StageConfigFactory:
         kwargs = normalize_and_validate_diffusion_engine_ingress_kwargs(kwargs, stage_id=0)
         raw_sampling_params = kwargs.get("default_sampling_params")
         if isinstance(raw_sampling_params, str):
-            try:
-                raw_sampling_params = json.loads(raw_sampling_params)
-            except json.JSONDecodeError:
-                logger.warning("Invalid default_sampling_params JSON, ignoring stage defaults.")
-                raw_sampling_params = None
+            raw_sampling_params = json.loads(raw_sampling_params)
         if not isinstance(raw_sampling_params, Mapping):
             raw_sampling_params = None
         default_sampling_params = dict(raw_sampling_params.get("0", {})) if raw_sampling_params else {}
@@ -783,9 +781,13 @@ class StageConfigFactory:
                 stage_overrides[f"stage_0_{name}"] = kwargs[name]
         # Caller defaults belong to deployment, not immutable pipeline constraints:
         # explicit request sampling parameters must still be able to override them.
-        deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, default_sampling_params=default_sampling_params)])
         return VllmOmniConfig.from_pipeline_config(
-            pipeline, user_deploy_config=deploy, cli_overrides={"model": model, **stage_overrides}
+            pipeline,
+            cli_overrides={
+                "model": model,
+                **stage_overrides,
+                "default_sampling_params": {"0": default_sampling_params},
+            },
         )
 
     @classmethod
@@ -820,14 +822,6 @@ class StageConfigFactory:
             explicit["quantization_config"] = quantization
 
         sampling = explicit.pop("default_sampling_params", None)
-        if isinstance(sampling, str):
-            try:
-                sampling = json.loads(sampling)
-            except json.JSONDecodeError:
-                logger.warning("Invalid default_sampling_params JSON, ignoring stage defaults.")
-                sampling = None
-        sampling_defaults = dict(sampling.get("0", {})) if isinstance(sampling, Mapping) else {}
-
         devices = explicit.pop("stage_0_devices", None)
         if devices is not None:
             explicit["devices"] = devices
@@ -860,18 +854,10 @@ class StageConfigFactory:
             pipeline,
             user_deploy_config=deploy,
             deploy_config_path=deploy_config_path,
-            cli_overrides={**global_overrides, "model": model, **stage_overrides},
+            cli_overrides={"model": model, **global_overrides, **stage_overrides, "default_sampling_params": sampling},
         )
         stage = config.stage_configs[0]
         assert isinstance(stage, VllmOmniDiffusionStageConfig)
-        if sampling_defaults:
-            stage.model_config.default_sampling_params = {
-                **dict(stage.model_config.default_sampling_params or {}),
-                **sampling_defaults,
-            }
-            stage.model_config.has_sampling_extra_args = bool(
-                stage.model_config.default_sampling_params.get("extra_args")
-            )
         if explicit.get("num_gpus") is not None:
             parallel_inputs = {
                 item.name: getattr(stage.parallel_config, item.name)

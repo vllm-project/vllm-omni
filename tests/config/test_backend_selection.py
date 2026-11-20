@@ -232,7 +232,7 @@ def test_generic_diffusion_cli_overrides_platform_deploy(tmp_path, generic_flux_
         "        devices: '2,3'\n"
         "        dtype: float16\n"
         "        enforce_eager: true\n"
-        "        default_sampling_params: {guidance_scale: 4.0, width: 256}\n"
+        "        default_sampling_params: {guidance_scale: 4.0, width: 256, extra_args: {keep: 1, shared: 2}}\n"
         "        extras: {keep: platform, added: platform}\n"
     )
     resolution = resolve_omni_config(
@@ -242,7 +242,7 @@ def test_generic_diffusion_cli_overrides_platform_deploy(tmp_path, generic_flux_
         cli_overrides={
             "dtype": cli_dtype,
             "linear_backend": "torch",
-            "default_sampling_params": {"0": {"guidance_scale": 7.5}},
+            "default_sampling_params": json.dumps({"0": {"guidance_scale": 7.5, "extra_args": {"shared": 3}}}),
             "extras": {"added": "cli"},
         },
         stage_overrides={"0": {"tensor_parallel_size": 1, "devices": "5"}},
@@ -254,7 +254,13 @@ def test_generic_diffusion_cli_overrides_platform_deploy(tmp_path, generic_flux_
     assert stage.diffusion_config.linear_backend == "torch"
     assert stage.parallel_config.world_size == 1
     assert stage.runtime_config.devices == "5"
-    assert stage.model_config.default_sampling_params == {"guidance_scale": 7.5, "height": 128, "width": 256}
+    assert stage.model_config.default_sampling_params == {
+        "guidance_scale": 7.5,
+        "height": 128,
+        "width": 256,
+        "extra_args": {"keep": 1, "shared": 3},
+    }
+    assert stage.model_config.has_sampling_extra_args
     assert stage.diffusion_config.extras["keep"] == "platform"
     assert stage.diffusion_config.extras["added"] == "cli"
 
