@@ -481,6 +481,98 @@ class TestQwenImageLoraLoaderMixin:
         assert_close(flat_out.weight, original_flat + (flat_b @ flat_a) * (alpha.item() / RANK))
         assert_close(dotted_out.weight, original_dotted + dotted_b @ dotted_a)
 
+    def _pipeline_with_legacy_block(self, bias: bool = False):
+        pipeline = DummyQwenImagePipeline(1, HEAD_DIM, bias=bias)
+        pipeline.transformer.transformer_blocks = nn.ModuleList(
+            [DummyTransformerBlock(HEAD_DIM, bias=bias, stacked_params=True)]
+        )
+        return pipeline
+
+    def test_load_diffusion_model_default_weights_with_unprefixed_alpha(self, mocker: MockerFixture):
+        pipeline = self._pipeline_with_legacy_block()
+        to_out = pipeline.transformer.transformer_blocks[0].attn.to_out
+        original_weight = to_out.weight.detach().clone()
+        module = "transformer_blocks.0.attn.to_out.0"
+        lora_a, lora_b = torch.randn(RANK, HEAD_DIM), torch.randn(HEAD_DIM, RANK)
+        alpha = torch.tensor(6.0)
+        state_dict = {
+            f"diffusion_model.{module}.lora_A.default.weight": lora_a,
+            f"diffusion_model.{module}.lora_B.default.weight": lora_b,
+            f"{module}.alpha": alpha,
+        }
+        mocker.patch(
+            "vllm_omni.diffusion.lora.loader.get_converter_by_pipeline",
+            return_value=_convert_non_diffusers_qwen_lora_to_diffusers,
+        )
+
+        pipeline.load_lora_weights(state_dict, "adapter0")
+
+        assert_close(to_out.weight, original_weight + (lora_b @ lora_a) * (alpha.item() / RANK))
+        pipeline.unload_lora_weights("adapter0")
+        assert_close(to_out.weight, original_weight)
+
+    def test_load_rejects_two_alphas_for_one_diffusion_model_module(self):
+        pipeline = self._pipeline_with_legacy_block()
+        to_out = pipeline.transformer.transformer_blocks[0].attn.to_out
+        original_weight = to_out.weight.detach().clone()
+        module = "transformer_blocks.0.attn.to_out.0"
+        state_dict = {
+            f"diffusion_model.{module}.lora_A.weight": torch.randn(RANK, HEAD_DIM),
+            f"diffusion_model.{module}.lora_B.weight": torch.randn(HEAD_DIM, RANK),
+            f"diffusion_model.{module}.alpha": torch.tensor(6.0),
+            f"{module}.alpha": torch.tensor(2.0),
+        }
+
+        with pytest.raises(ValueError, match="has both"):
+            pipeline.load_lora_weights(state_dict, "adapter0")
+
+        assert_close(to_out.weight, original_weight)
+        assert pipeline.lora_loaded == {}
+
+    def test_load_diffusion_model_keys_leave_dotted_bias_out_of_converter(self, mocker: MockerFixture):
+        pipeline = self._pipeline_with_legacy_block(bias=True)
+        legacy_out = pipeline.transformer.transformer_blocks[0].attn.to_out
+        dotted_out = pipeline.transformer.blocks[0].attn.to_out
+        original_legacy = legacy_out.weight.detach().clone()
+        original_weight = dotted_out.weight.detach().clone()
+        original_bias = dotted_out.bias.detach().clone()
+        module = "transformer_blocks.0.attn.to_out.0"
+        lora_a, lora_b = torch.randn(RANK, HEAD_DIM), torch.randn(HEAD_DIM, RANK)
+        alpha = torch.tensor(6.0)
+        dotted_a, dotted_b = torch.randn(RANK, HEAD_DIM), torch.randn(HEAD_DIM, RANK)
+        bias = torch.randn(HEAD_DIM)
+        state_dict = {
+            f"diffusion_model.{module}.lora_A.default.weight": lora_a,
+            f"diffusion_model.{module}.lora_B.default.weight": lora_b,
+            f"{module}.alpha": alpha,
+            "transformer.blocks.0.attn.to_out.0.lora_A.weight": dotted_a,
+            "transformer.blocks.0.attn.to_out.0.lora_B.weight": dotted_b,
+            "transformer.blocks.0.attn.to_out.bias": bias,
+        }
+        seen: list[set[str]] = []
+
+        def _recording_converter(lora_state):
+            seen.append(set(lora_state))
+            return _convert_non_diffusers_qwen_lora_to_diffusers(lora_state)
+
+        mocker.patch(
+            "vllm_omni.diffusion.lora.loader.get_converter_by_pipeline",
+            return_value=_recording_converter,
+        )
+
+        pipeline.load_lora_weights(state_dict, "adapter0")
+
+        assert seen == [
+            {
+                f"diffusion_model.{module}.lora_A.weight",
+                f"diffusion_model.{module}.lora_B.weight",
+                f"{module}.alpha",
+            }
+        ]
+        assert_close(legacy_out.weight, original_legacy + (lora_b @ lora_a) * (alpha.item() / RANK))
+        assert_close(dotted_out.weight, original_weight + dotted_b @ dotted_a)
+        assert_close(dotted_out.bias, original_bias + bias)
+
 
 # ======================================================
 # Test WanLoraLoaderMixin
