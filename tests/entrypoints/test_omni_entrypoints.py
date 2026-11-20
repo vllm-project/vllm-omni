@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import queue
+import threading
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
@@ -1771,4 +1772,123 @@ def test_omni_generate_dead_orchestrator_closes_engine(monkeypatch: pytest.Monke
         assert engine.aborted == [[engine.submitted[0]["request_id"]]]
         assert not app.request_states
     finally:
+        app.shutdown()
+
+
+# ───────── AsyncOmni.shutdown() fails in-flight requests ─────────
+
+
+@pytest.mark.asyncio
+async def test_async_omni_shutdown_ends_in_flight_streams(monkeypatch: pytest.MonkeyPatch):
+    """A shutdown after partial output must terminate every active stream."""
+    engine = FakeAsyncOmniEngine(
+        on_add_request=lambda eng, msg: eng.output_q.put_nowait(
+            make_output_msg(
+                msg["request_id"],
+                0,
+                payload="partial",
+                output_finished=False,
+            )
+        )
+    )
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+    streaming = {request_id: asyncio.Event() for request_id in ("req-1", "req-2")}
+
+    async def drain(request_id: str) -> None:
+        async for _ in app.generate(prompt="hello", request_id=request_id):
+            streaming[request_id].set()
+
+    streams = [asyncio.create_task(drain(request_id)) for request_id in streaming]
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(event.wait() for event in streaming.values())),
+            timeout=5,
+        )
+
+        app.shutdown()
+        results = await asyncio.wait_for(
+            asyncio.gather(*streams, return_exceptions=True),
+            timeout=5,
+        )
+        assert all(isinstance(result, OmniEngineDeadError) for result in results)
+        assert engine.shutdown_called
+        assert app.request_states == {}
+    finally:
+        app.shutdown()
+        for stream in streams:
+            stream.cancel()
+        await asyncio.gather(*streams, return_exceptions=True)
+
+
+async def _consume_async(gen) -> None:
+    """Drain an async generator so the test only observes the exception."""
+    async for _ in gen:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_async_omni_shutdown_rejects_request_racing_the_snapshot(monkeypatch: pytest.MonkeyPatch):
+    loop = asyncio.get_running_loop()
+    serving_thread = threading.current_thread()
+    first_streaming = asyncio.Event()
+    snapshot_taken = asyncio.Event()
+    late_submitted = threading.Event()
+    snapshot_threads: list[threading.Thread] = []
+
+    def on_add_request(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+        if msg["request_id"] == "req-late":
+            late_submitted.set()
+        else:
+            engine.output_q.put_nowait(make_output_msg("req-first", 0, payload="partial", output_finished=False))
+
+    engine = FakeAsyncOmniEngine(on_add_request=on_add_request)
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+
+    class RequestStates(dict[str, ClientRequestState]):
+        armed = True
+
+        def values(self):
+            snapshot = self.copy().values()
+            if not self.armed:
+                return snapshot
+            self.armed = False
+            snapshot_threads.append(threading.current_thread())
+            # Schedule the late request as soon as the first snapshot is taken.
+            # A worker-thread snapshot can overlap that request's registration.
+            if threading.current_thread() is serving_thread:
+                snapshot_taken.set()
+            else:
+                loop.call_soon_threadsafe(snapshot_taken.set)
+                assert late_submitted.wait(timeout=5)
+            return snapshot
+
+    async def drain_first() -> None:
+        async for _ in app.generate(prompt="hello", request_id="req-first"):
+            first_streaming.set()
+
+    async def drain_late() -> None:
+        await snapshot_taken.wait()
+        await _consume_async(app.generate(prompt="hello", request_id="req-late"))
+
+    streams = [asyncio.create_task(drain_first()), asyncio.create_task(drain_late())]
+    try:
+        await asyncio.wait_for(first_streaming.wait(), timeout=5)
+        pump = app.final_output_task
+        assert pump is not None and not pump.done()
+        app.request_states = RequestStates(app.request_states)
+
+        await asyncio.wait_for(asyncio.to_thread(app.shutdown), timeout=6)
+        result = await asyncio.wait_for(asyncio.gather(*streams, return_exceptions=True), timeout=2)
+        assert all(isinstance(exc, OmniEngineDeadError) and "shutting down" in str(exc) for exc in result), result
+        assert snapshot_threads == [serving_thread]
+        assert not late_submitted.is_set()
+        assert not app.request_states
+        assert engine.shutdown_called
+        assert app.final_output_task is None and pump.cancelled()
+    finally:
+        for stream in streams:
+            stream.cancel()
+        await asyncio.gather(*streams, return_exceptions=True)
         app.shutdown()

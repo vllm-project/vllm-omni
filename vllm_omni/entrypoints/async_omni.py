@@ -776,8 +776,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         """Track one stage call; abort it if the caller is cancelled and always drop its state."""
         request_id = f"{self._get_unique_request_id(external_request_id)}-{stage_id}"
         req_state = ClientRequestState(request_id, external_request_id=external_request_id)
-        self.request_states[request_id] = req_state
         self._final_output_handler()
+        self.request_states[request_id] = req_state
         try:
             yield req_state
         except asyncio.CancelledError:

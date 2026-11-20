@@ -456,8 +456,8 @@ class DuplexOmni(AsyncOmni):
         session_id = f"duplex-{uuid4().hex}"
         session_config = self._resolve_session_config(config, model=self.model)
         handle = DuplexSessionHandle(self, session_id)
-        self._handles[session_id] = handle
         self._final_output_handler()
+        self._handles[session_id] = handle
         try:
             result = await self.engine.open_session_async(
                 session_id, session_config, output_buffer=handle._outbox, timeout=timeout
