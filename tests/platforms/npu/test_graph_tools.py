@@ -610,6 +610,10 @@ def test_vae_npu_graph_runner_is_per_instance(monkeypatch):
     from vllm_omni.platforms import current_omni_platform
     from vllm_omni.platforms.npu import graph_tools as graph_tools_module
 
+    # Reset the module-global internal-format flag up front: the capture
+    # below mutates it, and a previous test may have left it True — the
+    # allow_internal_format assertion here must not depend on file order.
+    monkeypatch.setattr(talker_module, "_NPU_INTERNAL_FORMAT_MUTATED", False)
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
     monkeypatch.setenv("VLLM_OMNI_DISABLE_VAE_NPU_GRAPH", "0")
 
