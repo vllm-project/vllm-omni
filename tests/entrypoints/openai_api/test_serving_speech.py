@@ -20,8 +20,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import anyio
+import av
 import numpy as np
 import pytest
+import soundfile as sf
 import torch
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.params import File, Form
@@ -32,6 +34,7 @@ from pytest_mock import MockerFixture
 from vllm.entrypoints.serve import create_error_response
 from vllm.entrypoints.serve.engine.protocol import ErrorInfo, ErrorResponse
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+from vllm.exceptions import VLLMValidationError
 from vllm.outputs import CompletionOutput
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -328,6 +331,34 @@ def _wav_data_url(samples: np.ndarray, sample_rate: int) -> str:
         wav.writeframes(pcm.tobytes())
     encoded = base64.b64encode(buf.getvalue()).decode("ascii")
     return f"data:audio/wav;base64,{encoded}"
+
+
+def _encode_tone(fmt: str, sample_rate: int = 16000, seconds: float = 2.0) -> bytes:
+    """Encode a mono test tone as a real file in one of the upload formats."""
+    t = np.arange(int(sample_rate * seconds)) / sample_rate
+    tone = (0.3 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+    buf = io.BytesIO()
+    if fmt in ("wav", "flac", "ogg", "mp3"):
+        sf.write(buf, tone, sample_rate, format=fmt.upper())
+        return buf.getvalue()
+    # libsndfile cannot write (or read) AAC/WebM/MP4; encode them with PyAV.
+    container, codec, rate = {
+        "aac": ("adts", "aac", sample_rate),
+        "webm": ("webm", "libopus", 48000),
+        "mp4": ("mp4", "aac", sample_rate),
+    }[fmt]
+    with av.open(buf, "w", format=container) as out:
+        stream = out.add_stream(codec, rate=rate, layout="mono")
+        frame = av.AudioFrame.from_ndarray(tone[None, :], format="flt", layout="mono")
+        frame.sample_rate = sample_rate
+        resampler = av.AudioResampler(format=stream.format.name, layout="mono", rate=rate)
+        for resampled in resampler.resample(frame) + resampler.resample(None):
+            out.mux(stream.encode(resampled))
+        out.mux(stream.encode(None))
+    return buf.getvalue()
+
+
+_REAL_SF_READ = sf.read
 
 
 @pytest.fixture
@@ -671,6 +702,11 @@ class TestSpeechAPI:
         mock_safe_open.return_value.__enter__.return_value = mock_ctx
         mocker.patch("safetensors.safe_open", mock_safe_open)
 
+    @pytest.fixture
+    def real_audio_decoder(self, mocker: MockerFixture):
+        """Undo the soundfile stub of ``_mock_upload_io`` so uploads decode real bytes."""
+        mocker.patch("soundfile.read", _REAL_SF_READ)
+
     def test_create_speech_success(self, client):
         payload = {
             "input": "Hello world",
@@ -958,33 +994,80 @@ class TestSpeechAPI:
             assert "reserved" in response.json()["detail"]
         assert not handler.uploaded_speakers
 
-    def test_upload_voice_rejects_mp4_with_conversion_hint(self, client):
-        """MP4/M4A must be rejected at validation with the WAV conversion hint.
+    @pytest.mark.parametrize(
+        ("fmt", "content_type", "sample_rate"),
+        [
+            ("wav", "audio/wav", 16000),
+            ("flac", "audio/flac", 16000),
+            ("ogg", "audio/ogg", 16000),
+            ("mp3", "audio/mpeg", 16000),
+            ("aac", "audio/aac", 16000),
+            ("webm", "audio/webm", 48000),
+            ("mp4", "audio/mp4", 16000),
+        ],
+    )
+    def test_upload_voice_decodes_every_documented_format(
+        self, client, real_audio_decoder, fmt, content_type, sample_rate
+    ):
+        """Every documented upload format decodes, as it does for inline ref_audio."""
+        files = {"audio_sample": (f"ref.{fmt}", _encode_tone(fmt), content_type)}
+        response = client.post("/v1/audio/voices", files=files, data={"consent": "c1", "name": f"tone_{fmt}"})
+        assert response.status_code == 200, response.text
+        assert response.json()["voice"]["mime_type"] == content_type
+        assert client.app.state.openai_serving_speech.uploaded_speakers[f"tone_{fmt}"]["sample_rate"] == sample_rate
+        client.delete(f"/v1/audio/voices/tone_{fmt}")
 
-        soundfile cannot decode the MP4 container, so letting the upload pass
-        the MIME whitelist would fail later at the decode step with a
-        misleading "Could not decode audio file" instead of the real cause.
-        """
-        mp4_bytes = b"fake mp4 bytes" * 100
-        response = client.post(
-            "/v1/audio/voices",
-            files={"audio_sample": ("clip.mp4", mp4_bytes, "audio/mp4")},
-            data={"consent": "c1", "name": "mp4_voice"},
-        )
-        assert response.status_code == 400
-        detail = response.json()["detail"]
-        assert "MP4" in detail
-        assert "ffmpeg" in detail
+    @pytest.mark.parametrize(
+        ("filename", "expected_mime"),
+        [("ref.wav", "audio/wav"), ("ref.flac", "audio/flac"), ("ref.webm", "audio/webm"), ("ref.m4a", "audio/mp4")],
+    )
+    def test_upload_voice_without_content_type_uses_extension(self, client, mocker, filename, expected_mime):
+        """A part without Content-Type (``requests`` with a bare file) uses the extension."""
+        audio_file = mocker.MagicMock()
+        audio_file.filename = filename
+        audio_file.content_type = None
+        audio_file.file = io.BytesIO(b"fake audio")
+        audio_file.read = mocker.AsyncMock(return_value=b"fake audio")
+        handler = client.app.state.openai_serving_speech
 
-        # An .m4a file with a generic content type must be caught via its
-        # filename extension, not silently classified as the WAV default.
-        response = client.post(
-            "/v1/audio/voices",
-            files={"audio_sample": ("clip.m4a", mp4_bytes, "application/octet-stream")},
-            data={"consent": "c1", "name": "m4a_voice"},
-        )
+        result = asyncio.run(handler.upload_voice(audio_file, consent="c1", name="no_type"))
+
+        assert result["mime_type"] == expected_mime
+        client.delete("/v1/audio/voices/no_type")
+
+    @pytest.mark.parametrize(
+        ("filename", "content_type", "expected_mime"),
+        [
+            ("ref.wav", "audio/x-wav", "audio/wav"),
+            ("ref.webm", "video/webm", "audio/webm"),
+            ("ref.wav", "Audio/WAV", "audio/wav"),
+            ("ref.webm", "audio/webm;codecs=opus", "audio/webm"),
+            ("ref.flac", "application/octet-stream", "audio/flac"),
+        ],
+    )
+    def test_upload_voice_normalizes_mime_type(self, client, filename, content_type, expected_mime):
+        """Aliases, case and parameters normalize to the canonical type."""
+        files = {"audio_sample": (filename, b"fake audio content", content_type)}
+        response = client.post("/v1/audio/voices", files=files, data={"consent": "c1", "name": "alias"})
+        assert response.status_code == 200, response.text
+        assert response.json()["voice"]["mime_type"] == expected_mime
+        client.delete("/v1/audio/voices/alias")
+
+    def test_upload_voice_undecodable_audio_returns_400(self, client, real_audio_decoder):
+        files = {"audio_sample": ("ref.wav", b"definitely not audio" * 500, "audio/wav")}
+        response = client.post("/v1/audio/voices", files=files, data={"consent": "c1", "name": "garbage"})
         assert response.status_code == 400
-        assert "ffmpeg" in response.json()["detail"]
+        assert "Could not decode audio file" in response.json()["detail"]
+        assert not client.app.state.openai_serving_speech.uploaded_speakers
+
+    def test_upload_voice_unrecognized_payload_skips_vllm_loader(self, client, real_audio_decoder, mocker):
+        """Only AAC/WebM/MP4 content falls through to the vLLM loader after soundfile fails."""
+        loader = mocker.patch.object(serving_speech_module, "AudioMediaIO")
+        files = {"audio_sample": ("ref.aac", b"ffconcat version 1.0\nfile ref.wav\n", "audio/aac")}
+        response = client.post("/v1/audio/voices", files=files, data={"consent": "c1", "name": "text_payload"})
+        assert response.status_code == 400
+        assert "Could not decode audio file" in response.json()["detail"]
+        loader.assert_not_called()
         assert not client.app.state.openai_serving_speech.uploaded_speakers
 
     def test_upload_voice_overwrites_same_name_by_default(self, client):
@@ -1748,6 +1831,31 @@ class TestTTSMethods:
         assert isinstance(response, ErrorResponse)
         assert response.error.code == HTTPStatus.INTERNAL_SERVER_ERROR
         assert response.error.type == "InternalServerError"
+
+    @pytest.mark.asyncio
+    async def test_create_speech_engine_validation_error_returns_bad_request(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ):
+        # vLLM raises VLLMValidationError (a VLLMClientError, not a ValueError)
+        # from add_request when e.g. the prompt exceeds max_model_len.
+        mocker.patch.object(speech_server, "_check_model", new=mocker.AsyncMock(return_value=None))
+        mocker.patch.object(
+            speech_server,
+            "_generate_audio_bytes",
+            new=mocker.AsyncMock(
+                side_effect=VLLMValidationError(
+                    "The decoder prompt (length 12011) is longer than the maximum model length of 4096."
+                )
+            ),
+        )
+
+        response = await speech_server.create_speech(OpenAICreateSpeechRequest(input="Hello"))
+
+        assert isinstance(response, ErrorResponse)
+        assert response.error.code == HTTPStatus.BAD_REQUEST
+        assert response.error.type == "BadRequestError"
 
     @pytest.mark.asyncio
     async def test_create_speech_unexpected_failure_returns_internal_server_error(
