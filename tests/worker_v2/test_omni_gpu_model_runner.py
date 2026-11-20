@@ -7,15 +7,21 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 import torch
 from vllm import SamplingParams
 from vllm.compilation.cuda_graph import CUDAGraphEntry, CUDAGraphWrapper
 from vllm.config import SchedulerConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.lora import LoRAConfig
 from vllm.forward_context import ForwardContext, override_forward_context
+from vllm.lora.request import LoRARequest
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor, CudaGraphManager
+from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.lora_utils import LoraState
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
@@ -969,3 +975,59 @@ def test_drafter_target_layers_reach_execute_state(cg_mode, monkeypatch):
     assert runner.execute_model_state.aux_hidden_states is current_aux
     assert runner._last_aux_output is None
     assert previous_state.aux_hidden_states is aux
+
+
+class _StopAfterLoraActivationError(Exception):
+    """Ends the step at LoRA activation; the forward after it needs a GPU."""
+
+
+@pytest.mark.parametrize(("num_drafts", "expected_prompt_mapping"), [(0, (7, 0)), (1, (7, 7, 0))])
+def test_real_step_activates_loras_per_token_and_logits_row(num_drafts, expected_prompt_mapping):
+    """A real step builds its LoRA mappings with vLLM's LoraState signature, per token and per logits row."""
+    runner = object.__new__(OmniGPUModelRunner)
+    runner._staged_writes = staged_writes.StagedWrites()
+    for name in ("_prepare_native_data_plane", "finish_requests", "free_states", "add_requests", "update_requests"):
+        setattr(runner, name, lambda *_args: None)
+    runner._sync_native_data_plane_payloads = lambda *_args: None
+    runner.block_tables = MagicMock(spec=BlockTables)
+    # No model hooks: no duplex re-anchor and no runner-assisted attention request.
+    runner.model = object()
+    runner.aux_output_connector = None
+    # Encoder payload updates are disabled in this fixture.
+    runner.encoder_cache = None
+    runner.is_encoder_decoder = False
+    runner.lora_config = MagicMock(spec=LoRAConfig)
+    runner.lora_state = LoraState(max_num_reqs=4)
+    adapter = LoRARequest("adapter", 7, "/unused")
+    runner.lora_state.add_request("with-adapter", 0, adapter)
+    runner.lora_state.add_request("base", 1, None)
+    runner.gather_batch_req_state = MagicMock(return_value=(object(), None))
+    runner._adjust_dispatch_token_count = lambda _state, num_toks, max_query_len: (num_toks, max_query_len)
+    batch_desc = BatchExecutionDescriptor(
+        CUDAGraphMode.NONE, num_tokens=4, num_reqs=2, max_query_len=3, num_active_loras=1
+    )
+    runner._dispatch_batch_descriptor = MagicMock(return_value=(batch_desc, None))
+    # The first request schedules three tokens; each draft token adds a logits row.
+    input_batch = MagicMock(spec=InputBatch)
+    input_batch.req_ids = ["with-adapter", "base"]
+    input_batch.idx_mapping_np = np.array([0, 1], dtype=np.intp)
+    input_batch.num_scheduled_tokens = np.array([3, 1], dtype=np.int32)
+    input_batch.cu_num_logits_np = np.cumsum([0, 1 + num_drafts, 1], dtype=np.int32)
+    runner.prepare_inputs = MagicMock(return_value=input_batch)
+    runner.prepare_attn = MagicMock(return_value=(None, None))
+    runner.model_state = MagicMock()
+    runner.kv_cache_config = None
+    runner.req_states = MagicMock()
+    runner._set_active_loras = MagicMock(side_effect=_StopAfterLoraActivationError)
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_scheduled_tokens = {"with-adapter": 3, "base": 1}
+    scheduler_output.total_num_scheduled_tokens = 4
+    scheduler_output.scheduled_spec_decode_tokens = {"with-adapter": [11] * num_drafts} if num_drafts else {}
+
+    with pytest.raises(_StopAfterLoraActivationError):
+        runner.execute_model(scheduler_output)
+
+    prompt_mapping, token_mapping, active = runner._set_active_loras.call_args.args
+    assert tuple(int(i) for i in prompt_mapping) == expected_prompt_mapping
+    assert tuple(int(i) for i in token_mapping) == (7, 7, 7, 0)
+    assert active == {adapter}
