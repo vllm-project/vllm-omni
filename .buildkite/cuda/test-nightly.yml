@@ -282,7 +282,7 @@ steps:
         artifact_paths:
           - tests/dfx/perf/results/*.json
         commands:
-          - pytest -sv tests/dfx/perf/scripts/run_benchmark.py --assert-baseline --test-config-file tests/dfx/perf/tests/test_hunyuan_image3_it2i.json -m "full_model and diffusion and H100 and B200 and cards_4" --run-level full_model
+          - pytest -sv tests/dfx/perf/scripts/run_benchmark.py --assert-baseline --test-config-file tests/dfx/perf/tests/test_hunyuan_image3_ar_tp2_dit_sp2.json -m "full_model and diffusion and H100 and B200 and cards_4" --run-level full_model
           - pytest -sv tests/dfx/perf/scripts/run_benchmark.py --assert-baseline --test-config-file tests/dfx/perf/tests/test_hunyuan_image3_dit_sp4.json -m "full_model and diffusion and H100 and B200 and cards_4" --run-level full_model
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image-2.1 · Single-GPU"

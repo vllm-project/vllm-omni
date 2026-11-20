@@ -1594,6 +1594,7 @@ source_file_dependencies:
     - tests/dfx/conftest.py
     - tests/assets/hunyuan_image3/
     - tests/dfx/perf/tests/test_hunyuan_image3_it2i.json
+    - tests/dfx/perf/tests/test_hunyuan_image3_ar_tp2_dit_sp2.json
     - tests/dfx/perf/tests/test_hunyuan_image3_dit_sp4.json
     - tests/dfx/perf/tests/test_hunyuan_image_tp2_cfgp2.json
     - tests/dfx/perf/tests/test_hunyuan_image_tp2_sp2.json

@@ -494,7 +494,7 @@ for colocated AR+DiT, and limits AR memory utilization to 0.85 to leave
 headroom for IT2I VAE encoding. No performance-only deployment YAML is needed.
 
 The AR+DiT workload extends the existing
-`tests/dfx/perf/tests/test_hunyuan_image3_it2i.json`: it retains the custom
+`tests/dfx/perf/tests/test_hunyuan_image3_ar_tp2_dit_sp2.json`: it retains the custom
 prompt, input image, `/v1/images/edits` endpoint and `think_recaption` task.
 The DiT-only request format can also be compared with
 `tests/dfx/perf/tests/test_hunyuan_image3_prefix_caching.json`, which uses
@@ -508,7 +508,7 @@ Run from the repository root on four H100/B200 GPUs with the matching
 vLLM/vLLM-Omni runtime, cached weights and access to the input image URLs:
 
 ```bash
-pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_hunyuan_image3_it2i.json -m "full_model and diffusion and H100 and cards_4" --run-level full_model
+pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_hunyuan_image3_ar_tp2_dit_sp2.json -m "full_model and diffusion and H100 and cards_4" --run-level full_model
 pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_hunyuan_image3_dit_sp4.json -m "full_model and diffusion and H100 and cards_4" --run-level full_model
 pytest -sv tests/e2e/accuracy/test_hunyuan_image3.py -k test_hunyuan_image3_ar_tp2_dit_tp2_it2i -m "local_model and diffusion and H100 and cards_4" --run-level full_model
 ```
