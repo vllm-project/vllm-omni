@@ -1,63 +1,46 @@
 # Higgs-Audio V3 Deploy Profiles
 
-Higgs-Audio V3 has two Stage 0 graph profiles on the V1 runner. They are
-intentionally separate because the graph paths are mutually exclusive. The
-auto-discovered default deploy config runs Model Runner V2 (see
-[Model Runner V2](#model-runner-v2-default)); the two V1 profiles below also
-serve as the MRV2 opt-out.
-
-## High Throughput
-
-Use `higgs_multimodal_qwen3_high_throughput.yaml` for medium/high concurrency
-serving. This profile keeps Stage 0 `enforce_eager: true`, which preserves the
-Higgs-specific local MLP CUDA graph path. It is the throughput-oriented
-production profile for `model_runner: v1`.
-
-```bash
-vllm-omni serve bosonai/higgs-audio-v3-tts-4b \
-    --omni --trust-remote-code \
-    --deploy-config vllm_omni/deploy/higgs_multimodal_qwen3_high_throughput.yaml
-```
-
-## Low Latency
-
-Use `higgs_multimodal_qwen3_low_latency.yaml` for low-concurrency serving
-(for example c1-c4) where Stage 0 decode launch overhead dominates. This profile
-sets Stage 0 `enforce_eager: false` and explicitly enables vLLM
-`FULL_DECODE_ONLY` CUDA graph:
-
-```yaml
-compilation_config:
-  cudagraph_capture_sizes: [1, 2, 4, 8, 16]
-  cudagraph_mode: FULL_DECODE_ONLY
-  cudagraph_num_of_warmups: 1
-```
-
-FULL_DECODE is controlled by deploy configuration, not by an environment
-variable. When this external decode graph is active, the Higgs talker disables
-the local MLP CUDA graph automatically.
-
-```bash
-vllm-omni serve bosonai/higgs-audio-v3-tts-4b \
-    --omni --trust-remote-code \
-    --deploy-config vllm_omni/deploy/higgs_multimodal_qwen3_low_latency.yaml
-```
+With vLLM 0.34, Model Runner V2 is the only supported runner. The default
+profile is `higgs_multimodal_qwen3.yaml`; `model_runner: v1` is rejected.
 
 ## Model Runner V2 (default)
 
-`higgs_multimodal_qwen3.yaml`, the auto-discovered default deploy config, runs
-`model_runner: v2`. The MRV2 feature switches self-enable from the runner
-selection, so the profile needs no `hf_overrides`. Stage 0 runs non-eager with
-`FULL` CUDA graph capture and `async_scheduling: true` on FLASH_ATTN; Stage 1
-stays eager with codec CUDA graph windows sized to the connector geometry
-(25 steady frames + 8 left context; the first chunk is one 8-frame window,
-~320 ms, where the V1 profiles ship a 1-frame first chunk). Non-CUDA platforms
-fall back to V1 through the file's `platforms:` section. To opt out of MRV2,
-copy the config with `model_runner: v1` or use the profiles above.
+The default's MRV2 switches self-enable from the runner selection. On CUDA,
+Stage 0 uses FLASH_ATTN, `FULL` CUDA graph capture and `async_scheduling: true`.
+Stage 1 stays eager with codec graph windows `[8, 33]`. The connector emits
+25 steady frames with 8 frames of left context; its first 8-frame chunk holds
+about 320 ms of audio. The previous default emitted a 1-frame first chunk.
 
-Sampling under v2 supports `temperature`/`top_p`/`top_k`/`seed` only;
-penalties, logprobs, min_tokens, min_p, allowed/bad token ids, and logit_bias
-require `model_runner: v1`.
+```bash
+vllm-omni serve bosonai/higgs-audio-v3-tts-4b \
+    --omni --trust-remote-code \
+    --deploy-config vllm_omni/deploy/higgs_multimodal_qwen3.yaml
+```
+
+Non-CUDA overrides preserve eager execution and the previous connector
+geometry. They keep V2 and async scheduling enabled, with the six CUDA-tuned
+`audio_mrv2_*` optimizations disabled. They are retained for configuration and
+test coverage only: ROCm, NPU, XPU, and MUSA are not supported for Higgs Audio
+v3 on this vLLM 0.34 head until platform-specific quality and performance
+validation is available. Do not treat these overrides as production support.
+
+The sampler supports `temperature`, `top_p`, `top_k` and `seed`. Non-neutral
+penalties, logprobs, min_tokens, min_p, allowed/bad token ids and logit_bias
+are rejected. Remove unsupported parameters; no V1 opt-out is available.
+
+## H200 tuning
+
+`higgs_multimodal_qwen3_mrv2_h200.yaml` has 64-sequence capacities, larger
+capture sizes and MPS. Its earlier H200 validation predates the vLLM 0.34
+rebase; refresh hardware measurements when qualifying this version.
+
+## Legacy profiles
+
+`higgs_multimodal_qwen3_high_throughput.yaml` and
+`higgs_multimodal_qwen3_low_latency.yaml` retain the old V1 execution settings.
+They are historical profiles, not working V1 fallbacks on vLLM 0.34. Use the
+default or H200 profile instead. The FlashInfer discussion below records the
+reasoning behind those earlier configurations.
 
 For a large-card tuned V2 profile see `higgs_multimodal_qwen3_mrv2_h200.yaml`
 (H200-validated: 64-sequence capacities, larger capture sizes, MPS).

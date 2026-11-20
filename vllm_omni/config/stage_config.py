@@ -1320,7 +1320,7 @@ def _validate_mrv2_default_sampling_params(
     if bad:
         raise ValueError(
             f"stage {ps.stage_id}: default_sampling_params {bad} are not supported by this model's "
-            "model_runner: v2 path; remove them or run this stage with model_runner: v1"
+            "model_runner: v2 path; remove the unsupported parameters"
         )
 
 

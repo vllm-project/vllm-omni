@@ -1,11 +1,9 @@
 # Higgs-audio v3 deploy: Stage 0 (talker) -> Stage 1 (code2wav) via shared memory.
 #
-# Auto-discovered default for model_type=higgs_multimodal_qwen3. This file runs
-# model_runner: v2; the MRV2 feature switches self-enable from the runner
-# selection, so no audio_mrv2_* hf_overrides are needed. For the V1 profiles
-# use higgs_multimodal_qwen3_high_throughput.yaml / _low_latency.yaml, or copy
-# this file with model_runner: v1. Non-CUDA platforms fall back to V1 via the
-# platforms section below. The H200-tuned V2 profile is
+# Auto-discovered default for model_type=higgs_multimodal_qwen3. The MRV2
+# feature switches self-enable from the runner selection. The CUDA default
+# uses the graph shape below; other platforms keep their eager configuration.
+# vLLM 0.34 only supports model_runner: v2. The H200-tuned V2 profile is
 # higgs_multimodal_qwen3_mrv2_h200.yaml.
 #
 # Plain TTS only (no voice cloning). async_chunk streams codec chunks from
@@ -29,7 +27,7 @@ connectors:
       #   initial_codec_chunk_frames smaller first chunk to minimize TTFA
       # Under model_runner: v2 the Stage-1 codec CUDA graph windows are sized
       # to this shape (25 + 8 left context = 33 frames) and the first chunk is
-      # one 8-frame window (~320 ms; the V1 profiles ship a 1-frame first chunk).
+      # one 8-frame window (~320 ms; the previous default used a 1-frame first chunk).
       codec_chunk_frames: 25
       codec_left_context_frames: 8
       codec_right_holdback_frames: 0
@@ -43,7 +41,7 @@ stages:
     max_num_seqs: 16
     gpu_memory_utilization: 0.6
     # MRV2 runs the decode step on the external CUDA graph; the local MLP
-    # CUDA graph of the V1 high-throughput profile is not used here.
+    # CUDA graph of the old V1 profile is not used here.
     enforce_eager: false
     attention_backend: FLASH_ATTN
     trust_remote_code: true
@@ -86,30 +84,6 @@ stages:
     devices: "0"
     input_connectors:
       from_stage_0: connector_of_shared_memory
-    hf_overrides:
-      # Codec CUDA graph windows follow the connector chunk shape (25 + 8 = 33);
-      # batch buckets sized to this profile's max_num_seqs.
-      codec_graph_single_max_frames: 33
-      codec_graph_frame_sizes:
-      - 8
-      - 33
-      codec_graph_batch_sizes:
-      - 1
-      - 2
-      - 3
-      - 4
-      - 5
-      - 6
-      - 7
-      - 8
-      - 9
-      - 10
-      - 11
-      - 12
-      - 13
-      - 14
-      - 15
-      - 16
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
@@ -119,14 +93,41 @@ stages:
       repetition_penalty: 1.0
 
 platforms:
-  # MRV2 is CUDA-only; RFC #9387 Phase 3 owns the non-CUDA platforms. The
-  # other platforms fall back to the V1 runner and its shipped shape,
-  # connector geometry included. compilation_config and codec_graph_* are
-  # CUDA/v2-only and ignored on the fallbacks.
+  cuda:
+    stages:
+      - stage_id: 1
+        hf_overrides:
+          # Codec CUDA graph windows follow the connector chunk shape (25 + 8 = 33);
+          # batch buckets sized to this profile's max_num_seqs.
+          codec_graph_single_max_frames: 33
+          codec_graph_frame_sizes:
+          - 8
+          - 33
+          codec_graph_batch_sizes:
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          - 6
+          - 7
+          - 8
+          - 9
+          - 10
+          - 11
+          - 12
+          - 13
+          - 14
+          - 15
+          - 16
+  # Preserve the existing non-CUDA eager shape and connector geometry. The
+  # six CUDA-tuned MRV2 optimizations stay disabled; these non-CUDA paths are
+  # retained for configuration/test coverage only and are unsupported until
+  # platform-specific validation is available.
+  # Async payload/prompt mode remain enabled, as required by the V2 runner.
   rocm:
-    model_runner: v1
-    # Shipped V1 geometry; takes precedence over top-level codec_* here.
-    connectors: &v1_connector_geometry
+    # Platform geometry takes precedence over top-level codec_* values.
+    connectors: &eager_connector_geometry
       connector_of_shared_memory:
         extra:
           codec_left_context_frames: 25
@@ -137,37 +138,41 @@ platforms:
         # FlashInfer is not supported on ROCm.
         attention_backend: TRITON_ATTN
         enforce_eager: true
-        async_scheduling: false
+        async_scheduling: true
         enable_prefix_caching: true
+        hf_overrides: &eager_mrv2_options
+          audio_mrv2_static_inputs: false
+          audio_mrv2_slot_parameters: false
+          audio_mrv2_direct_payload: false
+          audio_mrv2_sample_graph_buckets: false
+          audio_mrv2_async_state_indices: false
+          audio_mrv2_fused_state: false
   npu:
-    # Stage 1 (code2wav) is a generation stage; NPU generation workers
-    # reject model_runner v2 at init. Both stages run V1.
-    model_runner: v1
-    connectors: *v1_connector_geometry
+    connectors: *eager_connector_geometry
     stages:
       - stage_id: 0
         enforce_eager: true
-        async_scheduling: false
+        async_scheduling: true
         enable_prefix_caching: true
+        hf_overrides: *eager_mrv2_options
   xpu:
-    # XPU rejects any v2 stage at deploy load.
-    model_runner: v1
-    connectors: *v1_connector_geometry
+    connectors: *eager_connector_geometry
     stages:
       - stage_id: 0
         # FlashInfer is not supported on XPU. Both stages share one 32 GiB card.
         attention_backend: FLASH_ATTN
         gpu_memory_utilization: 0.4
         enforce_eager: true
-        async_scheduling: false
+        async_scheduling: true
         enable_prefix_caching: true
+        hf_overrides: *eager_mrv2_options
       - stage_id: 1
         gpu_memory_utilization: 0.15
   musa:
-    model_runner: v1
-    connectors: *v1_connector_geometry
+    connectors: *eager_connector_geometry
     stages:
       - stage_id: 0
         enforce_eager: true
-        async_scheduling: false
+        async_scheduling: true
         enable_prefix_caching: true
+        hf_overrides: *eager_mrv2_options

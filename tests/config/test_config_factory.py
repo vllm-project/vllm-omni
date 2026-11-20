@@ -3309,26 +3309,40 @@ class TestPlatformOverrides:
         stages = merge_pipeline_deploy(pipeline, rocm)
         assert stages[0].yaml_engine_args["attention_backend"] == "TRITON_ATTN"
 
-    def test_higgs_audio_v3_non_cuda_platforms_fall_back_to_v1(self):
-        """Non-CUDA platforms must keep the V1 runner after the MRV2 flip.
-
-        XPU rejects any v2 stage at deploy load, NPU generation workers
-        reject v2 at init, and ROCm/MUSA v2 is RFC #9387 Phase 3. The
-        platforms section pins v1 and restores the shipped V1 stage-0 shape
-        and connector streaming geometry, so the fallback stays valid under
-        the flipped v2 base.
-        """
+    def test_higgs_audio_v3_non_cuda_platforms_keep_eager_mrv2(self):
+        """Preserve the non-CUDA eager shape without selecting retired V1."""
         deploy_path = Path(get_deploy_config_path("higgs_multimodal_qwen3.yaml"))
 
+        expected_attention_backend = {
+            "rocm": "TRITON_ATTN",
+            "npu": "FLASH_ATTN",
+            "xpu": "FLASH_ATTN",
+            "musa": "FLASH_ATTN",
+        }
         for platform in ("rocm", "npu", "xpu", "musa"):
             deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform)
-            assert deploy.model_runner == "v1", platform
+            assert deploy.model_runner == "v2", platform
             assert all(stage.model_runner is None for stage in deploy.stages), platform
             stage0 = deploy.stages[0]
+            assert stage0.attention_backend == expected_attention_backend[platform], platform
             assert stage0.enforce_eager is True, platform
-            assert stage0.async_scheduling is False, platform
+            assert stage0.async_scheduling is True, platform
             assert stage0.engine_extras["enable_prefix_caching"] is True, platform
-            # The connector restore keeps the shipped V1 streaming geometry:
+            assert "hf_overrides" not in deploy.stages[1].engine_extras, platform
+            flags = stage0.engine_extras["hf_overrides"]
+            for name in (
+                "audio_mrv2_static_inputs",
+                "audio_mrv2_slot_parameters",
+                "audio_mrv2_direct_payload",
+                "audio_mrv2_sample_graph_buckets",
+                "audio_mrv2_async_state_indices",
+                "audio_mrv2_fused_state",
+            ):
+                assert flags[name] is False, (platform, name)
+            pipeline = resolve_pipeline_config("higgs_multimodal_qwen3")
+            stages = merge_pipeline_deploy(pipeline, deploy)
+            assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+            # The connector restore keeps the previous streaming geometry:
             # the v2 chunk shape exists only for the codec CUDA-graph windows.
             extra = deploy.connectors["connector_of_shared_memory"]["extra"]
             assert extra["codec_left_context_frames"] == 25, platform
@@ -3378,6 +3392,22 @@ class TestPlatformOverrides:
         assert xpu.stages[1].gpu_memory_utilization == 0.15
         assert xpu.stages[1].enforce_eager is True
 
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "higgs_multimodal_qwen3_high_throughput.yaml",
+            "higgs_multimodal_qwen3_low_latency.yaml",
+        ],
+    )
+    def test_higgs_audio_v3_legacy_profiles_fail_at_config_load(self, filename):
+        """Historical V1 profiles fail before worker initialization on vLLM 0.34."""
+        deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
+        assert deploy.model_runner == "v1"
+
+        pipeline = resolve_pipeline_config("higgs_multimodal_qwen3")
+        with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
+            merge_pipeline_deploy(pipeline, deploy)
+
     def test_platform_connector_overrides_merge_with_base_config(self):
         from vllm_omni.config.stage_config import _merge_platforms
 
@@ -3403,7 +3433,7 @@ class TestPlatformOverrides:
 
         The v2 path's self-owned sampler supports temperature/top-k/top-p/seed
         only; a yaml carrying e.g. repetition_penalty=1.1 must fail at deploy
-        merge (with the v1 opt-out named), not on every request. Neutral
+        merge, not on every request. Neutral
         engine defaults (repetition_penalty=1.0) pass, and falsy neutral
         values (logprobs: null, bad_words: [], logit_bias: {}) pass too,
         matching the request-path checks in model_state.py add_request.
@@ -3428,46 +3458,34 @@ class TestPlatformOverrides:
 
         deploy = load_deploy_config(deploy_path)
         deploy.stages[0].default_sampling_params["repetition_penalty"] = 1.1
-        with pytest.raises(ValueError, match="model_runner: v1"):
+        with pytest.raises(ValueError, match="remove the unsupported parameters"):
             merge_pipeline_deploy(pipeline, deploy)
 
         # Non-neutral collection values fail the same way as scalars.
         deploy = load_deploy_config(deploy_path)
         deploy.stages[0].default_sampling_params["logprobs"] = 5
-        with pytest.raises(ValueError, match="model_runner: v1"):
+        with pytest.raises(ValueError, match="remove the unsupported parameters"):
             merge_pipeline_deploy(pipeline, deploy)
 
         # 0 looks neutral but still requests a logprob; keep it rejected so
         # startup matches add_request.
         deploy = load_deploy_config(deploy_path)
         deploy.stages[0].default_sampling_params["logprobs"] = 0
-        with pytest.raises(ValueError, match="model_runner: v1"):
+        with pytest.raises(ValueError, match="remove the unsupported parameters"):
             merge_pipeline_deploy(pipeline, deploy)
 
-        # The same penalties are legal on the v1 opt-out path.
-        deploy_v1 = _apply_platform_overrides(load_deploy_config(deploy_path), platform="rocm")
-        deploy_v1.stages[0].default_sampling_params["repetition_penalty"] = 1.1
-        merge_pipeline_deploy(pipeline, deploy_v1)
-
-    def test_higgs_audio_v2_mrv2_opt_in_runs_talker_on_v2_only(self):
-        """The opt-in MRV2 profile runs stage 0 on v2 with stage 1 kept on v1.
-
-        The stage-level ``model_runner`` key selects the talker's runner; the
-        codec stage has no MRV2 path, so it stays on v1 and the talker's
-        outputs ride the legacy transport. The pipeline declares no
-        ``mrv2_unsupported_sampling_params``, so the full staged sampling
-        surface — penalties included — stays available under v2.
-        """
+    def test_higgs_audio_v2_mrv2_alias_uses_v2_for_all_stages(self):
+        """The explicit MRV2 alias resolves both stages to Model Runner V2."""
         deploy_path = Path(get_deploy_config_path("higgs_audio_v2_mrv2.yaml"))
         pipeline = resolve_pipeline_config("higgs_audio_v2")
 
         deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
-        assert deploy.model_runner == "v1"
+        assert deploy.model_runner == "v2"
         assert deploy.stages[0].model_runner == "v2"
         assert deploy.stages[1].model_runner is None
 
         stages = merge_pipeline_deploy(pipeline, deploy)
-        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [True, False]
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [True, True]
         assert pipeline.stages[0].mrv2_unsupported_sampling_params == ()
 
         # Neutral sampling defaults pass the v2 startup validation unchanged.
@@ -3487,42 +3505,8 @@ class TestPlatformOverrides:
             load_deploy_config(Path(get_deploy_config_path("higgs_audio_v2.yaml")))
         )
 
-    def test_higgs_audio_v2_v1_optout_pins_talker_on_v1(self):
-        """The V1 opt-out profile flips only the stage-0 runner, inheriting the rest.
-
-        The thin ``stages:`` overlay must override the default's stage-0
-        ``model_runner: v2`` without dropping any inherited stage field
-        (shape, capacities, sampling defaults), and the inherited
-        ``platforms:`` section must leave it on v1 everywhere — including
-        CUDA, where nothing re-clears it.
-        """
-        deploy_path = Path(get_deploy_config_path("higgs_audio_v2_v1.yaml"))
-        pipeline = resolve_pipeline_config("higgs_audio_v2")
-        default_path = Path(get_deploy_config_path("higgs_audio_v2.yaml"))
-
-        for platform in ("cuda", "rocm", "npu", "xpu", "musa"):
-            deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform)
-            assert deploy.stages[0].model_runner == "v1", platform
-            assert deploy.stages[1].model_runner is None, platform
-            stages = merge_pipeline_deploy(pipeline, deploy)
-            assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [False, False], platform
-
-        # The overlay changes only the runner: every other stage-0 field the
-        # default ships must survive the merge untouched.
-        optout = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda").stages[0]
-        default = _apply_platform_overrides(load_deploy_config(default_path), platform="cuda").stages[0]
-        assert optout.enforce_eager is True
-        assert optout.max_num_seqs == default.max_num_seqs
-        assert optout.max_model_len == default.max_model_len
-        assert optout.default_sampling_params == default.default_sampling_params
-        assert optout.engine_extras == default.engine_extras
-
     def test_higgs_audio_v2_v2_default_does_not_warn_unvalidated(self, caplog):
-        """The flipped default declares its legacy-transport v2 path validated.
-
-        The pipeline declaration must silence the generic unvalidated-warning
-        at default boot; the codec stage stays on v1 and never warns.
-        """
+        """The flipped default does not warn about an unvalidated V2 path."""
         deploy_path = Path(get_deploy_config_path("higgs_audio_v2.yaml"))
         pipeline = resolve_pipeline_config("higgs_audio_v2")
         assert pipeline.stages[0].mrv2_legacy_transport_validated is True
@@ -3532,26 +3516,18 @@ class TestPlatformOverrides:
             merge_pipeline_deploy(pipeline, cuda)
         assert not any("has not been validated" in record.getMessage() for record in caplog.records)
 
-    def test_higgs_audio_v2_default_falls_back_to_v1_off_cuda(self):
-        """The flipped default keeps the v1 runner on non-CUDA platforms.
-
-        The default profile selects v2 for the talker on CUDA; NPU, XPU,
-        ROCm and MUSA pin v1 for both stages through the platforms section
-        and clear the stage-level v2 opt-in.
-        """
+    def test_higgs_audio_v2_default_uses_v2_on_all_platforms(self):
+        """The default never selects the retired V1 runner."""
         deploy_path = Path(get_deploy_config_path("higgs_audio_v2.yaml"))
         pipeline = resolve_pipeline_config("higgs_audio_v2")
 
-        cuda = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
-        assert cuda.stages[0].model_runner == "v2"
-        assert merge_pipeline_deploy(pipeline, cuda)[0].yaml_engine_args["use_v2_model_runner"] is True
-
-        for platform in ("rocm", "npu", "xpu", "musa"):
+        for platform in ("cuda", "rocm", "npu", "xpu", "musa"):
             deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform)
-            assert deploy.model_runner == "v1", platform
-            assert all(stage.model_runner is None for stage in deploy.stages), platform
+            assert deploy.model_runner == "v2", platform
+            assert deploy.stages[0].model_runner == "v2", platform
+            assert deploy.stages[1].model_runner is None, platform
             stages = merge_pipeline_deploy(pipeline, deploy)
-            assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [False, False], platform
+            assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [True, True], platform
 
     def test_qwen3_omni_cuda_uses_thinker_rotary_custom_op(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))

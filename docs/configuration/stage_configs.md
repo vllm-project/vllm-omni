@@ -97,7 +97,7 @@ The new deploy schema lives under `vllm_omni/deploy/` and is paired with a froze
 
 | Field | Type | Required | Default | Description |
 | ------- | ------ | ---------- | --------- | ------------- |
-| `base_config` | str (path) | optional | — | Overlay parent (relative or absolute). `stages:` / `platforms:` deep-merged by stage_id; other scalars overlay-wins. Intended for user-authored overlays and shipped alias profiles that pin a parent's selection (e.g. `higgs_audio_v2_mrv2.yaml` / `_v1.yaml`). |
+| `base_config` | str (path) | optional | — | Overlay parent (relative or absolute). `stages:` / `platforms:` deep-merged by stage_id; other scalars overlay-wins. Intended for user-authored overlays and shipped alias profiles that pin a parent's selection (e.g. `higgs_audio_v2_mrv2.yaml`). |
 | `async_chunk` | bool | optional | `true` | Enable chunked streaming between stages. Pin to `false` if the pipeline runs end-to-end. |
 | `session_mode` | str | optional | `"turn"` | Session behavior. For pipelines with a `duplex_plugin`, explicitly select `"duplex"` for the duplex engine or `"turn"` for the ordinary online serving stack. The shipped MiniCPM-o 4.5 default remains `"duplex"`. See [Full Duplex](../serving/full_duplex_api.md#enable-full-duplex). |
 | `active_stream_window` | int | optional | `0` | Number of active downstream stream slots; `0` preserves all-stream cycling. |
@@ -680,57 +680,50 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/depl
 
 ## Higgs-Audio V3 with Model Runner V2
 
-Higgs-Audio V3 runs `model_runner: v2` by default. The MRV2 feature switches
-(`audio_mrv2_*`, `audio_async_*`) are tri-state fields of `HiggsAudioV3Config`
-that self-enable from the runner selection, so a deploy yaml needs only the
-`model_runner` key — the old opt-in profile's explicit switch overrides are
-gone, and its remaining `hf_overrides` carry only codec-graph tuning keys.
-`audio_async_payload` and `audio_async_prompt_mode` are structural under v2
-and cannot be disabled.
-
-Select one of these deployment profiles:
+Higgs-Audio V3 uses `model_runner: v2`, the only runner available with vLLM
+0.34. Its `audio_mrv2_*` and `audio_async_*` switches are tri-state fields of
+`HiggsAudioV3Config`: omitted values follow the runner selection, and explicit
+values remain tuning overrides. `audio_async_payload` and
+`audio_async_prompt_mode` are structural under V2 and cannot be disabled.
+The talker requires `async_scheduling: true`.
 
 | Profile | Runner | Intended use |
 | --- | --- | --- |
-| `higgs_multimodal_qwen3.yaml` | V2 (default) | Shipped default; H200-validated shape scaled to 16 sequences |
+| `higgs_multimodal_qwen3.yaml` | V2 | Default CUDA graph shape scaled to 16 sequences |
 | `higgs_multimodal_qwen3_mrv2_h200.yaml` | V2 | Large-card tuning (64-sequence capacities, MPS) |
-| `higgs_multimodal_qwen3_high_throughput.yaml` | V1 | V1 opt-out: eager Stage 0 + local MLP CUDA graph |
-| `higgs_multimodal_qwen3_low_latency.yaml` | V1 | V1 opt-out: `FULL_DECODE_ONLY` external decode graph |
 
-The default's `platforms:` section keeps V1 on NPU, XPU, ROCm and MUSA
-(XPU rejects any v2 stage at deploy load; NPU generation workers — Higgs
-Stage 1 — reject v2 at init). The V2 shape pins the connector streaming
-geometry (25-frame chunks, 8-frame left context, 8-frame first chunk) that
-the Stage-1 codec CUDA graph windows are sized against.
+The default CUDA connector uses 25-frame chunks, 8-frame left context, and an
+8-frame first chunk, matching the Stage-1 codec graph windows `[8, 33]`.
+Non-CUDA platform overrides retain eager execution, prefix caching and the
+previous connector geometry (25-frame context, 4-frame holdback, 1-frame first
+chunk). They keep V2 and async scheduling enabled, but disable the six new
+CUDA-tuned `audio_mrv2_*` optimizations. This preserves configuration behavior;
+NPU, XPU, ROCm and MUSA hardware validation remains separate.
 
-Sampling surface under v2: the talker's self-owned sampler supports
-`temperature`/`top_p`/`top_k`/`seed` only. Penalties, logprobs, min_tokens,
-min_p, allowed/bad token ids, and logit_bias are text-generation machinery
-the captured sampling step does not wire in; a non-neutral unsupported value
-in `default_sampling_params` fails at startup, and per-request use raises.
-Remove the parameter or run the stage with `model_runner: v1`.
+The legacy `_high_throughput.yaml` and `_low_latency.yaml` files retain their
+old V1 execution settings and are not V1 opt-outs on vLLM 0.34. Use the default
+or H200 profile above; selecting `model_runner: v1` is rejected.
+
+The V2 sampler supports `temperature`, `top_p`, `top_k` and `seed`. Non-neutral
+penalties, logprobs, min_tokens, min_p, allowed/bad token ids and logit_bias
+are rejected at startup when present in `default_sampling_params`, or before
+queue admission for individual requests. Remove unsupported parameters; there
+is no V1 fallback.
 
 ## Higgs-Audio v2 with Model Runner V2
 
-Higgs-Audio v2 runs the talker (stage 0) on `model_runner: v2` by default;
-the codec stage (stage 1) has no MRV2 path and stays on v1, so the talker's
-outputs ride the legacy transport. Under v2 the talker delegates LM token
-sampling to the native staged sampler, keeping the full request surface —
-penalties and logprobs included — that the V1 engine offers.
-
-Select one of these deployment profiles:
+Higgs-Audio v2 runs both stages on `model_runner: v2` by default. The talker
+delegates LM token sampling to the native staged sampler, and the codec stage
+uses the native generation runner. Non-CUDA platforms are not supported until
+platform-specific validation is available.
 
 | Profile | Runner | Intended use |
 | --- | --- | --- |
-| `higgs_audio_v2.yaml` | V2 talker (default) | Shipped default; v1 codec stage |
-| `higgs_audio_v2_mrv2.yaml` | V2 talker | Explicit alias of the default selection |
-| `higgs_audio_v2_v1.yaml` | V1 talker | Explicit V1 opt-out on CUDA |
+| `higgs_audio_v2.yaml` | V2 | Shipped default |
+| `higgs_audio_v2_mrv2.yaml` | V2 | Explicit alias of the default selection |
 
-The default's `platforms:` section keeps both stages on V1 for NPU, XPU,
-ROCm and MUSA (XPU rejects v2 stages at deploy load; NPU generation workers
-reject v2 at init). To run the talker on v1 on CUDA, use
-`higgs_audio_v2_v1.yaml` (or copy the default deploy file and remove the
-stage-0 `model_runner` key).
+The retired V1 runner is not an available opt-out in vLLM 0.34; do not add a
+`model_runner: v1` overlay.
 
 ## Qwen3-TTS with Model Runner V2
 
