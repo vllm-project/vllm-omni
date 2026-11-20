@@ -8,8 +8,7 @@
             "cuda": [
               "H100",
               "B200"
-            ],
-            "npu": "A3"
+            ]
           },
           "num_cards": 4
         }
@@ -69,6 +68,76 @@
             ]
           }
         },
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "extra_body": {
+          "guidance_scale": 2.5,
+          "sys_type": "en_unified",
+          "bot_task": "none",
+          "width": 1024,
+          "height": 1024,
+          "num_inference_steps": 8
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_hunyuan_image3_distil_int8_dit_sp4",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "npu": "A3"
+          },
+          "num_cards": 4
+        }
+      },
+      "diffusion",
+      "full_model"
+    ],
+    "description": "INT8 distilled weights; DiT TP=1 SP=4 on NPUs 0,1,2,3; random dataset; concurrency 1,4",
+    "server_params": {
+      "model": "tencent/HunyuanImage-3.0-Instruct-Distil",
+      "serve_args": {
+        "trust-remote-code": true,
+        "enable-diffusion-pipeline-profiler": true,
+        "stage-init-timeout": 900,
+        "init-timeout": 1800,
+        "quantization": "int8",
+        "deploy-config": "vllm_omni/deploy/hunyuan_image3_dit.yaml"
+      },
+      "stage_overrides": {
+        "0": {
+          "devices": "0,1,2,3",
+          "parallel_config": {
+            "tensor_parallel_size": 1,
+            "sequence_parallel_size": 4,
+            "ulysses_degree": 4,
+            "ring_degree": 1,
+            "allgather_degree": 1,
+            "vae_patch_parallel_size": 4,
+            "enable_expert_parallel": true
+          },
+          "vae_use_tiling": true
+        }
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "random_1024x1024_steps8",
+        "endpoint": "/v1/images/generations",
+        "num_prompts": [
+          16,
+          32
+        ],
+        "max_concurrency": [
+          1,
+          4
+        ],
+        "percentile_metrics": "e2el",
+        "baseline": {},
         "dataset_name": "random",
         "tokenizer": "gpt2",
         "random_input_len": 8,
