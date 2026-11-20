@@ -218,6 +218,26 @@ steps:
       build.env("NIGHTLY") == "1" ||
       build.pull_request.labels includes "nightly-test"
     steps:
+      - label: ":full_moon: Diffusion X2I · Ming-Image NPU Smoke"
+        key: nightly-ming-image-npu-smoke
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_ming_image.py
+          - vllm_omni/deploy/ming_image.yaml
+          - vllm_omni/diffusion/data.py
+          - vllm_omni/diffusion/models/ming_image/
+          - vllm_omni/diffusion/models/ming_flash_omni/condition_encoder.py
+          - vllm_omni/diffusion/models/z_image/
+          - vllm_omni/model_executor/models/ming_image/
+          - vllm_omni/model_executor/models/ming_flash_omni/
+          - vllm_omni/model_executor/stage_input_processors/ming_image.py
+          - vllm_omni/platforms/npu/
+        mirror_hardwares: a3_npu_2
+        timeout_in_minutes: 45
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_TOKEN: "${HF_TOKEN}"
+        commands:
+          - pytest -s -v tests/e2e/online_serving/test_ming_image.py -m 'full_model and npu and A3' --run-level full_model
       - label: ":full_moon: Diffusion X2I(&A&T) · Qwen-Image 2.1 Accuracy Test"
         source_file_dependencies: diffusion_qwen_image_21_accuracy
         timeout_in_minutes: 180

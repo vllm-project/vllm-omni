@@ -37,6 +37,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.configs.ming_flash_omni import MingImageGenConfig
 
 logger = logging.getLogger(__name__)
@@ -332,9 +333,12 @@ class MingConditionEncoder(nn.Module):
         # attention mask of shape [B, 1, N, N] to the Qwen2 connector,
         # forcing full bidirectional self-attention over all query positions.
         if attention_mask is None:
+            # Transformers' NPU SDPA adapter inverts floating masks as if they
+            # were additive 0/-inf masks. A floating all-ones mask would therefore
+            # block every token. Boolean True preserves full attention on NPU.
             attention_mask = torch.ones(
                 (b, 1, n, n),
-                dtype=x.dtype,
+                dtype=torch.bool if current_omni_platform.is_npu() else x.dtype,
                 device=x.device,
             )
         elif attention_mask.dim() == 2:
