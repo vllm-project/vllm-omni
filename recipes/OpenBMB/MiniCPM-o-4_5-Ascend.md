@@ -156,12 +156,11 @@ bash recipes/OpenBMB/serve_minicpmo_ascend.sh
 
 The replicated profile keeps one Thinker with DSpark 7, two Talker replicas,
 and two Code2Wav replicas. Thinker and Talker allow 16 sequences per worker.
-Code2Wav allows 32 per worker. Use the launcher above to apply the secondary
-memory settings. The primary uses an eight-row CFM micro-batch and a 512-entry
-host setup cache. The secondary shares its device with Thinker and the primary
+Code2Wav allows 32 per worker. The primary uses an eight-row CFM micro-batch
+and a 512-entry host setup cache. The secondary shares its device with Thinker and the primary
 Talker, uses a two-row CFM micro-batch, and limits reference setup caching to
 two device entries and 64 host entries. It copies CFM attention history in
-smaller pieces. Quarter routing was used for the measured replicated profile.
+smaller pieces. The launcher sets quarter routing for the measured profile.
 
 In the vLLM 0.34 comparison, the replicated profile improved warm C8 throughput
 from 6.03 to 6.88 requests/s and RTF from 0.336 to 0.301. At C64, it shortened

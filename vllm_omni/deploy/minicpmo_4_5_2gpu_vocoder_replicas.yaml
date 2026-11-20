@@ -5,6 +5,9 @@ platforms:
     stages:
     - stage_id: 2
       max_num_seqs: 32
+      env:
+        MINICPMO_C8_SECONDARY_VOCODER_HOST_CACHE: '1'
+        MINICPMO_C8_SECONDARY_VOCODER_TIGHT_MEMORY: '1'
     connectors:
       connector_of_shared_memory:
         extra:

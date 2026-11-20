@@ -90,6 +90,10 @@ def test_two_card_vocoder_profiles_preserve_shared_tuning(monkeypatch, deploy_na
     assert (spec["method"], spec["num_speculative_tokens"]) == ("dspark", 7)
     assert talker.yaml_runtime["num_replicas"] == 2
     assert (vocoder.yaml_runtime["devices"], vocoder.yaml_runtime["num_replicas"]) == (devices, replicas)
+    assert vocoder.yaml_runtime["env"] == {
+        "MINICPMO_C8_SECONDARY_VOCODER_HOST_CACHE": "1",
+        "MINICPMO_C8_SECONDARY_VOCODER_TIGHT_MEMORY": "1",
+    }
     assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [16, 16, 32]
     extra = config.connectors["connector_of_shared_memory"]["extra"]
     assert extra["codec_chunk_frames"] == 32
