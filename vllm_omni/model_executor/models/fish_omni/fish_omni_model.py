@@ -79,14 +79,14 @@ def _first(value: Any) -> Any:
     return value[0] if isinstance(value, list) and value else value
 
 
-def max_top_k(config: Any, codebook_size: int) -> int:
-    """Candidates the fused draws keep: 64, or ``hf_overrides`` fish_omni_max_top_k for
-    requests that ask for more. The draw kernel spans them with one ``tl.arange``, and
-    every draw keeps at least the RAS re-draw's fixed top-k."""
-    value = int(getattr(config, "fish_omni_max_top_k", 64))
+def max_top_k(config: Any, num_candidates: int) -> int:
+    """Width of the main draw. An explicit deployment override can narrow it."""
+    if not hasattr(config, "fish_omni_max_top_k"):
+        return num_candidates
+    value = int(config.fish_omni_max_top_k)
     least = 1 << (RAS_TOP_K - 1).bit_length()
-    if value < least or value & (value - 1) or value > codebook_size:
-        raise ValueError(f"fish_omni_max_top_k={value}: needs a power of two in [{least}, {codebook_size}]")
+    if value < least or value & (value - 1) or value > num_candidates:
+        raise ValueError(f"fish_omni_max_top_k={value}: needs a power of two in [{least}, {num_candidates}]")
     return value
 
 
@@ -290,7 +290,7 @@ class FishOmniForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
             dtype=vllm_config.model_config.dtype,
             device=device,
         )
-        self.max_top_k = max_top_k(config, self.codebook_size)
+        self.max_top_k = max_top_k(config, len(candidate_ids))
         self.reference_sampling = reference_sampling_enabled(config)
         self.sampler: FusedFrameSampler | ReferenceFrameSampler
         if self.reference_sampling:
