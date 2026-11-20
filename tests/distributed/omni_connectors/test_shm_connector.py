@@ -685,3 +685,22 @@ def test_put_refuses_when_peer_shared_memory_is_not_visible():
         assert sender.put(str(base), str(base + 1), f"{key}-gone", {"a": 1})[0] is False
     finally:
         sender.close()
+
+
+def test_visibility_is_scoped_to_deployment():
+    """A same-numbered stage from another deployment in this namespace is not our peer."""
+    base = 50000 + (os.getpid() % 10000)
+    sender = SharedMemoryConnector({"stage_id": base, "wakeup_scope": f"b-{uuid.uuid4().hex}"})
+    other_deployment = SharedMemoryConnector({"stage_id": base + 1, "wakeup_scope": f"a-{uuid.uuid4().hex}"})
+    key = f"scoped_{uuid.uuid4().hex}"
+    try:
+        assert sender.put(str(base), str(base + 1), key, {"a": 1})[0] is False
+        receiver = SharedMemoryConnector({"stage_id": base + 1, "wakeup_scope": sender.config["wakeup_scope"]})
+        try:
+            assert sender.put(str(base), str(base + 1), key, {"a": 1})[0] is True
+            assert receiver.get(str(base), str(base + 1), key)[0] == {"a": 1}
+        finally:
+            receiver.close()
+    finally:
+        other_deployment.close()
+        sender.close()

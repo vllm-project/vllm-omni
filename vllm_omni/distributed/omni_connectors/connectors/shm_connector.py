@@ -115,7 +115,13 @@ class SharedMemoryConnector(OmniConnectorBase):
         self._publish_visibility()
 
     def _visibility_directory(self) -> str:
-        return f"{self.shm_directory}/omni_shm_visible_{os.getuid()}"
+        # Key by deployment, as the wakeup directory does: an unrelated
+        # deployment under the same UID may reuse these stage ids in this
+        # namespace, and its markers must not count as our peer.
+        scope = self.config.get("wakeup_scope")
+        key = str(scope) if scope is not None else f"ppid_{os.getppid()}"
+        digest = hashlib.sha256(key.encode()).hexdigest()[:24]
+        return f"{self.shm_directory}/omni_shm_visible_{os.getuid()}_{digest}"
 
     def _publish_visibility(self) -> None:
         """Leave a file in this process's IPC namespace so peers can see us.
