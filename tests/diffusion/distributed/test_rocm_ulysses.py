@@ -58,16 +58,27 @@ def _worker(rank, rendezvous):
                 assert actual.is_contiguous()
                 torch.testing.assert_close(actual, _reference(out, rank, 1, 2), rtol=0, atol=0)
                 torch.testing.assert_close(strategy.post_attention(Q, ctx), q, rtol=0, atol=0)
+
             # Replay the receive views and vectorized restore with new contents.
+            def round_trip():
+                received, _, _, _, context = strategy.pre_attention(q, k, v, metadata)
+                return received, strategy.post_attention(received, context)
+
             stream = torch.cuda.Stream(device=device)
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                round_trip()
+            torch.cuda.current_stream().wait_stream(stream)
+            dist.barrier()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream):
-                captured, _, _, _, ctx = strategy.pre_attention(q, k, v, metadata)
-                restored = strategy.post_attention(captured, ctx)
+                captured, restored = round_trip()
             q.add_(1)
             graph.replay()
             torch.testing.assert_close(captured, _reference(q, rank, 2, 1), rtol=0, atol=0)
             torch.testing.assert_close(restored, q, rtol=0, atol=0)
+            # Release references to the captured communicator before destroying it.
+            graph.reset()
             # A different head count should continue to use generic Ulysses on every rank.
             q = q[:, :, :8]
             Q, _, _, _, ctx = strategy.pre_attention(q, q, q, None)
