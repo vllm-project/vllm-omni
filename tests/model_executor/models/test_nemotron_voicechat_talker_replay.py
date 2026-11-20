@@ -134,7 +134,8 @@ def test_position_past_session_step_is_rejected():
         _preprocess(talker, offset=INIT_LEN + 3, span=1)
 
 
-def test_v2_payload_identity_commits_codes_before_the_next_timeline_step(monkeypatch):
+@pytest.mark.parametrize("payload_identity", [False, True])
+def test_v2_payload_identity_commits_codes_before_the_next_timeline_step(monkeypatch, payload_identity):
     import numpy as np
 
     from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
@@ -152,11 +153,13 @@ def test_v2_payload_identity_commits_codes_before_the_next_timeline_step(monkeyp
             req_id="req",
             mm_features=[],
             additional_information=None,
-            model_intermediate_buffer={"meta": {"request_id": "req"}},
+            model_intermediate_buffer={"meta": {"request_id": "req"}} if payload_identity else None,
         ),
     )
     info = buffer.buffers[1]
-    assert "request_id" not in info and info["meta"]["request_id"] == "req"
+    assert "request_id" not in info
+    if payload_identity:
+        assert info["meta"]["request_id"] == "req"
     state = object.__new__(OmniModelState)
     state.model, state.have_multimodal_outputs, state.intermediate_buffer = talker, True, buffer
     batch = SimpleNamespace(
