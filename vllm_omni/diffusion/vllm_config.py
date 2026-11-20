@@ -268,8 +268,12 @@ def _is_native_modelopt_nvfp4_moe(od_config: OmniDiffusionConfig) -> bool:
 
     quant_config = getattr(od_config, "quantization_config", None)
     if isinstance(quant_config, ModelOptMixedPrecisionConfig):
-        # Expert prefixes are unknown before the model is built; any NVFP4 layer counts.
-        algos = {str(recipe.get("quant_algo", "")).upper() for recipe in quant_config.quantized_layers.values()}
+        # Only layers with ".experts." in their name pick the MoE kernel; NVFP4 dense layers keep MoE LoRA.
+        algos = {
+            str(recipe.get("quant_algo", "")).upper()
+            for name, recipe in quant_config.quantized_layers.items()
+            if ".experts." in name
+        }
         if "NVFP4" not in algos:
             return False
     elif not isinstance(quant_config, ModelOptNvFp4Config) or quant_config.quant_method != "NVFP4":
