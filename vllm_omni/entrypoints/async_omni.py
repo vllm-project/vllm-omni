@@ -111,8 +111,10 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
     def __init__(self, model: str = "", *args: Any, **kwargs: Any) -> None:
         tts_max_instructions_length = kwargs.get("tts_max_instructions_length", None)
+        tts_streaming_idle_timeout = kwargs.get("tts_streaming_idle_timeout", None)
         AsyncOmniBase.__init__(self, *args, model=model, **kwargs)
         self.tts_max_instructions_length = tts_max_instructions_length
+        self.tts_streaming_idle_timeout = tts_streaming_idle_timeout
         self._pause_cond: asyncio.Condition = asyncio.Condition()
         self._paused: bool = False
         # In-flight EngineCore submits (non-streaming add_request, or each
