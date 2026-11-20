@@ -47,6 +47,7 @@ from vllm_omni.worker_v2.mooncake_capture import snapshot_mooncake_output
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 from vllm_omni.worker_v2.omni_sampler import sample_with_output
 from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot, pack_output_snapshot
+from vllm_omni.worker_v2.stage_trace import timed
 from vllm_omni.worker_v2.streaming_audio import StreamingAudioSnapshot
 from vllm_omni.worker_v2.warmup import is_warmup_request
 
@@ -189,6 +190,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
     # execute_model: KV transfer pre-hook + delegate to super
     # ------------------------------------------------------------------
 
+    @timed("execute")
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
@@ -249,6 +251,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
 
     @torch.inference_mode()
     @step_eplb_after()
+    @timed("sample")
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> OmniAsyncOutput | OmniModelRunnerOutput | ModelRunnerOutput | None:

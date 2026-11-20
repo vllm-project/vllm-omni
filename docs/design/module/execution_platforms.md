@@ -71,6 +71,27 @@ from the common or upstream implementation.
 Validate common import paths without the target accelerator and run focused
 tests in a fresh `uv` environment on every affected device platform.
 
+## MiniCPM-o Ascend shared KV
+
+The MiniCPM-o MRv2 Thinker worker extends Ascend's shared-attention eligibility
+before KV budgeting and allocation. Both call the same predicate and reuse
+Ascend's existing standardized backing allocator; installed `vllm-ascend`
+sources remain unchanged. The extension accepts only DSpark full-attention
+and native duplex-window groups with identical, unpadded FP16/BF16 pages.
+KV transfer, context parallelism, KVPP and sparse SFA retain their original
+paths. Other models, stages and MRv1 also retain Ascend's original predicate.
+The scheduler still owns block lifetimes and each group's block table;
+sharing the backing does not share live request contents or shorten context.
+Without DSpark the new mixed-group path is inactive.
+Focused coverage lives in `tests/platforms/npu/test_minicpmo_shared_kv.py`.
+
+The opt-in MiniCPM-o exact-prefill, fused decode and compact-batch graphs
+qualify on their first eligible use in each worker. Active mode still returns
+the reference result while comparing hidden state/KV or codec/stop/KV state;
+only a successful check enables later replay. Mismatches keep the reference
+path. The [Ascend recipe](../../../recipes/OpenBMB/MiniCPM-o-4_5-Ascend.md)
+supplies the deployment, explicit model assets and launcher controls.
+
 ## MiniMax H3 image NPU adapter
 
 The NPU model-patch hook defaults the image pipeline to single-tile VAE decoder

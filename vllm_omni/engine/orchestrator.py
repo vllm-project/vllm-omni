@@ -3726,6 +3726,8 @@ class OrchestratorBase:
                 except StageUnavailableError:
                     await self._fail_request_dead_stage(request_id, route_stage_id)
                     return False
+            if next_stage_id == 2 and pinned_replica_id is None and not req_state.session_owned:
+                pinned_replica_id = next_pool.select_experimental_code2wav_replica(request_id)
             route_kwargs: dict[str, Any] = {} if pinned_replica_id is None else {"pinned_replica_id": pinned_replica_id}
             stamp_downstream_stage_submit(
                 req_state,

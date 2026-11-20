@@ -600,22 +600,32 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         ).tolist()
 
     def update_draft_token_ids(self, draft_token_ids) -> None:
-        """Align the per-request draft buffers before the next schedule().
+        """Normalize Talker draft buffers before scheduling.
 
-        Upstream writes each request's drafts independently, so a request
-        whose buffer survived from an earlier state -- a duplex takeover
-        snapshot restored with its old drafts in place, or a step whose
-        schedule clipped this request while the neighbours ran full -- sits
-        next to neighbours with a different buffer length. The next
-        ``schedule()`` then books per-request spans of different widths (a
-        duplex takeover repro booked 8 and 4), and a non-uniform span is the
-        one shape the multi-frame loop declines -- fatally, with the stage.
-
-        A decode buffer is safe in exactly two states: empty, or a full
-        ``num_spec_tokens`` of drafts. Anything else is residue; clearing
-        every buffer leaves the next step to schedule a uniform padded
-        single-frame span, from which the K-step resumes on its own.
-        """
+        A buffer must be empty or contain exactly num_spec_tokens drafts.
+        Clear inconsistent buffers together so the next decode has uniform spans."""
+        config = getattr(self, "vllm_config", None)
+        speculative = getattr(config, "speculative_config", None)
+        model = getattr(config, "model_config", None)
+        if (
+            getattr(self, "use_v2_model_runner", False)
+            and getattr(model, "model_stage", None) == "llm"
+            and any("MiniCPMO45" in arch for arch in (getattr(model, "architectures", None) or ()))
+            and getattr(model, "session_mode", None) == "duplex"
+            and speculative is not None
+            and speculative.method == "dspark"
+        ):
+            filtered = []
+            for request_id, tokens in zip(draft_token_ids.req_ids, draft_token_ids.draft_token_ids):
+                request = self.requests.get(request_id)
+                payload = getattr(request, "additional_information", None)
+                info = deserialize_additional_information(payload) if payload is not None else {}
+                duplex = info.get("duplex")
+                native_duplex = info.get("native_duplex") or (
+                    isinstance(duplex, dict) and duplex.get("data_plane") is True
+                )
+                filtered.append([] if native_duplex else tokens)
+            draft_token_ids = DraftTokenIds(draft_token_ids.req_ids, filtered)
         if getattr(self, "_scheduler_ngram", None) is not None:
             draft_token_ids = DraftTokenIds(
                 draft_token_ids.req_ids,
@@ -669,22 +679,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             )
 
     def _talker_waiting_prefill_may_run(self) -> bool:
-        """Whether a waiting request can be admitted into the current step.
+        """Check whether waiting input can join this step.
 
-        vLLM drains the waiting queue first and stops admitting as soon as
-        ``len(self.running) + self.num_waiting_for_streaming_input`` reaches
-        ``max_num_running_reqs`` (vllm v1/core/sched/scheduler.py:864) -- the
-        same guard covers the skipped-waiting queue, so a full running batch
-        means nothing new joins this step.
-
-        That distinction matters under sustained load: a busy stream keeps a
-        request queued almost every step, and clearing the Talker's
-        continuation drafts on all of them turns most decode steps into
-        single-frame steps, which is exactly the K-step speedup this path
-        exists to provide. When the waiting request cannot be admitted, the
-        step is a pure decode batch and its spans stay uniform, so the
-        drafts are kept.
-        """
+        Retain K-step drafts when running and streaming-input slots already
+        fill capacity. A waiting request then cannot introduce a prefill."""
         if not self.waiting:
             return False
         max_running = getattr(self, "max_num_running_reqs", None)
@@ -698,27 +696,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return num_running < int(max_running)
 
     def _drop_talker_drafts_if_prefill_pending(self) -> None:
-        """Keep the Talker's K-frame decode out of steps with uneven spans.
+        """Clear batch drafts when the next step would have uneven query spans.
 
-        The Talker multi-frame loop requires uniform decode spans, and the
-        runner refuses anything else (better a crash than a silently wrong
-        codec stream). What matters is the number of rows vLLM is about to
-        schedule per request -- not the request's spec_token_ids length:
-
-        * a plain decode is scheduled ``1 + num_spec_tokens`` rows (the
-          continuation placeholders, re-armed every step);
-        * a request carrying a streaming (or chunked) input chunk keeps its
-          own token count, e.g. 7 rows for a 7-token chunk;
-        * a decode that cannot fit the padded width (near max_model_len)
-          falls back to a single row.
-
-        Any mix of those in one step produces non-uniform spans, even in a
-        pure decode batch with no prefill in sight. Rather than dying at
-        the runner, drop the continuation drafts for this round: every
-        decode row schedules a single token next step, the step takes the
-        single-frame path, and the next propose re-arms the K frames.
-        Continuation drafts are stateless, so dropping them is free.
-        """
+        Prefill, streaming input and requests near the context limit may
+        require different widths. Schedule one frame per decode request
+        until uniform K-step spans can resume."""
         if not self._talker_kstep_armed():
             return
         num_spec = int(getattr(self, "num_spec_tokens", 0) or 0)
@@ -821,27 +803,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 del spec_tokens[req_id]
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
-        """Rewrite the K-step spans before upstream books the step.
+        """Normalize K-step spans before upstream books token counters.
 
-        ``_enforce_kstep_span_uniformity`` can shrink rows the static-shape
-        multi-frame loop refuses to execute. Upstream books the step here --
-        ``_update_after_schedule`` is the last thing its ``schedule()`` does
-        (vllm/v1/core/sched/scheduler.py:1516) -- advancing
-        ``num_computed_tokens`` *and* ``num_in_flight_tokens`` by the span each
-        request was scheduled for, while ``update_from_output`` drains only
-        what the dispatched output says (:2023). Rewriting after that point
-        left every shrunk row carrying ``booked - 1`` tokens in flight for
-        good and handed the next admission an inflated computed count: two
-        requests booked 8/4 with drafts and executed as 1/1 settled at 108/104
-        instead of 101/101 (review on #7929).
-
-        Running ahead of the upstream body makes it book exactly the spans
-        that are dispatched, so no request state has to be reconciled
-        afterwards. Every path that books reaches this method -- upstream's
-        ``schedule()`` and the generation fast path both call it -- and the
-        call site in ``schedule()`` below stays as a backstop for a step built
-        without booking, where there is no accounting to settle.
-        """
+        The booked and executed widths must match for both computed tokens
+        and in-flight tokens. Rewriting after booking leaks in-flight tokens."""
         if getattr(self, "_thinker_ngram", False):
             self._limit_thinker_drafts(scheduler_output)
         self._enforce_kstep_span_uniformity(scheduler_output)
@@ -2036,6 +2001,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 plan = update.model_intermediate_buffer["duplex"]["stage0_window"]
                 if self._streaming_update_overflows(session, update, projected_len=plan["replacement_prompt_len"]):
                     return
+                logger.info(
+                    "RSI_DUPLEX_TRIM request=%s cached=%d replacement=%d",
+                    req_id,
+                    session.num_computed_tokens,
+                    plan["replacement_prompt_len"],
+                )
                 self._release_replaced_streaming_prompt_cache(session)
                 self._replace_streaming_session(session, update)
                 return
@@ -2339,35 +2310,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         *,
         projected_len: int | None = None,
     ) -> bool:
-        """Finish a streaming session whose next extension cannot fit the model.
+        """Check whether a streaming update leaves room for the next sampled token.
 
-        Upstream ``_update_request_as_session`` appends the update to the
-        session prompt without checking ``max_model_len``. The worker's input
-        batch then fails to copy the prompt (``could not broadcast input array
-        from shape (N,) into shape (max_model_len,)``) and the EngineCore dies,
-        taking every session on the replica with it. A native duplex session
-        grows by tens to hundreds of tokens per second of input, so long
-        sessions reach this point in normal use.
-
-        A prompt that fills the model exactly is over the line as well: the
-        session samples at least one listen/speak token after every append,
-        and upstream's running-request budget
-        ``max_model_len - num_computed_tokens - num_sampled_tokens_per_step``
-        then goes negative, which the ``num_new_tokens == 0`` guard in
-        ``schedule()`` does not catch (``allocate_slots`` dies, or the worker
-        asserts ``max_model_len + 1`` sampled positions). So the extended
-        prompt must leave room for the tokens sampled in one step.
-
-        The update is dropped and only this request is finished, right here:
-        a parked session does not make the engine schedule, so deferring the
-        finish to the next ``schedule()`` would leave the client waiting. The
-        reason is emitted with the terminal output (see
-        :meth:`_emit_streaming_context_overflow_outputs`).
-
-        ``projected_len`` overrides the extended-prompt projection for a caller
-        that replaces the prompt instead of growing it, such as the MiniCPM
-        Stage-0 window rebuild.
-        """
+        Reject overflow before mutating the prompt. A prompt exactly at the
+        model limit also overflows because each append needs a listen/speak
+        token. Finish through the normal request lifecycle."""
         max_model_len = getattr(self, "max_model_len", None)
         if max_model_len is None:
             model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
@@ -2418,17 +2365,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return True
 
     def _handle_stopped_request(self, request: Request) -> bool:
-        """Do not resume a session whose queued update overflowed the model.
+        """Keep terminal sessions out of the admission queue after overflow.
 
-        Upstream pops one queued ``StreamingUpdate``, applies it through
-        ``_update_request_as_session`` and then re-enqueues the request
-        unconditionally. When that update overflows, the request must not go
-        back into the waiting queue: it is terminal, and admission raises
-        ``RuntimeError: Invalid request status`` on anything that is neither
-        WAITING nor PREEMPTED, which would kill the EngineCore this guard
-        exists to keep alive. The same holds for a session whose overflow was
-        recorded before this call and that upstream still reports as resumed.
-        """
+        Upstream may report a popped streaming update as resumed even when
+        applying it finished the request. Preserve that terminal state."""
         finished = super()._handle_stopped_request(request)
         if finished:
             return True

@@ -1561,6 +1561,28 @@ def test_mid_block_stop_keeps_late_frames_as_stop_rows():
     assert state["finished"] is True
 
 
+def test_terminal_kstep_tail_preserves_stop_rows_without_emitting_audio():
+    model = _make_talker(k_step_frames=8, scripted_samples=[])
+    model._host_sample_empty_delta = torch.empty((0, 1), dtype=torch.long)
+    model._request_audio_states["finished"] = {"finished": True}
+    model._request_audio_states["running"] = {"finished": False}
+    hidden = torch.zeros((16, 8))
+    finished = {"req_id": "finished"}
+    running = {"req_id": "running"}
+
+    assert model.terminal_kstep_tail(hidden, [finished, running]) is None
+    assert model.terminal_kstep_tail(hidden, [{**finished, "native_duplex": True}]) is None
+
+    tail = model.terminal_kstep_tail(hidden, [finished])
+    assert tail is not None
+    out, stops = tail
+    assert out.text_hidden_states is hidden
+    assert out.multimodal_outputs["codes"]["audio"][0].shape == (0, 1)
+    assert out.multimodal_outputs["meta"]["codec_frame_valid"][0].numel() == 0
+    assert bool(out.multimodal_outputs["meta"]["finished"][0])
+    assert stops.argmax(dim=1).tolist() == [1]
+
+
 def test_stop_id_finishes_request_through_device_state_greedy():
     """A codec stop id finishes the request via the device state alone.
 

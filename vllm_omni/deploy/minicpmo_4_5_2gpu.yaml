@@ -1,115 +1,116 @@
-# MiniCPM-o 4.5 two-GPU continuous-batching layout.
-#
-# Thinker owns GPU 0. Talker and Code2Wav share GPU 1, keeping text decoding
-# isolated from codec/vocoder contention while preserving stage-2 batching.
-pipeline: minicpmo_4_5
-async_chunk: true
-# session_mode: duplex makes vllm-omni serve run this model duplex-only
-# (/v1/realtime?duplex=1); every other duplex_session knob keeps its runtime default.
-session_mode: duplex
-# Keep the active window aligned with the session and stage capacities below.
-# A smaller window serializes first-packet generation for concurrent chat turns.
+# Two-card placement and budgets; common settings inherit minicpmo_4_5.yaml.
+base_config: minicpmo_4_5.yaml
 duplex_session:
-  # Matches Stage 0/1 max_num_seqs below.
-  max_sessions: 4
-
-trust_remote_code: true
-enable_prefix_caching: false
-
-connectors:
-  connector_of_shared_memory:
-    name: SharedMemoryConnector
-    extra:
-      connector_get_sleep_s: 0.01
-      connector_get_max_wait_first_chunk: 3000
-      connector_get_max_wait: 300
-      codec_chunk_frames: 25
-      codec_left_context_frames: 3
-      # HiFT capture buckets are derived from codec_chunk_frames and
-      # codec_left_context_frames. (#5869)
-      # A future initial_codec_chunk_frames shape will use lazy capture unless
-      # HiFTGraphWrapper.derive_capture_bucket_size explicitly includes it.
-      enable_hift_graph: true
-      enable_cfm_graph: true
-      # Fused CFM DiT body: NPU packed QKV + ACLNN AddLayerNorm +
-      # im2col-GEMM convolutions and a single cache transpose.
-      cfm_fused_body: true
-      cfm_max_graphs: 32
-
+  max_sessions: 16
 stages:
-  - stage_id: 0
-    max_num_seqs: 4
-    gpu_memory_utilization: 0.9
-    enforce_eager: false
-    tensor_parallel_size: 1
-    max_num_batched_tokens: 16384
-    devices: "0"
-    limit_mm_per_prompt:
-      video: 1
-    default_sampling_params:
-      temperature: 0.0
-      top_p: 1.0
-      top_k: -1
-      max_tokens: 2048
-      seed: 42
-      detokenize: true
-      repetition_penalty: 1.1
-
-  - stage_id: 1
-    max_num_seqs: 4
-    gpu_memory_utilization: 0.55
-    enforce_eager: false
-    max_num_batched_tokens: 8192
-    devices: "1"
-    output_connectors:
-      to_stage_2: connector_of_shared_memory
-    default_sampling_params:
-      temperature: 0.8
-      top_p: 0.85
-      top_k: 25
-      # See minicpmo_4_5.yaml: the Talker rescores this over a 16-frame window.
-      repetition_penalty: 1.05
-      min_tokens: 50
-      max_tokens: 4096
-      seed: 42
-      detokenize: false
-
-  - stage_id: 2
-    max_num_seqs: 4
-    gpu_memory_utilization: 0.35
-    enforce_eager: true
-    enable_chunked_prefill: false
-    max_num_batched_tokens: 65536
-    max_model_len: 65536
-    devices: "1"
-    input_connectors:
-      from_stage_1: connector_of_shared_memory
-    default_sampling_params:
-      temperature: 0.0
-      top_p: 1.0
-      top_k: -1
-      max_tokens: 65536
-      detokenize: true
-
+- max_num_seqs: 4
+  gpu_memory_utilization: 0.9
+  default_sampling_params:
+    repetition_penalty: 1.1
+  stage_id: 0
+- max_num_seqs: 4
+  gpu_memory_utilization: 0.55
+  devices: '1'
+  stage_id: 1
+- max_num_seqs: 4
+  gpu_memory_utilization: 0.35
+  devices: '1'
+  stage_id: 2
 platforms:
   cuda:
     stages:
-      - stage_id: 0
-        # Match the default CUDA Thinker backend for full reference audio.
-        attention_backend: TRITON_ATTN
+    - stage_id: 0
+      attention_backend: TRITON_ATTN
+    - stage_id: 2
+      devices: '1'
+      num_replicas: 1
+      max_num_seqs: 4
+      gpu_memory_utilization: 0.35
   npu:
     stages:
-      - stage_id: 0
-        max_num_batched_tokens: 8192
-        compilation_config:
-          cudagraph_mode: PIECEWISE
-      - stage_id: 1
-        max_num_batched_tokens: 8192
-        compilation_config:
-          cudagraph_mode: PIECEWISE
-      - stage_id: 2
-        # Stage 2 stays outer-eager; CFM Whole-Euler, HiFT and encoder
-        # graphs use the shared Code2Wav wrappers with NPUGraph.
-        additional_config:
-          code2wav_enable_npu_graph: true
-          code2wav_max_npu_graphs: 32
+    - max_num_seqs: 16
+      devices: '1'
+      default_sampling_params:
+        temperature: 0.0
+        top_p: 1.0
+        top_k: -1
+        max_tokens: 2048
+        seed: 42
+        detokenize: true
+        repetition_penalty: 1.0
+      model_runner: v2
+      kv_cache_memory_bytes: 17179869184
+      max_model_len: 40960
+      hf_overrides:
+        rope_parameters:
+          rope_type: yarn
+          rope_theta: 1000000.0
+          factor: 4.0
+          original_max_position_embeddings: 10240
+      speculative_config:
+        method: dspark
+        model: DRAFT_MODEL_PATH
+        num_speculative_tokens: 7
+        draft_tensor_parallel_size: 1
+      model_subdir: thinker-w8a8
+      stage_id: 0
+      additional_config:
+        encoder_enable_npu_graph: true
+        encoder_max_npu_graphs: 4
+        minicpmo_long_prefill_eager: true
+      compilation_config:
+        cudagraph_mode: FULL_DECODE_ONLY
+    - max_num_seqs: 16
+      devices: 1,0
+      num_replicas: 2
+      model_runner: v2
+      model_subdir: original
+      additional_config:
+        minicpmo_talker_prefill_eager: true
+        ascend_compilation_config:
+          enable_npugraph_ex: true
+          enable_static_kernel: true
+          enable_super_kernel: false
+      stage_id: 1
+      default_sampling_params:
+        temperature: 0.8
+        top_p: 0.85
+        top_k: 25
+        repetition_penalty: 1.05
+        min_tokens: 50
+        max_tokens: 4096
+        seed: 42
+        detokenize: false
+        stop_token_ids:
+        - 1
+      speculative_config:
+        method: ngram
+        num_speculative_tokens: 15
+        prompt_lookup_min: 1
+        prompt_lookup_max: 1
+      compilation_config:
+        cudagraph_mode: FULL_DECODE_ONLY
+    - max_num_seqs: 16
+      devices: 0,1
+      num_replicas: 2
+      additional_config:
+        code2wav_enable_npu_graph: true
+        cfm_graph_batch_buckets:
+        - 1
+        - 2
+        - 4
+        - 8
+        code2wav_max_npu_graphs: 96
+      model_runner: v2
+      model_subdir: original
+      stage_id: 2
+      default_sampling_params:
+        temperature: 0.0
+        top_p: 1.0
+        top_k: -1
+        max_tokens: 65536
+        detokenize: true
+    connectors:
+      connector_of_shared_memory:
+        extra:
+          cfm_max_graphs: 96

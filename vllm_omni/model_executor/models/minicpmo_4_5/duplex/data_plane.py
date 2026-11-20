@@ -192,13 +192,15 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         token_ids = _completion_token_ids(completion)
         native_decision = _native_decision(completion, mm_output, token_ids=token_ids, finished=finished)
         if native_decision == "listen":
+            # A committed reply must settle even if the model elects to listen.
+            explicit_reply = _bool_metadata(mm_output, ("duplex_explicit_reply",), default=False)
             listen_result = runtime_result(
                 stage_role="llm",
                 is_listen=True,
                 model_listen=True,
                 listen_source="model_listen",
                 data_plane_request_id=request_id,
-                end_of_turn=False,
+                end_of_turn=explicit_reply,
             )
             if output_turn_id is not None:
                 listen_result["model_turn_id"] = output_turn_id

@@ -2248,7 +2248,7 @@ class DuplexSessionRunner:
             out=self.out,
             model=self.model,
             fail_session=self._fail_session_from_append,
-            payload=payload,
+            payload={**payload, "_native_explicit_reply": True} if precreate_response and final else payload,
             epoch=append_epoch,
             request_id=request_id,
             final=final,

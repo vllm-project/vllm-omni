@@ -11,6 +11,8 @@ from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from copy import copy
 from dataclasses import dataclass
+from os import environ
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from vllm.logger import init_logger
@@ -302,6 +304,14 @@ class StagePool:
         self._strict_watermarking = strict_watermarking
         self._watermark_lock = asyncio.Lock()
         self._next_replica_id = 0
+        mode_file = environ.get("MINICPMO_C8_TALKER_ROUTE_FILE") if stage_id == 1 else None
+        self._c8_route_file = Path(mode_file) if mode_file else None
+        self._c8_route_run = None
+        self._c8_route_counts = [0, 0]
+        c2w_mode_file = environ.get("MINICPMO_C8_VOCODER_ROUTE_FILE") if stage_id == 2 else None
+        self._c8_vocoder_route_file = Path(c2w_mode_file) if c2w_mode_file else None
+        self._c8_vocoder_route_run = None
+        self._c8_vocoder_route_counts = [0, 0]
         self._request_bindings: dict[str, int] = {}
         # Session -> replica. Round-robin would scatter a session's follow-up
         # requests across replicas that do not hold its state. This pool is the
@@ -582,7 +592,12 @@ class StagePool:
             candidates = self._collect_serviceable_replicas()
             if candidates:
                 # LB chose an index *into our candidates list*.
-                lb_idx = self._lb.select(task, [rep for rep, _ in candidates])
+                preferred = self._c8_experimental_talker_replica([rid for _, rid in candidates])
+                lb_idx = (
+                    self._lb.select(task, [rep for rep, _ in candidates])
+                    if preferred is None
+                    else next(i for i, (_, rid) in enumerate(candidates) if rid == preferred)
+                )
                 replica_info, replica_id = candidates[lb_idx]
                 self._affinity[request_id] = replica_info.input_addr
                 if session_id is not None:
@@ -659,7 +674,12 @@ class StagePool:
         if not candidates:
             return None
 
-        lb_idx = self._lb.select(selection_task, [rep for rep, _ in candidates])
+        preferred = self._c8_experimental_talker_replica([rid for _, rid in candidates])
+        lb_idx = (
+            self._lb.select(selection_task, [rep for rep, _ in candidates])
+            if preferred is None
+            else next(i for i, (_, rid) in enumerate(candidates) if rid == preferred)
+        )
         replica_info, replica_id = candidates[lb_idx]
         self._affinity[request_id] = replica_info.input_addr
         if session_id is not None:
@@ -1067,6 +1087,60 @@ class StagePool:
     def session_binding_count(self) -> int:
         return len(self._session_bindings)
 
+    def _c8_experimental_talker_replica(self, live: list[int]) -> int | None:
+        """Optional local experiment; choose only for previously unbound requests."""
+        if self._c8_route_file is None or self.stage_id != 1 or set(live) != {0, 1}:
+            return None
+        try:
+            mode, arm = self._c8_route_file.read_text().split()
+        except (OSError, ValueError):
+            return None
+        if mode not in {"primary", "quarter", "half", "secondary"}:
+            return None
+        if (mode, arm) != self._c8_route_run:
+            self._c8_route_run = (mode, arm)
+            self._c8_route_counts[:] = [0, 0]
+        n = sum(self._c8_route_counts)
+        secondary = mode == "secondary" or (mode == "quarter" and n % 4 == 3) or (mode == "half" and n % 2 == 1)
+        chosen = int(secondary)
+        self._c8_route_counts[chosen] += 1
+        if n + 1 in (4, 24, 32, 48, 72, 96):
+            logger.info(
+                "C8 Talker replica route mode=%s arm=%s primary=%d secondary=%d", mode, arm, *self._c8_route_counts
+            )
+        return chosen
+
+    def select_experimental_code2wav_replica(self, request_id: str) -> int | None:
+        """Pin an HTTP turn at prewarm, before the Talker is assigned at text handoff."""
+        if self._c8_vocoder_route_file is None or set(self.available_replica_ids()) != {0, 1}:
+            return None
+        existing = self.get_bound_replica_id(request_id)
+        if existing is not None:
+            return existing
+        if request_id in self._requested_replica_ids:
+            return None
+        try:
+            mode, arm = self._c8_vocoder_route_file.read_text().split()
+        except (OSError, ValueError):
+            return None
+        if mode not in ("primary", "secondary", "eighth", "quarter"):
+            return None
+        if (mode, arm) != self._c8_vocoder_route_run:
+            self._c8_vocoder_route_run = (mode, arm)
+            self._c8_vocoder_route_counts[:] = [0, 0]
+        n = sum(self._c8_vocoder_route_counts) + 1
+        pick_secondary = mode == "secondary" or (mode == "eighth" and n % 8 == 0) or (mode == "quarter" and n % 4 == 0)
+        chosen = int(pick_secondary)
+        self._c8_vocoder_route_counts[chosen] += 1
+        if n in (4, 32, 96):
+            logger.info(
+                "C8 vocoder route mode=%s arm=%s primary=%d secondary=%d",
+                mode,
+                arm,
+                *self._c8_vocoder_route_counts,
+            )
+        return chosen
+
     def select_replica_id(
         self,
         request_id: str,
@@ -1098,13 +1172,15 @@ class StagePool:
             live = [r for r in self.live_replica_ids() if self.is_replica_available(r)]
             if not live:
                 raise StageUnavailableError(f"stage {self.stage_id} has no live replicas")
-            if len(live) == 1:
-                chosen = live[0]
-            else:
-                # Round-robin over live, available replicas only.
-                start = self._next_replica_id % len(live)
-                chosen = live[start]
-                self._next_replica_id = (self._next_replica_id + 1) % len(live)
+            chosen = self._c8_experimental_talker_replica(live)
+            if chosen is None:
+                if len(live) == 1:
+                    chosen = live[0]
+                else:
+                    # Round-robin over live, available replicas only.
+                    start = self._next_replica_id % len(live)
+                    chosen = live[start]
+                    self._next_replica_id = (self._next_replica_id + 1) % len(live)
 
         self._request_bindings[request_id] = chosen
         if session_id is not None:

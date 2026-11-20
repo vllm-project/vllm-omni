@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniCPM-o 4.5 Thinker-to-Talker and Talker-to-Code2Wav bridges."""
 
+import os
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -23,6 +24,8 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
 from vllm_omni.model_executor.models.minicpmo_4_5.handoff import pack_handoff_tensor, unpack_handoff_tensor
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
+from vllm_omni.worker_v2.stage_trace import boundary as _c8_boundary
+from vllm_omni.worker_v2.stage_trace import enabled as _c8_trace_enabled
 
 logger = init_logger(__name__)
 _MINICPMO45_ASYNC_STATE = "_minicpmo45_async_codec_state"
@@ -195,6 +198,26 @@ def _codec_config(transfer_manager: Any) -> tuple[int, int]:
             f"codec_left_context_frames={left_context_frames}"
         )
     return chunk_frames, left_context_frames
+
+
+def _c8_turn_codec_windows(steady: int) -> tuple[int, int]:
+    # A request keeps its selected windows even when the experiment changes modes.
+    filename = os.environ.get("MINICPMO_C8_CODEC_WINDOW_MODE_FILE")
+    if filename:
+        try:
+            with open(filename, encoding="utf-8") as f:
+                mode = f.read().strip()
+        except OSError:
+            mode = ""
+        if mode == "64":
+            return 64, 64
+        if mode == "32_64":
+            return 32, 64
+        if mode == "96":
+            return 96, 96
+        if mode == "32_96":
+            return 32, 96
+    return steady, steady
 
 
 def _request_intermediate_section(request: object, section: str) -> dict[str, object]:
@@ -408,9 +431,12 @@ def tts2code2wav_async_chunk(
     if finished and condition_key is not None:
         record["last_closed_condition"] = condition_key
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
-    # One window size for every payload. A separate smaller first window
-    # (initial_codec_chunk_frames) used to shorten the first payload, but with
-    # the steady window itself at 25 frames it only added a seam.
+    if not native_duplex and os.environ.get("MINICPMO_C8_CODEC_WINDOW_MODE_FILE"):
+        windows = state.get("turn_experiment_windows")
+        if windows is None:
+            windows = _c8_turn_codec_windows(chunk_frames)
+            state["turn_experiment_windows"] = windows
+        chunk_frames = windows[bool(state["codec_end"])]
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
     if not flush_pending and len(pending) < chunk_frames:
@@ -439,6 +465,23 @@ def tts2code2wav_async_chunk(
     else:
         context = []
         output_codes = []
+    if native_duplex and os.getenv("MINICPMO_RSI_NATIVE_AUDIO_TRACE"):
+        logger.info(
+            "RSI_NATIVE_CODEC request=%s turn=%s condition=%s chunk=%d new=%d length=%d left=%d "
+            "held=%d flush=%s tail=%s sampled=%s codes=%s",
+            request_id,
+            duplex_turn_id,
+            condition_seq,
+            int(record["chunk_seq"]),
+            new_token_count,
+            codec_end,
+            len(context),
+            len(pending),
+            flush_pending,
+            last_chunk,
+            getattr(request, "sampled_token_ids", ()),
+            new_codes,
+        )
     state["codec_end"] = codec_end
     code_flat_numel = len(output_codes)
     if native_duplex and code_flat_numel > 0:
@@ -502,6 +545,8 @@ def tts2code2wav_async_chunk(
         record["cache_epoch"] = int(record["cache_epoch"]) + 1
         record["chunk_seq"] = 0
         _drop_codec_state(transfer_manager, request_id)
+    if _c8_trace_enabled():
+        _c8_boundary("codec_to_vocoder", request=request_id, chunk=chunk_seq, frames=new_token_count, last=last_chunk)
     return payload
 
 
@@ -1302,6 +1347,19 @@ def llm2tts(
                 llm_output_ids,
                 prompt_token_ids,
             )
+        if is_native_duplex_handoff and os.getenv("MINICPMO_RSI_NATIVE_AUDIO_TRACE"):
+            logger.info(
+                "RSI_NATIVE_TEXT request=%s condition=%s first=%s end=%s punct=%s ids=%s text=%r",
+                llm_output.request_id,
+                condition_sequence_value,
+                native_turn_start,
+                native_turn_end_handoff,
+                turn_text_ends_sentence,
+                handoff_ids,
+                thinker_text,
+            )
+        if _c8_trace_enabled():
+            _c8_boundary("text_to_talker", request=str(llm_output.request_id))
         tts_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=scheduler_prompt_token_ids,
