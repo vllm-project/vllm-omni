@@ -61,9 +61,6 @@ async def test_qwen3_omni_merged_lora_ipc_preserves_graph_storage_and_restores_o
         engine = AsyncOmni(
             model=MODEL,
             deploy_config=deploy,
-            # Real checkpoint loading and graph warmup need the test runner's startup budget.
-            stage_init_timeout=600,
-            init_timeout=1800,
             worker_extension_cls="tests.e2e.features.rlhf_test.qwen3_omni_merge_probe.Qwen3OmniMergeProbe",
         )
         after.callback(engine.shutdown)

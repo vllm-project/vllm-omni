@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import inspect
 import threading
 from contextlib import nullcontext
 from dataclasses import replace
@@ -126,6 +127,11 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     # FULL-graph aux-output contract (see _configure_cudagraph_output_contract).
     _full_graph_aux_outputs = False
     _aux_output_spec: Any = None
+    # `_call_model` inspects the model signature once so legacy Omni-only
+    # inputs are not passed to a fixed core-style forward().
+    _forward_signature_resolved: bool = False
+    _forward_accepts_var_kwargs: bool = False
+    _forward_param_names: frozenset[str] | None = None
 
     def _configure_cudagraph_output_contract(self) -> None:
         """Select the CUDA graph output contract declared by the model."""
@@ -1251,7 +1257,41 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
 
     def _call_model(self, model_inputs: dict[str, Any], *, input_batch: Any, batch_desc: Any) -> Any:
         """Invoke the model once; platform runners may override for frame loops."""
+        self._resolve_forward_signature()
+        if not self._forward_accepts_var_kwargs and self._forward_param_names is not None:
+            model_inputs = {
+                name: value for name, value in model_inputs.items() if name in self._forward_param_names
+            }
         return self.model(**model_inputs)
+
+    def _resolve_forward_signature(self) -> None:
+        """Cache which keyword arguments the model's forward() accepts.
+
+        Legacy AR inputs are only meant for Omni pipelines. A model with a fixed
+        core-style signature rejects them, while a model that declares
+        ``**kwargs`` (or whose signature cannot be inspected) keeps receiving
+        every input.
+        """
+        if self._forward_signature_resolved:
+            return
+        self._forward_signature_resolved = True
+        forward = getattr(self.model, "forward", None)
+        if forward is None:
+            self._forward_accepts_var_kwargs = True
+            return
+        try:
+            parameters = list(inspect.signature(forward).parameters.values())
+        except (TypeError, ValueError):
+            self._forward_accepts_var_kwargs = True
+            return
+        self._forward_accepts_var_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters
+        )
+        self._forward_param_names = frozenset(
+            parameter.name
+            for parameter in parameters
+            if parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        )
 
     # ------------------------------------------------------------------
     # Request lifecycle: update intermediate buffer from cached requests
