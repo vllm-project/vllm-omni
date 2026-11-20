@@ -7,8 +7,8 @@
 # model_type stays "yue2" so the registered Yue2Config is used; no
 # trust_remote_code is needed (the registered config/model win over the
 # checkpoint's auto_map).
-# Audio synthesis depends on V1 model sampling hooks.
-model_runner: v1
+# Model-owned sampling and acoustic completion use the V2 YuE2 worker.
+model_runner: v2
 pipeline: yue2
 async_chunk: false
 dtype: bfloat16
@@ -19,6 +19,7 @@ stages:
     max_num_seqs: 4
     async_scheduling: false
     enable_chunked_prefill: false
+    worker_cls: vllm_omni.model_executor.models.yue2.worker.Yue2Worker
     # Reserve synthesis headroom: NAR K/V, acoustic graph buffers and VAE
     # activations are allocated beyond the engine budget. The earlier 4090
     # memory measurement predates async/compiled synthesis; 0.70 is a starting
