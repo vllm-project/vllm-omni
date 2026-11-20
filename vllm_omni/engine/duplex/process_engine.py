@@ -19,7 +19,7 @@ import socket
 import traceback
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Protocol
 
@@ -63,6 +63,7 @@ class WorkerRuntime(Protocol):
     model: str
     engine: Any  # Native engine or the lightweight engine used by spawn tests.
     process_warmup_audio: dict[str, object]
+    process_warmup_turn: dict[str, object]
 
     async def check_health(self) -> None: ...
 
@@ -95,6 +96,7 @@ class ProcessDuplexMetadata:
     frontend_max_sessions: int
     warmup_audio: dict[str, object]
     endpoint_restrictions: list[tuple[str, str]]
+    warmup_turn: dict[str, object] = field(default_factory=dict)
 
     @classmethod
     def from_runtime(cls, runtime: WorkerRuntime) -> ProcessDuplexMetadata:
@@ -125,6 +127,7 @@ class ProcessDuplexMetadata:
             frontend_group_count=engine.duplex_frontend_group_count,
             frontend_max_sessions=engine.duplex_frontend_max_sessions,
             warmup_audio=runtime.process_warmup_audio,
+            warmup_turn=dict(runtime.process_warmup_turn),
             endpoint_restrictions=[(r.capability.name, r.reason) for r in engine.endpoint_restrictions],
         )
 

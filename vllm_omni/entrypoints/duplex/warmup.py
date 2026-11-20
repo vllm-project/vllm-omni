@@ -71,6 +71,15 @@ class _ProcessWarmupProfile:
     def silence_unit_payload(self) -> dict[str, object]:
         return dict(self.engine.metadata.warmup_audio)
 
+    def startup_warmup_turn(self) -> dict[str, object] | None:
+        """The spoken clip captured in the worker, or None when the plugin has none.
+
+        The API process never loads the model plugin, so this is the same
+        metadata channel ``warmup_audio`` already uses.
+        """
+        turn = getattr(self.engine.metadata, "warmup_turn", None)
+        return dict(turn) if isinstance(turn, dict) and turn else None
+
 
 def lookup_duplex_plugin(engine_client: object) -> object | None:
     from vllm_omni.engine.duplex.process_engine import ProcessDuplexEngineClient

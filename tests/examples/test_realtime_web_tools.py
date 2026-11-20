@@ -451,6 +451,7 @@ async def test_tool_frame_belongs_to_the_turn_that_made_the_call() -> None:
         # Turn 1: camera on.
         server._note_client_event(state, {"type": "input_audio_buffer.append", "video_frames": ["frame-1"]})
         server._note_client_event(state, {"type": "input_audio_buffer.commit"})
+        backend.push({"type": "response.created", "response_id": "resp_1"})
         backend.push(_call_event("call_1", "resp_1"))
         await _settle()
         # A second call in the same turn keeps that turn's frame.
@@ -459,9 +460,40 @@ async def test_tool_frame_belongs_to_the_turn_that_made_the_call() -> None:
         # Turn 2: camera turned off, audio only.
         server._note_client_event(state, {"type": "input_audio_buffer.append", "audio": "pcm"})
         server._note_client_event(state, {"type": "input_audio_buffer.commit"})
+        backend.push({"type": "response.created", "response_id": "resp_2"})
         backend.push(_call_event("call_2", "resp_2"))
         await _settle()
     finally:
         pump.cancel()
         await asyncio.gather(pump, return_exceptions=True)
     assert seen == ["frame-1", "frame-1", ""]
+
+
+@pytest.mark.asyncio
+async def test_unsubmitted_commit_does_not_replace_the_admitted_response_frame() -> None:
+    seen: list[str] = []
+
+    class _FrameTools(_Tools):
+        uses_latest_frame = True
+
+        async def run(self, name: str, arguments: str, frame_b64: str = "") -> str:
+            seen.append(frame_b64)
+            return await super().run(name, arguments)
+
+    backend = _QueueBackend()
+    state = _proxy_state()
+    pump = asyncio.create_task(server._pump_backend_to_client(_NullClient(), backend, _FrameTools(), state))
+    try:
+        server._note_client_event(state, {"type": "input_audio_buffer.append", "video_frames": ["frame-a"]})
+        server._note_client_event(state, {"type": "input_audio_buffer.commit"})
+        backend.push({"type": "response.created", "response_id": "resp_A"})
+        await _settle()
+        # A later video-only commit rotates the client buffer but is not admitted.
+        server._note_client_event(state, {"type": "input_audio_buffer.append", "video_frames": ["frame-b"]})
+        server._note_client_event(state, {"type": "input_audio_buffer.commit"})
+        backend.push(_call_event("call_a", "resp_A"))
+        await _settle()
+    finally:
+        pump.cancel()
+        await asyncio.gather(pump, return_exceptions=True)
+    assert seen == ["frame-a"]

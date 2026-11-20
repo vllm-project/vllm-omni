@@ -11,6 +11,7 @@ from vllm_omni.entrypoints.duplex.warmup import (
     _WARMUP_FRAME_WIDTH,
     _WARMUP_INSTRUCTIONS,
     _WARMUP_SAMPLE_RATE_HZ,
+    _ProcessWarmupProfile,
     _short_pcm_f32le_b64,
     _warmup_jpeg_b64,
     startup_warmup_kind,
@@ -63,6 +64,26 @@ def test_plugin_warmup_turn_replaces_the_shared_tone() -> None:
     assert turn["sample_rate_hz"] == 16000
     assert turn["instructions"] == _WARMUP_INSTRUCTIONS
     assert turn["video_frames"]
+
+
+class _ProcessEngine:
+    def __init__(self, warmup_turn: dict[str, object]) -> None:
+        self.metadata = type("Metadata", (), {"warmup_turn": warmup_turn})()
+        self.duplex_capabilities = DuplexCapabilities(required_input_modalities=frozenset({"video"}))
+
+
+def test_process_profile_carries_the_spoken_warmup_clip() -> None:
+    profile = _ProcessWarmupProfile(_ProcessEngine({"audio": "c3BlZWNo", "format": "pcm16", "sample_rate_hz": 16000}))
+    turn = video_warmup_turn(profile)
+    assert turn["audio"] == "c3BlZWNo"
+    assert turn["format"] == "pcm16"
+    assert turn["sample_rate_hz"] == 16000
+
+
+def test_process_profile_without_a_clip_keeps_the_shared_tone() -> None:
+    turn = video_warmup_turn(_ProcessWarmupProfile(_ProcessEngine({})))
+    assert turn["format"] == "pcm_f32le"
+    assert turn["audio"] == _short_pcm_f32le_b64()
 
 
 def test_incomplete_plugin_warmup_turn_keeps_the_shared_tone() -> None:

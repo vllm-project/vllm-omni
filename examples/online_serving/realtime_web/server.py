@@ -34,10 +34,11 @@ def _join_ws_url(base: str, path: str, query: str) -> str:
 class ToolExecutor(Protocol):
     """Runs the client side of function calling on the browser's behalf.
 
-    An executor that sets ``uses_latest_frame`` also receives the newest
-    camera frame the user sent for the turn that made the call (frames from
-    ``input_audio_buffer.append`` since the previous commit). It gets an empty
-    string when that turn had none. Executors that do not set it keep the
+    An executor that sets ``uses_latest_frame`` also receives the camera frame
+    bound to the response that made the call (frames from
+    ``input_audio_buffer.append`` since the previous commit, copied when that
+    response is created). It gets an empty string when that response had none.
+    Executors that do not set it keep the
     two-argument ``run`` and never see the frame.
     """
 
@@ -78,11 +79,15 @@ def _note_client_event(state: dict[str, Any], event: dict[str, Any]) -> None:
     """Reset a follow-up on a user commit, and keep the newest camera frame.
 
     Frames seen since the previous commit belong to the turn this commit closes:
-    they move to ``turn_frame`` and ``last_frame`` starts empty, so a later
+    they move to ``pending_frame`` and ``last_frame`` starts empty, so a later
     audio-only turn never reuses a frame from before the camera was turned off.
+    A commit the backend does not admit must not replace the frame of a
+    response that is already running, so the pending frame is copied onto a
+    response only when that response is created.
     """
     if event.get("type") == "input_audio_buffer.commit":
-        state["turn_frame"] = str(state.get("last_frame") or "")
+        state["pending_frame"] = str(state.get("last_frame") or "")
+        state["turn_frame"] = state["pending_frame"]
         state["last_frame"] = ""
         state["gen"] += 1
         state["count"] = 0
@@ -138,6 +143,33 @@ def _is_user_commit(text: str) -> bool:
 def _event_response_id(event: dict[str, Any]) -> str | None:
     response_id = event.get("response_id")
     return response_id if isinstance(response_id, str) and response_id else None
+
+
+def _bind_admitted_frame(state: dict[str, Any], response_id: str | None) -> None:
+    """Copy the frame of the latest commit onto a response the backend admitted.
+
+    Client commits rotate ``pending_frame`` before the backend decides whether
+    to submit them. A video-only commit that stays unsubmitted therefore leaves
+    the previous response's frame alone.
+    """
+    if response_id is None:
+        return
+    frames = state.setdefault("frames_by_response", {})
+    if response_id in frames:
+        return
+    frames[response_id] = str(state.get("pending_frame") or "")
+
+
+def _frame_for_response(state: dict[str, Any], response_id: str | None) -> str:
+    """The frame bound when this response was admitted.
+
+    A response that has not been created yet still reads the latest commit, so
+    a caller that never sees ``response.created`` keeps the previous behavior.
+    """
+    frames = state.get("frames_by_response")
+    if response_id is not None and isinstance(frames, dict) and response_id in frames:
+        return str(frames[response_id] or "")
+    return str(state.get("turn_frame") or "")
 
 
 def _hold_follow_up_for_response_done(state: dict[str, Any], response_id: str | None = None) -> None:
@@ -264,6 +296,8 @@ async def _pump_backend_to_client(
             if event is None:
                 continue
             kind = event.get("type")
+            if tool_followups is not None and kind == "response.created":
+                _bind_admitted_frame(tool_followups, _event_response_id(event))
             if (
                 tool_followups is not None
                 and kind == "response.done"
@@ -289,9 +323,13 @@ async def _pump_backend_to_client(
                         call,
                         follow_up=follow_up or final_answer,
                         follow_state=tool_followups,
-                        # The frame of the turn that made this call, read now: a
-                        # commit while the call is queued starts a new turn.
-                        frame_b64=str(tool_followups.get("turn_frame") or "") if tool_followups is not None else "",
+                        # The frame bound to this response. A later commit that the
+                        # backend has not admitted must not replace it.
+                        frame_b64=(
+                            _frame_for_response(tool_followups, _event_response_id(event))
+                            if tool_followups is not None
+                            else ""
+                        ),
                     )
                 )
                 calls.add(task)
@@ -415,6 +453,8 @@ def build_app(
                     "inflight_gen": None,
                     "last_frame": "",
                     "turn_frame": "",
+                    "pending_frame": "",
+                    "frames_by_response": {},
                     "pending_response_id": None,
                 }
                 tasks = {
