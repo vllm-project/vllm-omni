@@ -316,7 +316,7 @@ class StageEngineCoreClientBase(StageClientBase):
             if not address:
                 continue
             host = urlparse(address).hostname
-            if host in {None, "", "*", "0.0.0.0", "::"}:
+            if host is None or host in {"", "*", "0.0.0.0", "::"}:
                 continue
             if _is_loopback_host(host):
                 detected = self._detect_local_ip()
