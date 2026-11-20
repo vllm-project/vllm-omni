@@ -472,8 +472,10 @@ FP8/NVFP4 comparison tests.
 The test matrix includes these four-card workloads. AR+DiT accuracy is
 marked `local_model` and excluded from CUDA nightly `full_model` selection;
 its BF16 TP=2 DiT stage exceeded 80 GB per GPU during model initialization.
-The NPU accuracy job explicitly selects `(full_model or local_model)` to
-run all three accuracy cases. Other workloads use `full_model` selection:
+The NPU accuracy job selects `full_model` and runs only the DiT TP=4
+online IT2I case; it excludes the two `local_model` AR+DiT cases. The CUDA
+accuracy job selects the same DiT case and the separate LoRA test. The
+new distilled FP8 performance cases below are CUDA-only and use `full_model`:
 
 | Workload | Weights | Parallelism | Dataset / output | Concurrency | Metrics |
 | --- | --- | --- | --- | --- | --- |
@@ -482,19 +484,19 @@ run all three accuracy cases. Other workloads use `full_model` selection:
 | DiT accuracy | Distil, BF16 | TP=4 (0,1,2,3) | IT2I, one output image | 1 | PSNR, SSIM |
 | AR + DiT accuracy | Distil, BF16 | AR TP=2 (0,1), DiT TP=2 (2,3) | IT2I, one output image | 1 | PSNR, SSIM, CoT similarity, image similarity, CoT prefix |
 
-Performance uses `tencent/HunyuanImage-3.0-Instruct-Distil` with
+The CUDA performance matrix uses `tencent/HunyuanImage-3.0-Instruct-Distil` with
 `--quantization fp8` for both stages. It does not benchmark the original
 Instruct checkpoint with an eight-step schedule. SP uses Ulysses. Both
 performance deploys set `async_chunk: false` (non-duplex).
 
 Performance cases reuse the production `hunyuan_image_3_moe.yaml` and
 `hunyuan_image3_dit.yaml` deployments. Their JSON `stage_overrides` selects
-the four-card topology on CUDA and NPU, uses the shared-memory connector
+the four-card topology on CUDA, uses the shared-memory connector
 for colocated AR+DiT, and limits AR memory utilization to 0.85 to leave
 headroom for IT2I VAE encoding. No performance-only deployment YAML is needed.
 
-The AR+DiT workload extends the existing
-`tests/dfx/perf/tests/test_hunyuan_image3_ar_tp2_dit_sp2.json`: it retains the custom
+The CUDA AR+DiT workload is configured in
+`tests/dfx/perf/tests/test_hunyuan_image3_ar_tp2_dit_sp2.json`. It retains the custom
 prompt, input image, `/v1/images/edits` endpoint and `think_recaption` task.
 The DiT-only request format can also be compared with
 `tests/dfx/perf/tests/test_hunyuan_image3_prefix_caching.json`, which uses
@@ -503,6 +505,13 @@ existing local-model performance suite is retained alongside the new matrix;
 it does not supply an accuracy reference image. The previous
 AR+DiT H200 performance baseline describes Instruct with DiT TP=2, so it
 does not calibrate the distilled FP8 TP=1/SP=2 workload.
+
+NPU nightly performance retains the original Instruct DiT-only scenarios:
+TP=2/CFG=2, TP=2/SP=2 and TP=4, all at concurrency 1. These jobs use
+`run_diffusion_benchmark.py` with `test_hunyuan_image_tp2_cfgp2.json`,
+`test_hunyuan_image_tp2_sp2.json` and `test_hunyuan_image_tp4.json`,
+respectively, under `tests/dfx/perf/tests/`. They do not run the distilled
+FP8 CUDA matrix or an INT8 replacement.
 
 Run from the repository root on four H100/B200 GPUs with the matching
 vLLM/vLLM-Omni runtime, cached weights and access to the input image URLs:
@@ -514,7 +523,7 @@ pytest -sv tests/e2e/accuracy/test_hunyuan_image3.py -k test_hunyuan_image3_ar_t
 ```
 
 Both accuracy workloads use the distilled checkpoint in BF16 without
-quantization and with eight inference steps. Performance workloads retain FP8. AR+DiT accuracy also needs
+quantization and with eight inference steps. The CUDA performance matrix uses FP8. AR+DiT accuracy also needs
 `FlagEmbedding` and the embedding/CLIP model caches. `HUNYUAN_MODEL_PATH`
 (AR+DiT) and `HUNYUAN_IMAGE3_MODEL` (DiT-only) may point to local distilled
 checkpoints. AR+DiT retains its existing distilled image/CoT references and
@@ -529,13 +538,18 @@ platform from `tests/assets/hunyuan_image3/`:
 | Platform profile | Reference PNG | SSIM floor | PSNR floor (dB) |
 | --- | --- | --- | --- |
 | CUDA: H200/H100/B200/default | `hunyuan_image3_dit_distill_it2i_ref.png` | 0.95 | 29.0 |
-| NPU: A3 | `hunyuan_image3_dit_distill_it2i_ref_npu.png` | 0.92 | 28.0 |
+| NPU: A3 | `hunyuan_image3_dit_distill_it2i_ref_npu.png` | 0.92 | 25.0 |
 
-These are acceptance floors, with margin below the five-run calibration
-minima, rather than the measured means. The CUDA measurements were collected
-on H200; H100/B200 and the default profile use the same configured floors.
-See the [CUDA/H200 calibration](https://github.com/vllm-project/vllm-omni/pull/10408#issuecomment-6940430119)
-and [A3 calibration](https://github.com/vllm-project/vllm-omni/pull/10408#issuecomment-6936673053).
+These are acceptance floors rather than measured means. The CUDA floors
+allow margin below the five-run
+[CUDA/H200 calibration](https://github.com/vllm-project/vllm-omni/pull/10408#issuecomment-6940430119);
+H100/B200 and the default profile use the same configured floors.
+The A3 floors use the
+[two BF16 NPU measurements from November 19, 2026](https://github.com/vllm-project/vllm-omni/pull/10408#issuecomment-7027555651):
+both recorded SSIM 0.939406 and PSNR 26.196703 dB. The floors leave margins
+of approximately 0.0194 SSIM and 1.197 dB PSNR below those values. Two
+identical measurements do not characterize variation across more runs or
+environments.
 The AR+DiT image/CoT references and thresholds remain separate. No reference
 environment variables are required:
 
@@ -544,10 +558,15 @@ pytest -sv tests/e2e/accuracy/test_hunyuan_image3.py::test_hunyuan_image3_dit_tp
 pytest -sv tests/e2e/accuracy/test_hunyuan_image3.py::test_hunyuan_image3_dit_tp4_it2i_online -m "full_model and diffusion and H100 and cards_4" --run-level full_model
 ```
 
-The two new performance workloads intentionally have empty `baseline` maps
-until calibration on the target CI hardware. The unified runner records `mean_e2el_ms`,
-`p99_e2el_ms` and `request_throughput`, but empty baselines do not establish a
-performance regression gate. Populate each hardware bucket with measured
-values before treating the matrix as calibrated. Sweep baseline values are
-lists in concurrency order: `[1,16]` for AR+DiT and `[1,4]` for DiT. Do not
-reuse the previous Instruct TP=2/SP=2 or TP=4 benchmark numbers.
+Both CUDA performance JSONs contain H100 baselines for `mean_e2el_ms`
+(mean end-to-end latency in milliseconds) and `request_throughput`
+(requests per second). The
+[three-run H100 calibration](https://github.com/vllm-project/vllm-omni/pull/10408#issuecomment-6981504330)
+uses the highest observed mean latency and lowest observed throughput for
+each concurrency. Baseline values are lists in concurrency order:
+`[1,16]` for AR+DiT and `[1,4]` for DiT. CUDA nightly uses `--assert-baseline`
+to check the configured hardware baselines. Additional hardware profiles
+need their own measured baselines; the H100 calibration does not establish
+B200 performance. The retained NPU performance JSONs have separate A3
+baselines and use the original runner's metric names. Do not reuse their
+Instruct benchmark values for the distilled FP8 CUDA workloads.
