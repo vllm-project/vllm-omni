@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 import vllm_omni.diffusion.executor.multiproc_executor as executor_module
 from vllm_omni.diffusion.data import AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
@@ -27,6 +28,8 @@ def _make_executor(step_execution=False):
     """Create a minimal MultiprocDiffusionExecutor-like object with pump state."""
     od_config = MagicMock()
     od_config.step_execution = step_execution
+    # OmniDiffusionConfig defaults this to None; a MagicMock attribute would be parsed as a schedule.
+    od_config.diffusion_attention_schedule = None
 
     executor = object.__new__(MultiprocDiffusionExecutor)
     executor.od_config = od_config
@@ -38,6 +41,7 @@ def _make_executor(step_execution=False):
     executor._dropped_output_ids = OrderedDict()
     executor._batch_split_map = {}
     executor._futures_lock = threading.RLock()
+    executor._chunk_ready_handler = None
     executor._pump_running = False
     executor._pump_stop = threading.Event()
     executor._sync_result_buffer = queue.Queue()
@@ -686,7 +690,10 @@ class TestDropOutput:
 
     def test_dropped_ids_memory_is_bounded(self, monkeypatch):
         cap = 8
-        monkeypatch.setattr(executor_module, "_DROPPED_OUTPUT_IDS_MAX", cap)
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.executor.async_output_cache._DROPPED_OUTPUT_IDS_MAX",
+            cap,
+        )
         executor = _make_executor()
         n = cap + 5
         for i in range(n):
@@ -965,8 +972,8 @@ def test_async_request_output_preserves_error_metadata(status_code, error_type):
 @pytest.mark.parametrize("status_code", [400, 422, None])
 def test_request_rpc_exception_keeps_metadata_for_every_request(monkeypatch, mocker, dp_wave, status_code):
     executor = _make_executor()
-    monkeypatch.setattr(executor_module, "any_selected_component_uses_allgather", lambda config: dp_wave)
-    monkeypatch.setattr(executor_module, "_uses_text_encoder_allgather", lambda config: False)
+    monkeypatch.setattr(executor_module, "uses_rank_local_dp_concurrency", lambda config: dp_wave)
+    monkeypatch.setattr(executor_module, "uses_text_encoder_allgather", lambda config: False)
     error = (
         OmniClientError("invalid schedule", status_code=status_code, error_type="ScheduleError")
         if status_code is not None
@@ -1002,3 +1009,103 @@ def test_request_rpc_exception_keeps_metadata_for_every_request(monkeypatch, moc
         assert item.result.error_status_code == status_code
         assert item.result.error_type == ("ScheduleError" if status_code is not None else None)
     assert executor.collective_rpc.call_count == (1 if dp_wave else 2)
+
+
+def test_dp_wave_key_resolves_attention_schedules_against_the_service(monkeypatch, mocker):
+    """The wave check must build the scheduler's key, which resolves each request's schedule.
+
+    Without the service config, explicit ranges would be resolved against no profiles and rejected,
+    failing a wave the scheduler formed. Mirrors the Ray executor test of the same name.
+    """
+    executor = _make_executor()
+    service = object()
+    executor.od_config.diffusion_attention_schedule = service
+    monkeypatch.setattr(executor_module, "uses_rank_local_dp_concurrency", lambda config: True)
+    monkeypatch.setattr(executor_module, "uses_text_encoder_allgather", lambda config: False)
+    received: list[object] = []
+
+    def _recording_key(req, attention_schedule_config=None):
+        received.append(attention_schedule_config)
+        return ()
+
+    monkeypatch.setattr(executor_module, "build_request_batch_sampling_params_key", _recording_key)
+    # The wave fails after the compatibility check; only the key builder's arguments matter here.
+    executor.collective_rpc = mocker.Mock(side_effect=RuntimeError("worker failed"))
+    new_reqs = [
+        NewRequestData(
+            request_id=name,
+            req=OmniDiffusionRequest(
+                request_id=name,
+                prompt={"prompt": "a test"},
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=4),
+            ),
+        )
+        for name in ("first", "second")
+    ]
+    sched = DiffusionSchedulerOutput(
+        step_id=0,
+        scheduled_new_reqs=new_reqs,
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        finished_req_ids=set(),
+        num_running_reqs=len(new_reqs),
+        num_waiting_reqs=0,
+    )
+
+    executor.execute_request(sched)
+
+    assert received == [service, service]
+    executor.collective_rpc.assert_called_once()
+
+
+def test_result_pump_routes_chunk_ready_without_completing_rpc():
+    executor = _make_executor()
+    rpc_future: concurrent.futures.Future = concurrent.futures.Future()
+    executor._rpc_futures["7"] = rpc_future
+    seen: list[tuple] = []
+    executor.register_chunk_ready_handler(lambda *args: seen.append(args))
+    payload = torch.zeros(2)
+    output = DiffusionOutput(finished=False, chunk_index=0, total_chunks=3, output=payload, async_output_id="chunk-0")
+    msg = AsyncDiffusionOutput(
+        kind=AsyncOutputKind.CHUNK_READY,
+        rpc_id="7",
+        request_id="req",
+        chunk_index=0,
+        async_output_id="chunk-0",
+        output=output,
+    )
+
+    _feed_one_msg_to_pump(executor, msg)
+
+    assert not rpc_future.done()
+    assert "7" in executor._rpc_futures
+    assert len(seen) == 1
+    request_id, chunk_index, delivered, error = seen[0]
+    assert request_id == "req"
+    assert chunk_index == 0
+    assert delivered is output
+    assert error is None
+    ready = executor.wait_output_ready("chunk-0")
+    assert ready.done()
+    assert ready.result().output is payload
+
+
+def test_result_pump_closed_chunk_ready_reclaims_shm(mocker):
+    unpack = mocker.patch("vllm_omni.diffusion.executor.multiproc_executor.unpack_diffusion_output_shm")
+    executor = _make_executor()
+    executor._closed = True
+    seen: list[tuple] = []
+    executor.register_chunk_ready_handler(lambda *args: seen.append(args))
+    output = DiffusionOutput(finished=False, chunk_index=0, output=torch.zeros(1))
+    msg = AsyncDiffusionOutput(
+        kind=AsyncOutputKind.CHUNK_READY,
+        request_id="req",
+        chunk_index=0,
+        async_output_id="chunk-0",
+        output=output,
+    )
+
+    _feed_one_msg_to_pump(executor, msg)
+
+    unpack.assert_called_once_with(output)
+    assert seen == []
+    assert executor._completed_outputs == {}

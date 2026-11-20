@@ -73,6 +73,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+COSMOS3_MULTIVIEW_BACKBONE_TYPE = "cosmos3_multiview"
+
 
 def _pathway_quant_config(
     components: dict[str, QuantizationConfig | None],
@@ -225,7 +227,7 @@ def _validate_mixed_precision_runtime(
     if config is None:
         return
     # The policy resolver validates serialized ModelOpt FP8/NVFP4 configs,
-    # including homogeneous modelopt_mixed configs. A16 uses each linear's
+    # including hybrid modelopt_mixed configs. A16 uses each linear's
     # local weight partition; Column/RowParallelLinear owns TP communication.
     if int(getattr(od_config, "max_num_seqs", 1)) != 1:
         raise ValueError("Cosmos3 mixed precision currently supports one active request per worker")
@@ -330,12 +332,19 @@ def compute_mrope_position_ids_vision(
     base_temporal_compression_factor: int | None = None,
     enable_fps_modulation: bool = True,
     start_frame_offset: int = 0,
+    temporal_position_period: int | None = None,
 ) -> tuple[torch.Tensor, int | float]:
     """Generate 3D mRoPE position IDs for vision tokens.
 
     Creates a (t, h, w) position grid with spatial indices reset per segment
-    (Qwen3VL-style). Flattened in t-major order.
+    (Qwen3VL-style). Flattened in t-major order. When
+    ``temporal_position_period`` is set, camera-major frame indexes wrap at
+    that period before optional FPS scaling so corresponding views align.
     """
+    if temporal_position_period is not None and temporal_position_period <= 0:
+        raise ValueError(f"Cosmos3 temporal_position_period must be positive, got {temporal_position_period}.")
+    if fps is not None and (not math.isfinite(fps) or fps <= 0):
+        raise ValueError(f"Cosmos3 vision FPS must be finite and positive, got {fps!r}.")
     fps_modulation = enable_fps_modulation and fps is not None
 
     if fps_modulation:
@@ -347,6 +356,8 @@ def compute_mrope_position_ids_vision(
         )
         base_tps = base_fps / effective_base_tcf
         frame_indices = torch.arange(grid_t, dtype=torch.float32)
+        if temporal_position_period is not None:
+            frame_indices = frame_indices.remainder(temporal_position_period)
         t_index = (
             ((frame_indices + start_frame_offset) / tps * base_tps + temporal_offset)
             .view(-1, 1)
@@ -354,10 +365,11 @@ def compute_mrope_position_ids_vision(
             .flatten()
         )
     else:
+        frame_indices = torch.arange(grid_t, dtype=torch.long)
+        if temporal_position_period is not None:
+            frame_indices = frame_indices.remainder(temporal_position_period)
         t_index = (
-            torch.arange(grid_t, dtype=torch.long).view(-1, 1).expand(-1, grid_h * grid_w).flatten()
-            + int(temporal_offset)
-            + start_frame_offset
+            frame_indices.view(-1, 1).expand(-1, grid_h * grid_w).flatten() + int(temporal_offset) + start_frame_offset
         )
 
     h_index = torch.arange(grid_h, dtype=torch.long).view(1, -1, 1).expand(grid_t, -1, grid_w).flatten()
@@ -584,6 +596,7 @@ class Cosmos3CausalAttention(nn.Module):
         num_key_value_heads: int,
         head_dim: int,
         rms_norm_eps: float,
+        use_und_k_norm_for_gen: bool = False,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
@@ -636,6 +649,7 @@ class Cosmos3CausalAttention(nn.Module):
 
         self.norm_q = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.norm_k = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.k_norm_und_for_gen = RMSNorm(self.head_dim, eps=rms_norm_eps) if use_und_k_norm_for_gen else None
 
         # skip_sequence_parallel=True because the UND pathway is
         # computed once and replicated across SP ranks.
@@ -667,6 +681,13 @@ class Cosmos3CausalAttention(nn.Module):
 
         # Qwen3-style RoPE
         q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
+        if self.k_norm_und_for_gen is not None:
+            k = F.rms_norm(
+                k,
+                (self.head_dim,),
+                self.k_norm_und_for_gen.weight,
+                eps=self.k_norm_und_for_gen.variance_epsilon,
+            )
 
         out = self.attn(q, k, v).reshape(B, S, -1)
         return self.to_out(out), k, v
@@ -832,6 +853,18 @@ class Cosmos3CrossAttention(nn.Module):
         out = self.attn(q, k, v, attn_metadata)
         return out.reshape(B, S_gen, -1)
 
+    def _forward_multiview(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_und: torch.Tensor,
+        v_und: torch.Tensor,
+        multiview_layout: Any,
+    ) -> torch.Tensor:
+        del q, k, v, k_und, v_und, multiview_layout
+        raise TypeError("The base Cosmos3 transformer does not support multiview attention layouts.")
+
     def _forward_multi_control(
         self,
         q: torch.Tensor,
@@ -898,6 +931,7 @@ class Cosmos3CrossAttention(nn.Module):
         freqs_sin: torch.Tensor,
         control_token_sizes: tuple[int, ...] | None = None,
         control_weights: tuple[float, ...] | None = None,
+        multiview_layout: Any | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -921,7 +955,11 @@ class Cosmos3CrossAttention(nn.Module):
         # Qwen3-style RoPE
         q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
 
-        if control_token_sizes is not None or control_weights is not None:
+        if multiview_layout is not None:
+            if control_token_sizes is not None or control_weights is not None:
+                raise ValueError("Cosmos3 multiview attention cannot use the multi-control attention path.")
+            out = self._forward_multiview(q, k, v, k_und, v_und, multiview_layout)
+        elif control_token_sizes is not None or control_weights is not None:
             if control_token_sizes is None or control_weights is None:
                 raise ValueError("Cosmos3 multi-control attention requires both control token sizes and weights.")
             out = self._forward_multi_control(
@@ -956,6 +994,7 @@ class Cosmos3UndDecoderLayer(nn.Module):
         num_key_value_heads: int,
         head_dim: int,
         rms_norm_eps: float,
+        use_und_k_norm_for_gen: bool = False,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
@@ -966,6 +1005,7 @@ class Cosmos3UndDecoderLayer(nn.Module):
             num_key_value_heads=num_key_value_heads,
             head_dim=head_dim,
             rms_norm_eps=rms_norm_eps,
+            use_und_k_norm_for_gen=use_und_k_norm_for_gen,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )
@@ -1056,6 +1096,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None,
         control_token_sizes: tuple[int, ...] | None = None,
         control_weights: tuple[float, ...] | None = None,
+        multiview_layout: Any | None = None,
     ) -> torch.Tensor:
         if cached_kv is not None:
             if self.layer_idx is None:
@@ -1077,6 +1118,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             freqs_sin=freqs_sin,
             control_token_sizes=control_token_sizes,
             control_weights=control_weights,
+            multiview_layout=multiview_layout,
         )
         hidden_states = self._add_residual(hidden_states, residual)
 
@@ -1140,6 +1182,7 @@ class Cosmos3LanguageModel(nn.Module):
         rms_norm_eps: float,
         rope_theta: float,
         mrope_section: list[int],
+        use_und_k_norm_for_gen: bool = False,
         quant_config: QuantizationConfig | None = None,
         release_completed_blocks_to_meta: bool = False,
         prefix: str = "",
@@ -1160,6 +1203,7 @@ class Cosmos3LanguageModel(nn.Module):
                 num_key_value_heads=num_key_value_heads,
                 head_dim=head_dim,
                 rms_norm_eps=rms_norm_eps,
+                use_und_k_norm_for_gen=use_und_k_norm_for_gen,
                 quant_config=quant_config,
                 prefix=f"{prefix}.layers.{i}",
             )
@@ -1281,6 +1325,7 @@ class Cosmos3VFMTransformer(nn.Module):
     packed_modules_mapping = {}
 
     _language_model_cls = Cosmos3LanguageModel
+    _gen_layer_cls = Cosmos3GenDecoderLayer
     _gen_mlp_cls = Cosmos3GatedMLP
     _gen_layer_cls = Cosmos3GenDecoderLayer
     _cross_attention_cls = Cosmos3CrossAttention
@@ -1742,6 +1787,61 @@ class Cosmos3VFMTransformer(nn.Module):
 
     # -- RoPE computation ----------------------------------------------------
 
+    def encode_und_kv(
+        self,
+        text_ids: torch.Tensor,
+        text_mask: torch.Tensor,
+        *,
+        dtype: torch.dtype | None = None,
+        freqs_und: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], int]:
+        """Encode UND text tokens and return K/V trimmed to real prompt length.
+
+        ``freqs_und`` lets the regular Cosmos3 forward reuse the text mRoPE
+        frequencies it computes alongside GEN frequencies. Specialized
+        pipelines can omit it and reuse the complete UND encoding path.
+        """
+        if text_ids.ndim != 2 or text_ids.shape != text_mask.shape:
+            raise ValueError(
+                "Cosmos3 text IDs/mask must have matching rank-two shapes, "
+                f"got {tuple(text_ids.shape)} and {tuple(text_mask.shape)}."
+            )
+        text_lengths = text_mask.sum(dim=1).long()
+        min_real_len = int(text_lengths.min().item())
+        max_real_len = int(text_lengths.max().item())
+        if min_real_len <= 0:
+            raise ValueError("Cosmos3 prompts must contain at least one real text token.")
+        if min_real_len != max_real_len:
+            raise ValueError(
+                "Cosmos3 requires identical real text lengths within a batch "
+                f"(got min={min_real_len}, max={max_real_len})."
+            )
+
+        if freqs_und is None:
+            text_positions = []
+            padded_length = text_ids.shape[1]
+            for real_len_tensor in text_lengths:
+                real_len = int(real_len_tensor.item())
+                position_ids, _ = compute_mrope_position_ids_text(real_len, temporal_offset=0)
+                if real_len < padded_length:
+                    position_ids = torch.cat(
+                        [position_ids, torch.zeros(3, padded_length - real_len, dtype=position_ids.dtype)],
+                        dim=1,
+                    )
+                text_positions.append(position_ids)
+            position_ids = torch.stack(text_positions, dim=1).to(text_ids.device)
+            rotary_dtype = dtype if dtype is not None else self.proj_in.weight.dtype
+            dummy = torch.empty(0, device=text_ids.device, dtype=rotary_dtype)
+            cos_und, sin_und = self.language_model.rotary_emb(dummy, position_ids=position_ids)
+            freqs_und = cos_und.unsqueeze(2), sin_und.unsqueeze(2)
+
+        with self._offload_context("reasoner"):
+            full_kv = self.language_model(text_ids, freqs_und)
+        # K/V stay replicated; framework Attention head-slices them through
+        # joint_key/value when tensor parallelism is active.
+        trimmed_kv = [(key[:, :max_real_len], value[:, :max_real_len]) for key, value in full_kv]
+        return trimmed_kv, max_real_len
+
     def _compute_rope_freqs(
         self,
         text_mask: torch.Tensor,
@@ -1938,6 +2038,7 @@ class Cosmos3VFMTransformer(nn.Module):
         gather_output: bool = True,
         control_token_sizes: tuple[int, ...] | None = None,
         control_weights: tuple[float, ...] | None = None,
+        multiview_layout: Any | None = None,
     ) -> torch.Tensor:
         """Run the shared GEN stack, including sequence parallelism and cache-dit wrappers.
 
@@ -1956,6 +2057,7 @@ class Cosmos3VFMTransformer(nn.Module):
         layer_kwargs = {
             "control_token_sizes": control_token_sizes,
             "control_weights": control_weights,
+            "multiview_layout": multiview_layout,
         }
         if len(self.gen_layers) == len(self.cached_kv):
             # Under PP, gen_layers carries make_layers' PPMissingLayer padding so
@@ -2321,11 +2423,17 @@ class Cosmos3VFMTransformer(nn.Module):
             self.cached_freqs_gen = freqs_gen
 
             if need_kv:
-                with self._offload_context("reasoner"):
-                    cached_kv_full = self.language_model(text_ids, freqs_und)
-                # Trim to real text length (remove padding).  K/V stay replicated;
-                # the framework Attention layer head-slices them via joint_key/value.
-                self.cached_kv = [(k[:, :max_real_len], v[:, :max_real_len]) for k, v in cached_kv_full]
+                self.cached_kv, encoded_text_len = self.encode_und_kv(
+                    text_ids,
+                    text_mask,
+                    dtype=hidden_states.dtype,
+                    freqs_und=freqs_und,
+                )
+                if encoded_text_len != max_real_len:
+                    raise RuntimeError(
+                        "Cosmos3 UND encoder returned an inconsistent real text length: "
+                        f"{encoded_text_len} != {max_real_len}."
+                    )
 
         with self._offload_context("generator"):
             # Patchify latents and project to hidden space after UND cache

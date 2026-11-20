@@ -11,6 +11,7 @@ class DiffusionModelMetadata:
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
     supports_mixed_reference_inputs: bool = False
+    supports_multiview_reference_inputs: bool = False
     # Multipart controls are exposed as ``control_reference`` plus
     # ``control_type`` by the video API.  A pipeline that opts in receives the
     # persisted upload through ``extra_args[control_type]["control_path"]``.
@@ -24,22 +25,51 @@ class DiffusionModelMetadata:
     # Whether ``/v1/videos`` accepts the ``timeline_guides`` manifest plus
     # ``guide_files`` uploads, forwarded as ``multi_modal_data["timeline_guides"]``.
     supports_timeline_guides: bool = False
+    # Whether the pipeline keeps finished clips' latents under
+    # ``extra_args["latent_cache_key"]`` and accepts ``extra_args["continue_from"]``
+    # to continue one; the video API tags requests with their job id.
+    supports_latent_continuation: bool = False
+    # Whether ``/v1/images/segmentations`` may serve this model: it takes one
+    # image plus text/box prompts and returns a ``segmentation`` payload.
+    supports_segmentation: bool = False
+    # Whether ``/v1/videos/segmentations`` may serve this model: it takes one
+    # video path plus text prompts and returns a ``video_segmentation`` payload.
+    supports_video_segmentation: bool = False
+    # Whether ``/v1/videos/depth`` may serve this model: it takes one video path
+    # and returns a ``video_depth`` payload of per-frame depth maps.
+    supports_video_depth: bool = False
+
+
+# ``extra_args`` keys that only name a request (the video API's job-id tag for
+# ``supports_latent_continuation``) and never change its forward schedule, so
+# requests differing only in them may share a DLO data-parallel wave.
+REQUEST_IDENTITY_EXTRA_ARGS = frozenset({"latent_cache_key"})
 
 
 # FLUX.2 Klein supports up to four reference images.
 FLUX2_KLEIN_MAX_INPUT_IMAGES = 4
 QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES = 4
-# Qwen-Image 2.1 image-conditioned generation caps condition images at 4.
-QWEN_IMAGE_21_MAX_INPUT_IMAGES = 4
+# Qwen-Image 2.1 supports up to 10 reference images for image-conditioned generation.
+QWEN_IMAGE_21_MAX_INPUT_IMAGES = 10
 # Upstream HunyuanImage-3.0 "Multi-Image Fusion" caps reference images at 3.
 HUNYUAN_IMAGE3_MAX_INPUT_IMAGES = 3
-JOY_IMAGE_EDIT_MAX_INPUT_IMAGES = 1
 # Boogu-Image editing (TI2I) supports a single reference image for now.
 BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
+FLUX3_MAX_INPUT_IMAGES = 10
 
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
+    "Praxis1Pipeline": DiffusionModelMetadata(final_output_type="actions"),
+    "HyNomasPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "HyNomasModularPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SeedVR2Pipeline": DiffusionModelMetadata(supports_multimodal_inputs=True, final_output_type="video"),
+    "Sam3Pipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        supports_segmentation=True,
+        supports_video_segmentation=True,
+    ),
+    "VideoDepthAnythingPipeline": DiffusionModelMetadata(supports_video_depth=True),
     "Flux2KleinPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=FLUX2_KLEIN_MAX_INPUT_IMAGES,
@@ -65,16 +95,14 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=BOOGU_IMAGE_MAX_INPUT_IMAGES,
     ),
-    "JoyImageEditPipeline": DiffusionModelMetadata(
-        supports_multimodal_inputs=True,
-        max_multimodal_image_inputs=JOY_IMAGE_EDIT_MAX_INPUT_IMAGES,
-    ),
     "MiniMaxH3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=9,
         supports_mixed_reference_inputs=True,
+        supported_control_upload_types=("canny", "depth", "hed", "mlsd", "pose", "inpaint"),
         supports_latent_mask_editing=True,
         supports_timeline_guides=True,
+        supports_latent_continuation=True,
         final_output_type="video",
         # H3 represents alignment padding as a second packed sequence.  The
         # packed TRTLLM backend consumes cu_seqlens and isolates that padding.
@@ -89,9 +117,20 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=9,
         supports_mixed_reference_inputs=True,
+        supported_control_upload_types=("canny", "depth", "hed", "mlsd", "pose", "inpaint"),
         supports_latent_mask_editing=True,
         supports_timeline_guides=True,
+        supports_latent_continuation=True,
         final_output_type="video",
+        attention_mask_free=True,
+    ),
+    # MiniMax-H3-Image: t2i without references, edit with ordered references
+    # ("Picture i"); it shares H3's packed layout and padding document.
+    "MiniMaxH3ImagePipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        # MINIMAX_H3_IMAGE_MAX_REFERENCES in pipeline_minimax_h3_image.py.
+        max_multimodal_image_inputs=16,
+        final_output_type="image",
         attention_mask_free=True,
     ),
     # TaoMate-H3 is a text-prompted streaming model on the MiniMax-H3 packed
@@ -118,6 +157,11 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         attention_mask_free=True,
         final_output_type="video",
     ),
+    "Flux3Pipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=FLUX3_MAX_INPUT_IMAGES,
+        final_output_type="image",
+    ),
     "WanImageToVideoPipeline": DiffusionModelMetadata(
         attention_mask_free=True,
         final_output_type="video",
@@ -130,6 +174,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         attention_mask_free=True,
         final_output_type="video",
     ),
+    "CausVidWanPipeline": DiffusionModelMetadata(final_output_type="video"),
     "WanT2VDMD2Pipeline": DiffusionModelMetadata(final_output_type="video"),
     "WanI2VDMD2Pipeline": DiffusionModelMetadata(final_output_type="video"),
     "LTX2Pipeline": DiffusionModelMetadata(final_output_type="video"),
@@ -140,6 +185,12 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "HeliosPyramidPipeline": DiffusionModelMetadata(final_output_type="video"),
     "HunyuanVideo15Pipeline": DiffusionModelMetadata(final_output_type="video"),
     "HunyuanVideo15ImageToVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
+    # One pipeline serves text-to-video and, with a first frame, image-to-video.
+    "PAN2ModularPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        final_output_type="video",
+    ),
     "LingBotVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
     "LongCatVideoAvatarPipeline": DiffusionModelMetadata(final_output_type="video"),
     "MagiHumanPipeline": DiffusionModelMetadata(final_output_type="video"),
@@ -152,12 +203,20 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supported_control_upload_types=("edge", "blur", "depth", "seg", "wsm"),
         final_output_type="video",
     ),
+    "Cosmos3MultiviewPipeline": DiffusionModelMetadata(
+        supports_multiview_reference_inputs=True,
+        final_output_type="video",
+    ),
     "SanaVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SanaImageToVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SanaWmPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=1,
         final_output_type="video",
+    ),
+    "Cosmos3NanoSimBimanualPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
     ),
 }
 

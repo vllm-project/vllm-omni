@@ -107,11 +107,13 @@ class DiTAttention(nn.Module):
         self.inner_dim = dim_head * heads
         self.dropout = dropout
         self.scale = 1.0 / math.sqrt(dim_head)
+        self._use_npu_graph_attention = False
 
         # Q/K/V projections
         self.to_q = nn.Linear(dim, self.inner_dim)
         self.to_k = nn.Linear(dim, self.inner_dim)
         self.to_v = nn.Linear(dim, self.inner_dim)
+        self.to_qkv: nn.Linear | None = None
 
         # Output projection
         self.to_out = nn.Sequential(nn.Linear(self.inner_dim, dim), nn.Dropout(dropout))
@@ -124,18 +126,39 @@ class DiTAttention(nn.Module):
             causal=False,
         )
 
+    @torch.no_grad()
+    def fuse_qkv_projections(self) -> None:
+        """Pack weights for inference, changing this instance's state_dict keys."""
+        if self.training:
+            raise ValueError("QKV packing requires inference mode")
+        if self.to_qkv is not None:
+            return
+        # Meta initialization avoids consuming the serving RNG before sampling.
+        packed = nn.Linear(self.dim, 3 * self.inner_dim, device="meta")
+        packed.weight = nn.Parameter(
+            torch.cat([self.to_q.weight, self.to_k.weight, self.to_v.weight]), requires_grad=False
+        )
+        packed.bias = nn.Parameter(torch.cat([self.to_q.bias, self.to_k.bias, self.to_v.bias]), requires_grad=False)
+        self.to_qkv = packed.eval()
+        del self.to_q, self.to_k, self.to_v
+
     def forward(
         self,
         x: torch.Tensor,
         mask: torch.Tensor | None = None,
         rope=None,
+        blocked_attn_mask: torch.Tensor | None = None,
+        attention_mask_mode: str | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len = x.shape[0], x.shape[1]
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_dit_attention_qkv_projection"):
-            query = self.to_q(x)
-            key = self.to_k(x)
-            value = self.to_v(x)
+            if self.to_qkv is None:
+                query = self.to_q(x)
+                key = self.to_k(x)
+                value = self.to_v(x)
+            else:
+                query, key, value = self.to_qkv(x).chunk(3, dim=-1)
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_dit_attention_rope"):
             if rope is not None:
@@ -152,8 +175,30 @@ class DiTAttention(nn.Module):
 
             # The diffusion Attention layer expects (batch, seq, heads, head_dim)
             attn_mask = _normalize_attention_mask(mask, batch_size, seq_len)
-            attn_metadata = AttentionMetadata(attn_mask=attn_mask) if attn_mask is not None else None
-            out = self.attn(query, key, value, attn_metadata=attn_metadata)
+            if attn_mask is None:
+                attn_metadata = None
+            elif attention_mask_mode is None:
+                attn_metadata = AttentionMetadata(attn_mask=attn_mask)
+            else:
+                attn_metadata = AttentionMetadata(
+                    attn_mask=attn_mask, extra={"attention_mask_mode": attention_mask_mode}
+                )
+            use_fia = (
+                self._use_npu_graph_attention
+                and query.device.type == "npu"
+                and query.dtype in (torch.float16, torch.bfloat16)
+            )
+            if use_fia:
+                from vllm_omni.platforms.npu.models.cosyvoice3_graph import (
+                    cosyvoice3_fia_blocked_mask,
+                    cosyvoice3_graph_attention,
+                )
+
+                if blocked_attn_mask is None and attn_mask is not None:
+                    blocked_attn_mask = cosyvoice3_fia_blocked_mask(attn_mask, seq_len, key.shape[1])
+                out = cosyvoice3_graph_attention(query, key, value, blocked_attn_mask, self.scale)
+            else:
+                out = self.attn(query, key, value, attn_metadata=attn_metadata)
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_dit_attention_output_projection"):
             # Some attention backends return a non-contiguous layout.
@@ -161,9 +206,8 @@ class DiTAttention(nn.Module):
             out = out.to(x.dtype)
             out = self.to_out(out)
 
-        # Apply mask if provided
-        attn_mask = _normalize_attention_mask(mask, batch_size, seq_len)
-        if attn_mask is not None:
+        # Apply mask if provided; a mask published as "none" masks nothing.
+        if attn_mask is not None and attention_mask_mode != "none":
             out = out.masked_fill(~attn_mask.unsqueeze(-1), 0.0)
 
         return out
@@ -186,12 +230,18 @@ class DiTBlock(nn.Module):
         self.ff_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.ff = FeedForward(dim=dim, mult=ff_mult, dropout=dropout, approximate="tanh")
 
-    def forward(self, x, t, mask=None, rope=None):
+    def forward(self, x, t, mask=None, rope=None, blocked_attn_mask=None, attention_mask_mode=None):
         with cosyvoice3_batch_flow_profile("cosyvoice3_dit_adalayernorm_attention"):
             norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, emb=t)
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_dit_attention"):
-            attn_output = self.attn(x=norm, mask=mask, rope=rope)
+            attn_output = self.attn(
+                x=norm,
+                mask=mask,
+                rope=rope,
+                blocked_attn_mask=blocked_attn_mask,
+                attention_mask_mode=attention_mask_mode,
+            )
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_dit_attention_residual"):
             x = x + gate_msa.unsqueeze(1) * attn_output
@@ -403,7 +453,18 @@ class DiT(nn.Module):
         self.static_chunk_size = static_chunk_size
         self.num_decoding_left_chunks = num_decoding_left_chunks
 
-    def forward(self, x, mask, mu, t, spks=None, cond=None):
+    def _reads_unpublished_masks(self, device_type: str) -> bool:
+        # Only FLASH_ATTN's forward_cuda honors a published mode. ROCm reports
+        # device type "cuda" and dispatches to forward_cuda directly; MUSA
+        # reports "musa" and forward_musa defaults to forward_cuda too, so
+        # both land on the same honoring path. Elsewhere the read would only
+        # add a sync, and NPU graph capture must not read the host.
+        if device_type not in ("cuda", "musa") or getattr(self, "_use_npu_graph_attention", False):
+            return False
+        backend = getattr(self.transformer_blocks[0].attn.attn, "attn_backend", None)
+        return backend is not None and backend.get_name() == "FLASH_ATTN"
+
+    def forward(self, x, mask, mu, t, spks=None, cond=None, blocked_attn_mask=None):
         with cosyvoice3_batch_flow_profile("cosyvoice3_dit_prepare_inputs"):
             x = x.transpose(1, 2)
             mu = mu.transpose(1, 2)
@@ -420,6 +481,20 @@ class DiT(nn.Module):
         with cosyvoice3_batch_flow_profile("cosyvoice3_dit_rope_and_mask"):
             rope = self.rotary_embed.forward_from_seq_len(seq_len)
             attn_mask = mask[:, 0].bool() if mask.dim() == 3 and mask.shape[1] == 1 else mask.bool()
+            if (
+                blocked_attn_mask is None
+                and getattr(self, "_use_npu_graph_attention", False)
+                and x.device.type == "npu"
+                and x.dtype in (torch.float16, torch.bfloat16)
+            ):
+                from vllm_omni.platforms.npu.models.cosyvoice3_graph import cosyvoice3_fia_blocked_mask
+
+                blocked_attn_mask = cosyvoice3_fia_blocked_mask(attn_mask, seq_len, seq_len)
+            attention_mask_mode = None
+            if self._reads_unpublished_masks(attn_mask.device.type):
+                # FLASH_ATTN reads an unpublished mask back to the host in every
+                # layer; one read here classifies the mask for all layers.
+                attention_mask_mode = "none" if bool(attn_mask.all()) else "padding"
 
         if self.long_skip_connection is not None:
             residual = x
@@ -427,7 +502,14 @@ class DiT(nn.Module):
         with cosyvoice3_batch_flow_profile("cosyvoice3_dit_transformer_blocks"):
             for block_index, block in enumerate(self.transformer_blocks):
                 with cosyvoice3_batch_flow_profile(f"cosyvoice3_dit_transformer_block_{block_index}"):
-                    x = block(x, t, mask=attn_mask.bool(), rope=rope)
+                    x = block(
+                        x,
+                        t,
+                        mask=attn_mask,
+                        rope=rope,
+                        blocked_attn_mask=blocked_attn_mask,
+                        attention_mask_mode=attention_mask_mode,
+                    )
 
         if self.long_skip_connection is not None:
             with cosyvoice3_batch_flow_profile("cosyvoice3_dit_long_skip_projection"):

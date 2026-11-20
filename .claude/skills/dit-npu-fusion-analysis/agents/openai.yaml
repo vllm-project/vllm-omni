@@ -1,0 +1,4 @@
+interface:
+  display_name: "NPU Model Optimization Router"
+  short_description: "Route Ascend diffusion optimization to MindIE-SD skills"
+  default_prompt: "Use $dit-npu-fusion-analysis to load the applicable MindIE-SD skill, supply the current Omni model and workload context, and analyze or optimize within the task scope with validation evidence."

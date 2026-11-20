@@ -15,9 +15,17 @@ from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import (
 )
 from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import (
     DEFAULT_SYSTEM_PROMPT,
+    QA_HISTORY_HEADER,
     USER_QUERY_HEADER,
+    VIDEO_HISTORY_HEADER,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts import (
+    JOYAI_TTS_CLOSE_ONLY_KEY,
+    JOYAI_TTS_FINISH_ON_NEXT_STOP_KEY,
+    JOYAI_TTS_PARTIAL_KEY,
+    sanitize_spoken_text,
+)
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     Qwen3TTSPromptEmbedsBuilder,
     first_value,
@@ -47,6 +55,25 @@ def _clean_qwen3_asr_transcript(raw_text: str) -> str:
     return " ".join(raw_text.rsplit(_ASR_TEXT_TAG, 1)[-1].replace("</asr_text>", "").split())
 
 
+def render_joyai_memory_prefix(
+    summary: str | None,
+    visual_summaries: Sequence[str],
+    *,
+    archived_qa: str = "",
+    active_query: str = "",
+) -> str:
+    """Render model-owned memory with the same headings for text and speech."""
+    prefix = []
+    if visual_summaries:
+        prefix.append(VIDEO_HISTORY_HEADER + "\n\n".join(visual_summaries))
+    qa_memory = [text for text in (summary, archived_qa) if text]
+    if qa_memory:
+        prefix.append(QA_HISTORY_HEADER + "\n\n".join(qa_memory))
+    if active_query:
+        prefix.append(USER_QUERY_HEADER + "\n" + active_query)
+    return "\n\n".join(prefix)
+
+
 def render_joyai_session_prompt(
     processor: Any,
     *,
@@ -56,16 +83,22 @@ def render_joyai_session_prompt(
     images: list[Any],
     image_token_counts: list[int],
     budget: int,
+    instruction: str = "",
+    summary: str = "",
+    visual_summaries: Sequence[str] = (),
     context_blocks: Sequence[str] = (),
 ) -> tuple[str, list[Any]]:
-    """Fit the actual query, keeping system policy and the latest observation.
+    """Fit ASR's query, preserving the standing instruction and current input.
 
-    ``context_blocks`` are model-specific context sections (today: accepted
-    delegated results). They are not history and are never evicted, so they are
-    validated against the budget before this call keeps trimming history.
+    Evict history, then the text summary, then oldest visual blocks, as on the
+    text path. The standing instruction, actual transcript and delegated
+    results stay pinned.
     """
     blocks = [block for block in context_blocks if block]
     history, images, image_token_counts = list(history), list(images), list(image_token_counts)
+    recent_history = history.copy()
+    visual_summaries = list(visual_summaries)
+    rebudget_history = False
     while True:
         content = [{"type": "image"} for _ in images]
         content.extend({"type": "text", "text": block} for block in blocks)
@@ -77,15 +110,27 @@ def render_joyai_session_prompt(
                 else "Observe the current scene and choose whether to speak or stay silent.",
             }
         )
-        messages = [{"role": "system", "content": system}, *history, {"role": "user", "content": content}]
+        memory = render_joyai_memory_prefix(summary, visual_summaries)
+        prefix = [{"role": "user", "content": value} for value in (memory, instruction) if value]
+        messages = [{"role": "system", "content": system}, *prefix, *history, {"role": "user", "content": content}]
         rendered = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         text_tokens = processor.tokenizer(text=[rendered])["input_ids"][0]
         if len(text_tokens) + sum(image_token_counts) - len(images) <= budget:
+            if rebudget_history:
+                history = recent_history.copy()
+                rebudget_history = False
+                continue
             return rendered, images
         if history:
             history.pop(0)
             while history and history[0]["role"] == "assistant":
                 history.pop(0)
+        elif summary:
+            summary = ""
+            rebudget_history = True
+        elif visual_summaries:
+            visual_summaries.pop(0)
+            rebudget_history = True
         elif len(images) > 1:
             images.pop(0)
             image_token_counts.pop(0)
@@ -133,6 +178,9 @@ def asr_to_joyai(
                 not isinstance(context, dict)
                 or not isinstance(context.get("system"), str)
                 or not isinstance(context.get("history"), list)
+                or any(not isinstance(context.get(key, ""), str) for key in ("instruction", "summary"))
+                or not isinstance(context.get("visual_summaries", []), list)
+                or any(not isinstance(text, str) for text in context.get("visual_summaries", []))
                 or any(
                     not isinstance(message, dict)
                     or message.get("role") not in ("user", "assistant")
@@ -165,6 +213,9 @@ def asr_to_joyai(
                 images=images,
                 image_token_counts=image_token_counts,
                 budget=budget,
+                instruction=context.get("instruction", ""),
+                summary=context.get("summary", ""),
+                visual_summaries=context.get("visual_summaries", []),
                 context_blocks=(delegation_context,) if delegation_context else (),
             )
             visual_inputs = {"image": images} if images else {}
@@ -176,6 +227,20 @@ def asr_to_joyai(
             joyai_input["cache_salt"] = request_prompt["cache_salt"]
         joyai_inputs.append(joyai_input)
     return joyai_inputs
+
+
+def _talker_handoff_flags(prompt: object) -> tuple[bool, bool, bool]:
+    """Read the sentence-TTS flags stamped by ``mark_talker_prompt_flags``."""
+    if not isinstance(prompt, dict):
+        return False, False, False
+    raw_info = prompt.get("additional_information")
+    if not isinstance(raw_info, dict):
+        return False, False, False
+    return (
+        bool(raw_info.get(JOYAI_TTS_PARTIAL_KEY)),
+        bool(raw_info.get(JOYAI_TTS_CLOSE_ONLY_KEY)),
+        bool(raw_info.get(JOYAI_TTS_FINISH_ON_NEXT_STOP_KEY)),
+    )
 
 
 def _build_tts_metadata(request_prompt: object, spoken_text: str) -> dict[str, list[str]]:
@@ -257,20 +322,57 @@ def joyai_action_to_tts(
     request_prompts = prompt if isinstance(prompt, list) else [prompt] * len(source_outputs)
     talker_inputs: list[OmniTokensPrompt] = []
     for request_index, joyai_output in enumerate(source_outputs):
-        parsed_action = parse_action(_extract_completed_action_text(joyai_output))
-        if not parsed_action.spoke or not parsed_action.text:
-            continue
-
         request_prompt = request_prompts[request_index] if request_index < len(request_prompts) else None
-        tts_metadata = _build_tts_metadata(request_prompt, parsed_action.text)
+        partial, close_only, finish_on_next_stop = _talker_handoff_flags(request_prompt)
+        if close_only:
+            spoken_text = ""
+        elif partial:
+            # SentenceTtsOutput already holds the spoken sentence; do not
+            # re-parse the JoyAI action or the remainder is collapsed back
+            # into one Talker request.
+            spoken_text = _extract_completed_action_text(joyai_output).strip()
+            if not spoken_text:
+                continue
+        else:
+            parsed_action = parse_action(_extract_completed_action_text(joyai_output))
+            if not parsed_action.spoke or not parsed_action.text:
+                continue
+            # One-shot Talker (async_chunk=false) never goes through
+            # spoken_payload. Strip the same prompt scaffolding so a leaked
+            # USER_QUERY_HEADER / duration / trailing </silence> is not spoken.
+            spoken_text = sanitize_spoken_text(parsed_action.text)
+            if not spoken_text:
+                continue
+
+        tts_metadata = _build_tts_metadata(request_prompt, spoken_text)
         _validate_talker_speaker(tts_metadata, target_model_config)
-        talker_prompt_length = _compute_talker_prompt_length(tts_metadata, target_model_config)
+        talker_prompt_length = 1 if close_only else _compute_talker_prompt_length(tts_metadata, target_model_config)
+        # Sentence 2+ is submit_update on the same Talker id after 2150. The AR
+        # scheduler's default is streaming-input append (keep old codec KV).
+        # Each spoken sentence is a new utterance, so tell it to replace.
+        if partial and not close_only:
+            # Qwen3-TTS Talker does not set replace_runtime_additional_information
+            # (Omni/standalone TTS still append). The GPU runner therefore merges
+            # this payload onto sentence-1's buffer and would keep embed.prefill.
+            # Empty list is not a 2-D tensor, so preprocess rebuilds embeds from
+            # this sentence's text instead of slicing the previous utterance.
+            tts_metadata["meta"] = {
+                "replace_streaming_prompt": True,
+                "replace_runtime_additional_information": True,
+                "talker_prefill_offset": 0,
+                "talker_text_offset": 0,
+            }
+            if finish_on_next_stop:
+                tts_metadata["meta"][JOYAI_TTS_FINISH_ON_NEXT_STOP_KEY] = True
+            tts_metadata["embed"] = {"prefill": []}
+            tts_metadata["hidden_states"] = {"trailing_text": []}
         talker_inputs.append(
             OmniTokensPrompt(
                 # OmniTokensPrompt reserves vllm scheduler positions with zero IDs;
                 # the Talker builds the actual prompt from tts_metadata.
                 prompt_token_ids=[0] * talker_prompt_length,
                 additional_information=tts_metadata,
+                model_intermediate_buffer=dict(tts_metadata),
             )
         )
 

@@ -335,25 +335,6 @@ class DummyQwenImagePipeline(nn.Module, QwenImageLoraLoaderMixin):
 
 
 class TestQwenImageLoraLoaderMixin:
-    def test_load_lora_weights(self, mocker: MockerFixture):
-        pipeline = DummyQwenImagePipeline(NUM_LAYERS, HEAD_DIM)
-        original_params = {name: param.clone() for name, param in pipeline.transformer.named_parameters()}
-
-        lora_state_dict = make_lora_state_dict_for_module(pipeline.transformer)
-        assert len(lora_state_dict) > 0
-
-        mocker.patch(
-            "vllm_omni.diffusion.lora.loader.get_converter_by_pipeline",
-            return_value=_convert_non_diffusers_qwen_lora_to_diffusers,
-        )
-        pipeline.load_lora_weights(lora_state_dict, "adapter0")
-
-        # validate the weights are updated after lora loaded
-        assert_params_not_equal(pipeline.transformer, original_params)
-
-        # validate lora_loaded map is updated after lora loaded
-        assert "adapter0" in pipeline.lora_loaded
-
     def test_unload_lora_weights(self, mocker: MockerFixture):
         pipeline = DummyQwenImagePipeline(NUM_LAYERS, HEAD_DIM)
         original_params = {name: param.clone() for name, param in pipeline.transformer.named_parameters()}

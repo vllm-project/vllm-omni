@@ -48,6 +48,30 @@ def test_terminal_without_new_frames_does_not_replay_last_chunk(frames):
     assert terminal is not None and terminal.meta.finished.item()
     assert terminal.codes.audio.numel() == 0
     assert emitted == frames
+    assert terminal.meta.joyai_finish_on_next_stop is None
+
+
+def test_empty_finished_preserves_finish_on_next_stop_stamp():
+    from vllm_omni.data_entry_keys import JOYAI_FINISH_ON_NEXT_STOP_KEY
+
+    tm = _tm(initial_chunk_frames=1)
+    payload = _call(tm, "r", n_frames=1)
+    assert payload is not None
+    tm.put_req_chunk["r"] += 1
+    request = _req("r", finished=True)
+    setattr(request, f"_{JOYAI_FINISH_ON_NEXT_STOP_KEY}", True)
+    terminal = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        multimodal_output={"codes": {"audio": torch.zeros((0,))}},
+        request=request,
+        is_finished=True,
+    )
+    assert terminal is not None and terminal.codes.audio.numel() == 0
+    assert terminal.meta.joyai_finish_on_next_stop is True
+
+    empty = _call(_tm(initial_chunk_frames=1), "q", n_frames=0, finished=True)
+    assert empty is not None and empty.codes.audio.numel() == 0
+    assert empty.meta.joyai_finish_on_next_stop is None
 
 
 def test_repeated_nonterminal_callback_does_not_republish_boundary():
@@ -546,6 +570,7 @@ def test_followup_sends_only_codec_delta_without_ref_metadata():
     rid = "r-ref2"
     tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(35)]
     tm.put_req_chunk[rid] = 1
+    tm._qwen3_tts_emitted_frames = {rid: 10}
     ref_code = torch.tensor([[9, 9, 9, 9], [8, 8, 8, 8]], dtype=torch.long)
     tm.request_payload[rid] = ref_code
 

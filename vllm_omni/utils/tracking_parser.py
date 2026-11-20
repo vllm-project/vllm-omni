@@ -117,9 +117,11 @@ class TrackingSubparsers:
         self._real = real_sub
         self._shadow = shadow_sub
 
-    def add_parser(self, name, *args, **kwargs):
+    def add_parser(self, name: str, *args: Any, **kwargs: Any) -> "TrackingArgumentParser":
         """Add a parser to the encapsulated real parser and its shadow."""
         real_parser = self._real.add_parser(name, *args, **kwargs)
+        if not isinstance(real_parser, TrackingArgumentParser):
+            raise TypeError("Tracking subparsers must create TrackingArgumentParser instances")
         # real_parser is a TrackingArgumentParser with its own _shadow.
         # Reuse that shadow as the parent shadow's child — so when
         # real_parser.add_argument() mirrors to real_parser._shadow,
@@ -156,6 +158,35 @@ class TrackingArgumentParser(FlexibleArgumentParser):
         action = super().add_argument(*args, **kwargs)
         shadow_kwargs = build_shadow_kwargs(kwargs)
         self._shadow.add_argument(*args, **shadow_kwargs)
+        return action
+
+    def maybe_override_argument(
+        self,
+        group: TrackingGroup,
+        option_string: str,
+        *,
+        argument_type: Any,
+        default: Any,
+        help: str,
+    ) -> argparse.Action:
+        """Add an argument, or override it on both the real and shadow parsers."""
+        action = self._option_string_actions.get(option_string)
+        shadow_action = self._shadow._option_string_actions.get(option_string)
+        if action is None and shadow_action is None:
+            return group.add_argument(
+                option_string,
+                type=argument_type,
+                default=default,
+                help=help,
+            )
+        if action is None or shadow_action is None:
+            raise ValueError(f"{option_string} differs between the real and shadow parsers")
+        action.type = argument_type
+        action.default = default
+        action.help = help
+        shadow_action.type = argument_type
+        shadow_action.default = UNSET
+        shadow_action.help = help
         return action
 
     def add_argument_group(self, *args, **kwargs) -> TrackingGroup:

@@ -28,7 +28,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 pytestmark = [
     pytest.mark.core_model,
     pytest.mark.diffusion,
-    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
+    *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1),
 ]
 
 _GPU = torch.accelerator.is_available() if hasattr(torch, "accelerator") else torch.cuda.is_available()
