@@ -589,6 +589,7 @@ def _iter_steps(doc: dict):
         ("vllm_omni/deploy/qwen3_omni_duplex.yaml", False, False),
         ("tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json", True, True),
         ("tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json", True, True),
+        ("tests/dfx/perf/tests/test_qwen3_omni_datasets.json", True, True),
         ("vllm_omni/model_executor/models/qwen3_omni/qwen3_omni.py", True, True),
         ("vllm_omni/model_executor/models/common/qwen3_code_predictor.py", True, True),
         ("tests/dfx/perf/scripts/run_benchmark.py", True, True),
