@@ -60,6 +60,11 @@ The deploy config (`vllm_omni/deploy/pi0.yaml`) declares a single diffusion stag
 handshake metadata (3 cameras, `joint_position`, action horizon 50, action dim
 32) that enables the OpenPI realtime serving layer.
 
+FP32 is the default for this shipped deploy config. Programmatic construction
+and custom deploy configs that omit `dtype` inherit `OmniDiffusionConfig`'s
+`bfloat16` default; Pi0 then uses the LeRobot-compatible mixed-BF16 layout.
+Set `dtype: float32` explicitly when a custom configuration must retain FP32.
+
 #### Verification
 
 Run the example client (sends a synthetic observation and prints the returned
@@ -100,7 +105,7 @@ reference (`max|Δ| = 7.15e-07`, CPU/float32, fixed noise; see
 
 - Model blog: <https://www.physicalintelligence.company/blog/pi0>
 - Checkpoint: <https://huggingface.co/lerobot/pi0_base>
-- Pipeline: [`vllm_omni/diffusion/models/pi0/pipeline_pi0.py`](../../vllm_omni/diffusion/models/pi0/pipeline_pi0.py)
+- Pipeline: [`vllm_omni/diffusion/models/pi/pi0/pipeline_pi0.py`](../../vllm_omni/diffusion/models/pi/pi0/pipeline_pi0.py)
 - Deploy config: [`vllm_omni/deploy/pi0.yaml`](../../vllm_omni/deploy/pi0.yaml)
 - Example client: [`examples/online_serving/pi0/`](../../examples/online_serving/pi0/)
 - Tests: CPU units + LeRobot parity in [`tests/diffusion/models/pi0/`](../../tests/diffusion/models/pi0/),

@@ -59,6 +59,7 @@ from starlette.datastructures import State
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.websockets import WebSocketDisconnect
+from vllm.entrypoints.anthropic import api_router as anthropic_api_router
 from vllm.entrypoints.serve.tokenize import api_router as tokenization_api_router
 from vllm.entrypoints.serve.tokenize.protocol import DetokenizeResponse, TokenizeResponse, TokenizerInfoResponse
 from vllm.exceptions import RetryableRequestError
@@ -374,6 +375,7 @@ _DIFFUSION_APP_STATE_KEYS = {
     "openai_streaming_speech",
     "openai_streaming_video",
     "openai_serving_realtime_robot",
+    "anthropic_serving_messages",
     "rl_rollout_serving",
     "run_serving",
     "enable_server_load_tracking",
@@ -1653,6 +1655,38 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
         must_be_none=_DIFFUSION_MUST_BE_NONE,
     )
     assert state.diffusion_engine is engine
+    assert isinstance(state.anthropic_serving_messages, api_server._UnsupportedAnthropicMessages)
+
+
+def test_pure_diffusion_anthropic_routes_reject_with_501(caplog) -> None:
+    """Both Anthropic routes must answer 501 instead of raising AttributeError."""
+    app = FastAPI()
+    app.state.anthropic_serving_messages = api_server._UnsupportedAnthropicMessages()
+    # Pure-diffusion init leaves these None; the routes must not depend on them.
+    app.state.serving_tokenization = None
+    anthropic_api_router.attach_router(app)
+
+    messages_payload = {
+        "model": "demo-diffusion",
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+    count_tokens_payload = {"model": "demo-diffusion", "messages": messages_payload["messages"]}
+
+    with caplog.at_level(logging.ERROR), TestClient(app, raise_server_exceptions=False) as client:
+        messages_response = client.post("/v1/messages", json=messages_payload)
+        count_tokens_response = client.post("/v1/messages/count_tokens", json=count_tokens_payload)
+
+    for response in (messages_response, count_tokens_response):
+        assert response.status_code == 501
+        payload = response.json()
+        assert payload["type"] == "error"
+        assert payload["error"]["type"] == "api_error"
+        assert "not supported" in payload["error"]["message"]
+
+    # Returning the error keeps the router's exception logging quiet.
+    assert "Error in create_messages" not in caplog.text
+    assert "Error in count_tokens" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1901,6 +1935,7 @@ def test_api_topology_rejects_inconsistent_launch(requested, config):
         ("GET", "/v1/videos"),
         ("GET", "/v1/videos/job"),
         ("GET", "/v1/videos/job/content"),
+        ("GET", "/v1/videos/job/content?variant=lidar"),
         ("DELETE", "/v1/videos/job"),
     ],
 )

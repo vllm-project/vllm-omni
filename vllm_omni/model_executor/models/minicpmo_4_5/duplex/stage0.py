@@ -82,6 +82,7 @@ class _MiniCPMO45Stage0SessionState:
     pending_window_unit: _MiniCPMO45WindowUnit | None = None
     pending_window_generated_tokens: list[int] = field(default_factory=list)
     current_turn_ended: bool = True
+    opened_assistant_turn_segment: tuple[str, int] | None = None
     prepared_append_identity: tuple[int | None, int] | None = None
     prepared_inputs_embeds: torch.Tensor | None = None
     prepared_input_token_ids: list[int] = field(default_factory=list)
