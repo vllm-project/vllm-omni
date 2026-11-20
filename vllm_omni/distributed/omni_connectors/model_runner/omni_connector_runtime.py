@@ -1139,8 +1139,7 @@ class _OmniConnectorRuntimeMixin:
             return None
 
         params = signature.parameters
-        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
-            return "pooling_output"
+        accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values())
 
         supported = {
             name
@@ -1151,13 +1150,15 @@ class _OmniConnectorRuntimeMixin:
                 inspect.Parameter.KEYWORD_ONLY,
             )
         }
-        if not {"transfer_manager", "request"}.issubset(supported):
+        if not accepts_kwargs and not {"transfer_manager", "request"}.issubset(supported):
             return None
+        # Explicit payload parameters take precedence: a builder may accept
+        # unrelated **kwargs without reading its model output from them.
         if "pooling_output" in supported:
             return "pooling_output"
         if "multimodal_output" in supported:
             return "multimodal_output"
-        return None
+        return "pooling_output" if accepts_kwargs else None
 
     @staticmethod
     def _load_custom_batch_func(custom_process_func: Any | None) -> Any | None:

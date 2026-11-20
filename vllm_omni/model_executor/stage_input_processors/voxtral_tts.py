@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from collections.abc import Mapping
 from typing import Any
 
@@ -69,10 +72,12 @@ def generator2tokenizer_async_chunk(
             f"codec_left_context_frames={left_context_size}"
         )
     length = len(transfer_manager.code_prompt_token_ids[request_id])
+    state = transfer_manager.request_payload.setdefault(request_id, {})
+    pending_frames = length - int(state.get("voxtral_frames_sent", 0))
 
     # Avoid emitting empty chunks during normal streaming. If the request is
     # finished and nothing was produced, emit an EOF marker.
-    if length <= 0:
+    if pending_frames <= 0:
         if finished:
             return OmniPayloadStruct(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
@@ -89,13 +94,16 @@ def generator2tokenizer_async_chunk(
     if chunk_length != 0 and not finished:
         return None
 
-    context_length = chunk_length if chunk_length != 0 else chunk_size
+    # Count only unsent frames; a standalone EOF must not replay the last
+    # initial or steady-state chunk as new audio.
+    context_length = pending_frames
     end_index = min(length, left_context_size + context_length)
     ctx_frames = max(0, int(end_index - context_length))
     window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
 
     # Pack context + chunk into codebook-major flat codes for adapter.
     code_predictor_codes = torch.tensor(window_frames).reshape(-1).tolist()
+    state["voxtral_frames_sent"] = length
 
     return OmniPayloadStruct(
         codes=CodesStruct(
