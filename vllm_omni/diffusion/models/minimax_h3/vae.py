@@ -1240,8 +1240,23 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 num_tiles,
                 self.parallel_size,
             )
-            return self._rank_local_tiling()
-        return nullcontext()
+            return self._stacked_decode_tiles(self._rank_local_tiling())
+        return self._stacked_decode_tiles(nullcontext())
+
+    @contextmanager
+    def _stacked_decode_tiles(self, tiling: AbstractContextManager) -> Iterator[None]:
+        """Decode a rank's spatial tiles as one batch (the checkpoint's ``stack_tiling``)."""
+        if not hasattr(self.model, "stack_tiling"):
+            with tiling:
+                yield
+            return
+        saved = self.model.stack_tiling
+        self.model.stack_tiling = True
+        try:
+            with tiling:
+                yield
+        finally:
+            self.model.stack_tiling = saved
 
     @torch.inference_mode()
     def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
