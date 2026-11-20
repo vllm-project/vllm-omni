@@ -38,6 +38,21 @@ frames = output.images  # the video frames; the speech track and its rate are in
 - The portrait is resized and center-cropped to the closest training resolution: 576x576, or 768x512 (width x height). Portraits where the face fills a good part of the frame work best.
 - The first request compiles the transformer blocks (regional compilation); start the engine once and reuse it.
 
+## Online serving
+
+```bash
+vllm serve kyutai/AURA-1.3B --omni --port 8091
+
+curl -s http://localhost:8091/v1/videos/sync \
+  -F "prompt=A person speaking to the camera." \
+  -F "input_reference=@portrait.png" \
+  -F "audio_reference={\"audio_url\": \"data:audio/wav;base64,$(base64 -w0 speech.wav)\"}" \
+  -o aura.mp4
+```
+
+- The video API requires a non-empty `prompt`; any short description of the speaker works.
+- The returned MP4 carries the speech track. One request runs at a time.
+
 ## Validation
 
 Measured on 1x H100 80GB HBM3 against Kyutai's reference implementation ([kyutai-labs/aura](https://github.com/kyutai-labs/aura) @ `c06aa7d`, run in its own environment) on the sample of the model card (frame 0 and the 9.08 s speech of `assets/sample_1.mp4`), seed 42, 10 chunks (157 frames), with the reference's own default description passed as the prompt:
