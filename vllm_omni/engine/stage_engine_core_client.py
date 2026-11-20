@@ -10,6 +10,7 @@ Directly inherits from vLLM's AsyncMPClient to reuse EngineCore architecture.
 from __future__ import annotations
 
 import inspect
+import ipaddress
 import os
 import socket
 from typing import TYPE_CHECKING, Any
@@ -40,6 +41,15 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniTokensPrompt
 
 logger = init_logger(__name__)
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _default_process_engine_inputs(
@@ -299,22 +309,22 @@ class StageEngineCoreClientBase(StageClientBase):
         the KV connector binds — prefer it when available.
         """
         replica_host = self.client_addresses.get("replica_host")
-        if replica_host:
+        if replica_host and not _is_loopback_host(replica_host):
             return replica_host
         for key in ("input_address", "output_address", "stats_update_address"):
             address = self.client_addresses.get(key)
             if not address:
                 continue
             host = urlparse(address).hostname
-            if host in {None, "", "*", "0.0.0.0", "::"}:
+            if host is None or host in {"", "*", "0.0.0.0", "::"}:
                 continue
-            if host in {"localhost", "127.0.0.1"}:
+            if _is_loopback_host(host):
                 detected = self._detect_local_ip()
                 if detected:
                     return detected
                 continue
             return host
-        return self._detect_local_ip()
+        return self._detect_local_ip() or replica_host or None
 
     def _get_kv_connector_config(self) -> dict[str, Any] | None:
         omni_kv_config = getattr(self, "_omni_kv_config", None)
