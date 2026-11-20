@@ -28,7 +28,11 @@ no_async_chunk_params = [
         OmniServerParams(
             model=MODEL,
             stage_config_path=DEPLOY_CONFIG,
-            server_args=["--enforce-eager", "--no-async-chunk"],
+            server_args=[
+                "--stage-overrides",
+                '{"0": {"enforce_eager": true}, "1": {"enforce_eager": true}}',
+                "--no-async-chunk",
+            ],
         ),
         id="no_async_chunk",
     )
@@ -39,7 +43,7 @@ async_chunk_params = [
         OmniServerParams(
             model=MODEL,
             stage_config_path=DEPLOY_CONFIG,
-            server_args=["--enforce-eager"],
+            server_args=["--stage-overrides", '{"0": {"enforce_eager": true}, "1": {"enforce_eager": true}}'],
         ),
         id="async_chunk",
     )
