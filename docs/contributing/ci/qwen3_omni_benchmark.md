@@ -92,6 +92,15 @@ these ordinary performance artifacts. Performance subsets are marked
 Performance references must match the exact request count; subset and
 full-dataset measurements are separate workloads. Unmeasurable TPOT is null.
 
+Evaluated DuplexEval cases also publish `result_acc_*.json` under
+`tests/e2e/accuracy/omni_duplex_eval/results` (or `ACC_BENCH_RESULT_DIR`). This
+artifact copies the existing judge scores and coverage from the performance
+result; inference and judging run once. The CUDA DuplexEval job uploads both
+result directories. Publication does not require `duplex_eval_accuracy_config`;
+record-only cases retain an empty accuracy baseline and their existing score
+checks. The performance JSON, metric definitions and numerical scores are
+unchanged.
+
 ## Small smoke runs before full experiments
 
 Copy selected JSON entries into a separate smoke configuration. Set a small

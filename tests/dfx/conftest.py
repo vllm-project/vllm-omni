@@ -913,8 +913,8 @@ def run_benchmark(
         result["name"] = benchmark_params_name
     if result_transform is not None:
         result = result_transform(result, returncode)
-    # Accuracy is published only in ``result_acc_*.json`` below; the perf result
-    # must not carry a second copy of it. ``result`` keeps it in memory so the
+    # OmniInteract accuracy is published only in ``result_acc_*.json`` below;
+    # its perf result must not carry a second copy. ``result`` keeps it in memory so the
     # caller's IA-QTF1 floor assertions still see it.
     persisted = result
     if isinstance(omniinteract_summary := result.get("omniinteract"), dict) and "accuracy" in omniinteract_summary:
@@ -924,7 +924,8 @@ def run_benchmark(
         }
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(persisted, f, ensure_ascii=False, indent=2)
-    if dataset_name == "omni-duplex-eval" and "--duplex-eval-evaluate" in args and accuracy_baseline is not None:
+    # Evaluated scores must be published even when no quality baseline is configured.
+    if dataset_name == "omni-duplex-eval" and "--duplex-eval-evaluate" in args:
         from tests.e2e.accuracy.helpers import (
             _DUPLEX_EVAL_DEFAULT_ACC_DIR,
             _acc_result_filename,
@@ -964,12 +965,13 @@ def run_benchmark(
             accuracy=accuracy,
         )
         print(f"Accuracy result saved to {accuracy_path}")
-        from vllm_omni.platforms import current_omni_platform
+        if accuracy_baseline is not None:
+            from vllm_omni.platforms import current_omni_platform
 
-        # Preserve the accuracy job's torch_npu shutdown exception while
-        # requiring complete artifacts and scores in the caller's assertions.
-        allowed_exit_codes = (0, -6) if current_omni_platform.is_npu() else (0,)
-        assert returncode in allowed_exit_codes, f"benchmark exited with unexpected code {returncode}"
+            # Keep the accuracy-config CLI policy, including the NPU shutdown
+            # exception, independent of publishing record-only evaluated scores.
+            allowed_exit_codes = (0, -6) if current_omni_platform.is_npu() else (0,)
+            assert returncode in allowed_exit_codes, f"benchmark exited with unexpected code {returncode}"
     if dataset_name == "omniinteract" and "--omniinteract-evaluate" in args:
         _write_omniinteract_accuracy_result(
             result,

@@ -27,9 +27,11 @@ pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
 
 For A3, use `-m "full_model and npu and A3 and cards_2"`.
 The existing CUDA and NPU nightly jobs use this same JSON configuration.
-Setting `duplex_eval_accuracy_config` opts a DFX case into the accuracy
-artifact and CLI-exit guard. Existing evaluated cases such as Qwen3-Omni's
-`pr_correction` keep their current result and exit-code behavior.
+Setting `duplex_eval_evaluate: true` writes an independent `result_acc_*.json`
+from the same measured responses and judge scores, including record-only cases
+without a numerical baseline. `duplex_eval_accuracy_config` additionally enables
+the accuracy contract and CLI-exit guard. Qwen3-Omni's `PR_correction` retains
+its generation settings, embedded performance-JSON scores and exit-code policy.
 
 The AMD MiniCPM CI job passes `--require-duplex-eval-score-floors`.
 Missing or empty floors for the runtime hardware fail this case. Local DFX
