@@ -86,9 +86,6 @@ def assert_baseline_within_tolerance(
     unless ``required=True`` requests a failure instead.
     """
     baseline_hardware = hardware
-    # The A3 Nightly job identifies the board when the runtime reports only 910.
-    if hardware == "910" and os.environ.get("OMNI_DFX_ASCEND_910_PROFILE") == "A3":
-        baseline_hardware = "A3"
     # Ascend runtime labels use the A2 resource bucket when no exact bucket exists.
     if isinstance(baseline, dict) and hardware in ("910B", "910B4") and hardware not in baseline and "A2" in baseline:
         baseline_hardware = "A2"

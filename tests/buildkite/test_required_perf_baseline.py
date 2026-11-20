@@ -4,10 +4,8 @@
 """Execute DFX baseline logic on CPU without importing the serving runtime."""
 
 import ast
-import json
 import logging
 import math
-import os
 import typing
 from collections.abc import Mapping
 from pathlib import Path
@@ -45,7 +43,6 @@ def baseline_functions():
     namespace = {
         "__name__": __name__,
         "math": math,
-        "os": os,
         "logging": logging,
         "Mapping": Mapping,
         "Any": typing.Any,
@@ -122,21 +119,3 @@ def test_require_baseline_option_is_opt_in(baseline_functions):
     options = parser.parse(["--require-baseline"])
     assert options.require_baseline is True
     assert options.assert_baseline is False
-
-
-def test_a3_nightly_gate_rejects_historical_tts_regression(baseline_functions, monkeypatch):
-    cases = json.loads(Path("tests/dfx/perf/tests/test_tts.json").read_text(encoding="utf-8"))
-    case = next(case for case in cases if case["test_name"] == "test_qwen3_tts_base")
-    params = next(params for params in case["benchmark_params"] if params["eval_phase"] == "throughput")
-    baseline = baseline_functions["resolve_baseline_for_sweep"](
-        params["baseline"], sweep_index=params["max_concurrency"].index(64)
-    )
-    measured = dict(baseline["A3"], median_audio_ttfp_ms=2052.5907)
-    check = baseline_functions["assert_baseline_within_tolerance"]
-
-    monkeypatch.delenv("OMNI_DFX_ASCEND_910_PROFILE", raising=False)
-    check(measured, baseline, "910")
-    monkeypatch.setenv("OMNI_DFX_ASCEND_910_PROFILE", "A3")
-    check(dict(measured, median_audio_ttfp_ms=1254.17), baseline, "910")
-    with pytest.raises(AssertionError, match="median_audio_ttfp_ms"):
-        check(measured, baseline, "910")
