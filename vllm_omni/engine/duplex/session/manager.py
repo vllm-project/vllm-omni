@@ -29,7 +29,7 @@ from opentelemetry import trace
 from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.commands import AppendAudio, Commit, DuplexCommand
-from vllm_omni.engine.duplex.config import apply_session_stats_capability
+from vllm_omni.engine.duplex.config import apply_input_clock_capabilities, apply_session_stats_capability
 from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
     DuplexStagePort,
@@ -58,11 +58,18 @@ from vllm_omni.engine.duplex.messages import (
     ResumeDuplexSessionMessage,
     TouchDuplexSessionMessage,
 )
-from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexRuntimeConfigError, validate_duplex_plugin_sampling
+from vllm_omni.engine.duplex.plugin import (
+    DuplexModelPlugin,
+    DuplexRuntimeConfigError,
+    validate_duplex_plugin_sampling,
+    validate_session_tools,
+)
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
+from vllm_omni.engine.duplex.session.input_clock import check_input_clock_supported
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity, DuplexLeaseConfig, DuplexLeaseState
 from vllm_omni.engine.duplex.session.perf_ledger import SessionPerfLedger
 from vllm_omni.engine.duplex.turn_detection import SileroVADBackendProvider, SmartTurnBackendProvider
+from vllm_omni.engine.duplex.vad_batcher import TurnDetectionBatcher
 from vllm_omni.inputs.data import disable_watermarking
 from vllm_omni.tracing import SessionTrace
 
@@ -123,6 +130,7 @@ class DuplexSessionManager:
         tracer: trace.Tracer | None = None,
     ) -> None:
         validate_duplex_plugin_sampling(plugin, sampling_defaults=tuple(stage_port.sampling_defaults()))
+        plugin.configure_server(runtime_config)
         self.plugin = plugin
         self.tracer = tracer
         self.session_traces: dict[str, SessionTrace] = {}
@@ -155,6 +163,9 @@ class DuplexSessionManager:
         self.semantic_vad_backend_provider = SmartTurnBackendProvider(
             model_path=getattr(runtime_config, "semantic_vad_model_path", None)
         )
+        #: A single thread that runs every session's turn detection, batching Silero
+        #: across sessions; Smart Turn work goes to the session executor.
+        self.turn_detection_batcher = TurnDetectionBatcher(self.executor)
         self.runners: dict[str, DuplexSessionRunner] = {}
         self._outputs: dict[str, DuplexOutputBuffer] = {}
         self._output_failed: set[str] = set()
@@ -293,6 +304,11 @@ class DuplexSessionManager:
         holds its admitted byte reservation through decoding and VAD. The
         runner then replaces it with the decoded PCM reservation without an
         intervening await, keeping pending audio charged while it is busy.
+
+        A command refused here is answered with an ``error``. The modality and
+        backpressure refusals also call ``runner.input_refused``, which gives
+        an input-clocked session's refused input its acknowledgement in input
+        order; a refusal because the session is closing does not.
         """
         runner = self.runners.get(message.session_id)
         command = message.command
@@ -318,6 +334,9 @@ class DuplexSessionManager:
                     )
                 ],
             )
+            # Not ``input_refused``: an input-clocked session acknowledges only
+            # inputs that arrived before it began closing (its teardown
+            # acknowledgement covers them).
             return
         if isinstance(command, AppendAudio):
             has_audio = bool(command.audio)
@@ -328,6 +347,7 @@ class DuplexSessionManager:
                     session,
                     [self._error_event("invalid_input_modality", modality_error, command=command)],
                 )
+                runner.input_refused(command, "invalid_input_modality")
                 return
             limit = int(self.runtime_config.max_pending_input_bytes_per_session)
             pending_bytes = len(command.audio) + sum(len(frame) for frame in command.video_frames)
@@ -342,6 +362,7 @@ class DuplexSessionManager:
                         )
                     ],
                 )
+                runner.input_refused(command, "input_backpressure")
                 return
         elif isinstance(command, Commit):
             if not session.reserve_pending_turn(limit=int(self.runtime_config.max_pending_turns_per_session)):
@@ -355,6 +376,7 @@ class DuplexSessionManager:
                         )
                     ],
                 )
+                runner.input_refused(command, "input_backpressure")
                 return
         runner.submit(command)
 
@@ -460,10 +482,20 @@ class DuplexSessionManager:
         ok: bool,
         session: DuplexEngineSession | None = None,
         error: BaseException | None = None,
+        input_index: int | None = None,
     ) -> None:
+        """Answer a control message on the result sink.
+
+        A successful answer carries the session's capabilities and public
+        session object; ``input_index`` (a resume of an input-clocked session)
+        is added to that object as ``session.input_index``.
+        """
         error_code, error_message, error_retryable = (
             self._control_error(error) if error is not None else (None, None, False)
         )
+        public_session = session.as_public_dict() if session is not None and ok else None
+        if public_session is not None and input_index is not None:
+            public_session["input_index"] = input_index
         result = DuplexControlResultMessage(
             control_id=message.control_id,
             operation=operation,
@@ -471,7 +503,7 @@ class DuplexSessionManager:
             ok=ok,
             lease_generation=session.lease_generation if session is not None else None,
             capabilities=session.capabilities if session is not None and ok else None,
-            public_session=session.as_public_dict() if session is not None and ok else None,
+            public_session=public_session,
             error_code=error_code,
             error_message=error_message,
             error_retryable=error_retryable,
@@ -610,6 +642,7 @@ class DuplexSessionManager:
             holds_replica_reservation = True
             config = message.session_config
             self.plugin.validate_client_extra_body(config.extra_body)
+            check_input_clock_supported(self.plugin, config.extra_body)
             try:
                 runtime_config = await self.plugin.prepare_runtime_config(config, model_config=self.model_config)
             except DuplexRuntimeConfigError:
@@ -617,9 +650,11 @@ class DuplexSessionManager:
             except ValueError as exc:
                 raise DuplexRuntimeConfigError(str(exc)) from exc
             collect_stats = bool(getattr(self.runtime_config, "collect_stats", False))
-            capabilities = apply_session_stats_capability(
-                self.plugin.capabilities(max_sessions=max_sessions), collect_stats
+            capabilities = apply_input_clock_capabilities(
+                apply_session_stats_capability(self.plugin.capabilities(max_sessions=max_sessions), collect_stats),
+                config.extra_body,
             )
+            validate_session_tools(capabilities, config.extra_body)
             session = DuplexEngineSession(
                 session_id=session_id,
                 config=config,
@@ -889,7 +924,16 @@ class DuplexSessionManager:
                 )
             except ValueError as exc:
                 raise DuplexSessionError(str(exc), code="session_resume_conflict") from exc
-            await self._put_result(message, operation="resume", ok=True, session=session)
+            # An input-clocked client learns how many of its inputs reached the
+            # session (``input_index`` of the latest), so it can resend exactly
+            # those lost with the old connection.
+            await self._put_result(
+                message,
+                operation="resume",
+                ok=True,
+                session=session,
+                input_index=runner.admitted_inputs,
+            )
         except Exception as exc:
             logger.exception("resume_duplex_session failed: %s", exc)
             await self._put_result(message, operation="resume", ok=False, session=session, error=exc)
@@ -1132,6 +1176,7 @@ class DuplexSessionManager:
         self._request_index.clear()
         self._outputs.clear()
         self._output_failed.clear()
+        self.turn_detection_batcher.close()
         if self._owns_executor:
             self.executor.shutdown(wait=False, cancel_futures=True)
 

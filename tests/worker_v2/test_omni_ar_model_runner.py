@@ -3,7 +3,7 @@
 
 """Unit tests for OmniARModelRunner v2: async output staging, snapshot ownership, payload slicing."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -22,6 +22,217 @@ from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner, OmniAsyn
 from vllm_omni.worker_v2.output_snapshot import pack_output_snapshot
 
 pytestmark = [pytest.mark.core_model]
+
+
+@pytest.mark.cpu
+def test_bagel_img2img_kv_transfer_preserves_compressed_rope(monkeypatch):
+    from vllm_omni.diffusion.models.bagel.bagel_transformer import Bagel, get_flattened_position_ids_extrapolate
+    from vllm_omni.diffusion.models.bagel.pipeline_bagel import BagelPipeline
+    from vllm_omni.distributed.omni_connectors.kv_transfer_manager import KVCacheTransferData, OmniKVTransferManager
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.model_executor.models.bagel.bagel import OmniBagelForConditionalGeneration
+    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+    model = object.__new__(OmniBagelForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model._ropes_pending, model._ropes_metadata = [], {}
+    model._img2img_token_id = 99
+    # Substitute only the attention kernels; keep Bagel's real position rewrite.
+    model._mot_forward = lambda *args, **kwargs: torch.zeros(29, 2)
+    req_ids = ["cfg_text", "cfg_img", "gen"]
+    lengths = [12, 3, 14]
+    positions = torch.cat([torch.arange(n) for n in lengths])
+    input_ids = torch.tensor([99] * 11 + [1] + [2] * 3 + [99] * 11 + [3] * 3)
+    runner = object.__new__(OmniARModelRunner)
+    runner.model, runner.execute_model_state = model, None
+    runner.kv_caches = [(torch.zeros(1, 32, 1, 2), torch.ones(1, 32, 1, 2))]
+    runner.cache_config = SimpleNamespace(block_size=32, cache_dtype="auto")
+    runner.req_states = SimpleNamespace(req_id_to_index={})
+    manager = object.__new__(OmniKVTransferManager)
+    received = {}
+
+    def transfer(*, finished_reqs, kv_caches, block_size, cache_dtype, request_id_resolver):
+        for req_id, data in finished_reqs.items():
+            payload = manager._extract_kv_cache(
+                req_id,
+                data["block_ids"],
+                data["seq_len"],
+                kv_caches,
+                block_size,
+                cache_dtype,
+                data.get("custom_metadata"),
+            )
+            received[req_id] = KVCacheTransferData.from_bytes(bytearray(payload.to_bytes()))
+        return list(finished_reqs)
+
+    monkeypatch.setattr(
+        runner, "_ensure_kv_transfer_manager", lambda: SimpleNamespace(handle_finished_requests_kv_transfer=transfer)
+    )
+
+    def forward(_runner, *_args, **_kwargs):
+        model(
+            input_ids,
+            positions,
+            inputs_embeds=torch.zeros(29, 2),
+            seq_token_counts=lengths,
+            img2img_layouts=[(6, 4, 32, 32), None, (6, 4, 32, 32)],
+        )
+        runner.execute_model_state = SimpleNamespace(input_batch=SimpleNamespace(req_ids=req_ids))
+        return None
+
+    monkeypatch.setattr(OmniGPUModelRunner, "execute_model", forward)
+    runner.execute_model(SimpleNamespace(finished_requests_needing_kv_transfer={}))
+    # Transfer order differs from the forward order. Metadata must remain request-local.
+    finished = {rid: {"seq_len": n, "block_ids": [0]} for rid, n in zip(req_ids, lengths)}
+    runner._handle_kv_transfer_pre(
+        SimpleNamespace(finished_requests_needing_kv_transfer={rid: finished[rid] for rid in reversed(req_ids)})
+    )
+    assert model._ropes_pending == []
+
+    bagel = object.__new__(Bagel)
+    torch.nn.Module.__init__(bagel)
+    bagel.max_latent_size, bagel.latent_downsample = 64, 16
+    bagel.latent_channel, bagel.latent_patch_size = 16, 2
+    bagel.get_flattened_position_ids = get_flattened_position_ids_extrapolate
+    bagel.config = SimpleNamespace(llm_config=SimpleNamespace(num_hidden_layers=1))
+    pipeline = object.__new__(BagelPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.bagel, pipeline.device = bagel, torch.device("cpu")
+    pipeline.language_model = SimpleNamespace(vocab_size=100)
+    pipeline.new_token_ids = {"start_of_image": 1, "end_of_image": 2}
+    sampling = OmniDiffusionSamplingParams(height=32, width=32, seed=52, num_inference_steps=15)
+    sampling.past_key_values = SimpleNamespace(**received["gen"]["layer_blocks"])
+    sampling.kv_metadata = received["gen"]["metadata"]
+    for role in ("cfg_text", "cfg_img"):
+        setattr(sampling, role + "_past_key_values", SimpleNamespace(**received[role]["layer_blocks"]))
+        setattr(sampling, role + "_kv_metadata", received[role]["metadata"])
+    prepared = pipeline._forward_single({"prompt": "edit", "modalities": ["img2img"]}, sampling, prepare_only=True)
+    assert prepared["gen_context"]["ropes"] == [5]
+    assert prepared["cfg_text_context"]["ropes"] == [3]
+    assert prepared["cfg_img_context"]["ropes"] == [3]
+    assert prepared["generation_input"]["packed_position_ids"].tolist() == [5] * 6
+    assert prepared["cfg_text_packed_position_ids"].tolist() == [3] * 6
+    assert sampling.kv_metadata["image_shape"] == [32, 32]
+
+
+@pytest.mark.parametrize("step", ["dummy", "empty", "failed", "no_hook"])
+@pytest.mark.cpu
+def test_pending_metadata_only_flushes_after_a_real_successful_forward(monkeypatch, step):
+    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+    runner = object.__new__(OmniARModelRunner)
+    flush = MagicMock()
+    runner.model = SimpleNamespace(**({} if step == "no_hook" else {"flush_pending_metadata": flush}))
+    runner.execute_model_state = SimpleNamespace(input_batch=SimpleNamespace(req_ids=["previous"]))
+    monkeypatch.setattr(runner, "_handle_kv_transfer_pre", lambda _: None)
+    output = object()
+
+    def forward(_runner, *_args, **_kwargs):
+        if step == "failed":
+            raise RuntimeError("forward failed")
+        if step != "empty":
+            runner.execute_model_state = SimpleNamespace(input_batch=SimpleNamespace(req_ids=["current"]))
+        return output
+
+    monkeypatch.setattr(OmniGPUModelRunner, "execute_model", forward)
+    if step == "failed":
+        with pytest.raises(RuntimeError, match="forward failed"):
+            runner.execute_model(SimpleNamespace())
+    else:
+        assert runner.execute_model(SimpleNamespace(), dummy_run=step == "dummy") is output
+    if step == "no_hook":
+        flush.assert_not_called()
+    else:
+        flush.assert_called_once_with(())
+
+
+@pytest.mark.parametrize("step", ["dummy", "failed", "capture"])
+@pytest.mark.cpu
+def test_bagel_unassigned_metadata_does_not_leak_into_next_forward(monkeypatch, step):
+    from vllm_omni.model_executor.models.bagel.bagel import OmniBagelForConditionalGeneration
+    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+    model = object.__new__(OmniBagelForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model._ropes_pending = []
+    live_metadata = {"ropes": [7], "image_shape": [32, 32]}
+    model._ropes_metadata = {"live": live_metadata}
+    model._img2img_token_id = 99
+    runner = object.__new__(OmniARModelRunner)
+    runner.model, runner.execute_model_state = model, None
+    monkeypatch.setattr(runner, "_handle_kv_transfer_pre", lambda _: None)
+    fail = step == "failed"
+
+    def attention(_input_ids, positions, *_args, **_kwargs):
+        if fail:
+            raise RuntimeError("attention failed after position metadata")
+        return torch.zeros(len(positions), 2)
+
+    model._mot_forward = attention
+
+    def parent_forward(_runner, scheduler_output, *_args, **_kwargs):
+        n = scheduler_output.tokens
+        # Keep the real Bagel forward, position rewrite and pending producer.
+        model(
+            torch.full((n,), 99),
+            torch.arange(n),
+            inputs_embeds=torch.zeros(n, 2),
+            seq_token_counts=[n],
+            img2img_layouts=[(6, 4, 32, 32)],
+        )
+        runner.execute_model_state = SimpleNamespace(input_batch=SimpleNamespace(req_ids=scheduler_output.req_ids))
+        return None
+
+    monkeypatch.setattr(OmniGPUModelRunner, "execute_model", parent_forward)
+    excluded = SimpleNamespace(tokens=12, req_ids=["excluded"])
+    if step == "capture":
+        # Native graph capture invokes the model directly, bypassing the runner.
+        model(
+            torch.full((12,), 99),
+            torch.arange(12),
+            inputs_embeds=torch.zeros(12, 2),
+            seq_token_counts=[12],
+            img2img_layouts=[(6, 4, 32, 32)],
+        )
+    elif step == "failed":
+        with pytest.raises(RuntimeError, match="attention failed after position metadata"):
+            runner.execute_model(excluded)
+    else:
+        runner.execute_model(excluded, dummy_run=True)
+    assert model._ropes_pending[0]["ropes"] == [3]
+    assert "excluded" not in model._ropes_metadata
+
+    fail = False
+    runner.execute_model(SimpleNamespace(tokens=14, req_ids=["real"]))
+    assert model.get_kv_transfer_metadata("real") == {
+        "ropes": [5],
+        "image_shape": [32, 32],
+        "prefill_position_count": 14,
+    }
+    assert model._ropes_pending == []
+    assert model._ropes_metadata["live"] is live_metadata
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("num_tokens", "max_num_reqs", "max_model_len", "expected_tokens"),
+    [
+        (32768, 1, 22800, 22800),
+        (32768, 2, 22800, 32768),
+        (32768, 2, 8192, 16384),
+        (16384, 2, 8192, 16384),
+        (1, 1, 22800, 1),
+    ],
+)
+def test_dummy_run_respects_context_capacity(mocker, num_tokens, max_num_reqs, max_model_len, expected_tokens):
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    runner.max_num_reqs = max_num_reqs
+    runner.max_model_len = max_model_len
+    parent_run = mocker.patch.object(
+        omni_ar_model_runner.OmniGPUModelRunner, "_dummy_run", return_value=mocker.sentinel.outputs
+    )
+    assert runner._dummy_run(num_tokens, skip_attn=False, context_len=0) is mocker.sentinel.outputs
+    parent_run.assert_called_once_with(expected_tokens, skip_attn=False, context_len=0)
 
 
 class _FakeStream:
@@ -173,9 +384,15 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
     runner.is_last_pp_rank, runner.pp_handler, runner.check_ep_fault = True, None, False
     runner.aux_output_connector = None
     runner.model_config = SimpleNamespace(async_chunk=False)
-    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(engine_output_type=engine_output_type))
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(engine_output_type=engine_output_type), kv_transfer_config=None
+    )
     text_hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
-    runner.model_state = SimpleNamespace(postprocess_model_output=MagicMock(return_value=(text_hidden, None)))
+    multimodal_outputs = {"codes": {"audio": torch.ones(3, 1)}}
+    runner.model_state = SimpleNamespace(
+        postprocess_model_output=MagicMock(return_value=(text_hidden, multimodal_outputs)),
+        run_postprocess=MagicMock(),
+    )
     runner.model_state.intermediate_buffer = SimpleNamespace(buffers={0: {"global_request_id": "global-req"}})
     runner.req_states = SimpleNamespace(req_id_to_index={"req": 0})
     runner.req_states.all_token_ids = SimpleNamespace(gpu=torch.tensor([[1]]))
@@ -194,13 +411,25 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
         yield
         sampling_active = False
 
+    # Exercise the deferred structured-output branch in one existing matrix
+    # case without doubling the full orchestration parametrization.
+    requires_multimodal_postprocess = not needs_history and include_hidden is None and engine_output_type == "text"
+
+    def compute_prompt_logits(hidden):
+        return hidden
+
     runner.model = SimpleNamespace(
-        compute_logits=lambda hidden: hidden, logitsprocs_need_output_token_ids=needs_history
+        compute_logits=lambda hidden: hidden,
+        compute_prompt_logits=compute_prompt_logits,
+        logitsprocs_need_output_token_ids=needs_history,
+        postprocess_requires_multimodal_outputs=requires_multimodal_postprocess,
     )
     if include_hidden is not None:
         runner.model.omni_pooler_payload_include_hidden = include_hidden
     runner.model.mrv2_sampling_context = sampling_context
     runner.sampler = None
+    runner.speculator = None
+    runner.num_speculative_steps = 0
     runner.sample = MagicMock(return_value=sampler_out)
     runner.sample.side_effect = lambda *_: sampler_out if sampling_active is needs_history else pytest.fail()
     logprobs_mock = MagicMock(side_effect=lambda *_: pytest.fail("inside ctx") if sampling_active else {})
@@ -221,6 +450,11 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
     monkeypatch.setattr(omni_ar_model_runner, "OmniAsyncOutput", MagicMock(return_value=mock_out))
 
     assert runner.sample_tokens(None) is mock_out
+    assert logprobs_mock.call_args.args[0] is compute_prompt_logits
+    if requires_multimodal_postprocess:
+        runner.model_state.run_postprocess.assert_called_once_with(text_hidden, input_batch, multimodal_outputs)
+    else:
+        runner.model_state.run_postprocess.assert_not_called()
     kwargs = omni_ar_model_runner.OmniAsyncOutput.call_args.kwargs
     if engine_output_type != "text" and include_hidden is not False:
         assert kwargs["text_hidden"] is text_hidden
@@ -258,7 +492,9 @@ def test_sample_tokens_drafts_from_target_layers_after_postprocess(monkeypatch, 
     runner.is_last_pp_rank, runner.pp_handler, runner.check_ep_fault = True, None, False
     runner.aux_output_connector = None
     runner.model_config = SimpleNamespace(async_chunk=False)
-    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(engine_output_type="text"))
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(engine_output_type="text"), kv_transfer_config=None
+    )
     runner.model = SimpleNamespace(compute_logits=lambda h: h)
     runner.model_state = SimpleNamespace(
         postprocess_model_output=MagicMock(return_value=(hidden, None)), supports_mm_inputs=False
@@ -321,13 +557,93 @@ def test_sample_tokens_drafts_from_target_layers_after_postprocess(monkeypatch, 
     torch.testing.assert_close(handed, expected[[1, 0], :num_spec_tokens])
 
 
+@pytest.mark.parametrize(
+    "steps,last_rank,has_verifier",
+    [
+        (0, True, False),
+        (7, False, False),
+        (7, True, True),
+        (7, True, False),
+        (0, True, None),
+        (7, False, None),
+        (7, True, None),
+    ],
+)
+def test_speculative_load_requires_verifier_only_on_final_rank(monkeypatch, steps, last_rank, has_verifier):
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    calls = []
+
+    def load(self, *args, **kwargs):
+        calls.append((args, kwargs))
+        self.num_speculative_steps = steps
+        self.is_last_pp_rank = last_rank
+        if has_verifier is not None:
+            self.rejection_sampler = object() if has_verifier else None
+
+    monkeypatch.setattr(omni_ar_model_runner.OmniGPUModelRunner, "load_model", load)
+    if steps and last_rank and has_verifier is None:
+        # Missing base-runner state is an API-contract violation, not a disabled verifier.
+        with pytest.raises(AttributeError, match="rejection_sampler"):
+            runner.load_model(load_dummy_weights=True)
+    elif steps and last_rank and not has_verifier:
+        with pytest.raises(ValueError, match="requires a rejection sampler"):
+            runner.load_model(load_dummy_weights=True)
+    else:
+        runner.load_model(load_dummy_weights=True)
+    assert calls == [((), {"load_dummy_weights": True})]
+
+
+@pytest.mark.parametrize("scheduled", [0, 3, 7])
+def test_speculative_proposal_preserves_aux_and_publishes_scheduled_drafts(monkeypatch, scheduled):
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    runner.num_speculative_steps = 7
+    runner._draft_workspace_lane = object()
+    runner.model = object()
+    runner.pp_handler = None
+    runner.adaptive_verification = None
+    proposed = torch.arange(14).reshape(2, 7)
+    runner.speculator = SimpleNamespace(propose=MagicMock(return_value=proposed.clone()))
+    runner.sampler = SimpleNamespace(
+        sampling_states=SimpleNamespace(
+            temperature=SimpleNamespace(gpu=torch.ones(3)), seeds=SimpleNamespace(gpu=torch.zeros(3))
+        )
+    )
+    runner.req_states = SimpleNamespace(
+        draft_tokens=torch.full((3, 7), -9), last_sampled_tokens=object(), next_prefill_tokens=object()
+    )
+    runner.draft_tokens_handler = SimpleNamespace(set_draft_tokens=MagicMock())
+    batch = SimpleNamespace(idx_mapping=torch.tensor([2, 0]))
+    aux = [torch.ones(4, 2) for _ in range(3)]
+    state = omni_ar_model_runner.DraftInputs(
+        num_spec_tokens=scheduled,
+        hidden_states=torch.zeros(4, 2),
+        aux_hidden_states=aux,
+        attn_metadata=object(),
+        slot_mappings_by_layer=object(),
+        dp_sync_state=None,
+    )
+    monkeypatch.setattr(omni_ar_model_runner, "use_workspace_lane", lambda lane: nullcontext())
+    monkeypatch.setattr(omni_ar_model_runner, "get_drafter_hidden_states", lambda model, hidden: hidden)
+    accepted, rejected = torch.tensor([2, 3]), torch.tensor([5, 4])
+    runner._propose_draft_tokens(batch, state, accepted, rejected, None)
+    args = runner.speculator.propose.call_args.args
+    assert args[0] is batch and args[3] is state.hidden_states and args[4] is aux
+    assert args[5] is accepted and args[6] is rejected
+    expected = proposed.clone()
+    expected[:, scheduled:] = -1
+    torch.testing.assert_close(runner.req_states.draft_tokens[batch.idx_mapping], expected)
+    assert (runner.req_states.draft_tokens[1] == -9).all()
+    published_batch, published = runner.draft_tokens_handler.set_draft_tokens.call_args.args
+    assert published_batch is batch
+    torch.testing.assert_close(published, expected[:, :scheduled])
+
+
 @pytest.mark.cpu
 def test_async_output_preserves_fixed_token_scores_on_host(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
     scores = torch.tensor([[-0.5, -1.5], [-0.2, -2.2]])
     mro = omni_ar_model_runner.OmniModelRunnerOutput(
         req_ids=["req-0"],
-        req_id_to_index={"req-0": 0},
         sampled_token_ids=None,
         prompt_logprobs_dict={},
         prompt_token_id_logprobs_dict={"req-0": scores},
@@ -547,6 +863,87 @@ def test_async_output_slices_request_payloads_with_graph_padding(
                 torch.testing.assert_close(payload["hidden"], hidden[offsets[i] : offsets[i + 1]])
             else:
                 assert "hidden" not in payload
+
+
+@pytest.mark.parametrize("async_chunk", [False, True])
+@pytest.mark.cpu
+def test_gepard_sparse_audio_routes_by_request_id_without_hidden_fallback(monkeypatch, mocker, async_chunk) -> None:
+    """A Gepard delta must not expose neighbour hidden state as audio."""
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    hidden = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    audio = torch.arange(10 * 1024, dtype=torch.float32)
+    sample_rate = torch.tensor(22050, dtype=torch.int32)
+    batch = mocker.Mock(spec=InputBatch)
+    batch.query_start_loc_np = np.array([0, 1, 2])
+    batch.num_scheduled_tokens = np.array([1, 1])
+    batch.num_reqs = 2
+    batch.num_tokens_after_padding = 2
+
+    output = _async_output(
+        req_ids=["req-a", "req-b"],
+        sampler_output=SamplerOutput(
+            torch.ones(2, 1, dtype=torch.long),
+            None,
+            None,
+            torch.ones(2, dtype=torch.long),
+            torch.zeros(2, dtype=torch.long),
+        ),
+        num_sampled_tokens=torch.ones(2, dtype=torch.long),
+        text_hidden=hidden,
+        multimodal_outputs={
+            "model_outputs": [audio],
+            "sr": [sample_rate],
+            "meta": {"req_id": ["req-b"], "sparse_audio": ["1"]},
+        },
+        input_batch=batch,
+        async_chunk=async_chunk,
+        engine_output_type="audio",
+    ).get_output()
+
+    payloads = output.multimodal_outputs if async_chunk else output.inter_stage_outputs
+    assert payloads is not None
+    # Gepard hidden rows are 1024 wide. Returning one without model_outputs
+    # made the speech frontend encode it as a 1024-channel audio chunk.
+    assert payloads[0] in ({}, None)
+    if async_chunk:
+        expected_keys = {"model_outputs", "sr"}
+    else:
+        expected_keys = {"hidden", "model_outputs", "sr"}
+    assert payloads[1] is not None
+    assert set(payloads[1]) == expected_keys
+    if not async_chunk:
+        torch.testing.assert_close(payloads[1]["hidden"], hidden[1:2])
+    torch.testing.assert_close(payloads[1]["model_outputs"], audio)
+    torch.testing.assert_close(payloads[1]["sr"], sample_rate)
+    assert not any(key.startswith("meta.") for payload in payloads if payload for key in payload)
+
+
+@pytest.mark.cpu
+def test_non_audio_pooler_ignores_invalid_sparse_audio_declaration() -> None:
+    """Non-audio stages keep dense routing even if audio metadata is malformed."""
+    hidden = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    codes = torch.arange(32, dtype=torch.long).reshape(2, 16)
+
+    payloads = OmniARModelRunner._build_pooler_output_from_cpu(
+        hidden,
+        {
+            "codes": {"audio": codes},
+            "meta": {"req_id": ["req-b"], "sparse_audio": 1},
+        },
+        np.array([0, 1, 2]),
+        np.array([1, 1]),
+        2,
+        req_ids=["req-a", "req-b"],
+        engine_output_type="latent",
+    )
+
+    assert len(payloads) == 2
+    for i, payload in enumerate(payloads):
+        assert set(payload) == {"hidden", "codes.audio"}
+        torch.testing.assert_close(payload["hidden"], hidden[i : i + 1])
+        torch.testing.assert_close(payload["codes.audio"], codes[i : i + 1])
 
 
 @pytest.mark.parametrize("async_chunk", [False, True])
@@ -1177,6 +1574,42 @@ def test_request_owned_snapshot_skips_generic_partition(monkeypatch, streaming):
     assert (result.pooler_output is None) == streaming
     if not streaming:
         assert result.pooler_output is result.inter_stage_outputs
+
+
+@pytest.mark.cpu
+def test_stage0_async_chunk_publishes_thinker_latent_once(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    batch = SimpleNamespace(
+        num_reqs=1,
+        query_start_loc_np=np.array([0, 2]),
+        num_scheduled_tokens=np.array([2]),
+        num_tokens_after_padding=2,
+    )
+    latent = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    # Stage 0 does not send connector chunks, so the orchestrator pooler keeps
+    # the latent. The client channel must not mirror it.
+    result = _async_output(
+        sampler_output=SamplerOutput(torch.tensor([[7]]), None, None, torch.tensor([1]), torch.tensor([0])),
+        num_sampled_tokens=torch.tensor([1]),
+        multimodal_outputs={"latent": latent},
+        input_batch=batch,
+        async_chunk=True,
+        partition_async_payload=False,
+    ).get_output()
+    assert result.multimodal_outputs is None
+    assert result.pooler_output[0]["latent"].tolist() == [[1.0, 2.0], [3.0, 4.0]]
+    assert result.inter_stage_outputs[0]["latent"].tolist() == [[1.0, 2.0], [3.0, 4.0]]
+
+    partitioned = _async_output(
+        sampler_output=SamplerOutput(torch.tensor([[7]]), None, None, torch.tensor([1]), torch.tensor([0])),
+        num_sampled_tokens=torch.tensor([1]),
+        multimodal_outputs={"latent": latent.clone()},
+        input_batch=batch,
+        async_chunk=True,
+    ).get_output()
+    assert partitioned.pooler_output is None
+    assert partitioned.multimodal_outputs is None
+    assert partitioned.inter_stage_outputs[0]["latent"].tolist() == [[1.0, 2.0], [3.0, 4.0]]
 
 
 @pytest.mark.cpu

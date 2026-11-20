@@ -478,12 +478,6 @@ def parse_args():
         help="Timeout for initializing stages in seconds (default: 300)",
     )
     parser.add_argument(
-        "--shm-threshold-bytes",
-        type=int,
-        default=65536,
-        help="Threshold for using shared memory in bytes (default: 65536)",
-    )
-    parser.add_argument(
         "--output-dir",
         default="output_audio",
         help="Output directory for generated wav files (default: output_audio).",

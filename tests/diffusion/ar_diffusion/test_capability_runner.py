@@ -11,6 +11,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.experimental.ar_diffusion.capability import (
@@ -22,6 +24,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 from vllm_omni.experimental.ar_diffusion.runner import ARDiffusionModelRunner
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 BLOCK = 16
 POS = "positive"
@@ -194,7 +197,7 @@ def make_runner(
     runner.kv_cache = None
     runner.noisy_kv_cache = None
     runner._ar_diffusion_capability = None
-    runner._ar_diffusion_cell_capability = None
+    runner._ar_diffusion_noisy_kv_capability = None
     runner._ar_diffusion_kv_cache_spec = None
     runner._sessions = OrderedDict()
     runner._session_capacity = 0
@@ -457,6 +460,60 @@ def test_forward_exception_releases_pending_allocation_and_model_state(monkeypat
     assert pipeline.closes == ["broken"]
     assert not runner._sessions
     assert not kv._adapters
+    assert kv.manager.block_pool.get_num_free_blocks() == free_total
+
+
+@pytest.mark.parametrize("status_code", [400, 500])
+def test_error_output_releases_only_failed_session(monkeypatch, status_code):
+    pipeline = CapablePipeline(lingbot_like_spec(capacity=2))
+    runner = make_runner(pipeline)
+    kv = runner.kv_cache
+    assert kv is not None
+    free_total = kv.manager.block_pool.get_num_free_blocks()
+    healthy = commit_one_frame(runner, "healthy", "main")
+    healthy_blocks = list(kv.block_table(healthy.adapter("main")))
+    free_with_healthy = kv.manager.block_pool.get_num_free_blocks()
+    broken = commit_one_frame(runner, "broken", "main")
+    text_key = torch.ones(1, 8, 4, 64)
+    for state in (healthy, broken):
+        state.populate_cross_attention("main", "text", [(text_key, -text_key)] * state.num_layers)
+    healthy_text = healthy.get_cross_attention_kv("main", "text")[0]["k"]
+    output = DiffusionOutput(error="original forward error", error_status_code=status_code, error_type="test_error")
+
+    def return_error(self, req, kv_prefetch_job=None, diffusion_kv_metadata=None):
+        assert pipeline.bound_state is broken
+        # Also leave an unpublished allocation for the failing session.
+        ctx = broken.get_kv_caches("main", seq_len=BLOCK, commit_current=True)[0].forward_ctx
+        ctx.ensure_video_slots(torch.device("cpu"))
+        return output
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_model", return_error)
+    request = OmniDiffusionRequest(
+        prompt="test",
+        request_id="broken-request",
+        sampling_params=OmniDiffusionSamplingParams(seed=0, extra_args={"session_id": "broken"}),
+    )
+
+    actual = runner.execute_model(request)
+
+    assert actual is output
+    assert (actual.error, actual.error_status_code, actual.error_type) == (
+        "original forward error",
+        status_code,
+        "test_error",
+    )
+    assert pipeline.bound_state is None
+    assert pipeline.closes == ["broken"] and pipeline.resets == []
+    assert tuple(runner._sessions) == ("healthy",)
+    assert runner._sessions["healthy"] is healthy
+    assert "broken" not in kv._cross_sessions
+    assert kv.block_table(healthy.adapter("main")) == healthy_blocks
+    actual_text = healthy.get_cross_attention_kv("main", "text")[0]["k"]
+    assert actual_text.data_ptr() == healthy_text.data_ptr()
+    torch.testing.assert_close(actual_text, text_key)
+    assert kv.manager.block_pool.get_num_free_blocks() == free_with_healthy
+    runner.close_session("healthy")
+    assert not kv._adapters and not kv._cross_sessions
     assert kv.manager.block_pool.get_num_free_blocks() == free_total
 
 

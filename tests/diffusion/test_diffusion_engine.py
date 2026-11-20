@@ -20,6 +20,7 @@ from vllm_omni.diffusion.data import (
     DIFFUSION_REQUEST_LIFECYCLE_KEY,
     DIFFUSION_REQUEST_STARTED,
     DiffusionOutput,
+    DiffusionParallelConfig,
     OmniDiffusionConfig,
 )
 from vllm_omni.diffusion.diffusion_engine import (
@@ -27,6 +28,7 @@ from vllm_omni.diffusion.diffusion_engine import (
     DiffusionExecutionMode,
     _move_tensor_tree_to_cpu,
 )
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
@@ -151,6 +153,8 @@ class MockScheduler:
 
 def _make_admission_engine(pre_process_func) -> DiffusionEngine:
     engine = object.__new__(DiffusionEngine)
+    engine._request_chunk_states = {}
+    engine.od_config = SimpleNamespace(streaming_output=False)
     engine.scheduler = MockScheduler()
     engine.pre_process_func = pre_process_func
     engine._out_streams = {}
@@ -200,6 +204,7 @@ def test_request_started_output_is_emitted_only_for_opted_in_requests() -> None:
     sched_output = _make_request_mode_sched_output("tracked", "untracked")
     sched_output.scheduled_new_reqs[0].req.sampling_params.emit_request_lifecycle = True
     engine = object.__new__(DiffusionEngine)
+    engine._request_chunk_states = {}
     emitted = []
     engine._put_output = lambda request_id, output: emitted.append((request_id, output))
 
@@ -258,6 +263,7 @@ class TestRequestBatchCapability:
         )
 
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         with pytest.raises(ValueError, match="max_num_seqs=1"):
             engine._resolve_execution_mode(od_config)
 
@@ -283,6 +289,7 @@ class TestRequestBatchCapability:
         )
 
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
 
         assert engine._resolve_execution_mode(od_config) is DiffusionExecutionMode.REQUEST_BATCH
         registry_load.assert_not_called()
@@ -393,6 +400,10 @@ class TestRequestBatchCapability:
             custom_pipeline_args=custom_pipeline_args,
             streaming_output=False,
             max_num_seqs=1,
+            stage_role=None,
+            model_stage=None,
+            omni_kv_config=None,
+            diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
         )
         fake_executor = SimpleNamespace(
             execute_request=mocker.Mock(return_value="per-request"),
@@ -473,6 +484,10 @@ class TestRequestBatchCapability:
             custom_pipeline_args=None,
             streaming_output=False,
             max_num_seqs=2,
+            stage_role=None,
+            model_stage=None,
+            omni_kv_config=None,
+            diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
             request_batch_max_wait_ms=0,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             enable_distributed_layerwise_offload=True,
@@ -512,6 +527,95 @@ class TestRequestBatchCapability:
         assert od_config.request_batch_max_wait_ms == 0
         fake_executor_cls.assert_called_once_with(od_config)
 
+    def test_engine_allows_independent_hsdp_rank_requests_for_single_request_pipeline(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+    ) -> None:
+        od_config = OmniDiffusionConfig(
+            model_class_name="SinglePipeline",
+            max_num_seqs=1,
+            request_batch_max_wait_ms=0,
+            parallel_config=DiffusionParallelConfig(
+                use_hsdp=True,
+                hsdp_shard_size=8,
+                hsdp_data_parallel=True,
+            ),
+        )
+        fake_executor = SimpleNamespace(
+            execute_request=mocker.Mock(return_value="per-request"),
+            execute_batch=mocker.Mock(return_value="batch"),
+            execute_step=mocker.Mock(return_value="step"),
+        )
+        fake_executor_cls = mocker.Mock(return_value=fake_executor)
+
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.get_diffusion_post_process_func",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.get_diffusion_pre_process_func",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.DiffusionExecutor.get_class",
+            lambda *args, **kwargs: fake_executor_cls,
+        )
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            lambda model_class_name: _SingleRequestPipeline,
+        )
+
+        engine = DiffusionEngine(od_config)
+
+        assert engine.dp_concurrent is True
+        assert engine.scheduler.max_num_running_reqs == 8
+        fake_executor_cls.assert_called_once_with(od_config)
+
+    @pytest.mark.parametrize("model_class_name", ["MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"])
+    @pytest.mark.parametrize("max_num_seqs", [1, 2])
+    def test_engine_rejects_h3_hsdp_rank_requests_before_starting_workers(
+        self, model_class_name, max_num_seqs, monkeypatch, mocker
+    ):
+        od_config = SimpleNamespace(
+            model_class_name=model_class_name,
+            streaming_output=False,
+            max_num_seqs=max_num_seqs,
+            parallel_config=SimpleNamespace(data_parallel_size=2, use_hsdp=True, hsdp_data_parallel=True),
+        )
+        monkeypatch.setattr(DiffusionEngine, "_init_process_hooks", lambda *args: None)
+        init_executor = mocker.patch.object(DiffusionEngine, "_init_executor")
+
+        with pytest.raises(ValueError, match="hsdp_data_parallel is unsupported for MiniMax-H3"):
+            DiffusionEngine(od_config)
+
+        init_executor.assert_not_called()
+
+    @pytest.mark.parametrize("model_class_name", ["MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"])
+    def test_engine_allows_h3_serial_hsdp(self, model_class_name, monkeypatch):
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        od_config = SimpleNamespace(
+            model_class_name=model_class_name,
+            streaming_output=False,
+            max_num_seqs=1,
+            parallel_config=SimpleNamespace(data_parallel_size=1, use_hsdp=True, hsdp_data_parallel=False),
+        )
+        monkeypatch.setattr(diffusion_engine_module, "supports_request_batch", lambda _: False)
+
+        assert engine._resolve_execution_mode(od_config) == DiffusionExecutionMode.REQUEST_BATCH
+
+    def test_engine_rejects_hsdp_rank_requests_with_step_execution(self):
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        od_config = SimpleNamespace(
+            streaming_output=False,
+            step_execution=True,
+            parallel_config=SimpleNamespace(hsdp_data_parallel=True),
+        )
+
+        with pytest.raises(ValueError, match="request execution only"):
+            engine._resolve_execution_mode(od_config)
+
     @pytest.mark.parametrize("request_ids", [("req-a",), ("req-a", "req-b")])
     def test_engine_enables_batch_dispatch_for_request_batch_pipeline(
         self,
@@ -524,6 +628,10 @@ class TestRequestBatchCapability:
             custom_pipeline_args=None,
             streaming_output=False,
             max_num_seqs=2,
+            stage_role=None,
+            model_stage=None,
+            omni_kv_config=None,
+            diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
         )
         fake_executor = SimpleNamespace(
             execute_request=mocker.Mock(return_value="per-request"),
@@ -565,6 +673,11 @@ class TestRequestBatchCapability:
             custom_pipeline_args=None,
             engine_backend="default",
             streaming_output=False,
+            max_num_seqs=1,
+            stage_role=None,
+            model_stage=None,
+            omni_kv_config=None,
+            diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
         )
         fake_executor = SimpleNamespace(
             execute_request=mocker.Mock(),
@@ -597,6 +710,55 @@ class TestRequestBatchCapability:
 
         assert isinstance(engine, DiffusionEngine)
         warmup.assert_called_once_with()
+
+
+class _MixfusionCapablePipeline:
+    supports_mixfusion = True
+
+
+class TestMixFusionCapability:
+    pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+    @staticmethod
+    def _resolve(monkeypatch: pytest.MonkeyPatch, pipeline_cls: type, **config: object):
+        od_config = SimpleNamespace(
+            model_class_name="StubPipeline",
+            custom_pipeline_args=None,
+            streaming_output=False,
+            max_num_seqs=1,
+            **config,
+        )
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            lambda model_class_name: pipeline_cls,
+        )
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
+        return engine, od_config, engine._resolve_execution_mode(od_config)
+
+    def test_engine_rejects_server_level_mixfusion_on_unsupported_pipeline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with pytest.raises(ValueError, match="does not support MixFusion"):
+            self._resolve(monkeypatch, _SingleRequestPipeline, enable_mixfusion=True)
+
+    @pytest.mark.parametrize("step_execution", [False, True])
+    def test_server_level_mixfusion_runs_step_execution(
+        self, monkeypatch: pytest.MonkeyPatch, step_execution: bool
+    ) -> None:
+        # Request-mode batching keys on height/width, so MixFusion without step
+        # execution would silently never fuse.
+        engine, od_config, mode = self._resolve(
+            monkeypatch, _MixfusionCapablePipeline, enable_mixfusion=True, step_execution=step_execution
+        )
+        assert mode is DiffusionExecutionMode.STEP_BATCH
+        assert od_config.step_execution is True
+        assert engine.step_execution is True
+
+    def test_engine_ignores_mixfusion_check_when_flag_is_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _, _, mode = self._resolve(monkeypatch, _SingleRequestPipeline)
+        assert mode is DiffusionExecutionMode.REQUEST_BATCH
 
 
 class TestDiffusionCompileConfig:
@@ -727,7 +889,7 @@ class TestRequestBatchAdmission:
     def test_scheduler_exposes_waiting_and_running_counts(self) -> None:
         from vllm_omni.diffusion.sched import RequestScheduler
 
-        od_config = SimpleNamespace(max_num_seqs=4)
+        od_config = OmniDiffusionConfig(max_num_seqs=4, diffusion_attention_schedule=None)
         scheduler = RequestScheduler()
         scheduler.initialize(od_config)
 
@@ -758,10 +920,11 @@ class TestRequestBatchAdmission:
     def test_request_batch_admission_exits_early_when_waiting_queue_stable(self) -> None:
         from vllm_omni.diffusion.sched import RequestScheduler
 
-        od_config = SimpleNamespace(
+        od_config = OmniDiffusionConfig(
             max_num_seqs=32,
             request_batch_max_wait_ms=1000.0,
             step_execution=False,
+            diffusion_attention_schedule=None,
         )
         scheduler = RequestScheduler()
         scheduler.initialize(od_config)
@@ -775,6 +938,7 @@ class TestRequestBatchAdmission:
             )
 
         engine = object.__new__(DiffusionEngine)
+        engine._request_chunk_states = {}
         engine.od_config = od_config
         engine.scheduler = scheduler
         engine.step_execution = False
@@ -954,6 +1118,7 @@ async def test_engine_admission_preprocesses_request_once(entrypoint: str, mocke
 @pytest.mark.asyncio
 async def test_async_add_req_and_stream_response():
     engine = object.__new__(DiffusionEngine)
+    engine._request_chunk_states = {}
     engine.scheduler = MockScheduler()
     engine._out_streams = {}
     engine._unclaimed_async_outputs = {}
@@ -979,8 +1144,8 @@ async def test_async_add_req_and_stream_response():
     engine.execution_mode = DiffusionExecutionMode.REQUEST_BATCH
 
     def _finalize(rid, out, err=None, **kwargs):
-        # Stream consumers stop on ``finished``; keep result_data for assertions.
-        return SimpleNamespace(result_data=out.result.result_data, finished=True, async_output_id=None)
+        # Use the real output contract consumed by the asynchronous stream.
+        return DiffusionOutput(custom_output={"result_data": out.result.result_data})
 
     engine._finalize_finished_request = _finalize
 
@@ -1022,7 +1187,7 @@ async def test_async_add_req_and_stream_response():
         engine.worker_thread.join(timeout=5)
     assert len(results) == 5
     for rid, res, elapsed in results:
-        assert rid in res.result_data
+        assert rid in res.custom_output["result_data"]
 
     eps = 0.5
     latencies = [r[2] for r in results]
