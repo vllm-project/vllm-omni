@@ -217,6 +217,7 @@ COSMOS3_EDGE_VIDEO_DEFAULT_FLOW_SHIFT = 3.0
 COSMOS3_EDGE_T2I_DEFAULT_HEIGHT = 640
 COSMOS3_EDGE_T2I_DEFAULT_WIDTH = 640
 
+COSMOS3_BATCH_T2I_OUTPUTS_KEY = "cosmos3_batch_t2i_outputs"
 COSMOS3_DISTILLED_CHECKPOINT_SCHEDULER_CLASS = "FlowMatchEulerDiscreteScheduler"
 
 # Truncation cap on the prompt token count (shared by T2I and T2V).  Prompts
@@ -276,9 +277,29 @@ def _cosmos3_pp_size(od_config: Any) -> int:
     return int(getattr(parallel_config, "pipeline_parallel_size", 1) or 1)
 
 
-def _cosmos3_sp_size(od_config: Any) -> int:
+def _cosmos3_gen_parallel_size(od_config: OmniDiffusionConfig) -> int:
+    """GPUs that cooperate on each denoising step: SP x TP x CFG-parallel (DP excluded)."""
     parallel_config = getattr(od_config, "parallel_config", None)
-    return int(getattr(parallel_config, "sequence_parallel_size", 1) or 1)
+    size = 1
+    for name in ("sequence_parallel_size", "tensor_parallel_size", "cfg_parallel_size"):
+        size *= int(getattr(parallel_config, name, 1) or 1)
+    return size
+
+
+def _cosmos3_hsdp_active(od_config: OmniDiffusionConfig) -> bool:
+    parallel_config = getattr(od_config, "parallel_config", None)
+    return bool(getattr(parallel_config, "use_hsdp", False))
+
+
+def _cosmos3_batch_t2i_outputs_enabled(od_config: OmniDiffusionConfig) -> bool:
+    """Read ``additional_config["cosmos3_batch_t2i_outputs"]`` (default True)."""
+    additional_config = getattr(od_config, "additional_config", None) or {}
+    value = additional_config.get(COSMOS3_BATCH_T2I_OUTPUTS_KEY, True)
+    if not isinstance(value, bool):
+        raise TypeError(
+            f"additional_config[{COSMOS3_BATCH_T2I_OUTPUTS_KEY!r}] must be a bool, got {type(value).__name__}"
+        )
+    return value
 
 
 def _validate_cosmos3_pp_model_offload(od_config: Any, strategy: OffloadStrategy) -> None:
@@ -1168,6 +1189,8 @@ class Cosmos3OmniDiffusersPipeline(
         super().__init__()
         self.od_config = od_config
         _validate_cosmos3_pp_cache_backend(od_config)
+        # Reject a non-bool batching switch at startup, not on the first request.
+        _cosmos3_batch_t2i_outputs_enabled(od_config)
         resolved_offload = resolve_offload(od_config)
         if resolved_offload.public is not None and resolved_offload.strategy is OffloadStrategy.MODEL_LEVEL:
             raise ValueError(
@@ -1759,21 +1782,26 @@ class Cosmos3OmniDiffusersPipeline(
     def _can_batch_t2i_outputs(self) -> bool:
         """Whether T2I ``num_outputs_per_prompt > 1`` can run as one B=N denoising loop.
 
-        Falls back to one loop per output when batching would change results
-        or is unvalidated: batched bf16 math is not bitwise equal to serial, so
-        ``VLLM_BATCH_INVARIANT`` keeps the serial path; the distilled SDE
-        scheduler draws per-step noise from the shared generator, so the serial
-        draw order cannot be reproduced; cache backends make one skip decision
-        per batch (and Cache-DiT counts forwards for CFG parity); PP forwards
-        the UND cache across stages; the SP joint K/V path is not validated
-        with a broadcast cache yet.
+        Batched bf16 math is not bitwise equal to the serial loop.
+        ``additional_config["cosmos3_batch_t2i_outputs"] = False`` is the
+        dedicated opt-out that keeps the serial loop; ``VLLM_BATCH_INVARIANT``
+        still forces it as well. The serial loop also runs when batching cannot
+        reproduce it or is not validated: the distilled SDE scheduler draws
+        per-step noise from the shared generator, so the serial draw order
+        cannot be reproduced; cache backends make one skip decision per batch
+        (and Cache-DiT counts forwards for CFG parity); PP forwards the UND
+        cache across stages; TP, SP, CFG-parallel and HSDP are not validated
+        with a broadcast UND cache yet. DP replicas each run the whole GEN
+        forward on one GPU, so they stay batched.
         """
         return (
-            not envs.VLLM_BATCH_INVARIANT
+            _cosmos3_batch_t2i_outputs_enabled(self.od_config)
+            and not envs.VLLM_BATCH_INVARIANT
             and not self.is_distilled_model
             and not _cosmos3_cache_backend_active(self.od_config)
             and not self._pp_parallel_active()
-            and _cosmos3_sp_size(self.od_config) == 1
+            and _cosmos3_gen_parallel_size(self.od_config) == 1
+            and not _cosmos3_hsdp_active(self.od_config)
         )
 
     @staticmethod

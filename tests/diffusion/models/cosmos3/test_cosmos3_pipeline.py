@@ -3605,8 +3605,30 @@ class TestForwardRouting:
         generator = torch.Generator("cpu").manual_seed(seed)
         return [randn_tensor((1, 2, 1, 2, 2), generator=generator, dtype=torch.float32) for _ in range(num_outputs)]
 
-    def test_t2i_outputs_share_one_batched_diffusion(self, make_cosmos3_pipeline) -> None:
+    @staticmethod
+    def _t2i_od_config(*, additional_config=None, cache_backend=None, **parallel_kwargs):
+        from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+
+        return OmniDiffusionConfig(
+            model=None,
+            additional_config=additional_config or {},
+            cache_backend=cache_backend,
+            parallel_config=DiffusionParallelConfig(**parallel_kwargs),
+        )
+
+    @pytest.mark.parametrize(
+        "od_config_kwargs",
+        [
+            pytest.param({}, id="default"),
+            pytest.param({"additional_config": {"cosmos3_batch_t2i_outputs": True}}, id="opt_in"),
+            # DP replicas each run the whole GEN forward on one GPU.
+            pytest.param({"data_parallel_size": 2}, id="data_parallel"),
+        ],
+    )
+    def test_t2i_outputs_share_one_batched_diffusion(self, make_cosmos3_pipeline, od_config_kwargs) -> None:
         pipeline = make_cosmos3_pipeline()
+        pipeline.od_config = self._t2i_od_config(**od_config_kwargs)
+        assert pipeline._can_batch_t2i_outputs()
         self._install_forward_stubs(pipeline)
         events = self._record_t2i_events(pipeline)
 
@@ -3634,10 +3656,25 @@ class TestForwardRouting:
         )
 
     @pytest.mark.parametrize(
-        "fallback", ["batch_invariant", "distilled", "cache_dit", "sea_cache", "pipeline_parallel", "sequence_parallel"]
+        ("fallback", "od_config_kwargs"),
+        [
+            pytest.param("batch_invariant", {}, id="batch_invariant"),
+            pytest.param("distilled", {}, id="distilled"),
+            pytest.param("pipeline_parallel", {}, id="pipeline_parallel"),
+            pytest.param(None, {"additional_config": {"cosmos3_batch_t2i_outputs": False}}, id="opt_out"),
+            pytest.param(None, {"cache_backend": "cache_dit"}, id="cache_dit"),
+            pytest.param(None, {"cache_backend": "sea_cache"}, id="sea_cache"),
+            pytest.param(None, {"ulysses_degree": 2}, id="sequence_parallel"),
+            pytest.param(None, {"tensor_parallel_size": 2}, id="tensor_parallel"),
+            pytest.param(None, {"cfg_parallel_size": 2}, id="cfg_parallel"),
+            pytest.param(None, {"use_hsdp": True, "hsdp_shard_size": 2}, id="hsdp"),
+        ],
     )
-    def test_t2i_outputs_fall_back_to_serial(self, make_cosmos3_pipeline, monkeypatch, fallback) -> None:
+    def test_t2i_outputs_fall_back_to_serial(
+        self, make_cosmos3_pipeline, monkeypatch, fallback, od_config_kwargs
+    ) -> None:
         pipeline = make_cosmos3_pipeline()
+        pipeline.od_config = self._t2i_od_config(**od_config_kwargs)
         self._install_forward_stubs(pipeline)
         events = self._record_t2i_events(pipeline)
         if fallback == "batch_invariant":
@@ -3645,14 +3682,8 @@ class TestForwardRouting:
         elif fallback == "distilled":
             pipeline.is_distilled_model = True
             pipeline._scheduler_init_t_list = [1.0, 0.5]
-        elif fallback in ("cache_dit", "sea_cache"):
-            pipeline.od_config.cache_backend = fallback
         elif fallback == "pipeline_parallel":
             monkeypatch.setattr(pipeline, "_pp_parallel_active", lambda: True)
-        else:
-            from vllm_omni.diffusion.data import DiffusionParallelConfig
-
-            pipeline.od_config.parallel_config = DiffusionParallelConfig(ulysses_degree=2)
         assert not pipeline._can_batch_t2i_outputs()
 
         output = pipeline.forward(
@@ -5303,6 +5334,45 @@ def test_pipeline_init_rejects_cache_backend_under_pp_before_loading(monkeypatch
         parallel_config=SimpleNamespace(pipeline_parallel_size=2, cfg_parallel_size=1, ulysses_degree=1),
     )
     with pytest.raises(ValueError, match="cache_backend='sea_cache'"):
+        pipeline_cosmos3.Cosmos3OmniDiffusersPipeline(od_config=od_config)
+
+
+@pytest.mark.parametrize(
+    ("additional_config", "expected"),
+    [({}, True), ({"cosmos3_batch_t2i_outputs": True}, True), ({"cosmos3_batch_t2i_outputs": False}, False)],
+)
+def test_cosmos3_batch_t2i_outputs_enabled(additional_config, expected) -> None:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import _cosmos3_batch_t2i_outputs_enabled
+
+    od_config = OmniDiffusionConfig(model=None, additional_config=additional_config)
+    assert _cosmos3_batch_t2i_outputs_enabled(od_config) is expected
+
+
+@pytest.mark.parametrize("value", ["false", 0])
+def test_cosmos3_batch_t2i_outputs_rejects_non_bool(value) -> None:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+        COSMOS3_BATCH_T2I_OUTPUTS_KEY,
+        _cosmos3_batch_t2i_outputs_enabled,
+    )
+
+    od_config = OmniDiffusionConfig(model=None, additional_config={COSMOS3_BATCH_T2I_OUTPUTS_KEY: value})
+    with pytest.raises(TypeError, match=COSMOS3_BATCH_T2I_OUTPUTS_KEY):
+        _cosmos3_batch_t2i_outputs_enabled(od_config)
+
+
+def test_pipeline_init_rejects_non_bool_batch_t2i_outputs_before_loading(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    monkeypatch.setattr(
+        pipeline_cosmos3.FlowUniPCMultistepScheduler,
+        "load_config",
+        lambda *args, **kwargs: pytest.fail("component loading must not start for a non-bool batching switch"),
+    )
+    od_config = OmniDiffusionConfig(model=None, additional_config={"cosmos3_batch_t2i_outputs": "false"})
+    with pytest.raises(TypeError, match="cosmos3_batch_t2i_outputs"):
         pipeline_cosmos3.Cosmos3OmniDiffusersPipeline(od_config=od_config)
 
 
