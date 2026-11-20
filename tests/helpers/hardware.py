@@ -66,6 +66,9 @@ def _normalize_runtime_device_label(raw: str) -> str:
         if compact.upper().startswith(prefix):
             compact = compact[len(prefix) :]
             break
+    # The local H200 lane reports this vendor label; use its registered baseline key.
+    if compact.upper() == "L20X":
+        return "H200"
     return _safe_filename_token(compact[:48]) if compact else "na"
 
 

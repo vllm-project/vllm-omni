@@ -1,6 +1,7 @@
 [
   {
     "test_name": "test_qwen3_omni_duplex_omni_duplex_eval",
+    "description": "Provisional H100 mean_duplex_busy_rtf baseline: equal-day mean for 2026-11-16 through 2026-11-18 (3 days; daily CV 67.50%), rounded to four decimals without margin. Source: JiusiServe/omni-reviewbot@9c4086e9a36c. Higher variability is accepted for Busy RTF; this short window does not establish stability.",
     "mark": [
       {
         "hardware_marks": {
@@ -190,7 +191,14 @@
           "duplex_client_ttft_ms",
           "duplex_busy_rtf",
           "duplex_stall_ratio"
-        ]
+        ],
+        "baseline": {
+          "H100": {
+            "mean_duplex_busy_rtf": [
+              0.2984
+            ]
+          }
+        }
       }
     ],
     "judge_server_params": {
