@@ -33,7 +33,7 @@ output = omni.generate(
 frames = output.images  # the video frames; the speech track and its rate are in output.multimodal_output
 ```
 
-- `prompt` may stay empty: a default description of a person speaking to the camera is then used. The checkpoint was distilled with one fixed description; any description can be passed as `prompt`.
+- `prompt` may stay empty: a default description of a person speaking to the camera is then used. The checkpoint was distilled with one fixed description of its own, so output without a prompt differs from the reference implementation's default output; pass a description as `prompt` to steer it.
 - The video covers the whole speech, rounded up to a whole chunk; `extra_args={"num_chunks": N}` limits it to N chunks.
 - The portrait is resized and center-cropped to the closest training resolution: 576x576, or 768x512 (width x height). Portraits where the face fills a good part of the frame work best.
 - The first request compiles the transformer blocks (regional compilation); start the engine once and reuse it.
