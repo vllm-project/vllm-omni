@@ -192,7 +192,9 @@ MiniMax H3 Ref2VA accepts the boolean
 `extra_args`). Setting it to `true` reuses RGB from reference transcoding for
 Qwen3VL sampling and VAE input. Each prepared reference needs temporary
 `frame_count × height × width × 3` bytes, removed with the request artifacts.
-Non-boolean values are rejected, and other H3 tasks cannot enable this option.
+For example, 52 frames at 704×1280 require 134.1 MiB of RGB temporary storage;
+360 frames at the same canvas require 928.1 MiB per reference.
+Non-boolean values are rejected, and other H3 tasks cannot enable this option. See [benchmark evidence](../assets/performance/minimax_h3_rgb_reuse/README.md) for matched measurements and launch/request logs.
 
 JSON references currently support `image_url`/`video_url`; `file_id` references
 are not implemented yet. Models may expose additional V2V controls through

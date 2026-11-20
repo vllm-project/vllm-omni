@@ -4,12 +4,6 @@
   "reference_video_sha256": "cf57940d4d50d8ec062a8c1e567b3ea89f700c69671daf074e126ff3353ded68",
   "prompt_sha256": "9fb933739678525415daa5f2e6fb3e3b5cf92b991f59a5e8576f2edaeea9a72d",
   "reference_video": "$DATA/ref2va-v13-avatar12s/media/case01/video01.mp4",
-  "dimensions": {
-    "width": 480,
-    "height": 864,
-    "frames": 294,
-    "fps": 24
-  },
   "command": [
     "bash",
     "-c",
@@ -27,5 +21,19 @@
     "cpu_only.py": "2fd567348e0ed3ec3e7259d6bb9b28976bef480b2d477778018306eb86899cee",
     "cpu_prepare.py": "6f9a8d2da7da9b01f19ef545a532ec7ba749ec983685d6e9a09d751dc33d9e6e",
     "compat_bootstrap.py": "35975afd5010d8cc73070833dc67f8150e1693595d7d3b1da20517b0f4a111c5"
-  }
+  },
+  "target_dimensions": {
+    "width": 480,
+    "height": 864,
+    "frames": 294,
+    "fps": 24
+  },
+  "prepared_reference_shapes": [
+    [
+      52,
+      1280,
+      704,
+      3
+    ]
+  ]
 }

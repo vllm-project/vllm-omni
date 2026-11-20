@@ -1,21 +1,29 @@
-# MiniMax-H3 RGB reuse performance evidence
+# MiniMax-H3 performance evidence
 
-Measured code: `cef8d680fccbc38ce3901ec051a3f91ea1d2ecfa`. This is CPU input preparation for ref2va-v13-avatar12s/case01, not a whole-model E2E measurement. Each A/B/A arm has two complete warmups and three formal calls. Only `reference_video_decode_reuse` changes. All 15 VAE inputs, Qwen samples, audio arrays and timestamps match byte-for-byte.
+Measured source: `cef8d680fccbc38ce3901ec051a3f91ea1d2ecfa`.
 
-| CPU preparation arm | Mean ± SD |
-| --- | ---: |
-| off before | 2.965 ± 0.102 s |
-| on | 2.554 ± 0.039 s |
-| off after | 3.175 ± 0.294 s |
+[Results and commands](results.json) include dependency versions, actual per-request HTTP status, output byte counts and SHA256, stage timers, executed-path counters, source revision and launch/request arguments. [Server excerpts](server.log.txt) preserve the numeric instrumentation rows and HTTP 200 access-log lines. Private prompt/media contents are represented by hashes; no credentials are exported.
 
-At the on arm's mean timestamp, interpolated control is 3.070 s versus 2.554 s, 16.81% lower. The 95% bootstrap saving interval is 0.379–0.669 s (10,000 samples, seed42). Saving exceeds the largest within-arm SD and the lower interval bound is positive.
+Client E2E runs from sending the completed multipart HTTP request to reading the full MP4 response. Service startup, model loading and warmups are excluded. Stage values are auxiliary unsynchronized host wall times; the complete HTTP request is the performance authority. Tensor hashing runs only during warmups. All formal artifacts are byte-identical and completely decoded by ffmpeg.
 
-[Raw results and dependencies](cpu-results.json), [input hashes and command](cpu-manifest.json), [original driver](cpu_driver.py.txt), [preparation code](cpu_prepare.py.txt) and [compatibility helper](compat_bootstrap.py.txt). This is an evidence archive: original wrappers retain host-specific paths and private inputs are represented by hashes.
+A/B/A controls are interpolated at the optimized arm's mean request timestamp. Bootstrap intervals are recomputed from the raw request values (10,000 samples, seed42). An E2E gain is claimed only when its lower interval bound is positive and its magnitude exceeds the observed within-arm SD.
 
-Recompute the statistics and all input signatures using only the public records:
+Launch commands in results.json replace only model and run-directory paths with $MODEL and $RUN. The run-local wrapper sets torch deterministic algorithms and disables encoder cuDNN SDP consistently; it adds passive counters/host timers without changing model source or adding device synchronization. The installed vLLM 0.33 dependency lacks an unrelated MiniCPM-o ngram blacklist API, so the wrapper skips that unrelated AR patch before importing the unchanged H3 diffusion pipeline.
+
+Exact measurement wrapper sources: [server.py](server.py.txt), [observer.py](observer.py.txt) and [compatibility helper](compat_bootstrap.py.txt).
+
+Request execution and validation: [controller](control.py.txt), [sender](request_sender.py.txt), [CPU preparation](cpu_prepare.py.txt), [environment setup](stage.sh.txt), [lifecycle](lifecycle.py.txt) and [statistics](analysis.py.txt).
+
+This directory is an evidence archive. The original wrappers retain host-specific paths and require the private case01 inputs and scheduler job layout; they are not a portable benchmark entry point. The [measurement manifest](run-manifest.json) replaces model, data and run-directory paths with placeholders.
+
+To recompute the published means, drift correction and bootstrap intervals directly from the archived public requests:
 
 ```bash
-python reproduce_cpu_statistics.py.txt cpu-results.json
+python reproduce_statistics.py.txt results.json
 ```
 
-No accepted E2E timing is available. The [service attempt](failed-attempt.json) failed the same-configuration media byte gate with reuse disabled in both warmups. CPU inputs and encoder activations matched, but decoded video/audio did not; no formal timing samples were collected. Its cause is unresolved and cannot be attributed to toggling RGB reuse.
+A [previous attempt](failed-attempt.json) stopped at the same-configuration media byte gate during the second warmup with RGB reuse disabled in both requests. CPU inputs and encoder activations matched, but decoded video/audio did not. It contributed no formal timing samples. Any passing retry is evidence for that measured window and does not explain or erase the earlier cold-start difference.
+
+The independent CPU preparation A/B/A is retained separately in [CPU results](cpu-results.json) and [CPU manifest](cpu-manifest.json); it must not be mixed with the service-window CPU values above. `target_dimensions` describes the generated output target, while `prepared_reference_shapes` describes the measured reference input: 52 frames at height 1280 and width 704. The RGB sidecar is 140,574,720 bytes (134.1 MiB); 360 frames at the same canvas would require 928.1 MiB per reference.
+
+The exact independent CPU driver is [cpu_only.py](cpu_only.py.txt). It reads the archived path-redacted [run manifest](run-manifest.json), with the same schema as the executed driver. Private inputs and local paths need to be supplied to rerun preparation.

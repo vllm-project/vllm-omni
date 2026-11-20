@@ -1,0 +1,60 @@
+"""Recalculate means, drift-corrected controls and noise from raw request records."""
+import argparse
+import json
+from pathlib import Path
+import random
+import statistics as st
+
+ROOT = Path(__file__).resolve().parent
+parser = argparse.ArgumentParser()
+parser.add_argument("kind", choices=["encoder", "rgb"])
+parser.add_argument("job")
+args = parser.parse_args()
+base = ROOT / "jobs" / args.job
+config = json.loads((ROOT / "run-manifest.json").read_text())
+stages = [x for x in config["stages"] if x["kind"] == args.kind]
+groups = []
+for stage in stages:
+    folder = base / (stage["name"] if args.kind == "encoder" else "rgb")
+    records = json.loads((folder / "records.json").read_text())
+    selected = [x for x in records if x["stage"] == stage["name"]]
+    assert sum(x["phase"] == "warmup" for x in selected) == 2
+    formal = [x for x in selected if x["phase"] == "formal"]
+    assert len(formal) == 3 and all(x["status"] == "ok" for x in selected)
+    assert len({x["sha256"] for x in selected}) == 1
+    groups.append(formal)
+assert len({x["sha256"] for g in groups for x in g}) == 1
+
+
+def summarize(key):
+    samples = [[r[key] for r in group] for group in groups]
+    means = [st.mean(x) for x in samples]
+    sds = [st.stdev(x) for x in samples]
+    times = [st.mean(r["response"]["started_at_unix"] for r in group) for group in groups]
+    weight = (times[1] - times[0]) / (times[2] - times[0])
+    assert 0 < weight < 1
+    control = (1 - weight) * means[0] + weight * means[2]
+    saved = control - means[1]
+    rng = random.Random(42)
+    bootstrap = []
+    for _ in range(10000):
+        a1, b, a2 = [st.mean(rng.choices(values, k=len(values))) for values in samples]
+        bootstrap.append((1 - weight) * a1 + weight * a2 - b)
+    bootstrap.sort()
+    interval = [bootstrap[250], bootstrap[9750]]
+    noise = max(sds)
+    return {"samples": samples, "means": means, "sd": sds, "control": control,
+            "control_interpolation_weight": weight, "arm_mean_unix_times": times,
+            "optimized": means[1], "saved": saved, "percent": saved / control * 100,
+            "bootstrap95_saved": interval, "noise_sd": noise,
+            "distinguishable": interval[0] > 0 and saved > noise}
+
+
+result = {"kind": args.kind, "job": args.job, "source_revision": config["runtimes"][args.kind]["revision"],
+          "warmups_per_arm": 2, "formals_per_arm": 3,
+          "http_e2e": summarize("http_e2e_s"), "encode_prompt": summarize("encode_prompt_s"),
+          "dit": summarize("dit_s"), "media_sha256": groups[0][0]["sha256"],
+          "raw_requests": groups}
+if args.kind == "rgb":result["cpu_prepare"] = summarize("cpu_prepare_s")
+(ROOT / f"{args.kind}-analysis.json").write_text(json.dumps(result, indent=2))
+print(json.dumps({k:v for k,v in result.items() if k != "raw_requests"}, indent=2))
