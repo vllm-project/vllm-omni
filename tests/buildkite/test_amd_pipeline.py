@@ -1484,10 +1484,10 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
             "artifact_path": "artifacts/rocm-minicpmo-replica-reliability/**/*",
             "artifact_env": "ROCM_MINICPMO_REPLICA_ARTIFACT_DIR",
             "expected_nodes": 5,
-            "expected_skipped": 1,
+            "expected_skipped": 3,
             "timeout": "220m",
             "collection_message": "Expected exactly 5 MiniCPM-o 4.5 replica reliability nodes",
-            "junit_message": ("Expected exactly 5 executed MiniCPM-o 4.5 replica reliability tests with 1 known skip"),
+            "junit_message": ("Expected exactly 5 executed MiniCPM-o 4.5 replica reliability tests with 3 known skips"),
         },
         "Reliability Test · Invalid parameters · MI300 · Single-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-single/**/*",
@@ -1568,7 +1568,10 @@ def test_weekly_replica_reliability_is_blocking_rocm_coverage() -> None:
 
         source = source_path.read_text(encoding="utf-8")
         assert 'res = {"cuda": "H100", "rocm": "MI325"}' in source
-        assert "10391" not in source
+        if label == "Reliability Test · qwen3-omni replicas":
+            assert "10391" not in source
+        else:
+            assert source.count("10391") == 2
         assert "10378" in source
         for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
             assert label not in pipeline_path.read_text(encoding="utf-8")
@@ -1647,8 +1650,8 @@ def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
             "ROCM_MINICPMO_REPLICA_ARTIFACT_DIR",
             "minicpmo-replica-reliability-guard",
             5,
-            1,
-            "Expected exactly 5 executed MiniCPM-o 4.5 replica reliability tests with 1 known skip",
+            3,
+            "Expected exactly 5 executed MiniCPM-o 4.5 replica reliability tests with 3 known skips",
         ),
         (
             "Reliability Test · Invalid parameters · MI300 · Single-GPU",
