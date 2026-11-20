@@ -16,7 +16,8 @@ selects Step-Audio2's native `<|BOT|>` / `<|EOT|>` format and maps `user` to `hu
 vllm serve stepfun-ai/Step-Audio-2-mini --omni --port 8092 \
     --deploy-config vllm_omni/deploy/step_audio_2_async_chunk.yaml \
     --chat-template vllm_omni/transformers_utils/chat_templates/step_audio2.jinja \
-    --trust-remote-code --enforce-eager
+    --trust-remote-code \
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}'
 ```
 
 Sequential mode:
@@ -25,7 +26,8 @@ Sequential mode:
 vllm serve stepfun-ai/Step-Audio-2-mini --omni --port 8092 \
     --deploy-config vllm_omni/deploy/step_audio_2.yaml \
     --chat-template vllm_omni/transformers_utils/chat_templates/step_audio2.jinja \
-    --trust-remote-code --enforce-eager
+    --trust-remote-code \
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}'
 ```
 
 With local model:
@@ -33,7 +35,8 @@ With local model:
 ```bash
 vllm serve /path/to/Step-Audio-2-mini --omni --port 8092 \
     --chat-template vllm_omni/transformers_utils/chat_templates/step_audio2.jinja \
-    --trust-remote-code --enforce-eager
+    --trust-remote-code \
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}'
 ```
 
 ## Send Requests
