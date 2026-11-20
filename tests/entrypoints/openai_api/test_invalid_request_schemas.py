@@ -5,6 +5,7 @@
 Model/media-specific failures stay in the real-service reliability suite.
 """
 
+import logging
 from typing import Any
 
 import pytest
@@ -22,7 +23,16 @@ def client():
     # Reuse production's upstream exception conversion as well as Omni's actual
     # routes. Do not copy request-validation logic or invent a test-only mapper.
     args = make_arg_parser(FlexibleArgumentParser()).parse_args([])
-    upstream_app = build_openai_app(args, ("generate",))
+    root_logger = logging.getLogger()
+    original_level = root_logger.level
+    handler_levels = [(handler, handler.level) for handler in root_logger.handlers]
+    try:
+        upstream_app = build_openai_app(args, ("generate",))
+    finally:
+        # SageMaker initialization can change the process-wide logging levels.
+        root_logger.setLevel(original_level)
+        for handler, level in handler_levels:
+            handler.setLevel(level)
     app = FastAPI(exception_handlers=upstream_app.exception_handlers)
     app.include_router(router)
     app.state.api_server_count = 1
