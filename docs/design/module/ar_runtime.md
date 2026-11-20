@@ -124,6 +124,11 @@ in its local cache and uses `SchedulingMetadataAdapter` to translate
 model-specific fields into `SchedulingMetadataUpdate`. The Scheduler consumes
 only the typed update and readiness signal; it does not inspect payload fields.
 
+ZONOS2 registers a synchronous full-payload producer alongside its chunk
+producer. With codec chunking disabled, the orchestrator admits a token-only
+DAC prompt and the native connector carries the raw codes and terminal frame
+boundary. Inline prompt metadata does not bypass the input readiness gate.
+
 The receive flow is
 `process_pending_full_payload_inputs()` -> `register_chunk_recv()` ->
 `recv_full_payload_inputs()` -> `SchedulingMetadataAdapter.extract()` ->
@@ -147,6 +152,32 @@ adapter, not injected through unrelated scheduler state.
 ### AR-INV-003: Workers execute assigned work
 
 **Rule:** Workers and model runners MUST NOT implement cross-stage routing.
+
+## Model-owned sampling metadata
+
+ZONOS2 supplies a model-owned MRv2 ModelState and sampler. Its eager adapter
+builds preprocessing snapshots from resolved request parameters and the
+synchronous input batch's progress. Chunked re-prefill retains the committed
+output count until replay reaches the end of the saved sequence.
+
+The existing `request_id` is the sole request identity across preprocess,
+forward and postprocess. `data_entry_keys.py` owns `REQUEST_ID_KEY`,
+`REQUEST_SAMPLING_PARAMS_KEY`, `OUTPUT_TOKEN_COUNT_KEY` and
+`LAST_OUTPUT_TOKEN_KEY`. The sampling fields are transient preprocessing
+metadata, not `OmniPayload`/`MetaStruct` wire fields. The ZONOS2 adapter maps
+the native buffer's `req_id` to this model identity in a shallow snapshot;
+only model-owned codec state persists. Its registered sampler emits owned
+current-step codes after forward, with zero sampled tokens for partial
+prefill. Scalar lifecycle feedback and codec history survive slot removal on
+preemption, keyed by request ID, and are released on finish or cancellation.
+
+Sampling snapshots contain resolved vLLM values. Omitting offline request
+parameters selects deployment defaults; supplying `SamplingParams` overrides
+the complete parameter set, including values equal to vLLM's class defaults.
+Multi-codebook history needed for reconstruction remains request-owned
+multimodal state; lifecycle continue/stop tokens cannot replace that history.
+Partial prefill must not advance sampling state. Finished and cancelled
+requests release model-owned state through the existing lifecycle callback.
 
 ## Token-only output payloads
 
