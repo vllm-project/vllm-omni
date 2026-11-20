@@ -33,11 +33,8 @@ STAGE_CONFIG = get_deploy_config_path("higgs_multimodal_qwen3.yaml")
 SERVER_ARGS = ["--trust-remote-code", "--disable-log-stats"]
 SERVER_ENV = {"VLLM_USE_DEEP_GEMM": "0", "VLLM_MOE_USE_DEEP_GEMM": "0"}
 
-# The default yaml runs model_runner: v2 on CUDA (and the V1 fallback on
-# non-CUDA platforms via its platforms section), so the plain-text param
-# guards both. Two extra params keep the escape hatches alive: the V1
-# opt-out profiles (high_throughput stands in; both are FLASHINFER-shaped)
-# and the H200-tuned MRV2 profile.
+# Both profiles use V2. The H200-tuned profile is CUDA-only; the default
+# retains the existing non-CUDA eager settings through platform overrides.
 TEST_PARAMS = [
     pytest.param(
         OmniServerParams(
@@ -47,19 +44,6 @@ TEST_PARAMS = [
             env_dict=SERVER_ENV,
         ),
         id="higgs_audio_v3_plain_text",
-    ),
-    pytest.param(
-        OmniServerParams(
-            model=MODEL,
-            stage_config_path=get_deploy_config_path("higgs_multimodal_qwen3_high_throughput.yaml"),
-            server_args=SERVER_ARGS,
-            env_dict=SERVER_ENV,
-        ),
-        id="higgs_audio_v3_v1_optout_high_throughput",
-        marks=pytest.mark.skipif(
-            not current_platform.is_cuda(),
-            reason="V1 opt-out profile is CUDA-tuned (FLASHINFER, no platforms section)",
-        ),
     ),
     pytest.param(
         OmniServerParams(
@@ -171,7 +155,8 @@ class TestHiggsAudioV3OnlineHappyPath:
         about +1.5 dB, so a single unseeded request at a fixed floor fails
         whenever it draws a noisy rendition. The gate therefore sends four
         requests with pinned seeds and requires three of them to clear
-        ``min_hnr_db=0.0``: one noisy rendition no longer flakes CI, while a
+        the platform HNR floor (0.0 dB on CUDA, -2.0 dB on ROCm): one noisy
+        rendition no longer flakes CI, while a
         codec or runner regression that sinks every rendition still fails all
         four. The pinned seeds only bound CI variance; the pass count is the
         gate. Requests are sent one at a time because the V1 sampler produces a
@@ -189,7 +174,7 @@ class TestHiggsAudioV3OnlineHappyPath:
                     "stream_format": "audio",
                     "response_format": "pcm",
                     "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                    "min_hnr_db": 0.0,
+                    "min_hnr_db": _SINGLE_STREAM_HNR_DB,
                     "seed": next(seed_iter),
                 }
             )[0]
@@ -205,9 +190,8 @@ class TestHiggsAudioV3OnlineHappyPath:
         """A client aborting mid-stream must not wedge the server.
 
         Exiting the streaming context mid-iteration closes the connection
-        (client-side cancel). Guards request cleanup on both runner paths:
-        MRV2's owned-audio-output snapshots and the V1 connector's streaming
-        request recycling. A follow-up request proves the server survived.
+        (client-side cancel). Guards MRV2 owned-audio-output cleanup and
+        connector request recycling. A follow-up request proves the server survived.
         """
         long_text = (
             "This sentence is intentionally long so the stream has plenty of chunks to outlive the reader. " * 20
@@ -243,8 +227,7 @@ class TestHiggsAudioV3OnlineHappyPath:
         """A long prompt near the stage-0 context budget must synthesize fully.
 
         Guards the MRV2 decode-state capacity paths (_ensure_slot_capacity /
-        _ensure_decode_state_capacity) across many steps, and the V1 path's
-        equivalent per-request state, under one long sequence.
+        _ensure_decode_state_capacity) across many steps under one long sequence.
         """
         long_input = "The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs. " * 90
         online_client.send_audio_speech_request(

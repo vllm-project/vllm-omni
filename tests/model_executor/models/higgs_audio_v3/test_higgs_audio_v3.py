@@ -1685,10 +1685,10 @@ class TestRegistry:
 
     def test_deploy_yaml_flipped_default_shape(self):
         """The flipped default yaml anchors the validated MRV2 shape."""
-        from vllm_omni.config.stage_config import load_deploy_config
+        from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config
 
         yaml_path = get_deploy_config_path("higgs_multimodal_qwen3.yaml")
-        deploy = load_deploy_config(yaml_path)
+        deploy = _apply_platform_overrides(load_deploy_config(yaml_path), platform="cuda")
         assert deploy.model_runner == "v2"
         assert deploy.async_chunk is True
         stage0, stage1 = deploy.stages

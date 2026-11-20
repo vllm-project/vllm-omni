@@ -88,7 +88,7 @@ class HiggsModelState(OmniModelState):
                 f"request {new_req_data.req_id} set a text-generation sampling parameter "
                 "(frequency/presence/repetition penalty, logprobs, min_tokens, min_p, "
                 "allowed/bad token ids, or logit_bias). "
-                "Remove it or run this stage with model_runner: v1"
+                "Remove the unsupported parameter"
             )
         super().add_request(req_index, new_req_data)
         self.requests[new_req_data.req_id] = new_req_data

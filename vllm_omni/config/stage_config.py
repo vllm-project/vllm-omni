@@ -1316,7 +1316,7 @@ def _validate_mrv2_default_sampling_params(
     if bad:
         raise ValueError(
             f"stage {ps.stage_id}: default_sampling_params {bad} are not supported by this model's "
-            "model_runner: v2 path; remove them or run this stage with model_runner: v1"
+            "model_runner: v2 path; remove the unsupported parameters"
         )
 
 
@@ -1331,8 +1331,16 @@ def _apply_platform_overrides(
         device_name = current_omni_platform.device_name
         platform = device_name.lower() if device_name is not None else None
     platform_section = (deploy.platforms or {}).get(platform) if platform is not None else None
-    if platform_section is not None and "connectors" in platform_section:
-        deploy.connectors = _merge_connectors(deploy.connectors, platform_section["connectors"])
+    platform_connectors = platform_section.get("connectors") if platform_section else None
+    if platform_connectors is not None:
+        if not isinstance(platform_connectors, dict):
+            raise ValueError("platform connectors must be a mapping of connector name to overrides")
+        for conn_name, override in platform_connectors.items():
+            if not deploy.connectors or conn_name not in deploy.connectors:
+                raise ValueError(f"platform connectors override references unknown connector {conn_name!r}")
+            if not isinstance(override, dict):
+                raise ValueError(f"platform connectors override for {conn_name!r} must be a mapping")
+        deploy.connectors = _merge_connectors(deploy.connectors, platform_connectors)
     if platform_section is not None and "cuda_mps" in platform_section:
         cuda_mps = platform_section["cuda_mps"]
         if not isinstance(cuda_mps, bool):
@@ -1348,17 +1356,6 @@ def _apply_platform_overrides(
             for stage in deploy.stages:
                 if stage.model_runner == "v2":
                     stage.model_runner = None
-    platform_connectors = platform_section.get("connectors") if platform_section else None
-    if platform_connectors:
-        if not isinstance(platform_connectors, dict):
-            raise ValueError("platform connectors must be a mapping of connector name to overrides")
-        conns = deploy.connectors
-        for conn_name, override in platform_connectors.items():
-            if not conns or conn_name not in conns:
-                raise ValueError(f"platform connectors override references unknown connector {conn_name!r}")
-            if not isinstance(override, dict):
-                raise ValueError(f"platform connectors override for {conn_name!r} must be a mapping")
-            conns[conn_name] = _get_recursively_merged_dict(conns[conn_name], override)
     platform_stages = platform_section.get("stages", []) if platform_section else []
     base_by_id = {s.stage_id: s for s in deploy.stages}
 
