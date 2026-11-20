@@ -1606,7 +1606,13 @@ class MiniMaxH3DiTModel(nn.Module):
         if getattr(self, "adaln_cache", None) is not None:
             self.adaln_cache.prepare(t_emb)
 
+        # Every block but the last leaves its final gated residual to the next one, which fuses it with norm1.
+        # A single entry (Cache-DiT's wrapper around the blocks) is called exactly as before, and a block whose
+        # output takes a control hint applies its own gate.
+        last_block = len(self.blocks) - 1
+        handover = {}
         for block_index, block in enumerate(self.blocks):
+            defer_gate = block_index < last_block and block_index not in hints
             hidden = block(
                 hidden,
                 t_emb=t_emb,
@@ -1621,7 +1627,13 @@ class MiniMaxH3DiTModel(nn.Module):
                 reference_kv_state=reference_kv_state,
                 reference_kv_compact=compact_reference,
                 vdn_window=vdn_window,
+                **handover,
+                **({"defer_gate": True} if defer_gate else {}),
             )
+            handover = {}
+            if defer_gate:
+                hidden, pending_gate = hidden
+                handover = {"pending_gate": pending_gate}
             if block_index in hints:
                 hidden = hidden + hints.pop(block_index) * control_scale
         if local_len == seq_len:

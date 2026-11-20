@@ -828,13 +828,19 @@ class MiniMaxH3DiTBlock(nn.Module):
         reference_kv_state: MiniMaxH3ReferenceKVTier2State | None = None,
         reference_kv_compact: bool = False,
         vdn_window: VDNLayout | None = None,
-    ) -> torch.Tensor:
+        pending_gate: tuple[torch.Tensor, torch.Tensor] | None = None,
+        defer_gate: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
 
         Each block computes AdaLN parameters once, then applies
         norm1 -> scale/shift -> attention -> gated residual, followed by
         norm2 -> scale/shift -> MLP -> gated residual.
+
+        Consecutive blocks can hand the last gated residual over: with ``defer_gate`` a block returns
+        ``(residual, (gate_mlp, mlp_out))`` unapplied, and the next block, given them as ``x`` and
+        ``pending_gate``, applies the gate fused with its norm1 (bit-identical to gating, then normalizing).
         """
         (
             shift_msa,
@@ -845,15 +851,27 @@ class MiniMaxH3DiTBlock(nn.Module):
             gate_mlp,
         ) = self.adaln_proj(t_emb)
 
-        residual = x
-        h = rms_norm_indexed_scale_shift(
-            x,
-            self.norm1.weight,
-            shift_msa,
-            scale_msa,
-            combined_indices,
-            self.norm1.variance_epsilon,
-        )
+        if pending_gate is None:
+            residual = x
+            h = rms_norm_indexed_scale_shift(
+                x,
+                self.norm1.weight,
+                shift_msa,
+                scale_msa,
+                combined_indices,
+                self.norm1.variance_epsilon,
+            )
+        else:
+            residual, h = indexed_gate_rms_norm_scale_shift(
+                x,
+                pending_gate[0],
+                pending_gate[1],
+                self.norm1.weight,
+                shift_msa,
+                scale_msa,
+                combined_indices,
+                self.norm1.variance_epsilon,
+            )
         h = self.attn(
             h,
             rope_table=rope_table,
@@ -881,4 +899,6 @@ class MiniMaxH3DiTBlock(nn.Module):
         )
         residual = x
         h = self.mlp(h)
+        if defer_gate:
+            return residual, (gate_mlp, h)
         return indexed_gate(residual, gate_mlp, h, combined_indices)

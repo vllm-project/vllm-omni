@@ -180,6 +180,46 @@ if HAS_TRITON:
         tl.store(out_ptr + out_offsets, output, mask=mask)
 
     @triton.jit
+    def _token_qk_load_group(
+        in_ptr,
+        group: tl.constexpr,
+        dims,
+        num_heads: tl.constexpr,
+        head_dim: tl.constexpr,
+        heads_per_program: tl.constexpr,
+    ):
+        heads = group * heads_per_program + tl.arange(0, heads_per_program)
+        return tl.load(in_ptr + heads[:, None] * head_dim + dims[None, :], mask=heads[:, None] < num_heads, other=0.0)
+
+    @triton.jit
+    def _token_qk_store_group(
+        out_ptr,
+        group: tl.constexpr,
+        x,
+        dims,
+        pair_dims,
+        weight,
+        cos,
+        signed_sin,
+        num_heads: tl.constexpr,
+        head_dim: tl.constexpr,
+        rotary_half: tl.constexpr,
+        eps: tl.constexpr,
+        heads_per_program: tl.constexpr,
+    ):
+        heads = group * heads_per_program + tl.arange(0, heads_per_program)
+        x = x.to(tl.float32)
+        inv_rms = tl.rsqrt(tl.sum(x * x, axis=1) / head_dim + eps)
+        normalized = (x * inv_rms[:, None] * weight[None, :]).to(tl.bfloat16)
+        # The rotation partner's normalized value is normalized[pair_dims] (same element, weight and row scale),
+        # so a gather within the row replaces reloading and renormalizing it.
+        pair_normalized = tl.gather(normalized, tl.broadcast_to(pair_dims[None, :], normalized.shape), axis=1)
+        # x * cos - pair * sin on the first rotary half and x * cos + pair * sin on the second, via the sign of sin.
+        rotated = normalized.to(tl.float32) * cos + pair_normalized.to(tl.float32) * signed_sin
+        output = tl.where(dims < 2 * rotary_half, rotated, normalized.to(tl.float32))
+        tl.store(out_ptr + heads[:, None] * head_dim + dims[None, :], output, mask=heads[:, None] < num_heads)
+
+    @triton.jit
     def _token_qk_norm_rope_kernel(
         q_ptr,
         k_ptr,
@@ -199,12 +239,14 @@ if HAS_TRITON:
         eps: tl.constexpr,
         heads_per_program: tl.constexpr,
     ):
-        """Half-split RMSNorm + RoPE of every head of one token of Q (even programs) or K (odd).
+        """Half-split RMSNorm + RoPE of every head (up to 8 groups) of one token of Q (even programs) or K (odd).
 
         Each head group is the same [heads_per_program, head_dim] tile, with the same arithmetic, as
         _rms_norm_rope_kernel, so the results are bit-identical to it; walking the groups inside one
         program per token replaces tokens * ceil(heads / heads_per_program) programs per tensor, which
         are instruction-bound at diffusion sequence lengths. Heads are contiguous (head stride == head_dim).
+        Every group is loaded before the first store: the compiler cannot move a load above a store that
+        may alias it, so loading per group would leave a single group of loads in flight per program.
         """
         pid = tl.program_id(0)
         token = (pid // 2).to(tl.int64)
@@ -228,29 +270,65 @@ if HAS_TRITON:
             dims,
             tl.where(dims < rotary_dim, dims - rotary_half, 0),
         )
+        x0 = _token_qk_load_group(in_ptr, 0, dims, num_heads, head_dim, heads_per_program)
+        if num_heads > heads_per_program:
+            x1 = _token_qk_load_group(in_ptr, 1, dims, num_heads, head_dim, heads_per_program)
+        if num_heads > 2 * heads_per_program:
+            x2 = _token_qk_load_group(in_ptr, 2, dims, num_heads, head_dim, heads_per_program)
+        if num_heads > 3 * heads_per_program:
+            x3 = _token_qk_load_group(in_ptr, 3, dims, num_heads, head_dim, heads_per_program)
+        if num_heads > 4 * heads_per_program:
+            x4 = _token_qk_load_group(in_ptr, 4, dims, num_heads, head_dim, heads_per_program)
+        if num_heads > 5 * heads_per_program:
+            x5 = _token_qk_load_group(in_ptr, 5, dims, num_heads, head_dim, heads_per_program)
+        if num_heads > 6 * heads_per_program:
+            x6 = _token_qk_load_group(in_ptr, 6, dims, num_heads, head_dim, heads_per_program)
+        if num_heads > 7 * heads_per_program:
+            x7 = _token_qk_load_group(in_ptr, 7, dims, num_heads, head_dim, heads_per_program)
         weight = tl.load(weight_ptr + dims).to(tl.float32)
-        pair_weight = tl.load(weight_ptr + pair_dims).to(tl.float32)
         table_offsets = token * rope_stride_t + freq_dims
         cos = tl.load(rope_table_ptr + table_offsets).to(tl.float32)
         sin = tl.load(rope_table_ptr + table_offsets + rotary_half).to(tl.float32)
-        for head_group in tl.static_range(0, (num_heads + heads_per_program - 1) // heads_per_program):
-            heads = head_group * heads_per_program + tl.arange(0, heads_per_program)
-            mask = heads[:, None] < num_heads
-            offsets = heads[:, None] * head_dim + dims[None, :]
-            x = tl.load(in_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-            inv_rms = tl.rsqrt(tl.sum(x * x, axis=1) / head_dim + eps)
-            normalized = (x * inv_rms[:, None] * weight[None, :]).to(tl.bfloat16)
-            pair_offsets = heads[:, None] * head_dim + pair_dims[None, :]
-            pair_x = tl.load(in_ptr + pair_offsets, mask=mask, other=0.0).to(tl.float32)
-            pair_normalized = (pair_x * inv_rms[:, None] * pair_weight[None, :]).to(tl.bfloat16)
-            first = normalized.to(tl.float32) * cos - pair_normalized.to(tl.float32) * sin
-            second = normalized.to(tl.float32) * cos + pair_normalized.to(tl.float32) * sin
-            output = tl.where(
-                dims < rotary_dim,
-                tl.where(dims < rotary_half, first, second),
-                normalized.to(tl.float32),
-            )
-            tl.store(out_ptr + offsets, output, mask=mask)
+        signed_sin = tl.where(dims < rotary_half, -sin, sin)
+        _token_qk_store_group(
+            out_ptr, 0, x0, dims, pair_dims, weight, cos, signed_sin, num_heads, head_dim, rotary_half, eps,
+            heads_per_program,
+        )  # fmt: skip
+        if num_heads > heads_per_program:
+            _token_qk_store_group(
+                out_ptr, 1, x1, dims, pair_dims, weight, cos, signed_sin, num_heads, head_dim, rotary_half, eps,
+                heads_per_program,
+            )  # fmt: skip
+        if num_heads > 2 * heads_per_program:
+            _token_qk_store_group(
+                out_ptr, 2, x2, dims, pair_dims, weight, cos, signed_sin, num_heads, head_dim, rotary_half, eps,
+                heads_per_program,
+            )  # fmt: skip
+        if num_heads > 3 * heads_per_program:
+            _token_qk_store_group(
+                out_ptr, 3, x3, dims, pair_dims, weight, cos, signed_sin, num_heads, head_dim, rotary_half, eps,
+                heads_per_program,
+            )  # fmt: skip
+        if num_heads > 4 * heads_per_program:
+            _token_qk_store_group(
+                out_ptr, 4, x4, dims, pair_dims, weight, cos, signed_sin, num_heads, head_dim, rotary_half, eps,
+                heads_per_program,
+            )  # fmt: skip
+        if num_heads > 5 * heads_per_program:
+            _token_qk_store_group(
+                out_ptr, 5, x5, dims, pair_dims, weight, cos, signed_sin, num_heads, head_dim, rotary_half, eps,
+                heads_per_program,
+            )  # fmt: skip
+        if num_heads > 6 * heads_per_program:
+            _token_qk_store_group(
+                out_ptr, 6, x6, dims, pair_dims, weight, cos, signed_sin, num_heads, head_dim, rotary_half, eps,
+                heads_per_program,
+            )  # fmt: skip
+        if num_heads > 7 * heads_per_program:
+            _token_qk_store_group(
+                out_ptr, 7, x7, dims, pair_dims, weight, cos, signed_sin, num_heads, head_dim, rotary_half, eps,
+                heads_per_program,
+            )  # fmt: skip
 
     @triton.jit
     def _norm_rope_tile(

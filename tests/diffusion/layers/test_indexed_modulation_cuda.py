@@ -52,31 +52,12 @@ def test_column_tiled_gate_matches_row_kernel(table_dtype: torch.dtype, rows: in
 
 @pytest.mark.parametrize("table_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(("rows", "hidden"), [(1, 5376), (777, 5376), (64, 3072)])
-def test_split_gate_norm_matches_fused_kernel(table_dtype: torch.dtype, rows: int, hidden: int) -> None:
+def test_fused_gate_norm_matches_gate_then_norm(table_dtype: torch.dtype, rows: int, hidden: int) -> None:
+    # The fused op normalizes the BF16-rounded residual with the RMSNorm kernel's reduction, so it equals the
+    # gate kernel followed by the RMSNorm kernel; the DiT relies on this when it fuses across block boundaries.
     residual, branch, gate, shift, scale, weight, indices = _inputs(rows, hidden, table_dtype)
-    expected_residual, expected_modulated = torch.empty_like(residual), torch.empty_like(residual)
-    im._indexed_gate_rms_norm_scale_shift_kernel[(rows,)](
-        expected_residual,
-        expected_modulated,
-        residual,
-        gate,
-        branch,
-        weight,
-        shift,
-        scale,
-        indices,
-        hidden,
-        1e-6,
-        residual.stride(0),
-        gate.stride(0),
-        branch.stride(0),
-        shift.stride(0),
-        scale.stride(0),
-        indices.stride(0),
-        0,
-        block_n=triton.next_power_of_2(hidden),
-        num_warps=8,
-    )
+    expected_residual = im.indexed_gate(residual, gate, branch, indices)
+    expected_modulated = im.rms_norm_indexed_scale_shift(expected_residual, weight, shift, scale, indices, 1e-6)
     actual_residual, actual_modulated = im.indexed_gate_rms_norm_scale_shift(
         residual, gate, branch, weight, shift, scale, indices, 1e-6
     )

@@ -358,12 +358,6 @@ def _indexed_gate_rms_norm_scale_shift_impl(
             input_dtype
         )
         return residual_out, modulated_out
-    if residual.device.type == "cuda" and residual.dtype == torch.bfloat16:
-        # The fused kernel stores the BF16-rounded residual and normalizes that value, which is exactly the
-        # gate kernel followed by the RMSNorm kernel (same FP32 reduction over the same padded row). Two lean
-        # passes run faster on CUDA than one program holding six full-row operands.
-        residual_out = _indexed_gate_impl(residual, gate, branch, indices)
-        return residual_out, _rms_norm_indexed_scale_shift_impl(residual_out, weight, shift, scale, indices, eps)
     residual_out = torch.empty_like(residual)
     modulated_out = torch.empty_like(residual)
     rows, hidden_size = residual.shape
