@@ -72,7 +72,7 @@ steps:
         source_file_dependencies: reliability_invalid_param_l4
         timeout_in_minutes: 120
         commands:
-          - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and L4"
+          - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and L4" --run-level "full_model"
         mirror_hardwares: l4_1
 
   # Keep the scheduled CUDA lane unchanged while allowing a PR carrying the

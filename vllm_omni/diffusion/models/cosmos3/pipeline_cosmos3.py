@@ -4224,6 +4224,11 @@ class Cosmos3OmniDiffusersPipeline(
             raise ValueError("Cosmos3 non-action generation accepts either image or video input, not both.")
         if video_tensor is not None and is_t2i:
             raise ValueError("Cosmos3 video-to-video generation is supported only for video outputs.")
+        if image_tensor is not None and is_t2i:
+            raise ValueError(
+                "Cosmos3 image-conditioned image generation is unsupported; "
+                "image inputs are supported only for video outputs (image-to-video)."
+            )
 
         # T2I and T2V share the same model and forward path; their defaults are:
         #   T2I: regular 1024x1024, Edge 640x640; 50 steps, shift=3.0,
