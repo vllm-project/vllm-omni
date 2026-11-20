@@ -1,5 +1,7 @@
 # MiniMax-H3 Encoder Weight Transfer
 
+The packed mode is an opt-in capability and remains disabled by default. No distinguishable encode-stage or end-to-end gain was measured at 8 × Ascend 910B4 / case01 in the supported layerwise configuration. Selecting `off` disables packing only; pipeline hidden remains on device in every mode.
+
 The MiniMax-H3 video pipeline on Ascend NPU can pack the offloaded text
 encoder's host weights by module and dtype. This reduces the number of H2D
 copies when the encoder is loaded for a request. Packing preserves each

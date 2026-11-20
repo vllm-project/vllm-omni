@@ -13,3 +13,11 @@ Launch commands in results.json replace only model and run-directory paths with 
 Exact measurement wrapper sources: [server.py](server.py.txt), [observer.py](observer.py.txt) and [compatibility helper](compat_bootstrap.py.txt).
 
 Request execution and validation: [controller](control.py.txt), [sender](request_sender.py.txt), [CPU preparation](cpu_prepare.py.txt), [environment setup](stage.sh.txt), [lifecycle](lifecycle.py.txt) and [statistics](analysis.py.txt).
+
+This directory is an evidence archive. The original wrappers retain host-specific paths and require the private case01 inputs and scheduler job layout; they are not a portable benchmark entry point. The [measurement manifest](run-manifest.json) replaces model, data and run-directory paths with placeholders.
+
+To recompute the published means, drift correction and bootstrap intervals directly from the archived public requests:
+
+```bash
+python reproduce_statistics.py.txt results.json
+```
