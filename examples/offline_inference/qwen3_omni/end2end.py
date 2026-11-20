@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 This example shows how to use vLLM for running offline inference
 with the correct prompt format on Qwen3-Omni (thinker only).
@@ -279,7 +279,7 @@ def main(args):
         query_result = query_func(image_path=image_path)
     elif args.query_type == "use_audio":
         query_result = query_func(audio_path=audio_path, sampling_rate=getattr(args, "sampling_rate", 16000))
-    elif args.query_type == "mixed_modalities":
+    elif args.query_type == "use_mixed_modalities":
         query_result = query_func(
             video_path=video_path,
             image_path=image_path,
@@ -287,10 +287,6 @@ def main(args):
             num_frames=getattr(args, "num_frames", 16),
             sampling_rate=getattr(args, "sampling_rate", 16000),
         )
-    elif args.query_type == "multi_audios":
-        query_result = query_func()
-    elif args.query_type == "use_audio_in_video":
-        query_result = query_func()
     else:
         query_result = query_func()
 
@@ -434,7 +430,7 @@ def parse_args():
         type=str,
         default="use_mixed_modalities",
         choices=query_map.keys(),
-        help="Query type.",
+        help="For use_mixed_modalities, override demo inputs with --video-path, --image-path, or --audio-path.",
     )
     parser.add_argument(
         "--log-stats",
