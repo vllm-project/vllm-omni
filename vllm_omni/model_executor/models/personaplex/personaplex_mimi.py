@@ -431,12 +431,24 @@ class PersonaPlexMimiCodec(nn.Module):
         finally:
             torch.set_default_dtype(orig_default_dtype)
         codec_state = _map_moshi_codec_weights(sd)
+        encoder_owner, decoder_owner = self._codec_owners()
+        transformer_prefixes = ("encoder_transformer.", "decoder_transformer.")
+        # Newer Transformers packages the SEANet and resamplers in separate
+        # encoder/decoder models. The bundled checkpoint layout stays the same.
+        if encoder_owner is not self.model:
+            prefixes = {
+                "encoder.layers.": "encoder.encoder_seanet.layers.",
+                "decoder.layers.": "decoder.decoder_seanet.layers.",
+                "downsample.": "encoder.downsample.",
+                "upsample.": "decoder.upsample.",
+            }
+            codec_state = {
+                next((new + name[len(old) :] for old, new in prefixes.items() if name.startswith(old)), name): tensor
+                for name, tensor in codec_state.items()
+            }
+            transformer_prefixes = ("encoder.encoder_transformer.", "decoder.decoder_transformer.")
         incompatible = self.model.load_state_dict(codec_state, strict=False)
-        expected_missing = {
-            name
-            for name in self.model.state_dict()
-            if name.startswith(("encoder_transformer.", "decoder_transformer."))
-        }
+        expected_missing = {name for name in self.model.state_dict() if name.startswith(transformer_prefixes)}
         if set(incompatible.missing_keys) != expected_missing or incompatible.unexpected_keys:
             raise RuntimeError(
                 "PersonaPlex Mimi checkpoint did not exactly cover the local codec graph: "
@@ -446,7 +458,7 @@ class PersonaPlexMimiCodec(nn.Module):
         # The fused streaming transformers below replace these unloaded HF
         # stacks. Drop their randomly initialized weights before moving Mimi to
         # the target device.
-        del self.model.encoder_transformer, self.model.decoder_transformer
+        del encoder_owner.encoder_transformer, decoder_owner.decoder_transformer
         self.model = self.model.to(self.device).eval()
         self.dtype = next(self.model.parameters()).dtype
         self.encoder_transformer = _MimiStreamingTransformer().to(self.device, self.dtype)
@@ -458,12 +470,19 @@ class PersonaPlexMimiCodec(nn.Module):
 
         self._init_streaming_stages()
 
+    def _codec_owners(self) -> tuple[nn.Module, nn.Module]:
+        if hasattr(self.model.encoder, "encoder_seanet"):
+            return self.model.encoder, self.model.decoder
+        return self.model, self.model
+
     def _init_streaming_stages(self) -> None:
-        m = self.model
-        self._enc_stages = _walk_seanet(m.encoder.layers)
-        self._downsample = _StreamConv1d(m.downsample.conv, pad_mode="replicate")
-        self._upsample = _StreamConvTr1d(m.upsample.conv)
-        self._dec_stages = _walk_seanet(m.decoder.layers)
+        encoder_owner, decoder_owner = self._codec_owners()
+        encoder = getattr(encoder_owner, "encoder_seanet", self.model.encoder)
+        decoder = getattr(decoder_owner, "decoder_seanet", self.model.decoder)
+        self._enc_stages = _walk_seanet(encoder.layers)
+        self._downsample = _StreamConv1d(encoder_owner.downsample.conv, pad_mode="replicate")
+        self._upsample = _StreamConvTr1d(decoder_owner.upsample.conv)
+        self._dec_stages = _walk_seanet(decoder.layers)
         self._batch_size: int | None = None
         # The halves streaming_init allocated rows for: Stage 0 only encodes, Stage 1 only decodes.
         self._halves = {"encode": False, "decode": False}

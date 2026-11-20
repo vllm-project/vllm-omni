@@ -1,12 +1,7 @@
 # PersonaPlex
 
-> **Unavailable with vLLM 0.34 / V2-only execution.** The Talker requires the retired Model Runner V1; V2 Code2Wav alone does not make the workflow runnable.
-> The commands, configurations, and measurements below are historical reference,
-> not installation or serving instructions for this version. Configuration loading
-> rejects the V1 profile; changing its runner flag does not add V2 support.
->
-> Historical full-duplex speech-to-speech (the model listens while it speaks) with
-> persona and voice control, on the native vLLM-Omni engine.
+> On vLLM 0.34, use the `personaplex_duplex_mrv2.yaml` profile. Stage 0 MRv2 requires duplex mode with `async_chunk` enabled.
+> The measurements below are from the historical V1 deployment.
 
 ## Summary
 
@@ -107,8 +102,7 @@ eager. Other CUDA GPUs with enough memory are expected to work.
   `nvidia/personaplex-7b-v1` repo (accept the license on the model page)
 
 First run auto-downloads from the model repo: `model.safetensors`,
-`tokenizer_spm_32k_3.model`, `voices.tgz`, and the Mimi reference checkpoint;
-`kyutai/mimi` is fetched via `transformers` for the codec module graph.
+`tokenizer_spm_32k_3.model`, `voices.tgz`, and the Mimi reference checkpoint.
 
 #### Command
 
@@ -118,7 +112,7 @@ Live duplex serving through the unified stack:
 HF_TOKEN=... CUDA_VISIBLE_DEVICES=0 python -m vllm_omni.entrypoints.cli.main serve \
   /path/to/personaplex-7b-v1 \
   --omni \
-  --deploy-config vllm_omni/deploy/personaplex.yaml
+  --deploy-config vllm_omni/deploy/personaplex_duplex_mrv2.yaml
 ```
 
 This exposes `WS /v1/realtime?duplex=1` (alias `WS /v1/duplex`): the OpenAI
