@@ -401,6 +401,29 @@ def validate_function_call_policies(extra_body: Mapping[str, object] | None) -> 
         resolve_function_call_policy(extra_body, key)
 
 
+#: ``extra_body`` key and value that make a session input-clocked (``session/input_clock.py``).
+INPUT_CLOCK_KEY = "clock"
+INPUT_CLOCK_VALUE = "input"
+
+
+def input_clocked(extra_body: object) -> bool:
+    """Whether a session's ``extra_body`` opts into the input clock (``clock: "input"``)."""
+    return isinstance(extra_body, Mapping) and extra_body.get(INPUT_CLOCK_KEY) == INPUT_CLOCK_VALUE
+
+
+def apply_input_clock_capabilities(capabilities: DuplexCapabilities, extra_body: object) -> DuplexCapabilities:
+    """An input-clocked session never overlaps turns: do not advertise ``supports_concurrent_turn_requests``.
+
+    The clock credits outputs to the model units in order, so the runner keeps
+    the concurrent-turn gate shut in such a session and a commit during a
+    response waits for it (the deferred-turn path). The session's advertised
+    capabilities say so, instead of repeating the model's flag.
+    """
+    if not input_clocked(extra_body) or not capabilities.supports_concurrent_turn_requests:
+        return capabilities
+    return replace(capabilities, supports_concurrent_turn_requests=False)
+
+
 @dataclass
 class DuplexSessionConfig:
     model: str | None = None

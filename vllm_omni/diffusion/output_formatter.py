@@ -303,9 +303,9 @@ def _build_multimodal_output(
         mm_output["metadata"] = postprocess_output.metadata
     # Everything that is not a rendering key is a structured payload a
     # downstream stage may consume: packed latents, codec `packets`, decoded
-    # `rgb`/`waveform`, and the keys recognised above. Enumerating them instead
-    # of enumerating by exclusion silently dropped payload fields no one had
-    # added to a list yet (the Codec stage then raised KeyError on `packets`
+    # `rgb`/`waveform`, `audio`, and newer payload keys such as `lidar`. Listing
+    # them instead of enumerating by exclusion silently dropped payload fields
+    # no one had added yet (the Codec stage then raised KeyError on `packets`
     # after a successful decode), so the rule is expressed by exclusion.
     for key, value in postprocess_output.outputs.items():
         if key in MEDIA_RENDER_KEYS:

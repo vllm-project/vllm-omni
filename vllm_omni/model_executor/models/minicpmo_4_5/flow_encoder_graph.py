@@ -17,6 +17,7 @@ one private pool; a replay's results stay valid until the next replay.
 
 from __future__ import annotations
 
+import contextlib
 import math
 from collections import Counter, OrderedDict
 from collections.abc import Callable, Iterable, Sequence
@@ -24,6 +25,7 @@ from typing import Any
 
 import torch
 from vllm.logger import init_logger
+from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 
 from vllm_omni.utils.cuda_stream import create_cuda_stream
 
@@ -245,10 +247,14 @@ class FlowEncoderGraphs:
             self._caller_stream = _graph_api(device).current_stream(device)
             self._amp = (torch.is_autocast_enabled(device.type), torch.get_autocast_dtype(device.type))
         try:
-            for key, layout in zip(keys, layouts, strict=True):
-                with torch.inference_mode(False):
-                    views = {name: self._storage[name][: math.prod(s)].view(s) for name, s in layout.items()}
-                self.graphs[key] = (self._record(views), views)
+            # Cyclic GC during capture can reset a stale CUDAGraph and invalidate the capture; vLLM guards its
+            # captures the same way. Wrap the batch once: the helper runs full collections and must not nest.
+            gc_guard = freeze_gc_for_cudagraph_capture() if device.type == "cuda" else contextlib.nullcontext()
+            with gc_guard:
+                for key, layout in zip(keys, layouts, strict=True):
+                    with torch.inference_mode(False):
+                        views = {name: self._storage[name][: math.prod(s)].view(s) for name, s in layout.items()}
+                    self.graphs[key] = (self._record(views), views)
         except Exception:
             # A partial set would replay some shapes and not others.
             self.graphs.clear()
@@ -599,7 +605,11 @@ class FlowEncoderGraphs:
     def _install_capture(self, key, inputs, last_chunk, amp, dtype, position_tables):
         slot = len(self._slots)
         self._slots.append(None)
-        entry = self._capture(inputs, last_chunk, amp, dtype, position_tables, slot)
+        # Cyclic GC during capture can reset a stale CUDAGraph and invalidate the capture; vLLM guards its captures
+        # the same way. Wrap the pool sentinel and graph captures once: the helper runs full collections and must
+        # not nest. CUDA-only path (_capture runs torch.cuda.graph).
+        with freeze_gc_for_cudagraph_capture():
+            entry = self._capture(inputs, last_chunk, amp, dtype, position_tables, slot)
         self.exact_graphs[key] = entry
         self.seen.pop(key, None)
         self.stats["captures"] += 1

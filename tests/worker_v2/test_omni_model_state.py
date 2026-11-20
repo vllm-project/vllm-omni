@@ -36,6 +36,8 @@ def test_prepare_attn_forwards_release_model_specific_metadata():
 
 
 class _DummyInputBatch:
+    num_computed_prefill_tokens_np: np.ndarray
+    prefill_len_np: np.ndarray
     is_prefilling_np: np.ndarray
     req_ids: list[str]
 
@@ -832,6 +834,8 @@ def test_rope_shim_constructs_sequential_mrope_state():
     with (
         patch("vllm.platforms.current_platform", CpuPlatform()),
         patch("vllm.v1.worker.gpu.buffer_utils.is_uva_available", return_value=False),
+        # Pin-memory support is cached separately from the platform and UVA.
+        patch("vllm.v1.worker.gpu.buffer_utils.is_pin_memory_available", return_value=False),
     ):
         rope = _make_safe_get_rope(get_rope_state)(
             config,
@@ -850,7 +854,16 @@ def test_rope_shim_constructs_sequential_mrope_state():
     rope.init_prefill_positions(1, model, [11, 22, 33, 44], [])
     assert rope.prefill_delta.np[1] == 0
     assert rope.prefill_positions._staged_write_indices == [3, 4, 5]
-    assert rope.prefill_positions._staged_write_contents == [0, 1, 2, 3] * 3
+    # The pin's StagedWriteTensor keeps ndarray staged rows by reference in
+    # _staged_write_chunks instead of extending _staged_write_contents.
+    # With UVA available, omni's staged-write shim replaces stage_write and
+    # stages the same rows as a list of ndarrays in _staged_write_contents,
+    # leaving _staged_write_chunks empty. Accept either representation.
+    staged = rope.prefill_positions._staged_write_chunks
+    if not staged:
+        contents = rope.prefill_positions._staged_write_contents
+        staged = contents if isinstance(contents, list) else [contents]
+    assert [np.asarray(chunk).reshape(-1).tolist() for chunk in staged] == [[0, 1, 2, 3]] * 3
 
 
 @pytest.mark.parametrize("output_key", [None, ("only_one",)])

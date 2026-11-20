@@ -17,6 +17,7 @@ from typing import Any, TypeGuard
 import numpy as np
 import torch
 from vllm.logger import init_logger
+from vllm.utils.torch_utils import PIN_MEMORY
 
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.media import (
@@ -243,10 +244,10 @@ def _tensor_to_shm(
     The shared memory segment remains alive after this call (the local fd is
     closed, but the segment persists until ``_tensor_from_shm`` unlinks it).
 
-    If *d2h_stream* is provided, the D2H copy uses ``copy_()`` with
-    ``pin_memory=True`` on that stream instead of the synchronous ``.cpu()``
-    path.  The caller must synchronize *d2h_stream* after all tensors are
-    packed.
+    If *d2h_stream* is provided, the D2H copy uses ``copy_()`` into host
+    memory pinned per the platform flag ``PIN_MEMORY`` on that stream instead
+    of the synchronous ``.cpu()`` path.  The caller must synchronize
+    *d2h_stream* after all tensors are packed.
     """
     original_dtype = tensor.dtype
     if (
@@ -261,13 +262,28 @@ def _tensor_to_shm(
             created.append(handle)
         return handle
     if d2h_stream is not None and tensor.device.type != "cpu":
-        # Non-blocking D2H: copy on side stream to pinned CPU memory. Host
-        # tensors skip this staging copy; they are copied into SHM directly.
+        # Non-blocking D2H: copy on side stream into host memory pinned per
+        # the platform flag (PIN_MEMORY). Host tensors skip this staging
+        # copy; they are copied into SHM directly.
         old_stream = torch.accelerator.current_stream()
         torch.accelerator.set_stream(d2h_stream)
         try:
             t = tensor.detach()
-            cpu = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+            try:
+                cpu = torch.empty(t.shape, dtype=t.dtype, pin_memory=PIN_MEMORY)
+            except RuntimeError as exc:
+                # Some Ascend hosts cannot grant pinned host pages when free
+                # (non-reclaimable) memory runs low. The copy is still correct
+                # through pageable memory; only the transfer may be slower.
+                message = str(exc)
+                if "MallocHost" not in message and "out of memory" not in message.lower():
+                    raise
+                logger.warning_once(
+                    "Pinned host buffer unavailable for shape=%s dtype=%s; copying through pageable memory.",
+                    tuple(t.shape),
+                    t.dtype,
+                )
+                cpu = torch.empty(t.shape, dtype=t.dtype)
             cpu.copy_(t, non_blocking=True)
         finally:
             torch.accelerator.set_stream(old_stream)
@@ -409,6 +425,7 @@ def _pack_diffusion_media(
         "__type__": _DIFFUSION_MEDIA_WIRE_TYPE,
         "schema_version": video.schema_version,
         "prepared_for_transport": True,
+        "metadata": media.metadata,
         "video": {
             "tensor": packed_tensor,
             "layout": video.spec.layout.value,
@@ -453,6 +470,7 @@ def _unpack_diffusion_media(packed: dict[str, Any]) -> DiffusionMediaOutput:
             schema_version=1,
         ),
         prepared_for_transport=True,
+        metadata=packed.get("metadata", {}),
     )
     media.validate()
     return media

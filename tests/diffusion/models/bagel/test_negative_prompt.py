@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 import torch
@@ -38,7 +38,6 @@ def test_forward_reads_negative_prompt_from_prompt_with_legacy_fallback(
     pipeline.tokenizer = mocker.sentinel.tokenizer
     pipeline.new_token_ids = {}
     pipeline.language_model = mocker.Mock(vocab_size=10)
-    pipeline.image_processor = None
     pipeline.vae = None
 
     bagel = mocker.MagicMock()

@@ -185,6 +185,7 @@ class Harness:
             busy = (
                 drained
                 or not self.runner._mailbox.empty()
+                or self.runner._pending_input_appends > 0
                 or any(not task.done() for task in self.runner.tasks.append_tasks)
                 or any(not task.done() for task in self.runner._background_tasks)
             )
@@ -828,6 +829,71 @@ async def test_idle_expiry_emits_session_expired() -> None:
 
 
 @pytest.mark.asyncio
+async def test_buffered_speech_refreshes_idle_lease() -> None:
+    clock = {"now": 100.0}
+    h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(idle_ttl_s=2.0), clock=lambda: clock["now"])
+    try:
+        audio = append_audio(samples=1600)
+        for count, now in enumerate((101.0, 102.0), start=1):
+            clock["now"] = now
+            events = await h.run(audio)
+            assert "error" not in types(events)
+            assert h.runner.model_state.audio_buffer.pending_byte_count == count * len(audio.audio)
+            assert h.port.submissions == []
+            assert await h.manager.reap_expired() == 0
+
+        clock["now"] = 103.5
+        assert await h.manager.reap_expired() == 0
+        clock["now"] = 104.0
+        assert await h.manager.reap_expired() == 1
+        events = await h.settle()
+        assert types(events) == ["session.expired"]
+        assert events[0].reason == "idle_ttl_expired"
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_incomplete_float_pcm_does_not_refresh_idle_lease() -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
+    from vllm_omni.model_executor.models.aura_omni.duplex.plugin import AuraDuplexPlugin
+
+    frame = BytesIO()
+    Image.new("RGB", (8, 8)).save(frame, format="PNG")
+    video = b64(frame.getvalue())
+    append = translate_realtime_command(
+        {
+            "type": "input_audio_buffer.append",
+            "format": "pcm_f32le",
+            "audio": b64(bytes(1)),
+            "video_frames": [video],
+        }
+    )
+    clock = {"now": 100.0}
+    h = await open_harness(
+        plugin=AuraDuplexPlugin(_fake_encode_audio),
+        model="aura",
+        stage_count=4,
+        runtime_config=DuplexSessionRuntimeConfig(idle_ttl_s=2.0),
+        clock=lambda: clock["now"],
+    )
+    try:
+        clock["now"] = 101.0
+        assert "error" not in types(await h.run(append))
+        assert h.runner.model_state.audio_buffer.pending_byte_count == len(video)
+        assert h.port.submissions == []
+        clock["now"] = 102.0
+        assert await h.manager.reap_expired() == 1
+        assert find(await h.settle(), "session.expired").reason == "idle_ttl_expired"
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_commands_for_a_closed_session_are_answered_with_unknown_session() -> None:
     h = await open_harness()
     await h.manager.handle(CloseDuplexSessionMessage(control_id="c-close", session_id=SESSION_ID, reason="bye"))
@@ -1005,6 +1071,41 @@ async def test_clear_input_drops_buffered_audio() -> None:
         assert not h.runner.model_state.audio_buffer.has_pending()
         assert h.session.pending_input_bytes == 0
     finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_settle_waits_for_inflight_audio_preprocessing(monkeypatch) -> None:
+    h = await open_harness(auto_response=False)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    run_turn_detection = h.runner.control.run_turn_detection
+    settling: asyncio.Task[list[DuplexEvent]] | None = None
+
+    async def blocked_turn_detection(event):
+        started.set()
+        await release.wait()
+        return await run_turn_detection(event)
+
+    monkeypatch.setattr(h.runner.control, "run_turn_detection", blocked_turn_detection)
+    try:
+        h.submit(append_audio(samples=8000))
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+        assert h.runner._mailbox.empty()
+
+        settling = asyncio.create_task(h.settle(idle_s=0.0))
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(settling), timeout=0.1)
+
+        release.set()
+        await asyncio.wait_for(settling, timeout=2.0)
+        assert h.runner._pending_input_appends == 0
+        assert h.runner.model_state.audio_buffer.pending_byte_count == 32_000
+    finally:
+        release.set()
+        if settling is not None:
+            settling.cancel()
+            await asyncio.gather(settling, return_exceptions=True)
         await close_harness(h)
 
 
@@ -2666,6 +2767,86 @@ async def test_terminal_listen_preserves_manual_turn_lifecycle(budget_spent: boo
         assert len(h.port.submissions) == 2
         events = await h.deliver_and_settle(tts_output(reply.request_id, turn_id=reply.fence.turn_id, finished=True))
         assert find(events, "response.done").status == "completed" and "response.output_audio.delta" in types(events)
+
+
+@pytest.mark.asyncio
+async def test_forced_response_first_silence_unit_opens_the_assistant_turn() -> None:
+    """The first silence unit of a response.create-owned response must carry
+    ``open_assistant_turn`` so the model can release a stale turn-ended latch
+    (left set by a truncated prior turn) and actually answer.
+
+    The recognition CI sessions run with auto-responds enabled and hit exactly
+    this path, so the marker must be tied to the explicitly created response,
+    not to the session mode (silence continuations only run in auto sessions
+    anyway -- a manual session's listen clears the active request first).
+    """
+    h = await open_harness(extra_body={"force_listen_count": 0})
+    try:
+        for _ in range(7):
+            await h.run(append_audio(3200, value=0.05))
+        await h.run(commands.Commit(create_response=True))
+        first = h.port.submissions[-1].context
+        assert h.session.active_response_id is not None
+        submissions_before = len(h.port.submissions)
+
+        def silence_payload(index: int) -> dict:
+            duplex = h.port.submissions[index].prompt["model_intermediate_buffer"]["duplex"]
+            return duplex["payload"]
+
+        listen = listen_output(first.request_id)
+        listen.finished = False
+        await h.deliver_and_settle(
+            listen,
+            stage_id=0,
+            segment_finished=True,
+            segment_token_ids=[11, 12, LISTEN_TOKEN_ID],
+            segment_output_metadata={"meta.listen_token_id": LISTEN_TOKEN_ID},
+        )
+        assert len(h.port.submissions) == submissions_before + 1
+        assert silence_payload(submissions_before).get("open_assistant_turn") is True
+
+        # Later units of the same response do not repeat the marker.
+        second = h.port.submissions[-1].context
+        listen_again = listen_output(second.request_id)
+        listen_again.finished = False
+        await h.deliver_and_settle(
+            listen_again,
+            stage_id=0,
+            segment_finished=True,
+            segment_token_ids=[11, 12, LISTEN_TOKEN_ID],
+            segment_output_metadata={"meta.listen_token_id": LISTEN_TOKEN_ID},
+        )
+        assert len(h.port.submissions) == submissions_before + 2
+        assert "open_assistant_turn" not in silence_payload(submissions_before + 1)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_auto_response_silence_unit_has_no_turn_marker() -> None:
+    """Engine-owned auto responses must not carry the open-turn marker."""
+    h = await open_harness()
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"))
+        assert h.session.active_response_id is not None
+        submissions_before = len(h.port.submissions)
+
+        listen = listen_output(request_id)
+        listen.finished = False
+        await h.deliver_and_settle(
+            listen,
+            stage_id=0,
+            segment_finished=True,
+            segment_token_ids=[11, 12, LISTEN_TOKEN_ID],
+            segment_output_metadata={"meta.listen_token_id": LISTEN_TOKEN_ID},
+        )
+        assert len(h.port.submissions) == submissions_before + 1
+        duplex = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
+        assert "open_assistant_turn" not in duplex["payload"]
+    finally:
+        await close_harness(h)
 
 
 @pytest.mark.asyncio
@@ -4640,5 +4821,41 @@ async def test_response_create_waits_while_a_held_prefix_is_still_submitting() -
         finally:
             release.set()
             await task
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.parametrize("input_clock", [False, True])
+@pytest.mark.parametrize("retained_request", [False, True])
+@pytest.mark.parametrize("interrupt", ["vad", "client"])
+@pytest.mark.asyncio
+async def test_barge_in_clears_completed_response_on_retained_stream(
+    monkeypatch: pytest.MonkeyPatch, retained_request: bool, interrupt: str, input_clock: bool
+) -> None:
+    if input_clock:
+        # Opt in only the harness model, as in the input-clock runner tests.
+        monkeypatch.setattr(MiniCPMO45DuplexPlugin, "supports_input_clock", True)
+    h = await open_harness(extra_body={"clock": "input"} if input_clock else None)
+    try:
+        h.session.config.playback_commit_policy = "ack_only"
+        request_id = await _open_active_response(h)
+        response_id = h.session.active_response_id
+        events = await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello", turn_end=True))
+        assert find(events, "response.done").status == "completed"
+        assert h.session.active_response_id is None
+        assert h.session.playback.sent_ms > h.session.playback.committed_ms
+        h.runner.run.stream_request_id = request_id
+        if not retained_request:
+            h.session.clear_request()
+        if interrupt == "vad":
+            assert await h.runner._barge_in_for_overlap({}, {"cancel_reason": "turn_detected"})
+            events = await h.settle()
+        else:
+            events = await h.run(commands.BargeIn())
+        cleared = [event for event in events if event.type == "output_audio_buffer.cleared"]
+        assert len(cleared) == 1, types(events)
+        assert cleared[0].response_id == response_id
+        assert "response.done" not in types(events)
+        assert h.session.epoch == 1
     finally:
         await close_harness(h)
