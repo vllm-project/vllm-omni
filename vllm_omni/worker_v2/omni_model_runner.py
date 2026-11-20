@@ -10,6 +10,7 @@ from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
+import numpy as np
 import torch
 from torch.utils._pytree import tree_flatten, tree_unflatten
 from vllm.config.compilation import CUDAGraphMode
@@ -887,6 +888,16 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         finally:
             narrow.restore()
 
+    def _set_lora_inputs(self, input_batch: InputBatch) -> None:
+        """Activate the step's adapters: one adapter id per scheduled token and one per logits row."""
+        lora_inputs = self.lora_state.make_lora_inputs(
+            input_batch.req_ids,
+            input_batch.idx_mapping_np,
+            input_batch.num_scheduled_tokens,
+            np.diff(input_batch.cu_num_logits_np),
+        )
+        self._set_active_loras(*lora_inputs)
+
     @torch.inference_mode()
     @staged_writes.runner_context
     def execute_model(
@@ -1009,12 +1020,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             )
 
             if self.lora_config:
-                lora_inputs = self.lora_state.make_lora_inputs(
-                    input_batch.req_ids,
-                    input_batch.idx_mapping_np,
-                    input_batch.num_scheduled_tokens,
-                )
-                self._set_active_loras(*lora_inputs)
+                self._set_lora_inputs(input_batch)
             # Encode vision and audio before language-model attention metadata.
             # A long video's ViT FlashAttention workspace and the prefill's FA3
             # scheduler workspace do not fit together; V1 runs the encoder first.

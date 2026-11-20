@@ -3087,7 +3087,9 @@ class TestBaseConfigInheritance:
         [
             ("rocm", ["0", "1", "1"], 0.3),
             ("cuda", ["0", "1", "2"], 0.4),
-            ("xpu", ["0", "1", "2"], 0.5),
+            # XPU shares the talker card with Code2Wav, as ROCm does, so the CI
+            # deploy fits the two-card agents.
+            ("xpu", ["0", "1", "1"], 0.5),
         ],
     )
     def test_qwen2_5_omni_ci_placement(self, monkeypatch, platform, expected_devices, talker_memory):
@@ -3100,6 +3102,28 @@ class TestBaseConfigInheritance:
 
         assert [stage.yaml_runtime["devices"] for stage in stages] == expected_devices
         assert stages[1].yaml_engine_args["gpu_memory_utilization"] == talker_memory
+
+    @pytest.mark.parametrize("platform", ["cuda", "xpu"])
+    def test_qwen2_5_omni_1card_overlay_colocates_every_stage(self, monkeypatch, platform):
+        """The single-card overlay only tests colocation while the merge keeps all three stages together.
+
+        The base deploy's own ``platforms.xpu`` section moves Code2Wav to
+        device 1, so the overlay re-pins the devices. If that re-pin ever stops
+        winning the merge, the single-card lane would spread over three cards
+        instead of failing, and would silently stop covering colocation.
+        """
+        from vllm_omni import platforms
+
+        monkeypatch.setattr(platforms.current_omni_platform, "device_name", platform)
+        deploy = load_deploy_config(get_deploy_config_path("ci/qwen2_5_omni_1card.yaml"))
+        stages = merge_pipeline_deploy(resolve_pipeline_config("qwen2_5_omni"), deploy)
+
+        assert [stage.yaml_runtime["devices"] for stage in stages] == ["0", "0", "0"]
+        assert [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages] == [0.45, 0.25, 0.15]
+        if platform == "xpu":
+            # The talker's native sampler workaround comes from the base
+            # platforms section and must survive the overlay.
+            assert stages[1].yaml_runtime["env"]["VLLM_XPU_USE_SAMPLER_KERNEL"] == "0"
 
     def test_minicpmo_overlays_inherit_talker_sampling_params(self):
         """Overlays must keep the base Talker codec Sampler knobs."""
@@ -3598,12 +3622,27 @@ class TestPlatformOverrides:
         assert compilation["cudagraph_mode"] == "FULL"
         assert max(compilation["cudagraph_capture_sizes"]) == 128
         assert "inductor_compile_config" not in compilation
-        assert not any(
-            stage.supports_native_mrv2_data_plane for stage in resolve_pipeline_config("moss_tts_delay").stages
-        )
+        assert all(stage.supports_native_mrv2_data_plane for stage in resolve_pipeline_config("moss_tts_delay").stages)
         assert all(
             stage.supports_native_mrv2_data_plane for stage in resolve_pipeline_config("moss_tts_realtime").stages
         )
+
+    @pytest.mark.parametrize(
+        "pipeline_key,filename,native_stages",
+        [
+            ("aura_omni", "aura_omni.yaml", (2, 3)),
+            ("nemotron_voicechat", "nemotron_labs_voicechat_duplex.yaml", (0, 1, 2)),
+            ("personaplex", "personaplex.yaml", (0, 1)),
+        ],
+    )
+    def test_native_transport_preserves_duplex_deploy(self, pipeline_key, filename, native_stages):
+        pipeline = resolve_pipeline_config(pipeline_key)
+        deploy = load_deploy_config(get_deploy_config_path(filename))
+        assert deploy.session_mode == "duplex"
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        for stage in stages:
+            if stage.stage_id in native_stages:
+                assert stage.yaml_engine_args["supports_native_mrv2_data_plane"]
 
     def test_platform_mps_rejects_non_boolean(self):
         deploy = load_deploy_config(get_deploy_config_path("moss_tts_local.yaml"))

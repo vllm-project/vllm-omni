@@ -142,6 +142,7 @@ class _MiniCPMO45Stage0SessionState:
     #: ended it), waiting for the scheduler's first window plan of this one.
     carried_window_units: list[_MiniCPMO45WindowUnit] = field(default_factory=list)
     current_turn_ended: bool = True
+    opened_assistant_turn_segment: tuple[str, int] | None = None
     prepared_append_identity: tuple[int | None, int] | None = None
     prepared_inputs_embeds: torch.Tensor | None = None
     prepared_input_token_ids: list[int] = field(default_factory=list)
