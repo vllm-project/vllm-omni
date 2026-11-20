@@ -1417,6 +1417,7 @@ def _build_engine_args(
     """
     engine_args: dict[str, Any] = {"model_arch": ps.model_arch or pipeline.model_arch or None}
     engine_args["retains_state_across_chunks"] = ps.retains_state_across_chunks
+    engine_args["has_downstream_stages"] = any(ps.stage_id in other.input_sources for other in pipeline.stages)
     if ps.supports_pending_generation:
         engine_args["supports_pending_generation"] = True
     if ps.execution_type == StageExecutionType.DIFFUSION and ps.model_arch:

@@ -417,7 +417,14 @@ class TestThinkerOnlyPipeline:
         assert "output_connectors" not in thinker.yaml_extras
         assert not thinker.yaml_engine_args.get("custom_process_next_stage_input_func")
         assert thinker.yaml_engine_args["use_v2_model_runner"] is True
+        assert thinker.yaml_engine_args["has_downstream_stages"] is False
         assert thinker.yaml_engine_args["kv_cache_memory_bytes"] == 8 * 1024**3
+
+        full_deploy = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5.yaml")
+        full_stages = merge_pipeline_deploy(OMNI_PIPELINES[full_deploy.pipeline], full_deploy)
+        assert full_stages[0].yaml_engine_args["has_downstream_stages"] is True
+        assert full_stages[1].yaml_engine_args["has_downstream_stages"] is True
+        assert full_stages[2].yaml_engine_args["has_downstream_stages"] is False
         assert deploy.duplex_session.max_sessions == thinker.yaml_engine_args["max_num_seqs"]
 
 

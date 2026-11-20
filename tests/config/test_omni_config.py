@@ -1636,6 +1636,7 @@ def test_sub_config_fields_match_structured_scopes():
         "interleave_mm_strings",
         "media_io_kwargs",
         "final_output",
+        "has_downstream_stages",
         "supports_running_prefix_cache_reset",
         "supports_pending_generation",
         "recompute_preemption",

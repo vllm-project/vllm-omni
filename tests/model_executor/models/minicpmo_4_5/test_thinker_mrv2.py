@@ -50,7 +50,7 @@ def test_cuda_turn_inherits_mrv2_talker_kstep(monkeypatch):
     assert talker.yaml_runtime["cuda_mps"] is True
 
 
-def _model(mocker, *, v2=True, session="turn", async_chunk=False, speculative_config=None):
+def _model(mocker, *, v2=True, session="turn", async_chunk=False, speculative_config=None, has_downstream_stages=True):
     thinker = torch.nn.Module()
     thinker.make_empty_intermediate_tensors = lambda: None
     mocker.patch.object(omni, "init_vllm_registered_model", return_value=thinker)
@@ -63,6 +63,7 @@ def _model(mocker, *, v2=True, session="turn", async_chunk=False, speculative_co
             use_v2_model_runner=v2,
             session_mode=session,
             async_chunk=async_chunk,
+            has_downstream_stages=has_downstream_stages,
         ),
         speculative_config=speculative_config,
     )
@@ -544,3 +545,90 @@ def test_talker_stage_hands_drafter_hooks_to_the_talker(mocker):
     assert model.get_language_model() is model.talker.get_language_model.return_value
     model.set_aux_hidden_state_layers((2, 10, 17))
     model.talker.set_aux_hidden_state_layers.assert_called_once_with((2, 10, 17))
+
+
+def test_mrv2_thinker_only_skips_latent_and_preserves_control_meta(mocker):
+    """Single-stage Thinker-only omits llm2tts-only latent/prompt payloads while keeping control meta."""
+    from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner, _async_copy_mm
+
+    model = _model(mocker, session="duplex", has_downstream_stages=False)
+    assert model.omni_pooler_payload_include_hidden is False
+
+    batch = SimpleNamespace(
+        req_ids=["a", "b"],
+        num_reqs=2,
+        input_ids=torch.tensor([101, 102]),
+        positions=torch.tensor([0, 1]),
+        is_prefilling_np=np.array([True, False]),
+        num_computed_prefill_tokens_np=np.array([2, 0]),
+        num_scheduled_tokens=np.array([1, 1]),
+        prefill_len_np=np.array([3, 5]),
+    )
+    hidden = torch.randn(2, 8)
+    buffers = [
+        {
+            "duplex": {
+                "duplex_prompt_token_ids": [1, 2, 3],
+                "special_token_ids": {
+                    "listen_token_id": 151705,
+                    "turn_eos_token_id": 151704,
+                    "chunk_eos_token_id": 151718,
+                    "chunk_tts_eos_token_id": 151721,
+                },
+            }
+        },
+        {},
+    ]
+    out = model.make_omni_output_mrv2(
+        hidden,
+        input_batch=batch,
+        req_states=None,
+        model_intermediate_buffer=buffers,
+    )
+    assert out.text_hidden_states is hidden
+    for dropped_key in ("latent", "latent_input_ids", "latent_positions", "duplex_prompt_token_ids"):
+        assert dropped_key not in out.multimodal_outputs
+    assert set(out.multimodal_outputs.keys()) == {"meta"}
+    assert out.multimodal_outputs["meta"]["listen_token_id"][0].item() == 151705
+    assert out.multimodal_outputs["meta"]["turn_eos_token_id"][1].item() == 151704
+    assert out.multimodal_outputs["meta"]["listen_token_id"][0].device.type == "cpu"
+
+    snapshot = _async_copy_mm(out.multimodal_outputs, total_tokens=2)
+    inter_stage, client_mm = OmniARModelRunner._build_async_chunk_outputs_from_mm(
+        snapshot,
+        query_start_loc_np=np.array([0, 1, 2]),
+        num_scheduled_tokens=np.array([1, 1]),
+        num_reqs=2,
+        total_tokens=2,
+        padded_total_tokens=2,
+        req_ids=["a", "b"],
+        engine_output_type="latent",
+    )
+    assert client_mm is None
+    assert inter_stage is not None and len(inter_stage) == 2
+    assert inter_stage[0]["meta.listen_token_id"].item() == 151705
+    assert inter_stage[0]["meta.turn_eos_token_id"].item() == 151704
+    assert "latent" not in inter_stage[0]
+
+    batch.is_prefilling_np = np.array([False, False])
+    decode_out = model.make_omni_output_mrv2(
+        hidden,
+        input_batch=batch,
+        req_states=None,
+        model_intermediate_buffer=buffers,
+    )
+    assert decode_out.text_hidden_states is hidden
+    assert decode_out.multimodal_outputs == {}
+    decode_snapshot = _async_copy_mm(decode_out.multimodal_outputs, total_tokens=2)
+    assert decode_snapshot == {}
+    decode_inter, decode_client = OmniARModelRunner._build_async_chunk_outputs_from_mm(
+        decode_snapshot,
+        query_start_loc_np=np.array([0, 1, 2]),
+        num_scheduled_tokens=np.array([1, 1]),
+        num_reqs=2,
+        total_tokens=2,
+        padded_total_tokens=2,
+        req_ids=["a", "b"],
+        engine_output_type="latent",
+    )
+    assert decode_inter is None and decode_client is None

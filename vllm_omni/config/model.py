@@ -147,6 +147,10 @@ class OmniModelConfig(ModelConfig):
     # worker-side before IPC. Read by the AR scheduler.
     pooling_output_decoder: str | None = None
     final_output: bool = False
+    # True when at least one downstream stage consumes this stage's outputs.
+    # Single-stage / terminal deployments (e.g. Thinker-only) set this to False
+    # so models can skip building and copying inter-stage-only latent tensors.
+    has_downstream_stages: bool = True
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
     stage_connector_config: dict[str, Any] = field(
