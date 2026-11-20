@@ -6,6 +6,12 @@
 Video and audio decoding is delegated to PyAV (``av``), which bundles a pinned
 FFmpeg version, so results do not depend on whatever ffmpeg binary the host
 provides (see #7364: host ffmpeg 4.4.2 could hang forever on some HEVC clips).
+
+PyAV/libav is not safe for concurrent ``open`` + ``seek`` + ``decode`` in one
+process: C8 Omni-DuplexEval prepare on aarch64 deadlocks in native futex while
+eight worker threads each reopen the file per timestamp. All decode paths in
+this module take a process-wide lock, and :func:`iter_jpegs` walks the file
+once instead of seeking for every sampled frame.
 """
 
 from __future__ import annotations
@@ -15,6 +21,7 @@ import logging
 import math
 import os
 import tempfile
+import threading
 import wave
 from collections.abc import Iterator
 from fractions import Fraction
@@ -24,6 +31,11 @@ from typing import Any, Protocol
 from vllm_omni.experimental.fullduplex.client import PCM16_BYTES_PER_SAMPLE, PCM16_SAMPLE_RATE
 
 logger = logging.getLogger(__name__)
+
+# libavcodec frame threads deadlock under concurrent seek/decode (see #7364 for
+# HEVC). Holding this across every PyAV container in the duplex client keeps
+# C8 ``asyncio.to_thread(prepare_sample)`` from wedging on aarch64.
+_PYAV_LOCK = threading.RLock()
 
 
 def materialize_media(value: Any, output_dir: str | Path, stem: str, suffix: str) -> Path:
@@ -108,7 +120,7 @@ def video_duration(path: str | Path) -> float:
     import av
 
     try:
-        with av.open(str(path)) as container:
+        with _PYAV_LOCK, av.open(str(path)) as container:
             # Container-level duration is the same source ffprobe's format=duration reads.
             if container.duration and container.duration > 0:
                 return max(0.0, container.duration / av.time_base)
@@ -146,7 +158,7 @@ def extract_jpeg(path: str | Path, *, timestamp: float, quality: int = 3) -> byt
     """
     import av
 
-    with av.open(str(path)) as container:
+    with _PYAV_LOCK, av.open(str(path)) as container:
         if not container.streams.video:
             raise ValueError(f"no video stream in {path}")
         stream = container.streams.video[0]
@@ -165,33 +177,59 @@ def extract_jpeg(path: str | Path, *, timestamp: float, quality: int = 3) -> byt
             if frame.pts is not None and frame.pts >= target_pts:
                 break
         if closest_frame is not None:
-            image = closest_frame.to_image()
-            buf = io.BytesIO()
-            image.save(buf, format="JPEG", quality=_ffmpeg_q_to_pil_quality(quality))
-            return buf.getvalue()
+            return _frame_to_jpeg(closest_frame, quality)
     raise ValueError(f"no decodable video frames in {path} at timestamp {timestamp}")
+
+
+def _frame_to_jpeg(frame: Any, quality: int) -> bytes:
+    image = frame.to_image()
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=_ffmpeg_q_to_pil_quality(quality))
+    return buf.getvalue()
 
 
 def iter_jpegs(
     path: str | Path, *, fps: float = 1.0, duration: float | None = None, quality: int = 3
 ) -> Iterator[tuple[float, bytes]]:
+    """Sample JPEG frames at ``fps`` from ``path``.
+
+    Opens the container once and decodes forward. Each requested timestamp gets
+    the first frame whose presentation time is at or after that timestamp, the
+    same ``ffmpeg -ss`` rule :func:`extract_jpeg` uses, without a seek per sample.
+    """
     end = duration if duration is not None else video_duration(path)
     if not math.isfinite(fps) or fps <= 0 or not math.isfinite(end) or end < 0:
         raise ValueError("fps must be finite and positive; video duration must be finite and nonnegative")
-    index = 0
-    timestamp = 0.0
-    while timestamp < end:
-        try:
-            frame = extract_jpeg(path, timestamp=timestamp, quality=quality)
-        except (OSError, ValueError) as exc:
-            logger.warning("Frame extraction failed at %.3fs for %s: %s", timestamp, path, exc)
-            break
-        if frame:
-            yield timestamp, frame
-        # Repeated addition can turn the excluded endpoint into an extra frame
-        # (e.g. 4 seconds at 1.5 fps ends at 3.9999999999999996).
-        index += 1
-        timestamp = index / fps
+    import av
+
+    try:
+        with _PYAV_LOCK, av.open(str(path)) as container:
+            if not container.streams.video:
+                return
+            stream = container.streams.video[0]
+            stream.thread_type = _video_thread_type(stream)
+            time_base = stream.time_base if stream.time_base is not None else Fraction(1, 90000)
+            origin = _presentation_origin(container)
+            index = 0
+            timestamp = 0.0
+            for frame in container.decode(stream):
+                if frame.pts is None:
+                    continue
+                presented = float(Fraction(int(frame.pts)) * Fraction(time_base) - origin)
+                jpeg: bytes | None = None
+                # Repeated addition can turn the excluded endpoint into an extra
+                # frame (e.g. 4 seconds at 1.5 fps ends at 3.9999999999999996).
+                while timestamp < end and timestamp <= presented:
+                    if jpeg is None:
+                        jpeg = _frame_to_jpeg(frame, quality)
+                    yield timestamp, jpeg
+                    index += 1
+                    timestamp = index / fps
+                if timestamp >= end:
+                    return
+    except (OSError, ValueError) as exc:
+        logger.warning("Frame extraction failed for %s: %s", path, exc)
+        return
 
 
 def read_audio_pcm16(path: str | Path) -> bytes:
@@ -215,7 +253,7 @@ def read_audio_pcm16(path: str | Path) -> bytes:
     try:
         resampler = av.AudioResampler(format="s16", layout="mono", rate=PCM16_SAMPLE_RATE)
         chunks: list[Any] = []
-        with av.open(str(source)) as container:
+        with _PYAV_LOCK, av.open(str(source)) as container:
             for frame in container.decode(audio=0):
                 for resampled in resampler.resample(frame):
                     chunks.append(resampled.to_ndarray())
@@ -272,7 +310,7 @@ def read_soundtrack_pcm16(path: str | Path) -> bytes:
     import numpy as np
 
     try:
-        with av.open(str(path)) as container:
+        with _PYAV_LOCK, av.open(str(path)) as container:
             if not container.streams.audio:
                 return b""
             origin = _presentation_origin(container)

@@ -570,7 +570,8 @@
         "stages": {
           "0": ["speculative_config"]
         },
-        "platforms.npu.stages.0.speculative_config": null
+        "platforms.npu.stages.0.speculative_config": null,
+        "platforms.npu.stages.1.speculative_config": null
       }
     },
     "benchmark_params": [
