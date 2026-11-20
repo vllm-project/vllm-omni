@@ -1,0 +1,5 @@
+# Higgs-audio v2 explicit MRV2 profile: pins the talker (stage 0) to
+# model_runner v2 as a stable alias of the shipped default via base_config,
+# kept in case the default's selection ever flips back. The codec stage
+# stays on v1; the two files must resolve identically today.
+base_config: higgs_audio_v2.yaml

@@ -13,6 +13,7 @@ Extends ``OmniGPUModelRunner`` with:
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
@@ -41,7 +42,7 @@ from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async
 from vllm_omni.model_executor.models.interfaces import SupportsMRv2MultiFrameDecode
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.utils.mm_outputs import partition_flat_payload
+from vllm_omni.utils.mm_outputs import partition_flat_payload, partition_payload_list
 from vllm_omni.worker.sparse_audio import resolve_sparse_mm_routing
 from vllm_omni.worker_v2.mooncake_capture import snapshot_mooncake_output
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
@@ -1263,10 +1264,16 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 self._engine_output_type,
             )
             pooler_payload = cast(list[dict[str, Any] | None], pooler_output) if pooler_output else None
-            self.model_runner_output.pooler_output = pooler_payload
-            self.model_runner_output.inter_stage_outputs = pooler_payload
+            # Partition the flat payload once. pooler_output and
+            # multimodal_output are accumulated independently downstream, so
+            # mirroring the payload into both channels would double every row.
+            pooler_inter, pooler_client = partition_payload_list(
+                cast("Sequence[Mapping[str, object]]", pooler_payload or [])
+            )
+            self.model_runner_output.pooler_output = pooler_inter
+            self.model_runner_output.inter_stage_outputs = pooler_inter
             self.model_runner_output.multimodal_outputs = (
-                [_ensure_tensor_values(p) if p else {} for p in pooler_payload] if pooler_payload else None
+                [_ensure_tensor_values(p) if p else {} for p in pooler_client] if pooler_client else None
             )
             token_ranges = self._full_payload_token_ranges(num_output_rows)
             if token_ranges is not None:

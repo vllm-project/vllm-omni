@@ -68,15 +68,6 @@ stages:
     max_tokens: 2048
     seed: 42
     repetition_penalty: 1.0
-  hf_overrides:
-    audio_async_prompt_mode: true
-    audio_async_payload: true
-    audio_mrv2_static_inputs: true
-    audio_mrv2_slot_parameters: true
-    audio_mrv2_direct_payload: true
-    audio_mrv2_sample_graph_buckets: true
-    audio_mrv2_async_state_indices: true
-    audio_mrv2_fused_state: true
 - stage_id: 1
   max_num_seqs: 64
   gpu_memory_utilization: 0.25

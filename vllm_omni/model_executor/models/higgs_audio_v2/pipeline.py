@@ -24,6 +24,11 @@ HIGGS_AUDIO_V2_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
+            # The v2 talker rides the legacy transport to stage 1; the
+            # combination is e2e-validated in
+            # tests/e2e/online_serving/test_higgs_audio_v2_expansion.py, so
+            # skip the generic unvalidated-integration warning at default boot.
+            mrv2_legacy_transport_validated=True,
             async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2code2wav_async_chunk"),
             sampling_constraints={
                 "detokenize": False,
@@ -34,6 +39,9 @@ HIGGS_AUDIO_V2_PIPELINE = PipelineConfig(
                 #     upstream HiggsAudioModel._sample_audio_tokens override).
                 "stop_token_ids": [128009, 128012],
             },
+            # Audio codebooks are folded into the decode embeddings, so a
+            # preemption replay cannot reconstruct the same KV-cache state.
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,
