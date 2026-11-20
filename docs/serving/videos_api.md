@@ -46,7 +46,7 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 | `/v1/videos/sync` | `POST` | Generate a video synchronously and return raw video bytes |
 | `/v1/videos/{video_id}` | `GET` | Retrieve job status and metadata |
 | `/v1/videos` | `GET` | List stored video jobs |
-| `/v1/videos/{video_id}/content` | `GET` | Download generated video content |
+| `/v1/videos/{video_id}/content` | `GET` | Download generated content; `variant=video` (default) returns the MP4, `variant=lidar` returns a job's numeric LiDAR file when its record carries a `lidar` descriptor |
 | `/v1/videos/{video_id}` | `DELETE` | Delete a video job and stored output |
 
 ### Request Parameters
@@ -68,6 +68,7 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 | Parameter | Type | Default | Description |
 | ----------- | ------ | --------- | ------------- |
 | `input_reference` | file | null | Uploaded reference image or video for image-to-video/video-to-video requests |
+| `input_references` | repeated file | null | Ordered reference uploads; supported media types and mapping to model inputs depend on the active model |
 | `timeline_guides` | string | null | MiniMax H3 JSON manifest of ordered timeline guides; see [MiniMax H3 Timeline Guides](#minimax-h3-timeline-guides) |
 | `guide_files` | repeated file | null | Guide uploads addressed by zero-based `upload_index` in `timeline_guides` |
 | `control_reference` | file | null | Optional uploaded image/video control, up to 512 MiB, for models that declare control-upload support |
