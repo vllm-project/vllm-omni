@@ -191,7 +191,6 @@ class TestHiggsAudioV3OnlineHappyPath:
 
 
 @pytest.mark.slow
-@pytest.mark.full_model
 @pytest.mark.tts
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", CUDA_PROFILE_PARAMS, indirect=True)
