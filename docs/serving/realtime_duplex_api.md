@@ -658,6 +658,17 @@ The `"context"` mode instead retains `context_max_units` (24) recent units
 plus up to `context_previous_max_tokens` (500) tokens of earlier model text.
 The window configuration is fixed when the session is created.
 
+In `"basic"` and `"context"` mode the window is kept across a barge-in or a
+`response.cancel`: the next reply still sees the units completed before the
+cut, including model text whose audio the client had not played yet.
+Cancellation ends the interrupted response. A new response can still use
+the retained context and return to the earlier topic, even after a spoken
+stop request. The window waits up to 10 s for the next input, with at most 32 waiting windows
+retained per Stage-0 replica. Capacity eviction can discard it earlier, and
+the replacement request must reach the same Stage-0 replica; continuing to
+send audio alone does not guarantee retention. With `"off"`, the next reply
+starts again from the system turn and the reference audio.
+
 Constructor options: `reconnect` (a `ReconnectPolicy`, default five
 attempts with 0.25–4 s jittered backoff; `None` disables auto-resume),
 `heartbeat_interval_s` (default 30 s; `None` disables the lease heartbeat),
