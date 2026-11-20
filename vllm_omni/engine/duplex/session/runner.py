@@ -1714,6 +1714,10 @@ class DuplexSessionRunner:
             session.bind_response_turn(append_turn_id)
         if precreate_response and session.active_response_id is None:
             response_id = session.begin_response(turn_id=append_turn_id)
+            # Remember this response was opened by an explicit response.create
+            # (vs an engine-owned auto response): its first silence unit must
+            # be able to release a stale turn-ended latch in the model.
+            model_state.explicit_response_create_id = response_id
             self.emit(self.model.response_created_payload(response_id, epoch=append_epoch))
         if final and not session.capabilities.supports_core_resumable_request:
             logger.info(
