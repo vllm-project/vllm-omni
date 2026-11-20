@@ -179,6 +179,10 @@ class TestDeployTopology:
         monkeypatch.setattr(current_omni_platform, "device_name", platform)
         deploy = load_deploy_config(_DEPLOY_DIR / filename)
         pipeline = OMNI_PIPELINES[deploy.pipeline]
+        if platform == "cpu" and deploy.model_runner == "v1":
+            with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
+                merge_pipeline_deploy(pipeline, deploy)
+            return
         stages = merge_pipeline_deploy(pipeline, deploy)
 
         # The NPU two-card profile also inherits the base CUDA overrides
@@ -316,7 +320,10 @@ class TestDeployTopology:
             "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.tts2code2wav_token_only"
         )
 
-    def test_no_async_chunk_selects_full_payload_processor(self) -> None:
+    def test_no_async_chunk_selects_full_payload_processor(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Resolve on a platform that runs this deploy (MRv2). XPU and MUSA are
+        # deferred and must raise; test_minicpmo_4_5_duplex_mrv2_deploy covers that.
+        monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
         deploy = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5.yaml")
         deploy.async_chunk = False
         stages = merge_pipeline_deploy(OMNI_PIPELINES[_PIPELINE_KEY], deploy)

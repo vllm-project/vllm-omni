@@ -16,7 +16,6 @@ import sys
 import tempfile
 import threading
 import time
-from collections import deque
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
@@ -94,20 +93,6 @@ def get_open_port(host: str = "127.0.0.1", *, max_attempts: int = 128) -> int:
     raise RuntimeError(
         f"Could not obtain a free TCP port on {host!r} after {max_attempts} attempts (last error: {last_exc!r})"
     ) from last_exc
-
-
-def assign_ephemeral_master_port() -> int:
-    """Point ``MASTER_ADDR`` / ``MASTER_PORT`` at a free local port.
-
-    A literal port is shared by every xdist worker, so concurrent
-    ``init_process_group(env://)`` calls fail with ``EADDRINUSE``.
-    ``setdefault`` does not help: the first test on a worker leaves
-    ``MASTER_PORT`` set, and every later test keeps that occupied port.
-    """
-    port = get_open_port()
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    return port
 
 
 def dummy_messages_from_mix_data(
@@ -196,8 +181,13 @@ class OmniServer:
         env_dict: dict[str, str] | None = None,
         use_omni: bool = True,
         startup_timeout: int = SERVER_STARTUP_TIMEOUT_S,
+        wait_for_device_memory: bool = True,
     ) -> None:
-        cleanup_test_environment()
+        self.wait_for_device_memory = wait_for_device_memory
+        if self.wait_for_device_memory:
+            cleanup_test_environment()
+        else:
+            cleanup_test_environment(wait_for_device_memory=False)
         self.startup_timeout = startup_timeout
         self.model = model
         self.serve_args = list(serve_args)
@@ -209,8 +199,8 @@ class OmniServer:
         self._auto_port = port is None
         self._port_lock: FileLock | None = None
         self.port = get_open_port() if port is None else port
-        # Bounded ring buffer of child stderr for early-exit diagnostics.
-        self._server_error_lines: deque[str] = deque(maxlen=100)
+        # Preserve child stderr so later tracebacks cannot overwrite the root cause.
+        self._server_error_lines: list[str] = []
         self._server_log_thread: threading.Thread | None = None
 
     def _reserve_port(self) -> None:
@@ -285,7 +275,7 @@ class OmniServer:
         if self._port_lock is not None:
             self._port_lock.release()
             self._port_lock = None
-        self._server_error_lines = deque(maxlen=100)
+        self._server_error_lines = []
 
     def _start_server(self) -> None:
         attempts = SERVER_PORT_IN_USE_RETRIES if self._auto_port else 1
@@ -341,10 +331,11 @@ class OmniServer:
 
         print(f"Launching OmniServer with: {' '.join(cmd)}")
         startup_t0 = time.perf_counter()
-        # Inherit stdout (INFO still shows in CI); capture stderr only for the
-        # exited-before-ready RuntimeError message. errors=replace keeps the
-        # reader alive on undecodable bytes so a full pipe cannot hang serve.
-        self._server_error_lines = deque(maxlen=100)
+        # Inherit stdout; tee stderr to pytest and preserve the full diagnostics.
+        # Request failures after readiness also need the child traceback.
+        # errors=replace keeps the reader alive on undecodable bytes so a full
+        # pipe cannot hang serve.
+        self._server_error_lines = []
         self._server_log_thread = None
         self.proc = subprocess.Popen(
             cmd,
@@ -364,6 +355,12 @@ class OmniServer:
                 try:
                     for line in stderr:
                         error_lines.append(line)
+                        try:
+                            sys.stderr.write(line)
+                            sys.stderr.flush()
+                        except (OSError, ValueError):
+                            # A closed capture must not stop draining the pipe.
+                            pass
                 except Exception:
                     pass
 
@@ -580,7 +577,10 @@ class OmniServer:
             if self._port_lock is not None:
                 self._port_lock.release()
                 self._port_lock = None
-            cleanup_test_environment()
+            if self.wait_for_device_memory:
+                cleanup_test_environment()
+            else:
+                cleanup_test_environment(wait_for_device_memory=False)
 
 
 class OmniServerStageCli(OmniServer):

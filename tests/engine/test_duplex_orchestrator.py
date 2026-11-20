@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import struct
 import threading
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
@@ -26,6 +27,7 @@ from tests.engine.test_orchestrator import (
     _build_stage_pools,
 )
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.distributed.omni_coordinator import ReplicaStatus, RoundRobinBalancer
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexSessionConfig, DuplexSessionState
@@ -41,11 +43,18 @@ from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
     DuplexControlResultMessage,
     DuplexSessionCommandMessage,
+    DuplexSessionEventMessage,
     OpenDuplexSessionMessage,
 )
 from vllm_omni.engine.duplex.plugin import DuplexInputCapacityError
 from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator, DuplexOrchestratorRequestState
-from vllm_omni.engine.messages import AbortRequestMessage, AddCompanionRequestMessage, ShutdownRequestMessage
+from vllm_omni.engine.membership_controller import MembershipController
+from vllm_omni.engine.messages import (
+    AbortRequestMessage,
+    AddCompanionRequestMessage,
+    ErrorMessage,
+    ShutdownRequestMessage,
+)
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState, build_engine_core_request_from_tokens
 from vllm_omni.engine.stage_pool import StageUnavailableError
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
@@ -55,6 +64,18 @@ from vllm_omni.outputs import OmniRequestOutput
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 SESSION_ID = "duplex-orch"
+
+
+@dataclass
+class _StageView:
+    request_id: str
+    text: str
+    finished: bool = False
+
+
+@dataclass
+class _SamplingStub:
+    pass
 
 
 def _encode_audio(audio: object, sample_rate_hz: int, response_format: str, speed: float | None) -> str | None:
@@ -151,18 +172,20 @@ def _append_audio(samples: int = 16000) -> commands.AppendAudio:
     )
 
 
-async def _submit(orchestrator: DuplexOrchestrator, command: commands.DuplexCommand) -> None:
-    assert await orchestrator._dispatch_message(DuplexSessionCommandMessage(session_id=SESSION_ID, command=command))
-    await _settle(orchestrator)
+async def _submit(
+    orchestrator: DuplexOrchestrator, command: commands.DuplexCommand, *, session_id: str = SESSION_ID
+) -> None:
+    assert await orchestrator._dispatch_message(DuplexSessionCommandMessage(session_id=session_id, command=command))
+    await _settle(orchestrator, session_id=session_id)
 
 
-async def _settle(orchestrator: DuplexOrchestrator, *, timeout_s: float = 3.0) -> None:
+async def _settle(orchestrator: DuplexOrchestrator, *, timeout_s: float = 3.0, session_id: str = SESSION_ID) -> None:
     """Let the session runner drain its mailbox and append tasks."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
     quiet = 0
     while loop.time() < deadline:
-        runner = orchestrator.session_manager.runners.get(SESSION_ID)
+        runner = orchestrator.session_manager.runners.get(session_id)
         busy = runner is not None and (
             not runner._mailbox.empty()
             or any(not task.done() for task in runner.tasks.append_tasks)
@@ -412,6 +435,52 @@ async def test_append_submits_the_resumable_stage0_request_and_counts_it_running
     await _close(orchestrator, rpc_q)
     assert clients[0].abort_calls == [[request_id]]
     assert counter.value == 0
+
+
+@pytest.mark.asyncio
+async def test_resumable_append_refreshes_stage_submit_ts(monkeypatch) -> None:
+    """A later append on the same request id must not keep the first segment's clock."""
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr("vllm_omni.engine.orchestrator._time.time", lambda: clock["now"])
+    orchestrator, _, rpc_q, _ = _build()
+    await _open(orchestrator, rpc_q)
+    request_id = _stage0_request_id()
+
+    await _submit(orchestrator, _append_audio())
+    request_state = orchestrator.request_states[request_id]
+    assert request_state.stage_submit_ts[0] == pytest.approx(1_000.0)
+
+    clock["now"] = 5_000.0
+    await _submit(orchestrator, _append_audio())
+    assert request_state.stage_submit_ts[0] == pytest.approx(5_000.0)
+
+    await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_duplex_submit_excludes_llm_send_wait(monkeypatch) -> None:
+    """Duplex LLM submit() starts the stage clock after a delayed send, not before."""
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr("vllm_omni.engine.orchestrator._time.time", lambda: clock["now"])
+    seen_at_submit: list[float] = []
+    orchestrator, _, rpc_q, _ = _build()
+    await _open(orchestrator, rpc_q)
+    request_id = _stage0_request_id()
+    pool = orchestrator.stage_pools[0]
+    original = pool.submit_initial
+
+    async def delayed_submit_initial(req_id, req_state, request, **kwargs):
+        seen_at_submit.append(req_state.stage_submit_ts.get(0, -1.0))
+        clock["now"] = 1_500.0
+        return await original(req_id, req_state, request, **kwargs)
+
+    pool.submit_initial = delayed_submit_initial
+    await _submit(orchestrator, _append_audio())
+    request_state = orchestrator.request_states[request_id]
+    assert seen_at_submit == [-1.0]
+    assert request_state.stage_submit_ts[0] == pytest.approx(1_500.0)
+
+    await orchestrator.session_manager.shutdown()
 
 
 @pytest.fixture
@@ -1000,7 +1069,15 @@ async def test_reaper_runs_as_a_background_task_and_survives_one_failure(monkeyp
     tasks = orchestrator._background_tasks()
     assert len(tasks) == 1
     task = asyncio.create_task(tasks[0])
-    await asyncio.sleep(0.05)
+    # Wait for the second reap instead of sampling a fixed window: the first
+    # failure's log.exception writes a multi-line traceback synchronously, and
+    # under CI stdout backpressure that alone can stall the event loop past
+    # any fixed sleep (observed: 93 ms in build 20129, killing the old 50 ms
+    # window). Only a dead reaper misses the 500 ms deadline.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 0.5
+    while calls["count"] < 2 and loop.time() < deadline:
+        await asyncio.sleep(0.01)
     orchestrator._shutdown_event.set()
     await task
     assert calls["count"] >= 2
@@ -1150,13 +1227,13 @@ async def test_sentence_partial_does_not_legacy_forward_the_full_stage_output() 
     orchestrator.async_chunk = True
     orchestrator._stage_receives_async_chunks = lambda stage_id: False  # type: ignore[method-assign]
 
-    full = SimpleNamespace(request_id="r", finished=True, text="FULL")
-    chunk = SimpleNamespace(request_id="r", finished=True, text="CHUNK")
+    full = _StageView(request_id="r", finished=True, text="FULL")
+    chunk = _StageView(request_id="r", finished=True, text="CHUNK")
     req_state = DuplexOrchestratorRequestState(
         request_id="r",
         final_stage_id=3,
         session_owned=True,
-        sampling_params_list=[SimpleNamespace() for _ in range(4)],
+        sampling_params_list=[_SamplingStub() for _ in range(4)],
     )
     orchestrator.plugin.plan_partial_stage_output = lambda *args, **kwargs: PartialStageForward(  # type: ignore[method-assign]
         output=chunk, is_final_update=True
@@ -1173,6 +1250,55 @@ async def test_sentence_partial_does_not_legacy_forward_the_full_stage_output() 
     await orchestrator._route_output(1, 0, full, req_state, None)
 
     assert forwarded == [full]
+
+
+@pytest.mark.asyncio
+async def test_cross_stage_partial_keeps_legacy_and_forwards_from_source() -> None:
+    from vllm_omni.engine.duplex.plugin import PartialStageForward
+
+    orchestrator, *_ = _build(stages=4, replicas=2)
+    forwarded: list[tuple[int, object, int | None]] = []
+
+    async def record_forward(req_id, stage_id, output, req_state, *, src_replica_id=None, **kwargs):
+        del req_id, req_state, kwargs
+        forwarded.append((stage_id, output, src_replica_id))
+
+    async def no_intercept(*args, **kwargs):
+        del args, kwargs
+        return False
+
+    orchestrator._forward_to_next_stage = record_forward  # type: ignore[method-assign]
+    orchestrator._intercept_stage_output = no_intercept  # type: ignore[method-assign]
+    orchestrator.async_chunk = True
+    orchestrator._stage_receives_async_chunks = lambda stage_id: False  # type: ignore[method-assign]
+
+    full = _StageView(request_id="r", finished=True, text="CODEC")
+    chunk = _StageView(request_id="r", finished=False, text="关火。")
+    close = _StageView(request_id="r", finished=True, text="")
+    req_state = DuplexOrchestratorRequestState(
+        request_id="r",
+        final_stage_id=3,
+        session_owned=True,
+        sampling_params_list=[_SamplingStub() for _ in range(4)],
+    )
+    orchestrator.stage_pools[0].bind_request_to_replica("r", 0)
+    orchestrator.stage_pools[1].bind_request_to_replica("r", 1)
+    orchestrator.plugin.plan_partial_stage_output = lambda *args, **kwargs: PartialStageForward(  # type: ignore[method-assign]
+        output=chunk,
+        is_final_update=False,
+        source_stage_id=0,
+    )
+    orchestrator.plugin.partial_stage_followup = lambda *args, **kwargs: PartialStageForward(  # type: ignore[method-assign]
+        output=close,
+        is_final_update=True,
+        close_only=True,
+        source_stage_id=0,
+    )
+
+    await orchestrator._route_output(1, 1, full, req_state, None)
+
+    assert forwarded == [(1, full, 1), (0, chunk, 0), (0, close, 0)]
+    assert req_state.skip_legacy_stage_forward is False
 
 
 @pytest.mark.asyncio
@@ -1453,7 +1579,7 @@ async def test_failed_initial_submit_evicts_session_replica_after_binding_rollba
         await asyncio.wait_for(asyncio.gather(*tuple(manager._dispatched_control_tasks)), timeout=1)
         await asyncio.wait_for(manager.reap_expired(), timeout=1)
         assert not manager._closing
-        assert orchestrator.replica_placement.snapshot()["sessions"] == {"healthy": 1}
+        assert orchestrator.replica_placement.snapshot()["sessions"] == {"healthy": 3}
         assert set(orchestrator.session_manager.runners) == {"healthy"}
         assert not orchestrator.stage_pools[failing_stage].is_replica_available(0)
         assert (failing_stage, 0) in orchestrator.replica_placement.snapshot()["unavailable"]
@@ -1477,7 +1603,7 @@ async def test_replica_failure_closes_active_and_idle_owners_only() -> None:
         await asyncio.wait_for(asyncio.gather(*tuple(manager._dispatched_control_tasks)), timeout=1)
         await asyncio.wait_for(manager.reap_expired(), timeout=1)
         assert not manager._closing
-        assert orchestrator.replica_placement.snapshot()["sessions"] == {"healthy": 1}
+        assert orchestrator.replica_placement.snapshot()["sessions"] == {"healthy": 3}
         assert set(orchestrator.session_manager.runners) == {"healthy"}
         terminal_events = [output_q.get_nowait().event for _ in range(output_q.qsize())]
         for session_id in (SESSION_ID, "idle"):
@@ -1503,6 +1629,96 @@ async def test_replica_failure_closes_active_and_idle_owners_only() -> None:
 
 
 @pytest.mark.asyncio
+async def test_membership_detach_closes_active_and_idle_sessions_and_preserves_healthy_routing(monkeypatch) -> None:
+    orchestrator, _, rpc_q, output_q = _build(
+        replicas=2, runtime_config=_placement_config(replica_groups=[{0: 0}, {0: 1}])
+    )
+    pool = orchestrator.stage_pools[0]
+    addresses = ("tcp://replica-0", "tcp://replica-1")
+    replicas = [SimpleNamespace(input_addr=address, status=ReplicaStatus.UP) for address in addresses]
+    for replica_id, address in enumerate(addresses):
+        pool.add_client(address, pool.clients[replica_id], replica_id=replica_id)
+
+    hub = SimpleNamespace(
+        get_replicas_for_stage=lambda _stage_id: SimpleNamespace(replicas=replicas),
+        close=lambda: None,
+    )
+    monkeypatch.setattr("vllm_omni.engine.membership_controller.OmniCoordClientForHub", lambda _address: hub)
+    controller = MembershipController(
+        stage_pools=[pool],
+        coordinator_pub_address="tcp://127.0.0.1:12345",
+        load_balancer_factory=RoundRobinBalancer,
+        remote_replica_factory=lambda _stage_id, _replica_id: FakeStageClient(),
+    )
+
+    async def cleanup(request_ids: list[str]) -> None:
+        await orchestrator._cleanup_request_ids(request_ids, abort=True, trace_error="replica_removed")
+
+    controller.install_membership_handlers(
+        output_queue=output_q,
+        cleanup_callback=cleanup,
+        replica_removed_callback=orchestrator._handle_replica_removed,
+    )
+    buffers = {}
+    try:
+        for session_id in (SESSION_ID, "healthy", "idle"):
+            buffers[session_id] = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+            assert (await _open(orchestrator, rpc_q, session_id=session_id, output_buffer=buffers[session_id])).ok
+        placement = orchestrator.replica_placement
+        assert placement.snapshot()["sessions"] == {SESSION_ID: 0, "healthy": 1, "idle": 0}
+
+        await _submit(orchestrator, _append_audio())
+        request_id = _stage0_request_id()
+        assert pool.get_bound_replica_id(request_id) == 0
+        replicas[0].status = ReplicaStatus.DOWN
+        await controller.handle_unregister(0, addresses[0])
+        await _settle(orchestrator)
+
+        manager = orchestrator.session_manager
+        await asyncio.wait_for(asyncio.gather(*tuple(manager._dispatched_control_tasks)), timeout=1)
+        await asyncio.wait_for(manager.reap_expired(), timeout=1)
+        assert placement.snapshot()["sessions"] == {"healthy": 1}
+        assert placement.snapshot()["reserved"] == {(0, 0): 0, (0, 1): 1}
+        assert set(manager.runners) == {"healthy"}
+        assert pool.get_bound_replica_id(request_id) is None
+        assert request_id not in orchestrator.request_states
+        assert not pool.is_replica_available(0)
+
+        messages = [output_q.get_nowait() for _ in range(output_q.qsize())]
+        assert any(isinstance(message, ErrorMessage) and message.request_id == request_id for message in messages)
+        for session_id in (SESSION_ID, "idle"):
+            events = [await buffers[session_id].get() for _ in range(buffers[session_id].pending_events)]
+            events.extend(
+                message.event
+                for message in messages
+                if isinstance(message, DuplexSessionEventMessage) and message.event.session_id == session_id
+            )
+            assert any(event.type == "error" and event.code == "replica_unavailable" for event in events)
+            assert events[-1].type == "session.expired"
+
+        await _submit(orchestrator, _append_audio(), session_id="healthy")
+        healthy_request_id = duplex_resource_request_id(DuplexFence("healthy", epoch=0), "stage0")
+        assert pool.get_bound_replica_id(healthy_request_id) == 1
+        assert pool.clients[1].add_request_calls
+    finally:
+        controller.shutdown()
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_dynamic_replica_death_is_tolerated_without_a_placement_lookup() -> None:
+    """A replica attached after startup has no group; its death must not raise."""
+    orchestrator, _, rpc_q, _ = _build(stages=1, replicas=1, runtime_config=_placement_config())
+    try:
+        assert (await _open(orchestrator, rpc_q)).ok
+        await orchestrator._on_replica_removed(0, 7)
+        await _settle(orchestrator)
+        assert orchestrator.replica_placement.snapshot()["sessions"] == {SESSION_ID: 0}
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_legacy_session_open_keeps_request_round_robin_and_has_no_placement() -> None:
     orchestrator, _, rpc_q, _ = _build(replicas=2)
     try:
@@ -1518,26 +1734,61 @@ async def test_legacy_session_open_keeps_request_round_robin_and_has_no_placemen
         await orchestrator.session_manager.shutdown()
 
 
-@pytest.mark.parametrize("distributed_hook", ["hub", "lb", "membership"])
-def test_least_sessions_rejects_distributed_startup(distributed_hook) -> None:
-    pools = _build_stage_pools([[FakeStageClient()]], stage_vllm_configs=_stage_configs(1))
-    kwargs = {}
-    if distributed_hook == "hub":
+def _distributed_pools(*, replicas: int, hook: str):
+    pools = _build_stage_pools(
+        [[FakeStageClient() for _ in range(replicas)]],
+        stage_vllm_configs=_stage_configs(1),
+    )
+    kwargs: dict[str, object] = {}
+    if hook == "hub":
         pools[0].attach_hub(SimpleNamespace())
-    elif distributed_hook == "lb":
+    elif hook == "lb":
         pools[0].attach_load_balancer(SimpleNamespace())
     else:
         kwargs["membership_controller"] = SimpleNamespace()
-    with pytest.raises(ValueError, match="does not support distributed"):
-        DuplexOrchestrator(
-            request_async_queue=asyncio.Queue(),
-            output_async_queue=asyncio.Queue(),
-            rpc_async_queue=asyncio.Queue(),
-            stage_pools=pools,
-            plugin=MiniCPMO45DuplexPlugin(_encode_audio),
-            duplex_session_config=_placement_config(),
-            **kwargs,
-        )
+    return pools, kwargs
+
+
+def _make_distributed_orchestrator(pools, kwargs, runtime_config):
+    return DuplexOrchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=pools,
+        plugin=MiniCPMO45DuplexPlugin(_encode_audio),
+        duplex_session_config=runtime_config,
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize("distributed_hook", ["hub", "lb", "membership"])
+def test_least_sessions_accepts_distributed_single_replica_without_groups(distributed_hook) -> None:
+    """One replica per stage: every id is 0, so the derived group map is stable."""
+    pools, kwargs = _distributed_pools(replicas=1, hook=distributed_hook)
+    orchestrator = _make_distributed_orchestrator(pools, kwargs, _placement_config())
+    assert orchestrator.replica_placement is not None
+    assert orchestrator.replica_placement.owned_group_count == 1
+
+
+@pytest.mark.parametrize("distributed_hook", ["hub", "lb", "membership"])
+def test_least_sessions_accepts_distributed_multi_replica_without_groups(distributed_hook) -> None:
+    """Equal-count stages can derive groups in distributed mode too."""
+    pools, kwargs = _distributed_pools(replicas=2, hook=distributed_hook)
+    orchestrator = _make_distributed_orchestrator(pools, kwargs, _placement_config())
+    assert orchestrator.replica_placement is not None
+    assert orchestrator.replica_placement.owned_group_count == 2
+
+
+@pytest.mark.parametrize("distributed_hook", ["hub", "lb", "membership"])
+def test_least_sessions_accepts_distributed_multi_replica_with_groups(distributed_hook) -> None:
+    pools, kwargs = _distributed_pools(replicas=2, hook=distributed_hook)
+    orchestrator = _make_distributed_orchestrator(
+        pools,
+        kwargs,
+        _placement_config(replica_groups=[{0: 0}, {0: 1}]),
+    )
+    assert orchestrator.replica_placement is not None
+    assert orchestrator.replica_placement.owned_group_count == 2
 
 
 def test_orchestrator_validates_groups_against_actual_stage_pools() -> None:
@@ -1548,7 +1799,12 @@ def test_orchestrator_validates_groups_against_actual_stage_pools() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("frontend_index", range(4))
 async def test_frontend_reserves_only_owned_groups_with_local_admission_budget(frontend_index) -> None:
-    config = DuplexSessionRuntimeConfig(replica_policy="least_sessions", max_sessions=11, max_sessions_per_replica=2)
+    config = DuplexSessionRuntimeConfig(
+        replica_policy="least_sessions",
+        max_sessions=11,
+        max_sessions_per_replica=2,
+        replica_groups=[{0: replica, 1: replica} for replica in range(8)],
+    )
     orchestrator, _, rpc_q, _ = _build(
         stages=2, replicas=8, runtime_config=config, frontend_count=4, frontend_index=frontend_index
     )
@@ -1576,7 +1832,11 @@ async def test_frontend_reserves_only_owned_groups_with_local_admission_budget(f
 @pytest.mark.asyncio
 async def test_multi_frontend_initial_update_and_prewarm_use_owned_replica(monkeypatch) -> None:
     orchestrator, _, rpc_q, _ = _build(
-        stages=2, replicas=4, runtime_config=_placement_config(), frontend_count=2, frontend_index=1
+        stages=2,
+        replicas=4,
+        runtime_config=_placement_config(replica_groups=[{0: replica, 1: replica} for replica in range(4)]),
+        frontend_count=2,
+        frontend_index=1,
     )
     orchestrator.async_chunk = True
     monkeypatch.setattr(orchestrator, "_stage_receives_async_chunks", lambda stage: True)
@@ -1602,7 +1862,13 @@ async def test_frontends_emit_reserved_metrics_only_for_owned_replicas() -> None
         writes.append((stage, replica))
 
     frontends = [
-        _build(stages=2, replicas=2, runtime_config=_placement_config(), frontend_count=2, frontend_index=index)
+        _build(
+            stages=2,
+            replicas=2,
+            runtime_config=_placement_config(replica_groups=[{0: 0, 1: 0}, {0: 1, 1: 1}]),
+            frontend_count=2,
+            frontend_index=index,
+        )
         for index in range(2)
     ]
     try:
@@ -1793,7 +2059,7 @@ async def test_repeated_replica_failure_reports_session_error_and_close_once(
         assert dead_client.shutdown_calls == 1
         assert orchestrator.stage_pools[failing_stage].clients[0] is None
         assert not manager._closing
-        assert placement.snapshot()["sessions"] == {"healthy": 1}
+        assert placement.snapshot()["sessions"] == {"healthy": 3}
         assert set(placement.snapshot()["reserved"].values()) == {0, 1}
         messages = [output_q.get_nowait() for _ in range(output_q.qsize())]
         terminal_events = [message.event for message in messages if hasattr(message, "event")]
@@ -1870,7 +2136,7 @@ async def test_capacity_validation_reuses_engine_expansion_and_recovers_after_re
         expanded["prompt_token_ids"] = [1] * 15
     await submit("fits")
     assert len(clients[0].add_request_calls) == 1
-    assert clients[0].add_request_calls[0][0].prompt_token_ids == [1] * 15
+    assert clients[0].add_request_calls[0][0].prompt_token_ids.tolist() == [1] * 15
     assert renderer.render_cmpl.call_count == 1 + int(rejected)
     assert processor.process_inputs.call_count == 1
 
