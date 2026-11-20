@@ -324,16 +324,22 @@ model or deployment on a platform.
 
 Profiles that still resolve to V1 are unavailable with this version. These
 include Qwen3-TTS's and Qwen3-Omni's MUSA overrides, Fish-Omni's DAC stage,
-PersonaPlex's Talker, VibeVoice, YuE2, and the LFM3-Omni profiles. Selecting
+PersonaPlex's Talker, VibeVoice, and the LFM3-Omni profiles. Selecting
 `v2` manually does not establish support for those paths.
-YuE2's audio synthesis still depends on V1 model sampling hooks; its two
-offline audio export tests are not applicable to the V2 runtime.
 The complete PersonaPlex workflow is also unavailable: its Talker still
 requires V1, although its Code2Wav stage has V2 components.
 The Qwen3-TTS and Qwen3-Omni XPU profiles select V2; final-release XPU
 hardware validation remains pending. Retained V1 profiles identify unavailable
 workflows and preserve explicit configuration errors. They do not provide a V1
 fallback.
+
+YuE2's `yue2.yaml` uses the shared V2 AR runner with a model-owned sampler and
+model-state lifecycle hooks. The sampler preserves phase-specific sampling and
+paired CFG; the hooks release AR slots while NAR/VAE jobs complete and deliver audio by
+request ID. Automatic ABC transitions reset the same request's phase state.
+The profile requires one GPU, synchronous scheduling, and disabled prefix
+caching and external KV transfer. See the [YuE2 recipe](../../recipes/m-a-p/YuE2-3B.md).
+
 Drama 3 / Fish-Omni serving and both LFM3-Omni speech and text-only profiles
 are unavailable. Their retired serving E2E tests covered speech generation,
 voice cloning, streaming, concurrency and request validation across those
@@ -952,3 +958,18 @@ stereo; benchmark raw PCM with `VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=48000` and
 `VLLM_OMNI_BENCH_AUDIO_CHANNELS=2`. See the
 [MOSS recipe](gh-file:recipes/OpenMOSS/MOSS-TTS.md#local-15-unified-deployment-and-slot-attention)
 for the execution path and configuration overrides.
+
+## MiniMax-Music3 with Model Runner V2
+
+`minimax_music3.yaml` and `minimax_music3_2gpu.yaml` inherit the vLLM 0.34 MRV2
+default for both stages. The serving validation for these profiles used CUDA. The MRV2 model state passes the batch rows, counts and per-request
+arguments to the talker for CFG pairing, frame feedback and seeded sampling.
+Stage 0 uses `async_scheduling: false` so the two members of a CFG pair
+are sampled in the same engine step.
+
+Each window reaches stage 1 as its codes, 200 frames x 8 codebooks =
+1600 prompt tokens. A song's last window
+can be one frame longer: 201 frames, 1608 tokens. A window is never split, so
+in your own config keep stage 1's `max_num_batched_tokens` at least
+`max_num_seqs` x 1608 on MRV2. With less, a few requests take every step and
+the other streams wait.
