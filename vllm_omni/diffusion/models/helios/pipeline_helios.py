@@ -8,7 +8,8 @@ import json
 import logging
 import math
 import os
-from collections.abc import Iterable, Sequence
+import time
+from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
@@ -20,6 +21,7 @@ from torch import nn
 from transformers import AutoConfig, AutoTokenizer, UMT5EncoderModel
 from typing_extensions import override
 from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.utils.math_utils import round_down
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -47,6 +49,8 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.utils import StepRequestState
 
 logger = logging.getLogger(__name__)
+DEFAULT_NUM_LATENT_FRAMES_PER_CHUNK = 9
+REQUEST_RESOLUTION_ALIGNMENT = 16
 
 
 def calculate_shift(
@@ -346,11 +350,11 @@ class HeliosPipeline(
         extra = getattr(state.sampling, "extra_args", {}) or {}
 
         history_sizes = sorted(extra.get("history_sizes", [16, 2, 1]), reverse=True)
-        num_latent_frames_per_chunk = int(extra.get("num_latent_frames_per_chunk", 9))
+        num_latent_frames_per_chunk = int(extra.get("num_latent_frames_per_chunk", DEFAULT_NUM_LATENT_FRAMES_PER_CHUNK))
         keep_first_frame = bool(extra.get("keep_first_frame", True))
         frame_num = int(extra.get("frame_num", 132))
-        height = (int(state.sampling.height or extra.get("height", 384)) // 16) * 16
-        width = (int(state.sampling.width or extra.get("width", 640)) // 16) * 16
+        height = round_down(int(state.sampling.height or extra.get("height", 384)), REQUEST_RESOLUTION_ALIGNMENT)
+        width = round_down(int(state.sampling.width or extra.get("width", 640)), REQUEST_RESOLUTION_ALIGNMENT)
         num_frames = max(int(state.sampling.num_frames or frame_num), 1)
         num_steps = int(state.sampling.num_inference_steps or extra.get("num_inference_steps", 50))
         output_type = extra.get("output_type", "np")
@@ -1009,7 +1013,7 @@ class HeliosPipeline(
         attention_kwargs: dict | None = None,
         # Helios-specific
         history_sizes: list | None = None,
-        num_latent_frames_per_chunk: int = 9,
+        num_latent_frames_per_chunk: int = DEFAULT_NUM_LATENT_FRAMES_PER_CHUNK,
         keep_first_frame: bool = True,
         # I2V
         image: torch.Tensor | None = None,
@@ -1083,8 +1087,8 @@ class HeliosPipeline(
 
         self._guidance_scale = guidance_scale
 
-        height = (height // 16) * 16
-        width = (width // 16) * 16
+        height = round_down(height, REQUEST_RESOLUTION_ALIGNMENT)
+        width = round_down(width, REQUEST_RESOLUTION_ALIGNMENT)
         num_frames = max(num_frames, 1)
 
         device = self.device
@@ -1775,6 +1779,77 @@ class HeliosPipeline(
             raise ValueError(f"Generator list length {len(generator)} does not match batch size {batch_size}.")
         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         return latents
+
+    def warmup_vae_profiles(self, profiles: Iterable[Mapping[str, int]]) -> None:
+        """Warm only explicitly configured, exact Helios request geometries."""
+        if isinstance(profiles, (str, bytes, Mapping)):
+            raise TypeError("helios_vae_warmup_profiles must be a sequence of profile mappings")
+
+        try:
+            configured_profiles = list(profiles)
+        except TypeError as exc:
+            raise TypeError("helios_vae_warmup_profiles must be a sequence of profile mappings") from exc
+        if not configured_profiles:
+            return
+
+        exact_profiles: list[tuple[int, int]] = []
+        seen: set[tuple[int, int]] = set()
+        for index, profile in enumerate(configured_profiles):
+            if not isinstance(profile, Mapping) or set(profile) != {"height", "width"}:
+                raise ValueError(f"Helios VAE warmup profile {index} must contain exactly height and width")
+            geometry = (profile["height"], profile["width"])
+            if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in geometry):
+                raise ValueError(f"Helios VAE warmup profile {index} height and width must be positive integers")
+            height, width = geometry
+            if height % REQUEST_RESOLUTION_ALIGNMENT or width % REQUEST_RESOLUTION_ALIGNMENT:
+                raise ValueError(
+                    f"Helios VAE warmup profile {index} height and width must be multiples of "
+                    f"{REQUEST_RESOLUTION_ALIGNMENT} to match the request path without changing its geometry"
+                )
+            if geometry not in seen:
+                seen.add(geometry)
+                exact_profiles.append(geometry)
+
+        spatial_scale = self.vae_scale_factor_spatial
+        channels = self.vae.config.z_dim
+        total_started = time.perf_counter()
+        for height, width in exact_profiles:
+            latent_shape = (
+                1,
+                channels,
+                DEFAULT_NUM_LATENT_FRAMES_PER_CHUNK,
+                height // spatial_scale,
+                width // spatial_scale,
+            )
+            latents = output = None
+            try:
+                with torch.inference_mode():
+                    latents = torch.zeros(latent_shape, device=self.vae.device, dtype=self.vae.dtype)
+                    sync_device = (
+                        latents.device.type != "cpu" and getattr(current_omni_platform, "is_available", lambda: False)()
+                    )
+                    if sync_device:
+                        current_omni_platform.synchronize()
+                    profile_started = time.perf_counter()
+                    output = self.vae.decode(latents, return_dict=False)
+                    if sync_device:
+                        current_omni_platform.synchronize()
+                    elapsed = time.perf_counter() - profile_started
+                logger.info(
+                    "Helios VAE warmup: request profile=%dx%d latent_shape=%s elapsed=%.3fs",
+                    height,
+                    width,
+                    latent_shape,
+                    elapsed,
+                )
+            finally:
+                del output, latents
+
+        logger.info(
+            "Helios VAE warmup total: %d profiles elapsed=%.3fs",
+            len(exact_profiles),
+            time.perf_counter() - total_started,
+        )
 
     def prepare_image_latents(
         self,
