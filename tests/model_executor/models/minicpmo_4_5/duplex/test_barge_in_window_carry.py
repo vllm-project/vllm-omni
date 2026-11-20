@@ -1229,6 +1229,41 @@ def test_explicit_response_cancellation_respects_native_turn_decision(samples, c
     assert bool(first["payload"].get("force_listen")) is close_next
 
 
+def test_cancel_while_replaying_only_the_prefix_preserves_original_cut():
+    sched = _scheduler()
+    policy = sched._window_policy
+    source = _new_request(_stage0_id("double-cut", 0))
+    _first_input(source)
+    policy.prepare_admission(source, 4096)
+    _start(sched, source)
+    policy.observe_progress(source)
+    _finish(sched, [source.request_id])
+    original = _kept(sched)["double-cut"]
+
+    middle = _new_request(_stage0_id("double-cut", 1))
+    first = _first_input(middle)
+    policy.prepare_admission(middle, 4096)
+    _start(sched, middle)
+    middle.num_computed_tokens = first["open_input_start"] - 1
+    middle.num_in_flight_tokens = 0
+    policy.observe_progress(middle)
+    assert not getattr(middle, "_minicpmo45_settled", None)
+    policy.before_finish(sched.requests, [middle.request_id], aborted=True)
+
+    last = _new_request(_stage0_id("double-cut", 2))
+    first = _first_input(last)
+    policy.prepare_admission(last, 4096)
+    assert first["stage0_window"]["replay_cut"] == last.request_id
+    ops = policy.on_schedule(
+        {last.request_id: last},
+        SimpleNamespace(
+            finished_req_ids={middle.request_id}, scheduled_new_reqs=[SimpleNamespace(req_id=last.request_id)]
+        ),
+    )
+    assert _kept(sched)["double-cut"] is original
+    assert [(op.kind, op.source_request_id) for op in ops] == [("restore", source.request_id)]
+
+
 def test_empty_explicit_opening_preserves_next_units_native_listen_at_cancel():
     sched = _scheduler()
     policy = sched._window_policy
