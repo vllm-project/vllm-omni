@@ -29,7 +29,7 @@ from typing import Any, Literal
 import pytest
 import torch
 
-from tests.helpers.distributed import collective_context, configure_cpu_collective_worker, start_collective_workers
+from tests.helpers.distributed import configure_cpu_collective_worker
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.data import (
     AttentionConfig,
@@ -110,7 +110,26 @@ def _build_model(model_name: str, tp_size: int, device: torch.device):
             from vllm_omni.diffusion.models.flux.flux_transformer import FluxTransformer2DModel
 
             model = FluxTransformer2DModel(od_config=od_config, **_MODEL_KWARGS)
-    return model.to(device=device).eval()
+    model = model.to(device=device).eval()
+    if device.type == "cpu":
+        _use_native_ops(model)
+    return model
+
+
+def _use_native_ops(model) -> None:
+    """Run custom ops natively on CPU.
+
+    Custom ops dispatch on the platform, not the tensor device, so on a CUDA/XPU host
+    the CPU variant would otherwise call device kernels (e.g. the Triton rotary
+    kernel) on CPU tensors.
+    """
+    from vllm.model_executor.custom_op import CustomOp as VllmCustomOp
+
+    from vllm_omni.diffusion.layers.custom_op import CustomOp as OmniCustomOp
+
+    for module in model.modules():
+        if isinstance(module, (VllmCustomOp, OmniCustomOp)):
+            module._forward_method = module.forward_native
 
 
 def _make_checkpoint(model) -> dict[str, torch.Tensor]:
@@ -291,13 +310,15 @@ def _check_tp2(model_name: str, device_kind: DeviceKind) -> None:
     baseline = _run(model_name, 1, 0, _find_free_port(), device_kind, None)
     assert not baseline["unloaded"], baseline["unloaded"]
     checkpoint = baseline["checkpoint"]
-    with collective_context(device_kind).Manager() as manager:
+    # Spawn, not the shared CPU forkserver: the workers build real attention layers,
+    # and on a CUDA host (the L1 CPU job runs on L4) backend selection queries the
+    # device capability, which a forked child cannot. On CPU-only hosts it returns None.
+    with torch.multiprocessing.get_context("spawn").Manager() as manager:
         queue = manager.Queue()
-        start_collective_workers(
+        torch.multiprocessing.spawn(
             _rank_worker,
             args=(model_name, world_size, _find_free_port(), device_kind, checkpoint, queue),
             nprocs=world_size,
-            device_kind=device_kind,
         )
         reports = sorted((queue.get() for _ in range(world_size)), key=lambda report: report["rank"])
 
