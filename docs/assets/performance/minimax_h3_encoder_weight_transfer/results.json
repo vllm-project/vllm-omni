@@ -1,0 +1,4495 @@
+{
+  "source_revision": "7602d7980d8add4277353e8bc162ac1f98d98c19",
+  "job": "npuq-bb144187c1db428aac4b162c5426f4b1",
+  "dependencies": {
+    "torch": "2.10.0+cpu",
+    "torch-npu": "2.10.0.post2",
+    "vllm": "0.33.0+empty",
+    "vllm-ascend": "0.19.1rc2.dev1251",
+    "transformers": "5.19.0",
+    "diffusers": "0.40.0",
+    "numpy": "1.26.4",
+    "Pillow": "12.3.0",
+    "python": "3.12.13",
+    "platform": "Linux-5.15.152.bsk.10-amd64-x86_64-with-glibc2.35",
+    "ffmpeg": "ffmpeg version 4.4.2-0ubuntu0.22.04.1 Copyright (c) 2000-2021 the FFmpeg developers",
+    "recording_scope": "Installed dependency metadata recorded after encoder measurement and before RGB measurement; shared interpreter unchanged by this task."
+  },
+  "workload": {
+    "case": "ref2va-v13-avatar12s/case01",
+    "width": 480,
+    "height": 864,
+    "frames": 294,
+    "fps": 24,
+    "seed": 42,
+    "denoiser_calls": 8,
+    "encoder_tp": 8,
+    "usp": 8,
+    "vae_patch_parallel": 8
+  },
+  "protocol": "same-window A/B/A; exactly 2 validated complete warmups and 3 formal requests per arm; RGB one-service window",
+  "launches": [
+    {
+      "stage": "encoder_A1",
+      "argv": [
+        "/opt/tiger/lly/.tmp/20261118-h3-pr10352-validation/venv/bin/python",
+        "$RUN/server.py",
+        "serve",
+        "$MODEL",
+        "--port",
+        "31000",
+        "--omni",
+        "--host",
+        "127.0.0.1",
+        "--trust-remote-code",
+        "--task-type",
+        "ref2va",
+        "--num-gpus",
+        "8",
+        "--tensor-parallel-size",
+        "1",
+        "--usp",
+        "8",
+        "--ring",
+        "1",
+        "--text-encoder-tp-size",
+        "8",
+        "--vae-patch-parallel-size",
+        "8",
+        "--vae-parallel-mode",
+        "tile",
+        "--vae-use-tiling",
+        "--enable-layerwise-offload",
+        "--gpu-memory-utilization",
+        "0.85",
+        "--diffusion-attention-backend",
+        "FLASH_ATTN",
+        "--fa-deterministic",
+        "--additional-config",
+        "{\"encoder_weight_transfer\": \"off\"}"
+      ],
+      "environment": {
+        "H3_REF_IMAGE_RESIZE_MODE": "max",
+        "HCCL_BUFFSIZE": "786",
+        "HCCL_CONNECT_TIMEOUT": "600",
+        "HCCL_IF_BASE_PORT": "64500",
+        "HCCL_NPU_SOCKET_PORT_RANGE": "auto",
+        "HCCL_OP_EXPANSION_MODE": "AIV",
+        "HF_HUB_OFFLINE": "1",
+        "OMP_NUM_THREADS": "4",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONUNBUFFERED": "1",
+        "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+        "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
+        "TRANSFORMERS_OFFLINE": "1",
+        "VLLM_OMNI_VIDEO_SYNC_TIMEOUT": "1800",
+        "VLLM_PLUGINS": "ascend",
+        "VLLM_WORKER_MULTIPROC_METHOD": "spawn"
+      },
+      "source_revision": "7602d7980d8add4277353e8bc162ac1f98d98c19",
+      "devices": "0,1,2,3,4,5,6,7"
+    },
+    {
+      "stage": "encoder_B",
+      "argv": [
+        "/opt/tiger/lly/.tmp/20261118-h3-pr10352-validation/venv/bin/python",
+        "$RUN/server.py",
+        "serve",
+        "$MODEL",
+        "--port",
+        "31000",
+        "--omni",
+        "--host",
+        "127.0.0.1",
+        "--trust-remote-code",
+        "--task-type",
+        "ref2va",
+        "--num-gpus",
+        "8",
+        "--tensor-parallel-size",
+        "1",
+        "--usp",
+        "8",
+        "--ring",
+        "1",
+        "--text-encoder-tp-size",
+        "8",
+        "--vae-patch-parallel-size",
+        "8",
+        "--vae-parallel-mode",
+        "tile",
+        "--vae-use-tiling",
+        "--enable-layerwise-offload",
+        "--gpu-memory-utilization",
+        "0.85",
+        "--diffusion-attention-backend",
+        "FLASH_ATTN",
+        "--fa-deterministic",
+        "--additional-config",
+        "{\"encoder_weight_transfer\": \"packed\"}"
+      ],
+      "environment": {
+        "H3_REF_IMAGE_RESIZE_MODE": "max",
+        "HCCL_BUFFSIZE": "786",
+        "HCCL_CONNECT_TIMEOUT": "600",
+        "HCCL_IF_BASE_PORT": "64500",
+        "HCCL_NPU_SOCKET_PORT_RANGE": "auto",
+        "HCCL_OP_EXPANSION_MODE": "AIV",
+        "HF_HUB_OFFLINE": "1",
+        "OMP_NUM_THREADS": "4",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONUNBUFFERED": "1",
+        "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+        "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
+        "TRANSFORMERS_OFFLINE": "1",
+        "VLLM_OMNI_VIDEO_SYNC_TIMEOUT": "1800",
+        "VLLM_PLUGINS": "ascend",
+        "VLLM_WORKER_MULTIPROC_METHOD": "spawn"
+      },
+      "source_revision": "7602d7980d8add4277353e8bc162ac1f98d98c19",
+      "devices": "0,1,2,3,4,5,6,7"
+    },
+    {
+      "stage": "encoder_A2",
+      "argv": [
+        "/opt/tiger/lly/.tmp/20261118-h3-pr10352-validation/venv/bin/python",
+        "$RUN/server.py",
+        "serve",
+        "$MODEL",
+        "--port",
+        "31000",
+        "--omni",
+        "--host",
+        "127.0.0.1",
+        "--trust-remote-code",
+        "--task-type",
+        "ref2va",
+        "--num-gpus",
+        "8",
+        "--tensor-parallel-size",
+        "1",
+        "--usp",
+        "8",
+        "--ring",
+        "1",
+        "--text-encoder-tp-size",
+        "8",
+        "--vae-patch-parallel-size",
+        "8",
+        "--vae-parallel-mode",
+        "tile",
+        "--vae-use-tiling",
+        "--enable-layerwise-offload",
+        "--gpu-memory-utilization",
+        "0.85",
+        "--diffusion-attention-backend",
+        "FLASH_ATTN",
+        "--fa-deterministic",
+        "--additional-config",
+        "{\"encoder_weight_transfer\": \"off\"}"
+      ],
+      "environment": {
+        "H3_REF_IMAGE_RESIZE_MODE": "max",
+        "HCCL_BUFFSIZE": "786",
+        "HCCL_CONNECT_TIMEOUT": "600",
+        "HCCL_IF_BASE_PORT": "64500",
+        "HCCL_NPU_SOCKET_PORT_RANGE": "auto",
+        "HCCL_OP_EXPANSION_MODE": "AIV",
+        "HF_HUB_OFFLINE": "1",
+        "OMP_NUM_THREADS": "4",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONUNBUFFERED": "1",
+        "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+        "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
+        "TRANSFORMERS_OFFLINE": "1",
+        "VLLM_OMNI_VIDEO_SYNC_TIMEOUT": "1800",
+        "VLLM_PLUGINS": "ascend",
+        "VLLM_WORKER_MULTIPROC_METHOD": "spawn"
+      },
+      "source_revision": "7602d7980d8add4277353e8bc162ac1f98d98c19",
+      "devices": "0,1,2,3,4,5,6,7"
+    }
+  ],
+  "requests": [
+    {
+      "label": "encoder_A1.warmup1",
+      "stage": "encoder_A1",
+      "phase": "warmup",
+      "http_status": 200,
+      "bytes": 6940703,
+      "sha256": "c50c22e67ca11e2b0b8726ef5a44f138ef0dbc01650969bf997b847192809d10",
+      "http_e2e_s": 112.71414891630411,
+      "encode_prompt_s": 2.301333779003471,
+      "dit_s": 55.05700607364997,
+      "request_fields": {
+        "extra_params": "{\"audio_flow_shift\": 3.0}",
+        "flow_shift": "12.0",
+        "height": "864",
+        "num_inference_steps": "8",
+        "seconds": "12",
+        "seed": "42",
+        "width": "480",
+        "prompt_sha256": "9fb933739678525415daa5f2e6fb3e3b5cf92b991f59a5e8576f2edaeea9a72d"
+      },
+      "started_at_unix": 1795164407.130869,
+      "input_references": [
+        {
+          "mime_type": "video/mp4",
+          "bytes": 561390,
+          "sha256": "cf57940d4d50d8ec062a8c1e567b3ea89f700c69671daf074e126ff3353ded68"
+        }
+      ],
+      "ranks": [
+        {
+          "rank": 0,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 20.832525575067848,
+            "diffuse": 55.05700607364997,
+            "encode_prompt": 2.301333779003471,
+            "encoder_forward": 0.8880381579510868,
+            "forward": 111.27083968836814
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 1,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 44.33454209193587,
+            "diffuse": 55.05679836310446,
+            "encode_prompt": 2.299139660783112,
+            "encoder_forward": 0.8617556449025869,
+            "forward": 134.77138814888895
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 2,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 44.518823651596904,
+            "diffuse": 55.05678470619023,
+            "encode_prompt": 2.29909152071923,
+            "encoder_forward": 0.8612103573977947,
+            "forward": 134.9556593503803
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 3,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 44.44294683402404,
+            "diffuse": 55.056866927072406,
+            "encode_prompt": 2.29921652097255,
+            "encoder_forward": 0.8500074599869549,
+            "forward": 134.8806635881774
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 4,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 44.44437368307263,
+            "diffuse": 55.05684411013499,
+            "encode_prompt": 2.2988997329957783,
+            "encoder_forward": 0.842993657104671,
+            "forward": 134.88276594690979
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 5,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 44.97806364716962,
+            "diffuse": 55.05683999881148,
+            "encode_prompt": 2.2989206197671592,
+            "encoder_forward": 0.8590345899574459,
+            "forward": 135.41610103892162
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 6,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 43.773238870780915,
+            "diffuse": 55.0568564562127,
+            "encode_prompt": 2.299130189232528,
+            "encoder_forward": 0.8616663180291653,
+            "forward": 134.2121493862942
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 7,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 44.69604221498594,
+            "diffuse": 55.056859941687435,
+            "encode_prompt": 2.2988771749660373,
+            "encoder_forward": 0.8421869822777808,
+            "forward": 135.13528313301504
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        }
+      ],
+      "activation_fingerprints": {
+        "0": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          },
+          "video_input0": {
+            "dtype": "torch.uint8",
+            "sha256": "a4ea8caa4ebd971ae09b1bc0e818f8edaffd57b3b10db8a6fbc611012e165484",
+            "shape": [
+              52,
+              1280,
+              704,
+              3
+            ]
+          }
+        },
+        "1": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "2": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "3": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "4": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "5": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "6": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "7": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        }
+      }
+    },
+    {
+      "label": "encoder_A1.warmup2",
+      "stage": "encoder_A1",
+      "phase": "warmup",
+      "http_status": 200,
+      "bytes": 6940703,
+      "sha256": "c50c22e67ca11e2b0b8726ef5a44f138ef0dbc01650969bf997b847192809d10",
+      "http_e2e_s": 61.136119595728815,
+      "encode_prompt_s": 0.7377277580089867,
+      "dit_s": 45.56343670981005,
+      "request_fields": {
+        "extra_params": "{\"audio_flow_shift\": 3.0}",
+        "flow_shift": "12.0",
+        "height": "864",
+        "num_inference_steps": "8",
+        "seconds": "12",
+        "seed": "42",
+        "width": "480",
+        "prompt_sha256": "9fb933739678525415daa5f2e6fb3e3b5cf92b991f59a5e8576f2edaeea9a72d"
+      },
+      "started_at_unix": 1795164543.61458,
+      "input_references": [
+        {
+          "mime_type": "video/mp4",
+          "bytes": 561390,
+          "sha256": "cf57940d4d50d8ec062a8c1e567b3ea89f700c69671daf074e126ff3353ded68"
+        }
+      ],
+      "ranks": [
+        {
+          "rank": 0,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.329378694761544,
+            "diffuse": 45.56343670981005,
+            "encode_prompt": 0.7377277580089867,
+            "encoder_forward": 0.37403760803863406,
+            "forward": 60.16302723903209
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 1,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.331001008395106,
+            "diffuse": 45.563256579916924,
+            "encode_prompt": 0.7369264508597553,
+            "encoder_forward": 0.37154282303527,
+            "forward": 60.16275952896103
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 2,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.285702094901353,
+            "diffuse": 45.563261796254665,
+            "encode_prompt": 0.7369600320234895,
+            "encoder_forward": 0.34739453019574285,
+            "forward": 60.1169510781765
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 3,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.274474184960127,
+            "diffuse": 45.56328178104013,
+            "encode_prompt": 0.7368858209811151,
+            "encoder_forward": 0.34954829467460513,
+            "forward": 60.10684257186949
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 4,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.332367696799338,
+            "diffuse": 45.563268093857914,
+            "encode_prompt": 0.7368437135592103,
+            "encoder_forward": 0.3548988029360771,
+            "forward": 60.165148111991584
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 5,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.304714498110116,
+            "diffuse": 45.563284509815276,
+            "encode_prompt": 0.7369387191720307,
+            "encoder_forward": 0.3679748340509832,
+            "forward": 60.13638054905459
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 6,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.33191367983818,
+            "diffuse": 45.563264701049775,
+            "encode_prompt": 0.7369740037247539,
+            "encoder_forward": 0.3485817201435566,
+            "forward": 60.16529602184892
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 7,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.309093905612826,
+            "diffuse": 45.563300780020654,
+            "encode_prompt": 0.7367817093618214,
+            "encoder_forward": 0.35246280999854207,
+            "forward": 60.14128313306719
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        }
+      ],
+      "activation_fingerprints": {
+        "0": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          },
+          "video_input0": {
+            "dtype": "torch.uint8",
+            "sha256": "a4ea8caa4ebd971ae09b1bc0e818f8edaffd57b3b10db8a6fbc611012e165484",
+            "shape": [
+              52,
+              1280,
+              704,
+              3
+            ]
+          }
+        },
+        "1": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "2": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "3": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "4": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "5": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "6": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "7": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        }
+      }
+    },
+    {
+      "label": "encoder_A1.formal1",
+      "stage": "encoder_A1",
+      "phase": "formal",
+      "http_status": 200,
+      "bytes": 6940703,
+      "sha256": "c50c22e67ca11e2b0b8726ef5a44f138ef0dbc01650969bf997b847192809d10",
+      "http_e2e_s": 61.166108837816864,
+      "encode_prompt_s": 0.6889647911302745,
+      "dit_s": 45.929328980855644,
+      "request_fields": {
+        "extra_params": "{\"audio_flow_shift\": 3.0}",
+        "flow_shift": "12.0",
+        "height": "864",
+        "num_inference_steps": "8",
+        "seconds": "12",
+        "seed": "42",
+        "width": "480",
+        "prompt_sha256": "9fb933739678525415daa5f2e6fb3e3b5cf92b991f59a5e8576f2edaeea9a72d"
+      },
+      "started_at_unix": 1795164605.8585527,
+      "input_references": [
+        {
+          "mime_type": "video/mp4",
+          "bytes": 561390,
+          "sha256": "cf57940d4d50d8ec062a8c1e567b3ea89f700c69671daf074e126ff3353ded68"
+        }
+      ],
+      "ranks": [
+        {
+          "rank": 0,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.197962480131537,
+            "diffuse": 45.929328980855644,
+            "encode_prompt": 0.6889647911302745,
+            "encoder_forward": 0.3454714738763869,
+            "forward": 60.188680704217404
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 1,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.181694335769862,
+            "diffuse": 45.92914530914277,
+            "encode_prompt": 0.6882044598460197,
+            "encoder_forward": 0.34193444764241576,
+            "forward": 60.17196940584108
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 2,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.245332475285977,
+            "diffuse": 45.92916155839339,
+            "encode_prompt": 0.6881472142413259,
+            "encoder_forward": 0.3458764748647809,
+            "forward": 60.23705780599266
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 3,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.201088048983365,
+            "diffuse": 45.929176959209144,
+            "encode_prompt": 0.6881868238560855,
+            "encoder_forward": 0.3402071241289377,
+            "forward": 60.191633250098675
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 4,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.214005202054977,
+            "diffuse": 45.929179281927645,
+            "encode_prompt": 0.6880758507177234,
+            "encoder_forward": 0.3434400078840554,
+            "forward": 60.20501469820738
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 5,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.189450239762664,
+            "diffuse": 45.92915627500042,
+            "encode_prompt": 0.6881053927354515,
+            "encoder_forward": 0.3559434409253299,
+            "forward": 60.17993576312438
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 6,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.183640687260777,
+            "diffuse": 45.92909835558385,
+            "encode_prompt": 0.6881257290951908,
+            "encoder_forward": 0.34342708298936486,
+            "forward": 60.18439674703404
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 7,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.189577613025904,
+            "diffuse": 45.92912819981575,
+            "encode_prompt": 0.6881065629422665,
+            "encoder_forward": 0.3469578679651022,
+            "forward": 60.18042815383524
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        }
+      ]
+    },
+    {
+      "label": "encoder_A1.formal2",
+      "stage": "encoder_A1",
+      "phase": "formal",
+      "http_status": 200,
+      "bytes": 6940703,
+      "sha256": "c50c22e67ca11e2b0b8726ef5a44f138ef0dbc01650969bf997b847192809d10",
+      "http_e2e_s": 61.415012535173446,
+      "encode_prompt_s": 0.7017356879077852,
+      "dit_s": 46.28809688379988,
+      "request_fields": {
+        "extra_params": "{\"audio_flow_shift\": 3.0}",
+        "flow_shift": "12.0",
+        "height": "864",
+        "num_inference_steps": "8",
+        "seconds": "12",
+        "seed": "42",
+        "width": "480",
+        "prompt_sha256": "9fb933739678525415daa5f2e6fb3e3b5cf92b991f59a5e8576f2edaeea9a72d"
+      },
+      "started_at_unix": 1795164668.1181812,
+      "input_references": [
+        {
+          "mime_type": "video/mp4",
+          "bytes": 561390,
+          "sha256": "cf57940d4d50d8ec062a8c1e567b3ea89f700c69671daf074e126ff3353ded68"
+        }
+      ],
+      "ranks": [
+        {
+          "rank": 0,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.18214396899566,
+            "diffuse": 46.28809688379988,
+            "encode_prompt": 0.7017356879077852,
+            "encoder_forward": 0.3431483879685402,
+            "forward": 60.44534845324233
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 1,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.20835497835651,
+            "diffuse": 46.28792529227212,
+            "encode_prompt": 0.7008815230801702,
+            "encoder_forward": 0.34663927694782615,
+            "forward": 60.469233794137836
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 2,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.221173443831503,
+            "diffuse": 46.28792021609843,
+            "encode_prompt": 0.7009500311687589,
+            "encoder_forward": 0.3428845340386033,
+            "forward": 60.48291013529524
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 3,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.193885935936123,
+            "diffuse": 46.28799091698602,
+            "encode_prompt": 0.7007907130755484,
+            "encoder_forward": 0.3476947979070246,
+            "forward": 60.45486843585968
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 4,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.209980790968984,
+            "diffuse": 46.28796270489693,
+            "encode_prompt": 0.7008665129542351,
+            "encoder_forward": 0.34020582027733326,
+            "forward": 60.471421143971384
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 5,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.243133122101426,
+            "diffuse": 46.28800603095442,
+            "encode_prompt": 0.7009130204096437,
+            "encoder_forward": 0.34860292728990316,
+            "forward": 60.50496745668352
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 6,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.208861161023378,
+            "diffuse": 46.287930071819574,
+            "encode_prompt": 0.7009395477361977,
+            "encoder_forward": 0.3433404969982803,
+            "forward": 60.47011568862945
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 7,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.239605967886746,
+            "diffuse": 46.28789363708347,
+            "encode_prompt": 0.6988837122917175,
+            "encoder_forward": 0.33786786813288927,
+            "forward": 60.501821456011385
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        }
+      ]
+    },
+    {
+      "label": "encoder_A1.formal3",
+      "stage": "encoder_A1",
+      "phase": "formal",
+      "http_status": 200,
+      "bytes": 6940703,
+      "sha256": "c50c22e67ca11e2b0b8726ef5a44f138ef0dbc01650969bf997b847192809d10",
+      "http_e2e_s": 61.69643689226359,
+      "encode_prompt_s": 0.693365859799087,
+      "dit_s": 46.54539926489815,
+      "request_fields": {
+        "extra_params": "{\"audio_flow_shift\": 3.0}",
+        "flow_shift": "12.0",
+        "height": "864",
+        "num_inference_steps": "8",
+        "seconds": "12",
+        "seed": "42",
+        "width": "480",
+        "prompt_sha256": "9fb933739678525415daa5f2e6fb3e3b5cf92b991f59a5e8576f2edaeea9a72d"
+      },
+      "started_at_unix": 1795164730.6294935,
+      "input_references": [
+        {
+          "mime_type": "video/mp4",
+          "bytes": 561390,
+          "sha256": "cf57940d4d50d8ec062a8c1e567b3ea89f700c69671daf074e126ff3353ded68"
+        }
+      ],
+      "ranks": [
+        {
+          "rank": 0,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.2393241901882,
+            "diffuse": 46.54539926489815,
+            "encode_prompt": 0.693365859799087,
+            "encoder_forward": 0.3463152488693595,
+            "forward": 60.6284567839466
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 1,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.190752655733377,
+            "diffuse": 46.545258273836225,
+            "encode_prompt": 0.6925972383469343,
+            "encoder_forward": 0.3444387880153954,
+            "forward": 60.57882765401155
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 2,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.211216483730823,
+            "diffuse": 46.545203612186015,
+            "encode_prompt": 0.6926189488731325,
+            "encoder_forward": 0.3407382178120315,
+            "forward": 60.59960531396791
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 3,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.20696086389944,
+            "diffuse": 46.545264686923474,
+            "encode_prompt": 0.6923191878013313,
+            "encoder_forward": 0.35914700105786324,
+            "forward": 60.59546490479261
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 4,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.190562068950385,
+            "diffuse": 46.54524368606508,
+            "encode_prompt": 0.6925261989235878,
+            "encoder_forward": 0.34659021999686956,
+            "forward": 60.579529707785696
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 5,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.27529625268653,
+            "diffuse": 46.545249787159264,
+            "encode_prompt": 0.6925552990287542,
+            "encoder_forward": 0.3500837031751871,
+            "forward": 60.66425087116659
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 6,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.195954433176666,
+            "diffuse": 46.545234396122396,
+            "encode_prompt": 0.6905492967925966,
+            "encoder_forward": 0.3412206582725048,
+            "forward": 60.58473996212706
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 7,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.229382562916726,
+            "diffuse": 46.545217242091894,
+            "encode_prompt": 0.6899059722200036,
+            "encoder_forward": 0.3406517910771072,
+            "forward": 60.6180672692135
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        }
+      ]
+    },
+    {
+      "label": "encoder_B.warmup1",
+      "stage": "encoder_B",
+      "phase": "warmup",
+      "http_status": 200,
+      "bytes": 6940703,
+      "sha256": "c50c22e67ca11e2b0b8726ef5a44f138ef0dbc01650969bf997b847192809d10",
+      "http_e2e_s": 104.26431332016364,
+      "encode_prompt_s": 2.3307905178517103,
+      "dit_s": 46.635235198773444,
+      "request_fields": {
+        "extra_params": "{\"audio_flow_shift\": 3.0}",
+        "flow_shift": "12.0",
+        "height": "864",
+        "num_inference_steps": "8",
+        "seconds": "12",
+        "seed": "42",
+        "width": "480",
+        "prompt_sha256": "9fb933739678525415daa5f2e6fb3e3b5cf92b991f59a5e8576f2edaeea9a72d"
+      },
+      "started_at_unix": 1795164966.2057788,
+      "input_references": [
+        {
+          "mime_type": "video/mp4",
+          "bytes": 561390,
+          "sha256": "cf57940d4d50d8ec062a8c1e567b3ea89f700c69671daf074e126ff3353ded68"
+        }
+      ],
+      "ranks": [
+        {
+          "rank": 0,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 1,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 20.90877404389903,
+            "diffuse": 46.635235198773444,
+            "encode_prompt": 2.3307905178517103,
+            "encoder_forward": 0.8848408469930291,
+            "forward": 103.03830279968679
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 1,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 1,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 44.891401776112616,
+            "diffuse": 46.63505387119949,
+            "encode_prompt": 2.3280011671595275,
+            "encoder_forward": 0.8814355516806245,
+            "forward": 127.01981196505949
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 2,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 1,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 44.67519440734759,
+            "diffuse": 46.63506976887584,
+            "encode_prompt": 2.3285645893774927,
+            "encoder_forward": 0.8396195122040808,
+            "forward": 126.80333752091974
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 3,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 1,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 44.1935994992964,
+            "diffuse": 46.63502191705629,
+            "encode_prompt": 2.328545354772359,
+            "encoder_forward": 0.8744057090952992,
+            "forward": 126.32018344569951
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 4,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 1,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 44.39416518388316,
+            "diffuse": 46.63502219226211,
+            "encode_prompt": 2.3285521720536053,
+            "encoder_forward": 0.8688970631919801,
+            "forward": 126.52371134702116
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 5,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 1,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 45.08174080401659,
+            "diffuse": 46.635073027107865,
+            "encode_prompt": 2.328534048050642,
+            "encoder_forward": 0.880749131552875,
+            "forward": 127.2092173662968
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 6,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 1,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 45.46438828483224,
+            "diffuse": 46.63500001095235,
+            "encode_prompt": 2.328570504207164,
+            "encoder_forward": 0.8615144602954388,
+            "forward": 127.59215574292466
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 7,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 1,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 44.19541511312127,
+            "diffuse": 46.63499297108501,
+            "encode_prompt": 2.3286087992601097,
+            "encoder_forward": 0.872236744966358,
+            "forward": 126.3240407789126
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        }
+      ],
+      "activation_fingerprints": {
+        "0": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          },
+          "video_input0": {
+            "dtype": "torch.uint8",
+            "sha256": "a4ea8caa4ebd971ae09b1bc0e818f8edaffd57b3b10db8a6fbc611012e165484",
+            "shape": [
+              52,
+              1280,
+              704,
+              3
+            ]
+          }
+        },
+        "1": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "2": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "3": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "4": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "5": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "6": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "7": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        }
+      }
+    },
+    {
+      "label": "encoder_B.warmup2",
+      "stage": "encoder_B",
+      "phase": "warmup",
+      "http_status": 200,
+      "bytes": 6940703,
+      "sha256": "c50c22e67ca11e2b0b8726ef5a44f138ef0dbc01650969bf997b847192809d10",
+      "http_e2e_s": 61.41556756105274,
+      "encode_prompt_s": 0.7505013248883188,
+      "dit_s": 45.89372751908377,
+      "request_fields": {
+        "extra_params": "{\"audio_flow_shift\": 3.0}",
+        "flow_shift": "12.0",
+        "height": "864",
+        "num_inference_steps": "8",
+        "seconds": "12",
+        "seed": "42",
+        "width": "480",
+        "prompt_sha256": "9fb933739678525415daa5f2e6fb3e3b5cf92b991f59a5e8576f2edaeea9a72d"
+      },
+      "started_at_unix": 1795165094.1935844,
+      "input_references": [
+        {
+          "mime_type": "video/mp4",
+          "bytes": 561390,
+          "sha256": "cf57940d4d50d8ec062a8c1e567b3ea89f700c69671daf074e126ff3353ded68"
+        }
+      ],
+      "ranks": [
+        {
+          "rank": 0,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.366143383085728,
+            "diffuse": 45.89372751908377,
+            "encode_prompt": 0.7505013248883188,
+            "encoder_forward": 0.339369251858443,
+            "forward": 60.40233383094892
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 1,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.364324579015374,
+            "diffuse": 45.89362673508003,
+            "encode_prompt": 0.7493890477344394,
+            "encoder_forward": 0.34459411120042205,
+            "forward": 60.40081416675821
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 2,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.309366445057094,
+            "diffuse": 45.89369124220684,
+            "encode_prompt": 0.7496371744200587,
+            "encoder_forward": 0.3437248836271465,
+            "forward": 60.34433577302843
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 3,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.332210226915777,
+            "diffuse": 45.89366899803281,
+            "encode_prompt": 0.7497077756561339,
+            "encoder_forward": 0.33930148277431726,
+            "forward": 60.367116504348814
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 4,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.323324453085661,
+            "diffuse": 45.89365666685626,
+            "encode_prompt": 0.7496637352742255,
+            "encoder_forward": 0.3450028286315501,
+            "forward": 60.35902815172449
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 5,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.33988198498264,
+            "diffuse": 45.89362502004951,
+            "encode_prompt": 0.7496440461836755,
+            "encoder_forward": 0.36335973255336285,
+            "forward": 60.37516503268853
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 6,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.371990954037756,
+            "diffuse": 45.89362779026851,
+            "encode_prompt": 0.7496082209981978,
+            "encoder_forward": 0.34791573882102966,
+            "forward": 60.40687944041565
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 7,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.298556021880358,
+            "diffuse": 45.893573380075395,
+            "encode_prompt": 0.7497063642367721,
+            "encoder_forward": 0.3397247642278671,
+            "forward": 60.333784154150635
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        }
+      ],
+      "activation_fingerprints": {
+        "0": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          },
+          "video_input0": {
+            "dtype": "torch.uint8",
+            "sha256": "a4ea8caa4ebd971ae09b1bc0e818f8edaffd57b3b10db8a6fbc611012e165484",
+            "shape": [
+              52,
+              1280,
+              704,
+              3
+            ]
+          }
+        },
+        "1": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "2": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "3": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "4": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "5": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "6": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "7": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        }
+      }
+    },
+    {
+      "label": "encoder_B.formal1",
+      "stage": "encoder_B",
+      "phase": "formal",
+      "http_status": 200,
+      "bytes": 6940703,
+      "sha256": "c50c22e67ca11e2b0b8726ef5a44f138ef0dbc01650969bf997b847192809d10",
+      "http_e2e_s": 61.30425822502002,
+      "encode_prompt_s": 0.6907796859741211,
+      "dit_s": 46.20650664111599,
+      "request_fields": {
+        "extra_params": "{\"audio_flow_shift\": 3.0}",
+        "flow_shift": "12.0",
+        "height": "864",
+        "num_inference_steps": "8",
+        "seconds": "12",
+        "seed": "42",
+        "width": "480",
+        "prompt_sha256": "9fb933739678525415daa5f2e6fb3e3b5cf92b991f59a5e8576f2edaeea9a72d"
+      },
+      "started_at_unix": 1795165156.7275438,
+      "input_references": [
+        {
+          "mime_type": "video/mp4",
+          "bytes": 561390,
+          "sha256": "cf57940d4d50d8ec062a8c1e567b3ea89f700c69671daf074e126ff3353ded68"
+        }
+      ],
+      "ranks": [
+        {
+          "rank": 0,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.221596589311957,
+            "diffuse": 46.20650664111599,
+            "encode_prompt": 0.6907796859741211,
+            "encoder_forward": 0.3431190359406173,
+            "forward": 60.2752879797481
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 1,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.208402780815959,
+            "diffuse": 46.206344834994525,
+            "encode_prompt": 0.687427886761725,
+            "encoder_forward": 0.3406400727108121,
+            "forward": 60.26251140283421
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 2,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.199306322261691,
+            "diffuse": 46.20633624820039,
+            "encode_prompt": 0.6900383057072759,
+            "encoder_forward": 0.3376007559709251,
+            "forward": 60.25278663914651
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 3,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.226927252020687,
+            "diffuse": 46.20630694180727,
+            "encode_prompt": 0.6899919738061726,
+            "encoder_forward": 0.3367641963995993,
+            "forward": 60.2810973059386
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 4,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.161505485884845,
+            "diffuse": 46.20631580101326,
+            "encode_prompt": 0.6883126180619001,
+            "encoder_forward": 0.339157878421247,
+            "forward": 60.216463746037334
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 5,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.163676986005157,
+            "diffuse": 46.206348911393434,
+            "encode_prompt": 0.6878470289520919,
+            "encoder_forward": 0.33964702393859625,
+            "forward": 60.217445097863674
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 6,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.157335706055164,
+            "diffuse": 46.20631553279236,
+            "encode_prompt": 0.6899923840537667,
+            "encoder_forward": 0.3420331999659538,
+            "forward": 60.21086252992973
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 7,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.181826457381248,
+            "diffuse": 46.20631637098268,
+            "encode_prompt": 0.6900041401386261,
+            "encoder_forward": 0.33701008604839444,
+            "forward": 60.23543987702578
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        }
+      ]
+    },
+    {
+      "label": "encoder_B.formal2",
+      "stage": "encoder_B",
+      "phase": "formal",
+      "http_status": 200,
+      "bytes": 6940703,
+      "sha256": "c50c22e67ca11e2b0b8726ef5a44f138ef0dbc01650969bf997b847192809d10",
+      "http_e2e_s": 61.62573316274211,
+      "encode_prompt_s": 0.7106403200887144,
+      "dit_s": 46.52620911877602,
+      "request_fields": {
+        "extra_params": "{\"audio_flow_shift\": 3.0}",
+        "flow_shift": "12.0",
+        "height": "864",
+        "num_inference_steps": "8",
+        "seconds": "12",
+        "seed": "42",
+        "width": "480",
+        "prompt_sha256": "9fb933739678525415daa5f2e6fb3e3b5cf92b991f59a5e8576f2edaeea9a72d"
+      },
+      "started_at_unix": 1795165219.1245575,
+      "input_references": [
+        {
+          "mime_type": "video/mp4",
+          "bytes": 561390,
+          "sha256": "cf57940d4d50d8ec062a8c1e567b3ea89f700c69671daf074e126ff3353ded68"
+        }
+      ],
+      "ranks": [
+        {
+          "rank": 0,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.187232790049165,
+            "diffuse": 46.52620911877602,
+            "encode_prompt": 0.7106403200887144,
+            "encoder_forward": 0.33845363603904843,
+            "forward": 60.57474626926705
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 1,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.218795062974095,
+            "diffuse": 46.52614593086764,
+            "encode_prompt": 0.7069989680312574,
+            "encoder_forward": 0.3422842063009739,
+            "forward": 60.6051032692194
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 2,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.198046303354204,
+            "diffuse": 46.52613292308524,
+            "encode_prompt": 0.709731203969568,
+            "encoder_forward": 0.33843213599175215,
+            "forward": 60.58385974308476
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 3,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.197416701819748,
+            "diffuse": 46.52614071639255,
+            "encode_prompt": 0.7097365609370172,
+            "encoder_forward": 0.338446291629225,
+            "forward": 60.58361034700647
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 4,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.229799204040319,
+            "diffuse": 46.526140379253775,
+            "encode_prompt": 0.7076458558440208,
+            "encoder_forward": 0.3397254552692175,
+            "forward": 60.61686312314123
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 5,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.239128247834742,
+            "diffuse": 46.52615154720843,
+            "encode_prompt": 0.7096886090002954,
+            "encoder_forward": 0.339920949190855,
+            "forward": 60.62490179715678
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 6,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.250901759136468,
+            "diffuse": 46.52608990902081,
+            "encode_prompt": 0.7096972139552236,
+            "encoder_forward": 0.3419886250048876,
+            "forward": 60.6371924453415
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 7,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.190029466059059,
+            "diffuse": 46.52610713010654,
+            "encode_prompt": 0.7097125416621566,
+            "encoder_forward": 0.3593480992130935,
+            "forward": 60.576248820871115
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        }
+      ]
+    },
+    {
+      "label": "encoder_B.formal3",
+      "stage": "encoder_B",
+      "phase": "formal",
+      "http_status": 200,
+      "bytes": 6940703,
+      "sha256": "c50c22e67ca11e2b0b8726ef5a44f138ef0dbc01650969bf997b847192809d10",
+      "http_e2e_s": 61.74689798383042,
+      "encode_prompt_s": 0.7082747877575457,
+      "dit_s": 46.69147845497355,
+      "request_fields": {
+        "extra_params": "{\"audio_flow_shift\": 3.0}",
+        "flow_shift": "12.0",
+        "height": "864",
+        "num_inference_steps": "8",
+        "seconds": "12",
+        "seed": "42",
+        "width": "480",
+        "prompt_sha256": "9fb933739678525415daa5f2e6fb3e3b5cf92b991f59a5e8576f2edaeea9a72d"
+      },
+      "started_at_unix": 1795165281.865089,
+      "input_references": [
+        {
+          "mime_type": "video/mp4",
+          "bytes": 561390,
+          "sha256": "cf57940d4d50d8ec062a8c1e567b3ea89f700c69671daf074e126ff3353ded68"
+        }
+      ],
+      "ranks": [
+        {
+          "rank": 0,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.20846090093255,
+            "diffuse": 46.69147845497355,
+            "encode_prompt": 0.7082747877575457,
+            "encoder_forward": 0.33764585573226213,
+            "forward": 60.73608563095331
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 1,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.192060774192214,
+            "diffuse": 46.691263729240745,
+            "encode_prompt": 0.7032151166349649,
+            "encoder_forward": 0.34241817612200975,
+            "forward": 60.71974525321275
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 2,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.231960095930845,
+            "diffuse": 46.69132066704333,
+            "encode_prompt": 0.7074220632202923,
+            "encoder_forward": 0.34539149329066277,
+            "forward": 60.759077521041036
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 3,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.209017905872315,
+            "diffuse": 46.69123704638332,
+            "encode_prompt": 0.7074924414046109,
+            "encoder_forward": 0.33800520561635494,
+            "forward": 60.735649342648685
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 4,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.193436813075095,
+            "diffuse": 46.691295055206865,
+            "encode_prompt": 0.7054329146631062,
+            "encoder_forward": 0.34107476100325584,
+            "forward": 60.71983657311648
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 5,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.261665564030409,
+            "diffuse": 46.69130732584745,
+            "encode_prompt": 0.7074541351757944,
+            "encoder_forward": 0.3605338390916586,
+            "forward": 60.78803147189319
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 6,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.228215260896832,
+            "diffuse": 46.69130959874019,
+            "encode_prompt": 0.7073519080877304,
+            "encoder_forward": 0.3392031891271472,
+            "forward": 60.754594466183335
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 7,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 1
+          },
+          "durations": {
+            "decode": 8.206227292772382,
+            "diffuse": 46.691226901020855,
+            "encode_prompt": 0.7075018319301307,
+            "encoder_forward": 0.33799955202266574,
+            "forward": 60.732089668978006
+          },
+          "packed_stager": true,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        }
+      ]
+    },
+    {
+      "label": "encoder_A2.warmup1",
+      "stage": "encoder_A2",
+      "phase": "warmup",
+      "http_status": 200,
+      "bytes": 6940703,
+      "sha256": "c50c22e67ca11e2b0b8726ef5a44f138ef0dbc01650969bf997b847192809d10",
+      "http_e2e_s": 103.88981273910031,
+      "encode_prompt_s": 2.368086569942534,
+      "dit_s": 46.75848906626925,
+      "request_fields": {
+        "extra_params": "{\"audio_flow_shift\": 3.0}",
+        "flow_shift": "12.0",
+        "height": "864",
+        "num_inference_steps": "8",
+        "seconds": "12",
+        "seed": "42",
+        "width": "480",
+        "prompt_sha256": "9fb933739678525415daa5f2e6fb3e3b5cf92b991f59a5e8576f2edaeea9a72d"
+      },
+      "started_at_unix": 1795165518.0891917,
+      "input_references": [
+        {
+          "mime_type": "video/mp4",
+          "bytes": 561390,
+          "sha256": "cf57940d4d50d8ec062a8c1e567b3ea89f700c69671daf074e126ff3353ded68"
+        }
+      ],
+      "ranks": [
+        {
+          "rank": 0,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 20.533828494139016,
+            "diffuse": 46.75848906626925,
+            "encode_prompt": 2.368086569942534,
+            "encoder_forward": 0.9679179731756449,
+            "forward": 102.54211266711354
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 1,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 45.39504242921248,
+            "diffuse": 46.75833887187764,
+            "encode_prompt": 2.3658387758769095,
+            "encoder_forward": 0.9465335919521749,
+            "forward": 127.40048930468038
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 2,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 45.3403628077358,
+            "diffuse": 46.75832688296214,
+            "encode_prompt": 2.3658911739476025,
+            "encoder_forward": 0.9524300410412252,
+            "forward": 127.36417096294463
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 3,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 44.13707445189357,
+            "diffuse": 46.75829255208373,
+            "encode_prompt": 2.3657278791069984,
+            "encoder_forward": 0.9583284519612789,
+            "forward": 126.14436459587887
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 4,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 45.272952992934734,
+            "diffuse": 46.758360888343304,
+            "encode_prompt": 2.365694054402411,
+            "encoder_forward": 0.9507911549881101,
+            "forward": 127.2813880648464
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 5,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 44.20658393390477,
+            "diffuse": 46.75836613820866,
+            "encode_prompt": 2.365702349692583,
+            "encoder_forward": 0.9721143175847828,
+            "forward": 126.21345392381772
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 6,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 44.46741606295109,
+            "diffuse": 46.75837066071108,
+            "encode_prompt": 2.3658607322722673,
+            "encoder_forward": 0.9745574248954654,
+            "forward": 126.47401157021523
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 7,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 44.87049567885697,
+            "diffuse": 46.758380759041756,
+            "encode_prompt": 2.365814461838454,
+            "encoder_forward": 0.9519112790003419,
+            "forward": 126.87624290585518
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        }
+      ],
+      "activation_fingerprints": {
+        "0": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          },
+          "video_input0": {
+            "dtype": "torch.uint8",
+            "sha256": "a4ea8caa4ebd971ae09b1bc0e818f8edaffd57b3b10db8a6fbc611012e165484",
+            "shape": [
+              52,
+              1280,
+              704,
+              3
+            ]
+          }
+        },
+        "1": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "2": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "3": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "4": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "5": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "6": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "7": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        }
+      }
+    },
+    {
+      "label": "encoder_A2.warmup2",
+      "stage": "encoder_A2",
+      "phase": "warmup",
+      "http_status": 200,
+      "bytes": 6940703,
+      "sha256": "c50c22e67ca11e2b0b8726ef5a44f138ef0dbc01650969bf997b847192809d10",
+      "http_e2e_s": 61.6610075798817,
+      "encode_prompt_s": 0.739508518949151,
+      "dit_s": 45.94416647404432,
+      "request_fields": {
+        "extra_params": "{\"audio_flow_shift\": 3.0}",
+        "flow_shift": "12.0",
+        "height": "864",
+        "num_inference_steps": "8",
+        "seconds": "12",
+        "seed": "42",
+        "width": "480",
+        "prompt_sha256": "9fb933739678525415daa5f2e6fb3e3b5cf92b991f59a5e8576f2edaeea9a72d"
+      },
+      "started_at_unix": 1795165646.1258674,
+      "input_references": [
+        {
+          "mime_type": "video/mp4",
+          "bytes": 561390,
+          "sha256": "cf57940d4d50d8ec062a8c1e567b3ea89f700c69671daf074e126ff3353ded68"
+        }
+      ],
+      "ranks": [
+        {
+          "rank": 0,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.409359980840236,
+            "diffuse": 45.94416647404432,
+            "encode_prompt": 0.739508518949151,
+            "encoder_forward": 0.36713020177558064,
+            "forward": 60.588547985069454
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 1,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.398813979234546,
+            "diffuse": 45.9440480209887,
+            "encode_prompt": 0.7386595928110182,
+            "encoder_forward": 0.35334618063643575,
+            "forward": 60.57783498009667
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 2,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.388709011953324,
+            "diffuse": 45.944074776023626,
+            "encode_prompt": 0.7386824227869511,
+            "encoder_forward": 0.3536993460729718,
+            "forward": 60.56832956429571
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 3,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.39333090884611,
+            "diffuse": 45.944117886945605,
+            "encode_prompt": 0.7386737512424588,
+            "encoder_forward": 0.37524597998708487,
+            "forward": 60.57195102982223
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 4,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.426982284057885,
+            "diffuse": 45.94404654484242,
+            "encode_prompt": 0.7386476621031761,
+            "encoder_forward": 0.3517325110733509,
+            "forward": 60.60632543824613
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 5,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.370416902005672,
+            "diffuse": 45.944112294353545,
+            "encode_prompt": 0.7387201790697873,
+            "encoder_forward": 0.34632599586620927,
+            "forward": 60.54864929616451
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 6,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.38475914299488,
+            "diffuse": 45.944085338618606,
+            "encode_prompt": 0.7387425862252712,
+            "encoder_forward": 0.34745691483840346,
+            "forward": 60.56396415410563
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 7,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.358272092882544,
+            "diffuse": 45.9441208159551,
+            "encode_prompt": 0.7386626061052084,
+            "encoder_forward": 0.34900558087974787,
+            "forward": 60.53621568903327
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        }
+      ],
+      "activation_fingerprints": {
+        "0": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          },
+          "video_input0": {
+            "dtype": "torch.uint8",
+            "sha256": "a4ea8caa4ebd971ae09b1bc0e818f8edaffd57b3b10db8a6fbc611012e165484",
+            "shape": [
+              52,
+              1280,
+              704,
+              3
+            ]
+          }
+        },
+        "1": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "2": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "3": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "4": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "5": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "6": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        },
+        "7": {
+          "encoder_output": {
+            "dtype": "torch.bfloat16",
+            "sha256": "a43d3a26dd3df21d7f5ab1a110c88a8623ffc6579a9f5c2aeb843ae26b470c44",
+            "shape": [
+              3413,
+              5120
+            ]
+          }
+        }
+      }
+    },
+    {
+      "label": "encoder_A2.formal1",
+      "stage": "encoder_A2",
+      "phase": "formal",
+      "http_status": 200,
+      "bytes": 6940703,
+      "sha256": "c50c22e67ca11e2b0b8726ef5a44f138ef0dbc01650969bf997b847192809d10",
+      "http_e2e_s": 61.5203442950733,
+      "encode_prompt_s": 0.7213626839220524,
+      "dit_s": 46.2779213800095,
+      "request_fields": {
+        "extra_params": "{\"audio_flow_shift\": 3.0}",
+        "flow_shift": "12.0",
+        "height": "864",
+        "num_inference_steps": "8",
+        "seconds": "12",
+        "seed": "42",
+        "width": "480",
+        "prompt_sha256": "9fb933739678525415daa5f2e6fb3e3b5cf92b991f59a5e8576f2edaeea9a72d"
+      },
+      "started_at_unix": 1795165708.882497,
+      "input_references": [
+        {
+          "mime_type": "video/mp4",
+          "bytes": 561390,
+          "sha256": "cf57940d4d50d8ec062a8c1e567b3ea89f700c69671daf074e126ff3353ded68"
+        }
+      ],
+      "ranks": [
+        {
+          "rank": 0,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.249202803242952,
+            "diffuse": 46.2779213800095,
+            "encode_prompt": 0.7213626839220524,
+            "encoder_forward": 0.3651762488298118,
+            "forward": 60.484200283885
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 1,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.27636173227802,
+            "diffuse": 46.277712425682694,
+            "encode_prompt": 0.7205850933678448,
+            "encoder_forward": 0.35163299134001136,
+            "forward": 60.51112426118925
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 2,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.263502977322787,
+            "diffuse": 46.27768594678491,
+            "encode_prompt": 0.7203529672697186,
+            "encoder_forward": 0.3498712917789817,
+            "forward": 60.498485481832176
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 3,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.28588678734377,
+            "diffuse": 46.27772744791582,
+            "encode_prompt": 0.7188026122748852,
+            "encoder_forward": 0.35464178305119276,
+            "forward": 60.52175253117457
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 4,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.270747367292643,
+            "diffuse": 46.277669976931065,
+            "encode_prompt": 0.720276621170342,
+            "encoder_forward": 0.34852646198123693,
+            "forward": 60.50644654920325
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 5,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.271627724636346,
+            "diffuse": 46.27772685326636,
+            "encode_prompt": 0.7206190577708185,
+            "encoder_forward": 0.34884762205183506,
+            "forward": 60.50648809084669
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 6,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.271169688086957,
+            "diffuse": 46.277673276141286,
+            "encode_prompt": 0.720596443861723,
+            "encoder_forward": 0.35301897721365094,
+            "forward": 60.50583956530318
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 7,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.2830657241866,
+            "diffuse": 46.27770434785634,
+            "encode_prompt": 0.720571706071496,
+            "encoder_forward": 0.35079503804445267,
+            "forward": 60.51778113329783
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        }
+      ]
+    },
+    {
+      "label": "encoder_A2.formal2",
+      "stage": "encoder_A2",
+      "phase": "formal",
+      "http_status": 200,
+      "bytes": 6940703,
+      "sha256": "c50c22e67ca11e2b0b8726ef5a44f138ef0dbc01650969bf997b847192809d10",
+      "http_e2e_s": 61.73724944703281,
+      "encode_prompt_s": 0.7232509348541498,
+      "dit_s": 46.520684259943664,
+      "request_fields": {
+        "extra_params": "{\"audio_flow_shift\": 3.0}",
+        "flow_shift": "12.0",
+        "height": "864",
+        "num_inference_steps": "8",
+        "seconds": "12",
+        "seed": "42",
+        "width": "480",
+        "prompt_sha256": "9fb933739678525415daa5f2e6fb3e3b5cf92b991f59a5e8576f2edaeea9a72d"
+      },
+      "started_at_unix": 1795165771.5057487,
+      "input_references": [
+        {
+          "mime_type": "video/mp4",
+          "bytes": 561390,
+          "sha256": "cf57940d4d50d8ec062a8c1e567b3ea89f700c69671daf074e126ff3353ded68"
+        }
+      ],
+      "ranks": [
+        {
+          "rank": 0,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.254426581785083,
+            "diffuse": 46.520684259943664,
+            "encode_prompt": 0.7232509348541498,
+            "encoder_forward": 0.3582615368068218,
+            "forward": 60.706236615777016
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 1,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.227589135058224,
+            "diffuse": 46.52047684695572,
+            "encode_prompt": 0.7224057409912348,
+            "encoder_forward": 0.3500127512961626,
+            "forward": 60.67836146708578
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 2,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.243761774618179,
+            "diffuse": 46.52043211692944,
+            "encode_prompt": 0.7224018252454698,
+            "encoder_forward": 0.35154304979369044,
+            "forward": 60.69546297611669
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 3,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.247787014115602,
+            "diffuse": 46.52046275418252,
+            "encode_prompt": 0.7203799113631248,
+            "encoder_forward": 0.3580128289759159,
+            "forward": 60.69901753216982
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 4,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.296559105161577,
+            "diffuse": 46.52043147198856,
+            "encode_prompt": 0.7224598117172718,
+            "encoder_forward": 0.3462442667223513,
+            "forward": 60.74739181576297
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 5,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.24559483723715,
+            "diffuse": 46.52043496305123,
+            "encode_prompt": 0.7224377458915114,
+            "encoder_forward": 0.3437174940481782,
+            "forward": 60.69745027180761
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 6,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.26190619636327,
+            "diffuse": 46.520430884789675,
+            "encode_prompt": 0.7224350441247225,
+            "encoder_forward": 0.3451605699956417,
+            "forward": 60.71246635913849
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 7,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.267826201859862,
+            "diffuse": 46.520441161002964,
+            "encode_prompt": 0.722411832306534,
+            "encoder_forward": 0.36715567810460925,
+            "forward": 60.718230206053704
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        }
+      ]
+    },
+    {
+      "label": "encoder_A2.formal3",
+      "stage": "encoder_A2",
+      "phase": "formal",
+      "http_status": 200,
+      "bytes": 6940703,
+      "sha256": "c50c22e67ca11e2b0b8726ef5a44f138ef0dbc01650969bf997b847192809d10",
+      "http_e2e_s": 61.95373245514929,
+      "encode_prompt_s": 0.7080385368317366,
+      "dit_s": 46.73920017387718,
+      "request_fields": {
+        "extra_params": "{\"audio_flow_shift\": 3.0}",
+        "flow_shift": "12.0",
+        "height": "864",
+        "num_inference_steps": "8",
+        "seconds": "12",
+        "seed": "42",
+        "width": "480",
+        "prompt_sha256": "9fb933739678525415daa5f2e6fb3e3b5cf92b991f59a5e8576f2edaeea9a72d"
+      },
+      "started_at_unix": 1795165834.3514163,
+      "input_references": [
+        {
+          "mime_type": "video/mp4",
+          "bytes": 561390,
+          "sha256": "cf57940d4d50d8ec062a8c1e567b3ea89f700c69671daf074e126ff3353ded68"
+        }
+      ],
+      "ranks": [
+        {
+          "rank": 0,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.24886275222525,
+            "diffuse": 46.73920017387718,
+            "encode_prompt": 0.7080385368317366,
+            "encoder_forward": 0.3675610036589205,
+            "forward": 60.92771412199363
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 1,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.240933030843735,
+            "diffuse": 46.7390935071744,
+            "encode_prompt": 0.7070880988612771,
+            "encoder_forward": 0.3622628962621093,
+            "forward": 60.92104733781889
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 2,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.23585833190009,
+            "diffuse": 46.739071821793914,
+            "encode_prompt": 0.7071497966535389,
+            "encoder_forward": 0.3560067620128393,
+            "forward": 60.9149850839749
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 3,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.23746216762811,
+            "diffuse": 46.739069214090705,
+            "encode_prompt": 0.7070464720018208,
+            "encoder_forward": 0.36451959097757936,
+            "forward": 60.91733745485544
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 4,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.257664675824344,
+            "diffuse": 46.73902375996113,
+            "encode_prompt": 0.7071458701975644,
+            "encoder_forward": 0.3560490580275655,
+            "forward": 60.93665095092729
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 5,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.241180839948356,
+            "diffuse": 46.73906230088323,
+            "encode_prompt": 0.7071388261392713,
+            "encoder_forward": 0.36098097171634436,
+            "forward": 60.91985475784168
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 6,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.261551929172128,
+            "diffuse": 46.73904105601832,
+            "encode_prompt": 0.7071384359151125,
+            "encoder_forward": 0.3572739870287478,
+            "forward": 60.940744491294026
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        },
+        {
+          "rank": 7,
+          "counts": {
+            "dit": 8,
+            "encode": 1,
+            "new_pack": 0,
+            "prepare_packed": 0
+          },
+          "durations": {
+            "decode": 8.240559046156704,
+            "diffuse": 46.73903778102249,
+            "encode_prompt": 0.7071202071383595,
+            "encoder_forward": 0.3602444841526449,
+            "forward": 60.91954746004194
+          },
+          "packed_stager": false,
+          "parameter_precision": {
+            "text_encoder": {
+              "torch.bfloat16": 281039232
+            },
+            "transformer": {
+              "torch.bfloat16": 1472750592,
+              "torch.float32": 17222144
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "statistics": {
+    "http_e2e": {
+      "samples": [
+        [
+          61.166108837816864,
+          61.415012535173446,
+          61.69643689226359
+        ],
+        [
+          61.30425822502002,
+          61.62573316274211,
+          61.74689798383042
+        ],
+        [
+          61.5203442950733,
+          61.73724944703281,
+          61.95373245514929
+        ]
+      ],
+      "means": [
+        61.425852755084634,
+        61.55896312386418,
+        61.73710873241847
+      ],
+      "sd": [
+        0.26533016057188985,
+        0.22874913680438694,
+        0.2166941143039319
+      ],
+      "control": 61.58129684174739,
+      "control_interpolation_weight": 0.4994091615340351,
+      "arm_mean_unix_times": [
+        1795164668.2020757,
+        1795165219.2390635,
+        1795165771.5798874
+      ],
+      "optimized": 61.55896312386418,
+      "saved": 0.022333717883206816,
+      "percent": 0.036267047023384985,
+      "bootstrap95_saved": [
+        -0.23346701429188244,
+        0.29338506599242464
+      ],
+      "noise_sd": 0.26533016057188985,
+      "distinguishable": false
+    },
+    "encode_prompt": {
+      "samples": [
+        [
+          0.6889647911302745,
+          0.7017356879077852,
+          0.693365859799087
+        ],
+        [
+          0.6907796859741211,
+          0.7106403200887144,
+          0.7082747877575457
+        ],
+        [
+          0.7213626839220524,
+          0.7232509348541498,
+          0.7080385368317366
+        ]
+      ],
+      "means": [
+        0.6946887796123823,
+        0.703231597940127,
+        0.7175507185359796
+      ],
+      "sd": [
+        0.00648741387224252,
+        0.010848341786158974,
+        0.008291717160910851
+      ],
+      "control": 0.7061062413612584,
+      "control_interpolation_weight": 0.4994091615340351,
+      "arm_mean_unix_times": [
+        1795164668.2020757,
+        1795165219.2390635,
+        1795165771.5798874
+      ],
+      "optimized": 0.703231597940127,
+      "saved": 0.0028746434211314176,
+      "percent": 0.40711202546369946,
+      "bootstrap95_saved": [
+        -0.007012349815853969,
+        0.014925149715310893
+      ],
+      "noise_sd": 0.010848341786158974,
+      "distinguishable": false
+    },
+    "dit": {
+      "samples": [
+        [
+          45.929328980855644,
+          46.28809688379988,
+          46.54539926489815
+        ],
+        [
+          46.20650664111599,
+          46.52620911877602,
+          46.69147845497355
+        ],
+        [
+          46.2779213800095,
+          46.520684259943664,
+          46.73920017387718
+        ]
+      ],
+      "means": [
+        46.254275043184556,
+        46.474731404955186,
+        46.51260193794345
+      ],
+      "sd": [
+        0.309424605351627,
+        0.24654995705584026,
+        0.23074558362987405
+      ],
+      "control": 46.38328586109779,
+      "control_interpolation_weight": 0.4994091615340351,
+      "arm_mean_unix_times": [
+        1795164668.2020757,
+        1795165219.2390635,
+        1795165771.5798874
+      ],
+      "optimized": 46.474731404955186,
+      "saved": -0.09144554385739667,
+      "percent": -0.19715193126085348,
+      "bootstrap95_saved": [
+        -0.3728261719339727,
+        0.2027899814364318
+      ],
+      "noise_sd": 0.309424605351627,
+      "distinguishable": false
+    }
+  },
+  "correctness": {
+    "all_media_sha256_equal": true,
+    "warmup_activation_sha256_equal": true,
+    "one_video_one_audio_stream": true,
+    "full_ffmpeg_decode": true
+  }
+}
