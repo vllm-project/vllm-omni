@@ -182,6 +182,7 @@ class OmniServer:
         use_omni: bool = True,
         startup_timeout: int = SERVER_STARTUP_TIMEOUT_S,
         wait_for_device_memory: bool = True,
+        defer_stderr: bool = False,
     ) -> None:
         self.wait_for_device_memory = wait_for_device_memory
         if self.wait_for_device_memory:
@@ -194,6 +195,7 @@ class OmniServer:
         self.log_stats = "--disable-log-stats" not in self.serve_args and "--log-stats" in self.serve_args
         self.env_dict = env_dict
         self.use_omni = use_omni
+        self.defer_stderr = defer_stderr
         self.proc: subprocess.Popen | None = None
         self.host = "127.0.0.1"
         self._auto_port = port is None
@@ -333,11 +335,12 @@ class OmniServer:
 
         print(f"Launching OmniServer with: {' '.join(cmd)}")
         startup_t0 = time.perf_counter()
-        # Inherit stdout and drain stderr into the diagnostic buffer.
-        # Replaying it once at teardown preserves request-failure context
-        # without synchronously writing and flushing every server line while a
-        # performance benchmark is being measured. errors=replace keeps the
-        # reader alive on undecodable bytes so a full pipe cannot hang serve.
+        # Inherit stdout and preserve stderr in the diagnostic buffer. Functional
+        # tests tee each line immediately so a shared server's traceback stays
+        # attached to the failing test. Performance tests can opt into a single
+        # teardown replay to avoid synchronous writes during measurement.
+        # errors=replace keeps the reader alive on undecodable bytes so a full
+        # pipe cannot hang serve.
         self._server_error_lines = []
         self._server_log_thread = None
         self._server_ready = False
@@ -359,6 +362,13 @@ class OmniServer:
                 try:
                     for line in stderr:
                         error_lines.append(line)
+                        if not self.defer_stderr:
+                            try:
+                                sys.stderr.write(line)
+                                sys.stderr.flush()
+                            except (OSError, ValueError):
+                                # A closed capture must not stop draining the pipe.
+                                pass
                 except Exception:
                     pass
 
@@ -584,7 +594,7 @@ class OmniServer:
                 self._kill_process_tree(self.proc.pid)
         finally:
             self._stop_stderr_reader()
-            if self._server_ready:
+            if self.defer_stderr and self._server_ready:
                 self._replay_server_error_tail()
             self._server_ready = False
             if self._port_lock is not None:

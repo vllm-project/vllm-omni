@@ -1226,6 +1226,7 @@ def test_judge_uses_allocated_device(monkeypatch, device_env, devices, judge_ind
     @contextmanager
     def server(model, args, **kwargs):
         assert kwargs["wait_for_device_memory"] is False
+        assert kwargs["defer_stderr"] is True
         seen.append(kwargs["env_dict"])
 
         class Endpoint:
@@ -1242,6 +1243,26 @@ def test_judge_uses_allocated_device(monkeypatch, device_env, devices, judge_ind
     assert __import__("os").environ[device_env] == devices
     with pytest.raises(ValueError, match="outside"):
         runner._resolve_judge_visible_devices(str(len(devices.split(","))), device_env)
+
+
+def test_performance_server_defers_stderr_replay(monkeypatch):
+    from tests.dfx.perf.scripts import run_benchmark as runner
+
+    seen = []
+
+    @contextmanager
+    def server(model, args, **kwargs):
+        seen.append(kwargs)
+        yield ServerEndpoint(model=model)
+
+    monkeypatch.setattr(runner, "OmniServer", server)
+    monkeypatch.setattr(runner, "_resolve_offline_model", lambda model, revision=None: model)
+    monkeypatch.setattr(runner, "_judge_server_params_for_test", lambda test_name: None)
+    monkeypatch.setattr(runner, "_omni_server_env", lambda: {})
+    with runner._start_omni_server(("perf-case", "model", None, None, (), False)):
+        pass
+    assert len(seen) == 1
+    assert seen[0]["defer_stderr"] is True
 
 
 def test_omniinteract_result_rejects_incomplete_artifacts():

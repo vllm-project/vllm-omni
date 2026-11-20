@@ -54,15 +54,14 @@ def test_request_disconnect_preserves_server_stderr(monkeypatch, capfd):
             connection.close()
         assert server.proc is not None
         assert server.proc.wait(timeout=5) == 7
+        assert server._server_log_thread is not None
+        server._server_log_thread.join(timeout=5)
+        assert "injected server failure after readiness" in capfd.readouterr().err
 
-    # Teardown replays the buffered diagnostics once instead of streaming each line
-    # while the server is handling measured requests.
-    assert "injected server failure after readiness" in capfd.readouterr().err
 
-
-def test_ready_server_stderr_is_deferred_until_teardown(monkeypatch, capfd):
+def test_performance_server_stderr_is_deferred_until_teardown(monkeypatch, capfd):
     monkeypatch.setattr(runtime, "cleanup_test_environment", lambda: None)
-    server = runtime.OmniServer("fake-model", [])
+    server = runtime.OmniServer("fake-model", [], defer_stderr=True)
     popen = subprocess.Popen
 
     def launch(*args, **kwargs):

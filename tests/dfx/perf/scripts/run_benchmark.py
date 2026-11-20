@@ -169,6 +169,7 @@ def _start_judge_server(judge_params: dict[str, object]):
         # The primary model is alive on another visible device. Its outer
         # OmniServer owns the final device-memory wait after both servers exit.
         wait_for_device_memory=False,
+        defer_stderr=True,
     ) as judge:
         print(f"Benchmark judge started on {judge.host}:{judge.port}")
         yield judge
@@ -289,7 +290,13 @@ def _start_omni_server(server_param):
     model = _resolve_offline_model(model, revision=_cli_flag_value(extra, "--revision"))
     print(f"Starting OmniServer with test: {test_name}, model: {model}")
     judge_params = _judge_server_params_for_test(test_name)
-    with OmniServer(model, server_args, use_omni=use_omni, env_dict=_omni_server_env()) as server:
+    with OmniServer(
+        model,
+        server_args,
+        use_omni=use_omni,
+        env_dict=_omni_server_env(),
+        defer_stderr=True,
+    ) as server:
         server.test_name = test_name
         server.judge_base_url = None
         print("OmniServer started successfully")
