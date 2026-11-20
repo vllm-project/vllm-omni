@@ -96,6 +96,7 @@ environment variables.
 | `VLLM_OMNI_AR_SLEEP_DISCARD_WEIGHTS` | `1` enables; default `0` (off) | `AsyncOmni.sleep(level=2)` on AR stages; read on each sleep call | Only the exact value `1` lets AR stages wake after a level-2 sleep. The weights are discarded, not offloaded to host memory, so the caller must rewrite every parameter (an RL full-weight sync) before generating. Buffers and other non-parameter tensors are restored on wake. Diffusion stages still raise on wake after level 2. | Experimental |
 | `VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT` | Float seconds; default `600` | Diffusion engine async-output wait in `step_streaming`; resolved per call on the request path, not at import | Environment-only setting. A non-float or `<=0` value warns once and uses the default. | Experimental |
 | `VLLM_OMNI_CODE2WAV_WATCHDOG_TIMEOUT_S` | Positive finite seconds; unset or `<=0` disables | MiniCPM-o 4.5 Code2Wav stage; read when each Code2Wav model instance initializes | Reports the current phase, bounded request details, and the blocked owner-thread Python stack once per operation without interrupting it. Invalid or non-finite values raise `ValueError` at model startup. | Diagnostic |
+| `VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND` | `maskless` or `triton`; default: `maskless` with vLLM-bundled FA4/FA3/FA2, `triton` without FlashAttention | Cosmos3-Nano-Transfer-Auto pipeline at load time | Pins the multiview attention kernel strategy; both implement the same visibility rules. Unknown values, including the removed `fa4` strategy, fail at load. | Experimental |
 | `VLLM_OMNI_ENABLE_RUN_ENDPOINT` | `1` to enable; default off | Read when the server initializes its endpoints | Indicates that `POST /v1/run` should be enabled for independent stage execution; this should only be used by trusted callers. | Experimental |
 | `VLLM_OMNI_EVENT_DRIVEN_ORCH` | Defaults to on; `0`, `false`, `no` or `off` selects the legacy poll loop | Orchestrator stage-output loop; resolved at `Orchestrator` construction | Unset selects event-driven orchestration for every pipeline. Values are stripped and case-normalized; `1`, `true`, `yes` or `on` keep it enabled and any other value selects the legacy poll loop. The serving-side final-output loop always wakes on orchestrator output, independent of this setting. Set before server startup. | Experimental |
 | `VLLM_OMNI_INPUT_WAIT_TIMEOUT_S` | Float seconds; default `600`; `<=0` disables | Full-payload input coordinator, not async-chunk transfer; read when the scheduler module imports in each worker | Environment-only setting. A non-float logs a warning and uses `600`. | Stable operational control |
@@ -111,6 +112,8 @@ environment variables.
 
 | Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
 | --- | --- | --- | --- | --- |
+| `VLLM_OMNI_SPEECH_EDGE_PAD` | `0`/`1`-style truthy string; default `1` (shaping on) | VoxCPM2 edge digit-run prosody shaping; request text frontend | Read per request in the TTS text path. Falsy spellings (`0`/`false`/`no`/`off`, case-insensitive, surrounding whitespace ignored) disable the shaping (the text passes through untouched); anything else keeps it on (comma lead-in for edge digit-runs, sentence-final stop for trailing runs, lone-zero sentinel) — the same truthy/falsy convention as the NPU patch switches. | Behavioral switch, default on |
+| `VLLM_OMNI_SPEECH_TEXT_NORMALIZE` | `0`/`1`-style truthy string; default `1` (TN on) | VoxCPM2 digit/symbol text normalization (TextNormalizer); request text frontend | Read per request in the TTS text path. Falsy spellings (`0`/`false`/`no`/`off`, case-insensitive) skip numeric normalization; anything else keeps it on when the optional `TextNormalizer` dependency imports (an unavailable normalizer degrades to the TN-off path for both values; the lone-zero sentinel handling is independent of this switch). | Behavioral switch, default on |
 | `VLLM_OMNI_NIXL_LEASE_S` | Float seconds; default `3600` | Unclaimed producer payload expiry; connector construction | Nonempty environment value overrides `lease_seconds`; empty falls back to config/default. Invalid floats raise `ValueError`. Claimed READ allocations never expire by time. | Experimental |
 | `VLLM_OMNI_NIXL_XFER_TIMEOUT_S` | Float seconds; default `300` | Receiver READ wait; connector construction | Nonempty environment value overrides `transfer_timeout_s`; empty falls back to config/default. Invalid floats raise `ValueError`. Timeout does not cancel DMA or release active allocations. | Experimental |
 
@@ -193,7 +196,7 @@ their keys only.
 ## Inherited vLLM variables
 
 vLLM-Omni also reads variables through its aligned vLLM dependency. Refer to
-the [vLLM 0.33 environment-variable reference](https://docs.vllm.ai/en/v0.33.0/configuration/env_vars/)
+the [vLLM 0.34 environment-variable reference](https://github.com/vllm-project/vllm/blob/v0.34.0/docs/configuration/env_vars.md)
 for their definitions. This includes vLLM launch, cache, logging, plugin, ROCm,
 XPU, ModelScope, and FlashInfer workspace settings.
 

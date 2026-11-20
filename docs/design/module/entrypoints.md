@@ -82,6 +82,12 @@ last_verified_commit: 3d7fc3b9ba3cac88d579d4dc35b78b0b641675fc
 Entrypoints translate offline, CLI, and serving requests into stable engine
 operations and translate engine outputs into public responses.
 
+`AsyncOmni` explicitly rejects the process checkpoint methods exposed by newer
+vLLM `EngineClient` versions (`checkpoint_prepare`, `checkpoint_restore`, and
+`checkpoint_state`). This keeps ordinary serving instantiable without claiming
+checkpoint support. All three raise `NotImplementedError` before accessing or
+changing stage state; sleep and weight-transfer APIs retain their own contracts.
+
 ## Contract status
 
 This document describes current entrypoint responsibilities plus the boundary
@@ -115,6 +121,9 @@ launches the shared local stage engines. Each frontend receives only its own
 stage-client channel configuration and does not launch or retire backend
 processes. CLI validation rejects unsupported distributed, diffusion,
 fault-tolerant, elastic-EP, Ray, and runtime-LoRA combinations before startup.
+
+`DuplexOmni` supports an optional session-only process runtime. See
+[process runtime usage, ownership, and limits](../../serving/full_duplex_api.md#run-the-duplex-runtime-in-a-separate-process).
 
 It does not own configuration precedence, cross-stage routing, stage
 placement, payload implementation, or semantic error classification.

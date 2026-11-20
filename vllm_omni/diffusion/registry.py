@@ -54,11 +54,6 @@ _DIFFUSION_MODELS = {
         "pipeline_qwen_image_edit_plus",
         "QwenImageEditPlusPipeline",
     ),
-    "JoyImageEditPipeline": (
-        "joy_image",
-        "pipeline_joy_image_edit",
-        "JoyImageEditPipeline",
-    ),
     "QwenImageLayeredPipeline": (
         "qwen_image",
         "pipeline_qwen_image_layered",
@@ -439,6 +434,16 @@ _DIFFUSION_MODELS = {
         "pipeline_cosmos3",
         "Cosmos3OmniDiffusersPipeline",
     ),
+    "Cosmos3MultiviewPipeline": (
+        "cosmos3",
+        "pipeline_cosmos3_multiview",
+        "Cosmos3MultiviewPipeline",
+    ),
+    "Cosmos3NanoSimBimanualPipeline": (
+        "cosmos3_nano_sim_bimanual",
+        "pipeline_cosmos3_nano_sim_bimanual",
+        "Cosmos3NanoSimBimanualPipeline",
+    ),
     "DiffusersAdapterPipeline": (
         "diffusers_adapter",
         "pipeline_diffusers_adapter",
@@ -566,6 +571,9 @@ _NO_CACHE_ACCELERATION = {
     "Sam3Model",
     "Sam3VideoModel",
     "LingBotWorldCausalDMDPipeline",
+    # Cache-DiT has not been validated with the model-local FlexAttention mask.
+    "Cosmos3MultiviewPipeline",
+    "Cosmos3NanoSimBimanualPipeline",
     "TaoMateH3Pipeline",
     # PDD release: one fused output head per step, nothing to cache or skip.
     "MiniMaxH3ImagePipeline",
@@ -783,7 +791,6 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "AnimaPipeline": "get_anima_post_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_post_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_post_process_func",
-    "JoyImageEditPipeline": "get_joy_image_edit_post_process_func",
     "QwenImage21Pipeline": "get_qwen_image_21_post_process_func",
     "GlmImagePipeline": "get_glm_image_post_process_func",
     "ZImagePipeline": "get_post_process_func",
@@ -851,6 +858,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
+    "Cosmos3MultiviewPipeline": "get_cosmos3_multiview_post_process_func",
+    "Cosmos3NanoSimBimanualPipeline": "get_cosmos3_post_process_func",
     "HiDreamO1ImagePipeline": "get_hidream_o1_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
     "Krea2Pipeline": "get_krea2_post_process_func",
@@ -869,6 +878,8 @@ _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
     # where mod_folder and mod_relname are defined and mapped using `_DIFFUSION_MODELS` via the `arch` key.
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_ir_op_priority_func",
     "Cosmos3OmniPipeline": "get_cosmos3_ir_op_priority_func",
+    "Cosmos3MultiviewPipeline": "get_cosmos3_ir_op_priority_func",
+    "Cosmos3NanoSimBimanualPipeline": "get_cosmos3_ir_op_priority_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -883,7 +894,6 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "BooguImageTurboPipeline": "get_boogu_image_pre_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_pre_process_func",
-    "JoyImageEditPipeline": "get_joy_image_edit_pre_process_func",
     "QwenImage21Pipeline": "get_qwen_image_21_pre_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_edit_pre_process_func",
     "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_pre_process_func",
@@ -907,6 +917,8 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "SanaWmPipeline": "get_sana_wm_pre_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
+    "Cosmos3MultiviewPipeline": "get_cosmos3_multiview_pre_process_func",
+    "Cosmos3NanoSimBimanualPipeline": "get_cosmos3_nano_sim_bimanual_pre_process_func",
     "MammothModa2DiTPipeline": "get_mammoth_moda2_pre_process_func",
     "Kandinsky6TI2VAPipeline": "get_kandinsky6_pre_process_func",
     "Flux3Pipeline": "get_flux3_pre_process_func",

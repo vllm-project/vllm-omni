@@ -14,8 +14,9 @@ import copy
 import gc
 import math
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
+from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -55,6 +56,7 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionMetadata,
     DiffusionPagedAttentionRow,
 )
+from vllm_omni.diffusion.distributed.member_batch import BatchMember, ExecutionBatch
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_rank
 from vllm_omni.diffusion.forward_context import bind_attention_schedule, set_forward_context
 from vllm_omni.diffusion.graph import warn_if_denoise_graph_unsupported
@@ -81,6 +83,7 @@ from vllm_omni.diffusion.offloader.config import (
 from vllm_omni.diffusion.postprocess.device_reduction import prepare_diffusion_media_for_transport
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION, DiffusionModelRegistry
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.request_streaming import request_chunk_emitter
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
     DiffusionSchedulerOutput,
@@ -174,6 +177,36 @@ def _normalize_pipeline_outputs(
     return outputs
 
 
+def _abort_stepwise_prep(
+    state_cache: dict[str, Any],
+    state: Any,
+    error_outputs: list[Any],
+    per_req_exc: BaseException | None,
+) -> None:
+    """Drop a stepwise request whose preparation failed, recording why.
+
+    Called on every DiT rank so a peer failure cannot leave one rank out of the
+    following collective.
+    """
+    state_cache.pop(state.request_id, None)
+    if per_req_exc is None:
+        per_req_exc = RuntimeError(f"Stepwise preparation failed on another DiT rank for {state.request_id}")
+    logger.error(
+        "Stepwise request preparation failed for %s: %s",
+        state.request_id,
+        per_req_exc,
+        exc_info=isinstance(per_req_exc, Exception),
+    )
+    error_outputs.append(
+        RunnerOutput(
+            request_id=state.request_id,
+            step_index=state.step_index,
+            finished=True,
+            result=DiffusionOutput.from_exception(per_req_exc),
+        )
+    )
+
+
 def _attention_schedule_scope(
     schedule: AttentionSchedule, sigma_schedule: AttentionSigmaSchedule, *, from_request: bool = False
 ) -> AbstractContextManager[Any]:
@@ -230,9 +263,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
         # Initialize KV cache manager for connector management.
         payload_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
-        self.kv_transfer_manager = (
-            payload_transfer_manager if getattr(od_config, "kv_transfer_config", None) is None else None
-        )
+        self.kv_transfer_manager = payload_transfer_manager if od_config.kv_transfer_config is None else None
         self.init_omni_connectors(od_config, payload_transfer_manager, synchronous=True)  # type: ignore[arg-type]
         self._kv_connector = None
         from vllm_omni.diffusion.diffusion_kv.kv_connector import KVReceiveProgress, native_prefetch_enabled
@@ -241,7 +272,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
         # Prefetch covers TP / SP / CFG-Parallel / HSDP.  Disabled when a CFG
         # companion KV collector is set (that KV is not backgrounded).
-        has_cfg_companion_kv = getattr(od_config, "cfg_kv_collect_func", None) is not None
+        has_cfg_companion_kv = od_config.cfg_kv_collect_func is not None
 
         self._kv_prefetch_enabled = (
             self.kv_transfer_manager is not None
@@ -260,7 +291,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         request_id: str,
         metadata: DiffusionKVMetadata | None,
     ) -> None:
-        cache_mode = getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+        cache_mode = self.od_config.diffusion_kv_mode
         if cache_mode is DiffusionKVCacheMode.PAGED_SCHEDULER and metadata is None:
             raise ValueError(f"paged_scheduler request {request_id!r} requires Diffusion KV metadata")
         if cache_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER and metadata is not None:
@@ -281,7 +312,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         graph_layer = None
         if getattr(model, "enable_cuda_graph_decode", False):
             graph_layer = "CUDA graph decode"
-        elif getattr(self.od_config, "diffusion_use_graph", False):
+        elif self.od_config.diffusion_use_graph:
             graph_layer = "denoise graphs"
         if graph_layer is not None:
             # Graph capture records the compiled (fused) kernels. Scope inductor
@@ -356,11 +387,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         # Resolve environment overrides before model loading. Rank-local
         # prompt-cache hits cannot safely skip text-encoder collectives.
         enable_pec, pec_size = resolve_prompt_embed_cache_config(
-            enable=getattr(self.od_config, "enable_prompt_embed_cache", False),
-            max_size=getattr(self.od_config, "prompt_embed_cache_size", 32),
+            enable=self.od_config.enable_prompt_embed_cache,
+            max_size=self.od_config.prompt_embed_cache_size,
         )
         resolved_offload = resolve_offload(self.od_config)
-        dp_size = int(getattr(getattr(self.od_config, "parallel_config", None), "data_parallel_size", 1))
+        dp_size = int(self.od_config.parallel_config.data_parallel_size)
         if (
             enable_pec
             and dp_size > 1
@@ -381,11 +412,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
         load_device = "cpu" if offload_enabled(self.od_config) else str(self.device)
 
-        def get_memory_context() -> AbstractContextManager[Any]:
-            if memory_pool_context_fn is not None:
-                return memory_pool_context_fn("weights")
-            return nullcontext()
-
+        # Built inline: ``load_class_methods`` executes this method with a
+        # whitelisted namespace, so module-level helpers are not reachable here.
+        get_memory_context = (
+            partial(memory_pool_context_fn, "weights") if memory_pool_context_fn is not None else nullcontext
+        )
         # Load model within forward context
         weight_sharing_backend = None
         if shared_group is not None:
@@ -423,23 +454,17 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         logger.info("Model runner: Model loaded successfully.")
         warn_if_denoise_graph_unsupported(self.od_config, self.pipeline)
 
-        if self.od_config.streaming_output and not getattr(self.od_config, "step_execution", False):
-            logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
+        if self.od_config.streaming_output and not self.od_config.step_execution and self._supports_step_mode():
+            logger.warning("streaming_output=True enables step execution for a step-capable pipeline.")
             self.od_config.step_execution = True
 
-        if getattr(self.od_config, "step_execution", False) and not self._supports_step_mode():
+        if self.od_config.step_execution and not self._supports_step_mode():
             raise ValueError(
                 "step_execution=True requires a pipeline implementing "
                 "prepare_encode(), denoise_step(), post_decode(), and either "
                 "step_scheduler() or denoise_step_updates_state=True; "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
-        if self.od_config.streaming_output and not self._supports_step_mode():
-            raise ValueError(
-                "streaming_output=True requires step execution support; "
-                f"{self.od_config.model_class_name} does not support that contract."
-            )
-
         # The offloader owns loader-plan handoff and startup recovery. The
         # runner only receives the pipeline/backend pair that is ready to use.
         self.pipeline, self.offload_backend = enable_offload_backend(
@@ -523,7 +548,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         are accepted; a custom pipeline is not. A stage that runs no denoising, such as the encode
         stage of a disaggregated deployment, is also rejected: its schedule would never apply.
         """
-        if getattr(self.od_config, "diffusion_attention_schedule", None) is None:
+        if self.od_config.diffusion_attention_schedule is None:
             return
         model_class_name = self.od_config.model_class_name
         pipeline_class_name = None
@@ -547,7 +572,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         scheduled step would not run the attention it selects. Runs after the cache backend is
         final, because a model without cache acceleration clears ``od_config.cache_backend``.
         """
-        service = getattr(self.od_config, "diffusion_attention_schedule", None)
+        service = self.od_config.diffusion_attention_schedule
         if service is None:
             return
         cache_backend = self.od_config.cache_backend
@@ -557,6 +582,25 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 f"but cache_backend={cache_backend!r} reuses or skips transformer evaluations across denoise "
                 "steps. Disable the cache backend or remove the schedule."
             )
+
+    def run_helios_vae_warmup(self) -> None:
+        """Run configured Helios VAE profiles after engine startup dummy work."""
+        additional_config = getattr(self.od_config, "additional_config", None) or {}
+        if not isinstance(additional_config, Mapping):
+            raise TypeError("additional_config must be a mapping to configure Helios VAE warmup")
+        if "helios_vae_warmup_profiles" not in additional_config:
+            return
+
+        profiles = additional_config["helios_vae_warmup_profiles"]
+        if profiles is None or (
+            isinstance(profiles, Sequence) and not isinstance(profiles, (str, bytes, Mapping)) and not profiles
+        ):
+            return
+
+        warmup = getattr(self.pipeline, "warmup_vae_profiles", None)
+        if not callable(warmup):
+            raise ValueError("additional_config.helios_vae_warmup_profiles is only supported by HeliosPipeline")
+        warmup(profiles)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Collect native specs from cache-enabled loaded attention modules."""
@@ -593,7 +637,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
         self.diffusion_kv_backend.initialize_kv_cache(kv_cache_config)
         self.kv_cache_config = self.diffusion_kv_backend.kv_cache_config
-        if getattr(self.od_config, "kv_transfer_config", None) is not None:
+        if self.od_config.kv_transfer_config is not None:
             from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector
 
             self._kv_connector = ActiveKVConnector(self.vllm_config, self.diffusion_kv_backend.kv_caches_by_layer)
@@ -630,7 +674,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
     ) -> DiffusionPagedAttentionMetadata:
         """Translate Scheduler sequence state into ordered request-level rows."""
 
-        cfg_size = int(getattr(self.od_config.parallel_config, "cfg_parallel_size", 1) or 1)
+        cfg_size = int(self.od_config.parallel_config.cfg_parallel_size or 1)
         cfg_rank = get_classifier_free_guidance_rank() if cfg_size > 1 else None
         prefill_rows: list[DiffusionPagedAttentionRow] = []
         denoise_rows: list[DiffusionPagedAttentionRow] = []
@@ -654,7 +698,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 # Imported AR KV and local hits have separate owners.
                 kv_start_pos = (
                     sequence.num_computed_tokens
-                    if getattr(self.od_config, "kv_transfer_config", None) is not None
+                    if self.od_config.kv_transfer_config is not None
                     else sequence.cached_prefix_len
                 )
                 prefill_rows.append(
@@ -768,7 +812,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         else:
             self.kv_transfer_manager.receive_multi_kv_cache_distributed(
                 req,
-                cfg_kv_collect_func=getattr(od_config, "cfg_kv_collect_func", None),
+                cfg_kv_collect_func=od_config.cfg_kv_collect_func,
                 target_device=self._target_device if use_prefetch else getattr(self.pipeline, "device", None),
             )
         kv_recv_ms = (time.perf_counter() - kv_recv_t0) * 1000
@@ -889,7 +933,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 raise ValueError("Cannot execute model with empty prompt")
         if require_request_batch_support and not getattr(self.pipeline, "supports_request_batch", False):
             raise RuntimeError(f"{type(self.pipeline).__name__} does not support request-batch forward.")
-        service = getattr(od_config, "diffusion_attention_schedule", None)
+        service = od_config.diffusion_attention_schedule
         sampling_params = [req.sampling_params for req in reqs]
         attention_schedule = resolve_batch_attention_schedule(sampling_params, service)
         sigma_schedule = resolve_batch_attention_sigma_schedule(sampling_params, service)
@@ -924,7 +968,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                         "Diffusion KV metadata count must match the request batch: "
                         f"metadata={len(diffusion_kv_metadata)}, requests={len(reqs)}"
                     )
-                native_kv_transfer = getattr(self.od_config, "kv_transfer_config", None) is not None
+                native_kv_transfer = self.od_config.kv_transfer_config is not None
                 if native_kv_transfer:
                     for req, metadata in zip(reqs, diffusion_kv_metadata, strict=True):
                         # This field is consumed by Hunyuan only for native
@@ -969,6 +1013,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
                 ),
                 paged_kv_context,
+                request_chunk_emitter(
+                    reqs,
+                    enabled=self.od_config.streaming_output,
+                ),
                 request_cancellation_scope(
                     [getattr(req, "cancellation_signal", None) for req in reqs],
                     enabled=getattr(self.pipeline, "supports_request_cancellation", False) is True,
@@ -1118,7 +1166,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         runner_output: BatchRunnerOutput | None = None
         request_ids = [request.request_id for request in requests]
         try:
-            if getattr(self.od_config, "step_execution", False):
+            if self.od_config.step_execution:
                 packed_requests = [info for request in requests if (info := request.mixfusion_info) is not None]
                 if packed_requests and (
                     len(packed_requests) != len(requests) or not fits_chunk_budget(packed_requests)
@@ -1234,11 +1282,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         finished_req_ids = scheduler_output.finished_req_ids
         self.release_step_requests(list(finished_req_ids))
 
-        if (
-            getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
-            is DiffusionKVCacheMode.PAGED_SCHEDULER
-            and finished_req_ids
-        ):
+        if self.od_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER and finished_req_ids:
             self.remove_diffusion_kv_requests(list(finished_req_ids))
 
     def _update_states(self, scheduler_output: DiffusionSchedulerOutput) -> tuple[list[StepRequestState], list[str]]:
@@ -1263,16 +1307,13 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     external_req_id=getattr(sched_new_req.req, "external_req_id", None),
                     mixfusion_info=sched_new_req.req.mixfusion_info,
                     attention_schedule=resolve_request_attention_schedule(
-                        sched_new_req.req.sampling_params, getattr(self.od_config, "diffusion_attention_schedule", None)
+                        sched_new_req.req.sampling_params, self.od_config.diffusion_attention_schedule
                     ),
                     attention_sigma_schedule=resolve_request_attention_sigma_schedule(
-                        sched_new_req.req.sampling_params, getattr(self.od_config, "diffusion_attention_schedule", None)
+                        sched_new_req.req.sampling_params, self.od_config.diffusion_attention_schedule
                     ),
                 )
-                if (
-                    sched_new_req.diffusion_kv_metadata is not None
-                    and getattr(self.od_config, "kv_transfer_config", None) is not None
-                ):
+                if sched_new_req.diffusion_kv_metadata is not None and self.od_config.kv_transfer_config is not None:
                     new_state.extra["kv_computed_tokens"] = tuple(
                         seq.num_computed_tokens for seq in sched_new_req.diffusion_kv_metadata.sequences
                     )
@@ -1281,7 +1322,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 if self.kv_transfer_manager is not None:
                     self.kv_transfer_manager.receive_multi_kv_cache_distributed(
                         state_req,
-                        cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
+                        cfg_kv_collect_func=self.od_config.cfg_kv_collect_func,
                         target_device=self._target_device,
                     )
                 self.state_cache[request_id] = new_state
@@ -1323,26 +1364,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 # ``clear_pipeline_stage_durations`` on one rank would skip the
                 # all-reduce here while every peer proceeds into it, and the
                 # peers then hang on the NCCL collective until timeout.
-                def _abort_prep_failure(per_req_exc: BaseException | None) -> None:
-                    self.state_cache.pop(state.request_id, None)
-                    if per_req_exc is None:
-                        per_req_exc = RuntimeError(
-                            f"Stepwise preparation failed on another DiT rank for {state.request_id}"
-                        )
-                    logger.error(
-                        "Stepwise request preparation failed for %s: %s",
-                        state.request_id,
-                        per_req_exc,
-                        exc_info=isinstance(per_req_exc, Exception),
-                    )
-                    error_outputs.append(
-                        RunnerOutput(
-                            request_id=state.request_id,
-                            step_index=state.step_index,
-                            finished=True,
-                            result=DiffusionOutput.from_exception(per_req_exc),
-                        )
-                    )
+                _abort_prep_failure = partial(
+                    _abort_stepwise_prep,
+                    self.state_cache,
+                    state,
+                    error_outputs,
+                )
 
                 per_req_exc: BaseException | None = None
                 try:
@@ -1549,6 +1576,23 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 self.remove_diffusion_kv_requests(installed_request_ids)
             raise
 
+    def _step_execution_batch(self, states: Sequence[StepRequestState]) -> ExecutionBatch:
+        """Describe independent step members before packing model-specific tensors."""
+        members = []
+        for state in states:
+            if state.latents is None:
+                raise RuntimeError(f"Stepwise request {state.request_id} has no latent state.")
+            members.append(
+                BatchMember(
+                    request_id=state.request_id,
+                    position=(state.chunk_index, state.step_in_chunk, state.step_index),
+                    inputs=state,
+                    kv_view=None,
+                    rows=int(state.latents.shape[0]),
+                )
+            )
+        return ExecutionBatch(tuple(members))
+
     def _execute_stepwise_core(
         self,
         scheduler_output: DiffusionSchedulerOutput,
@@ -1593,6 +1637,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             ):
                 clear_pipeline_stage_durations(pipeline)
+                execution_batch = self._step_execution_batch(states)
+                input_batch.execution_batch = execution_batch
                 with _attention_schedule_scope(attention_schedule, sigma_schedule):
                     driver = getattr(pipeline, "mixfusion_driver", None)
                     if getattr(input_batch, "use_mixfusion", False) and driver is None:
@@ -1629,11 +1675,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                         )
 
                 else:
-                    offset = 0
+                    member_outputs = (
+                        execution_batch.split_rows(noise_pred)
+                        if noise_pred is not None and not isinstance(noise_pred, list)
+                        else None
+                    )
                     for req_idx, req in enumerate(states):
                         if req.latents is None:
                             raise RuntimeError(f"Stepwise request {req.request_id} has no latent state.")
-                        row_num = req.latents.shape[0]
                         try:
                             if sample_results is not None:
                                 error = sample_results[req.request_id]
@@ -1644,7 +1693,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                     req_noise_pred = noise_pred[req_idx] if noise_pred is not None else None
                                 else:
                                     req_noise_pred = (
-                                        noise_pred[offset : offset + row_num] if noise_pred is not None else None
+                                        member_outputs[req.request_id] if member_outputs is not None else None
                                     )
                                 pipeline.step_scheduler(req, req_noise_pred)
                             if self.od_config.streaming_output:
@@ -1696,9 +1745,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                     streaming_next_media_duration=streaming_next_media_duration,
                                 )
                             )
-                            offset = offset + row_num
                         except Exception as per_req_exc:
-                            offset = offset + row_num
                             self.state_cache.pop(req.request_id, None)
                             logger.error(
                                 "Stepwise per-request error for %s: %s",
@@ -1721,12 +1768,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             raise ValueError(
                                 f"Stepwise noise_pred list has {len(noise_pred)} entries, expected {expected}."
                             )
-                    elif noise_pred is not None and offset != noise_pred.shape[0]:
-                        raise ValueError(
-                            f"Stepwise noise_pred consumed {offset} rows, "
-                            f"but batched noise_pred has {noise_pred.shape[0]} rows."
-                        )
-
+                    # Tensor rows are validated by ``split_rows`` above.
                 if is_primary and record_output_peak_memory:
                     batch_peak_memory_mb = self._sample_peak_memory_mb()
                     states_by_id = {state.request_id: state for state in states}
@@ -1747,11 +1789,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     runner_output.request_id for runner_output in runner_output_list if runner_output.finished
                 ]
                 self._update_states_after(states, input_batch, pipeline_interrupted)
-                if (
-                    getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
-                    is DiffusionKVCacheMode.PAGED_SCHEDULER
-                    and terminal_request_ids
-                ):
+                if self.od_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER and terminal_request_ids:
                     self.remove_diffusion_kv_requests(terminal_request_ids)
 
                 return BatchRunnerOutput.from_list(runner_output_list)

@@ -472,8 +472,13 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         )
 
     def initialize_kv_cache(self, kv_cache_config: Any, *args: Any, **kwargs: Any) -> None:
-        spec = self.speculative_config
-        if self._scheduler_ngram and not spec.uses_dynamic_speculative_decoding():
+        # ``_scheduler_ngram`` defaults to False as a class attribute and is only
+        # set once ``__init__`` has run, so read ``speculative_config`` behind it:
+        # the flag is the precondition that the config carries a speculator to
+        # narrow, and reading it first would fail on runners built without
+        # ``__init__`` (unit tests use ``object.__new__``).
+        spec = self.speculative_config if self._scheduler_ngram else None
+        if spec is not None and not spec.uses_dynamic_speculative_decoding():
             # Capture ordinary decode and full-width verification.
             spec.num_speculative_tokens_per_batch_size = [
                 (1, 1, 0),
@@ -497,8 +502,8 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         if not getattr(self.model_state, "uses_ascend_attn_metadata", False):
             raise NotImplementedError(
                 "NPU Model Runner V2 needs a model state that builds Ascend attention "
-                f"metadata; {type(self.model_state).__name__} does not. Keep this stage "
-                "on model_runner v1, or provide an NPU state (Drama 3 does)."
+                f"metadata; {type(self.model_state).__name__} does not. Provide "
+                "an NPU-compatible model state before enabling this stage."
             )
         logger.info(
             "NPU Model Runner V2 loaded %s with Ascend attention metadata.",

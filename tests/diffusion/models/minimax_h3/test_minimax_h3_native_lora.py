@@ -425,6 +425,7 @@ def test_pipeline_replaces_native_classification_after_reload(monkeypatch, tmp_p
     torch.nn.Module.__init__(pipeline)
     pipeline.partition = "fl2va"
     pipeline.od_config = SimpleNamespace(
+        step_execution=False,
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
         enable_distributed_layerwise_offload=False,
@@ -483,6 +484,7 @@ def test_h3_native_allows_distributed_layerwise_offload(monkeypatch):
     torch.nn.Module.__init__(pipeline)
     pipeline.partition = "fl2va"
     pipeline.od_config = SimpleNamespace(
+        step_execution=False,
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
         enable_distributed_layerwise_offload=True,
@@ -627,6 +629,7 @@ def test_legacy_manager_uses_native_loader(tmp_path):
             pipeline = object.__new__(MiniMaxH3Pipeline)
             pipeline.partition = "fl2va"
             pipeline.od_config = SimpleNamespace(
+                step_execution=False,
                 enable_cpu_offload=False,
                 enable_layerwise_offload=False,
                 enable_distributed_layerwise_offload=False,
@@ -681,6 +684,7 @@ def test_pipeline_schedule_falls_back_after_eviction(monkeypatch, tmp_path):
     torch.nn.Module.__init__(pipeline)
     pipeline.partition = "fl2va"
     pipeline.od_config = SimpleNamespace(
+        step_execution=False,
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
         enable_distributed_layerwise_offload=False,

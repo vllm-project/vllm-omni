@@ -11,6 +11,7 @@ class DiffusionModelMetadata:
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
     supports_mixed_reference_inputs: bool = False
+    supports_multiview_reference_inputs: bool = False
     # Multipart controls are exposed as ``control_reference`` plus
     # ``control_type`` by the video API.  A pipeline that opts in receives the
     # persisted upload through ``extra_args[control_type]["control_path"]``.
@@ -48,11 +49,10 @@ REQUEST_IDENTITY_EXTRA_ARGS = frozenset({"latent_cache_key"})
 # FLUX.2 Klein supports up to four reference images.
 FLUX2_KLEIN_MAX_INPUT_IMAGES = 4
 QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES = 4
-# Qwen-Image 2.1 image-conditioned generation caps condition images at 4.
-QWEN_IMAGE_21_MAX_INPUT_IMAGES = 4
+# Qwen-Image 2.1 supports up to 10 reference images for image-conditioned generation.
+QWEN_IMAGE_21_MAX_INPUT_IMAGES = 10
 # Upstream HunyuanImage-3.0 "Multi-Image Fusion" caps reference images at 3.
 HUNYUAN_IMAGE3_MAX_INPUT_IMAGES = 3
-JOY_IMAGE_EDIT_MAX_INPUT_IMAGES = 1
 # Boogu-Image editing (TI2I) supports a single reference image for now.
 BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
 FLUX3_MAX_INPUT_IMAGES = 10
@@ -94,10 +94,6 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "BooguImagePipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=BOOGU_IMAGE_MAX_INPUT_IMAGES,
-    ),
-    "JoyImageEditPipeline": DiffusionModelMetadata(
-        supports_multimodal_inputs=True,
-        max_multimodal_image_inputs=JOY_IMAGE_EDIT_MAX_INPUT_IMAGES,
     ),
     "MiniMaxH3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
@@ -178,6 +174,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         attention_mask_free=True,
         final_output_type="video",
     ),
+    "CausVidWanPipeline": DiffusionModelMetadata(final_output_type="video"),
     "WanT2VDMD2Pipeline": DiffusionModelMetadata(final_output_type="video"),
     "WanI2VDMD2Pipeline": DiffusionModelMetadata(final_output_type="video"),
     "LTX2Pipeline": DiffusionModelMetadata(final_output_type="video"),
@@ -206,12 +203,20 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supported_control_upload_types=("edge", "blur", "depth", "seg", "wsm"),
         final_output_type="video",
     ),
+    "Cosmos3MultiviewPipeline": DiffusionModelMetadata(
+        supports_multiview_reference_inputs=True,
+        final_output_type="video",
+    ),
     "SanaVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SanaImageToVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SanaWmPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=1,
         final_output_type="video",
+    ),
+    "Cosmos3NanoSimBimanualPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
     ),
 }
 

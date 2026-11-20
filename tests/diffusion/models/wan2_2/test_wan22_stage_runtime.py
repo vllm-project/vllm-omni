@@ -515,6 +515,7 @@ def test_constructor_role_modules_and_weight_sources(monkeypatch, tmp_path, role
             boundary_ratio=None,
             flow_shift=None,
             enable_diffusion_pipeline_profiler=False,
+            diffusion_use_graph=False,
         )
     )
     assert (pipeline.text_encoder is not None) == (role in (DiffusionStageRole.FULL, DiffusionStageRole.ENCODE))
