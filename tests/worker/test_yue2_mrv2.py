@@ -10,17 +10,20 @@ import torch
 from vllm import SamplingParams
 from vllm.v1.outputs import AsyncModelRunnerOutput, SamplerOutput
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_omni.model_executor.models.yue2.model_state import Yue2ModelState, Yue2Sampler
 from vllm_omni.model_executor.models.yue2.runtime import Yue2ForCausalLM, Yue2SchedulerOutput
-from vllm_omni.model_executor.models.yue2.worker import Yue2ModelRunner
 from vllm_omni.model_executor.models.yue2.yue2 import CODEC_OFFSET, MUSIC_END
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
+from vllm_omni.worker_v2.model_states.mtp_model_state import MTPState
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
+from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -134,42 +137,72 @@ def _schedule():
     )
 
 
-def test_detachment_does_not_cancel_audio_and_phase_replacement_does(mocker):
-    runner = mocker.Mock(spec=Yue2ModelRunner)
-    finish = mocker.patch.object(OmniARModelRunner, "finish_requests")
+def test_detachment_does_not_cancel_audio_and_phase_replacement_does(state, mocker):
+    runner = object.__new__(OmniARModelRunner)
+    runner.model_state, runner.model = state, state.model
+    runner._mm_rng_state = None
+    runner.req_states = mocker.Mock(spec=RequestState, req_id_to_index={})
+    state._mtp_state = mocker.Mock(spec=MTPState)
+    remove = mocker.patch.object(runner, "_remove_request")
+    finish = mocker.patch.object(GPUModelRunner, "finish_requests")
     schedule = _schedule()
-    Yue2ModelRunner.finish_requests(runner, schedule)
+    runner.finish_requests(schedule)
     actual = finish.call_args.args[0]
     assert actual.finished_req_ids == {"aborted", "abc-to-semantic"}
     assert schedule.finished_req_ids == {"aborted"}  # scheduler-owned input is unchanged
-    assert {call.args[0] for call in runner._remove_request.call_args_list} == {"aborted", "synthesizing"}
+    state.model.on_requests_finished.assert_called_once_with({"aborted", "abc-to-semantic"})
+    remove.assert_called_once_with("synthesizing")
     # A later abort still reaches model cleanup after the native slot is gone.
-    Yue2ModelRunner.finish_requests(runner, replace(schedule, finished_req_ids={"synthesizing"}))
-    assert "synthesizing" in finish.call_args.args[0].finished_req_ids
+    runner.finish_requests(replace(schedule, finished_req_ids={"synthesizing"}, replaced_req_ids=set()))
+    state.model.on_requests_finished.assert_called_with({"synthesizing"})
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
-def test_audio_completion_preserves_metadata_and_drains_started_once(mocker, asynchronous):
+def test_audio_completion_preserves_metadata_and_drains_started_once(state, mocker, asynchronous):
     audio = {"audio": torch.ones(2, 8), "sr": torch.tensor(48000), "meta.truncated": torch.tensor(1)}
     model = mocker.Mock(spec=Yue2ForCausalLM, acoustic_started=["song"])
     model.poll_audio.return_value = {"song": audio}
-    runner = mocker.Mock(spec=Yue2ModelRunner, model=model)
+    runner = object.__new__(OmniARModelRunner)
+    runner.model_state = state
+    state.model = model
     output = OmniModelRunnerOutput(req_ids=["song"], sampled_token_ids=[[MUSIC_END]])
     output._async_chunk = False
     carrier = mocker.Mock(spec=AsyncModelRunnerOutput, get_output=lambda: output) if asynchronous else output
-    result = Yue2ModelRunner._with_audio(runner, carrier)
+    result = runner._finalize_runner_output(carrier, idle=False)
     assert result.req_ids == ["song"] and result.sampled_token_ids == [[MUSIC_END]]
     assert result.acoustic_started == ["song"] and not model.acoustic_started
     assert result.acoustic_ready["song"] is audio
-    assert Yue2ModelRunner._with_audio(runner, output).acoustic_started == []
+    assert runner._finalize_runner_output(output, idle=False).acoustic_started == []
 
 
-def test_idle_execution_polls_audio_without_a_sampling_step(mocker):
-    runner = object.__new__(Yue2ModelRunner)
-    runner.model = mocker.Mock(spec=Yue2ForCausalLM, acoustic_started=[])
-    runner.model.poll_audio.return_value = {"song": {"audio": torch.ones(2, 8)}}
-    mocker.patch.object(
-        OmniARModelRunner, "execute_model", return_value=OmniModelRunnerOutput(req_ids=[], sampled_token_ids=[])
-    )
-    result = runner.execute_model(_schedule())
-    assert result.acoustic_ready["song"]["audio"].shape == (2, 8)
+@pytest.mark.parametrize("dummy", [False, True], ids=["idle", "dummy"])
+def test_idle_execution_polls_audio_without_a_sampling_step(state, mocker, dummy):
+    runner = object.__new__(OmniARModelRunner)
+    runner.model_state, runner.model = state, state.model
+    runner.model.acoustic_started = []
+    runner.execute_model_state = None
+
+    def poll_audio():
+        assert torch.is_inference_mode_enabled()
+        return {"song": {"audio": torch.ones(2, 8)}}
+
+    runner.model.poll_audio.side_effect = poll_audio
+    mocker.patch.object(runner, "_handle_kv_transfer_pre")
+    output = OmniModelRunnerOutput(req_ids=[], sampled_token_ids=[])
+    mocker.patch.object(OmniGPUModelRunner, "execute_model", return_value=output)
+    result = runner.execute_model(_schedule(), dummy_run=dummy)
+    if dummy:
+        assert result is output
+        runner.model.poll_audio.assert_not_called()
+    else:
+        assert result.acoustic_ready["song"]["audio"].shape == (2, 8)
+
+
+@pytest.mark.parametrize("state_cls", [OmniModelState, DefaultModelState])
+@pytest.mark.parametrize("idle", [False, True])
+def test_other_model_states_preserve_deferred_outputs(mocker, state_cls, idle):
+    runner = object.__new__(OmniARModelRunner)
+    runner.model_state = object.__new__(state_cls)
+    output = mocker.Mock(spec=AsyncModelRunnerOutput)
+    assert runner._finalize_runner_output(output, idle=idle) is output
+    output.get_output.assert_not_called()

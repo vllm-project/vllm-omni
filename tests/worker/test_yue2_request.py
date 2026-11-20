@@ -314,10 +314,7 @@ def test_existing_model_and_pipeline_names_resolve_to_unified_path():
     assert deploy.model_runner == "v2"
     stages = merge_pipeline_deploy(pipeline, deploy)
     assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
-    from vllm_omni.model_executor.models.yue2.worker import Yue2Worker
-
-    worker_module, worker_name = stages[0].yaml_engine_args["worker_cls"].rsplit(".", 1)
-    assert getattr(import_module(worker_module), worker_name) is Yue2Worker
+    assert stages[0].yaml_engine_args.get("worker_cls", "auto") == "auto"
     family, module, name = _OMNI_MODELS["Yue2ForCausalLM"]
     assert getattr(import_module(f"vllm_omni.model_executor.models.{family}.{module}"), name) is Yue2ForCausalLM
     assert detect_tts_model_type("yue2", "Yue2ForCausalLM") == "yue2"

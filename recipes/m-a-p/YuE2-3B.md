@@ -4,7 +4,7 @@
 
 The default profile uses Model Runner V2 on CUDA with vLLM 0.34. Its
 model-owned sampler preserves ABC and semantic sampling, request-local seeds
-and paired CFG. The YuE2 worker retains acoustic jobs after releasing AR slots,
+and paired CFG. Model-state lifecycle hooks retain acoustic jobs after releasing AR slots,
 so audio completion, truncation/error metadata and cancellation survive the
 handoff. TP/PP, asynchronous scheduling, prefix caching, external KV transfer
 and speculative decoding remain unsupported.
@@ -111,9 +111,9 @@ chunked prefill disabled. Existing two-call ABC/semantic clients and external
 scores remain supported; pipeline, architecture and HTTP endpoint names stay
 `yue2`, `Yue2ForCausalLM` and `/v1/audio/speech`.
 
-The deploy YAML selects `model_runner: v2` and the model-specific
-`Yue2Worker`. Keep that worker override when copying the profile: it handles
-acoustic completion after the native AR slot has been released.
+The deploy YAML selects `model_runner: v2` and uses the standard AR worker and
+`OmniARModelRunner`. `Yue2ModelState` supplies request transitions and acoustic
+completion through the shared runner's lifecycle hooks, including idle steps.
 
 ### Acoustic batching and memory
 
