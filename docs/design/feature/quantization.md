@@ -188,10 +188,16 @@ independently.
 ## Platform and parallelism boundaries
 
 Platform checks belong in the method implementation rather than in the common
-factory. This keeps configuration parsing portable while allowing CUDA, NPU,
+factory. This keeps configuration parsing portable while allowing CUDA, ROCm, NPU,
 and XPU methods to select different kernels or reject unsupported execution at
 model construction time. The user guide is the source of truth for the current
 hardware support matrix.
+
+Diffusion INT8 routes CUDA and ROCm to the shared vLLM linear methods for both
+online and serialized weights. Omni adapts batched activations to a matrix at
+the kernel boundary and restores the leading dimensions; kernel selection and
+matrix multiplication remain upstream-owned. This backend enablement does not
+change weight quantization or synchronize tensor-parallel weight scales.
 
 Online CUDA MXFP8 reuses vLLM's online linear method for weight loading,
 quantization, scale layout and kernel selection. Omni supplies the diffusion
