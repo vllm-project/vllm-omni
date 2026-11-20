@@ -293,6 +293,10 @@ class VoxtralTTSForConditionalGeneration(
         # Delegate to generation model for multimodal processing
         return self.model.embed_multimodal(**kwargs)
 
+    @property
+    def mrv2_forward_returns_tensor(self) -> bool:
+        return self.model_stage == "audio_generation"
+
     def forward(
         self,
         input_ids: torch.Tensor,
