@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CUDA-only optimizations leave unsupported platforms and samplers upstream."""
 
+import sys
+
 import pytest
 import torch
 from vllm.config import CUDAGraphMode
@@ -89,7 +91,7 @@ def test_rocm_does_not_probe_cuda_pdl_capability(monkeypatch):
 def test_talker_graph_configuration_before_loading_weights(
     monkeypatch, mocker, is_npu, v2, mode, eager, enabled, rejected
 ):
-    from types import SimpleNamespace
+    from types import ModuleType, SimpleNamespace
 
     from vllm_omni.model_executor.models.qwen3_tts import qwen3_tts_talker as talker_module
     from vllm_omni.platforms import current_omni_platform
@@ -101,6 +103,10 @@ def test_talker_graph_configuration_before_loading_weights(
         raise ReachedBackboneError
 
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: is_npu)
+    # The simulated NPU branch runs in CPU test jobs without Ascend libraries.
+    npu_patches = ModuleType("vllm_omni.platforms.npu.models.qwen3_tts")
+    monkeypatch.setattr(npu_patches, "apply_qwen3_tts_patches", mocker.stub(), raising=False)
+    monkeypatch.setitem(sys.modules, npu_patches.__name__, npu_patches)
     monkeypatch.setattr(talker_module, "talker_stream_decode_enabled", lambda _: False)
     monkeypatch.setattr(talker_module, "Qwen3Model", stop_before_weights)
     config = SimpleNamespace(

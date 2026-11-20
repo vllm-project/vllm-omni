@@ -6,6 +6,7 @@ Unit tests for StageConfigFactory and related classes.
 
 import importlib
 import json
+import logging
 import warnings
 from dataclasses import fields
 from pathlib import Path
@@ -542,6 +543,31 @@ class TestStageConfigFactory:
 
 class TestStageResolutionHelpers:
     """Tests for shared stage override / filtering helpers."""
+
+    def test_build_stage_runtime_overrides_warns_when_stage_key_is_internal(self, caplog):
+        cli_overrides = {
+            "stage_0_default_sampling_params": {"temperature": 0.2},
+            "stage_0_env": {"TEST_ENV": "1"},
+            "stage_0_gpu_memory_utilization": 0.5,
+        }
+
+        with caplog.at_level(logging.WARNING, logger="vllm_omni.config.stage_config"):
+            overrides = build_stage_runtime_overrides(0, cli_overrides)
+
+        assert overrides == {
+            "env": {"TEST_ENV": "1"},
+            "gpu_memory_utilization": 0.5,
+        }
+        assert "default_sampling_params" in caplog.text
+
+    def test_build_stage_runtime_overrides_can_suppress_internal_key_warnings(self, caplog):
+        cli_overrides = {"stage_0_default_sampling_params": {"temperature": 0.2}}
+
+        with caplog.at_level(logging.WARNING, logger="vllm_omni.config.stage_config"):
+            overrides = build_stage_runtime_overrides(0, cli_overrides, warn_dropped=False)
+
+        assert overrides == {}
+        assert "default_sampling_params" not in caplog.text
 
     @pytest.mark.parametrize("global_first", [True, False], ids=["global-first", "stage-first"])
     def test_build_stage_runtime_overrides_ignores_other_stage_and_internal_keys(self, global_first):
@@ -1714,7 +1740,7 @@ stages:
         assert deploy.model_runner == "v2"
 
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
-    def test_qwen3_omni_default_runner_is_v2_on_cuda_and_npu(self, platform, monkeypatch):
+    def test_qwen3_omni_default_runner_is_v2_on_supported_platforms(self, platform, monkeypatch):
         from vllm_omni import platforms
 
         monkeypatch.setattr(platforms.current_omni_platform, "device_name", platform)
@@ -1724,7 +1750,7 @@ stages:
             load_deploy_config(Path(get_deploy_config_path("qwen3_omni_moe.yaml"))),
             platform=platform,
         )
-        expect_v2 = platform in {"cuda", "npu", "xpu"}
+        expect_v2 = platform in {"cuda", "npu", "xpu", "rocm"}
         if not expect_v2:
             with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
                 merge_pipeline_deploy(pipeline, deploy)
@@ -3190,16 +3216,26 @@ class TestPlatformOverrides:
         with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
             merge_pipeline_deploy(pipeline, musa)
 
-    def test_qwen3_tts_rocm_disables_code2wav_outer_cudagraph(self):
+    def test_qwen3_tts_rocm_uses_mrv2_with_eager_code2wav(self):
         deploy_path = Path(get_deploy_config_path("qwen3_tts.yaml"))
+        pipeline = resolve_pipeline_config("qwen3_tts")
 
         base = load_deploy_config(deploy_path)
         assert base.stages[0].enforce_eager is None
         assert base.stages[1].enforce_eager is False
 
         rocm = _apply_platform_overrides(base, platform="rocm")
+        assert rocm.model_runner == "v2"
         assert rocm.stages[0].enforce_eager is None
         assert rocm.stages[1].enforce_eager is True
+
+        legacy = merge_pipeline_deploy(pipeline, rocm)
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in legacy] == [True, True]
+        assert legacy[1].yaml_engine_args["enforce_eager"] is True
+
+        structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=rocm)
+        assert [stage.model_config.use_v2_model_runner for stage in structured.stage_configs] == [True, True]
+        assert structured.stage_by_id(1).model_config.enforce_eager is True
 
     @pytest.mark.parametrize("deploy_name", ["qwen3_tts.yaml", "qwen3_tts_high_concurrency.yaml"])
     @pytest.mark.parametrize("platform", ["cuda", "npu", "rocm"])
@@ -3207,31 +3243,23 @@ class TestPlatformOverrides:
         monkeypatch.setattr("vllm_omni.platforms.current_omni_platform.device_name", platform)
         deploy = load_deploy_config(Path(get_deploy_config_path(deploy_name)))
         deploy = _apply_platform_overrides(deploy, platform=platform)
-        if deploy.model_runner == "v1":
-            assert deploy.stages[1].engine_extras["dtype"] == "bfloat16"
-            with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
-                merge_pipeline_deploy(resolve_pipeline_config("qwen3_tts"), deploy)
-            return
         stages = merge_pipeline_deploy(resolve_pipeline_config("qwen3_tts"), deploy)
 
         assert stages[1].yaml_engine_args["dtype"] == "bfloat16"
+        assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
 
     @pytest.mark.parametrize("deploy_name", ["qwen3_tts.yaml", "qwen3_tts_high_concurrency.yaml"])
-    @pytest.mark.parametrize("platform", ["cuda", "npu"])
+    @pytest.mark.parametrize("platform", ["cuda", "npu", "rocm"])
     @pytest.mark.parametrize("dtype", ["float32", "bfloat16", "float16"])
     def test_qwen3_tts_propagates_explicit_code2wav_dtype(self, monkeypatch, deploy_name, platform, dtype):
         monkeypatch.setattr("vllm_omni.platforms.current_omni_platform.device_name", platform)
         deploy = load_deploy_config(Path(get_deploy_config_path(deploy_name)))
         deploy.stages[1].engine_extras["dtype"] = dtype
         deploy = _apply_platform_overrides(deploy, platform=platform)
-        if deploy.model_runner == "v1":
-            assert deploy.stages[1].engine_extras["dtype"] == dtype
-            with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
-                merge_pipeline_deploy(resolve_pipeline_config("qwen3_tts"), deploy)
-            return
         stages = merge_pipeline_deploy(resolve_pipeline_config("qwen3_tts"), deploy)
 
         assert stages[1].yaml_engine_args["dtype"] == dtype
+        assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
 
     def test_moss_tts_rocm_disables_codec_cudagraph(self):
         deploy_path = Path(get_deploy_config_path("moss_tts.yaml"))
@@ -3305,6 +3333,29 @@ class TestPlatformOverrides:
             assert talker_sampling["temperature"] > 0.0, "talker is expected to sample, not decode greedily"
             assert talker_sampling.get("seed") == 42, f"talker sampling lost its seed on {platform}"
 
+    def test_qwen3_omni_rocm_uses_mrv2_with_eager_code2wav(self):
+        deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
+        pipeline = resolve_pipeline_config(
+            "qwen3_omni_moe",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert isinstance(pipeline, PipelineConfig)
+
+        rocm = _apply_platform_overrides(load_deploy_config(deploy_path), platform="rocm")
+        assert rocm.model_runner == "v2"
+        assert rocm.stages[0].engine_extras["enable_prefix_caching"] is False
+        assert rocm.stages[2].enforce_eager is True
+
+        legacy = merge_pipeline_deploy(pipeline, rocm)
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in legacy] == [True, True, True]
+        assert legacy[0].yaml_engine_args["enable_prefix_caching"] is False
+        assert legacy[2].yaml_engine_args["enforce_eager"] is True
+
+        structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=rocm)
+        assert [stage.model_config.use_v2_model_runner for stage in structured.stage_configs] == [True, True, True]
+        assert structured.stage_by_id(0).cache_config.enable_prefix_caching is False
+        assert structured.stage_by_id(2).model_config.enforce_eager is True
+
     @pytest.mark.parametrize("platform", ["cuda", "npu"])
     def test_minicpmo_4_5_caps_talker_kv_cache(self, platform):
         pipeline = resolve_pipeline_config("minicpmo_4_5")
@@ -3366,9 +3417,10 @@ class TestPlatformOverrides:
         )
         # XPU has no V1 fallback: vLLM 0.34 removed Model Runner V1.
         xpu_full_mrv2 = platform == "xpu" and filename in ("qwen3_tts.yaml", "moss_tts_nano.yaml")
+        rocm_full_mrv2 = platform == "rocm" and filename in ("qwen3_tts.yaml", "minicpmo_4_5.yaml")
         if platform == "cuda":
             expected_runner = cuda_default_runner
-        elif all_platforms_mrv2 or npu_full_mrv2 or xpu_full_mrv2:
+        elif all_platforms_mrv2 or npu_full_mrv2 or xpu_full_mrv2 or rocm_full_mrv2:
             expected_runner = "v2"
         else:
             expected_runner = "v1"
@@ -3384,7 +3436,7 @@ class TestPlatformOverrides:
         stages = merge_pipeline_deploy(pipeline, deploy)
         if platform == "cuda":
             expected = [stage.stage_id not in cuda_v1_stages for stage in stages]
-        elif all_platforms_mrv2 or npu_full_mrv2 or xpu_full_mrv2:
+        elif all_platforms_mrv2 or npu_full_mrv2 or xpu_full_mrv2 or rocm_full_mrv2:
             expected = [True for _ in stages]
         else:
             expected = [False for _ in stages]
