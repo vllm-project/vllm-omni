@@ -203,19 +203,17 @@ responses and `truncated` on the SSE `speech.audio.done` event:
 
 Models that report it today: Qwen3-TTS, Breeze-TTS-2, Fish Audio Drama 3,
 CosyVoice3, Voxtral TTS and YuE2 (YuE2 on non-streaming responses only, from
-its own metadata). Qwen3-TTS
-rejects some truncated generations with an error instead (Base task requests,
-and requests whose budget the server sizes from the text), so those never
-return audio.
+its own metadata). Qwen3-TTS returns the generated audio when any task
+(Base, CustomVoice or VoiceDesign) reaches its length limit, including a
+server-derived budget. It does not retry or raise an error solely because
+codec EOS was not emitted before the limit. The context window, configured
+output limit and text-scaled codec budgets still bound generation; a successful
+response does not guarantee that the entire input was spoken.
 
-The default `qwen3_tts.yaml` reserves an 8192-token Talker context while
-keeping the codec output ceiling at 4096 tokens. The context includes the
-conditioned prompt as well as generated codec tokens: for example, an
-892-token prompt in a 4096-token context leaves only 3204 tokens for speech.
-When tuning a custom deployment, set stage 0 `max_model_len` to cover the
-conditioned prompt plus the desired output budget. Raising `max_new_tokens`
-alone cannot extend the context. Longer requests can occupy more KV cache;
-the output ceiling and incomplete-generation checks still apply.
+The context window includes both the conditioned prompt and generated codec
+tokens. For example, an 892-token prompt in a 4096-token context leaves only
+3204 tokens for speech. Raising `max_new_tokens` alone cannot extend the
+context; adjust the Talker stage's `max_model_len` or split the text when needed.
 
 Raw audio streams (`stream_format="audio"`) send their headers before
 generation ends, and the batch endpoint and WebSocket streaming do not carry the
