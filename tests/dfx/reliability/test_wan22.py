@@ -430,7 +430,6 @@ def test_graceful_shutdown(omni_server_function, online_client_function) -> None
 @launch_scenario_params(
     MODEL,
     ServeRootCrashAtLaunch,
-    skip_reason="Worker survives root crash during startup: https://github.com/vllm-project/vllm-omni/issues/10398",
 )
 def test_serve_root_crash_at_launch(launch_params) -> None:
     """SIGKILL only root before readiness, after a diffusion worker exists.

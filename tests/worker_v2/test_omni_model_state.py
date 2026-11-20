@@ -856,8 +856,14 @@ def test_rope_shim_constructs_sequential_mrope_state():
     assert rope.prefill_positions._staged_write_indices == [3, 4, 5]
     # The pin's StagedWriteTensor keeps ndarray staged rows by reference in
     # _staged_write_chunks instead of extending _staged_write_contents.
+    # With UVA available, omni's staged-write shim replaces stage_write and
+    # stages the same rows as a list of ndarrays in _staged_write_contents,
+    # leaving _staged_write_chunks empty. Accept either representation.
     staged = rope.prefill_positions._staged_write_chunks
-    assert [np.asarray(chunk).tolist() for chunk in staged] == [[0, 1, 2, 3]] * 3
+    if not staged:
+        contents = rope.prefill_positions._staged_write_contents
+        staged = contents if isinstance(contents, list) else [contents]
+    assert [np.asarray(chunk).reshape(-1).tolist() for chunk in staged] == [[0, 1, 2, 3]] * 3
 
 
 @pytest.mark.parametrize("output_key", [None, ("only_one",)])

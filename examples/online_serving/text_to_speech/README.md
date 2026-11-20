@@ -34,7 +34,8 @@ CosyVoice3 is intentionally absent: no online example exists for it yet. See its
 
 ## Common Quick Start
 
-Launch the server (defaults shown — adjust `--port`, `--gpu-memory-utilization`, etc. as needed):
+Launch the server with the desired port. For multi-stage models, tune each
+stage's memory budget in the deploy YAML or via `--stage-overrides`.
 
 ```bash
 vllm serve <hf-repo-or-local-path> --omni --port 8091
@@ -536,7 +537,8 @@ Equivalent manual command:
 vllm-omni serve inclusionAI/Ming-omni-tts-0.5B \
     --deploy-config vllm_omni/deploy/ming_tts.yaml \
     --host 0.0.0.0 --port 8091 \
-    --enforce-eager --omni
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}' \
+    --omni
 ```
 
 ### Sending requests
@@ -613,7 +615,7 @@ python examples/online_serving/text_to_speech/ming_flash_omni_tts/speech_client.
 
 - Server uses `use_zero_spk_emb=True` and the cookbook decode defaults (`max_decode_steps=200`, `cfg=2.0`, `sigma=0.25`, `temperature=0.0`). For other caption fields (`语速`, `基频`, `IP`, BGM, etc.) or overriding decode args, use the offline example where `additional_information` is set explicitly.
 - This is the online counterpart of [`examples/offline_inference/text_to_speech/ming_flash_omni_tts/`](../../offline_inference/text_to_speech/ming_flash_omni_tts/).
-- For multimodal Ming-flash-omni online serving, see [`examples/online_serving/ming_flash_omni/`](../../ming_flash_omni/).
+- For multimodal Ming-flash-omni online serving, see [`examples/online_serving/ming_flash_omni/`](../ming_flash_omni/).
 
 ---
 

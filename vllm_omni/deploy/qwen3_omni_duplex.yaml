@@ -7,6 +7,11 @@
 base_config: qwen3_omni_moe.yaml
 model_runner: v1
 session_mode: duplex
+platforms:
+  # Preserve the historical V1 duplex contract after inheriting the ROCm V2
+  # production override from qwen3_omni_moe.yaml.
+  rocm:
+    model_runner: v1
 stages:
   - stage_id: 0
     # The base profile's Thinker prefix cache is validated for turn serving only.

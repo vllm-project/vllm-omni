@@ -61,6 +61,16 @@ class _SchedulerNgramSpeculator:
     num_query_per_req = 1
     num_extra_query_per_req = 0
 
+    # The scheduler tracks request state and context limits for this proposer.
+    def add_request(self, req_index: int) -> None:
+        pass
+
+    def on_requests_finished(self, finished_req_ids: set[str]) -> None:
+        pass
+
+    def update_max_model_len(self, max_model_len: int) -> None:
+        pass
+
     def init_cudagraph_manager(self, cudagraph_mode: object) -> None:
         pass
 
@@ -90,7 +100,9 @@ def allow_ascend_scheduler_ngram() -> None:
     except ImportError:
         return
 
-    original = mrv2_utils._v2_blacklist
+    original = getattr(mrv2_utils, "_v2_blacklist", None)
+    if original is None:
+        return
 
     @wraps(original)
     def blacklist(config: VllmConfig) -> list[str]:

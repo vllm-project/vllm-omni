@@ -120,9 +120,12 @@ should happen:
   speaker tag is spoken by speaker 0.
 - The reference clip also shapes delivery implicitly (an expressive or pause-heavy
   reference carries over), but it is not a targeted control.
-- A tag or filler word at the very start of a line ("[sighs] …", "Yeah. …")
-  more often renders the first word or event and then only silence until
-  `max_new_tokens`; mid-sentence tags are more reliable.
+- For scripts that start with an event such as `[sighs]` and have no voice
+  reference or explicit speaker tags, whitespace between sentence-ending
+  punctuation and the next event starts another turn for speaker 0. This helps
+  the model resume speaking after the event. Adjacent events such as
+  `散步。[叹气] 记得带伞。` stay in the same turn to preserve the voice.
+  Use explicit speaker tags to specify your own turn boundaries.
 
 Offline (`Omni`): pass `additional_information` with `text`, `ref_text`,
 `ref_audio_wav`, `ref_audio_sr` (and optionally `voice_name` to cache the
@@ -134,14 +137,33 @@ which returns the exact prompt row count.
 
 - Memory: stage 0 weights take 36.9 GiB; the default deploy config uses
   0.78 of the GPU for stage 0 and 0.1 for the codec stage.
-- Default sampling (model card): temperature 1.0, top_p 0.9, top_k 30,
-  max_tokens 500. The codebook heads use the same values. Sampling runs in
-  fused kernels that cap top_k at 64 (`hf_overrides`
-  `fish_omni_max_top_k`, a power of two from 32 to 4096, raises it). A request's
-  `seed` drives every draw of its frames, the codebook heads included.
+- The deployment defaults to temperature 1.0, top_p 1.0 and max_tokens 500.
+  The main token's first draw considers all 4096 candidates, so low-probability
+  transitions out of quiet frames remain available. For voice cloning, the
+  deploy's `fish_omni_reference_top_p` defaults to 0.9. An explicit
+  `extra_params.top_p` overrides either default. Set `extra_params.top_k`
+  to a positive value to narrow the main draw.
+  Each codebook head keeps at most 30 candidates and honors smaller request
+  values. The stage 0 `hf_overrides.fish_omni_max_top_k` option can cap the
+  main draw for all requests (powers of two from 32 to 4096). A request's
+  `seed` drives every draw of its frames, including the codebook heads.
 - The main token uses repetition-aware sampling: a semantic token that
   repeats one of the last 16 main tokens is re-drawn with temperature 1.0,
-  top_k 30, top_p 0.95.
+  top_k 30, top_p 0.95. Both main-token draws keep the first candidate that
+  crosses the top_p threshold, which can be the end-of-speech token.
+- Reference sampling (off by default): `hf_overrides`
+  `{"fish_omni_reference_sampling": true}` on stage 0 samples each frame with
+  Fish Audio's reference rules for Drama 3 in PyTorch instead of the fused
+  kernels. The main token's first draw keeps only candidates whose probability
+  reaches the request's `epsilon_cutoff` (`extra_params`; 1e-3 when unset, 0
+  turns it off), with no top-k cap and the same candidates as the fused kernels.
+  A first draw that repeats one of the last 16 main tokens, end of speech
+  included, becomes the most probable candidate
+  (`fish_omni_reference_sampling_fallback: "ras"` re-draws at 1.0 / 0.95 / 30
+  instead). The codebook heads never return a code past the codec's 1024. The
+  recommended request parameters are temperature 1.0, top_p 1.0, top_k off and
+  epsilon_cutoff 1e-3. Without the override, a request with a non-zero
+  `epsilon_cutoff` is refused with a 400.
 - The default deploy keeps the gated-delta-net state in bfloat16 (the
   checkpoint's `mamba_ssm_dtype` is float32): +7% / +13% audio-s/s at 64 /
   128 streams with the same Seed-TTS-Eval WER and speaker similarity. Set
@@ -155,10 +177,10 @@ which returns the exact prompt row count.
 
 #### Measured performance (1x H200, both stages on one GPU)
 
-Default `vllm_omni/deploy/fish_omni.yaml` (vLLM 0.31.0). Seed-TTS-Eval en
+Benchmarked with vLLM 0.31.0 and the former stage 0 defaults of top_k 30 and top_p 0.9. Seed-TTS-Eval en
 (1088 lines, each cloning its own reference, sent pre-encoded as
-`ref_audio_codes`), streaming `/v1/audio/speech` (raw pcm), the sampling
-above, a fresh server per concurrency, 8 warmup requests excluded.
+`ref_audio_codes`), streaming `/v1/audio/speech` (raw pcm), a fresh server
+per concurrency, 8 warmup requests excluded.
 Throughput is seconds of audio generated per wall-clock second.
 
 | Concurrency | Audio s/s | TTFA p50 | TTFA p95 | RTF (mean) | Streams that stall |
@@ -173,9 +195,10 @@ Throughput is seconds of audio generated per wall-clock second.
   experts with them (see NPU below).
 - Prefix caching is off: prompt rows carry ten codes per audio row that
   token-id hashing does not see.
-- Some takes stop speaking after the first word or event and emit silence
-  until `max_tokens`. This is model behaviour; it is more frequent for lines
-  that start with a filler word or a tag, and with pause-heavy references.
+- The default sampling reduces long silent stretches and takes that run to
+  `max_tokens`. Neither occurred in the 80-case regression run, the 80-case
+  run with different seeds, or the 80 voice-cloning requests. Other takes
+  can still stop speaking mid-line and continue generating quiet frames.
 - `previous_takes` (editing as continuation) and long-text chunking are not
   exposed by the speech API yet.
 

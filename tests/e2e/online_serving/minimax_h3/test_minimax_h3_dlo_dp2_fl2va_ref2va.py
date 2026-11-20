@@ -68,7 +68,13 @@ def _partition_params() -> OmniServerParams:
     """DP2+DLO Ref2VA partition. Eager skips inductor compile in this process."""
     return OmniServerParams(
         model=MODEL,
-        server_args=[*DLO_SERVER_ARGS, "--task-type", "ref2va", "--enforce-eager"],
+        server_args=[
+            *DLO_SERVER_ARGS,
+            "--task-type",
+            "ref2va",
+            "--stage-overrides",
+            '{"0": {"enforce_eager": true}, "1": {"enforce_eager": true}}',
+        ],
         stage_init_timeout=1800,
         init_timeout=1800,
     )

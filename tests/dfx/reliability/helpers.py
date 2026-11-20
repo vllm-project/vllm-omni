@@ -990,11 +990,12 @@ def run_fault_injection_with_rate_load(
 
 
 def list_alive_pids(pids: Sequence[int]) -> list[int]:
-    """Return PIDs from ``pids`` that still exist in the kernel and are **not** zombies.
+    """Return PIDs from ``pids`` that still have a live process or thread.
 
     After SIGTERM/SIGKILL the serve child may exit before the test harness calls
     ``Popen.wait()``; until reaped, ``psutil.pid_exists`` stays true for the defunct
     slot. Those PIDs must not count as "residual server processes" for leak checks.
+    A zombie thread-group leader with surviving threads still counts as alive.
     """
     out: list[int] = []
     for pid in pids:
@@ -1002,7 +1003,8 @@ def list_alive_pids(pids: Sequence[int]) -> list[int]:
         if not psutil.pid_exists(pid_i):
             continue
         try:
-            if psutil.Process(pid_i).status() == psutil.STATUS_ZOMBIE:
+            process = psutil.Process(pid_i)
+            if process.status() == psutil.STATUS_ZOMBIE and process.num_threads() == 1:
                 continue
         except psutil.Error:
             continue
@@ -1381,7 +1383,7 @@ _LINUX_SHM_ROOT = Path("/dev/shm")
 
 
 def _linux_fd_counts(pids: Sequence[int]) -> dict[int, int]:
-    """Include zombie PIDs: they must not retain open file descriptors either."""
+    """Inspect FD tables; accept unreadable tables only after confirmed exit."""
     if sys.platform != "linux":
         return {}
     counts: dict[int, int] = {}
@@ -1389,6 +1391,19 @@ def _linux_fd_counts(pids: Sequence[int]) -> dict[int, int]:
         try:
             count = sum(1 for _ in (_LINUX_PROC_ROOT / str(pid) / "fd").iterdir())
         except FileNotFoundError:
+            continue
+        except PermissionError:
+            # A non-root reader can lose /proc/<pid>/fd access until the
+            # parent reaps its zombie. Require no surviving peer threads:
+            # a dead group leader alone does not prove their FDs are closed.
+            # Named SHM/FIFO cleanup is checked separately below.
+            try:
+                process = psutil.Process(pid)
+                exited = process.status() == psutil.STATUS_ZOMBIE and process.num_threads() == 1
+            except psutil.NoSuchProcess:
+                continue
+            if not exited:
+                raise
             continue
         if count:
             counts[pid] = count
@@ -1494,12 +1509,15 @@ def assert_no_server_tree_process_residual_and_gpu_release(
     injection time), not the marker-filtered ``worker_pids`` subset — so helpers like
     ``multiprocessing.resource_tracker`` are included in the residual check.
 
-    **Zombie** PIDs (exited children not yet reaped by the test ``Popen``) are excluded
-    from the "alive" list; ``psutil.pid_exists`` alone would false-positive on them.
+    **Zombie** PIDs with no surviving threads (exited children not yet reaped by
+    the test ``Popen``) are excluded from the "alive" list; ``psutil.pid_exists``
+    alone would false-positive on them.
 
     On Linux, also require captured PIDs' FD tables to empty and the named
     /dev/shm objects referenced at injection time to disappear. Identity uses
     device/inode pairs, so unrelated objects reusing a name do not fail cleanup.
+    A transient /proc permission error during process exit is retried within
+    the same deadline; a still-unreadable FD table fails the check.
     Objects created after the snapshot and references retained by processes
     outside the captured tree are not independently inventoried here.
 
@@ -1525,6 +1543,7 @@ def assert_no_server_tree_process_residual_and_gpu_release(
     last_alive: list[int] = []
     last_gpu_leaks: dict[int, int] = {}
     last_fds: dict[int, int] = {}
+    fd_error: PermissionError | None = None
     last_shm: list[str] = []
     gpu_telemetry_available: bool | None = None
     while time.monotonic() < deadline:
@@ -1541,7 +1560,12 @@ def assert_no_server_tree_process_residual_and_gpu_release(
         else:
             gpu_telemetry_available = True
             last_gpu_leaks = {pid: mem_mb for pid, mem_mb in gpu_map.items() if pid in tree_pid_set and mem_mb > 0}
-        last_fds = _linux_fd_counts(tree_pids)
+        try:
+            last_fds = _linux_fd_counts(tree_pids)
+        except PermissionError as error:
+            fd_error = error
+        else:
+            fd_error = None
         shm_objects = snapshot.get("shm_objects", [])
         last_shm = _remaining_linux_shm_objects(shm_objects)
         fifo_residual: list[str] = []
@@ -1551,12 +1575,14 @@ def assert_no_server_tree_process_residual_and_gpu_release(
             )
             fifo_residual = sorted(set(last_shm) - set(required_shm))
             last_shm = required_shm
-        if not last_alive and not last_gpu_leaks and not last_fds and not last_shm:
+        if fd_error is None and not last_alive and not last_gpu_leaks and not last_fds and not last_shm:
             if fifo_residual:
                 logger.warning("[%s] exempt named FIFO paths remain after SIGKILL: %s", scenario, fifo_residual)
             return
         time.sleep(poll_interval_sec)
 
+    if fd_error is not None:
+        raise fd_error
     assert not last_alive, f"[{scenario}] residual server-tree processes remain alive: {last_alive}"
     assert not last_gpu_leaks, f"[{scenario}] server-tree PID GPU memory not released: {last_gpu_leaks}"
     assert not last_fds, f"[{scenario}] server-tree file descriptors remain open: {last_fds}"
