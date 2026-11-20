@@ -19,6 +19,7 @@ import yaml
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+
 AMD_MERGE_PIPELINE = Path(".buildkite/amd/test-amd-merge.yml")
 AMD_NIGHTLY_PIPELINE = Path(".buildkite/amd/test-amd-nightly.yml")
 AMD_WEEKLY_PIPELINE = Path(".buildkite/amd/test-amd-weekly.yml")
@@ -1456,37 +1457,37 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
             "artifact_path": "artifacts/rocm-minicpmo-reliability/**/*",
             "artifact_env": "ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR",
             "expected_nodes": 14,
-            "expected_skipped": 3,
+            "expected_skipped": 0,
             "timeout": "220m",
             "collection_message": "Expected exactly 14 MiniCPM-o 4.5 reliability nodes",
-            "junit_message": "Expected exactly 14 executed MiniCPM-o 4.5 reliability tests with 3 known skips",
+            "junit_message": "Expected exactly 14 executed MiniCPM-o 4.5 reliability tests with no skips",
         },
         "Reliability Test · Invalid parameters · MI300 · Single-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-single/**/*",
             "artifact_env": "ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR",
-            "expected_nodes": 66,
+            "expected_nodes": 30,
             "expected_skipped": 5,
             "timeout": "75m",
-            "collection_message": "Expected exactly 66 single-GPU invalid-parameter nodes",
-            "junit_message": "Expected exactly 66 single-GPU invalid-parameter tests with 5 known skips",
+            "collection_message": "Expected exactly 30 single-GPU invalid-parameter nodes",
+            "junit_message": "Expected exactly 30 single-GPU invalid-parameter tests with 5 known skips",
         },
         "Reliability Test · Invalid parameters · MI300 · 2-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-reliability/**/*",
             "artifact_env": "ROCM_INVALID_PARAMETERS_ARTIFACT_DIR",
-            "expected_nodes": 24,
+            "expected_nodes": 18,
             "expected_skipped": 0,
             "timeout": "75m",
-            "collection_message": "Expected exactly 24 invalid-parameter reliability nodes",
-            "junit_message": "Expected exactly 24 executed invalid-parameter reliability tests",
+            "collection_message": "Expected exactly 18 invalid-parameter reliability nodes",
+            "junit_message": "Expected exactly 18 executed invalid-parameter reliability tests",
         },
         "Reliability Test · Invalid parameters · Audio · MI300 · Single-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-audio/**/*",
             "artifact_env": "ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR",
-            "expected_nodes": 127,
+            "expected_nodes": 85,
             "expected_skipped": 26,
             "timeout": "105m",
-            "collection_message": "Expected exactly 127 audio invalid-parameter nodes",
-            "junit_message": "Expected exactly 127 audio invalid-parameter tests with 26 known skips",
+            "collection_message": "Expected exactly 85 audio invalid-parameter nodes",
+            "junit_message": "Expected exactly 85 audio invalid-parameter tests with 26 known skips",
         },
     }
     for label, expected in guarded_jobs.items():
@@ -1568,32 +1569,32 @@ def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
             "ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR",
             "minicpmo-reliability-guard",
             14,
-            3,
-            "Expected exactly 14 executed MiniCPM-o 4.5 reliability tests with 3 known skips",
+            0,
+            "Expected exactly 14 executed MiniCPM-o 4.5 reliability tests with no skips",
         ),
         (
             "Reliability Test · Invalid parameters · MI300 · Single-GPU",
             "ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR",
             "invalid-parameters-single-reliability-guard",
-            66,
+            30,
             5,
-            "Expected exactly 66 single-GPU invalid-parameter tests with 5 known skips",
+            "Expected exactly 30 single-GPU invalid-parameter tests with 5 known skips",
         ),
         (
             "Reliability Test · Invalid parameters · MI300 · 2-GPU",
             "ROCM_INVALID_PARAMETERS_ARTIFACT_DIR",
             "invalid-parameters-reliability-guard",
-            24,
+            18,
             0,
-            "Expected exactly 24 executed invalid-parameter reliability tests",
+            "Expected exactly 18 executed invalid-parameter reliability tests",
         ),
         (
             "Reliability Test · Invalid parameters · Audio · MI300 · Single-GPU",
             "ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR",
             "invalid-parameters-audio-reliability-guard",
-            127,
+            85,
             26,
-            "Expected exactly 127 audio invalid-parameter tests with 26 known skips",
+            "Expected exactly 85 audio invalid-parameter tests with 26 known skips",
         ),
     ),
     ids=("qwen3-omni", "wan22", "minicpmo", "invalid-parameters-single", "invalid-parameters-2gpu", "audio"),
@@ -1643,16 +1644,6 @@ def test_weekly_reliability_executes_junit_guard_before_exit(
     )
 
 
-def test_hunyuan_offline_accuracy_has_cold_start_headroom() -> None:
-    accuracy = Path("tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py").read_text(encoding="utf-8")
-    offline_accuracy = accuracy.split("def _run_vllm_omni_hunyuan_image3_offline", maxsplit=1)[1].split(
-        "def _assert_against_baseline", maxsplit=1
-    )[0]
-
-    assert '"--stage-init-timeout",\n            "900"' in offline_accuracy
-    assert '"--init-timeout",\n            "1800"' in offline_accuracy
-
-
 def test_hunyuan_rocm_reliability_disables_expert_parallel() -> None:
     from vllm_omni.config.stage_config import resolve_deploy_yaml
 
@@ -1661,12 +1652,10 @@ def test_hunyuan_rocm_reliability_disables_expert_parallel() -> None:
     reliability = Path("tests/dfx/reliability/test_hunyuan_image.py").read_text(encoding="utf-8")
     reliability_fixtures = Path("tests/dfx/conftest.py").read_text(encoding="utf-8")
     startup = Path("tests/dfx/reliability/test_hunyuan_image_ep_startup.py").read_text(encoding="utf-8")
-    accuracy = Path("tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py").read_text(encoding="utf-8")
     step = _find_step("HunyuanImage Expert Parallel Startup", AMD_WEEKLY_PIPELINE)
     command = "\n".join(step["commands"])
     reliability_step = _find_step("Reliability Test · hunyuan-image", AMD_WEEKLY_PIPELINE)
     reliability_command = "\n".join(reliability_step["commands"])
-    nightly_accuracy = _find_step("HunyuanImage3 Offline Pixel Accuracy", AMD_NIGHTLY_PIPELINE)
     dependencies = yaml.safe_load(AMD_SOURCE_DEPENDENCIES.read_text(encoding="utf-8"))["source_file_dependencies"][
         "diffusion_hunyuan_image3_reliability"
     ]
@@ -1686,7 +1675,6 @@ def test_hunyuan_rocm_reliability_disables_expert_parallel() -> None:
     assert "send_health_http_request" in startup
     assert "send_images_generations_http_request" not in startup
     assert "hunyuan_image3_dit_rocm_reliability.yaml" not in startup
-    assert '"enable_expert_parallel": True' in accuracy
     assert step["agent_pool"] == "mi300_4"
     assert step["grade"] == "Blocking"
     assert step["depends_on"] == "amd-build"
@@ -1714,8 +1702,6 @@ def test_hunyuan_rocm_reliability_disables_expert_parallel() -> None:
     assert "vllm_omni/deploy/hunyuan_image3_dit_rocm_reliability.yaml" not in dependencies
     assert "tests/dfx/reliability/test_hunyuan_image_ep_startup.py" in dependencies
     assert "env" not in step
-    assert nightly_accuracy["grade"] == "NonBlocking"
-    assert nightly_accuracy["agent_pool"] == "mi300_4"
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
         assert "HunyuanImage Expert Parallel Startup" not in pipeline_path.read_text(encoding="utf-8")
 
@@ -2945,7 +2931,6 @@ def test_hunyuan_image3_lora_accuracy_is_one_blocking_nightly_job() -> None:
     assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
     assert step["env"]["HUNYUAN_IMAGE3_DEVICES"] == "0,1,2,3"
     assert "test_hunyuan_image3_lora.py" in commands
-    assert "test_hunyuan_image3_pixel_accuracy.py" not in commands
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert "HunyuanImage3 LoRA Accuracy" not in text

@@ -39,6 +39,13 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or positive, got {value!r}")
+    return parsed
+
+
 def _existing_file(value: str) -> str:
     path = Path(value).expanduser()
     if not path.is_file():
@@ -177,6 +184,7 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
 
 
 def add_duplex_eval_cli_args(parser: argparse.ArgumentParser) -> None:
+    from vllm_omni.benchmarks.duplex.omni_duplex_eval_eval import DEFAULT_JUDGE_FRAME_MAX_SIDE
     from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import MIX_MODES, MIX_QUESTION
     from vllm_omni.benchmarks.duplex_session_inputs import TURN_DETECTION_MODES, TURN_DETECTION_NONE
 
@@ -223,6 +231,12 @@ def add_duplex_eval_cli_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--duplex-eval-judge-timeout-s", type=_positive_finite_float, default=600.0)
     group.add_argument("--duplex-eval-judge-video-mode", choices=("video_url", "frame-sample"), default="video_url")
     group.add_argument("--duplex-eval-judge-fps", type=_positive_int, default=2)
+    group.add_argument(
+        "--duplex-eval-judge-frame-max-side",
+        type=_non_negative_int,
+        default=DEFAULT_JUDGE_FRAME_MAX_SIDE,
+        help="Scale judge frames down so the longer side is at most this many pixels (0 keeps source resolution).",
+    )
     group.add_argument("--duplex-eval-window-size", type=_positive_finite_float, default=10.0)
     group.add_argument("--duplex-eval-eval-workers", type=_positive_int, default=1)
 
