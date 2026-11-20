@@ -17,8 +17,10 @@ from unittest.mock import AsyncMock
 
 import janus
 import pytest
+from vllm.config.multimodal import MultiModalConfig
 from vllm.exceptions import VLLMValidationError
 from vllm.multimodal.cache import LruKeyReplicatedSenderCache
+from vllm.multimodal.processing import InputProcessingContext
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.serial_utils import MsgpackEncoder
@@ -362,7 +364,7 @@ async def test_forward_to_dead_downstream_stage_fails_request_not_server(orchest
 
 
 @pytest.mark.asyncio
-async def test_add_request_to_dead_stage_fails_request_not_server(orchestrator_factory) -> None:
+async def test_add_request_to_dead_stage_fails_request_not_server(orchestrator_factory, tmp_path) -> None:
     """A new request entering a stage that already lost all replicas fails that
     request instead of raising out of the request handler and tearing the server
     down. The guard runs before request state is registered, so nothing leaks.
@@ -385,7 +387,11 @@ async def test_add_request_to_dead_stage_fails_request_not_server(orchestrator_f
         r0.die = True
         await _wait_for(lambda: pool.live_replica_ids() == [])
 
-        # A new request now enters a stage with no live replica.
+        # A new request now enters a stage with no live replica. Its preprocessed
+        # artifacts must be cleaned even though request state is never registered.
+        artifact_dir = tmp_path / "request-artifacts"
+        artifact_dir.mkdir()
+        (artifact_dir / "prepared.mp4").touch()
         await _enqueue_add_request(
             orchestrator_fixture,
             request_id="req-after",
@@ -393,6 +399,7 @@ async def test_add_request_to_dead_stage_fails_request_not_server(orchestrator_f
             original_prompt={"prompt": "b"},
             sampling_params_list=[_sampling_params()],
             final_stage_id=0,
+            request_artifact_dirs=[str(artifact_dir)],
         )
 
         error_msg = await _wait_for_error_message(orchestrator_fixture, request_id="req-after")
@@ -402,6 +409,7 @@ async def test_add_request_to_dead_stage_fails_request_not_server(orchestrator_f
         assert orchestrator_fixture.thread.is_alive()
         # Guard runs before registration, so the failed request never enters state.
         assert "req-after" not in orchestrator_fixture.orchestrator.request_states
+        await _wait_for(lambda: not artifact_dir.exists())
     finally:
         if orchestrator_fixture.thread.is_alive():
             orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
@@ -527,7 +535,7 @@ async def test_async_chunk_prewarm_without_prompt_token_ids_fails_only_that_requ
 
 
 @pytest.mark.asyncio
-async def test_streaming_input_to_mrv2_downstream_stage_fails_with_client_error(orchestrator_factory) -> None:
+async def test_streaming_input_to_mrv2_downstream_stage_fails_with_client_error(orchestrator_factory, tmp_path) -> None:
     """A downstream MRv2 native-data-plane stage supports turn-based requests
     only: a resumable (realtime) request must fail up front, not hang."""
     stage0 = FakeStageClient(stage_type="llm", final_output=False)
@@ -537,6 +545,8 @@ async def test_streaming_input_to_mrv2_downstream_stage_fails_with_client_error(
         model_config=SimpleNamespace(max_model_len=64, use_v2_model_runner=True, supports_native_mrv2_data_plane=True)
     )
     fixture = orchestrator_factory([stage0, stage1], stage_vllm_configs=[v1, mrv2], async_chunk=True)
+    artifact_dir = tmp_path / "request-artifacts"
+    artifact_dir.mkdir()
 
     try:
         await _enqueue_add_request(
@@ -546,6 +556,7 @@ async def test_streaming_input_to_mrv2_downstream_stage_fails_with_client_error(
             original_prompt={"prompt": "stream"},
             sampling_params_list=[_sampling_params(), _sampling_params()],
             final_stage_id=1,
+            request_artifact_dirs=[str(artifact_dir)],
         )
 
         error_msg = await _wait_for_error_message(fixture, request_id="req-stream")
@@ -554,6 +565,8 @@ async def test_streaming_input_to_mrv2_downstream_stage_fails_with_client_error(
         assert "stage 1 runs on model_runner v2" in error_msg.error
         assert stage0.add_request_calls == [] and stage1.add_request_calls == []
         assert fixture.thread.is_alive()
+        assert "req-stream" not in fixture.orchestrator.request_states
+        assert not artifact_dir.exists()
     finally:
         if fixture.thread.is_alive():
             fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
@@ -1171,11 +1184,12 @@ async def test_bad_video_sampling_options_keep_orchestrator_alive(orchestrator_f
     stage1 = FakeStageClient(final_output=True)
     output_processor = FakeOutputProcessor(request_outputs=[_build_request_output("valid-video")])
     fixture = orchestrator_factory([stage0, stage1], output_processors=[FakeOutputProcessor(), output_processor])
+    ctx = InputProcessingContext(SimpleNamespace(get_multimodal_config=lambda: MultiModalConfig()), tokenizer=None)
     info = SimpleNamespace(
-        ctx=SimpleNamespace(
-            get_merged_mm_kwargs=lambda kw, **_: kw,
-            get_mm_config=lambda: SimpleNamespace(get_video_pruning_spec=lambda: None),
+        _merge_and_resolve_mm_processor_kwargs=lambda kw: ctx.get_merged_mm_kwargs(
+            kw, supported_mm_processor_kwargs={"videos_kwargs": {"size", "fps", "num_frames"}}
         ),
+        ctx=ctx,
         get_hf_config=lambda: SimpleNamespace(
             vision_config=SimpleNamespace(spatial_merge_size=2),
             vision_start_token_id=1,

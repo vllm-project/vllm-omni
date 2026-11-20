@@ -242,18 +242,16 @@ def test_validate_duplex_plugin_sampling_rejects_non_tuple_results() -> None:
 
 
 @pytest.mark.parametrize(
-    ("policy", "cap", "distributed", "sharing", "error"),
+    ("policy", "cap", "sharing", "error"),
     [
-        ("legacy", None, True, False, None),
-        ("legacy", 2, False, False, None),
-        ("least_sessions", 1, False, False, None),
-        ("least_sessions", 2, False, True, None),
-        ("least_sessions", 2, False, False, "set max_sessions_per_replica to 1"),
-        ("least_sessions", 1, True, False, "does not support distributed hub/LB mode"),
-        ("least_sessions", 2, True, False, "does not support distributed hub/LB mode"),
+        ("legacy", None, False, None),
+        ("legacy", 2, False, None),
+        ("least_sessions", 1, False, None),
+        ("least_sessions", 2, True, None),
+        ("least_sessions", 2, False, "set max_sessions_per_replica to 1"),
     ],
 )
-def test_validate_duplex_replica_policy(policy, cap, distributed, sharing, error) -> None:
+def test_validate_duplex_replica_policy(policy, cap, sharing, error) -> None:
     capability_calls: list[int] = []
 
     class CapabilityPlugin(FakePlugin):
@@ -265,12 +263,12 @@ def test_validate_duplex_replica_policy(policy, cap, distributed, sharing, error
     config = DuplexSessionRuntimeConfig(max_sessions=11, replica_policy=policy, max_sessions_per_replica=cap)
     if error is not None:
         with pytest.raises(ValueError, match=error):
-            validate_duplex_replica_policy(plugin, config, distributed=distributed)
+            validate_duplex_replica_policy(plugin, config)
     else:
-        validate_duplex_replica_policy(plugin, config, distributed=distributed)
-    # Distributed rejection precedes plugin access. Legacy and one-session
-    # replicas do not need a capability that permits sharing.
-    expected = [cap] if policy == "least_sessions" and not distributed and cap > 1 else []
+        validate_duplex_replica_policy(plugin, config)
+    # The capability is consulted whenever more than one session may share a
+    # replica, in local and distributed mode alike.
+    expected = [cap] if policy == "least_sessions" and cap > 1 else []
     assert capability_calls == expected
 
 
@@ -486,3 +484,63 @@ def test_default_session_state_implements_the_shared_transitions() -> None:
     assert state.continuation_owner_id is None
     assert state.continuation_units == 0
     assert state.pending_silence_task is None and state.pending_silence_owner_id is None
+
+
+def test_mergeable_committed_audio_stops_after_consume_starts() -> None:
+    """Once an append starts consuming retained PCM, the next commit must not merge it."""
+
+    class Buffer(PcmAppendBuffer):
+        pending_byte_count = 0
+
+        def clear(self) -> None: ...
+
+        def clear_force_listen(self) -> None: ...
+
+        def has_pending(self) -> bool:
+            return False
+
+        def has_reserved(self) -> bool:
+            return False
+
+        def prepare_append(self, payload, *, operation_id, chunk_period_ms, allow_emit):
+            return None
+
+        def prepare_commit(self, *, operation_id, chunk_period_ms):
+            raise NotImplementedError
+
+        def flush(self, *, chunk_period_ms):
+            return None
+
+    state = DefaultDuplexModelSessionState(audio_buffer=Buffer())
+    first = {"format": "pcm_f32le", "audio": "YQ==", "sample_rate_hz": 16000, "is_speech": True}
+    state.retain_committed_audio(first, operation_id="op1", reserved_bytes=8)
+    assert state.mergeable_committed_audio() is first
+    state.mark_committed_audio_consume_started()
+    assert state.mergeable_committed_audio() is None
+    assert state.committed_audio_payload is first
+    state.clear_committed_audio()
+    assert state.committed_audio_payload is None
+    assert state.committed_audio_consume_started is False
+
+
+def test_slots_session_states_track_committed_audio_consume() -> None:
+    """AURA and Qwen override retain/clear on slots dataclasses.
+
+    mergeable_committed_audio() reads committed_audio_consume_started. Without
+    the field on those states, the first commit raises AttributeError.
+    """
+    from vllm_omni.model_executor.models.aura_omni.duplex.session import AuraServingSessionState
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
+
+    for state in (AuraServingSessionState(), Qwen3OmniDuplexPlugin(lambda *args: "").create_session_state()):
+        first = {"audio": "YQ=="}
+        state.retain_committed_audio(first, operation_id="op1", reserved_bytes=4)
+        assert state.mergeable_committed_audio() is first
+        state.mark_committed_audio_consume_started()
+        assert state.mergeable_committed_audio() is None
+        state.retain_committed_audio({"audio": "Yg=="}, operation_id="op2", reserved_bytes=4)
+        assert state.committed_audio_consume_started is False
+        assert state.mergeable_committed_audio() == {"audio": "Yg=="}
+        state.clear_committed_audio()
+        assert state.committed_audio_payload is None
+        assert state.committed_audio_consume_started is False

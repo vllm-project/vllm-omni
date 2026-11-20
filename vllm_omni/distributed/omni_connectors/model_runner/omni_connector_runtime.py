@@ -22,7 +22,11 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
 )
 from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_connector_spec
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import get_local_tp_rank, get_omni_replica_id
-from vllm_omni.outputs import OmniConnectorOutput
+from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
+from vllm_omni.worker.scheduling_metadata_adapter import (
+    SchedulingMetadataAdapter,
+    resolve_scheduling_metadata_adapter,
+)
 
 logger = init_logger("vllm_omni.worker.omni_connector_model_runner_mixin")
 
@@ -111,6 +115,7 @@ class _OmniConnectorRuntimeMixin:
     _kv_transfer_manager: Any
     _async_chunk: bool
     _model_mode: str
+    _scheduling_metadata_adapter: SchedulingMetadataAdapter
     _stage_id: int
     _next_stage_id: int
     _from_tp: int
@@ -138,9 +143,11 @@ class _OmniConnectorRuntimeMixin:
     _full_payload_pending_broadcast_req_ids: set[str]
     _async_chunk_updated_req_ids: set[str]
     _local_stage_payload_cache: dict[str, dict[str, Any]]
-    _local_request_metadata: dict[str, dict[str, Any]]
+    _local_request_metadata: dict[str, SchedulingMetadataUpdate]
+    _run_stage_payloads: dict[str, bytes]
     _chunk_stream_completed: set[str]
     _pending_full_payload_send: dict[str, tuple[Any, ...]]
+    _full_payload_token_ends: dict[str, dict[str, int]]
     _kv_sent_req_ids: list[str]
     _kv_pending_transfers: dict[str, dict[str, Any]]
     _kv_active_transfers: set[str]
@@ -197,6 +204,9 @@ class _OmniConnectorRuntimeMixin:
 
         self._async_chunk: bool = getattr(model_config, "async_chunk", False)
         self._model_mode: str = getattr(model_config, "worker_type", "ar")
+        self._scheduling_metadata_adapter = resolve_scheduling_metadata_adapter(
+            getattr(model_config, "scheduling_metadata_adapter", None)
+        )
         stage_id = getattr(model_config, "stage_id", 0)
         if isinstance(stage_id, str):
             stage_id = int(stage_id)
@@ -288,7 +298,9 @@ class _OmniConnectorRuntimeMixin:
         # ownership.
         self._local_stage_payload_cache: dict[str, dict[str, Any]] = {}
         # Lightweight scheduling metadata pending delivery to the Scheduler.
-        self._local_request_metadata: dict[str, dict[str, Any]] = {}
+        self._local_request_metadata: dict[str, SchedulingMetadataUpdate] = {}
+        # Run requests' serialized stage payloads, returned to the Scheduler instead of sent.
+        self._run_stage_payloads: dict[str, bytes] = {}
         # Optional same-process control-plane fast path. Payload tensors remain
         # runner-owned; only OmniConnectorOutput readiness is published.
         self._omni_connector_output_sink: Callable[[OmniConnectorOutput], None] | None = None
@@ -300,6 +312,7 @@ class _OmniConnectorRuntimeMixin:
         # -- full_payload_mode: accumulate latest pooler_output per request,
         #    send only when the request finishes (next-cycle flush) --
         self._pending_full_payload_send: dict[str, tuple[Any, ...]] = {}
+        self._full_payload_token_ends: dict[str, dict[str, int]] = {}
 
         # -- KV sent accumulator --
         self._kv_sent_req_ids: list[str] = []
@@ -379,15 +392,8 @@ class _OmniConnectorRuntimeMixin:
         saves is added to ``_deferred_send_cleanup`` so the bg save's
         decrement path drains it without leaving orphans.
         """
-        # Force-flush any pending full-payload accumulator entry before
-        # cleanup proceeds.  Without this, finished requests with no
-        # downstream consumer (e.g. text-only on multi-modal arch) leave
-        # the entry orphaned in _pending_full_payload_send across requests,
-        # which empirically destabilises subsequent thinker forwards by
-        # making prefix-cache reuse observe stale accumulator state.  The
-        # flush is idempotent when the entry has already been flushed by the
-        # scheduler-driven path, but this cleanup path runs for every request,
-        # so skip it entirely when the request never accumulated a payload.
+        # Normal cleanup flushes an entry the scheduler-driven path did not send,
+        # so a text-only request cannot leave stale state across request ID reuse.
         if req_id in self._pending_full_payload_send:
             try:
                 self.flush_full_payload_outputs({req_id})
@@ -403,6 +409,7 @@ class _OmniConnectorRuntimeMixin:
                     exc_info=True,
                 )
 
+        self._drop_full_payload_token_end(req_id)
         ext_id = self._request_ids_mapping.pop(req_id, None)
         keys_to_clean: list[str] = [req_id]
         if ext_id is not None and ext_id != req_id:
@@ -1132,8 +1139,7 @@ class _OmniConnectorRuntimeMixin:
             return None
 
         params = signature.parameters
-        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
-            return "pooling_output"
+        accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values())
 
         supported = {
             name
@@ -1144,13 +1150,15 @@ class _OmniConnectorRuntimeMixin:
                 inspect.Parameter.KEYWORD_ONLY,
             )
         }
-        if not {"transfer_manager", "request"}.issubset(supported):
+        if not accepts_kwargs and not {"transfer_manager", "request"}.issubset(supported):
             return None
+        # Explicit payload parameters take precedence: a builder may accept
+        # unrelated **kwargs without reading its model output from them.
         if "pooling_output" in supported:
             return "pooling_output"
         if "multimodal_output" in supported:
             return "multimodal_output"
-        return None
+        return "pooling_output" if accepts_kwargs else None
 
     @staticmethod
     def _load_custom_batch_func(custom_process_func: Any | None) -> Any | None:

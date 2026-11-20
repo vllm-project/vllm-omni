@@ -51,6 +51,7 @@ device, a checkpoint, or the distributed VAE stack.
 
 from __future__ import annotations
 
+import threading
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
@@ -239,6 +240,20 @@ class WanStreamingDecoder:
         num_frames = int(latent.shape[2])
         if num_frames == 0:
             raise ValueError("latent must carry at least one frame.")
+
+        # Ascend-only, synchronous-path-only: reclaim the denoise loop's cached
+        # allocator blocks before the decode allocates its per-frame buffers.
+        # Scoped to NPU because the reclaim was only measured on 910B3; on
+        # CUDA/XPU empty_cache here is untested and may regress inter-chunk
+        # latency (allocator blocks are returned to the driver and re-faulted
+        # on the next allocation). Skipped on background consumer threads
+        # (the CausVid async path): a cross-thread allocator flush would
+        # steal cached blocks from the concurrently-denoising producer thread,
+        # defeating the decode/denoise overlap that path exists for. Placed
+        # after input validation so rejected calls acquire no device-wide
+        # side effect.
+        if latent.device.type == "npu" and threading.current_thread() is threading.main_thread():
+            torch.npu.empty_cache()
 
         decoded_frames = []
         with self._execution_context():

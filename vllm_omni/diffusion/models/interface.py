@@ -99,6 +99,13 @@ class SupportsStepExecution(Protocol):
     serving-scheduler cycle in between (a capability, not a policy: the runner
     that owns the scheduling decision chooses whether to group steps). It is
     optional so it does not become part of the runtime protocol check.
+
+    Likewise, a pipeline may set the optional class attribute
+    ``supports_mixfusion = True`` to declare that it can denoise a batch of
+    mixed-resolution requests (ragged/packed latents), which lets the
+    scheduler relax height/width out of the batch key when MixFusion is
+    enabled. It is read via ``getattr`` and is likewise not part of the
+    runtime protocol check.
     """
 
     supports_step_execution: ClassVar[bool] = True
@@ -119,6 +126,21 @@ class SupportsStepExecution(Protocol):
 
     def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput:
         """Decode output after denoise loop or at a partial chunk boundary."""
+        ...
+
+
+@runtime_checkable
+class SupportsSkipLayerGuidance(Protocol):
+    """Transformer with request-local identity skips for complete DiT blocks.
+
+    Layer IDs are defined by the model. Its forward accepts ``skip_layers``
+    without changing weights, hooks, or other requests' execution state.
+    """
+
+    supports_skip_layer_guidance: ClassVar[bool]
+
+    def validate_skip_layers(self, skip_layers: tuple[int, ...]) -> None:
+        """Reject layer IDs that cannot be skipped by this transformer."""
         ...
 
 
@@ -147,10 +169,33 @@ class SupportsComponentDiscovery(Protocol):
     _resident_modules: ClassVar[list[str]] = []
 
 
-def supports_step_execution(pipeline: object) -> bool:
-    """Return whether `pipeline` implements :class:`SupportsStepExecution`."""
+@runtime_checkable
+class SupportsSamplingStep(Protocol):
+    """Pipelines whose denoise_step also updates latents and step_index.
 
-    return isinstance(pipeline, SupportsStepExecution)
+    denoise_step owns every model evaluation and commits one complete algorithm
+    step per successful request. Return every request ID mapped to None on
+    success or its exception on failure. A failed request must not advance.
+    """
+
+    supports_step_execution: ClassVar[bool] = True
+    denoise_step_updates_state: ClassVar[bool] = True
+
+    def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState: ...
+
+    def denoise_step(
+        self, input_batch: InputBatch, *, states: Sequence[StepRequestState] | None = None
+    ) -> dict[str, Exception | None]: ...
+
+    def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput: ...
+
+
+def supports_step_execution(pipeline: object) -> bool:
+    """Return whether the pipeline implements either supported step protocol."""
+
+    return isinstance(pipeline, SupportsStepExecution) or (
+        isinstance(pipeline, SupportsSamplingStep) and pipeline.denoise_step_updates_state
+    )
 
 
 # --- Generic role-based component loading for diffusion disaggregation ---------

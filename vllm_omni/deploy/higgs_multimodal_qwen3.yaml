@@ -50,7 +50,7 @@ stages:
     # concurrent requests is a net throughput win. Stage 1 (codec decoder)
     # has no KV cache and stays disabled.
     enable_prefix_caching: true
-    async_scheduling: false
+    async_scheduling: true
     max_num_batched_tokens: 4096
     max_model_len: 8192
     devices: "0"
@@ -63,6 +63,9 @@ stages:
       max_tokens: 2048
       seed: 42
       repetition_penalty: 1.0
+    hf_overrides:
+      audio_async_prompt_mode: true
+      audio_async_payload: true
 
   - stage_id: 1
     max_num_seqs: 16

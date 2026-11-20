@@ -60,6 +60,7 @@ class DiffusionAttentionBackendEnum(Enum, metaclass=_DiffusionBackendEnumMeta):
     TORCH_SDPA = "vllm_omni.diffusion.attention.backends.sdpa.SDPABackend"
     SAGE_ATTN = "vllm_omni.diffusion.attention.backends.sage_attn.SageAttentionBackend"
     SAGE_ATTN_3 = "vllm_omni.diffusion.attention.backends.sage_attn3.SageAttention3Backend"
+    SPARGE_ATTN = "vllm_omni.diffusion.attention.backends.sparge_attn.SpargeAttentionBackend"
     CUDNN_ATTN = "vllm_omni.diffusion.attention.backends.cudnn_attn.CuDNNAttentionBackend"
     FLASHINFER_ATTN = "vllm_omni.diffusion.attention.backends.flashinfer_attn.FlashInferAttentionBackend"
     FASTVIDEO_VSA = "vllm_omni.diffusion.attention.backends.fastvideo_vsa.FastVideoVSABackend"

@@ -15,7 +15,7 @@ from tests.helpers.mark import hardware_marks
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
     pytest.mark.core_model,
-    *hardware_marks(res={"cuda": "L4"}),
+    *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}),
 ]
 
 DTYPE = torch.bfloat16
@@ -61,6 +61,7 @@ def _engine_config():
             encoder_cudagraph_token_budgets=BUDGETS,
             encoder_cudagraph_max_vision_items_per_batch=2,
             encoder_cudagraph_max_frames_per_batch=None,
+            encoder_cudagraph_max_token_budget=5120,
         ),
         parallel_config=SimpleNamespace(tensor_parallel_size=1),
     )
@@ -203,7 +204,6 @@ def test_replay_metadata_does_not_read_the_device(encoder):
 
 
 def test_captured_graphs_match_eager_and_keep_previous_outputs(encoder):
-    from vllm.compilation.monitor import set_cudagraph_capturing_enabled
     from vllm.distributed.parallel_state import graph_capture
     from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
 
@@ -215,15 +215,11 @@ def test_captured_graphs_match_eager_and_keep_previous_outputs(encoder):
         # The runner captures inside graph_capture(), which supplies the
         # non-default capture stream.
         with torch.inference_mode(), graph_capture(device=torch.device("cuda")):
-            set_cudagraph_capturing_enabled(True)
-            try:
-                manager.capture(graph_pool=torch.cuda.graph_pool_handle())
-            finally:
-                set_cudagraph_capturing_enabled(False)
+            manager.capture(graph_pool=torch.cuda.graph_pool_handle())
         assert manager.get_cumulative_stats()["num_budgets"] == len(BUDGETS)
         # A small image; two images that exactly fill the smallest budget; one
         # 256-patch sequence, longer than one attention tile, filling a budget
-        # alone; two images the manager packs into one replay in reverse order.
+        # alone; two images of different sizes in one replay.
         cases = [[[1, 4, 4]], [[1, 2, 8], [1, 4, 4]], [[1, 16, 16]], [[1, 8, 8], [1, 4, 8]]]
         retained = []
         for seed, grids in enumerate(cases):

@@ -196,19 +196,17 @@ class SequenceParallelSplitHook(ModelHook):
 
     def pre_forward(self, module: nn.Module, *args: Any, **kwargs: Any) -> tuple[tuple, dict]:
         """Shard inputs before forward."""
+        from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+
         args_list = list(args)
+        actually_sharded = False
+        equal_rank_seq_lens = True
         # Clear text length cache for this forward pass
         self._text_len_cache.clear()
-        if self._shard_groups:
-            from vllm_omni.diffusion.forward_context import (
-                get_forward_context,
-                is_forward_context_available,
-            )
-
-            if is_forward_context_available():
-                ctx = get_forward_context()
-                for shard_group in self._shard_groups:
-                    ctx.sp_shard_metadata.pop(shard_group, None)
+        if self._shard_groups and is_forward_context_available():
+            ctx = get_forward_context()
+            for shard_group in self._shard_groups:
+                ctx.sp_shard_metadata.pop(shard_group, None)
 
         for name, spm in self.metadata.items():
             # Skip if this is a split_output entry (handled in post_forward)
@@ -231,7 +229,11 @@ class SequenceParallelSplitHook(ModelHook):
                     raise ValueError(
                         f"Expected SequenceParallelInput for tensor parameter '{name}', got {type(spm).__name__}"
                     )
+                original = input_val
                 input_val = self._prepare_sp_input(input_val, spm, args_list, kwargs)
+                if input_val is not original:
+                    actually_sharded = True
+                    equal_rank_seq_lens &= isinstance(spm, SequenceParallelInput) and spm.auto_pad
             elif isinstance(input_val, (list, tuple)):
                 # Handle list/tuple of tensors with per-element config
                 if not isinstance(spm, (list, tuple)):
@@ -243,8 +245,13 @@ class SequenceParallelSplitHook(ModelHook):
                     raise ValueError(f"Expected {len(spm)} elements for parameter '{name}', got {len(input_val)}")
                 sharded_input_val = []
                 for i, x in enumerate(input_val):
-                    if torch.is_tensor(x) and not spm[i].split_output:
-                        x = self._prepare_sp_input(x, spm[i], args_list, kwargs)
+                    input_spec = spm[i]
+                    if torch.is_tensor(x) and not input_spec.split_output:
+                        original = x
+                        x = self._prepare_sp_input(x, input_spec, args_list, kwargs)
+                        if x is not original:
+                            actually_sharded = True
+                            equal_rank_seq_lens &= isinstance(input_spec, SequenceParallelInput) and input_spec.auto_pad
                     sharded_input_val.append(x)
                 input_val = type(input_val)(sharded_input_val)
             else:
@@ -266,6 +273,13 @@ class SequenceParallelSplitHook(ModelHook):
         for spm in self.metadata.values():
             if isinstance(spm, SequenceParallelPartialInput) and spm.split_output:
                 self._resolve_text_len(spm, args_list, kwargs)
+
+        # Attention inside this module already consumes sharded inputs.
+        # Enter one scope for the boundary, regardless of its tensor count.
+        if actually_sharded and is_forward_context_available():
+            ctx = get_forward_context()
+            ctx._sp_shard_depth += 1
+            ctx._sp_equal_pad_stack.append(equal_rank_seq_lens)
 
         return tuple(args_list), kwargs
 

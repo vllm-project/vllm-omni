@@ -15,7 +15,12 @@ import torch
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from PIL import Image
 
-from tests.e2e.accuracy.helpers import assert_image_sequence_similarity, model_output_dir
+from tests.e2e.accuracy.helpers import (
+    assert_image_sequence_similarity,
+    measure_image_sequence_similarity,
+    model_output_dir,
+    write_accuracy_result,
+)
 from tests.helpers.clean import cleanup_test_environment
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer
@@ -142,6 +147,24 @@ def test_qwen_image_layered_matches_diffusers(accuracy_artifact_root: Path, qwen
     vllm_outputs = _run_vllm_omni_qwen_image_layered(model=model, input_image=input_image, output_dir=output_dir)
     diffusers_outputs = _run_diffusers_qwen_image_layered(model=model, input_image=input_image, output_dir=output_dir)
 
+    layer_scores = measure_image_sequence_similarity(
+        model_name=MODEL_ID,
+        vllm_images=vllm_outputs,
+        diffusers_images=diffusers_outputs,
+        compare_mode="RGBA",
+    )
+    write_accuracy_result(
+        model_id=MODEL_ID,
+        dataset="image_similarity",
+        metrics={
+            "layers": [
+                {"layer": index, "ssim": ssim, "psnr": psnr} for index, (ssim, psnr) in enumerate(layer_scores, start=1)
+            ],
+            "ssim_min": min(ssim for ssim, _ in layer_scores),
+            "psnr_min": min(psnr for _, psnr in layer_scores),
+        },
+        baseline={"ssim": SSIM_THRESHOLD, "psnr": PSNR_THRESHOLD},
+    )
     assert_image_sequence_similarity(
         model_name=MODEL_ID,
         vllm_images=vllm_outputs,
@@ -149,4 +172,5 @@ def test_qwen_image_layered_matches_diffusers(accuracy_artifact_root: Path, qwen
         ssim_threshold=SSIM_THRESHOLD,
         psnr_threshold=PSNR_THRESHOLD,
         compare_mode="RGBA",
+        layer_scores=layer_scores,
     )

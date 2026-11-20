@@ -120,7 +120,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
             apply_minicpmo_4_5_code2wav_patch,
         )
         from vllm_omni.platforms.npu.models.qwen3_tts import (
-            apply_qwen3_tts_patches,
+            apply_qwen3_tts_code2wav_patch,
         )
         from vllm_omni.platforms.npu.models.qwen3_tts_tokenizer_v2 import (
             apply_qwen3_tts_tokenizer_v2_patch,
@@ -129,7 +129,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         adapt_patch(is_global_patch=True)
         apply_contiguous_kv_patch()
         apply_minicpmo_4_5_code2wav_patch()
-        apply_qwen3_tts_patches()
+        apply_qwen3_tts_code2wav_patch()
         apply_qwen3_tts_tokenizer_v2_patch()
         apply_310p_patches()
         # The Triton rejection/penalties warmup guard for multi-frame decode must
@@ -160,6 +160,12 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         torch.npu.config.allow_internal_format = True
 
     @classmethod
+    def prepare_stage_engine(cls) -> None:
+        from vllm_omni.platforms.npu.mamba_compat import _install_ascend_mamba_prefill_end_compat
+
+        _install_ascend_mamba_prefill_end_compat()
+
+    @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
         return "vllm_omni.platforms.npu.worker.npu_ar_worker.NPUARWorker"
 
@@ -178,6 +184,11 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         # non-UVA buffer implementation on NPU.
         adapt_patch()
         init_ascend_config(vllm_config)
+
+        # Register Ascend LoRA classes for generic vLLM from_layer paths.
+        from vllm_ascend.lora.utils import refresh_all_lora_classes
+
+        refresh_all_lora_classes()
 
     @classmethod
     def configure_diffusion_vllm_config(cls, vllm_config: Any, od_config: Any) -> None:
@@ -239,6 +250,12 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         # both multi-token updates and single-token updates in this path.
         kwargs["attn_state"] = AscendAttentionState.ChunkedPrefill
         return build_attn_metadata(**kwargs)
+
+    @classmethod
+    def apply_diffusion_model_patches(cls, model, od_config) -> None:
+        from vllm_omni.platforms.npu.models.minimax_h3_image import apply_minimax_h3_image_graphs
+
+        apply_minimax_h3_image_graphs(model, od_config)
 
     @classmethod
     def init_diffusion_model_runner_runtime(cls, vllm_config: Any, od_config: Any, device: torch.device) -> None:

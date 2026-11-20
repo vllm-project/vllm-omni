@@ -3,6 +3,8 @@
 """FlowEncoderGraphs: shared startup arena, dynamic CUDA capture and NPU fallback."""
 
 import functools
+import gc
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -123,7 +125,7 @@ def test_other_shapes_and_layouts_run_eager(fake_capture, monkeypatch: pytest.Mo
     assert graphs.replays == 1
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
 def test_captured_graphs_match_eager_bit_exactly_on_cuda() -> None:
     graphs, encode = _graphs("cuda")
@@ -169,7 +171,7 @@ def test_shared_capture_failure_blocks_subsequent_calls(fake_capture, monkeypatc
         graphs(tokens, last_chunk=False, cnn_cache=cnn[0], att_cache=att[0])
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_shared_arena_rejects_other_stream_and_autocast():
     graphs, _ = _graphs("cuda")
@@ -270,7 +272,7 @@ def test_exact_precapture_failure_blocks_retry(monkeypatch):
         graph(tokens, last_chunk=False, cnn_cache=None, att_cache=None)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("amp", [False, True])
 @torch.inference_mode()
@@ -353,7 +355,7 @@ def test_rocm_cuda_devices_fall_back_before_nvidia_stream_creation(monkeypatch):
         pytest.fail("ROCm fallback must not create or capture NVIDIA streams")
 
     monkeypatch.setattr(torch.version, "hip", "test-rocm")
-    monkeypatch.setattr(graph_module, "_new_capture_stream", forbidden)
+    monkeypatch.setattr(graph_module, "create_cuda_stream", forbidden)
     monkeypatch.setattr(FlowEncoderGraphs, "_capture", forbidden)
     token = SimpleNamespace(device=SimpleNamespace(type="cuda"))
     wrapper = FlowEncoderGraphs(lambda x, **kwargs: (x, x, x))
@@ -374,7 +376,7 @@ def test_rocm_eager_chunks_preserve_outputs_and_cache(monkeypatch):
     def forbidden(*args, **kwargs):
         pytest.fail("ROCm eager chunks must not enter NVIDIA capture")
 
-    monkeypatch.setattr(graph_module, "_new_capture_stream", forbidden)
+    monkeypatch.setattr(graph_module, "create_cuda_stream", forbidden)
     monkeypatch.setattr(FlowEncoderGraphs, "_capture", forbidden)
     weight = torch.randn(_HIDDEN, _HIDDEN, device="cuda")
     encode = functools.partial(_encode, weight=weight)
@@ -746,6 +748,7 @@ def test_failed_capture_blocks_even_eager_retry(monkeypatch, mock_nvidia_platfor
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.nvidia_only
 @_requires_nvidia_capture
+@pytest.mark.usefixtures("clean_gpu_memory_between_tests")
 @torch.inference_mode()
 def test_full_cache_preserves_graphs_outputs_and_bounded_metadata():
     weight = torch.randn(32, 32, device="cuda")
@@ -840,6 +843,64 @@ def test_capture_streams_are_not_reused_by_torch_pool():
     assert wrapper.stats["evictions"] == 0
     assert wrapper.stats["captures"] == 2
     assert wrapper.stats["capacity"] == 6
+
+
+def _stale_graphs_in_a_cycle():
+    # Mimics an earlier test's wrapper: once the caller drops its reference,
+    # only a reference cycle keeps it and its CUDA graphs alive, so they are
+    # freed by cyclic GC, not by refcount.
+    weight = torch.randn(64, 64, device="cuda")
+    stale = FlowEncoderGraphs(lambda x, **kw: ((x @ weight).sin(),) * 3, max_graphs=2)
+    for size in (4, 6):
+        x = torch.randn(size, 64, device="cuda")
+        for _ in range(2):
+            stale(x, last_chunk=False, cnn_cache=None, att_cache=None)
+    torch.accelerator.synchronize()
+    stale.cycle = stale
+    return stale, [weakref.ref(entry[0]) for entry in stale.exact_graphs.values()]
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.nvidia_only
+@_requires_nvidia_capture
+@torch.inference_mode()
+def test_capture_survives_a_cyclic_gc_of_a_stale_graph():
+    # Regression for an order-dependent CI failure: a GC cycle landing inside
+    # capture reset a stale CUDAGraph and invalidated the capture. The stale
+    # wrapper's strong reference is held across the capture guard's entry
+    # collect and dropped only once the stream is capturing, so the collect
+    # runs on graphs that are alive during the capture: the same-run case,
+    # unlike the between-test cleanup of #10481.
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        stale, stale_graphs = _stale_graphs_in_a_cycle()
+        assert stale_graphs and all(ref() is not None for ref in stale_graphs)
+        collected: list[int] = []
+        weight = torch.randn(32, 32, device="cuda")
+
+        def forward(x, **kw):
+            nonlocal stale
+            if torch.cuda.is_current_stream_capturing() and not collected:
+                stale = None  # only the reference cycle is left
+                collected.append(gc.collect())
+            y = (x @ weight).sin()
+            return y, y + 1, y + 2
+
+        wrapper = FlowEncoderGraphs(forward, max_graphs=2)
+        for size in (1, 2):
+            x = torch.randn(size, 32, device="cuda")
+            for _ in range(2):
+                wrapper(x, last_chunk=False, cnn_cache=None, att_cache=None)
+        torch.accelerator.synchronize()
+        assert collected, "no GC ran during capture"
+        assert wrapper.stats["captures"] == 2
+        # The guard unfreezes and collects on exit; the cycle is gone by then.
+        assert all(ref() is None for ref in stale_graphs)
+    finally:
+        if was_enabled:
+            gc.enable()
+        gc.collect()
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)

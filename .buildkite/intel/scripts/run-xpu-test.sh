@@ -102,9 +102,30 @@ HF_CACHE="${HF_CACHE:-$(realpath ~)/.cache/huggingface}"
 mkdir -p "${HF_CACHE}"
 HF_MOUNT="/root/.cache/huggingface"
 
+# Test budget inside the container; the pipeline gives the broad scope more.
+# Each stage also has its own cap - 6+13+28+2+10 = 59m in the pr scope, plus
+# 20+15 = 94m in the broad scope - so one runaway stage cannot eat the whole
+# budget, and the stages that run last still get their full cap. Measured end to
+# end in the pr scope on two cards: 3m40s dispatch + 10m05s omni + 23m01s core
+# 1-card + 23s mxfp8 + 1m41s core 2-card = 39m31s including the reaps.
+# timeout_in_minutes on the step has to cover the budget plus the image build
+# (check the "time docker build" line above when tuning either).
+XPU_TEST_BUDGET="${XPU_TEST_BUDGET:-60m}"
+
+# pr    = the no-card XPU-dispatch stage, every core_model case on one and on
+#         two cards, and the omni models. Needs tiny-random/Qwen-Image (30MB),
+#         riverclouds/qwen_image_random (9.9GB), Qwen2.5-Omni-3B (12GB) and
+#         Qwen2.5-Omni-7B (21GB); the container downloads any that are not
+#         in the mounted HF cache yet.
+# broad = also advanced_model on one card (Qwen3-TTS, Z-Image, Wan2.1, Voxtral,
+#         ~13m) and on two (11 sleep/wake cases, which additionally need
+#         BAGEL-7B-MoT).
+# Set XPU_TEST_SCOPE=broad on the nightly or a manually triggered build.
+export XPU_TEST_SCOPE="${XPU_TEST_SCOPE:-pr}"
+
 # Container variables below must expand in the container shell.
 # shellcheck disable=SC2016
-time timeout -k 30 30m docker run \
+time timeout -k 30 "${XPU_TEST_BUDGET}" docker run \
     --device /dev/dri:/dev/dri \
     --net=host \
     --ipc=host \
@@ -115,17 +136,217 @@ time timeout -k 30 30m docker run \
     -e VLLM_LOGGING_LEVEL \
     -e VLLM_OMNI_LOGGING_LEVEL \
     -e HF_TOKEN \
+    -e HF_HUB_OFFLINE \
+    -e XPU_TEST_SCOPE \
+    -e XPU_TEST_CARDS \
+    -e XPU_REQUIRE_CARDS \
+    -e XPU_CPU_WORKERS \
     -e ZE_AFFINITY_MASK \
     --name "${container_name}" \
     "${image_name}" \
     bash -c '
-    set -e
-    echo $ZE_AFFINITY_MASK
-    pip install tblib==3.1.0
-    cd /workspace/vllm-omni
-    XPU_TEST_PATHS="tests/diffusion tests/dfx tests/e2e tests/platforms"
-    pytest -v -s $XPU_TEST_PATHS -m "core_model and xpu and B60"
-    pytest -v -s tests/diffusion/quantization/test_mxfp8_config.py
-    pytest -v -s $XPU_TEST_PATHS -m "advanced_model and xpu and B60"
-    pytest -v -s $XPU_TEST_PATHS -m "omni and xpu and B60"
+    set -uo pipefail
+    pip install tblib==3.1.0 || exit 1
+    cd /workspace/vllm-omni || exit 1
+
+    # Card budget. The agent sets ZE_AFFINITY_MASK; take its first entry for the
+    # cards_1 stages and its first two for the cards_2 ones, so a test can never
+    # reach a card another agent on this host is using - with only the allotted
+    # devices visible, hardware_test(num_cards=N) skips itself when N is higher.
+    # Every marker expression below also pins cards_1 or cards_2 explicitly.
+    mask="${ZE_AFFINITY_MASK:-0}"
+    IFS="," read -r -a mask_cards <<< "${mask}"
+    one_card="${mask_cards[0]}"
+    two_cards="${mask_cards[0]}${mask_cards[1]+,${mask_cards[1]}}"
+    echo "ZE_AFFINITY_MASK=${mask} -> cards_1 on ${one_card}, cards_2 on ${two_cards}"
+
+    # How many cards this lane is entitled to. The pipeline asks for 2 so the
+    # cards_2 stages always run; an agent that hands over fewer fails the step
+    # instead of quietly dropping those stages. Set XPU_REQUIRE_CARDS=1 on a
+    # single-card queue to opt out of the 2-card stages on purpose.
+    require_cards="${XPU_REQUIRE_CARDS:-2}"
+    # Which card classes this step owns. A dedicated 2-card step sets
+    # XPU_TEST_CARDS=2 so it does not repeat the 1-card lane that the
+    # single-card agents already run; "1,2" (the default) runs everything.
+    test_cards="${XPU_TEST_CARDS:-1,2}"
+    case ",${test_cards}," in *,1,*) run_1card=1 ;; *) run_1card=0 ;; esac
+    case ",${test_cards}," in *,2,*) run_2card=1 ;; *) run_2card=0 ;; esac
+    echo "XPU_TEST_CARDS=${test_cards} -> 1-card stages=${run_1card}, 2-card stages=${run_2card}"
+    if [ "${#mask_cards[@]}" -lt "${require_cards}" ]; then
+        echo "ERROR: this step wants ${require_cards} cards but the agent gave" \
+             "${#mask_cards[@]} (ZE_AFFINITY_MASK=${mask}). Point the step at an" \
+             "agent with ${require_cards} cards, or set XPU_REQUIRE_CARDS to" \
+             "${#mask_cards[@]} to run the smaller lane deliberately." >&2
+        exit 1
+    fi
+
+    # Paths that hold XPU-tagged tests. Scoped explicitly: a bare
+    # "pytest tests/" still crashes during collection on XPU (#6175).
+    paths=(tests/diffusion tests/dfx tests/e2e tests/platforms
+           tests/model_executor tests/entrypoints tests/engine
+           tests/worker tests/worker_v2)
+
+    # Resolves a model directory at import time, so collection of the whole
+    # path list fails (pytest exit 2) whenever those weights are absent from
+    # the mounted cache. It carries no XPU marker, so skip the file outright.
+    ignore=(--ignore tests/e2e/offline_inference/test_cosyvoice3_expansion.py)
+
+
+    # The GPU stages load these from the mounted cache. Fetch what is missing
+    # up front: a fresh agent fills its cache on the first run (about 43 GB,
+    # kept on the host for later builds), and a download that fails stops the
+    # job here with the repo named, not six minutes into the omni stage.
+    # huggingface_hub locks per file, so two agents sharing one cache can
+    # fetch the same repo at once.
+    if [ "${run_1card}" = 1 ]; then
+        python - <<PY || exit 1
+import time
+from huggingface_hub import snapshot_download
+
+needed = ["tiny-random/Qwen-Image", "riverclouds/qwen_image_random",
+          "Qwen/Qwen2.5-Omni-3B", "Qwen/Qwen2.5-Omni-7B"]
+failed = []
+for repo in needed:
+    try:
+        snapshot_download(repo, local_files_only=True)
+        continue
+    except Exception:
+        pass
+    print(f"checkpoint preflight: downloading {repo}", flush=True)
+    start = time.monotonic()
+    try:
+        snapshot_download(repo)
+    except Exception as exc:
+        failed.append(f"{repo}: {type(exc).__name__}: {exc}")
+        continue
+    print(f"checkpoint preflight: {repo} done in "
+          f"{time.monotonic() - start:.0f}s", flush=True)
+if failed:
+    raise SystemExit(
+        "these checkpoints are neither in the mounted HF cache nor "
+        "downloadable (HF_HUB_OFFLINE set, or no network/HF_TOKEN):\n  "
+        + "\n  ".join(failed)
+    )
+print("checkpoint preflight ok:", ", ".join(needed))
+PY
+    fi
+
+    rc=0
+    # A stage that starts an engine can leave a worker process behind, and its
+    # device memory with it: a 19 GiB leftover once left 11 of 30 GiB free and
+    # failed the next stage at startup. Reap our own strays between stages and
+    # report what the card holds, so a leak shows up in the log instead of as a
+    # mysterious memory-profiling failure.
+    reap() {
+        pkill -f StageEngineCoreProc || true
+        pkill -f "VLLM::EngineCore" || true
+        pkill -f "vllm_omni.*worker" || true
+        sleep 5
+        ZE_AFFINITY_MASK="$1" MASK="$1" python - <<PY || true
+import os
+
+import torch
+
+free, total = torch.xpu.mem_get_info()
+# The index inside the process is always 0 for a one-card mask, so report the
+# mask the stage ran under instead.
+mask = os.getenv("MASK", "?")
+print(f"[ZE_AFFINITY_MASK={mask}] {free / 2**30:.2f} of {total / 2**30:.2f} GiB free")
+PY
+    }
+
+    rc=0
+    # stage <name> <budget> <cards> <pytest args...>; cards is the
+    # ZE_AFFINITY_MASK the stage runs under. Always pass a mask, also for the
+    # no-card stage: an empty ZE_AFFINITY_MASK makes every card on the host
+    # visible, including the ones other agents own.
+    stage() {
+        local name="$1" budget="$2" cards="$3"
+        shift 3
+        local t0=${SECONDS} code=0
+        echo "--- :pytest: ${name}"
+        ZE_AFFINITY_MASK="${cards}" timeout -k 30 "${budget}" \
+            pytest -v -s --durations=25 "$@" || code=$?
+        # Exit 5 means pytest collected nothing. Every stage here selects real
+        # tests, so an empty stage is coverage silently lost - for example a
+        # pinned path that upstream deleted - and it fails like any other.
+        if [ "${code}" = 0 ]; then
+            echo "+++ PASS ${name} ($((SECONDS - t0))s)"
+        else
+            [ "${code}" = 5 ] && echo "ERROR: stage ${name} collected no tests" >&2
+            echo "FAIL ${name} ($((SECONDS - t0))s, rc=${code})"
+            rc=1
+        fi
+        [ -n "${cards}" ] && reap "${cards}"
+    }
+
+    # No-card stage: the cpu-marked tests that can observe which platform they
+    # run on, so they exercise XPU dispatch without taking a card. The file list
+    # is pinned rather than globbed - the rest of the cpu suite is platform
+    # independent and the CUDA and ROCm lanes already run it. Note --ignore does
+    # not apply to files named explicitly, which is why the exclusions live in
+    # the list itself. See the header of both files for the measurements.
+    if [ "${run_1card}" = 1 ]; then
+        # Upstream deletes test files; one stale path aborts the whole
+        # collection, so drop missing ones loudly instead of failing on them.
+        xpu_path=()
+        while read -r f; do
+            if [ -f "${f}" ]; then
+                xpu_path+=("${f}")
+            else
+                echo "WARNING: ${f} is in xpu-path-tests.txt but no longer exists" >&2
+            fi
+        done < <(grep -v "^#" .buildkite/intel/xpu-path-tests.txt | grep .)
+        stage "xpu dispatch (no card)" 6m "${one_card}" -n "${XPU_CPU_WORKERS:-8}" \
+            "${xpu_path[@]}" \
+            -m "core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
+
+        # The omni models go first and in their own process. They want the most
+        # device memory of anything here - Qwen2.5-Omni colocates three stages
+        # on one card at utils 0.45/0.25/0.15 - so they run on a clean card.
+        stage "omni · 1 card" 13m "${one_card}" "${paths[@]}" "${ignore[@]}" \
+            -m "omni and xpu and B60 and cards_1" --run-level core_model
+
+        # core_model excludes omni: the async-omni tests carry both markers and
+        # would otherwise run twice.
+        stage "core_model · 1 card" 28m "${one_card}" "${paths[@]}" "${ignore[@]}" \
+            -m "core_model and not omni and xpu and B60 and cards_1" --run-level core_model
+        stage "mxfp8 config" 2m "${one_card}" tests/diffusion/quantization/test_mxfp8_config.py
+
+        # advanced_model loads the larger checkpoints (Qwen3-TTS, Z-Image,
+        # Wan2.1, Voxtral) with real weights - --run-level advanced_model, not
+        # core_model, which swaps in tiny checkpoints and dummy weights - so it
+        # waits for the nightly or a manual build. full_model stays out of both
+        # until the cache is seeded.
+        if [ "${XPU_TEST_SCOPE:-pr}" = "broad" ]; then
+            stage "advanced_model · 1 card" 20m "${one_card}" "${paths[@]}" "${ignore[@]}" \
+                -m "advanced_model and not full_model and xpu and B60 and cards_1" --run-level advanced_model
+        fi
+    fi
+
+    # Two cards: distributed init over XCCL plus the step pipeline in each
+    # parallel mode. The SKU set is wider here because the only 2-card XPU
+    # suites in-tree are marked B70 (sleep mode), and a B70 agent satisfies the
+    # B60-marked cases too.
+    if [ "${run_2card}" = 1 ]; then
+        # "or omni" picks up the Qwen2.5-Omni expansion, which carries the omni
+        # marker and no level; "not advanced_model" keeps the sleep/wake cases
+        # (omni + advanced_model, and BAGEL-7B-MoT) in the broad stage below.
+        stage "core_model · 2 cards" 10m "${two_cards}" "${paths[@]}" "${ignore[@]}" \
+            -m "(core_model or omni) and not advanced_model and not full_model and xpu and (B60 or B70) and cards_2" \
+            --run-level core_model
+
+        if [ "${XPU_TEST_SCOPE:-pr}" = "broad" ]; then
+            # Z-Image-Turbo on two cards and tensor parallel TP=2.
+            stage "advanced_model · 2 cards" 15m "${two_cards}" "${paths[@]}" "${ignore[@]}" \
+                --ignore tests/entrypoints/test_omni_sleep_mode_xpu.py \
+                -m "advanced_model and not full_model and xpu and (B60 or B70) and cards_2" --run-level advanced_model
+            # tests/entrypoints/test_omni_sleep_mode_xpu.py stays out: BAGEL-7B-MoT
+            # loads 27.37 GiB of LLM weights, and at the util 0.9 the suite sets on a
+            # 30.3 GiB card that leaves 0.0 GiB of KV cache, so every case fails
+            # engine init (VLLMZ-3554). It needs larger cards, not a CI change.
+        fi
+    fi
+
+    exit "${rc}"
 '

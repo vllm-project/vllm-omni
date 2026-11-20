@@ -8,13 +8,14 @@ import numpy as np
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
     HiggsAudioV3TalkerForConditionalGeneration,
 )
 from vllm_omni.model_executor.models.higgs_audio_v3.model_state import HiggsModelState
-from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
 from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
+from vllm_omni.worker_v2.model_states.mtp_model_state import MTPState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -35,8 +36,10 @@ def make_state():
         _audio_continuation_id=99,
         update_decode_step_metadata=Mock(),
     )
-    state._stream_pos = {}
-    state._eager_state = EagerMTPState(state)
+    state._embed_dim = 0
+    state.device = torch.device("cpu")
+    state.model.has_talker_mtp = False
+    state._mtp_state = MTPState(state)
     return state
 
 
@@ -52,9 +55,8 @@ def test_sampling_follows_request_identity_and_reinitializes_reused_slots(slots)
     if slots:
         s.sampling_slots = {
             name: torch.zeros(4, dtype=torch.long if name == "top_k" else torch.float32)
-            for name in ("temperature", "top_p", "top_k", "zeros", "ones")
+            for name in ("temperature", "top_p", "top_k")
         }
-        s.sampling_slots["ones"].fill_(1)
     s.add_request(0, request("a", 42, temperature=0.5))
     s.add_request(2, request("b", 99, temperature=0.9))
     a = s.generators["a"]
@@ -124,10 +126,11 @@ def test_finalizer_filters_unsampled_prefill_and_keeps_owned_audio():
     assert payload["_higgs_invalid_rows"] == ()
 
 
-def test_upstream_warmup_retains_generic_text_sampling():
+@pytest.mark.parametrize("req_id", ["_warmup_0_", "_v2_mixed_warmup_decode_", "_v2_mixed_warmup_prefill_"])
+def test_upstream_warmup_retains_generic_text_sampling(req_id):
     s = make_state()
-    s.add_request(0, request("_warmup_0_", 0, repetition_penalty=1.2, logprobs=1))
-    batch = SimpleNamespace(req_ids=["_warmup_0_"])
+    s.add_request(0, request(req_id, 0, repetition_penalty=1.2, logprobs=1))
+    batch = SimpleNamespace(req_ids=[req_id])
     sampler, rejection = s.custom_sampler(Mock())
     expected = (object(), torch.ones(1), torch.zeros(1))
     standard = Mock(return_value=expected)
@@ -135,7 +138,7 @@ def test_upstream_warmup_retains_generic_text_sampling():
     assert output.sampler_output is expected[0] and output.multimodal_outputs is None
     assert rejection is None
     standard.assert_called_once_with(None, batch, None)
-    s.remove_request("_warmup_0_")
+    s.remove_request(req_id)
     assert not s.requests
 
 
@@ -187,14 +190,20 @@ def test_direct_payload_owns_rows_and_filters_partial_prefill():
     assert out.inter_stage[1:] == [None, None]
 
 
-def test_registered_audio_sampler_preserves_rows_counts_and_owned_output(mocker):
+@pytest.mark.parametrize("stock_fallback", [False, True])
+def test_registered_audio_sampler_preserves_rows_counts_and_owned_output(mocker, stock_fallback):
     state = make_state()
     metadata, payload = object(), {"_higgs_audio_snapshot": torch.ones(2, 4)}
     state.sampling_metadata = Mock(return_value=metadata)
     state.model.compute_logits = Mock(return_value=torch.ones(2, 8))
-    state.model.sample = Mock(
-        return_value=SimpleNamespace(sampled_token_ids=torch.tensor([[9], [8]]), logprobs_tensors=None)
-    )
+    sampled_ids = torch.tensor([[9], [8]])
+    stock = SamplerOutput(sampled_ids, None, torch.tensor([0, 1]), torch.ones(2), torch.zeros(2))
+    base_sampler = Mock(return_value=stock)
+
+    def sample(logits, params, *, sample_text):
+        return sample_text(logits) if stock_fallback else sampled_ids
+
+    state.model.sample = Mock(side_effect=sample)
     state.model.post_sample_multimodal_outputs = Mock(return_value=payload)
     count, rejected = torch.tensor([1, 0]), torch.tensor([0, 0])
     mocker.patch(
@@ -212,12 +221,21 @@ def test_registered_audio_sampler_preserves_rows_counts_and_owned_output(mocker)
     )
     hidden = torch.arange(12).reshape(3, 4).float()
     standard = Mock(side_effect=AssertionError("must not sample twice"))
-    sampler, rejection = state.custom_sampler(Mock())
+    sampler, rejection = state.custom_sampler(base_sampler)
     result = sampler.sample_step(hidden, batch, SimpleNamespace(prefill_len=SimpleNamespace(gpu=None)), None, standard)
     state.sampling_metadata.assert_called_once()
     torch.testing.assert_close(state.model.compute_logits.call_args.args[0], hidden[[2, 0]])
     assert state.model.compute_logits.call_args.args[1] is metadata
     assert result.num_sampled is count and result.num_rejected is rejected
+    assert result.sampler_output.sampled_token_ids is sampled_ids
+    assert result.sampler_output.num_sampled is count and result.sampler_output.num_rejected is rejected
+    if stock_fallback:
+        base_sampler.assert_called_once_with(state.model.compute_logits.return_value, batch)
+        assert result.sampler_output.num_nans is stock.num_nans
+    else:
+        base_sampler.assert_not_called()
+        assert result.sampler_output.num_nans is None
+    state.model.compute_logits.assert_called_once()
     assert result.multimodal_outputs is payload and result.owns_multimodal_outputs
     assert not result.include_hidden_states and result.finalize_multimodal == state.finalize_audio_snapshot
     assert rejection is None

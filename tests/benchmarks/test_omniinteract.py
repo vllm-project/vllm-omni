@@ -20,6 +20,7 @@ import pytest
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 from vllm.benchmarks.serve import TaskType
 
+from tests.helpers.assertions import assert_duplex_artifact_publication
 from vllm_omni.benchmarks import omniinteract as oi
 from vllm_omni.benchmarks import serve as benchmark_serve
 from vllm_omni.benchmarks.data_modules import omniinteract_dataset as data
@@ -200,7 +201,6 @@ def test_response_metrics_include_engine_tpot_and_stream_window():
         "rtf": {"count": 2, "mean": 2.0, "p50": 2.0, "p99": 2.0},
         # Without server request metrics, TTFT already starts at response.created.
         "client_ttft_ms": {"count": 2, "mean": 100.0, "p50": 100.0, "p99": 100.0},
-        "client_ttfp_ms": {"count": 2, "mean": 300.0, "p50": 200.0, "p99": 400.0},
         "stages": {
             "0": {
                 "ttft_ms": {"count": 2, "mean": 0.0, "p50": 0.0, "p99": 0.0},
@@ -395,7 +395,10 @@ def test_load_cases_from_video_list_requires_existing_video(tmp_path: Path) -> N
         data.load_omniinteract_cases_from_video_list(video_list, num_prompts=0)
 
 
-def test_get_samples_from_video_list_without_dataset_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("pool_size, count", [(None, 2), (2, 4), (2, 1)])
+def test_get_samples_from_video_list_without_dataset_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pool_size, count
+) -> None:
     root = _write_dataset(tmp_path)
     cases = data.discover_omniinteract_cases(root, data.OMNIINTERACT_SUBSETS, num_prompts=0, disable_shuffle=True)
     video_list = tmp_path / "sampled_cases.jsonl"
@@ -415,7 +418,8 @@ def test_get_samples_from_video_list_without_dataset_path(tmp_path: Path, monkey
             "--endpoint",
             "/v1/realtime",
             "--num-prompts",
-            "2",
+            str(count),
+            *(["--duplex-sample-pool-size", str(pool_size)] if pool_size else []),
             "--omniinteract-ref-audio",
             str(ref),
             "--omniinteract-video-list",
@@ -427,10 +431,27 @@ def test_get_samples_from_video_list_without_dataset_path(tmp_path: Path, monkey
         "vllm_omni.clients.duplex.reference_audio_data_url",
         lambda _: "data:audio/wav;base64,ref",
     )
-    monkeypatch.setattr(benchmark_patch, "prepare_media", lambda *a, **k: (1.0, b"pcm", ["frame"]))
+    prepared_paths = []
+
+    def prepare_media(path, *args, **kwargs):
+        prepared_paths.append(path)
+        return 1.0, b"pcm", ["frame"]
+
+    monkeypatch.setattr(benchmark_patch, "prepare_media", prepare_media)
     samples = benchmark_patch.get_samples(args, None)
-    assert len(samples) == 2
-    assert [sample.omniinteract_case.video_path for sample in samples] == [case.video_path for case in cases[:2]]
+    distinct = min(count, pool_size or count)
+    assert len(samples) == args.num_prompts == count
+    assert prepared_paths == [case.video_path for case in cases[:distinct]]
+    assert len({sample.request_id for sample in samples}) == count
+    assert (
+        len({oi._output_dir(sample.omniinteract_options.output_root, sample.omniinteract_case) for sample in samples})
+        == count
+    )
+    for index, sample in enumerate(samples):
+        source = cases[index % distinct]
+        assert sample.omniinteract_case.video_path == source.video_path
+        assert sample.omniinteract_case.annotation_path == source.annotation_path
+        assert sample.omniinteract_prepared_input is samples[index % distinct].omniinteract_prepared_input
 
 
 def _write_overlapping_cover_dataset(root: Path) -> Path:
@@ -1195,6 +1216,62 @@ def _request(case: data.OmniInteractCase, options: data.OmniInteractSessionOptio
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["server_vad_unavailable", "semantic_vad_unavailable"])
+@pytest.mark.parametrize("phase", ["handshake", "stream", "adapter"])
+async def test_adapter_preserves_unavailable_vad_from_the_case_runner(tmp_path, monkeypatch, code, phase):
+    from vllm_omni.clients.duplex import DuplexProtocolError
+
+    class UnavailableVadClient(_ServerVadClient):
+        async def __aenter__(self):
+            if phase == "handshake":
+                raise DuplexProtocolError("missing VAD backend", code=code)
+            return await super().__aenter__()
+
+        async def send(self, event):
+            self.sent.append(event)
+            if event["type"] == "input_audio_buffer.append":
+                self.events.add({"type": "error", "error": {"code": code, "message": "missing VAD backend"}})
+
+    options = data.OmniInteractSessionOptions(tmp_path / "artifacts", 10.0, 5.0, None, turn_detection="server_vad")
+    request = _request(_case(tmp_path), options)
+    request.omniinteract_prepared_input = data.OmniInteractPreparedInput(1.0, b"\0\0\0\0", ("frame",), None)
+    monkeypatch.setattr(oi, "_RealtimeSession", UnavailableVadClient)
+    monkeypatch.setattr(oi, "SERVER_VAD_TAIL_S", 0.0)
+    if phase == "adapter":
+
+        async def fail(*args, **kwargs):
+            raise DuplexProtocolError("missing VAD backend", code=code)
+
+        monkeypatch.setattr(benchmark_patch, "run_omniinteract_case", fail)
+
+    output = await asyncio.wait_for(
+        benchmark_patch.async_request_openai_realtime_duplex(request, session=None), timeout=1.0
+    )
+    assert not output.success
+    assert output.duplex_fatal_error_code == code
+    assert output.error == f"{code}: missing VAD backend"
+    assert output.omniinteract_case_result.error_code == code
+
+
+@pytest.mark.asyncio
+async def test_realtime_consumer_preserves_protocol_error_code():
+    from vllm_omni.clients.duplex import DuplexProtocolError
+
+    client = oi._RealtimeSession(oi.OmniInteractBenchmarkConfig(model=MODEL), None)
+    error = DuplexProtocolError("missing VAD backend", code="server_vad_unavailable")
+
+    async def fail():
+        raise error
+
+    client._consume_task = asyncio.create_task(fail())
+    with pytest.raises(DuplexProtocolError):
+        await client._consume_task
+    with pytest.raises(DuplexProtocolError) as caught:
+        client.raise_if_reader_stopped()
+    assert caught.value is error
+
+
+@pytest.mark.asyncio
 async def test_adapter_requires_and_forwards_exact_prepared_payload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     case, options = _case(tmp_path), _session_options(tmp_path)
     request = _request(case, options)
@@ -1384,6 +1461,9 @@ def test_batch_artifact_failure_removes_partial_batch_files(tmp_path: Path, monk
     assert output.success
     assert not (options.output_root / "batch_summary.json").exists()
 
+    with pytest.raises(AssertionError, match="OmniInteract artifacts are incomplete"):
+        assert_duplex_artifact_publication({"omniinteract": summary}, {"dataset_name": "omniinteract"}, 1)
+
 
 @pytest.mark.parametrize(
     ("field", "value", "match"),
@@ -1440,7 +1520,7 @@ def test_whole_benchmark_lock_serializes_a_shared_output_root(tmp_path: Path, mo
             await asyncio.to_thread(release.wait)
         return {"total": 1}
 
-    monkeypatch.setattr(benchmark_serve, "main_async", fake_main_async)
+    monkeypatch.setattr(benchmark_serve, "vllm_main_async", fake_main_async)
     args = argparse.Namespace(dataset_name="omniinteract", omniinteract_output_dir=tmp_path, extra_body=None)
     with ThreadPoolExecutor(2) as executor:
         first = executor.submit(benchmark_serve.main, args)
