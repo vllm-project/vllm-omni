@@ -7,6 +7,8 @@ import json
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
+from contextlib import aclosing
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from io import BytesIO
@@ -156,6 +158,7 @@ from vllm_omni.entrypoints.openai.utils import (
     parse_lora_requests,
     resolve_diffusion_od_config,
 )
+from vllm_omni.entrypoints.transcription import SameModelTranscriber, TranscriptionSettings
 from vllm_omni.errors import OmniClientError
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
@@ -172,6 +175,14 @@ logger = init_logger(__name__)
 
 async def _identity_async(value: Any) -> Any:
     return value
+
+
+@dataclass(frozen=True)
+class _InlineTranscription:
+    settings: TranscriptionSettings
+    audio: str
+    message_index: int
+    content_index: int
 
 
 class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
@@ -222,6 +233,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
     # Harmony flag (always False for vllm-omni models)
     use_harmony: bool = False
+    input_audio_transcriber: SameModelTranscriber | None = None
 
     @property
     def tool_call_id_type(self) -> str:
@@ -668,11 +680,76 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             self._create_chat_completion(request, raw_request), request, raw_request
         )
 
+    def _inline_transcription_request(self, request: ChatCompletionRequest) -> _InlineTranscription | None:
+        extras = getattr(request, "extra_body", None) or request.model_extra or {}
+        options = extras.get("input_audio_transcription")
+        if options is None:
+            return None
+        if not request.stream or not isinstance(options, dict):
+            raise ValueError("input_audio_transcription requires a settings object and stream=true")
+        if self.input_audio_transcriber is None:
+            raise ValueError("Input audio transcription is unavailable for this pipeline")
+        settings = self.input_audio_transcriber.validate_settings({"model": request.model, **options})
+        # Only the latest user message is new input, not audio replayed in history.
+        for message_index in range(len(request.messages) - 1, -1, -1):
+            message = request.messages[message_index]
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            parts = content if isinstance(content, list) else []
+            recordings = [(index, part) for index, part in enumerate(parts) if part.get("type") == "input_audio"]
+            if len(recordings) != 1:
+                raise ValueError(
+                    "Inline transcription requires exactly one input_audio part in the latest user message"
+                )
+            content_index, part = recordings[0]
+            audio = part["input_audio"]["data"]
+            if len(audio) > 4 * ((self.input_audio_transcriber.max_file_bytes + 2) // 3):
+                raise ValueError("Transcription recording exceeds the upload size limit")
+            return _InlineTranscription(settings, audio, message_index, content_index)
+        raise ValueError("Inline transcription requires a user audio message")
+
+    async def _stream_with_input_transcription(self, stream, inline: _InlineTranscription, request_id: str):
+        # PR #3526's extra ASR pass, but opt-in and outside choices[].delta:
+        # normal OpenAI chat consumers must never mistake user speech for an answer.
+        async with aclosing(stream):
+            event = {
+                "type": "omni.input_audio_transcription.completed",
+                "message_index": inline.message_index,
+                "content_index": inline.content_index,
+            }
+            try:
+                audio = await asyncio.to_thread(base64.b64decode, inline.audio, validate=True)
+                event["transcript"] = await self.input_audio_transcriber.transcribe_encoded(
+                    audio, inline.settings, f"asr-{request_id}"
+                )
+            except Exception:
+                logger.exception(
+                    "Inline ASR failed request_id=asr-%s message_index=%s content_index=%s",
+                    request_id,
+                    inline.message_index,
+                    inline.content_index,
+                )
+                event["type"] = "omni.input_audio_transcription.failed"
+                event["error"] = {
+                    "type": "server_error",
+                    "code": "transcription_failed",
+                    "message": "Transcription failed",
+                }
+            yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+            async for chunk in stream:
+                yield chunk
+
     async def _create_chat_completion(
         self,
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        try:
+            inline_transcription = self._inline_transcription_request(request)
+        except ValueError as exc:
+            logger.warning("Inline ASR request rejected: %s", exc)
+            return self.create_error_response(str(exc))
         stage_configs = getattr(self.engine_client, "stage_configs", ()) or ()
         serves_diffusion = self._diffusion_mode or any(
             get_stage_type(stage_config) == "diffusion" for stage_config in stage_configs
@@ -1063,7 +1140,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         # Streaming response
         if request.stream:
-            return self.chat_completion_stream_generator(
+            stream = self.chat_completion_stream_generator(
                 request,
                 result_generator,
                 request_id,
@@ -1075,6 +1152,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 mm_token_counts=mm_token_counts,
                 raw_request=raw_request,
             )
+            if inline_transcription is not None:
+                return self._stream_with_input_transcription(stream, inline_transcription, request_id)
+            return stream
 
         try:
             return await self.chat_completion_full_generator(
