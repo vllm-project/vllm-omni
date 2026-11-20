@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # WanRMSNorm, WanLayerNorm, the attention projections, the block, Head and unpatchify are adapted from
 # Wan2.1 (https://github.com/Wan-Video/Wan2.1, wan/modules/model.py, Apache-2.0),
-# Copyright 2024-2025 The Alibaba Wan Team Authors.
+# Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 """Kyutai AURA diffusion transformer (https://arxiv.org/abs/2611.26540).
 
 AURA's student is a Wan2.1 DiT with three additions:

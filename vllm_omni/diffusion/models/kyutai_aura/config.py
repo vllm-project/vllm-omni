@@ -23,43 +23,66 @@ DEFAULT_PROMPT = (
 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class KyutaiAuraConfig:
-    """Architecture and sampling facts of one released AURA checkpoint."""
+    """Facts of one released AURA checkpoint, grouped by the part of the pipeline that reads them."""
 
+    # Where the weights come from.
     name: str
     hub_repo: str
-    checkpoint: str  # standalone DiT weights (LoRA merged), relative to ``hub_repo``
-    base_repo: str  # Wan base: VAE, umT5 encoder and tokenizer
+    checkpoint: str  # merged DiT weights inside ``hub_repo``
+    base_repo: str  # the Wan repository that provides the VAE, umT5 and its tokenizer
     vae_file: str
-    vae_stride: tuple[int, int, int]  # (time, height, width)
-    vae_fp32: bool  # VAE compute dtype: fp32 if True, else bf16 (weights are fp32 either way)
-    vae_decode_group: int  # latent frames per VAE decoder call after the first frame
-    audio_dim: int  # width of the speech features
-    audio_layers: int  # feature layers mixed by the learned weights of the speech encoder
-    fps: int
-    buckets: Mapping[float, tuple[int, int]]  # height / width -> (height, width)
+
+    # Diffusion transformer (Wan layout).
     dim: int
     ffn_dim: int
     num_heads: int
-    latent_channels: int
-    segment_frames: int  # latent frames of one training clip (RoPE layout)
-    ref_rope_offset: int  # temporal RoPE position of the reference frame inside a segment
-    rope_reindex: bool  # freeze positions after the last chunk that fits in a training clip
     num_layers: int = 30
+    latent_channels: int
     patch_size: tuple[int, int, int] = (1, 2, 2)
-    audio_inject_layers: tuple[int, ...] = (0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 29)
-    audio_local_tokens: int = 4  # local speech tokens per latent frame (plus one padding token)
-    audio_motion_frames: int = 73  # first feature repeated before each chunk's speech encoder input
-    frames_per_chunk: int = 4  # latent frames per streamed chunk
-    window_chunks: int = 2  # cached chunks besides the anchor, the current one included
-    timesteps: tuple[int, ...] = (1000, 745, 498, 255)
-    schedule_steps: int = 50  # flow-matching grid of the teacher
-    schedule_shift: float = 5.0
     text_len: int = 512
     text_dim: int = 4096
     freq_dim: int = 256
     eps: float = 1e-6
+
+    # Speech conditioning.
+    audio_dim: int  # channels of one speech feature frame
+    audio_layers: int  # how many feature layers the speech encoder mixes
+    audio_inject_layers: tuple[int, ...] = (
+        0,
+        3,
+        6,
+        9,
+        12,
+        15,
+        18,
+        21,
+        24,
+        27,
+        29,
+    )  # blocks followed by speech attention
+    audio_local_tokens: int = 4  # speech tokens per latent frame, not counting the padding token
+    audio_motion_frames: int = 73  # copies of the first feature put before each chunk's features
+
+    # Video and VAE.
+    fps: int
+    buckets: Mapping[float, tuple[int, int]]  # aspect ratio (height / width) -> (height, width)
+    vae_stride: tuple[int, int, int]  # downsampling of the VAE in (time, height, width)
+    vae_fp32: bool  # compute the VAE in fp32 (True) or bf16 (False); its weights are fp32
+    vae_decode_group: int  # how many latent frames one decoder call takes, after the first frame
+
+    # Streaming: chunks, history and temporal positions.
+    frames_per_chunk: int = 4  # latent frames generated together
+    window_chunks: int = 2  # chunks kept after the anchor chunk, counting the one being generated
+    segment_frames: int  # length in latent frames of the clips the model was trained on
+    ref_rope_offset: int  # where the reference frame sits in time inside such a clip
+    rope_reindex: bool  # stop advancing temporal positions once a clip's length is reached
+
+    # Sampling.
+    timesteps: tuple[int, ...] = (1000, 745, 498, 255)
+    schedule_steps: int = 50  # points of the teacher's flow-matching grid
+    schedule_shift: float = 5.0
 
     @property
     def head_dim(self) -> int:
@@ -85,17 +108,17 @@ KYUTAI_AURA_1_3B = KyutaiAuraConfig(
     checkpoint="stage2_dmd/step-6500_ema_merged.safetensors",
     base_repo="Wan-AI/Wan2.1-T2V-1.3B",
     vae_file="Wan2.1_VAE.pth",
-    vae_stride=(4, 8, 8),
-    vae_fp32=False,
-    vae_decode_group=4,
-    audio_dim=512,  # Mimi: the dequantized first (semantic) codebook
-    audio_layers=1,
-    fps=16,
-    buckets=MappingProxyType({0.67: (512, 768), 1.00: (576, 576)}),
     dim=1536,
     ffn_dim=8960,
     num_heads=12,
     latent_channels=16,
+    audio_dim=512,  # Mimi: the dequantized first (semantic) codebook
+    audio_layers=1,
+    fps=16,
+    buckets=MappingProxyType({0.67: (512, 768), 1.00: (576, 576)}),
+    vae_stride=(4, 8, 8),
+    vae_fp32=False,
+    vae_decode_group=4,
     segment_frames=20,
     ref_rope_offset=30,
     rope_reindex=True,
