@@ -42,6 +42,7 @@ from vllm_omni.model_executor.models.moss_tts.moss_codec_cudagraph import (
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot, pack_output_snapshot
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -784,7 +785,9 @@ class MossTTSCodecDecoder(nn.Module):
                 },
             )
 
-        if self._async_chunk and runtime_additional_information is None:
+        # MRv2 OmniModelState.prepare_dummy_inputs and empty dummy slots pass {}
+        # without _is_dummy; real scheduled requests always carry req_id / meta.
+        if self._async_chunk and all(not info or info.get("_is_dummy") for info in info_list):
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={
@@ -1294,7 +1297,10 @@ class MossTTSCodecDecoder(nn.Module):
             num_quantizers=self._n_vq,
             attention_backend=getattr(self.vllm_config.model_config.hf_config, "codec_attention_backend", "sdpa"),
         )
+        # Reference encoding belongs to the API process.
+        codec.encoder = None
         if device.type in ("cuda", "npu"):
+            current_omni_platform.empty_cache()
             from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import MossAudioTokenizerTransformer
 
             shared = 0

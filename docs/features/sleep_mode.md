@@ -127,33 +127,16 @@ if __name__ == "__main__":
 
 ```
 
-### server command Example
+### Server command example
 
-Start the server with sleep mode enabled:
-
-The first method
+Enable sleep mode and set the GPU memory utilization for both BAGEL stages.
 
 ```bash
-
-vllm serve ByteDance-Seed/BAGEL-7B-MoT \
---omni \
---enable-sleep-mode \
---trust-remote-code \
---gpu-memory-utilization 0.7
-
-```
-
-The second method
-
-```bash
-
-python3 -m vllm_omni.entrypoints.openai.api_server \
-    --model ByteDance-Seed/BAGEL-7B-MoT \
-    --omni \
-    --enable-sleep-mode \
-    --trust-remote-code \
---gpu-memory-utilization 0.7
-
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --trust-remote-code \
+  --stage-overrides '{
+    "0": {"enable_sleep_mode": true, "gpu_memory_utilization": 0.7},
+    "1": {"enable_sleep_mode": true, "gpu_memory_utilization": 0.7}
+  }'
 ```
 
 ### Test Scenarios & Commands
@@ -279,7 +262,7 @@ curl -X POST http://localhost:8000/v1/images/generations \
 Metadata Field Analysis
 The metadata field is a dynamic dictionary containing hardware-specific telemetry and audit data, primarily used for verifying memory reclamation on various backends (e.g., AMD ROCm, NVIDIA CUDA).
 
-```json
+```text
 "metadata": {
     "source": "Platform_AMD_Instinct_MI300X",
     "total_freed_gib": "78.57",

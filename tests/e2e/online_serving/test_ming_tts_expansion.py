@@ -28,7 +28,11 @@ no_async_chunk_params = [
         OmniServerParams(
             model=MODEL,
             stage_config_path=DEPLOY_CONFIG,
-            server_args=["--enforce-eager", "--no-async-chunk"],
+            server_args=[
+                "--stage-overrides",
+                '{"0": {"enforce_eager": true}, "1": {"enforce_eager": true}}',
+                "--no-async-chunk",
+            ],
         ),
         id="no_async_chunk",
     )
@@ -39,7 +43,7 @@ async_chunk_params = [
         OmniServerParams(
             model=MODEL,
             stage_config_path=DEPLOY_CONFIG,
-            server_args=["--enforce-eager"],
+            server_args=["--stage-overrides", '{"0": {"enforce_eager": true}, "1": {"enforce_eager": true}}'],
         ),
         id="async_chunk",
     )
@@ -54,7 +58,7 @@ def get_prompt(prompt_type="zh"):
     return prompts.get(prompt_type, prompts["zh"])
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", no_async_chunk_params, indirect=True)
 def test_text_to_audio_non_streaming_001(omni_server, online_client) -> None:
     """
@@ -74,7 +78,7 @@ def test_text_to_audio_non_streaming_001(omni_server, online_client) -> None:
     online_client.send_audio_speech_request(request_config, request_num=2)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", async_chunk_params, indirect=True)
 def test_text_to_audio_streaming_001(omni_server, online_client) -> None:
     """

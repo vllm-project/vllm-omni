@@ -51,6 +51,7 @@ nav:
   - Models:
     - models/supported_models.md
     - SeedVR2: models/seedvr2.md
+    - Praxis-1: models/praxis1.md
   - Features:
     - Overview: features/README.md
     - Runtime and Stage Execution:
@@ -133,6 +134,7 @@ nav:
     - contributing/model/adding_omni_model.md
     - contributing/model/adding_tts_model.md
     - contributing/model/adding_diffusion_model.md
+    - contributing/model/adding_rl_rollout_model.md
   - CI: contributing/ci
   - Design Documents:
     - design/index.md
@@ -147,6 +149,7 @@ nav:
         - Async Omni Output Materialization: design/feature/omni_async_output_materialization.md
         - Prefill/Decode Phase Contract: design/feature/preprocess_phase_contract.md
         - Automatic Prefix Caching: design/feature/prefix_caching.md
+        - Mooncake KV/HS Cache: design/feature/mooncake_kv_hs_cache.md
         - Realtime AR-Diffusion: design/feature/realtime_ar_diffusion.md
       - Communication:
         - OmniConnector Implementations:
