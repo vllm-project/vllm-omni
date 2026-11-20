@@ -22,6 +22,37 @@ vllm serve /path/to/MiniMax-H3 --omni \
 
 The first encoder call builds the packs; later requests reuse them.
 
+## First-call memory requirement
+
+Packing allocates and copies new CPU masters before rebinding the encoder's
+weights. The original CPU storage and the new packs therefore coexist during
+the first call. Keep enough host memory for the original weight storage plus
+the new pinned packs, in addition to the other model components and runtime.
+
+Each source storage is aligned to 512 bytes inside a pack. The Ascend pinned
+allocator rounds each pack allocation up to the next power of two, so its
+reservation can exceed the packs' logical byte size. For a successful cold
+pack build, budget the original CPU storage plus the sum of those rounded
+pack sizes. Partially built packs can remain in the allocator cache when
+allocation falls back to separate masters.
+
+Measured with the BF16 MiniMax-H3 encoder at TP8 on 8 × Ascend 910B4 (50 retained decoder layers, replicated vision weights):
+
+| Metric | Result |
+| --- | ---: |
+| First packing call, rank-max mean ± SD over three cold trials | 3582.5 ± 228.1 ms |
+| Original CPU weight storage per rank | 6.967 GiB |
+| Logical packed storage per rank | 6.967 GiB |
+| Peak pinned allocator reservation per rank | 7.980 GiB |
+| Original storage + rounded pack reservation per rank | 14.948 GiB |
+| Peak encoder process RSS per rank | 9.232 GiB |
+
+Measured over three trials with fresh encoder processes, after two complete
+warmup trials. Packing time excludes checkpoint loading and validation.
+RSS and native pinned reservation are reported separately. Budget the
+original weights plus rounded packs, with runtime and DiT/VAE memory added
+separately.
+
 ## Constraints
 
 - The text encoder must run locally on Ascend NPU.
