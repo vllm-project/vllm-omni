@@ -18,7 +18,11 @@ from vllm_omni.quantization.component_config import ComponentQuantizationConfig
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+    from vllm.config.lora import LoRAConfig
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+    from vllm_omni.diffusion.lora.layers.row_parallel_linear import DiffusionMergedRowParallelLinearWithLoRA
 
 # Quantization methods whose row-parallel parameters are either indexed by the input
 # dimension (and so can be re-ordered by ``MergedRowParallelLinear``) or carry no input
@@ -200,3 +204,24 @@ class MergedRowParallelLinear(RowParallelLinear):
 
     def weight_loader_v2(self, param: Parameter, loaded_weight: torch.Tensor):
         super().weight_loader_v2(param, self._to_rank_major(param, loaded_weight))
+
+    def _create_omni_lora_layer(
+        self,
+        *,
+        max_loras: int,
+        lora_config: LoRAConfig,
+        packed_modules_list: list[str],
+        model_config: PretrainedConfig | None = None,
+    ) -> DiffusionMergedRowParallelLinearWithLoRA:
+        """LoRA wrapper picked up by ``vllm_omni.lora.binding.from_layer``.
+
+        vLLM's row-parallel wrapper matches the exact ``RowParallelLinear`` type, so
+        without this a LoRA on a merged projection would be dropped silently. LoRA A
+        gets the same per-segment re-ordering as the weight.
+        """
+        # Imported here: the wrapper module imports this one.
+        from vllm_omni.diffusion.lora.layers.row_parallel_linear import DiffusionMergedRowParallelLinearWithLoRA
+
+        instance = DiffusionMergedRowParallelLinearWithLoRA(self)
+        instance.create_lora_weights(max_loras, lora_config, model_config)
+        return instance
