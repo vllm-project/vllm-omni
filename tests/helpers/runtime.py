@@ -16,7 +16,6 @@ import sys
 import tempfile
 import threading
 import time
-from collections import deque
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
@@ -214,8 +213,8 @@ class OmniServer:
         self._auto_port = port is None
         self._port_lock: FileLock | None = None
         self.port = get_open_port() if port is None else port
-        # Bounded ring buffer of child stderr for early-exit diagnostics.
-        self._server_error_lines: deque[str] = deque(maxlen=100)
+        # Preserve child stderr so later tracebacks cannot overwrite the root cause.
+        self._server_error_lines: list[str] = []
         self._server_log_thread: threading.Thread | None = None
 
     def _reserve_port(self) -> None:
@@ -290,7 +289,7 @@ class OmniServer:
         if self._port_lock is not None:
             self._port_lock.release()
             self._port_lock = None
-        self._server_error_lines = deque(maxlen=100)
+        self._server_error_lines = []
 
     def _start_server(self) -> None:
         attempts = SERVER_PORT_IN_USE_RETRIES if self._auto_port else 1
@@ -346,10 +345,10 @@ class OmniServer:
 
         print(f"Launching OmniServer with: {' '.join(cmd)}")
         startup_t0 = time.perf_counter()
-        # Inherit stdout (INFO still shows in CI); capture stderr only for the
-        # exited-before-ready RuntimeError message. errors=replace keeps the
-        # reader alive on undecodable bytes so a full pipe cannot hang serve.
-        self._server_error_lines = deque(maxlen=100)
+        # Inherit stdout; preserve full stderr for startup failure diagnostics.
+        # errors=replace keeps the reader alive on undecodable bytes so a full
+        # pipe cannot hang serve.
+        self._server_error_lines = []
         self._server_log_thread = None
         self.proc = subprocess.Popen(
             cmd,

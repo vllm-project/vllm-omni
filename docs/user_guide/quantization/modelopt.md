@@ -322,21 +322,11 @@ for those modules. Support for `modelopt_fp4` does not remove this limitation.
 2. Use `tests/diffusion/quantization/test_quantization_quality.py` with
    `VLLM_OMNI_QUALITY_CONFIGS` to validate local baseline and quantized model
    paths.
-3. For HunyuanImage-3.0 quantized DiT checkpoints, the opt-in accuracy check is:
-
-   ```bash
-   CUDA_VISIBLE_DEVICES=2,3 \
-   HUNYUAN_IMAGE3_RUN_QUANT_ACCURACY=1 \
-   HUNYUAN_IMAGE3_QUANT_DEVICES=0,1 \
-   HUNYUAN_IMAGE3_QUANT_TP=2 \
-   HUNYUAN_IMAGE3_BF16_MODEL=/path/to/hunyuan-image3-bf16 \
-   HUNYUAN_IMAGE3_FP8_MODEL=/path/to/hunyuan-image3-modelopt-fp8 \
-   HUNYUAN_IMAGE3_NVFP4_MODEL=/path/to/hunyuan-image3-modelopt-mixed-experts-nvfp4-dense-fp8 \
-   PYTHONPATH=/path/to/vllm-omni:${PYTHONPATH:-} \
-   python -m pytest -s -v \
-     tests/e2e/accuracy/test_hunyuan_image3.py \
-     -k quantized_dit_matches_bf16_accuracy
-   ```
+3. HunyuanImage-3.0 CI now uses the performance and accuracy matrix in the
+   [HunyuanImage recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/HunyuanImage-3.0-Instruct.md#ci-performance-and-accuracy-matrix).
+   The former model-specific opt-in BF16 versus FP8/NVFP4 accuracy tests
+   have been removed. Use the generic quantization quality check above
+   for additional local checkpoint comparisons.
 
 4. Report CLIP score deltas, SSIM, PSNR, throughput, latency, and peak memory
    when adding a new validated ModelOpt diffusion checkpoint.
