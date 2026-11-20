@@ -692,6 +692,9 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             with torch.inference_mode(), torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
                 normed, static_residual_out = layer.post_attention_layernorm(static_hidden, static_residual)
                 static_output = layer.mlp(normed)
+            # Capture only records kernels. The first request at a new batch
+            # size must execute them before consuming the graph's outputs.
+            graph.replay()
             self._mlp_graphs[key] = {
                 "graph": graph,
                 "static_hidden": static_hidden,

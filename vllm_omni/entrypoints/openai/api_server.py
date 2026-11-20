@@ -247,7 +247,7 @@ from vllm_omni.entrypoints.serve.utils.routes import (
     _remove_route_from_router,
     remove_route_from_app,
 )
-from vllm_omni.entrypoints.utils import PureDiffusionLauncherAdapter
+from vllm_omni.entrypoints.utils import PureDiffusionLauncherAdapter, mark_serve_cli_args
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt, absorb_attention_schedule_extra_args
 from vllm_omni.utils.forced_aligner import build_forced_aligner_config
@@ -1044,6 +1044,12 @@ async def omni_init_app_state(
             is_pure_diffusion = True
             logger.info("Detected diffusion mode (%d diffusion stage(s))", len(stage_configs))
 
+    supported_tasks: set[str] = {"generate"}
+    if hasattr(engine_client, "get_supported_tasks"):
+        supported_tasks = set(await engine_client.get_supported_tasks())
+    state.supported_tasks = frozenset(supported_tasks)
+    logger.info("Supported tasks: %s", supported_tasks)
+
     if args.served_model_name is not None:
         served_model_names = args.served_model_name
     else:
@@ -1083,47 +1089,68 @@ async def omni_init_app_state(
         # falls back to the None tokenization handler).
         state.anthropic_serving_messages = _UnsupportedAnthropicMessages()
 
-        # Use for_diffusion method to create chat handler
-        state.openai_serving_chat = OmniOpenAIServingChat.for_diffusion(
-            diffusion_engine=engine_client,  # type: ignore
-            model_name=model_name,
-            enable_force_include_usage=args.enable_force_include_usage,
-        )
-        state.openai_serving_chat_batch = OmniOpenAIServingChatBatch.for_diffusion(
-            diffusion_engine=engine_client,  # type: ignore
-            model_name=model_name,
+        # Image models also serve chat requests that return generated images.
+        enable_chat = bool(supported_tasks & {"generate", "x2i"})
+        state.openai_serving_chat = (
+            OmniOpenAIServingChat.for_diffusion(
+                diffusion_engine=engine_client,  # type: ignore
+                model_name=model_name,
+                enable_force_include_usage=args.enable_force_include_usage,
+            )
+            if enable_chat
+            else None
         )
 
-        # audio related
-        state.openai_serving_audio_generate = OmniOpenAIServingAudioGenerate.for_diffusion(
-            engine_client,
-            state.openai_serving_models,
-            request_logger=request_logger,
-            model_name=model_name,
+        state.openai_serving_chat_batch = (
+            OmniOpenAIServingChatBatch.for_diffusion(
+                diffusion_engine=engine_client,  # type: ignore
+                model_name=model_name,
+            )
+            if enable_chat
+            else None
+        )
+
+        state.openai_serving_audio_generate = (
+            OmniOpenAIServingAudioGenerate.for_diffusion(
+                engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
+            )
+            if "audio_generate" in supported_tasks
+            else None
         )
 
         # video related
         diffusion_stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
-        state.openai_serving_video = OmniOpenAIServingVideo.for_diffusion(
-            diffusion_engine=engine_client,  # type: ignore
-            model_name=model_name,
-            stage_configs=diffusion_stage_configs,
+        state.openai_serving_video = (
+            OmniOpenAIServingVideo.for_diffusion(
+                diffusion_engine=engine_client,  # type: ignore
+                model_name=model_name,
+                stage_configs=diffusion_stage_configs,
+            )
+            if "x2v" in supported_tasks
+            else None
         )
-        state.openai_streaming_video_output = OmniStreamingVideoOutputHandler(
-            engine_client=engine_client,
-            model_name=model_name,
-            stage_configs=diffusion_stage_configs,
+        state.openai_streaming_video_output = (
+            OmniStreamingVideoOutputHandler(
+                engine_client=engine_client,
+                model_name=model_name,
+                stage_configs=diffusion_stage_configs,
+            )
+            if "x2v" in supported_tasks
+            else None
         )
-
-        state.openai_serving_speech = OmniOpenAIServingSpeech.for_diffusion(
-            diffusion_engine=engine_client,
-            model_name=model_name,
-            served_model_names=served_model_names,
-            stage_configs=diffusion_stage_configs,
-            speech_cache_config=speech_cache_config,
-            allowed_local_media_path=getattr(args, "allowed_local_media_path", ""),
-            allowed_media_domains=getattr(args, "allowed_media_domains", None),
-            request_logger=request_logger,
+        state.openai_serving_speech = (
+            OmniOpenAIServingSpeech.for_diffusion(
+                diffusion_engine=engine_client,
+                model_name=model_name,
+                served_model_names=served_model_names,
+                stage_configs=diffusion_stage_configs,
+                speech_cache_config=speech_cache_config,
+                allowed_local_media_path=getattr(args, "allowed_local_media_path", ""),
+                allowed_media_domains=getattr(args, "allowed_media_domains", None),
+                request_logger=request_logger,
+            )
+            if "speech" in supported_tasks
+            else None
         )
         state.openai_serving_duplex = None
         state.openai_streaming_speech = None
@@ -1150,12 +1177,6 @@ async def omni_init_app_state(
             logger.warning("vllm_config is None, some features may not work correctly")
 
     state.vllm_config = vllm_config
-
-    # Get supported tasks
-    supported_tasks: set[str] = {"generate"}
-    if hasattr(engine_client, "get_supported_tasks"):
-        supported_tasks = set(await engine_client.get_supported_tasks())
-    logger.info("Supported tasks: %s", supported_tasks)
 
     resolved_chat_template = await _resolve_chat_template(engine_client, args)
     default_chat_template_kwargs = resolve_default_chat_template_kwargs(args)
@@ -1238,7 +1259,8 @@ async def omni_init_app_state(
         args,
         request_logger,
         resolved_chat_template,
-        enable_chat="generate" in supported_tasks,
+        # Both multi-stage Images APIs delegate to the chat service.
+        enable_chat=bool(supported_tasks & {"generate", "x2i"}),
         enable_batch=True,
     )
 
@@ -1394,29 +1416,34 @@ async def omni_init_app_state(
         else None
     )
 
-    state.openai_serving_speech = OmniOpenAIServingSpeech(
-        engine_client,
-        state.openai_serving_models,
-        request_logger=request_logger,
-        model_name=model_name,
-        speech_cache_config=speech_cache_config,
-        api_server_shared_dir=getattr(args, "_omni_api_server_shared_dir", None),
-        forced_aligner_enabled=build_forced_aligner_config(
-            getattr(args, "forced_aligner", None),
-            getattr(args, "forced_aligner_config", None),
+    state.openai_serving_speech = (
+        OmniOpenAIServingSpeech(
+            engine_client,
+            state.openai_serving_models,
+            request_logger=request_logger,
+            model_name=model_name,
+            speech_cache_config=speech_cache_config,
+            api_server_shared_dir=getattr(args, "_omni_api_server_shared_dir", None),
+            forced_aligner_enabled=build_forced_aligner_config(
+                getattr(args, "forced_aligner", None),
+                getattr(args, "forced_aligner_config", None),
+            )
+            is not None,
         )
-        is not None,
+        if "speech" in supported_tasks
+        else None
     )
 
     has_ming3_chat = (
         state.openai_serving_chat is not None
         and getattr(state.openai_serving_chat, "_has_ming3_talker_stage", lambda: False)()
     )
-    if has_ming3_chat or getattr(state.openai_serving_speech, "_tts_model_type", None) == "ming3_audio_tts":
+    speech_service = state.openai_serving_speech
+    if speech_service is not None and (has_ming3_chat or speech_service._tts_model_type == "ming3_audio_tts"):
         from vllm_omni.entrypoints.openai.ming3_voices import register_model_voice_presets
 
         await register_model_voice_presets(
-            state.openai_serving_speech,
+            speech_service,
             args.model,
             revision=getattr(args, "revision", None),
             cache_dir=getattr(args, "download_dir", None),
@@ -1426,14 +1453,23 @@ async def omni_init_app_state(
 
     # Warm up speech pipeline (CUDA Graph capture, torch.compile) so the first
     # real user request is fast instead of paying a 100s compilation tax.
-    await state.openai_serving_speech.warmup()
+    if state.openai_serving_speech is not None:
+        await state.openai_serving_speech.warmup()
 
-    state.openai_serving_audio_generate = OmniOpenAIServingAudioGenerate(
-        engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
+    state.openai_serving_audio_generate = (
+        OmniOpenAIServingAudioGenerate(
+            engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
+        )
+        if "audio_generate" in supported_tasks
+        else None
     )
 
-    state.openai_streaming_speech = OmniStreamingSpeechHandler(
-        speech_service=state.openai_serving_speech,
+    state.openai_streaming_speech = (
+        OmniStreamingSpeechHandler(
+            speech_service=state.openai_serving_speech,
+        )
+        if state.openai_serving_speech is not None
+        else None
     )
     state.openai_streaming_video = (
         create_streaming_video_handler(
@@ -1444,11 +1480,15 @@ async def omni_init_app_state(
         else None
     )
     state.openai_serving_duplex = None
-    state.openai_serving_video = OmniOpenAIServingVideo(
-        engine_client,
-        model_name=served_model_names[0] if served_model_names else None,
-        stage_configs=state.stage_configs,
-        allowed_local_media_path=getattr(args, "allowed_local_media_path", "") or "",
+    state.openai_serving_video = (
+        OmniOpenAIServingVideo(
+            engine_client,
+            model_name=served_model_names[0] if served_model_names else None,
+            stage_configs=state.stage_configs,
+            allowed_local_media_path=getattr(args, "allowed_local_media_path", "") or "",
+        )
+        if "x2v" in supported_tasks
+        else None
     )
     # Policies whose first stage is autoregressive (for example reasoning before
     # acting) serve OpenPI too; this is None without policy_server_config.
@@ -2356,6 +2396,11 @@ async def generate_images(
     Raises:
         HTTPException: For validation errors, missing engine, or generation failures
     """
+    if "x2i" not in raw_request.app.state.supported_tasks:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value, detail="The model does not support image generation"
+        )
+
     request_timestamp = float(getattr(raw_request.state, "request_timestamp", time.time()))
     # Get engine client (AsyncOmni) from app state
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
@@ -2623,6 +2668,11 @@ async def edit_images(
     """
     OpenAI-compatible image edit endpoint.
     """
+
+    if "x2i" not in raw_request.app.state.supported_tasks:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value, detail="The model does not support image generation"
+        )
 
     # 1. get engine and model
     request_timestamp = float(getattr(raw_request.state, "request_timestamp", time.time()))
@@ -3506,6 +3556,7 @@ async def download_video(video_id: str, variant: Literal["video", "lidar"] = "vi
     if job.status != VideoGenerationStatus.COMPLETED:
         raise HTTPException(status_code=404, detail="Generation is still in-progress")
 
+    media_type: str
     if variant == "lidar":
         if job.lidar is None:
             raise HTTPException(status_code=404, detail="This job has no LiDAR output")
@@ -3644,6 +3695,7 @@ if __name__ == "__main__":
     # when __main__ is called, i.e., --omni is only used when called through the entrypoints.
     parser.add_argument("--omni", action="store_true", default=False)
     args = parser.parse_args()
+    mark_serve_cli_args(args)
     configure_logging_from_args(args)
     # sync args.model to model_tag, because if we pass the model positionally,
     # args.model will be the default from vLLM's ModelConfig (currently
