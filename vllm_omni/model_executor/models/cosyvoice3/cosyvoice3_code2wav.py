@@ -33,6 +33,7 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
 )
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreLookaheadLayer
 from vllm_omni.model_executor.models.cosyvoice3.runtime import (
+    compile_cosyvoice3_padded_dit,
     cosyvoice3_batch_flow_debug,
     cosyvoice3_batch_flow_profile,
     cosyvoice3_full_response_enabled,
@@ -795,3 +796,8 @@ class CosyVoice3Code2Wav(nn.Module):
                 self.hift.enable_decode_graphs()
                 logger.info("CosyVoice3 streaming HiFT: decode CUDA graphs enabled")
         logger.info(f"Loaded hift weights from {hift_path}")
+        if self.config.cosyvoice3_compile_dit:
+            # Like HiFT folding, cuDNN QKV packing changes state_dict keys.
+            # Reload original checkpoints only into a fresh model instance.
+            compile_cosyvoice3_padded_dit(self.flow_model.decoder.estimator, device)
+            logger.info("CosyVoice3 padded DiT compilation configured; first-use compilation occurs during warmup")

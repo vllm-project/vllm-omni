@@ -70,7 +70,9 @@ def _time_shift_sigmas(
         dtype=torch.float32,
     )
     shifted = float(shift_scale) * base / (1 + (float(shift_scale) - 1) * base)
-    return [float(value) for value in shifted.tolist()]
+    # In float32 the first sigma can round one ulp above 1 (flow_shift 2.14, for example), which the
+    # sampler rejects. The last sigma is exactly 0 and the others are positive, so only 1 needs a clamp.
+    return shifted.clamp(max=1.0).tolist()
 
 
 class MiniMaxH3ShapePlanner:
@@ -103,6 +105,10 @@ class MiniMaxH3ShapePlanner:
 
 
 MINIMAX_H3_SHAPE_PLANNER = MiniMaxH3ShapePlanner()
+
+# Default denoise step count when a request omits ``num_inference_steps``;
+# the diffusion-stage resolver and the split-stage intake must agree on it.
+MINIMAX_H3_DEFAULT_NUM_INFERENCE_STEPS = 50
 
 
 def minimax_h3_align_frame_count(frame_count: int) -> int:

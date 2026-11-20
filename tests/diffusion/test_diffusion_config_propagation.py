@@ -84,10 +84,12 @@ class TestParallelConfigPropagation:
             tensor_parallel_size=2,
             ulysses_degree=2,
             ring_degree=1,
+            ulysses_a2a_permute=True,
         )
         od = _roundtrip_diffusion_config(model="x", parallel_config=pc)
         assert od.parallel_config.ulysses_degree == 2
         assert od.parallel_config.ring_degree == 1
+        assert od.parallel_config.ulysses_a2a_permute is True
 
     def test_mask_sp_padding_roundtrip(self):
         pc = DiffusionParallelConfig(ulysses_degree=2, mask_sp_padding=True)
@@ -138,6 +140,55 @@ class TestParallelConfigPropagation:
         od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4)
         assert od.parallel_config.data_parallel_size == 1
         assert od.parallel_config.world_size == 4
+
+    def test_hsdp_data_parallel_exposes_world_as_request_lanes(self):
+        pc = DiffusionParallelConfig(
+            use_hsdp=True,
+            hsdp_data_parallel=True,
+            hsdp_shard_size=4,
+        )
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4)
+
+        assert od.parallel_config.data_parallel_size == 4
+        assert od.parallel_config.world_size == 4
+
+    @pytest.mark.parametrize("cache_backend", ["tea_cache", "cache_dit", "mag_cache", "step_cache"])
+    def test_hsdp_data_parallel_rejects_rank_local_cache_backends(self, cache_backend):
+        pc = DiffusionParallelConfig(use_hsdp=True, hsdp_data_parallel=True, hsdp_shard_size=4)
+
+        with pytest.raises(ValueError, match="cannot be combined with hsdp_data_parallel"):
+            OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4, cache_backend=cache_backend)
+
+    @pytest.mark.parametrize("cache_backend", ["none", "sea_cache"])
+    def test_hsdp_data_parallel_allows_synchronized_cache_backends(self, cache_backend):
+        pc = DiffusionParallelConfig(use_hsdp=True, hsdp_data_parallel=True, hsdp_shard_size=4)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4, cache_backend=cache_backend)
+
+        assert od.cache_backend == cache_backend
+
+    def test_hsdp_data_parallel_defaults_request_batch_wait(self):
+        pc = DiffusionParallelConfig(use_hsdp=True, hsdp_data_parallel=True, hsdp_shard_size=4)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4)
+
+        assert od.request_batch_max_wait_ms == 500.0
+
+    def test_hsdp_data_parallel_keeps_explicit_zero_request_batch_wait(self):
+        pc = DiffusionParallelConfig(use_hsdp=True, hsdp_data_parallel=True, hsdp_shard_size=4)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4, request_batch_max_wait_ms=0)
+
+        assert od.request_batch_max_wait_ms == 0.0
+
+    def test_hsdp_without_data_parallel_disables_request_batch_wait_by_default(self):
+        pc = DiffusionParallelConfig(use_hsdp=True, hsdp_shard_size=4)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4)
+
+        assert od.request_batch_max_wait_ms == 0.0
+
+    def test_hsdp_without_data_parallel_keeps_cache_backends(self):
+        pc = DiffusionParallelConfig(use_hsdp=True, hsdp_shard_size=4)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4, cache_backend="tea_cache")
+
+        assert od.cache_backend == "tea_cache"
 
 
 class TestCreateDefaultDiffusion:

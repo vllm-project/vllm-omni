@@ -1,11 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import multiprocessing
+import os
+import queue
+import signal
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
 import pytest
+from pytest_mock import MockerFixture
+from vllm.config import VllmConfig
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine.core import EngineCoreProc
@@ -14,6 +22,7 @@ from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.request import RequestStatus
 from vllm.v1.serial_utils import run_method
 
+from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 from vllm_omni.engine.stage_engine_core_proc import (
     StageEngineCoreProc,
     _bind_first_audio_sink,
@@ -22,6 +31,66 @@ from vllm_omni.engine.stage_engine_core_proc import (
 from vllm_omni.worker_v2.first_audio_sender import supports_in_process_first_audio
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux fork and process signals")
+@pytest.mark.parametrize("repeated_signal", [signal.SIGTERM, signal.SIGINT])
+def test_shutdown_survives_repeated_termination_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, repeated_signal: int
+) -> None:
+    from vllm_omni.engine import stage_engine_core_proc as module
+
+    monkeypatch.setenv("VLLM_OMNI_SHM_WAKEUP", "1")
+    created = tmp_path / "created"
+    connector: SharedMemoryConnector | None = None
+
+    def construct(self: StageEngineCoreProc, *args: object, **kwargs: object) -> None:
+        nonlocal connector
+        self.input_queue = queue.Queue()
+        connector = SharedMemoryConnector({"stage_id": 0, "wakeup_scope": str(tmp_path)})
+        assert connector.get_wakeup_generation() is not None
+        assert connector._wake_path is not None
+        created.write_text(connector._wake_path)
+
+    def run(self: StageEngineCoreProc) -> None:
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    def shutdown(self: StageEngineCoreProc) -> None:
+        assert connector is not None
+        os.kill(os.getpid(), repeated_signal)
+        connector.close()
+
+    # Substitute model construction/execution, retaining the real process
+    # entrypoint, signal handlers and an owned OS FIFO in the forked child.
+    mocker.patch.object(StageEngineCoreProc, "__init__", construct)
+    mocker.patch.object(StageEngineCoreProc, "run_busy_loop", run)
+    mocker.patch.object(StageEngineCoreProc, "shutdown", shutdown)
+    mocker.patch.object(module, "maybe_register_config_serialize_by_value")
+    config = object.__new__(VllmConfig)
+    config.model_config = None
+    config.logging_config = None
+    process = multiprocessing.get_context("fork").Process(
+        target=StageEngineCoreProc.run_stage_core, kwargs={"vllm_config": config, "omni_stage_id": 0}
+    )
+    process.start()
+    try:
+        process.join(timeout=15)
+        assert not process.is_alive(), "Stage shutdown did not finish"
+        assert created.exists(), "Child did not create its FIFO"
+        assert not Path(created.read_text()).exists(), "Termination interrupted FIFO cleanup"
+        assert process.exitcode == 128 + signal.SIGTERM
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=5)
+        if created.exists():
+            owned = Path(created.read_text())
+            owned.unlink(missing_ok=True)
+            try:
+                owned.parent.rmdir()
+            except FileNotFoundError:
+                pass
+        process.close()
 
 
 def test_ordered_abort_supports_scheduler_without_overflow_fences(mocker):
