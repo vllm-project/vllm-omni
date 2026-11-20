@@ -40,15 +40,17 @@ frames = output.images  # the video frames; the speech track and its rate are in
 
 ## Validation
 
-Measured on 1x H100 80GB HBM3 against Kyutai's reference implementation ([kyutai-labs/aura](https://github.com/kyutai-labs/aura) @ `c06aa7d`, run in its own environment) on the sample of the model card (frame 0 and the 9.08 s speech of `assets/sample_1.mp4`), seed 42, 10 chunks (157 frames):
+Measured on 1x H100 80GB HBM3 against Kyutai's reference implementation ([kyutai-labs/aura](https://github.com/kyutai-labs/aura) @ `c06aa7d`, run in its own environment) on the sample of the model card (frame 0 and the 9.08 s speech of `assets/sample_1.mp4`), seed 42, 10 chunks (157 frames), with the reference's own default description passed as the prompt:
 
 | Check | Result |
 |---|---|
 | Reference against itself (flash vs memory-efficient SDPA): per-frame PSNR floor | min 28.93 dB, mean 40.48 dB |
 | vLLM-Omni, SDPA backend, against the reference | min 29.35 dB, mean 42.41 dB |
 | vLLM-Omni, FLASH_ATTN backend, against the reference | min 32.83 dB, mean 44.31 dB |
-| Speed through `Omni`, warm request of 157 frames (9.81 s of video) | 7.02 s with regional compilation (22.4 fps, 0.72x real time, all per-request costs included); 10.07 s with `enforce_eager` (15.6 fps) |
-| Speed of the reference with `--compile`, chunks 3-10 | 18.19 fps |
+| vLLM-Omni through `Omni` with regional compilation, against the reference | min 30.69 dB, mean 42.38 dB |
+| Speed through `Omni`, warm request of 157 frames (9.81 s of video) | 7.08 s with regional compilation (22.2 fps, 0.72x real time, all per-request costs included); 10.07 s with `enforce_eager` (15.6 fps) |
+
+The pass line sits 1 dB under the floor (every frame at or above 27.93 dB, the mean at or above 39.48 dB); every frame of the three vLLM-Omni rows passes it.
 
 ## Current limitations
 
