@@ -1497,6 +1497,28 @@ def test_parameter_validation():
     assert req.num_inference_steps is None  # Engine will use model defaults
     assert req.true_cfg_scale is None  # Engine will use model defaults
 
+    # Prompts must contain something other than whitespace, except that an empty
+    # negative prompt enables guidance with no negative text for Qwen-Image.
+    with pytest.raises(ValueError, match="non-empty"):
+        ImageGenerationRequest(prompt="")
+    with pytest.raises(ValueError, match="non-empty"):
+        ImageGenerationRequest(prompt="   ")
+    with pytest.raises(ValueError, match="non-empty"):
+        ImageGenerationRequest(prompt="test", system_prompt="   ")
+    assert ImageGenerationRequest(prompt="test", negative_prompt="").negative_prompt == ""
+
+    # Preserve the signed int64 seed contract and supported image formats.
+    for seed in (-(2**63), -1, 0, 2**32, 2**63 - 1):
+        assert ImageGenerationRequest(prompt="test", seed=seed).seed == seed
+    for seed in (-(2**63) - 1, 2**63):
+        with pytest.raises(ValueError):
+            ImageGenerationRequest(prompt="test", seed=seed)
+
+    for output_format in ("png", "jpg", "jpeg", "webp"):
+        assert ImageGenerationRequest(prompt="test", output_format=output_format).output_format == output_format
+    with pytest.raises(ValueError, match="output_format"):
+        ImageGenerationRequest(prompt="test", output_format="gif")
+
     # Invalid num_inference_steps (out of range)
     with pytest.raises(ValueError):
         ImageGenerationRequest(prompt="test", num_inference_steps=0)
@@ -2979,7 +3001,7 @@ def test_image_routes_inherit_engine_defaults(test_client: TestClient, route: st
     )
     test_client.app.state.engine_client.default_sampling_params_list = [defaults]
     for override in (explicit, False):
-        payload = {"prompt": "a cat"}
+        payload: dict[str, str | float | int] = {"prompt": "a cat"}
         if override:
             payload.update(guidance_scale=0.0, seed=0, n=1)
         if route == "generations":
