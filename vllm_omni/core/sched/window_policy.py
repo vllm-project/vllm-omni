@@ -48,8 +48,8 @@ class SchedulerWindowPolicy(Protocol):
         """Identify older response epochs fenced by this admission."""
         ...
 
-    def prepare_admission(self, request: Request, max_model_len: int) -> None:
-        """Adjust a new request's initial prefill before admission and KV allocation."""
+    def prepare_admission(self, request: Request, max_prompt_len: int) -> int | None:
+        """Prepare the initial prefill, or return its required length if it cannot fit."""
         ...
 
     def observe_progress(self, request: Request) -> None:
