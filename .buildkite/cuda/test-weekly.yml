@@ -493,6 +493,7 @@ steps:
         timeout_in_minutes: 120
         commands:
           - >-
+            bash .buildkite/cuda/scripts/run-ltx-weekly.sh
             pytest -sv
             tests/e2e/online_serving/test_ltx.py
             tests/e2e/online_serving/test_ltx25.py
