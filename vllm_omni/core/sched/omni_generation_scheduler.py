@@ -841,6 +841,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        self._record_full_payload_discard(request)
         if getattr(self, "_first_chunk_express", False):
             self._chunk_started.discard(request.request_id)
             getattr(self, "_stream_audio", {}).pop(request.request_id, None)
@@ -1044,7 +1045,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 or (
                     async_chunk_transport
                     and not generation_pending
-                    and input_terminal
+                    and (input_terminal or req_id in getattr(scheduler_output, "input_segment_finished_req_ids", set()))
                     and request.num_computed_tokens >= len(request.prompt_token_ids)
                 )
             ):
@@ -1143,7 +1144,14 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             if request in stopped_running_reqs or request.is_finished():
                 continue
             request.status = RequestStatus.FINISHED_STOPPED
-            if self._native_data_plane is True:
+            if (
+                self._native_data_plane is True
+                and self.input_coordinator is not None
+                and (
+                    request.request_id in self.input_coordinator.finished_requests
+                    or request.request_id in self.input_coordinator.input_terminal_req_ids
+                )
+            ):
                 # Native pending_finish is the empty last codec window after
                 # upstream meta.finished. Same V1 recv contract as above.
                 request.resumable = False

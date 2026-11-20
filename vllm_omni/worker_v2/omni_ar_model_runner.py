@@ -161,6 +161,14 @@ class OmniARModelRunner(OmniGPUModelRunner):
         self._async_mm_snapshot_cursor = 0
         self._last_multimodal_snapshot_slot: int | None = None
 
+    def _dummy_run(self, num_tokens: int, *args: Any, **kwargs: Any) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        # Upstream autotuning uses the batch token budget even when one dummy
+        # request would exceed the context-sized attention block table.
+        # This also bounds activation profiling to a schedulable batch. Remove
+        # the override once upstream caps dummy requests at max_model_len.
+        num_tokens = min(num_tokens, self.max_num_reqs * self.max_model_len)
+        return super()._dummy_run(num_tokens, *args, **kwargs)
+
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         super().load_model(*args, **kwargs)
         if (
@@ -383,9 +391,10 @@ class OmniARModelRunner(OmniGPUModelRunner):
 
         # --- Omni: prompt logprobs ---
         assert self.prompt_logprobs_worker is not None
+        prompt_logits_fn = self._prompt_logits_fn()
         # Mirror the current parent GPUModelRunner call exactly.
         prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
-            self.model.compute_logits,
+            prompt_logits_fn,
             text_hidden,
             input_batch,
             self.req_states.all_token_ids.gpu,
@@ -393,7 +402,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             self.req_states.prompt_len.np,
         )
         prompt_token_id_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_token_id_logprobs(
-            self.model.compute_logits,
+            prompt_logits_fn,
             text_hidden,
             input_batch,
             self.req_states.prompt_len.np,
@@ -1049,6 +1058,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         self._total_tokens: int = 0
         self._padded_total_tokens: int = 0
         self._req_ids = list(model_runner_output.req_ids)
+        self._num_computed_tokens_np: np.ndarray | None = None
         if self._need_pooler and input_batch is not None:
             self._query_start_loc_np = input_batch.query_start_loc_np.copy()
             self._num_scheduled_tokens = np.array(input_batch.num_scheduled_tokens, dtype=np.int32)
@@ -1058,6 +1068,11 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
             else:
                 self._total_tokens = int(self._num_scheduled_tokens[: self._num_reqs].sum())
             self._padded_total_tokens = int(getattr(input_batch, "num_tokens_after_padding", self._total_tokens))
+            computed = getattr(input_batch, "num_computed_tokens_np", None)
+            if computed is not None and not self._async_chunk:
+                # Captured before postprocess advances the batch, so the range
+                # is the input tokens this step executed.
+                self._num_computed_tokens_np = np.array(computed[: self._num_reqs], dtype=np.int64, copy=True)
 
         # Perform all D2H copies on the copy stream (non-blocking).
         import contextlib
@@ -1306,6 +1321,9 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
             self.model_runner_output.multimodal_outputs = (
                 [_ensure_tensor_values(p) if p else {} for p in pooler_payload] if pooler_payload else None
             )
+            token_ranges = self._full_payload_token_ranges(num_output_rows)
+            if token_ranges is not None:
+                self.model_runner_output.full_payload_token_ranges = token_ranges
 
         if self._request_errors is not None:
             flags, reason = self._request_errors
@@ -1327,6 +1345,19 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         if self._finalize_output is not None:
             return self._finalize_output(self.model_runner_output)
         return self.model_runner_output
+
+    def _full_payload_token_ranges(self, num_output_rows: np.ndarray | None) -> dict[str, tuple[int, int]] | None:
+        """Input-token span of each request's full-payload rows."""
+        computed = self._num_computed_tokens_np
+        if computed is None or num_output_rows is None:
+            return None
+        ranges: dict[str, tuple[int, int]] = {}
+        count = min(self._num_reqs, len(computed), len(num_output_rows), len(self._req_ids))
+        for index in range(count):
+            start = int(computed[index])
+            rows = max(0, int(num_output_rows[index]))
+            ranges[self._req_ids[index]] = (start, start + rows)
+        return ranges
 
     def get_kv_connector_output(self) -> KVConnectorOutput | None:
         return self.model_runner_output.kv_connector_output

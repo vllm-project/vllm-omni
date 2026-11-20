@@ -4091,10 +4091,14 @@ class Orchestrator(OrchestratorBase):
         final_output_stage_ids = set(msg.final_output_stage_ids or [final_stage_id])
         sampling_params_list = [_without_per_sample_kv_count(params) for params in sampling_params_list]
 
+        # Before registration, only the submission message owns the artifact
+        # dirs; state-based failure cleanup cannot find them yet.
+        artifact_dirs = msg.request_artifact_dirs or []
         if msg.requested_replica_id is not None:
             try:
                 self.stage_pools[stage_id].reserve_requested_replica(request_id, msg.requested_replica_id)
             except OmniClientError as exc:
+                cleanup_request_artifact_dirs(artifact_dirs)
                 await self._fail_request_client_error(
                     request_id,
                     stage_id,
@@ -4104,6 +4108,7 @@ class Orchestrator(OrchestratorBase):
                 )
                 return
         if await self._fail_if_cannot_submit(request_id, stage_id, is_run_request=msg.yield_stage_id is not None):
+            cleanup_request_artifact_dirs(artifact_dirs)
             return
 
         if getattr(prompt, "resumable", False):
@@ -4147,6 +4152,7 @@ class Orchestrator(OrchestratorBase):
                         and self._stage_receives_async_chunks(stage_id + 1)
                     ):
                         continue
+                    cleanup_request_artifact_dirs(artifact_dirs)
                     await self._fail_request_client_error(
                         request_id,
                         stage_id,
@@ -4157,6 +4163,7 @@ class Orchestrator(OrchestratorBase):
                     return
             mrv2_stage_id = self._native_mrv2_receiver_stage(final_stage_id)
             if mrv2_stage_id is not None and not native_resume:
+                cleanup_request_artifact_dirs(artifact_dirs)
                 await self._fail_request_client_error(
                     request_id,
                     stage_id,
@@ -4170,6 +4177,7 @@ class Orchestrator(OrchestratorBase):
         for later_stage_id in range(stage_id + 1, min(final_stage_id, len(sampling_params_list) - 1) + 1):
             later_n = getattr(sampling_params_list[later_stage_id], "n", 1) or 1
             if later_n > 1:
+                cleanup_request_artifact_dirs(artifact_dirs)
                 await self._fail_request_client_error(
                     request_id,
                     stage_id,
@@ -4198,6 +4206,7 @@ class Orchestrator(OrchestratorBase):
             elif self.stage_pools[stage_id].will_watermark(entry_params):
                 reason = f"n > 1 is not supported with output watermarking on stage {stage_id}"
             if reason is not None:
+                cleanup_request_artifact_dirs(artifact_dirs)
                 await self._fail_request_client_error(request_id, stage_id, reason)
                 return
 

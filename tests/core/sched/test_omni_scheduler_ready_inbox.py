@@ -202,14 +202,15 @@ def test_native_resume_prompt_replacement_clears_token_buffer(mocker, input_term
     assert not scheduler._resume_chunk_receivers
 
 
-@pytest.mark.parametrize("prompt_length", [8192, 8193])
-def test_ready_connector_prompt_respects_stage_context_limit(monkeypatch, mocker, prompt_length):
+@pytest.mark.parametrize("prompt_length,sample_room", [(8191, 1), (8192, 1), (8193, 1), (8188, 4), (8189, 4)])
+def test_ready_connector_prompt_respects_stage_context_limit(monkeypatch, mocker, prompt_length, sample_room):
     from collections import defaultdict
 
     from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
     from vllm.v1.engine import EngineCoreOutputs, FinishReason
 
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
+    scheduler.num_sampled_tokens_per_step = sample_room
     request = Request("long-prompt", [1] * prompt_length, SamplingParams(max_tokens=1), pooling_params=None)
     scheduler.requests = {request.request_id: request}
     scheduler.max_model_len = 8192
@@ -245,7 +246,7 @@ def test_ready_connector_prompt_respects_stage_context_limit(monkeypatch, mocker
     )
     scheduler._consume_pending_connector_output(model_mode="ar")
 
-    if prompt_length == scheduler.max_model_len:
+    if prompt_length + sample_room <= scheduler.max_model_len:
         assert request.request_id in scheduler.requests
         scheduler.finish_requests.assert_not_called()
         return
@@ -255,7 +256,7 @@ def test_ready_connector_prompt_respects_stage_context_limit(monkeypatch, mocker
     scheduler._attach_finished_request_sets(outputs, synthesize_abort_outputs=False)
     [error] = outputs[request.client_index].outputs
     assert error.finish_reason == FinishReason.ERROR
-    assert "8193" in error.stop_reason and "8192" in error.stop_reason
+    assert str(prompt_length) in error.stop_reason and "8192" in error.stop_reason
     assert not scheduler.has_requests()
 
 

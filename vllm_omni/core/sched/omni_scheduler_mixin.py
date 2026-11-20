@@ -409,6 +409,9 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
         self._init_omni_connector_output_inbox()
         self._pending_data_plane_terminal_req_ids: set[str] = set()
+        # Aborted, errored, and ignored requests. Wrapped onto the next
+        # scheduler output so the runner can drop their pending payloads.
+        self._discarded_req_ids: set[str] = set()
         # Async-chunk prewarm payloads popped in add_request, keyed by request
         # id; handed to the runner once by _wrap_omni_scheduler_output.
         self._pending_request_prewarms: dict[str, dict[str, Any]] = {}
@@ -638,7 +641,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
                         prompt_length = len(input_update.prompt_token_ids)
                     elif input_update.resize_prompt_to is not None:
                         prompt_length = input_update.resize_prompt_to
-                if prompt_length > max_model_len:
+                if prompt_length + max(1, int(getattr(self, "num_sampled_tokens_per_step", 1) or 1)) > max_model_len:
                     self._finish_oversized_prompt(request, prompt_length)
                     request_metadata.pop(req_id, None)
                     chunk_ready_req_ids.discard(req_id)
@@ -968,6 +971,20 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             return
         self._latest_omni_connector_output = omni_output
 
+    def _record_full_payload_discard(self, request: Request) -> None:
+        """Remember a failed request so its pending full payload is dropped."""
+        if getattr(request, "status", None) not in (
+            RequestStatus.FINISHED_ABORTED,
+            RequestStatus.FINISHED_ERROR,
+            RequestStatus.FINISHED_IGNORED,
+        ):
+            return
+        discarded = getattr(self, "_discarded_req_ids", None)
+        if discarded is None:
+            discarded = set()
+            self._discarded_req_ids = discarded
+        discarded.add(request.request_id)
+
     def _wrap_omni_scheduler_output(
         self,
         base: SchedulerOutput,
@@ -1018,6 +1035,12 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         finished_output_ids = {
             req_id: pending_output_ids.pop(req_id) for req_id in base.finished_req_ids if req_id in pending_output_ids
         }
+        discarded_req_ids: set[str] | None = getattr(self, "_discarded_req_ids", None)
+        if discarded_req_ids is None:
+            finished_discarded_req_ids: set[str] = set()
+        else:
+            finished_discarded_req_ids = discarded_req_ids & set(base.finished_req_ids)
+            discarded_req_ids.difference_update(finished_discarded_req_ids)
         scheduler_output = OmniSchedulerOutput(
             **base_data,
             finished_requests_needing_kv_transfer=finished_requests_needing_kv_transfer or {},
@@ -1025,9 +1048,15 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             pending_input_registrations=pending_input_registrations,
             data_plane_terminal_req_ids=data_plane_terminal_req_ids,
             input_terminal_req_ids=input_terminal_req_ids or set(),
+            input_segment_finished_req_ids=(
+                input_coordinator.segment_finished_req_ids.intersection(input_coordinator._scheduled_request_ids(base))
+                if input_coordinator is not None
+                else set()
+            ),
             pending_request_prewarms=request_prewarms,
             chunk_commits=getattr(self, "_pending_chunk_commits", []),
             resume_chunk_receivers=getattr(self, "_resume_chunk_receivers", set()),
+            discarded_req_ids=finished_discarded_req_ids,
         )
         self._pending_chunk_commits = []
         self._resume_chunk_receivers = set()
@@ -1360,6 +1389,8 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             or request.status != RequestStatus.WAITING_FOR_STREAMING_REQ
         ):
             return
+        # Connector-only resumes bypass the generation bump in _update_request_as_session.
+        request._omni_segment_generation = int(getattr(request, "_omni_segment_generation", 0) or 0) + 1
         self.num_waiting_for_streaming_input -= 1
         request.status = RequestStatus.WAITING
         self.deferred_waiting.discard(request)
@@ -1485,7 +1516,8 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
     def _finish_oversized_prompt(self, request: Request, prompt_length: int) -> None:
         """Emit a request-local error when a stage cannot accommodate its input."""
         reason = (
-            f"Stage input prompt has {prompt_length} tokens, exceeding max_model_len={self.max_model_len}. "
+            f"Stage input prompt has {prompt_length} tokens and cannot fit sampling room "
+            f"within max_model_len={self.max_model_len}. "
             "Increase this stage's max_model_len to accommodate the upstream payload."
         )
         logger.error("Rejecting request %s: %s", request.request_id, reason)

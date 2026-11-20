@@ -761,3 +761,46 @@ class TestNonChunkBehaviorUnchanged:
         output = sched.schedule()
 
         assert output.num_scheduled_tokens == {}
+
+
+@pytest.mark.parametrize("marker_only", [False, True])
+def test_native_segment_boundary_keeps_session_for_second_segment(marker_only):
+    sched = _make_scheduler(receive_path="native")
+    sched._pooling_output_decoder = None
+    sched._pending_data_plane_terminal_req_ids = set()
+    sched.kv_cache_manager.estimate_cached_tokens = lambda request: 0
+
+    def free_request(request):
+        sched.requests.pop(request.request_id, None)
+        return None, None
+
+    sched._free_request = free_request
+    request = _make_request("two-segments", 0 if marker_only else 2)
+    request.resumable = True
+    _stage_waiting_chunk(sched, request)
+    sched.input_coordinator.segment_finished_req_ids.add(request.request_id)
+    first = sched.schedule()
+    runner_output = _make_runner_output()
+    runner_output.req_ids = [request.request_id]
+    runner_output.num_nans_in_logits = {}
+    request.num_computed_tokens = len(request.prompt_token_ids)
+    sched.update_from_output(first, runner_output)
+    assert request.resumable
+    assert request.request_id in sched.requests
+    assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    # A later payload replaces the parked segment's prompt and can execute.
+    request.prompt_token_ids = [7, 8]
+    request.num_computed_tokens = 0
+    request.status = RequestStatus.WAITING
+    sched.input_coordinator.segment_finished_req_ids.discard(request.request_id)
+    sched.input_coordinator.finished_requests.add(request.request_id)
+    sched.input_coordinator.input_terminal_req_ids.add(request.request_id)
+    sched.waiting.add_request(request)
+    _ready_chunk_ids(sched).add(request.request_id)
+    second = sched.schedule()
+    assert second.num_scheduled_tokens == {request.request_id: 2}
+    request.num_computed_tokens = len(request.prompt_token_ids)
+    sched.update_from_output(second, runner_output)
+    assert not request.resumable
+    assert request.request_id not in sched.requests

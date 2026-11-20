@@ -890,6 +890,36 @@ def test_pooling_completion_uses_upstream_output_and_finishes_request(cache_miss
     assert request.external_req_id not in processor.external_req_ids
 
 
+def test_add_request_normalizes_numpy_prompt_ids_before_upstream_detokenizer(monkeypatch):
+    processor = MultimodalOutputProcessor(tokenizer=None, log_stats=False)
+    request = OmniEngineCoreRequest(
+        request_id="numpy-prompt",
+        external_req_id="numpy-prompt",
+        prompt_token_ids=np.array([10, 11], dtype=np.int32),
+        mm_features=None,
+        sampling_params=None,
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+    captured = {}
+
+    def fake_from_new_request(**kwargs):
+        captured["prompt_token_ids"] = kwargs["request"].prompt_token_ids
+        return SimpleNamespace(
+            external_req_id="numpy-prompt",
+            is_pooling_request=False,
+        )
+
+    monkeypatch.setattr(OmniRequestState, "from_new_request", staticmethod(fake_from_new_request))
+
+    processor.add_request(request, prompt=None)
+
+    assert captured["prompt_token_ids"] == [10, 11]
+
+
 def test_admission_error_returns_external_pause_message():
     """A queue=None generation request must surface RequestError, not a chunk."""
     kwargs = dict(_NO_DETOK_STATE_KWARGS)

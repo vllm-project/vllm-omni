@@ -377,7 +377,7 @@ class OmniSchedulingCoordinator:
         scheduler_output: Any,
     ) -> set[str]:
         """Return terminal inputs executed by this immutable scheduler step."""
-        return (self.input_terminal_req_ids | self.segment_finished_req_ids).intersection(
+        return self.input_terminal_req_ids.intersection(
             self._scheduled_request_ids(scheduler_output),
         )
 
