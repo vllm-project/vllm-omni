@@ -245,6 +245,7 @@ def test_omni_rejects_distilled_adapter_schedule(adapter_kind, ref2va_turbo_spec
 def test_local_encoder_accepts_lora_composition(variant, ref2va_turbo_spec):
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = SimpleNamespace(step_execution=False, diffusion_offload_config=None)
     pipeline._fasth3_checkpoint = FastH3OmniCheckpointSpec() if variant == "omni" else None
     pipeline.partition = "ref2va"
     pipeline.supported_tasks = frozenset({"ref2va"})

@@ -3221,7 +3221,7 @@ class MiniMaxH3Pipeline(
                 continuation = resolve_continuation(
                     sampling.extra_args or {},
                     task=task,
-                    step_execution=bool(getattr(getattr(self, "od_config", None), "step_execution", False)),
+                    step_execution=bool(getattr(self.od_config, "step_execution", False)),
                 )
                 prepared = prepare_encoder_inputs(
                     raw_prompt,
