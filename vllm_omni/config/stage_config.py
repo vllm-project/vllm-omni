@@ -8,7 +8,7 @@ import functools
 import math
 import re
 import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
@@ -419,6 +419,14 @@ class StagePipelineConfig:
     sync_process_input_func: str | None = None
     supports_native_mrv2_data_plane: bool = False
     supports_duplex_mrv2: bool = False
+    # Sampling keys this stage's model_runner: v2 implementation does not
+    # support. Checked against ``default_sampling_params`` at deploy-merge time
+    # and request sampling at the frontend admission boundary. An unsupported
+    # default fails at startup (with the v1 opt-out named), while an unsupported
+    # request fails before it can enter the engine queue. Keys whose
+    # engine-default value is neutral (e.g. repetition_penalty=1.0) pass; any
+    # non-neutral value fails.
+    mrv2_unsupported_sampling_params: tuple[str, ...] = ()
     # Rewrites the Stage-0 view of a raw prompt before vLLM input processing.
     # The callable receives ``(prompt, sampling_params_list)``; downstream
     # stages continue to receive the original prompt. It also runs on
@@ -1117,7 +1125,9 @@ def _merge_platforms(
     base: dict[str, Any] | None,
     overlay: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """Merge platform blocks by stage ID and named connector definition."""
+    """Deep-merge two ``platforms:`` blocks per-platform, stages by stage_id,
+    connectors by name. An overlay cannot clear a platform's inherited
+    connectors; omitted keys keep the base connector restores."""
     if not base and not overlay:
         return None
     base = base or {}
@@ -1126,11 +1136,11 @@ def _merge_platforms(
     for plat in set(base) | set(overlay):
         bp = base.get(plat) or {}
         op = overlay.get(plat) or {}
-        merged_plat = {**bp, **{k: v for k, v in op.items() if k != "stages"}}
+        merged_plat = {**bp, **{k: v for k, v in op.items() if k not in ("stages", "connectors")}}
         merged_plat["stages"] = _merge_stage_lists(bp.get("stages"), op.get("stages"))
-        connectors = _merge_connectors(bp.get("connectors"), op.get("connectors"))
-        if connectors is not None:
-            merged_plat["connectors"] = connectors
+        merged_conns = _merge_connectors(bp.get("connectors"), op.get("connectors"))
+        if merged_conns is not None:
+            merged_plat["connectors"] = merged_conns
         merged[plat] = merged_plat
     return merged
 
@@ -1253,6 +1263,63 @@ def _extract_platform_overrides(ps: dict[str, Any]) -> PlatformOverrides:
 _MRV2_UNSUPPORTED_PLATFORMS: dict[str, str] = {}
 
 
+# Engine-default (neutral) values for sampling params a v2 stage may list as
+# unsupported: a default equal to the engine default is a no-op and passes.
+# Unlisted keys have no scalar neutral; an empty value (None, [], {}) passes.
+# logprobs/prompt_logprobs stay unlisted: 0 still requests the sampled
+# token's logprob, and the request path rejects any explicit value.
+_MRV2_NEUTRAL_SAMPLING_VALUES: dict[str, Any] = {
+    "frequency_penalty": 0.0,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0,
+    "min_tokens": 0,
+    "min_p": 0.0,
+}
+_MRV2_EXPLICIT_SAMPLING_PARAMS = frozenset({"logprobs", "prompt_logprobs"})
+
+
+def get_unsupported_mrv2_sampling_params(
+    params: Mapping[str, Any] | Any,
+    unsupported: Collection[str],
+) -> tuple[str, ...]:
+    """Return unsupported MRV2 sampling keys that are active in *params*.
+
+    The same neutral-value rules apply to deploy defaults and request objects.
+    ``logprobs`` and ``prompt_logprobs`` are presence-sensitive: even zero
+    explicitly requests log-probabilities and therefore cannot be treated as a
+    neutral value.
+    """
+    bad: list[str] = []
+    for key in unsupported:
+        value = params.get(key) if isinstance(params, Mapping) else getattr(params, key, None)
+        if key in _MRV2_EXPLICIT_SAMPLING_PARAMS:
+            invalid = value is not None
+        elif key in _MRV2_NEUTRAL_SAMPLING_VALUES:
+            invalid = value not in (_MRV2_NEUTRAL_SAMPLING_VALUES[key], None, [], {})
+        else:
+            # Collection-valued options (allowed_token_ids, bad_words, and
+            # logit_bias) are neutral when empty; any populated value is active.
+            invalid = bool(value)
+        if invalid:
+            bad.append(key)
+    return tuple(sorted(set(bad)))
+
+
+def _validate_mrv2_default_sampling_params(
+    ps: StagePipelineConfig, ds: StageDeployConfig | None, stage_runner: str
+) -> None:
+    """Reject non-neutral unsupported ``default_sampling_params`` under v2 at startup."""
+    if stage_runner != "v2" or not ps.mrv2_unsupported_sampling_params:
+        return
+    params = (ds.default_sampling_params if ds is not None else None) or {}
+    bad = get_unsupported_mrv2_sampling_params(params, ps.mrv2_unsupported_sampling_params)
+    if bad:
+        raise ValueError(
+            f"stage {ps.stage_id}: default_sampling_params {bad} are not supported by this model's "
+            "model_runner: v2 path; remove the unsupported parameters"
+        )
+
+
 def _apply_platform_overrides(
     deploy: DeployConfig,
     platform: str | None = None,
@@ -1264,8 +1331,16 @@ def _apply_platform_overrides(
         device_name = current_omni_platform.device_name
         platform = device_name.lower() if device_name is not None else None
     platform_section = (deploy.platforms or {}).get(platform) if platform is not None else None
-    if platform_section is not None and "connectors" in platform_section:
-        deploy.connectors = _merge_connectors(deploy.connectors, platform_section["connectors"])
+    platform_connectors = platform_section.get("connectors") if platform_section else None
+    if platform_connectors is not None:
+        if not isinstance(platform_connectors, dict):
+            raise ValueError("platform connectors must be a mapping of connector name to overrides")
+        for conn_name, override in platform_connectors.items():
+            if not deploy.connectors or conn_name not in deploy.connectors:
+                raise ValueError(f"platform connectors override references unknown connector {conn_name!r}")
+            if not isinstance(override, dict):
+                raise ValueError(f"platform connectors override for {conn_name!r} must be a mapping")
+        deploy.connectors = _merge_connectors(deploy.connectors, platform_connectors)
     if platform_section is not None and "cuda_mps" in platform_section:
         cuda_mps = platform_section["cuda_mps"]
         if not isinstance(cuda_mps, bool):
@@ -1474,6 +1549,7 @@ def _build_engine_args(
                 )
     stage_runner = resolve_stage_model_runner(deploy, ds)
     validate_native_mrv2_session(deploy, ps, stage_runner)
+    _validate_mrv2_default_sampling_params(ps, ds, stage_runner)
     # This flag selects the LLM runner; diffusion stages own their runner.
     engine_args["use_v2_model_runner"] = stage_runner == "v2" and ps.execution_type is not StageExecutionType.DIFFUSION
     engine_args["supports_native_mrv2_data_plane"] = bool(ps.supports_native_mrv2_data_plane)
@@ -1536,6 +1612,8 @@ def _build_extras(
         extras["cfg_kv_collect_func"] = ps.cfg_kv_collect_func
     if ps.async_chunk_prewarm_payload_func:
         extras["async_chunk_prewarm_payload_func"] = ps.async_chunk_prewarm_payload_func
+    if ps.mrv2_unsupported_sampling_params:
+        extras["mrv2_unsupported_sampling_params"] = tuple(ps.mrv2_unsupported_sampling_params)
     if ps.extras:
         extras.update(ps.extras)
     return extras

@@ -12,18 +12,39 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any
 
 import transformers
 from transformers import AutoConfig, PretrainedConfig
 
-__all__ = ["HiggsAudioV3Config"]
+__all__ = ["HiggsAudioV3Config", "HiggsMrv2Options"]
 
 logger = logging.getLogger(__name__)
 
 _QWEN3_ROPE_THETA = 1_000_000
 
 _REQUIRED_SPECIALS = ("<|tts|>", "<|text|>", "<|audio|>")
+
+
+@dataclass(frozen=True)
+class HiggsMrv2Options:
+    """Resolved MRV2 feature switches (see ``HiggsAudioV3Config.resolve_mrv2_defaults``)."""
+
+    audio_async_prompt_mode: bool
+    audio_async_payload: bool
+    audio_mrv2_static_inputs: bool
+    audio_mrv2_slot_parameters: bool
+    audio_mrv2_direct_payload: bool
+    audio_mrv2_sample_graph_buckets: bool
+    audio_mrv2_async_state_indices: bool
+    audio_mrv2_fused_state: bool
+
+
+# Tri-state config fields resolved by ``resolve_mrv2_defaults``.
+_MRV2_FLAG_FIELDS = tuple(HiggsMrv2Options.__dataclass_fields__)
+# explicit False under v2 raises instead of silently degrading the sampler.
+_MRV2_STRUCTURAL_FLAGS = frozenset({"audio_async_payload", "audio_async_prompt_mode"})
 
 
 def _build_text_config(raw: Any) -> PretrainedConfig:
@@ -97,6 +118,14 @@ class HiggsAudioV3Config(PretrainedConfig):
         enable_mlp_cudagraph: bool = True,
         audio_full_sample_graph: bool | None = None,
         codec_cuda_graph: bool | None = None,
+        audio_async_prompt_mode: bool | None = None,
+        audio_async_payload: bool | None = None,
+        audio_mrv2_static_inputs: bool | None = None,
+        audio_mrv2_slot_parameters: bool | None = None,
+        audio_mrv2_direct_payload: bool | None = None,
+        audio_mrv2_sample_graph_buckets: bool | None = None,
+        audio_mrv2_async_state_indices: bool | None = None,
+        audio_mrv2_fused_state: bool | None = None,
         **kwargs: Any,
     ) -> None:
         # Legacy perf knob removed: Higgs v3 scheduler tokens now come from
@@ -135,6 +164,18 @@ class HiggsAudioV3Config(PretrainedConfig):
         self.enable_mlp_cudagraph = bool(enable_mlp_cudagraph)
         self.audio_full_sample_graph = audio_full_sample_graph
         self.codec_cuda_graph = codec_cuda_graph
+        # MRV2 feature switches: tri-state (None = follow the model runner).
+        # An explicit bool overrides under v2 only; v1 resolves every switch
+        # off. Resolved once at model init by ``resolve_mrv2_defaults`` —
+        # never read these raw.
+        self.audio_async_prompt_mode = audio_async_prompt_mode
+        self.audio_async_payload = audio_async_payload
+        self.audio_mrv2_static_inputs = audio_mrv2_static_inputs
+        self.audio_mrv2_slot_parameters = audio_mrv2_slot_parameters
+        self.audio_mrv2_direct_payload = audio_mrv2_direct_payload
+        self.audio_mrv2_sample_graph_buckets = audio_mrv2_sample_graph_buckets
+        self.audio_mrv2_async_state_indices = audio_mrv2_async_state_indices
+        self.audio_mrv2_fused_state = audio_mrv2_fused_state
 
         super().__init__(**kwargs)
 
@@ -144,6 +185,40 @@ class HiggsAudioV3Config(PretrainedConfig):
             use_v2_model_runner if self.audio_full_sample_graph is None else self.audio_full_sample_graph,
             use_v2_model_runner if self.codec_cuda_graph is None else self.codec_cuda_graph,
         )
+
+    def resolve_mrv2_defaults(self, *, use_v2_model_runner: bool) -> HiggsMrv2Options:
+        """Resolve the 8 MRV2 switches without mutating shared checkpoint config.
+
+        Under v2, ``None`` defaults the switch on and an explicit bool
+        overrides it; under v1 every switch resolves off regardless, since
+        the V1 paths never read them — an explicitly set switch is ignored
+        with a warning instead of silently doing nothing.
+        ``audio_async_payload`` and ``audio_async_prompt_mode`` are structural
+        requirements of the v2 sampler, so an explicit ``False`` under v2
+        raises instead of silently degrading.
+        """
+        resolved: dict[str, bool] = {}
+        ignored: list[str] = []
+        for name in _MRV2_FLAG_FIELDS:
+            explicit = getattr(self, name, None)
+            if not use_v2_model_runner:
+                if explicit is not None:
+                    ignored.append(name)
+                resolved[name] = False
+            elif explicit is False and name in _MRV2_STRUCTURAL_FLAGS:
+                raise ValueError(
+                    f"{name} cannot be disabled under model_runner: v2; it is a structural "
+                    "requirement of the Higgs v3 MRV2 sampler"
+                )
+            else:
+                resolved[name] = use_v2_model_runner if explicit is None else bool(explicit)
+        if ignored:
+            logger.warning(
+                "model_runner: v1 ignores the explicitly set MRV2 switches %s; "
+                "they only take effect under model_runner: v2",
+                ignored,
+            )
+        return HiggsMrv2Options(**resolved)
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs: Any) -> HiggsAudioV3Config:

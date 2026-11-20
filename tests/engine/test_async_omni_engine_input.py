@@ -172,6 +172,38 @@ def test_build_add_request_message_normalizes_watermark_opt_out():
     assert [params[0].watermarking, params[1].watermarking] == [False, True]
 
 
+def test_unsupported_mrv2_sampling_is_rejected_before_queue_and_does_not_poison_engine(
+    mocker: MockerFixture,
+):
+    """A rejected request must not prevent the next valid request from landing."""
+    engine = object.__new__(AsyncOmniEngine)
+    engine.default_sampling_params_list = [SamplingParams(max_tokens=8)]
+    engine.stage_metadata = [
+        StageRuntimeInfo(
+            final_output=False,
+            final_output_type=None,
+            stage_type="llm",
+            mrv2_unsupported_sampling_params=("repetition_penalty",),
+        )
+    ]
+    engine.request_queue = mocker.Mock()
+
+    with pytest.raises(ValueError, match="repetition_penalty"):
+        engine.add_request(
+            request_id="unsupported",
+            prompt=_make_engine_core_request("unsupported"),
+            sampling_params_list=[SamplingParams(max_tokens=8, repetition_penalty=1.2)],
+        )
+    engine.request_queue.sync_q.put.assert_not_called()
+
+    engine.add_request(
+        request_id="valid",
+        prompt=_make_engine_core_request("valid"),
+        sampling_params_list=[SamplingParams(max_tokens=8)],
+    )
+    engine.request_queue.sync_q.put.assert_called_once()
+
+
 def test_build_add_request_message_preserves_additional_information(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)

@@ -108,29 +108,18 @@ python examples/online_serving/text_to_speech/higgs_audio_v3/batch_speech_client
   and reference code row count without logging text or audio content. They do not
   change the existing fallback behavior; legacy counts describe the current span.
 - Deploy config: `vllm_omni/deploy/higgs_multimodal_qwen3.yaml` (auto-discovered from `model_type`).
-    - `max_num_seqs=16` for both stages.
-    - Stage 0 and Stage 1 default to the same device (`0`) for single-GPU serving.
-    - Stage 0 intentionally keeps `enforce_eager=true`. This preserves the Higgs-specific local MLP CUDA graph path, which is the current high-throughput default.
-    - Stage 1 remains `enforce_eager=true` for the codec decoder.
+    - Uses `model_runner: v2`; vLLM 0.34 no longer supports V1.
+    - MRV2 switches self-enable from the runner selection; no enabling `hf_overrides` block is needed on CUDA.
+    - Both stages use `max_num_seqs=16` and device `0` by default.
+    - CUDA Stage 0 uses FLASH_ATTN, `FULL` CUDA graph capture and `async_scheduling: true`; Stage 1 stays eager with codec graph windows `[8, 33]`.
+    - CUDA streaming uses 25-frame chunks with 8-frame left context and an 8-frame first chunk (~320 ms of audio).
+    - Non-CUDA overrides preserve eager execution and the earlier streaming geometry, use V2 with async scheduling, and disable the six CUDA-tuned `audio_mrv2_*` optimizations. Hardware qualification remains separate.
+    - The sampler supports `temperature`, `top_p`, `top_k` and `seed`. Remove unsupported penalties, logprobs, min_tokens, min_p, allowed/bad token ids and logit_bias; they are rejected before queue admission.
 - Deploy profiles:
-    - High throughput: `vllm_omni/deploy/higgs_multimodal_qwen3_high_throughput.yaml`.
-    Use this for medium/high concurrency. The auto-discovered
-    `higgs_multimodal_qwen3.yaml` is kept as a compatibility/default alias for
-    this profile.
-    - Low latency: `vllm_omni/deploy/higgs_multimodal_qwen3_low_latency.yaml`.
-    Use this for low-concurrency serving (for example c1-c4). It sets Stage 0
-    `enforce_eager=false` and enables vLLM `FULL_DECODE_ONLY` CUDA graph through
-    YAML `compilation_config`; no environment variable is required.
+    - Default: `vllm_omni/deploy/higgs_multimodal_qwen3.yaml`.
+    - H200 tuning: `vllm_omni/deploy/higgs_multimodal_qwen3_mrv2_h200.yaml` (64-sequence capacities, larger capture sizes, MPS).
+    - The old `_high_throughput.yaml` and `_low_latency.yaml` files retain V1 execution settings and are unavailable as V1 opt-outs with vLLM 0.34.
     - Profile details: `vllm_omni/deploy/README_higgs_audio_v3.md`.
-- Performance note:
-    - Do not switch the auto-discovered default Stage 0 profile to vLLM
-    `FULL_DECODE_ONLY` CUDA graph without an end-to-end throughput and
-    audio-quality revalidation. On the H20 SeedTTS c16/full-dataset benchmark,
-    the eager Stage 0 path with Higgs local MLP CUDA graph reproduced
-    ~35 audio_s/s (`1088/1088` OK per run, three runs around 134-136s). A
-    separate H20 low-concurrency smoke after the FULL_DECODE audio-feedback
-    capture fix showed lower c1/c4 latency, so the FULL_DECODE profile is kept
-    as an explicit low-latency option rather than the throughput default.
-- Known limitations:
-    - Stage 1 (code2wav) must use `enforce_eager=true` (`@torch.inference_mode` incompatible with graph capture).
-    - Stage 0 full-decode CUDA graph is experimental; sampler, delay-state updates, staging, and request postprocess remain outside the graph.
+- Validation notes:
+    - Earlier V1/V2 quality and performance comparisons predate the vLLM 0.34 rebase. They do not qualify the current runtime; repeat matched hardware measurements before making new parity or speedup claims.
+    - Stage 1 must use `enforce_eager=true`; its codec graphs are managed locally.

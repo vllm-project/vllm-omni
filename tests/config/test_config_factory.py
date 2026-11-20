@@ -3298,7 +3298,8 @@ class TestPlatformOverrides:
         deploy_path = Path(get_deploy_config_path("higgs_multimodal_qwen3.yaml"))
 
         base = load_deploy_config(deploy_path)
-        assert base.stages[0].attention_backend == "FLASHINFER"
+        assert base.model_runner == "v2"
+        assert base.stages[0].attention_backend == "FLASH_ATTN"
 
         rocm = _apply_platform_overrides(base, platform="rocm")
         assert rocm.stages[0].attention_backend == "TRITON_ATTN"
@@ -3307,6 +3308,153 @@ class TestPlatformOverrides:
         assert isinstance(pipeline, PipelineConfig)
         stages = merge_pipeline_deploy(pipeline, rocm)
         assert stages[0].yaml_engine_args["attention_backend"] == "TRITON_ATTN"
+
+    def test_higgs_audio_v3_non_cuda_platforms_keep_eager_mrv2(self):
+        """Preserve the non-CUDA eager shape without selecting retired V1."""
+        deploy_path = Path(get_deploy_config_path("higgs_multimodal_qwen3.yaml"))
+
+        for platform in ("rocm", "npu", "xpu", "musa"):
+            deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform)
+            assert deploy.model_runner == "v2", platform
+            assert all(stage.model_runner is None for stage in deploy.stages), platform
+            stage0 = deploy.stages[0]
+            assert stage0.enforce_eager is True, platform
+            assert stage0.async_scheduling is True, platform
+            assert stage0.engine_extras["enable_prefix_caching"] is True, platform
+            assert "hf_overrides" not in deploy.stages[1].engine_extras, platform
+            flags = stage0.engine_extras["hf_overrides"]
+            for name in (
+                "audio_mrv2_static_inputs",
+                "audio_mrv2_slot_parameters",
+                "audio_mrv2_direct_payload",
+                "audio_mrv2_sample_graph_buckets",
+                "audio_mrv2_async_state_indices",
+                "audio_mrv2_fused_state",
+            ):
+                assert flags[name] is False, (platform, name)
+            pipeline = resolve_pipeline_config("higgs_multimodal_qwen3")
+            stages = merge_pipeline_deploy(pipeline, deploy)
+            assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+            # The connector restore keeps the previous streaming geometry:
+            # the v2 chunk shape exists only for the codec CUDA-graph windows.
+            extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+            assert extra["codec_left_context_frames"] == 25, platform
+            assert extra["codec_right_holdback_frames"] == 4, platform
+            assert extra["initial_codec_chunk_frames"] == 1, platform
+            # The restore is a deep merge: untouched extra keys survive.
+            assert extra["codec_chunk_frames"] == 25, platform
+            assert extra["codec_streaming"] is True, platform
+
+        # The yaml anchor must resolve to independent containers: mutate the
+        # rocm entry of one parse and the xpu entry of the same parse must
+        # not change.
+        from vllm_omni.config.stage_config import resolve_deploy_yaml
+
+        raw = resolve_deploy_yaml(deploy_path)
+        assert raw["platforms"]["rocm"]["connectors"] is not raw["platforms"]["xpu"]["connectors"]
+        raw_rocm = raw["platforms"]["rocm"]["connectors"]["connector_of_shared_memory"]["extra"]
+        raw_xpu = raw["platforms"]["xpu"]["connectors"]["connector_of_shared_memory"]["extra"]
+        raw_rocm["codec_left_context_frames"] = 99
+        assert raw_xpu["codec_left_context_frames"] == 25
+
+        # The v2 default path keeps the graph-coupled chunk shape.
+        cuda = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
+        extra = cuda.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["codec_left_context_frames"] == 8
+        assert extra["codec_right_holdback_frames"] == 0
+        assert extra["initial_codec_chunk_frames"] == 8
+
+        # A platform connector override must name a defined connector.
+        deploy = load_deploy_config(deploy_path)
+        deploy.platforms["rocm"]["connectors"] = {"no_such_connector": {"extra": {}}}
+        with pytest.raises(ValueError, match="no_such_connector"):
+            _apply_platform_overrides(deploy, platform="rocm")
+
+        # And each override must itself be a mapping.
+        deploy = load_deploy_config(deploy_path)
+        deploy.platforms["rocm"]["connectors"] = {"connector_of_shared_memory": None}
+        with pytest.raises(ValueError, match="must be a mapping"):
+            _apply_platform_overrides(deploy, platform="rocm")
+
+        rocm = _apply_platform_overrides(load_deploy_config(deploy_path), platform="rocm")
+        assert rocm.stages[0].attention_backend == "TRITON_ATTN"
+
+        xpu = _apply_platform_overrides(load_deploy_config(deploy_path), platform="xpu")
+        assert xpu.stages[0].attention_backend == "FLASH_ATTN"
+        assert xpu.stages[0].gpu_memory_utilization == 0.4
+        assert xpu.stages[1].gpu_memory_utilization == 0.15
+        assert xpu.stages[1].enforce_eager is True
+
+    def test_platform_connector_overrides_merge_with_base_config(self):
+        from vllm_omni.config.stage_config import _merge_platforms
+
+        base = {
+            "rocm": {
+                "model_runner": "v1",
+                "connectors": {
+                    "connector_of_shared_memory": {
+                        "extra": {"codec_left_context_frames": 25, "initial_codec_chunk_frames": 1}
+                    }
+                },
+            }
+        }
+        overlay = {"rocm": {"connectors": {"connector_of_shared_memory": {"extra": {"initial_codec_chunk_frames": 2}}}}}
+        merged = _merge_platforms(base, overlay)["rocm"]
+        assert merged["model_runner"] == "v1"
+        extra = merged["connectors"]["connector_of_shared_memory"]["extra"]
+        assert extra["codec_left_context_frames"] == 25
+        assert extra["initial_codec_chunk_frames"] == 2
+
+    def test_higgs_audio_v3_v2_rejects_unsupported_default_sampling_params(self):
+        """Non-neutral unsupported sampling defaults fail at startup under v2.
+
+        The v2 path's self-owned sampler supports temperature/top-k/top-p/seed
+        only; a yaml carrying e.g. repetition_penalty=1.1 must fail at deploy
+        merge, not on every request. Neutral engine defaults (repetition_penalty=1.0) pass, and falsy neutral
+        values (logprobs: null, bad_words: [], logit_bias: {}) pass too,
+        matching the request-path checks in model_state.py add_request.
+        """
+        deploy_path = Path(get_deploy_config_path("higgs_multimodal_qwen3.yaml"))
+        pipeline = resolve_pipeline_config("higgs_multimodal_qwen3")
+
+        # Shipped defaults are neutral: merge succeeds.
+        stages = merge_pipeline_deploy(pipeline, load_deploy_config(deploy_path))
+        assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+
+        # Explicitly neutral None/collection values are no-ops, not failures.
+        deploy = load_deploy_config(deploy_path)
+        deploy.stages[0].default_sampling_params.update(
+            logprobs=None,
+            prompt_logprobs=None,
+            allowed_token_ids=None,
+            bad_words=[],
+            logit_bias={},
+        )
+        merge_pipeline_deploy(pipeline, deploy)
+
+        deploy = load_deploy_config(deploy_path)
+        deploy.stages[0].default_sampling_params["repetition_penalty"] = 1.1
+        with pytest.raises(ValueError, match="unsupported parameters"):
+            merge_pipeline_deploy(pipeline, deploy)
+
+        # Non-neutral collection values fail the same way as scalars.
+        deploy = load_deploy_config(deploy_path)
+        deploy.stages[0].default_sampling_params["logprobs"] = 5
+        with pytest.raises(ValueError, match="unsupported parameters"):
+            merge_pipeline_deploy(pipeline, deploy)
+
+        # 0 looks neutral but still requests a logprob; keep it rejected so
+        # startup matches add_request.
+        deploy = load_deploy_config(deploy_path)
+        deploy.stages[0].default_sampling_params["logprobs"] = 0
+        with pytest.raises(ValueError, match="unsupported parameters"):
+            merge_pipeline_deploy(pipeline, deploy)
+
+        # Non-CUDA profiles also use V2; they have the same sampling limits.
+        rocm = _apply_platform_overrides(load_deploy_config(deploy_path), platform="rocm")
+        rocm.stages[0].default_sampling_params["repetition_penalty"] = 1.1
+        with pytest.raises(ValueError, match="unsupported parameters"):
+            merge_pipeline_deploy(pipeline, rocm)
 
     def test_qwen3_omni_cuda_uses_thinker_rotary_custom_op(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
@@ -3422,6 +3570,7 @@ class TestPlatformOverrides:
             ("moss_tts_nano.yaml", "moss_tts_nano", "v2", ()),
             ("moss_tts_realtime.yaml", "moss_tts_realtime", "v2", ()),
             ("minicpmo_4_5.yaml", "minicpmo_4_5", "v2", ()),
+            ("higgs_multimodal_qwen3.yaml", "higgs_multimodal_qwen3", "v2", ()),
         ],
     )
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
@@ -3430,9 +3579,10 @@ class TestPlatformOverrides:
     ):
         deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
         deploy = _apply_platform_overrides(deploy, platform=platform)
-        # MOSS realtime and Nano inherit V2 on every platform; other profiles
+        # Higgs, MOSS realtime and Nano inherit V2 on every platform; other profiles
         # retain their explicit platform overrides.
         all_platforms_mrv2 = filename in (
+            "higgs_multimodal_qwen3.yaml",
             "moss_tts_nano.yaml",
             "moss_tts_realtime.yaml",
         )
