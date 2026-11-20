@@ -440,7 +440,11 @@ class OmniEngineBase:
         self.stage_vllm_configs = [pool.stage_vllm_config for pool in self.stage_pools]
         self.output_processors = [pool.output_processor for pool in self.stage_pools]
         self.input_processor = (
-            build_stage0_input_processor(self.stage_vllm_configs[0])
+            build_stage0_input_processor(
+                self.stage_vllm_configs[0],
+                # Distributed frontends can gain replicas after initialization.
+                replicated=self.single_stage_mode or self.stage_pools[0].live_num_replicas > 1,
+            )
             if self.stage_vllm_configs and self.stage_vllm_configs[0] is not None
             else None
         )

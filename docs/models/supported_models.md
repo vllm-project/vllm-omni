@@ -10,6 +10,12 @@ For deployment recipes (TTS and multimodal), see [recipes.vllm.ai](https://recip
 
 ## List of Supported Models
 
+With vLLM 0.34.0, profiles that require Model Runner V1 are unavailable,
+including Drama 3 / Fish-Omni serving and the LFM3-Omni profiles. Their
+implementation entries below do not imply runnable V2 deployments. See
+[stage-level runner selection](../configuration/stage_configs.md#stage-level-runner-selection)
+for the unavailable workflows and CI coverage limits.
+
 <style>
 th {
   white-space: nowrap;
@@ -50,6 +56,7 @@ th {
 | `LingBotWorldCausalDMDPipeline` | LingBot-World 2.0 v1 (experimental) | `robbyant/lingbot-world-v2-14b-causal-fast-diffusers` | Experimental | | | | — |
 | `ABotWorldCausalPipeline` | ABot-World (experimental) | `acvlab/ABot-World-0-5B-LF` | Experimental | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ACVLab/ABot-World.md) |
 | `Cosmos3OmniDiffusersPipeline` | Cosmos3 T2I, T2V, I2V, V2V, T2V with sound, action policy | `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
+| `Cosmos3MultiviewPipeline` | Cosmos3 multiview T2V, I2V, WSM transfer, view completion, optional joint LiDAR | `Cosmos3-Nano-Transfer-Auto` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/cosmos3/Cosmos3-Nano-Transfer-Auto-GB200.md) |
 | `Flux3Pipeline` | Flux3 — T2I, I2I | — | ✅︎ | | | | — |
 | `SanaWmPipeline` | SANA-WM | `BBBBruce/SANA-WM_bidirectional-stage1-diffusers` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NVIDIA/SANA-WM.md) |
 | `HyNomasModularPipeline` | Hy-Nomas distilled (Diffusers-format weights, reference runtime adapter) | `tencent/Hy-Nomas-Diffusers` | ✅︎ (H200 tested) | | | | [Recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/Hy-Nomas.md) |

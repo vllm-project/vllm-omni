@@ -13,9 +13,12 @@ from vllm.inputs.engine import tokens_input
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import renderer_from_config
 from vllm.sampling_params import SamplingParams
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
+from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_config
+from vllm_omni.config.stage_config import STREAMING_UPDATE_TRANSFORM_ATTR, on_streaming_updates
 from vllm_omni.data_entry_keys import returns_stage_payload
 from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
 from vllm_omni.engine import OmniEngineCoreRequest
@@ -400,6 +403,73 @@ def test_build_add_request_message_with_resumable_streaming(mocker: MockerFixtur
     assert msg.type == "streaming_update"
     input_processor.process_inputs.assert_called_once()
     assert input_processor.process_inputs.call_args.kwargs["resumable"] is True
+
+
+@pytest.mark.parametrize("message_type", ["add_request", "streaming_update"])
+@pytest.mark.parametrize("update_mark", ["unmarked", "skip", "other"])
+def test_prompt_transform_on_streaming_updates_follows_its_mark(
+    mocker: MockerFixture, message_type: str, update_mark: str
+):
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.default_sampling_params_list = [params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("generate",)
+    engine.input_processor = mocker.Mock()
+    engine.input_processor.process_inputs.return_value = _make_engine_core_request()
+    engine.output_processors = [mocker.Mock()]
+
+    calls = []
+
+    def transform(prompt, sampling_params_list):
+        calls.append("transform")
+        return prompt
+
+    def update_transform(prompt, sampling_params_list):
+        calls.append("update_transform")
+        return prompt
+
+    if update_mark != "unmarked":
+        on_streaming_updates(update_transform if update_mark == "other" else None)(transform)
+    engine.prompt_transform_func = transform
+
+    engine._build_add_request_message(
+        request_id="req-stream",
+        prompt={"prompt_token_ids": [1, 2, 3]},
+        sampling_params_list=[params],
+        final_stage_id=0,
+        resumable=True,
+        message_type=message_type,
+    )
+
+    # Unmarked transforms keep running on every message, as before.
+    if message_type == "add_request" or update_mark == "unmarked":
+        assert calls == ["transform"]
+    else:
+        assert calls == (["update_transform"] if update_mark == "other" else [])
+
+
+_QWEN3_TTS_CHECKS = "vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder"
+
+
+def test_only_the_qwen3_tts_check_changes_its_streaming_update_transform():
+    # Every other stage-0 transform keeps running itself on streaming updates.
+    pipelines = [resolve_pipeline_config(key) for key in OMNI_PIPELINES]
+    hooks = {
+        stage.prompt_transform_func
+        for pipeline in pipelines
+        if pipeline is not None
+        for stage in pipeline.stages
+        if stage.prompt_transform_func
+    }
+    marked = {
+        path: getattr(resolve_obj_by_qualname(path), STREAMING_UPDATE_TRANSFORM_ATTR)
+        for path in hooks
+        if hasattr(resolve_obj_by_qualname(path), STREAMING_UPDATE_TRANSFORM_ATTR)
+    }
+    assert marked == {
+        f"{_QWEN3_TTS_CHECKS}.check_text_prompt": resolve_obj_by_qualname(f"{_QWEN3_TTS_CHECKS}.check_text_update")
+    }
 
 
 class _FakeStageClient:
