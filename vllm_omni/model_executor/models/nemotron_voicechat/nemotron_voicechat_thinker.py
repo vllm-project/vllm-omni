@@ -1234,6 +1234,8 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         last prefill position, acoustic frame 0) contributes a token.
         """
         request_id = kwargs.get("request_id")
+        if request_id is None:
+            request_id = kwargs.get("req_id")
         session = self._sessions.get(request_id) if isinstance(request_id, str) else None
         if (
             getattr(self, "_mrv2_duplex_sampling", False)
@@ -1257,22 +1259,19 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 func_logits = self.function_head(hidden_states[-1, :].reshape(1, -1).to(self._dtype))
             token = func_logits.argmax(dim=-1)
         token = token.reshape(-1)[-1].reshape(()).detach()
-        request_id = kwargs.get("request_id")
-        if isinstance(request_id, str):
-            session = self._sessions.get(request_id)
-            if session is not None:
-                forced = session.pop("forced_function_token", None)
-                if isinstance(forced, int):
-                    queue = session.get("forced_function_tokens")
-                    if not isinstance(queue, list) or not queue or queue.pop(0) != forced:
-                        raise RuntimeError("Nemotron VoiceChat forced function-token queue lost alignment")
-                    # The client list is per request, but this hook receives the
-                    # whole batch output. Recompute from this request's hidden
-                    # slice, then apply the same override the client token used.
-                    token = torch.full_like(token, forced)
-                # StreamingUpdate replaces the runner payload at each append;
-                # retain the function channel in model-owned session state.
-                session["func_token"] = int(token.item())
+        if session is not None:
+            forced = session.pop("forced_function_token", None)
+            if isinstance(forced, int):
+                queue = session.get("forced_function_tokens")
+                if not isinstance(queue, list) or not queue or queue.pop(0) != forced:
+                    raise RuntimeError("Nemotron VoiceChat forced function-token queue lost alignment")
+                # The client list is per request, but this hook receives the
+                # whole batch output. Recompute from this request's hidden
+                # slice, then apply the same override the client token used.
+                token = torch.full_like(token, forced)
+            # StreamingUpdate replaces the runner payload at each append;
+            # retain the function channel in model-owned session state.
+            session["func_token"] = int(token.item())
         update: dict[str, Any] = {"nvc_prev_function_token": token}
         if os.environ.get("NEMOTRON_VOICECHAT_DEBUG_FUNCTION_TIMELINE", "0") == "1":
             existing = kwargs.get("nvc_function_tokens")

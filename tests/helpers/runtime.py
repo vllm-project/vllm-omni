@@ -96,20 +96,6 @@ def get_open_port(host: str = "127.0.0.1", *, max_attempts: int = 128) -> int:
     ) from last_exc
 
 
-def assign_ephemeral_master_port() -> int:
-    """Point ``MASTER_ADDR`` / ``MASTER_PORT`` at a free local port.
-
-    A literal port is shared by every xdist worker, so concurrent
-    ``init_process_group(env://)`` calls fail with ``EADDRINUSE``.
-    ``setdefault`` does not help: the first test on a worker leaves
-    ``MASTER_PORT`` set, and every later test keeps that occupied port.
-    """
-    port = get_open_port()
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    return port
-
-
 def dummy_messages_from_mix_data(
     system_prompt: dict[str, Any] | None = None,
     video_data_url: Any = None,
@@ -346,9 +332,10 @@ class OmniServer:
 
         print(f"Launching OmniServer with: {' '.join(cmd)}")
         startup_t0 = time.perf_counter()
-        # Inherit stdout (INFO still shows in CI); capture stderr only for the
-        # exited-before-ready RuntimeError message. errors=replace keeps the
-        # reader alive on undecodable bytes so a full pipe cannot hang serve.
+        # Inherit stdout; tee stderr to pytest and the startup diagnostic tail.
+        # Request failures after readiness also need the child traceback.
+        # errors=replace keeps the reader alive on undecodable bytes so a full
+        # pipe cannot hang serve.
         self._server_error_lines = deque(maxlen=100)
         self._server_log_thread = None
         self.proc = subprocess.Popen(
@@ -369,6 +356,12 @@ class OmniServer:
                 try:
                     for line in stderr:
                         error_lines.append(line)
+                        try:
+                            sys.stderr.write(line)
+                            sys.stderr.flush()
+                        except (OSError, ValueError):
+                            # A closed capture must not stop draining the pipe.
+                            pass
                 except Exception:
                     pass
 
