@@ -3,6 +3,7 @@
 """Exercise upstream Mooncake completion accounting without device/network I/O."""
 
 import asyncio
+from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -33,6 +34,14 @@ def producer(monkeypatch, mooncake_clock):
     worker.shutdown = Mock()  # No hardware constructor, sockets or listener thread.
     worker.is_kv_consumer = False
     worker.tp_rank, worker.tp_size = 0, 1
+    # vLLM 0.34 lease bookkeeping read by record_send_reqs / heartbeats;
+    # None = lease disabled, so send deadlines fall back to the
+    # monkeypatched VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT below.
+    worker._kv_lease_duration = None
+    worker._lease_reqs = {}
+    worker._last_heartbeat_time = 0.0
+    # vLLM 0.34 fetch_finished_sending_reqs parks expired tickets here.
+    worker._expired_transfer_ids = OrderedDict()
     worker.transfer_topo = SimpleNamespace(
         handshake_target_ranks=lambda size: list(range(size)),
         total_num_kv_heads=1,

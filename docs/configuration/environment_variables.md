@@ -112,6 +112,8 @@ environment variables.
 
 | Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
 | --- | --- | --- | --- | --- |
+| `VLLM_OMNI_SPEECH_EDGE_PAD` | `0`/`1`-style truthy string; default `1` (shaping on) | VoxCPM2 edge digit-run prosody shaping; request text frontend | Read per request in the TTS text path. Falsy spellings (`0`/`false`/`no`/`off`, case-insensitive, surrounding whitespace ignored) disable the shaping (the text passes through untouched); anything else keeps it on (comma lead-in for edge digit-runs, sentence-final stop for trailing runs, lone-zero sentinel) — the same truthy/falsy convention as the NPU patch switches. | Behavioral switch, default on |
+| `VLLM_OMNI_SPEECH_TEXT_NORMALIZE` | `0`/`1`-style truthy string; default `1` (TN on) | VoxCPM2 digit/symbol text normalization (TextNormalizer); request text frontend | Read per request in the TTS text path. Falsy spellings (`0`/`false`/`no`/`off`, case-insensitive) skip numeric normalization; anything else keeps it on when the optional `TextNormalizer` dependency imports (an unavailable normalizer degrades to the TN-off path for both values; the lone-zero sentinel handling is independent of this switch). | Behavioral switch, default on |
 | `VLLM_OMNI_NIXL_LEASE_S` | Float seconds; default `3600` | Unclaimed producer payload expiry; connector construction | Nonempty environment value overrides `lease_seconds`; empty falls back to config/default. Invalid floats raise `ValueError`. Claimed READ allocations never expire by time. | Experimental |
 | `VLLM_OMNI_NIXL_XFER_TIMEOUT_S` | Float seconds; default `300` | Receiver READ wait; connector construction | Nonempty environment value overrides `transfer_timeout_s`; empty falls back to config/default. Invalid floats raise `ValueError`. Timeout does not cancel DMA or release active allocations. | Experimental |
 
@@ -194,7 +196,7 @@ their keys only.
 ## Inherited vLLM variables
 
 vLLM-Omni also reads variables through its aligned vLLM dependency. Refer to
-the [vLLM 0.33 environment-variable reference](https://docs.vllm.ai/en/v0.33.0/configuration/env_vars/)
+the [vLLM 0.34 environment-variable reference](https://github.com/vllm-project/vllm/blob/v0.34.0/docs/configuration/env_vars.md)
 for their definitions. This includes vLLM launch, cache, logging, plugin, ROCm,
 XPU, ModelScope, and FlashInfer workspace settings.
 

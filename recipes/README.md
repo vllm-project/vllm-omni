@@ -25,7 +25,7 @@ published recipe when available and otherwise to the corresponding recipe in
 this directory. The recipe files remain the source of truth for commands and
 validation details.
 
-This source checkout targets final vLLM 0.33.0. Use the matching runtime in
+This source checkout targets final vLLM 0.34.0. Use the matching runtime in
 [the installation guide](../docs/getting_started/installation/README.md).
 Recipes explicitly pinned to an older Omni release, commit, external PR or
 container retain their historical runtime. Their measured hardware and quality
@@ -126,11 +126,13 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`OpenBMB/MiniCPM-o-4_5.md`](./OpenBMB/MiniCPM-o-4_5.md) | Online full-duplex serving and offline inference for omni multimodal chat (text / image / audio / video → text + 24 kHz speech) | 2x A100/H100 80GB / 3x mid-tier GPU / 8x RTX 4090 24GB |
 | [`OpenBMB/VoxCPM2.md`](./OpenBMB/VoxCPM2.md) | Online + offline TTS with native AR pipeline (48 kHz, 30+ languages) | 1x RTX 4090 24GB / 1x Ascend 910B3 64GB |
 | [`OpenMOSS/MOSS-TTS.md`](./OpenMOSS/MOSS-TTS.md) | Online + offline multilingual TTS (MOSS-TTS family, 8B) | 1x H100 80GB |
+| [`OpenMOSS/MOSS-TTS-Realtime-RTX5060Ti-16GB.md`](./OpenMOSS/MOSS-TTS-Realtime-RTX5060Ti-16GB.md) | Streaming voice-cloned TTS baseline | 1x RTX 5060 Ti 16GB |
 | [`OpenMOSS/MOSS-TTS-Nano-NPU.md`](./OpenMOSS/MOSS-TTS-Nano-NPU.md) | Online multilingual voice-cloned TTS | 1x Ascend 910B3 64GB |
 | [`Physis-AI/CausVid-Wan.md`](./Physis-AI/CausVid-Wan.md) | Experimental offline Noisy PP / Chunk PP on CausVid Wan 2.1 1.3B | Multi-GPU CUDA (SF: S=1; Latest-KV: S=D+1) |
 | [`Physis-AI/Physis-Same-Step.md`](./Physis-AI/Physis-Same-Step.md) | Experimental Same-Step video on five Physis checkpoints | Multi-GPU CUDA |
 | [`NVIDIA/Nemotron-Labs-Audex.md`](./NVIDIA/Nemotron-Labs-Audex.md) | TTS / text-to-audio / audio understanding / cascaded S2S (Audex 2B + 30B-A3B) | 1x H100 80GB |
 | [`NVIDIA/NemotronLabs-VoiceChat.md`](./NVIDIA/NemotronLabs-VoiceChat.md) | Offline speech-to-speech voice chat (11B, frame-locked 12.5 Hz, 3-stage thinker/talker/code2wav) | 1x H100 80GB |
+| [`NVIDIA/PersonaPlex-RTX5080-Laptop-16GB.md`](./NVIDIA/PersonaPlex-RTX5080-Laptop-16GB.md) | Live full-duplex speech-to-speech with per-session voice and persona, Stage 0 in FP8 | 1x RTX 5080 Laptop 16GB |
 | [`NVIDIA/SANA-WM.md`](./NVIDIA/SANA-WM.md) | First-frame image-to-video serving with camera control | 1x 24GB+ CUDA GPU; ~40GB disk |
 | [`Qwen/Qwen-Image.md`](./Qwen/Qwen-Image.md) | Text-to-image serving with step-wise continuous batching replay and ModelOpt mixed FP8/NVFP4; offline text-to-image on XPU | 1x A100 80GB / 2x B200 / 1x Intel Arc Pro B70 32GB |
 | [`Qwen/Qwen-Image-2.1.md`](./Qwen/Qwen-Image-2.1.md) | Text-to-image and image-conditioned generation (editing) with prefix KV cache and CUDA graph decode | 1x GPU with CPU offload / 1x H200 |

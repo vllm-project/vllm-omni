@@ -41,7 +41,6 @@ EXCLUDED_MODELS = [
     # Action expert that needs the reasoning stage's KV prefix; covered by
     # tests/diffusion/models/alpamayo2_super and the full-model E2E test.
     "Alpamayo2SuperPipeline",
-    "WanPipeline",
     # Uses a full checkpoint and video input; covered by its checkpoint-gated E2E test.
     "SeedVR2Pipeline",
     "WanDMDPipeline",
@@ -119,6 +118,9 @@ EXCLUDED_MODELS = [
     # Multi-camera AV variant of Cosmos3; covered by the dedicated
     # tests/diffusion/models/cosmos3 multiview tests instead of a tiny model.
     "Cosmos3MultiviewPipeline",
+    # Causal AR bimanual sim model requiring action/camera assets and
+    # persistent AR state; covered by tests/diffusion/models/cosmos3_nano_sim_bimanual.
+    "Cosmos3NanoSimBimanualPipeline",
     "DiffusersAdapterPipeline",
     "HiDreamO1ImagePipeline",
     "DreamZeroPipeline",

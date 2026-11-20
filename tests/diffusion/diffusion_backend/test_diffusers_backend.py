@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import errno
+import gc
+import json
+import stat
+import zipfile
 from collections import namedtuple
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -391,6 +397,11 @@ class TestPipelineArgumentsHandling:
             )
 
     def test_adapter_load_weights_preserves_diffusers_native_quantization_config(self, mocker):
+        mocker.patch(
+            "vllm_omni.diffusion.models.diffusers_adapter.dduf.diffusers_version",
+            "0.40.0",
+        )
+
         class MockPipeline:
             def __call__(self, prompt=None):
                 return None
@@ -769,6 +780,229 @@ class TestPipelineArgumentsHandling:
         od_config.enrich_config()
 
         assert od_config.model_class_name == "DiffusersAdapterPipeline"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+class TestDDUFCompatibility:
+    @pytest.fixture
+    def bridge(self, tmp_path, monkeypatch):
+        from vllm_omni.diffusion.models.diffusers_adapter import dduf
+
+        monkeypatch.setattr(dduf, "diffusers_version", "0.42.0")
+        monkeypatch.setattr(dduf.tempfile, "tempdir", str(tmp_path))
+        return dduf
+
+    @pytest.fixture
+    def archive_path(self, tmp_path):
+        from huggingface_hub import export_entries_as_dduf
+
+        path = tmp_path / "model.dduf"
+        export_entries_as_dduf(
+            path,
+            [("model_index.json", b"{}"), ("weights.safetensors", b"tiny fixture")],
+        )
+        return path
+
+    @pytest.mark.parametrize("version,dduf_file", [("0.40.0", "model.dduf"), ("0.42.0", None), ("0.42.0", "")])
+    def test_legacy_and_non_dduf_loading_preserve_arguments(self, bridge, mocker, version, dduf_file):
+        bridge.diffusers_version = version
+        loader = mocker.Mock(spec=DiffusionPipeline)
+        kwargs = {"dduf_file": dduf_file, "revision": "frozen", "local_files_only": True}
+
+        result = bridge.load_diffusers_pipeline(loader, "test/model", kwargs)
+
+        expected = kwargs if version == "0.40.0" else {k: v for k, v in kwargs.items() if k != "dduf_file"}
+        loader.from_pretrained.assert_called_once_with("test/model", **expected)
+        assert result is loader.from_pretrained.return_value
+        assert kwargs["dduf_file"] == dduf_file
+
+    def test_download_streaming_and_directory_lifetime(self, bridge, archive_path, tmp_path, mocker):
+        api = mocker.Mock(spec=["hf_hub_download"])
+        api.hf_hub_download.return_value = str(archive_path)
+        mocker.patch.object(bridge, "hf_api", return_value=api)
+        loader = mocker.Mock(spec=DiffusionPipeline)
+        loader.from_pretrained.side_effect = lambda *args, **kwargs: DiffusionPipeline()
+        copy = mocker.spy(bridge.shutil, "copyfileobj")
+        kwargs = {
+            "dduf_file": "model.dduf",
+            "cache_dir": str(tmp_path / "cache"),
+            "revision": "frozen",
+            "token": "test-token",
+            "local_files_only": False,
+            "force_download": False,
+            "subfolder": "archives",
+            "torch_dtype": torch.float32,
+        }
+
+        pipeline = bridge.load_diffusers_pipeline(loader, "test/model", kwargs)
+
+        download_kwargs = api.hf_hub_download.call_args.kwargs
+        assert download_kwargs == {
+            "repo_id": "test/model",
+            "filename": "model.dduf",
+            **{
+                key: kwargs[key]
+                for key in ("cache_dir", "revision", "token", "local_files_only", "force_download", "subfolder")
+            },
+        }
+        directory = Path(loader.from_pretrained.call_args.args[0])
+        assert (directory / "weights.safetensors").read_bytes() == b"tiny fixture"
+        assert loader.from_pretrained.call_args.kwargs == {
+            **{k: v for k, v in kwargs.items() if k != "dduf_file"},
+            "local_files_only": True,
+        }
+        assert kwargs["local_files_only"] is False
+        assert copy.call_count == 2
+        assert all(0 < call.kwargs["length"] <= 1024 * 1024 for call in copy.call_args_list)
+        assert directory.is_dir()
+        del pipeline
+        gc.collect()
+        assert not directory.exists()
+
+    @pytest.mark.parametrize("failure", ["loader", "post_load", "to"])
+    def test_failed_load_cleans_materialized_directory(self, bridge, archive_path, tmp_path, mocker, failure):
+        load = mocker.patch.object(
+            DiffusionPipeline, "from_pretrained", side_effect=lambda *args, **kwargs: DiffusionPipeline()
+        )
+        if failure == "loader":
+            load.side_effect = RuntimeError("fixture load failure")
+        elif failure == "post_load":
+            mocker.patch(
+                "vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils.BasePipelineUtils.apply_post_load_updates",
+                side_effect=RuntimeError("fixture load failure"),
+            )
+        else:
+            mocker.patch.object(DiffusionPipeline, "to", side_effect=RuntimeError("fixture load failure"))
+        adapter = DiffusersAdapterPipeline(
+            od_config=_make_od_config(model=str(tmp_path), diffusers_load_kwargs={"dduf_file": archive_path.name}),
+            device=torch.device("cpu"),
+        )
+
+        with pytest.raises(RuntimeError, match="fixture load failure"):
+            adapter.load_weights()
+
+        assert not list(tmp_path.glob("vllm-omni-dduf-*"))
+
+    def test_failed_reload_preserves_live_pipeline_directory(self, bridge, archive_path, tmp_path, mocker):
+        loader = mocker.Mock(spec=DiffusionPipeline)
+        loader.from_pretrained.side_effect = lambda *args, **kwargs: DiffusionPipeline()
+        pipeline = bridge.load_diffusers_pipeline(loader, str(tmp_path), {"dduf_file": archive_path.name})
+        directory = Path(loader.from_pretrained.call_args.args[0])
+        adapter = DiffusersAdapterPipeline(
+            od_config=_make_od_config(model=str(tmp_path), diffusers_load_kwargs={"dduf_file": "missing.dduf"}),
+            device=torch.device("cpu"),
+        )
+        adapter._pipeline = pipeline
+
+        with pytest.raises(FileNotFoundError):
+            adapter.load_weights()
+
+        assert adapter._pipeline is pipeline
+        assert directory.is_dir()
+        bridge.cleanup_dduf_pipeline(pipeline)
+        assert not directory.exists()
+
+    @pytest.mark.parametrize("malformed", ["traversal", "absolute", "duplicate", "symlink", "compressed", "crc"])
+    def test_invalid_archive_is_rejected_without_writes(self, bridge, archive_path, tmp_path, mocker, malformed):
+        from huggingface_hub.errors import DDUFCorruptedFileError
+
+        model_index = {"..": ["diffusers", "UNet2DModel"]} if malformed == "traversal" else {}
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("model_index.json", json.dumps(model_index))
+            if malformed == "traversal":
+                archive.writestr("../config.json", "{}")
+                archive.writestr("../escape.txt", "escape")
+            elif malformed == "absolute":
+                archive.writestr(str(tmp_path / "escape.txt"), "escape")
+            else:
+                info = zipfile.ZipInfo("weights.safetensors")
+                if malformed == "symlink":
+                    info.create_system = 3
+                    info.external_attr = (stat.S_IFLNK | 0o777) << 16
+                if malformed == "compressed":
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                archive.writestr(info, b"tiny fixture")
+                if malformed == "duplicate":
+                    with pytest.warns(UserWarning, match="Duplicate name"):
+                        archive.writestr("weights.safetensors", b"duplicate")
+        if malformed == "crc":
+            entry = bridge.read_dduf_file(archive_path)["weights.safetensors"]
+            with archive_path.open("r+b") as archive:
+                archive.seek(entry.offset)
+                archive.write(b"X")
+        loader = mocker.Mock(spec=DiffusionPipeline)
+
+        with pytest.raises((ValueError, DDUFCorruptedFileError, zipfile.BadZipFile)):
+            bridge.load_diffusers_pipeline(loader, str(tmp_path), {"dduf_file": archive_path.name})
+
+        loader.from_pretrained.assert_not_called()
+        assert not (tmp_path / "escape.txt").exists()
+        assert not list(tmp_path.glob("vllm-omni-dduf-*"))
+
+    def test_insufficient_disk_space_fails_before_copy(self, bridge, archive_path, tmp_path, mocker):
+        usage = bridge.shutil.disk_usage(tmp_path)
+        mocker.patch.object(bridge.shutil, "disk_usage", return_value=usage._replace(free=0))
+        copy = mocker.spy(bridge.shutil, "copyfileobj")
+        loader = mocker.Mock(spec=DiffusionPipeline)
+
+        with pytest.raises(OSError) as error:
+            bridge.load_diffusers_pipeline(loader, str(tmp_path), {"dduf_file": archive_path.name})
+
+        assert error.value.errno == errno.ENOSPC
+        copy.assert_not_called()
+        loader.from_pretrained.assert_not_called()
+        assert not list(tmp_path.glob("vllm-omni-dduf-*"))
+
+    @pytest.mark.parametrize("unsupported", ["custom_pipeline", "load_connected_pipeline"])
+    def test_unsupported_pipeline_mode_remains_rejected(self, bridge, archive_path, tmp_path, unsupported):
+        with pytest.raises(NotImplementedError, match="not supported with DDUF"):
+            bridge.load_diffusers_pipeline(
+                DiffusionPipeline, str(tmp_path), {"dduf_file": archive_path.name, unsupported: True}
+            )
+        assert not list(tmp_path.glob("vllm-omni-dduf-*"))
+
+    def test_real_diffusers_loads_dduf_weights_on_cpu(self, tmp_path, monkeypatch):
+        from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel
+        from huggingface_hub import export_folder_as_dduf
+        from packaging.version import Version
+
+        from vllm_omni.diffusion.models.diffusers_adapter import dduf
+
+        if Version(dduf.diffusers_version) < Version("0.42.0"):
+            pytest.skip("Actual new directory loader requires Diffusers >=0.42.0")
+        monkeypatch.setattr(dduf.tempfile, "tempdir", str(tmp_path))
+        unet = UNet2DModel(
+            sample_size=8,
+            in_channels=3,
+            out_channels=3,
+            layers_per_block=1,
+            block_out_channels=(8,),
+            down_block_types=("DownBlock2D",),
+            up_block_types=("UpBlock2D",),
+            norm_num_groups=4,
+        )
+        original = DDPMPipeline(unet=unet, scheduler=DDPMScheduler(num_train_timesteps=4))
+        source = tmp_path / "original"
+        original.save_pretrained(source, safe_serialization=True)
+        archive_path = tmp_path / "tiny.dduf"
+        export_folder_as_dduf(archive_path, source)
+
+        loaded = dduf.load_diffusers_pipeline(
+            DiffusionPipeline, str(tmp_path), {"dduf_file": archive_path.name, "local_files_only": True}
+        )
+
+        assert isinstance(loaded, DDPMPipeline)
+        assert loaded.unet.device == torch.device("cpu")
+        assert loaded.scheduler.config.num_train_timesteps == 4
+        assert loaded.unet.state_dict().keys() == unet.state_dict().keys()
+        for name, tensor in unet.state_dict().items():
+            assert torch.equal(loaded.unet.state_dict()[name], tensor), name
+        directories = list(tmp_path.glob("vllm-omni-dduf-*"))
+        assert len(directories) == 1
+        del loaded
+        gc.collect()
+        assert not directories[0].exists()
 
 
 @pytest.mark.advanced_model

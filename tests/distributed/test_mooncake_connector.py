@@ -1246,7 +1246,7 @@ class LookupRpcGate:
         self.rpcs: list[int] = []
         self.result = MooncakeLookupResult(0)
 
-    def __call__(self, num_tokens, block_hashes):
+    def __call__(self, num_tokens, block_hashes, deadline):
         self.rpcs.append(num_tokens)
         # Bounded so that a failing test cannot leave the client's worker blocked.
         self.release.wait(timeout=10)
@@ -1418,7 +1418,7 @@ def test_lookup_timeout_is_a_miss_until_the_lookup_queue_drains(lookup_connector
     assert connector.get_num_new_matched_tokens(slow, 0) == (0, False)
     # A lookup queued behind the stalled reply is cancelled, not waited for.
     assert connector.get_num_new_matched_tokens(queued, 0) == (0, False)
-    assert connector.connector_scheduler.client.futures == {}
+    assert connector.connector_scheduler.client._lookups == {}
     assert gate.rpcs == [32]
     gate.release.set()
     connector._lookup_probe.result(timeout=5)
@@ -1467,7 +1467,6 @@ def sampled(*requests):
     ids = [request.request_id for request in requests]
     return ModelRunnerOutput(
         req_ids=ids,
-        req_id_to_index={req_id: index for index, req_id in enumerate(ids)},
         sampled_token_ids=[[1] for _ in ids],
         logprobs=None,
         prompt_logprobs_dict={},
