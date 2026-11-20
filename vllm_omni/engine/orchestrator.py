@@ -62,6 +62,7 @@ from vllm_omni.engine import (
 )
 from vllm_omni.engine.async_engine_utils import apply_omni_final_stage_metadata, scope_stage_replica_mm_uuids
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
+from vllm_omni.engine.dit_load_state import DitLoadState
 from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.messages import (
@@ -86,7 +87,7 @@ from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_k
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.shared_request_queue import SharedRequestQueue
 from vllm_omni.engine.stage_client import DiffusionSubmitKwargs
-from vllm_omni.engine.stage_pool import StagePool, StageRequestMetrics, StageUnavailableError
+from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError
 from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
 from vllm_omni.metrics import definitions as metric_defs
@@ -299,43 +300,6 @@ def _update_stale_request_metadata(
         request.additional_information.entries[RETURN_STAGE_PAYLOAD_KEY] = return_stage_payload_entry
 
 
-def stamp_stage_submit(req_state: OrchestratorRequestState, stage_id: int, *, refresh: bool) -> float:
-    """Record a stage's submit clocks.
-
-    ``stage_submit_ts`` stays wall time for published output messages. Generation
-    elapsed uses the paired ``stage_submit_perf`` so it is on the same monotonic
-    clock as diffusion ``scheduler_queue_wait_ms``. ``refresh`` starts a later
-    segment; the first submit keeps the clocks already recorded.
-    """
-    if refresh or stage_id not in req_state.stage_submit_ts:
-        req_state.stage_submit_ts[stage_id] = _time.time()
-        req_state.stage_submit_perf[stage_id] = _time.perf_counter()
-    return req_state.stage_submit_ts[stage_id]
-
-
-def stamp_downstream_stage_submit(
-    req_state: OrchestratorRequestState,
-    stage_id: int,
-    pool: object,
-    *,
-    already_submitted: bool,
-    after_submit: bool,
-) -> None:
-    """Stamp a downstream stage around ``submit_initial`` / ``submit_update``.
-
-    Diffusion stamps before enqueue so scheduler admission stays in the stage
-    clock. LLM stamps after a successful submit so replica-selection wait is
-    not counted as generation.
-    """
-    is_diffusion = getattr(pool, "stage_type", None) == "diffusion"
-    if after_submit:
-        if not is_diffusion:
-            stamp_stage_submit(req_state, stage_id, refresh=True)
-        return
-    if is_diffusion:
-        stamp_stage_submit(req_state, stage_id, refresh=already_submitted)
-
-
 @dataclass
 class OrchestratorRequestState:
     """Per-request bookkeeping inside the Orchestrator."""
@@ -356,12 +320,8 @@ class OrchestratorRequestState:
     # Wall-clock timestamp when the client-facing engine request was accepted.
     request_timestamp: float = 0.0
 
-    # Wall-clock time the request was submitted to each stage. Output messages
-    # publish this. Elapsed generation uses stage_submit_perf, not this value.
+    # Metrics: timestamp when request was submitted to each stage.
     stage_submit_ts: dict[int, float] = field(default_factory=dict)
-    # perf_counter() at the same instant as stage_submit_ts. Paired so a wall-clock
-    # step cannot disagree with the diffusion scheduler's monotonic queue wait.
-    stage_submit_perf: dict[int, float] = field(default_factory=dict)
     mm_processor_kwargs: dict | None = None
     mm_features: list | None = None
     pd_prefill_multimodal_output: dict[str, Any] | None = None
@@ -470,6 +430,11 @@ class OrchestratorBase:
     _stat_logger: OmniPrometheusStatLogger | None = None
     collect_stage_metrics: bool = True
     tracer: Tracer | None = None
+    _dit_load_state: DitLoadState | None = None
+    _dit_load_aware: bool = False
+    _dit_load_aware_config: list[dict[str, Any]] | None = None
+    _dit_load_fail_count: dict[tuple[int, int], int] | None = None
+    _dit_load_dirty: bool = False
 
     def __init__(
         self,
@@ -489,6 +454,7 @@ class OrchestratorBase:
         collect_stage_metrics: bool = True,
         enable_orch_monitor: bool = False,
         tracer: Tracer | None = None,
+        dit_load_aware_config: list[dict[str, Any]] | None = None,
     ) -> None:
         self.tracer = tracer
         self.request_async_queue = request_async_queue
@@ -544,6 +510,24 @@ class OrchestratorBase:
 
         # Distributed membership (optional, injected by DistStageRuntime)
         self._membership = membership_controller
+        self._dit_load_aware = dit_load_aware_config is not None
+        self._dit_load_aware_config = dit_load_aware_config
+        # Build lookup sets for poll/push filtering. Each pair maps an AR
+        # stage to its target DiT stage so load collection and delivery are
+        # isolated per pair.
+        self._dtps_pairs: list[dict[str, Any]] = dit_load_aware_config or []
+        self._dit_target_stage_ids: set[int] = {p["dit_stage_id"] for p in self._dtps_pairs}
+        if self._dit_load_aware:
+            self._dit_load_state: DitLoadState = DitLoadState()
+            self._dit_load_last_poll: dict[tuple[int, int], float] = {}
+            self._dit_load_fail_count: dict[tuple[int, int], int] = {}
+
+    # [OmniDTPS] Min interval between DiT-load polls per replica.
+    _DIT_LOAD_POLL_INTERVAL_S: float = 0.1
+    # [OmniDTPS] Consecutive poll failures before evicting a DiT replica's
+    # load data. Filters transient hiccups; requires at least 5 consecutive
+    # failed polls (actual window is longer due to RPC timeout per attempt).
+    _DIT_LOAD_EVICT_THRESHOLD: int = 5
 
     def _init_metrics_state(
         self,
@@ -813,6 +797,22 @@ class OrchestratorBase:
             elif isinstance(msg, UnregisterRemoteReplicaMessage):
                 if self._membership is not None:
                     await self._membership.handle_unregister(msg.stage_id, msg.input_addr)
+                if self._dit_load_aware and self._dit_load_state is not None and msg.stage_id < len(self.stage_pools):
+                    pool = self.stage_pools[msg.stage_id]
+                    if pool.stage_type == "diffusion":
+                        replica_id = pool.get_replica_id_by_addr(msg.input_addr)
+                        if replica_id is not None:
+                            try:
+                                self._dit_load_state.remove(msg.stage_id, replica_id)
+                            except Exception:
+                                logger.debug(
+                                    "[Orchestrator] DitLoadState.remove on unregister failed for stage-%s rep-%s",
+                                    msg.stage_id,
+                                    replica_id,
+                                    exc_info=True,
+                                )
+                            success = await self._push_dit_load_to_ar(self._dit_load_state)
+                            self._dit_load_dirty = not success
             elif isinstance(msg, ShutdownRequestMessage):
                 logger.info("[Orchestrator] Received shutdown signal")
                 self._shutdown_event.set()
@@ -1366,6 +1366,102 @@ class OrchestratorBase:
                 self._update_stage_replica_waiting(stage_id, replica_id, int(n_waiting))
         return diffusion_output.request_id == DIFFUSION_METRICS_ONLY_REQUEST_ID
 
+    async def _poll_dit_load_throttled(
+        self,
+        stage_id: int,
+        pool: StagePool,
+        replica_id: int,
+        *,
+        force: bool = False,
+    ) -> None:
+        state = self._dit_load_state
+        if state is None:
+            return
+        if not self._dit_load_aware:
+            return
+        now = _time.monotonic()
+        key = (stage_id, replica_id)
+        if not force:
+            last = self._dit_load_last_poll.get(key, 0.0)
+            if (now - last) < self._DIT_LOAD_POLL_INTERVAL_S:
+                return
+        self._dit_load_last_poll[key] = now
+
+        # Exit-driven eviction: a dead replica's last waiting=0 would falsely
+        # signal idle, so drop it before polling.
+        if not pool.check_dit_health(replica_id):
+            try:
+                state.remove(stage_id, replica_id)
+            except Exception:
+                logger.debug(
+                    "[Orchestrator] DitLoadState.remove failed for stage-%s rep-%s",
+                    stage_id,
+                    replica_id,
+                    exc_info=True,
+                )
+            await self._push_dit_load_to_ar(state)
+            return
+
+        load = await pool.poll_dit_load(replica_id)
+        if load is None:
+            # Poll failed — track consecutive failures; evict after
+            # _DIT_LOAD_EVICT_THRESHOLD to avoid flapping on transient hiccups.
+            key = (stage_id, replica_id)
+            self._dit_load_fail_count[key] = self._dit_load_fail_count.get(key, 0) + 1
+            if self._dit_load_fail_count[key] >= self._DIT_LOAD_EVICT_THRESHOLD:
+                # Evict: remove replica data (if any) and push the updated
+                # snapshot regardless of whether data existed. This ensures
+                # the AR scheduler receives the stale transition even when
+                # the replica never supplied a sample.
+                state.remove(stage_id, replica_id)
+                self._dit_load_fail_count[key] = 0
+                success = await self._push_dit_load_to_ar(state)
+                self._dit_load_dirty = not success
+            elif self._dit_load_dirty:
+                # Retry failed delivery while queries continue to fail.
+                success = await self._push_dit_load_to_ar(state)
+                self._dit_load_dirty = not success
+            return
+        # Poll succeeded — reset failure counter
+        self._dit_load_fail_count[(stage_id, replica_id)] = 0
+        waiting, running, waiting_ids, running_ids = load
+        try:
+            changed = state.update(
+                stage_id,
+                replica_id,
+                waiting,
+                running,
+                waiting_ids=waiting_ids,
+                running_ids=running_ids,
+            )
+        except Exception:
+            logger.debug(
+                "[Orchestrator] DitLoadState.update failed for stage-%s rep-%s",
+                stage_id,
+                replica_id,
+                exc_info=True,
+            )
+            return
+
+        if changed or self._dit_load_dirty:
+            success = await self._push_dit_load_to_ar(state)
+            self._dit_load_dirty = not success
+
+    async def _push_dit_load_to_ar(self, state: DitLoadState) -> bool:
+        if not self._dit_load_aware:
+            return True
+        all_ok = True
+        for pair in self._dtps_pairs:
+            ar_stage_id = pair["ar_stage_id"]
+            dit_stage_id = pair["dit_stage_id"]
+            # Filter snapshot to only this pair's DiT stage so each AR
+            # receives load data from its paired DiT, not unrelated stages.
+            snapshot = state.snapshot(stage_id=dit_stage_id)
+            pool = self.stage_pools[ar_stage_id]
+            if not await pool.push_dit_load(snapshot):
+                all_ok = False
+        return all_ok
+
     async def _orchestration_loop(self) -> None:
         """Poll stage pools and route logical outputs."""
         while not self._shutdown_event.is_set():
@@ -1382,6 +1478,8 @@ class OrchestratorBase:
                     try:
                         if pool.stage_type == "diffusion":
                             diffusion_output = pool.poll_diffusion_output(replica_id)
+                            if self._dit_load_aware:
+                                await self._poll_dit_load_throttled(stage_id, pool, replica_id)
                             if diffusion_output is None:
                                 continue
 
@@ -1475,11 +1573,28 @@ class OrchestratorBase:
                         except EngineDeadError as e:
                             await ready_q.put(("error", stage_id, replica_id, e))
                             continue
-                        if output is None:
-                            continue
-                        await ready_q.put(("diffusion", stage_id, replica_id, output))
-                        self._orch_monitor.set_dispatch_queue_size(ready_q.qsize())
-                        got = True
+                        # Queue the output before DTPS load polling so that a
+                        # slow or hung load RPC does not delay output delivery.
+                        if output is not None:
+                            await ready_q.put(("diffusion", stage_id, replica_id, output))
+                            self._orch_monitor.set_dispatch_queue_size(ready_q.qsize())
+                            got = True
+                        # [OmniDTPS] Poll DiT load only for stages that are
+                        # paired with a DTPS-enabled AR stage.
+                        if self._dit_load_aware and stage_id in self._dit_target_stage_ids:
+                            try:
+                                await self._poll_dit_load_throttled(
+                                    stage_id,
+                                    pool,
+                                    replica_id,
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "[Orchestrator] _poll_dit_load_throttled failed for stage-%s rep-%s",
+                                    stage_id,
+                                    replica_id,
+                                    exc_info=True,
+                                )
                     await asyncio.sleep(0 if got else 0.001)
             except asyncio.CancelledError:
                 raise
@@ -1711,6 +1826,7 @@ class OrchestratorBase:
 
     async def _handle_processed_outputs(self, stage_id: int, replica_id: int, outputs: list[Any]) -> None:
         """Route processed stage outputs produced by one stage poll."""
+        pool = self.stage_pools[stage_id]
         for output in outputs:
             req_state = self.request_states.get(output.request_id)
             if req_state is None:
@@ -1729,40 +1845,18 @@ class OrchestratorBase:
             stage_metrics = None
             segment_finished = req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished
             if output.finished or segment_finished:
-                stage_metrics = self._attach_finished_stage_metrics(stage_id, replica_id, output, req_state)
+                stage_metrics = pool.build_stage_metrics(
+                    [output],
+                    submit_ts=req_state.stage_submit_ts.get(stage_id, _time.time()),
+                    request_timestamp=req_state.request_timestamp,
+                    replica_id=replica_id,
+                    sampling_params=req_state.sampling_params_list[stage_id],
+                )
+                if self.collect_stage_metrics:
+                    stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
 
             await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
             self._note_routed_stage_output(stage_id, output, req_state)
-
-    def _attach_finished_stage_metrics(
-        self,
-        stage_id: int,
-        replica_id: int,
-        output: object,
-        req_state: OrchestratorRequestState,
-    ) -> StageRequestMetrics:
-        """Build finished-stage metrics and fold scheduler wait into queue wait.
-
-        The pool returns the measured wait. This method, which owns the request
-        timings, adds it before the per-stage copy. ``extract_queue_wait_s``
-        later reads that one key.
-        """
-        pool = self.stage_pools[stage_id]
-        stage_metrics = pool.build_stage_metrics(
-            [output],
-            submit_ts=req_state.stage_submit_ts.get(stage_id, _time.time()),
-            submit_perf=req_state.stage_submit_perf.get(stage_id),
-            request_timestamp=req_state.request_timestamp,
-            replica_id=replica_id,
-            sampling_params=req_state.sampling_params_list[stage_id],
-        )
-        wait_ms = stage_metrics.scheduler_queue_wait_ms
-        if wait_ms is not None:
-            # A missing orchestrator hop still records the scheduler wait.
-            req_state.pipeline_timings["queue_wait_ms"] = req_state.pipeline_timings.get("queue_wait_ms", 0.0) + wait_ms
-        if self.collect_stage_metrics:
-            stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
-        return stage_metrics
 
     async def _handle_stage_error(
         self,
@@ -3415,7 +3509,8 @@ class OrchestratorBase:
                 final_output_type=final_output_type,
                 audio_sample_rate=final_pool._infer_audio_sample_rate(),
             )
-            submit_ts = stamp_stage_submit(req_state, final_stage_id, refresh=True)
+            submit_ts = _time.time()
+            req_state.stage_submit_ts[final_stage_id] = submit_ts
             logger.info(
                 "[Orchestrator] req=%s stage-%s produced no terminal inputs for stage-%s; "
                 "returning empty %s output from final stage-%s",
@@ -3498,13 +3593,6 @@ class OrchestratorBase:
 
                 if mark_submitting is not None:
                     mark_submitting()
-                stamp_downstream_stage_submit(
-                    req_state,
-                    next_logical,
-                    next_pool,
-                    already_submitted=already_submitted,
-                    after_submit=False,
-                )
                 if already_submitted:
                     replica_id = await next_pool.submit_update(req_id, req_state, request, **route_kwargs)
                 else:
@@ -3516,13 +3604,6 @@ class OrchestratorBase:
                         expected_replica_id=scoped_replica_id,
                         **route_kwargs,
                     )
-                stamp_downstream_stage_submit(
-                    req_state,
-                    next_logical,
-                    next_pool,
-                    already_submitted=already_submitted,
-                    after_submit=True,
-                )
             self._on_stage_submitted(
                 next_logical,
                 req_id,
@@ -3542,6 +3623,7 @@ class OrchestratorBase:
             )
             return
 
+        req_state.stage_submit_ts[next_logical] = _time.time()
         _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
         self._emit_tx_edge(
             from_stage=src_stage_id,
@@ -3590,26 +3672,13 @@ class OrchestratorBase:
         if params_override is not None:
             initial_kwargs["params_override"] = params_override
         for request in requests:
-            stamp_downstream_stage_submit(
-                req_state,
-                receiver_stage_id,
-                to_pool,
-                already_submitted=already_submitted,
-                after_submit=False,
-            )
             if already_submitted:
                 replica_id = await to_pool.submit_update(req_id, req_state, request, **update_kwargs)
             else:
                 replica_id = await to_pool.submit_initial(req_id, req_state, request, **initial_kwargs)
-            stamp_downstream_stage_submit(
-                req_state,
-                receiver_stage_id,
-                to_pool,
-                already_submitted=already_submitted,
-                after_submit=True,
-            )
             self._on_stage_submitted(receiver_stage_id, req_id, replica_id, req_state)
 
+        req_state.stage_submit_ts[receiver_stage_id] = _time.time()
         self._emit_tx_edge(
             from_stage=source_stage_id,
             from_replica=source_replica_id if source_replica_id is not None else 0,
@@ -3727,13 +3796,7 @@ class OrchestratorBase:
                     await self._fail_request_dead_stage(request_id, route_stage_id)
                     return False
             route_kwargs: dict[str, Any] = {} if pinned_replica_id is None else {"pinned_replica_id": pinned_replica_id}
-            stamp_downstream_stage_submit(
-                req_state,
-                next_stage_id,
-                next_pool,
-                already_submitted=False,
-                after_submit=False,
-            )
+            req_state.stage_submit_ts[next_stage_id] = _time.time()
             _t_submit_start = _time.perf_counter()
 
             if next_pool.stage_type == "diffusion":
@@ -3842,13 +3905,6 @@ class OrchestratorBase:
             # request is already cleaned up, so stop prewarming.
             if not submitted:
                 return False
-            stamp_downstream_stage_submit(
-                req_state,
-                next_stage_id,
-                next_pool,
-                already_submitted=False,
-                after_submit=True,
-            )
 
             # The guard swallows submit_initial's return value; the pool binding
             # it recorded carries the same replica.
@@ -4360,7 +4416,7 @@ class Orchestrator(OrchestratorBase):
                     await asyncio.to_thread(self._clear_stage_input_cache, stage_id)
                     return
                 req_state.pipeline_timings["preprocess_ms"] = (_time.perf_counter() - _t_preprocess) * 1000.0
-            stamp_stage_submit(req_state, stage_id, refresh=True)
+            req_state.stage_submit_ts[stage_id] = _time.time()
             if mark_submitting is not None:
                 mark_submitting()
             if not await self._dispatch_or_fail_request(
@@ -4407,7 +4463,7 @@ class Orchestrator(OrchestratorBase):
             req_state.sampling_params_list = [_without_per_sample_kv_count(p) for p in msg.sampling_params_list]
 
         req_state.streaming.enabled = True
-        stamp_stage_submit(req_state, stage_id, refresh=True)
+        req_state.stage_submit_ts[stage_id] = _time.time()
         if not await self._dispatch_or_fail_request(
             lambda: self.stage_pools[stage_id].submit_update(
                 request_id,
@@ -4458,7 +4514,7 @@ class Orchestrator(OrchestratorBase):
             ),
         )
         self.request_states[companion_id] = companion_state
-        stamp_stage_submit(companion_state, 0, refresh=True)
+        companion_state.stage_submit_ts[0] = _time.time()
 
         # A dead-stage failure is attributed to the parent request; its cleanup
         # also releases this companion.

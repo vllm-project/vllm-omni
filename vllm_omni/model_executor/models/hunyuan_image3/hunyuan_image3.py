@@ -75,6 +75,7 @@ from vllm.multimodal.inputs import (
 )
 from vllm.multimodal.parse import (
     MultiModalDataItems,
+    MultiModalDataParser,
 )
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
@@ -997,6 +998,31 @@ class HunyuanImage3Processor:
         return image.crop((crop_left, crop_top, crop_left + tw, crop_top + th))
 
 
+class HunyuanImage3DataParser(MultiModalDataParser):
+    """Extends MultiModalDataParser with img2img subparser for it2i via chat endpoint."""
+
+    def _get_subparsers(self):
+        parsers = super()._get_subparsers()
+        parsers["img2img"] = self._parse_img2img_data
+        return parsers
+
+    def _parse_img2img_data(self, data):
+        """Parse img2img data, preserving the 'img2img' modality name.
+
+        The base _parse_image_data creates ImageProcessorItems with
+        modality='image' (hardcoded), which breaks mm_hashes/modality
+        matching for it2i requests. We create a ProcessorBatchItems with
+        modality='img2img' so get_processor_data() returns
+        {'img2imgs': ...} matching the mm_items key.
+        """
+        from vllm.multimodal.parse import ProcessorBatchItems
+
+        result = self._parse_image_data(data)
+        if result is None:
+            return None
+        return ProcessorBatchItems(result.data, "img2img")
+
+
 class HunyuanImage3ProcessingInfo(BaseProcessingInfo):
     """Processing information for HunyuanImage3 model."""
 
@@ -1011,7 +1037,10 @@ class HunyuanImage3ProcessingInfo(BaseProcessingInfo):
         )
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        return {"image": None}
+        return {"image": None, "img2img": None}
+
+    def get_data_parser(self) -> HunyuanImage3DataParser:
+        return HunyuanImage3DataParser()
 
 
 class HunyuanImage3DummyInputsBuilder(BaseDummyInputsBuilder[HunyuanImage3ProcessingInfo]):
@@ -1081,12 +1110,17 @@ class HunyuanImage3MultiModalProcessor(OmniMultiModalProcessor[HunyuanImage3Proc
         tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         image_processor = self.info.get_image_processor(**mm_kwargs)
-        images = mm_data.get("images", [])
+        _modalities = mm_kwargs.get("modalities") or tok_kwargs.get("modalities") or []
+        is_img2img = "img2img" in _modalities
+        images = mm_data.get("img2imgs", mm_data.get("img2img", mm_data.get("images", [])))
+        if not isinstance(images, list):
+            images = [images]
         logger.debug(f"process image count: {len(images)}")
         batch_feature = image_processor(prompt, images, **tok_kwargs)
         vae_generator_seed = mm_kwargs.get("vae_generator_seed")
         if vae_generator_seed is not None and images:
             batch_feature["vae_generator_seed"] = torch.full((len(images),), int(vae_generator_seed), dtype=torch.long)
+        batch_feature["_input_modality"] = "img2img" if is_img2img else "image"
         return batch_feature
 
     def _apply_hf_processor_main(self, mm_items: MultiModalDataItems, hf_kwargs: Mapping[str, object]) -> BatchFeature:
@@ -1118,28 +1152,29 @@ class HunyuanImage3MultiModalProcessor(OmniMultiModalProcessor[HunyuanImage3Proc
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
         config = {}
+        modality = hf_inputs.get("_input_modality", "image")
 
         if "vit_pixel_values" in hf_inputs:
-            config["vit_pixel_values"] = MultiModalFieldConfig.batched("image")
+            config["vit_pixel_values"] = MultiModalFieldConfig.batched(modality)
         if "vit_pixel_attention_mask" in hf_inputs:
-            config["vit_pixel_attention_mask"] = MultiModalFieldConfig.batched("image")
+            config["vit_pixel_attention_mask"] = MultiModalFieldConfig.batched(modality)
         if "vit_spatial_shapes" in hf_inputs:
-            config["vit_spatial_shapes"] = MultiModalFieldConfig.batched("image")
+            config["vit_spatial_shapes"] = MultiModalFieldConfig.batched(modality)
         # `vae_pixel_values` is a 1-D concatenation of variable-shape per-image
         # VAE tensors (see `process_image`). `vae_pixel_size` carries the
         # per-image flat length so vLLM can split the buffer back per image.
         if "vae_pixel_values" in hf_inputs and "vae_pixel_size" in hf_inputs:
-            config["vae_pixel_values"] = MultiModalFieldConfig.flat_from_sizes("image", hf_inputs["vae_pixel_size"])
+            config["vae_pixel_values"] = MultiModalFieldConfig.flat_from_sizes(modality, hf_inputs["vae_pixel_size"])
         if "vae_pixel_size" in hf_inputs:
-            config["vae_pixel_size"] = MultiModalFieldConfig.batched("image")
+            config["vae_pixel_size"] = MultiModalFieldConfig.batched(modality)
         if "vae_token_grid_hw" in hf_inputs:
-            config["vae_token_grid_hw"] = MultiModalFieldConfig.batched("image", keep_on_cpu=True)
+            config["vae_token_grid_hw"] = MultiModalFieldConfig.batched(modality, keep_on_cpu=True)
         if "base_size" in hf_inputs:
-            config["base_size"] = MultiModalFieldConfig.batched("image")
+            config["base_size"] = MultiModalFieldConfig.batched(modality)
         if "ratio_index" in hf_inputs:
-            config["ratio_index"] = MultiModalFieldConfig.batched("image")
+            config["ratio_index"] = MultiModalFieldConfig.batched(modality)
         if "vae_generator_seed" in hf_inputs:
-            config["vae_generator_seed"] = MultiModalFieldConfig.batched("image", keep_on_cpu=True)
+            config["vae_generator_seed"] = MultiModalFieldConfig.batched(modality, keep_on_cpu=True)
         return config
 
     def _get_prompt_updates(
@@ -1219,9 +1254,43 @@ class HunyuanImage3MultiModalProcessor(OmniMultiModalProcessor[HunyuanImage3Proc
                 embed_token_ids=[img_token_id, joint_img_sep_token_id],
             )
 
+        if "img2img" in mm_items:
+            return []
         return [
             PromptReplacement(modality="image", target=[img_token_id], replacement=get_replacement_image),
         ]
+
+    def _get_mm_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        out_mm_kwargs: MultiModalKwargsItems,
+    ):
+        result = super()._get_mm_prompt_updates(
+            mm_items,
+            hf_processor_mm_kwargs,
+            out_mm_kwargs,
+        )
+        if "img2img" in mm_items:
+            count = mm_items.get_all_counts().get("img2img", 0)
+            if "img2img" not in result:
+                result["img2img"] = [[] for _ in range(count)]
+        return result
+
+    def _maybe_apply_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        mm_res,
+    ):
+        if "img2img" in mm_items:
+            filtered = MultiModalDataItems()
+            for k, v in mm_items.items():
+                if k != "img2img":
+                    filtered[k] = v
+            if "img2img" in (mm_res.prompt_updates or {}):
+                del mm_res.prompt_updates["img2img"]
+            return super()._maybe_apply_prompt_updates(filtered, mm_res)
+        return super()._maybe_apply_prompt_updates(mm_items, mm_res)
 
 
 def _hunyuan_image3_unpack_packed_topk(

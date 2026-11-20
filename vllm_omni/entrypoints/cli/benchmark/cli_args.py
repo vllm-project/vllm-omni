@@ -528,6 +528,7 @@ _OMNI_BENCH_DATASET_CHOICES = (
     "ttsd",
     "sound-effect",
     "videomme",
+    "mixed-omni",
 )
 
 
@@ -720,6 +721,13 @@ def add_omni_args(parser: argparse.ArgumentParser) -> None:
     add_multi_stage_cli_args(parser)
     add_diffusion_cli_args(parser)
     add_realtime_video_cli_args(parser)
+    group = parser.add_argument_group("Mixed-Omni Benchmark Options")
+    group.add_argument(
+        "--mixed-omni-config",
+        default=None,
+        help='JSON config for mixed-omni dataset, e.g. \'{"i2t":14,"t2i":3,"it2i":3,"seed":1}\'. '
+        "Used with --dataset-name mixed-omni --backend openai-chat-omni.",
+    )
 
 
 def preprocess_serve_args(args: argparse.Namespace) -> None:

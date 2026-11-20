@@ -353,6 +353,7 @@ class OmniEngineArgs(EngineArgs):
     # model-owned streaming state (codec, decoder, and similar resources).
     duplex_max_sessions: int = 1
     omni_kv_config: dict | None = None
+    dit_load_aware_config: dict[str, Any] | None = None
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
     diffusion_flashinfer_autotune: bool | None = None
@@ -366,7 +367,7 @@ class OmniEngineArgs(EngineArgs):
     enable_sleep_mode: bool = False
     omni: bool = False
     # Diffusion request-mode batch admission (forwarded to OmniDiffusionConfig).
-    request_batch_max_wait_ms: float | None = None
+    request_batch_max_wait_ms: float = 0.0
     fa_deterministic: bool = False
     # Tensor-parallel degree for the diffusion text encoder (forwarded to
     # DiffusionParallelConfig via the generic diffusion fallback). Declared
@@ -681,6 +682,7 @@ class OmniEngineArgs(EngineArgs):
             subtalker_sampling_params=self.subtalker_sampling_params,
             silence_ban_frames=self.silence_ban_frames,
             omni_kv_config=self.omni_kv_config,
+            dit_load_aware_config=self.dit_load_aware_config,
             task_type=self.task_type,
             has_sampling_extra_args=self.has_sampling_extra_args,
             sampling_extra_args_keys=tuple(self.sampling_extra_args_keys or ()),
@@ -814,7 +816,6 @@ class OrchestratorArgs:
     allgather_degree: int | None = None
     diffusion_quantization_config: str | None = None
     use_hsdp: bool = False
-    hsdp_data_parallel: bool = False
     hsdp_shard_size: int = -1
     hsdp_replicate_size: int = 1
     diffusion_attention_backend: str | None = None

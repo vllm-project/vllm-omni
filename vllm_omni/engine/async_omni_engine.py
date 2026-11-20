@@ -50,7 +50,29 @@ class AsyncOmniEngine(OmniEngineBase):
     """Turn-based engine used by ``Omni`` / ``AsyncOmni``."""
 
     def _create_orchestrator(self, **orchestrator_kwargs: Any) -> OrchestratorBase:
+        orchestrator_kwargs.setdefault("dit_load_aware_config", self._detect_dit_load_aware_config())
         return Orchestrator(**orchestrator_kwargs)
+
+    def _detect_dit_load_aware_config(self) -> list[dict[str, Any]] | None:
+        """Return DTPS pairing configs for all AR stages that have dit_load_aware enabled.
+
+        Each dict carries ``ar_stage_id``, ``dit_stage_id``, and ``threshold``
+        so the orchestrator can isolate load collection and delivery per pair.
+        Returns ``None`` when no AR stage has DTPS enabled.
+        """
+        pairs: list[dict[str, Any]] = []
+        for cfg in self.stage_configs:
+            # Structured config path (production): BaseVllmOmniStageConfig.model_config
+            mc = getattr(cfg, "model_config", None)
+            dtps_cfg = getattr(mc, "dit_load_aware_config", None)
+            if dtps_cfg:
+                pairs.append(dtps_cfg)
+                continue
+            # Legacy path (override/test): StageConfig.yaml_engine_args
+            ea = getattr(cfg, "yaml_engine_args", None)
+            if isinstance(ea, dict) and ea.get("dit_load_aware_config"):
+                pairs.append(ea["dit_load_aware_config"])
+        return pairs if pairs else None
 
     # ---- request helpers ----
 
