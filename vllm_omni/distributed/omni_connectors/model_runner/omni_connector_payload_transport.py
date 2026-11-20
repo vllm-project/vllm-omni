@@ -19,7 +19,7 @@ import torch
 from vllm.distributed.parallel_state import get_tp_group
 
 from vllm_omni.data_entry_keys import OmniPayload, OmniPayloadStruct, returns_stage_payload, to_dict
-from vllm_omni.distributed.omni_connectors.connectors.base import PermanentTransferError
+from vllm_omni.distributed.omni_connectors.connectors.base import OmniConnectorBase, PermanentTransferError
 from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime import (
     _OmniConnectorRuntimeMixin,
     logger,
@@ -59,9 +59,6 @@ _INPUT_WAIT_TIMEOUT_MODULE: Any = None
 _RECV_DRAIN_REPOLL_PASSES = 8
 
 if TYPE_CHECKING:
-    from vllm_omni.distributed.omni_connectors.connectors.base import (
-        OmniConnectorBase,
-    )
     from vllm_omni.engine import AdditionalInformationPayload
 
 
@@ -224,16 +221,40 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         to_stage: str,
         connector_get_key: str | None,
         metadata: dict[str, Any] | None = None,
+        deadline: float | None = None,
     ) -> Any:
         """Receive one ordinary non-KV stage payload on the local leader rank only."""
         if connector_get_key is None:
             return None
-        if not self._stage_payload_broadcast_groups():
-            if metadata is None:
-                return connector.get(from_stage, to_stage, connector_get_key)
-            return connector.get(from_stage, to_stage, connector_get_key, metadata)
-        if not self.is_data_transfer_rank():
+        if self._stage_payload_broadcast_groups() and not self.is_data_transfer_rank():
             return None
+        return self._get_stage_payload(connector, from_stage, to_stage, connector_get_key, metadata, deadline)
+
+    def _get_stage_payload(
+        self,
+        connector: OmniConnectorBase,
+        from_stage: str,
+        to_stage: str,
+        connector_get_key: str,
+        metadata: dict[str, Any] | None,
+        deadline: float | None,
+    ) -> Any:
+        """Use a deadline-aware get when this connector implements one.
+
+        A mock connector grows ``get_with_deadline`` automatically. Only a
+        method defined on the connector class counts, so tests that stub
+        ``get`` keep that stub.
+        """
+        deadline_get = getattr(type(connector), "get_with_deadline", None)
+        if (
+            deadline is not None
+            and deadline_get is not None
+            and deadline_get is not OmniConnectorBase.get_with_deadline
+        ):
+            try:
+                return connector.get_with_deadline(from_stage, to_stage, connector_get_key, metadata, deadline=deadline)
+            except NotImplementedError:
+                pass
         if metadata is None:
             return connector.get(from_stage, to_stage, connector_get_key)
         return connector.get(from_stage, to_stage, connector_get_key, metadata)
@@ -245,6 +266,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         to_stage: str,
         connector_get_key: str | None,
         metadata: dict[str, Any] | None = None,
+        deadline: float | None = None,
     ) -> Any:
         """Receive one full-payload transfer on the local leader rank only."""
         return self._recv_ordinary_stage_result(
@@ -253,6 +275,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             to_stage,
             connector_get_key,
             metadata,
+            deadline,
         )
 
     def _recv_async_chunk_result(
@@ -995,7 +1018,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     self._stage_full_payload_locked(request_id, OmniSerializer.deserialize(request.payload_sender_info))
                 return
             self._pending_load_reqs[request_id] = request
-            self._recv_wait_since().setdefault(request_id, time.monotonic())
+            # Chunk streams reset their wait in the scheduler adapter when a
+            # chunk arrives. Starting one clock here fails a healthy stream
+            # that simply runs longer than the timeout. Full payload has no
+            # such reset: the clock covers the one get.
+            if not self._async_chunk:
+                self._recv_wait_since().setdefault(request_id, time.monotonic())
         self._work_available.set()
 
     def recv_chunk(self) -> dict[str, Any]:
@@ -1217,6 +1245,16 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         self._recv_wait_since().pop(req_id, None)
         super()._clear_recv_delivery_state(req_id)
 
+    def _full_payload_recv_deadline(self, req_id: str) -> float | None:
+        timeout_s = self._input_wait_timeout_s()
+        if timeout_s <= 0:
+            return None
+        with self._lock:
+            started = self._recv_wait_since().get(req_id)
+        if started is None:
+            return None
+        return started + timeout_s
+
     def _input_wait_timeout_s(self) -> float:
         global _INPUT_WAIT_TIMEOUT_MODULE
         if _INPUT_WAIT_TIMEOUT_MODULE is None:
@@ -1306,6 +1344,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 client_index = 0
             with self._lock:
                 self._permanent_send_failure_map().setdefault(req_id, (client_index, reason))
+            sink = getattr(self, "_omni_connector_output_sink", None)
+            if sink is not None:
+                try:
+                    sink(OmniConnectorOutput(permanent_send_failures={req_id: (client_index, reason)}))
+                except Exception:
+                    logger.exception("Connector output sink failed for send give-up %s", req_id)
             logger.error(
                 "[Stage-%s] Giving up on send for %s after %d retries",
                 stage_id,
@@ -1392,13 +1436,22 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 metadata,
             )
         else:
+            deadline = self._full_payload_recv_deadline(req_id)
             result = self._recv_full_payload_result(
                 connector,
                 from_stage,
                 to_stage,
                 connector_get_key,
                 metadata,
+                deadline,
             )
+            if result is None and deadline is not None and time.monotonic() >= deadline and connector_get_key:
+                # The read stopped at the request deadline. Drop its claim so a
+                # later poll cannot publish the buffer after the request fails.
+                try:
+                    connector.abandon_get(connector_get_key)
+                except Exception:
+                    logger.debug("abandon_get failed for %s", connector_get_key, exc_info=True)
 
         if result is None:
             return False

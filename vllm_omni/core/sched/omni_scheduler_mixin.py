@@ -6,6 +6,7 @@ from __future__ import annotations
 import math
 import os
 import queue
+import threading
 import time
 from collections.abc import Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING, Any
@@ -210,10 +211,14 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
 
     def _init_omni_connector_output_inbox(self) -> None:
         self._omni_connector_output_inbox: queue.SimpleQueue[OmniConnectorOutput] = queue.SimpleQueue()
+        self._omni_connector_inbox_lock = threading.Lock()
+        self._omni_connector_inbox_count = 0
 
     def enqueue_omni_connector_output(self, output: OmniConnectorOutput) -> None:
         """Accept a lightweight readiness event from the local runner thread."""
-        self._omni_connector_output_inbox.put(output)
+        with self._omni_connector_inbox_lock:
+            self._omni_connector_output_inbox.put(output)
+            self._omni_connector_inbox_count += 1
 
     # ------------------------------------------------------------------ #
     #  Shared scheduler/output helpers (lift the AR / generation duplicates)
@@ -578,7 +583,16 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         """Collect control messages in order, without changing request state."""
         connector_outputs: list[OmniConnectorOutput] = []
         inbox = getattr(self, "_omni_connector_output_inbox", None)
-        if inbox is not None:
+        lock = getattr(self, "_omni_connector_inbox_lock", None)
+        if inbox is not None and lock is not None:
+            with lock:
+                while True:
+                    try:
+                        connector_outputs.append(inbox.get_nowait())
+                    except queue.Empty:
+                        break
+                self._omni_connector_inbox_count = 0
+        elif inbox is not None:
             while True:
                 try:
                     connector_outputs.append(inbox.get_nowait())
@@ -1172,9 +1186,32 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             return
         outputs[request.client_index].append(output)
 
+    def _has_connector_transfer_work(self) -> bool:
+        """True when a send is still running or its failure has not been emitted.
+
+        The producer request has usually left the scheduler before the
+        background put finishes. Without this, the engine goes idle and the
+        give-up stays stashed until some later request wakes it.
+        """
+        latest = getattr(self, "_latest_omni_connector_output", None)
+        if latest is not None and (
+            getattr(latest, "permanent_send_failures", None) or getattr(latest, "permanent_recv_failures", None)
+        ):
+            return True
+        if getattr(self, "_queued_permanent_send_failures", None):
+            return True
+        # A give-up on the runner thread is queued here. Counting under the
+        # same lock as the enqueue keeps the engine runnable until the next
+        # schedule drains it. This is not "a send is still in flight": that
+        # would make every successful background put keep execute_model spinning.
+        return bool(getattr(self, "_omni_connector_inbox_count", 0))
+
     def has_requests(self) -> bool:
         """Keep stepping while a finished run request's output waits for its stage payload."""
-        return bool(self._outputs_awaiting_stage_payload) or super().has_requests()
+        if bool(self._outputs_awaiting_stage_payload) or self._has_connector_transfer_work():
+            return True
+        parent = getattr(super(), "has_requests", None)
+        return bool(parent()) if callable(parent) else False
 
     def _handle_failed_kv_load_outputs(
         self,

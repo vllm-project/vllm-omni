@@ -1654,7 +1654,11 @@ def run_headless(args: TrackingNamespace) -> None:
         )
         return
 
-    omni_transfer_config = load_omni_transfer_config_for_model(model, config_path)
+    omni_transfer_config = load_omni_transfer_config_for_model(
+        model,
+        config_path,
+        deployment_scope=f"{omni_master_address}:{omni_master_port}",
+    )
     omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
     stage_connector_spec = get_stage_connector_spec(
         omni_transfer_config=omni_transfer_config,

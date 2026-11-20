@@ -704,3 +704,54 @@ def test_visibility_is_scoped_to_deployment():
     finally:
         other_deployment.close()
         sender.close()
+
+
+def test_separate_config_loads_share_one_deployment_scope():
+    """Head and --headless each load the config. The same master endpoint must match."""
+    from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
+    from vllm_omni.distributed.omni_connectors.utils.initialization import (
+        load_omni_transfer_config,
+        resolve_connector_spec,
+    )
+
+    config = {"stage_args": [{"stage_id": 0}, {"stage_id": 1, "engine_input_source": [0]}]}
+    scope = f"10.0.0.8:{18000 + (os.getpid() % 1000)}"
+    head = load_omni_transfer_config(config_dict=config, deployment_scope=scope)
+    headless = load_omni_transfer_config(config_dict=config, deployment_scope=scope)
+    other = load_omni_transfer_config(config_dict=config, deployment_scope=scope + "-other")
+    sender = OmniConnectorFactory.create_connector(
+        resolve_connector_spec(head.connectors[("0", "1")], stage_id=0, role="sender")
+    )
+    stranger = OmniConnectorFactory.create_connector(
+        resolve_connector_spec(other.connectors[("0", "1")], stage_id=1, role="receiver")
+    )
+    key = f"deploy_{uuid.uuid4().hex}"
+    receiver = None
+    try:
+        assert sender.put("0", "1", key, {"a": 1})[0] is False
+        receiver = OmniConnectorFactory.create_connector(
+            resolve_connector_spec(headless.connectors[("0", "1")], stage_id=1, role="receiver")
+        )
+        assert sender.put("0", "1", key, {"a": 1})[0] is True
+        assert receiver.get("0", "1", key)[0] == {"a": 1}
+    finally:
+        if receiver is not None:
+            receiver.close()
+        stranger.close()
+        sender.close()
+
+
+def test_closing_one_receiver_keeps_the_other_visible():
+    base = 60000 + (os.getpid() % 1000)
+    scope = f"live-{uuid.uuid4().hex}"
+    sender = SharedMemoryConnector({"stage_id": base, "wakeup_scope": scope})
+    first = SharedMemoryConnector({"stage_id": base + 1, "wakeup_scope": scope})
+    second = SharedMemoryConnector({"stage_id": base + 1, "wakeup_scope": scope})
+    key = f"both_{uuid.uuid4().hex}"
+    try:
+        first.close()
+        assert sender.put(str(base), str(base + 1), key, {"a": 1})[0] is True
+        assert second.get(str(base), str(base + 1), key)[0] == {"a": 1}
+    finally:
+        second.close()
+        sender.close()

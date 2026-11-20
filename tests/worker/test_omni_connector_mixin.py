@@ -2212,3 +2212,68 @@ def test_permanent_recv_error_fails_on_first_get():
         assert "invalid metadata" in reason
     finally:
         host.shutdown_omni_connectors()
+
+
+def test_async_chunk_recv_is_not_expired_by_the_full_payload_clock(monkeypatch):
+    from vllm_omni.core.sched import omni_scheduler_mixin as sched
+    from vllm_omni.distributed.omni_connectors.model_runner import omni_connector_payload_transport as transport
+
+    monkeypatch.setattr(sched, "DEFAULT_INPUT_WAIT_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(transport, "_INPUT_WAIT_TIMEOUT_MODULE", sched)
+    host = MixinHost()
+    host.init_omni_connectors(model_config=_make_model_config(stage_id=1, async_chunk=True))
+    connector = MagicMock()
+    connector.get.return_value = None
+    host._omni_connector = connector
+    host._stage_id = 1
+    host._async_chunk = True
+    request = _make_request("req-chunk")
+    try:
+        host.register_chunk_recv(request)
+        time.sleep(0.02)
+        host._poll_pending_requests_once(list(host._pending_load_reqs))
+        assert "req-chunk" in host._pending_load_reqs
+        assert not host.get_omni_connector_output().permanent_recv_failures
+    finally:
+        host.shutdown_omni_connectors()
+
+
+def test_full_payload_poll_uses_recv_deadline_for_every_pending_request(monkeypatch):
+    from vllm_omni.core.sched import omni_scheduler_mixin as sched
+    from vllm_omni.distributed.omni_connectors.model_runner import omni_connector_payload_transport as transport
+
+    monkeypatch.setattr(sched, "DEFAULT_INPUT_WAIT_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(transport, "_INPUT_WAIT_TIMEOUT_MODULE", sched)
+    host = MixinHost()
+    host.init_omni_connectors(model_config=_make_model_config(stage_id=1, async_chunk=False))
+    calls: list[float] = []
+
+    class _DeadlineConnector:
+        def get(self, *args, **kwargs):
+            raise AssertionError("full-payload poll used get() without a deadline")
+
+        def get_with_deadline(self, from_stage, to_stage, key, metadata=None, *, deadline):
+            calls.append(deadline)
+            time.sleep(0.02)
+            return None
+
+        def abandon_get(self, key):
+            return None
+
+    host._omni_connector = _DeadlineConnector()
+    host._stage_id = 1
+    host._async_chunk = False
+    first = _make_request("req-a")
+    second = _make_request("req-b")
+    try:
+        host.register_chunk_recv(first)
+        host.register_chunk_recv(second)
+        started = time.monotonic()
+        host._poll_pending_requests_once(["req-a", "req-b"])
+        elapsed = time.monotonic() - started
+        assert len(calls) == 2
+        assert elapsed < 0.5
+        assert calls[0] - started < 1.5
+        assert not host.get_omni_connector_output().permanent_recv_failures
+    finally:
+        host.shutdown_omni_connectors()

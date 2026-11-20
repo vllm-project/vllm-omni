@@ -2018,7 +2018,11 @@ def release_device_locks(lock_fds: list[int]) -> None:
             pass
 
 
-def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> Any:
+def load_omni_transfer_config_for_model(
+    model: str,
+    config_path: str | None,
+    deployment_scope: str | None = None,
+) -> Any:
     """Load omni transfer config from the resolver-selected deploy config.
 
     Resolves ``base_config`` inheritance (CI overlay → base deploy YAML) so
@@ -2033,7 +2037,7 @@ def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> 
         from vllm_omni.config.stage_config import resolve_deploy_yaml
 
         resolved_dict = resolve_deploy_yaml(config_path)
-        return load_omni_transfer_config(config_dict=resolved_dict)
+        return load_omni_transfer_config(config_dict=resolved_dict, deployment_scope=deployment_scope)
     except Exception as e:
         logger.warning("[stage_init] Failed to load transfer config: %s", e)
         return None

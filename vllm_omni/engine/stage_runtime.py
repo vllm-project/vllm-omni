@@ -732,7 +732,17 @@ class StageRuntime:
             self._stage_configs, local_replica_counts=self._get_local_replica_counts()
         )
         prepare_engine_environment()
-        omni_transfer_config = load_omni_transfer_config_for_model(self._model, self._config_path)
+        address = getattr(self, "_omni_master_address", None)
+        port = getattr(self, "_omni_master_port", None)
+        # Head and every --headless process of this deployment pass the same
+        # master endpoint. Local single-process launch has no master and keeps
+        # one UUID for the stages this call creates.
+        deployment_scope = f"{address}:{port}" if address and port else None
+        omni_transfer_config = load_omni_transfer_config_for_model(
+            self._model,
+            self._config_path,
+            deployment_scope=deployment_scope,
+        )
         stage_plans = self._build_logical_stage_init_plans(
             omni_transfer_config,
             replicas_per_stage,

@@ -497,5 +497,38 @@ def test_permanent_send_failure_finishes_request_still_scheduled():
     assert "Stage-0" in eco.stop_reason
 
 
+def test_idle_producer_stays_runnable_until_send_failure_is_emitted():
+    """A give-up stashed on the last runner output must still reach the client."""
+    reason = "Stage-0 connector send failed permanently for request 'req-idle'"
+    scheduler = _PermanentSendScheduler({})
+    scheduler._latest_omni_connector_output = OmniConnectorOutput(
+        permanent_send_failures={"req-idle": (7, reason)},
+    )
+
+    assert scheduler.has_requests() is True
+    scheduler._process_pending_omni_inputs("ar")
+    assert scheduler.has_requests() is False
+    outputs: dict[int, EngineCoreOutputs] = {}
+    scheduler._attach_finished_request_sets(outputs, synthesize_abort_outputs=False)
+    eco = outputs[7].outputs[0]
+    assert eco.finish_reason == FinishReason.ERROR
+    assert eco.stop_reason == reason
+
+
+def test_give_up_enqueued_from_the_runner_keeps_idle_producer_runnable():
+    """The runner thread can fail a send after the producer request has left."""
+    scheduler = _PermanentSendScheduler({})
+    scheduler._init_omni_connector_output_inbox()
+    reason = "Stage-0 connector send failed permanently for request 'req-late'"
+    assert scheduler.has_requests() is False
+    scheduler.enqueue_omni_connector_output(OmniConnectorOutput(permanent_send_failures={"req-late": (4, reason)}))
+    assert scheduler.has_requests() is True
+    scheduler._process_pending_omni_inputs("ar")
+    assert scheduler.has_requests() is False
+    outputs: dict[int, EngineCoreOutputs] = {}
+    scheduler._attach_finished_request_sets(outputs, synthesize_abort_outputs=False)
+    assert outputs[4].outputs[0].stop_reason == reason
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

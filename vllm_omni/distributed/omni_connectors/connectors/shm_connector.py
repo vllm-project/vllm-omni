@@ -139,7 +139,9 @@ class SharedMemoryConnector(OmniConnectorBase):
         try:
             directory = self._visibility_directory()
             os.makedirs(directory, mode=0o700, exist_ok=True)
-            path = f"{directory}/{stage}_{os.getpid()}"
+            # One file per connector. Two connectors for this stage in this
+            # process must not share a name: closing one would hide the other.
+            path = f"{directory}/{stage}_{os.getpid()}_{uuid.uuid4().hex}"
             fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
             os.close(fd)
         except OSError as exc:
@@ -171,10 +173,6 @@ class SharedMemoryConnector(OmniConnectorBase):
         try:
             os.unlink(path)
         except FileNotFoundError:
-            pass
-        try:
-            os.rmdir(os.path.dirname(path))
-        except OSError:
             pass
 
     def _thread_encode_buffer(self) -> bytearray:

@@ -1549,7 +1549,11 @@ def launch_headless_diffusion_replicas(
     replica_bind_address: str | None = None,
 ) -> None:
     """Prepare diffusion config, launch replicas, monitor, and clean up."""
-    omni_transfer_config = stage_init_utils.load_omni_transfer_config_for_model(model, config_path)
+    omni_transfer_config = stage_init_utils.load_omni_transfer_config_for_model(
+        model,
+        config_path,
+        deployment_scope=f"{omni_master_address}:{omni_master_port}",
+    )
     omni_conn_cfg, omni_from, omni_to = initialization.resolve_omni_kv_config_for_stage(
         omni_transfer_config,
         stage_id,
@@ -1561,6 +1565,8 @@ def launch_headless_diffusion_replicas(
         else stage_init_utils.extract_legacy_stage_metadata(stage_cfg)
     )
     if omni_conn_cfg:
+        if omni_from is None or omni_to is None:
+            raise RuntimeError("Omni KV connector requires source and destination stages")
         inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
     # Headless single-stage launch must still infer cross-stage TP topology
     # from the loaded deploy config so heterogeneous KV routing keys match the
