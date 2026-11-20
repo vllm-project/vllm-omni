@@ -201,8 +201,9 @@ responses and `truncated` on the SSE `speech.audio.done` event:
 - absent: the model does not report truncation, or the server did not record
   why generation stopped. This does not mean the audio is complete.
 
-Models that report it today: Qwen3-TTS, Breeze-TTS-2, Fish Audio Drama 3 and
-YuE2 (YuE2 on non-streaming responses only, from its own metadata). Qwen3-TTS
+Models that report it today: Qwen3-TTS, Breeze-TTS-2, Fish Audio Drama 3,
+CosyVoice3, Voxtral TTS and YuE2 (YuE2 on non-streaming responses only, from
+its own metadata). Qwen3-TTS
 rejects some truncated generations with an error instead (Base task requests,
 and requests whose budget the server sizes from the text), so those never
 return audio.
@@ -323,7 +324,7 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
 
 | Parameter | Type | Required | Description |
 | ----------- | ------ | ---------- | ------------- |
-| `audio_sample` | file | Yes | Audio file (max 10MB, supported formats: wav, mp3, flac, ogg, aac, webm). MP4/M4A is **not** supported — extract the audio track as WAV first, e.g. `ffmpeg -i clip.mp4 -vn -ar 48000 -ac 1 -sample_fmt s16 clip.wav`. |
+| `audio_sample` | file | Yes | Audio file (max 10MB, supported formats: wav, mp3, flac, ogg, aac, webm, mp4/m4a). AAC, WebM and MP4/M4A are decoded with the same loader as inline `ref_audio`. Without a content type (or with `application/octet-stream`) the format is taken from the filename extension. |
 | `consent` | string | Yes | Consent recording ID |
 | `name` | string | Yes | Name for the new voice |
 | `ref_text` | string | No | Transcript of the audio. When provided, enables in-context voice cloning (higher quality). Without it, only the speaker embedding is extracted. |
@@ -559,7 +560,14 @@ upstream LLM) pays the WebSocket handshake once instead of once per utterance.
 
 ### Session Config Parameters
 
-All REST API parameters are supported, plus:
+All REST API parameters are supported, except `input` (sent as `input.text`)
+and `stream` / `stream_format` (replaced by `stream_audio`). The REST request
+rules are checked when `session.config` arrives; checks that depend on how the
+server was started, such as `word_timestamps` without `--forced-aligner`, run
+when the first text arrives. `ref_audio` takes a single string and
+`speaker_embedding` a flat list. `duration_seconds` and `token_count` set the
+length of a whole request, so they require `split_granularity="none"` and
+`text_input_mode="buffered"`. Session parameters:
 
 | Parameter | Type | Default | Description |
 | ----------- | ------ | --------- | ------------- |

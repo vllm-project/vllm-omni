@@ -1444,6 +1444,22 @@ source_file_dependencies:
     - tests/e2e/online_serving/test_wan22_t2v.py
     - tests/e2e/online_serving/test_wan22_expansion.py
 
+  diffusion_wan22_device_postprocess:
+    - *wan22
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
+    - tests/e2e/offline_inference/test_device_postprocess_equivalence.py
+    - tests/helpers/mark.py
+    - vllm_omni/diffusion/data.py
+    - vllm_omni/diffusion/postprocess/
+    - vllm_omni/diffusion/worker/
+    - vllm_omni/diffusion/stage_diffusion_client.py
+    - vllm_omni/diffusion/stage_diffusion_proc.py
+    - vllm_omni/entrypoints/omni.py
+    - vllm_omni/entrypoints/omni_base.py
+    - vllm_omni/inputs/
+    - vllm_omni/outputs/
+
   diffusion_wan22_accuracy:
     - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
     - .buildkite/amd/scripts/assert-pytest-collection.sh
@@ -1496,6 +1512,8 @@ source_file_dependencies:
     - tests/e2e/accuracy/test_diffusers_backend_similarity.py
 
   diffusion_qwen_image_21_accuracy:
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
     - *qwen_image_21
     - tests/e2e/accuracy/qwen_image_21/
     - tests/e2e/accuracy/helpers.py
