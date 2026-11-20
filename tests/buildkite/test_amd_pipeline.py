@@ -2712,37 +2712,39 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
     assert '--run-level "$run_level"' in runner_text
 
 
-def test_stable_audio_cpu_offload_has_one_nonblocking_nightly_owner() -> None:
+def test_stable_audio_cpu_offload_has_one_blocking_nightly_owner() -> None:
     label = "Stable Audio CPU Offload"
     step = _find_step(label, AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 60
     assert step["artifact_paths"] == ["artifacts/rocm-stable-audio-cpu-offload/**/*"]
     assert "retry" not in step
-    assert "env" not in step
+    assert step["env"] == {"STABLE_AUDIO_ROCM_CPU_OFFLOAD_CHECK": "1"}
     _assert_build_scoped_aiter_mha_cache(
         step,
         "tests/diffusion/offloader/test_diffusion_cpu_offload.py",
         publishes=False,
     )
 
-    commands = "\n".join(step["commands"])
-    assert "DIFFUSION_ATTENTION_BACKEND" not in commands
-    assert "VLLM_ROCM_USE_AITER" not in commands
-    assert "test_diffusion_layerwise_offload.py" not in commands
-    assert "tests/diffusion/offloader/test_diffusion_cpu_offload.py" in commands
-    assert "full_model and rocm and MI325 and cards_1" in commands
-    assert "--run-level full_model" in commands
-    assert "--collect-only" in commands
-    assert "exit 5" in commands
-    assert "pytest.xml" in commands
-    assert "pytest.log" in commands
+    assert split(step["commands"][-1]) == [
+        "bash",
+        ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh",
+        "1",
+        "1",
+        "45m",
+        "rocm-stable-audio-cpu-offload",
+        "tests/diffusion/offloader/test_diffusion_cpu_offload.py"
+        "::test_cpu_offload_diffusion_model[stabilityai/stable-audio-open-1.0]",
+        "-m",
+        "full_model and rocm and MI325 and cards_1",
+    ]
 
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert label not in text
+        assert "STABLE_AUDIO_ROCM_CPU_OFFLOAD_CHECK" not in text
         assert "full_model and rocm and MI325 and cards_1" not in text
 
 
