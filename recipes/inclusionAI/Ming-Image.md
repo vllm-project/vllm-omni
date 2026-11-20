@@ -98,7 +98,7 @@ described above.
 | Stage 1 generation (ms) | 2697.153 | 3811.630 |
 | Stage 1 duration divided by 12 (ms, includes VAE and stage overhead) | 224.763 | 317.636 |
 
-All four A3 requests produced identical 1024×1024 RGBA PNGs. The repository
+All four A3 requests produced identical 1024×1024 RGBA PNG files. The repository
 RGB image helpers measured SSIM 0.899985 and PSNR 19.7015 dB against the
 CUDA image. CUDA/NPU numerical parity remains under review. Coverage here
 is limited to Design text-to-image.
