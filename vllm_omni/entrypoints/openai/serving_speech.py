@@ -33,6 +33,7 @@ from vllm.entrypoints.generate.base.serving import GenerateBaseServing as OpenAI
 from vllm.entrypoints.launchers.launcher import terminate_if_errored
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+from vllm.exceptions import VLLMClientError
 from vllm.logger import init_logger
 from vllm.multimodal.media import AudioMediaIO, MediaConnector
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -2340,13 +2341,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         request_id = request_id or f"speech-{random_uuid()}"
 
-        # Normalize before adapter validation/build: some models read sampling
-        # metadata from extra_params rather than stage SamplingParams. Keep the
-        # merged dict on a request-local copy so the caller's request is intact.
-        if request.temperature is not None:
-            request = request.model_copy(
-                update={"extra_params": {**(request.extra_params or {}), "temperature": request.temperature}}
-            )
+        # Resolve precedence and apply vLLM's temperature validation/floor
+        # before adapters consume sampling metadata from extra_params.
+        temperature = request.temperature
+        if temperature is None and request.extra_params is not None:
+            temperature = request.extra_params.get("temperature")
+        if temperature is not None:
+            temperature = SamplingParams(temperature=temperature).temperature
+            updates: dict[str, object] = {"extra_params": {**(request.extra_params or {}), "temperature": temperature}}
+            if request.temperature is not None:
+                updates["temperature"] = temperature
+            request = request.model_copy(update=updates)
 
         # If this is a streaming request with real async chunks, we need to
         # coerce cumulative outputs to delta outputs; this ensures we don't
@@ -2448,8 +2453,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     setattr(sampling_params_list[0], name, value)
             if sampling_params_list[0].extra_args is None:
                 sampling_params_list[0].extra_args = {}
-            sampling_params_list[0].extra_args.update(extra_params)
-            logger.info("Applied extra_params: %s", extra_params)
+            # ``omni_user_seed`` is a serving-layer marker for the
+            # seeded-request isolation policy, not a client knob: copying it
+            # from extra_params would let a request serialize the engine without
+            # asking for reproducibility.
+            applied_extra_params = {key: value for key, value in extra_params.items() if key != "omni_user_seed"}
+            sampling_params_list[0].extra_args.update(applied_extra_params)
+            logger.info("Applied extra_params: %s", applied_extra_params)
 
         # Apply adapter-owned sampling overrides, including request-level token
         # limits and model-specific dynamic token or stop-token configuration.
@@ -2465,6 +2475,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if stage0_params.extra_args is None:
                 stage0_params.extra_args = {}
             stage0_params.extra_args["tts_local_seed"] = request.seed
+            # Only this stage received the client seed, so it is the only one
+            # that opts into seeded-request isolation; stage defaults stay
+            # unmarked and keep normal batching.
+            stage0_params.extra_args["omni_user_seed"] = True
 
         # When word_timestamps is requested, also ask for the aligner stage's
         # output so the orchestrator drives the request through the forced-aligner
@@ -2914,7 +2928,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._diffusion_error_response("Client disconnected")
         except (EngineGenerateError, EngineDeadError):
             raise  # Propagate to the global Omni exception handler
-        except ValueError as e:
+        except (ValueError, VLLMClientError) as e:
             return self._diffusion_error_response(str(e), status_code=400)
         except Exception as e:
             logger.exception("Diffusion speech generation failed: %s", e)
@@ -3176,7 +3190,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 total_ms,
             )
             raise  # Propagate to the global Omni exception handler
-        except ValueError as e:
+        except (ValueError, VLLMClientError) as e:
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
             logger.warning(
                 "[SpeechE2E] request_id=%s stream=%s status=bad_request total_ms=%.2f error=%s",

@@ -34,6 +34,7 @@ from pytest_mock import MockerFixture
 from vllm.entrypoints.serve import create_error_response
 from vllm.entrypoints.serve.engine.protocol import ErrorInfo, ErrorResponse
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+from vllm.exceptions import VLLMValidationError
 from vllm.outputs import CompletionOutput
 from vllm.sampling_params import SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -1832,6 +1833,31 @@ class TestTTSMethods:
         assert isinstance(response, ErrorResponse)
         assert response.error.code == HTTPStatus.INTERNAL_SERVER_ERROR
         assert response.error.type == "InternalServerError"
+
+    @pytest.mark.asyncio
+    async def test_create_speech_engine_validation_error_returns_bad_request(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ):
+        # vLLM raises VLLMValidationError (a VLLMClientError, not a ValueError)
+        # from add_request when e.g. the prompt exceeds max_model_len.
+        mocker.patch.object(speech_server, "_check_model", new=mocker.AsyncMock(return_value=None))
+        mocker.patch.object(
+            speech_server,
+            "_generate_audio_bytes",
+            new=mocker.AsyncMock(
+                side_effect=VLLMValidationError(
+                    "The decoder prompt (length 12011) is longer than the maximum model length of 4096."
+                )
+            ),
+        )
+
+        response = await speech_server.create_speech(OpenAICreateSpeechRequest(input="Hello"))
+
+        assert isinstance(response, ErrorResponse)
+        assert response.error.code == HTTPStatus.BAD_REQUEST
+        assert response.error.type == "BadRequestError"
 
     @pytest.mark.asyncio
     async def test_create_speech_unexpected_failure_returns_internal_server_error(
@@ -6392,6 +6418,9 @@ class TestTTSAsyncOffloading:
         [
             (0.2, None, 0.2),
             (0.0, None, 0.0),
+            (1e-6, None, 0.01),
+            (None, {"temperature": 1e-6}, 0.01),
+            (0.2, {"temperature": 3.0}, 0.2),
             (0.2, {"temperature": 0.8, "top_p": 0.95}, 0.2),
             (0.0, {"temperature": 0.8}, 0.0),
             (None, {"temperature": 0.8}, 0.8),
@@ -6403,6 +6432,8 @@ class TestTTSAsyncOffloading:
     def test_prepare_speech_generation_temperature(
         self, qwen3_tts_server, mocker: MockerFixture, temperature, extra_params, expected, stream
     ):
+        from vllm.sampling_params import SamplingType
+
         defaults = [SamplingParams(temperature=0.9), SamplingParams(temperature=0.7)]
         qwen3_tts_server.engine_client.default_sampling_params_list = defaults
         qwen3_tts_server._adapter.validate = mocker.MagicMock(return_value=None)
@@ -6419,6 +6450,7 @@ class TestTTSAsyncOffloading:
 
         params = qwen3_tts_server.engine_client.generate.call_args.kwargs["sampling_params_list"]
         assert params[0].temperature == expected
+        assert params[0].sampling_type == (SamplingType.GREEDY if expected == 0 else SamplingType.RANDOM)
         assert params[1].temperature == 0.7
         if temperature is not None or (extra_params is not None and "temperature" in extra_params):
             assert params[0].extra_args["temperature"] == expected
@@ -6434,11 +6466,25 @@ class TestTTSAsyncOffloading:
         next_params = qwen3_tts_server.engine_client.generate.call_args.kwargs["sampling_params_list"]
         assert next_params[0].temperature == 0.9
 
+    @pytest.mark.parametrize("overrides", [{"temperature": 3.0}, {"extra_params": {"temperature": 3.0}}])
+    def test_temperature_limit_checked_before_adapter_build(self, qwen3_tts_server, mocker: MockerFixture, overrides):
+        from vllm.exceptions import VLLMValidationError
+
+        adapter = qwen3_tts_server._get_tts_adapter()
+        adapter.build = mocker.AsyncMock()
+        request = OpenAICreateSpeechRequest(input="hello", **overrides)
+        with pytest.raises(VLLMValidationError, match="temperature"):
+            asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
+        adapter.build.assert_not_awaited()
+        qwen3_tts_server.engine_client.generate.assert_not_called()
+
     @pytest.mark.parametrize(
         "temperature,extra_params,expected",
         [
             (0.2, None, 0.2),
             (0.0, None, 0.0),
+            (1e-6, None, 0.01),
+            (None, {"temperature": 1e-6}, 0.01),
             (0.2, {"temperature": 0.8, "top_p": 0.95}, 0.2),
             (0.0, {"temperature": 0.8}, 0.0),
             (None, {"temperature": 0.8}, 0.8),
@@ -6487,6 +6533,8 @@ class TestTTSAsyncOffloading:
         [
             (0.2, None, 0.2),
             (0.0, None, 0.0),
+            (1e-6, None, 0.01),
+            (None, {"temperature": 1e-6}, 0.01),
             (0.2, {"temperature": 0.8}, 0.2),
             (0.0, {"temperature": 0.8}, 0.0),
             (None, {"temperature": 0.8}, 0.8),

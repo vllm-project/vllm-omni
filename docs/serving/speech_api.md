@@ -148,7 +148,7 @@ Content-Type: application/json
 | `language` | string | "Auto" | Language (see supported languages below) |
 | `instructions` | string | "" | Voice style/emotion instructions |
 | `max_new_tokens` | integer | 2048 | Maximum tokens to generate |
-| `temperature` | float | null | Sampling temperature for the first autoregressive stage. Must be finite and nonnegative; `0` selects greedy sampling. A non-null top-level value overrides `extra_params.temperature`; otherwise the legacy nested value or deployment default is used. Does not change Qwen3-TTS residual Code Predictor sampling. Models whose generation does not consume it (MiniMax Music 3, OmniVoice, VoxCPM2, Voxtral TTS, Ming TTS / Ming-flash-omni TTS, MOSS-TTS family, Higgs Audio v2, Gepard, YuE2, Ming3 Audio) and pure-diffusion TTS deployments reject this field with HTTP 400. For Audex with `cfg_scale > 1`, an explicit value overrides the tuned default of 0.05. |
+| `temperature` | float | null | Sampling temperature for the first autoregressive stage. Uses vLLM validation and normalization before adapter metadata and stage sampling: finite values in `[0, 2]`, with small positive values raised to `0.01`; `0` selects greedy sampling. A non-null top-level value overrides `extra_params.temperature`; otherwise the legacy nested value or deployment default is used. Does not change Qwen3-TTS residual Code Predictor sampling. Models whose generation does not consume it (MiniMax Music 3, OmniVoice, VoxCPM2, Voxtral TTS, Ming TTS / Ming-flash-omni TTS, MOSS-TTS family, Higgs Audio v2, Gepard, YuE2, Ming3 Audio) and pure-diffusion TTS deployments reject this field with HTTP 400. For Audex with `cfg_scale > 1`, an explicit value overrides the tuned default of 0.05. |
 | `seed` | integer | null | Random seed for repeatable generation. |
 | `initial_codec_chunk_frames` | integer | null | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
 | `non_streaming_mode` | bool | null | Qwen3-TTS prompt construction mode override. Does not affect HTTP response streaming or async-chunk pipelining. When null, Qwen3-TTS uses model defaults: Base=false, CustomVoice/VoiceDesign=true. |
@@ -561,7 +561,14 @@ upstream LLM) pays the WebSocket handshake once instead of once per utterance.
 
 ### Session Config Parameters
 
-All REST API parameters are supported, plus:
+All REST API parameters are supported, except `input` (sent as `input.text`)
+and `stream` / `stream_format` (replaced by `stream_audio`). The REST request
+rules are checked when `session.config` arrives; checks that depend on how the
+server was started, such as `word_timestamps` without `--forced-aligner`, run
+when the first text arrives. `ref_audio` takes a single string and
+`speaker_embedding` a flat list. `duration_seconds` and `token_count` set the
+length of a whole request, so they require `split_granularity="none"` and
+`text_input_mode="buffered"`. Session parameters:
 
 | Parameter | Type | Default | Description |
 | ----------- | ------ | --------- | ------------- |
