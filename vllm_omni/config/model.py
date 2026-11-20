@@ -169,6 +169,7 @@ class OmniModelConfig(ModelConfig):
     sampling_extra_args_keys: tuple[str, ...] = ()
     requires_full_payload_input: bool = False
     scheduling_metadata_adapter: str | None = None
+    #: Dotted class path for this stage's optional scheduler window policy.
     scheduler_window_policy: str | None = None
 
     def compile_factors(self) -> CompileFactors:

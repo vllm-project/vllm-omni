@@ -15,19 +15,47 @@ if TYPE_CHECKING:
     from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 
 
+class WindowCut(NamedTuple):
+    """A settled input range and the generated/closing tokens to replay after it."""
+
+    seq: int
+    start: int
+    rows: int
+    accepted_ids: tuple[int, ...]
+    trailing_ids: tuple[int, ...]
+
+
 class WindowOperation(NamedTuple):
     """An ordered worker instruction, applied before finished-request cleanup.
 
-    Keep captures the finished request's window. Hand transfers a kept window
-    to a new request. Drop discards the session's window and needs no request.
+    Keep captures a finished request. Restore binds its accepted cut to an
+    identified successor. Hand and drop deliver or expire a bounded offer.
     """
 
-    kind: Literal["keep", "hand", "drop"]
+    kind: Literal["keep", "hand", "drop", "restore"]
     session_id: str
     request_id: str = ""
+    cut: WindowCut | None = None
+    source_request_id: str = ""
 
 
 class SchedulerWindowPolicy(Protocol):
+    def release_session(self, session_id: str) -> None:
+        """Release retained request windows on logical session teardown."""
+        ...
+
+    def superseded_by(self, request: Request, live: Mapping[str, Request]) -> list[str]:
+        """Identify older response epochs fenced by this admission."""
+        ...
+
+    def prepare_admission(self, request: Request, max_model_len: int) -> None:
+        """Adjust a new request's initial prefill before admission and KV allocation."""
+        ...
+
+    def observe_progress(self, request: Request) -> None:
+        """Observe settled model inputs and accepted samples before segment rollover."""
+        ...
+
     def prepare_append(
         self,
         scheduler: OmniARScheduler,

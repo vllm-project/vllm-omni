@@ -89,6 +89,7 @@ def _scheduler() -> OmniARScheduler:
     sched.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=0, session_mode="duplex"))
     sched.num_waiting_for_streaming_input = 0
     sched.log_stats = False
+    sched.max_model_len = 4096
     sched.hash_block_size = 16
     sched.chunk_transfer_adapter = None
     sched.kv_holding_waiting = set()
@@ -960,10 +961,7 @@ def test_finishes_of_one_session_are_ordered_by_epoch_number() -> None:
     ops = _finish(sched, [_stage0_id("s", 10), _stage0_id("s", 9)])
 
     assert [unit["length"] for unit in _kept(sched)["s"]["units"]] == [5, 6]
-    assert [op.request_id for op in ops if op.kind == "keep"] == [
-        _stage0_id("s", 9),
-        _stage0_id("s", 10),
-    ]
+    assert [op.request_id for op in ops if op.kind == "keep"] == [_stage0_id("s", 10)]
 
 
 def test_an_abort_of_a_request_that_already_finished_keeps_nothing() -> None:
@@ -1005,8 +1003,10 @@ def test_units_handed_to_a_request_that_never_got_its_state_go_on_with_its_abort
     _keep(helper, "s", _state(window_units=[_unit(100, 5)]), request_id="w")
     helper.apply_carry_ops([WindowOperation("hand", "s", "x")], lambda rid: None, lambda sid: None)
 
+    packed = helper._handed_window_units["s"][1]
     # x is aborted before its state was created; the scheduler keeps the units it carried.
     helper.apply_carry_ops([WindowOperation("keep", "s", "x")], lambda rid: None, lambda sid: None)
+    assert helper._carried_window_units["s"] is packed
     helper.apply_carry_ops([WindowOperation("hand", "s", "z")], lambda rid: None, lambda sid: None)
     state = _state()
     helper.restore_window_units(state)
@@ -1092,3 +1092,308 @@ def test_a_keep_this_side_cannot_fill_stores_nothing_and_says_so(caplog: pytest.
 
     assert helper._carried_window_units == {}
     assert "kept request x for session s" in caplog.text
+
+
+def _first_input(request: Request, mode: str = "basic") -> dict:
+    info = _second_append(mode).model_intermediate_buffer
+    duplex = info["duplex"]
+    duplex.update(seq=1, payload={"is_speech": True})
+    duplex["runtime_config"]["duplex_boundary_token_ids"] = {
+        "listen_token_id": LISTEN,
+        "turn_eos_token_id": TURN_EOS,
+        "unit_end_token_id": UNIT_END,
+        "chunk_eos_token_id": CHUNK_EOS,
+        "chunk_tts_eos_token_id": CHUNK_TTS_EOS,
+    }
+    request.model_intermediate_buffer = info
+    return duplex
+
+
+@pytest.mark.parametrize("mode", ["basic", "context", "off"])
+@pytest.mark.parametrize("parked", [True, False])
+def test_first_admission_replays_only_the_accepted_open_input(mode, parked):
+    sched = _scheduler()
+    old = _new_request(_stage0_id("partial", 0))
+    _first_input(old, mode)
+    policy = sched._window_policy
+    policy.prepare_admission(old, 4096)
+    _start(sched, old)
+    if parked:
+        old.append_output_token_ids([CHUNK_EOS])
+    # Three reserved rows still in flight. A partially executed prefill
+    # must not commit the rest of the audio or its unconsumed sample.
+    old.num_in_flight_tokens = 0 if parked else 3
+    policy.observe_progress(old)
+    policy.before_finish(sched.requests, [old.request_id], aborted=True)
+    new = _new_request(_stage0_id("partial", 1))
+    first = _first_input(new, mode)
+    policy.prepare_admission(new, 4096)
+    plan = first["stage0_window"]
+    cut = policy.carry.pending[old.request_id]
+    assert cut["rows"] == (6 if parked else 4)
+    assert cut["tail"] == ([40, CHUNK_EOS, UNIT_END] if parked else [LISTEN, UNIT_END])
+    assert plan["close_on_next_input"] == parked
+    assert new.num_prompt_tokens == 9 + cut["rows"] + len(cut["tail"]) + int(parked)
+    assert len(new.prompt_token_ids) == new.num_prompt_tokens
+    assert plan["replay_cut"] == new.request_id
+    ops = policy.on_schedule(
+        {new.request_id: new}, SimpleNamespace(finished_req_ids={old.request_id}, scheduled_new_reqs=[])
+    )
+    assert [op.kind for op in ops] == ["keep", "restore"]
+    assert ops[1].source_request_id == old.request_id
+
+
+def test_window_survives_idle_until_session_release(monkeypatch):
+    sched = _scheduler()
+    old = _new_request(_stage0_id("lease", 0))
+    _first_input(old)
+    policy = sched._window_policy
+    policy.prepare_admission(old, 4096)
+    _start(sched, old)
+    policy.observe_progress(old)
+    _finish(sched, [old.request_id])
+    monkeypatch.setattr("time.monotonic", lambda: 1e15)
+    empty = SimpleNamespace(finished_req_ids=set(), scheduled_new_reqs=[])
+    assert policy.on_schedule({}, empty) == []
+    new = _new_request(_stage0_id("lease", 1))
+    first = _first_input(new)
+    policy.prepare_admission(new, 4096)
+    assert first["stage0_window"]["replay_cut"] == new.request_id
+    policy.release_session("lease")
+    assert policy.on_schedule({}, empty) == []
+    assert "lease" not in _kept(sched)
+
+
+def test_replay_preserves_native_raw_draws_at_the_settled_cut():
+    state = _MiniCPMO45Stage0SessionState("raw")
+    state.replay_samples[4] = ([51], [(71, LISTEN), (CHUNK_EOS, None), (85, 85)])
+    assert state.accepted_sampling_history(4, [71, CHUNK_EOS]) == [51, LISTEN]
+    assert state.accepted_sampling_history(4, [71, 99]) is None
+    assert state.accepted_sampling_history(4, []) == [51]
+
+
+def test_cut_before_first_decode_closes_seeded_active_turn():
+    sched = _scheduler()
+    request = _new_request(_stage0_id("seeded", 0))
+    first = _first_input(request)
+    first["runtime_config"]["initial_user_text"] = "tell a story"
+    request.num_in_flight_tokens = 4
+    policy = sched._window_policy
+    policy.prepare_admission(request, 4096)
+    policy.observe_progress(request)
+    cut = request._minicpmo45_settled
+    assert cut["accepted"] == []
+    assert cut["tail"] == [TURN_EOS, LISTEN, UNIT_END]
+
+
+def test_already_listening_at_cancel_does_not_force_next_speech_to_listen():
+    sched = _scheduler()
+    old = _new_request(_stage0_id("listening", 0))
+    _first_input(old)
+    old._all_token_ids[-1] = LISTEN
+    policy = sched._window_policy
+    policy.prepare_admission(old, 4096)
+    _start(sched, old)
+    policy.observe_progress(old)
+    _finish(sched, [old.request_id])
+    new = _new_request(_stage0_id("listening", 1))
+    duplex = _first_input(new)
+    policy.prepare_admission(new, 4096)
+    assert not duplex["stage0_window"]["close_on_next_input"]
+    assert "force_listen" not in duplex["payload"]
+
+
+@pytest.mark.parametrize(
+    ("samples", "close_next"),
+    [([LISTEN], False), ([40, CHUNK_EOS], True), ([TURN_EOS, LISTEN], False)],
+)
+def test_explicit_response_cancellation_respects_native_turn_decision(samples, close_next):
+    sched = _scheduler()
+    policy = sched._window_policy
+    old = _new_request(_stage0_id("explicit", 0))
+    first = _first_input(old)
+    first["payload"] = {"open_assistant_turn": True, "is_speech": False}
+    old._all_token_ids[-1] = samples[0]
+    old.append_output_token_ids(samples[1:])
+    old.num_computed_tokens = old.num_tokens
+    policy.prepare_admission(old, 4096)
+    _start(sched, old)
+    # A repeated observation of the same unit must not reopen an ended turn.
+    policy.observe_progress(old)
+    policy.observe_progress(old)
+    _finish(sched, [old.request_id])
+    new = _new_request(_stage0_id("explicit", 1))
+    first = _first_input(new)
+    policy.prepare_admission(new, 4096)
+    assert first["stage0_window"]["close_on_next_input"] is close_next
+    assert bool(first["payload"].get("force_listen")) is close_next
+
+
+def test_empty_explicit_opening_preserves_next_units_native_listen_at_cancel():
+    sched = _scheduler()
+    policy = sched._window_policy
+    old = _new_request(_stage0_id("cross-unit", 0))
+    first = _first_input(old)
+    first["payload"] = {"open_assistant_turn": True, "is_speech": False}
+    old._all_token_ids[-1] = CHUNK_EOS
+    policy.prepare_admission(old, 4096)
+    _start(sched, old)
+    policy.observe_progress(old)
+
+    update = _second_append("basic")
+    second = update.model_intermediate_buffer["duplex"]
+    second["runtime_config"] = first["runtime_config"]
+    second["payload"] = {"is_speech": False}
+    sched._update_request_as_session(old, update)
+    old.append_output_token_ids([LISTEN])
+    old.num_computed_tokens = old.num_tokens
+    policy.observe_progress(old)
+    _finish(sched, [old.request_id])
+    new = _new_request(_stage0_id("cross-unit", 1))
+    first = _first_input(new)
+    policy.prepare_admission(new, 4096)
+    assert not first["stage0_window"]["close_on_next_input"]
+    assert "force_listen" not in first["payload"]
+
+
+def test_delayed_finish_does_not_publish_an_expired_offer(monkeypatch):
+    sched = _scheduler()
+    _carry(sched)
+    old = _new_request(_stage0_id("delayed", 0))
+    old._minicpmo45_window_units = CARRIED
+    new = _new_request(_stage0_id("delayed", 1))
+    sched.requests.update({old.request_id: old, new.request_id: new})
+    monkeypatch.setattr(time, "monotonic", lambda: 100.0)
+    sched._window_policy.before_finish(sched.requests, [old.request_id], aborted=True)
+    monkeypatch.setattr(time, "monotonic", lambda: 101.0 + CARRIED_WINDOW_OFFER_TTL_S)
+    ops = sched._window_policy.on_schedule(
+        sched.requests,
+        SimpleNamespace(finished_req_ids={old.request_id}, scheduled_new_reqs=[SimpleNamespace(req_id=new.request_id)]),
+    )
+    assert all(op.kind not in {"keep", "hand"} for op in ops)
+    assert "delayed" not in _kept(sched)
+    assert getattr(new, "_minicpmo45_carried_window", None) is None
+
+
+def test_capacity_elides_unretained_copies_but_preserves_same_step_handoff(monkeypatch):
+    monkeypatch.setattr("vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv.CARRIED_WINDOW_MAX_SESSIONS", 1)
+    sched = _scheduler()
+    _carry(sched)
+    old = [_new_request(_stage0_id(sid, 0)) for sid in ("a", "b", "c")]
+    new = _new_request(_stage0_id("a", 1))
+    for req in old:
+        req._minicpmo45_window_units = CARRIED
+        sched.requests[req.request_id] = req
+    sched.requests[new.request_id] = new
+    ids = {r.request_id for r in old}
+    sched._window_policy.before_finish(sched.requests, ids, aborted=True)
+    ops = sched._window_policy.on_schedule(
+        sched.requests,
+        SimpleNamespace(finished_req_ids=ids, scheduled_new_reqs=[SimpleNamespace(req_id=new.request_id)]),
+    )
+    assert [op.kind for op in ops if op.session_id == "a"] == ["keep", "hand"]
+    assert [op.session_id for op in ops if op.kind == "keep"] == ["a", "c"]
+    assert list(_kept(sched)) == ["c"]
+
+
+def test_filler_reuses_one_embedding_and_preserves_unit_lengths():
+    helper = _worker()
+    helper._embed_token = MagicMock(wraps=helper._embed_token)
+    units = helper._filler_units([3, 4000], 3)
+    helper._embed_token.assert_called_once_with(LISTEN)
+    assert [len(u.token_ids) for u in units] == [3, 4000, 1]
+    for u in units:
+        assert all(token == LISTEN for token in u.token_ids)
+        assert torch.cat(u.embeds).shape == (len(u.token_ids), 4)
+
+
+def test_early_successor_settles_only_the_same_sessions_older_epoch(monkeypatch):
+    sched = _scheduler()
+    monkeypatch.setattr(
+        _upstream(OmniARScheduler, "add_request"),
+        "add_request",
+        lambda self, req: self.requests.__setitem__(req.request_id, req),
+    )
+    policy = sched._window_policy
+    old = _new_request(_stage0_id("early", 0))
+    _first_input(old)
+    policy.prepare_admission(old, 4096)
+    _start(sched, old)
+    policy.observe_progress(old)
+    other = _new_request(_stage0_id("other", 0))
+    _start(sched, other)
+
+    def finish(request_ids, status):
+        assert request_ids == [old.request_id] and status == RequestStatus.FINISHED_ABORTED
+        policy.before_finish(sched.requests, request_ids, aborted=True)
+        sched.requests.pop(old.request_id)
+
+    sched.finish_requests = finish
+    new = _new_request(_stage0_id("early", 1))
+    duplex = _first_input(new)
+    sched.add_request(new)
+    assert duplex["stage0_window"]["replay_cut"] == new.request_id
+    assert set(sched.requests) == {new.request_id, other.request_id}
+
+
+def test_new_input_padding_follows_physical_header_and_carried_rows():
+    helper = _worker()
+    helper.stage_padding_token_id = lambda: 9
+    header = _MiniCPMO45CarriedWindow.pack([_unit_of([9, 1]), _unit_of([2])])
+    kept = _MiniCPMO45CarriedWindow.pack([_unit_of([3, 4])])
+    kept.header = header
+    helper._replay_windows = {"new": kept}
+    state = _state(pending_window_unit=_unit_of([7, 8]))
+    plan = {
+        "replace": True,
+        "mode": "basic",
+        "replay_cut": "new",
+        "carried_units": 1,
+        "carried_unit_lengths": [2],
+        "replacement_prompt_len": 8,
+    }
+    pieces, ids = helper._window_replacement_parts(state, plan)
+    assert ids == [9, 1, 2, 3, 4, 9, 7, 8]
+    assert torch.cat(pieces)[:, 0].tolist() == ids
+
+
+@pytest.mark.parametrize("surplus", [0, 1])
+def test_preempted_mixed_span_keeps_generated_rows_after_the_prompt(surplus):
+    helper = _worker()
+    helper.stage_padding_token_id = lambda: 99
+    state = _state(
+        context_token_ids=[10, 11],
+        context_embeds=_unit_of([10, 11]).embeds,
+        window_units=[_unit_of([12, 13])],
+        pending_window_unit=_unit_of([14, 15]),
+    )
+    state.replay_inputs = {2: ([], 0, [], torch.zeros(0, 4))}
+    helper.take_staged_prefill = lambda *args: {
+        "success": True,
+        "inputs_embeds": torch.cat(_unit_of([14, 15]).embeds),
+        "input_token_ids": [14, 15],
+    }
+    model = SimpleNamespace(
+        model_stage="llm",
+        _duplex_data_plane_helper=lambda: helper,
+        _minicpmo45_duplex_session_state=lambda *args: state,
+        _minicpmo45_duplex_prefill_kwargs=lambda *args: {"epoch": 1, "seq": 3},
+        _commit_minicpmo45_duplex_pending_samples=lambda **kwargs: None,
+        get_input_embeddings=lambda ids: ids.float().reshape(-1, 1).expand(-1, 4),
+    )
+    length = 6 + surplus
+    ids, embeds, _ = MiniCPMO45OmniForConditionalGeneration.preprocess(
+        model,
+        torch.tensor([0] * length + [16, 17]),
+        _omni_prompt_len=length,
+        _omni_num_computed_tokens=0,
+        duplex={
+            "session_id": "mixed",
+            "data_plane": True,
+            "payload": {},
+            "runtime_config": {"duplex_window_config": {"sliding_window_mode": "basic"}},
+        },
+    )
+    expected = [10, 11, 12, 13] + [99] * surplus + [14, 15, 16, 17]
+    assert ids.tolist() == expected
+    assert embeds[:, 0].tolist() == expected
