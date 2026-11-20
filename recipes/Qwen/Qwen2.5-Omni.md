@@ -51,7 +51,7 @@ bundled deploy**, with CI e2e coverage on 2x L4.
 | --- | --- | --- |
 | Bundled default (`qwen2_5_omni.yaml`) | 2 GPUs (Thinker+Code2Wav on 0, Talker on 1) | Configuration from in-tree deploy (YAML header: 2x H100). Weekly e2e uses 2x L4 |
 | `Qwen/Qwen2.5-Omni-3B` same YAML | 2 GPUs | Configuration-only in this recipe |
-| Single-GPU colocation | 1 GPU via `--stage-overrides` | Configuration-only; memory headroom is model- and context-dependent |
+| Single-GPU colocation (7B) | 1 CUDA GPU via `--stage-overrides` | Configuration only. A 24 GiB card is too small for this profile |
 
 ## References
 
@@ -130,12 +130,31 @@ curl http://localhost:8091/v1/chat/completions \
   }'
 ```
 
-Single-GPU colocation is configuration-only. Point every stage at device 0
-only when the card has enough memory:
+The single-GPU 7B CUDA profile below is configuration-only, with unmeasured
+peak VRAM. The 7B Thinker weights alone need about 16.78 GiB. At a 45%
+allocation, that requires about 37.3 GiB of total GPU memory before
+activations and the KV cache. The one-card CI profile uses the 3B model on
+a 24 GiB Intel Arc Pro B60.
 
 ```bash
 vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 \
-  --stage-overrides '{"0": {"devices": "0"}, "1": {"devices": "0"}, "2": {"devices": "0"}}'
+  --stage-overrides '{
+    "0": {
+      "devices": "0", "gpu_memory_utilization": 0.45,
+      "max_model_len": 16384, "max_num_batched_tokens": 16384,
+      "skip_mm_profiling": true
+    },
+    "1": {
+      "devices": "0", "gpu_memory_utilization": 0.25,
+      "max_model_len": 16384, "max_num_batched_tokens": 16384,
+      "skip_mm_profiling": true, "enforce_eager": true
+    },
+    "2": {
+      "devices": "0", "gpu_memory_utilization": 0.15,
+      "max_model_len": 16384, "max_num_batched_tokens": 16384
+    }
+  }' \
+  --default-sampling-params '{"0": {"max_tokens": 128}}'
 ```
 
 Offline:
@@ -184,8 +203,6 @@ and `tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py` (2x L4 weekly).
 - Prefix caching is off. Thinker `mm_processor_cache_gb` is 0.
 - Stage 2 disables FlashInfer autotune so a dummy autotune run does not OOM
   the shared GPU 0.
-- Known limitation: this recipe does not claim a 1x 16 GB consumer-GPU
-  serving profile.
 
 ## Supported features
 
@@ -195,6 +212,6 @@ and `tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py` (2x L4 weekly).
 | Async chunk | Off in the bundled deploy | [Async chunk](../../docs/design/feature/async_chunk.md) |
 | Prefix caching | Off | [Prefix caching](../../docs/design/feature/prefix_caching.md) |
 | Thinker CUDA graph | Off (eager) | Deploy YAML comments in `qwen2_5_omni.yaml` |
-| Talker CUDA graph | On (CUDA); eager on ROCm / XPU | same |
+| Talker CUDA graph | On in the bundled CUDA layout. The single-GPU profile, ROCm, and XPU use eager execution | same |
 | Tensor-parallel Thinker | Example `strategy_tp2.yaml` needs ≥3 GPUs | [Composable parallel](../../docs/configuration/composable_parallel.md) |
 | AutoRound thinker | Supported through AutoRound checkpoints | [Quantization overview](../../docs/user_guide/quantization/overview.md) |
