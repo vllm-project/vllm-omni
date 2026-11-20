@@ -194,7 +194,14 @@
           "duplex_client_ttft_ms",
           "duplex_busy_rtf",
           "duplex_stall_ratio"
-        ]
+        ],
+        "baseline": {
+          "H100": {
+            "mean_duplex_busy_rtf": [
+              0.1749
+            ]
+          }
+        }
       }
     ],
     "judge_server_params": {

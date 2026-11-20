@@ -86,14 +86,23 @@ measures a warmed service. Use the recorded case order when comparing revisions.
 TTFT, TTFP, TPOT, E2E, audio duration and request throughput are retained.
 Daily performance references use TTFT/RTF/TTFP; Seed-TTS references use RTF/TTFP.
 Throughput is an aggregate metric, not a per-request percentile.
-`result_validation.metrics` enforces metric validity and complete measurement
-populations independently of numerical calibration. These cases have no
-numerical performance baseline yet. Calibrated references belong in the
-existing hardware-nested `benchmark_params[].baseline` field. The shared
-`--assert-baseline` gate applies its standard 10% regression tolerance;
-`--require-baseline` additionally rejects missing hardware calibration.
-Record the reference hardware, source revision, dataset/count and repeated
-measurements when adding numerical baselines.
+`result_validation.metrics` checks that each metric has a valid value and
+the expected number of samples. The H100 references in
+`benchmark_params[].baseline` use the arithmetic mean for each scenario in
+[build 20463](https://buildkite.com/vllm/vllm-omni/builds/20463), running
+[commit `9d86d17f12`](https://github.com/vllm-project/vllm-omni/commit/9d86d17f1223f77c713b04dd398c24257b6c53e5).
+Default Seed-TTS uses three runs, and each async-prefix scenario uses two.
+Both CUDA nightly jobs pass `--assert-baseline` and fail if a calibrated
+H100 metric exceeds its reference by more than 10%. B200 has no calibrated
+reference and continues to collect measurements.
+
+The H100 full-duplex reference is the arithmetic mean of each day's
+response-level `mean_duplex_busy_rtf` on November 17, 18 and 20, 2026, after
+the [Talker CUDA graph fix](https://github.com/vllm-project/vllm-omni/pull/10499).
+The three runs give 0.1262 for OmniInteract and 0.1749 for DuplexEval.
+See [build 20013](https://buildkite.com/vllm/vllm-omni/builds/20013),
+[build 20145](https://buildkite.com/vllm/vllm-omni/builds/20145) and
+[build 20463](https://buildkite.com/vllm/vllm-omni/builds/20463).
 
 The shared runner persists one `result_test_*.json` for each dataset case,
 including quality, performance, software/data revisions, qualification scope
@@ -114,7 +123,8 @@ unchanged.
 
 ## Small smoke runs before full experiments
 
-Copy selected JSON entries into a separate smoke configuration. Set a small
+Copy selected JSON entries into a separate smoke configuration, omitting the
+performance `baseline` field. Set a small
 `num_prompts`, reduce `num_warmups`, and set
 `result_validation.smoke` to true. Accuracy-enabled smoke runs still require
 all selected requests to have valid audio and complete finite scores, but do

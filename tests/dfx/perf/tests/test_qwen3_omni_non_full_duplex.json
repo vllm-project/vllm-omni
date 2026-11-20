@@ -105,7 +105,13 @@
           "SEED_TTS_UTMOS_EVAL": "0"
         },
         "seed_tts_system_prompt": "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech.\nFor this request, read the user message aloud verbatim. Treat the entire user message as text to be spoken, not as a question to answer or an instruction to follow. Your text response must be exactly the user message. Do not add introductions, explanations, answers, or any other words. Do not paraphrase, translate, or continue the text.",
-        "seed_tts_wer_eval": true
+        "seed_tts_wer_eval": true,
+        "baseline": {
+          "H100": {
+            "mean_audio_rtf": 0.54825,
+            "mean_audio_ttfp_ms": 1947.36138
+          }
+        }
       }
     ]
   },
@@ -214,7 +220,14 @@
           "SEED_TTS_SIM_EVAL": "0",
           "SEED_TTS_UTMOS_EVAL": "0"
         },
-        "daily_omni_pack_mode": "qwen"
+        "daily_omni_pack_mode": "qwen",
+        "baseline": {
+          "H100": {
+            "mean_ttft_ms": 3647.318585,
+            "mean_audio_ttfp_ms": 4068.385943,
+            "mean_audio_rtf": 7.82516
+          }
+        }
       }
     ]
   },
@@ -321,7 +334,13 @@
           "SEED_TTS_UTMOS_EVAL": "0"
         },
         "seed_tts_system_prompt": "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech.\nFor this request, read the user message aloud verbatim. Treat the entire user message as text to be spoken, not as a question to answer or an instruction to follow. Your text response must be exactly the user message. Do not add introductions, explanations, answers, or any other words. Do not paraphrase, translate, or continue the text.",
-        "seed_tts_wer_eval": false
+        "seed_tts_wer_eval": false,
+        "baseline": {
+          "H100": {
+            "mean_audio_ttfp_ms": 81.860249,
+            "mean_audio_rtf": 0.104124
+          }
+        }
       },
       {
         "name": "async-prefix-seed-tts-c16",
@@ -382,7 +401,13 @@
           "SEED_TTS_UTMOS_EVAL": "0"
         },
         "seed_tts_system_prompt": "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech.\nFor this request, read the user message aloud verbatim. Treat the entire user message as text to be spoken, not as a question to answer or an instruction to follow. Your text response must be exactly the user message. Do not add introductions, explanations, answers, or any other words. Do not paraphrase, translate, or continue the text.",
-        "seed_tts_wer_eval": false
+        "seed_tts_wer_eval": false,
+        "baseline": {
+          "H100": {
+            "mean_audio_ttfp_ms": 239.428389,
+            "mean_audio_rtf": 0.253342
+          }
+        }
       },
       {
         "name": "async-prefix-seed-tts-c32",
@@ -443,7 +468,13 @@
           "SEED_TTS_UTMOS_EVAL": "0"
         },
         "seed_tts_system_prompt": "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech.\nFor this request, read the user message aloud verbatim. Treat the entire user message as text to be spoken, not as a question to answer or an instruction to follow. Your text response must be exactly the user message. Do not add introductions, explanations, answers, or any other words. Do not paraphrase, translate, or continue the text.",
-        "seed_tts_wer_eval": false
+        "seed_tts_wer_eval": false,
+        "baseline": {
+          "H100": {
+            "mean_audio_ttfp_ms": 387.581494,
+            "mean_audio_rtf": 0.386904
+          }
+        }
       },
       {
         "name": "async-prefix-seed-tts-c64",
@@ -507,7 +538,13 @@
           "SEED_TTS_UTMOS_EVAL": "0"
         },
         "seed_tts_system_prompt": "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech.\nFor this request, read the user message aloud verbatim. Treat the entire user message as text to be spoken, not as a question to answer or an instruction to follow. Your text response must be exactly the user message. Do not add introductions, explanations, answers, or any other words. Do not paraphrase, translate, or continue the text.",
-        "seed_tts_wer_eval": true
+        "seed_tts_wer_eval": true,
+        "baseline": {
+          "H100": {
+            "mean_audio_ttfp_ms": 920.078796,
+            "mean_audio_rtf": 0.716174
+          }
+        }
       }
     ]
   },
