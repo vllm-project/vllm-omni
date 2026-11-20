@@ -172,14 +172,14 @@ def test_qwen3_tts_runtime_changes_keep_qwen3_tts_perf_nightly(changed_file: str
         "vllm_omni/deploy/minicpmo_4_5.yaml",
     ),
 )
-def test_minicpmo_runtime_changes_keep_minicpmo_perf_nightly(changed_file: str) -> None:
+def test_minicpmo_runtime_changes_keep_minicpmo_nightly_jobs(changed_file: str) -> None:
     filtered = FILTER.filter_amd_nightly_suite(
         _load_pipeline(AMD_NIGHTLY_PIPELINE),
         [changed_file],
         pipeline_path=AMD_NIGHTLY_PIPELINE,
     )
 
-    assert "MiniCPM-o 4.5 Perf" in _labels(filtered)
+    assert "MiniCPM-o 4.5 Duplex Function" in _labels(filtered)
 
 
 def test_missing_base_and_shared_filter_changes_keep_full_amd_nightly_suite() -> None:
