@@ -1818,7 +1818,12 @@ def test_gen_layers_broadcast_batch1_und_kv_to_gen_batch(config_kind, batch_size
     else:
         model_cls, config = Cosmos3VFMTransformer, _tiny_cosmos3_config(num_hidden_layers=2)
         latents, video_shape = torch.randn(batch_size, 2, 1, 2, 2), (1, 2, 2)
-    model = model_cls(SimpleNamespace(tf_model_config=config, dtype=torch.float32)).eval()
+    from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
+
+    od_config = OmniDiffusionConfig(
+        model=None, tf_model_config=TransformerConfig.from_dict(config), dtype=torch.float32
+    )
+    model = model_cls(od_config).eval()
     with torch.no_grad():
         for param in model.parameters():
             param.normal_(0, 0.5)
