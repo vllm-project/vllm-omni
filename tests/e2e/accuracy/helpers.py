@@ -1807,6 +1807,41 @@ def assert_images_pixel_close(
     return dict(metrics)
 
 
+def assert_video_pixel_close(
+    *,
+    model_name: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    mean_threshold: float,
+    p99_threshold: float,
+    frame_psnr_threshold: float,
+) -> None:
+    """Assert frame-first ``[frames, ...]`` videos in ``[0, 1]`` match within pixel tolerances.
+
+    ``mean_abs_diff`` and ``p99_abs_diff`` bound global and tail drift like
+    ``assert_images_pixel_close``; ``worst_frame_psnr`` (dB) keeps one bad
+    frame from hiding in the clip-wide averages.
+    """
+    assert actual.shape == expected.shape, f"{model_name} video shapes differ: {actual.shape} vs {expected.shape}"
+    diff = (actual.float() - expected.float()).abs()
+    mean_abs_diff = diff.mean().item()
+    p99_abs_diff = float(np.quantile(diff.numpy(), 0.99))
+    frame_mse = diff.pow(2).flatten(1).mean(dim=1)
+    worst_frame_psnr = (-10 * torch.log10(frame_mse.max().clamp_min(1e-12))).item()
+    print(
+        f"{model_name} video metrics: mean_abs_diff={mean_abs_diff:.6e} (<={mean_threshold:.6e}), "
+        f"p99_abs_diff={p99_abs_diff:.6e} (<={p99_threshold:.6e}), "
+        f"worst_frame_psnr={worst_frame_psnr:.2f} dB (>={frame_psnr_threshold:.2f}), "
+        f"max_abs_diff={diff.max().item():.6e}"
+    )
+    assert (
+        mean_abs_diff <= mean_threshold and p99_abs_diff <= p99_threshold and worst_frame_psnr >= frame_psnr_threshold
+    ), (
+        f"Video diff exceeded threshold for {model_name}: mean_abs_diff={mean_abs_diff:.6e}, "
+        f"p99_abs_diff={p99_abs_diff:.6e}, worst_frame_psnr={worst_frame_psnr:.2f} dB"
+    )
+
+
 def compute_image_ssim_psnr(
     *,
     prediction: Image.Image,

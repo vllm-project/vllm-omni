@@ -33,15 +33,15 @@ class StepAudio2Adapter(ARTTSAdapter):
     ) -> PreparedRequest:
         """Build a chat prompt ending at ``<tts_start>``.
 
-        The assistant turn deliberately omits ``<|im_end|>`` so the thinker
+        The assistant turn deliberately omits ``<|EOT|>`` so the thinker
         continues by generating audio tokens.
         """
-        system_prompt = request.instructions or "You are a voice assistant. Read the text aloud."
+        system_prompt = request.instructions or "以自然的语速读出下面的文字。"
         prompt = {
             "prompt": (
-                f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-                f"<|im_start|>user\n{request.input}<|im_end|>\n"
-                "<|im_start|>assistant\n<tts_start>"
+                f"<|BOT|>system\n{system_prompt}<|EOT|>"
+                f"<|BOT|>human\n{request.input}<|EOT|>"
+                "<|BOT|>assistant\n<tts_start>"
             )
         }
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="step_audio2")
