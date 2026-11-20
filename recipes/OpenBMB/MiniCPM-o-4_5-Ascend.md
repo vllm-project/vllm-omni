@@ -167,6 +167,24 @@ bash recipes/OpenBMB/serve_minicpmo_ascend.sh
 An explicit `MAX_NUM_SEQS` overrides every stage in the selected deployment.
 Keep it unset to retain that deployment's per-stage limits.
 
+To opt in to additional exact-shape graphs for single-row Code2Wav continuation
+chunks, add this override to the NPU connector in your deployment YAML.
+
+```yaml
+platforms:
+  npu:
+    connectors:
+      connector_of_shared_memory:
+        extra:
+          code2wav_encoder_graph_singleton_history_frames: [100, 400, 2]
+```
+
+The range is inclusive and uses encoder history frames. This setting reduced
+isolated Code2Wav time on one NPU. The two-card Seed-TTS run did not exercise
+the extra graphs, so both two-card presets leave it unset. Each enabled worker
+used about 230 MiB more device memory and spent about 19 seconds longer in
+encoder graph capture during startup.
+
 The initial graph compilation can take several minutes. The service is ready
 when `/health` succeeds. Fast graph variants qualify on their first eligible
 request in each worker: prefill compares hidden state and KV; fused decoding
