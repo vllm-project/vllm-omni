@@ -105,7 +105,7 @@ The new deploy schema lives under `vllm_omni/deploy/` and is paired with a froze
 | `connectors` | dict | optional | `null` | Named connector specs (`{name, extra}`). Referenced by each stage's `input_connectors` / `output_connectors`. See [Connector schema](#connector-schema). |
 | `edges` | list | optional | `null` | Explicit edge list for the KV transfer graph. Auto-derived from stage inputs if omitted. |
 | `stages` | list | optional | `[]` | Per-stage runtime overrides matched by `stage_id`. Pipeline stages are still created from `PipelineConfig` when this list is empty. |
-| `platforms` | dict | optional | `null` | Keyed by `npu` / `rocm` / `xpu`, each contains a `stages:` list with per-platform overrides applied on top of the CUDA defaults. |
+| `platforms` | dict | optional | `null` | Keyed by platform (`cuda`, `npu`, `rocm`, `xpu`, etc.). Per-platform `stages:` and named `connectors:` overrides are applied on top of the shared defaults. |
 | `pipeline` | str | optional | `null` | Override the auto-detected pipeline registry key (used for structural variants like `qwen2_5_omni_thinker_only` / `qwen3_omni_moe_thinker_only`). |
 | `trust_remote_code` | bool \| null | optional | `null` | **Pipeline-wide.** Trust HF remote code on model load; applies to every stage when specified. |
 | `distributed_executor_backend` | str \| null | optional | `null` | **Pipeline-wide.** Distributed executor backend forwarded to vLLM (`"mp"`, `"ray"`, `"external_launcher"`). If omitted, vLLM auto-selects backend from runtime topology. |
@@ -128,7 +128,7 @@ The following fields belong under `duplex_session` and apply when
 | `max_sessions` | int | `1` | Global session limit, including sessions being opened or closed. |
 | `replica_policy` | `legacy` \| `least_sessions` | `legacy` | `legacy` preserves existing request routing and worker capacities. `least_sessions` reserves a replica group once when a session opens. |
 | `max_sessions_per_replica` | int \| null | `null` | Required and at least `1` for `least_sessions`. Bounds reserved sessions and model-owned session resources on each replica of every stage. |
-| `replica_groups` | list of stage-to-replica maps \| null | `null` | Explicit groups such as `[{0: 0, 1: 0}, {0: 1, 1: 0}]`. Stage and replica IDs must be nonnegative integers. |
+| `replica_groups` | list of stage-to-replica maps \| null | `null` | Omitted or `null` allows every combination of one replica per stage (a Cartesian product / SQL `CROSS JOIN`), selected lazily without expanding the product. Explicit maps restrict the allowed paths. Stage and replica IDs must be nonnegative integers. |
 
 For example, a two-stage local pipeline with two replicas per stage can use:
 
@@ -147,9 +147,13 @@ stages:
     devices: "2,3"
 ```
 
-This example assumes one GPU per replica. With equal replica counts and no
-explicit groups, group `g` maps every stage to replica `g`. Unequal counts
-require explicit groups. Every group must cover every pipeline stage, all
+This example assumes one GPU per replica. Omitting `replica_groups` joins all
+replicas across stages, yielding `{0: 0, 1: 0}`, `{0: 0, 1: 1}`, `{0: 1, 1: 0}`,
+and `{0: 1, 1: 1}`. This also works with unequal counts: `[1, 3, 1]` yields the
+three paths `{0: 0, 1: i, 2: 0}` for `i = 0, 1, 2`. Group IDs follow the
+combination order, with the last stage's replica index changing fastest.
+Specify groups explicitly to pair matching replica indexes or restrict paths.
+Every explicit group must cover every pipeline stage, all
 replica IDs must exist, every replica must belong to at least one group, and
 duplicate groups are rejected. A replica shared by multiple groups has one
 shared capacity counter; the global limit can therefore exceed the capacity
@@ -162,9 +166,23 @@ hold their slots, and closing sessions release them after cleanup completes.
 When no group has capacity, opening a session fails with the retryable
 `resource_exhausted` error containing `replica_capacity_exhausted`.
 
-`least_sessions` supports local single-host deployments only; coordinator or
-distributed routing is rejected at startup. A per-replica cap above `1` also
-requires the model plugin to support concurrent sessions on one replica; use
+`least_sessions` supports replicas attached through distributed runtimes,
+including multiple runtimes serving the same stage across hosts. Declare the
+cluster-wide total with `stages[].num_replicas` and each runtime's local count
+with `--omni-dp-size-local`. On the head, the local count is also the minimum
+total, preserving the CLI override when the configured count defaults to `1`.
+Any stage runtime can be the head by omitting `--headless`; the others connect
+to its master address and port. Use a connector that supports the deployed
+cross-host transport. Automatic groups join the cluster-wide replica slots;
+they do not depend on how those replicas are split across runtimes or hosts.
+Groups refer to registration-assigned replica IDs, not host identities.
+The group topology is fixed at startup; attaching more replicas does not add
+duplex groups or migrate existing sessions. See the
+[multi-runtime design](../design/fullduplex.md#multiple-runtimes-and-hosts)
+for a split-stage topology, ownership boundaries and validation scope.
+
+A per-replica cap above `1` also requires the model plugin to support concurrent
+sessions on one replica; use
 `1` for plugins without that capability, including VoiceChat. A failed replica
 closes all sessions assigned to it, including idle sessions. Those sessions
 are not migrated, and other groups continue serving. Under `least_sessions`,
@@ -179,10 +197,15 @@ require `replica_policy: least_sessions` and a plugin whose capabilities declare
 `supports_session_resume: false`, such as PersonaPlex. Resume-capable models and
 the `legacy` policy remain unsupported with multiple duplex frontends.
 
-Group `g` (its zero-based position in `replica_groups`, or its implicit replica
-index) belongs to frontend `g % K`. `K` cannot exceed the number of groups.
+Group `g` (its zero-based position in the explicit or generated group list)
+belongs to frontend `g % K`. `K` cannot exceed the number of groups.
 Explicit groups sharing any stage replica must have the same frontend owner;
-cross-owner sharing is rejected. Each frontend places sessions only in its
+cross-owner sharing is rejected for both explicit and generated groups.
+Automatic joins commonly share replicas across frontend owners; use explicit
+groups with disjoint ownership for those multi-frontend deployments. For
+example, two stages with two replicas and two frontends can use
+`replica_groups: [{0: 0, 1: 0}, {0: 1, 1: 1}]`.
+Each frontend places sessions only in its
 owned groups, while workers still use `max_sessions_per_replica` as their cap.
 
 The global `max_sessions` budget is split evenly: frontend `i` receives
@@ -287,19 +310,59 @@ exclusively.
 
 ### Stage-level runner selection
 
-`model_runner: v1` or `v2` at the deploy level sets the default runner.
-A `model_runner` on an individual stage overrides that default, allowing
-one stage to migrate or roll back independently. This does not change
-`PipelineConfig` topology, input adapters, or the connector payload contract.
-An omitted stage override preserves the deploy-level selection.
+With vLLM 0.34, `model_runner: v2` is the default and the only supported
+model runner. An individual stage can select `v2` explicitly. Configuration
+resolution still applies platform overrides before stage selection; any
+resolved `v1` stage raises an error. There is no V1 fallback. Runner selection
+does not change `PipelineConfig` topology or the connector payload contract.
+
+The default Qwen3-TTS and Qwen3-Omni profiles select V2 on CUDA, ROCm, NPU and
+XPU. MiniCPM-o 4.5 selects V2 through its CUDA, ROCm and NPU platform overlays,
+while Moss-TTS-local selects V2 on CUDA. The CUDA-tuned `*_mrv2.yaml` overlays
+are not NPU profiles. A V2 worker implementation alone does not qualify every
+model or deployment on a platform.
+
+Profiles that still resolve to V1 are unavailable with this version. These
+include Qwen3-TTS's and Qwen3-Omni's MUSA overrides, Fish-Omni's DAC stage,
+PersonaPlex's Talker, VibeVoice, YuE2, and the LFM3-Omni profiles. Selecting
+`v2` manually does not establish support for those paths.
+YuE2's audio synthesis still depends on V1 model sampling hooks; its two
+offline audio export tests are not applicable to the V2 runtime.
+The complete PersonaPlex workflow is also unavailable: its Talker still
+requires V1, although its Code2Wav stage has V2 components.
+The Qwen3-TTS and Qwen3-Omni XPU profiles select V2; final-release XPU
+hardware validation remains pending. Retained V1 profiles identify unavailable
+workflows and preserve explicit configuration errors. They do not provide a V1
+fallback.
+Drama 3 / Fish-Omni serving and both LFM3-Omni speech and text-only profiles
+are unavailable. Their retired serving E2E tests covered speech generation,
+voice cloning, streaming, concurrency and request validation across those
+workflows. Retained Fish AR and LFM3-Omni component tests are not complete V2
+serving replacements; LFM3-Audio uses a different checkpoint and profile.
+Drama jobs are removed from CUDA Weekly and AMD CI. The Merge matrix also
+excludes VibeVoice. These exclusions do not count as passing V2 model tests.
+
+Retiring V1 dispatch also reduces the following Weekly CI coverage:
+
+| Retired selection | Retained V2 CI selection | Remaining coverage limit |
+| --- | --- | --- |
+| Audex offline TTS, S2T and TTA on CUDA L4 and AMD MI325 | H100 selects Audex offline S2S and online TTA/TTS. | No effective V2 CI owner is established for the three offline files. Their L4/MI325 markers exclude them from the H100 aggregate. |
+| CUDA L4 Higgs V2/V3, IndexTTS2, and Ming/GLM online serving | AMD MI325 selects the corresponding offline/online files. H100 selects only the dedicated Higgs V3 full-response case. | These selections do not replace the retired L4 scenarios. |
+| CUDA L4 CosyVoice3 offline inference | AMD MI325 selects the same offline expansion file. H100 selects CosyVoice3 online expansion. | Online coverage and another hardware backend do not replace L4 offline coverage. |
+
+The existing Ming and GLM **offline L4** cases already use the default V2
+runner and remain selected. These are CI source selections, not new passing
+results or qualification of every model/platform combination. Retained test
+source or another backend's CI lane does not establish support for a retired
+workflow.
 
 MRv2 native downstream receivers accept turn-based requests. A pipeline that
-sets `supports_duplex_mrv2` also accepts duplex sessions on those stages.
-Qwen3-Omni and MiniCPM-o 4.5 set that flag. Resumable streaming input uses the
-V1 prompt-replacement path unless the pipeline implements the MRv2 equivalent.
-Selecting a runner does not add session capabilities the pipeline lacks.
-Platform fallbacks and stage overrides are validated after configuration
-resolution.
+sets `supports_duplex_mrv2` also accepts duplex sessions on those stages;
+Qwen3-Omni and MiniCPM-o 4.5 set that flag. Resumable streaming input without
+a model-owned V2 implementation is unsupported. Pipeline parallelism and
+prefill context parallelism greater than one remain unsupported by the Omni
+V2 runner. These are source-defined limits, not a claim that model or hardware
+validation has passed.
 
 ### Stage fields
 
@@ -415,6 +478,14 @@ stages:
     input_connectors:  {from_stage_0: shm}
 ```
 
+`platforms.<platform>.connectors` deep-merges named connector definitions,
+including `extra`, through each `base_config` inheritance level and then onto
+the shared connectors. A partial platform override retains the other inherited
+platform values. This applies both to deploy
+resolution and to the connector spec passed to workers. Unspecified keys retain
+their shared values; other platforms retain the shared connector. To override a
+platform-specific value in a user overlay, use the same platform block.
+
 ### CLI flags
 
 | Flag | Description |
@@ -422,6 +493,9 @@ stages:
 | `--deploy-config PATH` | Load a deploy YAML. **Optional** — when omitted, the bundled `vllm_omni/deploy/<model_type>.yaml` is auto-loaded by the model registry. |
 | `--stage-overrides JSON` | Per-stage JSON overrides, e.g. `'{"0":{"gpu_memory_utilization":0.5}}'`. Per-stage values always win over global flags. |
 | `--async-chunk` / `--no-async-chunk` | Flip the deploy YAML's `async_chunk:` bool. Unset (default) leaves the YAML value in force. |
+
+`--stage-overrides` logs a warning and ignores deploy-only fields such
+as `session_mode` and `connectors`. Set those fields in the deploy YAML.
 
 ### Stage-Based CLI Paradigm
 
@@ -606,27 +680,31 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/depl
 
 ## Qwen3-TTS with Model Runner V2
 
-Qwen3-TTS runs the native CUDA Model Runner V2 pipeline by default on vLLM
-0.29.0. MRV2 is an experimental feature for this model: the bundled default
-profile selects it on CUDA only, and its scheduler and delivery paths are
-still being qualified. Set `model_runner: v1` in a copy of the deploy config
-to opt out; the `platforms:` sections of `qwen3_tts.yaml` keep V1 on NPU, XPU,
-ROCm and MUSA. Select one of these deployment profiles:
+Qwen3-TTS selects Model Runner V2 by default on CUDA, ROCm, NPU and XPU. With
+vLLM 0.34.0, V2 is the only supported model runner; the MUSA override that
+selects V1 is rejected. MRV2 remains experimental for this model.
+ROCm keeps Code2Wav eager because its decoder convolutions are not safe inside
+the outer graph capture.
+On NPU, the V2 Talker uses `FULL_AND_PIECEWISE`; Code2Wav retains
+`PIECEWISE`. These settings do not establish hardware qualification.
+Select one of these deployment profiles:
 
 | Profile | Runner | Code2Wav graph batches | Intended use |
 | --- | --- | --- | --- |
-| `qwen3_tts.yaml` | V2 (default) | Existing defaults | Shipped default; experimental |
-| `qwen3_tts_mrv2.yaml` | V2 | B1 | Explicit MRV2 profile (same runner selection as the default) |
+| `qwen3_tts.yaml` | V2 on CUDA/ROCm/NPU/XPU; MUSA V1 override unsupported | B1 | Shipped default; experimental |
 | `qwen3_tts_high_concurrency_mrv2.yaml` | V2 | B1, B2 | Opt-in throughput tuning |
 | `qwen3_tts_high_concurrency_mrv2_b4.yaml` | V2 | B1, B2, B3, B4 | Experimental throughput / buffered playback |
 | `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` | V2 | B1–B8 | Experimental two-stage deployment on one GPU, with MPS |
-| `qwen3_tts_high_concurrency.yaml` | V1 | Existing defaults | V1 high-concurrency control |
+| `qwen3_tts_high_concurrency.yaml` | V2 (default) | Existing defaults | Original high-concurrency tuning |
 | `qwen3_tts_fused_single_gpu.yaml` | V2 | N/A (in-Talker decoder) | Opt-in single-stage CUDA pipeline on one GPU |
 
+The former `qwen3_tts_mrv2.yaml` profile has been removed. Use
+`qwen3_tts.yaml` instead; it selects V2 on CUDA, ROCm, NPU and XPU.
+
 ```bash
-# MRV2 is the default; pass a copy with `model_runner: v1` to force V1.
+# Use the bundled V2 profile.
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni \
-  --deploy-config /path/to/qwen3_tts_v1.yaml
+  --deploy-config vllm_omni/deploy/qwen3_tts.yaml
 ```
 
 The V2 profiles bound Talker prefill to 512 tokens per step and select the
@@ -634,8 +712,9 @@ Talker AR runner and the Code2Wav generation
 runner together. Native inter-stage delivery carries codec payloads directly;
 request-owned snapshots preserve buffers through asynchronous completion and
 CUDA graph reuse. Terminal completion waits for upstream stage metrics before
-releasing request state. Platform sections retain V1 on NPU, XPU, ROCm and MUSA;
-this change does not qualify MRV2 on those backends or enable other model families.
+releasing request state. The platform section that retains V1 on MUSA is
+unsupported. XPU selects V2, but final-release XPU hardware qualification
+remains pending.
 Selecting V2 for a stage without `supports_native_mrv2_data_plane` emits a warning
 when pipeline and deployment settings are merged. That stage retains the legacy
 transport path; the warning does not establish support for that combination.
@@ -714,8 +793,8 @@ the shared worker does not select Qwen's context length or codebook layout.
 
 ### Qwen3-TTS first-frame delivery and rollback
 
-The standard `qwen3_tts.yaml`, `qwen3_tts_high_concurrency.yaml`,
-`qwen3_tts_mrv2.yaml` and `qwen3_tts_high_concurrency_mrv2.yaml` profiles
+The standard `qwen3_tts.yaml`, `qwen3_tts_high_concurrency.yaml`
+and `qwen3_tts_high_concurrency_mrv2.yaml` profiles
 enable the `talker_first_audio` connector option, as does the experimental
 two-stage `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` profile.
 This changes the default CUDA MRV2 streaming path:

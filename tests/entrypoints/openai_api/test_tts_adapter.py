@@ -53,6 +53,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import (
     MossTTSNanoAdapter,
     _code_grid_cache_salt,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.omnivoice import OmniVoiceAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import (
     QWEN3_TTS_AUTO_BUDGET_KEY,
     QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY,
@@ -67,6 +68,7 @@ from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
     INDEXTTS25_TOKENIZER_FILE,
 )
 from vllm_omni.model_executor.models.ming_flash_omni.reference_audio import unpack_reference_audio
+from vllm_omni.model_executor.models.moss_tts import processor_loading as moss_processor_loading
 from vllm_omni.model_executor.stage_input_processors.auk import encoder2dit
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -651,9 +653,9 @@ def test_moss_salt_shares_reference_across_texts(mocker):
     assert salt(voice + 1, input="Hello.") != hello
 
 
-def _moss_adapter_with_stage_configs(stage_configs, mocker):
+def _moss_adapter_with_stage_configs(stage_configs, mocker, model="OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"):
     engine_client = SimpleNamespace(
-        model_config=SimpleNamespace(model="OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"),
+        model_config=SimpleNamespace(model=model),
         stage_configs=stage_configs,
     )
     server = mocker.Mock(api_server_shared_dir=None)  # one API process
@@ -753,17 +755,49 @@ def test_moss_get_processor_places_audio_tokenizer_on_codec_stage_device(mocker)
     audio_tokenizer = mocker.Mock()
     audio_tokenizer.to.return_value = audio_tokenizer
     processor = SimpleNamespace(audio_tokenizer=audio_tokenizer)
-    native_loader = mocker.patch("vllm_omni.entrypoints.openai.tts_adapters.moss_tts.get_class_from_dynamic_module")
-    from_pretrained = native_loader.return_value.from_pretrained
-    from_pretrained.return_value = processor
+    load_processor = mocker.patch(
+        "vllm_omni.entrypoints.openai.tts_adapters.moss_tts.load_moss_processor", return_value=processor
+    )
 
     assert adapter._get_moss_processor() is processor
     audio_tokenizer.to.assert_called_once_with(torch.device("cuda", 3))
     audio_tokenizer.eval.assert_called_once_with()
     # Lazy cache: no re-load / re-placement on the second call.
     assert adapter._get_moss_processor() is processor
-    from_pretrained.assert_called_once()
+    load_processor.assert_called_once()
     audio_tokenizer.to.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("model", "class_reference"),
+    [
+        ("OpenMOSS-Team/MOSS-TTS", "processing_moss_tts.MossTTSDelayProcessor"),
+        ("OpenMOSS-Team/MOSS-TTS-v1.5", "processing_moss_tts.MossTTSDelayProcessor"),
+        ("OpenMOSS-Team/MOSS-TTSD-v1.0", "processing_moss_tts.MossTTSDelayProcessor"),
+        ("OpenMOSS-Team/MOSS-SoundEffect", "processing_moss_tts.MossTTSDelayProcessor"),
+        ("OpenMOSS-Team/MOSS-VoiceGenerator", "processing_moss_tts.MossTTSDelayProcessor"),
+        ("OpenMOSS-Team/MOSS-TTS-Local-Transformer", "processing_moss_tts.MossTTSDelayProcessor"),
+        ("OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5", "processing_moss_tts.MossTTSLocalProcessor"),
+    ],
+)
+def test_moss_get_processor_loads_checkpoint_class_not_auto_processor(mocker, tmp_path, model, class_reference):
+    # AutoProcessor passes these checkpoints a ``revision`` kwarg that they reject (#9717).
+    adapter = _moss_adapter_with_stage_configs([], mocker, model=model)
+    config_file = tmp_path / "processor_config.json"
+    config_file.write_text(json.dumps({"auto_map": {"AutoProcessor": class_reference}}), encoding="utf-8")
+    config_lookup = mocker.patch.object(moss_processor_loading, "cached_file", return_value=str(config_file))
+    auto_processor = mocker.patch("transformers.AutoProcessor.from_pretrained")
+    class_lookup = mocker.patch.object(moss_processor_loading, "get_class_from_dynamic_module")
+    checkpoint_from_pretrained = class_lookup.return_value.from_pretrained
+    processor = object()
+    checkpoint_from_pretrained.return_value = processor
+
+    assert adapter._get_moss_processor() is processor
+    config_lookup.assert_called_once_with(model, "processor_config.json", _raise_exceptions_for_missing_entries=False)
+    class_lookup.assert_called_once_with(class_reference, model)
+    # Any other kwarg would reach ProcessorMixin.__init__ through the checkpoint's from_pretrained.
+    checkpoint_from_pretrained.assert_called_once_with(model, trust_remote_code=True)
+    auto_processor.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -936,14 +970,19 @@ def test_ming3_tts_does_not_reinterpret_ip_voice_as_ming2_preset():
     assert prepared.model_type == "ming3_audio_tts"
 
 
-def test_step_audio2_build_constructs_open_assistant_turn():
+@pytest.mark.parametrize(
+    "instructions,expected_system",
+    [(None, "以自然的语速读出下面的文字。"), ("Read warmly.", "Read warmly.")],
+)
+def test_step_audio2_build_constructs_open_assistant_turn(instructions, expected_system):
     adapter = StepAudio2Adapter(SimpleNamespace(server=SimpleNamespace(), engine_client=SimpleNamespace()))
-    request = OpenAICreateSpeechRequest(input="hello", instructions="Read warmly.")
+    request = OpenAICreateSpeechRequest(input="hello", instructions=instructions)
 
     prepared = asyncio.run(adapter.build(request, [], False))
 
-    assert "<|im_start|>system\nRead warmly.<|im_end|>" in prepared.prompt["prompt"]
-    assert prepared.prompt["prompt"].endswith("<|im_start|>assistant\n<tts_start>")
+    assert prepared.prompt["prompt"] == (
+        f"<|BOT|>system\n{expected_system}<|EOT|><|BOT|>human\nhello<|EOT|><|BOT|>assistant\n<tts_start>"
+    )
     assert prepared.tts_params == {}
     assert prepared.model_type == "step_audio2"
 
@@ -1530,10 +1569,56 @@ def test_diffusion_adapter_extra_body_params_fallback():
     class _DiffAdapter(DiffusionTTSAdapter):
         name = "diff_probe"
 
-        async def build(self, request, sampling_params_list):  # pragma: no cover
+        async def build(self, request, sampling_params_list, has_inline_ref_audio):  # pragma: no cover
             raise NotImplementedError
 
     assert _DiffAdapter.extra_body_params() == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_omnivoice_diffusion_adapter_request_preparation():
+    server = SimpleNamespace(
+        _apply_uploaded_speaker=lambda request: None,
+        _get_normalized_voice=lambda voice: voice,
+        _validate_ref_audio_format=lambda ref_audio: None,
+        _resolve_ref_audio=None,
+        uploaded_speakers={"alice": {}},
+        _voice_created_at=lambda voice: 123,
+    )
+    adapter = OmniVoiceAdapter(SpeechServingContext(server=server, diffusion_engine=object()))
+    request = OpenAICreateSpeechRequest(
+        input="Hello",
+        voice="alice",
+        language="English",
+        instructions="男, american accent",
+    )
+
+    adapter.normalize(request)
+    assert adapter.validate(request) is None
+    prepared = await adapter.build(request, [], False)
+
+    assert prepared.model_type == "omnivoice"
+    assert prepared.prompt == {
+        "input": "Hello",
+        "voice_name": "alice",
+        "voice_created_at": 123,
+        "lang": "English",
+        "instruct": "male, american accent",
+    }
+
+
+def test_omnivoice_diffusion_adapter_ref_audio_validation():
+    server = SimpleNamespace(
+        _apply_uploaded_speaker=lambda request: None,
+        _get_normalized_voice=lambda voice: voice,
+        _validate_ref_audio_format=lambda ref_audio: "unsupported reference audio",
+    )
+    adapter = OmniVoiceAdapter(SpeechServingContext(server=server, diffusion_engine=object()))
+    request = OpenAICreateSpeechRequest(input="Hello", ref_audio="unsupported")
+
+    adapter.normalize(request)
+
+    assert adapter.validate(request) == "unsupported reference audio"
 
 
 def _higgs_v2_adapter() -> HiggsAudioV2Adapter:

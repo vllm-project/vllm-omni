@@ -839,6 +839,8 @@ vllm serve openbmb/VoxCPM2 --omni --host 0.0.0.0 --port 8000
 
 Deploy config auto-loads from `vllm_omni/deploy/voxcpm2.yaml`. Pass `--deploy-config <path>` to override or `--stage-N-<field> <value>` for per-stage runtime tweaks.
 
+On CUDA, the default uses Model Runner V2 with incremental VAE decoding (`vae_decode_every: 1`, `audio_emit_every: 3`). Other platforms retain their existing runner and audio settings.
+
 ### Sending requests
 
 ```bash

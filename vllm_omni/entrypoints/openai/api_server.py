@@ -20,7 +20,7 @@ import socket
 import time
 from argparse import Namespace
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, suppress
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from http import HTTPStatus
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -80,6 +80,7 @@ from vllm.entrypoints.speech_to_text.transcription.serving import (
 from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
 )
+from vllm.exceptions import VLLMClientError
 from vllm.logger import configure_logging_from_args, init_logger
 from vllm.renderers.chat_utils import ChatTemplateConfig, load_chat_template
 from vllm.renderers.online_derenderer import OnlineDerenderer
@@ -407,11 +408,17 @@ async def omni_run_server_worker(
     log_config = get_uvicorn_log_config(args)
     if log_config is not None:
         uvicorn_kwargs["log_config"] = log_config
+    if getattr(args, "disable_websocket_compression", False):
+        uvicorn_kwargs["ws_per_message_deflate"] = False
 
-    async with build_async_omni(
-        args,
-        client_config=client_config,
-    ) as engine_client:
+    async with (
+        build_async_omni(
+            args,
+            client_config=client_config,
+        ) as engine_client,
+        AsyncExitStack() as server_lifecycle,
+    ):
+        server_lifecycle.callback(sock.close)
         supported_tasks: tuple[str, ...]
         if hasattr(engine_client, "get_supported_tasks"):
             supported_tasks = tuple(await engine_client.get_supported_tasks())
@@ -472,6 +479,18 @@ async def omni_run_server_worker(
 
         await omni_init_app_state(engine_client, app.state, args)
 
+        # Complete the configured video request before serve_http can expose
+        # /health or admit user traffic. Failure unwinds the engine context.
+        video_warmup_request = getattr(args, "video_output_warmup", None)
+        if video_warmup_request is not None:
+            video_output_handler = getattr(app.state, "openai_streaming_video_output", None)
+            if video_output_handler is None:
+                raise ValueError("--video-output-warmup requires a streaming video output handler")
+            await video_output_handler.warmup(
+                video_warmup_request,
+                timeout=getattr(args, "video_output_warmup_timeout", 180.0),
+            )
+
         # The inherited routes assume a tokenization handler. Pure diffusion
         # has none; omit those capabilities instead of dereferencing None.
         if getattr(app.state, "serving_tokenization", None) is None:
@@ -489,7 +508,8 @@ async def omni_run_server_worker(
         shutdown_unsupported_routes(app, run_endpoint_restrictions())
 
         # Start background processes
-        await STORAGE_MANAGER.start()
+        await STORAGE_MANAGER.start(on_expire=VIDEO_STORE.remove_many)
+        server_lifecycle.push_async_callback(STORAGE_MANAGER.stop)
 
         # Conditionally register profiler endpoints based on stage YAML configs
         stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
@@ -520,7 +540,7 @@ async def omni_run_server_worker(
         is_pure_diffusion = vllm_config is None
         if is_pure_diffusion:
             logger.info(
-                "Starting vLLM API server (pure diffusion mode) on %s",
+                "Starting vLLM API server without a frontend LLM configuration on %s",
                 listen_address,
             )
             # The vLLM 0.27 launcher's shutdown path reads
@@ -613,7 +633,6 @@ async def omni_run_server_worker(
             serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
             if serving_speech is not None:
                 serving_speech.shutdown()
-            sock.close()
 
 
 @asynccontextmanager
@@ -756,9 +775,14 @@ async def build_async_omni_from_stage_config(
             kwargs.setdefault("log_stats", True)
         if client_config is not None:
             kwargs["client_config"] = client_config
+        backend_as_process = kwargs.pop("duplex_engine_backend_as_process", False)
         if _should_serve_duplex(model, kwargs):
+            if backend_as_process:
+                kwargs["duplex_engine_backend_as_process"] = True
             async_omni = DuplexOmni(model=model, **kwargs)
         else:
+            if backend_as_process:
+                raise ValueError("--duplex-engine-backend-as-process requires a session_mode: duplex deployment")
             async_omni = AsyncOmni(model=model, **kwargs)
 
         # # Don't keep the dummy data in memory
@@ -767,7 +791,10 @@ async def build_async_omni_from_stage_config(
         yield async_omni
     finally:
         if async_omni:
-            async_omni.shutdown()
+            if isinstance(async_omni, DuplexOmni) and backend_as_process:
+                await async_omni.aclose()
+            else:
+                async_omni.shutdown()
 
 
 async def _init_duplex_app_state(
@@ -781,11 +808,14 @@ async def _init_duplex_app_state(
     """Minimal app state for a duplex server: only the surfaces a duplex session backs."""
     state.vllm_config = vllm_config
     state.diffusion_engine = None
-    state.openai_serving_models = OpenAIServingModels(
-        engine_client=engine_client,  # type: ignore[arg-type]
-        base_model_paths=base_model_paths,
-        lora_modules=None,
-    )
+    if engine_client.session_only:
+        state.openai_serving_models = openai_models_serving.SessionServingModels(base_model_paths)
+    else:
+        state.openai_serving_models = OpenAIServingModels(
+            engine_client=engine_client,  # type: ignore[arg-type]
+            base_model_paths=base_model_paths,
+            lora_modules=None,
+        )
     state.serving_tokenization = None
     state.serving_tokens = None
     # Replaced by the chat init below when the model serves chat.
@@ -846,7 +876,7 @@ async def _init_duplex_chat(
     answering badly. ``endpoint_restrictions`` remains the per-deployment
     opt-out on top of this.
     """
-    if not engine_client.duplex_capabilities.supports_chat_completions:
+    if engine_client.session_only or not engine_client.duplex_capabilities.supports_chat_completions:
         return None
     supported_tasks: set[str] = {"generate"}
     if hasattr(engine_client, "get_supported_tasks"):
@@ -863,6 +893,10 @@ async def _init_duplex_chat(
 
 async def _resolve_chat_template(engine_client: EngineClient, args: Namespace) -> str | None:
     resolved_chat_template = load_chat_template(args.chat_template)
+    if resolved_chat_template is None:
+        # Reuse the selected topology, including deploy-config overrides.
+        pipeline = getattr(getattr(engine_client, "engine", None), "pipeline_config", None)
+        resolved_chat_template = getattr(pipeline, "chat_template", None)
     if resolved_chat_template is None:
         try:
             tokenizer = await engine_client.get_tokenizer()
@@ -1626,7 +1660,7 @@ async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request)
         return JSONResponse(content=result.model_dump(exclude_none=True))
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
-    except ValueError as e:
+    except (ValueError, VLLMClientError) as e:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e

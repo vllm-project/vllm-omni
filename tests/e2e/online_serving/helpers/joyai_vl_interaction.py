@@ -13,9 +13,11 @@ from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config.stage_config import resolve_deploy_yaml
 
 
-def joyai_server_params(*, asr=False):
+def joyai_server_params(*, asr=False, session_limits=None):
     profile = "joyai_vl_interaction" + ("_asr" if asr else "") + "_duplex.yaml"
     config = resolve_deploy_yaml(get_deploy_config_path(profile))
+    if session_limits:
+        config.setdefault("duplex_session", {}).update(session_limits)
     # The fixture patches load_format on explicit stages; resolve inheritance
     # first so the test exercises the production overlay, including its limits.
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as handle:
