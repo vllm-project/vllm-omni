@@ -658,16 +658,18 @@ The `"context"` mode instead retains `context_max_units` (24) recent units
 plus up to `context_previous_max_tokens` (500) tokens of earlier model text.
 The window configuration is fixed when the session is created.
 
-In `"basic"` and `"context"` mode the window is kept across a barge-in or a
-`response.cancel`: the next reply still sees the units completed before the
-cut, including model text whose audio the client had not played yet.
-Cancellation ends the interrupted response. A new response can still use
-the retained context and return to the earlier topic, even after a spoken
-stop request. The window waits up to 10 s for the next input, with at most 32 waiting windows
-retained per Stage-0 replica. Capacity eviction can discard it earlier, and
-the replacement request must reach the same Stage-0 replica; continuing to
-send audio alone does not guarantee retention. With `"off"`, the next reply
-starts again from the system turn and the reference audio.
+On a locally managed Stage-0 replica, a barge-in or `response.cancel` ends the
+old output. Its replacement re-prefills the accepted Thinker context before
+processing its first input, including the processed rows of an unfinished
+unit. This applies in all three window modes. The session keeps the snapshot
+on its Stage-0 replica until replacement or session cleanup. Model text can
+include speech the client has not played yet, and a new response can return to
+the interrupted topic. A replica failure still ends the session.
+
+An independently hosted Stage-0 replica uses the bounded handoff in `"basic"`
+and `"context"`: the same replica can offer completed units for 10 seconds
+from the abort, subject to a limit of 32 waiting windows. In `"off"` mode this
+deployment starts the replacement from the system turn and reference audio.
 
 Constructor options: `reconnect` (a `ReconnectPolicy`, default five
 attempts with 0.25–4 s jittered backoff; `None` disables auto-resume),

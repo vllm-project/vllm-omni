@@ -38,7 +38,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy, record_turn_sample
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMDummyInputsBuilder,
     MiniCPMO45OmniLLMMultiModalProcessor,
@@ -430,6 +430,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                         if turn_ended:
                             state.current_turn_ended = False
                             state.pending_speech_response_open = True
+                            state.explicit_response_awaiting_content = True
                             turn_ended = False
                     if turn_ended and not pending_speech_context:
                         force_listen = True
@@ -596,6 +597,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         update_result.pop("inputs_embeds", None)
         if result.get("success") is not True:
             embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
+            if error := result.get("request_error"):
+                return input_ids, embeds, {"request_error": error, "duplex": update_result}
             return input_ids, embeds, {"duplex": update_result}
 
         target_dtype = (
@@ -610,6 +613,39 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             prompt_len = int(prompt_len) if prompt_len is not None else int(full_req_embeds.shape[0])
         except (TypeError, ValueError):
             prompt_len = int(full_req_embeds.shape[0])
+        if (
+            token_offset_meta == 0
+            and seq is not None
+            and seq > 1
+            and state.replay_inputs
+            and full_req_embeds.shape[0] < prompt_len
+            and not result.get("stage0_window_replaced")
+        ):
+            # Preemption restarts a persistent request at row zero. A normal
+            # append only supplies its suffix because prior KV usually exists.
+            # Recover the complete physical prompt before processing any slice.
+            cfg = duplex["runtime_config"]["duplex_window_config"]
+            rebuild = {
+                "replace": True,
+                "mode": cfg["sliding_window_mode"],
+                "previous_token_ids": state.window_previous_ids,
+                "previous_marker_token_ids": state.window_previous_marker,
+            }
+            # Reserve surplus rows at the start of the pending unit. Rows of
+            # the already accepted prefix must remain in their original positions.
+            rebuild.update(recompute=True, replacement_prompt_len=prompt_len)
+            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _UnrecoverableWindowError
+
+            try:
+                parts = helper._window_replacement_parts(state, rebuild)
+            except _UnrecoverableWindowError as exc:
+                embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
+                return input_ids, embeds, {"request_error": str(exc)}
+            if parts is not None:
+                parts_embeds, rebuilt_ids = parts
+                restored = torch.cat(parts_embeds, dim=0).to(device=input_ids.device, dtype=target_dtype)
+                full_req_embeds = state.prepared_inputs_embeds = restored
+                full_input_token_ids = state.prepared_input_token_ids = rebuilt_ids
         pad_token_id = helper.stage_padding_token_id()
         if prompt_len > int(full_req_embeds.shape[0]):
             pad_len = prompt_len - int(full_req_embeds.shape[0])
@@ -639,6 +675,34 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 prompt_len,
             )
 
+        start = duplex.get("open_input_start")
+        if seq is not None and state.window_enabled and isinstance(start, int) and seq not in state.replay_inputs:
+            # Use the positions the runner actually consumes, including reserved
+            # padding. A single physical slice can end inside an audio tensor.
+            if seq == 1 and not duplex.get("stage0_window", {}).get("replay_cut"):
+                # Surplus slots sit *before* the model template. Retain exactly
+                # what reached these positions, including the real left padding.
+                prefix_len = duplex["runtime_config"]["duplex_window_prefix_tokens"]
+                state.context_prefix_embeds = [full_req_embeds[:prefix_len].clone()]
+                state.context_prefix_token_ids = full_input_token_ids[:prefix_len]
+                state.context_suffix_embeds = [full_req_embeds[prefix_len:start].clone()]
+                state.context_suffix_token_ids = full_input_token_ids[prefix_len:start]
+                state.context_embeds = [*state.context_prefix_embeds, *state.context_suffix_embeds]
+                state.context_token_ids = state.context_prefix_token_ids + state.context_suffix_token_ids
+            rows = max(0, prompt_len - start)
+            ids = full_input_token_ids[start:prompt_len]
+            tensor = full_req_embeds[start:prompt_len]
+            if rows == len(ids) == tensor.shape[0] and rows and state.pending_window_unit is not None:
+                if tensor.untyped_storage().nbytes() > 2 * tensor.numel() * tensor.element_size():
+                    tensor = tensor.clone()
+                state.pending_window_unit.embeds = [tensor]
+                state.pending_window_unit.token_ids = ids
+                state.replay_inputs[seq] = (list(state.window_units), start, ids, tensor)
+                state.replay_samples[seq] = (list(state.generated_tokens), [])
+                if len(state.replay_samples) > 2:
+                    del state.replay_samples[min(state.replay_samples)]
+                if len(state.replay_inputs) > 2:
+                    del state.replay_inputs[min(state.replay_inputs)]
         span_len = int(input_ids.shape[0])
         token_offset = kwargs.get("_omni_num_computed_tokens")
         if token_offset is None:
@@ -647,28 +711,21 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             token_offset = max(0, int(token_offset))
         except (TypeError, ValueError):
             token_offset = 0
-        req_embeds = full_req_embeds[token_offset : token_offset + span_len]
-        if req_embeds.shape[0] < span_len:
-            pad_ids = torch.full(
-                (span_len - req_embeds.shape[0],),
-                pad_token_id,
-                dtype=input_ids.dtype,
-                device=input_ids.device,
-            )
-            pad_embeds = self.get_input_embeddings(pad_ids).to(dtype=req_embeds.dtype)
-            req_embeds = torch.cat([req_embeds, pad_embeds], dim=0)
-        elif req_embeds.shape[0] > span_len:
-            req_embeds = req_embeds[:span_len]
-
-        input_token_ids = full_input_token_ids[token_offset : token_offset + span_len]
-        if len(input_token_ids) < span_len:
-            input_token_ids.extend([pad_token_id] * (span_len - len(input_token_ids)))
-        if input_token_ids:
-            # Pinned + non-blocking: a pageable copy would wait for all queued GPU work.
-            req_input_ids = index_to_device(input_token_ids, input_ids.device, input_ids.dtype)
-            update_result["duplex_prompt_token_ids"] = full_input_token_ids
-        else:
-            req_input_ids = torch.full_like(input_ids, helper._required_token_id("unit_token_id"))
+        prompt_rows = min(span_len, max(0, prompt_len - token_offset))
+        if prompt_rows == 0:
+            req_embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
+            return input_ids, req_embeds, {"duplex": update_result}
+        req_embeds = full_req_embeds[token_offset : token_offset + prompt_rows]
+        input_token_ids = full_input_token_ids[token_offset : token_offset + prompt_rows]
+        req_input_ids = index_to_device(input_token_ids, input_ids.device, input_ids.dtype)
+        update_result["duplex_prompt_token_ids"] = full_input_token_ids
+        if prompt_rows < span_len:
+            # A resumed request can schedule both the end of its prompt and
+            # already-generated tokens in a single prefill. Preserve the actual
+            # sampled IDs from the runner for that suffix.
+            suffix_ids = input_ids[prompt_rows:]
+            req_input_ids = torch.cat((req_input_ids, suffix_ids))
+            req_embeds = torch.cat((req_embeds, self.get_input_embeddings(suffix_ids).to(req_embeds.dtype)))
         return req_input_ids, req_embeds, {"duplex": update_result}
 
     preprocess_batch_requires_stable_decode = True
@@ -847,6 +904,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             session_config = dict(session_config) if isinstance(session_config, dict) else {}
             runtime_config = duplex.get("runtime_config")
             runtime_config = dict(runtime_config) if isinstance(runtime_config, dict) else {}
+            if duplex.get("session_window_owned") is False:
+                runtime_config.pop("duplex_boundary_token_ids", None)
             if hasattr(helper.thinker, "audio_past_key_values"):
                 helper.thinker.audio_past_key_values = None
             helper._configure_streaming_processor(state)
@@ -1206,6 +1265,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # Use model for logits computation
         return self.model.compute_logits(hidden_states)
 
+    def release_session_window(self, session_id: str) -> None:
+        helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
+        if helper is not None:
+            helper.release_session_window(session_id)
+
     def on_scheduler_output(self, scheduler_output: Any) -> None:
         """Follow the scheduler's barge-in carry decisions, before this step frees the finished requests' state."""
         ops = getattr(scheduler_output, "duplex_carry_ops", None)
@@ -1227,6 +1291,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             # A state freed later in this step belongs to the finished request, not the new one.
             return None if session_id in finishing else sessions.get(session_id)
 
+        if any(getattr(op, "cut", None) for op in ops):
+            self._commit_minicpmo45_duplex_pending_samples()
         apply_carry_ops(list(ops), state_of_request, live_state_of_session)
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
@@ -1708,11 +1774,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             and state is not None
             and not getattr(state, "current_turn_ended", True)
             and not force_listen
-            and not (
-                isinstance(payload, dict)
-                and payload.get("open_assistant_turn") is True
-                and getattr(state, "pending_speech_response_open", False)
-            )
+            and not getattr(state, "explicit_response_awaiting_content", False)
         ):
             return int(tts_bos_id)
         return int(sampled)
@@ -1735,6 +1797,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if not isinstance(generated_tokens, list):
             generated_tokens = []
             state.generated_tokens = generated_tokens
+        state.last_raw_draw = int(sampled)
         generated_tokens.append(int(sampled))
         history_size = MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE
         del generated_tokens[:-history_size]
@@ -1752,53 +1815,19 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if state is None:
             return
         payload = self._minicpmo45_duplex_payload_for_row(row_idx)
-        force_listen = isinstance(payload, dict) and payload.get("force_listen") is True
-        listen_id = token_ids.get("listen_token_id", -1)
-        tts_bos_id = token_ids.get("tts_bos_token_id", -1)
-        turn_eos_id = token_ids.get("turn_eos_token_id", -1)
-        if sampled in self._minicpmo45_chunk_terminator_token_ids(token_ids):
-            state.pending_terminator_token = int(sampled)
-            state.last_terminator_token = int(sampled)
-            opening_explicit_response = (
-                isinstance(payload, dict)
-                and payload.get("open_assistant_turn") is True
-                and getattr(state, "pending_speech_response_open", False)
-            )
-            if sampled == listen_id and (force_listen or opening_explicit_response):
-                state.current_turn_ended = True
-                with suppress(Exception):
-                    state.pending_speech_response_open = False
-            return
-        if sampled == turn_eos_id:
-            # Official streaming_generate feeds <|turn_eos|> like text (its
-            # hidden state conditions the Talker) and keeps sampling until a
-            # chunk terminator, so nothing is pending for the next append;
-            # only the turn-ended latch flips.
-            state.pending_terminator_token = None
-            state.last_terminator_token = int(sampled)
-            state.current_turn_ended = True
-            with suppress(Exception):
-                state.pending_speech_response_open = False
-            return
-        # A seeded prefix can open the response before tts_bos is sampled.
-        # Keep its pending input until the first content token in either case.
-        if (
-            sampled == tts_bos_id
-            and (getattr(state, "current_turn_ended", True) or getattr(state, "pending_speech_response_open", False))
-            and getattr(state, "pending_speech_context", False)
-        ):
-            with suppress(Exception):
-                state.pending_speech_response_open = True
-        elif getattr(state, "pending_speech_response_open", False):
-            with suppress(Exception):
-                state.pending_speech_context = False
-                state.pending_speech_response_open = False
-        elif getattr(state, "current_turn_ended", True):
-            with suppress(Exception):
-                state.pending_speech_context = False
-        state.pending_terminator_token = None
-        state.last_terminator_token = None
-        state.current_turn_ended = False
+        identity = getattr(state, "prepared_append_identity", None)
+        journal = getattr(state, "replay_samples", {}).get(identity[1]) if identity else None
+        if journal is not None:
+            journal[1].append((int(sampled), getattr(state, "last_raw_draw", None)))
+            state.last_raw_draw = None
+        terminator = sampled in self._minicpmo45_chunk_terminator_token_ids(token_ids)
+        record_turn_sample(
+            state, sampled, token_ids, payload if isinstance(payload, dict) else {}, terminator=terminator
+        )
+        state.pending_terminator_token = int(sampled) if terminator else None
+        state.last_terminator_token = (
+            int(sampled) if terminator or sampled == token_ids.get("turn_eos_token_id") else None
+        )
 
     @staticmethod
     def _minicpmo45_chunk_terminator_token_ids(token_ids: dict[str, int]) -> set[int]:

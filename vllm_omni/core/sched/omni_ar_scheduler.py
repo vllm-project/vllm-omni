@@ -308,6 +308,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if request.request_id in getattr(self, "_overflowed_streaming_requests", ()):
             logger.debug("[Omni] Dropping append for overflowed request %s pending ordered abort", request.request_id)
             return
+        if self._window_policy is not None and request.request_id not in self.requests:
+            if retired := self._window_policy.superseded_by(request, self.requests):
+                self.finish_requests(retired, RequestStatus.FINISHED_ABORTED)
+            self._window_policy.prepare_admission(request, self.max_model_len)
         super().add_request(request)
 
     def release_overflowed_requests(self, request_ids: Iterable[str]) -> None:
@@ -1210,7 +1214,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             scheduler_output,
             finished_requests_needing_kv_transfer=finished_reqs,
         )
-        omni_output.duplex_carry_ops = window_ops
+        if window_ops:
+            omni_output.duplex_carry_ops = window_ops
         return omni_output
 
     def update_from_output(
@@ -1345,6 +1350,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # ModelRunnerOutput.req_id_to_index was dropped upstream; derive the
         # row index from req_ids like the pin's scheduler does.
         req_indices = {req_id: i for i, req_id in enumerate(model_runner_output.req_ids)}
+        window_policy = getattr(self, "_window_policy", None)
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             if num_tokens_scheduled <= 0:
                 # A zero-token schedule entry used to die on the bare assert
@@ -1437,6 +1443,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             ):
                 new_token_ids, stopped = self._update_request_with_output(request, generated_token_ids)
                 if not stopped:
+                    if window_policy is not None:
+                        window_policy.observe_progress(request)
                     prefill_stats = request.take_prefill_stats()
                     if prefill_stats is not None:
                         prefill_stats.finalize(self.kv_cache_manager.estimate_cached_tokens(request))
@@ -1621,6 +1629,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             ):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
+
+            if window_policy is not None and not output_is_stale and not sampling_validation_failed:
+                window_policy.observe_progress(request)
 
             # If criteria returns True, it means we must STOP the request.
             # If criteria returns False, it might have triggered a background

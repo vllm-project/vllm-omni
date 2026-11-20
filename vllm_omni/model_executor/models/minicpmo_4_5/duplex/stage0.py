@@ -21,7 +21,7 @@ from vllm.logger import init_logger
 from vllm.multimodal.image import open_image
 
 from vllm_omni.core.sched.window_policy import WindowOperation
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy, MiniCPMO45TurnState
 
 if TYPE_CHECKING:
     import torch
@@ -56,6 +56,10 @@ def _frame_preprocess_pool() -> ThreadPoolExecutor | None:
     return _MINICPMO45_FRAME_POOL
 
 
+class _UnrecoverableWindowError(RuntimeError):
+    """The admitted request cannot reproduce its accepted history."""
+
+
 @dataclass
 class _MiniCPMO45WindowUnit:
     embeds: list[Any] = field(default_factory=list)
@@ -74,6 +78,9 @@ class _MiniCPMO45CarriedWindow:
     unit_sizes: list[int]
     token_ids: list[list[int]]
     device: torch.device | str | None
+    #: Accepted physical prefix and suffix on either side of a context summary.
+    header: _MiniCPMO45CarriedWindow | None = None
+    sampling_history: list[int] = field(default_factory=list)
     #: Units whose embeds could not be packed; kept as they are.
     units: list[_MiniCPMO45WindowUnit] | None = None
 
@@ -119,7 +126,7 @@ class _MiniCPMO45CarriedWindow:
 
 
 @dataclass
-class _MiniCPMO45Stage0SessionState:
+class _MiniCPMO45Stage0SessionState(MiniCPMO45TurnState):
     session_id: str
     #: Any: MiniCPM-o remote-code processor (transformers, no importable type).
     streaming_processor: Any | None = None
@@ -136,12 +143,17 @@ class _MiniCPMO45Stage0SessionState:
     context_suffix_token_ids: list[int] = field(default_factory=list)
     window_units: list[_MiniCPMO45WindowUnit] = field(default_factory=list)
     window_enabled: bool = False
+    window_previous_ids: list[int] = field(default_factory=list)
+    window_previous_marker: list[int] = field(default_factory=list)
     pending_window_unit: _MiniCPMO45WindowUnit | None = None
     pending_window_generated_tokens: list[int] = field(default_factory=list)
     #: Completed units of the session's previous Stage-0 request (a barge-in
     #: ended it), waiting for the scheduler's first window plan of this one.
     carried_window_units: list[_MiniCPMO45WindowUnit] = field(default_factory=list)
-    current_turn_ended: bool = True
+    # Only the latest two append versions can straddle an asynchronous cancel.
+    replay_inputs: dict[int, tuple[list[_MiniCPMO45WindowUnit], int, list[int], torch.Tensor]] = field(
+        default_factory=dict
+    )
     opened_assistant_turn_segment: tuple[str, int] | None = None
     prepared_append_identity: tuple[int | None, int] | None = None
     prepared_inputs_embeds: torch.Tensor | None = None
@@ -156,10 +168,21 @@ class _MiniCPMO45Stage0SessionState:
     staged_prefill: tuple[tuple[int | None, int], dict[str, object]] | None = None
     pending_terminator_token: int | None = None
     last_terminator_token: int | None = None
-    pending_speech_context: bool = False
     pending_speech_append_identity: tuple[int | None, int] | None = None
-    pending_speech_response_open: bool = False
     generated_tokens: list[int] = field(default_factory=list)
+    # Per-append raw draws and their returned IDs. A sampled listen can be
+    # converted to tts_bos, and forced controls do not enter the penalty history.
+    replay_samples: dict[int, tuple[list[int], list[tuple[int, int | None]]]] = field(default_factory=dict)
+    last_raw_draw: int | None = None
+
+    def accepted_sampling_history(self, seq: int, accepted) -> list[int] | None:
+        base, draws = self.replay_samples.get(seq, ([], []))
+        prefix = draws[: len(accepted)]
+        if [final for final, _ in prefix] != list(accepted):
+            return None
+        return [*base, *(raw for _, raw in prefix if raw is not None)][
+            -MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE :
+        ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +247,8 @@ class MiniCPMO45Stage0DuplexRuntime:
         # that request's state is created.
         self._carried_window_units: dict[str, _MiniCPMO45CarriedWindow] = {}
         # session_id -> (request it was handed to, units).
+        self._replay_sources: dict[str, str] = {}
+        self._replay_windows: dict[str, _MiniCPMO45CarriedWindow] = {}
         self._handed_window_units: dict[str, tuple[str, _MiniCPMO45CarriedWindow]] = {}
 
     def apply_carry_ops(
@@ -234,31 +259,49 @@ class MiniCPMO45Stage0DuplexRuntime:
     ) -> None:
         """Follow the scheduler's barge-in carry decisions for this step, in order.
 
-        A barge-in ends the epoch's Stage-0 request, and the next append opens a
-        new one whose context starts from the session template. The scheduler
-        keeps the aborted request's completed units, and its first window plan
-        for the new request (``carried_units``) puts them back ahead of that
-        request's own, so the model keeps the conversation it had. The unit open
-        at the cut is left out on both sides: its closing tokens never reached
-        the KV. Runs before the step frees the finished requests' state.
+        A managed session keeps its accepted input rows, native sampler history
+        and the completed part of its open unit before the runner frees the old
+        request. The scheduler binds that snapshot to its replacement by request
+        ID before sizing the replacement's first prefill. Session teardown
+        releases the stored snapshot, including any unused receiver reference.
 
-        * ``keep``: pack the finished request's units (and units it carried but
-          never placed) into pinned host memory for the session;
-        * ``drop``: forget the session's kept units;
-        * ``hand``: give them to the session's new request. Its state is
-          normally created later in this step and takes them in
-          :meth:`restore_window_units`; a state the session already has takes
-          them at once.
+        Independently managed replicas use the bounded completed-unit offer.
+        Its hand and drop operations follow the scheduler's expiry decisions.
         """
-        for op, session_id, request_id in ops:
+        for operation in ops:
+            op, session_id, request_id = operation[:3]
+            cut = operation[3] if len(operation) > 3 else ()
+            if op == "restore":
+                if (record := self._replay_windows.get(operation.source_request_id)) is not None:
+                    self._replay_windows[request_id] = record
+                continue
             if op == "keep":
                 state = state_of_request(request_id)
                 units: list[_MiniCPMO45WindowUnit] = []
                 if state is not None and state.window_enabled:
                     units = [*state.carried_window_units, *state.window_units]
-                elif state is None and self._handed_window_units.get(session_id, ("",))[0] == request_id:
+                    if cut:
+                        seq, start, rows, accepted, tail = cut
+                        record = state.replay_inputs.get(seq)
+                        if record is None:
+                            logger.error("No accepted MiniCPM-o prefill record for %s, seq=%s", request_id, seq)
+                            continue
+                        closed, offset, ids, tensor = record
+                        lo = start - offset
+                        if lo < 0 or lo + rows > len(ids):
+                            logger.error(
+                                "Invalid MiniCPM-o accepted span for %s: offset=%s rows=%s", request_id, lo, rows
+                            )
+                            continue
+                        last = _MiniCPMO45WindowUnit(
+                            [tensor[lo : lo + rows], *(self._embed_token(t) for t in tail)],
+                            [*ids[lo : lo + rows], *tail],
+                        )
+                        units = [*closed, last]
+                elif not cut and state is None and self._handed_window_units.get(session_id, ("",))[0] == request_id:
                     # Handed to this request but its state was never created: pass the same units on.
-                    units = self._handed_window_units.pop(session_id)[1].unpack()
+                    self._carried_window_units[session_id] = self._handed_window_units.pop(session_id)[1]
+                    continue
                 self._carried_window_units.pop(session_id, None)
                 if not units:
                     # The scheduler keeps only windows with units, so the two sides disagree from here on.
@@ -269,7 +312,28 @@ class MiniCPMO45Stage0DuplexRuntime:
                         session_id,
                     )
                     continue
-                self._carried_window_units[session_id] = _MiniCPMO45CarriedWindow.pack(units)
+                if cut:
+                    # An admitted successor may still be waiting for its first GPU
+                    # slice, so retain its reference when replacing the source.
+                    packed = _MiniCPMO45CarriedWindow.pack(units)
+                    history = state.accepted_sampling_history(seq, accepted)
+                    if history is None:
+                        logger.error("Missing accepted MiniCPM-o sampling history for %s seq=%s", request_id, seq)
+                        continue
+                    packed.sampling_history = history
+                    packed.header = _MiniCPMO45CarriedWindow.pack(
+                        [
+                            _MiniCPMO45WindowUnit(state.context_prefix_embeds, state.context_prefix_token_ids),
+                            _MiniCPMO45WindowUnit(state.context_suffix_embeds, state.context_suffix_token_ids),
+                        ]
+                    )
+                    prior_source = self._replay_sources.get(session_id)
+                    if prior_source != request_id and prior_source is not None:
+                        self._replay_windows.pop(prior_source, None)
+                    self._replay_sources[session_id] = request_id
+                    self._replay_windows[request_id] = packed
+                else:
+                    self._carried_window_units[session_id] = _MiniCPMO45CarriedWindow.pack(units)
             elif op == "drop":
                 self._carried_window_units.pop(session_id, None)
             elif op == "hand":
@@ -284,6 +348,16 @@ class MiniCPMO45Stage0DuplexRuntime:
                 else:
                     self._handed_window_units[session_id] = (request_id, kept)
 
+    def release_session_window(self, session_id: str) -> None:
+        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import duplex_stage0_session_id
+
+        self._carried_window_units.pop(session_id, None)
+        self._handed_window_units.pop(session_id, None)
+        self._replay_sources.pop(session_id, None)
+        for rid in list(self._replay_windows):
+            if duplex_stage0_session_id(rid) == session_id:
+                self._replay_windows.pop(rid, None)
+
     def restore_window_units(self, state: _MiniCPMO45Stage0SessionState) -> None:
         """Give a new request's state the units the scheduler handed to its session (:meth:`apply_carry_ops`)."""
         handed = self._handed_window_units.pop(state.session_id, None)
@@ -291,6 +365,8 @@ class MiniCPMO45Stage0DuplexRuntime:
 
     def forget_handed_window_units(self, session_id: str, request_id: str) -> None:
         """Drop units handed to a request that finished before its state took them."""
+        if getattr(self, "_replay_sources", {}).get(session_id) != request_id and hasattr(self, "_replay_windows"):
+            self._replay_windows.pop(request_id, None)
         if self._handed_window_units.get(session_id, ("",))[0] == request_id:
             self._handed_window_units.pop(session_id)
 
@@ -408,10 +484,9 @@ class MiniCPMO45Stage0DuplexRuntime:
         runtime_config: dict[str, object] | None = None,
     ) -> None:
         window_config = (runtime_config or {}).get("duplex_window_config")
-        state.window_enabled = isinstance(window_config, dict) and window_config.get("sliding_window_mode", "off") in {
-            "basic",
-            "context",
-        }
+        state.window_enabled = bool((runtime_config or {}).get("duplex_boundary_token_ids")) or (
+            isinstance(window_config, dict) and window_config.get("sliding_window_mode") in {"basic", "context"}
+        )
         if not self._stage_runtime_ready():
             return
         self._require_special_token_ids()
@@ -562,6 +637,13 @@ class MiniCPMO45Stage0DuplexRuntime:
             completed_ids = stage0_window.get("completed_token_ids")
             if isinstance(completed_ids, list):
                 state.pending_window_generated_tokens = [int(token_id) for token_id in completed_ids]
+                prior = state.prepared_append_identity
+                if prior is not None and prior[1] in state.replay_samples:
+                    accepted = list(completed_ids)
+                    if isinstance(stop := stage0_window.get("completed_terminator_token_id"), int):
+                        accepted.append(stop)
+                    if (history := state.accepted_sampling_history(prior[1], accepted)) is not None:
+                        state.generated_tokens = history
             completed_terminator = stage0_window.get("completed_terminator_token_id")
             if isinstance(completed_terminator, int):
                 # Async sampling can overwrite the worker's pending token
@@ -720,7 +802,12 @@ class MiniCPMO45Stage0DuplexRuntime:
 
         import torch
 
-        window_result = self._window_replacement_parts(state, stage0_window)
+        try:
+            window_result = self._window_replacement_parts(state, stage0_window)
+        except _UnrecoverableWindowError as exc:
+            result = self._stage_prefill_result(False, start_time, str(exc))
+            result["request_error"] = str(exc)
+            return result
         if window_result is not None:
             embed_parts, token_ids = window_result
         inputs_embeds = torch.cat([self._as_2d_tensor(embed) for embed in embed_parts], dim=0)
@@ -882,10 +969,10 @@ class MiniCPMO45Stage0DuplexRuntime:
         sizes = [max(1, int(n)) for n in lengths][:count]
         sizes += [1] * (count - len(sizes))
         token = self.listen_token_id if self.listen_token_id >= 0 else 0
-        return [
-            _MiniCPMO45WindowUnit(embeds=[self._embed_token(token) for _ in range(n)], token_ids=[token] * n)
-            for n in sizes
-        ]
+        if not sizes:
+            return []
+        embed = self._embed_token(token)
+        return [_MiniCPMO45WindowUnit(embeds=[embed] * n, token_ids=[token] * n) for n in sizes]
 
     def _end_carried_speech_with_listen(self, unit: _MiniCPMO45WindowUnit) -> None:
         """Close the last unit before a cut as one where the model stopped speaking.
@@ -917,6 +1004,23 @@ class MiniCPMO45Stage0DuplexRuntime:
             return None
         # The first window plan of a request is the only one that can place carried units.
         carried, state.carried_window_units = state.carried_window_units, []
+        target = stage0_window.get("replay_cut")
+        if isinstance(target, str):
+            record = self._replay_windows.pop(target, None)
+            if record is None:
+                raise _UnrecoverableWindowError(f"Missing admitted MiniCPM-o replay for {target}")
+            carried = record.unpack()
+            if record.header is not None:
+                prefix, suffix = record.header.unpack()
+                state.context_prefix_embeds, state.context_prefix_token_ids = prefix.embeds, prefix.token_ids
+                state.context_suffix_embeds, state.context_suffix_token_ids = suffix.embeds, suffix.token_ids
+                state.context_embeds = [*prefix.embeds, *suffix.embeds]
+                state.context_token_ids = [*prefix.token_ids, *suffix.token_ids]
+            state.generated_tokens = list(record.sampling_history)
+            state.explicit_response_awaiting_content = False
+            state.current_turn_ended = True
+            state.pending_speech_context = False
+            state.pending_speech_response_open = False
         if stage0_window.get("replace") is not True:
             return None
         try:
@@ -940,8 +1044,10 @@ class MiniCPMO45Stage0DuplexRuntime:
                 len(carried),
                 carried_units,
             )
+            if target:
+                raise _UnrecoverableWindowError(f"Inconsistent admitted MiniCPM-o replay for {target}")
             placed = self._filler_units(lengths if isinstance(lengths, list) else [], carried_units)
-        elif placed:
+        elif placed and not stage0_window.get("replay_cut"):
             self._end_carried_speech_with_listen(placed[-1])
         state.window_units[:0] = placed
         if drop_units > len(state.window_units):
@@ -960,6 +1066,8 @@ class MiniCPMO45Stage0DuplexRuntime:
             token_ids.extend(state.context_prefix_token_ids)
             previous = stage0_window.get("previous_token_ids")
             previous_ids = [int(token_id) for token_id in previous] if isinstance(previous, list) else []
+            state.window_previous_ids = previous_ids
+            state.window_previous_marker = list(stage0_window.get("previous_marker_token_ids") or ())
             if previous_ids:
                 # The plan carries the marker ids the scheduler sized the
                 # `previous` region from. Re-tokenizing here would be a second
@@ -978,13 +1086,36 @@ class MiniCPMO45Stage0DuplexRuntime:
             embeds.extend(unit.embeds)
             token_ids.extend(unit.token_ids)
         if state.pending_window_unit is not None:
+            if target or stage0_window.get("recompute"):
+                # The replacement's new audio may have a conservative slot
+                # budget. Put surplus rows before that audio, after the exact
+                # accepted prefix, so chunked prefill sees the same cut.
+                expected = int(stage0_window["replacement_prompt_len"])
+                data = state.pending_window_unit
+                budget = expected - len(token_ids) - int(bool(stage0_window.get("close_on_next_input")))
+                if budget < 0:
+                    raise _UnrecoverableWindowError("Accepted window exceeds the admitted replacement")
+                if len(data.token_ids) < budget:
+                    pad = self.stage_padding_token_id()
+                    surplus = budget - len(data.token_ids)
+                    data.embeds.insert(0, self._embed_token(pad).expand(surplus, -1))
+                    data.token_ids[:0] = [pad] * surplus
+                elif len(data.token_ids) > budget:
+                    raise _UnrecoverableWindowError(
+                        f"New input needs {len(data.token_ids)} rows, only {budget} reserved"
+                    )
+            if stage0_window.get("close_on_next_input"):
+                state.pending_window_unit.embeds.append(self._embed_token(self.turn_eos_token_id))
+                state.pending_window_unit.token_ids.append(self.turn_eos_token_id)
+                state.current_turn_ended = True
             embeds.extend(state.pending_window_unit.embeds)
             token_ids.extend(state.pending_window_unit.token_ids)
         expected = stage0_window.get("replacement_prompt_len")
         if isinstance(expected, int) and expected != len(token_ids):
             unit_lengths = [len(unit.token_ids) for unit in state.window_units]
             pending_len = len(state.pending_window_unit.token_ids) if state.pending_window_unit is not None else 0
-            raise RuntimeError(
+            error_type = _UnrecoverableWindowError if target or stage0_window.get("recompute") else RuntimeError
+            raise error_type(
                 "MiniCPM-o Stage-0 window rebuild length mismatch: "
                 f"worker={len(token_ids)}, scheduler={expected}, mode={mode}, "
                 f"prefix={len(state.context_prefix_token_ids)}, "

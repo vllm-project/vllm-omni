@@ -227,7 +227,7 @@ class OmniModelState(DefaultModelState):
         The runner copies the mask with its other outputs and only reads it
         after D2H completes. A failure terminates that request, not the batch.
         """
-        return None
+        return getattr(self, "_preprocess_error", None)
 
     def on_requests_finished(self, req_ids: set[str]) -> None:
         self._mtp_state.finish_audio(req_ids)
@@ -635,6 +635,7 @@ class OmniModelState(DefaultModelState):
         in-place. Decode rows consume cached frame embeddings; MTP itself runs
         after token sampling through post_sample.
         """
+        self._preprocess_error = None
         if not self.has_preprocess:
             return
 
@@ -858,6 +859,14 @@ class OmniModelState(DefaultModelState):
             ids_slice = input_ids[start : start + n_tok]
             emb_slice = embeds[start : start + n_tok]
             new_ids, new_emb, updates = self.model.preprocess(ids_slice, emb_slice, **info)
+            if error := updates.pop("request_error", None):
+                if self._preprocess_error is None:
+                    self._preprocess_error = (
+                        torch.zeros(input_batch.num_reqs, dtype=torch.bool, device=input_ids.device),
+                        "Model prefill could not restore accepted session context",
+                    )
+                self._preprocess_error[0][i] = True
+                logger.error("Request %s failed during prefill: %s", input_batch.req_ids[i], error)
 
             # Write back in-place
             seg = min(n_tok, new_ids.shape[0])

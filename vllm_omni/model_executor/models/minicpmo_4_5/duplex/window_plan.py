@@ -66,16 +66,10 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from vllm.v1.request import Request, StreamingUpdate
 
-# Barge-in carry: a Stage-0 request a barge-in or cancel aborted leaves its
-# completed window units to the session's next Stage-0 request. The scheduler
-# (MiniCPMO45SchedulerWindowPolicy) decides which windows are kept, for how long
-# and which new request gets one, and sends each step's decisions to the worker
-# in ``OmniSchedulerOutput.duplex_carry_ops``; the worker
-# (MiniCPMO45Stage0DuplexRuntime) only follows them, so the two never disagree.
-
-#: Sessions whose aborted window the scheduler keeps at once; the oldest is
-#: dropped first. The worker keeps the same windows in pinned host memory
-#: (about 64 MB each at the ``basic`` limit), so this also bounds that.
+# The Stage-0 window policy owns interruption handoff. Managed sessions keep
+# a settled input snapshot until their replacement claims it or the session
+# closes. External replicas use the bounded, completed-unit offer below.
+#: Maximum concurrent externally held completed-unit offers.
 CARRIED_WINDOW_MAX_SESSIONS = 32
 #: Seconds the scheduler offers an aborted request's window to the session's
 #: next Stage-0 request. The next append normally follows within a second.
@@ -328,7 +322,10 @@ def prepare_stage0_window(
     # Boundary reconciliation is required even with an unbounded context:
     # async lookahead can overwrite the worker's pending terminator after
     # the scheduler accepted the segment stop. Window retention is optional.
-    if not isinstance(window, dict) or mode not in {"basic", "context"}:
+    if not isinstance(window, dict) or (
+        mode not in {"basic", "context"}
+        and (not runtime_config.get("duplex_boundary_token_ids") or duplex.get("session_window_owned") is False)
+    ):
         return False
     base_len = int(getattr(session, "num_prompt_tokens", 0) or 0) + len(generated_ids)
     boundary = base_len + 2
@@ -378,7 +375,7 @@ def prepare_stage0_window(
                 drop_count += 1
                 if drop_count >= len(units):
                     break
-    else:
+    elif mode == "context":
         try:
             max_units = int(window.get("context_max_units", 24))
             previous_max = int(window.get("context_previous_max_tokens", 500))

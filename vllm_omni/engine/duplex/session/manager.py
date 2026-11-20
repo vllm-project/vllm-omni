@@ -905,6 +905,9 @@ class DuplexSessionManager:
             return
         self._unregister_session_requests(pending.session_id)
         if self._closing.get(pending.session_id) is pending:
+            await self._release_session_window(pending.session_id)
+            if self._closing.get(pending.session_id) is not pending:
+                return
             self.stage_port.release_session(pending.session_id)
             self._closing.pop(pending.session_id, None)
         self._session_snapshots.pop(pending.session_id, None)
@@ -1093,22 +1096,30 @@ class DuplexSessionManager:
         active_keys = {key for key in self._request_cleanups_in_progress if key[0] in session_id_set}
         self._request_cleanups_in_progress.difference_update(active_keys)
 
-    def finalize_closed_sessions(self, session_ids: Iterable[str]) -> None:
-        session_id_set = set(session_ids)
-        for key in list(self._pending_request_cleanups):
-            if key[0] not in session_id_set:
-                continue
-            self._pending_request_cleanups.pop(key, None)
-            self._request_cleanups_in_progress.discard(key)
-        for session_id in session_id_set:
+    async def finalize_closed_sessions(self, session_ids: Iterable[str]) -> None:
+        for session_id in set(session_ids):
+            closing = self._closing.get(session_id)
+            if closing is not None:
+                await self._release_session_window(session_id)
+                if self._closing.get(session_id) is not closing:
+                    continue
+            for key in list(self._pending_request_cleanups):
+                if key[0] == session_id:
+                    self._pending_request_cleanups.pop(key, None)
+                    self._request_cleanups_in_progress.discard(key)
             session = self._session_snapshots.pop(session_id, None)
             if session is not None and session.lease.terminal_reason is not None:
                 session.release_all_requests()
                 session.close()
-            if session_id in self._closing:
+            if closing is not None:
                 self.stage_port.release_session(session_id)
                 self._closing.pop(session_id, None)
             self._unregister_session_requests(session_id)
+
+    async def _release_session_window(self, session_id: str) -> None:
+        release = getattr(self.stage_port, "release_session_window", None)
+        if release is not None:
+            await release(session_id)
 
     async def _complete_request_cleanup(
         self,
@@ -1136,16 +1147,16 @@ class DuplexSessionManager:
     async def _run_request_cleanup(self, key: tuple[str, int], pending: _PendingRequestCleanup) -> None:
         await self.stage_port.cleanup(list(pending.request_ids), abort=pending.abort)
         is_current = self._pending_request_cleanups.get(key) is pending
-        if is_current:
-            self._pending_request_cleanups.pop(key, None)
-            self._request_cleanups_in_progress.discard(key)
         # An open rollback has no closing owner. Its cleanup can finish after
         # the same id is admitted again, even with the same lease generation.
         # Preserve legacy finalization; only placement owners require this fence.
         if self.runtime_config.replica_policy == "legacy" or (
             is_current and pending.closing is not None and self._closing.get(pending.session_id) is pending.closing
         ):
-            self.finalize_closed_sessions([pending.session_id])
+            await self.finalize_closed_sessions([pending.session_id])
+        elif is_current:
+            self._pending_request_cleanups.pop(key, None)
+            self._request_cleanups_in_progress.discard(key)
 
     # ------------------------------------------------------------------ #
     # Shutdown                                                           #
