@@ -1326,9 +1326,10 @@ An explicit `response.create` may open a latched assistant turn on its first
 silence unit. The sampler consumes that opening marker once per request/unit,
 even if the turn was already open, so repeated decode steps cannot undo a later
 `<|turn_eos|>` decision. The consumed identity lives in the session state.
-Opening a forced response permits the model to speak or listen. Its initial
-listen decision is preserved and closes the response without audio; only an
-already-speaking turn uses the normal listen-to-TTS continuation rewrite.
+A forced response opened this way waits for content across empty chunk
+boundaries. Before content starts, a listen decision closes the response
+without audio. The listen-to-TTS continuation rewrite still applies to
+already-speaking turns and seeded assistant prefixes.
 
 `<|turn_eos|>` does not terminate the input unit. The Thinker continues until
 a chunk terminator, and the Talker receives all forwarded tokens and their

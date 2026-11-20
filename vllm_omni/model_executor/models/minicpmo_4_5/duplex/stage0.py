@@ -99,6 +99,7 @@ class _MiniCPMO45Stage0SessionState:
     pending_speech_context: bool = False
     pending_speech_append_identity: tuple[int | None, int] | None = None
     pending_speech_response_open: bool = False
+    explicit_response_awaiting_content: bool = False
     generated_tokens: list[int] = field(default_factory=list)
 
 

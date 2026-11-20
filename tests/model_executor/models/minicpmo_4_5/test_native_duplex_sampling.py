@@ -414,7 +414,8 @@ def _policy_row(payload):
     )
 
 
-def test_response_create_unit_releases_turn_ended_latch():
+@pytest.mark.parametrize("empty_opening_chunk", [False, True])
+def test_response_create_unit_releases_turn_ended_latch(empty_opening_chunk):
     """A response.create unit opens the assistant turn despite the latch.
 
     A truncated turn leaves ``current_turn_ended`` set; without the
@@ -428,16 +429,23 @@ def test_response_create_unit_releases_turn_ended_latch():
     model = _policy_model_with_state(state)
     logits = torch.zeros(1, VOCAB)
     model.prepare_duplex_sampling(logits, None, rows=(_policy_row({"open_assistant_turn": True}),))
-    # The latch is released and the response is open: the silent row is not
-    # masked to listen-only and the listen -> tts_bos swap can fire.
+    # Releasing the latch allows the model to decide whether to speak.
     assert state.current_turn_ended is False
     assert state.pending_speech_response_open is True
     assert bool(torch.isfinite(logits[0]).all())
+    if empty_opening_chunk:
+        model._record_minicpmo45_duplex_terminator(0, CHUNK_EOS, TOKEN_IDS)
+        row = _policy_row({})
+        row.seq = 1
+        model.prepare_duplex_sampling(torch.zeros(1, VOCAB), None, rows=(row,))
+        assert state.pending_speech_response_open is True
+        assert state.current_turn_ended is False
     # Opening a response permits generation; it must also permit the model to listen.
     assert model._finalize_minicpmo45_native_duplex_sample(0, LISTEN, TOKEN_IDS) == LISTEN
     model._record_minicpmo45_duplex_terminator(0, LISTEN, TOKEN_IDS)
     assert state.current_turn_ended is True
     assert state.pending_speech_response_open is False
+    assert state.explicit_response_awaiting_content is False
 
 
 def test_latched_silent_row_still_masked_without_marker():
@@ -454,16 +462,18 @@ def test_latched_silent_row_still_masked_without_marker():
     assert logits[0][LISTEN] == 0.0
 
 
-def test_marker_does_not_touch_already_open_turn():
+@pytest.mark.parametrize("seeded_prefix", [False, True])
+def test_marker_does_not_touch_already_open_turn(seeded_prefix):
     """An unlatched turn keeps its state: the marker only releases the latch."""
     state = _MiniCPMO45Stage0SessionState(session_id="s0")
     state.current_turn_ended = False
-    state.pending_speech_response_open = False
+    state.pending_speech_context = seeded_prefix
+    state.pending_speech_response_open = seeded_prefix
     model = _policy_model_with_state(state)
     logits = torch.zeros(1, VOCAB)
     model.prepare_duplex_sampling(logits, None, rows=(_policy_row({"open_assistant_turn": True}),))
     assert state.current_turn_ended is False
-    assert state.pending_speech_response_open is False
+    assert state.pending_speech_response_open is seeded_prefix
     assert model._finalize_minicpmo45_native_duplex_sample(0, LISTEN, TOKEN_IDS) == TOKEN_IDS["tts_bos_token_id"]
 
 
@@ -474,6 +484,7 @@ def test_response_create_marker_is_consumed_once_per_unit(initially_ended):
     row = _policy_row({"open_assistant_turn": True})
     model.prepare_duplex_sampling(torch.zeros(1, VOCAB), None, rows=(row,))
     model._record_minicpmo45_duplex_terminator(0, TOKEN_IDS["turn_eos_token_id"], TOKEN_IDS)
+    assert state.explicit_response_awaiting_content is False
     logits = torch.zeros(1, VOCAB)
     model.prepare_duplex_sampling(logits, None, rows=(row,))
     assert state.current_turn_ended is True
