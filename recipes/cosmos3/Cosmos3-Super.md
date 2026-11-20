@@ -19,6 +19,10 @@ recommended parallelism differ. Mode is selected per request (T2I →
 `/v1/images/generations`; T2V/I2V/V2V → `/v1/videos/sync`; add
 `generate_sound=true` for audio).
 
+T2I with `n > 1` runs as one batched denoising loop where supported, so images
+can differ slightly from earlier releases for the same seed; set
+`VLLM_BATCH_INVARIANT=1` on the server to keep the serial path.
+
 ## References
 
 - Model card (authoritative usage + example assets): <https://huggingface.co/nvidia/Cosmos3-Super>

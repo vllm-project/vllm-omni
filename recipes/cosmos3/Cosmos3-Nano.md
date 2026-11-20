@@ -17,6 +17,9 @@ A single pipeline class (`Cosmos3OmniDiffusersPipeline`) serves these modes; the
 mode is selected per request:
 
 - **T2I** — `POST /v1/images/generations` (or a prompt carrying `modalities=["image"]`).
+  With `n > 1`, the images run as one batched denoising loop where supported, so they
+  can differ slightly from earlier releases for the same seed; set
+  `VLLM_BATCH_INVARIANT=1` on the server to keep the serial path.
 - **T2V** — `POST /v1/videos/sync` with `num_frames > 1` and no reference image/video.
 - **I2V** — `POST /v1/videos/sync` with a reference image (`input_reference` file
   upload, or `image_reference` JSON).
