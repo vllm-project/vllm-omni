@@ -17,7 +17,7 @@ from vllm import envs
 
 from vllm_omni.diffusion.postprocess import rife_interpolator
 from vllm_omni.diffusion.utils import media_utils
-from vllm_omni.entrypoints.openai import video_api_utils
+from vllm_omni.entrypoints.openai import media_input, video_api_utils
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -51,6 +51,14 @@ def _install_http_transport(monkeypatch, handler, client_kwargs):
         return async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
 
     monkeypatch.setattr(video_api_utils.httpx, "AsyncClient", _client_factory)
+
+
+def test_media_input_limits_follow_vllm_configuration():
+    mib = 1024 * 1024
+
+    assert media_input.MAX_IMAGE_INPUT_BYTES == envs.VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB * mib
+    assert media_input.MAX_VIDEO_INPUT_BYTES == envs.VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB * mib
+    assert media_input.MAX_AUDIO_INPUT_BYTES == envs.VLLM_MAX_AUDIO_CLIP_FILESIZE_MB * mib
 
 
 @pytest.mark.asyncio

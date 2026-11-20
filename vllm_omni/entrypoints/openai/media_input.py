@@ -15,12 +15,15 @@ from typing import Final
 
 import httpx
 import pybase64 as base64
+from vllm import envs
 
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 
-MAX_IMAGE_INPUT_BYTES: Final = 30 * 1024 * 1024
-MAX_VIDEO_INPUT_BYTES: Final = 50 * 1024 * 1024
-MAX_AUDIO_INPUT_BYTES: Final = 15 * 1024 * 1024
+_MIB: Final = 1024 * 1024
+# Keep these limits aligned with the vLLM 0.34.0 media configuration.
+MAX_IMAGE_INPUT_BYTES: Final = envs.VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB * _MIB
+MAX_VIDEO_INPUT_BYTES: Final = envs.VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB * _MIB
+MAX_AUDIO_INPUT_BYTES: Final = envs.VLLM_MAX_AUDIO_CLIP_FILESIZE_MB * _MIB
 MEDIA_DOWNLOAD_TIMEOUT_S: Final = 60.0
 _READ_CHUNK_SIZE: Final = 64 * 1024
 _MAX_REDIRECTS: Final = 20

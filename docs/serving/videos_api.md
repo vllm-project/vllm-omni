@@ -246,12 +246,14 @@ upstream vLLM's media URL allowlist protection. Deployments should therefore
 treat remote media URLs as untrusted and choose this setting as part of their
 URL access policy.
 
-Remote and base64 data-URL references are bounded before decoding: images are
-limited to 30 MiB, videos to 50 MiB, and audio to 15 MiB. HTTP responses are
-read incrementally and rejected when they exceed the applicable limit, including
-responses without `Content-Length`. The same limits apply to the URL fields in
-`image_reference`, `video_reference`, and `audio_reference`. Each remote
-download also has a 60-second total time limit.
+Remote and base64 data-URL references are bounded before decoding. Images and
+videos use vLLM's `VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB` limit (256 MiB by default),
+while audio uses `VLLM_MAX_AUDIO_CLIP_FILESIZE_MB` (25 MiB by default). Set
+these environment variables before starting the server to change the limits.
+HTTP responses are read incrementally and rejected when they exceed the
+applicable limit, including responses without `Content-Length`. The same
+limits apply to the URL fields in `image_reference`, `video_reference`, and
+`audio_reference`. Each remote download also has a 60-second total time limit.
 Responses with non-identity `Content-Encoding` are rejected before decoding.
 
 ### MiniMax H3 Samplers
