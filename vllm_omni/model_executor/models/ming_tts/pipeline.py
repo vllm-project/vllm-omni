@@ -28,7 +28,6 @@ MING_TTS_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             hf_config_name="llm_config",
             engine_output_type="latent",
-            supports_native_mrv2_data_plane=True,
             async_chunk_process_next_stage_input_func=(f"{_PROC}.llm2audio_vae_async_chunk"),
             sampling_constraints={
                 "temperature": 0.0,
@@ -51,7 +50,6 @@ MING_TTS_PIPELINE = PipelineConfig(
             final_output_type="audio",
             hf_config_name="llm_config",
             engine_output_type="audio",
-            supports_native_mrv2_data_plane=True,
             sync_process_input_func=f"{_PROC}.llm2audio_vae",
             sampling_constraints={
                 "temperature": 0.0,

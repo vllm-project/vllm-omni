@@ -3,6 +3,7 @@
 """Ming TTS on Model Runner V2: default profiles, request-id contract, state release."""
 
 from collections import OrderedDict
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -10,7 +11,10 @@ import torch
 import torch.nn as nn
 
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.config.omni_config import VllmOmniConfig
+from vllm_omni.config.resolver import resolve_omni_config
 from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config, merge_pipeline_deploy
+from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
 from vllm_omni.model_executor.models.ming_tts import ming_tts as ming_tts_module
 from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
     KEY_DECODE_STEP,
@@ -28,27 +32,54 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.tts]
 _PROFILES = [("ming_tts.yaml", MING_TTS_PIPELINE), ("ming_tts_moe.yaml", MING_TTS_MOE_PIPELINE)]
 
 
-def _resolve_stages(monkeypatch, deploy_name, pipeline, platform):
-    # Resolve the platform's overrides regardless of the host running the test.
+@pytest.mark.parametrize("platform", ["cuda", "rocm", "npu", "xpu", "musa"])
+@pytest.mark.parametrize("deploy_name, pipeline", _PROFILES)
+def test_ming_tts_bundled_profiles_resolve_on_native_mrv2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, deploy_name: str, pipeline, platform: str
+):
+    # Resolve through both the production stage launcher path and legacy merge
+    # regardless of the host running the test.
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
-    config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(deploy_name)), platform=platform)
-    return merge_pipeline_deploy(pipeline, config)
+    (tmp_path / "config.json").write_text("{}")
+    model = str(tmp_path)
+    deploy_path = get_deploy_config_path(deploy_name)
 
-
-@pytest.mark.parametrize("deploy_name, pipeline", _PROFILES)
-def test_ming_tts_cuda_profiles_run_both_stages_on_native_mrv2(monkeypatch, deploy_name, pipeline):
-    stages = _resolve_stages(monkeypatch, deploy_name, pipeline, "cuda")
-    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True]
-    assert [s.yaml_engine_args["supports_native_mrv2_data_plane"] for s in stages] == [True, True]
+    resolution = resolve_omni_config(
+        model,
+        trust_remote_code=None,
+        deploy_config_path=deploy_path,
+        cli_overrides=None,
+        stage_overrides=None,
+        strategy_config_path=None,
+    )
+    assert resolution.pipeline_config is pipeline
+    assert [s.model_config.use_v2_model_runner for s in resolution.stage_configs] == [True, True]
+    assert [s.model_config.supports_native_mrv2_data_plane for s in resolution.stage_configs] == [True, True]
     # Stage-0 decode state is not in the token stream, so recompute must fail loudly.
-    assert stages[0].yaml_engine_args["recompute_preemption"] == "fail"
+    assert resolution.stage_by_id(0).model_config.recompute_preemption == "fail"
+
+    engine_args = [build_engine_args_dict_from_omni_stage_config(stage, model) for stage in resolution.stage_configs]
+    assert [args["use_v2_model_runner"] for args in engine_args] == [True, True]
+    assert [args["supports_native_mrv2_data_plane"] for args in engine_args] == [True, True]
+    assert engine_args[0]["recompute_preemption"] == "fail"
+
+    deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform)
+    legacy_stages = merge_pipeline_deploy(pipeline, deploy)
+    assert [s.yaml_engine_args["use_v2_model_runner"] for s in legacy_stages] == [True, True]
+    assert [s.yaml_engine_args["supports_native_mrv2_data_plane"] for s in legacy_stages] == [True, True]
+    assert legacy_stages[0].yaml_engine_args["recompute_preemption"] == "fail"
 
 
-@pytest.mark.parametrize("platform", ["rocm", "npu", "xpu", "musa"])
 @pytest.mark.parametrize("deploy_name, pipeline", _PROFILES)
-def test_ming_tts_profiles_keep_non_cuda_on_v1(monkeypatch, deploy_name, pipeline, platform):
-    stages = _resolve_stages(monkeypatch, deploy_name, pipeline, platform)
-    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [False, False]
+def test_ming_tts_v1_override_is_rejected(monkeypatch: pytest.MonkeyPatch, deploy_name: str, pipeline):
+    monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
+    deploy = load_deploy_config(get_deploy_config_path(deploy_name))
+    deploy.model_runner = "v1"
+
+    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
+        VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
+        merge_pipeline_deploy(pipeline, deploy)
 
 
 class _RecordingStage(nn.Module):

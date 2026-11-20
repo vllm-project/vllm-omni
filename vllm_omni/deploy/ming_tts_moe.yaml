@@ -10,8 +10,9 @@
 # H20). For smaller cards raise Stage-0 tensor_parallel_size or split the stages
 # onto separate devices. Multi-request batching is not yet validated (max_num_seqs: 1).
 pipeline: ming_tts_moe
-# On CUDA both stages run on Model Runner V2 (native data plane). Set
-# `model_runner: v1` in a copy of this file to opt out until upstream removes V1.
+# Both stages run on Model Runner V2 (native data plane); vLLM 0.34+ does not
+# support Model Runner V1. Qualified on CUDA; ROCm, NPU, XPU and MUSA are not
+# yet qualified on MRV2.
 model_runner: v2
 async_chunk: true
 # The MoE ships a custom tokenizer (tokenization_bailing.BailingTokenizer) that
@@ -70,16 +71,3 @@ stages:
       top_k: -1
       max_tokens: 1
       detokenize: false
-
-platforms:
-  # MRV2 is qualified on CUDA only; keep the legacy V1 runner elsewhere.
-  # The pipeline's supports_native_mrv2_data_plane only takes effect with
-  # model_runner: v2, so moving a platform to v2 here also enables that plane.
-  rocm:
-    model_runner: v1
-  npu:
-    model_runner: v1
-  xpu:
-    model_runner: v1
-  musa:
-    model_runner: v1
