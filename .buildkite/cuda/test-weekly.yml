@@ -510,6 +510,9 @@ steps:
 
       - label: "Diffusion · LTX · H100 · Single-GPU"
         timeout_in_minutes: 120
+        # Skip DiffVAE video cases until CUDA CI can load a compatible NATTEN kernel.
+        # https://github.com/SHI-Labs/NATTEN/issues/356
+        # https://github.com/vllm-project/vllm-omni/issues/10231
         commands:
           - >-
             pytest -sv
@@ -520,6 +523,8 @@ steps:
             tests/e2e/accuracy/ltx/test_ltx_official_similarity.py
             tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py
             -m "slow and diffusion and H100 and cards_1"
+            -k "not (test_ltx25_pipeline_entries or
+            test_ltx25_distilled_two_stage_matches_official or test_ltx25_full_matches_official)"
             --run-level "full_model"
         mirror_hardwares: h100_1
 

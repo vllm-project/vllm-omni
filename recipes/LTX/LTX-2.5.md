@@ -76,9 +76,14 @@ image selects I2V, while omitting it selects T2V.
 LTX-2.5 uses the canonical Native Diffusion VAE decoder by default. To opt in
 to the legacy convolutional VAE, set the startup-only stage-0 model extra
 `ltx2_use_conv_vae: true`. The choice applies to all requests and all four
-pipeline classes above. DiffVAE loads its NATTEN kernel from Hugging Face Hub
-during startup. `decode_timestep` and `decode_noise_scale` condition only the
-legacy ConvVAE and have no effect when DiffVAE is selected.
+pipeline classes above. On CUDA, DiffVAE loads its NATTEN kernel from Hugging
+Face Hub during startup. Only the legacy ConvVAE uses `decode_timestep` and
+`decode_noise_scale`.
+
+> **CUDA compatibility.** With PyTorch `2.14.0+cu130`, the default DiffVAE
+> video pipelines fail to start when the Hub has no matching `shi-labs/natten`
+> build. To serve text-to-video or image-to-video in this environment, use the
+> ConvVAE override shown below. [NATTEN build request](https://github.com/SHI-Labs/NATTEN/issues/356)
 
 For offline Python usage:
 
