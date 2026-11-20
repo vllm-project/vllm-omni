@@ -3774,9 +3774,9 @@ def test_qwen_image_backend_similarity_executes_junit_guard_before_exit(
     )
 
 
-def test_minicpmo_duplex_function_is_one_nonblocking_nightly_job() -> None:
+def test_minicpmo_duplex_function_is_one_blocking_nightly_job() -> None:
     step = _find_step("MiniCPM-o 4.5 Duplex Function", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
