@@ -15,7 +15,15 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import init_logger
 
 from vllm_omni.metrics import definitions as defs
-from vllm_omni.metrics.utils import _as_float, _as_float_list, _as_int, _build_field_defs, _build_row, _format_table
+from vllm_omni.metrics.utils import (
+    _as_float,
+    _as_float_list,
+    _as_int,
+    _build_field_defs,
+    _build_row,
+    _format_table,
+    diffusion_output_metrics,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.metrics.transfer import OmniTransferMetrics
@@ -77,6 +85,9 @@ class StageRequestStats:
     vllm_prefill_ms: float | None = None
     vllm_decode_ms: float | None = None
     vllm_num_preemptions: int | None = None
+    # Diffusion scheduler admission wait for this stage, in milliseconds.
+    # None means the output did not carry scheduler_queue_wait_ms.
+    scheduler_queue_wait_ms: float | None = None
 
     @property
     def rx_mbps(self) -> float:
@@ -139,6 +150,7 @@ STAGE_EXCLUDE = {
     "final_output_type",
     "finish_reason",
     "pipeline_timings",
+    "scheduler_queue_wait_ms",
 }
 # Duplex logs one StageRequestStats table per response. Chunk submits refresh
 # ``request_timestamp``, so serving_time_to_first_output_ms is often a clamped
@@ -795,7 +807,7 @@ class OrchestratorAggregator:
         "postprocess_time_ms": "postprocess_time_s",
         "vae_decode_time_ms": "vae_decode_time_s",
         "forward_time_ms": "forward_time_s",
-        "scheduler_queue_wait_ms": "scheduler_queue_wait_s",
+        defs.SCHEDULER_QUEUE_WAIT_MS: "scheduler_queue_wait_s",
         "kv_recv_time_ms": "kv_recv_time_s",
     }
 
@@ -815,9 +827,7 @@ class OrchestratorAggregator:
         if stage_type != "diffusion":
             return
         engine_output = engine_outputs[0] if isinstance(engine_outputs, list) and engine_outputs else engine_outputs
-        diffusion_metrics: dict = getattr(engine_output, "metrics", {})
-        if isinstance(diffusion_metrics, list):
-            diffusion_metrics = diffusion_metrics[0]
+        diffusion_metrics = diffusion_output_metrics(engine_output)
         if not diffusion_metrics:
             return
         bucket = self.diffusion_metrics[req_id]

@@ -335,6 +335,7 @@ x-cosmos3: &cosmos3
   - vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_wan.py
   - vllm_omni/experimental/world_models/
   - vllm_omni/model_extras/cosmos3.py
+  - vllm_omni/model_extras/cosmos3_lidar.py
 
 x-qwen-image: &qwen_image
   - vllm_omni/diffusion/models/qwen_image/
@@ -781,12 +782,8 @@ source_file_dependencies:
     - examples/online_serving/openai_chat_completion_client_for_multimodal_generation.py
     - tests/examples/qwen3_omni_audio_artifacts.py
     - tests/examples/online_serving/test_qwen3_omni.py
-
-  omni_qwen2_5_omni_doc:
-    - *qwen2_5_omni
-    - examples/online_serving/qwen2_5_omni/
-    - examples/online_serving/openai_chat_completion_client_for_multimodal_generation.py
-    - tests/examples/online_serving/test_qwen2_5_omni.py
+    - tests/examples/helpers.py
+    - tests/examples/conftest.py
 
   omni_qwen2_5_omni_expansion:
     - *qwen2_5_omni
@@ -1444,6 +1441,22 @@ source_file_dependencies:
     - tests/e2e/online_serving/test_wan22_t2v.py
     - tests/e2e/online_serving/test_wan22_expansion.py
 
+  diffusion_wan22_device_postprocess:
+    - *wan22
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
+    - tests/e2e/offline_inference/test_device_postprocess_equivalence.py
+    - tests/helpers/mark.py
+    - vllm_omni/diffusion/data.py
+    - vllm_omni/diffusion/postprocess/
+    - vllm_omni/diffusion/worker/
+    - vllm_omni/diffusion/stage_diffusion_client.py
+    - vllm_omni/diffusion/stage_diffusion_proc.py
+    - vllm_omni/entrypoints/omni.py
+    - vllm_omni/entrypoints/omni_base.py
+    - vllm_omni/inputs/
+    - vllm_omni/outputs/
+
   diffusion_wan22_accuracy:
     - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
     - .buildkite/amd/scripts/assert-pytest-collection.sh
@@ -1472,9 +1485,8 @@ source_file_dependencies:
   diffusion_image_to_video_doc:
     - *wan22
     - *hunyuan_video
-    - *ltx2
-    - *sana_video
-    - *lingbot_video
+    - tests/examples/helpers.py
+    - tests/examples/conftest.py
     - examples/offline_inference/image_to_video/
     - tests/examples/offline_inference/test_image_to_video.py
 
@@ -1496,6 +1508,8 @@ source_file_dependencies:
     - tests/e2e/accuracy/test_diffusers_backend_similarity.py
 
   diffusion_qwen_image_21_accuracy:
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
     - *qwen_image_21
     - tests/e2e/accuracy/qwen_image_21/
     - tests/e2e/accuracy/helpers.py
@@ -1526,22 +1540,13 @@ source_file_dependencies:
     - tests/dfx/perf/tests/test_qwen_image_21_vllm_omni.json
 
   diffusion_text_to_image_doc:
-    - *qwen_image
-    - *z_image
+    - *qwen_image_21
     - examples/offline_inference/text_to_image/
     - examples/online_serving/text_to_image/
     - tests/examples/offline_inference/test_text_to_image.py
     - tests/examples/online_serving/test_text_to_image.py
-    - vllm_omni/diffusion/models/nextstep_1_1/
-    - vllm_omni/diffusion/models/longcat_image/
-    - vllm_omni/diffusion/models/ovis_image/
-    - vllm_omni/diffusion/models/omnigen2/
-    - vllm_omni/diffusion/models/sd3/
-    - vllm_omni/diffusion/models/flux/
-    - vllm_omni/diffusion/models/flux2/
-    - vllm_omni/diffusion/models/flux2_klein/
-    - vllm_omni/diffusion/models/krea2/
-    - vllm_omni/diffusion/models/lingbot_video/
+    - tests/examples/helpers.py
+    - tests/examples/conftest.py
 
   diffusion_hunyuan_image3_function:
     - *hunyuan_image3

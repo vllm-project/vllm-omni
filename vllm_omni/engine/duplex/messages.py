@@ -14,11 +14,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
 
+from vllm_omni.engine.duplex.config import DuplexCapabilities
 from vllm_omni.engine.messages import EngineQueueMessage
 
 if TYPE_CHECKING:
     from vllm_omni.engine.duplex.commands import DuplexCommand
-    from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
+    from vllm_omni.engine.duplex.config import DuplexSessionConfig
     from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
     from vllm_omni.engine.duplex.events import DuplexEvent
 
