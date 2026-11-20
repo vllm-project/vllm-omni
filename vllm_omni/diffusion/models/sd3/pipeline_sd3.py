@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import copy
 import inspect
 import json
 import logging
 import os
 from collections.abc import Iterable
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import torch
 from diffusers.image_processor import VaeImageProcessor
@@ -30,7 +31,10 @@ from vllm_omni.diffusion.models.sd3.sd3_transformer import (
     SD3Transformer2DModel,
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
+from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -139,6 +143,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
     # Both CFG branches share latents and timestep; CLIP (77) and T5 prompts are padded to fixed lengths.
     supports_cfg_batching = True
     supports_request_batch = True
+    supports_step_execution = True
 
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder", "text_encoder_2", "text_encoder_3"]
@@ -151,6 +156,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         prefix: str = "",
     ):
         super().__init__()
+        self._interrupt = False
         self.od_config = od_config
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
@@ -564,6 +570,37 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
     def interrupt(self):
         return self._interrupt
 
+    def _predict_noise(
+        self,
+        latents: torch.Tensor,
+        timestep: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        pooled_prompt_embeds: torch.Tensor | None,
+        negative_prompt_embeds: torch.Tensor | None,
+        negative_pooled_prompt_embeds: torch.Tensor | None,
+        do_true_cfg: bool,
+        guidance_scale: float,
+        cfg_normalize: bool = False,
+    ) -> torch.Tensor:
+        timestep = timestep.expand(latents.shape[0]).to(device=self.device, dtype=self.od_config.dtype)
+        positive_kwargs = {
+            "hidden_states": latents,
+            "timestep": timestep,
+            "encoder_hidden_states": prompt_embeds,
+            "pooled_projections": pooled_prompt_embeds,
+            "return_dict": False,
+        }
+        negative_kwargs = None
+        if do_true_cfg:
+            negative_kwargs = {
+                **positive_kwargs,
+                "encoder_hidden_states": negative_prompt_embeds,
+                "pooled_projections": negative_pooled_prompt_embeds,
+            }
+        return self.predict_noise_maybe_with_cfg(
+            do_true_cfg, guidance_scale, positive_kwargs, negative_kwargs, cfg_normalize
+        )
+
     def diffuse(
         self,
         latents: torch.Tensor,
@@ -600,32 +637,15 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
                 continue
             self._current_timestep = t
 
-            # Broadcast timestep to match batch size
-            timestep = t.expand(latents.shape[0]).to(device=self.device, dtype=self.od_config.dtype)
-            positive_kwargs = {
-                "hidden_states": latents,
-                "timestep": timestep,
-                "encoder_hidden_states": prompt_embeds,
-                "pooled_projections": pooled_prompt_embeds,
-                "return_dict": False,
-            }
-            if do_true_cfg:
-                negative_kwargs = {
-                    "hidden_states": latents,
-                    "timestep": timestep,
-                    "encoder_hidden_states": negative_prompt_embeds,
-                    "pooled_projections": negative_pooled_prompt_embeds,
-                    "return_dict": False,
-                }
-            else:
-                negative_kwargs = None
-
-            # Predict noise with automatic CFG parallel handling
-            noise_pred = self.predict_noise_maybe_with_cfg(
+            noise_pred = self._predict_noise(
+                latents,
+                t,
+                prompt_embeds,
+                pooled_prompt_embeds,
+                negative_prompt_embeds,
+                negative_pooled_prompt_embeds,
                 do_true_cfg,
                 guidance_scale,
-                positive_kwargs,
-                negative_kwargs,
                 cfg_normalize,
             )
 
@@ -634,7 +654,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
 
         return latents
 
-    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+    def _prepare_generation_context(self, req: DiffusionRequestBatch) -> dict[str, Any]:
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
         sampling_params_list = req.sampling_params_list
@@ -658,7 +678,6 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         )
         generator = req.collate_request_generators(num_images_per_prompt, None)
         latents = req.collate_request_tensors("latents", None)
-        output_type = common_sampling_params.output_type or "pil"
 
         prompt_fields = DiffusionRequestBatch.collate_prompt_field_map(
             req.prompts,
@@ -748,19 +767,67 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         # runs CFG.
         set_separate_cfg(self.transformer, do_cfg)
 
-        # Denoising loop using diffuse method
-        latents = self.diffuse(
-            latents=latents,
-            timesteps=timesteps,
-            prompt_embeds=prompt_embeds,
-            pooled_prompt_embeds=pooled_prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds if do_cfg else None,
-            negative_pooled_prompt_embeds=negative_pooled_prompt_embeds if do_cfg else None,
-            do_true_cfg=do_cfg,
-            guidance_scale=self.guidance_scale,
-            cfg_normalize=False,
+        return {
+            "latents": latents,
+            "timesteps": timesteps,
+            "prompt_embeds": prompt_embeds,
+            "pooled_prompt_embeds": pooled_prompt_embeds,
+            "negative_prompt_embeds": negative_prompt_embeds if do_cfg else None,
+            "negative_pooled_prompt_embeds": negative_pooled_prompt_embeds if do_cfg else None,
+            "do_true_cfg": do_cfg,
+            "guidance_scale": self.guidance_scale,
+        }
+
+    def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState:
+        req = OmniDiffusionRequest(
+            prompt=state.prompt, sampling_params=copy.copy(state.sampling), request_id=state.request_id
+        )
+        context = self._prepare_generation_context(DiffusionRequestBatch(requests=[req]))
+        state.prompt_embeds = context["prompt_embeds"]
+        state.negative_prompt_embeds = context["negative_prompt_embeds"]
+        state.latents = context["latents"]
+        state.timesteps = context["timesteps"]
+        state.scheduler = copy.deepcopy(self.scheduler)
+        state.scheduler.set_begin_index(0)
+        state.step_index = 0
+        state.do_true_cfg = context["do_true_cfg"]
+        state.extra["pooled_prompt_embeds"] = context["pooled_prompt_embeds"]
+        state.extra["negative_pooled_prompt_embeds"] = context["negative_pooled_prompt_embeds"]
+        return state
+
+    def denoise_step(self, input_batch: InputBatch, **kwargs: Any) -> torch.Tensor | None:
+        if self.interrupt:
+            return None
+        states = input_batch.states
+        pooled = torch.cat([state.extra["pooled_prompt_embeds"] for state in states])
+        negative_pooled = None
+        if input_batch.do_true_cfg:
+            negative_pooled = torch.cat([state.extra["negative_pooled_prompt_embeds"] for state in states])
+        self._current_timestep = input_batch.timesteps
+        return self._predict_noise(
+            input_batch.latents,
+            input_batch.timesteps,
+            input_batch.prompt_embeds,
+            pooled,
+            input_batch.negative_prompt_embeds,
+            negative_pooled,
+            input_batch.do_true_cfg,
+            states[0].sampling.guidance_scale,
         )
 
+    def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
+        if self.interrupt:
+            return
+        state.latents = self.scheduler_step_maybe_with_cfg(
+            noise_pred,
+            state.current_timestep,
+            state.latents,
+            state.do_true_cfg,
+            per_request_scheduler=state.scheduler,
+        )
+        state.step_index += 1
+
+    def _decode_latents(self, latents: torch.Tensor, output_type: str) -> DiffusionOutput:
         self._current_timestep = None
         if output_type == "latent":
             image = latents
@@ -771,13 +838,22 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
 
             image = self.vae.decode(latents, return_dict=False)[0]
 
+        return DiffusionOutput(
+            output=image,
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        )
+
+    def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput:
+        return self._decode_latents(state.latents, state.sampling.output_type or "pil")
+
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        context = self._prepare_generation_context(req)
+        latents = self.diffuse(**context)
+        sampling = req.sampling_params_list[0]
         return split_diffusion_output_by_request(
-            DiffusionOutput(
-                output=image,
-                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
-            ),
+            self._decode_latents(latents, sampling.output_type or "pil"),
             req,
-            num_outputs_per_prompt=num_images_per_prompt,
+            num_outputs_per_prompt=max(1, sampling.num_outputs_per_prompt),
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

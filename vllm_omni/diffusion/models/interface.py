@@ -193,7 +193,7 @@ class SupportsSamplingStep(Protocol):
 def supports_step_execution(pipeline: object) -> bool:
     """Return whether the pipeline implements either supported step protocol."""
 
-    return isinstance(pipeline, SupportsStepExecution) or (
+    return (isinstance(pipeline, SupportsStepExecution) and pipeline.supports_step_execution) or (
         isinstance(pipeline, SupportsSamplingStep) and pipeline.denoise_step_updates_state
     )
 
