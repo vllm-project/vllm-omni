@@ -1,0 +1,379 @@
+"""Linux scheduler stages for current-PR H3 accuracy and matched timing.
+
+Requires an eight-card npuq job, the frozen source/dependency/model/input
+manifest, ffmpeg/ffprobe and the declared localhost service. No external
+service or process is reused. All path defaults come from --root.
+"""
+import argparse
+import ctypes
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+import uuid
+
+
+def write(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    temp.replace(path)
+
+
+def sha(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def identity(pid):
+    try:
+        parts = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+        return {"pid": pid, "state": parts[0], "start_ticks": parts[19],
+                "pgid": int(parts[2]), "boot": Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
+    except FileNotFoundError:
+        return None
+
+
+def alive(saved):
+    now = identity(saved["pid"])
+    return now is not None and now["state"] != "Z" and all(
+        now[k] == saved[k] for k in ("pid", "start_ticks", "boot"))
+
+
+def descendants(pid):
+    rows = subprocess.check_output(["ps", "-eo", "pid=,ppid="], text=True).splitlines()
+    pairs = [tuple(map(int, row.split())) for row in rows]
+    known = {pid}
+    while True:
+        extra = {child for child, parent in pairs if parent in known}
+        if extra <= known:
+            return known
+        known |= extra
+
+
+def record_children(window):
+    saved = json.loads((window / "owner.json").read_text())
+    if alive(saved):
+        rows = [identity(pid) for pid in descendants(saved["pid"])]
+        write(window / "children.json", [r for r in rows if r])
+
+
+def signal_owned(saved, sig):
+    if not alive(saved):
+        return
+    command = Path(f"/proc/{saved['pid']}/cmdline").read_bytes()
+    assert b"/opt/tiger/arnold" not in command, "refuse to signal Arnold infrastructure"
+    try:
+        os.kill(saved["pid"], sig)
+    except ProcessLookupError:
+        pass
+
+
+def get_models(port):
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=3) as response:
+        assert response.status == 200
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=3) as response:
+        return json.load(response)
+
+
+def request_helper(contract):
+    path = Path(contract["request_helper"])
+    spec = importlib.util.spec_from_file_location("h3_fixed_case_request", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    config = json.loads(Path(contract["request_config"]).read_text())
+    config["datasets"] = [d for d in config["datasets"] if d["name"] == "ref2va-v13-avatar12s"]
+    config["resolutions"] = [r for r in config["resolutions"] if r["name"] == "480p"]
+    jobs = module.build_plan(Path(contract["data_root"]), config)
+    job, = [j for j in jobs if j["case"]["case_id"] == "case01"]
+    assert config["request"]["seed"] == 42 and config["request"]["num_inference_steps"] == 8
+    return module, config, job
+
+
+class FrequencyRecorder:
+    def __init__(self, path, cards):
+        self.path, self.cards = path, cards
+        self.done = threading.Event()
+        self.lib = ctypes.CDLL("/usr/local/Ascend/driver/lib64/driver/libdcmi.so")
+        assert self.lib.dcmi_init() == 0
+        self.thread = threading.Thread(target=self.record, daemon=True)
+
+    def record(self):
+        with self.path.open("x") as stream:
+            while not self.done.is_set():
+                row = {"unix": time.time(), "cards": {}}
+                for card in self.cards:
+                    mhz = ctypes.c_uint()
+                    rc = self.lib.dcmi_get_device_frequency(card, 0, 7, ctypes.byref(mhz))
+                    row["cards"][str(card)] = {"rc": rc, "mhz": mhz.value}
+                stream.write(json.dumps(row) + "\n")
+                stream.flush()
+                self.done.wait(0.5)
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.done.set()
+        self.thread.join(timeout=5)
+
+
+def verify_sources(root, contract):
+    actual = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root / "runtime", text=True).strip()
+    assert actual == contract["git_revision"]
+    for name, digest in contract["source_sha256"].items():
+        assert sha(root / "runtime" / name) == digest, name
+    for name, digest in contract["tool_sha256"].items():
+        assert sha(root / name) == digest, name
+    for name, digest in contract["input_sha256"].items():
+        assert sha(name) == digest, name
+    for name, digest in contract.get("dependency_sha256", {}).items():
+        assert sha(name) == digest, name
+    for row in contract["model_files"]:
+        stat = Path(row["path"]).stat()
+        assert stat.st_size == row["bytes"] and stat.st_mtime_ns == row["mtime_ns"], row["path"]
+
+
+def setup(root, job_root, window, stage, contract, port):
+    window.mkdir()
+    verify_sources(root, contract)
+    with socket.socket() as sock:
+        assert sock.connect_ex(("127.0.0.1", port)) != 0, "allocated service port already occupied"
+    env = dict(os.environ)
+    for key in list(env):
+        if key.startswith(("H3_", "VLLM_OMNI_H3_", "VLLM_OMNI_MINIMAX_H3_", "BENCH_")):
+            env.pop(key)
+    env.update(contract["common_environment"])
+    env.update({"H3_ACCEPTANCE_WINDOW": str(window), "H3_ACCEPTANCE_MODE": stage["mode"],
+                "PYTHONPATH": str(root / "runtime") + ":" + str(root) + ":" + os.environ.get("PYTHONPATH", ""),
+                "TRITON_CACHE_DIR": str(root / "cache" / "triton"),
+                "TORCHINDUCTOR_CACHE_DIR": str(root / "cache" / "inductor")})
+    args = [contract["python"], str(root / "server.py"), "serve", contract["model_root"],
+            "--port", str(port), *contract["common_cli"],
+            "--text-encoder-vision-sp-size", str(stage["vision_sp_size"])]
+    if contract["deterministic"]:
+        args += ["--fa-deterministic"]
+    if stage["mode"] == "accuracy":
+        args += ["--enable-diffusion-pipeline-profiler"]
+    # Respect runner mappings and both allocated ports; no physical card IDs are set here.
+    write(window / "launch.json", {"argv": args, "mode": stage["mode"],
+          "vision_sp_size": stage["vision_sp_size"], "master_port": os.environ["MASTER_PORT"],
+          "service_port": port, "devices": os.environ["NPUQ_PHYSICAL_DEVICES"],
+          "environment": {k: env[k] for k in contract["common_environment"]}})
+    with (window / "server.log").open("x") as log:
+        proc = subprocess.Popen(args, env=env, cwd=window, stdout=log, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+    write(window / "owner.json", identity(proc.pid))
+    deadline = time.monotonic() + contract["startup_timeout_seconds"]
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"owned service exited during startup: {proc.returncode}")
+        record_children(window)
+        try:
+            models = get_models(port)
+            data = models.get("data", [])
+            assert len(data) == 1 and data[0].get("id") == contract["model_root"], models
+            write(window / "models.json", models)
+            print("SERVICE_READY", stage["name"], proc.pid, flush=True)
+            return
+        except (OSError, AssertionError, urllib.error.URLError):
+            time.sleep(2)
+    raise TimeoutError("service startup timeout")
+
+
+def request(root, window, stage, contract, port, phase_dir, phase):
+    owner = json.loads((window / "owner.json").read_text())
+    assert alive(owner), "owned service exited"
+    records = json.loads((window / "records.json").read_text()) if (window / "records.json").exists() else []
+    formal = ".formal" in phase
+    if formal:
+        assert sum(r["phase"] == "warmup" and r["status"] == "ok" for r in records) == 2
+    active = {"nonce": uuid.uuid4().hex, "label": phase,
+              "capture": stage["mode"] == "accuracy" and formal,
+              "tensor_dir": str(phase_dir / "tensors"), "stats_dir": str(phase_dir / "stats")}
+    write(window / "active-request.json", active)
+    offset = (window / "server.log").stat().st_size
+    helper, config, job = request_helper(contract)
+    checked_status = []
+    original = helper.urllib.request.urlopen
+
+    def checked_open(*args, **kwargs):
+        response = original(*args, **kwargs)
+        checked_status.append(response.status)
+        assert response.status == 200
+        return response
+
+    helper.urllib.request.urlopen = checked_open
+    cards = list(map(int, os.environ["NPUQ_PHYSICAL_DEVICES"].split(",")))
+    recorder = FrequencyRecorder(phase_dir / "frequency.jsonl", cards) if formal and stage["mode"] == "performance" else None
+    if recorder:
+        recorder.start()
+    try:
+        media, response = helper.send_request(f"http://127.0.0.1:{port}", job["data_dir"], job["case"],
+                                             12, 480, 864, config["request"], contract["request_timeout_seconds"])
+    finally:
+        helper.urllib.request.urlopen = original
+        if recorder:
+            recorder.stop()
+    assert checked_status == [200]
+    video = phase_dir / "case01.mp4"
+    with video.open("xb") as stream:
+        stream.write(media)
+    text = (window / "server.log").read_bytes()[offset:].decode(errors="replace")
+    (phase_dir / "request-server.log").write_text(text)
+    record = {"status": "unvalidated", "phase": "formal" if formal else "warmup", "label": phase,
+              "nonce": active["nonce"], "mode": stage["mode"], "vision_sp_size": stage["vision_sp_size"],
+              "video": str(video), "bytes": len(media), "sha256": sha(video), "http_status": 200,
+              "http_e2e_s": response["http_seconds"], "response": response,
+              "stats_dir": active["stats_dir"], "tensor_dir": active["tensor_dir"]}
+    write(phase_dir / "result.json", record)
+    record_children(window)
+    print("REQUEST_COMPLETE", phase, record["http_e2e_s"], flush=True)
+
+
+def validate(root, job_root, window, stage, contract, port, phase_dir, phase):
+    record = json.loads((phase_dir / "result.json").read_text())
+    assert record["http_status"] == 200 and record["bytes"] > 100000
+    assert sha(record["video"]) == record["sha256"]
+    headers = {k.lower(): v for k, v in record["response"]["response_headers"].items()}
+    assert headers.get("content-type", "").startswith("video/mp4")
+    media = json.loads(subprocess.check_output(["ffprobe", "-v", "error", "-count_frames", "-show_streams",
+                                              "-show_format", "-of", "json", record["video"]]))
+    helper, _, _ = request_helper(contract)
+    helper.validate_media(media, 480, 864, 12)
+    streams = media["streams"]
+    assert sum(s["codec_type"] == "video" for s in streams) == 1
+    assert sum(s["codec_type"] == "audio" for s in streams) == 1
+    subprocess.run(["ffmpeg", "-v", "error", "-xerror", "-i", record["video"],
+                    "-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"], check=True, capture_output=True)
+    # A reply rank may return HTTP before non-reply ranks finish their local
+    # decode/cleanup. Wait for full worker completion before counting warmup
+    # success or admitting the next serial request.
+    expected_stats = [Path(record["stats_dir"]) / f"rank{rank}.json" for rank in range(8)]
+    deadline = time.monotonic() + 180
+    while not all(path.exists() for path in expected_stats) and time.monotonic() < deadline:
+        owner = json.loads((window / "owner.json").read_text())
+        assert alive(owner), "service exited before all worker completion records"
+        time.sleep(0.5)
+    assert all(path.exists() for path in expected_stats), "incomplete eight-rank request accounting"
+    rows = []
+    for rank in range(8):
+        row = json.loads((Path(record["stats_dir"]) / f"rank{rank}.json").read_text())
+        assert row["rank"] == rank and row["nonce"] == record["nonce"]
+        assert row["vision_sp_size"] == stage["vision_sp_size"] and row["encoder_tp_size"] == 8
+        assert row["world_size"] == 8 and row["counts"]["dit_forwards"] == 8
+        counts = row["counts"]
+        assert counts["vision_forwards"] > 0
+        expected = 4 * counts["vision_blocks"] if stage["vision_sp_size"] == 8 else 0
+        assert counts["all_to_all"] == expected
+        assert row["torch_deterministic"] == contract["deterministic"]
+        assert all(item["finite"] for item in row["tensors"])
+        if stage["mode"] == "accuracy" and record["phase"] == "formal":
+            keys = [item["key"] for item in row["tensors"]]
+            for required in ["vision_input", "vision_output", "encoder_output", "conditioning", "latents"]:
+                assert any(key.startswith(required) for key in keys), (rank, required)
+            if rank == 0:
+                assert any(key.startswith("decoded") for key in keys)
+                assert any(key.startswith("model_output") for key in keys)
+            for item in row["tensors"]:
+                assert sha(item["path"]) == item["sha256"]
+        rows.append(row)
+    write(phase_dir / "media-validation.json", media)
+    assert record["sha256"] == contract["expected_media_sha256"][str(stage["vision_sp_size"])], "current-window output changed from the quality-reviewed frozen artifact"
+    record.update(status="ok", nfe=8, rank_stats=rows,
+                  encode_prompt_s=max(r["stage_durations"].get("MiniMaxH3Pipeline.encode_prompt", 0.0) for r in rows),
+                  dit_s=max(r["stage_durations"].get("MiniMaxH3Pipeline.diffuse", 0.0) for r in rows),
+                  encoder_forward_s=max(r["gpu_event_ms"].get("encoder_forward", 0.0) for r in rows) / 1000,
+                  vision_s=max(r["gpu_event_ms"].get("vision", 0.0) for r in rows) / 1000)
+    assert record["encode_prompt_s"] > 0 and record["dit_s"] > 0 and record["encoder_forward_s"] > 0
+    if "x-inference-time-s" in headers:
+        record["server_e2e_s"] = float(headers["x-inference-time-s"])
+    records = json.loads((window / "records.json").read_text()) if (window / "records.json").exists() else []
+    assert not any(r["label"] == phase for r in records), "duplicate request label"
+    records.append(record)
+    write(phase_dir / "result.json", record)
+    write(window / "records.json", records)
+    models = get_models(port)
+    assert models["data"][0]["id"] == contract["model_root"]
+    if stage.get("compare_accuracy_after") and record["phase"] == "formal":
+        subprocess.run([sys.executable, str(root / "compare_accuracy.py"), "--root", str(job_root)], check=True)
+    print("VALIDATED", phase, "E2E", record["http_e2e_s"], "ENCODE", record["encode_prompt_s"], flush=True)
+
+
+def teardown(window, port):
+    if not (window / "owner.json").exists():
+        return
+    record_children(window)
+    owner = json.loads((window / "owner.json").read_text())
+    rows = json.loads((window / "children.json").read_text()) if (window / "children.json").exists() else [owner]
+    if alive(owner):
+        command = Path(f"/proc/{owner['pid']}/cmdline").read_bytes()
+        assert b"/opt/tiger/arnold" not in command
+        assert identity(owner["pid"])["pgid"] == owner["pgid"] == owner["pid"]
+        try:
+            os.killpg(owner["pgid"], signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 75
+    while any(alive(row) for row in rows) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    for row in rows:
+        signal_owned(row, signal.SIGTERM)
+    deadline = time.monotonic() + 10
+    while any(alive(row) for row in rows) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    for row in rows:
+        signal_owned(row, signal.SIGKILL)
+    deadline = time.monotonic() + 10
+    while any(alive(row) for row in rows) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert not any(alive(row) for row in rows), "owned processes remain"
+    with socket.socket() as sock:
+        assert sock.connect_ex(("127.0.0.1", port)) != 0, "owned service port remains open"
+    write(window / "cleanup.json", {"status": "ok", "owned_identities": rows, "port_closed": True})
+    print("SERVICE_RELEASED", window.name, flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("action", choices=["setup", "request", "validate", "teardown"])
+    parser.add_argument("stage")
+    parser.add_argument("--root", type=Path, required=True)
+    args = parser.parse_args()
+    assert os.environ.get("NPUQ_JOB_ID"), "scheduler-managed execution required"
+    assert list(map(int, os.environ["NPUQ_PHYSICAL_DEVICES"].split(","))) == list(range(8))
+    root = args.root.resolve()
+    contract = json.loads((root / "run-manifest.json").read_text())
+    stage = next(s for s in contract["stages"] if s["name"] == args.stage)
+    job_root = root / "jobs" / os.environ["NPUQ_JOB_ID"]
+    job_root.mkdir(parents=True, exist_ok=True)
+    window = job_root / args.stage
+    port = int(os.environ["MINDIE_SERVICE_PORT"])
+    phase_dir = Path(os.environ["NPUQ_PHASE_DIR"])
+    phase = os.environ["NPUQ_PHASE"]
+    if args.action == "setup":
+        setup(root, job_root, window, stage, contract, port)
+    elif args.action == "request":
+        request(root, window, stage, contract, port, phase_dir, phase)
+    elif args.action == "validate":
+        validate(root, job_root, window, stage, contract, port, phase_dir, phase)
+    else:
+        teardown(window, port)
+
+
+if __name__ == "__main__":
+    main()

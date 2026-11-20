@@ -36,7 +36,7 @@ pack build, budget the original CPU storage plus the sum of those rounded
 pack sizes. Partially built packs can remain in the allocator cache when
 allocation falls back to separate masters.
 
-Measured with the BF16 MiniMax-H3 encoder at TP8 on 8 × Ascend 910B4 (50 retained decoder layers, replicated vision weights):
+Independent full-encoder packing measured with the BF16 MiniMax-H3 encoder at TP8 on 8 × Ascend 910B4 (50 retained decoder layers, replicated vision weights):
 
 | Metric | Result |
 | --- | ---: |
@@ -63,3 +63,7 @@ separately.
 
 The video pipeline keeps encoder hidden states on the device for broadcast in
 every mode. Standalone encoder calls still return CPU tensors by default.
+
+## End-to-end evidence
+
+The matched current-source measurement and exact launch/request logs are in [the benchmark record](../../assets/performance/minimax_h3_encoder_weight_transfer/README.md). The full-encoder packing figures above cover the independent path without per-layer offload hooks. A deployment with encoder layerwise hooks packs only its non-block modules.
