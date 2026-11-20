@@ -1040,6 +1040,24 @@ def test_gepard_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatch)
     )
 
 
+def test_yue2_offline_nightly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    pipeline_path = Path(".buildkite/cuda/test-nightly.yml")
+    doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    label = ":full_moon: TTS · Function Test with L4"
+    for changed_file in (
+        "tests/e2e/offline_inference/test_yue2.py",
+        "examples/offline_inference/yue2/end2end.py",
+        "vllm_omni/model_executor/models/yue2/runtime.py",
+        "vllm_omni/deploy/yue2.yaml",
+        "vllm_omni/worker_v2/omni_ar_model_runner.py",
+        "vllm_omni/worker_v2/omni_model_runner.py",
+        "vllm_omni/worker_v2/model_states/omni_model_state.py",
+    ):
+        assert label in _surviving_labels(doc, [changed_file], pipeline_path=pipeline_path)
+    assert label not in _surviving_labels(doc, ["docs/source/index.md"], pipeline_path=pipeline_path)
+
+
 def test_h100_tts_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MIRROR_HW", raising=False)
     pipeline_path = Path(".buildkite/cuda/test-weekly.yml")

@@ -89,7 +89,14 @@ tts_server_params = [
 ]
 
 
-def _http_speech(omni_server, *, seed: int, frames: int, extra_params: dict | None = None) -> bytes:
+def _http_speech(
+    omni_server,
+    *,
+    seed: int,
+    frames: int,
+    extra_params: dict | None = None,
+    expected_truncated: bool | None = None,
+) -> bytes:
     """Raw-HTTP speech request returning (and structurally checking) the WAV.
 
     The OpenAI SDK client swallows response headers, so the truncation flag is
@@ -114,6 +121,10 @@ def _http_speech(omni_server, *, seed: int, frames: int, extra_params: dict | No
     assert response.status_code == 200, response.text[:500]
     truncated = response.headers.get("X-Audio-Truncated")
     assert truncated in ("true", "false"), f"X-Audio-Truncated missing/invalid: {truncated!r}"
+    if expected_truncated is not None:
+        assert truncated == str(expected_truncated).lower(), (
+            f"X-Audio-Truncated={truncated}, expected {expected_truncated}"
+        )
     audio = response.content
     with wave.open(io.BytesIO(audio)) as wav:
         assert wav.getnchannels() == 2
@@ -143,6 +154,7 @@ def test_yue2_automatic_abc_to_audio(omni_server, cfg_scale: float) -> None:
         seed=SEED,
         frames=200,
         extra_params={"cot": "melody", "abc_max_tokens": 64, "cfg_scale": cfg_scale},
+        expected_truncated=True,
     )
     assert len(audio) > _MIN_BYTES
 
