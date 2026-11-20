@@ -464,11 +464,14 @@ class TalkerCudaKStepState:
         for row, (config, generator) in enumerate(zip(sampling, generators)):
             temperature = config[0]
             scores = filtered[row]
-            token = (
-                torch.multinomial(scores.softmax(-1), 1, generator=generator).reshape(1)
-                if temperature
-                else scores.argmax(dim=-1)
-            )
+            if temperature and scores.is_cuda and _HAS_TRITON:
+                from .talker_cuda_sample import sample
+
+                token = sample(scores.softmax(-1), generator)
+            elif temperature:
+                token = torch.multinomial(scores.softmax(-1), 1, generator=generator).reshape(1)
+            else:
+                token = scores.argmax(dim=-1)
             sampled.append(token)
         return self.advance(torch.cat(sampled), frame, eos_token_id)
 

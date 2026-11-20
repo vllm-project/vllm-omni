@@ -50,6 +50,9 @@ class StableDiffusionXLPipeline(
     # Both CFG branches share latents and timestep and have fixed 77-token prompts.
     supports_cfg_batching = True
     supports_request_batch = True
+    # diffusers' StableDiffusionXLPipeline defaults guidance_scale to 5.0, so an
+    # omitted guidance_scale must resolve to the same value here.
+    default_guidance_scale: float = 5.0
 
     def __init__(
         self,
@@ -331,7 +334,14 @@ class StableDiffusionXLPipeline(
         generator = req.collate_request_generators(num_images_per_prompt, generator)
         latents = req.collate_request_tensors("latents", latents)
 
-        self._guidance_scale = common_sampling_params.guidance_scale
+        # An omitted guidance_scale must fall back to the model default
+        # (diffusers uses 5.0) instead of the 1.0 placeholder, otherwise CFG
+        # is silently disabled for every request that leaves the field unset.
+        self._guidance_scale = (
+            common_sampling_params.guidance_scale
+            if common_sampling_params.guidance_scale_provided
+            else self.default_guidance_scale
+        )
         self._current_timestep = None
         self._interrupt = False
 

@@ -41,6 +41,7 @@ from vllm_omni.diffusion.offloader.config import (
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization import resolve_component_quant_config as _resolve_component_quant_config
@@ -812,16 +813,18 @@ class Flux2Pipeline(
         if num_inference_steps is not None and num_inference_steps <= 0:
             raise ValueError(f"num_inference_steps must be positive, got {num_inference_steps}")
 
-        if (
-            height is not None
-            and height % (self.vae_scale_factor * 2) != 0
-            or width is not None
-            and width % (self.vae_scale_factor * 2) != 0
-        ):
+        multiple_of = self.vae_scale_factor * 2
+        for name, size in (("height", height), ("width", width)):
+            if size is not None and size < multiple_of:
+                raise OmniClientError(
+                    f"`{name}` must be at least {multiple_of} to produce a non-empty latent grid, got {size}."
+                )
+
+        if any(size is not None and size % multiple_of for size in (height, width)):
             logger.warning(
                 "`height` and `width` have to be divisible by %s but are %s and %s. "
                 "Dimensions will be resized accordingly",
-                self.vae_scale_factor * 2,
+                multiple_of,
                 height,
                 width,
             )
@@ -927,8 +930,8 @@ class Flux2Pipeline(
         else:
             image = PIL.Image.open(raw_image) if isinstance(raw_image, str) else cast(PIL.Image.Image, raw_image)
 
-        height = req.sampling_params.height or height
-        width = req.sampling_params.width or width
+        height = req.sampling_params.height if req.sampling_params.height is not None else height
+        width = req.sampling_params.width if req.sampling_params.width is not None else width
         if req.sampling_params.num_inference_steps is not None:
             num_inference_steps = req.sampling_params.num_inference_steps
 

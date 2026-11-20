@@ -510,14 +510,32 @@ class FlowMatchingAudioTransformer(nn.Module):
         semantic_code: torch.Tensor,
         llm_hidden: torch.Tensor,
         cfg_alpha: torch.Tensor,
+        noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B = semantic_code.shape[0]
 
         # Skip decoding if codebook 0 is [END_AUDIO] token.
         should_decode = semantic_code != self._end_audio_token_id
 
-        # acoustic_codes starts from x_0; generate directly on device to skip H2D.
-        x_0 = torch.randn(B, self.model_args.n_acoustic_codebook, dtype=llm_hidden.dtype, device=llm_hidden.device)
+        # acoustic_codes starts from x_0. Request-aware callers provide noise;
+        # direct/internal callers retain the legacy device-global RNG path.
+        if noise is None:
+            x_0 = torch.randn(
+                B,
+                self.model_args.n_acoustic_codebook,
+                dtype=llm_hidden.dtype,
+                device=llm_hidden.device,
+            )
+        else:
+            expected_shape = (B, self.model_args.n_acoustic_codebook)
+            if noise.shape != expected_shape:
+                raise ValueError(f"Expected acoustic noise shape {expected_shape}, got {tuple(noise.shape)}")
+            if noise.device != llm_hidden.device or noise.dtype != llm_hidden.dtype:
+                raise ValueError(
+                    "Acoustic noise must match llm_hidden device and dtype: "
+                    f"noise=({noise.device}, {noise.dtype}), llm_hidden=({llm_hidden.device}, {llm_hidden.dtype})"
+                )
+            x_0 = noise
         x_0 = self._noise_scale * x_0
 
         # Build the schedule constants once per dtype and reuse them every frame.
@@ -598,6 +616,7 @@ class FlowMatchingAudioTransformer(nn.Module):
         self,
         llm_hidden: torch.Tensor,
         cfg_alpha: torch.Tensor,
+        noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # llm_hidden: BxD
         semantic_logit = self.semantic_codebook_output(llm_hidden).float()
@@ -611,6 +630,7 @@ class FlowMatchingAudioTransformer(nn.Module):
             semantic_code.squeeze(1),
             llm_hidden,
             cfg_alpha=cfg_alpha,
+            noise=noise,
         )
 
         audio_codes = torch.concatenate(
@@ -962,7 +982,6 @@ class VoxtralTTSAudioGenerationForConditionalGeneration(nn.Module, SupportsMulti
         self.eos_tok_id = self.tokenizer.instruct.tokenizer.eos_id
         self.vocab_size = config.text_config.vocab_size
         self._end_audio_token_id = AudioSpecialTokens.id(AudioSpecialTokens.end_audio)
-        self._fake_eos_consts: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def get_language_model(self) -> torch.nn.Module:
         return self.language_model
@@ -1056,20 +1075,15 @@ class VoxtralTTSAudioGenerationForConditionalGeneration(nn.Module, SupportsMulti
         self,
         hidden_states: torch.Tensor,
         cfg_alpha: torch.Tensor,
+        noise: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         audio_codes = self.acoustic_transformer(
             llm_hidden=hidden_states,
             cfg_alpha=cfg_alpha,
+            noise=noise,
         )
-        # Cache device-resident 1.0/0.0 scalars to avoid a per-call H2D transfer.
-        consts = self._fake_eos_consts.get(audio_codes.device)
-        if consts is None:
-            consts = (
-                torch.tensor(1.0, dtype=torch.bfloat16, device=audio_codes.device),
-                torch.tensor(0.0, dtype=torch.bfloat16, device=audio_codes.device),
-            )
-            self._fake_eos_consts[audio_codes.device] = consts
-        fake_eos = torch.where(audio_codes[:, 0] == self._end_audio_token_id, consts[0], consts[1])
+        # Match hidden_states.dtype for the caller's indexed write-back into channel 0.
+        fake_eos = (audio_codes[:, 0] == self._end_audio_token_id).to(dtype=hidden_states.dtype)
         # BxC -> Bx1xC since this is per-step
         # Make it a list for vllm-omni processing
         audio_list = list(torch.split(audio_codes.unsqueeze(1), 1, dim=0))
