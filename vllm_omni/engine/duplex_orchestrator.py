@@ -784,7 +784,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         self._fork_parents.add(parent_request_id)
         self._fork_children.setdefault(parent_request_id, set()).add(request_id)
         runner = cast("DuplexSessionRunner", self.session_manager.runner_for_request_id(request_id))
-        runner.session.reserve_stage_request(stage_id, request_id, fence=context.fence)
+        runner.session.reserve_stage_request(stage_id, request_id, fence=context.fence, forked=True)
         return child
 
     def _upgrade_processed_stage_request(self, request, raw_prompt):

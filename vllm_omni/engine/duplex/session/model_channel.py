@@ -810,7 +810,7 @@ class ModelChannel:
                 # fence already validated above -- and keep its id so the data
                 # plane can still resolve the block it belongs to.
                 if not (
-                    session.is_reserved_request(item.request_id)
+                    session.is_forked_request(item.request_id)
                     or (
                         session.capabilities.supports_concurrent_turn_requests
                         and session.is_draining_request(item.request_id)

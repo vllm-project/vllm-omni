@@ -191,6 +191,10 @@ class DuplexRequestResource:
     request_id: str
     fence: DuplexFence
     submitted: bool = False
+    # A forked child streams under its own request id while the parent stays the
+    # session's active request; the output mailbox needs to tell it apart from an
+    # ordinary request reserved for a later turn.
+    forked: bool = False
     input_audio_part: dict[str, object] | None = field(default=None, repr=False)
 
 
@@ -329,18 +333,37 @@ class DuplexEngineSession:
 
     # ---- stage request resources ----
 
-    def reserve_stage_request(self, stage_id: int, request_id: str, *, fence: DuplexFence) -> None:
+    def reserve_stage_request(
+        self,
+        stage_id: int,
+        request_id: str,
+        *,
+        fence: DuplexFence,
+        forked: bool = False,
+    ) -> None:
+        """Reserve a stage request, optionally marking it a forked child.
+
+        A forked child (Duo's H50 block handoff) streams its own stage output
+        under its own request id while the parent stays the session's
+        ``active_request_id``. Marking it here is what lets the output mailbox
+        distinguish that child from an ordinary request of a later turn, which
+        is also reserved on this session but must not be accepted early.
+        """
         self._validate_fence(fence)
         resource_key = (stage_id, request_id)
         existing = self.request_resources.get(resource_key)
         if existing is not None:
             if existing.fence.session_id != fence.session_id or existing.fence.epoch != fence.epoch:
                 raise ValueError(f"Duplex request resource already reserved with different identity: {request_id}")
+            if forked and not existing.forked:
+                existing.forked = True
+                self.request_resources[resource_key] = existing
             return
         self.request_resources[resource_key] = DuplexRequestResource(
             stage_id=stage_id,
             request_id=request_id,
             fence=fence,
+            forked=forked,
         )
 
     def bind_stage_request(self, stage_id: int, request_id: str, *, fence: DuplexFence) -> None:
@@ -845,17 +868,19 @@ class DuplexEngineSession:
             return None
         return self._response.draining_response_by_request.pop(request_id, None)
 
-    def is_reserved_request(self, request_id: str | None) -> bool:
-        """True when this session itself reserved a stage request for *request_id*.
+    def is_forked_request(self, request_id: str | None) -> bool:
+        """True when *request_id* is a child this session forked.
 
-        A forked child is reserved on the session that forked it, under that
-        session's fence. That is what lets the output mailbox accept the
-        child's stage output while still rejecting a request that belongs to
-        another session or generation.
+        A forked child (Duo's H50 block handoff) streams its stage output under
+        its own request id while the parent stays ``active_request_id``. Only
+        such a child may be accepted early: an ordinary request reserved for a
+        later turn is also in ``request_resources`` and must not be.
         """
         if not isinstance(request_id, str):
             return False
-        return any(resource.request_id == request_id for resource in self.request_resources.values())
+        return any(
+            resource.forked and resource.request_id == request_id for resource in self.request_resources.values()
+        )
 
     def is_draining_request(self, request_id: str | None) -> bool:
         return isinstance(request_id, str) and request_id in self._response.draining_response_by_request

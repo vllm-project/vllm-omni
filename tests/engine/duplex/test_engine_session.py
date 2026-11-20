@@ -1641,29 +1641,49 @@ def test_rejected_user_sources_preserve_new_input_and_ignore_deleted_or_recreate
     assert session.unanswered_user_items() == 0
 
 
-def test_reserved_child_request_is_distinguishable_from_a_foreign_request():
-    # Duo's H50 block handoff forks the next Intent block onto its own request
-    # id, reserved by the session that forked it. The output mailbox has to
-    # accept such a child while still rejecting output belonging to any other
-    # session, so the check must be session-scoped rather than id-shaped.
+def test_only_a_forked_child_may_be_accepted_while_a_parent_is_active():
+    # Duo's H50 block handoff forks each block onto its own request id, so the
+    # output mailbox must accept that child while the parent stays the session's
+    # active request. The tempting shortcut -- "any request this session
+    # reserved" -- is wrong: every append reserves the next turn's request ids on
+    # the same session too, and accepting those early would admit output for a
+    # turn the client has not committed.
     session = _session()
     fence = session.fence
 
     session.reserve_stage_request(1, "parent", fence=fence)
-    session.reserve_stage_request(1, "parent-block0", fence=fence)
+    session.reserve_stage_request(1, "parent-block0", fence=fence, forked=True)
+    # A later turn's ordinary reservation, exactly as append creates it.
+    session.reserve_stage_request(1, "next-turn", fence=fence)
 
-    assert session.is_reserved_request("parent")
-    assert session.is_reserved_request("parent-block0"), (
-        "a forked child must be recognised as reserved by its own session, "
-        "otherwise its stage output is dropped before the data plane runs"
+    assert session.is_forked_request("parent-block0"), (
+        "a forked child must be recognisable, otherwise its Realization/Codec "
+        "output is dropped before the data plane runs"
     )
-    # A request that belongs to another session, or one that never went through
-    # this session's reservation, must not become eligible by accident.
-    assert not session.is_reserved_request("someone-elses-request")
-    assert not session.is_reserved_request(None)
+    assert not session.is_forked_request("parent")
+    assert not session.is_forked_request("next-turn"), (
+        "an ordinary reservation for a later turn must not be accepted early; "
+        "only a real fork may bypass the active-request check"
+    )
+    assert not session.is_forked_request("someone-elses-request")
+    assert not session.is_forked_request(None)
 
     other = _session(session_id="other-session")
-    other.reserve_stage_request(1, "foreign", fence=other.fence)
-    assert not session.is_reserved_request("foreign"), (
-        "another session's reservation must not make a request eligible here"
-    )
+    other.reserve_stage_request(1, "foreign-fork", fence=other.fence, forked=True)
+    assert not session.is_forked_request("foreign-fork"), "another session's fork must not make a request eligible here"
+
+
+def test_fork_marking_is_idempotent_and_upgrades_an_existing_reservation():
+    # fork_stage_request may reserve a key that append already reserved (the
+    # child inherits the parent's fence). The mark must still land, and a repeat
+    # must not raise on the identity check.
+    session = _session()
+    fence = session.fence
+
+    session.reserve_stage_request(1, "child", fence=fence)
+    assert not session.is_forked_request("child")
+
+    session.reserve_stage_request(1, "child", fence=fence, forked=True)
+    assert session.is_forked_request("child")
+    session.reserve_stage_request(1, "child", fence=fence, forked=True)
+    assert session.is_forked_request("child")

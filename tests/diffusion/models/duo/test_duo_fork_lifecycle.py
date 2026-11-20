@@ -204,3 +204,44 @@ def test_parent_request_id_is_declared_on_the_request_state():
     assert state.parent_request_id is None
     assert "parent_request_id" in {f.name for f in dataclasses.fields(DuplexOrchestratorRequestState)}
     assert "parent_request_id" not in {f.name for f in dataclasses.fields(OrchestratorRequestState)}
+
+
+def test_fork_stage_request_marks_the_child_as_forked_on_its_session(monkeypatch):
+    # Regression for the duplex output boundary: the mailbox may only accept a
+    # child that the session itself forked, so `fork_stage_request` has to hand
+    # the session that mark. Driving the real method (with a session stub in
+    # place of a live runner) is what makes this catch a missing `forked=True`;
+    # calling `reserve_stage_request` directly would pass either way.
+    from vllm_omni.engine.duplex_orchestrator import DuplexStageRequestContext
+
+    orch = _build_orchestrator()
+    _add_request(orch, PARENT)
+    parent = orch.request_states[PARENT]
+    parent.session_id = "sess"
+    parent.fence = "fence"
+    parent.final_stage_id = 3
+    parent.config_generation = 0
+    parent.sampling_params_list = ()
+    parent.streaming = type("S", (), {"bridge_states": {"duplex": {"session_config": {}, "runtime_config": {}}}})()
+
+    reservations: list[tuple[int, str, bool]] = []
+
+    class _Session:
+        def reserve_stage_request(self, stage_id, request_id, *, fence, forked=False):
+            reservations.append((stage_id, request_id, forked))
+
+    runner = type("R", (), {"session": _Session()})()
+    orch.session_manager = type("M", (), {"runner_for_request_id": lambda self, rid: runner})()
+
+    def _ensure_request(self, context: DuplexStageRequestContext) -> None:
+        orch.request_states[context.request_id] = DuplexOrchestratorRequestState(request_id=context.request_id)
+
+    monkeypatch.setattr(DuplexOrchestrator, "ensure_request", _ensure_request, raising=False)
+
+    child = orch.fork_stage_request(PARENT, "sess-block0", 1)
+
+    assert child.parent_request_id == PARENT
+    assert reservations == [(1, "sess-block0", True)], (
+        "fork_stage_request must reserve the child as forked, otherwise the "
+        f"output mailbox drops its stage output (got {reservations})"
+    )
