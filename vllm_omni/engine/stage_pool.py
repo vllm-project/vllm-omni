@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 from vllm.logger import init_logger
 from vllm.pooling_params import PoolingParams
 from vllm.v1.engine import EngineCoreOutputs
-from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.engine.output_processor import RequestState
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats
@@ -60,6 +59,7 @@ from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import (
     coerce_positive_int_scalar,
+    extract_diffusion_scheduler_wait_ms,
     iter_mm_outputs,
     iter_request_output_items,
 )
@@ -1131,13 +1131,26 @@ class StagePool:
         request_outputs: list[Any],
         *,
         submit_ts: float,
+        submit_perf: float | None = None,
         request_timestamp: float,
         replica_id: int,
         sampling_params: Any | None = None,
     ) -> StageRequestMetrics:
         """Build stage metrics for outputs produced on one replica."""
-        now = _time.time()
-        stage_gen_time_ms = (now - submit_ts) * 1000.0
+        if submit_perf is not None:
+            stage_gen_time_ms = (_time.perf_counter() - submit_perf) * 1000.0
+        else:
+            stage_gen_time_ms = (_time.time() - submit_ts) * 1000.0
+        scheduler_wait_ms = extract_diffusion_scheduler_wait_ms(request_outputs[0]) if request_outputs else None
+        if scheduler_wait_ms is not None:
+            if scheduler_wait_ms > stage_gen_time_ms:
+                logger.warning(
+                    "Stage-%s diffusion scheduler wait %.3f ms exceeds stage generation %.3f ms",
+                    self.stage_id,
+                    scheduler_wait_ms,
+                    stage_gen_time_ms,
+                )
+            stage_gen_time_ms -= scheduler_wait_ms
         request_id = str(getattr(request_outputs[0], "request_id", "")) if request_outputs else ""
         native_text_metrics = {}
         if request_id:
@@ -1183,6 +1196,7 @@ class StagePool:
             # happens inside the model runner and is not observable here.
             batch_size=1,
             stage_gen_time_ms=stage_gen_time_ms,
+            scheduler_queue_wait_ms=scheduler_wait_ms,
             rx_transfer_bytes=0,
             rx_decode_time_ms=0.0,
             rx_in_flight_time_ms=0.0,
@@ -1219,6 +1233,7 @@ class StagePool:
         image_pixels = self._count_image_pixels(request_outputs) if output_unit_type == "image" else 0
         num_inference_steps = coerce_positive_int_scalar(getattr(sampling_params, "num_inference_steps", None)) or 0
         has_output_timestamps = bool(output_timestamps)
+        now = _time.time()
         first_ts = output_timestamps[0] if has_output_timestamps else now
         serving_time_to_first_output_ms = (
             max((non_empty_first_output_ts - request_timestamp) * 1000.0, 0.0)
@@ -1911,6 +1926,69 @@ class StagePool:
             )
             raise
 
+    async def push_dit_load(self, snapshot: DitLoadSnapshot) -> bool:
+        """Push DiT load snapshot to all live AR replicas via UTILITY ZMQ."""
+        payload = dict(snapshot)
+        all_ok = True
+        for replica_id in self.live_replica_ids():
+            client = self.clients[replica_id]
+            if client is None:
+                continue
+            call_utility = getattr(client, "call_utility_async", None)
+            if call_utility is None:
+                continue
+            try:
+                await asyncio.wait_for(
+                    call_utility("omni_update_dit_load", payload),
+                    timeout=self._DIT_LOAD_PUSH_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                logger.debug(
+                    "[StagePool] push_dit_load timed out (%ss) for stage=%s replica=%s",
+                    self._DIT_LOAD_PUSH_TIMEOUT_S,
+                    self.stage_id,
+                    replica_id,
+                )
+                all_ok = False
+            except Exception:
+                logger.warning(
+                    "[StagePool] push_dit_load failed for stage=%s replica=%s",
+                    self.stage_id,
+                    replica_id,
+                    exc_info=True,
+                )
+                all_ok = False
+        return all_ok
+
+    async def poll_dit_load(self, replica_id: int) -> tuple[int, int, list[str], list[str]] | None:
+        """Query one DiT replica's ``(waiting, running, waiting_ids, running_ids)``."""
+        raw_client = self.clients[replica_id]
+        if raw_client is None or not hasattr(raw_client, "get_dit_load_async"):
+            return None
+        try:
+            return await raw_client.get_dit_load_async()
+        except Exception:
+            logger.debug(
+                "[StagePool] poll_dit_load failed for stage=%s replica=%s",
+                self.stage_id,
+                replica_id,
+                exc_info=True,
+            )
+            return None
+
+    def check_dit_health(self, replica_id: int) -> bool:
+        """Check if a DiT replica is alive and responsive."""
+        raw_client = self.clients[replica_id]
+        if raw_client is None:
+            return False
+        check_fn = getattr(raw_client, "check_health", None)
+        if check_fn is None:
+            return True
+        try:
+            return bool(check_fn())
+        except Exception:
+            return False
+
     def poll_diffusion_output(self, replica_id: int) -> Any | None:
         """Drain one ready diffusion output from the given replica if present."""
         if not self.is_replica_available(replica_id):
@@ -1977,82 +2055,6 @@ class StagePool:
         for watermarker in self._watermarkers.values():
             for request_id in request_ids:
                 watermarker.discard_request_state(request_id)
-
-    # [OmniDTPS] Timeout for AR load-update RPC. A timeout cancels the push
-    # for that replica; the next push only happens on the next poll cycle.
-    _DIT_LOAD_PUSH_TIMEOUT_S: float = 0.5
-
-    async def poll_dit_load(self, replica_id: int) -> tuple[int, int, list[str], list[str]] | None:
-        """Query one DiT replica's ``(waiting, running, waiting_ids, running_ids)``."""
-        raw_client = self.clients[replica_id]
-        if raw_client is None or not hasattr(raw_client, "get_dit_load_async"):
-            return None
-        try:
-            return await raw_client.get_dit_load_async()
-        except Exception:
-            logger.debug(
-                "[StagePool] poll_dit_load failed for stage-%s replica-%s",
-                self.stage_id,
-                replica_id,
-                exc_info=True,
-            )
-            return None
-
-    def check_dit_health(self, replica_id: int) -> bool:
-        raw_client = self.clients[replica_id]
-        if raw_client is None or not hasattr(raw_client, "check_health"):
-            return False
-        try:
-            raw_client.check_health()
-            return True
-        except EngineDeadError:
-            return False
-        except Exception:
-            logger.debug(
-                "[StagePool] check_dit_health failed for stage-%s replica-%s",
-                self.stage_id,
-                replica_id,
-                exc_info=True,
-            )
-            return False
-
-    async def push_dit_load(self, snapshot: DitLoadSnapshot) -> bool:
-        """Push DiT load snapshot to all live AR replicas via UTILITY ZMQ.
-
-        Returns ``True`` if all live replicas received the push, ``False`` if
-        any replica timed out or raised.
-        """
-        payload = dict(snapshot)
-        all_ok = True
-        for replica_id in self.live_replica_ids():
-            client = self.clients[replica_id]
-            if client is None:
-                continue
-            call_utility = getattr(client, "call_utility_async", None)
-            if call_utility is None:
-                continue
-            try:
-                await asyncio.wait_for(
-                    call_utility("omni_update_dit_load", payload),
-                    timeout=self._DIT_LOAD_PUSH_TIMEOUT_S,
-                )
-            except asyncio.TimeoutError:
-                logger.debug(
-                    "[StagePool] push_dit_load timed out (%ss) for stage=%s replica=%s",
-                    self._DIT_LOAD_PUSH_TIMEOUT_S,
-                    self.stage_id,
-                    replica_id,
-                )
-                all_ok = False
-            except Exception:
-                logger.warning(
-                    "[StagePool] push_dit_load failed for stage=%s replica=%s",
-                    self.stage_id,
-                    replica_id,
-                    exc_info=True,
-                )
-                all_ok = False
-        return all_ok
 
     # ---- Stage-local control plane ----
 
