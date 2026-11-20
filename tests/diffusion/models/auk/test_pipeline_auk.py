@@ -810,6 +810,33 @@ class TestRequestParsing:
         assert outputs[0].output.shape == (145 * HOP,)
         assert outputs[1].output.shape == (155 * HOP,)
 
+    def test_unseeded_multi_schedule_preserves_request_order_rng(self, build_pipeline):
+        pipeline, _ = build_pipeline()
+
+        def make_requests():
+            reqs = [
+                _batch(
+                    _prompt(audio=_silence(0.5), knobs={"gen_seconds": seconds, "vae_sample": vae_sample}),
+                    seed=None,
+                    output_type="latent",
+                ).requests[0]
+                for seconds, vae_sample in [(1.0, True), (2.0, False), (1.0, True)]
+            ]
+            # Clear the random seed auto-assigned by OmniDiffusionRequest so
+            # pipeline._resolve_generator exercises the unseeded fallback.
+            for req in reqs:
+                req.sampling_params.seed = None
+            return reqs
+
+        torch.manual_seed(1234)
+        serial_outputs = [pipeline.forward(DiffusionRequestBatch([req]))[0].output for req in make_requests()]
+
+        torch.manual_seed(1234)
+        batched_outputs = [out.output for out in pipeline.forward(DiffusionRequestBatch(make_requests()))]
+
+        for batched, serial in zip(batched_outputs, serial_outputs, strict=True):
+            torch.testing.assert_close(batched, serial, atol=0, rtol=0)
+
 
 def _reference_audio_path(messages: list[dict[str, Any]]) -> str:
     for message in messages:

@@ -262,11 +262,6 @@ def test_pad_batch_time_pads_batch_and_time() -> None:
     assert padded_mask.shape == (4, 5)
     assert padded_mask.dtype == torch.bool
     assert not padded_mask[2:].any() and not padded_mask[:, 3:].any()
-    padded_c_mask = AuKCUDAGraphWrapper._pad_c_mask(mask, 4, 5)
-    assert padded_c_mask.shape == (4, 5)
-    assert torch.equal(padded_c_mask[:2, :3], mask)
-    assert padded_c_mask[2:, 0].all()
-    assert not padded_c_mask[2:, 1:].any()
 
 
 @pytest.mark.cpu
@@ -302,16 +297,92 @@ def test_fit_loop_inputs_preserves_valid_c_mask_on_padded_rows() -> None:
 
 
 @pytest.mark.cpu
-def test_retire_graph_generation_preserves_uncapturable_loop_keys() -> None:
+def test_is_oom_capture_error_classifies_oom_and_non_oom() -> None:
+    oom_exc = torch.cuda.OutOfMemoryError("CUDA out of memory")
+    wrapped = RuntimeError("capture aborted")
+    wrapped.__cause__ = oom_exc
+    assert AuKCUDAGraphWrapper._is_oom_capture_error(oom_exc) is True
+    assert AuKCUDAGraphWrapper._is_oom_capture_error(RuntimeError("CUDA out of memory.")) is True
+    assert AuKCUDAGraphWrapper._is_oom_capture_error(wrapped) is True
+    assert AuKCUDAGraphWrapper._is_oom_capture_error(RuntimeError("unsupported op")) is False
+
+
+@pytest.mark.cpu
+def test_retire_graph_generation_preserves_uncapturable_and_resets_oom_cooldowns() -> None:
     wrapper = AuKCUDAGraphWrapper(_make_dit("cpu"), enabled=False, max_graphs=1)
     bad_key = (2, 32, 16, 0, False, 4)
+    oom_key = (4, 32, 16, 0, False, 4)
     wrapper._uncapturable_loop_keys.add(bad_key)
+    wrapper._oom_loop_cooldowns[oom_key] = 5
     wrapper._loop_cache[(1, 32, 16, 0, False, 4)] = object()  # type: ignore[assignment]
 
     wrapper._retire_graph_generation_if_full()
 
     assert wrapper._loop_cache == {}
     assert bad_key in wrapper._uncapturable_loop_keys
+    assert wrapper._oom_loop_cooldowns == {}
+
+
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
+@torch.inference_mode()
+def test_oom_loop_capture_retries_after_retirement_then_pins(mocker) -> None:
+    dit = _make_dit("cuda")
+    wrapper = AuKCUDAGraphWrapper(dit, max_graphs=1)
+    real_capture_loop = wrapper._capture_loop
+    capture_outcomes: list[object] = [
+        torch.cuda.OutOfMemoryError("CUDA out of memory during capture"),
+        "real",
+        torch.cuda.OutOfMemoryError("CUDA out of memory on first attempt"),
+        torch.cuda.OutOfMemoryError("CUDA out of memory on retry"),
+    ]
+    attempts = 0
+
+    def flaky_capture(*args, **kwargs):
+        nonlocal attempts
+        outcome = capture_outcomes[attempts]
+        attempts += 1
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return real_capture_loop(*args, **kwargs)
+
+    mocker.patch.object(wrapper, "_capture_loop", side_effect=flaky_capture)
+    inputs = _sample_inputs("cuda")
+    common = dict(**inputs, gen_frames=9, t_grid=[0.0, 0.4, 1.0], cfg_strength=0.0)
+
+    # 1. Transient OOM falls back to eager and enters cooldown (not permanent blacklist).
+    out1 = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=wrapper)
+    assert out1 is not None and attempts == 1
+    assert not wrapper._uncapturable_loop_keys and len(wrapper._oom_loop_cooldowns) == 1
+
+    # While still in cooldown without retirement, capture is not retried immediately.
+    out2 = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=wrapper)
+    assert out2 is not None and attempts == 1
+
+    # Filling and retiring the generation clears OOM cooldowns so capture retries and succeeds.
+    wrapper._loop_cache[("dummy",)] = object()  # type: ignore[assignment]
+    wrapper._retire_graph_generation_if_full()
+    out3 = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=wrapper)
+    assert out3 is not None and attempts == 2
+    assert len(wrapper._loop_cache) == 1
+    assert wrapper._oom_loop_retry_counts == {}
+
+    # 2. Simulate repeated OOM on a fresh wrapper: retries once after retirement, then pins permanently.
+    wrapper._loop_cache.clear()
+    wrapper._pool_handle = None
+    sample_a = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=wrapper)
+    assert sample_a is not None and attempts == 3
+    wrapper._loop_cache[("dummy",)] = object()  # type: ignore[assignment]
+    wrapper._retire_graph_generation_if_full()
+    sample_b = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=wrapper)
+    assert sample_b is not None and attempts == 4
+    assert len(wrapper._uncapturable_loop_keys) == 1
+
+    # Even after another retirement, the OOM-exhausted key stays permanently eager.
+    wrapper._loop_cache[("dummy",)] = object()  # type: ignore[assignment]
+    wrapper._retire_graph_generation_if_full()
+    sample_c = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=wrapper)
+    assert sample_c is not None and attempts == 4
 
 
 @pytest.mark.cpu

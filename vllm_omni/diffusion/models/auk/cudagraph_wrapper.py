@@ -60,6 +60,8 @@ class AuKCUDAGraphWrapper:
     _TEXT_ALIGNMENT = 32
     _REF_ALIGNMENT = 50
     _BATCH_LADDER = (1, 2, 4, 8, 16, 32, 64, 128)
+    _MAX_OOM_LOOP_RETRIES = 1
+    _OOM_COOLDOWN_CALLS = 16
 
     @classmethod
     def _batch_bucket(cls, batch_size: int) -> int:
@@ -69,13 +71,34 @@ class AuKCUDAGraphWrapper:
                 return b
         return batch_size
 
+    @staticmethod
+    def _is_oom_capture_error(exc: BaseException) -> bool:
+        """Return True when a capture failure is caused by CUDA out-of-memory."""
+        seen: set[int] = set()
+        cur: BaseException | None = exc
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            if isinstance(cur, torch.cuda.OutOfMemoryError):
+                return True
+            if isinstance(cur, RuntimeError) and "out of memory" in str(cur).lower():
+                return True
+            cur = cur.__cause__ if cur.__cause__ is not None else cur.__context__
+        return False
+
     def __init__(self, dit: AuKTransformer, *, enabled: bool = True, max_graphs: int = 32) -> None:
         self.dit = dit
         self.enabled = bool(enabled)
         self.max_graphs = max(1, int(max_graphs))
         self._cache: OrderedDict[tuple, _GraphEntry] = OrderedDict()
         self._loop_cache: OrderedDict[tuple, _LoopGraphEntry] = OrderedDict()
+        # Deterministic capture failures (and OOM-exhausted keys) stay eager for
+        # the process lifetime; transient OOMs cool down and retry once after
+        # generation retirement.
         self._uncapturable_loop_keys: set[tuple] = set()
+        self._oom_loop_cooldowns: dict[tuple, int] = {}
+        self._oom_loop_retry_counts: dict[tuple, int] = {}
+        # Single pool shared by single-step and loop graphs, retired atomically.
+        # Safe because both __call__ and sample_loop clone static outputs before return.
         self._pool_handle: int | None = None
         # Key whose static context holds the current request, and the context
         # the eager fallback reuses across the steps of one request.
@@ -124,6 +147,10 @@ class AuKCUDAGraphWrapper:
             self._loop_cache.clear()
             self._active_key = None
             self._pool_handle = None
+            # Retirement frees the pool held by the previous graph generation,
+            # so keys that only hit transient CUDA OOM can retry once; deterministic
+            # (or OOM-exhausted) failures remain in _uncapturable_loop_keys.
+            self._oom_loop_cooldowns.clear()
 
     def _prepare(
         self,
@@ -214,6 +241,7 @@ class AuKCUDAGraphWrapper:
             except Exception:
                 self._cache.clear()
                 self._loop_cache.clear()
+                self._oom_loop_cooldowns.clear()
                 self._active_key = None
                 self.enabled = False
                 logger.exception(
@@ -358,6 +386,22 @@ class AuKCUDAGraphWrapper:
                 timesteps=timesteps,
                 cfg_strength=cfg_strength,
             )
+        cooldown = self._oom_loop_cooldowns.get(key)
+        if cooldown is not None:
+            if cooldown > 1:
+                self._oom_loop_cooldowns[key] = cooldown - 1
+            else:
+                del self._oom_loop_cooldowns[key]
+            return self._run_eager_loop(
+                x=x,
+                x_mask=orig_x_mask,
+                text=text,
+                c_mask=c_mask,
+                ref=ref,
+                ref_mask=ref_mask,
+                timesteps=timesteps,
+                cfg_strength=cfg_strength,
+            )
         entry = self._loop_cache.get(key)
         hit_key = key if entry is not None else None
         if entry is None:
@@ -384,17 +428,43 @@ class AuKCUDAGraphWrapper:
                     cfg_strength=cfg_strength,
                 )
                 self._loop_cache[key] = entry
-            except Exception:
+                self._oom_loop_cooldowns.pop(key, None)
+                self._oom_loop_retry_counts.pop(key, None)
+            except Exception as exc:
                 self._cache.clear()
                 self._loop_cache.clear()
                 self._active_key = None
                 self._pool_handle = None
-                logger.warning(
-                    "AuK DiT multi-step CUDA graph capture failed for key=%s; falling back to eager loop.",
-                    key,
-                    exc_info=True,
-                )
-                self._uncapturable_loop_keys.add(key)
+                self._oom_loop_cooldowns.clear()
+                if self._is_oom_capture_error(exc):
+                    retries = self._oom_loop_retry_counts.get(key, 0) + 1
+                    self._oom_loop_retry_counts[key] = retries
+                    if retries <= self._MAX_OOM_LOOP_RETRIES:
+                        self._oom_loop_cooldowns[key] = self._OOM_COOLDOWN_CALLS
+                        logger.warning(
+                            "AuK DiT multi-step CUDA graph capture hit transient OOM for key=%s "
+                            "(attempt %d/%d); falling back to eager until next cache retirement.",
+                            key,
+                            retries,
+                            self._MAX_OOM_LOOP_RETRIES + 1,
+                            exc_info=True,
+                        )
+                    else:
+                        self._uncapturable_loop_keys.add(key)
+                        logger.warning(
+                            "AuK DiT multi-step CUDA graph capture failed with repeated OOM for key=%s "
+                            "after %d attempts; keeping eager loop permanently.",
+                            key,
+                            retries,
+                            exc_info=True,
+                        )
+                else:
+                    self._uncapturable_loop_keys.add(key)
+                    logger.warning(
+                        "AuK DiT multi-step CUDA graph capture failed for key=%s; falling back to eager loop.",
+                        key,
+                        exc_info=True,
+                    )
                 return self._run_eager_loop(
                     x=x,
                     x_mask=orig_x_mask,
