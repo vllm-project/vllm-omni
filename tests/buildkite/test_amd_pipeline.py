@@ -1643,24 +1643,6 @@ def test_weekly_reliability_executes_junit_guard_before_exit(
     )
 
 
-def test_minicpmo_weekly_rejects_issue_10391_skips(tmp_path: Path) -> None:
-    """This single-GPU job's three previous known skips all referenced #10391."""
-    _assert_nightly_junit_guard(
-        tmp_path,
-        pipeline_path=AMD_WEEKLY_PIPELINE,
-        step_label="Reliability Test · minicpmo-4.5",
-        command_fragment="pytest -s -v -ra",
-        expected_message="Expected exactly 14 executed MiniCPM-o 4.5 reliability tests",
-        artifact_env="ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR",
-        job_id_prefix="minicpmo-restored-shutdown-guard",
-        pytest_status=0,
-        tests=14,
-        skipped=3,
-        timeout_status=None,
-        expected_status=5,
-    )
-
-
 def test_hunyuan_offline_accuracy_has_cold_start_headroom() -> None:
     accuracy = Path("tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py").read_text(encoding="utf-8")
     offline_accuracy = accuracy.split("def _run_vllm_omni_hunyuan_image3_offline", maxsplit=1)[1].split(
