@@ -107,6 +107,13 @@ optional `/tokenizer_info` routes when no tokenization handler is configured
 (including pure diffusion mode). These endpoints return HTTP 404 and are absent
 from OpenAPI in that mode; configured handlers retain upstream vLLM routing.
 
+The server uses the deployed model's generation tasks to initialize its speech,
+audio generation, and video handlers. Unsupported speech and audio generation
+requests return HTTP 404, and unsupported image and video generation requests
+return HTTP 503 before reaching the engine. Diffusion image models also support
+image generation through Chat Completions. Segmentation and depth routes check
+their own model capabilities.
+
 An optional `--video-output-warmup` request runs through the streaming video
 handler before HTTP serving starts. The frontend owns request validation,
 draining generation and encoding, and the startup deadline. It does not expose
@@ -121,6 +128,9 @@ launches the shared local stage engines. Each frontend receives only its own
 stage-client channel configuration and does not launch or retire backend
 processes. CLI validation rejects unsupported distributed, diffusion,
 fault-tolerant, elastic-EP, Ray, and runtime-LoRA combinations before startup.
+
+`DuplexOmni` supports an optional session-only process runtime. See
+[process runtime usage, ownership, and limits](../../serving/full_duplex_api.md#run-the-duplex-runtime-in-a-separate-process).
 
 It does not own configuration precedence, cross-stage routing, stage
 placement, payload implementation, or semantic error classification.

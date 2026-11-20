@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from dataclasses import dataclass
 from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
@@ -16,11 +17,13 @@ import pytest
 from pytest_mock import MockerFixture
 from vllm.v1.engine.utils import EngineZmqAddresses
 
+from vllm_omni import platforms
 from vllm_omni.config.omni_config import (
     VllmOmniDiffusionStageConfig,
     normalize_and_validate_diffusion_engine_ingress_kwargs,
 )
-from vllm_omni.config.resolver import OmniConfigResolution
+from vllm_omni.config.pipeline_registry import resolve_pipeline_config
+from vllm_omni.config.resolver import OmniConfigResolution, resolve_omni_config
 from vllm_omni.config.watermarking import WatermarkConfig
 from vllm_omni.engine.arg_utils import FRONTEND_ONLY_ID_FILTER
 from vllm_omni.engine.stage_engine_startup import StageReplicaResources
@@ -33,7 +36,7 @@ from vllm_omni.entrypoints.cli.serve import (
     run_headless,
 )
 from vllm_omni.entrypoints.omni_base import OmniBase
-from vllm_omni.entrypoints.utils import parse_stage_overrides
+from vllm_omni.entrypoints.utils import parse_stage_overrides, prepare_stage_config_inputs
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -918,7 +921,8 @@ def test_parse_stage_overrides_valid_json() -> None:
     assert parsed == {"0": {"devices": "0,1"}, "1": {"devices": "2"}}
 
 
-def test_serve_parser_parses_stage_overrides_before_resolution() -> None:
+@pytest.mark.parametrize("stage_id", ["0", "00"])
+def test_serve_parser_parses_stage_overrides_before_resolution(stage_id: str) -> None:
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="subcommand")
     OmniServeCommand().subparser_init(subparsers)
@@ -929,7 +933,7 @@ def test_serve_parser_parses_stage_overrides_before_resolution() -> None:
             "fake-model",
             "--omni",
             "--stage-overrides",
-            '{"0": {"devices": "0,1"}}',
+            f'{{"{stage_id}": {{"devices": "0,1"}}}}',
         ]
     )
 
@@ -965,6 +969,11 @@ def test_parse_stage_overrides_rejects_invalid_stage_ids(payload: str) -> None:
         _parse_stage_overrides(payload)
 
 
+def test_parse_stage_overrides_rejects_duplicate_logical_stage_ids() -> None:
+    with pytest.raises(argparse.ArgumentTypeError, match="more than one key for stage 0"):
+        _parse_stage_overrides('{"0": {"enforce_eager": true}, "00": {"enforce_eager": false}}')
+
+
 def test_parse_stage_overrides_preserves_arbitrary_override_fields() -> None:
     parsed = _parse_stage_overrides(
         '{"0": {"extras": {"ltx2_use_conv_vae": true}, "kv_cache_dtype": "fp8", "typo_field_xyz": 1}}'
@@ -974,6 +983,102 @@ def test_parse_stage_overrides_preserves_arbitrary_override_fields() -> None:
         "kv_cache_dtype": "fp8",
         "typo_field_xyz": 1,
     }
+
+
+def test_serve_warns_once_per_ignored_stage_override(caplog: pytest.LogCaptureFixture, mocker: MockerFixture) -> None:
+    mocker.patch.dict("os.environ", {"VLLM_DISABLE_LOG_LOGO": "1"})
+    launch = mocker.patch("vllm_omni.entrypoints.cli.serve.run_multi_api_server_omni")
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subparser")
+    OmniServeCommand().subparser_init(subparsers)
+
+    with caplog.at_level(logging.WARNING):
+        args = parser.parse_args(
+            [
+                "serve",
+                "fake-model",
+                "--omni",
+                "--api-server-count",
+                "2",
+                "--stage-overrides",
+                '{"0": {"session_mode": "duplex", "duplex_session.idle_ttl_s": 60, "env": {"TEST_ENV": "1"}}}',
+            ]
+        )
+        OmniServeCommand.cmd(args)
+
+    assert [message for message in caplog.messages if "Ignoring --stage-overrides" in message] == [
+        "Ignoring --stage-overrides['0']['session_mode']: set 'session_mode' in the deploy config instead.",
+        "Ignoring --stage-overrides['0']['duplex_session.idle_ttl_s']: set 'duplex_session' in the deploy config instead.",
+    ]
+    launch.assert_called_once_with(args)
+    assert args.get_explicit_kwargs_dict()["stage_overrides"] == {"0": {"env": {"TEST_ENV": "1"}}}
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "expected"),
+    [
+        ([], None),
+        (["--stage-id", "none"], None),
+        (["--stage-id", "0"], [0.25, 0.8, 0.15]),
+        (
+            ["--stage-id", "0", "--stage-overrides", '{"0": {"gpu_memory_utilization": 0.4}}'],
+            [0.4, 0.8, 0.15],
+        ),
+        (
+            ["--stage-overrides", '{"01": {"gpu_memory_utilization": 0.4}, "2": {"gpu_memory_utilization": 0.3}}'],
+            [0.25, 0.4, 0.3],
+        ),
+    ],
+)
+def test_serve_stage_owned_flag_targets_at_most_one_stage(
+    extra_args: list[str], expected: list[float] | None, mocker: MockerFixture
+) -> None:
+    pipeline = resolve_pipeline_config("qwen2_5_omni")
+    assert pipeline is not None
+    mocker.patch("vllm_omni.config.config_factory.StageConfigFactory.get_pipeline_config", return_value=pipeline)
+    mocker.patch("vllm_omni.diffusion.utils.hf_utils.is_diffusion_model", return_value=False)
+    mocker.patch.dict("os.environ", {"VLLM_DISABLE_LOG_LOGO": "1"})
+    mocker.patch.object(platforms.current_omni_platform, "device_name", "cuda")
+    parser = TrackingArgumentParser()
+    command = OmniServeCommand()
+    command.subparser_init(parser.add_subparsers(dest="subparser"))
+    distributed_args = ["--omni-master-address", "127.0.0.1", "--omni-master-port", "26000"]
+    args = parser.parse_args(
+        ["serve", "fake-model", "--omni", "--gpu-memory-utilization", "0.25", *distributed_args, *extra_args]
+    )
+    command.validate(args)
+    budgets: list[float] = []
+
+    async def resolve_before_startup(args: TrackingNamespace) -> None:
+        inputs = prepare_stage_config_inputs(args.model, args.get_explicit_kwargs_dict(), trust_remote_code=None)
+        config = resolve_omni_config(
+            inputs.model,
+            trust_remote_code=inputs.trust_remote_code,
+            cli_overrides=inputs.kwargs,
+            deploy_config_path=inputs.deploy_config_path,
+            stage_overrides=inputs.stage_overrides,
+            strategy_config_path=inputs.strategy_config_path,
+        )
+        budgets.extend(stage.cache_config.gpu_memory_utilization for stage in config.stage_configs)
+
+    mocker.patch("vllm_omni.entrypoints.cli.serve.omni_run_server", resolve_before_startup)
+    if expected is None:
+        with pytest.raises(ValueError, match=r"--gpu-memory-utilization .*\[0, 1, 2\].*--stage-overrides"):
+            OmniServeCommand.cmd(args)
+    else:
+        OmniServeCommand.cmd(args)
+        assert budgets == expected
+
+
+def test_parse_stage_overrides_warns_and_skips_non_stage_fields(caplog) -> None:
+    with caplog.at_level(logging.WARNING, logger="vllm_omni.entrypoints.utils"):
+        parsed = parse_stage_overrides(
+            '{"0": {"session_mode": "duplex", "duplex_session.idle_ttl_s": 60, "env": {"TEST_ENV": "1"}}}'
+        )
+
+    assert parsed == {"0": {"env": {"TEST_ENV": "1"}}}
+    assert "session_mode" in caplog.text
+    assert "duplex_session.idle_ttl_s" in caplog.text
 
 
 def test_parse_stage_overrides_rejects_non_dict_top_level() -> None:
@@ -1006,7 +1111,7 @@ def test_parse_stage_overrides_rejects_non_integer_stage_id() -> None:
 
 
 def test_parse_stage_overrides_accepts_stage_merge_extras_and_engine_args() -> None:
-    """Three classes of keys pass through the shape-only parser:
+    """The parser retains stage fields and unknown keys for downstream validation.
 
     - ``extras`` is read by the default-diffusion fallback
       (``async_omni_engine.py``); registered pipelines carry it on
@@ -1014,11 +1119,8 @@ def test_parse_stage_overrides_accepts_stage_merge_extras_and_engine_args() -> N
     - Engine arguments (``kv_cache_dtype``, ``stage_connector_spec``, ...)
       are forwarded as ``stage_<id>_<key>`` and applied via
       ``OmniEngineArgs``.
-    - Unknown keys parse through and are dropped with a warning at
-      ``filter_dataclass_kwargs`` (see
-      ``tests/entrypoints/test_utils.py::TestFilterDataclassKwargs``).
-
-    ``typo_field_xyz`` in the payload exercises the third case.
+    - Unknown keys such as ``typo_field_xyz`` are dropped with a warning
+      when filtered against ``OmniEngineArgs``.
     """
     parsed = parse_stage_overrides(
         '{"0": {"extras": {"ltx2_use_conv_vae": true},'

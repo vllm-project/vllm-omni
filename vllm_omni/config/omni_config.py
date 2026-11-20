@@ -41,7 +41,10 @@ from vllm.pooling_params import PoolingParams
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
     _STAGE_DEPLOY_FIELDS,
+    _STAGE_OVERRIDE_PATTERN,
+    NON_STAGE_OVERRIDE_FIELDS,
     PIPELINE_WIDE_ENGINE_FIELDS,
+    SERVE_CLI_SCOPE_KEY,
     DeployConfig,
     PipelineConfig,
     StageDeployConfig,
@@ -78,6 +81,18 @@ _EXECUTION_TYPE_TO_STAGE_WORKER: dict[StageExecutionType, tuple[StageType, str |
 
 _PIPELINE_DEPLOY_CLI_FIELDS = PIPELINE_WIDE_ENGINE_FIELDS
 
+# Keep model source pins and settings shared with the serving frontend global.
+_SERVE_SHARED_CLI_FIELDS = frozenset(
+    {
+        "allowed_local_media_path",
+        "allowed_media_domains",
+        "code_revision",
+        "revision",
+        "served_model_name",
+        "tokenizer_revision",
+    }
+)
+
 _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
     {
         "async_chunk",
@@ -96,6 +111,7 @@ _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
         "tokenizer",
         "video_output_warmup",
         "video_output_warmup_timeout",
+        SERVE_CLI_SCOPE_KEY,
     }
 )
 
@@ -117,6 +133,11 @@ _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS = frozenset({"kv_cache_dtype", "seed"})
 # stages that own them (``--no-guardrails`` rides on ``model_config``). Stages
 # that do not own them skip them silently instead of rejecting the flag.
 _OWNER_ONLY_GLOBAL_STAGE_CLI_FIELDS = frozenset({"model_config"})
+_DIFFUSION_STAGE_CLI_ALIASES = {
+    "diffusion_attention_backend": "diffusion_attention_config",
+    "fastvideo_vsa_topk": "diffusion_attention_config",
+    "diffusion_quantization_config": "quantization_config",
+}
 
 
 class _QuantizationEngineOverrides(TypedDict, total=False):
@@ -287,6 +308,7 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     vae_parallel_mode: str
     text_encoder_tp_size: int
     use_hsdp: bool
+    hsdp_data_parallel: bool
     mask_sp_padding: bool
     hsdp_shard_size: int
     hsdp_replicate_size: int
@@ -374,6 +396,19 @@ def _resolve_scheduler_path(execution_type: StageExecutionType, async_scheduling
     return _scheduler_path(_resolve_scheduler(execution_type, async_scheduling))
 
 
+def _global_stage_engine_fields(
+    execution_type: StageExecutionType,
+    *,
+    stage_scoped_lora: bool,
+) -> frozenset[str]:
+    owned_fields = _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[execution_type]
+    if execution_type == StageExecutionType.DIFFUSION:
+        return owned_fields - _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS
+    if stage_scoped_lora:
+        owned_fields = owned_fields - _LLM_LORA_ENGINE_FIELDS
+    return owned_fields - {"step_execution"}
+
+
 def _stage_cli_overrides(
     stage_id: int,
     cli_overrides: Mapping[str, Any],
@@ -381,6 +416,11 @@ def _stage_cli_overrides(
     execution_type: StageExecutionType | None = None,
     stage_scoped_lora: bool = False,
 ) -> dict[str, Any]:
+    scoped_inputs = {
+        match[2]: value
+        for name, value in cli_overrides.items()
+        if (match := _STAGE_OVERRIDE_PATTERN.fullmatch(name)) is not None and int(match[1]) == stage_id
+    }
     if execution_type == StageExecutionType.DIFFUSION:
         stage_override_pattern = re.compile(r"^stage_\d+_")
         stage_scoped = {
@@ -394,23 +434,20 @@ def _stage_cli_overrides(
             ),
             **stage_scoped,
         }
-    elif stage_scoped_lora and execution_type is not None:
-        # Filter global LoRA inputs before merging stage-scoped values so a
-        # diffusion cache size cannot overwrite an LLM stage's explicit value.
-        cli_overrides = {name: value for name, value in cli_overrides.items() if name not in _LLM_LORA_ENGINE_FIELDS}
-    runtime_overrides = build_stage_runtime_overrides(stage_id, dict(cli_overrides))
+    runtime_overrides = build_stage_runtime_overrides(
+        stage_id,
+        dict(cli_overrides),
+        warn_dropped=execution_type is not StageExecutionType.DIFFUSION,
+    )
     global_stage_fields = _global_stage_cli_fields() | _OWNER_ONLY_GLOBAL_STAGE_CLI_FIELDS
-    owned_fields = None if execution_type is None else _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[execution_type]
+    owned_fields = (
+        None
+        if execution_type is None
+        else _global_stage_engine_fields(execution_type, stage_scoped_lora=stage_scoped_lora)
+    )
     result: dict[str, Any] = {}
     for key, value in runtime_overrides.items():
-        stage_key = f"stage_{stage_id}_{key}"
-        stage_specific = stage_key in cli_overrides
-        if (
-            execution_type == StageExecutionType.DIFFUSION
-            and key in _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS
-            and not stage_specific
-        ):
-            continue
+        stage_specific = scoped_inputs.get(key) is not None
         if stage_specific or (key in global_stage_fields and (owned_fields is None or key in owned_fields)):
             result[key] = _copy_value(value)
 
@@ -419,19 +456,104 @@ def _stage_cli_overrides(
     if execution_type is not None and execution_type is not StageExecutionType.DIFFUSION:
         result.pop("step_execution", None)
     if execution_type == StageExecutionType.DIFFUSION:
-        prefix = f"stage_{stage_id}_"
-        for key, value in cli_overrides.items():
-            if key.startswith(prefix):
-                field_name = key.removeprefix(prefix)
-                if field_name in {"model", "model_arch", "stage_id"}:
-                    raise ValueError(f"Diffusion stage {stage_id} cannot override identity field {field_name!r}.")
-                if field_name in _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS:
-                    raise ValueError(
-                        f"Diffusion stage {stage_id} cannot override shared engine field {field_name!r}; "
-                        "it has no diffusion stage-config consumer."
-                    )
-                result.setdefault(field_name, _copy_value(value))
+        for field_name, value in scoped_inputs.items():
+            if field_name in {"model", "model_arch", "stage_id"}:
+                raise ValueError(f"Diffusion stage {stage_id} cannot override identity field {field_name!r}.")
+            if field_name in _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS:
+                raise ValueError(
+                    f"Diffusion stage {stage_id} cannot override shared engine field {field_name!r}; "
+                    "it has no diffusion stage-config consumer."
+                )
+            if field_name in NON_STAGE_OVERRIDE_FIELDS or field_name == "default_sampling_params":
+                logger.warning(
+                    "Ignoring --stage-overrides[%s].%s: this field is not a per-stage override.",
+                    stage_id,
+                    field_name,
+                )
+                continue
+            result.setdefault(field_name, _copy_value(value))
     return result
+
+
+def _scope_serve_stage_flags(pipeline: PipelineConfig, cli_overrides: dict[str, Any]) -> None:
+    """Prevent a flat serve flag from silently overriding multiple stage configs."""
+    if len(pipeline.stages) <= 1:
+        return
+
+    cli_fields = _global_stage_cli_fields() | _OWNER_ONLY_GLOBAL_STAGE_CLI_FIELDS | _DIFFUSION_STAGE_CLI_ALIASES.keys()
+    stage_fields = cli_fields - _SERVE_SHARED_CLI_FIELDS - set(_PIPELINE_DEPLOY_CLI_FIELDS)
+    explicit_flags = {
+        name: value for name, value in cli_overrides.items() if name in stage_fields and value is not None
+    }
+    if not explicit_flags:
+        return
+
+    scoped_overrides = {name: value for name, value in cli_overrides.items() if _STAGE_OVERRIDE_PATTERN.fullmatch(name)}
+    scoped_by_stage: dict[int, set[str]] = {}
+    owners_by_stage: dict[int, frozenset[str]] = {}
+    diffusion_stage_ids = {
+        stage.stage_id for stage in pipeline.stages if stage.execution_type == StageExecutionType.DIFFUSION
+    }
+    for stage in pipeline.stages:
+        stage_overrides = build_stage_runtime_overrides(stage.stage_id, scoped_overrides, warn_dropped=False)
+        scoped_fields = set(stage_overrides)
+        nested_parallel = _mapping_or_empty(stage_overrides.get("parallel_config"))
+        if nested_parallel:
+            if stage.execution_type == StageExecutionType.DIFFUSION:
+                # Flat diffusion flags move into parallel_config before the
+                # scoped mapping is merged. Even a nested null replaces one.
+                scoped_fields.update(nested_parallel.keys() & _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS)
+            else:
+                field_map = _PARALLEL_CONFIG_ENGINE_FIELD_MAP
+                effective_parallel = _normalize_config_mapping(nested_parallel, field_map)
+                scoped_fields.update(field_map[field] for field in effective_parallel if field in field_map)
+        scoped_by_stage[stage.stage_id] = scoped_fields
+        owners_by_stage[stage.stage_id] = _global_stage_engine_fields(stage.execution_type, stage_scoped_lora=True)
+
+    selected_id = cli_overrides.get("stage_id")
+    selected = next((stage for stage in pipeline.stages if stage.stage_id == selected_id), None)
+    ambiguous = []
+    for name, value in explicit_flags.items():
+        recipients = []
+        owners = []
+        for stage in pipeline.stages:
+            aliases = _DIFFUSION_STAGE_CLI_ALIASES if stage.execution_type == StageExecutionType.DIFFUSION else {}
+            field = aliases.get(name, name)
+            if field not in owners_by_stage[stage.stage_id]:
+                continue
+            owners.append(stage.stage_id)
+            # Diffusion globals are normalized before they are merged with raw
+            # stage-scoped inputs. Only the same resulting key masks a global.
+            if field not in scoped_by_stage[stage.stage_id]:
+                recipients.append(stage.stage_id)
+
+        # Leave flags consumed outside the stage engines to their own validation.
+        if not owners:
+            continue
+        flag = "--" + name.replace("_", "-")
+        if selected is not None:
+            if selected.stage_id not in owners:
+                raise ValueError(
+                    f"{flag} is not used by stage {selected.stage_id} of pipeline {pipeline.model_type!r}; "
+                    "use --stage-overrides or set it in the owning stage's deploy YAML entry."
+                )
+            del cli_overrides[name]
+            if selected.stage_id in recipients and name not in scoped_by_stage[selected.stage_id]:
+                cli_overrides[f"stage_{selected.stage_id}_{name}"] = value
+        elif len(recipients) > 1:
+            ambiguous.append(f"{flag} (stages {recipients})")
+        elif diffusion_stage_ids and diffusion_stage_ids.isdisjoint(owners):
+            # Route LLM-only flags before diffusion ingress validates global inputs.
+            del cli_overrides[name]
+            if recipients:
+                cli_overrides[f"stage_{recipients[0]}_{name}"] = value
+
+    if ambiguous:
+        flags = ", ".join(ambiguous)
+        raise ValueError(
+            f"Pipeline {pipeline.model_type!r} has stage-specific flags targeting multiple stages: {flags}. "
+            "Use --stage-overrides or set the values in the corresponding deploy YAML stages."
+        )
 
 
 def _validate_global_stage_cli_ownership(
@@ -788,6 +910,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     text_encoder_tp_size: int = Field(default=1, ge=1)
     vae_parallel_mode: str = "tile"
     use_hsdp: bool = False
+    hsdp_data_parallel: bool = False
     mask_sp_padding: bool = False
     hsdp_shard_size: int = -1
     hsdp_replicate_size: int = Field(default=1, ge=1)
@@ -808,14 +931,10 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
                 "vae_parallel_mode must be one of {'tile', 'batch', 'spatial_shard_height', 'spatial_shard_width'}, "
                 f"but got {self.vae_parallel_mode!r}."
             )
-        if self.vae_parallel_mode == "batch" and (
-            self.data_parallel_size != 1 or self.pipeline_parallel_size != 1 or self.cfg_parallel_size != 1
-        ):
-            raise ValueError("VAE batch parallel decode requires DP, PP, and CFG parallel sizes to be 1")
-
+        world_size_dp_factor = 1 if self.use_hsdp and self.hsdp_data_parallel else self.data_parallel_size
         other_parallel_world_size = (
             self.pipeline_parallel_size
-            * self.data_parallel_size
+            * world_size_dp_factor
             * self.tensor_parallel_size
             * self.sequence_parallel_size
             * self.cfg_parallel_size
@@ -824,7 +943,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
             incompatible = []
             if self.tensor_parallel_size > 1:
                 incompatible.append("TP")
-            if self.data_parallel_size > 1:
+            if self.data_parallel_size > 1 and not self.hsdp_data_parallel:
                 incompatible.append("DP")
             if self.pipeline_parallel_size > 1:
                 incompatible.append("PP")
@@ -832,6 +951,24 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
                 incompatible.append("EP")
             if incompatible:
                 raise ValueError("HSDP (FSDP2) is not compatible with " + ", ".join(incompatible))
+            if self.hsdp_data_parallel and (
+                self.tensor_parallel_size
+                * self.sequence_parallel_size
+                * self.pipeline_parallel_size
+                * self.cfg_parallel_size
+                != 1
+            ):
+                raise ValueError(
+                    "hsdp_data_parallel requires tensor, sequence, pipeline, and CFG parallel sizes to all be 1"
+                )
+            if self.hsdp_data_parallel and self.text_encoder_tp_size > 1:
+                # Encoder TP collectives require every encoder rank to process
+                # the same input, while HSDP request ranks own different prompts.
+                raise ValueError("hsdp_data_parallel requires text_encoder_tp_size to be 1")
+            if self.hsdp_data_parallel and self.vae_patch_parallel_size > 1:
+                # Patch-parallel VAE decode splits and stitches tiles across WORLD,
+                # which would mix latents from the different requests on each rank.
+                raise ValueError("hsdp_data_parallel requires vae_patch_parallel_size to be 1")
             if self.hsdp_shard_size == -1:
                 if other_parallel_world_size == 1:
                     raise ValueError("Cannot auto-calculate hsdp_shard_size when other parallelism is all 1")
@@ -856,8 +993,22 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
                             f"({other_parallel_world_size})"
                         )
                     self.world_size = other_parallel_world_size
+            if self.hsdp_data_parallel:
+                if self.data_parallel_size not in (1, self.world_size):
+                    raise ValueError(
+                        f"hsdp_data_parallel data_parallel_size must be 1 or HSDP world size "
+                        f"({self.world_size}), but got {self.data_parallel_size}"
+                    )
+                self.data_parallel_size = self.world_size
         else:
+            if self.hsdp_data_parallel:
+                raise ValueError("hsdp_data_parallel requires use_hsdp=True")
             self.world_size = other_parallel_world_size
+
+        if self.vae_parallel_mode == "batch" and (
+            self.data_parallel_size != 1 or self.pipeline_parallel_size != 1 or self.cfg_parallel_size != 1
+        ):
+            raise ValueError("VAE batch parallel decode requires DP, PP, and CFG parallel sizes to be 1")
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True, extra="forbid"))
@@ -875,7 +1026,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     model_class_name: str | None = None
     engine_backend: str | type = "default"
     diffusion_model_runner_cls: str | type | None = None
-    request_batch_max_wait_ms: float = 0.0
+    request_batch_max_wait_ms: float | None = None
     streaming_output: bool = False
     model_arch: str | None = None
     task_type: str | None = None
@@ -2447,6 +2598,8 @@ class VllmOmniConfig:
         if cli_overrides is None:
             cli_overrides = {}
         cli_overrides = normalize_pipeline_cli_overrides(pipeline_cfg, cli_overrides)
+        if cli_overrides.pop(SERVE_CLI_SCOPE_KEY, False):
+            _scope_serve_stage_flags(pipeline_cfg, cli_overrides)
         _validate_global_stage_cli_ownership(pipeline_cfg, cli_overrides)
 
         deploy, loaded_deploy_config_path = _get_deploy_config(
@@ -2480,7 +2633,7 @@ class VllmOmniConfig:
             }
             for stage_id, parallel in strategy_result.per_stage_config.items():
                 declared = set(parallel.l1_owners)
-                explicit = build_stage_runtime_overrides(stage_id, cli_overrides)
+                explicit = build_stage_runtime_overrides(stage_id, cli_overrides, warn_dropped=False)
                 for axis, field_name in axis_fields.items():
                     if axis not in declared:
                         continue

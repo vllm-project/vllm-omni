@@ -66,6 +66,7 @@ def test_judge_cleanup_leaves_final_memory_wait_to_primary(monkeypatch, device_e
             "_resolve_offline_model": lambda model, **_: model,
             "_cli_flag_value": lambda *_: None,
             "_merge_omni_default_server_args": lambda *_, **__: [],
+            "_preflight_server_vad": lambda *_: None,
             "_judge_server_params_for_test": lambda _: {"model": "judge", "device_index": "1"},
             "_omni_server_env": lambda: {},
         },
