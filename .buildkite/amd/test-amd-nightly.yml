@@ -1205,7 +1205,37 @@ steps:
 
   - group: ":full_moon: Qwen-Image 2.1 Accuracy MI300 Nightly"
     steps:
-      - label: "Qwen-Image 2.1 Accuracy"
+      - label: "Qwen-Image 2.1 T2I Accuracy"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 180
+        source_file_dependencies: diffusion_qwen_image_21_accuracy
+        env:
+          QWEN_IMAGE_21_CALIBRATE: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+          ACC_BENCH_RESULT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen-image-21-t2i/accuracy-results"
+        artifact_paths:
+          - artifacts/rocm-qwen-image-21-t2i/**/*
+        commands:
+          - export ROCM_QWEN_IMAGE_21_T2I_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen-image-21-t2i"
+          - source tests/e2e/accuracy/qwen_image_21/setup_reference.sh
+          - |
+            set +e
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh \
+              1 1 165m rocm-qwen-image-21-t2i \
+              "tests/e2e/accuracy/qwen_image_21/test_qwen_image_21.py::test_qwen_image_21_matches_reference[t2i]" \
+              -m "full_model and diffusion and rocm and MI325 and cards_1"
+            status=$$?
+            set -e
+            if [[ -d tests/e2e/accuracy/artifacts ]]; then
+              mkdir -p "$$ROCM_QWEN_IMAGE_21_T2I_ARTIFACT_DIR/accuracy"
+              cp -a tests/e2e/accuracy/artifacts/. "$$ROCM_QWEN_IMAGE_21_T2I_ARTIFACT_DIR/accuracy/"
+            fi
+            exit "$$status"
+
+      # gfx942 IT2I remains an expected XFAIL; its metrics and images are retained.
+      - label: "Qwen-Image 2.1 IT2I Accuracy"
         agent_pool: mi300_1
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
@@ -1223,7 +1253,6 @@ steps:
           - |
             nodes=(
               "tests/e2e/accuracy/qwen_image_21/test_qwen_image_21.py::test_qwen_image_21_matches_reference[it2i]"
-              "tests/e2e/accuracy/qwen_image_21/test_qwen_image_21.py::test_qwen_image_21_matches_reference[t2i]"
             )
             pytest --collect-only -q "$${nodes[@]}" \
               -m "full_model and diffusion and rocm and MI325 and cards_1" --run-level full_model \
@@ -1246,7 +1275,6 @@ steps:
             set +e
             nodes=(
               "tests/e2e/accuracy/qwen_image_21/test_qwen_image_21.py::test_qwen_image_21_matches_reference[it2i]"
-              "tests/e2e/accuracy/qwen_image_21/test_qwen_image_21.py::test_qwen_image_21_matches_reference[t2i]"
             )
             timeout --signal=TERM --kill-after=2m 165m \
               pytest -s -v "$${nodes[@]}" \
@@ -1899,7 +1927,7 @@ steps:
       - label: "BAGEL Sleep Mode"
         agent_pool: mi300_2
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: omni_bagel_sleep_function
         env:
@@ -1962,6 +1990,24 @@ steps:
 
   - group: ":full_moon: Wan2.2 Function 1 GPU Group"
     steps:
+      - label: "Wan2.2 Device-Postprocess Equivalence"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 60
+        source_file_dependencies: diffusion_wan22_device_postprocess
+        env:
+          VLLM_OMNI_DEVICE_POSTPROCESS_MODEL: Wan-AI/Wan2.2-TI2V-5B-Diffusers
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-wan22-device-postprocess/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 1 40m rocm-wan22-device-postprocess
+            tests/e2e/offline_inference/test_device_postprocess_equivalence.py::test_device_postprocess_produces_equivalent_frames
+            -m "full_model and diffusion and rocm and MI325 and cards_1"
+
       - label: "Wan2.2 Function 1 GPU"
         agent_pool: mi300_1
         mirror_hardwares: [amdproduction]
