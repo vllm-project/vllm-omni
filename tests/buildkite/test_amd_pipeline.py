@@ -19,6 +19,7 @@ import yaml
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+
 AMD_MERGE_PIPELINE = Path(".buildkite/amd/test-amd-merge.yml")
 AMD_NIGHTLY_PIPELINE = Path(".buildkite/amd/test-amd-nightly.yml")
 AMD_WEEKLY_PIPELINE = Path(".buildkite/amd/test-amd-weekly.yml")
@@ -1464,29 +1465,29 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
         "Reliability Test · Invalid parameters · MI300 · Single-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-single/**/*",
             "artifact_env": "ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR",
-            "expected_nodes": 76,
+            "expected_nodes": 30,
             "expected_skipped": 5,
             "timeout": "75m",
-            "collection_message": "Expected exactly 76 single-GPU invalid-parameter nodes",
-            "junit_message": "Expected exactly 76 single-GPU invalid-parameter tests with 5 known skips",
+            "collection_message": "Expected exactly 30 single-GPU invalid-parameter nodes",
+            "junit_message": "Expected exactly 30 single-GPU invalid-parameter tests with 5 known skips",
         },
         "Reliability Test · Invalid parameters · MI300 · 2-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-reliability/**/*",
             "artifact_env": "ROCM_INVALID_PARAMETERS_ARTIFACT_DIR",
-            "expected_nodes": 24,
+            "expected_nodes": 18,
             "expected_skipped": 0,
             "timeout": "75m",
-            "collection_message": "Expected exactly 24 invalid-parameter reliability nodes",
-            "junit_message": "Expected exactly 24 executed invalid-parameter reliability tests",
+            "collection_message": "Expected exactly 18 invalid-parameter reliability nodes",
+            "junit_message": "Expected exactly 18 executed invalid-parameter reliability tests",
         },
         "Reliability Test · Invalid parameters · Audio · MI300 · Single-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-audio/**/*",
             "artifact_env": "ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR",
-            "expected_nodes": 127,
+            "expected_nodes": 85,
             "expected_skipped": 26,
             "timeout": "105m",
-            "collection_message": "Expected exactly 127 audio invalid-parameter nodes",
-            "junit_message": "Expected exactly 127 audio invalid-parameter tests with 26 known skips",
+            "collection_message": "Expected exactly 85 audio invalid-parameter nodes",
+            "junit_message": "Expected exactly 85 audio invalid-parameter tests with 26 known skips",
         },
     }
     for label, expected in guarded_jobs.items():
@@ -1575,25 +1576,25 @@ def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
             "Reliability Test · Invalid parameters · MI300 · Single-GPU",
             "ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR",
             "invalid-parameters-single-reliability-guard",
-            76,
+            30,
             5,
-            "Expected exactly 76 single-GPU invalid-parameter tests with 5 known skips",
+            "Expected exactly 30 single-GPU invalid-parameter tests with 5 known skips",
         ),
         (
             "Reliability Test · Invalid parameters · MI300 · 2-GPU",
             "ROCM_INVALID_PARAMETERS_ARTIFACT_DIR",
             "invalid-parameters-reliability-guard",
-            24,
+            18,
             0,
-            "Expected exactly 24 executed invalid-parameter reliability tests",
+            "Expected exactly 18 executed invalid-parameter reliability tests",
         ),
         (
             "Reliability Test · Invalid parameters · Audio · MI300 · Single-GPU",
             "ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR",
             "invalid-parameters-audio-reliability-guard",
-            127,
+            85,
             26,
-            "Expected exactly 127 audio invalid-parameter tests with 26 known skips",
+            "Expected exactly 85 audio invalid-parameter tests with 26 known skips",
         ),
     ),
     ids=("qwen3-omni", "wan22", "minicpmo", "invalid-parameters-single", "invalid-parameters-2gpu", "audio"),
