@@ -789,7 +789,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t",
         AMD_READY_PIPELINE,
         "NonBlocking",
-        1436,
+        1454,
         "core_model and rocm and MI325 and not nvidia_only and not "
         "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
     ),
@@ -1464,11 +1464,11 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
         "Reliability Test · Invalid parameters · MI300 · Single-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-single/**/*",
             "artifact_env": "ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR",
-            "expected_nodes": 76,
+            "expected_nodes": 66,
             "expected_skipped": 5,
             "timeout": "75m",
-            "collection_message": "Expected exactly 76 single-GPU invalid-parameter nodes",
-            "junit_message": "Expected exactly 76 single-GPU invalid-parameter tests with 5 known skips",
+            "collection_message": "Expected exactly 66 single-GPU invalid-parameter nodes",
+            "junit_message": "Expected exactly 66 single-GPU invalid-parameter tests with 5 known skips",
         },
         "Reliability Test · Invalid parameters · MI300 · 2-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-reliability/**/*",
@@ -1575,9 +1575,9 @@ def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
             "Reliability Test · Invalid parameters · MI300 · Single-GPU",
             "ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR",
             "invalid-parameters-single-reliability-guard",
-            76,
+            66,
             5,
-            "Expected exactly 76 single-GPU invalid-parameter tests with 5 known skips",
+            "Expected exactly 66 single-GPU invalid-parameter tests with 5 known skips",
         ),
         (
             "Reliability Test · Invalid parameters · MI300 · 2-GPU",
@@ -3378,7 +3378,6 @@ def test_qwen_image_backend_similarity_is_one_blocking_nightly_job() -> None:
 _NIGHTLY_PROMOTED_ACCURACY_DOC_JOBS = (
     ("Qwen3-Omni Accuracy", 4, "Qwen3-Omni accuracy", "ROCM_QWEN3_ACCURACY_ARTIFACT_DIR"),
     ("Qwen3-Omni Documentation Examples", 7, "Qwen3-Omni documentation", "ROCM_QWEN3_DOC_ARTIFACT_DIR"),
-    ("Qwen2.5-Omni Documentation Examples", 7, "Qwen2.5-Omni documentation", "QWEN25_OMNI_DOC_ARTIFACT_DIR"),
     ("Wan2.2 I2V Accuracy 2 GPU", 3, "Wan2.2 I2V accuracy", "ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR"),
     ("HunyuanImage3 LoRA Accuracy", 1, "HunyuanImage3 LoRA accuracy", "ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR"),
     (
@@ -4350,7 +4349,7 @@ def test_entrypoints_full_nightly_splits_qwen_and_bagel_without_skips() -> None:
         step = _find_step(label, AMD_NIGHTLY_PIPELINE)
         assert step["agent_pool"] == "mi300_2"
         assert step["mirror_hardwares"] == ["amdproduction"]
-        assert step["grade"] == ("Blocking" if label == "Qwen3-Omni Duplex Playback" else "NonBlocking")
+        assert step["grade"] == "Blocking"
         assert step["timeout_in_minutes"] == 180
         assert step["source_file_dependencies"] == dependency_key
         assert step["artifact_paths"] == [artifacts]
@@ -4926,7 +4925,7 @@ _WORKER_ONE_CARD_NODES = (
 def test_worker_one_card_ready_stays_outside_r2_01() -> None:
     """READY blocks on the collected one-card worker nodes.
 
-    The V2/shared one-card cases retain their exact IDs after V1 removal. R2-01 still collects 1436 model-executor nodes and does not run them.
+    The V2/shared one-card cases retain their exact IDs after V1 removal. R2-01 still collects 1454 model-executor nodes and does not run them.
     """
     step = _find_step("ROCm · One-Card Worker GPU Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -4964,15 +4963,19 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
     for path in _WORKER_ONE_CARD_FILES[:1]:
         source = Path(path).read_text(encoding="utf-8")
         assert source.count('res={"cuda": "L4", "rocm": "MI325"}, num_cards=1') == 1
+    # The Intel single-card lane selects some cases of this file too, so their
+    # res dicts name a third platform. The AMD node list is unchanged: the marker
+    # expression for this step is still core_model and rocm and MI325 and cards_1.
     eager = Path(_WORKER_ONE_CARD_FILES[1]).read_text(encoding="utf-8")
-    assert eager.count('res={"cuda": "L4", "rocm": "MI325"}, num_cards=1') == 6
+    assert eager.count('res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1') == 3
+    assert eager.count('res={"cuda": "L4", "rocm": "MI325"}, num_cards=1') == 3
 
     r2_01 = _find_step(
         "ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t",
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1436" in r2_01_command
+    assert "assert-pytest-collection.sh 1454" in r2_01_command
     assert "tests/model_executor/" in r2_01_command
     for path in _WORKER_ONE_CARD_FILES:
         assert path not in r2_01_command
@@ -5080,7 +5083,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
 
     The marker selects both intermediate-buffer residency rows and the three
     device-copy GPU tests. #9552's worker files stay on the other job. R2-01
-    still collects 1436 model-executor nodes.
+    still collects 1454 model-executor nodes.
     """
     step = _find_step("ROCm · One-Card Worker Copy Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -5119,8 +5122,10 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
     assert "--junitxml=" in command
     assert "Expected exactly 6 executed one-card worker copy tests" in command
 
+    # As above: the Intel lane also runs this file, so the dicts name xpu as well.
     device_copy = Path(_WORKER_COPY_FILES[0]).read_text(encoding="utf-8")
-    assert device_copy.count('res={"cuda": "L4", "rocm": "MI325"}, num_cards=1') == 3
+    assert device_copy.count('res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1') == 1
+    assert device_copy.count('res={"cuda": "L4", "rocm": "MI325"}, num_cards=1') == 2
     assert device_copy.count("@pytest.mark.cpu") == 2
     residency_source = Path(_WORKER_COPY_FILES[1]).read_text(encoding="utf-8")
     assert residency_source.count('res={"cuda": "L4", "rocm": "MI325"}, num_cards=1') == 1
@@ -5132,7 +5137,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1436" in r2_01_command
+    assert "assert-pytest-collection.sh 1454" in r2_01_command
     for path in _WORKER_COPY_FILES:
         assert path not in r2_01_command
 

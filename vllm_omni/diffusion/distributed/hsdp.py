@@ -318,7 +318,8 @@ def shard_model(
             hsdp_kwargs={
                 "reshard_after_forward": reshard_after_forward,
                 "mesh": mesh,
-                "mp_policy": mp_policy,
+                # torch >= 2.15 fully_shard rejects mp_policy=None; use its default.
+                "mp_policy": mp_policy if mp_policy is not None else MixedPrecisionPolicy(),
             },
             ignored_params=ignored_params,
         )

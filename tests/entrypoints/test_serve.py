@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from dataclasses import dataclass
 from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
@@ -976,6 +977,46 @@ def test_parse_stage_overrides_preserves_arbitrary_override_fields() -> None:
     }
 
 
+def test_serve_warns_once_per_ignored_stage_override(caplog: pytest.LogCaptureFixture, mocker: MockerFixture) -> None:
+    mocker.patch.dict("os.environ", {"VLLM_DISABLE_LOG_LOGO": "1"})
+    launch = mocker.patch("vllm_omni.entrypoints.cli.serve.run_multi_api_server_omni")
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subparser")
+    OmniServeCommand().subparser_init(subparsers)
+
+    with caplog.at_level(logging.WARNING):
+        args = parser.parse_args(
+            [
+                "serve",
+                "fake-model",
+                "--omni",
+                "--api-server-count",
+                "2",
+                "--stage-overrides",
+                '{"0": {"session_mode": "duplex", "duplex_session.idle_ttl_s": 60, "env": {"TEST_ENV": "1"}}}',
+            ]
+        )
+        OmniServeCommand.cmd(args)
+
+    assert [message for message in caplog.messages if "Ignoring --stage-overrides" in message] == [
+        "Ignoring --stage-overrides['0']['session_mode']: set 'session_mode' in the deploy config instead.",
+        "Ignoring --stage-overrides['0']['duplex_session.idle_ttl_s']: set 'duplex_session' in the deploy config instead.",
+    ]
+    launch.assert_called_once_with(args)
+    assert args.get_explicit_kwargs_dict()["stage_overrides"] == {"0": {"env": {"TEST_ENV": "1"}}}
+
+
+def test_parse_stage_overrides_warns_and_skips_non_stage_fields(caplog) -> None:
+    with caplog.at_level(logging.WARNING, logger="vllm_omni.entrypoints.utils"):
+        parsed = parse_stage_overrides(
+            '{"0": {"session_mode": "duplex", "duplex_session.idle_ttl_s": 60, "env": {"TEST_ENV": "1"}}}'
+        )
+
+    assert parsed == {"0": {"env": {"TEST_ENV": "1"}}}
+    assert "session_mode" in caplog.text
+    assert "duplex_session.idle_ttl_s" in caplog.text
+
+
 def test_parse_stage_overrides_rejects_non_dict_top_level() -> None:
     """Top-level must be a JSON object (dict). A list, scalar, or non-dict
     mapping is rejected with a ValueError naming ``--stage-overrides`` and
@@ -1006,7 +1047,7 @@ def test_parse_stage_overrides_rejects_non_integer_stage_id() -> None:
 
 
 def test_parse_stage_overrides_accepts_stage_merge_extras_and_engine_args() -> None:
-    """Three classes of keys pass through the shape-only parser:
+    """The parser retains stage fields and unknown keys for downstream validation.
 
     - ``extras`` is read by the default-diffusion fallback
       (``async_omni_engine.py``); registered pipelines carry it on
@@ -1014,11 +1055,8 @@ def test_parse_stage_overrides_accepts_stage_merge_extras_and_engine_args() -> N
     - Engine arguments (``kv_cache_dtype``, ``stage_connector_spec``, ...)
       are forwarded as ``stage_<id>_<key>`` and applied via
       ``OmniEngineArgs``.
-    - Unknown keys parse through and are dropped with a warning at
-      ``filter_dataclass_kwargs`` (see
-      ``tests/entrypoints/test_utils.py::TestFilterDataclassKwargs``).
-
-    ``typo_field_xyz`` in the payload exercises the third case.
+    - Unknown keys such as ``typo_field_xyz`` are dropped with a warning
+      when filtered against ``OmniEngineArgs``.
     """
     parsed = parse_stage_overrides(
         '{"0": {"extras": {"ltx2_use_conv_vae": true},'
