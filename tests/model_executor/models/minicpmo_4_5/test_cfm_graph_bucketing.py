@@ -636,12 +636,26 @@ def test_batched_token2wav_prompt_att_sharing_matches_unshared_across_trims(monk
     assert prompt_suffix.shape[5] == 6
     assert torch.equal(prompt_suffix, states_s[0].flow_cache["estimator_att_cache"][..., -6:, :])
 
+    orig_equal = torch.equal
+    eq_calls_per_step: list[int] = []
     with caplog.at_level(logging.INFO, logger=btw_mod.logger.name):
         for step in range(4):
             toks = torch.full((2, 5), 10 + step * 3, dtype=torch.long)
             toks[1] += 1
             aud_u, states_u = unshared.decode_batch(toks, feat_u, states_u, last_chunk=(step == 3))
-            aud_s, states_s = shared.decode_batch(toks, feat_s, states_s, last_chunk=(step == 3))
+            step_eq_calls = 0
+
+            def _counting_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
+                nonlocal step_eq_calls
+                step_eq_calls += 1
+                return orig_equal(a, b)
+
+            monkeypatch.setattr(btw_mod.torch, "equal", _counting_equal)
+            try:
+                aud_s, states_s = shared.decode_batch(toks, feat_s, states_s, last_chunk=(step == 3))
+            finally:
+                monkeypatch.setattr(btw_mod.torch, "equal", orig_equal)
+            eq_calls_per_step.append(step_eq_calls)
             for row in range(2):
                 torch.testing.assert_close(aud_s[row], aud_u[row], rtol=0, atol=0)
                 att_s = states_s[row].flow_cache["estimator_att_cache"]
@@ -654,6 +668,9 @@ def test_batched_token2wav_prompt_att_sharing_matches_unshared_across_trims(monk
                     atol=0,
                 )
 
+    assert eq_calls_per_step[0] > 0
+    assert eq_calls_per_step[1:] == [0, 0, 0]
+    assert feat_s.cache_key in shared._prompt_att_verified
     assert any("CFM prompt attention suffix verified bit-exact" in rec.message for rec in caplog.records)
     assert any(rec.levelname == "INFO" and "prompt=voice-a" in rec.message for rec in caplog.records)
     assert states_s[0].flow_cache["estimator_att_cache"].prefix.data_ptr() != (
@@ -664,13 +681,15 @@ def test_batched_token2wav_prompt_att_sharing_matches_unshared_across_trims(monk
     assert isinstance(extra_trimmed, SharedPromptAttCache)
     assert extra_trimmed.shape[5] == 10
 
-    # Inject a corrupted prompt suffix on chunk 2+ to confirm per-call validation
-    # catches mismatches even after initial verification succeeded.
+    # Inject a corrupted prompt suffix for an unverified voice key to confirm
+    # first-time validation catches mismatches and disables sharing cleanly.
+    bad_key = ("voice-corrupt", "/fake/corrupt.wav")
+    shared._record_prompt_att_cache(bad_key, prompt_suffix)
     corrupted = states_s[0].flow_cache["estimator_att_cache"].materialize()
     corrupted[..., -1:, :] += 9.0
-    rejected_rows = shared._share_prompt_att_rows(feat_s.cache_key, prompt_suffix, [corrupted])
+    rejected_rows = shared._share_prompt_att_rows(bad_key, prompt_suffix, [corrupted])
     assert isinstance(rejected_rows[0], torch.Tensor)
-    assert feat_s.cache_key in shared._prompt_att_rejected
+    assert bad_key in shared._prompt_att_rejected
     assert any("CFM prompt attention suffix differs" in rec.message for rec in caplog.records)
 
 
@@ -752,10 +771,11 @@ def test_split_segments_before_tail_and_matches():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA for WholeEulerCFMGraphWrapper replay")
-def test_whole_euler_replay_reuses_shared_prompt_att_cache_in_place():
+def test_whole_euler_replay_reuses_shared_prompt_att_cache_in_place(monkeypatch):
     import torch.nn as nn
 
     from vllm_omni.model_executor.models.minicpmo_4_5 import batched_token2wav as btw_mod
+    from vllm_omni.model_executor.models.minicpmo_4_5 import cuda_graph_wrapper as cgw_mod
     from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
 
     class _FakePad(nn.Module):
@@ -895,6 +915,15 @@ def test_whole_euler_replay_reuses_shared_prompt_att_cache_in_place():
             cnn_cache=None,
             att_keep=(6, 4),
         )
+        match_calls = 0
+        orig_matches = cgw_mod._matches_frame_segments
+
+        def _counting_matches(src, segments, reference):
+            nonlocal match_calls
+            match_calls += 1
+            return orig_matches(src, segments, reference)
+
+        monkeypatch.setattr(cgw_mod, "_matches_frame_segments", _counting_matches)
         mel_u1, cnn_u1, out_u1 = b_unshared._decode_cfm(**kwargs, att_cache=att_init_u)
         mel_s1, cnn_s1, out_s1 = b_shared._decode_cfm(
             **kwargs,
@@ -903,6 +932,8 @@ def test_whole_euler_replay_reuses_shared_prompt_att_cache_in_place():
             prompt_cache_key=cache_key,
             prompt_att_segments=[prompt_seg, prompt_seg],
         )
+        assert match_calls == 2
+        assert cache_key in b_shared._prompt_att_verified
         torch.testing.assert_close(mel_s1, mel_u1, rtol=0, atol=0)
         for row in range(2):
             assert isinstance(out_s1[row], SharedPromptAttCache)
@@ -912,6 +943,7 @@ def test_whole_euler_replay_reuses_shared_prompt_att_cache_in_place():
             torch.testing.assert_close(out_s1[row].materialize(), out_u1[row], rtol=0, atol=0)
 
         prev_ptrs = [row.prefix.data_ptr() for row in out_s1]
+        match_calls = 0
         mel_u2, _, out_u2 = b_unshared._decode_cfm(**kwargs, att_cache=out_u1)
         mel_s2, _, out_s2 = b_shared._decode_cfm(
             **kwargs,
@@ -920,6 +952,8 @@ def test_whole_euler_replay_reuses_shared_prompt_att_cache_in_place():
             prompt_cache_key=cache_key,
             prompt_att_segments=[prompt_seg, prompt_seg],
         )
+        # Verified voice skips frame-segment sync comparison in steady state.
+        assert match_calls == 0
         torch.testing.assert_close(mel_s2, mel_u2, rtol=0, atol=0)
         for row in range(2):
             assert isinstance(out_s2[row], SharedPromptAttCache)
@@ -927,22 +961,222 @@ def test_whole_euler_replay_reuses_shared_prompt_att_cache_in_place():
             assert out_s2[row].prefix.data_ptr() == prev_ptrs[row]
             torch.testing.assert_close(out_s2[row].materialize(), out_u2[row], rtol=0, atol=0)
 
-        # If one row's prompt suffix mismatches, WholeEuler replay falls back to a full Tensor
-        # for that row and _share_prompt_att_rows materializes sibling SharedPromptAttCache rows.
+        # For an unverified voice, if one row's prompt suffix mismatches, WholeEuler replay falls back
+        # to a full Tensor for that row and _share_prompt_att_rows materializes sibling rows.
+        bad_key = ("cuda-voice-bad", "v1")
+        b_shared._record_prompt_att_cache(bad_key, prompt_att)
+        prompt_seg_bad = b_shared._prompt_att_caches[bad_key]
         corrupted = out_u2[1].clone()
         corrupted[..., -1, :] += 5.0
+        row0_shared = SharedPromptAttCache(out_s2[0].prefix.clone(), prompt_seg_bad)
         mel_u3, _, out_u3 = b_unshared._decode_cfm(**kwargs, att_cache=[out_u2[0], corrupted.clone()])
         mel_s3, _, out_s3 = b_shared._decode_cfm(
             **kwargs,
-            att_cache=[out_s2[0], corrupted],
-            prompt_att_cache=prompt_seg,
-            prompt_cache_key=cache_key,
-            prompt_att_segments=[prompt_seg, prompt_seg],
+            att_cache=[row0_shared, corrupted],
+            prompt_att_cache=prompt_seg_bad,
+            prompt_cache_key=bad_key,
+            prompt_att_segments=[prompt_seg_bad, prompt_seg_bad],
         )
         torch.testing.assert_close(mel_s3, mel_u3, rtol=0, atol=0)
-        assert cache_key in b_shared._prompt_att_rejected
+        assert bad_key in b_shared._prompt_att_rejected
         assert all(isinstance(row, torch.Tensor) for row in out_s3)
         for row in range(2):
             torch.testing.assert_close(out_s3[row], out_u3[row], rtol=0, atol=0)
+
+        # Replacing the cached prompt suffix starts a new generation: even if the new generation is
+        # verified, a stale SharedPromptAttCache row from an older generation (and direct replay
+        # calls passing prompt_att_verified=[True]) must still re-validate instead of sharing the
+        # replacement suffix.
+        alt_prompt = prompt_att + 10.0
+        gen2 = b_shared._record_prompt_att_cache(cache_key, alt_prompt)
+        assert cache_key not in b_shared._prompt_att_verified
+        alt_seg = b_shared._prompt_att_caches[cache_key]
+        gen2_init = [alt_prompt.clone()]
+        match_calls = 0
+        mel_gen2_u, _, out_gen2_u = b_unshared._decode_cfm(
+            mu=kwargs["mu"][:1],
+            speakers=kwargs["speakers"][:1],
+            cond=kwargs["cond"][:1],
+            cnn_cache=None,
+            att_keep=kwargs["att_keep"],
+            att_cache=[alt_prompt.clone()],
+        )
+        mel_gen2_s, _, out_gen2_s = b_shared._decode_cfm(
+            mu=kwargs["mu"][:1],
+            speakers=kwargs["speakers"][:1],
+            cond=kwargs["cond"][:1],
+            cnn_cache=None,
+            att_keep=kwargs["att_keep"],
+            att_cache=gen2_init,
+            prompt_att_cache=alt_seg,
+            prompt_cache_key=cache_key,
+            prompt_att_segments=[alt_seg],
+            prompt_att_row_generations=[gen2],
+        )
+        assert match_calls == 1
+        assert b_shared._prompt_att_verified.get(cache_key) == gen2
+        assert isinstance(out_gen2_s[0], SharedPromptAttCache)
+        assert out_gen2_s[0].prompt is alt_seg
+        torch.testing.assert_close(mel_gen2_s, mel_gen2_u, rtol=0, atol=0)
+
+        # Stale gen1 SharedPromptAttCache row (even if prompt_att_verified=[True] is passed directly)
+        match_calls = 0
+        mel_stale_u, _, out_stale_u = b_unshared._decode_cfm(
+            mu=kwargs["mu"][:1],
+            speakers=kwargs["speakers"][:1],
+            cond=kwargs["cond"][:1],
+            cnn_cache=None,
+            att_keep=kwargs["att_keep"],
+            att_cache=[out_u2[0].clone()],
+        )
+        mel_stale_s, _, out_stale_s = b_shared._decode_cfm(
+            mu=kwargs["mu"][:1],
+            speakers=kwargs["speakers"][:1],
+            cond=kwargs["cond"][:1],
+            cnn_cache=None,
+            att_keep=kwargs["att_keep"],
+            att_cache=[SharedPromptAttCache(out_s2[0].prefix.clone(), out_s2[0].prompt)],
+            prompt_att_cache=alt_seg,
+            prompt_cache_key=cache_key,
+            prompt_att_segments=[alt_seg],
+            prompt_att_verified=[True],
+        )
+        assert match_calls == 1
+        assert isinstance(out_stale_s[0], torch.Tensor)
+        torch.testing.assert_close(mel_stale_s, mel_stale_u, rtol=0, atol=0)
+        torch.testing.assert_close(out_stale_s[0], out_stale_u[0], rtol=0, atol=0)
+        assert cache_key not in b_shared._prompt_att_rejected
     finally:
         btw_mod._CACHE_TRIM_SUFFIX = orig_suffix
+
+
+def test_prompt_att_verification_is_scoped_by_generation(monkeypatch):
+    from vllm_omni.model_executor.models.minicpmo_4_5 import batched_token2wav as btw_mod
+    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
+
+    monkeypatch.setattr(btw_mod, "_CACHE_TRIM_SUFFIX", 6)
+
+    unshared = BatchedToken2Wav(_make_history_preserving_token2wav(prompt_len=10), setup_cache_size=2)
+    shared = BatchedToken2Wav(
+        _make_history_preserving_token2wav(prompt_len=10),
+        cfm_graph_config={"prompt_att_sharing": True},
+        setup_cache_size=2,
+    )
+
+    feat_u = unshared.prepare_prompt("voice-gen", "/fake/gen.wav")
+    feat_s = shared.prepare_prompt("voice-gen", "/fake/gen.wav")
+
+    # Setup 1 creates initial request states (both fresh Tensor and chunked SharedPromptAttCache).
+    r1_u_init = unshared.setup_batch(feat_u, 1)
+    r1_s_init = shared.setup_batch(feat_s, 1)
+    assert r1_s_init[0].prompt_att_generation == 1
+    # Cache hits on setup_batch preserve verification and object identity when active.
+    assert shared.setup_batch(feat_s, 1)[0] is r1_s_init[0]
+
+    toks_chunk0 = torch.full((1, 5), 11, dtype=torch.long)
+    _, r1_u_chunk = unshared.decode_batch(toks_chunk0, feat_u, r1_u_init, last_chunk=False)
+    _, r1_s_chunk = shared.decode_batch(toks_chunk0, feat_s, r1_s_init, last_chunk=False)
+    assert shared._prompt_att_verified[feat_s.cache_key] == 1
+    assert isinstance(r1_s_chunk[0].flow_cache["estimator_att_cache"], SharedPromptAttCache)
+    assert r1_s_chunk[0].prompt_att_generation == 1
+
+    # Cache hit after verification does NOT invalidate _prompt_att_verified.
+    r1_s_hit = shared.setup_batch(feat_s, 1)
+    assert r1_s_hit[0] is r1_s_init[0]
+    assert shared._prompt_att_verified[feat_s.cache_key] == 1
+
+    # Setup 2 replaces the voice's cached suffix with a distinct generation (S2 != S1).
+    alt_suffix = shared._prompt_att_caches[feat_s.cache_key] + 7.0
+    gen2 = shared._record_prompt_att_cache(feat_s.cache_key, alt_suffix)
+    assert gen2 == 2
+    assert feat_s.cache_key not in shared._prompt_att_verified
+
+    r2_init_state = btw_mod.BatchedToken2WavState(
+        flow_cache={
+            **r1_s_init[0].flow_cache,
+            "estimator_att_cache": r1_s_init[0].flow_cache["estimator_att_cache"] + 7.0,
+        },
+        hift_cache=r1_s_init[0].hift_cache,
+        prompt_att_generation=gen2,
+    )
+    r2_u_init = btw_mod.BatchedToken2WavState(
+        flow_cache={
+            **r1_u_init[0].flow_cache,
+            "estimator_att_cache": r1_u_init[0].flow_cache["estimator_att_cache"] + 7.0,
+        },
+        hift_cache=r1_u_init[0].hift_cache,
+    )
+    _, r2_u = unshared.decode_batch(toks_chunk0, feat_u, [r2_u_init], last_chunk=False)
+    _, r2_s = shared.decode_batch(toks_chunk0, feat_s, [r2_init_state], last_chunk=False)
+    assert shared._prompt_att_verified[feat_s.cache_key] == gen2
+    assert isinstance(r2_s[0].flow_cache["estimator_att_cache"], SharedPromptAttCache)
+    assert r2_s[0].prompt_att_generation == gen2
+
+    orig_equal = torch.equal
+    eq_calls = 0
+
+    def _counting_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
+        nonlocal eq_calls
+        eq_calls += 1
+        return orig_equal(a, b)
+
+    monkeypatch.setattr(btw_mod.torch, "equal", _counting_equal)
+    try:
+        # Stale gen1 initial Tensor row and stale gen1 SharedPromptAttCache row must NOT
+        # skip verification or be corrupted with gen2's prompt suffix, nor reject gen2.
+        toks_next = torch.full((1, 5), 17, dtype=torch.long)
+        aud_init_u, next_init_u = unshared.decode_batch(toks_next, feat_u, r1_u_init, last_chunk=False)
+        aud_init_s, next_init_s = shared.decode_batch(toks_next, feat_s, r1_s_init, last_chunk=False)
+        assert eq_calls > 0
+        assert isinstance(next_init_s[0].flow_cache["estimator_att_cache"], torch.Tensor)
+        assert next_init_s[0].prompt_att_generation == 1
+        torch.testing.assert_close(aud_init_s[0], aud_init_u[0], rtol=0, atol=0)
+        torch.testing.assert_close(
+            next_init_s[0].flow_cache["estimator_att_cache"],
+            next_init_u[0].flow_cache["estimator_att_cache"],
+            rtol=0,
+            atol=0,
+        )
+
+        eq_calls = 0
+        aud_chunk_u, next_chunk_u = unshared.decode_batch(toks_next, feat_u, r1_u_chunk, last_chunk=False)
+        aud_chunk_s, next_chunk_s = shared.decode_batch(toks_next, feat_s, r1_s_chunk, last_chunk=False)
+        assert eq_calls > 0
+        assert isinstance(next_chunk_s[0].flow_cache["estimator_att_cache"], torch.Tensor)
+        assert next_chunk_s[0].prompt_att_generation == 1
+        torch.testing.assert_close(aud_chunk_s[0], aud_chunk_u[0], rtol=0, atol=0)
+        torch.testing.assert_close(
+            next_chunk_s[0].flow_cache["estimator_att_cache"],
+            next_chunk_u[0].flow_cache["estimator_att_cache"],
+            rtol=0,
+            atol=0,
+        )
+
+        # Gen2 itself stays verified and continues running zero-sync without rejection.
+        assert feat_s.cache_key not in shared._prompt_att_rejected
+        assert shared._prompt_att_verified[feat_s.cache_key] == gen2
+        eq_calls = 0
+        aud_r2_u, _ = unshared.decode_batch(toks_next, feat_u, r2_u, last_chunk=True)
+        aud_r2_s, next_r2_s = shared.decode_batch(toks_next, feat_s, r2_s, last_chunk=True)
+        assert eq_calls == 0
+        assert isinstance(next_r2_s[0].flow_cache["estimator_att_cache"], SharedPromptAttCache)
+        torch.testing.assert_close(aud_r2_s[0], aud_r2_u[0], rtol=0, atol=0)
+
+        # A stale-generation row whose tail genuinely equals the new generation re-verifies and upgrades.
+        gen3 = shared._record_prompt_att_cache(
+            feat_s.cache_key,
+            r1_u_init[0].flow_cache["estimator_att_cache"],
+        )
+        assert gen3 == 3
+        eq_calls = 0
+        _, upgraded_s = shared.decode_batch(toks_chunk0, feat_s, r1_s_init, last_chunk=False)
+        assert eq_calls > 0
+        assert isinstance(upgraded_s[0].flow_cache["estimator_att_cache"], SharedPromptAttCache)
+        assert upgraded_s[0].prompt_att_generation == gen3
+        assert shared._prompt_att_verified[feat_s.cache_key] == gen3
+        eq_calls = 0
+        _, upgraded_next = shared.decode_batch(toks_next, feat_s, upgraded_s, last_chunk=True)
+        assert eq_calls == 0
+        assert isinstance(upgraded_next[0].flow_cache["estimator_att_cache"], SharedPromptAttCache)
+    finally:
+        monkeypatch.setattr(btw_mod.torch, "equal", orig_equal)

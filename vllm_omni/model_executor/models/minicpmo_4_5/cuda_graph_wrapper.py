@@ -2340,6 +2340,7 @@ class WholeEulerCFMGraphWrapper:
         att_keep: tuple[int, int] | None = None,
         prompt_lengths: list[int] | None = None,
         prompt_att_segments: list[torch.Tensor | None] | None = None,
+        prompt_att_verified: list[bool] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | list[torch.Tensor | SharedPromptAttCache]] | None:
         """Solve the chunk through captured graphs; ``None`` sends it to the step/eager path.
 
@@ -2590,7 +2591,13 @@ class WholeEulerCFMGraphWrapper:
                     ):
                         shared_len = int(prompt_segment.shape[5])
                         prefix_segments, tail_segments = _split_segments_before_tail(row_segments, shared_len)
-                        if _matches_frame_segments(row_src, tail_segments, prompt_segment):
+                        already_verified = bool(
+                            prompt_att_verified is not None
+                            and global_row < len(prompt_att_verified)
+                            and prompt_att_verified[global_row]
+                            and (not isinstance(old, SharedPromptAttCache) or old.prompt is prompt_segment)
+                        )
+                        if already_verified or _matches_frame_segments(row_src, tail_segments, prompt_segment):
                             prefix_len = total_frames - shared_len
                             prefix = None
                             if (
