@@ -17,10 +17,11 @@ import traceback
 import uuid
 import wave
 from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 from urllib.parse import urlparse
 
 import aiohttp
@@ -128,6 +129,7 @@ logger = init_logger(__name__)
 
 _AUDIO_CONTINUITY_THRESHOLD_ENV = "VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S"
 RETURN_STAGE_METRICS_FIELD = "return_stage_metrics"
+CAPTURE_AUDIO_STREAM_DETAILS: ContextVar[bool] = ContextVar("capture_audio_stream_details", default=False)
 _IMAGE_STAGE_METRICS_BACKENDS = frozenset(
     {
         "/v1/images/generations",
@@ -137,6 +139,7 @@ _IMAGE_STAGE_METRICS_BACKENDS = frozenset(
 )
 _PRINT_STAGE = False
 _DUPLEX_METRIC_AGGREGATION = "session"
+_DUPLEX_BACKEND_UNAVAILABLE_CODES = frozenset({"server_vad_unavailable", "semantic_vad_unavailable"})
 
 
 def maybe_enable_stage_metrics(extra_body: dict[str, Any] | None, *, enabled: bool) -> dict[str, Any] | None:
@@ -1111,6 +1114,15 @@ if _serve_mod is not None:
     setattr(_serve_mod, "get_samples", get_samples)
 
 
+class AudioStreamDetails(TypedDict):
+    sample_rate: int
+    channels: int
+    sample_width: int
+    chunk_arrival_times_s: list[float]
+    chunk_sizes_bytes: list[int]
+    response_end_s: float | None
+
+
 @dataclass
 class MixRequestFuncOutput(RequestFuncOutput):
     timed_out: bool = False
@@ -1122,6 +1134,7 @@ class MixRequestFuncOutput(RequestFuncOutput):
     audio_latency: float | None = None
     audio_frames: int = 0
     audio_rtf: float = 0.0
+    audio_stream_details: AudioStreamDetails | None = None
     image_count: int = 0
     image_generation_time_ms: float = 0.0
     image_pixels: int = 0
@@ -1160,6 +1173,8 @@ class MixRequestFuncOutput(RequestFuncOutput):
     #: Retries before the reported attempt. Diagnostic only: excluded from the
     #: measured latency, but a run that needed them is not silently clean.
     duplex_retries: int = 0
+    #: A rejected duplex backend configuration cannot recover by sending more prompts.
+    duplex_fatal_error_code: str | None = None
 
 
 _IMAGE_EDITS_EXTRA_BODY_FORM_FIELDS = (
@@ -2888,6 +2903,7 @@ async def async_request_openai_audio_speech(
     pcm_capture = bytearray() if capture_wer_pcm else None
     chunk_arrival_times_s: list[float] = []
     chunk_sizes: list[int] = []
+    response_end_s: float | None = None
     try:
         async with session.post(url=api_url, json=payload, headers=headers) as response:
             if response.status == 200:
@@ -2909,6 +2925,17 @@ async def async_request_openai_audio_speech(
 
                 end_time = time.perf_counter()
                 output.latency = end_time - st
+                response_end_s = output.latency
+
+                if not total_pcm_bytes:
+                    raise ValueError(
+                        f"Audio stream returned no PCM data (Content-Type={response.headers.get('Content-Type')!r})"
+                    )
+                if total_pcm_bytes % (sample_width * channels):
+                    raise ValueError(
+                        "Audio stream ended with an incomplete PCM frame "
+                        f"(Content-Type={response.headers.get('Content-Type')!r})"
+                    )
 
                 total_samples = defs.compute_audio_frames(
                     total_pcm_bytes,
@@ -2944,14 +2971,6 @@ async def async_request_openai_audio_speech(
                     except Exception as ex:
                         logger.warning("Seed-TTS WER PCM normalization failed: %s", ex)
                         output.tts_output_pcm_bytes = bytes(pcm_capture)
-                elif capture_wer_pcm:
-                    ct = response.headers.get("Content-Type", "")
-                    logger.warning(
-                        "Seed-TTS WER: HTTP 200 but no PCM bytes (Content-Type=%r, url=%s). "
-                        "Check stream=true, stream_format=audio, and response_format=pcm on the server.",
-                        ct,
-                        api_url,
-                    )
                 output.success = True
             else:
                 output.error = response.reason or ""
@@ -2960,6 +2979,16 @@ async def async_request_openai_audio_speech(
         output.success = False
         output.error = traceback.format_exc()
         logger.error(f"ERROR: send request failed, reason is: {output.error}")
+    finally:
+        if CAPTURE_AUDIO_STREAM_DETAILS.get():
+            output.audio_stream_details = AudioStreamDetails(
+                sample_rate=sample_rate,
+                channels=channels,
+                sample_width=sample_width,
+                chunk_arrival_times_s=chunk_arrival_times_s,
+                chunk_sizes_bytes=chunk_sizes,
+                response_end_s=response_end_s,
+            )
 
     if pbar:
         pbar.update(1)
@@ -3105,6 +3134,8 @@ async def _async_request_omniinteract(
     *,
     pbar: tqdm | None,
 ) -> MixRequestFuncOutput:
+    from vllm_omni.clients.duplex import DuplexProtocolError
+
     case = getattr(request_func_input, "omniinteract_case", None)
     options = getattr(request_func_input, "omniinteract_options", None)
     output = MixRequestFuncOutput()
@@ -3165,11 +3196,20 @@ async def _async_request_omniinteract(
         output.duplex_session_metrics = session_metrics
         output.success = case_result.success
         output.error = case_result.error
+        if case_result.error_code in _DUPLEX_BACKEND_UNAVAILABLE_CODES:
+            output.duplex_fatal_error_code = case_result.error_code
+        if output.error:
+            logger.error("OmniInteract Realtime request failed: %s", output.error)
         setattr(output, "omniinteract_case", case)
         setattr(output, "omniinteract_case_result", case_result)
-    except Exception:
+    except Exception as exc:
         output.success = False
-        output.error = traceback.format_exc()
+        if isinstance(exc, DuplexProtocolError):
+            if exc.code in _DUPLEX_BACKEND_UNAVAILABLE_CODES:
+                output.duplex_fatal_error_code = exc.code
+            output.error = f"{exc.code}: {exc}"
+        else:
+            output.error = traceback.format_exc()
         logger.error("OmniInteract Realtime request failed: %s", output.error)
         if case is not None:
             case_result = OmniInteractCaseResult(
@@ -3177,6 +3217,7 @@ async def _async_request_omniinteract(
                 video=str(case.video_path),
                 output_dir="",
                 error=output.error,
+                error_code=exc.code if isinstance(exc, DuplexProtocolError) else None,
             )
             setattr(output, "omniinteract_case", case)
             setattr(output, "omniinteract_case_result", case_result)
@@ -3187,7 +3228,7 @@ async def _async_request_omniinteract(
 
 async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | None) -> MixRequestFuncOutput:
     from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import generate_sample
-    from vllm_omni.clients.duplex import metric_mean
+    from vllm_omni.clients.duplex import DuplexProtocolError, metric_mean
 
     output = MixRequestFuncOutput()
     output.prompt_len = request.prompt_len
@@ -3287,9 +3328,16 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
         # indistinguishable from one that never ran. A completed sample keeps
         # its advisory timeouts (a stalled close or ack) in metadata only.
         output.error = (result.error or (_duplex_stall_reason(result) or "")) if not output.success else ""
+        if output.error:
+            logger.error("Omni-DuplexEval sample %s failed: %s", sample.sample.id, output.error)
         # Readiness/warmups run the identical session but retain no judge files.
         if request.request_id is not None:
             setattr(output, "duplex_eval_result", result)
+    except DuplexProtocolError as exc:
+        if exc.code in _DUPLEX_BACKEND_UNAVAILABLE_CODES:
+            output.duplex_fatal_error_code = exc.code
+        output.error = f"{exc.code}: {exc}"
+        logger.error("Omni-DuplexEval Realtime request failed: %s", output.error)
     except Exception:
         output.error = traceback.format_exc()
         logger.error("Omni-DuplexEval Realtime request failed: %s", output.error)
@@ -3964,8 +4012,21 @@ async def benchmark(
     test_input = bind_realtime_video(input_requests[0], test_input)
 
     if ready_check_timeout_sec > 0:
+
+        async def ready_request_func(
+            request_func_input: RequestFuncInput, session: aiohttp.ClientSession
+        ) -> RequestFuncOutput:
+            output = await request_func(request_func_input=request_func_input, session=session)
+            if getattr(output, "duplex_fatal_error_code", None):
+                await session.close()
+                raise ValueError(
+                    f"Duplex readiness probe rejected the server configuration; "
+                    f"measured requests were not sent: {output.error}"
+                )
+            return output
+
         test_output = await wait_for_endpoint(
-            request_func,
+            ready_request_func,
             _salted_copy(test_input, warmup_scope and f"{warmup_scope}-ready"),
             session,
             timeout_seconds=ready_check_timeout_sec,
@@ -4003,18 +4064,25 @@ async def benchmark(
             warmup_pbar.close()
         print("Warmup run completed.")
 
-    if endpoint_type == "realtime-video" and any(not output.success for output in warmup_outputs):
+    failed_warmups = [output for output in warmup_outputs if not output.success]
+    if failed_warmups:
         await session.close()
-        return await asyncio.to_thread(
-            finalize_realtime_video,
-            input_requests,
-            [],
-            warmup_outputs,
-            duration=0.0,
-            endpoint=api_url,
-            model=model_id,
-            selected_percentile_metrics=selected_percentile_metrics,
-            selected_percentiles=selected_percentiles,
+        if endpoint_type == "realtime-video":
+            return await asyncio.to_thread(
+                finalize_realtime_video,
+                input_requests,
+                [],
+                warmup_outputs,
+                duration=0.0,
+                endpoint=api_url,
+                model=model_id,
+                selected_percentile_metrics=selected_percentile_metrics,
+                selected_percentiles=selected_percentiles,
+            )
+        first_error = next((output.error for output in failed_warmups if output.error), "No request error recorded")
+        raise ValueError(
+            f"{len(failed_warmups)}/{len(warmup_outputs)} warmup requests failed; "
+            f"measured requests were not sent: {first_error}"
         )
 
     print("Starting main benchmark run...")
@@ -4316,6 +4384,8 @@ async def benchmark(
     result["cancelled_after_timeout_requests"] = sum(
         bool(getattr(output, "cancelled_after_timeout", False)) for output in outputs
     )
+    if CAPTURE_AUDIO_STREAM_DETAILS.get() and endpoint_type == "openai-audio-speech":
+        result["audio_stream_details"] = [getattr(output, "audio_stream_details", None) for output in outputs]
     # Preserve request order, including missing snapshots, so CI can verify
     # fixed stage workloads without parsing logs or storing audio payloads.
     request_stage_metrics = [

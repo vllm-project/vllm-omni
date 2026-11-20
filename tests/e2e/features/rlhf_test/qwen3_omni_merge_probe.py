@@ -7,12 +7,11 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner as LegacyRunner
     from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
 
 
 class Qwen3OmniMergeProbe:
-    model_runner: "LegacyRunner | OmniARModelRunner"
+    model_runner: "OmniARModelRunner"
 
     def merged_memory_probe(self, reset: bool = False) -> dict[str, int]:
         if reset:

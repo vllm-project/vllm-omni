@@ -633,6 +633,7 @@ async def _enqueue_add_request(
     yield_stage_id: int | None = None,
     entry_stage_id: int = 0,
     lora_request: LoRARequest | None = None,
+    request_artifact_dirs: list[str] | None = None,
 ) -> None:
     orchestrator_fixture.request_sync_q.put_nowait(
         StageSubmissionMessage(
@@ -650,6 +651,7 @@ async def _enqueue_add_request(
             enqueue_ts=time.perf_counter(),
             entry_stage_id=entry_stage_id,
             lora_request=lora_request,
+            request_artifact_dirs=request_artifact_dirs,
         )
     )
 
@@ -716,7 +718,9 @@ async def test_run_two_stage_llm(orchestrator_factory) -> None:
         await _wait_for(lambda: len(stage1.add_request_calls) == 1)
         stage1_request = stage1.add_request_calls[0][0]
         assert stage1_request.request_id == "req-llm"
-        assert stage1_request.prompt_token_ids == [7, 8, 9]
+        # v0.34 packs prompt token ids as an int32 ndarray (see
+        # build_engine_core_request_from_tokens); compare in list space.
+        assert stage1_request.prompt_token_ids.tolist() == [7, 8, 9]
 
         stage1.push_engine_core_outputs(_engine_core_outputs("stage1-raw", 2.0))
 
@@ -833,7 +837,7 @@ async def test_run_chain_yields_at_each_stage_until_final_output(orchestrator_fa
             await _wait_for(lambda: len(stage.add_request_calls) == 1)
             submitted = stage.add_request_calls[0][0]
             assert submitted.request_id == request_id
-            assert submitted.prompt_token_ids == list(input_token_ids)
+            assert submitted.prompt_token_ids.tolist() == list(input_token_ids)
             assert submitted.sampling_params.max_tokens == sampling_params_list[stage_id].max_tokens
             assert returns_stage_payload(submitted.additional_information) is returns_payload
 
@@ -1548,7 +1552,8 @@ async def test_run_async_chunk(orchestrator_factory) -> None:
         await _wait_for(lambda: len(stage1.add_request_calls) == 1)
         prewarmed_request = stage1.add_request_calls[0][0]
         assert prewarmed_request.request_id == "req-async"
-        assert prewarmed_request.prompt_token_ids
+        # ndarray prompt token ids are falsy when the single placeholder is 0.
+        assert len(prewarmed_request.prompt_token_ids) > 0
         assert all(token_id == 0 for token_id in prewarmed_request.prompt_token_ids)
 
         stage1.push_engine_core_outputs(_engine_core_outputs("stage1-final", 3.0))
@@ -2518,9 +2523,11 @@ async def test_stage_pool_pinned_submit_in_distributed_mode_uses_that_replica() 
 
 
 @pytest.mark.asyncio
-async def test_explicit_run_request_detached_before_admission_returns_client_error() -> None:
+async def test_explicit_run_request_detached_before_admission_returns_client_error(tmp_path) -> None:
     pool, clients, hub = _distributed_routing_pool()
     request_id = "requested"
+    artifact_dir = tmp_path / "request-artifacts"
+    artifact_dir.mkdir()
 
     hub.replicas[1].status = ReplicaStatus.DOWN
     pool.remove_client("tcp://replica-1")
@@ -2544,6 +2551,7 @@ async def test_explicit_run_request_detached_before_admission_returns_client_err
             preprocess_ms=0,
             request_timestamp=0,
             enqueue_ts=0,
+            request_artifact_dirs=[str(artifact_dir)],
             requested_replica_id=1,
         )
     )
@@ -2555,12 +2563,15 @@ async def test_explicit_run_request_detached_before_admission_returns_client_err
     assert error.error == "stage 0 replica_id 1 does not exist or is not available"
     assert pool._requested_replica_ids == {}
     assert all(not client.add_request_calls for client in clients)
+    assert not artifact_dir.exists()
 
 
 @pytest.mark.asyncio
-async def test_explicit_run_rejected_before_admission_releases_reservation() -> None:
+async def test_explicit_run_rejected_before_admission_releases_reservation(tmp_path) -> None:
     pool, clients, _ = _distributed_routing_pool()
     request_id = "requested"
+    artifact_dir = tmp_path / "request-artifacts"
+    artifact_dir.mkdir()
     output_queue: asyncio.Queue = asyncio.Queue()
     orchestrator = Orchestrator(
         request_async_queue=asyncio.Queue(),
@@ -2583,6 +2594,7 @@ async def test_explicit_run_rejected_before_admission_releases_reservation() -> 
             preprocess_ms=0,
             request_timestamp=0,
             enqueue_ts=0,
+            request_artifact_dirs=[str(artifact_dir)],
             requested_replica_id=1,
         )
     )
@@ -2595,6 +2607,7 @@ async def test_explicit_run_rejected_before_admission_releases_reservation() -> 
     assert pool._requested_replica_ids == {}
     assert pool.get_bound_replica_id(request_id) is None
     assert all(not client.add_request_calls for client in clients)
+    assert not artifact_dir.exists()
 
 
 @pytest.mark.asyncio
@@ -4815,8 +4828,10 @@ def test_diffusion_params_carry_the_sample_count(n: int, per_sample_kv: bool, co
     ],
 )
 async def test_add_request_rejects_qwen3_omni_dflash_resumable_input(
-    mocker, resumable: bool, model_type: str, method: str | None, accepted: bool
+    mocker, tmp_path, resumable: bool, model_type: str, method: str | None, accepted: bool
 ) -> None:
+    artifact_dir = tmp_path / "request-artifacts"
+    artifact_dir.mkdir()
     pool = StagePool(
         0,
         FakeStageClient(),
@@ -4845,11 +4860,14 @@ async def test_add_request_rejects_qwen3_omni_dflash_resumable_input(
             preprocess_ms=0,
             request_timestamp=0,
             enqueue_ts=0,
+            request_artifact_dirs=[str(artifact_dir)],
         )
     )
     if accepted:
         dispatch.assert_awaited_once()
         assert output_queue.empty()
+        assert artifact_dir.exists()
+        assert orchestrator.request_states["req"].request_artifact_dirs == {str(artifact_dir)}
     else:
         dispatch.assert_not_awaited()
         error = output_queue.get_nowait()
@@ -4858,13 +4876,16 @@ async def test_add_request_rejects_qwen3_omni_dflash_resumable_input(
         assert "streaming (resumable) input is not supported with Qwen3-Omni DFlash" in error.error
         assert "req" not in orchestrator.request_states
         assert pool.get_bound_replica_id("req") is None
+        assert not artifact_dir.exists()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("watermarking", "accepted"), [(None, False), (False, True)])
 async def test_add_request_rejects_parallel_samples_on_a_watermarking_stage(
-    mocker, watermarking: bool | None, accepted: bool
+    mocker, tmp_path, watermarking: bool | None, accepted: bool
 ) -> None:
+    artifact_dir = tmp_path / "request-artifacts"
+    artifact_dir.mkdir()
     pool = _audio_stage_pool(_audio_stage_client("llm"))
     orchestrator = Orchestrator(
         request_async_queue=asyncio.Queue(),
@@ -4888,15 +4909,19 @@ async def test_add_request_rejects_parallel_samples_on_a_watermarking_stage(
             preprocess_ms=0,
             request_timestamp=0,
             enqueue_ts=0,
+            request_artifact_dirs=[str(artifact_dir)],
         )
     )
 
     if accepted:
         fail.assert_not_awaited()
         dispatch.assert_awaited_once()
+        assert artifact_dir.exists()
+        assert orchestrator.request_states["req"].request_artifact_dirs == {str(artifact_dir)}
     else:
         dispatch.assert_not_awaited()
         fail.assert_awaited_once_with("req", 0, "n > 1 is not supported with output watermarking on stage 0")
+        assert not artifact_dir.exists()
 
 
 @pytest.mark.asyncio
@@ -4910,8 +4935,10 @@ async def test_add_request_rejects_parallel_samples_on_a_watermarking_stage(
     ids=["middle-stage-n2", "watermarked-final-stage-n2", "n1-everywhere"],
 )
 async def test_add_request_rejects_parallel_samples_on_a_later_stage_before_submission(
-    mocker, stage_n: list[int], watermark_final: bool, rejected_stage: int | None
+    mocker, tmp_path, stage_n: list[int], watermark_final: bool, rejected_stage: int | None
 ) -> None:
+    artifact_dir = tmp_path / "request-artifacts"
+    artifact_dir.mkdir()
     pools = [StagePool(0, FakeStageClient()), StagePool(1, FakeStageClient())]
     pools.append(_audio_stage_pool(_audio_stage_client("llm")) if watermark_final else StagePool(2, FakeStageClient()))
     assert pools[2].will_watermark(SamplingParams(n=2)) is watermark_final
@@ -4938,12 +4965,15 @@ async def test_add_request_rejects_parallel_samples_on_a_later_stage_before_subm
             preprocess_ms=0,
             request_timestamp=0,
             enqueue_ts=0,
+            request_artifact_dirs=[str(artifact_dir)],
         )
     )
 
     if rejected_stage is None:
         fail.assert_not_awaited()
         submits[0].assert_awaited_once()
+        assert artifact_dir.exists()
+        assert orchestrator.request_states["req"].request_artifact_dirs == {str(artifact_dir)}
     else:
         fail.assert_awaited_once_with(
             "req", 0, f"n > 1 is supported only on the entry stage 0; stage {rejected_stage} has n=2"
@@ -4951,6 +4981,7 @@ async def test_add_request_rejects_parallel_samples_on_a_later_stage_before_subm
         for submit in submits:
             submit.assert_not_awaited()
         assert "req" not in orchestrator.request_states
+        assert not artifact_dir.exists()
 
 
 @pytest.mark.asyncio

@@ -24,6 +24,99 @@ class ServerEndpoint:
     judge_base_url: str | None = None
 
 
+def test_request_failure_assertion_shows_the_underlying_error():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="server_vad_unavailable: missing Silero") as caught:
+        assert_result({"completed": 0, "errors": ["", "server_vad_unavailable: missing Silero"]}, {}, 120)
+    assert "0/120 completed" in str(caught.value)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_server_vad_preflight_checks_only_enabled_vad_workloads(monkeypatch, enabled):
+    from tests.dfx.perf.scripts import run_benchmark
+    from vllm_omni.engine.duplex.vad import ServerVADUnavailableError, SileroVADBackendProvider
+
+    monkeypatch.setattr(
+        run_benchmark,
+        "BENCHMARK_CONFIGS",
+        [
+            {
+                "test_name": "offline-vad",
+                "benchmark_params": [{"enabled": enabled, "duplex_eval_turn_detection": "server_vad"}],
+            }
+        ],
+    )
+    calls = []
+
+    def unavailable(self):
+        calls.append(self.model_path)
+        raise ServerVADUnavailableError("server_vad needs a local Silero artifact")
+
+    monkeypatch.setattr(SileroVADBackendProvider, "get", unavailable)
+    if enabled:
+        with pytest.raises(ServerVADUnavailableError, match="local Silero artifact"):
+            run_benchmark._preflight_server_vad("offline-vad", [])
+        assert calls == [None]
+    else:
+        run_benchmark._preflight_server_vad("offline-vad", [])
+        assert calls == []
+
+
+@pytest.mark.parametrize(
+    "deploy_args",
+    [
+        ("--deploy-config", "offline.yaml"),
+        ("--deploy-config=offline.yaml",),
+        ("--deploy-config", "unused.yaml", "--deploy-config", "offline.yaml"),
+        ("--deploy-config=unused.yaml", "--deploy-config=offline.yaml"),
+        ("--deploy-config", "unused.yaml", "--deploy-config=offline.yaml"),
+        ("--deploy-config=unused.yaml", "--deploy-config", "offline.yaml"),
+    ],
+)
+def test_server_vad_preflight_fails_before_model_resolution_or_server_start(monkeypatch, deploy_args):
+    from tests.dfx.perf.scripts import run_benchmark
+    from vllm_omni.config import stage_config
+    from vllm_omni.engine.duplex.vad import ServerVADUnavailableError, SileroVADBackendProvider
+
+    monkeypatch.setattr(
+        run_benchmark,
+        "BENCHMARK_CONFIGS",
+        [
+            {
+                "test_name": "offline-vad",
+                "benchmark_params": [{"duplex_eval_turn_detection": "server_vad"}],
+            }
+        ],
+    )
+    deploy_paths = []
+
+    def resolve_deploy(path):
+        deploy_paths.append(path)
+        return {"duplex_session": {"server_vad_model_path": f"/models/{Path(path).stem}/silero.onnx"}}
+
+    monkeypatch.setattr(stage_config, "resolve_deploy_yaml", resolve_deploy)
+    selected = []
+
+    def unavailable(self):
+        selected.append(self.model_path)
+        raise ServerVADUnavailableError("Configured Silero VAD model does not exist")
+
+    def must_not_start(*args, **kwargs):
+        pytest.fail("model startup ran before VAD validation")
+
+    monkeypatch.setattr(SileroVADBackendProvider, "get", unavailable)
+    monkeypatch.setattr(run_benchmark, "_resolve_offline_model", must_not_start)
+    monkeypatch.setattr(run_benchmark, "OmniServer", must_not_start)
+    server = ("offline-vad", "model", None, None, deploy_args, True)
+    with pytest.raises(ServerVADUnavailableError, match="does not exist"):
+        with run_benchmark._start_omni_server(server):
+            pytest.fail("unavailable VAD yielded a server")
+    # Match the serving CLI: the final flag overrides any earlier default.
+    assert deploy_paths == ["offline.yaml"]
+    assert selected == ["/models/offline/silero.onnx"]
+
+
 def test_task_excluded_from_cli_args():
     """'task' field must not become --task CLI arg."""
     params = {
@@ -778,7 +871,9 @@ def test_qwen3_duplex_c8_measures_and_judges_distinct_samples(monkeypatch, datas
     monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
     monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
     monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
-    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args, check_baseline=False: None)
+    monkeypatch.setattr(
+        run_benchmark, "assert_result", lambda *args, check_baseline=False, require_baseline=False: None
+    )
     run_benchmark.test_performance_benchmark(
         ServerEndpoint(), {"test_name": config["test_name"], "params": params}, pytestconfig=pytestconfig
     )
@@ -980,7 +1075,9 @@ def test_dataset_judging_uses_launched_judge(monkeypatch, prefix, judge_url, pyt
 
     monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
     # The result contract is covered above; exercise actual CLI assembly here.
-    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args, check_baseline=False: None)
+    monkeypatch.setattr(
+        run_benchmark, "assert_result", lambda *args, check_baseline=False, require_baseline=False: None
+    )
     server = ServerEndpoint(judge_base_url=judge_url)
     case = {
         "test_name": "test_duplex",
@@ -996,7 +1093,7 @@ def test_dataset_judging_uses_launched_judge(monkeypatch, prefix, judge_url, pyt
         assert args[args.index(f"--{prefix.replace('_', '-')}-judge-base-url") + 1] == judge_url
 
 
-@pytest.mark.parametrize(("hardware", "enforce_score_floors"), [("H100", True), ("MI300", False)])
+@pytest.mark.parametrize(("hardware", "enforce_score_floors"), [("H100", True), ("MI300", True)])
 def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(
     monkeypatch, hardware, enforce_score_floors, pytestconfig
 ):
@@ -1042,7 +1139,9 @@ def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(
         return {"completed": 66}
 
     monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
-    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args, check_baseline=False: None)
+    monkeypatch.setattr(
+        run_benchmark, "assert_result", lambda *args, check_baseline=False, require_baseline=False: None
+    )
     run_benchmark.test_performance_benchmark(
         ServerEndpoint(model="openbmb/MiniCPM-o-4_5", judge_base_url="http://localhost:8001"),
         {"test_name": config["test_name"], "params": params},
@@ -1064,6 +1163,7 @@ def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(
     assert args.trust_remote_code
     assert args.duplex_eval_evaluate
     assert args.duplex_eval_judge_base_url == "http://localhost:8001"
+    assert "--duplex-eval-require-score-floors" not in call["args"]
     assert "--duplex-eval-accuracy-config" not in call["args"]
     assert "--duplex-eval-score-floor-hardware" not in call["args"]
     assert "--required-duplex-metrics" not in call["args"]
@@ -1073,7 +1173,7 @@ def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(
     assert call["accuracy_baseline"] == selected
 
 
-@pytest.mark.parametrize("device_env", ["CUDA_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES"])
+@pytest.mark.parametrize("device_env", ["CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES"])
 @pytest.mark.parametrize(("devices", "judge_index", "expected"), [("4,7", "1", "7"), ("4,7,3", "2", "3")])
 def test_judge_uses_allocated_device(monkeypatch, device_env, devices, judge_index, expected):
     from tests.dfx.perf.scripts import run_benchmark as runner
@@ -1085,6 +1185,7 @@ def test_judge_uses_allocated_device(monkeypatch, device_env, devices, judge_ind
 
     @contextmanager
     def server(model, args, **kwargs):
+        assert kwargs["wait_for_device_memory"] is False
         seen.append(kwargs["env_dict"])
 
         class Endpoint:
@@ -1405,7 +1506,9 @@ def test_omniinteract_ephemeral_artifacts_override_output_dir(tmp_path, monkeypa
         return {"completed": 4}
 
     monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
-    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args, check_baseline=False: None)
+    monkeypatch.setattr(
+        run_benchmark, "assert_result", lambda *args, check_baseline=False, require_baseline=False: None
+    )
     monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [])
     monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
     server = ServerEndpoint(judge_base_url="http://127.0.0.1:8001")
@@ -1443,7 +1546,9 @@ def test_omniinteract_persisted_artifacts_keep_configured_output_dir(tmp_path, m
         return {"completed": 4}
 
     monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
-    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args, check_baseline=False: None)
+    monkeypatch.setattr(
+        run_benchmark, "assert_result", lambda *args, check_baseline=False, require_baseline=False: None
+    )
     monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [])
     monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
     server = ServerEndpoint(judge_base_url="http://127.0.0.1:8001")

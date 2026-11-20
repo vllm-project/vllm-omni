@@ -3,10 +3,10 @@
 
 """Request-controlled logits processors."""
 
-from vllm.v1.sample.logits_processor.interface import (
-    LogitsProcessor,
-    MoveDirectionality,
-)
+import torch
+from vllm.config import VllmConfig
+from vllm.sampling_params import SamplingParams
+from vllm.v1.worker.gpu.sample.logits_processor import LogitsContext, LogitsProcessor, LogitsProcRequestState
 
 
 def banned_tokens(sequence, n, window, whitelist=()):
@@ -29,48 +29,47 @@ class NoRepeatNGramLogitsProcessor(LogitsProcessor):
     no_repeat_ngram_whitelist (token IDs exempt from the restriction).
     """
 
-    def __init__(self, vllm_config, device, is_pin_memory):
-        self.requests = {}
+    def __init__(self, vllm_config: VllmConfig, req_states: LogitsProcRequestState) -> None:
+        self.req_states = req_states
+        self.requests: dict[int, tuple[int, int, list[int]]] = {}
+        self._speculative = vllm_config.speculative_config is not None
 
-    def is_argmax_invariant(self):
-        return False
+    def add_request(self, req_idx: int, sampling_params: SamplingParams) -> bool:
+        self.requests.pop(req_idx, None)
+        extras = sampling_params.extra_args or {}
+        n = int(extras.get("no_repeat_ngram_size", 0))
+        window = int(extras.get("no_repeat_ngram_window", 8192))
+        if n <= 0 or window <= 0:
+            return False
+        if self._speculative:
+            raise ValueError("No-repeat n-grams require non-speculative decoding")
+        self.requests[req_idx] = (n, window, extras.get("no_repeat_ngram_whitelist", []))
+        return True
 
-    def update_state(self, batch_update):
-        if batch_update is None:
-            return
-        for index in batch_update.removed:
-            self.requests.pop(index, None)
-        for index, params, prompt_ids, output_ids in batch_update.added:
-            extras = params.extra_args or {}
-            n = int(extras.get("no_repeat_ngram_size", 0))
-            window = int(extras.get("no_repeat_ngram_window", 8192))
-            self.requests.pop(index, None)
-            if n <= 0 or window <= 0:
+    def apply(self, logits: torch.Tensor, ctx: LogitsContext) -> torch.Tensor:
+        for row, slot in enumerate(ctx.idx_mapping_np):
+            config = self.requests.get(int(slot))
+            if config is None:
                 continue
-            self.requests[index] = (
-                prompt_ids or [],
-                output_ids,
-                n,
-                window,
-                extras.get("no_repeat_ngram_whitelist", []),
+            n, window, whitelist = config
+            # Non-speculative context gives the exact visible length. Keep the
+            # bounded native history on device and append the current input,
+            # which need not yet be present in committed history.
+            length = int(ctx.seq_lens_upper_bound_np[row])
+            start = max(0, length - window - n)
+            sequence = torch.cat(
+                (self.req_states.all_token_ids.gpu[slot, start : length - 1], ctx.input_ids[row : row + 1])
             )
-        for source, target, direction in batch_update.moved:
-            source_request = self.requests.pop(source, None)
-            target_request = self.requests.pop(target, None)
-            if direction == MoveDirectionality.SWAP:
-                if target_request is not None:
-                    self.requests[source] = target_request
-            if source_request is not None:
-                self.requests[target] = source_request
-
-    def apply(self, logits):
-        for index, (prompt, output, n, window, whitelist) in self.requests.items():
-            # Only the scan window and current n-gram prefix can affect bans.
-            tail_length = window + n
-            sequence = list(output[-tail_length:])
-            if len(sequence) < tail_length:
-                sequence = list(prompt[-(tail_length - len(sequence)) :]) + sequence
-            banned = banned_tokens(sequence, n, window, whitelist)
-            if banned:
-                logits[index, list(banned)] = -float("inf")
+            if len(sequence) < n:
+                continue
+            candidates = sequence.unfold(0, n, 1)[max(0, len(sequence) - window) :]
+            matches = torch.ones(len(candidates), dtype=torch.bool, device=logits.device)
+            if n > 1:
+                matches = (candidates[:, :-1] == sequence[-(n - 1) :]).all(dim=-1)
+            banned = torch.zeros(logits.shape[-1], dtype=torch.bool, device=logits.device)
+            banned.scatter_reduce_(0, candidates[:, -1].long(), matches, reduce="amax")
+            if whitelist:
+                allowed = [token for token in whitelist if 0 <= token < logits.shape[-1]]
+                banned[allowed] = False
+            logits[row].masked_fill_(banned, -float("inf"))
         return logits
