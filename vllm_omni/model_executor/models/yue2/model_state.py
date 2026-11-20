@@ -54,6 +54,10 @@ class Yue2ModelState(OmniModelState):
             return self.model.compute_prompt_logits(hidden_states)
         return self.model.compute_logits(hidden_states)
 
+    def postprocess_model_output(self, model_output, input_batch, req_states):
+        # Audio is request-owned and may finish after its AR row has been reused.
+        return model_output, {}
+
     def custom_sampler(self, sampler: Sampler) -> tuple[Yue2Sampler, None]:
         return Yue2Sampler(sampler, self), None
 

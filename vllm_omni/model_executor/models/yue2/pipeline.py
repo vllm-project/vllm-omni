@@ -14,7 +14,7 @@ Sampling is model-owned. ``sampling_constraints`` pins ``detokenize`` and the
 union of both phase end tokens; ``extra_args`` carry the phase and the
 request-local sampling preset. ``Yue2ModelState`` reads these arguments from
 the native MRv2 intermediate buffer before forward, including graph replay.
-The deployment remains disabled until the acoustic lifecycle is migrated.
+The model-owned worker retires AR slots while bounded acoustic work continues.
 """
 
 from vllm_omni.config.stage_config import (

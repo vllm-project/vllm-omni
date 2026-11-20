@@ -3,6 +3,7 @@
 """Same-worker acoustic synthesis after releasing native AR slots."""
 
 import copy
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 
 import torch
@@ -15,7 +16,6 @@ from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_cfg_ar_scheduler import OmniCFGARScheduler
 from vllm_omni.core.sched.output import OmniSchedulerOutput
 from vllm_omni.engine import OmniEngineCoreOutput
-from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.request import OmniRequest
 
 from .batched_synthesis import BatchedSynthesisQueue
@@ -29,12 +29,6 @@ class Yue2SchedulerOutput(OmniSchedulerOutput):
     # Remove runner AR state without cancelling the model's acoustic job.
     acoustic_req_ids: set[str] = field(default_factory=set)
     replaced_req_ids: set[str] = field(default_factory=set)
-
-
-@dataclass
-class Yue2ModelRunnerOutput(OmniModelRunnerOutput):
-    acoustic_started: list[str] = field(default_factory=list)
-    acoustic_ready: dict[str, dict[str, torch.Tensor]] = field(default_factory=dict)
 
 
 class Yue2ForCausalLM(Yue2Backbone):
@@ -54,8 +48,8 @@ class Yue2ForCausalLM(Yue2Backbone):
             raise ValueError("YuE2 requires TP=PP=1")
         if vllm_config.scheduler_config.async_scheduling:
             raise ValueError("YuE2 requires synchronous scheduling")
-        if vllm_config.model_config.use_v2_model_runner or vllm_config.speculative_config is not None:
-            raise ValueError("YuE2 requires model runner v1 without speculative decoding")
+        if not vllm_config.model_config.use_v2_model_runner or vllm_config.speculative_config is not None:
+            raise ValueError("YuE2 requires model runner v2 without speculative decoding")
         if vllm_config.cache_config.enable_prefix_caching or vllm_config.kv_transfer_config is not None:
             raise ValueError("YuE2 requires APC and external KV connectors disabled")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
@@ -94,6 +88,16 @@ class Yue2ForCausalLM(Yue2Backbone):
             for request_id in finished_req_ids:
                 self._synthesis.cancel_request(request_id)
         super().on_requests_finished(finished_req_ids)
+
+    def close(self):
+        # Run every cancellation even if an earlier job fails during release.
+        with ExitStack() as cleanup:
+            for rid in tuple(self._states):
+                cleanup.callback(self.on_requests_finished, (rid,))
+            pending, self._pending = self._pending, None
+            if pending is not None:
+                cleanup.callback(pending[0].synchronize)
+            self.acoustic_started.clear()
 
     def _finish_request_safely(self, state, *, hit_end):
         if state.constants.skip_synthesis:
@@ -202,8 +206,8 @@ class Yue2SchedulerBase(OmniARScheduler):
             output = OmniARScheduler.schedule(self, throttle_prefills)
         acoustic = {rid for rid, r in self.requests.items() if getattr(r, "yue2_acoustic", False)}
         replaced = set()
-        for rid in output.num_scheduled_tokens:
-            request = self.requests[rid]
+        # A replaced ABC phase must release its slot even while CFG admission waits.
+        for rid, request in self.requests.items():
             if getattr(request, "yue2_reset_phase", False):
                 replaced.add(rid)
                 request.yue2_reset_phase = False
@@ -223,7 +227,10 @@ class Yue2SchedulerBase(OmniARScheduler):
                 continue
             args = dict(request.sampling_params.extra_args[SEMANTIC_ARGS])
             args["yue2_prefix_ids"] = prefix
+            if "omni_user_seed" in request.sampling_params.extra_args:
+                args["omni_user_seed"] = request.sampling_params.extra_args["omni_user_seed"]
             params = SamplingParams(
+                seed=request.sampling_params.seed,
                 max_tokens=args["yue2_max_audio_frames"] + 2,
                 detokenize=False,
                 stop_token_ids=list(STOP_TOKEN_IDS),
