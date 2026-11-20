@@ -5,7 +5,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -73,6 +73,57 @@ def _make_runner():
     runner.req_states = SimpleNamespace(req_id_to_index={"r1": 0, "r2": 1})
     runner.execute_model_state = None
     return runner
+
+
+def test_dummy_sampler_run_uses_stateless_prompt_logits(monkeypatch) -> None:
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+
+    from vllm_omni.platforms import current_omni_platform
+
+    runner = _make_runner()
+    runner._kstep_frames = 0
+    hidden_states = torch.randn(3, 4)
+    logits = torch.randn(3, 8)
+    runner.model = SimpleNamespace(
+        compute_prompt_logits=MagicMock(return_value=logits),
+        compute_logits=MagicMock(side_effect=AssertionError("stateful logits must not run during profiling")),
+    )
+    runner.model_state = SimpleNamespace(dummy_sampler_run=MagicMock(return_value=False))
+    runner.sampler = MagicMock()
+    runner.input_buffers = object()
+    dummy_input_batch = object()
+    make_dummy = MagicMock(return_value=dummy_input_batch)
+    warmup_params = object()
+    monkeypatch.setattr(InputBatch, "make_dummy", make_dummy)
+    monkeypatch.setattr(current_omni_platform, "is_cpu", lambda: False)
+    monkeypatch.setattr(SamplingParams, "for_sampler_warmup", MagicMock(return_value=warmup_params))
+
+    runner._dummy_sampler_run(hidden_states)
+
+    runner.model_state.dummy_sampler_run.assert_called_once_with(runner.sampler, hidden_states)
+    runner.model.compute_prompt_logits.assert_called_once_with(hidden_states)
+    runner.model.compute_logits.assert_not_called()
+    make_dummy.assert_called_once_with(3, 3, runner.input_buffers)
+    assert runner.sampler.call_args_list == [call(logits, dummy_input_batch), call(logits, dummy_input_batch)]
+    assert runner.sampler.add_request.call_args_list == [
+        call(0, warmup_params),
+        call(1, warmup_params),
+        call(2, warmup_params),
+    ]
+    runner.sampler.apply_staged_writes.assert_called_once_with()
+
+
+def test_dummy_sampler_run_without_stateless_hook_keeps_upstream_path() -> None:
+    runner = _make_runner()
+    runner._kstep_frames = 0
+    runner.model = SimpleNamespace(compute_logits=MagicMock())
+    hidden_states = torch.randn(2, 4)
+    sentinel = object()
+
+    with patch.object(GPUModelRunner, "_dummy_sampler_run", return_value=sentinel) as parent:
+        assert runner._dummy_sampler_run(hidden_states) is sentinel
+
+    parent.assert_called_once_with(hidden_states)
 
 
 def test_native_output_freezes_each_requests_current_perf_chunk():
@@ -687,6 +738,69 @@ def test_minicpmo_capture_contract(stage, use_mrv2, returns_aux, exclude_full):
 
     assert runner._model_has_structured_output is exclude_full
     assert runner._exclude_full_graph is exclude_full
+
+
+def _make_graph_contract_model(architecture, stage):
+    from vllm_omni.model_executor.models.registry import OmniModelRegistry
+
+    model_cls = OmniModelRegistry.models[architecture].load_model_cls()
+    model = model_cls.__new__(model_cls)
+    torch.nn.Module.__init__(model)
+    model.have_multimodal_outputs = True
+    if stage is not None:
+        model.model_stage = stage
+    return model
+
+
+@pytest.mark.parametrize(
+    ("architecture", "stage"),
+    [
+        ("BreezeForConditionalGeneration", None),
+        ("HiggsAudioV3TalkerForConditionalGeneration", None),
+        ("Ming3TTSForConditionalGeneration", "llm"),
+        ("MossTTSDelayModel", None),
+        ("MossTTSLocalModel", None),
+        ("VoxtralTTSForConditionalGeneration", "audio_generation"),
+    ],
+)
+def test_tensor_returning_model_preserves_mrv2_full_capture(architecture, stage, monkeypatch):
+    model = _make_graph_contract_model(architecture, stage)
+
+    runner = _make_runner()
+    runner.model = model
+    runner._configure_cudagraph_output_contract()
+    full = BatchExecutionDescriptor(CUDAGraphMode.FULL, 1, 1)
+    runner.cudagraph_manager = SimpleNamespace(
+        _capture_descs={CUDAGraphMode.FULL: [full]},
+        _candidates={(1, 0): [full]},
+        _decode_descs={1: full},
+    )
+
+    def capture(self, *, profile_only):
+        assert self.cudagraph_manager._capture_descs[CUDAGraphMode.FULL] == [full]
+        assert self.cudagraph_manager._candidates[(1, 0)] == [full]
+        assert self.cudagraph_manager._decode_descs[1] == full
+        return 0
+
+    monkeypatch.setattr(GPUModelRunner, "capture_model", capture)
+    assert runner.capture_model(profile_only=True) == 0
+
+
+@pytest.mark.parametrize(
+    ("architecture", "stage"),
+    [
+        ("Ming3TTSForConditionalGeneration", "audio_vae"),
+        ("VoxtralTTSForConditionalGeneration", "audio_tokenizer"),
+    ],
+)
+def test_tensor_return_contract_excludes_structured_decoder_stages(architecture, stage):
+    model = _make_graph_contract_model(architecture, stage)
+
+    runner = _make_runner()
+    runner.model = model
+    runner._configure_cudagraph_output_contract()
+
+    assert runner._exclude_full_graph
 
 
 def _aux_output(num_tokens):

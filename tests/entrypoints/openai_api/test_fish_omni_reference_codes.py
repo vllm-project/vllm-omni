@@ -81,6 +81,18 @@ def test_protocol_accepts_a_codes_grid_and_rejects_malformed_ones():
         _request(ref_audio_codes=_codes(), ref_text=" ")
 
 
+@pytest.mark.parametrize("value", [0, 1.5, "x", None, float("nan"), True])
+def test_adapter_rejects_invalid_reference_top_p(value):
+    req = _request(ref_audio_codes=_codes(), extra_params={"fish_omni_reference_top_p": value})
+    assert _adapter().validate(req) == "fish_omni_reference_top_p must be a number in (0, 1]"
+
+
+@pytest.mark.parametrize("value", [0.4, 1])
+def test_adapter_accepts_valid_reference_top_p(value):
+    req = _request(ref_audio_codes=_codes(), extra_params={"fish_omni_reference_top_p": value})
+    assert _adapter().validate(req) is None
+
+
 def test_adapter_checks_codes_against_the_codec():
     adapter = _adapter()
     assert adapter.validate(_request(ref_audio_codes=_codes())) is None
