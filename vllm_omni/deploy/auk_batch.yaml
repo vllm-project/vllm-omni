@@ -11,5 +11,9 @@ stages:
     max_num_seqs: 128
     request_batch_max_wait_ms: 200
     model_config:
+      # Stage overlays replace model_config whole rather than deep-merging, so
+      # keep the base decode bucket and DiT graph limits from auk.yaml here.
+      auk_vae_compile_shapes: [160, 320, 640]
+      max_dit_graphs: 32
       auk_vae_warmup_batches: [1, 64, 128]
       auk_dit_warmup_batches: [1, 64, 128]

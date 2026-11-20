@@ -709,11 +709,13 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
                 ref = items[0].ref
                 ref_mask = torch.ones(ref.shape[:2], dtype=torch.bool, device=ref.device)
                 group_gen_frames = items[0].target_frames
+                noise_frames = None
                 x_mask = None
             else:
                 ref, ref_mask = _pad_conditions([item.ref[0] for item in items])
                 group_gen_frames = target_bucket
-                target_lens = torch.tensor([item.target_frames for item in items], device=self.device)
+                noise_frames = [item.target_frames for item in items]
+                target_lens = torch.tensor(noise_frames, device=self.device)
                 x_mask = torch.arange(target_bucket, device=self.device)[None, :] < target_lens[:, None]
             with self._dit_autocast():
                 latents = sample_latents(
@@ -724,6 +726,7 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
                     ref_mask=ref_mask,
                     gen_frames=group_gen_frames,
                     x_mask=x_mask,
+                    noise_frames=noise_frames,
                     nfe=nfe,
                     cfg_strength=cfg,
                     sway_sampling_coef=sway,

@@ -171,18 +171,35 @@ def _stub_sampler(calls: list[dict[str, Any]]):
         calls.append(kwargs)
         shape = (kwargs["text"].shape[0], kwargs["gen_frames"], kwargs["latent_dim"])
         generator = kwargs.get("generator")
+        noise_frames = kwargs.get("noise_frames")
         if isinstance(generator, list):
-            return torch.stack(
-                [
-                    torch.randn(*shape[1:], generator=g, device=kwargs["device"], dtype=kwargs["dtype"])
-                    if g is not None
-                    else torch.zeros(*shape[1:], device=kwargs["device"], dtype=kwargs["dtype"])
-                    for g in generator
-                ]
-            )
+            rows = []
+            for idx, g in enumerate(generator):
+                row_frames = kwargs["gen_frames"] if noise_frames is None else int(noise_frames[idx])
+                if g is not None:
+                    row = torch.randn(
+                        row_frames, kwargs["latent_dim"], generator=g, device=kwargs["device"], dtype=kwargs["dtype"]
+                    )
+                else:
+                    row = torch.zeros(row_frames, kwargs["latent_dim"], device=kwargs["device"], dtype=kwargs["dtype"])
+                if row_frames < kwargs["gen_frames"]:
+                    row = F.pad(row, (0, 0, 0, kwargs["gen_frames"] - row_frames))
+                rows.append(row)
+            return torch.stack(rows)
+        row_frames = kwargs["gen_frames"] if noise_frames is None else int(noise_frames[0])
         if generator is None:
             return torch.zeros(*shape, device=kwargs["device"], dtype=kwargs["dtype"])
-        return torch.randn(*shape, generator=generator, device=kwargs["device"], dtype=kwargs["dtype"])
+        row = torch.randn(
+            shape[0],
+            row_frames,
+            kwargs["latent_dim"],
+            generator=generator,
+            device=kwargs["device"],
+            dtype=kwargs["dtype"],
+        )
+        if row_frames < kwargs["gen_frames"]:
+            row = F.pad(row, (0, 0, 0, kwargs["gen_frames"] - row_frames))
+        return row
 
     return sample_latents
 
@@ -768,12 +785,55 @@ class TestRequestParsing:
         assert outputs[0].output.shape == (1, expected_f1, LATENT_DIM)
         assert outputs[1].output.shape == (1, expected_f2, LATENT_DIM)
 
-        expected_latents1 = torch.randn(1, 160, LATENT_DIM, generator=torch.Generator().manual_seed(7))[:, :expected_f1]
-        expected_latents2 = torch.randn(1, 160, LATENT_DIM, generator=torch.Generator().manual_seed(11))[
-            :, :expected_f2
-        ]
+        expected_latents1 = torch.randn(1, expected_f1, LATENT_DIM, generator=torch.Generator().manual_seed(7))
+        expected_latents2 = torch.randn(1, expected_f2, LATENT_DIM, generator=torch.Generator().manual_seed(11))
         torch.testing.assert_close(outputs[0].output, expected_latents1, atol=0, rtol=0)
         torch.testing.assert_close(outputs[1].output, expected_latents2, atol=0, rtol=0)
+        assert calls[0]["noise_frames"] == [expected_f1, expected_f2]
+
+    def test_mixed_target_lengths_preserve_reusable_generator_state(self, build_pipeline):
+        pipeline, _ = build_pipeline()
+
+        def make_requests(gen: torch.Generator):
+            return [
+                OmniDiffusionRequest(
+                    prompt=_prompt(audio=_silence(0.5), knobs={"gen_seconds": sec}),
+                    sampling_params=OmniDiffusionSamplingParams(generator=gen, output_type="latent"),
+                    request_id=f"auk-rng-{idx}",
+                )
+                for idx, sec in enumerate((2.9, 3.1))
+            ]
+
+        serial_gen = torch.Generator().manual_seed(123)
+        serial_outputs = [pipeline.forward(DiffusionRequestBatch([r]))[0].output for r in make_requests(serial_gen)]
+
+        batched_gen = torch.Generator().manual_seed(123)
+        batched_outputs = [out.output for out in pipeline.forward(DiffusionRequestBatch(make_requests(batched_gen)))]
+
+        for batched, serial in zip(batched_outputs, serial_outputs, strict=True):
+            torch.testing.assert_close(batched, serial, atol=0, rtol=0)
+        assert torch.equal(batched_gen.get_state(), serial_gen.get_state())
+
+    def test_auk_batch_profile_preserves_base_model_config(self):
+        from tests.helpers.stage_config import get_deploy_config_path
+        from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
+        from vllm_omni.model_executor.models.auk.pipeline import AUK_PIPELINE
+
+        base = load_deploy_config(get_deploy_config_path("auk.yaml"))
+        batch = load_deploy_config(get_deploy_config_path("auk_batch.yaml"))
+        base_model_cfg = dict(base.stages[1].engine_extras["model_config"])
+        batch_model_cfg = dict(batch.stages[1].engine_extras["model_config"])
+        for key, value in base_model_cfg.items():
+            assert batch_model_cfg.get(key) == value
+        assert batch_model_cfg["auk_vae_warmup_batches"] == [1, 64, 128]
+        assert batch_model_cfg["auk_dit_warmup_batches"] == [1, 64, 128]
+
+        merged = merge_pipeline_deploy(AUK_PIPELINE, batch)
+        merged_model_cfg = dict(merged[1].yaml_engine_args["model_config"])
+        for key, value in base_model_cfg.items():
+            assert merged_model_cfg.get(key) == value
+        assert merged_model_cfg["auk_vae_warmup_batches"] == [1, 64, 128]
+        assert merged_model_cfg["auk_dit_warmup_batches"] == [1, 64, 128]
 
     def test_batched_unequal_target_lengths_vae_tail_isolation(self, build_pipeline):
         pipeline, _ = build_pipeline()

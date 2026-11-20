@@ -28,7 +28,7 @@ Deliberate differences from the reference, all inference-only:
 """
 
 import math
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -901,6 +901,7 @@ def sample_latents(
     ref_mask: torch.Tensor | None,
     gen_frames: int,
     x_mask: torch.Tensor | None = None,
+    noise_frames: Sequence[int] | None = None,
     nfe: int = 32,
     cfg_strength: float = 1.0,
     sway_sampling_coef: float | None = None,
@@ -923,6 +924,11 @@ def sample_latents(
         ref: Reference prompt latents ``[B, np, latent_dim]``.
         ref_mask: Reference padding mask ``[B, np]``.
         gen_frames: Target latent frames to generate.
+        x_mask: Target padding mask ``[B, gen_frames]``, ``True`` where valid.
+        noise_frames: Per-request valid target frames to sample before
+            zero-padding to ``gen_frames``. Preserves exact per-request RNG
+            consumption when requests of different unaligned lengths are
+            batched to a shared bucket.
         nfe: Euler steps, ignored when ``t_grid`` is given.
         cfg_strength: Classifier-free guidance weight. Below ``1e-5`` the
             uncond branch is skipped entirely.
@@ -951,34 +957,49 @@ def sample_latents(
     dtype = dtype if dtype is not None else ref.dtype
     latent_dim = latent_dim if latent_dim is not None else dit.latent_dim
     batch_size = text.shape[0]
+    frame_counts: list[int] | None = None
+    if noise_frames is not None:
+        frame_counts = [int(frames) for frames in noise_frames]
+        if len(frame_counts) != batch_size:
+            raise ValueError("AuK needs one noise frame count per request.")
+        if any(frames < 0 or frames > gen_frames for frames in frame_counts):
+            raise ValueError(f"AuK noise_frames must lie in [0, {gen_frames}]; got {frame_counts}.")
+
+    def _draw_row(row_frames: int, row_generator: torch.Generator | None) -> torch.Tensor:
+        if row_generator is not None:
+            row_noise = torch.randn(
+                row_frames, latent_dim, generator=row_generator, device=row_generator.device, dtype=dtype
+            ).to(device)
+        else:
+            row_noise = torch.randn(row_frames, latent_dim, device=device, dtype=dtype)
+        if row_frames < gen_frames:
+            row_noise = F.pad(row_noise, (0, 0, 0, gen_frames - row_frames))
+        return row_noise
 
     if isinstance(generator, list):
         if len(generator) != batch_size:
             raise ValueError("AuK needs one noise generator per request.")
         latents_list = []
-        for g in generator:
-            if g is not None:
-                latents_list.append(
-                    torch.randn(gen_frames, latent_dim, generator=g, device=g.device, dtype=dtype).to(device)
-                )
-            elif seed is not None:
+        for idx, g in enumerate(generator):
+            row_frames = gen_frames if frame_counts is None else frame_counts[idx]
+            if g is None and seed is not None:
                 torch.manual_seed(seed)
-                latents_list.append(torch.randn(gen_frames, latent_dim, device=device, dtype=dtype))
-            else:
-                latents_list.append(torch.randn(gen_frames, latent_dim, device=device, dtype=dtype))
+            latents_list.append(_draw_row(row_frames, g))
         x = torch.stack(latents_list, dim=0)
     elif generator is None:
         if seed is not None:
             torch.manual_seed(seed)
-        x = torch.randn(batch_size, gen_frames, latent_dim, device=device, dtype=dtype)
+        if frame_counts is not None and any(frames != gen_frames for frames in frame_counts):
+            x = torch.stack([_draw_row(frames, None) for frames in frame_counts], dim=0)
+        else:
+            x = torch.randn(batch_size, gen_frames, latent_dim, device=device, dtype=dtype)
     else:
         if batch_size > 1:
             raise ValueError(
                 "AuK needs one noise generator per request when batch_size > 1, or pass a list of generators."
             )
-        x = torch.randn(
-            batch_size, gen_frames, latent_dim, generator=generator, device=generator.device, dtype=dtype
-        ).to(device)
+        row_frames = gen_frames if frame_counts is None else frame_counts[0]
+        x = _draw_row(row_frames, generator).unsqueeze(0)
 
     t = build_time_grid(
         nfe=nfe,

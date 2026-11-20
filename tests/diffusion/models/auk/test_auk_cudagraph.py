@@ -580,3 +580,72 @@ def test_batched_unequal_target_lengths_matches_serial() -> None:
     torch.testing.assert_close(actual_batch[0:1, :6], expected_serial0[:, :6], atol=1e-5, rtol=1e-5)
     # The serial and batched calls with the same generator and bucket draw identical initial noise
     torch.testing.assert_close(actual_batch[0:1], expected_serial0, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.cpu
+@torch.inference_mode()
+def test_sample_latents_noise_frames_matches_unpadded_serial() -> None:
+    """``noise_frames`` consumes the exact unpadded RNG count per request before padding."""
+    dit = _make_dit("cpu")
+    text = torch.randn(2, 7, 8)
+    c_mask = torch.ones(2, 7, dtype=torch.bool)
+    ref = torch.randn(2, 4, 4)
+    ref_mask = torch.ones(2, 4, dtype=torch.bool)
+
+    gen0_serial = torch.Generator().manual_seed(42)
+    expected_serial0 = sample_latents(
+        dit,
+        text=text[0:1],
+        c_mask=c_mask[0:1],
+        ref=ref[0:1],
+        ref_mask=ref_mask[0:1],
+        gen_frames=6,
+        generator=gen0_serial,
+        t_grid=[0.0, 0.5, 1.0],
+        cfg_strength=2.0,
+        dtype=torch.float32,
+    )
+
+    gen0_batch = torch.Generator().manual_seed(42)
+    gen1_batch = torch.Generator().manual_seed(99)
+    x_mask = torch.tensor([[True] * 6 + [False] * 3, [True] * 9])
+    actual_batch = sample_latents(
+        dit,
+        text=text,
+        c_mask=c_mask,
+        ref=ref,
+        ref_mask=ref_mask,
+        gen_frames=9,
+        x_mask=x_mask,
+        noise_frames=[6, 9],
+        generator=[gen0_batch, gen1_batch],
+        t_grid=[0.0, 0.5, 1.0],
+        cfg_strength=2.0,
+        dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(actual_batch[0:1, :6], expected_serial0, atol=1e-5, rtol=1e-5)
+    assert torch.equal(gen0_batch.get_state(), gen0_serial.get_state())
+
+    with pytest.raises(ValueError, match="one noise frame count per request"):
+        sample_latents(
+            dit,
+            text=text,
+            c_mask=c_mask,
+            ref=ref,
+            ref_mask=ref_mask,
+            gen_frames=9,
+            noise_frames=[6],
+            generator=[gen0_batch, gen1_batch],
+        )
+    with pytest.raises(ValueError, match="noise_frames must lie in"):
+        sample_latents(
+            dit,
+            text=text,
+            c_mask=c_mask,
+            ref=ref,
+            ref_mask=ref_mask,
+            gen_frames=9,
+            noise_frames=[10, 9],
+            generator=[gen0_batch, gen1_batch],
+        )
