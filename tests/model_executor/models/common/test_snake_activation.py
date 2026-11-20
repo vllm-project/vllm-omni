@@ -5,12 +5,13 @@
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.common.alias_free_activation import AliasFreeActivation1d
 from vllm_omni.model_executor.models.common.snake_activation import Snake, SnakeBeta
 
 pytestmark = [
     pytest.mark.core_model,
-    pytest.mark.cuda,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
 ]
 
