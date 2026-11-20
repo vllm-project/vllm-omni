@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
@@ -33,6 +34,7 @@ from vllm.v1.worker.gpu.model_runner import (
     IntermediateTensors,
     build_slot_mappings_by_layer,
 )
+from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
@@ -106,13 +108,34 @@ def _supports_full_graph_aux_outputs(model: Any) -> bool:
     return _needs_capture_tensor_unwrap(model) and bool(getattr(model, "supports_mrv2_full_graph_aux_outputs", False))
 
 
+def _optional_state_hook(state: ModelState, name: str) -> Callable[..., Any] | None:
+    hook = getattr(state, name, None)
+    if hook is not None and not callable(hook):
+        raise TypeError(f"{type(state).__name__}.{name} must be callable")
+    return hook
+
+
+def _require_buffer_method(state: ModelState, name: str, capability: str) -> Callable[..., Any]:
+    method = getattr(getattr(state, "intermediate_buffer", None), name, None)
+    if not callable(method):
+        raise NotImplementedError(f"{capability} requires intermediate_buffer.{name} on {type(state).__name__}")
+    return method
+
+
+def _require_buffer_rows(state: ModelState, capability: str) -> Sequence[dict[str, Any]]:
+    rows = getattr(getattr(state, "intermediate_buffer", None), "buffers", None)
+    if not isinstance(rows, Sequence):
+        raise NotImplementedError(f"{capability} requires intermediate_buffer.buffers on {type(state).__name__}")
+    return rows
+
+
 class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     """Thin layer over v2 ``GPUModelRunner`` for Omni lifecycle hooks."""
 
     supports_mm_inputs: bool
     encoder_cache: EncoderCache | None
     _native_output_materializer: NativeOutputWorker | None
-    model_state: OmniModelState
+    model_state: ModelState
     _mm_rng_state: MMRequestRNGState | None = None
     vocab_size: int
     # Speculative decoding state; the upstream __init__ sets the real values.
@@ -127,6 +150,41 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     # FULL-graph aux-output contract (see _configure_cudagraph_output_contract).
     _full_graph_aux_outputs = False
     _aux_output_spec: Any = None
+
+    def _validate_model_state_capabilities(self, state: ModelState, model: torch.nn.Module) -> None:
+        if getattr(self, "_omni_data_plane", None) is not None:
+            _require_buffer_method(state, "update", "Native MRv2 data plane")
+            _require_buffer_rows(state, "Native MRv2 data plane")
+
+        # Only the primary Omni config can enable send or receive. The core
+        # KV config fallback supplies connector settings with both flags off.
+        kv_config = getattr(self.model_config, "omni_kv_config", None)
+        if isinstance(kv_config, dict) and (kv_config.get("need_send_cache") or kv_config.get("need_recv_cache")):
+            _require_buffer_rows(state, "Omni KV transfer")
+
+        if not getattr(self.model_config, "enforce_eager", False) and callable(
+            getattr(model, "capture_stream_decode_graphs", None)
+        ):
+            self._require_capture_sizes(state)
+
+    @staticmethod
+    def _require_capture_sizes(state: ModelState) -> Callable[[], Sequence[int]]:
+        sizes = getattr(state, "_get_mtp_capture_sizes", None)
+        if not callable(sizes):
+            raise NotImplementedError(f"Model-owned stream capture requires capture sizes on {type(state).__name__}")
+        return sizes
+
+    def _validate_unconverted_output(self, output: object) -> None:
+        # Check before unpacking. An OmniOutput with an empty payload or a
+        # tuple with None auxiliaries can otherwise look like a plain tensor.
+        if (
+            not isinstance(output, torch.Tensor)
+            and _optional_state_hook(self.model_state, "postprocess_model_output") is None
+        ):
+            raise NotImplementedError(
+                f"MRv2 structured output ({type(output).__name__}) requires postprocess_model_output "
+                f"on {type(self.model_state).__name__}"
+            )
 
     def _configure_cudagraph_output_contract(self) -> None:
         """Select the CUDA graph output contract declared by the model."""
@@ -361,6 +419,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         plane = getattr(self, "_omni_data_plane", None)
         if plane is None:
             return
+        update = _require_buffer_method(self.model_state, "update", "Native MRv2 data plane")
         gpu_keys: set[tuple[str, str]] = getattr(self.model, "gpu_resident_buffer_keys", set())
         for req_id in scheduler_output.num_scheduled_tokens:
             req_idx = self.req_states.req_id_to_index.get(req_id)
@@ -368,11 +427,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                 continue
             payload = plane.pop_local_stage_payload(req_id)
             if isinstance(payload, dict) and payload:
-                self.model_state.intermediate_buffer.update(
-                    req_idx,
-                    payload,
-                    gpu_keys,
-                )
+                update(req_idx, payload, gpu_keys)
 
     def _uses_native_output_materializer(self) -> bool:
         parallel = getattr(getattr(self, "vllm_config", None), "parallel_config", None)
@@ -412,7 +467,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         if plane is not None:
             # The materializer and transport can run after the next scheduler
             # update. Bind each tag to this output while its model step is live.
-            buffers = self.model_state.intermediate_buffer.buffers
+            buffers = _require_buffer_rows(self.model_state, "Native MRv2 data plane")
             output._duplex_perf_chunks = {
                 req_id: chunk
                 for req_id in output.req_ids
@@ -442,7 +497,9 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             # MiniCPM-o codec Talker's config has no vocab_size at all) sizes
             # the MRv2 sampler and request state by that head.
             self._adopt_model_logits_vocab(model)
-            return init_omni_model_state(vllm_config, model, encoder_cache, device)
+            state = init_omni_model_state(vllm_config, model, encoder_cache, device)
+            self._validate_model_state_capabilities(state, model)
+            return state
 
         with _model_state_patch_lock:
             _orig = _mr_module.init_model_state
@@ -632,7 +689,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             capture_first_frame()
         capture_stream = getattr(self.model, "capture_stream_decode_graphs", None)
         if callable(capture_stream):
-            sizes = [int(s) for s in self.model_state._get_mtp_capture_sizes()]
+            sizes = [int(s) for s in self._require_capture_sizes(self.model_state)()]
             capture_stream(sorted(set(sizes + [1])))
         return result
 
@@ -649,7 +706,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         return max(free_before - torch.accelerator.get_memory_info()[0], 0)
 
     def _dispatch_mtp_batch_descriptor(self, num_mtp_reqs: int) -> BatchExecutionDescriptor:
-        capture_sizes = self.model_state._get_mtp_capture_sizes()
+        capture_sizes = self._require_capture_sizes(self.model_state)()
         captured_bucket = next(
             (size for size in sorted(capture_sizes) if num_mtp_reqs <= size <= self.scheduler_config.max_num_seqs),
             None,
@@ -1102,12 +1159,9 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         # in-place to this buffer, and FULL graph replay reads the
         # updated values from the same tensor address.
         if not dummy_run:
-            self.model_state.run_preprocess(
-                input_batch,
-                model_inputs,
-                self.req_states,
-                self._dispatch_mtp_batch_descriptor,
-            )
+            preprocess = _optional_state_hook(self.model_state, "run_preprocess")
+            if preprocess is not None:
+                preprocess(input_batch, model_inputs, self.req_states, self._dispatch_mtp_batch_descriptor)
 
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
@@ -1146,6 +1200,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                 input_batch=input_batch,
             )
             if stepped is not None:
+                self._validate_unconverted_output(stepped)
                 # The platform loop already sampled this step.
                 hidden_states = stepped.text_hidden_states
                 self._last_aux_output = None
@@ -1153,6 +1208,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                     self._last_multimodal_outputs = cast(dict[str, Any], stepped.multimodal_outputs)
             else:
                 replayed = self.cudagraph_manager.run_fullgraph(batch_desc)
+                self._validate_unconverted_output(replayed)
                 if self.use_aux_hidden_state_outputs:
                     replayed, draft_aux_hidden_states = replayed
                 hidden_states, self._last_aux_output = self._split_fullgraph_output(replayed)
@@ -1202,6 +1258,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                 if runner_assisted_full_attn:
                     self.model.set_runner_assisted_full_attention_metadata_context(enabled=False)
 
+            self._validate_unconverted_output(model_output)
             # Extract hidden_states from model output.
             self._last_aux_output = None
             self._last_multimodal_outputs = None
@@ -1224,6 +1281,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                 for i in range(input_batch.num_reqs)
             ]
             output = self.model.make_omni_output(hidden_states, **kstep_extra)
+            self._validate_unconverted_output(output)
             hidden_states = output.text_hidden_states
             self._last_multimodal_outputs = output.multimodal_outputs
         if (
@@ -1233,7 +1291,9 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             # sampling phase, so their state update must wait for that phase.
             and not getattr(self.model, "postprocess_requires_multimodal_outputs", False)
         ):
-            self.model_state.run_postprocess(hidden_states, input_batch)
+            postprocess = _optional_state_hook(self.model_state, "run_postprocess")
+            if postprocess is not None:
+                postprocess(hidden_states, input_batch)
 
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
@@ -1272,22 +1332,28 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         Upstream GPUModelRunner.update_requests does not handle this
         field, so we merge it into the intermediate buffer here.
         """
-        super().update_requests(scheduler_output)
-
         cached = scheduler_output.scheduled_cached_reqs
         addl_info = getattr(cached, "additional_information", None)
         if not addl_info:
+            super().update_requests(scheduler_output)
             return
+
+        updates = []
         for req_id, info in addl_info.items():
-            if info is None:
-                continue
             req_idx = self.req_states.req_id_to_index.get(req_id)
-            if req_idx is None:
-                continue
-            resolved = _resolve_additional_information(info)
-            if resolved:
-                gpu_keys: set[tuple[str, str]] = getattr(self.model, "gpu_resident_buffer_keys", set())
-                self.model_state.intermediate_buffer.update(req_idx, resolved, gpu_keys)
+            if info is not None and req_idx is not None:
+                resolved = _resolve_additional_information(info)
+                if resolved:
+                    updates.append((req_idx, resolved))
+
+        update = (
+            _require_buffer_method(self.model_state, "update", "Cached additional_information") if updates else None
+        )
+        super().update_requests(scheduler_output)
+        if update is not None:
+            gpu_keys: set[tuple[str, str]] = getattr(self.model, "gpu_resident_buffer_keys", set())
+            for req_idx, resolved in updates:
+                update(req_idx, resolved, gpu_keys)
 
     # ------------------------------------------------------------------
     # Request lifecycle: clean up intermediate buffer on finish
@@ -1316,9 +1382,4 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                 idx = self.req_states.req_id_to_index.get(req_id)
                 if idx is not None:
                     suspend_state(req_id, idx)
-        all_done = finished | preempted if preempted else finished
-        for req_id in all_done:
-            idx = self.req_states.req_id_to_index.get(req_id)
-            if idx is not None:
-                self.model_state.remove_request(idx)
         super().finish_requests(scheduler_output)

@@ -29,6 +29,7 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.worker.gpu.eplb_utils import step_eplb_after
+from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import get_drafter_hidden_states
 from vllm.v1.worker.workspace import use_workspace_lane
@@ -44,7 +45,7 @@ from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import partition_flat_payload
 from vllm_omni.worker.sparse_audio import resolve_sparse_mm_routing
 from vllm_omni.worker_v2.mooncake_capture import snapshot_mooncake_output
-from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner, _optional_state_hook, _require_buffer_rows
 from vllm_omni.worker_v2.omni_sampler import sample_with_output
 from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot, pack_output_snapshot
 from vllm_omni.worker_v2.streaming_audio import StreamingAudioSnapshot
@@ -160,6 +161,27 @@ class OmniARModelRunner(OmniGPUModelRunner):
         self._async_mm_snapshot_cursor = 0
         self._last_multimodal_snapshot_slot: int | None = None
 
+    def _validate_model_state_capabilities(self, state: ModelState, model: torch.nn.Module) -> None:
+        super()._validate_model_state_capabilities(state, model)
+        needs_converter = self.use_aux_hidden_state_outputs or any(
+            getattr(model, flag, False) is True
+            for flag in (
+                "_returns_tuple",
+                "have_multimodal_outputs",
+                "mrv2_forward_returns_native_aux",
+                "postprocess_requires_multimodal_outputs",
+            )
+        )
+        if needs_converter and _optional_state_hook(state, "postprocess_model_output") is None:
+            raise NotImplementedError(
+                f"MRv2 AR structured output requires postprocess_model_output on {type(state).__name__}"
+            )
+        if (
+            getattr(model, "postprocess_requires_multimodal_outputs", False)
+            and _optional_state_hook(state, "run_postprocess") is None
+        ):
+            raise NotImplementedError(f"MRv2 multimodal feedback requires run_postprocess on {type(state).__name__}")
+
     def _dummy_run(self, num_tokens: int, *args: Any, **kwargs: Any) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         # Upstream autotuning uses the batch token budget even when one dummy
         # request would exceed the context-sized attention block table.
@@ -252,16 +274,29 @@ class OmniARModelRunner(OmniGPUModelRunner):
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> OmniAsyncOutput | OmniModelRunnerOutput | ModelRunnerOutput | None:
-        kv_extracted = self._kv_extracted_req_ids
-        self._kv_extracted_req_ids = None
-
         if self.execute_model_state is None:
+            self._kv_extracted_req_ids = None
             return None
 
         input_batch = self.execute_model_state.input_batch
         hidden_states = self.execute_model_state.hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
         ec_connector_output = self.execute_model_state.ec_connector_output
+        raw_output = self._reconstruct_raw_model_output(
+            hidden_states=hidden_states,
+            multimodal_outputs=self._last_multimodal_outputs,
+            aux=self._last_aux_output,
+        )
+        converter = _optional_state_hook(self.model_state, "postprocess_model_output")
+        if converter is None:
+            self._validate_unconverted_output(raw_output)
+            if self.execute_model_state.aux_hidden_states is not None:
+                raise NotImplementedError(
+                    f"MRv2 AR auxiliary output requires postprocess_model_output on {type(self.model_state).__name__}"
+                )
+
+        kv_extracted = self._kv_extracted_req_ids
+        self._kv_extracted_req_ids = None
         draft_inputs = None
         if self.num_speculative_steps > 0:
             draft_inputs = DraftInputs(
@@ -277,25 +312,19 @@ class OmniARModelRunner(OmniGPUModelRunner):
             pending_aux_output = self.aux_output_connector.prepare_output(input_batch)
         self.execute_model_state = None
 
-        # --- Omni: reconstruct raw model output and post-process ---
-        aux = self._last_aux_output
         self._last_aux_output = None
-        multimodal_outputs = self._last_multimodal_outputs
         self._last_multimodal_outputs = None
         snapshot_slot = None
         self._last_multimodal_snapshot_slot = None
-        raw_output = self._reconstruct_raw_model_output(
-            hidden_states=hidden_states,
-            multimodal_outputs=multimodal_outputs,
-            aux=aux,
-        )
-        text_hidden, multimodal_outputs = self.model_state.postprocess_model_output(
-            raw_output, input_batch, self.req_states
-        )
+        if converter is None:
+            text_hidden, multimodal_outputs = raw_output, None
+        else:
+            text_hidden, multimodal_outputs = converter(raw_output, input_batch, self.req_states)
         if getattr(self.model, "postprocess_requires_multimodal_outputs", False):
-            # The raw forward cannot publish this state: make_omni_output()
-            # above creates the current feedback frame.
-            self.model_state.run_postprocess(text_hidden, input_batch, multimodal_outputs)
+            # make_omni_output() above creates the current feedback frame.
+            postprocess = _optional_state_hook(self.model_state, "run_postprocess")
+            if postprocess is not None:
+                postprocess(text_hidden, input_batch, multimodal_outputs)
         prefix_cache_rewrite = self._prefix_cache_save_mrv2(input_batch, text_hidden, multimodal_outputs)
         mooncake_rewrite = snapshot_mooncake_output(self, input_batch)
         if bool(getattr(self.model_config, "async_chunk", False)) and multimodal_outputs:
@@ -735,7 +764,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         req_idx = self.req_states.req_id_to_index.get(req_id)
         if req_idx is None:
             return req_id
-        info = self.model_state.intermediate_buffer.buffers[req_idx]
+        info = _require_buffer_rows(self.model_state, "Omni KV transfer")[req_idx]
         global_id = info.get("global_request_id")
         if isinstance(global_id, list):
             global_id = global_id[0] if global_id else None
