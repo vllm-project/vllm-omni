@@ -248,7 +248,7 @@ from vllm_omni.entrypoints.serve.utils.routes import (
     _remove_route_from_router,
     remove_route_from_app,
 )
-from vllm_omni.entrypoints.utils import PureDiffusionLauncherAdapter
+from vllm_omni.entrypoints.utils import PureDiffusionLauncherAdapter, mark_serve_cli_args
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt, absorb_attention_schedule_extra_args
 from vllm_omni.utils.forced_aligner import build_forced_aligner_config
@@ -3678,6 +3678,7 @@ if __name__ == "__main__":
     # when __main__ is called, i.e., --omni is only used when called through the entrypoints.
     parser.add_argument("--omni", action="store_true", default=False)
     args = parser.parse_args()
+    mark_serve_cli_args(args)
     configure_logging_from_args(args)
     # sync args.model to model_tag, because if we pass the model positionally,
     # args.model will be the default from vLLM's ModelConfig (currently
