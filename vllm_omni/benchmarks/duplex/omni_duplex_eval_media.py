@@ -141,7 +141,7 @@ def video_duration(path: str | Path) -> float:
         raise
 
 
-def extract_jpeg(path: str | Path, *, timestamp: float, quality: int = 3) -> bytes:
+def extract_jpeg(path: str | Path, *, timestamp: float, quality: int = 3, max_side: int | None = None) -> bytes:
     """Extract a single JPEG frame at ``timestamp`` using PyAV.
 
     ``quality`` follows the ffmpeg ``-q:v`` convention (lower = better, 1..31)
@@ -152,6 +152,9 @@ def extract_jpeg(path: str | Path, *, timestamp: float, quality: int = 3) -> byt
     continues decoding until a frame with PTS >= target_pts is found, matching
     the ``ffmpeg -ss`` semantic of returning the first decodable frame *at or
     after* the requested timestamp.
+
+    If ``max_side`` is set, a frame whose longer side exceeds it is scaled down
+    to fit, keeping the aspect ratio. Smaller frames are left untouched.
 
     Raises:
         ValueError: If the file contains no video stream or no frame could be decoded.
@@ -177,12 +180,14 @@ def extract_jpeg(path: str | Path, *, timestamp: float, quality: int = 3) -> byt
             if frame.pts is not None and frame.pts >= target_pts:
                 break
         if closest_frame is not None:
-            return _frame_to_jpeg(closest_frame, quality)
+            return _frame_to_jpeg(closest_frame, quality, max_side=max_side)
     raise ValueError(f"no decodable video frames in {path} at timestamp {timestamp}")
 
 
-def _frame_to_jpeg(frame: Any, quality: int) -> bytes:
+def _frame_to_jpeg(frame: Any, quality: int, max_side: int | None = None) -> bytes:
     image = frame.to_image()
+    if max_side is not None and max(image.size) > max_side:
+        image.thumbnail((max_side, max_side))
     buf = io.BytesIO()
     image.save(buf, format="JPEG", quality=_ffmpeg_q_to_pil_quality(quality))
     return buf.getvalue()
