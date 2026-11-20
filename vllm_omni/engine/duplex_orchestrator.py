@@ -848,7 +848,12 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
 
         # The current-stage send has completed. Downstream prewarm
         # must not hold up another session's use of this stage's sender cache.
-        if not submission.already_submitted and self.async_chunk and context.stage_id == 0:
+        if (
+            not submission.already_submitted
+            and self.async_chunk
+            and context.stage_id == request_state.entry_stage_id
+            and request_state.final_stage_id > context.stage_id
+        ):
             prewarmed = await self._prewarm_async_chunk_stages(context.request_id, request, request_state)
             if not prewarmed:
                 # The prewarm already failed the request, aborted it and

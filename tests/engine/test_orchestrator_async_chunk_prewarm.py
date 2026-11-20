@@ -352,3 +352,71 @@ async def test_duplex_session_submit_does_not_request_payload(mocker) -> None:
 
     prewarm.assert_awaited_once()
     assert prewarm.await_args.kwargs.get("attach_prewarm_payload", False) is False
+
+
+@pytest.mark.asyncio
+async def test_prewarm_drops_deferred_multimodal_data_from_wire_payload() -> None:
+    """Deferred PIL images stay on req_state.prompt for stage handoff and stay off prewarm wire payloads."""
+    from PIL import Image
+
+    orchestrator = _orchestrator()
+    image = Image.new("RGB", (4, 4), color=(12, 34, 56))
+    prompt = {
+        "prompt": "Please transcribe this speech.",
+        "additional_information": {
+            "tts_speaker": "vivian",
+            "deferred_multi_modal_data": {"image": [image]},
+        },
+    }
+    req_state = OrchestratorRequestState(
+        request_id="asr-req",
+        prompt=prompt,
+        sampling_params_list=_sampling_params(),
+        final_stage_id=2,
+        session_owned=True,
+    )
+
+    prewarmed = await orchestrator._prewarm_async_chunk_stages("asr-req", _stage0(resumable=False), req_state)
+
+    assert prewarmed is True
+    (placeholder,) = orchestrator.stage_pools[2].submitted
+    wire_info = deserialize_additional_information(placeholder.additional_information)
+    assert "deferred_multi_modal_data" not in wire_info
+    assert wire_info["tts_speaker"] == "vivian"
+    # The raw prompt keeps its deferred PIL image untouched for asr_to_joyai.
+    assert prompt["additional_information"]["deferred_multi_modal_data"]["image"] == [image]
+
+
+@pytest.mark.asyncio
+async def test_duplex_session_submit_prewarms_bypassed_nonzero_entry_stage(mocker) -> None:
+    """Bypassed turns entering at stage 1 (e.g. text/video on ASR duplex) still prewarm downstream stages."""
+    orchestrator = _orchestrator(cls=DuplexOrchestrator)
+    orchestrator.replica_placement = None
+    prewarm = mocker.AsyncMock(return_value=True)
+    orchestrator._prewarm_async_chunk_stages = prewarm  # type: ignore[method-assign]
+    sampling_params = tuple(_sampling_params())
+    orchestrator.request_states["bypass-req"] = DuplexOrchestratorRequestState(
+        request_id="bypass-req",
+        entry_stage_id=1,
+        final_stage_id=2,
+        session_owned=True,
+        sampling_params_list=list(sampling_params),
+    )
+    context = DuplexStageRequestContext(
+        request_id="bypass-req",
+        session_id="sess",
+        fence=DuplexFence(session_id="sess"),
+        stage_id=1,
+        final_stage_id=2,
+        config_generation=0,
+        sampling_params=sampling_params,
+    )
+
+    await orchestrator.submit(
+        DuplexStageSubmission(
+            context=context, prompt={"prompt_token_ids": list(_TOKENS)}, already_submitted=False, resumable=True
+        )
+    )
+
+    prewarm.assert_awaited_once()
+    assert prewarm.await_args.args[0] == "bypass-req"
