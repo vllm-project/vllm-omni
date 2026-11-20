@@ -26,13 +26,15 @@ Example::
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+import weakref
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, suppress
 from typing import Any
 from uuid import uuid4
 
 from vllm.logger import init_logger
 
+from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands as duplex_commands
 from vllm_omni.engine.duplex.commands import DuplexCommand
@@ -44,8 +46,10 @@ from vllm_omni.engine.duplex.messages import (
     DuplexSessionError,
     DuplexSessionEventMessage,
 )
+from vllm_omni.engine.duplex.process_engine import ProcessDuplexEngineClient
 from vllm_omni.engine.duplex_omni_engine import DuplexOmniEngine
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
@@ -53,6 +57,28 @@ _DEFAULT_CONTROL_TIMEOUT_S = 10.0
 # A cold engine can spend tens of seconds initializing per-session state before
 # the first open lands; control ops on a live session keep the short budget.
 _DEFAULT_OPEN_TIMEOUT_S = 60.0
+
+
+class _ProcessWorkerRuntime:
+    """Entrypoint-owned factory adapter; no frontend object is sent over IPC."""
+
+    def __init__(self, model: str, options: dict[str, Any]) -> None:
+        from vllm.plugins import load_general_plugins
+
+        from vllm_omni.entrypoints.duplex.warmup import warmup_silence_unit
+
+        load_general_plugins()
+        self.runtime = DuplexOmni(model=model, **options)
+        self.model = self.runtime.model
+        self.engine = self.runtime.engine
+        assert isinstance(self.engine, DuplexOmniEngine)
+        self.process_warmup_audio = warmup_silence_unit(self.engine.plugin)
+
+    async def check_health(self) -> None:
+        await self.runtime.check_health()
+
+    def shutdown(self) -> None:
+        self.runtime.shutdown()
 
 
 class DuplexSessionHandle:
@@ -311,25 +337,65 @@ class DuplexOmni(AsyncOmni):
 
     Construct it like ``AsyncOmni``. The pipeline must declare
     ``duplex_plugin`` and the deploy config ``session_mode: duplex``; the
-    engine raises at startup otherwise. There is no ``generate()``: duplex
-    serving is session-only.
+    engine raises at startup otherwise. ``duplex_engine_backend_as_process=True``
+    isolates the runtime from the frontend GIL and restricts this deployment
+    to sessions. The default ``False`` also permits model-supported chat.
     """
 
-    engine: DuplexOmniEngine
+    session_only: bool = False
+    final_output_task: asyncio.Task[None] | None
+    engine: DuplexOmniEngine | ProcessDuplexEngineClient  # type: ignore[assignment]
 
     def _create_engine(self, **engine_kwargs: Any) -> DuplexOmniEngine:
         from vllm_omni.entrypoints.duplex.audio_encoding import encode_audio
 
         return DuplexOmniEngine(duplex_audio_encoder=encode_audio, **engine_kwargs)
 
-    def __init__(self, model: str = "", *args: Any, **kwargs: Any) -> None:
-        super().__init__(model, *args, **kwargs)
+    def __init__(
+        self,
+        model: str = "",
+        *args: Any,
+        duplex_engine_backend_as_process: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        self.session_only = duplex_engine_backend_as_process
+        if self.session_only:
+            if args:
+                raise TypeError("The process duplex backend accepts keyword engine options only")
+            self.engine = ProcessDuplexEngineClient(model, kwargs, factory=_ProcessWorkerRuntime)
+            self.model = self.engine.metadata.model
+            self._initialize_output_state()
+            self._initialize_async_frontend()
+            self.endpoint_restrictions += tuple(
+                EndpointRestriction(capability, "The process duplex backend serves sessions only")
+                for capability in OmniServingCapability
+            )
+            self._weak_finalizer = weakref.finalize(self, self.engine.shutdown)
+        else:
+            super().__init__(model, *args, **kwargs)
         self._handles: dict[str, DuplexSessionHandle] = {}
         #: Rollbacks of resumes whose caller was cancelled mid-RPC (see ``resume_session``).
         self._resume_compensations: set[asyncio.Task[None]] = set()
         #: Initial and maximum delay between replays of an abandoned resume
         #: whose answers keep timing out.
         self._resume_replay_backoff_s: tuple[float, float] = (0.5, 5.0)
+
+    async def generate(self, *args: Any, **kwargs: Any) -> AsyncGenerator[OmniRequestOutput, None]:
+        if self.session_only:
+            raise NotImplementedError("The process duplex backend serves sessions only; use open_session()")
+        async for output in super().generate(*args, **kwargs):
+            yield output
+
+    async def aclose(self) -> None:
+        """Release sessions and flush the process shutdown before joining it."""
+        try:
+            await self.close_all_sessions()
+        finally:
+            try:
+                if isinstance(self.engine, ProcessDuplexEngineClient):
+                    await self.engine.aclose()
+            finally:
+                self.shutdown()
 
     # ---- deployment facts ----
 
@@ -651,7 +717,14 @@ class DuplexOmni(AsyncOmni):
         self._handles.clear()
         for compensation in list(self._resume_compensations):
             compensation.cancel()
-        super().shutdown(timeout)
+        if isinstance(self.engine, ProcessDuplexEngineClient):
+            if self.final_output_task is not None:
+                self.final_output_task.cancel()
+                self.final_output_task = None
+            self.engine.shutdown(timeout)
+            self._weak_finalizer.detach()
+        else:
+            super().shutdown(timeout)
 
 
 __all__ = ["DuplexOmni", "DuplexSessionHandle"]

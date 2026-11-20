@@ -165,6 +165,9 @@ def _start_judge_server(judge_params: dict[str, object]):
         [str(item) for item in extra],
         use_omni=bool(judge_params.get("use_omni", False)),
         env_dict={device_env: visible},
+        # The primary model is alive on another visible device. Its outer
+        # OmniServer owns the final device-memory wait after both servers exit.
+        wait_for_device_memory=False,
     ) as judge:
         print(f"Benchmark judge started on {judge.host}:{judge.port}")
         yield judge
@@ -219,7 +222,18 @@ def _omni_server_env() -> dict[str, str]:
     return {"VLLM_OMNI_STORAGE_PATH": str(storage_path)}
 
 
-def _resolve_offline_model(model: str) -> str:
+def _cli_flag_value(args: tuple[str, ...] | list[str], flag: str) -> str | None:
+    # Match argparse when extra_cli_args overrides a serve_args default.
+    for index in range(len(args) - 1, -1, -1):
+        arg = args[index]
+        if arg == flag and index + 1 < len(args):
+            return args[index + 1]
+        if arg.startswith(f"{flag}="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def _resolve_offline_model(model: str, revision: str | None = None) -> str:
     """Resolve HF ids / MiniMax env overrides the same way as the diffusion runner."""
     import huggingface_hub
 
@@ -252,17 +266,14 @@ def _resolve_offline_model(model: str) -> str:
 
     if not huggingface_hub.constants.HF_HUB_OFFLINE:
         return model
-    return hf_api().snapshot_download(model, local_files_only=True)
+    # A pinned download (``hf download --revision <sha>``) caches no refs/main.
+    return hf_api().snapshot_download(model, revision=revision, local_files_only=True)
 
 
 @contextmanager
 def _start_omni_server(server_param):
     test_name, model, stage_config_path, stage_overrides, extra_cli_args, use_omni = server_param
     extra = tuple(extra_cli_args or ())
-    model = _resolve_offline_model(model)
-
-    print(f"Starting OmniServer with test: {test_name}, model: {model}")
-
     server_args: list[str] = _merge_omni_default_server_args(extra, use_omni=use_omni)
     # --deploy-config and --stage-overrides compose at the CLI (see vllm_omni/entrypoints/utils.py):
     # deploy-config sets the base; stage-overrides are applied on top. Both can be set.
@@ -272,6 +283,10 @@ def _start_omni_server(server_param):
         server_args = ["--stage-overrides", stage_overrides] + server_args
     if extra:
         server_args = list(extra) + server_args
+    if use_omni:
+        _preflight_server_vad(test_name, server_args)
+    model = _resolve_offline_model(model, revision=_cli_flag_value(extra, "--revision"))
+    print(f"Starting OmniServer with test: {test_name}, model: {model}")
     judge_params = _judge_server_params_for_test(test_name)
     with OmniServer(model, server_args, use_omni=use_omni, env_dict=_omni_server_env()) as server:
         server.test_name = test_name
@@ -286,6 +301,36 @@ def _start_omni_server(server_param):
         print("OmniServer stopping...")
 
     print("OmniServer stopped")
+
+
+def _preflight_server_vad(test_name: str, server_args: list[str]) -> None:
+    """Validate a required local VAD backend before allocating model GPUs."""
+    config = _config_for_test(test_name)
+    if config is None:
+        return
+    benchmark_params = config.get("benchmark_params") or []
+    if not isinstance(benchmark_params, list):
+        raise TypeError(f"benchmark_params for {test_name} must be a list")
+    if not any(
+        isinstance(params, dict)
+        and params.get("enabled", True)
+        and (
+            params.get("duplex_eval_turn_detection") == "server_vad"
+            or params.get("omniinteract_turn_detection") == "server_vad"
+        )
+        for params in benchmark_params
+    ):
+        return
+
+    from vllm_omni.config.stage_config import resolve_deploy_yaml
+    from vllm_omni.engine.duplex.vad import SileroVADBackendProvider
+
+    model_path = None
+    if deploy_path := _cli_flag_value(server_args, "--deploy-config"):
+        model_path = (resolve_deploy_yaml(deploy_path).get("duplex_session") or {}).get("server_vad_model_path")
+    print(f"Checking server_vad before model startup: {model_path or 'local cache / silero-vad package'}", flush=True)
+    backend = SileroVADBackendProvider(model_path=model_path).get()
+    print(f"server_vad preflight passed: {type(backend).__name__}", flush=True)
 
 
 @pytest.fixture(scope="module")
@@ -644,7 +689,9 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
         # close-boundary responses. Preserve its eligibility policy; missing
         # client measurements and unfinished counts remain visible in artifacts.
         config = load_accuracy_config(path, params)
-        selected = select_duplex_eval_baseline(config, result.get("Hardware"))
+        selected = select_duplex_eval_baseline(
+            config, result.get("Hardware"), required=params.get("duplex_eval_require_score_floors", False)
+        )
         assert_accuracy_result(
             result,
             {**config, "baseline": selected},
@@ -687,8 +734,36 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
             assert _is_finite_number(score) and 0 <= score <= 1, "Omni-DuplexEval correction score is invalid"
 
 
-def assert_result(result, params, num_prompt, *, check_baseline: bool = False) -> None:
-    assert result["completed"] == num_prompt, "Request failures exist"
+def assert_result(result, params, num_prompt, *, check_baseline: bool = False, require_baseline: bool = False) -> None:
+    if result["completed"] != num_prompt:
+        first_error = next((error for error in result.get("errors", []) if error), "No per-request error recorded")
+        raise AssertionError(
+            f"Request failures exist: {result['completed']}/{num_prompt} completed. First request error: {first_error}"
+        )
+    if params.get("dataset_name") == "realtime-video":
+        video = result.get("realtime_video")
+        assert isinstance(video, dict) and video.get("passed") is True, "Realtime video measurement is incomplete"
+        assert not video.get("finalization_errors"), "Realtime video finalization failed"
+        sessions = video.get("sessions")
+        assert isinstance(sessions, list) and len(sessions) == num_prompt, "Realtime video sessions are missing"
+        warmups = video.get("warmups")
+        assert isinstance(warmups, list) and len(warmups) == _resolve_num_warmups(params, default=2), (
+            "Realtime video warmups are missing"
+        )
+        assert all(row.get("success") is True and not row.get("error") for row in [*sessions, *warmups]), (
+            "Realtime video session or warmup failed"
+        )
+        for name in (
+            "mean_e2el_ms",
+            "request_throughput",
+            "mean_video_ttfc_ms",
+            "min_video_fps",
+            "mean_video_steady_interval_ms",
+            "p95_video_steady_interval_ms",
+            "mean_video_rtf",
+        ):
+            value = result.get(name)
+            assert _is_finite_number(value) and value >= 0, f"Realtime video has no valid {name} measurement"
     _assert_fixed_stage_workloads(result, params, num_prompt)
     assert_duplex_artifact_publication(result, params, num_prompt)
     for metric in params.get("required_duplex_metrics", []):
@@ -707,12 +782,13 @@ def assert_result(result, params, num_prompt, *, check_baseline: bool = False) -
                     f"Missing or invalid P{percentile} {metric}"
                 )
     hardware = result.get("Hardware")
-    if check_baseline:
+    if check_baseline or require_baseline:
         baseline = result.get("baseline")
         assert_baseline_within_tolerance(
             result,
             baseline if isinstance(baseline, dict) else None,
             hardware if isinstance(hardware, str) else None,
+            required=require_baseline,
         )
     if params.get("duplex_performance_only"):
         return
@@ -787,8 +863,13 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
     if path := params.get("duplex_eval_accuracy_config"):
         from tests.e2e.accuracy.omni_duplex_eval.validation import load_accuracy_config, select_duplex_eval_baseline
 
+        params["duplex_eval_require_score_floors"] = params.get(
+            "duplex_eval_require_score_floors", False
+        ) or pytestconfig.getoption("require_duplex_eval_score_floors")
         accuracy_config = load_accuracy_config(path, params)
-        accuracy_baseline = select_duplex_eval_baseline(accuracy_config, resource_label)
+        accuracy_baseline = select_duplex_eval_baseline(
+            accuracy_config, resource_label, required=params.get("duplex_eval_require_score_floors", False)
+        )
     elif params.get("omniinteract_evaluate"):
         accuracy_baseline = _omniinteract_accuracy_baseline(params, test_name)
     for dataset_prefix in ("omniinteract", "duplex_eval"):
@@ -849,6 +930,7 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
         _OMNIINTERACT_PERSIST_ARTIFACTS,
         "judge_server_params",
         "duplex_eval_accuracy_config",
+        "duplex_eval_require_score_floors",
         "duplex_eval_score_floor_hardware",
         "duplex_performance_only",
         "required_duplex_metrics",
@@ -914,7 +996,11 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
             assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
             try:
                 assert_result(
-                    result, assert_params, num_prompt, check_baseline=pytestconfig.getoption("assert_baseline")
+                    result,
+                    assert_params,
+                    num_prompt,
+                    check_baseline=pytestconfig.getoption("assert_baseline"),
+                    require_baseline=pytestconfig.getoption("require_baseline"),
                 )
             finally:
                 _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)
@@ -952,7 +1038,11 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
             assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
             try:
                 assert_result(
-                    result, assert_params, num_prompt, check_baseline=pytestconfig.getoption("assert_baseline")
+                    result,
+                    assert_params,
+                    num_prompt,
+                    check_baseline=pytestconfig.getoption("assert_baseline"),
+                    require_baseline=pytestconfig.getoption("require_baseline"),
                 )
             finally:
                 _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)

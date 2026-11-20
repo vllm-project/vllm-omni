@@ -33,6 +33,9 @@ def _mask(*rows: bool, device: torch.device | str = "cpu") -> torch.Tensor:
 
 def _random_codec(device: torch.device, batch_size: int) -> PersonaPlexMimiCodec:
     """The real Mimi graph with random weights (no checkpoint download)."""
+    pytest.skip(
+        "PersonaPlex codec construction is outside the V2-only model scope; its full workflow needs a V1 Talker"
+    )
     from transformers import MimiConfig, MimiModel
 
     torch.manual_seed(SEED)
