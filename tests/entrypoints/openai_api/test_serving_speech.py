@@ -20,8 +20,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import anyio
+import av
 import numpy as np
 import pytest
+import soundfile as sf
 import torch
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.params import File, Form
@@ -32,10 +34,12 @@ from pytest_mock import MockerFixture
 from vllm.entrypoints.serve import create_error_response
 from vllm.entrypoints.serve.engine.protocol import ErrorInfo, ErrorResponse
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+from vllm.exceptions import VLLMValidationError
 from vllm.outputs import CompletionOutput
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.config.stage_config import StagePipelineConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.request_scheduler import RequestScheduler
 from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
@@ -61,6 +65,7 @@ from vllm_omni.entrypoints.openai.serving_speech import (
     OmniOpenAIServingSpeech,
     _audio_duration_seconds,
     _audio_format_headers,
+    _coerce_sample_rate,
     _create_wav_header,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.base import (
@@ -167,7 +172,7 @@ class TestAudioMixin:
         audio_obj = CreateAudio(audio_tensor=stereo_tensor)
 
         mock_speed = mocker.patch.object(
-            audio_mixin, "_apply_speed_adjustment", side_effect=lambda tensor, speed, sr: (tensor, sr)
+            audio_mixin, "apply_speed_adjustment", side_effect=lambda tensor, speed: tensor
         )
         mocker.patch("soundfile.write")
 
@@ -181,7 +186,7 @@ class TestAudioMixin:
     def test_speed_adjustment(self, audio_mixin):
         audio_tensor = np.random.rand(24000).astype(np.float32)
 
-        adjusted_audio, _ = audio_mixin._apply_speed_adjustment(audio_tensor, speed=2.0, sample_rate=24000)
+        adjusted_audio = audio_mixin.apply_speed_adjustment(audio_tensor, speed=2.0)
 
         assert adjusted_audio.shape == (12000,)
 
@@ -234,7 +239,7 @@ class TestAudioMixin:
 
         mock_time_stretch = mocker.patch("torchaudio.transforms.TimeStretch")
         # speed=1.0 should return immediately without calling torchaudio
-        result, _ = audio_mixin._apply_speed_adjustment(audio_tensor, speed=1.0, sample_rate=24000)
+        result = audio_mixin.apply_speed_adjustment(audio_tensor, speed=1.0)
 
         mock_time_stretch.assert_not_called()
         assert np.array_equal(result, audio_tensor)
@@ -243,7 +248,7 @@ class TestAudioMixin:
         """Test that speed adjustment handles stereo (channels-last) input."""
         stereo_tensor = np.random.rand(24000, 2).astype(np.float32)
 
-        result, _ = audio_mixin._apply_speed_adjustment(stereo_tensor, speed=2.0, sample_rate=24000)
+        result = audio_mixin.apply_speed_adjustment(stereo_tensor, speed=2.0)
 
         assert result.shape == (12000, 2)
 
@@ -252,6 +257,7 @@ class TestAudioMixin:
 def create_mock_audio_output_for_test(
     request_id: str = "speech-mock-123",
     metrics: dict | None = None,
+    audio_sample_rate: int | None = None,
 ) -> OmniRequestOutput:
     class MockCompletionOutput:
         def __init__(self, index: int = 0):
@@ -267,6 +273,8 @@ def create_mock_audio_output_for_test(
             self.request_id = request_id
             self.outputs = [MockCompletionOutput(index=0)]
             self.multimodal_output = {"audio": audio_tensor}
+            if audio_sample_rate is not None:
+                self.multimodal_output["audio_sample_rate"] = audio_sample_rate
             self.finished = True
             self.prompt_token_ids = None
             self.encoder_prompt_token_ids = None
@@ -290,6 +298,20 @@ def create_mock_audio_output_for_test(
     return output
 
 
+def omnivoice_diffusion_stage_configs():
+    return [
+        SimpleNamespace(
+            stage_pipeline_config=StagePipelineConfig(
+                stage_id=0,
+                model_stage="dit",
+                model_arch="OmniVoicePipeline",
+            ),
+            model_config=SimpleNamespace(model_arch="OmniVoicePipeline"),
+            worker_type="diffusion",
+        )
+    ]
+
+
 def _write_custom_voice_manifest(root: Path, *, model_type: str, voices: dict) -> None:
     payload = {
         "schema_version": 1,
@@ -309,6 +331,34 @@ def _wav_data_url(samples: np.ndarray, sample_rate: int) -> str:
         wav.writeframes(pcm.tobytes())
     encoded = base64.b64encode(buf.getvalue()).decode("ascii")
     return f"data:audio/wav;base64,{encoded}"
+
+
+def _encode_tone(fmt: str, sample_rate: int = 16000, seconds: float = 2.0) -> bytes:
+    """Encode a mono test tone as a real file in one of the upload formats."""
+    t = np.arange(int(sample_rate * seconds)) / sample_rate
+    tone = (0.3 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+    buf = io.BytesIO()
+    if fmt in ("wav", "flac", "ogg", "mp3"):
+        sf.write(buf, tone, sample_rate, format=fmt.upper())
+        return buf.getvalue()
+    # libsndfile cannot write (or read) AAC/WebM/MP4; encode them with PyAV.
+    container, codec, rate = {
+        "aac": ("adts", "aac", sample_rate),
+        "webm": ("webm", "libopus", 48000),
+        "mp4": ("mp4", "aac", sample_rate),
+    }[fmt]
+    with av.open(buf, "w", format=container) as out:
+        stream = out.add_stream(codec, rate=rate, layout="mono")
+        frame = av.AudioFrame.from_ndarray(tone[None, :], format="flt", layout="mono")
+        frame.sample_rate = sample_rate
+        resampler = av.AudioResampler(format=stream.format.name, layout="mono", rate=rate)
+        for resampled in resampler.resample(frame) + resampler.resample(None):
+            out.mux(stream.encode(resampled))
+        out.mux(stream.encode(None))
+    return buf.getvalue()
+
+
+_REAL_SF_READ = sf.read
 
 
 @pytest.fixture
@@ -431,7 +481,15 @@ def client(test_app):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("enable_scale_out", [False, True], ids=["default", "scale-out"])
-async def test_server_worker_applies_speech_only_endpoint_restrictions(mocker: MockerFixture, enable_scale_out):
+async def test_server_worker_applies_speech_only_endpoint_restrictions(
+    mocker: MockerFixture, enable_scale_out, request: pytest.FixtureRequest
+):
+    # SageMaker route registration imports a dependency that changes root.level.
+    # Restore it through setLevel so later tests also clear cached log filters.
+    root_logger = logging.getLogger()
+    previous_level = root_logger.level
+    request.addfinalizer(lambda: root_logger.setLevel(previous_level))
+
     class FakeCompletionHandler:
         def __init__(self):
             self.create_completion = mocker.AsyncMock(return_value={"id": "cmpl", "choices": []})
@@ -514,7 +572,8 @@ async def test_server_worker_applies_speech_only_endpoint_restrictions(mocker: M
     mocker.patch.object(api_server_module, "build_async_omni", fake_build_async_omni)
     mocker.patch.object(api_server_module, "omni_init_app_state", fake_init_app_state)
     mocker.patch.object(api_server_module, "serve_http", fake_serve_http)
-    mocker.patch.object(api_server_module.STORAGE_MANAGER, "start", new=mocker.AsyncMock())
+    storage_start = mocker.patch.object(api_server_module.STORAGE_MANAGER, "start", new=mocker.AsyncMock())
+    storage_stop = mocker.patch.object(api_server_module.STORAGE_MANAGER, "stop", new=mocker.AsyncMock())
     mocker.patch.object(api_server_module.openai_app_state, "_get_vllm_config", new=mocker.AsyncMock(return_value=None))
     mocker.patch.object(api_server_module, "get_uvicorn_log_config", return_value=None)
     args = api_server_module.make_arg_parser(FlexibleArgumentParser()).parse_args([])
@@ -618,6 +677,8 @@ async def test_server_worker_applies_speech_only_endpoint_restrictions(mocker: M
     speech_handler.create_speech.assert_awaited_once()
     speech_handler.create_speech_batch.assert_awaited_once()
     speech_handler.shutdown.assert_called_once()
+    storage_start.assert_awaited_once_with(on_expire=api_server_module.VIDEO_STORE.remove_many)
+    storage_stop.assert_awaited_once_with()
     engine.generate.assert_not_awaited()
     sock.close.assert_called_once()
 
@@ -640,6 +701,11 @@ class TestSpeechAPI:
         mock_safe_open = mocker.MagicMock()
         mock_safe_open.return_value.__enter__.return_value = mock_ctx
         mocker.patch("safetensors.safe_open", mock_safe_open)
+
+    @pytest.fixture
+    def real_audio_decoder(self, mocker: MockerFixture):
+        """Undo the soundfile stub of ``_mock_upload_io`` so uploads decode real bytes."""
+        mocker.patch("soundfile.read", _REAL_SF_READ)
 
     def test_create_speech_success(self, client):
         payload = {
@@ -927,6 +993,82 @@ class TestSpeechAPI:
             assert response.status_code == 400
             assert "reserved" in response.json()["detail"]
         assert not handler.uploaded_speakers
+
+    @pytest.mark.parametrize(
+        ("fmt", "content_type", "sample_rate"),
+        [
+            ("wav", "audio/wav", 16000),
+            ("flac", "audio/flac", 16000),
+            ("ogg", "audio/ogg", 16000),
+            ("mp3", "audio/mpeg", 16000),
+            ("aac", "audio/aac", 16000),
+            ("webm", "audio/webm", 48000),
+            ("mp4", "audio/mp4", 16000),
+        ],
+    )
+    def test_upload_voice_decodes_every_documented_format(
+        self, client, real_audio_decoder, fmt, content_type, sample_rate
+    ):
+        """Every documented upload format decodes, as it does for inline ref_audio."""
+        files = {"audio_sample": (f"ref.{fmt}", _encode_tone(fmt), content_type)}
+        response = client.post("/v1/audio/voices", files=files, data={"consent": "c1", "name": f"tone_{fmt}"})
+        assert response.status_code == 200, response.text
+        assert response.json()["voice"]["mime_type"] == content_type
+        assert client.app.state.openai_serving_speech.uploaded_speakers[f"tone_{fmt}"]["sample_rate"] == sample_rate
+        client.delete(f"/v1/audio/voices/tone_{fmt}")
+
+    @pytest.mark.parametrize(
+        ("filename", "expected_mime"),
+        [("ref.wav", "audio/wav"), ("ref.flac", "audio/flac"), ("ref.webm", "audio/webm"), ("ref.m4a", "audio/mp4")],
+    )
+    def test_upload_voice_without_content_type_uses_extension(self, client, mocker, filename, expected_mime):
+        """A part without Content-Type (``requests`` with a bare file) uses the extension."""
+        audio_file = mocker.MagicMock()
+        audio_file.filename = filename
+        audio_file.content_type = None
+        audio_file.file = io.BytesIO(b"fake audio")
+        audio_file.read = mocker.AsyncMock(return_value=b"fake audio")
+        handler = client.app.state.openai_serving_speech
+
+        result = asyncio.run(handler.upload_voice(audio_file, consent="c1", name="no_type"))
+
+        assert result["mime_type"] == expected_mime
+        client.delete("/v1/audio/voices/no_type")
+
+    @pytest.mark.parametrize(
+        ("filename", "content_type", "expected_mime"),
+        [
+            ("ref.wav", "audio/x-wav", "audio/wav"),
+            ("ref.webm", "video/webm", "audio/webm"),
+            ("ref.wav", "Audio/WAV", "audio/wav"),
+            ("ref.webm", "audio/webm;codecs=opus", "audio/webm"),
+            ("ref.flac", "application/octet-stream", "audio/flac"),
+        ],
+    )
+    def test_upload_voice_normalizes_mime_type(self, client, filename, content_type, expected_mime):
+        """Aliases, case and parameters normalize to the canonical type."""
+        files = {"audio_sample": (filename, b"fake audio content", content_type)}
+        response = client.post("/v1/audio/voices", files=files, data={"consent": "c1", "name": "alias"})
+        assert response.status_code == 200, response.text
+        assert response.json()["voice"]["mime_type"] == expected_mime
+        client.delete("/v1/audio/voices/alias")
+
+    def test_upload_voice_undecodable_audio_returns_400(self, client, real_audio_decoder):
+        files = {"audio_sample": ("ref.wav", b"definitely not audio" * 500, "audio/wav")}
+        response = client.post("/v1/audio/voices", files=files, data={"consent": "c1", "name": "garbage"})
+        assert response.status_code == 400
+        assert "Could not decode audio file" in response.json()["detail"]
+        assert not client.app.state.openai_serving_speech.uploaded_speakers
+
+    def test_upload_voice_unrecognized_payload_skips_vllm_loader(self, client, real_audio_decoder, mocker):
+        """Only AAC/WebM/MP4 content falls through to the vLLM loader after soundfile fails."""
+        loader = mocker.patch.object(serving_speech_module, "AudioMediaIO")
+        files = {"audio_sample": ("ref.aac", b"ffconcat version 1.0\nfile ref.wav\n", "audio/aac")}
+        response = client.post("/v1/audio/voices", files=files, data={"consent": "c1", "name": "text_payload"})
+        assert response.status_code == 400
+        assert "Could not decode audio file" in response.json()["detail"]
+        loader.assert_not_called()
+        assert not client.app.state.openai_serving_speech.uploaded_speakers
 
     def test_upload_voice_overwrites_same_name_by_default(self, client):
         """Default policy: re-registering an uploaded name replaces it in place."""
@@ -1231,7 +1373,8 @@ class TestSpeechAPI:
         engine_client = mocker.MagicMock()
         server = OmniOpenAIServingSpeech.for_diffusion(
             diffusion_engine=engine_client,
-            model_name="test-model",
+            model_name="k2-fsa/OmniVoice",
+            stage_configs=omnivoice_diffusion_stage_configs(),
         )
         assert isinstance(server._adapter, OmniVoiceAdapter)
 
@@ -1250,7 +1393,11 @@ class TestSpeechAPI:
             yield create_mock_audio_output_for_test()
 
         mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
-        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mock_engine,
+            model_name="test-model",
+            stage_configs=omnivoice_diffusion_stage_configs(),
+        )
 
         response = await server.create_speech(OpenAICreateSpeechRequest(input="Hello", response_format="pcm"))
 
@@ -1271,7 +1418,11 @@ class TestSpeechAPI:
             yield create_mock_audio_output_for_test()
 
         mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
-        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mock_engine,
+            model_name="test-model",
+            stage_configs=omnivoice_diffusion_stage_configs(),
+        )
         await server.create_speech(OpenAICreateSpeechRequest(input="Hello", watermarking=False))
         assert mock_engine.generate.call_args.kwargs["watermarking"] is False
 
@@ -1309,11 +1460,15 @@ class TestSpeechAPI:
 
         # Mock generate to yield a valid OmniRequestOutput
         async def mock_generate(*args, **kwargs):
-            yield create_mock_audio_output_for_test()
+            yield create_mock_audio_output_for_test(audio_sample_rate=16000)
 
         mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
 
-        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mock_engine,
+            model_name="k2-fsa/OmniVoice",
+            stage_configs=omnivoice_diffusion_stage_configs(),
+        )
 
         # Mock create_audio to avoid actual audio processing/saving
         mocker.patch.object(
@@ -1340,6 +1495,9 @@ class TestSpeechAPI:
         assert response.media_type == "audio/wav"
         assert response.body == b"dummy"
 
+        audio_obj = server.create_audio.call_args.args[0]
+        assert audio_obj.sample_rate == 16000
+
         # Verify generate was called
         mock_engine.generate.assert_called_once()
 
@@ -1353,8 +1511,6 @@ class TestSpeechAPI:
         expected_extra = {
             "existing_arg": "new_value",
             "new_arg": 123,
-            "num_inference_steps": 12,
-            "guidance_scale": 7.0,
         }
         if default_legacy_seed is not None:
             expected_extra["seed"] = (
@@ -1369,6 +1525,7 @@ class TestSpeechAPI:
         # Regression: StepScheduler.add_request() used to receive
         # num_inference_steps=None and fail while converting it to int.
         scheduler = StepScheduler()
+        scheduler.od_config = SimpleNamespace(diffusion_attention_schedule=None)
         scheduler.add_request(
             OmniDiffusionRequest(
                 prompt="Hello",
@@ -1393,7 +1550,11 @@ class TestSpeechAPI:
             yield create_mock_audio_output_for_test()
 
         mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
-        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mock_engine,
+            model_name="k2-fsa/OmniVoice",
+            stage_configs=omnivoice_diffusion_stage_configs(),
+        )
         mocker.patch.object(
             server,
             "create_audio",
@@ -1410,7 +1571,7 @@ class TestSpeechAPI:
             assert response.status_code == 200
 
         scheduler = RequestScheduler()
-        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+        scheduler.initialize(OmniDiffusionConfig(max_num_seqs=2, diffusion_attention_schedule=None))
         for index, sampling_params in enumerate(passed_sampling_params):
             scheduler.add_request(
                 OmniDiffusionRequest(
@@ -1459,7 +1620,11 @@ class TestSpeechAPI:
     ) -> None:
         mock_engine = mocker.MagicMock()
         mock_engine.default_sampling_params_list = [OmniDiffusionSamplingParams()]
-        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mock_engine,
+            model_name="k2-fsa/OmniVoice",
+            stage_configs=omnivoice_diffusion_stage_configs(),
+        )
 
         response = await server.create_speech(OpenAICreateSpeechRequest(input="Hello", extra_params=extra_params))
 
@@ -1492,7 +1657,11 @@ class TestSpeechAPI:
             yield create_mock_audio_output_for_test()
 
         mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
-        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mock_engine,
+            model_name="test-model",
+            stage_configs=omnivoice_diffusion_stage_configs(),
+        )
         mocker.patch.object(
             server, "create_audio", return_value=mocker.MagicMock(audio_data=b"dummy", media_type="audio/wav")
         )
@@ -1510,6 +1679,80 @@ class TestSpeechAPI:
 
 class TestTTSMethods:
     """Unit tests for TTS validation and parameter building."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure", [None, "empty", "nan", "rate"])
+    async def test_segmented_request_encodes_all_audio_once(self, speech_server, mocker, failure):
+        from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import IndexTTS25Adapter
+
+        server = speech_server
+        server._tts_model_type = "indextts2_5"
+        adapter = IndexTTS25Adapter(SpeechServingContext(server=server))
+        mocker.patch.object(server, "_get_tts_adapter", return_value=adapter)
+        mocker.patch.object(adapter, "validate", return_value=None)
+        mocker.patch.object(
+            adapter,
+            "build",
+            new=mocker.AsyncMock(
+                return_value=PreparedRequest(
+                    prompt={"part": 0, "cache_salt": "segment-0"},
+                    additional_prompts=[{"part": 1, "cache_salt": "segment-1"}],
+                    model_type="indextts2_5",
+                    segment_silence_ms=0,
+                )
+            ),
+        )
+        server.engine_client.default_sampling_params_list = []
+        server.engine_client.abort = mocker.AsyncMock()
+        calls = []
+
+        async def engine_generate(**kwargs):
+            calls.append(kwargs["request_id"])
+            part = kwargs["prompt"]["part"]
+            assert kwargs["prompt"]["cache_salt"] == f"tenant:segment-{part}"
+            assert kwargs["watermarking"] is False
+            wave = torch.full((4,), float(part))
+            sr = 22050
+            if part == 1:
+                if failure == "empty":
+                    wave = torch.empty(0)
+                elif failure == "nan":
+                    wave.fill_(float("nan"))
+                elif failure == "rate":
+                    sr = 24000
+            yield OmniRequestOutput(
+                _multimodal_output={"audio": wave, "sr": sr},
+                metrics={"stage_metrics": {"0": {"num_tokens_out": 3}}},
+            )
+
+        server.engine_client.generate = engine_generate
+        create_audio = mocker.patch.object(
+            server,
+            "create_audio",
+            return_value=SimpleNamespace(
+                audio_data=b"encoded",
+                media_type="audio/wav",
+            ),
+        )
+        if failure is not None:
+            mocker.patch.object(server, "_check_model", new=mocker.AsyncMock(return_value=None))
+            response = await server.create_speech(
+                OpenAICreateSpeechRequest(input="full text", seed=42, cache_salt="tenant", watermarking=False)
+            )
+            assert response.status_code == 500
+            assert len(calls) == 2
+            server.engine_client.abort.assert_awaited_once_with(calls[1])
+            create_audio.assert_not_called()
+            return
+
+        result = await server._generate_audio_bytes(
+            OpenAICreateSpeechRequest(input="full text", seed=42, cache_salt="tenant", watermarking=False)
+        )
+
+        assert result == (b"encoded", "audio/wav")
+        create_audio.assert_called_once()
+        assert create_audio.call_args.args[0].audio_tensor.tolist() == [0.0] * 4 + [1.0] * 4
+        assert len(calls) == 2 and calls[0] != calls[1]
 
     @pytest.fixture
     def speech_server(self, mocker, tmp_path, monkeypatch):
@@ -1537,18 +1780,38 @@ class TestTTSMethods:
         yield server
         server.shutdown()
 
-    def test_diffusion_audio_encode_speed_skips_ar_adapter(self, mocker: MockerFixture):
-        """Pure-diffusion speech keeps generic speed handling outside AR adapters."""
+    def test_diffusion_audio_encode_speed_uses_diffusion_adapter(self, mocker: MockerFixture):
+        """Pure-diffusion speech uses its adapter's speed capability."""
         server = OmniOpenAIServingSpeech.for_diffusion(
             diffusion_engine=mocker.MagicMock(),
-            model_name="test-model",
+            model_name="k2-fsa/OmniVoice",
+            stage_configs=omnivoice_diffusion_stage_configs(),
         )
-        resolve_adapter = mocker.patch.object(serving_speech_module, "resolve_adapter")
 
         speed = server._audio_encode_speed(OpenAICreateSpeechRequest(input="Hello", speed=1.25))
 
         assert speed == 1.25
-        resolve_adapter.assert_not_called()
+
+    def test_diffusion_adapter_detection_scans_pipeline_stages(self, mocker: MockerFixture):
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mocker.MagicMock(),
+            model_name="custom-served-name",
+            stage_configs=[
+                SimpleNamespace(
+                    stage_pipeline_config=StagePipelineConfig(
+                        stage_id=0,
+                        model_stage="llm",
+                        model_arch="OtherModel",
+                    ),
+                    model_config=SimpleNamespace(model_arch="OtherModel"),
+                    worker_type="ar",
+                ),
+                omnivoice_diffusion_stage_configs()[0],
+            ],
+        )
+
+        assert server._tts_model_type == "omnivoice"
+        assert isinstance(server._adapter, OmniVoiceAdapter)
 
     @pytest.mark.asyncio
     async def test_create_speech_cuda_oom_returns_internal_server_error(
@@ -1568,6 +1831,31 @@ class TestTTSMethods:
         assert isinstance(response, ErrorResponse)
         assert response.error.code == HTTPStatus.INTERNAL_SERVER_ERROR
         assert response.error.type == "InternalServerError"
+
+    @pytest.mark.asyncio
+    async def test_create_speech_engine_validation_error_returns_bad_request(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ):
+        # vLLM raises VLLMValidationError (a VLLMClientError, not a ValueError)
+        # from add_request when e.g. the prompt exceeds max_model_len.
+        mocker.patch.object(speech_server, "_check_model", new=mocker.AsyncMock(return_value=None))
+        mocker.patch.object(
+            speech_server,
+            "_generate_audio_bytes",
+            new=mocker.AsyncMock(
+                side_effect=VLLMValidationError(
+                    "The decoder prompt (length 12011) is longer than the maximum model length of 4096."
+                )
+            ),
+        )
+
+        response = await speech_server.create_speech(OpenAICreateSpeechRequest(input="Hello"))
+
+        assert isinstance(response, ErrorResponse)
+        assert response.error.code == HTTPStatus.BAD_REQUEST
+        assert response.error.type == "BadRequestError"
 
     @pytest.mark.asyncio
     async def test_create_speech_unexpected_failure_returns_internal_server_error(
@@ -1667,6 +1955,78 @@ class TestTTSMethods:
             )
 
         assert exc_info.value.retryable is False
+
+    @pytest.mark.asyncio
+    async def test_audio_synthesis_error_flag_fails_batch_item_and_stream(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ) -> None:
+        from vllm_omni.entrypoints.openai.protocol.audio import (
+            BatchSpeechRequest,
+            SpeechBatchItem,
+        )
+
+        async def mock_generate():
+            yield create_mock_audio_output_for_test()
+
+        mocker.patch.object(
+            speech_server,
+            "_prepare_speech_generation",
+            new=mocker.AsyncMock(side_effect=lambda *a, **k: ("speech-synth-err", mock_generate(), {})),
+        )
+        mocker.patch.object(speech_server, "_check_model", new=mocker.AsyncMock(return_value=None))
+        mocker.patch.object(speech_server, "_validate_tts_request", return_value=None)
+        speech_server._batch_max_items = 32
+
+        adapter = mocker.MagicMock()
+        adapter.validates_generation = False
+        adapter.collect_response_metadata = lambda _audio_output, collect: collect.__setitem__(
+            "audio_synthesis_error", True
+        )
+        mocker.patch.object(speech_server, "_get_tts_adapter", return_value=adapter)
+
+        batch_resp = await speech_server.create_speech_batch(BatchSpeechRequest(items=[SpeechBatchItem(input="Hello")]))
+        assert batch_resp.results[0].status == "error"
+        assert batch_resp.failed == 1
+        assert batch_resp.succeeded == 0
+
+        with pytest.raises(TTSGenerationError, match="failed to synthesize audio"):
+            async for _ in speech_server._generate_audio_chunks(
+                generator=mock_generate(),
+                request_id="speech-stream-synth-err",
+                response_format="pcm",
+            ):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_sse_audio_synthesis_error_after_audio_discards_partial(self, speech_server) -> None:
+        """A later failed output must reject the stream without emitting its audio."""
+        speech_server._tts_model_type = "yue2"
+
+        async def mock_generate():
+            yield create_mock_audio_output_for_test(audio_sample_rate=24000)
+            failed_output = create_mock_audio_output_for_test(audio_sample_rate=24000)
+            assert failed_output.multimodal_output is not None
+            failed_output.multimodal_output["meta.error"] = torch.tensor(1)
+            yield failed_output
+
+        events = [
+            json.loads(event.split("data: ", 1)[1])
+            async for event in speech_server._generate_audio_sse_events(
+                generator=mock_generate(),
+                request_id="speech-sse-synth-err",
+                response_format="pcm",
+            )
+        ]
+
+        # Only the healthy chunk is emitted: no failed audio or success event.
+        assert [event["type"] for event in events] == ["speech.audio.delta", "speech.audio.error"]
+        assert events[0]["audio"]
+        assert events[1]["error"]["partial_audio"] is True
+        assert events[1]["error"]["action"] == "discard"
+        assert events[1]["error"]["code"] == HTTPStatus.INTERNAL_SERVER_ERROR
+        assert "failed to synthesize audio" in events[1]["error"]["message"]
 
     def test_is_tts_detection_with_tts_stage(self, mocker: MockerFixture):
         """Test TTS model detection when TTS stage exists."""
@@ -2978,6 +3338,28 @@ class TestTTSMethods:
         assert additional["voice_name"] == "alice"
         assert additional["voice_created_at"] == 0
 
+    def test_voxcpm2_voice_reupload_changes_default_cache_salt(self, speech_server, mocker):
+        """A re-upload under the same voice name must mint a fresh salt."""
+        speech_server._tts_model_type = "voxcpm2"
+        speech_server._adapter = speech_server._get_tts_adapter()
+        speech_server._adapter.capabilities = replace(
+            speech_server._adapter.capabilities,
+            precomputed_speakers={},
+        )
+        speech_server.engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=2048)]
+        speech_server.engine_client.generate = mocker.MagicMock(return_value=iter(()))
+        speech_server._adapter._build_prompt = mocker.AsyncMock(side_effect=lambda *a, **kw: {"prompt_token_ids": [1]})
+
+        speech_server.uploaded_speakers = {"bob": {"created_at": 100}}
+        asyncio.run(speech_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="Hello", voice="Bob")))
+        salt_first = speech_server.engine_client.generate.call_args.kwargs["prompt"]["cache_salt"]
+
+        speech_server.uploaded_speakers = {"bob": {"created_at": 200}}
+        asyncio.run(speech_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="Hello", voice="Bob")))
+        salt_second = speech_server.engine_client.generate.call_args.kwargs["prompt"]["cache_salt"]
+
+        assert salt_first != salt_second
+
     def test_build_tts_params(self, speech_server):
         """Test TTS parameter building."""
         req = OpenAICreateSpeechRequest(input="Hello", voice="Ryan", language="English")
@@ -3415,7 +3797,10 @@ class TestTTSMethods:
         assert prepared.prompt["additional_information"]["speaker_count"] == 1
         assert prepared.model_type == "ming_tts"
 
-    def test_ming_adapter_uploaded_audio_forwards_worker_cache_metadata(self, speech_server, mocker: MockerFixture):
+    @pytest.mark.parametrize("x_vector_only_mode", [None, False, True])
+    def test_ming_adapter_uploaded_audio_forwards_worker_cache_metadata(
+        self, speech_server, mocker: MockerFixture, x_vector_only_mode
+    ):
         """Ming audio voices defer extraction and cache ownership to Stage-0."""
         speech_server.uploaded_speakers = {
             "audio_voice": {
@@ -3437,13 +3822,14 @@ class TestTTSMethods:
         )
         adapter = MingTTSAdapter(SpeechServingContext(server=speech_server))
         speech_server._adapter = adapter
-        mock_prompt = mocker.patch.object(
-            speech_server._adapter,
-            "_build_ming_dense_prompt",
-            return_value={"additional_information": {"speaker_count": 1}},
+        speech_server._tts_tokenizer = mocker.Mock(unk_token_id=-1)
+        speech_server._tts_tokenizer.encode.return_value = [1]
+        speech_server._tts_tokenizer.convert_tokens_to_ids.side_effect = lambda token: (
+            888 if token == "<audioPatch>" else -1
         )
+        mock_prompt = mocker.spy(adapter, "_build_ming_dense_prompt")
 
-        req = OpenAICreateSpeechRequest(input="Hello", voice="audio_voice")
+        req = OpenAICreateSpeechRequest(input="Hello", voice="audio_voice", x_vector_only_mode=x_vector_only_mode)
         prepared = asyncio.run(adapter.build(req, [], False))
 
         mock_prompt.assert_called_once_with(
@@ -3455,6 +3841,13 @@ class TestTTSMethods:
         assert req.ref_text == "Reference transcript."
         assert req.speaker_embedding is None
         assert prepared.model_type == "ming_tts"
+        info = prepared.prompt["additional_information"]
+        assert ("prompt_waveform" in info) == (not x_vector_only_mode)
+        assert ("prompt_text" in info) == (not x_vector_only_mode)
+        assert prepared.prompt["prompt_token_ids"].count(888) == (0 if x_vector_only_mode else 1)
+        torch.testing.assert_close(info[KEY_SPEAKER_WAVEFORM], torch.tensor([[0.0, 0.1]]))
+        assert info["voice_name"] == "audio_voice"
+        assert info["voice_created_at"] == 123
 
     def test_build_ming_prompt_forwards_audio_segments_and_worker_cache_metadata(self, speech_server):
         class FakeTokenizer:
@@ -3498,7 +3891,13 @@ class TestTTSMethods:
         assert info["voice_created_at"] == 123
         assert prompt["prompt_token_ids"].count(777) == 2
 
-    def test_build_ming_prompt_forwards_speaker_waveform_without_ref_text(self, speech_server):
+    @pytest.mark.parametrize(
+        ("ref_text", "x_vector_only_mode"),
+        [(None, None), (None, False), (None, True), ("Reference transcript.", True)],
+    )
+    def test_build_ming_prompt_forwards_speaker_waveform_without_prompt_latents(
+        self, speech_server, ref_text, x_vector_only_mode
+    ):
         class FakeTokenizer:
             unk_token_id = -1
 
@@ -3511,7 +3910,7 @@ class TestTTSMethods:
         speech_server._tts_model_type = "ming_tts"
         speech_server._adapter = speech_server._get_tts_adapter()
         speech_server._tts_tokenizer = FakeTokenizer()
-        request = OpenAICreateSpeechRequest(input="Hello")
+        request = OpenAICreateSpeechRequest(input="Hello", ref_text=ref_text, x_vector_only_mode=x_vector_only_mode)
 
         prompt = speech_server._adapter._build_ming_dense_prompt(
             request,
@@ -3523,6 +3922,7 @@ class TestTTSMethods:
         assert info[KEY_SPEAKER_WAVEFORM_LENGTHS].tolist() == [3]
         assert info[KEY_SPEAKER_SAMPLE_RATES].tolist() == [16000]
         assert "prompt_waveform" not in info
+        assert "prompt_text" not in info
         assert KEY_SPEAKER_EMBEDDING not in info
 
     def test_ming_adapter_legacy_audio_only_voice_forwards_audio_to_worker(
@@ -3966,6 +4366,7 @@ def _build_streaming_speech_app(
     mocker: MockerFixture,
     chunk: torch.Tensor | None = None,
     sample_rate: int | None = None,
+    sparse_first: bool = False,
 ) -> FastAPI:
     """Speech app whose mock engine yields one intermediate then one final chunk.
 
@@ -3977,10 +4378,17 @@ def _build_streaming_speech_app(
     if chunk is None:
         chunk = torch.sin(torch.linspace(0, 440 * 2 * torch.pi, 24000))
 
-    def _make_output(finished: bool) -> OmniRequestOutput:
-        mm_output: dict = {"audio": chunk}
-        if sample_rate is not None:
-            mm_output["sr"] = torch.tensor(sample_rate)
+    def _make_output(
+        finished: bool,
+        *,
+        output_chunk: torch.Tensor = chunk,
+        output_sample_rate: int | torch.Tensor | None = sample_rate,
+    ) -> OmniRequestOutput:
+        mm_output: dict = {"audio": output_chunk}
+        if output_sample_rate is not None:
+            mm_output["sr"] = (
+                output_sample_rate if isinstance(output_sample_rate, torch.Tensor) else torch.tensor(output_sample_rate)
+            )
 
         class MockCompletionOutput:
             def __init__(self, index: int = 0):
@@ -4011,7 +4419,14 @@ def _build_streaming_speech_app(
         )
 
     async def mock_generate_streaming(*args, **kwargs):
-        yield _make_output(finished=False)
+        if sparse_first:
+            yield _make_output(
+                finished=False,
+                output_chunk=torch.empty(0),
+                output_sample_rate=torch.empty(0),
+            )
+        else:
+            yield _make_output(finished=False)
         yield _make_output(finished=True)
 
     mock_engine_client.generate = mocker.MagicMock(side_effect=mock_generate_streaming)
@@ -4080,6 +4495,21 @@ class TestStreamingResponse:
         client = TestClient(streaming_app)
         response = client.post("/v1/audio/speech", json={"input": "Hello", "stream": True, "response_format": "pcm"})
         self._assert_sse_audio_response(response)
+
+    def test_streaming_ignores_empty_sparse_sample_rate_before_audio(self, mocker: MockerFixture):
+        """An empty sparse step must not become the stream's first audio chunk."""
+        app = _build_streaming_speech_app(mocker, sample_rate=22050, sparse_first=True)
+        response = TestClient(app).post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream": True, "response_format": "wav"},
+        )
+
+        self._assert_sse_audio_response(response, response_format="wav")
+        assert "event: speech.audio.error" not in response.text
+
+    def test_sparse_sample_rate_uses_last_nonempty_value(self):
+        """A trailing empty carrier must not hide an earlier request's rate."""
+        assert _coerce_sample_rate([torch.tensor(22050), torch.empty(0)]) == 22050
 
     def test_stream_format_audio_streaming(self, streaming_app):
         """stream_format=audio without stream=True returns raw audio/pcm chunks."""
@@ -5144,7 +5574,8 @@ def test_api_server_create_speech_engine_error_response_includes_request_and_sta
     assert isinstance(response, JSONResponse)
     assert response.status_code == 500
     assert response.body.decode("utf-8") == (
-        '{"error":{"message":"engine dead","type":"InternalServerError","param":null,'
+        '{"error":{"message":"The server had an error while processing your request.",'
+        '"type":"InternalServerError","param":null,'
         '"code":500,"request_id":"speech-req-1","error_stage_id":1}}'
     )
     terminate_mock.assert_called_once()
@@ -6110,6 +6541,27 @@ class TestTTSAsyncOffloading:
         asyncio.run(voxtral_server._prepare_speech_generation(request))
         voxtral_server._adapter._build_prompt_async.assert_awaited_once()
 
+    def test_prepare_speech_generation_voxtral_seed_sets_tts_local_seed(self, voxtral_server, mocker: MockerFixture):
+        default_params = voxtral_server.engine_client.default_sampling_params_list[0]
+        default_params.seed = None
+        default_params.extra_args = None
+        voxtral_server.engine_client.collective_rpc = mocker.AsyncMock(return_value=[False])
+        voxtral_server._adapter._build_prompt_async = mocker.AsyncMock(
+            return_value={
+                "prompt_token_ids": [1, 2, 3],
+                "additional_information": {"voice": ["test"]},
+            }
+        )
+        request = OpenAICreateSpeechRequest(input="hello", voice="test", seed=42)
+
+        asyncio.run(voxtral_server._prepare_speech_generation(request))
+
+        stage0_params = voxtral_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
+        assert stage0_params.seed == 42
+        assert stage0_params.extra_args["tts_local_seed"] == 42
+        assert stage0_params.extra_args["omni_user_seed"] is True
+        assert voxtral_server.engine_client.default_sampling_params_list[0].extra_args is None
+
     def test_prepare_speech_generation_awaits_qwen3_tts_async(self, qwen3_tts_server, mocker: MockerFixture):
         """Qwen3 TTS path should call _estimate_prompt_len_async."""
         qwen3_tts_server._adapter.validate = mocker.MagicMock(return_value=None)
@@ -6866,3 +7318,204 @@ def test_per_request_success_logs_follow_enable_log_requests(mocker: MockerFixtu
     used, unused = (log_info, log_debug) if request_logger else (log_debug, log_info)
     used.assert_called_once_with("TTS speech request %s: model=%s", "req-1", "CustomVoice")
     unused.assert_not_called()
+
+
+class TestLengthTruncationSignal:
+    """A ``length`` finish of stage 0 is reported to clients by opted-in adapters."""
+
+    OPTED_IN = [
+        "audio_generation",
+        "breeze_tts_2",
+        "cosyvoice3_talker",
+        "fish_omni",
+        "qwen3_tts",
+    ]
+
+    @pytest.fixture
+    def make_server(self, mocker: MockerFixture):
+        mocker.patch(
+            "vllm_omni.entrypoints.openai.tts_adapters.base.load_supported_speakers",
+            return_value=set(),
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.openai.tts_adapters.base.load_codec_frame_rate",
+            return_value=None,
+        )
+        servers = []
+
+        def make(model_stage: str) -> OmniOpenAIServingSpeech:
+            engine_client = mocker.MagicMock()
+            engine_client.errored = False
+            engine_client.model_config = mocker.MagicMock(model="test-model", hf_config=mocker.MagicMock())
+            engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=2048)]
+            engine_client.tts_batch_max_items = 32
+            engine_client.tts_max_instructions_length = None
+            engine_client.stage_configs = [
+                SimpleNamespace(engine_args=SimpleNamespace(model_stage=model_stage), tts_args={})
+            ]
+            models = mocker.MagicMock()
+            models.is_base_model.return_value = True
+            server = OmniOpenAIServingSpeech(
+                engine_client=engine_client, models=models, request_logger=mocker.MagicMock()
+            )
+            mocker.patch.object(server, "_count_usage_text_tokens", return_value=2)
+            servers.append(server)
+            return server
+
+        yield make
+        for server in servers:
+            server.shutdown()
+
+    @staticmethod
+    def _output(request_id: str, finish_reason: str) -> OmniRequestOutput:
+        return create_mock_audio_output_for_test(
+            request_id,
+            metrics={"stage_metrics": {"0": {"num_tokens_out": 5, "finish_reason": finish_reason}}},
+        )
+
+    async def _create_speech(self, server, mocker: MockerFixture, output, tts_params=None, **request_kwargs):
+        async def generator():
+            yield output
+
+        mocker.patch.object(
+            server, "_prepare_speech_generation", return_value=("req-trunc", generator(), tts_params or {})
+        )
+        return await server.create_speech(
+            OpenAICreateSpeechRequest(input="Hello", response_format="wav", **request_kwargs)
+        )
+
+    async def _sse_done(self, server, output) -> dict:
+        async def generator():
+            yield output
+
+        events = [
+            event
+            async for event in server._generate_audio_sse_events(
+                generator(), "req-trunc-sse", request=OpenAICreateSpeechRequest(input="Hello"), tts_params={}
+            )
+        ]
+        done_event = next(event for event in events if "event: speech.audio.done" in event)
+        return json.loads(next(line for line in done_event.splitlines() if line.startswith("data: "))[6:])
+
+    @staticmethod
+    def _exposed(response) -> set[str]:
+        return {h.strip().lower() for h in response.headers["access-control-expose-headers"].split(",")}
+
+    @pytest.mark.parametrize("model_stage", OPTED_IN)
+    def test_opted_in_adapters(self, make_server, model_stage: str):
+        assert make_server(model_stage)._get_tts_adapter().reports_length_truncation is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("model_stage", OPTED_IN)
+    @pytest.mark.parametrize("finish_reason", ["length", "stop"])
+    async def test_nonstream_header(self, make_server, mocker: MockerFixture, model_stage: str, finish_reason: str):
+        response = await self._create_speech(make_server(model_stage), mocker, self._output("req-trunc", finish_reason))
+
+        assert response.status_code == 200
+        assert response.headers["x-audio-truncated"] == ("true" if finish_reason == "length" else "false")
+        assert {"x-audio-truncated", "x-audio-duration-seconds"} <= self._exposed(response)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("model_stage", OPTED_IN)
+    @pytest.mark.parametrize("finish_reason", ["length", "stop"])
+    async def test_sse_done_field(self, make_server, model_stage: str, finish_reason: str):
+        payload = await self._sse_done(make_server(model_stage), self._output("req-trunc-sse", finish_reason))
+        assert payload["truncated"] is (finish_reason == "length")
+
+    @pytest.mark.asyncio
+    async def test_adapters_that_do_not_opt_in_are_unchanged(self, make_server, mocker: MockerFixture):
+        server = make_server("glm_tts")
+        assert server._get_tts_adapter().reports_length_truncation is False
+
+        response = await self._create_speech(server, mocker, self._output("req-no-opt-in", "length"))
+        assert response.status_code == 200
+        assert "x-audio-truncated" not in response.headers
+        assert "x-audio-truncated" not in self._exposed(response)
+
+        payload = await self._sse_done(server, self._output("req-no-opt-in-sse", "length"))
+        assert "truncated" not in payload
+
+    @pytest.mark.asyncio
+    async def test_qwen3_rejected_generation_is_not_flagged(self, make_server, mocker: MockerFixture):
+        # validate_generation runs first: a rejected generation returns no
+        # audio, so it never carries the truncation flag.
+        server = make_server("qwen3_tts")
+
+        async def generator():
+            yield self._output("req-qwen3-base", "length")
+
+        params = {"task_type": ["Base"], "_qwen3_tts_effective_max_tokens": [5]}
+        mocker.patch.object(server, "_prepare_speech_generation", return_value=("req-qwen3-base", generator(), params))
+        collect: dict = {}
+        with pytest.raises(Qwen3TTSCodecLimitError):
+            await server._generate_audio_bytes(
+                OpenAICreateSpeechRequest(input="Hello", task_type="Base"), collect=collect
+            )
+        assert "audio_truncated" not in collect
+
+    @pytest.mark.asyncio
+    async def test_qwen3_explicit_budget_is_flagged(self, make_server, mocker: MockerFixture):
+        # A caller budget on a non-Base task passes validation and returns the
+        # audio; before this flag the client could not tell it was cut off.
+        params = {"task_type": ["CustomVoice"], "_qwen3_tts_effective_max_tokens": [5]}
+        response = await self._create_speech(
+            make_server("qwen3_tts"),
+            mocker,
+            self._output("req-qwen3-explicit", "length"),
+            tts_params=params,
+            max_new_tokens=5,
+        )
+        assert response.status_code == 200
+        assert response.headers["x-audio-truncated"] == "true"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("meta_truncated", [0, 1])
+    async def test_yue2_header_comes_from_its_metadata(self, make_server, mocker: MockerFixture, meta_truncated: int):
+        # YuE2 does not opt in: its header follows meta.truncated, not the
+        # stage-0 finish reason, and is now exposed to browser clients.
+        output = self._output("req-yue2", "length")
+        output.multimodal_output["meta.truncated"] = torch.tensor(meta_truncated)
+        response = await self._create_speech(make_server("yue2"), mocker, output)
+
+        assert response.status_code == 200
+        assert response.headers["x-audio-truncated"] == ("true" if meta_truncated else "false")
+        assert "x-audio-truncated" in self._exposed(response)
+
+    @pytest.mark.asyncio
+    async def test_unknown_finish_reason_is_not_reported(self, make_server, mocker: MockerFixture):
+        # Without a recorded finish reason the server cannot tell, so it sends
+        # no signal instead of ``false``.
+        server = make_server("breeze_tts_2")
+        output = create_mock_audio_output_for_test(
+            "req-unknown", metrics={"stage_metrics": {"0": {"num_tokens_out": 5}}}
+        )
+        response = await self._create_speech(server, mocker, output)
+        assert response.status_code == 200
+        assert "x-audio-truncated" not in response.headers
+
+        sse_output = create_mock_audio_output_for_test(
+            "req-unknown-sse", metrics={"stage_metrics": {"0": {"num_tokens_out": 5}}}
+        )
+        assert "truncated" not in await self._sse_done(server, sse_output)
+
+    @pytest.mark.asyncio
+    async def test_qwen3_rejected_sse_generation_is_not_flagged(self, make_server):
+        # On SSE, validate_generation fails the stream before the done event,
+        # so a rejected generation never reports ``truncated``.
+        server = make_server("qwen3_tts")
+
+        async def generator():
+            yield self._output("req-qwen3-base-sse", "length")
+
+        events = [
+            event
+            async for event in server._generate_audio_sse_events(
+                generator(),
+                "req-qwen3-base-sse",
+                request=OpenAICreateSpeechRequest(input="Hello", task_type="Base"),
+                tts_params={"task_type": ["Base"], "_qwen3_tts_effective_max_tokens": [5]},
+            )
+        ]
+        assert not any("event: speech.audio.done" in event for event in events)
+        assert any("event: speech.audio.error" in event for event in events)
+        assert not any('"truncated"' in event for event in events)

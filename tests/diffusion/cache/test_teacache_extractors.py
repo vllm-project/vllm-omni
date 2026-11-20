@@ -463,7 +463,7 @@ class TestFlux2KleinExtractor(BaseExtractorTest):
     def get_sample_inputs(self, sample_inputs):
         return sample_inputs
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
     def test_modulated_input_shape(self, flux2_klein_module, sample_inputs):
         """Test that modulated_input has correct shape matching the model's inner_dim.
 
@@ -477,19 +477,19 @@ class TestFlux2KleinExtractor(BaseExtractorTest):
         inner_dim = flux2_klein_module.inner_dim
         assert context.modulated_input.shape == (batch_size, img_seq_len, inner_dim)
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
     def test_run_transformer_blocks_callable(self, flux2_klein_module, sample_inputs):
         """Test that run_transformer_blocks is callable."""
         context = extract_flux2_klein_context(flux2_klein_module, **sample_inputs)
         assert callable(context.run_transformer_blocks)
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
     def test_postprocess_callable(self, flux2_klein_module, sample_inputs):
         """Test that postprocess is callable."""
         context = extract_flux2_klein_context(flux2_klein_module, **sample_inputs)
         assert callable(context.postprocess)
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
     def test_extra_states_contains_full_transformer(self, flux2_klein_module, sample_inputs):
         """Test that extra_states contains run_flux2_full_transformer_with_single."""
         context = extract_flux2_klein_context(flux2_klein_module, **sample_inputs)
@@ -575,7 +575,7 @@ class TestFlux2Extractor(BaseExtractorTest):
     def get_sample_inputs(self, sample_inputs):
         return sample_inputs
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
     def test_modulated_input_shape(self, flux2_module, sample_inputs):
         """Test that modulated_input has correct shape matching the model's inner_dim.
 
@@ -589,13 +589,13 @@ class TestFlux2Extractor(BaseExtractorTest):
         inner_dim = flux2_module.inner_dim
         assert context.modulated_input.shape == (batch_size, img_seq_len, inner_dim)
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
     def test_run_transformer_blocks_callable(self, flux2_module, sample_inputs):
         """Test that run_transformer_blocks is callable."""
         context = extract_flux2_context(flux2_module, **sample_inputs)
         assert callable(context.run_transformer_blocks)
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
     def test_postprocess_callable(self, flux2_module, sample_inputs):
         """Test that postprocess is callable."""
         context = extract_flux2_context(flux2_module, **sample_inputs)
@@ -840,6 +840,12 @@ class _MiniMaxH3FakeAttention(nn.Module):
         self.attn_backend = self.FakeBackend
         self.use_ring = False
 
+    def add_schedule_candidate_check(self, check):
+        del check
+
+    def effective_attention(self):
+        return self, self.attn_backend, None
+
     def forward(self, q, k, v, metadata=None):
         del k, v, metadata
         return q
@@ -922,13 +928,16 @@ class TestMiniMaxH3Extractor(BaseExtractorTest):
     @pytest.fixture
     def minimax_h3_module(self, monkeypatch):
         """Create a minimal MiniMaxH3DiTModel with fake parallel linears for CPU tests."""
+        from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
         from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
 
         monkeypatch.setattr(h3, "ColumnParallelLinear", _MiniMaxH3FakeLinear)
-        monkeypatch.setattr(h3, "MergedColumnParallelLinear", _MiniMaxH3FakeMergedLinear)
-        monkeypatch.setattr(h3, "QKVParallelLinear", _MiniMaxH3FakeQKVLinear)
         monkeypatch.setattr(h3, "RowParallelLinear", _MiniMaxH3FakeLinear)
-        monkeypatch.setattr(h3, "Attention", _MiniMaxH3FakeAttention)
+        monkeypatch.setattr(blocks, "ColumnParallelLinear", _MiniMaxH3FakeLinear)
+        monkeypatch.setattr(blocks, "MergedColumnParallelLinear", _MiniMaxH3FakeMergedLinear)
+        monkeypatch.setattr(blocks, "QKVParallelLinear", _MiniMaxH3FakeQKVLinear)
+        monkeypatch.setattr(blocks, "RowParallelLinear", _MiniMaxH3FakeLinear)
+        monkeypatch.setattr(blocks, "Attention", _MiniMaxH3FakeAttention)
         monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
 
         model = h3.MiniMaxH3DiTModel(_minimax_h3_small_od_config(), quant_config=None)
@@ -936,7 +945,7 @@ class TestMiniMaxH3Extractor(BaseExtractorTest):
         # With one frequency per axis, the RoPE inverse frequency is 1.
         model.rope.inv_freq.fill_(1.0)
         for submodule in model.modules():
-            if isinstance(submodule, h3.MiniMaxH3Attention):
+            if isinstance(submodule, blocks.MiniMaxH3Attention):
                 submodule.rope._forward_method = submodule.rope.forward_native
         model.eval()
         return model

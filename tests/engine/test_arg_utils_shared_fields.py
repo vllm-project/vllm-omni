@@ -29,7 +29,7 @@ def test_no_ambiguous_overlap_with_real_engine():
     """
     # Fields on both classes by design: orchestrator captures them to prevent
     # uniform per-stage propagation; redistributed via DeployConfig.
-    orchestrator_captured = {"async_chunk", "tokenizer"}
+    orchestrator_captured = {"async_chunk", "tokenizer", "otlp_traces_endpoint"}
     # Orchestrator holds Omni's per-modality watermarking config, which may contain a
     # subconfig that is passed to vLLM to configure sampling time watermarking for text.
     derived_per_modality = {"watermark_config"}
@@ -70,9 +70,9 @@ def test_aux_outputs_require_a_supported_omni_stage_runner(aux_args, use_v2_mode
     # select their runner from the separate per-stage flag instead.
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     monkeypatch.setattr("vllm_omni.engine.arg_utils.current_omni_platform.is_npu", lambda: is_npu)
-    if use_v2_model_runner or is_npu:
+    if use_v2_model_runner:
         args = OmniEngineArgs(model="unused", use_v2_model_runner=use_v2_model_runner, **aux_args)
         assert args.aux_output_config.enabled
     else:
-        with pytest.raises(ValueError, match="use_v2_model_runner=True for this Omni stage"):
-            OmniEngineArgs(model="unused", **aux_args)
+        with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
+            OmniEngineArgs(model="unused", use_v2_model_runner=False, **aux_args)

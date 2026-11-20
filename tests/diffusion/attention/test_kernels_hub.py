@@ -21,7 +21,31 @@ def _clear_hub_module_cache(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_flash_attention_hub_uses_torch_stable_abi_build(monkeypatch):
+    """Torch 2.14 has no FA2 v1/v2 binaries; v3 supplies a stable-ABI build."""
+    from vllm_omni.diffusion.attention.backends.flash_attn_hub import _load_hub_module
+
+    kernel = types.SimpleNamespace(flash_attn_func=lambda *args, **kwargs: None)
+    attempted = []
+
+    def get_kernel(repo_id, *, version):
+        attempted.append(version)
+        if version in (1, 2):
+            raise FileNotFoundError("Torch version 2.13 does not match environment Torch version 2.14")
+        assert version == 3
+        return kernel
+
+    monkeypatch.setitem(sys.modules, "kernels", types.SimpleNamespace(get_kernel=get_kernel))
+    assert _load_hub_module("kernels-community/flash-attn2") is kernel
+    assert 3 in attempted
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_explicit_kernels_hub_selection_does_not_fallback(monkeypatch: pytest.MonkeyPatch):
+    # Explicit FA/Sage selections must not initialize the unrelated cuDNN runtime.
+    monkeypatch.setattr(torch.backends.cudnn, "version", lambda: pytest.fail("Unexpected cuDNN initialization"))
+
     from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
 
     # Temporarily hide/remove kernels module if present

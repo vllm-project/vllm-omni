@@ -11,6 +11,7 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_omni.inputs.data import OmniPromptType
+from vllm_omni.metrics.utils import iter_request_output_items
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,8 @@ class SchedulingMetadataUpdate:
     prompt_token_ids: tuple[int, ...] | None = None
     resize_prompt_to: int | None = None
     input_terminal: bool = False
+    # Native MRv2 receive: the producing step's duplex chunk id from payload meta.
+    duplex_perf_chunk: tuple[int, int] | None = None
 
 
 @dataclass
@@ -46,6 +49,8 @@ class OmniConnectorOutput:
         stage_recv_req_ids: Request IDs that received batch stage inputs.
         has_pending_kv_work: True if the mixin has pending, active, or
             completed KV transfers that the scheduler should account for.
+        stage_payloads: Serialized stage payloads of run requests keyed by
+            request ID, returned to the scheduler instead of sent on the connector.
     """
 
     chunk_ready_req_ids: set[str] = field(default_factory=set)
@@ -54,6 +59,7 @@ class OmniConnectorOutput:
     kv_sent_req_ids: list[str] = field(default_factory=list)
     stage_recv_req_ids: set[str] = field(default_factory=set)
     has_pending_kv_work: bool = False
+    stage_payloads: dict[str, bytes] = field(default_factory=dict)
 
 
 @dataclass
@@ -73,6 +79,8 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
 
     multimodal_outputs: list[dict[str, object]] | None = None
     inter_stage_outputs: list[dict[str, Any] | None] | None = None
+    # MRv2-only tags frozen before asynchronous output materialization.
+    _duplex_perf_chunks: dict[str, tuple[int, int]] | None = None
     # IDs of requests whose KV cache has been extracted from GPU/NPU to CPU.
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None
@@ -88,12 +96,17 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     invalid_logits_req_ids: set[str] = field(default_factory=set)
     # Request-local model failures, materialized after asynchronous D2H.
     request_errors: dict[str, str] | None = None
+    # AR full-payload steps: executed input-token range [start, end) per request.
+    # Absent for one-shot generation, which keeps append/replace accumulation.
+    full_payload_token_ranges: dict[str, tuple[int, int]] | None = None
+    # Keys replaced by the prefix-cache merge for each request. Only those
+    # tensors may contain rows from before this step.
+    full_payload_prefix_cache_keys: dict[str, frozenset[str]] | None = None
 
     @classmethod
     def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":
         return cls(
             req_ids=[],
-            req_id_to_index={},
             sampled_token_ids=[],
             logprobs=None,
             prompt_logprobs_dict={},
@@ -212,7 +225,7 @@ class OmniRequestOutput(RequestOutput):
     error_status_code: int | None = None
     error_type: str | None = None
 
-    def _copy_content_from(self, source: RequestOutput) -> None:
+    def _copy_content_from(self, source: object) -> None:
         """Copy generation content from a stage output into this object.
 
         *source* should be a vLLM ``RequestOutput`` or a subclass such as
@@ -220,13 +233,22 @@ class OmniRequestOutput(RequestOutput):
         ``final_output_type``, ``stage_durations``, ``peak_memory_mb``,
         ``error``, ...) are intentionally not copied.
         """
-        # RequestOutput attributes — guaranteed on any RequestOutput.
-        # Only copy attributes that actually exist on the source, so that
-        # duck-typed mocks can omit optional fields without overwriting the
-        # dataclass defaults (e.g. ``outputs=[]``, ``finished=True``).
+        # RequestOutput attributes — guaranteed on generation outputs and
+        # duck-typed on PoolingRequestOutput. Only copy attributes that
+        # actually exist on the source, so mocks can omit optional fields
+        # without overwriting the dataclass defaults.
         for name in _REQUEST_OUTPUT_CONTENT_ATTRS:
             if hasattr(source, name):
-                setattr(self, name, getattr(source, name))
+                value = getattr(source, name)
+                if name == "outputs":
+                    # RequestOutput carries a list of CompletionOutput values,
+                    # while PoolingRequestOutput carries one scalar
+                    # PoolingOutput. OmniRequestOutput is consumed by serving
+                    # paths that require list semantics, so normalize at the
+                    # wrapping boundary instead of making every consumer
+                    # special-case pooling output.
+                    value = list(iter_request_output_items(source))
+                setattr(self, name, value)
 
         # Omni-specific fields — only present when the source is itself an
         # OmniRequestOutput (e.g. a diffusion stage inside a pipeline).
@@ -243,7 +265,7 @@ class OmniRequestOutput(RequestOutput):
                 self._multimodal_output = src_mm
 
     @classmethod
-    def from_stage_output(cls, source: RequestOutput, **kwargs: Any) -> "OmniRequestOutput":
+    def from_stage_output(cls, source: object, **kwargs: Any) -> "OmniRequestOutput":
         """Create an OmniRequestOutput from a stage's raw output.
 
         Copies generation content (``outputs``, ``prompt``, ``prompt_token_ids``,
@@ -255,7 +277,8 @@ class OmniRequestOutput(RequestOutput):
         that wraps a stage result.
 
         Args:
-            source: The stage output whose content is copied onto the new object.
+            source: The generation or pooling stage output whose content is
+                copied onto the new object.
             **kwargs: Passed through to the dataclass constructor (``request_id``,
                 ``stage_id``, ``final_output_type``, ``metrics``,
                 ``stage_durations``, ``peak_memory_mb``, ``finished``, etc.).

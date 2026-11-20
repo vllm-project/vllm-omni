@@ -13,19 +13,24 @@ and applies the session-owned policy.
 from __future__ import annotations
 
 import time as _time
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
+from vllm.inputs import split_enc_dec_input
 from vllm.logger import init_logger
-from vllm.v1.engine import FinishReason
+from vllm.renderers.inputs.preprocess import parse_model_prompt
+from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.v1.engine import EngineCoreRequest, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.core.sched.duplex_stage_work import stage_work_rows
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreRequest
 from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
+    DuplexInputCapacity,
     DuplexOutputContext,
     DuplexRequestIdentity,
     DuplexStagePort,
@@ -35,22 +40,34 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_is_auxiliary_request,
 )
 from vllm_omni.engine.duplex.messages import DuplexSessionError
-from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, validate_duplex_replica_policy
+from vllm_omni.engine.duplex.plugin import (
+    DuplexInputCapacityError,
+    DuplexModelPlugin,
+    PartialStageForward,
+)
 from vllm_omni.engine.duplex.replica_placement import DuplexReplicaPlacement
 from vllm_omni.engine.duplex.session.engine_session import DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
+from vllm_omni.engine.duplex.session.perf_ledger import with_perf_chunk
 from vllm_omni.engine.messages import EngineQueueMessage, OutputMessage
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
     OrchestratorRequestState,
+    _build_terminal_empty_output,
     build_engine_core_request_from_tokens,
+    stamp_downstream_stage_submit,
+    stamp_stage_submit,
 )
 from vllm_omni.engine.stage_pool import StageUnavailableError
+from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.tracing import RequestTrace
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
     from vllm.outputs import RequestOutput
 
+    from vllm_omni.engine import OmniEngineCoreOutputs
+    from vllm_omni.engine.stage_pool import StagePool
     from vllm_omni.metrics.stats import StageRequestStats
 
 logger = init_logger(__name__)
@@ -64,6 +81,10 @@ class DuplexOrchestratorRequestState(OrchestratorRequestState):
     fence: DuplexFence | None = None
     stage_fences: dict[int, DuplexFence] = field(default_factory=dict)
     config_generation: int = -1
+    # Session stats (RFC #8325): per stage, the chunks with spans since its last
+    # session output, and the chunk of its latest producing step.
+    pending_perf_chunks: dict[int, set[tuple[int, int]]] = field(default_factory=dict)
+    stage_output_chunks: dict[int, tuple[int, int]] = field(default_factory=dict)
 
 
 class DuplexOrchestrator(Orchestrator, DuplexStagePort):
@@ -92,14 +113,11 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         self.replica_placement: DuplexReplicaPlacement | None = None
         admission_limit = None
         if duplex_session_config.replica_policy == "least_sessions":
-            if self._membership is not None or any(
-                pool.is_distributed or pool._lb is not None for pool in self.stage_pools
-            ):
-                validate_duplex_replica_policy(plugin, duplex_session_config, distributed=True)
+            stage_replica_counts = [pool.num_replicas for pool in self.stage_pools]
             cap = duplex_session_config.max_sessions_per_replica
             assert cap is not None
             self.replica_placement = DuplexReplicaPlacement(
-                stage_replica_counts=[pool.num_replicas for pool in self.stage_pools],
+                stage_replica_counts=stage_replica_counts,
                 max_sessions_per_replica=cap,
                 replica_groups=duplex_session_config.replica_groups,
                 frontend_count=frontend_count,
@@ -116,7 +134,17 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             model_config=model_config,
             admission_limit=admission_limit,
             log_stats=self.log_stats,
+            tracer=self.tracer,
         )
+
+    def duplex_stage_names(self) -> list[str]:
+        """Each stage's model role (``thinker``, ``talker``, ...) for session stats."""
+        names = []
+        for stage_id, pool in enumerate(self.stage_pools):
+            model_config = getattr(getattr(pool, "stage_vllm_config", None), "model_config", None)
+            name = getattr(model_config, "model_stage", None)
+            names.append(name if isinstance(name, str) and name else f"stage{stage_id}")
+        return names
 
     # ------------------------------------------------------------------ #
     # Template seams                                                     #
@@ -147,6 +175,30 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             raise StageUnavailableError(f"stage {stage_id}: pinned duplex replica {replica_id} is unavailable")
         return replica_id
 
+    def _prewarm_downstream_resumable(
+        self, stage_id: int, entry_request: Any, req_state: OrchestratorRequestState
+    ) -> bool:
+        return super()._prewarm_downstream_resumable(stage_id, entry_request, req_state) or (
+            req_state.session_owned
+            and stage_id in self.plugin.resumable_downstream_stage_ids(stage_count=len(self.stage_pools))
+        )
+
+    async def _retire_replica(self, stage_id: int, replica_id: int, reason: str) -> None:
+        """Mark a replica unavailable, stop dispatch to it, and fail its sessions.
+
+        Shared by the in-process engine-death path and the membership-detach path so
+        both reach the same placement/eviction/session-failure sequence.
+        """
+        if self.replica_placement is None:
+            return
+        affected = self.replica_placement.mark_unavailable(stage_id, replica_id)
+        pool = self.stage_pools[stage_id]
+        if 0 <= replica_id < pool.num_replicas and pool.clients[replica_id] is not None:
+            # Prevent dispatch before any cleanup await. Preserve request bindings
+            # so the generic failure path can still attribute ordinary requests.
+            pool.evict_replica(replica_id)
+        await self.session_manager.fail_sessions(affected, reason=reason)
+
     async def _handle_dead_replica(
         self,
         stage_id: int,
@@ -155,15 +207,20 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         *,
         failed_request_id: str | None = None,
     ) -> None:
-        if self.replica_placement is not None:
-            affected = self.replica_placement.mark_unavailable(stage_id, replica_id)
-            # Prevent dispatch before any cleanup await. Preserve request bindings
-            # so the generic failure path can still attribute ordinary requests.
-            self.stage_pools[stage_id].evict_replica(replica_id)
-            await self.session_manager.fail_sessions(
-                affected, reason=f"Stage-{stage_id} replica-{replica_id} is unavailable: {error}"
-            )
+        await self._retire_replica(
+            stage_id,
+            replica_id,
+            f"Stage-{stage_id} replica-{replica_id} is unavailable: {error}",
+        )
         await super()._handle_dead_replica(stage_id, replica_id, error, failed_request_id=failed_request_id)
+
+    async def _on_replica_removed(self, stage_id: int, replica_id: int) -> None:
+        """A replica left the pool (hub-reported detach), not necessarily an engine death."""
+        await self._retire_replica(
+            stage_id,
+            replica_id,
+            f"Stage-{stage_id} replica-{replica_id} left the pool",
+        )
 
     def _on_stage_submitted(
         self,
@@ -187,7 +244,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             # raced the submit); the cancel path aborts the stale request id.
             logger.debug("[DuplexOrchestrator] stale stage binding ignored for %s stage-%s", request_id, stage_id)
             return
-        req_state.stage_submit_ts[stage_id] = _time.time()
+        stamp_stage_submit(req_state, stage_id, refresh=False)
         if req_state.request_timestamp <= 0.0:
             req_state.request_timestamp = req_state.stage_submit_ts[stage_id]
         self._register_running_request(req_state)
@@ -211,11 +268,18 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             # Session gone: nothing may forward or reach a client.
             return True
         segment = req_state.streaming.segment(stage_id)
-        # A codec segment stop is not the utterance. Leave RequestOutput.finished
-        # for the real stop (is_segment_finished is false on that poll).
-        if req_state.streaming.enabled and segment.finished and getattr(output, "finished", False):
+        # A codec segment stop is not the utterance. Clear RequestOutput.finished
+        # only when THIS poll is a segment park. Leave it for a real request-end
+        # (is_segment_finished is false on that poll), including when
+        # streaming.segments still holds a leftover True from an earlier sentence.
+        poll_segment_finished = getattr(output, "is_segment_finished", None)
+        if poll_segment_finished is None:
+            poll_segment_finished = bool(req_state.streaming.enabled and segment.finished)
+        else:
+            poll_segment_finished = bool(poll_segment_finished)
+        if req_state.streaming.enabled and poll_segment_finished and getattr(output, "finished", False):
             output.finished = False
-        finished = bool(getattr(output, "finished", False)) or (req_state.streaming.enabled and segment.finished)
+        finished = bool(getattr(output, "finished", False)) or (req_state.streaming.enabled and poll_segment_finished)
         transcript = self.plugin.user_transcript(
             stage_id=stage_id,
             output=output,
@@ -234,6 +298,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             segment_finished=finished,
             segment_token_ids=tuple(segment.token_ids),
             segment_output_metadata=segment.output_metadata,
+            perf_chunks=self._take_perf_chunks(req_state, stage_id),
         )
         return runner.on_stage_output(
             stage_id,
@@ -245,25 +310,176 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             input_item_id=item_id if isinstance(item_id, str) else None,
         )
 
+    def _collect_duplex_stage_work(
+        self,
+        stage_id: int,
+        eco: Any,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        if not isinstance(req_state, DuplexOrchestratorRequestState):
+            return
+        rows = stage_work_rows(eco.stage_work)
+        if not rows:
+            return
+        runner = self.session_manager.runners.get(req_state.session_id)
+        if runner is not None:
+            # Now, not with a later session output: the step may never produce one.
+            runner.on_stage_work([(stage_id, *row) for row in rows])
+        req_state.pending_perf_chunks.setdefault(stage_id, set()).update((row[0], row[1]) for row in rows)
+        # The recorder puts the producing step's chunk last.
+        req_state.stage_output_chunks[stage_id] = (rows[-1][0], rows[-1][1])
+
+    @staticmethod
+    def _take_perf_chunks(req_state: DuplexOrchestratorRequestState, stage_id: int) -> frozenset[tuple[int, int]]:
+        """The chunks a session output of ``stage_id`` finishes handling for.
+
+        Those with spans since the stage's last output, plus its producing chunk:
+        outputs and raw outputs need not pair one to one.
+        """
+        chunks = req_state.pending_perf_chunks.pop(stage_id, set())
+        output_chunk = req_state.stage_output_chunks.get(stage_id)
+        if output_chunk is not None:
+            chunks.add(output_chunk)
+        return frozenset(chunks)
+
+    def _annotate_next_stage_inputs(
+        self,
+        src_stage_id: int,
+        req_state: OrchestratorRequestState,
+        next_inputs: list[Any],
+    ) -> None:
+        """Carry the source step's chunk id into the forwarded duplex envelope (RFC #8325)."""
+        if not isinstance(req_state, DuplexOrchestratorRequestState):
+            return
+        chunk = req_state.stage_output_chunks.get(src_stage_id)
+        if chunk is None:
+            return
+        for index, next_input in enumerate(next_inputs):
+            if isinstance(next_input, dict):
+                next_inputs[index] = with_perf_chunk(next_input, chunk)
+
     async def _report_duplex_session_request_error(
         self,
         stage_id: int,
         replica_id: int | None,
         eco: OmniEngineCoreOutput,
         req_state: OrchestratorRequestState,
-    ) -> None:
+    ) -> bool:
         if not req_state.session_owned or getattr(eco, "finish_reason", None) != FinishReason.ERROR:
-            return
+            return False
         # Segment boundaries do not terminate a resumable request. Context
         # overflow emits a separate terminal ERROR with is_segment_finished=False.
         if getattr(eco, "is_segment_finished", False):
-            return
+            return False
         reason = getattr(eco, "stop_reason", None)
         error = reason if isinstance(reason, str) and reason else "duplex session request failed"
         # Duplex sessions receive session events, not the ordinary request queue's
         # ErrorMessage. Close a resident session before another append can recreate
         # its finished stage request without the model's voice/persona prefill.
-        await self._handle_forward_failure(req_state.request_id, stage_id, req_state, RuntimeError(error))
+        return await self._handle_forward_failure(req_state.request_id, stage_id, req_state, RuntimeError(error))
+
+    def _stamp_poll_segment_finished(
+        self, stage_id: int, raw_outputs: OmniEngineCoreOutputs, processed: list[RequestOutput]
+    ) -> None:
+        """Bind this poll's ``is_segment_finished`` onto processed outputs.
+
+        Also copies ``segment_generation`` so sentence-TTS park can tell a
+        leftover 2150 from the next utterance. Intercept must not read a leftover
+        ``streaming.segments[stage].finished`` from an earlier sentence park. A
+        real request-end eco (``finish_reason`` set, ``is_segment_finished=False``)
+        wins over a later eco in the same poll so ``RequestOutput.finished`` is
+        not stripped before ``response.done``.
+        """
+        poll_is_segment_finished: dict[str, bool] = {}
+        poll_segment_generation: dict[str, int] = {}
+        poll_request_end: set[str] = set()
+        for eco in getattr(raw_outputs, "outputs", ()) or ():
+            rid = getattr(eco, "request_id", None)
+            if not isinstance(rid, str):
+                continue
+            segment_finished = bool(getattr(eco, "is_segment_finished", False))
+            poll_is_segment_finished[rid] = segment_finished
+            generation = getattr(eco, "segment_generation", None)
+            if not isinstance(generation, bool) and isinstance(generation, int):
+                poll_segment_generation[rid] = generation
+            if getattr(eco, "finish_reason", None) is not None and not segment_finished:
+                poll_request_end.add(rid)
+
+        for output in processed:
+            rid = getattr(output, "request_id", None)
+            if not isinstance(rid, str):
+                continue
+            this_poll_segment = bool(poll_is_segment_finished.get(rid)) and rid not in poll_request_end
+            setattr(output, "is_segment_finished", this_poll_segment)
+            generation = poll_segment_generation.get(rid)
+            if generation is not None:
+                setattr(output, "segment_generation", generation)
+            if rid not in poll_request_end:
+                continue
+            req_state = self.request_states.get(rid)
+            if req_state is None or not req_state.streaming.enabled:
+                continue
+            snap = req_state.streaming.segments.get(stage_id)
+            if snap is not None:
+                snap.finished = False
+
+    def _note_routed_stage_output(
+        self,
+        stage_id: int,
+        output: object,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        final_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
+        if req_state.session_owned and stage_id in final_ids and getattr(output, "finished", False):
+            req_state.routed_final_finished = True
+
+    async def _finish_session_owned_raw_terminal(
+        self,
+        stage_id: int,
+        replica_id: int,
+        request_id: str,
+        req_state: OrchestratorRequestState,
+        pool: StagePool,
+    ) -> None:
+        """Route a swallowed duplex request-end through the session interceptor.
+
+        Segment parks never reach ``_finish_raw_terminal_requests``. Skip when a
+        processed final output already kept ``finished=True``. Do not put the
+        empty fallback on the client queue and do not cleanup here: the mailbox
+        still has to project ``response.done``.
+        """
+        if req_state.routed_final_finished:
+            return
+        if not pool.final_output:
+            return
+        final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
+        if not final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids):
+            return
+        final_output_type = getattr(pool.stage_client, "final_output_type", None)
+        logger.info(
+            "[Orchestrator] req=%s stage-%s session raw terminal produced no processed "
+            "terminal; routing empty %s output through intercept",
+            request_id,
+            stage_id,
+            final_output_type or "text",
+        )
+        terminal_output = OmniRequestOutput.from_stage_output(
+            _build_terminal_empty_output(
+                request_id,
+                final_output_type=final_output_type,
+                audio_sample_rate=pool._infer_audio_sample_rate(),
+            ),
+            request_id=request_id,
+            finished=True,
+            stage_id=stage_id,
+            final_output_type=final_output_type if isinstance(final_output_type, str) else "audio",
+        )
+        completion = next(iter(terminal_output.outputs or ()), None)
+        mm = getattr(completion, "multimodal_output", None)
+        if mm:
+            terminal_output._multimodal_output = mm
+        setattr(terminal_output, "is_segment_finished", False)
+        await self._route_output(stage_id, replica_id, terminal_output, req_state, None)
 
     async def _handle_forward_failure(
         self,
@@ -289,6 +505,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
             abort=True,
             release_owners=close_session,
+            trace_error=type(exc).__name__,
         )
         return True
 
@@ -298,6 +515,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         *,
         abort: bool = False,
         release_owners: bool = False,
+        trace_error: str | None = None,
     ) -> list[OutputMessage]:
         if not request_ids:
             return []
@@ -319,7 +537,9 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 cleanup_ids.extend(stale_request_ids)
             cleanup_ids = list(dict.fromkeys(cleanup_ids))
         try:
-            outputs = await super()._cleanup_request_ids(cleanup_ids, abort=abort)
+            outputs = await super()._cleanup_request_ids(
+                cleanup_ids, abort=abort, release_owners=release_owners, trace_error=trace_error
+            )
         except BaseException:
             if closing_session_ids:
                 self.session_manager.defer_request_cleanups(closing_session_ids)
@@ -440,6 +660,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 raise StageUnavailableError(f"stage {context.stage_id}: pinned duplex replica is unavailable")
         request_state = self.request_states.get(context.request_id)
         if request_state is None:
+            session_trace = self.session_manager.session_traces.get(context.session_id)
             request_state = DuplexOrchestratorRequestState(
                 request_id=context.request_id,
                 prompt=None,
@@ -451,6 +672,10 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 session_id=context.session_id,
                 fence=context.fence,
                 config_generation=context.config_generation,
+                # Resumable stage resources survive turns, so their parent is the session.
+                trace=RequestTrace(self.tracer, context.request_id, session_trace.headers())
+                if self.tracer is not None and session_trace is not None
+                else None,
             )
             self.request_states[context.request_id] = request_state
         elif isinstance(request_state, DuplexOrchestratorRequestState):
@@ -491,6 +716,50 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             kwargs["replica_id"] = replica_id
         return await super()._build_next_stage_request(req_id, next_stage_id, next_input, params, **kwargs)
 
+    def _process_stage_inputs_in_worker(
+        self, stage_id: int, *, validate_input_tokens: Callable[[int], None] | None = None, **kwargs: Any
+    ) -> EngineCoreRequest:
+        """Own duplex renderer adaptation inside the shared, joined worker.
+
+        Render once before backend length admission, preserving exact recoverable
+        capacity errors and reusing the engine input's multimodal features.
+        """
+        if validate_input_tokens is None:
+            return super()._process_stage_inputs_in_worker(stage_id, **kwargs)
+        processor = self._get_stage_input_processor(stage_id)
+        prompt = kwargs["prompt"]
+        if isinstance(prompt, dict) and "type" in prompt:
+            engine_input = prompt
+        else:
+            parsed = parse_model_prompt(processor.model_config, prompt)
+            params = processor.renderer.default_cmpl_tok_params.with_kwargs(**(kwargs.get("tokenization_kwargs") or {}))
+            # The renderer's early length check would hide our
+            # recoverable error (and can truncate counting at cap+1).
+            # Change only this request; the callback checks the full
+            # expanded count before normal backend validation.
+            params = replace(params, max_total_tokens=None)
+            (engine_input,) = processor.renderer.render_cmpl([parsed], params)
+        _, decoder = split_enc_dec_input(engine_input)
+        validate_input_tokens(
+            length_from_prompt_token_ids_or_embeds(decoder.get("prompt_token_ids"), decoder.get("prompt_embeds"))
+        )
+        return processor.process_inputs(**{**kwargs, "prompt": engine_input})
+
+    @staticmethod
+    def _input_capacity_validator(capacity: DuplexInputCapacity) -> Callable[[int], None]:
+        """Enforce model-supplied limits on already expanded engine input."""
+
+        def validate(input_tokens: int) -> None:
+            if input_tokens + capacity.reserved_output_tokens > capacity.max_context_tokens:
+                raise DuplexInputCapacityError(
+                    f"History context needs {input_tokens} input tokens and "
+                    f"{capacity.reserved_output_tokens} reserved output tokens; "
+                    f"the context limit is {capacity.max_context_tokens}. "
+                    "Delete source items or select an explicit history policy."
+                )
+
+        return validate
+
     async def submit(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult:
         context = submission.context
         input_guard = nullcontext() if submission.resumable else self._stage_input_submission(context.stage_id)
@@ -511,6 +780,10 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                     model_config=self.stage_pools[context.stage_id].stage_vllm_config.model_config,
                     resumable=True,
                 )
+                if submission.input_capacity is not None:
+                    self._input_capacity_validator(submission.input_capacity)(
+                        length_from_prompt_token_ids_or_embeds(request.prompt_token_ids, request.prompt_embeds)
+                    )
             else:
                 # Keep raw Stage0 prompt (additional_information / multi_modal_data) for
                 # stage input processors via process_engine_inputs. Resumable requests
@@ -519,12 +792,18 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 request_state.prompt = dict(submission.prompt)
                 # Use the ordinary multimodal input processor for turn-model plugins.
                 # Its CPU preprocessing runs off the session/orchestrator event loop.
+                validation = (
+                    {}
+                    if submission.input_capacity is None
+                    else {"validate_input_tokens": self._input_capacity_validator(submission.input_capacity)}
+                )
                 request = await self._build_next_stage_request(
                     context.request_id,
                     context.stage_id,
                     dict(submission.prompt),
                     context.stage_sampling_params,
                     resumable=False,
+                    **validation,
                 )
                 if self.request_states.get(context.request_id) is not request_state:
                     raise RuntimeError("duplex request cancelled during input preprocessing")
@@ -535,6 +814,13 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             pool = self.stage_pools[context.stage_id]
             if mark_submitting is not None:
                 mark_submitting()
+            stamp_downstream_stage_submit(
+                request_state,
+                context.stage_id,
+                pool,
+                already_submitted=submission.already_submitted,
+                after_submit=False,
+            )
             try:
                 if submission.already_submitted:
                     if not submission.resumable:
@@ -552,6 +838,13 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 if pinned_replica_id is not None:
                     await self._handle_dead_replica(context.stage_id, pinned_replica_id, exc)
                 raise
+            stamp_downstream_stage_submit(
+                request_state,
+                context.stage_id,
+                pool,
+                already_submitted=submission.already_submitted,
+                after_submit=True,
+            )
 
         # The current-stage send has completed. Downstream prewarm
         # must not hold up another session's use of this stage's sender cache.
@@ -566,13 +859,64 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 )
         request_state.stage_fences[context.stage_id] = context.fence
         now = _time.time()
-        request_state.stage_submit_ts[context.stage_id] = now
         request_state.request_timestamp = now
         self._register_running_request(request_state)
         return DuplexStageSubmissionResult(
             request_id=context.request_id,
             stage_id=context.stage_id,
             replica_id=replica_id,
+        )
+
+    @staticmethod
+    def _partial_forward_source_stage(plan: PartialStageForward, stage_id: int) -> int:
+        """Stage to forward from. ``None`` means the producing stage."""
+        source = plan.source_stage_id
+        return stage_id if source is None else source
+
+    def _partial_forward_source_replica(
+        self,
+        source_stage_id: int,
+        req_state: OrchestratorRequestState,
+        poll_replica_id: int,
+    ) -> int:
+        """Replica of ``source_stage_id``. The poll replica may belong to another stage."""
+        bound = self.stage_pools[source_stage_id].get_bound_replica_id(req_state.request_id)
+        return poll_replica_id if bound is None else bound
+
+    async def _submit_partial_stage_forward(
+        self,
+        plan: PartialStageForward,
+        *,
+        source_stage_id: int,
+        replica_id: int,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        """Submit ``plan`` (and an optional close follow-up) from ``source_stage_id``.
+
+        The orchestrator owns this await so abort cancels the submit with the
+        poll, and a failed submit surfaces instead of a fire-and-forget task.
+        """
+        await self._forward_to_next_stage(
+            req_state.request_id,
+            source_stage_id,
+            plan.output,
+            req_state,
+            src_replica_id=self._partial_forward_source_replica(source_stage_id, req_state, replica_id),
+            is_streaming_session=True,
+            is_final_update=plan.is_final_update and not plan.queue_close_after,
+        )
+        followup = self.plugin.partial_stage_followup(plan, req_state)
+        if followup is None:
+            return
+        followup_source = self._partial_forward_source_stage(followup, source_stage_id)
+        await self._forward_to_next_stage(
+            req_state.request_id,
+            followup_source,
+            followup.output,
+            req_state,
+            src_replica_id=self._partial_forward_source_replica(followup_source, req_state, replica_id),
+            is_streaming_session=True,
+            is_final_update=followup.is_final_update,
         )
 
     async def _route_output(
@@ -584,38 +928,38 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         stage_metrics: Any,
     ) -> None:
         plan = self.plugin.plan_partial_stage_output(self, stage_id, replica_id, output, req_state)
+        deferred: PartialStageForward | None = None
         if plan is not None:
-            # A text-bearing final is not itself the end sentinel. Submit the
-            # sentence resumable first; the follow-up, if any, closes the stream.
-            await self._forward_to_next_stage(
-                req_state.request_id,
-                stage_id,
-                plan.output,
-                req_state,
-                src_replica_id=replica_id,
-                is_streaming_session=True,
-                is_final_update=plan.is_final_update and not plan.queue_close_after,
-            )
-            followup = self.plugin.partial_stage_followup(plan, req_state)
-            if followup is not None:
-                await self._forward_to_next_stage(
-                    req_state.request_id,
-                    stage_id,
-                    followup.output,
-                    req_state,
-                    src_replica_id=replica_id,
-                    is_streaming_session=True,
-                    is_final_update=followup.is_final_update,
+            source_stage_id = self._partial_forward_source_stage(plan, stage_id)
+            if source_stage_id == stage_id:
+                # This stage's output is the sentence itself. Submit it now
+                # and skip the legacy full-text forward.
+                await self._submit_partial_stage_forward(
+                    plan,
+                    source_stage_id=source_stage_id,
+                    replica_id=replica_id,
+                    req_state=req_state,
                 )
-            # Sentence TTS already handed this Stage1 result to Talker. The
-            # legacy path below would run aura2tts on the original full text
-            # again when the next stage is not connector-fed (AURA Talker is
-            # a sender: Stage1→2 is orchestrator-fed).
-            req_state.skip_legacy_stage_forward = True
+                # Sentence TTS already handed this Stage1 result to Talker. The
+                # legacy path below would run aura2tts on the original full text
+                # again when the next stage is not connector-fed (AURA Talker is
+                # a sender: Stage1→2 is orchestrator-fed).
+                req_state.skip_legacy_stage_forward = True
+            else:
+                # Talker-park follow-up: keep routing this poll to Code2Wav,
+                # then submit the next sentence from the thinker stage.
+                deferred = plan
         try:
             await super()._route_output(stage_id, replica_id, output, req_state, stage_metrics)
         finally:
             req_state.skip_legacy_stage_forward = False
+        if deferred is not None:
+            await self._submit_partial_stage_forward(
+                deferred,
+                source_stage_id=self._partial_forward_source_stage(deferred, stage_id),
+                replica_id=replica_id,
+                req_state=req_state,
+            )
 
     async def cleanup(self, request_ids: list[str], *, abort: bool = False) -> None:
         await self._cleanup_request_ids(request_ids, abort=abort)

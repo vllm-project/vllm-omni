@@ -3,7 +3,7 @@
 
 """Session-owned execution of model-planned memory work.
 
-The model plugin owns memory content, prompts and source validity. This helper
+The model plugin owns memory content, prompts and source selection. This helper
 owns one private request, its retry budget and interaction priority. Tasks remain
 tracked by the runner, and results return through its mailbox before writeback.
 """
@@ -27,6 +27,7 @@ from vllm_omni.engine.duplex.contracts import (
 from vllm_omni.engine.duplex.plugin import DuplexAuxiliaryRequest, duplex_text_history
 from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext
+from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot
 
 logger = init_logger(__name__)
 
@@ -53,6 +54,7 @@ class SessionMemoryRuntime:
         self._completion_pending = False
         self._epoch = ctx.session.epoch
         self._generation = 0
+        self._snapshot: DuplexHistorySnapshot | None = None
         self._history_revision = -1
         self._history: tuple[dict[str, object], ...] = ()
         self._retry_source: tuple[int, int, Hashable] | None = None
@@ -181,6 +183,13 @@ class SessionMemoryRuntime:
         if self._history_revision != self._ctx.session.history_revision:
             self._history = self._ctx.session.history
             self._history_revision = self._ctx.session.history_revision
+            if self._ctx.plugin.uses_history_context:
+                self._snapshot = self._ctx.session.history_snapshot()
+        if self._ctx.plugin.uses_history_context:
+            assert self._snapshot is not None
+            ledger = self._ctx.session.context_ledger
+            ledger.refresh(self._snapshot)
+            self._ctx.plugin.bind_history_context(state=self._ctx.model_state, snapshot=self._snapshot, ledger=ledger)
         return self._history
 
     @property

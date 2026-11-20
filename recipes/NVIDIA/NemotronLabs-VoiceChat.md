@@ -171,7 +171,7 @@ stages:
       cudagraph_mm_encoder: true
 ```
 
-Perception graphs are disabled by default and target single-session serving. On single-rank CUDA deployments, vLLM's encoder graph manager captures the first-frame and steady-frame geometries, with one frame per replay and independently owned session caches. This option does not add multi-session admission or capture batch sizes above one. Other frame geometries and incompatible tensor shapes, dtypes, or devices use eager perception. An enabled graph logs its first eager fallback reason. Multi-rank deployments, non-CUDA platforms, and `enforce_eager: true` also retain eager perception. This option does not change the existing language-model or talker graph settings.
+Perception graphs are disabled by default and target single-session serving. On single-rank CUDA deployments, vLLM's encoder graph manager captures the first-frame and steady-frame geometries, with one frame per replay and independently owned session caches. This option does not add multi-session admission or capture batch sizes above one. Singleton groups from the native batching hook can replay; groups with more than one frame use batched eager perception. Other frame geometries and incompatible tensor shapes, dtypes, or devices also use eager perception. An enabled graph logs its first eager fallback reason. Multi-rank deployments, non-CUDA platforms, and `enforce_eager: true` also retain eager perception. This option does not change the existing language-model or talker graph settings.
 
 In another shell, stream only the user channel of one of NVIDIA's bundled
 stereo conversation fixtures:
@@ -211,6 +211,12 @@ after the final commit" is timing-sensitive — a faster pipeline can legitimate
 complete every turn before the commit lands (use
 `--allow-incomplete-response` when measuring latency rather than protocol
 completion).
+
+#### Duplex perception batching
+
+Compatible audio frames in the same thinker step are batched automatically. Waveform windows are grouped by length, and encoder chunks by width and stream-start drop count. Each request retains its own caches. Session admission limits are unchanged.
+
+Batching is enabled through the shared runner hook without a platform gate; NPU/XPU runners that inherit this hook also use it when running this model. Validation covers CPU regressions and real-weight CUDA runs on an A800. NPU/XPU execution has not been validated.
 
 #### Duplex performance profile
 

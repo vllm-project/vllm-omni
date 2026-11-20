@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from __future__ import annotations
+
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -32,8 +35,9 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 logger = init_logger(__name__)
 
@@ -412,7 +416,6 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.sampler = Sampler()
 
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
@@ -441,6 +444,9 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> SamplerOutput | None:
+        from vllm.v1.sample.sampler import Sampler
+
+        self.sampler = Sampler()
         next_tokens = self.sampler(logits, sampling_metadata)
         return next_tokens
 
