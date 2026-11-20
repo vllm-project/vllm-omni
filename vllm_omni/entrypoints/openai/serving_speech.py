@@ -33,8 +33,9 @@ from vllm.entrypoints.generate.base.serving import GenerateBaseServing as OpenAI
 from vllm.entrypoints.launchers.launcher import terminate_if_errored
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+from vllm.exceptions import VLLMClientError
 from vllm.logger import init_logger
-from vllm.multimodal.media import MediaConnector
+from vllm.multimodal.media import AudioMediaIO, MediaConnector
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.utils import random_uuid
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
@@ -160,6 +161,41 @@ _REF_AUDIO_METADATA_FETCH_ATTEMPTS = 3
 _REMOTE_REF_AUDIO_SCHEMES = frozenset({"http", "https", "data"})
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
 _DEFAULT_VOICE_NAME = "default"
+
+# Voice upload MIME type by filename extension, used when the client sends no
+# content type (e.g. ``requests`` with a bare file object) or a generic one.
+_UPLOAD_MIME_BY_EXTENSION = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".mpeg": "audio/mpeg",
+    ".flac": "audio/flac",
+    ".ogg": "audio/ogg",
+    ".aac": "audio/aac",
+    ".webm": "audio/webm",
+    ".mp4": "audio/mp4",
+    ".m4a": "audio/mp4",
+}
+_UPLOAD_MIME_TYPES = frozenset(_UPLOAD_MIME_BY_EXTENSION.values())
+# Other spellings browsers, OS MIME tables and Python's ``mimetypes`` use for
+# the accepted formats (e.g. ``mimetypes`` maps ``.webm`` to ``video/webm``).
+_UPLOAD_MIME_ALIASES = {
+    "audio/x-wav": "audio/wav",
+    "audio/wave": "audio/wav",
+    "audio/vnd.wave": "audio/wav",
+    "audio/mp3": "audio/mpeg",
+    "audio/x-mp3": "audio/mpeg",
+    "audio/x-flac": "audio/flac",
+    "audio/x-aac": "audio/aac",
+    "video/webm": "audio/webm",
+    "audio/x-m4a": "audio/mp4",
+    "video/mp4": "audio/mp4",
+}
+
+
+def _is_non_soundfile_container(content: bytes) -> bool:
+    """Whether *content* starts like AAC (ADTS), WebM/Matroska or MP4/M4A."""
+    is_adts = len(content) >= 2 and content[0] == 0xFF and content[1] & 0xF6 == 0xF0
+    return is_adts or content.startswith(b"\x1a\x45\xdf\xa3") or content[4:8] == b"ftyp"
 
 
 def _is_default_voice(voice, supported_speakers):
@@ -1239,54 +1275,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if file_size > MAX_FILE_SIZE:
             raise ValueError(f"File size exceeds maximum limit of 10MB. Got {file_size} bytes.")
 
-        # Detect MIME type from filename if content_type is generic
-        mime_type = audio_file.content_type
-        if mime_type == "application/octet-stream":
-            # Simple MIME type detection based on file extension
-            filename_lower = audio_file.filename.lower()
-            if filename_lower.endswith(".wav"):
-                mime_type = "audio/wav"
-            elif filename_lower.endswith((".mp3", ".mpeg")):
-                mime_type = "audio/mpeg"
-            elif filename_lower.endswith(".flac"):
-                mime_type = "audio/flac"
-            elif filename_lower.endswith(".ogg"):
-                mime_type = "audio/ogg"
-            elif filename_lower.endswith(".aac"):
-                mime_type = "audio/aac"
-            elif filename_lower.endswith(".webm"):
-                mime_type = "audio/webm"
-            elif filename_lower.endswith((".mp4", ".m4a")):
-                mime_type = "audio/mp4"
-            else:
-                mime_type = "audio/wav"  # Default
+        # Normalize the declared type (drop parameters such as ";codecs=opus",
+        # map aliases); detect it from the filename if it is missing or generic.
+        mime_type = (audio_file.content_type or "").partition(";")[0].strip().lower()
+        if mime_type in ("", "application/octet-stream"):
+            mime_type = _UPLOAD_MIME_BY_EXTENSION.get(Path(audio_file.filename).suffix.lower(), "audio/wav")
+        mime_type = _UPLOAD_MIME_ALIASES.get(mime_type, mime_type)
 
-        # MP4/M4A (the same ISO-BMFF container) is accepted upstream as a
-        # transfer format but soundfile cannot decode it, so an upload would
-        # pass the MIME whitelist below and then die at the decode step with
-        # a misleading "Could not decode audio file". Reject it here with the
-        # actual fix instead.
-        if mime_type in ("audio/mp4", "audio/x-m4a", "video/mp4"):
-            raise ValueError(
-                "MP4/M4A uploads are not supported for voice registration: the "
-                "audio decoder cannot read the MP4 container. Extract the audio "
-                "track as WAV first, e.g. `ffmpeg -i clip.mp4 -vn -ar 48000 -ac 1 "
-                "-sample_fmt s16 clip.wav`, then upload the WAV."
-            )
-
-        # Validate MIME type
-        allowed_mime_types = {
-            "audio/mpeg",
-            "audio/wav",
-            "audio/x-wav",
-            "audio/ogg",
-            "audio/aac",
-            "audio/flac",
-            "audio/webm",
-        }
-
-        if mime_type not in allowed_mime_types:
-            raise ValueError(f"Unsupported MIME type: {mime_type}. Allowed: {allowed_mime_types}")
+        if mime_type not in _UPLOAD_MIME_TYPES:
+            raise ValueError(f"Unsupported MIME type: {mime_type}. Allowed: {sorted(_UPLOAD_MIME_TYPES)}")
 
         # Read content before acquiring the lock; decode happens inside.
         content = await audio_file.read()
@@ -1314,7 +1311,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             try:
                 wav_np, sr = sf.read(io.BytesIO(content))
             except Exception as e:
-                raise ValueError(f"Could not decode audio file: {e}")
+                if not _is_non_soundfile_container(content):
+                    raise ValueError(f"Could not decode audio file: {e}")
+                try:
+                    # Same vLLM loader as inline ref_audio for containers soundfile cannot read.
+                    wav_np, sr = await asyncio.to_thread(AudioMediaIO().load_bytes, content)
+                except Exception as exc:
+                    raise ValueError(f"Could not decode audio file: {exc}")
             duration = len(wav_np) / sr if sr > 0 else 0.0
             _check_ref_audio_duration(duration)
 
@@ -2897,7 +2900,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._diffusion_error_response("Client disconnected")
         except (EngineGenerateError, EngineDeadError):
             raise  # Propagate to the global Omni exception handler
-        except ValueError as e:
+        except (ValueError, VLLMClientError) as e:
             return self._diffusion_error_response(str(e), status_code=400)
         except Exception as e:
             logger.exception("Diffusion speech generation failed: %s", e)
@@ -3159,7 +3162,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 total_ms,
             )
             raise  # Propagate to the global Omni exception handler
-        except ValueError as e:
+        except (ValueError, VLLMClientError) as e:
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
             logger.warning(
                 "[SpeechE2E] request_id=%s stream=%s status=bad_request total_ms=%.2f error=%s",

@@ -126,6 +126,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
 
     # vLLM-Omni integration flags
     have_multimodal_outputs: bool = True
+    mrv2_forward_returns_tensor = True
     has_preprocess: bool = True
     has_postprocess: bool = True
 
@@ -1330,6 +1331,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
     """
 
     have_multimodal_outputs: bool = True
+    mrv2_forward_returns_tensor = True
     has_preprocess: bool = True
     has_postprocess: bool = True
 
