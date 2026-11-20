@@ -310,14 +310,31 @@ class IndexTTS2S2MelDecoder(nn.Module):
         if runtime_additional_information is not None and "model_intermediate_buffer" not in kwargs:
             logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
 
+        device = input_ids.device
         request_infos: list[dict[str, Any]] = []
         if model_intermediate_buffer:
             request_infos = [info for info in model_intermediate_buffer if isinstance(info, dict)]
-        additional_information: dict[str, Any] = request_infos[0] if request_infos else {}
+        if not any(request_infos):
+            # vLLM profiles or runs dummy batches with empty placeholder dicts
+            # ({}) or no upstream payload during engine initialization.
+            num_dummy = max(1, len(model_intermediate_buffer)) if model_intermediate_buffer else 1
+            dummy_audio: torch.Tensor | list[torch.Tensor] = (
+                [torch.zeros(2, device=device) for _ in range(num_dummy)]
+                if num_dummy > 1
+                else torch.zeros(2, device=device)
+            )
+            return OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={
+                    "audio": dummy_audio,
+                    "sr": torch.tensor(22050, dtype=torch.int32),
+                },
+            )
+
+        additional_information: dict[str, Any] = request_infos[0]
         self._validate_payload_policy(request_infos)
         self._validate_payload_contract(request_infos)
 
-        device = input_ids.device
         model_dtype = self._s2mel_model_dtype()
 
         logger.debug(
@@ -363,13 +380,6 @@ class IndexTTS2S2MelDecoder(nn.Module):
             s_ref_lengths_list = None
 
         if mel_codes is None or (self.use_gpt_latent and latent is None):
-            if not request_infos:
-                # vLLM profiles generation stages once with synthetic token
-                # inputs and no upstream payload during engine initialization.
-                return OmniOutput(
-                    text_hidden_states=torch.zeros(1, device=device),
-                    multimodal_outputs={"audio": torch.zeros(1, device=device), "sr": 22050},
-                )
             raise ValueError("S2Mel decoder requires mel_codes" + (" and latent" if self.use_gpt_latent else ""))
 
         logger.debug(

@@ -258,8 +258,8 @@ def test_mrv2_abort_and_publish_output_with_indextts_full_payload():
        scalars are never sent to the API server;
     2. aborting before first output and after partial output raises no exception, sends no partial
        synthesis payload, emits one terminal marker, cleans up request state, and ignores late output;
-    3. Both indextts2_mrv2.yaml and indextts2_5_mrv2.yaml overlays declare MRv2 on Stage 0 with
-       supports_native_mrv2_data_plane=True and unchunked prefill.
+    3. Both indextts2_mrv2.yaml and indextts2_5_mrv2.yaml overlays declare MRv2 on Stage 0 and
+       Stage 1 with supports_native_mrv2_data_plane=True and unchunked prefill on Stage 0.
     """
     plane, sent_packets, cleaned_reqs = _make_mrv2_data_plane_with_indextts()
 
@@ -268,7 +268,6 @@ def test_mrv2_abort_and_publish_output_with_indextts_full_payload():
     shared_payload = [{"meta.use_gpt_latent": True}]
     runner_out = OmniModelRunnerOutput(
         req_ids=["r0"],
-        req_id_to_index={"r0": 0},
         sampled_token_ids=[[10]],
         pooler_output=shared_payload,
         inter_stage_outputs=shared_payload,
@@ -285,7 +284,6 @@ def test_mrv2_abort_and_publish_output_with_indextts_full_payload():
     preserved_mm = [{"audio": torch.zeros(4)}]
     runner_out_other = OmniModelRunnerOutput(
         req_ids=["r0"],
-        req_id_to_index={"r0": 0},
         sampled_token_ids=[[10]],
         pooler_output=shared_payload,
         inter_stage_outputs=shared_payload,
@@ -390,6 +388,8 @@ def test_mrv2_abort_and_publish_output_with_indextts_full_payload():
     for pipeline in (INDEXTTS2_PIPELINE, INDEXTTS25_PIPELINE):
         assert pipeline.stages[0].supports_native_mrv2_data_plane is True
         assert pipeline.stages[0].custom_process_next_stage_input_func.endswith("talker2s2mel_full_payload")
+        assert pipeline.stages[1].supports_native_mrv2_data_plane is True
+        assert pipeline.stages[1].sync_process_input_func.endswith("talker2s2mel_token_only")
 
     deploy_dir = Path(__file__).parents[4] / "vllm_omni" / "deploy"
     for overlay_name in ("indextts2_mrv2.yaml", "indextts2_5_mrv2.yaml"):
@@ -397,6 +397,7 @@ def test_mrv2_abort_and_publish_output_with_indextts_full_payload():
         stage0 = next(s for s in cfg["stages"] if s["stage_id"] == 0)
         stage1 = next(s for s in cfg["stages"] if s["stage_id"] == 1)
         assert stage0["model_runner"] == "v2"
+        assert stage1["model_runner"] == "v2"
         assert stage0["enable_prefix_caching"] is False
         assert stage0["enable_chunked_prefill"] is False
         assert stage0["max_num_batched_tokens"] >= stage0["max_model_len"]
@@ -717,3 +718,27 @@ def test_indextts2_talker_mrv2_enables_full_cuda_graph_capture():
     assert runner._model_has_structured_output is False
     assert runner._full_graph_aux_outputs is False
     assert runner._exclude_full_graph is False
+
+
+def test_s2mel_forward_handles_mrv2_dummy_placeholders_and_rejects_partial_missing_payload():
+    """MRv2 dummy/profile passes pass empty dict placeholders in model_intermediate_buffer.
+
+    Verify Stage 1 returns a valid dummy OmniOutput for all-empty placeholder
+    batches while still raising cleanly when a batch mixes a real request with a
+    missing payload slot.
+    """
+    decoder = _make_decoder()
+
+    single_dummy = decoder.forward(torch.tensor([0]), model_intermediate_buffer=[{}])
+    assert single_dummy.text_hidden_states is None
+    assert isinstance(single_dummy.multimodal_outputs["audio"], torch.Tensor)
+    assert single_dummy.multimodal_outputs["audio"].ndim == 1
+    assert int(single_dummy.multimodal_outputs["sr"].item()) == 22050
+
+    multi_dummy = decoder.forward(torch.tensor([0, 0]), model_intermediate_buffer=[{}, {}])
+    assert isinstance(multi_dummy.multimodal_outputs["audio"], list)
+    assert len(multi_dummy.multimodal_outputs["audio"]) == 2
+
+    valid_payload = _stage1_payload(4, seed=9)
+    with pytest.raises(ValueError, match="input 1 is missing use_gpt_latent"):
+        decoder.forward(torch.tensor([0, 0]), model_intermediate_buffer=[valid_payload, {}])

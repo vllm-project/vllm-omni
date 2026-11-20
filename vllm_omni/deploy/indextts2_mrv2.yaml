@@ -32,7 +32,7 @@ stages:
       stop_token_ids: [8193]
       detokenize: false
   - stage_id: 1
-    model_runner: v1
+    model_runner: v2
     max_num_seqs: 16
     gpu_memory_utilization: 0.35
     enable_prefix_caching: false
