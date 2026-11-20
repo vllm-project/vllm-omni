@@ -208,7 +208,7 @@ def test_load_encoder_builds_the_shared_encoder_once(cuda_graph: bool, codec_cud
     assert codecs[0].inits == [(4, False)] and codecs[0].captures == expected_captures
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("kind", ["encode", "decode"])
 def test_graph_replay_matches_eager(kind: str) -> None:

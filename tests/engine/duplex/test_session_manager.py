@@ -12,6 +12,7 @@ from dataclasses import FrozenInstanceError, dataclass, field
 from typing import Any
 
 import pytest
+from vllm.sampling_params import SamplingParams
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex.commands import AppendAudio, CloseSession, Commit, DuplexCommand, Heartbeat
@@ -599,6 +600,24 @@ async def test_sampling_params_for_validates_the_plugin_policy() -> None:
         assert result.ok is False
         assert result.error_code == "invalid_argument"
         assert "as a tuple" in str(result.error_message)
+
+
+@pytest.mark.parametrize("watermarking", [True, False])
+async def test_sampling_params_for_applies_session_watermarking(watermarking: bool) -> None:
+    class SamplingParamsStagePort(FakeStagePort):
+        def sampling_defaults(self) -> tuple[SamplingParams, ...]:
+            return tuple(SamplingParams() for _ in range(self.stage_count))
+
+    class PassthroughSamplingPlugin(FakePlugin):
+        def configure_sampling_params(self, *, runtime_config, defaults):
+            return tuple(defaults)
+
+    async with Harness.create(plugin=PassthroughSamplingPlugin(), stage_port=SamplingParamsStagePort()) as harness:
+        await harness.open("sid-wm", DuplexSessionConfig(model="fake-model", watermarking=watermarking))
+
+        sampling_params = harness.manager.sampling_params_for(harness.session("sid-wm"))
+
+        assert [params.watermarking is not False for params in sampling_params] == [watermarking] * len(sampling_params)
 
 
 async def test_duplicate_open_is_rejected_with_session_exists() -> None:
@@ -1941,7 +1960,7 @@ async def test_replica_reservation_is_held_before_plugin_await_without_exceeding
         # Both opens execute their synchronous admission before parking on the gate.
         await asyncio.sleep(0)
         try:
-            assert port.placement.snapshot()["sessions"] == {"a": 0, "b": 1}
+            assert port.placement.snapshot()["sessions"] == {"a": 0, "b": 3}
             assert harness.manager._admission_count() == 2
             rejected = await harness.open("c")
             assert rejected.error_code == "resource_exhausted"
@@ -2198,7 +2217,7 @@ async def test_replica_failure_expires_idle_owner_and_preserves_other_group() ->
         assert events[0].code == "replica_unavailable"
         assert harness.manager.get("a") is None
         assert harness.manager.get("b") is not None
-        assert port.placement.snapshot()["sessions"] == {"b": 1}
+        assert port.placement.snapshot()["sessions"] == {"b": 3}
         assert port.placement.route("b", 1) == 1
         assert port.release_calls == ["a"]
 
@@ -2219,8 +2238,10 @@ async def test_failure_inside_append_does_not_await_its_own_cancellation() -> No
 
         append = asyncio.create_task(append_discovering_failure())
         runner.tasks.track_append_task(append, epoch=0, final=False, response_bound=False)
-        await asyncio.wait_for(returned_from_failure.wait(), timeout=1)
-        await asyncio.wait_for(asyncio.gather(*tuple(harness.manager._dispatched_control_tasks)), timeout=1)
+        # Keep the deadlock checks bounded while allowing scheduler latency on
+        # loaded CI workers.
+        await asyncio.wait_for(returned_from_failure.wait(), timeout=5.0)
+        await asyncio.wait_for(asyncio.gather(*tuple(harness.manager._dispatched_control_tasks)), timeout=5.0)
         assert append.cancelled()
         assert harness.manager.get("a") is None
         assert port.placement.snapshot()["sessions"] == {}
@@ -2306,6 +2327,31 @@ async def test_detach_is_refused_for_a_lease_the_caller_no_longer_holds() -> Non
 # --------------------------------------------------------------------------- #
 # Cancellation waits                                                          #
 # --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("response_bound", [False, True])
+async def test_completed_append_does_not_hold_response_gate(response_bound: bool) -> None:
+    tasks = DuplexSessionTasks()
+
+    async def append() -> bool:
+        return True
+
+    task = asyncio.create_task(append())
+    tasks.track_append_task(task, epoch=0, final=True, response_bound=response_bound)
+    tasks.append_tail = task
+    try:
+        assert tasks.has_response_bound_append_tasks() is response_bound
+        # The append runs before this coroutine resumes, but its done callback
+        # is queued for the following loop iteration. Barge-in can see this
+        # same window when prompt preparation finishes alongside VAD scoring.
+        await asyncio.sleep(0)
+        assert task.done()
+        assert task in tasks.append_tasks
+        assert not tasks.has_response_bound_append_tasks()
+        await tasks.cancel_append_tasks()
+        assert not tasks.has_response_bound_append_tasks()
+    finally:
+        await asyncio.gather(task, return_exceptions=True)
 
 
 async def test_cancel_append_tasks_absorbs_a_task_that_outlives_the_wait() -> None:

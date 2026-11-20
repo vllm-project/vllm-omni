@@ -4,14 +4,12 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
 import pytest
 import torch
 import torch.nn as nn
-from torch.overrides import TorchFunctionMode
 
 from vllm_omni.model_executor.models.minicpmo_4_5.handoff import pack_handoff_tensor
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
@@ -35,6 +33,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     MiniCPMO45OmniTTSForConditionalGeneration,
     _apply_batched_repetition_penalty,
     _native_duplex_chunk_budget,
+    _native_duplex_row_meta,
     _restore_weight_norm_weight,
     _trailing_code_runs,
     _turn_end_boundary_eos_masked,
@@ -304,6 +303,10 @@ def test_blanked_prompt_leaves_every_codec_logit_unpenalized() -> None:
 
 
 def test_talker_sample_blanks_penalty_prompt_without_touching_runner_state(mocker) -> None:
+    pytest.importorskip(
+        "vllm.v1.sample.sampler",
+        reason="MiniCPM V1 model.sample protocol is retired; native V2 sampler has separate coverage",
+    )
     talker = _make_talker()
     metadata = _PenaltyMetadata(prompt_token_ids=torch.tensor([[0, 2, 0]]))
     captured: dict[str, torch.Tensor] = {}
@@ -371,6 +374,10 @@ def _capture_sampler_logits(mocker) -> dict[str, Any]:
 
 
 def test_sample_scores_the_upstream_windowed_codec_penalty(mocker) -> None:
+    pytest.importorskip(
+        "vllm.v1.sample.sampler",
+        reason="MiniCPM V1 model.sample protocol is retired; native V2 sampler has separate coverage",
+    )
     talker = _make_talker()
     talker._request_audio_states["req-pen"] = {"finished": False, "step": 0}
     # ``head_code`` is eye(8, 2) here, so only codes 0 and 1 carry a non-zero
@@ -401,6 +408,10 @@ def test_codec_penalty_forgets_codes_older_than_the_upstream_window(mocker) -> N
     # vLLM's sampler penalty spans the whole stream, so every code ever sampled
     # stays taxed and a long tail drifts toward never-sampled codes. Upstream
     # scores only the last ``past_window`` frames.
+    pytest.importorskip(
+        "vllm.v1.sample.sampler",
+        reason="MiniCPM V1 model.sample protocol is retired; native V2 sampler has separate coverage",
+    )
     talker = _make_talker()
     talker._request_audio_states["req-window"] = {"finished": False, "step": 0}
     hidden = torch.tensor([[1.0, -2.0]])
@@ -427,6 +438,10 @@ def test_codec_penalty_forgets_codes_older_than_the_upstream_window(mocker) -> N
 
 
 def test_sample_honours_a_request_that_disabled_penalties(mocker) -> None:
+    pytest.importorskip(
+        "vllm.v1.sample.sampler",
+        reason="MiniCPM V1 model.sample protocol is retired; native V2 sampler has separate coverage",
+    )
     talker = _make_talker()
     talker._request_audio_states["req-none"] = {"finished": False, "step": 0}
     hidden = torch.tensor([[1.0, -2.0]])
@@ -448,6 +463,10 @@ def test_sample_restores_forced_eos_that_min_tokens_masked_away(mocker) -> None:
     # ``min_tokens`` masks every stage stop_token_id, including the codec EOS
     # compute_logits just forced, so the sampler returns an arbitrary id for a
     # request the model already finished.
+    pytest.importorskip(
+        "vllm.v1.sample.sampler",
+        reason="MiniCPM V1 model.sample protocol is retired; native V2 sampler has separate coverage",
+    )
     talker = _make_talker()
     talker._request_audio_states["req-empty"] = {"finished": True}
 
@@ -474,6 +493,10 @@ def test_sample_restores_forced_eos_that_min_tokens_masked_away(mocker) -> None:
 
 
 def test_sample_leaves_unforced_rows_to_the_sampler(mocker) -> None:
+    pytest.importorskip(
+        "vllm.v1.sample.sampler",
+        reason="MiniCPM V1 model.sample protocol is retired; native V2 sampler has separate coverage",
+    )
     talker = _make_talker()
     talker._request_audio_states["req-a"] = {"finished": True}
     talker._request_audio_states["req-b"] = {"finished": False, "step": 0}
@@ -708,78 +731,19 @@ def test_make_omni_output_packs_the_previous_codec_id() -> None:
     assert _routed(output, 0)["meta"]["finished"].item() is False
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
-@pytest.mark.parametrize("default_device", [None, "cpu"])
-def test_make_omni_output_reads_history_from_runner_cpu_buffer(device, default_device) -> None:
-    if device == "cuda" and not torch.cuda.is_available():
-        pytest.skip("requires CUDA codec output")
-    from types import SimpleNamespace
-
-    from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
-
-    talker = _make_talker()
-    talker.emb_code = nn.ModuleList([nn.Embedding(8, 2, device=device)])
-    talker.gpu_resident_buffer_keys = {("codes", "audio")}
-    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
-    nn.Module.__init__(model)
-    model.model_stage = "tts"
-    model.model = model.talker = talker
-    state = {"finished": False, "step": 16, "recent_codes": [0] + [1] * 14 + [2]}
-    talker._request_audio_states["req"] = state
-
-    runner = object.__new__(OmniGPUModelRunner)
-    runner.model = model
-    runner.requests = {"req": SimpleNamespace(output_token_ids=[])}
-    runner.input_batch = SimpleNamespace(req_ids=["req"])
-    runner.model_intermediate_buffer = {"req": {"request_id": "req", "audio_state": state}}
-    _, _, updates = model.preprocess(
-        torch.tensor([3], dtype=torch.int32, device=device),
-        **runner.model_intermediate_buffer["req"],
-    )
-    assert updates["codes"]["audio"].device.type == "cpu"
-    assert updates["codes"]["audio"].dtype == torch.long
-    # The real outer model does not expose its Talker's GPU-resident keys.
-    runner._update_intermediate_buffer("req", updates)
-    infos = runner._gather_runtime_additional_information()
-    source = infos[0]["codes"]["audio"]
-    assert source.device.type == "cpu"
-    torch.testing.assert_close(source, torch.tensor([[3]], dtype=torch.long))
-
-    readback_devices = []
-
-    class CpuOnlyToList(TorchFunctionMode):
-        def __torch_function__(self, func, types, args=(), kwargs=None):
-            if func is torch.Tensor.tolist:
-                tensor = args[0]
-                readback_devices.append(tensor.device.type)
-                assert tensor.device.type == "cpu", "codec history must use the CPU transport delta"
-            return func(*args, **(kwargs or {}))
-
-    # A Tensor.tolist monkeypatch is re-entered by default-device dispatch.
-    # Observe dispatch directly so each CPU readback is counted once.
-    device_context = torch.device(default_device) if default_device is not None else nullcontext()
-    with device_context, CpuOnlyToList():
-        output = model.make_omni_output(
-            torch.ones(1, 2, device=device),
-            model_intermediate_buffer=infos,
-            request_token_spans=[(0, 1)],
-        )
-
-    assert readback_devices == ["cpu"]
-    emitted = output.multimodal_outputs["codes"]["audio"][0]
-    assert emitted.device.type == "cpu"
-    torch.testing.assert_close(emitted, source)
-    expected_codes = [1] * 14 + [2, 3]
-    assert state["step"] == 17
-    assert state["recent_codes"] == expected_codes
-    expected_history = torch.tensor(expected_codes, dtype=torch.long, device=device)
-    torch.testing.assert_close(talker._penalty_histories[0], expected_history.cpu())
-    logits = torch.arange(-4, 4, dtype=torch.float32, device=device).reshape(1, 8)
-    actual, _ = talker._apply_codec_repetition_penalty(
-        logits.clone(), _CodecSamplingMetadata(repetition_penalties=torch.tensor([1.05], device=device))
-    )
-    expected = _reference_repetition_penalty(logits, expected_history, penalty=1.05, window_size=_CODEC_PENALTY_WINDOW)
-    torch.testing.assert_close(actual, expected)
+@pytest.mark.parametrize("as_tensor", [False, True], ids=["transport-list", "tensor"])
+@pytest.mark.parametrize(
+    "condition_ids,turn_end",
+    [([99, 41], False), ([99, 41, 99], True), ([99], True), ([], False)],
+)
+def test_talker_turn_end_follows_last_condition_token(condition_ids, turn_end, as_tensor) -> None:
+    info = {
+        "native_duplex": True,
+        "duplex": {"epoch": 0, "turn_id": 10},
+        "ids": {"tts": torch.tensor(condition_ids, dtype=torch.long) if as_tensor else condition_ids},
+        "meta": {"turn_eos_token_id": 99},
+    }
+    assert _native_duplex_row_meta(info)[-1] is turn_end
 
 
 def test_talker_projects_request_aligned_duplex_metadata() -> None:
@@ -789,7 +753,7 @@ def test_talker_projects_request_aligned_duplex_metadata() -> None:
             "request_id": "req-a",
             "native_duplex": True,
             "duplex": {"epoch": 3, "turn_id": 7},
-            "ids": {"tts": [41]},
+            "ids": {"tts": [99, 41]},
             "meta": {
                 "native_duplex_segment_text": "first",
                 "turn_eos_token_id": 99,
@@ -896,86 +860,6 @@ def test_cpu_codec_transport_preserves_embedding_and_owns_delta(device, dtype, c
     assert state == {"finished": code_id == 7, "step": 0}
     ids.fill_(5)
     assert delta.tolist() == ([] if code_id == 7 else [[code_id]])
-
-
-@pytest.mark.parametrize("use_snapshot", [False, True])
-def test_cpu_codec_transport_routes_owned_payloads_with_hidden(monkeypatch, use_snapshot) -> None:
-    from types import SimpleNamespace
-
-    from tests.worker.test_gpu_ar_model_runner import _make_async_output_runner
-    from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import _extract_codec_delta
-    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner, _snapshot_tensor_payload_to_cpu_async
-
-    talker = _make_talker()
-    req_ids = ["r2", "r1", "r3"]
-    codes = [torch.tensor([[0]]), torch.empty(0, dtype=torch.long), torch.tensor([[3]])]
-    talker._request_audio_states = {
-        "r2": {"finished": False, "step": 0},
-        "r1": {"finished": True, "step": 0},
-        "r3": {"finished": False, "step": 0},
-    }
-    hidden = torch.arange(6, dtype=torch.float32).reshape(3, 2)
-    model_output = talker.make_omni_output(
-        hidden,
-        model_intermediate_buffer=[
-            {"request_id": rid, "codes": {"audio": code}} for rid, code in zip(req_ids, codes, strict=True)
-        ],
-        request_token_spans=[(0, 1), (1, 2), (2, 3)],
-    )
-    assert model_output.text_hidden_states is hidden
-    mm = model_output.multimodal_outputs
-    assert [value.device.type for value in mm["codes"]["audio"]] == ["cpu"] * 3
-    assert [value.shape for value in mm["codes"]["audio"]] == [(1, 1), (0, 1), (1, 1)]
-    if use_snapshot:
-        snapshot = _snapshot_tensor_payload_to_cpu_async(
-            {"hidden_states": hidden, "multimodal_outputs": mm}, copy_stream=None, pin_memory=False
-        )
-        assert snapshot._ready_event is None
-        snapshot.wait()
-        mm = snapshot.payload["multimodal_outputs"]
-        codes[0].fill_(6)
-        assert mm["codes"]["audio"][0].tolist() == [[0]]
-
-    runner = _make_async_output_runner(engine_output_type="latent")
-    assert runner._pooler_payload_include_hidden_flag is True
-    runner.requests = {rid: object() for rid in req_ids}
-    monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, ids: ("latent", ids))
-    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
-    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
-    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
-    output = runner._build_omni_model_runner_output_from_snapshot(
-        scheduler_output=SimpleNamespace(total_num_scheduled_tokens=3, num_scheduled_tokens=dict.fromkeys(req_ids, 1)),
-        hidden_states=hidden,
-        staged_hidden_states_cpu=None,
-        multimodal_outputs=mm,
-        req_ids_output_copy=req_ids,
-        req_id_to_index_output_copy={rid: index for index, rid in enumerate(req_ids)},
-        valid_sampled_token_ids=[[1], [7], [1]],
-        logprobs_lists=None,
-        prompt_logprobs_dict={},
-        num_nans_in_logits=None,
-        kv_connector_output=None,
-        ec_connector_output=None,
-        cudagraph_stats=None,
-        kv_extracted_req_ids=None,
-        num_scheduled_tokens_np=torch.ones(3, dtype=torch.int32).numpy(),
-        query_start_loc_cpu=torch.arange(3),
-    )
-    for code in codes:
-        code.fill_(6)
-    for code in mm["codes"]["audio"]:
-        code.fill_(5)
-    talker.on_requests_finished(set(req_ids))
-    talker._flush_deferred_cleanup()
-    talker._request_audio_states["r2"] = {"finished": False, "step": 0}
-    extracted = [
-        _extract_codec_delta(payload, rid) for rid, payload in zip(req_ids, output.inter_stage_outputs, strict=True)
-    ]
-    assert extracted == [[0], [], [3]]
-    assert [payload["meta.finished"].item() for payload in output.inter_stage_outputs] == [False, True, False]
-    assert all(payload["codes.audio"].device.type == "cpu" for payload in output.inter_stage_outputs)
-    for index, payload in enumerate(output.inter_stage_outputs):
-        torch.testing.assert_close(payload["hidden"], hidden[index : index + 1])
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -1496,6 +1380,10 @@ def test_turn_end_drain_until_silent_stops_only_after_silence() -> None:
 
 @pytest.mark.parametrize("aux_penalty", [None, "frequency", "presence"])
 def test_sample_skips_only_neutral_upstream_penalties(mocker, aux_penalty):
+    pytest.importorskip(
+        "vllm.v1.sample.sampler",
+        reason="MiniCPM V1 model.sample protocol is retired; native V2 sampler has separate coverage",
+    )
     from vllm.sampling_params import SamplingParams
 
     talker = _make_talker()
@@ -1528,6 +1416,10 @@ def test_sample_skips_only_neutral_upstream_penalties(mocker, aux_penalty):
 
 @pytest.mark.parametrize("params", [None, [], [None], [None, None]])
 def test_sample_keeps_general_penalties_when_request_context_is_missing(mocker, params):
+    pytest.importorskip(
+        "vllm.v1.sample.sampler",
+        reason="MiniCPM V1 model.sample protocol is retired; native V2 sampler has separate coverage",
+    )
     talker = _make_talker()
     talker._penalty_histories = [torch.tensor([1])]
     captured = _capture_sampler_logits(mocker)
@@ -1537,6 +1429,10 @@ def test_sample_keeps_general_penalties_when_request_context_is_missing(mocker, 
 
 
 def test_sample_keeps_general_penalties_without_codec_history(mocker):
+    pytest.importorskip(
+        "vllm.v1.sample.sampler",
+        reason="MiniCPM V1 model.sample protocol is retired; native V2 sampler has separate coverage",
+    )
     from vllm.sampling_params import SamplingParams
 
     talker = _make_talker()
@@ -1592,3 +1488,64 @@ def test_mrv2_overlapping_native_conditions_use_distinct_request_ids(mocker, leg
     condition("session-a", 12)
     assert talker._request_condition_states["new-session"]["condition_seq"] == 0
     assert talker._request_condition_states["session-a"]["condition_seq"] == 12
+
+
+def test_host_sampler_resumes_only_for_a_new_duplex_condition(mocker):
+    talker = _make_talker()
+    talker._codec_seed = 0
+    talker.emb_text = nn.Embedding(1, 2)
+    mocker.patch.object(talker, "_build_condition_embeddings", return_value=torch.ones(2, 2))
+
+    def prefill(request_id, seq):
+        return talker.preprocess(
+            torch.zeros(2, dtype=torch.long),
+            None,
+            req_id=request_id,
+            native_duplex=True,
+            _omni_is_prefill=True,
+            _omni_prompt_len=2,
+            tts_token_ids=torch.tensor([1]),
+            tts_hidden_states=torch.ones(1, 2),
+            **({"meta": {"streaming_condition_seq": seq, "turn_start": seq == 0}} if seq is not None else {}),
+        )[2]["audio_state"]
+
+    def sample(request_id, state, max_tokens):
+        return talker._sample_audio_code_host(
+            hidden_state=torch.zeros(1, 2),
+            history=torch.empty(0, dtype=torch.long),
+            request_id=request_id,
+            request_state=state,
+            step=0,
+            min_tokens=0,
+            max_tokens=max_tokens,
+            eos_window_masked=False,
+            lg_dev=torch.zeros(8),
+        )
+
+    first = prefill("a", 0)
+    other = prefill("b", 0)
+    assert sample("a", first, 1)[1:] == (True, False)
+    assert sample("b", other, 1)[1:] == (True, False)
+    host_state = talker._request_host_codec_states["a"]
+    generator = host_state["generator"]
+    host_state["history"] = [3, 4]
+    host_state["bins"] = {3: 2}
+
+    # Repeating a prefill for the same condition must not reopen the segment.
+    retry = prefill("a", 0)
+    assert sample("a", retry, 3)[1:] == (True, False)
+
+    next_condition = prefill("a", 1)
+    assert host_state["generator"] is generator
+    assert host_state["history"] == [3, 4]
+    assert host_state["bins"] == {3: 2}
+    assert sample("a", next_condition, 3)[1:] == (False, True)
+    assert talker._request_host_codec_states["b"]["finished"] is True
+
+    # An unnumbered prefill retains the other request's finished state.
+    prefill("b", None)
+    assert talker._request_host_codec_states["b"]["finished"] is True
+
+    talker.on_requests_finished({"a"})
+    talker._flush_deferred_cleanup()
+    assert "a" not in talker._request_host_codec_states

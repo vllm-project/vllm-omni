@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
+from vllm.multimodal.image import open_image
 from vllm.multimodal.media import MediaConnector
 from vllm.sampling_params import SamplingParams
 
@@ -145,7 +146,7 @@ def _duplex_base_frame_blocks(frame: str, tile_pixels: int | None) -> int:
 
     try:
         raw = b64decode(frame, validate=True)
-        with Image.open(BytesIO(raw)) as image:
+        with open_image(BytesIO(raw)) as image:
             width, height = image.size
     except (BinasciiError, ValueError, OSError, Image.DecompressionBombError):
         return _DUPLEX_HD_SLICES_PER_BASE_FRAME
@@ -817,12 +818,9 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             wav_np, sr = default_ref_audio
         # torchaudio resampling is CPU work: keep it off the orchestrator loop.
         wav_np = await asyncio.to_thread(normalize_ref_audio, wav_np, int(sr), target_sr=16000)
-        # Trim to a whole number of pooled audio embeddings (100 ms frames) so
-        # the first-append scheduler reserve can count them exactly.
-        usable = (len(wav_np) // MiniCPMO45DuplexPolicy.SAMPLES_PER_AUDIO_TOKEN) * (
-            MiniCPMO45DuplexPolicy.SAMPLES_PER_AUDIO_TOKEN
-        )
-        wav_np = wav_np[:usable]
+        # Preserve the reference waveform used by the checkpoint's prepare().
+        # Its final samples still condition the encoder even when pooling does
+        # not produce another token. Budget the actual encoder output below.
         ref_audio_bytes = np.ascontiguousarray(wav_np, dtype=np.float32).tobytes()
         runtime_config["ref_audio_data"] = base64.b64encode(ref_audio_bytes).decode("ascii")
         runtime_config["ref_audio_format"] = "pcm_f32le"

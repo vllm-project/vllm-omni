@@ -157,28 +157,51 @@ def test_unpack_accepts_openpi_client_ndarray_markers():
     assert decoded["observation/exterior_image_0_left"].dtype == np.uint8
 
 
+def _cross_check_installed_openpi_client(payload: object, packed: bytes) -> None:
+    """When PyPI openpi-client is installed, the standalone codec must match it."""
+    try:
+        from openpi_client import msgpack_numpy as installed
+    except ImportError:
+        return
+
+    from tests.helpers import openpi_msgpack
+
+    np.testing.assert_equal(installed.unpackb(packed), openpi_msgpack.unpackb(packed))
+    np.testing.assert_equal(
+        installed.unpackb(installed.packb(payload)),
+        openpi_msgpack.unpackb(openpi_msgpack.packb(payload)),
+    )
+
+
 def test_unpack_openpi_client_packed_observation():
-    openpi_msgpack = pytest.importorskip("openpi_client.msgpack_numpy")
+    from tests.helpers import openpi_msgpack
+
     image = np.zeros((180, 320, 3), dtype=np.uint8)
     obs = {
         "observation/exterior_image_0_left": image,
         "observation/joint_position": np.zeros(7, dtype=np.float32),
     }
+    packed = openpi_msgpack.packb(obs)
+    assert b"__ndarray__" in packed
 
-    decoded = openpi_connection._unpack(openpi_msgpack.packb(obs))
+    decoded = openpi_connection._unpack(packed)
 
     np.testing.assert_array_equal(decoded["observation/exterior_image_0_left"], image)
     np.testing.assert_allclose(decoded["observation/joint_position"], obs["observation/joint_position"])
+    _cross_check_installed_openpi_client(obs, packed)
 
 
 def test_pack_uses_openpi_client_ndarray_markers():
-    openpi_msgpack = pytest.importorskip("openpi_client.msgpack_numpy")
+    from tests.helpers import openpi_msgpack
+
     actions = np.asarray([[1.0, 2.0]], dtype=np.float32)
 
     packed = openpi_connection._pack(actions)
+    assert b"__ndarray__" in packed
     decoded = openpi_msgpack.unpackb(packed)
 
     np.testing.assert_allclose(decoded, actions)
+    _cross_check_installed_openpi_client(actions, packed)
 
 
 def test_unpack_leaves_user_dict_without_numpy_kind_marker_unchanged():

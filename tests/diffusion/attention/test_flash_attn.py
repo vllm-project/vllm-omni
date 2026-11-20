@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, QueryRange
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.attention.backends.utils import fa  # noqa: E402
@@ -30,6 +30,39 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 is_gpu = current_omni_platform.is_cuda_alike() or current_omni_platform.is_xpu()
 HAS_FLASH_ATTN = fa.HAS_FLASH_ATTN
 flash_attn_func = fa.flash_attn_func  # noqa: N813
+
+
+@pytest.mark.cpu
+def test_fa4_dense_dispatch_is_opaque_to_compile(monkeypatch):
+    calls = []
+
+    def kernel(query, key, value, **kwargs):
+        calls.append(kwargs)
+        return query + value.mean()
+
+    monkeypatch.setattr(fa, "IS_FLASH_ATTN_4", True)
+    monkeypatch.setattr(fa, "flash_attn_func", kernel)
+    impl = FlashAttentionImpl(2, 16, softmax_scale=0.25, causal=True)
+    impl.fa_deterministic = True
+    query = torch.randn(1, 5, 2, 16)
+    key, value = torch.randn(1, 7, 2, 16), torch.randn(1, 7, 2, 16)
+    expected = impl.forward_cuda(query, key, value)
+    compiled = torch.compile(impl.forward_cuda, backend="eager", fullgraph=True, dynamic=True)
+    torch.testing.assert_close(compiled(query, key, value), expected, rtol=0, atol=0)
+    assert calls == [dict(softmax_scale=0.25, causal=True, deterministic=True)] * 2
+
+
+@pytest.mark.cpu
+def test_fa4_dense_fake_preserves_value_head_dimension():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        query = torch.empty(1, 5, 4, 16)
+        key = torch.empty(1, 7, 2, 16)
+        value = torch.empty(1, 7, 2, 32)
+        output = torch.ops.vllm_omni.fa4_dense_attention(query, key, value, 0.25, False, False)
+        assert output.shape == (1, 5, 4, 32)
+        assert output.dtype == query.dtype and output.device == query.device
 
 
 @pytest.mark.parametrize(
@@ -72,6 +105,66 @@ def test_vllm_varlen_version_kwargs_targets_only_vllm_dispatcher(monkeypatch):
     assert fa.vllm_varlen_version_kwargs(vllm_func) == {"fa_version": 3}
     assert fa.vllm_varlen_version_kwargs(other_func) == {}
     assert fa.vllm_varlen_version_kwargs(None) == {}
+
+
+@pytest.fixture
+def clear_vllm_varlen_cache():
+    fa._vllm_flash_attn_varlen.cache_clear()
+    yield
+    fa._vllm_flash_attn_varlen.cache_clear()
+
+
+def _count_vllm_flash_attn_imports(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+    calls = []
+
+    def counting_import(name, *args, **kwargs):
+        if name == "vllm.vllm_flash_attn":
+            calls.append(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", counting_import)
+    return calls
+
+
+@pytest.mark.cpu
+def test_vllm_varlen_lookup_caches_failed_import(monkeypatch, clear_vllm_varlen_cache):
+    # A ``None`` entry in sys.modules makes the import raise ImportError.
+    monkeypatch.setitem(sys.modules, "vllm.vllm_flash_attn", None)
+    calls = _count_vllm_flash_attn_imports(monkeypatch)
+
+    def some_func(**_kwargs):
+        return None
+
+    for _ in range(3):
+        assert fa._is_vllm_flash_attn_varlen(some_func) is False
+        assert fa.vllm_varlen_version_kwargs(some_func) == {}
+    assert fa._vllm_flash_attn_varlen() is None
+    assert len(calls) == 1
+
+
+@pytest.mark.cpu
+def test_vllm_varlen_lookup_matches_dispatcher_by_identity(monkeypatch, clear_vllm_varlen_cache):
+    def vllm_func(**_kwargs):
+        return None
+
+    def other_func(**_kwargs):
+        return None
+
+    monkeypatch.setitem(sys.modules, "vllm.vllm_flash_attn", SimpleNamespace(flash_attn_varlen_func=vllm_func))
+    monkeypatch.setattr(fa, "resolve_vllm_flash_attn_version", lambda requested=None: 3)
+    calls = _count_vllm_flash_attn_imports(monkeypatch)
+
+    for _ in range(3):
+        assert fa._is_vllm_flash_attn_varlen(vllm_func) is True
+        assert fa.vllm_varlen_version_kwargs(vllm_func) == {"fa_version": 3}
+        assert fa._is_vllm_flash_attn_varlen(other_func) is False
+        assert fa.vllm_varlen_version_kwargs(other_func) == {}
+    assert fa.vllm_varlen_version_kwargs(None) == {}
+    assert fa._vllm_flash_attn_varlen() is vllm_func
+    assert len(calls) == 1
 
 
 @pytest.mark.cpu
@@ -248,7 +341,7 @@ def test_vllm_dense_adapter_builds_varlen_metadata_and_restores_lse(monkeypatch)
     assert captured["softmax_scale"] == 0.25
 
 
-@hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "H100", "B200"]}, num_cards=1)
 @pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="vLLM FlashAttention requires CUDA")
 def test_vllm_dense_adapter_cuda_matches_sdpa_and_lse():
     """Exercise the real versioned vLLM dispatcher and its LSE contract."""
@@ -263,8 +356,7 @@ def test_vllm_dense_adapter_cuda_matches_sdpa_and_lse():
     value = torch.randn_like(key)
 
     capability = torch.cuda.get_device_capability(device)
-    expected_version = 3 if capability[0] == 9 else 2
-    assert capability[0] in (8, 9), f"test expects an Ampere/Ada or Hopper GPU, got SM{capability[0]}{capability[1]}"
+    expected_version = 4 if capability[0] >= 10 else 3 if capability[0] == 9 else 2
     assert fa.resolve_vllm_flash_attn_version() == expected_version
 
     output, lse = fa.vllm_flash_attn_dense_with_lse(
@@ -949,6 +1041,93 @@ def test_npu_contract_unusable_packing_does_not_run_unmasked(npu_contract):
     packed.assert_not_called()
 
 
+@pytest.mark.cpu
+def test_npu_contract_cp_packed_forward_forwards_query_ranges(npu_contract):
+    """The packed route must receive the QueryRange recorded by AllGather-KV."""
+    impl, _, dense, packed = npu_contract
+    query = torch.zeros(1, 4, 2, 4)
+    key = torch.zeros(1, 8, 2, 4)
+    cu = torch.tensor([0, 5, 8], dtype=torch.int32)
+    metadata = AttentionMetadata(
+        query_ranges=(QueryRange(local_start=0, local_end=4, global_start=4),),
+        extra={
+            "npu_attn_varlen": True,
+            "cu_seqlens_q": cu,
+            "cu_seqlens_k": cu,
+            "max_seqlen_q": 5,
+            "max_seqlen_k": 5,
+        },
+    )
+    # The routing probe and the execution path must agree on the new contract.
+    # The K/V side spans the global sequence, so pass the 8-row key here.
+    context = ExecutionContext(platform="npu", require_fullgraph=True)
+    assert impl.resolve_execution_path(context, query, key, key, metadata).path == "npu_packed_varlen"
+
+    impl.forward_npu(query, key, key, metadata)
+
+    packed.assert_called_once()
+    dense.assert_not_called()
+    assert packed.call_args.args[3:] == ([0, 1, 4], [0, 5, 8])
+
+
+@pytest.mark.cpu
+def test_npu_contract_cp_mask_fallback_uses_kv_domain(npu_contract):
+    """A declined packed contract must rebuild the mask over the K/V domain,
+    not the shorter local query length."""
+    impl, _, dense, packed = npu_contract
+    query = torch.zeros(1, 4, 2, 4)
+    key = torch.zeros(1, 8, 2, 4)
+    cu = torch.tensor([0, 4, 8], dtype=torch.int32)
+    metadata = AttentionMetadata(
+        # Two ranges decline the CP generalization, so the mask fallback runs.
+        query_ranges=(
+            QueryRange(local_start=0, local_end=2, global_start=0),
+            QueryRange(local_start=2, local_end=4, global_start=4),
+        ),
+        extra={
+            "npu_attn_varlen": True,
+            "cu_seqlens_q": cu,
+            "cu_seqlens_k": cu,
+            "max_seqlen_q": 4,
+            "max_seqlen_k": 4,
+            "valid_kv_length": 6,
+        },
+    )
+
+    impl.forward_npu(query, key, key, metadata)
+
+    packed.assert_not_called()
+    dense.assert_called_once()
+    mask = (torch.arange(8) < 6)[None, None, None, :].expand(1, 1, 4, 8)
+    torch.testing.assert_close(dense.call_args.kwargs["attn_mask"], mask)
+
+
+@pytest.mark.cpu
+def test_npu_contract_cp_fully_real_shard_keeps_zero_length_tail(npu_contract):
+    """A fully-real local shard resolves to [L, L]; the varlen route must
+    receive that zero-length tail document unchanged."""
+    impl, _, dense, packed = npu_contract
+    query = torch.zeros(1, 4, 2, 4)
+    key = torch.zeros(1, 8, 2, 4)
+    cu = torch.tensor([0, 4, 8], dtype=torch.int32)
+    metadata = AttentionMetadata(
+        query_ranges=(QueryRange(local_start=0, local_end=4, global_start=0),),
+        extra={
+            "npu_attn_varlen": True,
+            "cu_seqlens_q": cu,
+            "cu_seqlens_k": cu,
+            "max_seqlen_q": 4,
+            "max_seqlen_k": 4,
+        },
+    )
+
+    impl.forward_npu(query, key, key, metadata)
+
+    packed.assert_called_once()
+    dense.assert_not_called()
+    assert packed.call_args.args[3:] == ([0, 4, 4], [0, 4, 8])
+
+
 @pytest.fixture
 def rocm_contract(monkeypatch, mocker):
     query = torch.zeros(1, 8, 2, 4)
@@ -1110,6 +1289,119 @@ def test_resolve_packed_seq_rejects_malformed_metadata(case):
         extra = base
 
     assert impl._resolve_packed_seq_npu(q, q, extra) is None
+
+
+# --- Test group A2: AllGather-KV (CP) local-Q/global-KV generalization -------
+#
+# With AllGather-KV sequence parallelism the backend sees a local query shard
+# against the global K/V. The strategy records the shard's position as a
+# single QueryRange; the resolver must then derive the shard's [real, pad]
+# boundary pair from the global real length instead of rejecting the contract
+# (used_q is global and exceeds the local shard length by construction).
+
+
+@pytest.mark.cpu
+def test_resolve_packed_seq_cp_local_query_shards():
+    """Each AllGather-KV rank resolves its own [real, pad] Q boundaries."""
+    impl = _npu_impl()
+    # Global packed layout: 5 real + 3 pad = 8 tokens; CP x2 splits Q into two
+    # 4-row shards. max_seqlen_* describe the GLOBAL real document length.
+    cu = torch.tensor([0, 5, 8], dtype=torch.int32)
+    extra = {"cu_seqlens_q": cu, "cu_seqlens_k": cu, "max_seqlen_q": 5, "max_seqlen_k": 5}
+    k_global = torch.randn(1, 8, 2, 4)
+    q_shard = torch.randn(1, 4, 2, 4)
+
+    # Rank 0 owns global rows [0, 4): all real, so the local pad document is
+    # empty (zero-length tail).
+    rank0_ranges = (QueryRange(local_start=0, local_end=4, global_start=0),)
+    assert impl._resolve_packed_seq_npu(q_shard, k_global, extra, rank0_ranges) == ([4, 4], [5, 8])
+
+    # Rank 1 owns global rows [4, 8): 1 real + 3 pad rows.
+    rank1_ranges = (QueryRange(local_start=0, local_end=4, global_start=4),)
+    assert impl._resolve_packed_seq_npu(q_shard, k_global, extra, rank1_ranges) == ([1, 4], [5, 8])
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "ranges",
+    [
+        # Joint layouts produce multiple ranges; the CP generalization is only
+        # defined for a single packed query range.
+        (
+            QueryRange(local_start=0, local_end=2, global_start=0),
+            QueryRange(local_start=2, local_end=4, global_start=4),
+        ),
+        # Shard starts beyond the global real document: nothing real locally.
+        (QueryRange(local_start=0, local_end=4, global_start=6),),
+        # Shard starts exactly at the real boundary: zero real rows locally.
+        (QueryRange(local_start=0, local_end=4, global_start=5),),
+    ],
+)
+def test_resolve_packed_seq_cp_rejects_unsupported_ranges(ranges):
+    impl = _npu_impl()
+    cu = torch.tensor([0, 5, 8], dtype=torch.int32)
+    extra = {"cu_seqlens_q": cu, "cu_seqlens_k": cu, "max_seqlen_q": 5, "max_seqlen_k": 5}
+    q_shard = torch.randn(1, 4, 2, 4)
+    k_global = torch.randn(1, 8, 2, 4)
+
+    assert impl._resolve_packed_seq_npu(q_shard, k_global, extra, ranges) is None
+
+
+@pytest.mark.cpu
+def test_resolve_packed_seq_cp_rejects_multi_range_that_fits_square_contract():
+    """A joint layout whose global used_q happens to fit the local shard must
+    still decline; otherwise it falls through to the square branch and treats
+    non-contiguous local rows as one document."""
+    impl = _npu_impl()
+    cu = torch.tensor([0, 4, 8], dtype=torch.int32)
+    extra = {"cu_seqlens_q": cu, "cu_seqlens_k": cu, "max_seqlen_q": 4, "max_seqlen_k": 4}
+    q_shard = torch.randn(1, 4, 2, 4)
+    k_global = torch.randn(1, 8, 2, 4)
+    ranges = (
+        QueryRange(local_start=0, local_end=2, global_start=0),
+        QueryRange(local_start=2, local_end=4, global_start=4),
+    )
+
+    # Without the range guard this returned ([4, 4], [4, 8]).
+    assert impl._resolve_packed_seq_npu(q_shard, k_global, extra, ranges) is None
+
+
+@pytest.mark.cpu
+def test_resolve_packed_seq_cp_rejects_partial_coverage():
+    impl = _npu_impl()
+    cu = torch.tensor([0, 5, 8], dtype=torch.int32)
+    extra = {"cu_seqlens_q": cu, "cu_seqlens_k": cu, "max_seqlen_q": 5, "max_seqlen_k": 5}
+    q_shard = torch.randn(1, 4, 2, 4)
+    k_global = torch.randn(1, 8, 2, 4)
+    # Covers only rows [0, 3) of the 4-row shard.
+    ranges = (QueryRange(local_start=0, local_end=3, global_start=0),)
+
+    assert impl._resolve_packed_seq_npu(q_shard, k_global, extra, ranges) is None
+
+
+@pytest.mark.cpu
+def test_resolve_packed_seq_cp_rejects_mismatched_qk_real_lengths():
+    impl = _npu_impl()
+    cu = torch.tensor([0, 5, 8], dtype=torch.int32)
+    extra = {"cu_seqlens_q": cu, "cu_seqlens_k": cu, "max_seqlen_q": 5, "max_seqlen_k": 7}
+    q_shard = torch.randn(1, 4, 2, 4)
+    k_global = torch.randn(1, 8, 2, 4)
+    ranges = (QueryRange(local_start=0, local_end=4, global_start=4),)
+
+    assert impl._resolve_packed_seq_npu(q_shard, k_global, extra, ranges) is None
+
+
+@pytest.mark.cpu
+def test_resolve_packed_seq_without_ranges_keeps_square_contract():
+    """No query_ranges means no SP slicing: the square contract still applies
+    and a global-length used_q against a local-length query is rejected."""
+    impl = _npu_impl()
+    cu = torch.tensor([0, 5, 8], dtype=torch.int32)
+    extra = {"cu_seqlens_q": cu, "cu_seqlens_k": cu, "max_seqlen_q": 5, "max_seqlen_k": 5}
+    q_shard = torch.randn(1, 4, 2, 4)
+    k_global = torch.randn(1, 8, 2, 4)
+
+    assert impl._resolve_packed_seq_npu(q_shard, k_global, extra) is None
 
 
 # --- Test group B: env dispatch in forward_fa_npu (current behavior) --------
@@ -1371,6 +1663,138 @@ def test_prefix_kv_slice_no_scaling_without_factor(monkeypatch):
     torch.testing.assert_close(captured["query"], q)
     assert captured["scale"] == pytest.approx(0.5)
     torch.testing.assert_close(out, torch.ones(1, 8, 2, 4))
+
+
+# --- Test group E: NPU piecewise block-causal attention ----------------------
+#
+# ``forward_fa_npu`` must honour ``full_attn_spans`` the way ``forward_cuda``
+# does. Before this was wired up, span metadata was silently dropped and the
+# whole sequence ran bidirectional attention, which is wrong for block-causal
+# models (e.g. Qwen-Image-2.1 prefill) and poisoned the cached prefix K/V.
+
+
+def _npu_fusion_attention_reference(
+    query,
+    key,
+    value,
+    *,
+    atten_mask=None,
+    head_num,
+    input_layout="BSND",
+    scale=1.0,
+    keep_prob=1.0,
+    sparse_mode=0,
+    inner_precise=0,
+):
+    """Pure-torch stand-in for ``npu_fusion_attention`` (BSND, no dropout).
+
+    Implements the two sparse modes the piecewise path relies on: 0 (no mask,
+    full attention) and 3 (right-down causal, bottom-right aligned). The shared
+    compressed mask is validated for shape and convention, but the alignment
+    itself comes from ``sparse_mode`` -- exactly as the real kernel documents.
+    """
+    del inner_precise
+    assert input_layout == "BSND"
+    assert query.shape[2] == head_num == key.shape[2]
+    assert keep_prob == 1.0
+    query_length, key_length = query.shape[1], key.shape[1]
+    if sparse_mode == 0:
+        assert atten_mask is None, "full segments must not carry a mask"
+        keep = torch.ones(query_length, key_length, dtype=torch.bool)
+    elif sparse_mode == 3:
+        assert atten_mask is not None and atten_mask.shape == (2048, 2048)
+        assert atten_mask.dtype == torch.bool
+        # Ascend convention: True = masked out, so the mask is the strict
+        # upper triangle.
+        strict_upper = torch.triu(torch.ones(2048, 2048, dtype=torch.bool), diagonal=1)
+        assert torch.equal(atten_mask, strict_upper)
+        assert query_length <= key_length, "right-down causal requires Sq <= Skv"
+        query_positions = torch.arange(query_length).unsqueeze(1)
+        key_positions = torch.arange(key_length).unsqueeze(0)
+        keep = key_positions <= query_positions + (key_length - query_length)
+    else:
+        raise AssertionError(f"unexpected sparse_mode {sparse_mode}")
+
+    scores = torch.einsum("bqhd,bkhd->bhqk", query.float(), key.float()) * scale
+    scores = scores.masked_fill(~keep, float("-inf"))
+    out = torch.einsum("bhqk,bkhd->bqhd", torch.softmax(scores, dim=-1), value.float())
+    return out.to(query.dtype), None, None, None, 0, 0, 0
+
+
+def _block_causal_reference(query, key, value, image_ids, scale):
+    """Dense ``(q >= kv) or same_image_block`` reference for the joint sequence."""
+    seq_len = query.shape[1]
+    query_positions = torch.arange(seq_len).unsqueeze(1)
+    key_positions = torch.arange(seq_len).unsqueeze(0)
+    same_block = (image_ids.view(-1, 1) == image_ids.view(1, -1)) & (image_ids.view(-1, 1) >= 0)
+    keep = (query_positions >= key_positions) | same_block
+    scores = torch.einsum("bqhd,bkhd->bhqk", query.float(), key.float()) * scale
+    scores = scores.masked_fill(~keep, float("-inf"))
+    return torch.einsum("bhqk,bkhd->bqhd", torch.softmax(scores, dim=-1), value.float())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("causal", [False, True])
+def test_npu_piecewise_reports_its_own_execution_path(npu_contract, causal):
+    _, query, _, _ = npu_contract
+    impl = _npu_impl(causal=causal)
+    metadata = AttentionMetadata(full_attn_spans=[[(3, 5)]])
+    _assert_platform_path(impl, "npu", query, metadata, "npu_piecewise")
+
+
+@pytest.mark.cpu
+def test_npu_causal_without_spans_stays_unverified(npu_contract):
+    _, query, _, _ = npu_contract
+    impl = _npu_impl(causal=True)
+    _assert_platform_path(impl, "npu", query, None, "npu_unverified")
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("causal", [False, True])
+def test_npu_piecewise_runs_one_fusion_attention_per_segment(monkeypatch, causal):
+    fusion_attention = Mock(side_effect=lambda q, k, v, **kwargs: (torch.zeros_like(q), None, None, None, 0, 0, 0))
+    fake_torch_npu = _fake_torch_npu(monkeypatch, npu_fusion_attention=fusion_attention)
+    impl = FlashAttentionImpl(num_heads=2, head_size=4, softmax_scale=0.5, causal=causal)
+    query = torch.randn(1, 5, 2, 4)
+    # Two text tokens, then one condition-image block covering [2, 5).
+    metadata = AttentionMetadata(full_attn_spans=[[(2, 5)]])
+
+    impl.forward_fa_npu(query, query, query, metadata)
+
+    assert fake_torch_npu.npu_fusion_attention.call_count == 2
+    causal_call, full_call = fake_torch_npu.npu_fusion_attention.call_args_list
+    # Causal text segment: K truncated to its own end, compressed mask, mode 3.
+    assert causal_call.args[0].shape == (1, 2, 2, 4)
+    assert causal_call.args[1].shape == (1, 2, 2, 4)
+    assert causal_call.kwargs["sparse_mode"] == 3
+    assert causal_call.kwargs["atten_mask"].shape == (2048, 2048)
+    # Full image segment: K spans the whole prefix, no mask materialized.
+    assert full_call.args[0].shape == (1, 3, 2, 4)
+    assert full_call.args[1].shape == (1, 5, 2, 4)
+    assert full_call.kwargs["sparse_mode"] == 0
+    assert full_call.kwargs["atten_mask"] is None
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("causal", [False, True])
+def test_npu_piecewise_matches_block_causal_reference(monkeypatch, causal):
+    """Segments reproduce the dense block-causal pattern end to end."""
+    torch.manual_seed(0)
+    _fake_torch_npu(monkeypatch, npu_fusion_attention=_npu_fusion_attention_reference)
+    impl = FlashAttentionImpl(num_heads=2, head_size=4, softmax_scale=0.5, causal=causal)
+    # text(0-1) | image A(2-4) | text(5) | image B(6-8)
+    image_ids = torch.tensor([-1, -1, 0, 0, 0, -1, 1, 1, 1])
+    metadata = AttentionMetadata(full_attn_spans=[[(2, 5), (6, 9)]])
+    seq_len = image_ids.shape[0]
+    query = torch.randn(1, seq_len, 2, 4)
+    key = torch.randn(1, seq_len, 2, 4)
+    value = torch.randn(1, seq_len, 2, 4)
+
+    out = impl.forward_fa_npu(query, key, value, metadata)
+    expected = _block_causal_reference(query, key, value, image_ids, impl.softmax_scale)
+
+    assert out.shape == query.shape
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-6)
 
 
 if __name__ == "__main__":

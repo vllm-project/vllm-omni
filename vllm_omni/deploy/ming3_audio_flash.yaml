@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Ming-3.0-audio-flash: audio understanding plus optional speech output.
 #
-# Stage 0 runs TP=4 across GPUs 0-3. Stage 1 reuses the last GPU for the
-# self-contained Qwen2 + CFM + AudioVAE talker. Use the thinker-only profile
-# when only ASR / Speech-QA text is required.
+# Concurrent serving on 2x H200 with CUDA Model Runner V2. The TP=2 Thinker
+# shares GPU 1 with the batched Talker; both stages schedule up to 32 requests.
+# Use the ASR or thinker-only profiles when speech output is not needed.
 pipeline: bailing_moe_v3_audio
 async_chunk: true
 trust_remote_code: false
@@ -17,23 +17,31 @@ stages:
   - stage_id: 0
     limit_mm_per_prompt:
       audio: 20
-    devices: "0,1,2,3"
-    tensor_parallel_size: 4
+    devices: "0,1"
+    tensor_parallel_size: 2
     enable_expert_parallel: false
-    # Also disable alternate all-reduce backends via the environment to align the metrics.
     disable_custom_all_reduce: true
-    max_num_seqs: 1
+    max_num_seqs: 32
     max_model_len: 131072
-    max_num_batched_tokens: 32768
-    gpu_memory_utilization: 0.78
+    max_num_batched_tokens: 2048
+    # Leave KV-cache headroom for the full 128K context after graph profiling.
+    gpu_memory_utilization: 0.89
     enforce_eager: false
-    async_scheduling: false
-    enable_prefix_caching: true
+    model_runner: v2
+    async_scheduling: true
+    enable_prefix_caching: false
     enable_chunked_prefill: true
     engine_extras:
-      mamba_cache_mode: align
+      mamba_cache_mode: none
     compilation_config:
       cudagraph_mode: FULL_AND_PIECEWISE
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 96, 128, 192, 256, 384, 512, 768, 1024]
+    # Batch arrivals under load to reduce prefill steps, at the cost of up to
+    # 100 ms of extra first-token latency. Set min_batch to 0 to disable.
+    additional_config:
+      ar_prefill_admission_min_batch: 8
+      ar_prefill_admission_max_wait_ms: 100
+      ar_prefill_admission_min_running: 4
     default_sampling_params:
       temperature: 0.6
       top_p: 1.0
@@ -43,11 +51,12 @@ stages:
       ignore_eos: false
 
   - stage_id: 1
-    devices: "3"
-    max_num_seqs: 1
+    devices: "1"
+    max_num_seqs: 32
     max_num_batched_tokens: 8192
-    gpu_memory_utilization: 0.18
+    gpu_memory_utilization: 0.10
     enforce_eager: false
+    model_runner: v2
     enable_prefix_caching: false
     compilation_config:
       mode: 0
@@ -55,7 +64,9 @@ stages:
     engine_extras:
       hf_overrides:
         enable_llm_cuda_graph: true
-        low_latency_streaming: false
+        # Compile the batched flow/layer work before graph capture.
+        compile_flow: true
+        low_latency_streaming: true
         normalize_text: true
         tn_mode: upstream
     default_sampling_params:

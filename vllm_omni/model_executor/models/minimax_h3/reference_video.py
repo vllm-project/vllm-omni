@@ -339,15 +339,21 @@ def _transcode_reference_video(
     start_time_seconds: float = 0.0,
     duration_seconds: float | None = None,
     pad_last_frame: bool = False,
+    cover: bool = False,
 ) -> str:
     output = str(Path(workdir) / "prepared.mp4")
     duration_args = ["-t", f"{float(duration_seconds):.6f}"] if duration_seconds is not None else []
     frame_count_args = ["-frames:v", str(int(target_frame_count))] if target_frame_count > 0 else []
-    filters = [
-        f"fps={MINIMAX_H3_FPS:g}",
-        f"scale={target_width}:{target_height}:flags=lanczos",
-        "setsar=1",
-    ]
+    if cover:
+        # Fill the canvas and centre-crop the overflow instead of stretching,
+        # as Open-H3-Regenerate prepares its drafts.
+        resize = [
+            f"scale={target_width}:{target_height}:force_original_aspect_ratio=increase:flags=bilinear",
+            f"crop={target_width}:{target_height}",
+        ]
+    else:
+        resize = [f"scale={target_width}:{target_height}:flags=lanczos"]
+    filters = [f"fps={MINIMAX_H3_FPS:g}", *resize, "setsar=1"]
     if pad_last_frame:
         # Keep cloning the final converted frame until -frames:v reaches the
         # requested target; longer inputs are deterministically trimmed by the
@@ -396,8 +402,12 @@ def prepare_edit_video(
     target_height: int,
     target_frame_count: int,
     workdir: str,
+    cover: bool = False,
 ) -> dict[str, Any]:
-    """Resize an edit source and clone its last frame to the target length."""
+    """Resize an edit source and clone its last frame to the target length.
+
+    ``cover`` scales to fill the canvas and centre-crops instead of stretching.
+    """
     if not isinstance(value, str | os.PathLike):
         raise OmniClientError("MiniMax H3 edit video input must be a single file path")
     source = str(value)
@@ -413,6 +423,7 @@ def prepare_edit_video(
         target_frame_count=target_frame_count,
         workdir=workdir,
         pad_last_frame=True,
+        cover=cover,
     )
 
     return {

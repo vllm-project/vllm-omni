@@ -31,7 +31,6 @@ MING_EMIT_PATCH_COUNT_KEY = "ming_emit_patch_count"
 MING_LATENT_SHAPE_KEY = "ming_latent_shape"
 MING_ESTIMATED_BYTES_KEY = "ming_estimated_bytes"
 MING_FINAL_FLUSH_KEY = "ming_final_flush"
-MING_FINAL_DECODE_STEP_KEY = "ming_final_decode_step"
 
 
 def _extract_last_patch(pooling_output: Mapping[str, Any] | None) -> torch.Tensor | None:
@@ -186,7 +185,6 @@ def llm2audio_vae_async_chunk(
     request_id = request.external_req_id
     chunk_id = int(transfer_manager.put_req_chunk[request_id])
     finished = bool(is_finished or request.is_finished())
-    final_decode_step = _extract_last_value(pooling_output, "ming_decode_step")
     stop_reason = _decode_stop_reason(_extract_last_value(pooling_output, KEY_STOP_REASON))
     request_payload = transfer_manager.request_payload
     request_state = request_payload.get(request_id)
@@ -220,8 +218,6 @@ def llm2audio_vae_async_chunk(
                 KEY_REQUEST_ID: request_id,
                 **observability,
             }
-            if final_decode_step is not None:
-                kv_meta[MING_FINAL_DECODE_STEP_KEY] = int(final_decode_step)
             if stop_reason is not None:
                 kv_meta[KEY_STOP_REASON] = stop_reason
             state["terminal_sent"] = True
@@ -256,8 +252,6 @@ def llm2audio_vae_async_chunk(
         KEY_REQUEST_ID: request_id,
         **observability,
     }
-    if final_decode_step is not None:
-        kv_meta[MING_FINAL_DECODE_STEP_KEY] = int(final_decode_step)
     if stop_reason is not None:
         kv_meta[KEY_STOP_REASON] = stop_reason
     if finished:
@@ -297,10 +291,7 @@ def llm2audio_vae(
             KEY_REQUEST_ID: getattr(stage_output, "request_id", None),
             "finished": torch.tensor(finished, dtype=torch.bool),
         }
-        final_decode_step = _extract_last_value(output.multimodal_output, "ming_decode_step")
         stop_reason = _decode_stop_reason(_extract_last_value(output.multimodal_output, KEY_STOP_REASON))
-        if final_decode_step is not None:
-            additional_information[MING_FINAL_DECODE_STEP_KEY] = int(final_decode_step)
         if stop_reason is not None:
             additional_information[KEY_STOP_REASON] = stop_reason
         outputs.append(

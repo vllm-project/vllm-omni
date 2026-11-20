@@ -24,6 +24,7 @@ FISH_OMNI_PIPELINE = PipelineConfig(
             stage_id=0,
             model_stage="fish_omni",
             execution_type=StageExecutionType.LLM_AR,
+            supports_native_mrv2_data_plane=True,
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
@@ -33,12 +34,15 @@ FISH_OMNI_PIPELINE = PipelineConfig(
                 # Drama 3 end of speech (config eos_token_id).
                 "stop_token_ids": [248046],
             },
+            # MRv2 saves generated codebooks on preemption and restores the full
+            # frame rows on resume, so retain the default recompute policy.
         ),
         StagePipelineConfig(
             stage_id=1,
             model_stage="dac_decoder",
             model_arch="FishSpeechDACDecoder",
             execution_type=StageExecutionType.LLM_GENERATION,
+            supports_native_mrv2_data_plane=True,
             input_sources=(0,),
             final_output=True,
             final_output_type="audio",

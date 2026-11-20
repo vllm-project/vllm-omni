@@ -53,12 +53,13 @@ def _attention(*, enabled: bool, prefix: str = "image_attention") -> Attention:
     attention.head_size = 8
     attention.causal = False
     attention.attn_backend = _Backend
+    attention._schedule_candidate_checks = []
     return attention
 
 
 def _runner(attention: Attention) -> DiffusionModelRunner:
     runner = object.__new__(DiffusionModelRunner)
-    runner.od_config = SimpleNamespace(diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER)
+    runner.od_config = SimpleNamespace(diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER, kv_transfer_config=None)
     runner.vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=4),
         model_config=SimpleNamespace(dtype=torch.float16),

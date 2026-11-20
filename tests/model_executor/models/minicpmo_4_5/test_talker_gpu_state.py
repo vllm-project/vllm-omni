@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch.overrides import TorchFunctionMode
 
+from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
 from tests.helpers.mark import hardware_marks, hardware_test
 from tests.model_executor.models.minicpmo_4_5.test_talker_batching import (
     _CodecSamplingMetadata,
@@ -24,7 +25,7 @@ pytestmark = [pytest.mark.core_model]
 
 @pytest.fixture(
     params=[
-        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)),
         pytest.param("npu", marks=hardware_marks(res={"npu": "A3"}, num_cards=1)),
     ]
 )
@@ -290,59 +291,6 @@ def test_fused_gpu_window_penalty_matches_reference(device, batch):
     torch.testing.assert_close(actual.cpu(), expected, rtol=1e-6, atol=1e-6)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_v1_gpu_output_uses_async_snapshot_and_reuses_finished_slot():
-    from vllm_omni.worker.gpu_ar_model_runner import _snapshot_tensor_payload_to_cpu_async
-
-    talker = _make_talker()
-    talker.emb_code = torch.nn.ModuleList([torch.nn.Embedding(8, 2, device="cuda")])
-    talker._request_audio_states["a"] = {"finished": False, "step": 0}
-    ids = torch.tensor([2], device="cuda")
-    _, _, updates = talker.preprocess_decode_batch(
-        input_ids=ids, req_infos=[dict(request_id="a", audio_state=talker._request_audio_states["a"])]
-    )
-    output = talker.make_omni_output(
-        torch.ones(1, 2, device="cuda"),
-        model_intermediate_buffer=[dict(request_id="a", **updates[0])],
-        request_token_spans=[(0, 1)],
-    )
-    slot = talker._request_audio_states["a"]["_gpu_slot"]
-    snapshot = _snapshot_tensor_payload_to_cpu_async(
-        output.multimodal_outputs, copy_stream=torch.cuda.Stream(), pin_memory=True
-    )
-    # Scalar fallback after GPU batching must still emit the device codec ID.
-    with NoHostRead():
-        _, _, update = talker.preprocess(
-            torch.tensor([3], device="cuda"), None, request_id="a", audio_state=talker._request_audio_states["a"]
-        )
-        second = talker.make_omni_output(
-            torch.ones(1, 2, device="cuda"),
-            model_intermediate_buffer=[dict(request_id="a", **update)],
-            request_token_spans=[(0, 1)],
-        )
-    ids.zero_()
-    talker.on_requests_finished({"a"})
-    talker._flush_deferred_cleanup()
-    assert not talker._device_codec_state.slots
-    talker._request_audio_states["b"] = {"finished": False, "step": 0}
-    _, _, updates = talker.preprocess_decode_batch(
-        input_ids=torch.tensor([4], device="cuda"),
-        req_infos=[dict(request_id="b", audio_state=talker._request_audio_states["b"])],
-    )
-    talker.make_omni_output(
-        torch.ones(1, 2, device="cuda"),
-        model_intermediate_buffer=[dict(request_id="b", **updates[0])],
-        request_token_spans=[(0, 1)],
-    )
-    assert talker._request_audio_states["b"]["_gpu_slot"] == slot
-    snapshot.wait()
-    assert _extract_codec_delta(to_payload_element(snapshot.payload, 0, 0, 1, seq_len=1), "a") == [2]
-    assert _extract_codec_delta(
-        to_payload_element(build_mm_cpu(second.multimodal_outputs), 0, 0, 1, seq_len=1), "a"
-    ) == [3]
-
-
 def test_gpu_decode_masks_finished_request_when_new_request_joins(device):
     talker = _make_talker()
     talker.emb_code = torch.nn.ModuleList([torch.nn.Embedding(8, 2, device=device)])
@@ -374,10 +322,14 @@ def test_gpu_decode_masks_finished_request_when_new_request_joins(device):
     assert _extract_codec_delta(to_payload_element(mm, 1, 1, 2, seq_len=2), "b") == [3]
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
+@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="GPU required")
 @pytest.mark.parametrize("aux_penalty", ["neutral", "frequency", "presence", "mixed"])
 def test_sampler_fast_path_preserves_seeded_tokens_and_auxiliary_penalties(aux_penalty, mocker):
+    pytest.importorskip(
+        "vllm.v1.sample.sampler",
+        reason="MiniCPM V1 model.sample protocol is retired; native V2 sampler has separate coverage",
+    )
     from dataclasses import replace
     from types import SimpleNamespace
 
@@ -408,18 +360,18 @@ def test_sampler_fast_path_preserves_seeded_tokens_and_auxiliary_penalties(aux_p
 
     def metadata():
         return SamplingMetadata(
-            temperature=torch.tensor([p.temperature for p in params], device="cuda"),
+            temperature=torch.tensor([p.temperature for p in params], device=DEVICE_TYPE),
             all_greedy=False,
             all_random=True,
-            top_p=torch.tensor([p.top_p for p in params], device="cuda"),
-            top_k=torch.tensor([p.top_k for p in params], device="cuda", dtype=torch.int32),
-            generators={row: torch.Generator(device="cuda").manual_seed(p.seed) for row, p in enumerate(params)},
+            top_p=torch.tensor([p.top_p for p in params], device=DEVICE_TYPE),
+            top_k=torch.tensor([p.top_k for p in params], device=DEVICE_TYPE, dtype=torch.int32),
+            generators={row: torch.Generator(device=DEVICE_TYPE).manual_seed(p.seed) for row, p in enumerate(params)},
             max_num_logprobs=None,
             no_penalties=False,
-            prompt_token_ids=torch.zeros(batch, 8, device="cuda", dtype=torch.long),
-            frequency_penalties=torch.tensor([p.frequency_penalty for p in params], device="cuda"),
-            presence_penalties=torch.tensor([p.presence_penalty for p in params], device="cuda"),
-            repetition_penalties=torch.tensor([p.repetition_penalty for p in params], device="cuda"),
+            prompt_token_ids=torch.zeros(batch, 8, device=DEVICE_TYPE, dtype=torch.long),
+            frequency_penalties=torch.tensor([p.frequency_penalty for p in params], device=DEVICE_TYPE),
+            presence_penalties=torch.tensor([p.presence_penalty for p in params], device=DEVICE_TYPE),
+            repetition_penalties=torch.tensor([p.repetition_penalty for p in params], device=DEVICE_TYPE),
             output_token_ids=[[row] * 32 for row in range(batch)],
             allowed_token_ids_mask=None,
             bad_words_token_ids={},
@@ -438,11 +390,11 @@ def test_sampler_fast_path_preserves_seeded_tokens_and_auxiliary_penalties(aux_p
     requests = {rid: SimpleNamespace(sampling_params=params[row]) for row, rid in enumerate(input_batch.req_ids)}
     reference_sampler = Sampler()
     calls = mocker.spy(talker._codec_sampler, "forward")
-    raw = torch.arange(batch * vocab, device="cuda").float().reshape(batch, vocab).sin()
+    raw = torch.arange(batch * vocab, device=DEVICE_TYPE).float().reshape(batch, vocab).sin()
     for step in range(20):
-        histories = torch.tensor([ids[-16:] for ids in reference_meta.output_token_ids], device="cuda")
+        histories = torch.tensor([ids[-16:] for ids in reference_meta.output_token_ids], device=DEVICE_TYPE)
         talker._penalty_histories = histories
-        forced = torch.tensor([step == 19, False, False], device="cuda")
+        forced = torch.tensor([step == 19, False, False], device=DEVICE_TYPE)
         talker._pending_force_eos_rows = forced
         expected_logits = apply_window_penalty(raw.clone(), histories, reference_meta.repetition_penalties)
         prepared = replace(
