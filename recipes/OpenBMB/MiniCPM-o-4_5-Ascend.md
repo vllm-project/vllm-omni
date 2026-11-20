@@ -153,6 +153,20 @@ export PORT=8000
 bash recipes/OpenBMB/serve_minicpmo_ascend.sh
 ```
 
+For sustained traffic with reused reference audio, the two-card throughput
+profile uses one Code2Wav replica and retains both Talker replicas. It allows
+32 sequences at Code2Wav and uses an eight-row CFM micro-batch. The five CFM
+steps and codec chunk sizes are inherited from the base profile.
+
+```bash
+unset MAX_NUM_SEQS
+export DEPLOY_CONFIG="$PWD/vllm_omni/deploy/minicpmo_4_5_2gpu_throughput.yaml"
+bash recipes/OpenBMB/serve_minicpmo_ascend.sh
+```
+
+An explicit `MAX_NUM_SEQS` overrides every stage in the selected deployment.
+Keep it unset to retain that deployment's per-stage limits.
+
 The initial graph compilation can take several minutes. The service is ready
 when `/health` succeeds. Fast graph variants qualify on their first eligible
 request in each worker: prefill compares hidden state and KV; fused decoding

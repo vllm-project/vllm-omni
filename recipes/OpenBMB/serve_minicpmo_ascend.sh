@@ -27,7 +27,7 @@ touch "$MINICPMO_NPU_TALKER_HYBRID_CONTEXT_FILE"
 printf '%s deployment\n' "${TALKER_ROUTE:-quarter}" > "$MINICPMO_C8_TALKER_ROUTE_FILE"
 printf '%s deployment\n' "${VOCODER_ROUTE:-quarter}" > "$MINICPMO_C8_VOCODER_ROUTE_FILE"
 
-python3 - "$repo_root" "$runtime_dir" "$MODEL_ROOT" "$DRAFT_MODEL" "${MAX_NUM_SEQS:-16}" <<'PY'
+python3 - "$repo_root" "$runtime_dir" "$MODEL_ROOT" "$DRAFT_MODEL" "${DEPLOY_CONFIG:-}" "${MAX_NUM_SEQS:-}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -36,8 +36,12 @@ import yaml
 from vllm_omni.config.stage_config import resolve_deploy_yaml
 
 repo, runtime, model, draft = (Path(p).resolve() for p in sys.argv[1:5])
-seqs = int(sys.argv[5])
-if seqs <= 0:
+deployment, seqs_arg = sys.argv[5:7]
+deploy_path = Path(deployment).resolve() if deployment else repo / "vllm_omni/deploy/minicpmo_4_5_2gpu.yaml"
+if not deployment and not seqs_arg:
+    seqs_arg = "16"
+seqs = int(seqs_arg) if seqs_arg else None
+if seqs is not None and seqs <= 0:
     raise ValueError("MAX_NUM_SEQS must be positive")
 for directory in (model, model / "original", model / "thinker-w8a8", draft):
     if not (directory / "config.json").is_file():
@@ -45,11 +49,13 @@ for directory in (model, model / "original", model / "thinker-w8a8", draft):
 quant = json.loads((model / "thinker-w8a8/config.json").read_text()).get("quantization_config", {})
 if quant.get("quant_method") != "compressed-tensors":
     raise ValueError("thinker-w8a8 must contain the qualified compressed-tensors W8A8 checkpoint")
-config = resolve_deploy_yaml(repo / "vllm_omni/deploy/minicpmo_4_5_2gpu.yaml")
-for stage in config["stages"]:
-    stage["max_num_seqs"] = seqs
+config = resolve_deploy_yaml(deploy_path)
+if seqs is not None:
+    for stage in config["stages"]:
+        stage["max_num_seqs"] = seqs
 for stage in config["platforms"]["npu"]["stages"]:
-    stage["max_num_seqs"] = seqs
+    if seqs is not None:
+        stage["max_num_seqs"] = seqs
     if stage["stage_id"] == 0:
         stage["speculative_config"]["model"] = str(draft)
 (runtime / "deploy.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
