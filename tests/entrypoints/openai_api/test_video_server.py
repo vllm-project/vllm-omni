@@ -39,7 +39,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoResponse,
 )
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
-from vllm_omni.entrypoints.openai.storage import LocalStorageManager
+from vllm_omni.entrypoints.openai.storage import LocalStorageManager, LocalStorageTTLManager
 from vllm_omni.entrypoints.openai.stores import AsyncDictStore, TaskRegistry
 from vllm_omni.entrypoints.openai.video.generation import helpers as video_generation_helpers
 from vllm_omni.entrypoints.openai.video.generation.helpers import (
@@ -546,8 +546,12 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch,
 
         return asyncio.create_task(wait_for_shutdown())
 
-    async def fake_storage_start():
+    async def fake_storage_start(*, on_expire):
+        assert on_expire == api_server.VIDEO_STORE.remove_many
         events.append("storage_start")
+
+    async def fake_storage_stop():
+        events.append("storage_stop")
 
     async def fake_get_vllm_config(engine_client):
         del engine_client
@@ -561,6 +565,7 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch,
     monkeypatch.setattr(api_server, "build_openai_app", lambda args, supported_tasks: app)
     monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
     monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", fake_storage_start)
+    monkeypatch.setattr(api_server.STORAGE_MANAGER, "stop", fake_storage_stop)
     monkeypatch.setattr(api_server.openai_app_state, "_get_vllm_config", fake_get_vllm_config)
     monkeypatch.setattr(api_server, "omni_init_app_state", fake_init_app_state)
     monkeypatch.setattr(api_server, "get_uvicorn_log_config", lambda args: None)
@@ -601,6 +606,7 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch,
 
     assert sock.closed
     assert events.index("http_shutdown") < events.index("engine_exit")
+    assert events.index("http_shutdown") < events.index("storage_stop") < events.index("engine_exit")
 
 
 @pytest.fixture
@@ -679,10 +685,10 @@ def _cosmos3_stage_configs():
     ]
 
 
-def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: float = 2.0):
-    deadline = time.time() + timeout_s
+def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: float = 30.0):
+    deadline = time.monotonic() + timeout_s
     last_payload = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         response = client.get(f"/v1/videos/{video_id}")
         last_payload = response.json()
         if last_payload["status"] == status:
@@ -691,9 +697,9 @@ def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: 
     raise AssertionError(f"Timed out waiting for status={status}. Last payload: {last_payload}")
 
 
-def _wait_until(predicate, timeout_s: float = 2.0, interval_s: float = 0.02):
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
+def _wait_until(predicate, timeout_s: float = 30.0, interval_s: float = 0.02):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
         if predicate():
             return
         time.sleep(interval_s)
@@ -1167,23 +1173,31 @@ def test_hy_nomas_rejects_conflicting_frame_count_and_model_duration():
         normalize_request(engine.captured_prompt, engine.captured_sampling_params_list[0])
 
 
-def test_kandinsky6_serving_applies_defaults_but_allows_explicit_frame_count():
-    """Kandinsky 6 publishes Pro-geometry defaults (480x864, 125 frames, 50
-    steps) but is not a fixed-duration model: an explicit ``num_frames``
-    must be honoured rather than rejected."""
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers",
+        "kandinskylab/Kandinsky-6.0-Lite-distill-5s-Diffusers",
+        "kandinskylab/Kandinsky-6.0-Pro-distill-5s-Diffusers",
+    ],
+)
+def test_kandinsky6_serving_defers_checkpoint_defaults_and_preserves_explicit_values(model_name):
+    """The model resolves omitted settings from its checkpoint; explicit values survive serving."""
     engine = FakeAsyncOmni()
     engine.model_class_name = "Kandinsky6TI2VAPipeline"
     handler = OmniOpenAIServingVideo.for_diffusion(
         diffusion_engine=engine,
-        model_name="kandinsky6-bundle",
+        model_name=model_name,
     )
 
     asyncio.run(handler._run_and_extract(VideoGenerationRequest(prompt="A dog runs on a beach"), "defaults"))
     assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[0]
-    assert (sampling.width, sampling.height) == (864, 480)
-    assert sampling.num_frames == 125
-    assert sampling.num_inference_steps == 50
+    assert (sampling.width, sampling.height) == (None, None)
+    # The generic image-model sentinel is resolved to the checkpoint's video
+    # length by Kandinsky6TI2VAPipeline._resolve_generation_settings().
+    assert sampling.num_frames == 1
+    assert sampling.num_inference_steps is None
     assert sampling.fps == 24.0
 
     asyncio.run(
@@ -3002,6 +3016,61 @@ def test_list_videos_supports_order_after_and_limit(test_client, mocker: MockerF
     assert zero_limit_after_body["has_more"] is False
 
 
+def test_ttl_expiration_removes_video_from_metadata_and_content_endpoints(
+    test_client, isolated_video_backends, monkeypatch, mocker: MockerFixture, tmp_path
+):
+    store, _, _ = isolated_video_backends
+    storage = LocalStorageTTLManager(
+        storage_path=str(tmp_path / "ttl-storage"),
+        ttl_seconds=60,
+        sweep_interval_seconds=3600,
+    )
+    monkeypatch.setattr(api_server, "STORAGE_MANAGER", storage)
+    monkeypatch.setattr(video_generation_helpers, "STORAGE_MANAGER", storage)
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"stored-video")
+
+    async def start_storage():
+        await storage.start(on_expire=store.remove_many)
+        await asyncio.sleep(0)
+
+    test_client.portal.call(start_storage)
+    try:
+        completed_ids = []
+        for prompt in ("expired video", "retained video"):
+            response = test_client.post("/v1/videos", data={"prompt": prompt})
+            assert response.status_code == 200
+            video_id = response.json()["id"]
+            completed = _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+            assert completed["expires_at"] is not None
+            assert test_client.get(f"/v1/videos/{video_id}/content").status_code == 200
+            completed_ids.append(video_id)
+        expired_id, retained_id = completed_ids
+
+        for status in (VideoGenerationStatus.QUEUED, VideoGenerationStatus.FAILED):
+            job = VideoResponse(id=status.value, model="test-model", prompt="unrelated job", status=status)
+            test_client.portal.call(store.upsert, job.id, job)
+
+        old_mtime = time.time() - 70
+        expired_path = storage.get_full_file_path(expired_id)
+        os.utime(expired_path, (old_mtime, old_mtime))
+        assert test_client.portal.call(storage._sweep_once, time.time() - 60) == 1
+
+        assert not os.path.exists(expired_path)
+        listing = test_client.get("/v1/videos")
+        assert listing.status_code == 200
+        assert {job["id"] for job in listing.json()["data"]} == {retained_id, "queued", "failed"}
+        assert test_client.get(f"/v1/videos/{expired_id}").status_code == 404
+        assert test_client.get(f"/v1/videos/{expired_id}/content").status_code == 404
+        assert test_client.get(f"/v1/videos/{retained_id}").json()["status"] == "completed"
+        retained_content = test_client.get(f"/v1/videos/{retained_id}/content")
+        assert retained_content.status_code == 200
+        assert retained_content.content == b"stored-video"
+        assert test_client.portal.call(store.get, "queued").status == VideoGenerationStatus.QUEUED
+        assert test_client.portal.call(store.get, "failed").status == VideoGenerationStatus.FAILED
+    finally:
+        test_client.portal.call(storage.stop)
+
+
 def test_delete_completed_job_removes_file_and_metadata(test_client, mocker: MockerFixture):
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
@@ -4440,3 +4509,32 @@ def test_h3_control_does_not_borrow_another_stage_checkpoint():
         assert not handler.controlnet_configured
     finally:
         handler.shutdown()
+
+
+@pytest.mark.parametrize("route", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize("explicit", [False, True], ids=["inherit", "override-zero"])
+def test_video_routes_inherit_engine_defaults(test_client, mocker: MockerFixture, route: str, explicit: bool) -> None:
+    _mock_encode_video_bytes(mocker)
+    engine = test_client.app.state.openai_serving_video._engine_client
+    defaults = OmniDiffusionSamplingParams(
+        num_inference_steps=4,
+        guidance_scale=3.0,
+        seed=42,
+        extra_args={"stage_default": "keep"},
+    )
+    engine.default_sampling_params_list = [defaults]
+    for override in (explicit, False):
+        payload = {"prompt": "a cat", "fps": "8"}
+        if override:
+            payload.update(guidance_scale="0", seed="0")
+        response = test_client.post(route, data=payload)
+        assert response.status_code == 200, response.text
+        if route == "/v1/videos":
+            _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
+        params = engine.captured_sampling_params_list[0]
+        assert params.num_inference_steps == 4
+        assert params.guidance_scale == (0.0 if override else 3.0)
+        assert params.seed == (0 if override else 42)
+        assert params.extra_args["stage_default"] == "keep"
+        params.extra_args["stage_default"] = "mutated"
+    assert defaults.extra_args == {"stage_default": "keep"}

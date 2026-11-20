@@ -40,6 +40,23 @@ class YuE2TextTokenizer:
             special_tokens={s: i + len(ranks) for i, s in enumerate(specials)},
         )
 
+    @classmethod
+    def from_pretrained(
+        cls,
+        model: str | Path,
+        *,
+        revision: str | None = None,
+        cache_dir: str | Path | None = None,
+        token: str | bool | None = None,
+    ) -> YuE2TextTokenizer:
+        """Resolve checkpoint BPE from a local directory or the standard HF cache."""
+        from transformers.utils.hub import cached_file
+
+        path = cached_file(str(model), "qwen.tiktoken", revision=revision, cache_dir=cache_dir, token=token)
+        if path is None:
+            raise FileNotFoundError(f"Missing qwen.tiktoken in {model}")
+        return cls(path)
+
     def encode(self, text):
         return self._enc.encode_ordinary(unicodedata.normalize("NFC", text))
 

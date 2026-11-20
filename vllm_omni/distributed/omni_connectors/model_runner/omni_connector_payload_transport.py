@@ -11,13 +11,14 @@ import os
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
+from copy import copy
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.distributed.parallel_state import get_tp_group
 
-from vllm_omni.data_entry_keys import OmniPayload, returns_stage_payload
+from vllm_omni.data_entry_keys import OmniPayload, OmniPayloadStruct, returns_stage_payload, to_dict
 from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime import (
     _OmniConnectorRuntimeMixin,
     logger,
@@ -691,17 +692,77 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         )
         return self._full_payload_replace_keys_cached
 
+    def _full_payload_token_ends_map(self) -> dict[str, dict[str, int]]:
+        ends = getattr(self, "_full_payload_token_ends", None)
+        if ends is None:
+            ends = {}
+            self._full_payload_token_ends = ends
+        return ends
+
+    def _drop_full_payload_token_end(self, req_id: str) -> None:
+        ends = getattr(self, "_full_payload_token_ends", None)
+        if ends is not None:
+            ends.pop(req_id, None)
+
+    def _reconcile_full_payload_output(
+        self,
+        req_id: str,
+        output: dict[str, Any],
+        token_range: tuple[int, int],
+        replace_keys: frozenset[str],
+        prefix_cache_keys: frozenset[str],
+    ) -> dict[str, Any]:
+        """Keep previously emitted positions when an AR step replays a prefix."""
+        start, end = token_range
+        token_ends = self._full_payload_token_ends_map().setdefault(req_id, {})
+        reconciled: dict[str, Any] = {}
+        for key, value in output.items():
+            if value is None:
+                continue
+            previous_end = token_ends.get(key)
+            if previous_end is not None:
+                if end <= previous_end:
+                    continue
+                if _is_full_payload_row_tensor(key, value) and key not in replace_keys:
+                    num_rows = int(value.shape[0])
+                    # Only cache-merged token-aligned tensors carry rows before this step.
+                    row_start = end - num_rows if key in prefix_cache_keys else start
+                    overlap = previous_end - row_start
+                    if overlap > 0:
+                        if num_rows != end - row_start:
+                            raise ValueError(
+                                f"Cannot reconcile replayed full payload {key!r} for {req_id!r}: "
+                                f"{num_rows} rows do not align with token range [{row_start}, {end})."
+                            )
+                        # Drop the replayed prefix so the accumulator retains only the new suffix.
+                        value = value[overlap:].clone()
+            reconciled[key] = value
+        token_ends.update({key: end for key in reconciled})
+        return reconciled
+
     def accumulate_full_payload_output(
         self,
         req_id: str,
         pooler_output: Any,
         request: Any,
+        *,
+        token_range: tuple[int, int] | None = None,
+        prefix_cache_keys: frozenset[str] = frozenset(),
     ) -> None:
         """Accumulate pooler_output for a request across steps (full_payload_mode).
 
         Per-token tensors (2-D+, matching trailing dims) and the 1-D codec
         validity mask are concatenated along dim-0. Scalar / global tensors
         are replaced with the latest value.
+
+        AR callers provide the executed input-token range [start, end).
+        ``prefix_cache_keys`` identifies token-aligned tensors that the prefix
+        cache merged, which may include rows before this step. Previously
+        emitted positions survive preemption: replayed prefixes are skipped
+        and only a new suffix is appended. A partially overlapping
+        non-token-aligned tensor raises, because its rows cannot be sliced by
+        token position. One-shot generation outputs omit ``token_range`` and
+        keep the append/replace policy below.
 
         Note: codec rows are NOT filtered for zero placeholders here. The
         downstream consumer ``_extract_qwen3_full_payload_codec_rows`` crops
@@ -715,6 +776,14 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         """
         replace_keys = self._resolve_full_payload_replace_keys()
         existing = self._pending_full_payload_send.get(req_id)
+        if token_range is not None:
+            if existing is None:
+                self._drop_full_payload_token_end(req_id)
+            pooler_output = self._reconcile_full_payload_output(
+                req_id, pooler_output, token_range, replace_keys, prefix_cache_keys
+            )
+            if not pooler_output:
+                return
 
         if existing is None:
             chunks, latest, rows = self._new_full_payload_accumulator(pooler_output)
@@ -757,8 +826,13 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
         self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
 
-    def flush_full_payload_outputs(self, finished_req_ids: set[str]) -> None:
-        """Send accumulated full_payload outputs for requests that just finished."""
+    def flush_full_payload_outputs(
+        self,
+        finished_req_ids: set[str],
+        *,
+        finished_req_output_token_ids: Mapping[str, list[int]] | None = None,
+    ) -> None:
+        """Send accumulated full-payload outputs for finished requests."""
         pending_req_ids = set(self._pending_full_payload_send.keys())
         if not (finished_req_ids & pending_req_ids):
             return
@@ -772,8 +846,16 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         to_send: dict[str, tuple[Any, Any]] = {}
         for req_id in finished_req_ids:
             entry = self._pending_full_payload_send.pop(req_id, None)
+            self._drop_full_payload_token_end(req_id)
             if entry is not None:
-                to_send[req_id] = self._materialize_full_payload_entry(entry)
+                output, request = self._materialize_full_payload_entry(entry)
+                if finished_req_output_token_ids is not None and req_id in finished_req_output_token_ids:
+                    # Give the processor authoritative terminal IDs without
+                    # modifying the runner's live cached request or its lists.
+                    request = copy(request)
+                    request.output_token_ids = list(finished_req_output_token_ids[req_id])
+                    request.all_token_ids = list(request.prompt_token_ids or []) + request.output_token_ids
+                to_send[req_id] = (output, request)
         logger.debug("[Stage-%s] flush_full_payload_outputs: to_send=%s", self._stage_id, list(to_send.keys()))
         if to_send:
             self.send_full_payload_outputs(scheduler_output=None, outputs=to_send)
@@ -1558,7 +1640,10 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
     def _drain_omni_connector_output(self) -> OmniConnectorOutput:
         tp_group = self._get_local_tp_group()
-        if self._async_chunk and tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
+        # Stage zero has no upstream payload to fan out. In MRv2 its output
+        # is materialized only on the reply rank, so a receive-side collective
+        # here has no matching reader and eventually fills the TP SHM ring.
+        if self._stage_id > 0 and self._async_chunk and tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
             if self.is_data_transfer_rank():
                 with self._lock:
                     fanout_packet = self._collect_async_chunk_fanout_packet_locked()
@@ -1723,6 +1808,14 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         emitted = 0
         completions: list[Any] = []
         for request, payload in entries:
+            # Read only the tag frozen with this output, not a request buffer
+            # that may already describe the next chunk. Builders can reuse
+            # payloads, so keep request-specific metadata off shared objects.
+            perf_chunk = getattr(request, "_omni_duplex_perf_chunk", None)
+            if perf_chunk is not None:
+                if isinstance(payload, OmniPayloadStruct):
+                    payload = to_dict(payload)
+                payload = {**payload, "meta": {**(payload.get("meta") or {}), "duplex_perf_chunk": list(perf_chunk)}}
             enqueued, completion = self._enqueue_chunk_payload(request, payload, wait_for_delivery=wait_for_delivery)
             if enqueued:
                 emitted += 1

@@ -1,0 +1,3 @@
+# LFM3-Audio-2B text-output profile (ASR and audio understanding), no codec stage.
+base_config: lfm3_omni_text.yaml
+pipeline: lfm3_audio_text

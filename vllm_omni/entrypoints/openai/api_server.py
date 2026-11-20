@@ -20,7 +20,7 @@ import socket
 import time
 from argparse import Namespace
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, suppress
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from http import HTTPStatus
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -80,6 +80,7 @@ from vllm.entrypoints.speech_to_text.transcription.serving import (
 from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
 )
+from vllm.exceptions import VLLMClientError
 from vllm.logger import configure_logging_from_args, init_logger
 from vllm.renderers.chat_utils import ChatTemplateConfig, load_chat_template
 from vllm.renderers.online_derenderer import OnlineDerenderer
@@ -123,7 +124,6 @@ from vllm_omni.entrypoints.openai.chat_template import _load_model_chat_template
 from vllm_omni.entrypoints.openai.diffusion import (
     MAX_UINT32_SEED,
     _generate_with_async_omni,
-    apply_stage_default_sampling_params,
 )
 from vllm_omni.entrypoints.openai.errors import (
     InvalidPresetVoiceReferenceError,
@@ -151,7 +151,7 @@ from vllm_omni.entrypoints.openai.images.helpers import (
     _supports_segmentation,
     _update_if_not_none,
 )
-from vllm_omni.entrypoints.openai.lora import _get_lora_from_json_str, _parse_lora_request
+from vllm_omni.entrypoints.openai.lora import _get_lora_from_json_str, _parse_lora_requests
 from vllm_omni.entrypoints.openai.models import serving as openai_models_serving
 from vllm_omni.entrypoints.openai.protocol.audio import (
     BatchSpeechRequest,
@@ -200,6 +200,10 @@ from vllm_omni.entrypoints.openai.serving_video import (
 )
 from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler
 from vllm_omni.entrypoints.openai.serving_video_stream import create_streaming_video_handler
+from vllm_omni.entrypoints.openai.stage_params import (
+    get_default_sampling_params_list,
+    resolve_diffusion_sampling_params,
+)
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, FileStorageHandle
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type
@@ -404,11 +408,17 @@ async def omni_run_server_worker(
     log_config = get_uvicorn_log_config(args)
     if log_config is not None:
         uvicorn_kwargs["log_config"] = log_config
+    if getattr(args, "disable_websocket_compression", False):
+        uvicorn_kwargs["ws_per_message_deflate"] = False
 
-    async with build_async_omni(
-        args,
-        client_config=client_config,
-    ) as engine_client:
+    async with (
+        build_async_omni(
+            args,
+            client_config=client_config,
+        ) as engine_client,
+        AsyncExitStack() as server_lifecycle,
+    ):
+        server_lifecycle.callback(sock.close)
         supported_tasks: tuple[str, ...]
         if hasattr(engine_client, "get_supported_tasks"):
             supported_tasks = tuple(await engine_client.get_supported_tasks())
@@ -469,6 +479,18 @@ async def omni_run_server_worker(
 
         await omni_init_app_state(engine_client, app.state, args)
 
+        # Complete the configured video request before serve_http can expose
+        # /health or admit user traffic. Failure unwinds the engine context.
+        video_warmup_request = getattr(args, "video_output_warmup", None)
+        if video_warmup_request is not None:
+            video_output_handler = getattr(app.state, "openai_streaming_video_output", None)
+            if video_output_handler is None:
+                raise ValueError("--video-output-warmup requires a streaming video output handler")
+            await video_output_handler.warmup(
+                video_warmup_request,
+                timeout=getattr(args, "video_output_warmup_timeout", 180.0),
+            )
+
         # The inherited routes assume a tokenization handler. Pure diffusion
         # has none; omit those capabilities instead of dereferencing None.
         if getattr(app.state, "serving_tokenization", None) is None:
@@ -486,7 +508,8 @@ async def omni_run_server_worker(
         shutdown_unsupported_routes(app, run_endpoint_restrictions())
 
         # Start background processes
-        await STORAGE_MANAGER.start()
+        await STORAGE_MANAGER.start(on_expire=VIDEO_STORE.remove_many)
+        server_lifecycle.push_async_callback(STORAGE_MANAGER.stop)
 
         # Conditionally register profiler endpoints based on stage YAML configs
         stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
@@ -517,7 +540,7 @@ async def omni_run_server_worker(
         is_pure_diffusion = vllm_config is None
         if is_pure_diffusion:
             logger.info(
-                "Starting vLLM API server (pure diffusion mode) on %s",
+                "Starting vLLM API server without a frontend LLM configuration on %s",
                 listen_address,
             )
             # The vLLM 0.27 launcher's shutdown path reads
@@ -610,7 +633,6 @@ async def omni_run_server_worker(
             serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
             if serving_speech is not None:
                 serving_speech.shutdown()
-            sock.close()
 
 
 @asynccontextmanager
@@ -753,9 +775,14 @@ async def build_async_omni_from_stage_config(
             kwargs.setdefault("log_stats", True)
         if client_config is not None:
             kwargs["client_config"] = client_config
+        backend_as_process = kwargs.pop("duplex_engine_backend_as_process", False)
         if _should_serve_duplex(model, kwargs):
+            if backend_as_process:
+                kwargs["duplex_engine_backend_as_process"] = True
             async_omni = DuplexOmni(model=model, **kwargs)
         else:
+            if backend_as_process:
+                raise ValueError("--duplex-engine-backend-as-process requires a session_mode: duplex deployment")
             async_omni = AsyncOmni(model=model, **kwargs)
 
         # # Don't keep the dummy data in memory
@@ -764,7 +791,10 @@ async def build_async_omni_from_stage_config(
         yield async_omni
     finally:
         if async_omni:
-            async_omni.shutdown()
+            if isinstance(async_omni, DuplexOmni) and backend_as_process:
+                await async_omni.aclose()
+            else:
+                async_omni.shutdown()
 
 
 async def _init_duplex_app_state(
@@ -778,11 +808,14 @@ async def _init_duplex_app_state(
     """Minimal app state for a duplex server: only the surfaces a duplex session backs."""
     state.vllm_config = vllm_config
     state.diffusion_engine = None
-    state.openai_serving_models = OpenAIServingModels(
-        engine_client=engine_client,  # type: ignore[arg-type]
-        base_model_paths=base_model_paths,
-        lora_modules=None,
-    )
+    if engine_client.session_only:
+        state.openai_serving_models = openai_models_serving.SessionServingModels(base_model_paths)
+    else:
+        state.openai_serving_models = OpenAIServingModels(
+            engine_client=engine_client,  # type: ignore[arg-type]
+            base_model_paths=base_model_paths,
+            lora_modules=None,
+        )
     state.serving_tokenization = None
     state.serving_tokens = None
     # Replaced by the chat init below when the model serves chat.
@@ -843,7 +876,7 @@ async def _init_duplex_chat(
     answering badly. ``endpoint_restrictions`` remains the per-deployment
     opt-out on top of this.
     """
-    if not engine_client.duplex_capabilities.supports_chat_completions:
+    if engine_client.session_only or not engine_client.duplex_capabilities.supports_chat_completions:
         return None
     supported_tasks: set[str] = {"generate"}
     if hasattr(engine_client, "get_supported_tasks"):
@@ -860,6 +893,10 @@ async def _init_duplex_chat(
 
 async def _resolve_chat_template(engine_client: EngineClient, args: Namespace) -> str | None:
     resolved_chat_template = load_chat_template(args.chat_template)
+    if resolved_chat_template is None:
+        # Reuse the selected topology, including deploy-config overrides.
+        pipeline = getattr(getattr(engine_client, "engine", None), "pipeline_config", None)
+        resolved_chat_template = getattr(pipeline, "chat_template", None)
     if resolved_chat_template is None:
         try:
             tokenizer = await engine_client.get_tokenizer()
@@ -1623,7 +1660,7 @@ async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request)
         return JSONResponse(content=result.model_dump(exclude_none=True))
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
-    except ValueError as e:
+    except (ValueError, VLLMClientError) as e:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
@@ -2207,6 +2244,22 @@ def _build_image_response_metrics(
     return metrics
 
 
+def _image_json_response(response: Any) -> Any:
+    """Serialize an image response with orjson.
+
+    Image responses carry multi-megabyte base64 strings, which the default
+    FastAPI JSON path (``json.dumps``) serializes several times slower. The
+    JSON document is the same; streaming responses pass through unchanged.
+    """
+    if not isinstance(response, ImageGenerationResponse):
+        return response
+    try:
+        import orjson
+    except ImportError:
+        return response
+    return Response(content=orjson.dumps(response.model_dump(mode="json")), media_type="application/json")
+
+
 def _build_image_generation_response(
     *,
     images: list[Image.Image],
@@ -2302,10 +2355,9 @@ async def generate_images(
                     detail="openai_serving_chat is not initialized for multi-stage image generation.",
                 )
 
-            effective_seed = request.seed if request.seed is not None else random.randint(0, MAX_UINT32_SEED)
             extra_body: dict[str, Any] = {
-                "seed": effective_seed,
-                "num_outputs_per_prompt": request.n,
+                **({"seed": request.seed} if request.seed is not None else {}),
+                **({"num_outputs_per_prompt": request.n} if "n" in request.model_fields_set else {}),
             }
             if request.size is not None:
                 width, height = parse_size(request.size)
@@ -2333,7 +2385,7 @@ async def generate_images(
                 extra_body["generator_device"] = request.generator_device
             if request.lora is not None:
                 # Keep /images validation semantics: invalid LoRA should fail with 400.
-                _parse_lora_request(request.lora)
+                _parse_lora_requests(request.lora)
                 extra_body["lora"] = request.lora
             if request.bot_task is not None:
                 extra_body["bot_task"] = request.bot_task
@@ -2371,8 +2423,10 @@ async def generate_images(
         prompt = OmniTextPrompt(prompt=request.prompt, modalities=["image"])
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
-        gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)
-        extra_args = dict(request.extra_params or {})
+        gen_params = resolve_diffusion_sampling_params(get_default_sampling_params_list(engine_client))
+        if "n" in request.model_fields_set:
+            gen_params.num_outputs_per_prompt = request.n
+        extra_args = {**gen_params.extra_args, **(request.extra_params or {})}
         if request.use_system_prompt is not None:
             extra_args["use_system_prompt"] = request.use_system_prompt
         if request.system_prompt is not None:
@@ -2390,9 +2444,9 @@ async def generate_images(
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
-        lora_request, lora_scale = _parse_lora_request(request.lora) if request.lora is not None else (None, None)
-        _update_if_not_none(gen_params, "lora_request", lora_request)
-        _update_if_not_none(gen_params, "lora_scale", lora_scale)
+        lora_requests, lora_scales = _parse_lora_requests(request.lora)
+        _update_if_not_none(gen_params, "lora_request", lora_requests)
+        _update_if_not_none(gen_params, "lora_scale", lora_scales)
 
         # Parse and add size if provided
         if request.size:
@@ -2423,13 +2477,12 @@ async def generate_images(
         _update_if_not_none(gen_params, "true_cfg_scale", request.true_cfg_scale)
         # Whitelisted per-request sampling grid (e.g. QwenImage21Pipeline's sigmas).
         _update_if_not_none(gen_params, "sigmas", (request.model_extra or {}).get("sigmas"))
-        # If seed is not provided, generate a random one to ensure
-        # a proper generator is initialized in the backend.
-        # This fixes issues where using the default global generator
-        # might produce blurry images in some environments.
-        _update_if_not_none(
-            gen_params, "seed", request.seed if request.seed is not None else random.randint(0, MAX_UINT32_SEED)
-        )
+        # Image modality on video pipelines (e.g. LingBot T2I) may need num_frames=1.
+        _update_if_not_none(gen_params, "num_frames", (request.model_extra or {}).get("num_frames"))
+        if request.seed is not None:
+            gen_params.seed = request.seed
+        elif gen_params.seed is None:
+            gen_params.seed = random.randint(0, MAX_UINT32_SEED)
         _update_if_not_none(gen_params, "generator_device", request.generator_device)
         _update_if_not_none(gen_params, "layers", request.layers)
 
@@ -2462,12 +2515,14 @@ async def generate_images(
         stage_durations = getattr(result, "stage_durations", None)
         peak_memory_mb = getattr(result, "peak_memory_mb", None)
         response_metrics = getattr(result, "metrics", None) if request.return_stage_metrics else None
-        return _build_image_generation_response(
-            images=images,
-            request=request,
-            stage_durations=stage_durations,
-            peak_memory_mb=peak_memory_mb,
-            response_metrics=response_metrics,
+        return _image_json_response(
+            _build_image_generation_response(
+                images=images,
+                request=request,
+                stage_durations=stage_durations,
+                peak_memory_mb=peak_memory_mb,
+                response_metrics=response_metrics,
+            )
         )
 
     except (EngineGenerateError, EngineDeadError) as exc:
@@ -2506,7 +2561,7 @@ async def edit_images(
     url_array: list[str] | None = Form(None, alias="url[]"),
     prompt: str = Form(...),
     model: str | None = Form(None),
-    n: int = Form(1),
+    n: int | None = Form(None),
     size: str = Form("auto"),
     response_format: str = Form("b64_json"),
     output_format: str | None = Form("png"),
@@ -2611,32 +2666,19 @@ async def edit_images(
             loaded = await _load_input_images([reference_image], normalize_rgb=normalize_edit_images_rgb)
             omni_prompt["multi_modal_data"]["reference_image"] = loaded[0]
 
-        # 3 Build sample params
-        gen_params = OmniDiffusionSamplingParams()
-        # 3.0 Init with system default values
-        app_state_args = getattr(raw_request.app.state, "args", None)
-        default_sample_param = getattr(app_state_args, "default_sampling_params", None)
-        # Image edits (img2img) remain gated to classical diffusion stages;
-        # MammothModa2 is rejected at route level by its pipeline's endpoint
-        # restrictions (test_mammoth_moda2_shared_runtime.py).
-        image_stage_ids = [i for i, cfg in enumerate(stage_configs) if get_stage_type(cfg) == "diffusion"]
-        if not image_stage_ids:
+        if not any(get_stage_type(cfg) == "diffusion" for cfg in stage_configs):
             raise HTTPException(
                 status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
                 detail="No diffusion stage found in multi-stage pipeline.",
             )
-        image_stage_id = image_stage_ids[0]
-        apply_stage_default_sampling_params(
-            default_sample_param,
-            gen_params,
-            str(image_stage_id),
-        )
+        gen_params = resolve_diffusion_sampling_params(get_default_sampling_params_list(engine_client))
+        app_state_args = getattr(raw_request.app.state, "args", None)
         _update_if_not_none(gen_params, "num_outputs_per_prompt", n)
         # 3.1 Parse per-request LoRA (compatible with chat's extra_body.lora shape).
         lora_dict = _get_lora_from_json_str(lora)
-        lora_request, lora_scale = _parse_lora_request(lora_dict)
-        _update_if_not_none(gen_params, "lora_request", lora_request)
-        _update_if_not_none(gen_params, "lora_scale", lora_scale)
+        lora_requests, lora_scales = _parse_lora_requests(lora_dict)
+        _update_if_not_none(gen_params, "lora_request", lora_requests)
+        _update_if_not_none(gen_params, "lora_scale", lora_scales)
         # 3.2 Validate resolution if provided
         if resolution is not None and resolution not in SUPPORTED_LAYERED_RESOLUTIONS:
             raise HTTPException(
@@ -2700,7 +2742,10 @@ async def edit_images(
         # a proper generator is initialized in the backend.
         # This fixes issues where using the default global generator
         # might produce blurry images in some environments.
-        _update_if_not_none(gen_params, "seed", seed if seed is not None else random.randint(0, MAX_UINT32_SEED))
+        if seed is not None:
+            gen_params.seed = seed
+        elif gen_params.seed is None:
+            gen_params.seed = random.randint(0, MAX_UINT32_SEED)
         _update_if_not_none(gen_params, "generator_device", generator_device)
         _update_if_not_none(gen_params, "layers", layers)
         _update_if_not_none(gen_params, "resolution", resolution)
@@ -2741,10 +2786,9 @@ async def edit_images(
                 _img.save(buf, format="PNG")
                 ref_b64_list.append(base64.b64encode(buf.getvalue()).decode())
 
-            effective_seed = seed if seed is not None else random.randint(0, MAX_UINT32_SEED)
             extra_body: dict[str, Any] = {
-                "seed": effective_seed,
-                "num_outputs_per_prompt": n,
+                **({"seed": seed} if seed is not None else {}),
+                **({"num_outputs_per_prompt": n} if n is not None else {}),
             }
             # size="auto" resolves width/height from input image; forwarding
             # those would override AR-driven `<img_ratio_*>` token selection.
@@ -2772,7 +2816,7 @@ async def edit_images(
             if lora is not None:
                 # Validate LoRA, then pass through.
                 lora_dict = _get_lora_from_json_str(lora)
-                _parse_lora_request(lora_dict)
+                _parse_lora_requests(lora_dict)
                 extra_body["lora"] = lora_dict
             if bot_task is not None:
                 extra_body["bot_task"] = bot_task
@@ -2837,17 +2881,19 @@ async def edit_images(
             for img in images
         ]
 
-        return ImageGenerationResponse(
-            created=int(time.time()),
-            data=image_data,
-            output_format=output_format,
-            size=_generated_size_str(images, size_str),
-            cot_output=cot_output,
-            metrics=_build_image_response_metrics(
-                response_metrics=response_metrics,
-                stage_durations=stage_durations,
-                peak_memory_mb=peak_memory_mb,
-            ),
+        return _image_json_response(
+            ImageGenerationResponse(
+                created=int(time.time()),
+                data=image_data,
+                output_format=output_format,
+                size=_generated_size_str(images, size_str),
+                cot_output=cot_output,
+                metrics=_build_image_response_metrics(
+                    response_metrics=response_metrics,
+                    stage_durations=stage_durations,
+                    peak_memory_mb=peak_memory_mb,
+                ),
+            )
         )
 
     except (EngineGenerateError, EngineDeadError) as exc:
