@@ -137,7 +137,15 @@ def _assert_valid_inference(client, server, module):
             response = client.send_audio_generate_http_request({"json": body, "timeout": 180})[0]
         else:
             assert model_id == "Qwen/Qwen3-TTS-12Hz-0.6B-Base", f"Unexpected speech deployment: {model}"
-            body.update(ref_audio=module.REF_AUDIO_URL, ref_text=module.REF_TEXT, voice="clone", language="English")
+            # Leave room for Base to emit EOS even when the short probe text
+            # would select the minimum automatic codec budget.
+            body.update(
+                ref_audio=module.REF_AUDIO_URL,
+                ref_text=module.REF_TEXT,
+                voice="clone",
+                language="English",
+                max_new_tokens=2048,
+            )
             response = client.send_audio_speech_http_request({"json": body, "timeout": 180})[0]
         assert response.status_code == 200, response.error_message
         with wave.open(BytesIO(response.content), "rb") as audio:
