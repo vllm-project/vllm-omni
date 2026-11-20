@@ -311,7 +311,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self._window_policy is not None and request.request_id not in self.requests:
             if retired := self._window_policy.superseded_by(request, self.requests):
                 self.finish_requests(retired, RequestStatus.FINISHED_ABORTED)
-            self._window_policy.prepare_admission(request, self.max_model_len)
+            max_prompt_len = self.max_model_len - self._streaming_sample_room()
+            required = self._window_policy.prepare_admission(request, max_prompt_len)
+            if required is not None:
+                self._record_context_overflow(request, required, self.max_model_len)
+                return
         super().add_request(request)
 
     def release_overflowed_requests(self, request_ids: Iterable[str]) -> None:
@@ -2201,15 +2205,29 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Room for the tokens one step samples on top of the prompt (1 without
         # speculative decoding). __new__-built test schedulers carry no
         # num_sampled_tokens_per_step.
-        sample_room = max(1, int(getattr(self, "num_sampled_tokens_per_step", 1) or 1))
-        if projected + sample_room <= int(max_model_len):
+        if projected + self._streaming_sample_room() <= int(max_model_len):
             return False
+        self._record_context_overflow(session, projected, int(max_model_len))
+        if session.is_finished():
+            # Reached from ``_handle_stopped_request`` with a queued update.
+            # ``update_from_output`` frees every request that call reports as
+            # finished, so finishing the session here too would free it twice.
+            # ``_handle_stopped_request`` below takes it out of admission and
+            # leaves the single free to the caller.
+            return True
+        self.finish_requests((session.request_id,), RequestStatus.FINISHED_ERROR)
+        return True
+
+    def _streaming_sample_room(self) -> int:
+        return max(1, int(getattr(self, "num_sampled_tokens_per_step", 1) or 1))
+
+    def _record_context_overflow(self, session: Request, projected: int, max_model_len: int) -> None:
         reason = (
             f"{self.STREAMING_CONTEXT_OVERFLOW_STOP_REASON}: streaming session prompt would grow to "
             f"{projected} tokens, leaving no room to sample within max_model_len {int(max_model_len)}"
         )
         logger.error(
-            "[Omni] %s: %s; finishing the request instead of extending it",
+            "[Omni] %s: %s; rejecting the streaming prompt",
             session.request_id,
             reason,
         )
@@ -2221,15 +2239,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if overflowed is None:
             overflowed = self._overflowed_streaming_requests = set()
         overflowed.add(session.request_id)
-        if session.is_finished():
-            # Reached from ``_handle_stopped_request`` with a queued update.
-            # ``update_from_output`` frees every request that call reports as
-            # finished, so finishing the session here too would free it twice.
-            # ``_handle_stopped_request`` below takes it out of admission and
-            # leaves the single free to the caller.
-            return True
-        self.finish_requests((session.request_id,), RequestStatus.FINISHED_ERROR)
-        return True
 
     def _handle_stopped_request(self, request: Request) -> bool:
         """Do not resume a session whose queued update overflowed the model.
@@ -2518,7 +2527,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def has_finished_requests(self) -> bool:
         """Check if there are any finished requests (including those needing KV transfer)."""
-        return self._has_pending_kv_work() or super().has_finished_requests()
+        return (
+            bool(getattr(self, "_streaming_context_overflow", None))
+            or self._has_pending_kv_work()
+            or super().has_finished_requests()
+        )
 
     def has_unfinished_requests(self) -> bool:
         """Check if there are any unfinished requests (including those needing KV transfer)."""

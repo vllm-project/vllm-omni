@@ -56,8 +56,15 @@ from vllm_omni.engine.messages import (
     ShutdownRequestMessage,
 )
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState, build_engine_core_request_from_tokens
+from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
 from vllm_omni.engine.stage_pool import StageUnavailableError
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import MiniCPMO45Stage0DuplexRuntime
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+    MiniCPMO45CarriedWindows,
+    MiniCPMO45SchedulerWindowPolicy,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -1583,6 +1590,150 @@ async def test_failed_initial_submit_evicts_session_replica_after_binding_rollba
         assert set(orchestrator.session_manager.runners) == {"healthy"}
         assert not orchestrator.stage_pools[failing_stage].is_replica_available(0)
         assert (failing_stage, 0) in orchestrator.replica_placement.snapshot()["unavailable"]
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+def _enable_managed_windows(orchestrator, mocker):
+    pool = orchestrator.stage_pools[0]
+    pool.stage_vllm_config.model_config.scheduler_window_policy = (
+        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv.MiniCPMO45SchedulerWindowPolicy"
+    )
+    for client in pool.clients:
+        client.resources = SimpleNamespace(engine_manager=object())
+        client.call_utility_async = mocker.AsyncMock()
+    return pool
+
+
+@pytest.mark.asyncio
+async def test_managed_window_follows_cancelled_epoch_and_releases_both_copies(mocker):
+    orchestrator, _, rpc_q, _ = _build(stages=2, replicas=2)
+    pool = _enable_managed_windows(orchestrator, mocker)
+    try:
+        assert (await _open(orchestrator, rpc_q)).ok
+        await _submit(orchestrator, _append_audio())
+        index, owner = orchestrator._window_replicas[SESSION_ID]
+        first = _stage0_request_id()
+        await orchestrator._intercept_stage_output(
+            1, 0, _tts_output(first), orchestrator.request_states[first], None, None
+        )
+        await _settle(orchestrator)
+        session = orchestrator.session_manager.get(SESSION_ID)
+        assert session.active_response_id
+        await _submit(orchestrator, commands.CancelResponse(response_id=session.active_response_id))
+        await _submit(orchestrator, _append_audio())
+        second = _stage0_request_id(1)
+        assert [args[0].request_id for args in owner.add_request_calls] == [first, second]
+        assert all(
+            args[0].model_intermediate_buffer["duplex"]["session_window_owned"] for args in owner.add_request_calls
+        )
+        assert not pool.clients[1 - index].add_request_calls
+
+        policy = MiniCPMO45SchedulerWindowPolicy()
+        policy.carry = MiniCPMO45CarriedWindows()
+        policy.carry.windows.update({SESSION_ID: {}, "sibling": {}})
+        helper = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
+        sibling_req = duplex_resource_request_id(DuplexFence("sibling"), "stage0")
+        helper._replay_sources = {SESSION_ID: first, "sibling": sibling_req}
+        helper._replay_windows = {first: object(), second: object(), sibling_req: object()}
+        helper._handed_window_units = {}
+        helper._carried_window_units = {}
+        model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+        model._minicpmo45_duplex_data_plane_helper = helper
+        worker = SimpleNamespace(model_runner=SimpleNamespace(get_model=lambda: model))
+        core = StageEngineCoreProc.__new__(StageEngineCoreProc)
+        core.scheduler = SimpleNamespace(_window_policy=policy)
+        core.model_executor = SimpleNamespace(collective_rpc=lambda fn, args: [fn(worker, *args)])
+
+        # Replace transport only: dispatch the actual utility method on the core.
+        def utility(method, *args):
+            return getattr(core, method)(*args)
+
+        owner.call_utility_async.side_effect = utility
+        assert (await _close(orchestrator, rpc_q)).ok
+        owner.call_utility_async.assert_any_await("omni_release_session_window", SESSION_ID)
+        assert set(policy.carry.windows) == set(helper._replay_sources) == {"sibling"}
+        assert set(helper._replay_windows) == {sibling_req}
+        assert SESSION_ID not in orchestrator._window_replicas
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_dies", [False, True])
+async def test_managed_window_release_timeout_and_owner_retirement(mocker, monkeypatch, owner_dies):
+    orchestrator, _, rpc_q, _ = _build(replicas=2, runtime_config=_placement_config(replica_groups=[{0: 0}, {0: 1}]))
+    pool = _enable_managed_windows(orchestrator, mocker)
+    ack = asyncio.Event()
+
+    async def delayed_release(method, *args):
+        if method == "omni_release_session_window":
+            await ack.wait()
+
+    try:
+        manager = orchestrator.session_manager
+        assert (await _open(orchestrator, rpc_q)).ok
+        assert (await _open(orchestrator, rpc_q, session_id="healthy")).ok
+        await _submit(orchestrator, _append_audio())
+        await _submit(orchestrator, _append_audio(), session_id="healthy")
+        index, owner = orchestrator._window_replicas[SESSION_ID]
+        owner.call_utility_async.side_effect = delayed_release
+        monkeypatch.setattr(pool, "RELEASE_RPC_TIMEOUT_S", 0.02)
+        assert (await _close(orchestrator, rpc_q)).ok
+        assert SESSION_ID in manager._closing
+        assert SESSION_ID in orchestrator.replica_placement.snapshot()["sessions"]
+        pending = orchestrator._window_releases[SESSION_ID]
+        if owner_dies:
+            await orchestrator._handle_dead_replica(0, index, EngineDeadError("owner died during close"))
+        else:
+            ack.set()
+        await manager.reap_expired()
+        done, _ = await asyncio.wait((pending,), timeout=1)
+        assert pending in done and pending.cancelled() == owner_dies
+        assert SESSION_ID not in manager._closing
+        assert SESSION_ID not in orchestrator._window_releases
+        assert SESSION_ID not in orchestrator._window_replicas
+        assert set(orchestrator.replica_placement.snapshot()["sessions"]) == {"healthy"}
+        assert [call.args for call in owner.call_utility_async.await_args_list].count(
+            ("omni_release_session_window", SESSION_ID)
+        ) == 1
+        await _submit(orchestrator, _append_audio(), session_id="healthy")
+        assert "healthy" in manager.runners
+    finally:
+        ack.set()
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_managed_window_owner_failure_expires_only_its_session(mocker):
+    # Legacy placement has no session reservation to identify the failed owner.
+    orchestrator, _, rpc_q, output_q = _build(replicas=2, runtime_config=DuplexSessionRuntimeConfig(max_sessions=2))
+    pool = _enable_managed_windows(orchestrator, mocker)
+    buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+    try:
+        assert (await _open(orchestrator, rpc_q, output_buffer=buffer)).ok
+        assert (await _open(orchestrator, rpc_q, session_id="healthy")).ok
+        await _submit(orchestrator, _append_audio())
+        await _submit(orchestrator, _append_audio(), session_id="healthy")
+        index, owner = orchestrator._window_replicas[SESSION_ID]
+        healthy_owner = orchestrator._window_replicas["healthy"]
+        assert healthy_owner[0] != index
+        await orchestrator._handle_dead_replica(0, index, EngineDeadError("window owner failed"))
+        await _settle(orchestrator)
+        await orchestrator.session_manager.reap_expired()
+        assert set(orchestrator.session_manager.runners) == {"healthy"}
+        assert orchestrator._window_replicas == {"healthy": healthy_owner}
+        assert not pool.is_replica_available(index)
+        events = [await buffer.get() for _ in range(buffer.pending_events)]
+        while not output_q.empty():
+            message = output_q.get_nowait()
+            if isinstance(message, DuplexSessionEventMessage):
+                events.append(message.event)
+        assert any(event.type == "error" and event.code == "replica_unavailable" for event in events)
+        assert sum(event.type == "session.expired" and event.session_id == SESSION_ID for event in events) == 1
+        assert ("omni_release_session_window", SESSION_ID) not in [
+            call.args for call in owner.call_utility_async.await_args_list
+        ]
     finally:
         await orchestrator.session_manager.shutdown()
 

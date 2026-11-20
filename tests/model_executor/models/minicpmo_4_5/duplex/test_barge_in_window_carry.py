@@ -19,6 +19,8 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.engine import FinishReason
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
@@ -1141,6 +1143,51 @@ def test_first_admission_replays_only_the_accepted_open_input(mode, parked):
     )
     assert [op.kind for op in ops] == ["keep", "restore"]
     assert ops[1].source_request_id == old.request_id
+
+
+@pytest.mark.parametrize("sample_room", [1, 4])
+@pytest.mark.parametrize("excess", [-1, 0, 1, 109])
+def test_full_history_recovery_at_context_limit(mocker, sample_room, excess):
+    sched = _scheduler()
+    source = _stage0_id("full", 0)
+    new = _new_request(_stage0_id("full", 1))
+    first = _first_input(new, "off")
+    new.client_index = 3
+    units = [{"length": 400, "generated_token_ids": []}, {"length": 400, "generated_token_ids": []}]
+    _kept(sched)["full"] = {"source": source, "seq": 5, "previous": [], "units": units, "close_on_next_input": True}
+    projected = new.num_prompt_tokens + 800 + 1
+    sched.num_sampled_tokens_per_step = sample_room
+    sched.max_model_len = projected + sample_room - excess
+    admit = mocker.patch.object(Scheduler, "add_request")
+    sched.add_request(new)
+    if excess <= 0:
+        admit.assert_called_once_with(new)
+        assert first["stage0_window"]["carried_unit_lengths"] == [400, 400]
+        assert new.num_prompt_tokens == projected
+        return
+
+    admit.assert_not_called()
+    assert "stage0_window" not in first
+    assert not _carry(sched).admitted
+    assert _kept(sched)["full"]["units"] == units
+    # A late append with the same ID cannot start from an empty template.
+    sched.add_request(_new_request(new.request_id))
+    admit.assert_not_called()
+    sched.release_overflowed_requests([new.request_id])
+    sched.requests_needing_kv_transfer = sched.active_kv_transfers = sched.waiting_for_transfer_free = set()
+    sched.finished_req_ids = set()
+    sched.connector = sched.ec_connector = None
+    mocker.patch.object(Scheduler, "has_unfinished_requests", return_value=False)
+    assert sched.has_requests()
+    outputs = {}
+    sched._emit_streaming_context_overflow_outputs(outputs)
+    sched._emit_streaming_context_overflow_outputs(outputs)
+    (error,) = outputs[3]
+    assert error.request_id == new.request_id and error.finish_reason == FinishReason.ERROR
+    assert not error.is_segment_finished
+    assert error.stop_reason.startswith("context_length_exceeded:")
+    assert str(projected) in error.stop_reason
+    assert not sched.has_requests()
 
 
 def test_window_survives_idle_until_session_release(monkeypatch):

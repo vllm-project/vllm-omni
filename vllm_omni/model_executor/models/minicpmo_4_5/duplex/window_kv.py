@@ -908,10 +908,10 @@ class MiniCPMO45SchedulerWindowPolicy:
             if duplex_stage0_session_id(rid) == sid and _stage0_order(rid)[1] < epoch and not previous.is_finished()
         ]
 
-    def prepare_admission(self, request: Request, max_model_len: int) -> None:
+    def prepare_admission(self, request: Request, max_prompt_len: int) -> int | None:
         sid = duplex_stage0_session_id(request.request_id)
         if sid is None:
-            return
+            return None
         if self.carry is None:
             self.carry = MiniCPMO45CarriedWindows()
         carry = self.carry
@@ -924,16 +924,16 @@ class MiniCPMO45SchedulerWindowPolicy:
         info = getattr(request, "model_intermediate_buffer", None)
         duplex = info.get("duplex") if isinstance(info, dict) else None
         if not isinstance(duplex, dict) or duplex.get("seq") != 1:
-            return
+            return None
         if duplex.get("session_window_owned") is False:
-            return
+            return None
         cfg = duplex["runtime_config"]
         if "duplex_first_append_context_tokens" in cfg:
             duplex["open_input_start"] = cfg["duplex_first_append_context_tokens"]
         if not window or "seq" not in window:
-            return
+            return None
         if _stage0_order(request.request_id)[1] <= _stage0_order(window["source"])[1]:
-            return
+            return None
         mode = cfg["duplex_window_config"]["sliding_window_mode"]
         units = list(window["units"])
         previous = list(window["previous"])
@@ -944,15 +944,15 @@ class MiniCPMO45SchedulerWindowPolicy:
         length = request.num_prompt_tokens + extra
         config = cfg["duplex_window_config"]
         # If the next prefill crosses the same window watermark as an ordinary
-        # append, evict whole oldest units before admission. Keep at least one
-        # decode position within the deployed model's context length.
-        high = int(config.get("basic_window_high_tokens", max_model_len)) if mode == "basic" else max_model_len
-        cap = max_model_len - 1
-        if mode == "basic" and length > high:
-            cap = min(cap, int(config.get("basic_window_low_tokens", high)))
+        # append, evict whole oldest units before admission.
+        cap = max_prompt_len
+        if mode == "basic":
+            high = int(config.get("basic_window_high_tokens", cap))
+            if length > high:
+                cap = min(cap, int(config.get("basic_window_low_tokens", high)))
         max_units = int(config.get("context_max_units", len(units))) if mode == "context" else len(units)
         skipped = 0
-        while units and (length > cap or len(units) > max_units):
+        while mode != "off" and units and (length > cap or len(units) > max_units):
             unit = units.pop(0)
             skipped += 1
             carried -= unit["length"]
@@ -961,10 +961,8 @@ class MiniCPMO45SchedulerWindowPolicy:
                 previous = (previous + unit["generated_token_ids"])[-limit:] if limit else []
                 previous_len = len(marker) + len(previous) if previous else 0
             length = request.num_prompt_tokens + carried + previous_len + int(window["close_on_next_input"])
-        if length >= max_model_len:
-            # The original input is already at the deployment limit. Leave the
-            # request's usual admission/overflow handling in control.
-            return
+        if length > max_prompt_len:
+            return length
         prompt_ids = [cfg["duplex_scheduler_token_id"]] * length
         request.prompt_token_ids = prompt_ids
         del request._all_token_ids[:]
@@ -993,6 +991,7 @@ class MiniCPMO45SchedulerWindowPolicy:
         }
         if window["close_on_next_input"]:
             duplex["payload"] = {**duplex["payload"], "force_listen": True}
+        return None
 
     def prepare_append(
         self,

@@ -196,6 +196,11 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         window_sessions = [sid for sid, (index, _) in owners.items() if stage_id == 0 and index == replica_id]
         for sid in window_sessions:
             owners.pop(sid)
+            release = self._window_releases.pop(sid, None)
+            if release is not None:
+                # A timed-out utility call still belongs to the retired client.
+                if not release.cancel() and not release.cancelled():
+                    release.exception()
         if self.replica_placement is None:
             if window_sessions:
                 pool = self.stage_pools[stage_id]
@@ -609,7 +614,11 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 release = asyncio.create_task(client.call_utility_async("omni_release_session_window", session_id))
                 self._window_releases[session_id] = release
             try:
-                await asyncio.wait_for(asyncio.shield(release), timeout=pool.RELEASE_RPC_TIMEOUT_S)
+                done, _ = await asyncio.wait((release,), timeout=pool.RELEASE_RPC_TIMEOUT_S)
+                if owners.get(session_id) is owner:
+                    if not done:
+                        raise TimeoutError(f"Timed out releasing the Stage-0 window for {session_id}")
+                    release.result()
             finally:
                 if release.done() and self._window_releases.get(session_id) is release:
                     self._window_releases.pop(session_id)
