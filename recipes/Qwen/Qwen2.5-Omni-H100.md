@@ -1,4 +1,4 @@
-# Qwen2.5-Omni
+# Qwen2.5-Omni on NVIDIA H100
 
 > Online serving for multimodal chat (text / image / audio / video → text +
 > speech)
@@ -21,10 +21,8 @@ Talker → Code2Wav). It matches the serving and offline paths already
 exercised by repository examples and e2e tests.
 
 The default deploy YAML colocates Thinker and Code2Wav on GPU 0 and places
-Talker on GPU 1. That 2-GPU layout is the in-tree default (`devices: "0"` /
-`"1"` / `"0"` in `vllm_omni/deploy/qwen2_5_omni.yaml`). This recipe does not
-re-measure H100 timing; treat the 2x H100 profile as **configuration from the
-bundled deploy**, with CI e2e coverage on 2x L4.
+Talker on GPU 1. The bundled [CUDA deploy configuration](../../vllm_omni/deploy/qwen2_5_omni.yaml)
+identifies this as its two-H100 layout.
 
 ## Supported model contract
 
@@ -49,7 +47,7 @@ bundled deploy**, with CI e2e coverage on 2x L4.
 
 | Profile on this recipe | Devices | Qualification |
 | --- | --- | --- |
-| Bundled default (`qwen2_5_omni.yaml`) | 2 GPUs (Thinker+Code2Wav on 0, Talker on 1) | Configuration from in-tree deploy (YAML header: 2x H100). Weekly e2e uses 2x L4 |
+| Bundled default (`qwen2_5_omni.yaml`) | 2 GPUs (Thinker+Code2Wav on 0, Talker on 1) | Two-H100 configuration from the bundled deploy YAML |
 | `Qwen/Qwen2.5-Omni-3B` same YAML | 2 GPUs | Configuration-only in this recipe |
 | Single-GPU colocation (7B) | 1 CUDA GPU via `--stage-overrides` | Configuration only. A 24 GiB card is too small for this profile |
 
@@ -77,7 +75,7 @@ bundled deploy**, with CI e2e coverage on 2x L4.
 - Number of devices: 2
 - Device interconnect: NVLink (typical H100 server); the deploy file does not
   require a specific interconnect
-- Host memory: not required for the default path (no CPU offload)
+- Weight placement: all three stages keep their weights on the GPUs.
 - Qualification scope: configuration from
   `vllm_omni/deploy/qwen2_5_omni.yaml` (header: verified on 2x H100). This
   recipe does not add new H100 wall-clock or peak-HBM measurements.
@@ -193,8 +191,10 @@ curl http://localhost:8091/v1/chat/completions \
 
 Expect `choices[0].message.content` plus audio in the multimodal payload.
 
-In-tree e2e coverage: `tests/e2e/online_serving/test_qwen2_5_omni_expansion.py`
-and `tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py` (2x L4 weekly).
+The weekly CUDA [online suite](../../tests/e2e/online_serving/test_qwen2_5_omni_expansion.py)
+uses two L4 GPUs. Its CI configuration places Code2Wav on GPU 1 with Talker.
+The [offline suite](../../tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py)
+runs on four L4 GPUs. Both suites use dedicated CI deployment settings.
 
 ## Notes
 

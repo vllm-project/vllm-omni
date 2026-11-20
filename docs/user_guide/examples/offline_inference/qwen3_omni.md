@@ -73,7 +73,7 @@ python end2end.py --query-type use_image --image-path /path/to/image.jpg
 # Use local audio file
 python end2end.py --query-type use_audio --audio-path /path/to/audio.wav
 
-# The mixed query uses the default video, image, and audio
+# Run a mixed query with the bundled video, image, and audio
 python end2end.py --query-type use_mixed_modalities
 ```
 
@@ -83,7 +83,7 @@ If media file paths are not provided, the script will use default assets. Suppor
 - `use_image`: Image input
 - `use_audio`: Audio input
 - `text`: Text-only query
-- `multi_audios`: Multiple audio inputs
+- `use_multi_audios`: Multiple audio inputs
 - `use_mixed_modalities`: Combination of video, image, and audio inputs
 
 ### Async-chunk (offline)

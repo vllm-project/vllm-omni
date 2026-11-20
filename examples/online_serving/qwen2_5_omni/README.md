@@ -1,6 +1,6 @@
 # Qwen2.5-Omni: Online serving
 
-Deployment recipe: [`recipes/Qwen/Qwen2.5-Omni.md`](../../../recipes/Qwen/Qwen2.5-Omni.md).
+Deployment recipe: [`recipes/Qwen/Qwen2.5-Omni-H100.md`](../../../recipes/Qwen/Qwen2.5-Omni-H100.md).
 
 ## 🛠️ Installation
 

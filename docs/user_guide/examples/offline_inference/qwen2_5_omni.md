@@ -2,35 +2,46 @@
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/qwen2_5_omni>.
 
-Deployment recipe: [`recipes/Qwen/Qwen2.5-Omni.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen2.5-Omni.md).
+Deployment recipe: [`recipes/Qwen/Qwen2.5-Omni-H100.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen2.5-Omni-H100.md).
 
 ## Setup
+
 See the [pipeline and deploy configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) to configure memory allocation for your hardware.
 
 ## Run examples
 
 ### Multiple Prompts
+
 Get into the example folder
+
 ```bash
 cd examples/offline_inference/qwen2_5_omni
 ```
+
 Then run the command below. Note: for processing large volume data, it uses py_generator mode, which will return a python generator from Omni class.
+
 ```bash
 bash run_multiple_prompts.sh
 ```
 
 ### Single Prompt
+
 Get into the example folder
+
 ```bash
 cd examples/offline_inference/qwen2_5_omni
 ```
+
 Then run the command below.
+
 ```bash
 bash run_single_prompt.sh
 ```
 
 ### Modality control
+
 If you want to control output modalities, e.g. only output text, you can run the command below:
+
 ```bash
 python end2end.py --output-wav output_audio \
                   --query-type use_mixed_modalities \
@@ -38,6 +49,7 @@ python end2end.py --output-wav output_audio \
 ```
 
 #### Using Local Media Files
+
 The `end2end.py` script supports local media files (audio, video, image) via CLI arguments:
 
 ```bash
@@ -46,7 +58,7 @@ python end2end.py --query-type use_image --image-path /path/to/image.jpg
 python end2end.py --query-type use_video --video-path /path/to/video.mp4
 python end2end.py --query-type use_audio --audio-path /path/to/audio.wav
 
-# The mixed query uses the default video, image, and audio
+# Run a mixed query with the bundled video, image, and audio
 python end2end.py --query-type use_mixed_modalities
 
 # Use audio from video file
@@ -55,6 +67,7 @@ python end2end.py --query-type use_audio_in_video --video-path /path/to/video.mp
 ```
 
 If media file paths are not provided, the script will use default assets. Supported query types:
+
 - `use_image`: Image input only
 - `use_video`: Video input only
 - `use_audio`: Audio input only
