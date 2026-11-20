@@ -7,14 +7,15 @@
 # model_type stays "yue2" so the registered Yue2Config is used; no
 # trust_remote_code is needed (the registered config/model win over the
 # checkpoint's auto_map).
-# Audio synthesis depends on V1 model sampling hooks.
-model_runner: v1
+# Model-owned MRv2 runner retires AR slots while acoustic work continues.
+model_runner: v2
 pipeline: yue2
 async_chunk: false
 dtype: bfloat16
 
 stages:
   - stage_id: 0
+    worker_cls: vllm_omni.model_executor.models.yue2.worker.Yue2Worker
     # AR slots are released while the same worker finishes NAR/VAE synthesis.
     max_num_seqs: 4
     async_scheduling: false
@@ -25,9 +26,11 @@ stages:
     # point, not a guarantee for 9000 frames or long ABC prefixes. Lower it if
     # the target workload needs more synthesis memory (see the model recipe).
     gpu_memory_utilization: 0.70
-    # Keep AR capture off by default. Sampler/NAR graphs still need
-    # separate synthesis headroom.
-    enforce_eager: true
+    enforce_eager: false
+    compilation_config:
+      mode: 0
+      cudagraph_mode: FULL_DECODE_ONLY
+      decode_cudagraph_capture_request_sizes: [1, 2, 4]
     # Model-owned acoustic state cannot be restored from an AR prefix cache.
     enable_prefix_caching: false
     max_num_batched_tokens: 24576
@@ -50,8 +53,7 @@ stages:
       yue2_nar_batch_max_tokens: 0
     default_sampling_params:
       # Defaults for callers that omit model-owned sampling options. The
-      # opt-in prepare_runner_inputs hook reads each request's extra_args;
-      # it does not depend on the forward's has_sampling_extra_args flag.
+      # ModelState binds each admitted request's extra_args before forward.
       extra_args:
         yue2_phase: "semantic"
         yue2_seed: 831001

@@ -2,9 +2,10 @@
 
 > Text-to-music: style + lyrics (optionally an ABC score) in, a 48 kHz stereo song out
 
-YuE2 requires Model Runner V1, which this vLLM 0.34 branch removes. Its deploy
-profile is rejected; the commands below require a model-owner migration to
-Model Runner V2 before they can run on this branch.
+YuE2 uses Model Runner V2 through a model-owned worker. Native AR batching and
+same-worker acoustic synthesis share one CUDA context. Completed AR requests
+release their slots and KV while audio synthesis continues. The deployment
+keeps four configurable AR slots and defaults to NAR/VAE batch size one.
 
 ## Summary
 
@@ -99,18 +100,18 @@ request instead of waiting forever. Set deployment capacity for the expected
 request lengths; four AR slots allow at most two guided semantic songs.
 Ordinary CFG=1 songs retain native AR admission and support one-slot servers.
 
-This implementation requires one GPU (`TP=PP=1`), model runner v1,
+This implementation requires one GPU (`TP=PP=1`), model runner v2,
 synchronous FCFS scheduling, prefix caching disabled, and no external KV
 connector or speculative decoding. Chunked prefill remains available for
 ordinary requests; CFG requests require it disabled. The default config
-keeps the existing 24576 context, four AR slots and eager backbone, with
-chunked prefill disabled. Existing two-call ABC/semantic clients and external
+keeps the existing 24576 context and four AR slots. It enables native FULL
+decode CUDA graphs and disables chunked prefill. Existing two-call ABC/semantic clients and external
 scores remain supported; pipeline, architecture and HTTP endpoint names stay
 `yue2`, `Yue2ForCausalLM` and `/v1/audio/speech`.
 
-The deploy YAML explicitly selects `model_runner: v1`. Selecting V2 raises
-an error before backbone initialization. A V2-only runtime requires a YuE2
-runner migration; changing the YAML to V2 does not provide compatibility.
+The deploy YAML selects `model_runner: v2` and the model-owned `Yue2Worker`.
+Native AR slots are retired before the same worker finishes acoustic synthesis.
+Final audio is attached by request ID, independently of the current AR batch.
 
 ### Acoustic batching and memory
 
@@ -222,20 +223,21 @@ The test retains the module's weekly TTS routing; it is not a per-PR CI gate.
   workload needs more synthesis memory, especially for long ABC prefixes and
   the 9000-frame cap. Releasing completed chunks bounds live NAR buffers,
   while the shared graph allocator retains reserved storage for reuse.
-- **CUDA graphs:** the default deploy keeps the AR backbone eager. Both ABC
-  and semantic sampling use prewarmed power-of-two graph buckets. Custom
+- **CUDA graphs:** the default deploy uses native AR `FULL_DECODE_ONLY` graphs
+  for batches of 1, 2 and 4 requests, with compilation mode 0. Prefill runs
+  outside these graphs. Both ABC and semantic sampling use prewarmed
+  power-of-two graph buckets. Custom
   sampler captures have a bounded cache and fall back to eager sampling when
   it fills. The NAR velocity pass uses a chunk graph on the serialized synthesis
   stream. Chunk graphs share one allocator pool; completed chunks release
   their engines and buffers after their own events. FA3 runs on Hopper; other
   CUDA cards use SDPA, which is also warmed at startup.
 - **Serving:** run `vllm serve m-a-p/YuE2-3B --omni` with the default
-  `yue2.yaml`, which uses eager AR with 4 slots. Validate memory capacity
+  `yue2.yaml`, which uses native AR decode graphs with 4 slots. Validate memory capacity
   for the target card and workload.
-  For the tested single-H200 graph settings, reuse this deploy with
-  `--stage-overrides '{"0":{"max_num_seqs":32,"gpu_memory_utilization":0.5,"enforce_eager":false,"compilation_config":{"cudagraph_mode":"FULL_AND_PIECEWISE"}}}'`.
-  Decode uses FULL and mixed prefill uses PIECEWISE; VAE and the Python
-  synthesis queue remain outside these graphs.
+  When increasing `max_num_seqs`, extend
+  `compilation_config.decode_cudagraph_capture_request_sizes` to cover the
+  larger batches. VAE and the Python synthesis queue remain outside AR graphs.
   Audio is delivered as a whole song; time to first audio equals completion
   latency. Aborting a running song stops future work units and waits only for
   the at-most-two submitted units before releasing its buffers.
