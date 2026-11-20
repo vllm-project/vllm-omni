@@ -66,6 +66,7 @@ platforms:
       model_runner: v2
       model_subdir: original
       additional_config:
+        minicpmo_talker_prefill_eager: true
         ascend_compilation_config:
           enable_npugraph_ex: true
           enable_static_kernel: true

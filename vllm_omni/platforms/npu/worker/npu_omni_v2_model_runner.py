@@ -348,13 +348,9 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
                 if output is not None:
                     return output
         if self._kstep_active():
-            mode_path = os.getenv("MINICPMO_NPU_TALKER_FUSED_MODE_FILE")
-            if mode_path and input_batch.has_prefill:
-                from vllm_omni.platforms.npu.worker.prefill_graph import run_prefill
-
-                output = run_prefill(self, mode_path, model_inputs, input_batch, batch_desc)
+            if input_batch.has_prefill:
+                output = self._call_talker_prefill(mode_path, model_inputs, input_batch, batch_desc)
                 if output is not None:
-                    self._kstep_ran_last = False
                     return output
             kstep_output = self._run_kstep_frames(model_inputs, input_batch)
             if kstep_output is not None:
@@ -370,6 +366,33 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
             finally:
                 context.skip_compiled = previous
         return super()._call_model(model_inputs, input_batch=input_batch, batch_desc=batch_desc)
+
+    def _call_talker_prefill(self, mode_path, model_inputs, input_batch, batch_desc):
+        use_eager = (
+            (self.vllm_config.additional_config or {}).get("minicpmo_talker_prefill_eager") is True
+            and not input_batch.is_dummy
+        )
+        context = get_forward_context() if use_eager else None
+        if context is not None:
+            # Avoid blocking the Talker worker on first-use static kernel
+            # compilation. Exact prefill graphs qualify against eager.
+            previous = context.skip_compiled
+            context.skip_compiled = True
+        try:
+            if mode_path:
+                from vllm_omni.platforms.npu.worker.prefill_graph import run_prefill
+
+                output = run_prefill(self, mode_path, model_inputs, input_batch, batch_desc)
+                if output is not None:
+                    self._kstep_ran_last = False
+                    return output
+            if use_eager:
+                self._kstep_ran_last = False
+                return super()._call_model(model_inputs, input_batch=input_batch, batch_desc=batch_desc)
+            return None
+        finally:
+            if context is not None:
+                context.skip_compiled = previous
 
     def _full_graph_step_output(self, batch_desc, *, model_inputs, input_batch):
         """Drive the K-step frame loop on top of FULL graph replays."""
