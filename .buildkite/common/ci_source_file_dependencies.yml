@@ -666,9 +666,8 @@ source_file_dependencies:
     - vllm_omni/benchmarks/data_modules/utmos_jit.py
 
   omni_qwen3_omni_perf:
-    - tests/dfx/perf/qwen3_omni_workload.py
-    - tests/dfx/perf/baselines/qwen3_omni.json
     - *qwen3_omni_evaluation
+    - vllm_omni/benchmarks/data_modules/__init__.py
     - tests/e2e/accuracy/qwen3_omni/
     - vllm_omni/benchmarks/validation.py
     - .buildkite/amd/scripts/assert-pytest-collection.sh
@@ -678,7 +677,7 @@ source_file_dependencies:
     - tests/dfx/perf/scripts/run_benchmark.py
     - tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
     - tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json
-    - tests/dfx/perf/tests/test_qwen3_omni_datasets.json
+    - tests/dfx/perf/tests/test_qwen3_omni_non_full_duplex.json
 
   omni_qwen3_omni_duplex_perf:
     - *qwen3_omni_evaluation

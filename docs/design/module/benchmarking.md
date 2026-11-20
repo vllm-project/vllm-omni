@@ -59,9 +59,11 @@ Qwen3-Omni's dataset scenarios use the shared DFX JSON runner. An explicit
 accuracy flag selects scoring independently of concurrency. Accuracy scenarios
 share their measured inference requests with performance collection and use the
 complete pinned dataset. Performance-only Seed-TTS tiers use fixed manifest
-prefixes with explicit sample counts. The workload helper
-checks complete requests, audio, scoring and metric samples, and annotates the
-ordinary performance artifact before asserting. Smoke subsets are identified
+prefixes with explicit sample counts. The shared DFX parameter fixture prepares
+pinned sources through the existing dataset modules. JSON declares evaluator
+environment, input packing, score thresholds and deployment metadata. The
+ordinary runner and result writer check complete requests, audio, scoring and
+metric samples, and persist diagnostics before asserting. Smoke subsets are identified
 separately from full-dataset accuracy and regular performance subsets.
 Numerical performance floors require
 hardware-specific calibration; collect mode still checks measurement validity.

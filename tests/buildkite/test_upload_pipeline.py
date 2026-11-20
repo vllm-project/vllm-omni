@@ -584,7 +584,6 @@ def _iter_steps(doc: dict):
         ("vllm_omni/benchmarks/data_modules/seed_tts_dataset.py", True, False),
         ("vllm_omni/benchmarks/data_modules/daily_omni_dataset.py", True, False),
         ("vllm_omni/benchmarks/validation.py", True, True),
-        ("tests/dfx/perf/qwen3_omni_workload.py", True, True),
         ("vllm_omni/clients/duplex.py", False, False),
         ("vllm_omni/deploy/qwen3_omni_duplex.yaml", False, False),
         ("tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json", True, True),

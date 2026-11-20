@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Protocol
 
 
@@ -42,4 +42,15 @@ def coverage_errors(result: dict, expected: int, *, require_audio: bool = False)
             errors.append(f"{key}={result[key]!r}, expected 0")
     if require_audio and result.get("successful_audio_requests") != expected:
         errors.append(f"successful_audio_requests={result.get('successful_audio_requests')!r}, expected {expected}")
+    return errors
+
+
+def metric_coverage_errors(result: Mapping[str, object], expected: int, metrics: Mapping[str, str]) -> list[str]:
+    """Validate each configured metric and its full measurement population."""
+    errors = []
+    for metric, count_key in metrics.items():
+        if not positive_finite(value := result.get(metric)):
+            errors.append(f"{metric} is missing, non-finite or non-positive: {value!r}")
+        if result.get(count_key) != expected:
+            errors.append(f"{count_key}={result.get(count_key)!r}, expected {expected}")
     return errors

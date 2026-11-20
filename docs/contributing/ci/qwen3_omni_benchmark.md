@@ -1,7 +1,7 @@
 # Qwen3-Omni dataset accuracy and performance
 
 Qwen3-Omni uses the shared `tests/dfx/perf/scripts/run_benchmark.py` runner
-with `tests/dfx/perf/tests/test_qwen3_omni_datasets.json`. Explicit accuracy
+with `tests/dfx/perf/tests/test_qwen3_omni_non_full_duplex.json`. Explicit accuracy
 cases reuse their inference requests for performance and scoring. Accuracy
 is independent of concurrency. Every non-duplex request generates text and audio.
 
@@ -25,10 +25,19 @@ utterances. Performance-only tiers use fixed prefixes of the pinned manifest:
 32 utterances at c1, 256 at c16 and 512 at CUDA c32. Every tier requires
 complete request/audio/metric coverage for its configured sample count.
 Daily-Omni uses all 1197 questions, including both 30-second and 60-second videos. Sources are
-pinned by revision and manifest SHA256 in `tests/dfx/perf/qwen3_omni_workload.py`.
+pinned by revision and manifest SHA256 in each scenario's `dataset_source`.
 Shuffling and oversampling are disabled. Offline mirrors can be selected with
 `QWEN3_OMNI_DAILY_ROOT` and `QWEN3_OMNI_SEED_ROOT`; their original manifests
 must match the checksums.
+
+The shared DFX parameter fixture resolves `dataset_source` and scopes
+`benchmark_env`. Daily-Omni and Seed-TTS materialize their source prefixes in
+their existing dataset modules, before loading can skip invalid rows. Every
+case enters the ordinary `run_benchmark.py` sweep and shared result writer.
+`result_validation` declares accuracy, coverage requirements and quality
+thresholds; `result_metadata` declares deployment labels and device counts.
+The model, backend, input packing and Seed-TTS system prompt are explicit JSON
+parameters, so another model can reuse the same path with its own settings.
 
 Both deployments use MRv2. Default disables async chunk and all stage prefix
 caches. Async-prefix enables async chunk and Thinker prefix caching only.
@@ -77,12 +86,14 @@ measures a warmed service. Use the recorded case order when comparing revisions.
 TTFT, TTFP, TPOT, E2E, audio duration and request throughput are retained.
 Daily performance references use TTFT/RTF/TTFP; Seed-TTS references use RTF/TTFP.
 Throughput is an aggregate metric, not a per-request percentile.
-`tests/dfx/perf/baselines/qwen3_omni.json` starts in `collect` mode. It enforces
-metric validity immediately and defers numerical performance acceptance until
-repeated target-hardware calibration. References must identify the hardware,
-case, dataset revision, request count, reference commit, at least two repeated
-measurements, metric values and relative tolerances. Set
-`QWEN3_OMNI_BASELINE_MODE=enforce` or use `--require-baseline` after calibration.
+`result_validation.metrics` enforces metric validity and complete measurement
+populations independently of numerical calibration. These cases have no
+numerical performance baseline yet. Calibrated references belong in the
+existing hardware-nested `benchmark_params[].baseline` field. The shared
+`--assert-baseline` gate applies its standard 10% regression tolerance;
+`--require-baseline` additionally rejects missing hardware calibration.
+Record the reference hardware, source revision, dataset/count and repeated
+measurements when adding numerical baselines.
 
 The shared runner persists one `result_test_*.json` for each dataset case,
 including quality, performance, software/data revisions, qualification scope
@@ -105,11 +116,11 @@ unchanged.
 
 Copy selected JSON entries into a separate smoke configuration. Set a small
 `num_prompts`, reduce `num_warmups`, and set
-`qwen3_omni_workload.smoke` to true. Accuracy-enabled smoke runs still require
+`result_validation.smoke` to true. Accuracy-enabled smoke runs still require
 all selected requests to have valid audio and complete finite scores, but do
 not apply full-dataset quality or calibrated performance floors. Their results
 are marked `qualification_scope: smoke` and cannot qualify a full dataset.
-Daily smoke can use explicit `smoke_indices`, for example `[0, 647]`, to
+Daily smoke can use explicit `dataset_source.sample_indices`, for example `[0, 647]`, to
 exercise both clip durations. Other runs use the source manifest order.
 
 Accuracy qualification rejects truncated request counts. Performance subsets
@@ -126,7 +137,7 @@ With matching vLLM/Omni dependencies, model, media and evaluators cached:
 BENCHMARK_DIR=tests/dfx/perf/results \
 SEED_TTS_EVAL_DEVICE=cuda:1 \
 pytest -sv tests/dfx/perf/scripts/run_benchmark.py \
-  --test-config-file tests/dfx/perf/tests/test_qwen3_omni_datasets.json \
+  --test-config-file tests/dfx/perf/tests/test_qwen3_omni_non_full_duplex.json \
   -m 'full_model and cuda and cards_2' --run-level full_model
 ```
 
@@ -134,7 +145,7 @@ For the NPU candidate, use `SEED_TTS_EVAL_DEVICE=npu:3`,
 `SEED_TTS_SIM_DEVICE=npu:3`, and `-m 'full_model and npu and cards_4'`.
 Run inside the host's GPU/NPU scheduler. Full-duplex uses
 `test_qwen3_omni_duplex_omni_duplex_eval.json` with `cuda and cards_3` or
-`npu and cards_4`. CPU contracts run without loading model dependencies:
+`npu and cards_4`. CPU contracts run without loading model weights:
 
 ```bash
 pytest --noconftest -o addopts='' tests/benchmarks/test_qwen3_dataset_contract.py
