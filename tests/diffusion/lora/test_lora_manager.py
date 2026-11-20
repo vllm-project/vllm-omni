@@ -293,7 +293,7 @@ def test_moe_adapter_fails_before_dense_layers_are_wrapped_without_token_capacit
     )()
     with pytest.raises(
         RuntimeError,
-        match="request-time MoE adapters cannot use the native MXFP4 path",
+        match="request-time MoE adapters cannot use the native path",
     ):
         manager._replace_layers_with_lora(peft_helper)
 
@@ -372,7 +372,7 @@ def test_rejected_moe_adapter_preserves_cache_active_adapter_and_rank(monkeypatc
     for _ in range(2):
         with pytest.raises(
             RuntimeError,
-            match="request-time MoE adapters cannot use the native MXFP4 path",
+            match="request-time MoE adapters cannot use the native path",
         ):
             manager.set_active_adapter(moe_request, lora_scale=1.0)
         assert _state() == state_before_rejection
