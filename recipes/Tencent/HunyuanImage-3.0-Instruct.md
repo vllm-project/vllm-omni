@@ -529,7 +529,7 @@ platform from `tests/assets/hunyuan_image3/`:
 | Platform profile | Reference PNG | SSIM floor | PSNR floor (dB) |
 | --- | --- | --- | --- |
 | CUDA: H200/H100/B200/default | `hunyuan_image3_dit_distill_it2i_ref.png` | 0.95 | 29.0 |
-| NPU: A3 | `hunyuan_image3_dit_distill_it2i_ref_npu.png` | 0.92 | 28.0 |
+| NPU: A3 | `hunyuan_image3_dit_distill_it2i_ref_npu.png` | 0.92 | 25.0 |
 
 These are acceptance floors, with margin below the five-run calibration
 minima, rather than the measured means. The CUDA measurements were collected
