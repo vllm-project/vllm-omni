@@ -11,9 +11,14 @@
 
 ## When to use this recipe
 
-Use this recipe to reproduce the reported MammothModa2-Preview text-to-image
-smoke test on one Ascend 910B3. Qualification covers one 1024x1024 request;
-it does not establish support for other tasks or MammothModa2-Dev on NPU.
+Use the recorded versions below to reproduce the pre-MRv2 MammothModa2-Preview
+text-to-image smoke test on one Ascend 910B3. Validation covered one 1024x1024
+request with vLLM 0.34.0 at vLLM-Omni revision `0.33.0rc2.dev385+g62d0e880a`.
+
+Validation on the current Model Runner V2 stack remains pending. The
+[MRv2 T2I tracking issue](https://github.com/vllm-project/vllm-omni/issues/10752)
+tracks missing `generated_len` metadata that can cause the AR stage to skip
+grid constraints.
 
 ## References
 
@@ -29,11 +34,9 @@ it does not establish support for other tasks or MammothModa2-Dev on NPU.
 - Execution: eager, request mode, one request
 - AR/DiT `gpu_memory_utilization`: 0.5/0.3, as committed; these are configuration
   budgets, not measured peak-memory values
-- Successful-run vLLM version: `0.33.0`
-- Successful-run vLLM-Omni version: `0.1.dev1+g08e9267ed.npu`
-- Successful-run code revision: `75c26a8ef5746c0f5d93b1c5772b3c5204935f8c`
-- Qualification limitations: CANN/driver and torch-npu versions and host
-  memory were not recorded
+- Successful-run vLLM version: `0.34.0`
+- Successful-run vLLM-Omni version: `0.33.0rc2.dev385+g62d0e880a`
+
 
 ## Offline command
 
