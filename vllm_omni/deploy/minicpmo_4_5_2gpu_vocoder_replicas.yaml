@@ -1,0 +1,17 @@
+base_config: minicpmo_4_5_2gpu.yaml
+
+platforms:
+  npu:
+    stages:
+    - stage_id: 2
+      max_num_seqs: 32
+    connectors:
+      connector_of_shared_memory:
+        extra:
+          micro_batch_size: 8
+          whole_euler_pad_max_rows: 2
+          token2wav_runtime_prompt_cache_size: 512
+          token2wav_setup_host_cache_size: 512
+          token2wav_ref_cpu_prefetch_workers: 4
+          generation_max_regular_batch: 16
+          cfm_drop_upstream_att_buffer: true

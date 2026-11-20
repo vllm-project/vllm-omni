@@ -19,10 +19,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 _DEPLOY = "minicpmo_4_5.yaml"
 
 
-def _resolve_stages(monkeypatch, platform: str):
+def _resolve_stages(monkeypatch, platform: str, deploy_name: str = _DEPLOY):
     # Resolve platform overrides even when this test runs on a different host.
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
-    config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform=platform)
+    config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(deploy_name)), platform=platform)
     return config, merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
 
 
@@ -72,6 +72,32 @@ def test_duplex_mrv2_profile_npu_full_mrv2(monkeypatch) -> None:
     config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform="npu")
     stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
     assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True, True]
+
+
+@pytest.mark.parametrize(
+    ("deploy_name", "devices", "replicas"),
+    [
+        ("minicpmo_4_5_2gpu_vocoder_replicas.yaml", "0,1", 2),
+        ("minicpmo_4_5_2gpu_throughput.yaml", "0", 1),
+    ],
+)
+def test_two_card_vocoder_profiles_preserve_shared_tuning(monkeypatch, deploy_name, devices, replicas) -> None:
+    config, stages = _resolve_stages(monkeypatch, "npu", deploy_name)
+    thinker, talker, vocoder = stages
+    assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+    assert thinker.yaml_engine_args["max_model_len"] == 40960
+    spec = thinker.yaml_engine_args["speculative_config"]
+    assert (spec["method"], spec["num_speculative_tokens"]) == ("dspark", 7)
+    assert talker.yaml_runtime["num_replicas"] == 2
+    assert (vocoder.yaml_runtime["devices"], vocoder.yaml_runtime["num_replicas"]) == (devices, replicas)
+    assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [16, 16, 32]
+    extra = config.connectors["connector_of_shared_memory"]["extra"]
+    assert extra["codec_chunk_frames"] == 32
+    assert extra["token2wav_n_timesteps"] == 5
+    assert extra["micro_batch_size"] == 8
+    assert extra["token2wav_setup_host_cache_size"] == 512
+    assert extra["token2wav_runtime_prompt_cache_size"] == 512
+    assert "code2wav_encoder_graph_singleton_history_frames" not in extra
 
 
 @pytest.mark.parametrize("deploy_name", [_DEPLOY, "minicpmo_4_5_turn.yaml"])

@@ -147,16 +147,31 @@ The launcher prepends this checkout and prints the rendered deployment path.
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0,1
 export NUMA_NODE=0
-export MAX_NUM_SEQS=16
+unset MAX_NUM_SEQS
+export DEPLOY_CONFIG="$PWD/vllm_omni/deploy/minicpmo_4_5_2gpu_vocoder_replicas.yaml"
 export TALKER_ROUTE=quarter VOCODER_ROUTE=quarter
 export PORT=8000
 bash recipes/OpenBMB/serve_minicpmo_ascend.sh
 ```
 
-For sustained traffic with reused reference audio, the two-card throughput
-profile uses one Code2Wav replica and retains both Talker replicas. It allows
-32 sequences at Code2Wav and uses an eight-row CFM micro-batch. The five CFM
-steps and codec chunk sizes are inherited from the base profile.
+The replicated profile keeps one Thinker with DSpark 7, two Talker replicas,
+and two Code2Wav replicas. Thinker and Talker allow 16 sequences per worker.
+Code2Wav allows 32 per worker. Use the launcher above to apply the secondary
+memory settings. The primary uses an eight-row CFM micro-batch and a 512-entry
+host setup cache. The secondary shares its device with Thinker and the primary
+Talker, uses a two-row CFM micro-batch, and limits reference setup caching to
+two device entries and 64 host entries. It copies CFM attention history in
+smaller pieces. Quarter routing was used for the measured replicated profile.
+
+In the vLLM 0.34 comparison, the replicated profile improved warm C8 throughput
+from 6.03 to 6.88 requests/s and RTF from 0.336 to 0.301. At C64, it shortened
+the P95 inter-chunk gap from 1.61 s to 0.98 s. Throughput moved from 8.22 to
+8.00 requests/s and P95 audio TTFP increased from 5.90 s to 9.02 s. The C64
+automatic-routing trial exceeded the secondary device's available memory.
+
+The single-vocoder throughput profile uses the same primary settings and
+retains both Talker replicas. Both profiles inherit five-step CFM and the same
+codec chunk sizes.
 
 ```bash
 unset MAX_NUM_SEQS
@@ -181,7 +196,7 @@ platforms:
 
 The range is inclusive and uses encoder history frames. This setting reduced
 isolated Code2Wav time on one NPU. The two-card Seed-TTS run did not exercise
-the extra graphs, so both two-card presets leave it unset. Each enabled worker
+the extra graphs, so the two-card profiles leave it unset. Each enabled worker
 used about 230 MiB more device memory and spent about 19 seconds longer in
 encoder graph capture during startup.
 
@@ -210,7 +225,8 @@ and five-step CFM. The high-concurrency profile improved historical throughput
 but had a worse C64 streaming tail; the PR retains that tradeoff explicitly.
 The old 40-request ingress cap is not part of this recipe.
 
-For the historical C1 profile, set `MAX_NUM_SEQS=8`, `TALKER_ROUTE=primary` and
+For the historical profiles, select `vllm_omni/deploy/minicpmo_4_5_2gpu.yaml`
+with `DEPLOY_CONFIG`. For C1, set `MAX_NUM_SEQS=8`, `TALKER_ROUTE=primary` and
 `VOCODER_ROUTE=primary` before launching. For the other five-tier cases, keep
 `MAX_NUM_SEQS=8` and use `quarter` for both routes. These commands reproduce the
 configuration; they do not assert that the rebased source reproduces old timing
