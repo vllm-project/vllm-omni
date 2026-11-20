@@ -764,6 +764,7 @@ def _make_graph_contract_model(architecture, stage):
         ("BreezeForConditionalGeneration", None),
         ("HiggsAudioV3TalkerForConditionalGeneration", None),
         ("Ming3TTSForConditionalGeneration", "llm"),
+        ("MiniMaxMusic3TalkerForConditionalGeneration", None),
         ("MossTTSDelayModel", None),
         ("MossTTSLocalModel", None),
         ("VoxtralTTSForConditionalGeneration", "audio_generation"),
@@ -775,6 +776,8 @@ def test_tensor_returning_model_preserves_mrv2_full_capture(architecture, stage,
     runner = _make_runner()
     runner.model = model
     runner._configure_cudagraph_output_contract()
+    assert not runner._model_has_structured_output
+    assert not runner._exclude_full_graph
     full = BatchExecutionDescriptor(CUDAGraphMode.FULL, 1, 1)
     runner.cudagraph_manager = SimpleNamespace(
         _capture_descs={CUDAGraphMode.FULL: [full]},
