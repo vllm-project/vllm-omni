@@ -333,9 +333,9 @@ hardware validation remains pending. Retained V1 profiles identify unavailable
 workflows and preserve explicit configuration errors. They do not provide a V1
 fallback.
 
-YuE2's `yue2.yaml` uses Model Runner V2 with a model-owned sampler and worker.
-The sampler preserves phase-specific sampling and paired CFG; the worker
-releases AR slots while NAR/VAE jobs complete and delivers their audio by
+YuE2's `yue2.yaml` uses the shared V2 AR runner with a model-owned sampler and
+model-state lifecycle hooks. The sampler preserves phase-specific sampling and
+paired CFG; the hooks release AR slots while NAR/VAE jobs complete and deliver audio by
 request ID. Automatic ABC transitions reset the same request's phase state.
 The profile requires one GPU, synchronous scheduling, and disabled prefix
 caching and external KV transfer. See the [YuE2 recipe](../../recipes/m-a-p/YuE2-3B.md).
