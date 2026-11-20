@@ -621,9 +621,6 @@ class StageDeployConfig:
     async_scheduling: bool | None = None
     disable_hybrid_kv_cache_manager: bool | None = None
     mm_processor_cache_gb: float | None = None
-    # AR-stage DiT-load-aware scheduling (DTPS): when True, the AR scheduler
-    # reorders its waiting queue by task type + downstream DiT load.
-    dit_load_aware: bool | None = None
     # Hybrid-mamba stages (e.g. the NemotronVoiceChat thinker's NemotronH
     # backbone) pin the SSM state dtype; projected onto vLLM CacheConfig.
     mamba_ssm_cache_dtype: str | None = None
@@ -651,6 +648,7 @@ class StageDeployConfig:
     vae_parallel_mode: str | None = None
     text_encoder_tp_size: int | None = None
     use_hsdp: bool | None = None
+    hsdp_data_parallel: bool | None = None
     hsdp_shard_size: int | None = None
     hsdp_replicate_size: int | None = None
 
@@ -1608,10 +1606,7 @@ def derive_dtps_config(
     DTPS is only supported for a single AR→DiT topology (one AR stage
     feeding exactly one downstream DIFFUSION stage). Returns ``None`` if
     DTPS is disabled, or a dict carrying the AR↔DiT pairing and DTPS
-    parameters if enabled. The pairing info (``ar_stage_id``,
-    ``dit_stage_id``) lets the orchestrator isolate load collection and
-    delivery to the correct stages. Future parameters can be added to
-    the dict without changing the config plumbing layers.
+    parameters if enabled.
     """
     dit_load_aware = bool(stage_deploy.dit_load_aware) if stage_deploy is not None else False
     if not dit_load_aware:
