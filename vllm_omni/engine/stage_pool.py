@@ -1123,13 +1123,15 @@ class StagePool:
             mode, arm = self._c8_vocoder_route_file.read_text().split()
         except (OSError, ValueError):
             return None
-        if mode not in ("primary", "secondary", "eighth", "quarter"):
+        if mode not in ("primary", "secondary", "eighth", "quarter", "adaptive"):
             return None
         if (mode, arm) != self._c8_vocoder_route_run:
             self._c8_vocoder_route_run = (mode, arm)
             self._c8_vocoder_route_counts[:] = [0, 0]
         n = sum(self._c8_vocoder_route_counts) + 1
         pick_secondary = mode == "secondary" or (mode == "eighth" and n % 8 == 0) or (mode == "quarter" and n % 4 == 0)
+        if mode == "adaptive":
+            pick_secondary = self._adaptive_code2wav_route(n)
         chosen = int(pick_secondary)
         self._c8_vocoder_route_counts[chosen] += 1
         if n in (4, 32, 96):
@@ -1140,6 +1142,26 @@ class StagePool:
                 *self._c8_vocoder_route_counts,
             )
         return chosen
+
+    def _adaptive_code2wav_route(self, ordinal: int) -> bool:
+        """Compare live turns relative to the two replicas' configured 3:1 split."""
+        bindings = {
+            **self._requested_replica_ids,
+            **{req: self._addr_to_replica_id.get(addr) for req, addr in self._affinity.items()},
+            **self._request_bindings,
+        }
+        primary = sum(replica == 0 for replica in bindings.values())
+        secondary = sum(replica == 1 for replica in bindings.values())
+        # The secondary shares its device with Thinker and Talker. Include
+        # prewarm reservations and keep headroom for their shared allocations.
+        if secondary >= 16:
+            return False
+        if primary + secondary >= 8:
+            primary_wait = (primary + 1) / 3
+            secondary_wait = secondary + 1
+            if abs(primary_wait - secondary_wait) >= 1:
+                return secondary_wait < primary_wait
+        return ordinal % 4 == 0
 
     def select_replica_id(
         self,

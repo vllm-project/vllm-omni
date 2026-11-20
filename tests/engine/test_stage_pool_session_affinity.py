@@ -30,6 +30,27 @@ def _pool(mocker, replicas: int = 2) -> StagePool:
     return StagePool(0, [_Replica() for _ in range(replicas)], stage_vllm_config=config)
 
 
+@pytest.mark.parametrize(
+    "primary, secondary, expected",
+    [(0, 0, 0), (24, 2, 1), (3, 8, 0), (64, 16, 0)],
+)
+def test_code2wav_adaptive_route_uses_live_and_reserved_turns(
+    monkeypatch, mocker, tmp_path, primary, secondary, expected
+):
+    route = tmp_path / "vocoder-route"
+    route.write_text("adaptive benchmark\n")
+    monkeypatch.setenv("MINICPMO_C8_VOCODER_ROUTE_FILE", str(route))
+    config = mocker.Mock(model_config=mocker.Mock(async_chunk=True))
+    pool = StagePool(2, [_Replica(), _Replica()], stage_vllm_config=config)
+    for i in range(primary):
+        pool.bind_requested_replica(f"active-{i}", 0)
+    for i in range(secondary):
+        pool.reserve_requested_replica(f"reserved-{i}", 1)
+    assert pool.select_experimental_code2wav_replica("new") == expected
+    if primary:
+        assert pool.select_experimental_code2wav_replica("active-0") == 0
+
+
 def test_a_follow_up_lands_on_the_replica_that_holds_the_session(mocker):
     pool = _pool(mocker)
     first = pool.select_replica_id("r1", session_id="s1")
