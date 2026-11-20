@@ -54,7 +54,7 @@ def state(mocker):
 
 def test_prepare_inputs_binds_slots_and_discards_partial_recompute(state, batch, mocker):
     base = mocker.patch.object(OmniModelState, "prepare_inputs", return_value={"positions": batch.positions})
-    request_state = mocker.Mock(spec=RequestState)
+    request_state = mocker.Mock(spec=RequestState, req_id_to_index={"first": 1, "second": 3})
     result = state.prepare_inputs(batch, request_state)
     assert result is base.return_value
     args = state.model.prepare_runner_inputs.call_args.kwargs
@@ -103,6 +103,16 @@ def test_warmup_uses_stock_sampler_without_creating_song_state(state, batch, moc
     )
     assert result.sampler_output is expected[0]
     state.model.sample.assert_not_called()
+
+
+@pytest.mark.parametrize("is_padding", [False, True], ids=["profile", "capture"])
+def test_native_dummy_batch_does_not_bind_song_state(state, mocker, is_padding):
+    inputs = InputBuffers(2, 4, torch.device("cpu"))
+    batch = InputBatch.make_dummy(2, 4, inputs, is_padding=is_padding)
+    mocker.patch.object(OmniModelState, "prepare_inputs", return_value={})
+    request_state = mocker.Mock(spec=RequestState, req_id_to_index={"first": 1, "second": 3})
+    state.prepare_inputs(batch, request_state)
+    state.model.prepare_runner_inputs.assert_not_called()
 
 
 @pytest.mark.parametrize("grammar,drafts", [(object(), 0), (None, 1)])
