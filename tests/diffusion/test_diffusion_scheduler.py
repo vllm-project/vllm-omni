@@ -1978,6 +1978,7 @@ class TestDiffusionEngine:
         engine.od_config = SimpleNamespace(model_class_name="mock_model", diffusion_load_format="default")
         engine.pre_process_func = mocker.Mock()
         engine.add_req_and_wait_for_response = mocker.Mock(return_value=DiffusionOutput(output=None))
+        engine.executor = mocker.Mock()
 
         engine._dummy_run()
 

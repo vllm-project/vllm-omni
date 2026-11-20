@@ -62,11 +62,13 @@ def test_dummy_run_uses_enough_steps_for_execution_mode(
         return type("Output", (), {"error": None})()
 
     engine.add_req_and_wait_for_response = run_request
+    engine.executor = Mock()
 
     engine._dummy_run()
 
     assert len(captured_requests) == 1
     assert captured_requests[0].sampling_params.num_inference_steps == 2
+    engine.executor.collective_rpc.assert_called_once_with("empty_cache")
 
 
 def test_allgather_startup_runs_broadcast_dummy_request() -> None:
