@@ -1456,10 +1456,10 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
             "artifact_path": "artifacts/rocm-minicpmo-reliability/**/*",
             "artifact_env": "ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR",
             "expected_nodes": 14,
-            "expected_skipped": 3,
+            "expected_skipped": 0,
             "timeout": "220m",
             "collection_message": "Expected exactly 14 MiniCPM-o 4.5 reliability nodes",
-            "junit_message": "Expected exactly 14 executed MiniCPM-o 4.5 reliability tests with 3 known skips",
+            "junit_message": "Expected exactly 14 executed MiniCPM-o 4.5 reliability tests with no skips",
         },
         "Reliability Test · Invalid parameters · MI300 · Single-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-single/**/*",
@@ -1568,8 +1568,8 @@ def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
             "ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR",
             "minicpmo-reliability-guard",
             14,
-            3,
-            "Expected exactly 14 executed MiniCPM-o 4.5 reliability tests with 3 known skips",
+            0,
+            "Expected exactly 14 executed MiniCPM-o 4.5 reliability tests with no skips",
         ),
         (
             "Reliability Test · Invalid parameters · MI300 · Single-GPU",
@@ -1640,6 +1640,24 @@ def test_weekly_reliability_executes_junit_guard_before_exit(
         skipped=skipped,
         timeout_status=timeout_status,
         expected_status=expected_status,
+    )
+
+
+def test_minicpmo_weekly_rejects_issue_10391_skips(tmp_path: Path) -> None:
+    """This single-GPU job's three previous known skips all referenced #10391."""
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=AMD_WEEKLY_PIPELINE,
+        step_label="Reliability Test · minicpmo-4.5",
+        command_fragment="pytest -s -v -ra",
+        expected_message="Expected exactly 14 executed MiniCPM-o 4.5 reliability tests",
+        artifact_env="ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR",
+        job_id_prefix="minicpmo-restored-shutdown-guard",
+        pytest_status=0,
+        tests=14,
+        skipped=3,
+        timeout_status=None,
+        expected_status=5,
     )
 
 
