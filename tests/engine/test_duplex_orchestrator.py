@@ -861,6 +861,8 @@ async def test_terminal_stage_error_closes_session_before_another_append(mocker,
         events = [await output_buffer.get() for _ in range(output_buffer.pending_events)]
         events.extend(output_q.get_nowait().event for _ in range(output_q.qsize()))
         types = [event.type for event in events]
+        (error,) = [event for event in events if event.type == "error"]
+        assert error.code == "context_length_exceeded" and error.message == reason
         assert types.index("error") < types.index("session.expired")
         assert types[-1] == "session.expired"
         # A request-local failure must release admission without evicting the replica.

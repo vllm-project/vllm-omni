@@ -3029,20 +3029,27 @@ async def test_a_dropped_continuation_is_not_re_aimed_across_a_barge_in() -> Non
 
 
 @pytest.mark.asyncio
-async def test_stage_failure_fails_the_active_response() -> None:
+@pytest.mark.parametrize(
+    ("reason", "code"),
+    [
+        ("boom", "runtime_data_plane_stream_failed"),
+        ("context_length_exceeded: prompt too long", "context_length_exceeded"),
+    ],
+)
+async def test_stage_failure_fails_the_active_response(reason, code) -> None:
     h = await open_harness()
     try:
         await h.run(append_audio())
         request_id = h.stage0_request_id()
         await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"))
 
-        h.runner.on_stage_failure(1, RuntimeError("boom"))
+        h.runner.on_stage_failure(1, RuntimeError(reason))
         events = await h.settle()
         assert types(events)[0] == "error"
-        assert events[0].code == "runtime_data_plane_stream_failed"
+        assert events[0].code == code
         done = find(events, "response.done")
         assert done.status == "failed"
-        assert done.response["status_details"]["reason"] == "runtime_data_plane_stream_failed"
+        assert done.response["status_details"]["reason"] == code
         assert h.session.active_response_id is None
     finally:
         await close_harness(h)

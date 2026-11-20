@@ -39,7 +39,7 @@ from vllm_omni.core.sched.utils import (
     streaming_update_replaces_prompt as _streaming_update_replaces_prompt,
 )
 from vllm_omni.core.sched.window_policy import SchedulerWindowPolicy
-from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreOutput
+from vllm_omni.engine import CONTEXT_LENGTH_EXCEEDED, AdditionalInformationPayload, OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import CONTINUE_TOKEN_ID
 from vllm_omni.worker_v2.ngram_adapter import is_thinker_ngram, use_scheduler_ngram
@@ -2148,7 +2148,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     # Prefix of the stop_reason carried by the FinishReason.ERROR output, so the
     # serving side can map it to a stable error code.
-    STREAMING_CONTEXT_OVERFLOW_STOP_REASON = "context_length_exceeded"
+    STREAMING_CONTEXT_OVERFLOW_STOP_REASON = CONTEXT_LENGTH_EXCEEDED
 
     def _streaming_update_overflows(
         self,
