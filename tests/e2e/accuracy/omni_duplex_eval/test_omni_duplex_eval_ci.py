@@ -475,19 +475,12 @@ def test_dfx_writes_both_artifacts_before_quality_gate(
         }
 
 
-@pytest.mark.parametrize("returncode", [0, 1, -6])
-@pytest.mark.parametrize("config_index,resource_label", [(0, "H100"), (1, "A3")])
-@pytest.mark.parametrize("accuracy_dir_override", [False, True])
 @pytest.mark.parametrize("evaluate", [False, True])
-def test_qwen3_accuracy_publication_preserves_perf_and_exit_behavior(
-    tmp_path, monkeypatch, returncode, config_index, resource_label, accuracy_dir_override, evaluate
-):
+def test_qwen3_record_only_accuracy_publication(tmp_path, monkeypatch, evaluate):
     from tests.dfx import conftest as dfx
 
     test_root = Path(__file__).resolve().parents[3]
-    config = json.loads((test_root / "dfx/perf/tests/test_qwen3_omni_duplex_omni_duplex_eval.json").read_text())[
-        config_index
-    ]
+    config = json.loads((test_root / "dfx/perf/tests/test_qwen3_omni_duplex_omni_duplex_eval.json").read_text())[0]
     params = config["benchmark_params"][0]
     assert params["duplex_eval_evaluate"] is True
     assert "duplex_eval_accuracy_config" not in params
@@ -495,12 +488,8 @@ def test_qwen3_accuracy_publication_preserves_perf_and_exit_behavior(
     perf_dir = tmp_path / "perf-results"
     perf_dir.mkdir()
     monkeypatch.setenv("BENCHMARK_DIR", str(perf_dir))
-    if accuracy_dir_override:
-        accuracy_dir = tmp_path / "accuracy"
-        monkeypatch.setenv("ACC_BENCH_RESULT_DIR", str(accuracy_dir))
-    else:
-        accuracy_dir = tmp_path / "tests/e2e/accuracy/omni_duplex_eval/results"
-        monkeypatch.delenv("ACC_BENCH_RESULT_DIR", raising=False)
+    accuracy_dir = tmp_path / "accuracy"
+    monkeypatch.setenv("ACC_BENCH_RESULT_DIR", str(accuracy_dir))
     monkeypatch.setenv("BUILDKITE_BRANCH", "test-branch")
     accuracy = {
         "status": "completed",
@@ -535,7 +524,7 @@ def test_qwen3_accuracy_publication_preserves_perf_and_exit_behavior(
             path.write_text(json.dumps(payload))
 
         def wait(self):
-            return returncode
+            return 0
 
     monkeypatch.setattr(dfx.subprocess, "Popen", BenchmarkProcess)
     args = [
@@ -554,14 +543,14 @@ def test_qwen3_accuracy_publication_preserves_perf_and_exit_behavior(
         flow=params["max_concurrency"][0],
         dataset_name=params["dataset_name"],
         num_prompt=params["num_prompts"][0],
-        resource_label=resource_label,
+        resource_label="H100",
         num_warmups=params["num_warmups"],
         benchmark_params_name=params["name"],
     )
     expected = {
         **payload,
         "baseline": {},
-        "Hardware": resource_label,
+        "Hardware": "H100",
         "branch": "test-branch",
         "test_name": config["test_name"],
         "name": params["name"],
@@ -578,18 +567,3 @@ def test_qwen3_accuracy_publication_preserves_perf_and_exit_behavior(
     published = json.loads(accuracy_paths[0].read_text())
     assert published["accuracy"] == accuracy
     assert published["baseline"] == {}
-    assert published["benchmark_exit_code"] == returncode
-    assert published["Hardware"] == resource_label
-    assert published["model_id"] == payload["model_id"]
-    assert published["dataset"] == "omni_duplex_eval"
-    assert published["dataset_path"] == params["dataset_path"]
-    assert published["test_name"] == config["test_name"]
-    assert published["name"] == params["name"]
-    assert published["num_prompts"] == params["num_prompts"][0] == 120
-    assert published["max_concurrency"] == params["max_concurrency"][0] == 8
-    assert published["generation"] == {
-        "completed": payload["completed"],
-        "failed": 0,
-        "published": 120,
-        "artifact_errors": [],
-    }

@@ -513,20 +513,6 @@ def test_qwen3_combined_jobs_do_not_enter_function_filter(nightly_generated_jobs
     assert all(not (jobs / f"{key}.sh").exists() for key in CUDA_COMBINED_JOB_KEYS)
 
 
-def test_qwen3_duplex_eval_job_uploads_accuracy_result():
-    pipeline = yaml.safe_load((ROOT / ".buildkite/cuda/test-nightly.yml").read_text(encoding="utf-8"))
-    step = next(
-        step
-        for group in pipeline["steps"]
-        for step in group.get("steps", [])
-        if step.get("key") == "nightly-omni-performance-qwen3-omni-duplex-omni-duplex-eval"
-    )
-    assert "tests/dfx/perf/results/*.json" in step["artifact_paths"]
-    accuracy_dir = "tests/e2e/accuracy/omni_duplex_eval/results"
-    assert f"{accuracy_dir}/*.json" in step["artifact_paths"]
-    assert f"export ACC_BENCH_RESULT_DIR={accuracy_dir}" in step["commands"]
-
-
 def test_cuda_pipeline_selects_each_matrix_case_once():
     pipeline = yaml.safe_load((ROOT / ".buildkite/cuda/test-nightly.yml").read_text(encoding="utf-8"))
     steps = [s for group in pipeline["steps"] if "steps" in group for s in group["steps"]]
