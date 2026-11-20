@@ -96,6 +96,7 @@ def qkv_head_layer_norm(
     k_norm: torch.nn.LayerNorm,
     rows: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
+    use_triton: bool | None = None,
 ) -> torch.Tensor:
     """Split packed ``qkv``, LayerNorm q/k per head, write q and the split ``kv`` cache."""
     batch, frames, width = (int(dim) for dim in qkv.shape)
@@ -117,7 +118,9 @@ def qkv_head_layer_norm(
         raise ValueError(f"qkv_head_layer_norm: positions must be contiguous ({batch}, {frames})")
     q_out = torch.empty((batch, num_heads, frames, head_dim), device=qkv.device, dtype=qkv.dtype)
 
-    if not _use_triton(qkv):
+    if use_triton is None:
+        use_triton = _use_triton(qkv)
+    if not use_triton:
         heads = qkv.view(batch, frames, 3, num_heads, head_dim)
         q_out.copy_(q_norm(heads[:, :, 0].transpose(1, 2)))
         keys = k_norm(heads[:, :, 1].transpose(1, 2))
