@@ -38,7 +38,7 @@ from vllm_omni.entrypoints.openai.api_server import (
     omni_run_server,
     run_omni_api_server_worker_proc,
 )
-from vllm_omni.entrypoints.utils import parse_stage_overrides, prepare_stage_config_inputs
+from vllm_omni.entrypoints.utils import mark_serve_cli_args, parse_stage_overrides, prepare_stage_config_inputs
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 if TYPE_CHECKING:
@@ -171,6 +171,7 @@ class OmniServeCommand(CLISubcommand):
 
     @staticmethod
     def cmd(args: TrackingNamespace) -> None:
+        mark_serve_cli_args(args)
         if not os.environ.get("VLLM_DISABLE_LOG_LOGO"):
             os.environ["VLLM_DISABLE_LOG_LOGO"] = "1"
             log_logo()

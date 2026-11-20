@@ -16,6 +16,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 
+from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.engine.omni_engine_base import _derive_supported_tasks
 from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.models.serving import _DiffusionServingModels
 
@@ -55,7 +57,12 @@ def _client(engine) -> TestClient:
     app.include_router(router)
     app.state.engine_client = engine
     app.state.diffusion_engine = engine
-    app.state.stage_configs = [SimpleNamespace(stage_type="diffusion")]
+    config = StageConfigFactory.create_typed_default_diffusion(
+        "test-model", {"model_class_name": engine.od_config.model_class_name}
+    )
+    app.state.stage_configs = config.stage_configs
+    app.state.supported_tasks = _derive_supported_tasks(config.stage_configs)
+    assert "x2v" not in app.state.supported_tasks
     app.state.openai_serving_models = _DiffusionServingModels(
         [BaseModelPath(name="depth-anything/Video-Depth-Anything-Small", model_path="vda")]
     )
