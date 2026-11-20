@@ -44,7 +44,7 @@ def zeros_for_storage(
     device: torch.device | str = "cpu",
     pin_memory: bool = False,
 ) -> torch.Tensor:
-    """Allocate a zeroed CPU transport buffer, using byte storage for packed FP4."""
+    """Allocate a zeroed transport buffer, using byte storage for packed FP4."""
     if dtype in _PACKED_FP4_DTYPES:
         return torch.zeros(numel, dtype=torch.uint8, device=device, pin_memory=pin_memory).view(dtype)
     return torch.zeros(numel, dtype=dtype, device=device, pin_memory=pin_memory)

@@ -1025,9 +1025,9 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
     def _unsupported_dlo_allgather_online_quant_methods(model: nn.Module) -> tuple[str, ...]:
         """Return unsupported online-quant methods for DLO AllGather.
 
-        Per-tensor online FP8, online INT8, online MXFP8, and the vLLM online
-        MXFP4 method are safe after the ordinary loader has finalized their
-        weight and scale parameters.
+        Per-tensor online FP8, online INT8, online MXFP8, and the vLLM XPU
+        MXFP4 online method are safe after the ordinary loader has finalized
+        their weight and scale parameters.
         DLO shards those runtime tensors by dtype and reconstructs their
         recorded shapes and strides before the kernel consumes them. They all
         keep plain transportable 1-byte dtypes over ordinary strided views:
@@ -1038,7 +1038,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
           (NPU: (K, N) weight with (K_groups/2, N, 2) scale) or with the
           scale stored as a transposed view (vLLM kernel, .t() over a
           contiguous (K/32, N) buffer).
-        - online MXFP4 (vLLM kernel): packed float4_e2m1fn_x2 weight plus
+        - online MXFP4 (vLLM XPU kernel): packed float4_e2m1fn_x2 weight plus
           a uint8/e8m0 block scale, both one-byte transport dtypes.
 
         Both shape families are already covered by the physical-order packing
