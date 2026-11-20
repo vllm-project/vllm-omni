@@ -83,6 +83,8 @@ def test_gate_enables_eligible_strict_ulysses_call():
     assert _gate(_strategy()) == 2
     # MiniMax-H3 publishes a contiguous valid K/V prefix instead of a mask; that stays eligible.
     assert _gate(_strategy(), metadata=AttentionMetadata(extra={"valid_kv_length": 9})) == 2
+    # int8 with a non-power-of-two head dim keeps the overlap; the runner sends bf16 instead.
+    assert _gate(_strategy(int8=True), shape=(1, 16, 56, 96)) == 2
 
 
 @pytest.mark.cpu
@@ -95,7 +97,6 @@ def test_gate_enables_eligible_strict_ulysses_call():
         ("a2a permute", {"strategy": _strategy(permute=True)}),
         ("heads not divisible", {"strategy": _strategy(chunks=3)}),
         ("batch > 1", {"strategy": _strategy(), "shape": (2, 16, 56, 128)}),
-        ("int8 non-pow2 head dim", {"strategy": _strategy(int8=True), "shape": (1, 16, 56, 96)}),
         ("paged kv", {"strategy": _strategy(), "paged": True}),
         ("ring layer", {"strategy": _strategy(), "use_ring": True}),
         ("explicit cross", {"strategy": _strategy(), "cross": True}),
@@ -146,6 +147,29 @@ def test_int8_pack_unpack_round_trip_reads_strided_source(chunks):
             assert torch.all(err <= step * 0.51 + expected.float().abs() * 2**-7 + 1e-6)
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_int8_pack_unpack_offsets_past_int32():
+    from vllm_omni.diffusion.attention.parallel.ulysses_overlap import ROW_BYTES_EXTRA, pack_int8, unpack_int8
+
+    # Source element offsets (s * 3*H*D) and packed byte offsets (row * row_bytes) both pass 2**31 at the tail.
+    P, S, H, D = 4, 352_000, 16, 128
+    hc = H // P
+    assert (S - 1) * 3 * H * D >= 2**31 and P * S * 3 * hc * (D + ROW_BYTES_EXTRA) >= 2**31
+    fused = torch.zeros(S, 3, H, D, device="cuda", dtype=torch.bfloat16)
+    tail = torch.randn(8, 3, H, D, device="cuda", dtype=torch.bfloat16)
+    fused[-8:] = tail
+    buf = torch.empty(P, S, 3, hc, D + ROW_BYTES_EXTRA, device="cuda", dtype=torch.uint8)
+    for t, x in enumerate(fused.unbind(1)):
+        pack_int8(x, buf, chunk=0, t=t, n_t=3, world_size=P, hc=hc)
+    del fused
+    out = torch.empty(P * S, hc, D, device="cuda", dtype=torch.bfloat16)
+    unpack_int8(buf, out, t=2, n_t=3)
+    got = out.view(P, S, hc, D)[:, -8:].permute(1, 0, 2, 3).reshape(8, H, D).float()
+    expected = tail[:, 2].float()
+    step = expected.abs().amax(dim=-1, keepdim=True) / 127
+    assert torch.all((got - expected).abs() <= step * 0.51 + expected.abs() * 2**-7 + 1e-6)
+
+
 # --------------------------------------------------------------------------- overlapped exchange (2 GPUs)
 
 
@@ -161,20 +185,25 @@ def _run_overlap_case(rank: int, world_size: int, init_method: str) -> None:
     current_omni_platform.set_device(torch.device("cuda", rank))
     dist.init_process_group("nccl", init_method=init_method, world_size=world_size, rank=rank)
     try:
-        S, H, D = 96, 8, 128
-        g = torch.Generator(device="cuda").manual_seed(0)
-        q_g, k_g, v_g = (
-            torch.randn(1, world_size * S, H, D, device="cuda", dtype=torch.bfloat16, generator=g) for _ in range(3)
-        )
-        ref = _sdpa_nhd(q_g, k_g, v_g)[:, rank * S : (rank + 1) * S].float()
-        q, k, v = (x[:, rank * S : (rank + 1) * S].contiguous() for x in (q_g, k_g, v_g))
-        for chunks in (1, 2):
-            exact = run_ulysses_overlap(dist.group.WORLD, q, k, v, _sdpa_nhd, chunks=chunks, int8=False)
-            assert exact.shape == q.shape
-            torch.testing.assert_close(exact.float(), ref, atol=2e-2, rtol=2e-2)
-            lossy = run_ulysses_overlap(dist.group.WORLD, q, k, v, _sdpa_nhd, chunks=chunks, int8=True)
-            cos = F.cosine_similarity(lossy.float().flatten(), ref.flatten(), dim=0).item()
-            assert cos > 0.9995, cos
+        S, H = 96, 8
+        # D=96: int8 falls back to the bf16 exchange. transposed: the head dim is not contiguous.
+        for D, transposed in ((128, False), (96, False), (128, True)):
+            g = torch.Generator(device="cuda").manual_seed(0)
+            q_g, k_g, v_g = (
+                torch.randn(1, world_size * S, H, D, device="cuda", dtype=torch.bfloat16, generator=g) for _ in range(3)
+            )
+            ref = _sdpa_nhd(q_g, k_g, v_g)[:, rank * S : (rank + 1) * S].float()
+            q, k, v = (x[:, rank * S : (rank + 1) * S].contiguous() for x in (q_g, k_g, v_g))
+            if transposed:
+                q, k, v = (x.transpose(-1, -2).contiguous().transpose(-1, -2) for x in (q, k, v))
+                assert q.stride(-1) != 1
+            for chunks in (1, 2):
+                exact = run_ulysses_overlap(dist.group.WORLD, q, k, v, _sdpa_nhd, chunks=chunks, int8=False)
+                assert exact.shape == q.shape
+                torch.testing.assert_close(exact.float(), ref, atol=2e-2, rtol=2e-2)
+                lossy = run_ulysses_overlap(dist.group.WORLD, q, k, v, _sdpa_nhd, chunks=chunks, int8=True)
+                cos = F.cosine_similarity(lossy.float().flatten(), ref.flatten(), dim=0).item()
+                assert cos > 0.9995, (D, transposed, chunks, cos)
     finally:
         dist.destroy_process_group()
 

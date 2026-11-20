@@ -29,7 +29,10 @@ from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+
+logger = init_logger(__name__)
 
 ROW_BYTES_EXTRA = 4  # one fp32 scale per (token, head) row
 _BLOCK_ROWS = 32  # (token, head) rows per Triton program
@@ -53,7 +56,8 @@ def _quant_pack_kernel(
     row_bytes: tl.constexpr,
     block_rows: tl.constexpr,
 ):
-    rows = tl.program_id(0) * block_rows + tl.arange(0, block_rows)
+    # int64: element offsets (s * stride_s, row * row_bytes) pass 2**31 on long sequences.
+    rows = (tl.program_id(0) * block_rows + tl.arange(0, block_rows)).to(tl.int64)
     mask = rows < n_rows
     j = rows % hc
     s = (rows // hc) % seq_len
@@ -88,7 +92,8 @@ def _dequant_unpack_kernel(
     row_bytes: tl.constexpr,
     block_rows: tl.constexpr,
 ):
-    rows = tl.program_id(0) * block_rows + tl.arange(0, block_rows)
+    # int64: element offsets (s * stride_s, row * row_bytes) pass 2**31 on long sequences.
+    rows = (tl.program_id(0) * block_rows + tl.arange(0, block_rows)).to(tl.int64)
     mask = rows < n_rows
     j = rows % hc
     s = (rows // hc) % seq_len
@@ -177,9 +182,12 @@ class UlyssesOverlapRunner:
         dev, dtype = query.device, query.dtype
         compute = torch.cuda.current_stream(dev)
         comm = self._comm_stream(dev)
-        srcs = [x[0] for x in (query, key, value)]  # (S, H, D) views
-        for x in srcs:
-            assert x.stride(-1) == 1, "last dim must be contiguous"
+        # (S, H, D) views; the pack kernels read strided rows but need a contiguous head dim.
+        srcs = [x[0] if x.stride(-1) == 1 else x[0].contiguous() for x in (query, key, value)]
+        if int8 and D & (D - 1):
+            # tl.arange in the pack kernels needs a power-of-two head dim; keep the bf16 overlap instead.
+            logger.warning_once("ulysses_overlap_int8 needs a power-of-two head_dim (got %d); sending bf16.", D)
+            int8 = False
 
         # Allocate everything on the compute stream, before any side-stream work (see ordering note).
         row = D + ROW_BYTES_EXTRA

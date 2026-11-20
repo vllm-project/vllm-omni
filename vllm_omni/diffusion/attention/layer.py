@@ -1220,9 +1220,6 @@ class Attention(nn.Module):
             return 0
         if query.shape[2] % (sp_group.ulysses_world_size * chunks):
             return 0
-        head_dim = int(query.shape[3])
-        if getattr(strategy, "overlap_int8", False) and (head_dim & (head_dim - 1)) != 0:
-            return 0  # the int8 pack kernels vectorize over a power-of-two head dim
         if attn_metadata is not None:
             if (
                 attn_metadata.attn_mask is not None
