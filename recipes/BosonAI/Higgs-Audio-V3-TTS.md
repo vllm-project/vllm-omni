@@ -113,7 +113,12 @@ python examples/online_serving/text_to_speech/higgs_audio_v3/batch_speech_client
     - Both stages use `max_num_seqs=16` and device `0` by default.
     - CUDA Stage 0 uses FLASH_ATTN, `FULL` CUDA graph capture and `async_scheduling: true`; Stage 1 stays eager with codec graph windows `[8, 33]`.
     - CUDA streaming uses 25-frame chunks with 8-frame left context and an 8-frame first chunk (~320 ms of audio).
-    - Non-CUDA overrides preserve eager execution and the earlier streaming geometry, use V2 with async scheduling, and disable the six CUDA-tuned `audio_mrv2_*` optimizations. Hardware qualification remains separate.
+    - Non-CUDA overrides preserve eager execution and the earlier streaming
+      geometry, use V2 with async scheduling, and disable the six CUDA-tuned
+      `audio_mrv2_*` optimizations. ROCm, NPU, XPU, and MUSA are not supported
+      on this vLLM 0.34 head; these overrides are retained only for
+      configuration/test coverage until platform-specific quality and
+      performance validation is available.
     - The sampler supports `temperature`, `top_p`, `top_k` and `seed`. Remove unsupported penalties, logprobs, min_tokens, min_p, allowed/bad token ids and logit_bias; they are rejected before queue admission.
 - Deploy profiles:
     - Default: `vllm_omni/deploy/higgs_multimodal_qwen3.yaml`.

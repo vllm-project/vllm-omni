@@ -19,8 +19,10 @@ vllm-omni serve bosonai/higgs-audio-v3-tts-4b \
 
 Non-CUDA overrides preserve eager execution and the previous connector
 geometry. They keep V2 and async scheduling enabled, with the six CUDA-tuned
-`audio_mrv2_*` optimizations disabled. These configuration checks do not
-establish hardware support or performance parity.
+`audio_mrv2_*` optimizations disabled. They are retained for configuration and
+test coverage only: ROCm, NPU, XPU, and MUSA are not supported for Higgs Audio
+v3 on this vLLM 0.34 head until platform-specific quality and performance
+validation is available. Do not treat these overrides as production support.
 
 The sampler supports `temperature`, `top_p`, `top_k` and `seed`. Non-neutral
 penalties, logprobs, min_tokens, min_p, allowed/bad token ids and logit_bias
