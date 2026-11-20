@@ -2667,7 +2667,7 @@ def test_checkpoint_proxies_apply_component_adapter_before_conversion(tmp_path, 
     )
     args = (loader, model, discovered, HSDPInferenceConfig(enabled=True, hsdp_shard_size=1), torch.device("cpu"))
     if missing_scale:
-        with pytest.raises(ValueError, match="Missing ModelOpt FP8 weight_scale"):
+        with pytest.raises(ValueError, match=r"Missing ModelOpt .*transformer\.orig\.1\.weight_scale"):
             proxy_module.load_with_checkpoint_proxies(*args)
         assert model.transformer.blocks[1] not in processed
         return
