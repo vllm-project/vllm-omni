@@ -3313,11 +3313,18 @@ class TestPlatformOverrides:
         """Preserve the non-CUDA eager shape without selecting retired V1."""
         deploy_path = Path(get_deploy_config_path("higgs_multimodal_qwen3.yaml"))
 
+        expected_attention_backend = {
+            "rocm": "TRITON_ATTN",
+            "npu": "FLASH_ATTN",
+            "xpu": "FLASH_ATTN",
+            "musa": "FLASH_ATTN",
+        }
         for platform in ("rocm", "npu", "xpu", "musa"):
             deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform)
             assert deploy.model_runner == "v2", platform
             assert all(stage.model_runner is None for stage in deploy.stages), platform
             stage0 = deploy.stages[0]
+            assert stage0.attention_backend == expected_attention_backend[platform], platform
             assert stage0.enforce_eager is True, platform
             assert stage0.async_scheduling is True, platform
             assert stage0.engine_extras["enable_prefix_caching"] is True, platform
