@@ -277,9 +277,6 @@ def test_process_tree_crash_at_load(
 
 
 @scenario_params(MODEL, ProcessKillServeRootNoLoad)
-@pytest.mark.skip(
-    reason="Child wakeup FIFOs remain after root crash: https://github.com/vllm-project/vllm-omni/issues/10391"
-)
 def test_serve_root_crash_at_idle(
     omni_server_function,
     online_client_function,
@@ -289,9 +286,6 @@ def test_serve_root_crash_at_idle(
 
 
 @scenario_params(MODEL, ProcessKillServeRootWithLoad)
-@pytest.mark.skip(
-    reason="Child wakeup FIFOs remain after root crash: https://github.com/vllm-project/vllm-omni/issues/10391"
-)
 def test_serve_root_crash_at_load(
     omni_server_function,
     online_client_function,
