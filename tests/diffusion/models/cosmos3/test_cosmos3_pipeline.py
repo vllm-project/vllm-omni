@@ -2787,6 +2787,7 @@ def tiny_real_cosmos3_transformer(monkeypatch: pytest.MonkeyPatch) -> nn.Module:
     from tests.diffusion.models.cosmos3.test_cosmos3_transformer import _tiny_cosmos3_config
     from vllm_omni.diffusion.attention import selector
     from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+    from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
     from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
     from vllm_omni.platforms import current_omni_platform
 
@@ -2803,7 +2804,11 @@ def tiny_real_cosmos3_transformer(monkeypatch: pytest.MonkeyPatch) -> nn.Module:
     selector._cached_get_backend_cls.cache_clear()
     torch.manual_seed(0)
     model = transformer_cosmos3.Cosmos3VFMTransformer(
-        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(num_hidden_layers=2), dtype=torch.float32)
+        OmniDiffusionConfig(
+            model=None,
+            tf_model_config=TransformerConfig.from_dict(_tiny_cosmos3_config(num_hidden_layers=2)),
+            dtype=torch.float32,
+        )
     ).eval()
     with torch.no_grad():
         for param in model.parameters():
@@ -3645,7 +3650,9 @@ class TestForwardRouting:
         elif fallback == "pipeline_parallel":
             monkeypatch.setattr(pipeline, "_pp_parallel_active", lambda: True)
         else:
-            pipeline.od_config.parallel_config = SimpleNamespace(sequence_parallel_size=2)
+            from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+            pipeline.od_config.parallel_config = DiffusionParallelConfig(ulysses_degree=2)
         assert not pipeline._can_batch_t2i_outputs()
 
         output = pipeline.forward(
@@ -5275,10 +5282,11 @@ def test_pipeline_parallel_rejects_cache_backends(pp_size, cache_backend, should
     [(None, False), ("none", False), ("None", False), ("", False), ("cache_dit", True), ("sea_cache", True)],
 )
 def test_cosmos3_cache_backend_active(cache_backend, active) -> None:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import _cosmos3_cache_backend_active
 
-    assert _cosmos3_cache_backend_active(SimpleNamespace(cache_backend=cache_backend)) is active
-    assert _cosmos3_cache_backend_active(SimpleNamespace()) is False
+    assert _cosmos3_cache_backend_active(OmniDiffusionConfig(model=None, cache_backend=cache_backend)) is active
+    assert _cosmos3_cache_backend_active(OmniDiffusionConfig(model=None)) is False
 
 
 def test_pipeline_init_rejects_cache_backend_under_pp_before_loading(monkeypatch: pytest.MonkeyPatch) -> None:
