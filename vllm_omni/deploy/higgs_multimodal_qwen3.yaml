@@ -121,7 +121,9 @@ platforms:
           - 15
           - 16
   # Preserve the existing non-CUDA eager shape and connector geometry. The
-  # six CUDA-tuned MRV2 optimizations stay disabled until validated there.
+  # six CUDA-tuned MRV2 optimizations stay disabled; these non-CUDA paths are
+  # retained for configuration/test coverage only and are unsupported until
+  # platform-specific validation is available.
   # Async payload/prompt mode remain enabled, as required by the V2 runner.
   rocm:
     # Platform geometry takes precedence over top-level codec_* values.

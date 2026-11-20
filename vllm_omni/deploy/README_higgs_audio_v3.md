@@ -41,6 +41,13 @@ vllm-omni serve bosonai/higgs-audio-v3-tts-4b \
     --deploy-config vllm_omni/deploy/higgs_multimodal_qwen3_high_throughput.yaml
 ```
 
+Non-CUDA overrides preserve eager execution and the previous connector
+geometry. They keep V2 and async scheduling enabled, with the six CUDA-tuned
+`audio_mrv2_*` optimizations disabled. They are retained for configuration and
+test coverage only: ROCm, NPU, XPU, and MUSA are not supported for Higgs Audio
+v3 on this vLLM 0.34 head until platform-specific quality and performance
+validation is available. Do not treat these overrides as production support.
+
 ## Low Latency
 
 Use `higgs_multimodal_qwen3_low_latency.yaml` for low-concurrency serving
