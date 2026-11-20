@@ -1389,9 +1389,11 @@ consumes them in unit order, the n-th flag completing the n-th speaking unit
 (a Code2Wav segment end alone does not complete a unit, so a trailing
 control-only turn-end snapshot of the previous unit cannot complete the next
 one); a Stage-0 segment that
-hands the Talker nothing (`<|speak|>` straight into `<|chunk_eos|>`) is
-forwarded as an empty hand-off, which the Talker closes like any segment,
-so the default `unit_decision` is enough; and its input buffer implements
+hands the Talker nothing (`<|speak|>` straight into `<|chunk_eos|>`, or the
+chunk terminator drawn as the unit's first decision) is forwarded as an
+empty hand-off, which the Talker closes like any segment, so every speaking
+unit has a Talker segment end and a flagged Code2Wav output of its own and
+the default `unit_decision` is enough; and its input buffer implements
 `prepare_backlog`. The flag marks the end of what the bridge hands Code2Wav
 for the unit, not of its audio: the vocoder's lookahead, and a remainder
 shorter than 5 frames that the connector carries into the next unit's first

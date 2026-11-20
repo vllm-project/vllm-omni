@@ -250,6 +250,44 @@ async def test_flushes_of_two_queued_units_that_overtake_both_stage0_segment_end
         await close_harness(h)
 
 
+async def test_a_unit_that_opens_with_the_chunk_terminator_is_acknowledged_before_the_next_speaking_unit() -> None:
+    """Stage 0 can draw the chunk terminator as a unit's first decision; ``llm2tts`` hands the Talker an empty condition
+    for it, so the unit has a Talker segment end and an empty flagged Code2Wav marker of its own. The speaking unit
+    after it is acknowledged after its own audio instead of standing in for the empty unit."""
+    h = await open_harness(extra_body=INPUT_CLOCK, stage_count=3)
+    try:
+        await h.run(append_audio())
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        terminator_only = SimpleNamespace(
+            request_id=request_id,
+            finished=False,
+            outputs=[SimpleNamespace(text="", token_ids=[CHUNK_EOS], multimodal_output={})],
+            multimodal_output={},
+        )
+        h.deliver(terminator_only, stage_id=0, segment_finished=True)
+        h.deliver(_speak_segment_end(request_id), stage_id=0, segment_finished=True)
+        assert "input_audio_buffer.processed" not in types(await h.settle())
+
+        talker = SimpleNamespace(request_id=request_id, finished=False, outputs=[], multimodal_output={})
+        events = await h.deliver_and_settle(talker, stage_id=1, segment_finished=True)
+        assert "input_audio_buffer.processed" not in types(events), "the empty marker has not arrived"
+        marker = tts_output(request_id, samples=0, text="", tts_is_last_chunk=True)
+        events = await h.deliver_and_settle(marker, stage_id=2)
+        acks = [e for e in events if e.type == "input_audio_buffer.processed"]
+        assert [(a.input_index, a.units) for a in acks] == [(1, ({"end_ms": 1000, "decision": "speak"},))]
+
+        flush = tts_output(request_id, samples=24000, text="unit 2", tts_is_last_chunk=True)
+        events = await h.deliver_and_settle(flush, stage_id=2)
+        assert "input_audio_buffer.processed" not in types(events), "unit 2 still waits for its Talker end"
+        talker = SimpleNamespace(request_id=request_id, finished=False, outputs=[], multimodal_output={})
+        events = await h.deliver_and_settle(talker, stage_id=1, segment_finished=True)
+        acks = [e for e in events if e.type == "input_audio_buffer.processed"]
+        assert [(a.input_index, a.units) for a in acks] == [(2, ({"end_ms": 2000, "decision": "speak"},))]
+    finally:
+        await close_harness(h)
+
+
 # --------------------------------------------------------------------------- #
 # Backlog, and audio-only input                                                #
 # --------------------------------------------------------------------------- #

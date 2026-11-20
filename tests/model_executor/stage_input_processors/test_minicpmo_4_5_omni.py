@@ -456,6 +456,63 @@ def test_native_duplex_empty_speech_chunk_preserves_segment_boundary(boundary: i
     assert info["meta"]["streaming_condition_seq"] == 0
 
 
+@pytest.mark.parametrize("boundary", [9308, 9309])
+@pytest.mark.parametrize("leading_listens", [0, 2])
+def test_native_duplex_terminator_first_unit_is_an_empty_condition_and_the_next_unit_keeps_its_own(
+    boundary: int, leading_listens: int
+) -> None:
+    """Stage 0 draws the chunk terminator on every uncapped step, so a unit
+    can open with it: no <|speak|>, no folded <|tts_bos|>, no speech. The
+    unit still ends a segment, so it is handed over as an empty condition
+    (closed by the Talker like any segment) and the following speaking unit
+    gets its own hand-off and condition sequence rather than standing in for
+    the terminator-only unit's missing segment end."""
+    prompt_ids = [101, 102]
+    context = SimpleNamespace(bridge_states={"duplex": {"epoch": 3, "model_turn_id": 7}})
+    first_ids = [*([9303] * leading_listens), boundary]
+    first = _output(
+        prompt_ids=prompt_ids,
+        output_ids=first_ids,
+        latent=torch.arange((len(prompt_ids) + len(first_ids)) * 4, dtype=torch.float32).reshape(-1, 4),
+        multimodal_output={"duplex_prompt_token_ids": prompt_ids, "meta": dict(_NATIVE_META)},
+    )
+    second_ids = [*first_ids, 9304, 21, 22, 9308]
+    second_latent = torch.arange((len(prompt_ids) + len(second_ids)) * 4, dtype=torch.float32).reshape(-1, 4)
+    second = _output(
+        prompt_ids=prompt_ids,
+        output_ids=second_ids,
+        latent=second_latent,
+        multimodal_output={"duplex_prompt_token_ids": prompt_ids, "meta": dict(_NATIVE_META)},
+    )
+
+    first_info = llm2tts([first], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+    second_info = llm2tts([second], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+
+    assert first_info["ids"]["tts"] == []
+    assert torch.as_tensor(unpack_handoff_tensor(first_info["hidden_states"]["tts"])).numel() == 0
+    assert first_info["meta"]["segment_end"] is True
+    assert first_info["meta"]["turn_end"] is False
+    assert first_info["meta"]["next_stage_prompt_len"] == 2
+    assert first_info["meta"]["streaming_condition_seq"] == 0
+    text_rows = len(prompt_ids) + len(first_ids) + 1
+    assert second_info["ids"]["tts"] == [21, 22]
+    assert torch.equal(
+        torch.as_tensor(unpack_handoff_tensor(second_info["hidden_states"]["tts"])),
+        second_latent[text_rows : text_rows + 2],
+    )
+    assert second_info["meta"]["segment_end"] is True
+    assert second_info["meta"]["streaming_condition_seq"] == 1
+
+
+def test_native_duplex_listen_only_unit_hands_the_talker_nothing() -> None:
+    """A unit that ends in <|listen|> (not a chunk terminator) has no Talker
+    segment: it is the listen decision, not an empty speech segment."""
+    source, _ = _native_source(prompt_ids=[101, 102], output_ids=[9303, 9303], row_ids=[101, 102, 9303, 9303])
+    context = SimpleNamespace(bridge_states={"duplex": {"epoch": 3, "model_turn_id": 7}})
+
+    assert llm2tts([source], prompt=[{}], _streaming_context=context) == []
+
+
 def test_native_duplex_turn_eos_row_is_handed_to_talker() -> None:
     """<|turn_eos|> is forwarded (it is not a stop token) and the model keeps
     sampling until a chunk terminator; the Talker gets every forwarded row
