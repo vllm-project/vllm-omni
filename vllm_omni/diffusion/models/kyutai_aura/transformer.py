@@ -175,7 +175,7 @@ class HistorySelfAttention(WanAttentionProjections):
         return self.o(out)
 
 
-class AuraBlock(nn.Module):
+class KyutaiAuraBlock(nn.Module):
     """Wan2.1 attention block (self-attention, text cross-attention, FFN, six modulation vectors)
     with two modulation rows, one for the noisy tokens and one for the reference-frame tokens."""
 
@@ -255,7 +255,7 @@ class KyutaiAuraTransformer(nn.Module):
     the chunk's speech tokens and the request's rolling history."""
 
     # Regional compilation (vllm_omni/diffusion/compile.py) compiles each of these blocks.
-    _repeated_blocks = ["AuraBlock"]
+    _repeated_blocks = ["KyutaiAuraBlock"]
 
     def __init__(self, cfg: KyutaiAuraConfig) -> None:
         super().__init__()
@@ -267,7 +267,7 @@ class KyutaiAuraTransformer(nn.Module):
         )
         self.time_embedding = nn.Sequential(nn.Linear(cfg.freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
-        self.blocks = nn.ModuleList(AuraBlock(cfg, prefix=f"blocks.{i}") for i in range(cfg.num_layers))
+        self.blocks = nn.ModuleList(KyutaiAuraBlock(cfg, prefix=f"blocks.{i}") for i in range(cfg.num_layers))
         self.head = Head(dim, cfg.latent_channels, cfg.patch_size, cfg.eps)
         self.trainable_cond_mask = nn.Embedding(2, dim)  # token types: noisy, reference frame
         self.casual_audio_encoder = CausalAudioEncoder(

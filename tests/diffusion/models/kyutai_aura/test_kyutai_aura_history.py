@@ -5,7 +5,7 @@ import torch
 
 from vllm_omni.diffusion.models.kyutai_aura.audio import to_video_rate
 from vllm_omni.diffusion.models.kyutai_aura.config import (
-    AURA_1_3B,
+    KYUTAI_AURA_1_3B,
     closest_bucket,
     resolve_kyutai_aura_config,
     unsupported_kyutai_aura,
@@ -22,7 +22,7 @@ def _span(start: int, stop: int) -> list[int]:
 
 # AURA-1.3B: 4 latent frames per chunk, anchor + 2 chunks, reference frame at 30 inside a
 # 20-frame segment; positions freeze once chunk 4 (the last that fits a segment) is reached.
-POSITIONS_1_3B = ChunkPositions.for_config(AURA_1_3B)
+POSITIONS_1_3B = ChunkPositions.for_config(KYUTAI_AURA_1_3B)
 EXPECTED_1_3B = {
     0: (_span(0, 4) + [30], _span(0, 4) + [30]),
     1: (_span(4, 8) + [30], _span(0, 8) + [30]),
@@ -81,17 +81,17 @@ def test_to_video_rate_pads_to_whole_chunks():
 
 
 def test_buckets_and_checkpoint_resolution(tmp_path):
-    assert closest_bucket(AURA_1_3B.buckets, 1080, 1920) == (512, 768)
-    assert closest_bucket(AURA_1_3B.buckets, 1024, 1024) == (576, 576)
-    assert resolve_kyutai_aura_config("kyutai/AURA-1.3B") is AURA_1_3B
+    assert closest_bucket(KYUTAI_AURA_1_3B.buckets, 1080, 1920) == (512, 768)
+    assert closest_bucket(KYUTAI_AURA_1_3B.buckets, 1024, 1024) == (576, 576)
+    assert resolve_kyutai_aura_config("kyutai/AURA-1.3B") is KYUTAI_AURA_1_3B
     # AURA-5B is recognized, so the pipeline can say why it is not supported yet.
     assert resolve_kyutai_aura_config("https://huggingface.co/kyutai/aura-5b") is None
     assert "AURA-5B" in unsupported_kyutai_aura("kyutai/AURA-5B")
     assert unsupported_kyutai_aura("kyutai/AURA-1.3B") is None
     assert resolve_kyutai_aura_config(str(tmp_path)) is None
-    (tmp_path / AURA_1_3B.checkpoint).parent.mkdir(parents=True)
-    (tmp_path / AURA_1_3B.checkpoint).touch()
-    assert resolve_kyutai_aura_config(str(tmp_path)) is AURA_1_3B
+    (tmp_path / KYUTAI_AURA_1_3B.checkpoint).parent.mkdir(parents=True)
+    (tmp_path / KYUTAI_AURA_1_3B.checkpoint).touch()
+    assert resolve_kyutai_aura_config(str(tmp_path)) is KYUTAI_AURA_1_3B
 
 
 def test_decode_spans_first_frame_alone_then_groups():
@@ -102,10 +102,10 @@ def test_decode_spans_first_frame_alone_then_groups():
 
 
 def test_student_sigmas_on_the_shifted_grid():
-    sigma_of = StudentSigmas(AURA_1_3B.schedule_steps, AURA_1_3B.schedule_shift)
+    sigma_of = StudentSigmas(KYUTAI_AURA_1_3B.schedule_steps, KYUTAI_AURA_1_3B.schedule_shift)
     assert sigma_of(1000) == 1.0
-    sigmas = [sigma_of(t) for t in AURA_1_3B.timesteps]
+    sigmas = [sigma_of(t) for t in KYUTAI_AURA_1_3B.timesteps]
     assert sigmas == sorted(sigmas, reverse=True)
-    for t, sigma in zip(AURA_1_3B.timesteps, sigmas):
+    for t, sigma in zip(KYUTAI_AURA_1_3B.timesteps, sigmas):
         # Each student timestep sits within half a grid step of its sigma's timestep.
-        assert abs(1000 * sigma - t) < 1000 / AURA_1_3B.schedule_steps, t
+        assert abs(1000 * sigma - t) < 1000 / KYUTAI_AURA_1_3B.schedule_steps, t

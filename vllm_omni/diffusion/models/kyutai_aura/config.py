@@ -79,8 +79,8 @@ class KyutaiAuraConfig:
         return self.segment_frames // self.frames_per_chunk - 1
 
 
-AURA_1_3B = KyutaiAuraConfig(
-    name="aura-1.3b",
+KYUTAI_AURA_1_3B = KyutaiAuraConfig(
+    name="kyutai-aura-1.3b",
     hub_repo="kyutai/AURA-1.3B",
     checkpoint="stage2_dmd/step-6500_ema_merged.safetensors",
     base_repo="Wan-AI/Wan2.1-T2V-1.3B",
@@ -101,7 +101,7 @@ AURA_1_3B = KyutaiAuraConfig(
     rope_reindex=True,
 )
 
-SUPPORTED: Mapping[str, KyutaiAuraConfig] = MappingProxyType({AURA_1_3B.hub_repo.lower(): AURA_1_3B})
+SUPPORTED: Mapping[str, KyutaiAuraConfig] = MappingProxyType({KYUTAI_AURA_1_3B.hub_repo.lower(): KYUTAI_AURA_1_3B})
 NOT_SUPPORTED_YET: Mapping[str, str] = MappingProxyType(
     {"kyutai/aura-5b": "Kyutai AURA-5B (wav2vec2 speech features, Wan2.2 VAE) is not supported yet"}
 )
