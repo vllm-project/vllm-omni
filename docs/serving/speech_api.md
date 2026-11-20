@@ -208,6 +208,15 @@ rejects some truncated generations with an error instead (Base task requests,
 and requests whose budget the server sizes from the text), so those never
 return audio.
 
+The default `qwen3_tts.yaml` reserves an 8192-token Talker context while
+keeping the codec output ceiling at 4096 tokens. The context includes the
+conditioned prompt as well as generated codec tokens: for example, an
+892-token prompt in a 4096-token context leaves only 3204 tokens for speech.
+When tuning a custom deployment, set stage 0 `max_model_len` to cover the
+conditioned prompt plus the desired output budget. Raising `max_new_tokens`
+alone cannot extend the context. Longer requests can occupy more KV cache;
+the output ceiling and incomplete-generation checks still apply.
+
 Raw audio streams (`stream_format="audio"`) send their headers before
 generation ends, and the batch endpoint and WebSocket streaming do not carry the
 flag; use a non-streaming request or the SSE stream to detect truncation.

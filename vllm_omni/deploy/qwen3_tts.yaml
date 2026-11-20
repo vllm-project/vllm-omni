@@ -93,7 +93,10 @@ stages:
     # Bound per-step prefill work (validated MRV2 basic profile). Small
     # per-step batches keep first-chunk latency low.
     max_num_batched_tokens: 512
-    max_model_len: 4096
+    # The context includes conditioning AND generated codec tokens. Reserve
+    # input headroom so long CustomVoice/VoiceDesign prompts can use the full
+    # 4096-frame output budget instead of hitting the context limit first.
+    max_model_len: 8192
     devices: "0"
     output_connectors:
       to_stage_1: connector_of_shared_memory
