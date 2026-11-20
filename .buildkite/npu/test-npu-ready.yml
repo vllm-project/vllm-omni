@@ -207,6 +207,29 @@ steps:
                 "
         timeout_in_minutes: 60
 
+      - label: "Diffusion · LingBot-World Test (A2)"
+        key: ready-diffusion-lingbot-world-a2
+        source_file_dependencies: diffusion_lingbot_world_npu_function
+        timeout_in_minutes: 90
+        mirror_hardwares: a2b3_npu_4
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          VLLM_IMAGE_FETCH_TIMEOUT: "60"
+          VLLM_OMNI_AR_DIFFUSION_KV_GATHER: "0"
+          AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH: "0"
+          OMP_NUM_THREADS: "1"
+        commands:
+          # The advanced run level keeps real weights in the explicit deploy config.
+          - |
+            set -e
+            VLLM_OMNI_LINGBOT_WORLD_V2_CHECKPOINT_PATH=$$(
+              HF_HUB_OFFLINE=0 hf download robbyant/lingbot-world-v2-14b-causal-fast-diffusers \
+                --revision 59cccf49f2d2dd27418ae7a04b82b10868d455c2 --quiet
+            )
+            export VLLM_OMNI_LINGBOT_WORLD_V2_CHECKPOINT_PATH
+            MODEL_PREFIX="" pytest -s -v tests/e2e/offline_inference/test_lingbot_world_v2.py \
+              -m "core_model and diffusion and npu and A2 and cards_4" --run-level advanced_model
+
       - label: "Diffusion · Hunyuan Image Test"
         mirror_hardwares: a3_npu_4
         env:

@@ -2,9 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """End-to-end smoke test for LingBot-World v2 generation.
 
-Both cases send the same one-block request. Ready checks that it succeeds with
-one finite video of the expected shape. Merge and Nightly also check that the
-video is not constant and varies over time.
+Every case sends a one-block request and checks the shape and finiteness of
+the RGB frames. CUDA Merge/Nightly and Ascend A2 Ready also check motion.
 """
 
 from __future__ import annotations
@@ -37,7 +36,7 @@ _HEIGHT = 480
 _WIDTH = 832
 _NUM_FRAMES = 9
 
-_OMNI_RUNNER_PARAM = (
+_CUDA_RUNNER = (
     MODEL,
     None,
     {
@@ -46,10 +45,13 @@ _OMNI_RUNNER_PARAM = (
     },
 )
 
-pytestmark = [
-    pytest.mark.diffusion,
-    pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
-]
+_NPU_RUNNER = (
+    MODEL,
+    str(Path(__file__).resolve().parents[1] / "accuracy/lingbot_world/configs/npu_usp4_offload.yaml"),
+    {"stage_init_timeout": 2400, "init_timeout": 2400},
+)
+
+pytestmark = [pytest.mark.diffusion]
 
 
 def _write_forward_trajectory(action_dir: Path) -> None:
@@ -82,8 +84,8 @@ def _first_frame() -> str:
     return str(ImageAsset(_IMAGE_ASSET).get_path("jpg"))
 
 
-def _generate_one_block(handler: OmniRunnerHandler, action_path: str) -> np.ndarray:
-    """Generate one causal block and check success, one video, shape and finiteness."""
+def _generate_one_block(handler: OmniRunnerHandler, action_path: str, *, stepwise: bool = False) -> np.ndarray:
+    """Generate and return the nine RGB frames from one causal block."""
     response = handler.send_diffusion_request(
         {
             "model": handler.runner.model_name,
@@ -108,13 +110,25 @@ def _generate_one_block(handler: OmniRunnerHandler, action_path: str) -> np.ndar
     assert response.images is not None
     assert len(response.images) == 1
     video = np.asarray(response.images[0])
-    assert video.shape == (1, _NUM_FRAMES, _HEIGHT, _WIDTH, 3)
+    # Whole-clip inference includes a batch axis. Step execution returns one
+    # decoded THWC chunk directly in the video payload.
+    if not stepwise:
+        assert video.shape == (1, _NUM_FRAMES, _HEIGHT, _WIDTH, 3)
+        video = video[0]
+    assert video.shape == (_NUM_FRAMES, _HEIGHT, _WIDTH, 3)
     assert np.isfinite(video).all()
     return video
 
 
+def _assert_video_varies(video: np.ndarray) -> None:
+    assert np.ptp(video) > 1e-6
+    # Stepwise output uses uint8, so subtract in floating point.
+    assert np.mean(np.abs(np.diff(video.astype(np.float32, copy=False), axis=0))) > 1e-6
+
+
 @pytest.mark.core_model
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@pytest.mark.parametrize("omni_runner", [_CUDA_RUNNER], indirect=True)
 def test_lingbot_world_v2_tp1_one_block_ready(lingbot_action_path: str, omni_runner_handler: OmniRunnerHandler) -> None:
     """Load the real checkpoint and generate one causal block on one GPU."""
     _generate_one_block(omni_runner_handler, lingbot_action_path)
@@ -123,8 +137,17 @@ def test_lingbot_world_v2_tp1_one_block_ready(lingbot_action_path: str, omni_run
 @pytest.mark.advanced_model
 @pytest.mark.full_model
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@pytest.mark.parametrize("omni_runner", [_CUDA_RUNNER], indirect=True)
 def test_lingbot_world_v2_tp1_one_block(lingbot_action_path: str, omni_runner_handler: OmniRunnerHandler) -> None:
     """Generate one causal block and check that the video varies."""
     video = _generate_one_block(omni_runner_handler, lingbot_action_path)
-    assert float(np.ptp(video)) > 1e-6
-    assert float(np.mean(np.abs(np.diff(video, axis=1)))) > 1e-6
+    _assert_video_varies(video)
+
+
+@pytest.mark.core_model
+@hardware_test(res={"npu": "A2"}, num_cards=4)
+@pytest.mark.parametrize("omni_runner", [_NPU_RUNNER], indirect=True)
+def test_lingbot_world_v2_usp4_one_block(lingbot_action_path: str, omni_runner_handler: OmniRunnerHandler) -> None:
+    """Decode one block with Ulysses SP-4 and text-encoder offload on four A2 devices."""
+    video = _generate_one_block(omni_runner_handler, lingbot_action_path, stepwise=True)
+    _assert_video_varies(video)
