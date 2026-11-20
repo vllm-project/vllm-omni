@@ -1201,7 +1201,7 @@ class TestStreamingSpeechWebSocket:
             captured_requests.append(request)
             assert arrival_time is not None
             captured_timing["prepare_arrival"] = arrival_time
-            return request_id or "req-stream", object(), {"_qwen3_tts_effective_max_tokens": [192]}
+            return request_id or "req-stream", object(), {"task_type": ["Base"]}
 
         speech_service._prepare_speech_generation = mock_prepare_speech_generation
 
@@ -1269,7 +1269,7 @@ class TestStreamingSpeechWebSocket:
         assert captured_requests[0].initial_codec_chunk_frames == 12
         assert captured_timing["prepare_arrival"] == captured_timing["chunk_arrival"]
         assert captured_timing["chunk_start"] > 0
-        assert captured_tts_params == [{"_qwen3_tts_effective_max_tokens": [192]}]
+        assert captured_tts_params == [{"task_type": ["Base"]}]
         assert speech_service._generate_audio_bytes.await_count == 0
 
     @staticmethod

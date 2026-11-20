@@ -13,7 +13,9 @@ omni_source_dir=$(git rev-parse --show-toplevel)
 # builds below, so pulling it is equivalent to building the fallback base.
 upstream_base_image="vllm/vllm-openai-xpu:${VLLM_VERSION}"
 local_base_image="xpu/vllm-omni-ci-base:${VLLM_VERSION}"
-image_name="xpu/vllm-omni-ci:${BUILDKITE_COMMIT:?BUILDKITE_COMMIT must be set}"
+# The job id in the tag keeps the 1-card and 2-card jobs of one commit from
+# deleting each other's image when they land on the same host.
+image_name="xpu/vllm-omni-ci:${BUILDKITE_COMMIT:?BUILDKITE_COMMIT must be set}-${BUILDKITE_JOB_ID:-local}"
 container_name="xpu_${BUILDKITE_COMMIT}_$(
     tr -dc A-Za-z0-9 </dev/urandom | head -c 10
     echo
@@ -103,11 +105,14 @@ mkdir -p "${HF_CACHE}"
 HF_MOUNT="/root/.cache/huggingface"
 
 # Test budget inside the container; the pipeline gives the broad scope more.
-# Each stage also has its own cap - 6+13+28+2+10 = 59m in the pr scope, plus
-# 20+15 = 94m in the broad scope - so one runaway stage cannot eat the whole
-# budget, and the stages that run last still get their full cap. Measured end to
-# end in the pr scope on two cards: 3m40s dispatch + 10m05s omni + 23m01s core
-# 1-card + 23s mxfp8 + 1m41s core 2-card = 39m31s including the reaps.
+# Each stage also has its own cap, per job:
+#   pr · 1 card   6+13+28+2 = 49m
+#   pr · 2 cards  10m
+#   broad (both card groups in one step)  49+20+10+15 = 94m
+# so one runaway stage cannot eat the whole budget, and the stages that run
+# last still get their full cap. Measured end to end in the pr scope:
+# 3m40s dispatch + 10m05s omni + 23m01s core 1-card + 23s mxfp8 on the 1-card
+# job and 1m41s core 2-card on the 2-card job, including the reaps.
 # timeout_in_minutes on the step has to cover the budget plus the image build
 # (check the "time docker build" line above when tuning either).
 XPU_TEST_BUDGET="${XPU_TEST_BUDGET:-60m}"
