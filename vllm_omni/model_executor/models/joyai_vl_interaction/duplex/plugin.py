@@ -383,12 +383,18 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
 
     @staticmethod
     def _system_prompt(runtime_config: Mapping[str, object]) -> str:
-        """Session system prompt: optional extra_body override, else silence persona."""
+        """Session system prompt: persona, then the delegate action, then instructions.
+
+        The persona is the optional extra_body override, else the silence persona.
+        Session instructions come last, after the delegate action they may refer to.
+        """
         override = runtime_config.get("joyai_system_prompt")
         if isinstance(override, str) and override.strip():
             system = override.strip()
         else:
             system = SILENT_SYSTEM_PROMPT
+        if JoyAIDuplexPlugin.delegation_enabled(runtime_config):
+            system += "\n\n" + delegation_system_section()
         instructions = runtime_config.get("instructions")
         if instructions:
             system += "\n\n" + str(instructions)
@@ -1356,7 +1362,6 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         delegation = self.delegation_enabled(runtime_config)
         results_block, rendered_call_ids = "", []
         if delegation:
-            system += "\n\n" + delegation_system_section()
             results_block, rendered_call_ids = render_result_blocks(
                 unanswered_results(runtime_config, chunk=session_config.get("joyai_chunk_id"))
             )
@@ -1454,7 +1459,6 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         delegation = self.delegation_enabled(runtime_config)
         results_block, rendered_call_ids = "", []
         if delegation:
-            system += "\n\n" + delegation_system_section()
             results_block, rendered_call_ids = render_result_blocks(
                 unanswered_results(runtime_config, chunk=session_config.get("joyai_chunk_id"))
             )

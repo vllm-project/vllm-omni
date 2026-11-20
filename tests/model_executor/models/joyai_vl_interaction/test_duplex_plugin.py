@@ -499,6 +499,19 @@ def test_joyai_system_prompt_extra_replaces_silence_persona():
     assert plugin._system_prompt(with_instructions) == "Read aloud.\n\nKeep going."
 
 
+def test_delegate_action_precedes_session_instructions_in_system_prompt():
+    from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import SILENT_SYSTEM_PROMPT
+    from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.delegation import (
+        delegation_system_section,
+        delegation_tool_definition,
+    )
+
+    runtime = {"instructions": "Answer delegated results aloud.", "realtime_tools": [delegation_tool_definition()]}
+    assert JoyAIDuplexPlugin._system_prompt(runtime) == "\n\n".join(
+        (SILENT_SYSTEM_PROMPT, delegation_system_section(), "Answer delegated results aloud.")
+    )
+
+
 def test_plan_partial_is_off_when_async_chunk_is_disabled():
     plugin = JoyAIDuplexPlugin(lambda *args: "")
     plugin.configure_pipeline(JOYAI_VL_INTERACTION_PIPELINE)
