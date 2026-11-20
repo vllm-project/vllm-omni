@@ -56,9 +56,8 @@ class Yue2ModelState(OmniModelState):
         # admitted requests. Its slot numbers may overlap live buffers.
         if not any(rid in req_states.req_id_to_index for rid in input_batch.req_ids):
             return inputs
-        # Slot indices and batch rows differ after admission/preemption. Gather
-        # parameters in forward order, including both members of a CFG pair.
-        buffers = self.intermediate_buffer.gather(input_batch)
+        # The parent supplies buffers in forward order, including both CFG rows.
+        buffers = inputs["model_intermediate_buffer"]
         self.model.prepare_runner_inputs(
             req_ids=input_batch.req_ids,
             num_computed_tokens=input_batch.num_computed_tokens_np,

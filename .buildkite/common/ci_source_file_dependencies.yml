@@ -1313,6 +1313,9 @@ source_file_dependencies:
     - vllm_omni/tokenizers/yue2_prompt.py
     - vllm_omni/tokenizers/yue2_tokenizer.py
     - vllm_omni/transformers_utils/configs/yue2.py
+    - vllm_omni/worker_v2/omni_ar_model_runner.py
+    - vllm_omni/worker_v2/omni_model_runner.py
+    - vllm_omni/worker_v2/model_states/omni_model_state.py
 
   tts_cosyvoice3_function:
     - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
