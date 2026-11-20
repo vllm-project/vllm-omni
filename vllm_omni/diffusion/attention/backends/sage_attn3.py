@@ -177,6 +177,21 @@ def _validate_sage3_metadata(attn_metadata: AttentionMetadata | None) -> None:
         raise ValueError("SAGE_ATTN_3 does not support attn_mask. Select a mask-capable backend.")
 
 
+def _validate_sage3_causal_prefix_length(
+    causal: bool,
+    q_len: int,
+    kv_len: int,
+    attn_metadata: AttentionMetadata | None,
+) -> None:
+    if not causal or attn_metadata is None or attn_metadata.extra.get("valid_kv_length") is None:
+        return
+    if q_len != kv_len:
+        raise ValueError(
+            "SAGE_ATTN_3: causal attention with valid_kv_length requires matching query and sliced K/V lengths "
+            f"(got q_len={q_len}, sliced kv_len={kv_len}). Select a mask-capable backend or match lengths."
+        )
+
+
 class SageAttention3Backend(AttentionBackend):
     accept_output_buffer: bool = True
     supports_prefix_kv_slicing: bool = True
@@ -284,6 +299,12 @@ class SageAttention3Impl(AttentionImpl):
             return replace(result, support=CapabilityResult.unsupported("SAGE_ATTN_3: " + reason))
         try:
             key, value = slice_valid_kv_prefix(key, value, attn_metadata)
+            _validate_sage3_causal_prefix_length(
+                self.causal,
+                query.shape[1],
+                key.shape[1],
+                attn_metadata,
+            )
             _validate_sage3_delta_s_stride(
                 query.shape[2],
                 query.shape[1],
@@ -339,6 +360,12 @@ class SageAttention3Impl(AttentionImpl):
                 f"SAGE_ATTN_3: softmax_scale {self.softmax_scale} does not match head dim {query.shape[-1]}."
             )
         key, value = slice_valid_kv_prefix(key, value, attn_metadata)
+        _validate_sage3_causal_prefix_length(
+            self.causal,
+            query.shape[1],
+            key.shape[1],
+            attn_metadata,
+        )
         query = query.transpose(1, 2).contiguous()
         key = key.transpose(1, 2).contiguous()
         value = value.transpose(1, 2).contiguous()

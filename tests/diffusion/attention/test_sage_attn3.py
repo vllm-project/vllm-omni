@@ -447,6 +447,57 @@ def test_sage3_rejects_invalid_valid_kv_length(monkeypatch: pytest.MonkeyPatch, 
         impl.forward_cuda(q, q, q, metadata)
 
 
+@pytest.mark.parametrize("variant", [None, "sage3_sm100", "sage3_sm120", "sage3_sm121"])
+@pytest.mark.parametrize(("q_len", "kv_len", "valid_len"), [(12, 12, 8), (10, 12, 8), (6, 12, 8)])
+def test_sage3_causal_rejects_partial_valid_kv_length(
+    monkeypatch: pytest.MonkeyPatch, variant, q_len: int, kv_len: int, valid_len: int
+):
+    from vllm_omni.diffusion.attention.capabilities import ExecutionContext, SupportStatus
+
+    module = load_sage_attn3_module(
+        monkeypatch, lambda *args, **kwargs: pytest.fail("kernel must not run on causal partial valid_kv_length")
+    )
+    monkeypatch.setattr(module, "_sage3_kernel_variant", lambda q: variant)
+    impl = module.SageAttention3Impl(2, 64, 0.125, causal=True)
+    q = torch.empty(1, q_len, 2, 64, dtype=torch.bfloat16)
+    k = torch.empty(1, kv_len, 2, 64, dtype=torch.bfloat16)
+    v = torch.empty(1, kv_len, 2, 64, dtype=torch.bfloat16)
+    metadata = AttentionMetadata(extra={"valid_kv_length": valid_len})
+
+    result = impl.resolve_execution_path(ExecutionContext(platform="cuda" if variant else "cpu"), q, k, v, metadata)
+    assert result.support.status is SupportStatus.UNSUPPORTED
+    assert "causal attention with valid_kv_length" in result.support.reason
+    assert result.requested_support(ExecutionContext(platform="cuda" if variant else "cpu")).status is (
+        SupportStatus.UNSUPPORTED
+    )
+    with pytest.raises(ValueError, match="causal attention with valid_kv_length"):
+        impl.forward_cuda(q, k, v, metadata)
+
+
+def test_sage3_causal_allows_matching_sliced_valid_kv_length(monkeypatch: pytest.MonkeyPatch):
+    from vllm_omni.diffusion.attention.capabilities import ExecutionContext, SupportStatus
+
+    seen: list[tuple[int, int]] = []
+
+    def kernel(q, k, v, is_causal=False):
+        seen.append((q.shape[2], k.shape[2]))
+        return torch.ones_like(q)
+
+    module = load_sage_attn3_module(monkeypatch, kernel)
+    monkeypatch.setattr(module, "_sage3_kernel_variant", lambda q: "sage3_sm120")
+    impl = module.SageAttention3Impl(2, 64, 0.125, causal=True)
+    q = torch.randn(1, 8, 2, 64, dtype=torch.bfloat16)
+    k = torch.randn(1, 12, 2, 64, dtype=torch.bfloat16)
+    v = torch.randn(1, 12, 2, 64, dtype=torch.bfloat16)
+    metadata = AttentionMetadata(extra={"valid_kv_length": 8})
+
+    result = impl.resolve_execution_path(ExecutionContext(platform="cuda"), q, k, v, metadata)
+    assert result.support.status is SupportStatus.SUPPORTED
+    out = impl.forward_cuda(q, k, v, metadata)
+    assert out.shape == q.shape
+    assert seen == [(8, 8)]
+
+
 def test_sage3_backend_kwargs_and_compile(monkeypatch: pytest.MonkeyPatch):
     from vllm_omni.diffusion.attention.capabilities import ExecutionContext, SupportStatus
 
