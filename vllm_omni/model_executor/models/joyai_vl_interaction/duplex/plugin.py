@@ -22,7 +22,13 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.config.stage_config import PipelineConfig
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
-from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, DuplexFence, DuplexOutputAction, DuplexOutputDecision
+from vllm_omni.engine.duplex.contracts import (
+    DuplexAppendPlan,
+    DuplexFence,
+    DuplexOutputAction,
+    DuplexOutputDecision,
+    ToolCallAbandonReason,
+)
 from vllm_omni.engine.duplex.plugin import (
     DuplexAuxiliaryPolicy,
     DuplexAuxiliaryRequest,
@@ -30,8 +36,18 @@ from vllm_omni.engine.duplex.plugin import (
     DuplexModelPlugin,
     DuplexModelSessionState,
     DuplexRuntimeConfigError,
+    PartialStageForward,
     duplex_history_digest,
     duplex_text_history,
+)
+from vllm_omni.engine.duplex.text_folding import fit_text_excerpt
+from vllm_omni.engine.duplex.visual_memory import (
+    EncodedVisualImage,
+    VisualClosureReason,
+    VisualFrame,
+    VisualMemoryCapacityError,
+    VisualMemorySource,
+    VisualSummary,
 )
 from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import Action
 from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import (
@@ -67,27 +83,32 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import (
     RECENT_MESSAGES,
     SUMMARY_CHUNK_MESSAGES,
     SUMMARY_MAX_TOKENS,
-    EncodedVisualImage,
     TextSummaryChunk,
     TextSummaryLimit,
     TextSummaryProgress,
-    VisualClosureReason,
-    VisualFrame,
-    VisualMemoryCapacityError,
-    VisualMemorySource,
-    VisualSummary,
 )
 from vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction import (
     _clean_qwen3_asr_transcript,
     _extract_completed_action_text,
     render_joyai_memory_prefix,
 )
+from vllm_omni.worker.sampling_utils import apply_fixed_seed_to_sampling_params
 
 if TYPE_CHECKING:
     from transformers import ProcessorMixin
 
 
 class JoyAIDuplexPlugin(DuplexModelPlugin):
+    #: A cancelled turn's question must not resurface on its own. If the model
+    #: asks it again, that repeat is current, and the refusal is the notice.
+    abandoned_tool_call_reasons = frozenset(
+        {
+            ToolCallAbandonReason.TIMEOUT,
+            ToolCallAbandonReason.CLIENT_CANCELLED,
+            ToolCallAbandonReason.CLIENT_FAILED,
+            ToolCallAbandonReason.SUPPRESSED,
+        }
+    )
     plugin_id = "joyai-vl-interaction"
     supports_auxiliary_requests = True
     joyai_stage_id = 0
@@ -115,6 +136,11 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         self._timestamp_tokens = 0
         self._processor_lock = asyncio.Lock()
         self._memory_budget_error: str | None = None
+        # Deploy-level ``async_chunk``: the single switch for everything this
+        # plugin streams (JoyAI text deltas, per-sentence Talker handoff, Talker
+        # DELTA parks, output-stage draining). Default on so a plugin built
+        # without the engine hook keeps the streaming profile.
+        self._async_chunk_streaming = True
 
     def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
         super().configure_pipeline(pipeline_config)
@@ -124,6 +150,36 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         self.audio_stage_id = stages["code2wav"]
         self.data_plane.joyai_stage_id = self.joyai_stage_id
         self.data_plane.audio_stage_id = self.audio_stage_id
+
+    def configure_async_chunk(self, *, enabled: bool) -> None:
+        """Follow the deploy's ``async_chunk`` for every streaming behavior.
+
+        ``async_chunk: false`` is the off switch for this profile, not just for
+        the Talker→Code2Wav edge. Sentence TTS, Talker DELTA parks and live text
+        projection all assume a prewarmed Code2Wav fed by connector chunks; with
+        the edge off, the one-shot path needs a ``finished`` Talker output and
+        would silently produce no audio, so the plugin reverts to it entirely.
+        """
+        self._async_chunk_streaming = bool(enabled)
+
+    def resumable_downstream_stage_ids(self, *, stage_count: int) -> frozenset[int]:
+        """Sentence TTS reuses Talker and Code2Wav across each turn's sentences."""
+        if not self._async_chunk_streaming:
+            return frozenset()
+        return frozenset(
+            stage_id for stage_id in (self.joyai_stage_id + 1, self.audio_stage_id) if stage_id < stage_count
+        )
+
+    def draining_stage_ids(self, *, stage_count: int) -> frozenset[int]:
+        """Talker and Code2Wav keep running after JoyAI has finished the action."""
+        if not self._async_chunk_streaming:
+            # The one-shot path submits each output stage once per turn, so
+            # nothing of a previous turn is still draining.
+            return frozenset()
+        talker_stage_id = self.joyai_stage_id + 1
+        if talker_stage_id >= stage_count:
+            return frozenset()
+        return frozenset(range(talker_stage_id, stage_count))
 
     def input_stage_id(self, payload: object) -> int:
         if isinstance(payload, Mapping) and payload.get("audio"):
@@ -157,6 +213,9 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             supports_reencode_context=True,
             supports_turn_commit_only=True,
             supports_core_resumable_request=False,
+            tool_mode="delegate_only",
+            function_call_output_continuation="next_observation",
+            max_tools=1,
             required_input_modalities=frozenset(),
             optional_input_modalities=frozenset({"video", "audio"} if self.asr_stage_id is not None else {"video"}),
             supports_independent_io_streams=True,
@@ -252,7 +311,12 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             "max_tokens": config.max_tokens,
             **{
                 key: extra.get(key, default)
-                for key, default in (("tts_speaker", "Vivian"), ("tts_language", "Auto"), ("tts_instruct", ""))
+                for key, default in (
+                    ("tts_speaker", "Vivian"),
+                    ("tts_language", "Auto"),
+                    ("tts_instruct", ""),
+                    ("joyai_system_prompt", ""),
+                )
             },
         }
         # Delegation and chunk state are per-session bookkeeping, not session
@@ -275,10 +339,18 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         for index, params in enumerate(defaults):
             if isinstance(params, SamplingParams):
                 params = params.clone()
-                # Code2Wav streams each decoded chunk once. DELTA is also safe on the all-sync
-                # profiles, where Code2Wav emits one output per request. The rest only matter when complete.
+                # Code2Wav streams each decoded chunk once (DELTA). With
+                # async_chunk on, JoyAI also streams its action text and the
+                # Talker is DELTA so a 2150 park is visible and the next queued
+                # sentence can be submitted without aborting the current one.
+                # With it off, this is the one-shot profile: only Code2Wav is
+                # DELTA and every upstream stage completes before the next runs.
+                talker_stage_id = self.joyai_stage_id + 1
+                streaming_stages = {self.audio_stage_id}
+                if self._async_chunk_streaming:
+                    streaming_stages.update((self.joyai_stage_id, talker_stage_id))
                 params.output_kind = (
-                    RequestOutputKind.DELTA if index == self.audio_stage_id else RequestOutputKind.FINAL_ONLY
+                    RequestOutputKind.DELTA if index in streaming_stages else RequestOutputKind.FINAL_ONLY
                 )
                 if index == self.joyai_stage_id:
                     params.detokenize = True
@@ -286,8 +358,35 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                     for key in ("temperature", "max_tokens"):
                         if runtime_config.get(key) is not None:
                             setattr(params, key, runtime_config[key])
+                elif index == talker_stage_id:
+                    from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts import (
+                        JOYAI_TTS_SEED,
+                        JOYAI_TTS_TEMPERATURE,
+                    )
+
+                    # This plugin only loads for session_mode: duplex
+                    # (joyai_vl_interaction_duplex.yaml). Unseeded Talker (and
+                    # MTP) is why each turn sounded like a different speaker.
+                    # Pin seed/temperature on both async_chunk on and off so a
+                    # WER A/B measures chunking, not YAML 0.9 sampler drift.
+                    # The turn YAML never reaches this method.
+                    apply_fixed_seed_to_sampling_params(params, JOYAI_TTS_SEED, seed_talker_mtp=True)
+                    params.temperature = JOYAI_TTS_TEMPERATURE
             configured.append(params)
         return tuple(configured)
+
+    @staticmethod
+    def _system_prompt(runtime_config: Mapping[str, object]) -> str:
+        """Session system prompt: optional extra_body override, else silence persona."""
+        override = runtime_config.get("joyai_system_prompt")
+        if isinstance(override, str) and override.strip():
+            system = override.strip()
+        else:
+            system = SILENT_SYSTEM_PROMPT
+        instructions = runtime_config.get("instructions")
+        if instructions:
+            system += "\n\n" + str(instructions)
+        return system
 
     @staticmethod
     def _sync_visual_history(state: JoyAISessionState, history: Sequence[dict[str, object]]) -> tuple[str, ...]:
@@ -554,58 +653,18 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             # bounded excerpts into private progress; publish coverage only
             # after the entire Q&A has been consumed.
             offset = continuation.offset if continuation else 0
-            low = offset + 1
-            high = min(len(transcript), offset + limit.max_chars) if limit else len(transcript)
-            # max_chars caps raw transcript progress. If it ends within a
-            # label, extend to the first evidence character so the fold can
-            # advance. Labels are rendered whole; fits() still enforces the
-            # model token budget, including the reserved summary output.
-            first_text = next((max(offset, text_start) for _, text_start, end, _ in spans if end > offset), offset)
-            high = max(high, first_text + 1)
-
-            def excerpt_prompt(stop: int) -> str | None:
-                fragments = []
-                for start, text_start, end, label in spans:
-                    if stop <= start or offset >= end:
-                        continue
-                    first, last = max(offset, text_start), min(stop, end)
-                    if first < last:
-                        continued = "(continued) " if offset > text_start else ""
-                        fragments.append(label + continued + transcript[first:last])
-                if not fragments:
-                    return None
-                excerpt = f"[Conversation excerpt {offset}:{stop} of {len(transcript)} characters]\n" + "\n".join(
-                    fragments
-                )
-                return render(excerpt, target)
-
-            candidate = None
-            while low <= high:
-                stop = (low + high) // 2
-                prompt = excerpt_prompt(stop)
-                if prompt is None:
-                    low = stop + 1
-                elif fits(prompt):
-                    candidate = request(prompt, target, TextSummaryChunk(partial, stop, stop == len(transcript)))
-                    low = stop + 1
-                else:
-                    high = stop - 1
-            if candidate is None:
+            fitted = fit_text_excerpt(
+                transcript,
+                spans,
+                offset=offset,
+                max_chars=limit.max_chars if limit else None,
+                render=lambda excerpt: render(excerpt, target),
+                fits=fits,
+            )
+            if fitted is None:
                 return None
-            candidate_source = candidate.model_source
-            assert isinstance(candidate_source, TextSummaryChunk)
-            if not candidate_source.complete:
-                stop = candidate_source.end_offset
-                window = transcript[offset:stop]
-                boundary = window.rfind("\n")
-                if boundary <= 0:
-                    boundary = max(window.rfind(" "), window.rfind("\t"))
-                if boundary > 0:
-                    stop = offset + boundary
-                    prompt = excerpt_prompt(stop)
-                    if prompt is not None and fits(prompt):
-                        candidate = request(prompt, target, TextSummaryChunk(partial, stop, False))
-            return candidate
+            prompt, stop = fitted
+            return request(prompt, target, TextSummaryChunk(partial, stop, stop == len(transcript)))
 
         return await asyncio.to_thread(prepare)
 
@@ -1287,7 +1346,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             self._drop_oldest_visual_frame(working_messages)
             images.pop(0)
             image_token_counts.pop(0)
-        system = SILENT_SYSTEM_PROMPT
+        system = self._system_prompt(runtime_config)
         delegation = self.delegation_enabled(runtime_config)
         results_block, rendered_call_ids = "", []
         if delegation:
@@ -1295,8 +1354,6 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             results_block, rendered_call_ids = render_result_blocks(
                 unanswered_results(runtime_config, chunk=session_config.get("joyai_chunk_id"))
             )
-        if runtime_config.get("instructions"):
-            system += "\n\n" + runtime_config["instructions"]
         summary = session_config.get("joyai_summary")
         visual_summaries = [
             f"<{entry.start_s:.1f} seconds-{entry.end_s:.1f} seconds>\n{entry.text}"
@@ -1387,7 +1444,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             with open_image(io.BytesIO(pybase64.b64decode(encoded, validate=True))) as image:
                 image.thumbnail((448, 448))
                 images.append(image.convert("RGB").copy())
-        system = SILENT_SYSTEM_PROMPT
+        system = self._system_prompt(runtime_config)
         delegation = self.delegation_enabled(runtime_config)
         results_block, rendered_call_ids = "", []
         if delegation:
@@ -1395,8 +1452,6 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             results_block, rendered_call_ids = render_result_blocks(
                 unanswered_results(runtime_config, chunk=session_config.get("joyai_chunk_id"))
             )
-        if runtime_config.get("instructions"):
-            system += "\n\n" + runtime_config["instructions"]
         budget = self.max_model_len - (sampling_params.max_tokens or 256)
         image_token_counts = self._image_token_counts(images)
         prompt_data = {
@@ -1468,8 +1523,59 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             return DuplexOutputDecision(action=DuplexOutputAction.DIRECT_RESPONSE)
         return None
 
+    def plan_partial_stage_output(
+        self,
+        orchestrator: object,
+        stage_id: int,
+        replica_id: int,
+        output: object,
+        req_state: object,
+    ) -> PartialStageForward | None:
+        """Hand confirmed spoken sentences to Talker while JoyAI still generates.
+
+        Only one Talker sentence is in flight. Later sentences wait for a 2150
+        park, which this plugin sees because Talker uses DELTA output. The park
+        returns a plan whose ``source_stage_id`` is JoyAI; the orchestrator
+        submits it onto Talker after this poll's Code2Wav routing.
+
+        Requires the streaming profile: with ``async_chunk: false`` the Talker is
+        one-shot, its segment stops are not visible, and Code2Wav is not
+        prewarmed, so per-sentence handoff would strand the audio.
+        """
+        if not self._async_chunk_streaming:
+            return None
+        from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts import (
+            plan_partial_stage_output,
+        )
+
+        request_id = getattr(output, "request_id", None)
+        observation = self.data_plane.requests.get(request_id) if isinstance(request_id, str) else None
+        return plan_partial_stage_output(
+            orchestrator,
+            stage_id,
+            replica_id,
+            output,
+            req_state,
+            joyai_stage_id=self.joyai_stage_id,
+            observation=observation,
+        )
+
     def project_intermediate_output(self, *, stage_id: int, output: object, context: object) -> bool:
-        return stage_id == self.joyai_stage_id and context.segment_finished
+        """Project JoyAI action text to the client while it is generated.
+
+        With ``async_chunk`` on, every JoyAI output is projected so DELTA text
+        reaches the client live; Code2Wav still owns the terminal audio event,
+        this only adds the assistant transcript ahead of it.
+
+        With it off, this is the one-shot profile: the whole action is projected
+        once at the segment boundary, exactly as before live text existed.
+        """
+        del output
+        if stage_id != self.joyai_stage_id:
+            return False
+        if not self._async_chunk_streaming:
+            return bool(getattr(context, "segment_finished", False))
+        return True
 
     # ---- delegation: the shared tool-call lifecycle, model side ---------- #
 

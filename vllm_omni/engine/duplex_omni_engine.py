@@ -98,13 +98,19 @@ class DuplexOmniEngine(AsyncOmniEngine):
         self.duplex_session_config = deploy_config.duplex_session
         self.plugin = load_duplex_plugin(plugin_path, self._audio_encoder)
         self.plugin.configure_pipeline(pipeline_config)
-        validate_duplex_replica_policy(self.plugin, self.duplex_session_config, distributed=self.single_stage_mode)
+        self.plugin.configure_server(self.duplex_session_config)
+        validate_duplex_replica_policy(self.plugin, self.duplex_session_config)
 
     # Any: signature of the ``OmniEngineBase._create_orchestrator`` seam it overrides.
     def _create_orchestrator(self, **orchestrator_kwargs: Any) -> OrchestratorBase:
         from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator
 
         assert self.plugin is not None, "_validate_deployment() must run before the orchestrator is created"
+        assert self.pipeline_config is not None, "Duplex deployment must resolve a model pipeline"
+        # ``self.async_chunk`` is the deploy-resolved flag (per-stage connector
+        # override included). Plugins that gate their own streaming on it
+        # receive it here, before any session can be admitted.
+        self.plugin.configure_async_chunk(enabled=bool(self.async_chunk))
         # Match the frontend's comprehension-stage selection. An optional ASR
         # stage does not own the served model's tokenizer or prompt policy.
         pipeline_config = self.pipeline_config

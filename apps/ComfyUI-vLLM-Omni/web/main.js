@@ -81,7 +81,7 @@ class ModelComboController {
         // addWidget appends; move the button right after the model widget.
         const widgets = this.node.widgets;
         widgets.splice(widgets.indexOf(this.modelWidget) + 1, 0, widgets.pop());
-        this.node.setSize([this.node.size[0], this.node.computeSize()[1]]);
+        this.node.setSize([this.node.size[0], Math.max(this.node.size[1], this.node.computeSize()[1])]);
 
         // Defer past onConfigure so a value restored from a saved workflow is
         // the one merged into the fetched list.
@@ -116,7 +116,7 @@ class ModelComboController {
         widgets.splice(widgets.indexOf(widget), 1);
         widgets.splice(index, 0, widget);
         this.modelWidget = widget;
-        this.node.setSize([this.node.size[0], this.node.computeSize()[1]]);
+        this.node.setSize([this.node.size[0], Math.max(this.node.size[1], this.node.computeSize()[1])]);
         this.node.graph?.setDirtyCanvas?.(true, true);
     }
 
@@ -196,6 +196,29 @@ function migrateNumFramesToDuration(node, info) {
     duration.value = seconds;
 }
 
+function setupH3ModeWidgets(node) {
+    const longVideo = node.widgets.find((widget) => widget.name === "long_video");
+    const mode = node.widgets.find((widget) => widget.name === "long_video_mode");
+    const update = () => {
+        mode.hidden = !longVideo.value;
+        for (const widget of node.widgets) {
+            if (widget.name.startsWith("continuation_")) {
+                widget.hidden = !longVideo.value || mode.value !== "continuation";
+            }
+        }
+        node.setDirtyCanvas(true, true);
+    };
+    for (const widget of [longVideo, mode]) {
+        const callback = widget.callback;
+        widget.callback = function () {
+            callback?.apply(this, arguments);
+            update();
+        };
+    }
+    update();
+    return update;
+}
+
 const mark = new Image();
 let markReady = false;
 mark.addEventListener("load", () => {
@@ -218,6 +241,46 @@ app.registerExtension({
             nodeType.prototype.onNodeCreated = function () {
                 onNodeCreated?.apply(this, arguments);
                 setupModelCombo(this);
+            };
+        }
+
+        if (nodeData.name === "VLLMOmniRemoteLoRA") {
+            const onNodeCreated = nodeType.prototype.onNodeCreated;
+            const onConfigure = nodeType.prototype.onConfigure;
+            nodeType.prototype.onNodeCreated = function () {
+                onNodeCreated?.apply(this, arguments);
+                const scale = this.widgets.find(widget => widget.name === "scale");
+                const enabled = this.widgets.find(widget => widget.name === "enabled");
+                const scaleCallback = scale.callback;
+                const enabledCallback = enabled.callback;
+                scale.callback = function () {
+                    scaleCallback?.apply(this, arguments);
+                    enabled.value = scale.value > 0;
+                };
+                enabled.callback = function () {
+                    enabledCallback?.apply(this, arguments);
+                    scale.value = enabled.value ? (scale.value > 0 ? scale.value : 1) : 0;
+                };
+            };
+            nodeType.prototype.onConfigure = function () {
+                onConfigure?.apply(this, arguments);
+                const scale = this.widgets.find(widget => widget.name === "scale");
+                const enabled = this.widgets.find(widget => widget.name === "enabled");
+                enabled.value = scale.value > 0;
+            };
+        }
+
+        if (nodeData.name === "VLLMOmniMiniMaxH3Params") {
+            const onNodeCreated = nodeType.prototype.onNodeCreated;
+            const onConfigure = nodeType.prototype.onConfigure;
+            const updates = new WeakMap();
+            nodeType.prototype.onNodeCreated = function () {
+                onNodeCreated?.apply(this, arguments);
+                updates.set(this, setupH3ModeWidgets(this));
+            };
+            nodeType.prototype.onConfigure = function () {
+                onConfigure?.apply(this, arguments);
+                updates.get(this)?.();
             };
         }
 

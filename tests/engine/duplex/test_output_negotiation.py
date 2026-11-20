@@ -448,3 +448,28 @@ async def test_text_sessions_resume_without_generation_and_expire_independently(
         assert await h.manager.reap_expired() == 2
         assert not first.request_resources and not second.request_resources
         assert not h.manager.runners
+
+
+@pytest.mark.asyncio
+async def test_terminal_native_listen_keeps_speech_history_waiting_for_playback_ack():
+    h = await open_harness()
+    try:
+        assert h.session.capabilities.emits_audio
+        h.session.replace_config(replace(h.session.config, playback_commit_policy="ack_only"))
+        await h.runner.model._send_one_model_output_event(
+            {"text": "spoken reply", "model_turn_id": 0, "audio_duration_ms": 100, "audio_complete": True}
+        )
+        await h.settle()
+        response = h.session.active_response_id
+        assert response is not None
+        await h.runner.model._send_one_model_output_event({"is_listen": True, "end_of_turn": True, "model_turn_id": 0})
+        terminal = await h.settle()
+        assert len([event for event in terminal if event.type == "response.done"]) == 1
+        assert h.session.history == ()
+        assert f"item_{response}" in h.session.pending_history_item_ids
+        events = await h.run(commands.AckPlayback(response_id=response, played_ms=100))
+        assert not any(event.type == "error" for event in events)
+        assert h.session.history == ({"role": "assistant", "content": "spoken reply"},)
+        assert not h.session.pending_history_item_ids
+    finally:
+        await close_harness(h)
