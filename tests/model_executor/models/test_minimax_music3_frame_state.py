@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for MiniMax Music 3 per-request AR frame bookkeeping.
 
 The talker emits overlapping windows while dropping frames it can no longer
@@ -92,8 +92,12 @@ class TestWindowLifecycle:
     """Drive the state exactly as the talker does, one frame per step."""
 
     @staticmethod
-    def _run(total_frames: int) -> tuple[list[list[int]], int]:
+    def _run(total_frames: int, *, budget_ends_song: bool = False) -> tuple[list[list[int]], int]:
         """Generate ``total_frames`` frames, returning the emitted spans.
+
+        By default the model ends the song on the step after its last frame.
+        With ``budget_ends_song`` the frame budget ends it on the last frame,
+        so that step publishes the terminal span without checking for a window.
 
         Returns:
             The frame identities of every emitted span, and the peak buffer
@@ -105,6 +109,8 @@ class TestWindowLifecycle:
             state.frames.append(_frame(index))
             state.codes.append(torch.full((1, NUM_CODEBOOKS), index))
             state.generated_frames += 1
+            if budget_ends_song and index == total_frames - 1:
+                break
             window = state.ready_window()
             if window is not None:
                 spans.append(_identities(state.take_window(window, is_final=False)))
@@ -152,10 +158,14 @@ class TestWindowLifecycle:
         assert spans[-1][-1] == total - 1
 
     def test_terminal_span_is_bounded(self) -> None:
-        """The tail is at most one full window plus one hop."""
-        for total in (250, 301, 437, 600, 901, 1000):
-            spans, _ = self._run(total)
-            assert len(spans[-1]) <= AR_CHUNK_FRAMES + AR_CHUNK_HOP_FRAMES
+        """Windows are released one frame late, so the tail is at most one
+        window plus the frame that would have released the next one."""
+        for total in (200, 201, 250, 300, 301, 437, 600, 901, 1000):
+            for budget_ends_song in (False, True):
+                spans, _ = self._run(total, budget_ends_song=budget_ends_song)
+                assert len(spans[-1]) <= AR_CHUNK_FRAMES + 1
+        spans, _ = self._run(301, budget_ends_song=True)
+        assert len(spans[-1]) == AR_CHUNK_FRAMES + 1
 
     def test_buffer_stays_bounded_over_a_long_song(self) -> None:
         """Peak occupancy must not grow with song length; that is the point
