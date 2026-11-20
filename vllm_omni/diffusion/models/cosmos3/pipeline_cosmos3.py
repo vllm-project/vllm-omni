@@ -765,6 +765,10 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig, *, crop_action_
         target_w = request.sampling_params.width
         target_h = request.sampling_params.height
         if action_mode is not None:
+            if image.size != (int(target_w), int(target_h)):
+                # Action frames with an explicit size are stretched to it, as
+                # the serving layer did before Cosmos3 received them unresized.
+                image = image.resize((int(target_w), int(target_h)), PIL.Image.Resampling.LANCZOS)
             prompt["additional_information"]["preprocessed_image"] = _preprocess_action_image(
                 image,
                 int(target_h),
