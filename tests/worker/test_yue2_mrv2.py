@@ -56,10 +56,14 @@ def state(mocker):
 
 
 def test_prepare_inputs_binds_slots_and_discards_partial_recompute(state, batch, mocker):
-    base = mocker.patch.object(OmniModelState, "prepare_inputs", return_value={"positions": batch.positions})
+    state.has_preprocess = False
+    state.rope_state = None
+    state._static_inputs_embeds = None
+    gather = mocker.spy(state.intermediate_buffer, "gather")
     request_state = mocker.Mock(spec=RequestState, req_id_to_index={"first": 1, "second": 3})
     result = state.prepare_inputs(batch, request_state)
-    assert result is base.return_value
+    gather.assert_called_once_with(batch)
+    assert result["model_intermediate_buffer"] is gather.spy_return
     args = state.model.prepare_runner_inputs.call_args.kwargs
     assert args["req_ids"] == ["second", "first"]
     assert args["sampling_extra_args"] == [{"yue2_seed": 22}, {"yue2_seed": 11}]

@@ -1082,6 +1082,9 @@ def test_h100_tts_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatc
         "tests/e2e/offline_inference/test_moss_tts_v1_5_expansion.py",
         "tests/e2e/online_serving/test_minimax_music3.py",
         "tests/e2e/online_serving/test_yue2.py",
+        "vllm_omni/worker_v2/omni_ar_model_runner.py",
+        "vllm_omni/worker_v2/omni_model_runner.py",
+        "vllm_omni/worker_v2/model_states/omni_model_state.py",
     ):
         assert label in _surviving_labels(doc, [changed_file], pipeline_path=pipeline_path)
     assert label not in _surviving_labels(doc, ["docs/source/index.md"], pipeline_path=pipeline_path)
