@@ -76,9 +76,19 @@ steps:
           - export SEED_TTS_SIM_DEVICE=cuda:1
           - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json -k test_minicpmo_4_5_nightly_default -m "full_model and H100 and B200 and cuda and omni and cards_2" --run-level full_model
 
-      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Async Prefix Daily-Omni and Seed-TTS Accuracy and Perf Test"
+      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Async Prefix Daily-Omni Accuracy and Perf Test"
         source_file_dependencies: omni_minicpmo_4_5_perf
-        key: nightly-omni-minicpmo-4-5-async-prefix
+        key: nightly-omni-minicpmo-4-5-async-prefix-daily-omni
+        timeout_in_minutes: 240
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json -k test_minicpmo_4_5_nightly_async_prefix_daily_omni -m "full_model and H100 and B200 and cuda and omni and cards_2" --run-level full_model
+
+      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Async Prefix Seed-TTS Accuracy and Perf Test"
+        source_file_dependencies: omni_minicpmo_4_5_perf
+        key: nightly-omni-minicpmo-4-5-async-prefix-seed-tts
         timeout_in_minutes: 480
         artifact_paths:
           - tests/dfx/perf/results/*.json
@@ -89,7 +99,7 @@ steps:
           - export SEED_TTS_UTMOS_EVAL=0
           - export SEED_TTS_EVAL_DEVICE=cuda:1
           - export SEED_TTS_SIM_DEVICE=cuda:1
-          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json -k test_minicpmo_4_5_nightly_async_prefix -m "full_model and H100 and B200 and cuda and omni and cards_2" --run-level full_model
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json -k "test_minicpmo_4_5_nightly_async_prefix and not daily" -m "full_model and H100 and B200 and cuda and omni and cards_2" --run-level full_model
 
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Async Duplex Omni-DuplexEval Accuracy and Perf Test"
         source_file_dependencies: omni_duplex_eval_ci
