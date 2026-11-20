@@ -612,6 +612,12 @@ def _apply_default_scheduler_policy(
         runtime_config["duplex_vision_tile_pixels"] = tile_pixels
 
 
+def _count(state: dict[str, object], key: str) -> int:
+    """A counter kept in the input clock's per-session plugin ``state`` (fresh after every cancel)."""
+    value = state.get(key, 0)
+    return value if isinstance(value, int) else 0
+
+
 class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
     """MiniCPM-owned sampling policy, append planning, session state and output projection."""
 
@@ -720,23 +726,34 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         as one chunk flagged ``tts_is_last_chunk`` (an empty marker when
         nothing is left). Code2Wav echoes the flag on its output. A speaking
         unit is therefore complete once its Talker segment has ended and a
-        Code2Wav output carrying the flag was credited to it; the orchestrator
-        may deliver the two in either order, so the flag is remembered in
-        ``state``. (Output that overtakes the unit's Stage-0 segment end is
-        held by the engine and handed over once the unit speaks.) A Code2Wav
-        segment end alone does not complete a unit: the flag is per unit,
-        while a segment end can also be a trailing control-only snapshot of
-        the previous unit (a repeated turn end), which the engine would
-        otherwise credit to the next unit.
+        flagged Code2Wav output was credited to it. The orchestrator reads
+        each stage's stream independently, so the two may arrive in either
+        order, and the flushes of several queued units may all arrive before
+        the first Talker segment end; the engine hands every final-stage
+        output to the oldest speaking unit. The flags are therefore counted in
+        ``state`` and consumed in unit order, one per completed unit: the
+        n-th flagged output belongs to the n-th speaking unit of the epoch.
+        (Output that overtakes the unit's Stage-0 segment end is held by the
+        engine and handed over once the unit speaks.) A Code2Wav segment end
+        alone does not complete a unit: the flag is per unit, while a segment
+        end can also be a trailing control-only snapshot of the previous unit
+        (a repeated turn end), which the engine would otherwise credit to the
+        next unit.
         """
         del final_stage_id, new_context, runtime_config
         if unit is None:
             return False
+        flushes = _count(state, "code2wav_flushes")
         if new_output is not None and is_last_tts_chunk(_multimodal_output(new_output, _first_completion(new_output))):
-            state["flushed_unit"] = unit.index
+            flushes += 1
+            state["code2wav_flushes"] = flushes
         if not unit.upstream_segment_finished:
             return False
-        return state.get("flushed_unit") == unit.index
+        completed = _count(state, "completed_units")
+        if flushes <= completed:
+            return False
+        state["completed_units"] = completed + 1
+        return True
 
     def decide_output(
         self,

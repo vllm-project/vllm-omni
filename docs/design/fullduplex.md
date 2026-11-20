@@ -1381,9 +1381,14 @@ the modality check refuses them (`invalid_input_modality`). MiniCPM-o 4.5
 opts in, for audio: its Code2Wav stage streams across unit boundaries, so
 its `unit_output_complete` waits for the Talker segment end and the Code2Wav
 output of the chunk that flushes the unit's remaining codes
-(`tts_is_last_chunk`), remembered in `state` (a Code2Wav segment end alone
-does not complete a unit, so a trailing control-only turn-end snapshot of
-the previous unit cannot complete the next one); a Stage-0 segment that
+(`tts_is_last_chunk`). The orchestrator reads each stage's stream
+independently, so the flushes of several queued units can arrive before the
+first Talker segment end while the engine hands every final-stage output to
+the oldest speaking unit; the hook therefore counts the flags in `state` and
+consumes them in unit order, the n-th flag completing the n-th speaking unit
+(a Code2Wav segment end alone does not complete a unit, so a trailing
+control-only turn-end snapshot of the previous unit cannot complete the next
+one); a Stage-0 segment that
 hands the Talker nothing (`<|speak|>` straight into `<|chunk_eos|>`) is
 forwarded as an empty hand-off, which the Talker closes like any segment,
 so the default `unit_decision` is enough; and its input buffer implements

@@ -25,6 +25,7 @@ from vllm_omni.engine.duplex.plugin import DuplexUnitOutputs
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.capabilities import minicpmo45_native_capabilities
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.input import MiniCPMO45PcmAppendBuffer
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
+from vllm_omni.protocol.duplex.events import InputProcessed
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -88,6 +89,25 @@ def test_a_speaking_unit_needs_its_talker_segment_end_and_a_flagged_code2wav_out
     assert _complete(plugin, _unit(upstream=True), state, flagged)
     assert not _complete(plugin, _unit(upstream=True, index=1), state)
     assert not _complete(plugin, None, state, flagged), "no speaking unit: nothing to complete"
+
+
+def test_the_flushes_of_queued_speaking_units_are_consumed_in_unit_order() -> None:
+    """The engine hands every final-stage output to the oldest speaking unit, whichever unit it belongs to."""
+    plugin = _plugin()
+    flagged = _code2wav(last_chunk=True, nested=True)
+
+    state: dict = {}  # both flushes before either Talker segment end
+    assert not _complete(plugin, _unit(upstream=False), state, flagged)
+    assert not _complete(plugin, _unit(upstream=False), state, flagged)
+    assert _complete(plugin, _unit(upstream=True), state)
+    assert _complete(plugin, _unit(upstream=True, index=1), state)
+    assert not _complete(plugin, _unit(upstream=True, index=2), state), "a third unit has no flush yet"
+
+    state = {}  # both Talker segment ends before either flush
+    assert not _complete(plugin, _unit(upstream=True), state)
+    assert _complete(plugin, _unit(upstream=True), state, flagged)
+    assert not _complete(plugin, _unit(upstream=True, index=1), state)
+    assert _complete(plugin, _unit(upstream=True, index=1), state, flagged)
 
 
 def test_a_trailing_code2wav_segment_end_of_a_completed_unit_does_not_complete_the_next_unit() -> None:
@@ -156,6 +176,76 @@ async def test_a_talker_end_and_flush_that_overtake_their_stage0_segment_end_sti
 
         assert events[-1].type == "input_audio_buffer.processed"
         assert events[-1].units == ({"end_ms": 1000, "decision": "speak"},)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.parametrize("flush_ends_segment", [False, True], ids=["mid-turn flush", "turn-end flush"])
+@pytest.mark.parametrize("order", ["flushes-first", "talker-ends-first", "interleaved"])
+async def test_two_queued_speaking_units_are_each_acknowledged_after_their_own_audio(
+    order: str, flush_ends_segment: bool
+) -> None:
+    """The orchestrator reads the Talker and Code2Wav streams independently, so both flushes can precede the first Talker end.
+
+    A flush that ends the turn is also a Code2Wav segment end (``flush_ends_segment``), which the engine credits
+    separately; the hook must not depend on it.
+    """
+    steps = {
+        "flushes-first": ["flush", "flush", "talker", "talker"],
+        "talker-ends-first": ["talker", "talker", "flush", "flush"],
+        "interleaved": ["talker", "flush", "flush", "talker"],
+    }[order]
+    h = await open_harness(extra_body=INPUT_CLOCK, stage_count=3)
+    try:
+        await h.run(append_audio())
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        h.deliver(_speak_segment_end(request_id), stage_id=0, segment_finished=True)
+        h.deliver(_speak_segment_end(request_id), stage_id=0, segment_finished=True)
+        assert "input_audio_buffer.processed" not in types(await h.settle())
+
+        acks: list[InputProcessed] = []
+        talker_ends = flushes = 0
+        for step in steps:
+            if step == "talker":
+                talker_ends += 1
+                talker = SimpleNamespace(request_id=request_id, finished=False, outputs=[], multimodal_output={})
+                events = await h.deliver_and_settle(talker, stage_id=1, segment_finished=True)
+            else:
+                flushes += 1
+                flush = tts_output(request_id, samples=24000, text=f"unit {flushes}", tts_is_last_chunk=True)
+                events = await h.deliver_and_settle(flush, stage_id=2, segment_finished=flush_ends_segment)
+            acks.extend(e for e in events if e.type == "input_audio_buffer.processed")
+            assert len(acks) == min(talker_ends, flushes), f"after {step} ({talker_ends=}, {flushes=}): {acks}"
+        assert [(ack.input_index, ack.units) for ack in acks] == [
+            (1, ({"end_ms": 1000, "decision": "speak"},)),
+            (2, ({"end_ms": 2000, "decision": "speak"},)),
+        ]
+    finally:
+        await close_harness(h)
+
+
+async def test_flushes_of_two_queued_units_that_overtake_both_stage0_segment_ends_complete_them_in_order() -> None:
+    """Both Code2Wav flushes are held by the engine until the units speak, then replayed to the oldest one."""
+    h = await open_harness(extra_body=INPUT_CLOCK, stage_count=3)
+    try:
+        await h.run(append_audio())
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        h.deliver(tts_output(request_id, samples=24000, text="unit 1", tts_is_last_chunk=True), stage_id=2)
+        h.deliver(tts_output(request_id, samples=24000, text="unit 2", tts_is_last_chunk=True), stage_id=2)
+        h.deliver(_speak_segment_end(request_id), stage_id=0, segment_finished=True)
+        h.deliver(_speak_segment_end(request_id), stage_id=0, segment_finished=True)
+        assert "input_audio_buffer.processed" not in types(await h.settle()), "no Talker end yet"
+
+        talker = SimpleNamespace(request_id=request_id, finished=False, outputs=[], multimodal_output={})
+        events = await h.deliver_and_settle(talker, stage_id=1, segment_finished=True)
+        acks = [e for e in events if e.type == "input_audio_buffer.processed"]
+        assert [(a.input_index, a.units) for a in acks] == [(1, ({"end_ms": 1000, "decision": "speak"},))]
+        talker = SimpleNamespace(request_id=request_id, finished=False, outputs=[], multimodal_output={})
+        events = await h.deliver_and_settle(talker, stage_id=1, segment_finished=True)
+        acks = [e for e in events if e.type == "input_audio_buffer.processed"]
+        assert [(a.input_index, a.units) for a in acks] == [(2, ({"end_ms": 2000, "decision": "speak"},))]
     finally:
         await close_harness(h)
 
