@@ -245,7 +245,8 @@ class CompactGraph:
 
 
 def prepare(runner, talker, model_inputs, input_batch, width):
-    if MODE is None or not 2 <= input_batch.num_reqs <= 8 or width != 16 or input_batch.has_prefill:
+    rows = input_batch.num_reqs
+    if MODE is None or width != 16 or input_batch.has_prefill or (rows != 16 and not 2 <= rows <= 8):
         return None
     try:
         mode, _, variant = Path(MODE).read_text().strip().partition("_")
@@ -253,12 +254,13 @@ def prepare(runner, talker, model_inputs, input_batch, width):
         return None
     if (
         mode not in ("shadow", "active")
-        or variant not in ("", "fixed", "fixed_rope")
+        or variant not in ("", "fixed", "fixed_rope", "fixed_wide")
         or model_inputs.get("intermediate_tensors") is not None
     ):
         return None
-    rows = input_batch.num_reqs
-    fixed_down_lanes = variant in ("fixed", "fixed_rope") and rows > 4
+    if rows == 16 and variant != "fixed_wide":
+        return None
+    fixed_down_lanes = variant in ("fixed", "fixed_rope", "fixed_wide") and rows > 4
     fused_rope = variant == "fixed_rope"
     spans = runner.model_state._request_token_spans(input_batch)
     if spans != [(i * width, (i + 1) * width) for i in range(rows)]:
@@ -305,6 +307,9 @@ def prepare(runner, talker, model_inputs, input_batch, width):
         or first.seq_lens_device.numel() < rows
     ):
         return None
+    wide_rows = embeds.shape[0]
+    if rows == 16 and wide_rows != rows * width:
+        return None
     if not hasattr(runner, "_c8_talker_graphs"):
         runner._c8_talker_graphs = {}
         runner._c8_talker_ready = set()
@@ -313,12 +318,12 @@ def prepare(runner, talker, model_inputs, input_batch, width):
         runner._c8_talker_capture_stream = torch.npu.Stream()
         runner._c8_talker_shared_capture_pool = torch.npu.graph_pool_handle()
     graphs, ready, rejected = runner._c8_talker_graphs, runner._c8_talker_ready, runner._c8_talker_rejected
-    wide_rows = embeds.shape[0]
     # MRv2's host seq_lens_np already counts this entire scheduled K-step
     # window. A bucket that fits it is safe for every frame in the step.
     # Use 512 on any build that cannot provide a host length vector.
     preferred = full_capacity
-    if length is not None:
+    # The 16-row variant uses one capture shape to bound retained graph memory.
+    if length is not None and rows != 16:
         preferred = static_shape_decode.select_bucket(length, (128, 256, full_capacity))
     candidate_capacities = (preferred, full_capacity) if preferred != full_capacity else (full_capacity,)
     graph_key = next(

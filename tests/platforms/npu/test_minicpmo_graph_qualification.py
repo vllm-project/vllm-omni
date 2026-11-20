@@ -111,29 +111,41 @@ def test_active_fused_decode_checks_shadow_before_commit(tmp_path, monkeypatch, 
 
 
 @pytest.mark.parametrize("matches", [False, True])
-def test_active_batch_checks_the_entire_kstep(tmp_path, monkeypatch, matches):
+@pytest.mark.parametrize("rows", [2, 16])
+def test_active_batch_checks_the_entire_kstep(tmp_path, monkeypatch, matches, rows):
     mode = tmp_path / "mode"
     mode.write_text("active_fixed")
     monkeypatch.setattr(talker_batched_decode, "MODE", str(mode))
     monkeypatch.setattr(torch.npu, "Stream", lambda: None)
     monkeypatch.setattr(torch.npu, "graph_pool_handle", lambda: None)
-    wide = torch.arange(64, dtype=torch.bfloat16).reshape(32, 2)
+    tokens = rows * 16
+    wide = torch.arange(tokens * 2, dtype=torch.bfloat16).reshape(tokens, 2)
     metadata = Mock(
-        seq_lens_device=torch.tensor([32, 32]), block_tables=torch.zeros(2, 4), slot_mapping=torch.arange(32)
+        seq_lens_device=torch.full((rows,), 32), block_tables=torch.zeros(rows, 4), slot_mapping=torch.arange(tokens)
     )
     runner = Mock(spec=["model_config", "model_state", "vllm_config"])
     runner.vllm_config = Mock(cache_config=Mock(block_size=128))
     runner.model_config = Mock(max_model_len=512)
     runner.model_state = Mock(attn_metadata={"layer": metadata})
-    runner.model_state._request_token_spans.return_value = [(0, 16), (16, 32)]
-    batch = Mock(num_reqs=2, has_prefill=False, seq_lens_np=np.array([32, 32]))
-    inputs = {"model_intermediate_buffer": [{}, {}], "inputs_embeds": wide, "positions": torch.arange(32)}
+    runner.model_state._request_token_spans.return_value = [(i, i + 16) for i in range(0, tokens, 16)]
+    batch = Mock(num_reqs=rows, has_prefill=False, seq_lens_np=np.full(rows, 32))
+    inputs = {
+        "model_intermediate_buffer": [{} for _ in range(rows)],
+        "inputs_embeds": wide,
+        "positions": torch.arange(tokens),
+    }
+
+    if rows == 16:
+        assert talker_batched_decode.prepare(runner, None, inputs, batch, 16) is None
+        mode.write_text("active_fixed_wide")
 
     class Graph:
         def __init__(self, *args, **kwargs):
             self.metadata = {"layer": metadata}
-            self.slots = torch.tensor([0, 1])
+            self.slots = torch.arange(rows)
             self.kv = []
+            if rows == 16:
+                assert args[-2:] == (512, tokens)
 
         def prepare_step(self, *args):
             pass
@@ -142,7 +154,7 @@ def test_active_batch_checks_the_entire_kstep(tmp_path, monkeypatch, matches):
             self.frame = frame
 
         def replay(self):
-            result = wide[self.frame : 32 : 16]
+            result = wide[self.frame : tokens : 16]
             return result + (0 if matches else 1)
 
     monkeypatch.setattr(talker_batched_decode, "CompactGraph", Graph)
@@ -150,12 +162,12 @@ def test_active_batch_checks_the_entire_kstep(tmp_path, monkeypatch, matches):
     assert forward is not None
     reference = Mock(return_value=wide)
     for frame in range(16):
-        assert torch.equal(forward(frame, reference), wide[frame:32:16])
+        assert torch.equal(forward(frame, reference), wide[frame:tokens:16])
     assert reference.call_count == 16
     if matches:
         assert len(runner._c8_talker_ready) == 1
         forward = talker_batched_decode.prepare(runner, None, inputs, batch, 16)
-        assert torch.equal(forward(0, reference), wide[0:32:16])
+        assert torch.equal(forward(0, reference), wide[0:tokens:16])
         assert reference.call_count == 16
     else:
         assert not runner._c8_talker_ready and runner._c8_talker_rejected
