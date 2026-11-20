@@ -153,8 +153,6 @@ def test_adarms_fusion_parity_cuda(input_dtype: torch.dtype) -> None:
 def test_action_cudagraph_replay_matches_eager_and_handles_steps_and_shapes_cuda(
     model: LingBotVLAV2ForActionPrediction, assets
 ) -> None:
-    cuda_model = copy.deepcopy(model).fuse_adarms()
-    del cuda_model
     cuda_model = copy.deepcopy(model).cuda().eval()
     cuda_model.fuse_adarms()
 
