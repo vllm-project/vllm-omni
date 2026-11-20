@@ -202,6 +202,7 @@ steps:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
           HF_TOKEN: "${HF_TOKEN}"
+          OMNI_DFX_ASCEND_910_PROFILE: "A3"
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
