@@ -4,16 +4,26 @@
 """MRV2 admission, capture, dispatch and request lifecycle contracts."""
 
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
+import numpy as np
 import pytest
 import torch
+from pytest_mock import MockerFixture
 from vllm import SamplingParams
+from vllm.compilation.cuda_graph import CUDAGraphEntry, CUDAGraphWrapper
+from vllm.config import SchedulerConfig, VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.lora import LoRAConfig
 from vllm.forward_context import ForwardContext, override_forward_context
+from vllm.lora.request import LoRARequest
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor, CudaGraphManager
+from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.lora_utils import LoraState
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
@@ -22,11 +32,13 @@ from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from vllm_omni.config.model import OmniModelConfig
+from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker_v2 import staged_writes
 from vllm_omni.worker_v2.model_states import init_omni_model_state
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+from vllm_omni.worker_v2.omni_data_plane import OmniRunnerDataPlane
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner, _runner_assisted_batch_descriptor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -71,6 +83,117 @@ def _make_runner():
     runner.req_states = SimpleNamespace(req_id_to_index={"r1": 0, "r2": 1})
     runner.execute_model_state = None
     return runner
+
+
+def test_dummy_sampler_run_uses_stateless_prompt_logits(monkeypatch) -> None:
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+
+    from vllm_omni.platforms import current_omni_platform
+
+    runner = _make_runner()
+    runner._kstep_frames = 0
+    hidden_states = torch.randn(3, 4)
+    logits = torch.randn(3, 8)
+    runner.model = SimpleNamespace(
+        compute_prompt_logits=MagicMock(return_value=logits),
+        compute_logits=MagicMock(side_effect=AssertionError("stateful logits must not run during profiling")),
+    )
+    runner.model_state = SimpleNamespace(dummy_sampler_run=MagicMock(return_value=False))
+    runner.sampler = MagicMock()
+    runner.input_buffers = object()
+    dummy_input_batch = object()
+    make_dummy = MagicMock(return_value=dummy_input_batch)
+    warmup_params = object()
+    monkeypatch.setattr(InputBatch, "make_dummy", make_dummy)
+    monkeypatch.setattr(current_omni_platform, "is_cpu", lambda: False)
+    monkeypatch.setattr(SamplingParams, "for_sampler_warmup", MagicMock(return_value=warmup_params))
+
+    runner._dummy_sampler_run(hidden_states)
+
+    runner.model_state.dummy_sampler_run.assert_called_once_with(runner.sampler, hidden_states)
+    runner.model.compute_prompt_logits.assert_called_once_with(hidden_states)
+    runner.model.compute_logits.assert_not_called()
+    make_dummy.assert_called_once_with(3, 3, runner.input_buffers)
+    assert runner.sampler.call_args_list == [call(logits, dummy_input_batch), call(logits, dummy_input_batch)]
+    assert runner.sampler.add_request.call_args_list == [
+        call(0, warmup_params),
+        call(1, warmup_params),
+        call(2, warmup_params),
+    ]
+    runner.sampler.apply_staged_writes.assert_called_once_with()
+
+
+def test_dummy_sampler_run_without_stateless_hook_keeps_upstream_path() -> None:
+    runner = _make_runner()
+    runner._kstep_frames = 0
+    runner.model = SimpleNamespace(compute_logits=MagicMock())
+    hidden_states = torch.randn(2, 4)
+    sentinel = object()
+
+    with patch.object(GPUModelRunner, "_dummy_sampler_run", return_value=sentinel) as parent:
+        assert runner._dummy_sampler_run(hidden_states) is sentinel
+
+    parent.assert_called_once_with(hidden_states)
+
+
+def test_native_output_freezes_each_requests_current_perf_chunk():
+    runner = _make_runner()
+    runner._omni_data_plane = SimpleNamespace(reserve_outputs=MagicMock())
+    first, second = {"duplex": {"perf_chunk": [3, 7]}}, {"duplex": {"perf_chunk": [8, 2]}}
+    runner.model_state = SimpleNamespace(intermediate_buffer=SimpleNamespace(buffers=[first, second]))
+    output = SimpleNamespace(req_ids=["r2", "r1"])
+
+    runner._reserve_native_data_plane_outputs(output)
+    first["duplex"]["perf_chunk"][:] = [3, 8]
+    second["duplex"]["perf_chunk"] = [9, 0]
+
+    assert output._duplex_perf_chunks == {"r1": (3, 7), "r2": (8, 2)}
+    runner._omni_data_plane.reserve_outputs.assert_called_once_with(["r2", "r1"])
+
+
+@pytest.mark.parametrize("backbone_mode", [CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE, CUDAGraphMode.NONE])
+@pytest.mark.parametrize("num_reqs,bucket", [(1, 1), (3, 4), (4, 4)])
+def test_mtp_graph_replay_is_independent_of_backbone_mode(mocker, backbone_mode, num_reqs, bucket):
+    runner = _make_runner()
+    runner.scheduler_config = SchedulerConfig(max_model_len=16, is_encoder_decoder=False, max_num_seqs=4)
+    runner.model_state = mocker.Mock(spec=OmniModelState)
+    runner.model_state._get_mtp_capture_sizes.return_value = [4, 1]
+    manager = runner.cudagraph_manager = object.__new__(CudaGraphManager)
+    manager._graphs_captured = True
+    manager._candidates = {
+        (size, 0): [BatchExecutionDescriptor(backbone_mode, size, size, 1)]
+        for size in (1, 4)
+        if backbone_mode != CUDAGraphMode.NONE
+    }
+
+    # MTP capture forces FULL even when the backbone dispatches PIECEWISE/NONE.
+    captured = runner._dispatch_mtp_batch_descriptor(bucket)
+    replay = mocker.Mock()
+    output = torch.ones(bucket, 2)
+    wrapper = object.__new__(CUDAGraphWrapper)
+    wrapper.runtime_mode = CUDAGraphMode.FULL
+    wrapper.runnable = mocker.Mock(side_effect=AssertionError("MTP graph was bypassed"))
+    wrapper.is_debugging_mode = False
+    wrapper.concrete_cudagraph_entries = {
+        captured: CUDAGraphEntry(batch_descriptor=captured, cudagraph=replay, output=output)
+    }
+    dispatched = runner._dispatch_mtp_batch_descriptor(num_reqs)
+    context = ForwardContext({}, {}, {}, cudagraph_runtime_mode=dispatched.cg_mode, batch_descriptor=dispatched)
+    with override_forward_context(context):
+        assert wrapper() is output
+    replay.replay.assert_called_once_with()
+    wrapper.runnable.assert_not_called()
+    assert dispatched.num_tokens == dispatched.num_reqs == bucket
+
+
+@pytest.mark.parametrize("capture_sizes,num_reqs", [([], 1), ([8], 3), ([8, 4, 1], 5)])
+def test_mtp_dispatch_without_supported_bucket_stays_eager(mocker, capture_sizes, num_reqs):
+    runner = _make_runner()
+    runner.scheduler_config = SchedulerConfig(max_model_len=16, is_encoder_decoder=False, max_num_seqs=4)
+    runner.model_state = mocker.Mock(spec=OmniModelState)
+    runner.model_state._get_mtp_capture_sizes.return_value = capture_sizes
+    desc = runner._dispatch_mtp_batch_descriptor(num_reqs)
+    assert desc == BatchExecutionDescriptor(CUDAGraphMode.NONE, num_reqs, num_reqs)
 
 
 @pytest.mark.parametrize("hook_fails", [False, True])
@@ -160,6 +283,57 @@ def test_shutdown_accepts_upstream_states_without_an_audio_sender():
     with patch.object(GPUModelRunner, "shutdown") as parent:
         runner.shutdown()
     parent.assert_called_once()
+
+
+def test_shutdown_unlinks_owned_wakeup_fifo_across_restarts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture
+) -> None:
+    """Runner shutdown releases real FIFO/thread owners without removing a peer."""
+    monkeypatch.setenv("VLLM_OMNI_SHM_WAKEUP", "1")
+    config = object.__new__(OmniModelConfig)
+    config.stage_id = 1
+    config.async_chunk = True
+    config.worker_type = "ar"
+    config.stage_connector_config = {
+        "name": "SharedMemoryConnector",
+        "extra": {"role": "receiver", "wakeup_scope": str(tmp_path)},
+    }
+    engine_config = object.__new__(VllmConfig)
+    engine_config.model_config = config
+    # Only upstream model/GPU teardown is substituted. The data-plane
+    # constructor, background threads, runner shutdown and FIFO close are real.
+    mocker.patch.object(GPUModelRunner, "shutdown")
+    peer = SharedMemoryConnector({"stage_id": 1, "wakeup_scope": str(tmp_path)})
+    try:
+        assert peer.get_wakeup_generation() is not None
+        assert peer._wake_path is not None
+        peer_path = Path(peer._wake_path)
+        for _ in range(3):
+            plane = OmniRunnerDataPlane(engine_config, config)
+            try:
+                connector = plane._omni_connector
+                assert isinstance(connector, SharedMemoryConnector)
+                assert connector.get_wakeup_generation() is not None
+                assert connector._wake_path is not None
+                path = Path(connector._wake_path)
+                assert path.exists()
+                threads = (plane._recv_thread, plane._save_thread, plane._native_output_worker)
+                runner = object.__new__(OmniGPUModelRunner)
+                runner.model_state = object.__new__(DefaultModelState)
+                runner._native_output_materializer = None
+                runner._omni_data_plane = plane
+
+                runner.shutdown()
+                runner.shutdown()
+
+                assert not path.exists()
+                assert peer_path.exists()
+                assert not any(thread.is_alive() for thread in threads if thread is not None)
+            finally:
+                plane.close()
+    finally:
+        peer.close()
+    assert not peer_path.exists()
 
 
 def test_add_requests_empty_admission_and_stop_id_sanitization():
@@ -312,6 +486,7 @@ def test_capture_model_unwraps_multimodal_output_and_excludes_full(output_form, 
     runner.cudagraph_manager = SimpleNamespace(
         _capture_descs={CUDAGraphMode.PIECEWISE: [piecewise], CUDAGraphMode.FULL: [full]},
         _candidates={(1, 0): [piecewise, full]},
+        _decode_descs={},
     )
     runner.model_state = SimpleNamespace(capture_mtp_graphs=mocker.Mock(), _is_mtp_graph_runner=lambda: True)
     runner._dispatch_mtp_batch_descriptor = mocker.Mock(return_value="desc")
@@ -331,6 +506,73 @@ def test_capture_model_unwraps_multimodal_output_and_excludes_full(output_form, 
     runner.model_state.capture_mtp_graphs.assert_called_once_with(
         runner._dispatch_mtp_batch_descriptor, restore_capturing=profile_only
     )
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.FULL_AND_PIECEWISE, CUDAGraphMode.FULL_DECODE_ONLY, CUDAGraphMode.FULL])
+@pytest.mark.parametrize("supports_full", [False, True])
+def test_capture_exclusion_keeps_native_decode_dispatch_consistent(mode, supports_full, monkeypatch):
+    from vllm.v1.worker.gpu import cudagraph_utils
+
+    monkeypatch.setattr(cudagraph_utils, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True))
+    monkeypatch.setattr(cudagraph_utils.current_platform, "get_global_graph_pool", lambda: None)
+    monkeypatch.setattr(cudagraph_utils, "get_offloader", lambda: SimpleNamespace(sync_prev_onload=lambda: None))
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=64),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1),
+        cache_config=SimpleNamespace(use_kda_recoverssm=False),
+        uniform_decode_query_len=1,
+        compilation_config=SimpleNamespace(
+            prefill_cudagraph_capture_token_sizes=[1, 8, 16, 64, 512, 1024],
+            decode_cudagraph_capture_request_sizes=[1, 2, 8, 32, 64],
+            max_cudagraph_capture_size=1024,
+            max_decode_cudagraph_capture_tokens=1024,
+            use_breakable_cudagraph=False,
+        ),
+    )
+    manager = cudagraph_utils.CudaGraphManager(config, torch.device("cpu"), mode, {1: 64, 8: 64, 16: 64}, [0, 2])
+    runner = _make_runner()
+    runner.model = SimpleNamespace(
+        _returns_tuple=True, supports_mrv2_full_graph_aux_outputs=supports_full, forward=lambda: ()
+    )
+    runner._configure_cudagraph_output_contract()
+    runner.use_aux_hidden_state_outputs = False
+    runner.cudagraph_manager = manager
+    runner.model_state = SimpleNamespace()
+
+    def capture(_self, *, profile_only=False):
+        # Replace CUDA recording only; native candidate construction and
+        # dispatch remain real, including the request-indexed decode tables.
+        manager.graphs.update(
+            {desc: SimpleNamespace(replay=lambda: None) for desc in manager._capture_descs.get(CUDAGraphMode.FULL, [])}
+        )
+        manager._graphs_captured = True
+        return 0
+
+    monkeypatch.setattr(GPUModelRunner, "capture_model", capture)
+    runner.capture_model()
+    expected = CUDAGraphMode.FULL if supports_full else mode.mixed_mode()
+    if not supports_full and expected == CUDAGraphMode.FULL:
+        expected = CUDAGraphMode.NONE
+    # Plain decode and the MiniCPM K7/K15 ngram verification widths.
+    for query_len in (1, 8, 16):
+        for num_reqs in (1, 2, 5, 32, 64):
+            for num_loras in (0, 1, 2):
+                desc = manager.dispatch(num_reqs, num_reqs * query_len, query_len, num_loras)
+                if desc.cg_mode == CUDAGraphMode.FULL:
+                    # The startup sampler dummy run must never replay an
+                    # excluded graph, even when decode lookup precedes tokens.
+                    manager.run_fullgraph(desc)
+                assert desc.cg_mode == expected
+                assert desc.num_active_loras == (2 if num_loras else 0)
+                if desc.cg_mode != CUDAGraphMode.NONE:
+                    assert desc in manager._capture_descs[desc.cg_mode]
+    mixed = manager.dispatch(2, 8, None, 0)
+    expected_mixed = mode.mixed_mode()
+    if not supports_full and expected_mixed == CUDAGraphMode.FULL:
+        expected_mixed = CUDAGraphMode.NONE
+    assert mixed.cg_mode == expected_mixed
+    if not supports_full:
+        assert manager._decode_descs == {}
 
 
 @pytest.mark.parametrize(
@@ -474,6 +716,9 @@ def test_hybrid_state_constructs_and_reuses_request_slots(remove_by_id):
         ),
         scheduler_config=SimpleNamespace(max_num_seqs=2, max_num_batched_tokens=16),
         cache_config=SimpleNamespace(mamba_cache_mode="none", use_kda_recoverssm=False),
+        # The pin's VllmConfig grew this top-level field; the pin's
+        # MambaHybridModelState reads it unconditionally in __init__.
+        use_flashinfer_replayssm=False,
     )
     # Exercise both real parent constructors and their lifecycle methods.
     state = OmniMambaHybridModelState(config, torch.nn.Linear(8, 8), None, torch.device("cpu"))
@@ -502,10 +747,28 @@ def test_finish_requests_notifies_model_and_cleans_only_known_slots(monkeypatch)
     assert sorted(c.args[0] for c in runner.model_state.remove_request.call_args_list) == [0]
 
 
+def test_aux_hidden_state_contract_uses_tuple_slot_not_structured_output():
+    runner = _make_runner()
+    runner.model = SimpleNamespace(have_multimodal_outputs=True)
+    runner.use_aux_hidden_state_outputs = True
+
+    runner._configure_cudagraph_output_contract()
+
+    assert runner._model_has_structured_output is True
+    assert runner._model_returns_tuple is False
+    assert runner._aux_hidden_state_contract_conflicts() is False
+
+    runner.model = SimpleNamespace(_returns_tuple=True)
+    runner._configure_cudagraph_output_contract()
+
+    assert runner._model_returns_tuple is True
+    assert runner._aux_hidden_state_contract_conflicts() is True
+
+
 @pytest.mark.parametrize("stage,declared", [("thinker", False), ("custom_ar", True)])
 def test_capture_contract_uses_model_declaration(stage, declared):
     runner = _make_runner()
-    runner.model = SimpleNamespace(model_stage=stage, _returns_tuple=declared)
+    runner.model = SimpleNamespace(model_stage=stage, _returns_tuple=declared, mrv2_forward_returns_native_aux=True)
     runner._configure_cudagraph_output_contract()
     assert runner._model_has_structured_output is declared
     assert runner._exclude_full_graph is declared
@@ -514,7 +777,7 @@ def test_capture_contract_uses_model_declaration(stage, declared):
 
 @pytest.mark.parametrize(
     ("stage", "use_mrv2", "returns_aux", "exclude_full"),
-    [("llm", True, False, False), ("tts", True, False, False), ("llm", True, True, True), ("llm", False, False, True)],
+    [("llm", True, False, False), ("tts", True, False, False), ("llm", True, True, False), ("llm", False, False, True)],
 )
 def test_minicpmo_capture_contract(stage, use_mrv2, returns_aux, exclude_full):
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
@@ -527,6 +790,8 @@ def test_minicpmo_capture_contract(stage, use_mrv2, returns_aux, exclude_full):
     model._use_v2_model_runner = use_mrv2
     model._returns_aux_hidden_states = returns_aux
     model.have_multimodal_outputs = True
+    assert model.mrv2_forward_returns_tensor is (use_mrv2 and (stage == "tts" or not returns_aux))
+    assert model.mrv2_forward_returns_native_aux is (use_mrv2 and stage == "llm" and returns_aux)
 
     runner = _make_runner()
     runner.model = model
@@ -534,6 +799,72 @@ def test_minicpmo_capture_contract(stage, use_mrv2, returns_aux, exclude_full):
 
     assert runner._model_has_structured_output is exclude_full
     assert runner._exclude_full_graph is exclude_full
+
+
+def _make_graph_contract_model(architecture, stage):
+    from vllm_omni.model_executor.models.registry import OmniModelRegistry
+
+    model_cls = OmniModelRegistry.models[architecture].load_model_cls()
+    model = model_cls.__new__(model_cls)
+    torch.nn.Module.__init__(model)
+    model.have_multimodal_outputs = True
+    if stage is not None:
+        model.model_stage = stage
+    return model
+
+
+@pytest.mark.parametrize(
+    ("architecture", "stage"),
+    [
+        ("BreezeForConditionalGeneration", None),
+        ("HiggsAudioV3TalkerForConditionalGeneration", None),
+        ("Ming3TTSForConditionalGeneration", "llm"),
+        ("MiniMaxMusic3TalkerForConditionalGeneration", None),
+        ("MossTTSDelayModel", None),
+        ("MossTTSLocalModel", None),
+        ("VoxtralTTSForConditionalGeneration", "audio_generation"),
+    ],
+)
+def test_tensor_returning_model_preserves_mrv2_full_capture(architecture, stage, monkeypatch):
+    model = _make_graph_contract_model(architecture, stage)
+
+    runner = _make_runner()
+    runner.model = model
+    runner._configure_cudagraph_output_contract()
+    assert not runner._model_has_structured_output
+    assert not runner._exclude_full_graph
+    full = BatchExecutionDescriptor(CUDAGraphMode.FULL, 1, 1)
+    runner.cudagraph_manager = SimpleNamespace(
+        _capture_descs={CUDAGraphMode.FULL: [full]},
+        _candidates={(1, 0): [full]},
+        _decode_descs={1: full},
+    )
+
+    def capture(self, *, profile_only):
+        assert self.cudagraph_manager._capture_descs[CUDAGraphMode.FULL] == [full]
+        assert self.cudagraph_manager._candidates[(1, 0)] == [full]
+        assert self.cudagraph_manager._decode_descs[1] == full
+        return 0
+
+    monkeypatch.setattr(GPUModelRunner, "capture_model", capture)
+    assert runner.capture_model(profile_only=True) == 0
+
+
+@pytest.mark.parametrize(
+    ("architecture", "stage"),
+    [
+        ("Ming3TTSForConditionalGeneration", "audio_vae"),
+        ("VoxtralTTSForConditionalGeneration", "audio_tokenizer"),
+    ],
+)
+def test_tensor_return_contract_excludes_structured_decoder_stages(architecture, stage):
+    model = _make_graph_contract_model(architecture, stage)
+
+    runner = _make_runner()
+    runner.model = model
+    runner._configure_cudagraph_output_contract()
+
+    assert runner._exclude_full_graph
 
 
 def _aux_output(num_tokens):
@@ -816,3 +1147,59 @@ def test_drafter_target_layers_reach_execute_state(cg_mode, monkeypatch):
     assert runner.execute_model_state.aux_hidden_states is current_aux
     assert runner._last_aux_output is None
     assert previous_state.aux_hidden_states is aux
+
+
+class _StopAfterLoraActivationError(Exception):
+    """Ends the step at LoRA activation; the forward after it needs a GPU."""
+
+
+@pytest.mark.parametrize(("num_drafts", "expected_prompt_mapping"), [(0, (7, 0)), (1, (7, 7, 0))])
+def test_real_step_activates_loras_per_token_and_logits_row(num_drafts, expected_prompt_mapping):
+    """A real step builds its LoRA mappings with vLLM's LoraState signature, per token and per logits row."""
+    runner = object.__new__(OmniGPUModelRunner)
+    runner._staged_writes = staged_writes.StagedWrites()
+    for name in ("_prepare_native_data_plane", "finish_requests", "free_states", "add_requests", "update_requests"):
+        setattr(runner, name, lambda *_args: None)
+    runner._sync_native_data_plane_payloads = lambda *_args: None
+    runner.block_tables = MagicMock(spec=BlockTables)
+    # No model hooks: no duplex re-anchor and no runner-assisted attention request.
+    runner.model = object()
+    runner.aux_output_connector = None
+    # Encoder payload updates are disabled in this fixture.
+    runner.encoder_cache = None
+    runner.is_encoder_decoder = False
+    runner.lora_config = MagicMock(spec=LoRAConfig)
+    runner.lora_state = LoraState(max_num_reqs=4)
+    adapter = LoRARequest("adapter", 7, "/unused")
+    runner.lora_state.add_request("with-adapter", 0, adapter)
+    runner.lora_state.add_request("base", 1, None)
+    runner.gather_batch_req_state = MagicMock(return_value=(object(), None))
+    runner._adjust_dispatch_token_count = lambda _state, num_toks, max_query_len: (num_toks, max_query_len)
+    batch_desc = BatchExecutionDescriptor(
+        CUDAGraphMode.NONE, num_tokens=4, num_reqs=2, max_query_len=3, num_active_loras=1
+    )
+    runner._dispatch_batch_descriptor = MagicMock(return_value=(batch_desc, None))
+    # The first request schedules three tokens; each draft token adds a logits row.
+    input_batch = MagicMock(spec=InputBatch)
+    input_batch.req_ids = ["with-adapter", "base"]
+    input_batch.idx_mapping_np = np.array([0, 1], dtype=np.intp)
+    input_batch.num_scheduled_tokens = np.array([3, 1], dtype=np.int32)
+    input_batch.cu_num_logits_np = np.cumsum([0, 1 + num_drafts, 1], dtype=np.int32)
+    runner.prepare_inputs = MagicMock(return_value=input_batch)
+    runner.prepare_attn = MagicMock(return_value=(None, None))
+    runner.model_state = MagicMock()
+    runner.kv_cache_config = None
+    runner.req_states = MagicMock()
+    runner._set_active_loras = MagicMock(side_effect=_StopAfterLoraActivationError)
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_scheduled_tokens = {"with-adapter": 3, "base": 1}
+    scheduler_output.total_num_scheduled_tokens = 4
+    scheduler_output.scheduled_spec_decode_tokens = {"with-adapter": [11] * num_drafts} if num_drafts else {}
+
+    with pytest.raises(_StopAfterLoraActivationError):
+        runner.execute_model(scheduler_output)
+
+    prompt_mapping, token_mapping, active = runner._set_active_loras.call_args.args
+    assert tuple(int(i) for i in prompt_mapping) == expected_prompt_mapping
+    assert tuple(int(i) for i in token_mapping) == (7, 7, 7, 0)
+    assert active == {adapter}

@@ -45,7 +45,9 @@ from vllm_omni.core.sched.output import (
 )
 from vllm_omni.data_entry_keys import (
     ASYNC_CHUNK_PREWARM_NS,
+    JOYAI_FINISH_ON_NEXT_STOP_KEY,
     deserialize_payload,
+    request_flag_is_set,
     returns_stage_payload,
     unflatten_payload,
 )
@@ -62,6 +64,28 @@ logger = init_logger(__name__)
 
 _STATS_INTERVAL_S = 1.0
 _ASYNC_CHUNK_PREWARM_PREFIX = f"{ASYNC_CHUNK_PREWARM_NS}."
+_FINISH_ON_NEXT_STOP_ATTR = f"_{JOYAI_FINISH_ON_NEXT_STOP_KEY}"
+
+
+def _request_finishes_on_next_stop(request: Request) -> bool:
+    return request_flag_is_set(request, JOYAI_FINISH_ON_NEXT_STOP_KEY)
+
+
+def _initialize_resumable_segment_generation(request: Request) -> None:
+    """Publish generation 0 on a fresh resumable request before its first park.
+
+    Streaming replacements increment with ``int(getattr(..., 0) or 0) + 1``.
+    A missing counter made the first 2150 publish ``None``, so sentence-TTS
+    compared ``None`` to ``1`` with the 200 ms token-identity fallback.
+    One-shot requests stay unset so connector watermarking does not
+    speculate ``generation + 1`` (#6816).
+    """
+    if not getattr(request, "resumable", False):
+        return
+    if getattr(request, "_omni_segment_generation", None) is not None:
+        return
+    request._omni_segment_generation = 0
+
 
 # Upper bound on how long a request may wait for stage input before the
 # scheduler force-fails it.  Defends against stuck consumer-side requests when
@@ -379,6 +403,9 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
         self._init_omni_connector_output_inbox()
         self._pending_data_plane_terminal_req_ids: set[str] = set()
+        # Aborted, errored, and ignored requests. Wrapped onto the next
+        # scheduler output so the runner can drop their pending payloads.
+        self._discarded_req_ids: set[str] = set()
         # Async-chunk prewarm payloads popped in add_request, keyed by request
         # id; handed to the runner once by _wrap_omni_scheduler_output.
         self._pending_request_prewarms: dict[str, dict[str, Any]] = {}
@@ -467,7 +494,9 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         """Replace a downstream stage's placeholder with its next payload."""
         self._reset_streaming_session_replacement_state(session)
         session._output_token_ids.clear()
-        session._all_token_ids.clear()
+        # _all_token_ids is a TokenBuffer (array) since vLLM 0.34; it has no
+        # .clear(), so empty it with the del-slice idiom the pin uses.
+        del session._all_token_ids[:]
         new_prompt = update.prompt_token_ids or ()
         session._all_token_ids.extend(new_prompt)
         session.num_computed_tokens = 0
@@ -874,6 +903,20 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             return
         self._latest_omni_connector_output = omni_output
 
+    def _record_full_payload_discard(self, request: Request) -> None:
+        """Remember a failed request so its pending full payload is dropped."""
+        if getattr(request, "status", None) not in (
+            RequestStatus.FINISHED_ABORTED,
+            RequestStatus.FINISHED_ERROR,
+            RequestStatus.FINISHED_IGNORED,
+        ):
+            return
+        discarded = getattr(self, "_discarded_req_ids", None)
+        if discarded is None:
+            discarded = set()
+            self._discarded_req_ids = discarded
+        discarded.add(request.request_id)
+
     def _wrap_omni_scheduler_output(
         self,
         base: SchedulerOutput,
@@ -924,6 +967,12 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         finished_output_ids = {
             req_id: pending_output_ids.pop(req_id) for req_id in base.finished_req_ids if req_id in pending_output_ids
         }
+        discarded_req_ids: set[str] | None = getattr(self, "_discarded_req_ids", None)
+        if discarded_req_ids is None:
+            finished_discarded_req_ids: set[str] = set()
+        else:
+            finished_discarded_req_ids = discarded_req_ids & set(base.finished_req_ids)
+            discarded_req_ids.difference_update(finished_discarded_req_ids)
         scheduler_output = OmniSchedulerOutput(
             **base_data,
             finished_requests_needing_kv_transfer=finished_requests_needing_kv_transfer or {},
@@ -932,6 +981,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             data_plane_terminal_req_ids=data_plane_terminal_req_ids,
             input_terminal_req_ids=input_terminal_req_ids or set(),
             pending_request_prewarms=request_prewarms,
+            discarded_req_ids=finished_discarded_req_ids,
         )
         OmniSchedulerMixin._duplex_stage_work_recorder(self).step_begin(scheduler_output, getattr(self, "requests", {}))
         return scheduler_output
@@ -1009,6 +1059,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         routed_experts: Any = None,
         num_nans_in_logits: int = 0,
         is_segment_finished: bool | None = False,
+        segment_generation: int | None = None,
         new_prompt_len_snapshot: int | None = None,
         num_generation_tokens: int | None = None,
         error: Any = None,
@@ -1018,6 +1069,10 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         if isinstance(pooling_output, dict):
             pooling_output_payload = serialize_additional_information(pooling_output)
             pooling_output = None
+        if segment_generation is None:
+            raw_generation = getattr(request, "_omni_segment_generation", None)
+            if not isinstance(raw_generation, bool) and isinstance(raw_generation, int):
+                segment_generation = raw_generation
 
         return OmniEngineCoreOutput(
             request_id=request.request_id,
@@ -1038,6 +1093,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             routed_experts=routed_experts,
             num_nans_in_logits=num_nans_in_logits,
             is_segment_finished=is_segment_finished,
+            segment_generation=segment_generation,
             new_prompt_len_snapshot=new_prompt_len_snapshot,
             num_generation_tokens=num_generation_tokens,
             error=error,
@@ -1233,6 +1289,8 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             or request.status != RequestStatus.WAITING_FOR_STREAMING_REQ
         ):
             return
+        # Connector-only resumes bypass the generation bump in _update_request_as_session.
+        request._omni_segment_generation = int(getattr(request, "_omni_segment_generation", 0) or 0) + 1
         self.num_waiting_for_streaming_input -= 1
         request.status = RequestStatus.WAITING
         self.deferred_waiting.discard(request)
@@ -1341,16 +1399,23 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
                 super().add_request(request)
                 self.finish_requests([request.request_id], RequestStatus.FINISHED_ERROR)
                 return
+        finishes_on_next_stop = _request_finishes_on_next_stop(request)
+        if finishes_on_next_stop:
+            setattr(request, _FINISH_ON_NEXT_STOP_ATTR, True)
         existing = self.requests.get(request.request_id)
         if existing is None:
             # Only a fresh prewarm placeholder carries the payload; streaming
             # updates re-add a live id and are left untouched.
             self._take_async_chunk_prewarm(request)
-        elif existing.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
-            adapter = None if getattr(request, "resumable", False) else self._adapter_owing_terminal(existing)
-            if adapter is not None:
-                self._finish_parked_streaming_session(existing, adapter)
-                return
+            _initialize_resumable_segment_generation(request)
+        else:
+            if finishes_on_next_stop:
+                setattr(existing, _FINISH_ON_NEXT_STOP_ATTR, True)
+            if existing.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                adapter = None if getattr(request, "resumable", False) else self._adapter_owing_terminal(existing)
+                if adapter is not None:
+                    self._finish_parked_streaming_session(existing, adapter)
+                    return
         super().add_request(request)
 
     def _take_async_chunk_prewarm(self, request: Request) -> None:
@@ -1414,13 +1479,28 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         Sender ownership starts when the first chunk is queued, before the
         background thread initializes its chunk counter. A prewarmed receiver
         needs a terminal even if that first chunk has not been sent yet.
-        Final stages never queue sends, so they never match.
+
+        A 2150 segment stop may already have dropped the sender token. The
+        producer stage still owes that terminal; ``has_active_sender`` alone
+        would abort a parked close with no ``finished`` chunk, and the
+        downstream vocoder waits until the client times out. That no-sender
+        fallback is only for a parked request already stamped
+        finish-on-next-stop. Unstamped MiniCPM-style sessions keep the old
+        ``has_active_sender``-only behavior. Receiver-only final stages never
+        queue sends, so they never match.
         """
         adapter = getattr(self, "chunk_transfer_adapter", None)
         if adapter is None:
             return None
         external_req_id = getattr(request, "external_req_id", None) or request.request_id
-        return adapter if adapter.has_active_sender(external_req_id) else None
+        if adapter.has_active_sender(external_req_id):
+            return adapter
+        if not _request_finishes_on_next_stop(request):
+            return None
+        sends = getattr(adapter, "custom_process_next_stage_input_func", None) is not None
+        if getattr(adapter, "receives_chunks", False) and not sends:
+            return None
+        return adapter
 
     def _finish_parked_streaming_session(self, request: Request, adapter: OmniChunkTransferAdapter) -> None:
         """End a parked async-chunk session with a downstream terminal chunk."""

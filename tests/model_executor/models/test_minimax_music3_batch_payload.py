@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for MiniMax Music 3 batched payload partitioning.
 
 The stage-0 payload is split per request by indexing list values: a list is
@@ -18,6 +18,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.minimax_music3.frame_state import RequestARState
 from vllm_omni.model_executor.models.minimax_music3.talker import (
     MiniMaxMusic3TalkerForConditionalGeneration as Talker,
 )
@@ -130,3 +131,47 @@ class TestPartialBatches:
         talker.make_omni_output(torch.zeros(1, _WIDTH), model_intermediate_buffer=infos)
         assert "latent" not in infos[0]
         assert "meta" not in infos[0]
+
+
+class TestWholeSongWithoutAsyncChunk:
+    """With ``async_chunk: false`` the engine collects stage 0's outputs and
+    ``ar2acoustic`` hands stage 1 the whole song, so the talker must publish it
+    once, from frame 0."""
+
+    @staticmethod
+    def _talker(total_frames: int) -> tuple[Talker, RequestARState]:
+        talker = Talker.__new__(Talker)
+        talker.publishes_windows = False
+        state = RequestARState(seed=5, max_frames=total_frames)
+        talker._states = {"song": state}
+        return talker, state
+
+    def test_the_song_is_published_once_when_it_ends(self) -> None:
+        talker, state = self._talker(450)
+        for index in range(450):
+            state.frames.append(torch.full((1, _WIDTH), float(index)))
+            state.codes.append(torch.full((1, 8), index))
+            state.generated_frames += 1
+            # Past several window boundaries, and nothing is published.
+            assert talker.postprocess(None, None, global_request_id="song") == {}
+
+        state.finished = True
+        span = talker.postprocess(None, None, global_request_id="song")
+        assert span["latent"][:, 0].tolist() == [float(index) for index in range(450)]
+        assert span["codes"]["audio"].shape == (450, 8)
+        assert span["meta"]["num_processed_tokens"] == 0
+        assert span["meta"]["last_chunk"] is True
+        assert span["meta"]["audio_seed"] == 5
+        assert talker.postprocess(None, None, global_request_id="song") == {}
+
+    def test_idle_rows_get_placeholders_of_the_published_dtypes(self) -> None:
+        """The engine joins each request's outputs, so a float32 placeholder
+        would turn the bf16 song it is later joined with into float32."""
+        talker = Talker.__new__(Talker)
+        infos = [{}, _info(seed=777, start=0, frames=2, last=True)]
+        output = talker.make_omni_output(torch.zeros(2, _WIDTH, dtype=torch.bfloat16), model_intermediate_buffer=infos)
+
+        idle = _payload_for(output, 0)
+        assert idle["latent"].numel() == 0
+        assert idle["latent"].dtype == torch.bfloat16
+        assert idle["codes.audio"].dtype == torch.long

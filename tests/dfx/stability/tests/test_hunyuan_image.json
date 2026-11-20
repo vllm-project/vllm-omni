@@ -16,6 +16,7 @@
         "server_params": {
             "model": "tencent/HunyuanImage-3.0-Instruct",
             "serve_args": {
+                "deploy-config": "vllm_omni/deploy/hunyuan_image3_dit.yaml",
                 "tensor-parallel-size": 2,
                 "usp": 2,
                 "quantization": "fp8",
