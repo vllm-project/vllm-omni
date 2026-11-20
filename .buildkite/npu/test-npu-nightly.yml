@@ -143,7 +143,7 @@ steps:
           - |
             set +e
             pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline \
-              --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_npu_nightly.json \
+              --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json \
               -k test_minicpmo_4_5_npu_nightly_default \
               -m "full_model and npu and A3 and omni and cards_2" --run-level full_model
             EXIT=$$?
@@ -193,36 +193,9 @@ steps:
           - |
             set +e
             pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline \
-              --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_npu_nightly.json \
-              -k test_minicpmo_4_5_npu_nightly_async_prefix_c32 \
+              --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json \
+              -k test_minicpmo_4_5_npu_nightly_async_prefix \
               -m "full_model and npu and A3 and omni and cards_2" --run-level full_model
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
-            exit $$EXIT
-      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Async Prefix C64 Seed-TTS Accuracy and Perf Test"
-        source_file_dependencies: omni_minicpmo_4_5_perf
-        key: nightly-omni-minicpmo-4-5-npu-async-prefix-c64
-        timeout_in_minutes: 480
-        mirror_hardwares: a3_npu_4
-        env:
-          VLLM_WORKER_MULTIPROC_METHOD: spawn
-          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-          HF_TOKEN: "${HF_TOKEN}"
-        artifact_paths:
-          - tests/dfx/perf/results/*.json
-        commands:
-          - export BENCHMARK_DIR=tests/dfx/perf/results
-          - export SEED_TTS_WER_EVAL=1
-          - export SEED_TTS_SIM_EVAL=1
-          - export SEED_TTS_UTMOS_EVAL=0
-          - export SEED_TTS_EVAL_DEVICE=npu:2
-          - export SEED_TTS_SIM_DEVICE=npu:2
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline \
-              --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_npu_nightly.json \
-              -k test_minicpmo_4_5_npu_nightly_async_prefix_c64 \
-              -m "full_model and npu and A3 and omni and cards_3" --run-level full_model
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
@@ -239,7 +212,7 @@ steps:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline -m "npu and A3" --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline -m "npu and A3" -k "not nightly" --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
