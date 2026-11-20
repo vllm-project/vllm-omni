@@ -311,13 +311,13 @@ def test_existing_model_and_pipeline_names_resolve_to_unified_path():
     deploy_root = Path(__file__).parents[2] / "vllm_omni/deploy"
     deploy = load_deploy_config(deploy_root / "yue2.yaml")
     assert deploy.pipeline == "yue2"
-    assert deploy.model_runner == "v1"
-    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
-        merge_pipeline_deploy(pipeline, deploy)
-    supported = OMNI_PIPELINES["qwen2_5_omni"]
-    assert isinstance(supported, PipelineConfig)
-    stages = merge_pipeline_deploy(supported, load_deploy_config(deploy_root / "qwen2_5_omni.yaml"))
+    assert deploy.model_runner == "v2"
+    stages = merge_pipeline_deploy(pipeline, deploy)
     assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+    from vllm_omni.model_executor.models.yue2.worker import Yue2Worker
+
+    worker_module, worker_name = stages[0].yaml_engine_args["worker_cls"].rsplit(".", 1)
+    assert getattr(import_module(worker_module), worker_name) is Yue2Worker
     family, module, name = _OMNI_MODELS["Yue2ForCausalLM"]
     assert getattr(import_module(f"vllm_omni.model_executor.models.{family}.{module}"), name) is Yue2ForCausalLM
     assert detect_tts_model_type("yue2", "Yue2ForCausalLM") == "yue2"
