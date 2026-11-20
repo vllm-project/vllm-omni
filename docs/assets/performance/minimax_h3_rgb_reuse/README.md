@@ -2,6 +2,22 @@
 
 Measured source: `cef8d680fccbc38ce3901ec051a3f91ea1d2ecfa`.
 
+## Matched service-window results
+
+Each arm has two complete validated warmups and three formal requests. These CPU preparation calls were measured alongside the service window; they are separate from HTTP time and the earlier independent CPU benchmark.
+
+| Arm | HTTP E2E mean ± SD | CPU preparation mean ± SD |
+| --- | ---: | ---: |
+| RGB reuse off before | 61.239 ± 0.244 s | 3.304 ± 0.030 s |
+| RGB reuse on | 61.508 ± 0.097 s | 2.941 ± 0.011 s |
+| RGB reuse off after | 61.991 ± 0.050 s | 3.301 ± 0.014 s |
+
+Timestamp-interpolated HTTP control: **61.613 s** versus **61.508 s** with reuse on. Saving: 0.106 s (0.17%). The 95% bootstrap saving interval is **-0.044–0.248 s**; **no distinguishable E2E gain** was measured.
+
+CPU preparation in the same window: **3.303 → 2.941 s (10.95% lower)**. Its 95% bootstrap saving interval is 0.344–0.381 s and exceeds the observed within-arm noise.
+
+All 15 requests passed HTTP/media checks, full ffmpeg decoding and exact output-byte equality; warmup encoder activations also matched. These results do not erase the earlier cold-start failure documented below.
+
 [Results and commands](results.json) include dependency versions, actual per-request HTTP status, output byte counts and SHA256, stage timers, executed-path counters, source revision and launch/request arguments. [Server excerpts](server.log.txt) preserve the numeric instrumentation rows and HTTP 200 access-log lines. Private prompt/media contents are represented by hashes; no credentials are exported.
 
 Client E2E runs from sending the completed multipart HTTP request to reading the full MP4 response. Service startup, model loading and warmups are excluded. Stage values are auxiliary unsynchronized host wall times; the complete HTTP request is the performance authority. Tensor hashing runs only during warmups. All formal artifacts are byte-identical and completely decoded by ffmpeg.
