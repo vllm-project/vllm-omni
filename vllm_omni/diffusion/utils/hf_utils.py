@@ -95,12 +95,15 @@ def _looks_like_flux3(model_name: str, config: Mapping | None = None) -> bool:
 
 def resolve_native_diffusion_model_class(model_name: str) -> str | None:
     """Resolve native checkpoints that have no root HF or Diffusers config."""
+    from vllm_omni.diffusion.models.kyutai_aura.config import resolve_kyutai_aura_config, unsupported_kyutai_aura
     from vllm_omni.diffusion.models.video_depth_anything.checkpoints import resolve_checkpoint
 
     if _looks_like_magi2(model_name):
         return "Magi2Pipeline"
     if resolve_checkpoint(model_name) is not None:
         return "VideoDepthAnythingPipeline"
+    if resolve_kyutai_aura_config(model_name) is not None or unsupported_kyutai_aura(model_name) is not None:
+        return "KyutaiAuraPipeline"  # the pipeline explains a checkpoint that is not supported yet
     return None
 
 
