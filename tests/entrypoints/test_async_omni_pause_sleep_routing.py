@@ -482,6 +482,94 @@ def test_pause_then_sleep_wake_keeps_admission_paused_for_ar():
 
 
 @pytest.mark.cpu
+def test_overlapping_wake_does_not_reopen_admission_during_inflight_sleep():
+    """Waking stage A while stage B's sleep RPC is in flight must keep
+    admission closed until stage B finishes sleeping and is fully woken."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "llm"])
+        omni._pending_submits = {}
+        omni.request_states = {}
+        omni.engine.num_stages = 2
+        omni.log_stats = False
+        omni._maybe_expand_sampling_params = lambda spl: spl
+        omni.resolve_sampling_params_list = lambda spl, **_: spl
+        omni._compute_final_stage_id = lambda output_modalities: 1
+        omni._compute_final_output_stage_ids = lambda output_modalities: [1]
+        omni._get_pd_separation_pair = lambda: None
+        omni._publish_request_gauges = lambda total: None
+        omni._log_summary_and_cleanup = lambda request_id, reason="stage_error": None
+        add_request = omni.engine.add_request_async = AsyncMock()
+
+        async def no_outputs(*args, **kwargs):
+            return
+            yield  # pragma: no cover
+
+        omni._process_orchestrator_results = no_outputs
+
+        # Stage 0 (A) is already asleep.
+        await omni.sleep(stage_ids=[0], level=1, mode="abort")
+        assert omni._paused is True
+        assert omni._stage_sleeping_tags == {0: {CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value}}
+
+        # Park stage 1 (B)'s sleep RPC mid-flight.
+        b_sleep_entered = asyncio.Event()
+        release_b_sleep = asyncio.Event()
+        orig_rpc = omni._engine_core_rpc
+
+        async def gated_rpc(method: str, *, stage_ids=None, args=(), kwargs=None):
+            if method == "sleep" and stage_ids == [1]:
+                b_sleep_entered.set()
+                await release_b_sleep.wait()
+            return await orig_rpc(method, stage_ids=stage_ids, args=args, kwargs=kwargs)
+
+        omni._engine_core_rpc = gated_rpc
+
+        sleep_b = asyncio.create_task(omni.sleep(stage_ids=[1], level=1, mode="abort"))
+        await asyncio.wait_for(b_sleep_entered.wait(), timeout=1.0)
+
+        # Overlapping wake_up(A) clears stage 0's tags while B is still offloading.
+        await omni.wake_up(stage_ids=[0])
+        assert not omni._sleeping_tags
+        assert omni._paused is True
+
+        async def consume() -> None:
+            async for _ in omni.generate("hi", sampling_params_list=[SimpleNamespace(max_tokens=1)] * 2):
+                pass
+
+        req_task = asyncio.create_task(consume())
+        await asyncio.sleep(0.05)
+        assert not req_task.done()
+        assert omni._admitting == 0
+        add_request.assert_not_awaited()
+
+        # Once stage B's sleep completes, B's tags are recorded and the request stays parked.
+        release_b_sleep.set()
+        await asyncio.wait_for(sleep_b, timeout=1.0)
+        assert omni._paused is True
+        assert omni._stage_sleeping_tags == {1: {CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value}}
+        await asyncio.sleep(0.05)
+        assert not req_task.done()
+        add_request.assert_not_awaited()
+
+        # Partial wake of B keeps the request parked; full wake admits it.
+        await omni.wake_up(stage_ids=[1], tags=[CuMemTag.WEIGHTS.value])
+        await asyncio.sleep(0.05)
+        assert not req_task.done()
+        assert omni._paused is True
+        add_request.assert_not_awaited()
+
+        await omni.wake_up(stage_ids=[1], tags=[CuMemTag.KV_CACHE.value])
+        await asyncio.wait_for(req_task, timeout=2.0)
+        assert omni._paused is False
+        assert not omni._sleeping_tags
+        add_request.assert_awaited_once()
+        assert omni._admitting == 0
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_sleep_level1_wake_without_tags_clears_all_sleeping_tags():
     """sleep(level=1) tracks WEIGHTS+KV; untagged wake_up must clear both."""
 
