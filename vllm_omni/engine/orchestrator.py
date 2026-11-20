@@ -226,6 +226,9 @@ def build_engine_core_request_from_tokens(
     wire_payload: dict[str, Any] | None = None
     if isinstance(raw_additional_information, dict):
         wire_payload = dict(raw_additional_information)
+        # Deferred image/video stays on the original prompt for the orchestrator;
+        # keep it off the wire, where PIL images and video arrays cannot be serialized.
+        wire_payload.pop("deferred_multi_modal_data", None)
     additional_info_payload = serialize_additional_information(
         wire_payload,
         log_prefix=f"build_engine_core_request_from_tokens req={request_id}",
@@ -3790,8 +3793,15 @@ class OrchestratorBase:
                         memo,
                     )
                     if "additional_information" in original_prompt:
+                        raw_additional_info = original_prompt["additional_information"]
+                        if isinstance(raw_additional_info, dict) and "deferred_multi_modal_data" in raw_additional_info:
+                            # Deferred visuals belong to the raw prompt for stage handoff,
+                            # not to prewarmed downstream wire placeholders.
+                            raw_additional_info = {
+                                k: v for k, v in raw_additional_info.items() if k != "deferred_multi_modal_data"
+                            }
                         base_input["additional_information"] = copy_request_snapshot(
-                            original_prompt["additional_information"],
+                            raw_additional_info,
                             memo,
                             shared_types=(torch.Tensor,),
                         )

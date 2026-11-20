@@ -851,7 +851,8 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         if (
             not submission.already_submitted
             and self.async_chunk
-            and context.stage_id == 0
+            and context.stage_id == request_state.entry_stage_id
+            and request_state.final_stage_id > context.stage_id
             and self.plugin.prewarms_downstream_stages(context.request_id)
         ):
             prewarmed = await self._prewarm_async_chunk_stages(context.request_id, request, request_state)

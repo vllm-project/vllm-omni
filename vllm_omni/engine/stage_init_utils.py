@@ -2081,6 +2081,10 @@ def get_stage_connector_spec(
                 extra["from_stage"] = int(from_stage)
                 extra["to_stage"] = int(to_stage)
             return {"name": spec.name, "extra": extra}
+    if getattr(omni_transfer_config, "connectors", None):
+        # Other stages in this pipeline use explicit connectors, so this stage
+        # is orchestrator-only and must neither wait for nor send connector chunks.
+        return {"extra": {"role": "none"}}
     return {}
 
 

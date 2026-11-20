@@ -251,6 +251,43 @@ def test_full_payload_consumer_uses_receiver_connector_spec():
     assert spec["extra"] == {"codec_chunk_frames": 25, "role": "receiver"}
 
 
+@pytest.mark.parametrize("stage_id", [0, 1])
+@pytest.mark.parametrize("async_chunk", [False, True])
+def test_connectorless_stage_in_partial_connector_pipeline_uses_none_role(stage_id: int, async_chunk: bool):
+    from types import SimpleNamespace
+
+    from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime import (
+        _should_create_payload_connector,
+        needs_omni_connector,
+    )
+    from vllm_omni.distributed.omni_connectors.utils.config import (
+        stage_receives_chunks,
+        stage_sends_async_output,
+    )
+
+    config = OmniTransferConfig(
+        connectors={
+            ("2", "3"): ConnectorSpec(
+                name="SharedMemoryConnector",
+                extra={"codec_chunk_frames": 25},
+            )
+        }
+    )
+
+    spec = get_stage_connector_spec(config, stage_id=stage_id, async_chunk=async_chunk)
+    assert spec == {"extra": {"role": "none"}}
+
+    model_config = SimpleNamespace(
+        stage_id=stage_id,
+        async_chunk=async_chunk,
+        stage_connector_config=spec,
+    )
+    assert stage_receives_chunks(model_config) is False
+    assert stage_sends_async_output(model_config) is False
+    assert needs_omni_connector(model_config) is False
+    assert _should_create_payload_connector(model_config) is False
+
+
 def test_recv_with_missing_metadata(mocker: MockerFixture):
     """Test recv when queue payload is malformed (missing metadata)."""
     # Connector expects metadata but task doesn't have it
