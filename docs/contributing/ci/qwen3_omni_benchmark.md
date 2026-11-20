@@ -58,9 +58,9 @@ does not get reused for Seed's concurrency sweep; Seed tiers share one lifetime.
 
 The full-duplex JSON configurations use the same shared runner. CUDA covers
 Omni-DuplexEval `PR_correction` (120 selected IDs, c8) and OmniInteract
-`1q1a_math` (60 sessions, c8). The NPU DuplexEval candidate covers the same
-120 IDs at c8. CUDA uses device 2 for the judge; NPU uses device 3. Candidate NPU profiles
-require qualification before replacing scheduled A3 jobs. A2/H200 supporting
+`1q1a_math` (60 sessions, c8). A3 nightly runs DuplexEval on the same 120 IDs
+at c8, with the judge on device 3. CUDA uses device 2 for the judge.
+The four non-duplex NPU cases still await A3 qualification. A2/H200 supporting
 results identify their actual hardware and do not establish A3/H100 results.
 
 ## Completeness, accuracy and performance
@@ -106,7 +106,7 @@ full-dataset measurements are separate workloads. Unmeasurable TPOT is null.
 Evaluated DuplexEval cases also publish `result_acc_*.json` under
 `tests/e2e/accuracy/omni_duplex_eval/results` (or `ACC_BENCH_RESULT_DIR`). This
 artifact copies the existing judge scores and coverage from the performance
-result; inference and judging run once. The CUDA DuplexEval job uploads both
+result; inference and judging run once. The CUDA and A3 DuplexEval jobs upload both
 result directories. Publication does not require `duplex_eval_accuracy_config`;
 record-only cases retain an empty accuracy baseline and their existing score
 checks. The performance JSON, metric definitions and numerical scores are

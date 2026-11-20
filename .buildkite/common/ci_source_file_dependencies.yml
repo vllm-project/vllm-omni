@@ -695,8 +695,7 @@ source_file_dependencies:
     - tests/dfx/perf/tests/test_qwen3_omni_duplex_omniinteract.json
     - tests/dfx/perf/tests/test_qwen3_omni_duplex_omni_duplex_eval.json
 
-  # Reusable V2/prefix-cache runtime dependencies. Currently composed only by
-  # Qwen CUDA nightly jobs; NPU/ROCm still use V1.
+  # Shared by Qwen CUDA nightly jobs and the A3 DuplexEval job.
   omni_v2_runtime:
     - vllm_omni/core/prefix_cache/
     - vllm_omni/worker_v2/__init__.py

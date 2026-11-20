@@ -4,8 +4,8 @@ Qwen3-Omni CUDA nightly uses a
 [combined accuracy and performance suite](./qwen3_omni_benchmark.md) so the
 full accuracy requests run only once. Its smaller performance runs use the
 same benchmark CLI. The older random workload JSON files remain available to
-other pipelines and manual callers. A3 keeps its existing nightly executions
-until both candidate deployments complete target-hardware qualification.
+other pipelines and manual callers. A3 nightly runs the existing random
+workloads and a separate Qwen3-Omni DuplexEval job.
 
 #### Config file layout (in-tree examples)
 
@@ -230,7 +230,7 @@ You can add any benchmark running parameters you need here. For all optional par
 CUDA/NPU ready performance jobs and the MiniCPM-o 4.5 A3 two-card nightly
 job currently have no configured baseline, so the flag only enables the check
 entry point and those cases skip threshold validation until baselines are added.
-The two Qwen3-Omni NPU nightly performance jobs intentionally omit
+The two Qwen3-Omni NPU nightly random-workload jobs intentionally omit
 `--assert-baseline` while the known performance issue
 [#10055](https://github.com/vllm-project/vllm-omni/issues/10055) is evaluated.
 
