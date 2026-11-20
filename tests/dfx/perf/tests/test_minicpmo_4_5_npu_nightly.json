@@ -1,0 +1,350 @@
+[
+  {
+    "test_name": "test_minicpmo_4_5_npu_nightly_default",
+    "description": "1 card · 3-stage · stage2: 2 replicas (MiniCPM-o only; Whisper/SIM uses a second NPU). NPU nightly default serving: --no-async-chunk and prefix cache off on the duplex deploy. One C32 English Seed-TTS pass of all 1088 utterances records ttft/tpot/rtf/ttfp/throughput/e2e and gates WER 0.05 / SIM 0.80. pytest cards_2 is the scorer, not a second model card. max_num_seqs is 32; drop stages and duplex_session.max_sessions to 16 if this OOMs. Performance baselines start empty until a measured A3 window is collected.",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "npu": "A3"
+          },
+          "num_cards": 2
+        }
+      },
+      "full_model",
+      "omni"
+    ],
+    "server_params": {
+      "model": "openbmb/MiniCPM-o-4_5",
+      "extra_cli_args": [
+        "--deploy-config",
+        "vllm_omni/deploy/minicpmo_4_5.yaml",
+        "--trust-remote-code",
+        "--no-async-chunk"
+      ],
+      "update": {
+        "async_chunk": false,
+        "duplex_session.max_sessions": 32,
+        "stages": {
+          "0": {"max_num_seqs": 32},
+          "1": {"max_num_seqs": 32},
+          "2": {"max_num_seqs": 32}
+        },
+        "platforms.npu.stages.0.max_num_seqs": 32,
+        "platforms.npu.stages.1.max_num_seqs": 32,
+        "platforms.npu.stages.2.max_num_seqs": 32,
+        "platforms.npu.stages.2.num_replicas": 2,
+        "platforms.npu.stages.2.devices": "0,0",
+        "platforms.npu.stages.2.gpu_memory_utilization": 0.11
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "default-seed-tts-c32",
+        "dataset_name": "seed-tts",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "backend": "openai-chat-omni",
+        "endpoint": "/v1/chat/completions",
+        "num_prompts": [1088],
+        "max_concurrency": [32],
+        "num_warmups": 0,
+        "no_oversample": true,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "seed_tts_locale": "en",
+        "seed_tts_wer_eval": true,
+        "omni_fail_fast_on_timeout": true,
+        "max_seed_tts_mean_wer": 0.05,
+        "min_seed_tts_mean_sim": 0.80,
+        "extra_body": {
+          "modalities": ["text", "audio"],
+          "chat_template_kwargs": {
+            "enable_thinking": false,
+            "use_tts_template": true
+          }
+        },
+        "percentile-metrics": "ttft,tpot,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "baseline": {}
+      }
+    ]
+  },
+  {
+    "test_name": "test_minicpmo_4_5_npu_nightly_async_prefix_c32",
+    "description": "1 card · 3-stage · stage2: 2 replicas (MiniCPM-o only; Whisper/SIM uses a second NPU). NPU nightly async_chunk + Thinker prefix cache on turn serving. Seed-TTS C1/C16 are perf-only prefixes (32/256); C32 also gates WER 0.05 / SIM 0.80 on all 1088 English utterances. pytest cards_2 is the scorer, not a second model card. max_num_seqs is 32; drop to 16 if C32 OOMs. Stage-0 ngram is removed because omni prefix cache refuses speculative decoding. Performance baselines start empty until a measured A3 window is collected.",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "npu": "A3"
+          },
+          "num_cards": 2
+        }
+      },
+      "full_model",
+      "omni"
+    ],
+    "server_params": {
+      "model": "openbmb/MiniCPM-o-4_5",
+      "extra_cli_args": [
+        "--deploy-config",
+        "vllm_omni/deploy/minicpmo_4_5_turn.yaml",
+        "--trust-remote-code"
+      ],
+      "update": {
+        "async_chunk": true,
+        "session_mode": "turn",
+        "stages": {
+          "0": {
+            "enable_prefix_caching": true,
+            "max_num_seqs": 32
+          },
+          "1": {"max_num_seqs": 32},
+          "2": {"max_num_seqs": 32}
+        },
+        "platforms.npu.stages.0.enable_prefix_caching": true,
+        "platforms.npu.stages.0.max_num_seqs": 32,
+        "platforms.npu.stages.1.max_num_seqs": 32,
+        "platforms.npu.stages.2.max_num_seqs": 32,
+        "platforms.npu.stages.2.num_replicas": 2,
+        "platforms.npu.stages.2.devices": "0,0",
+        "platforms.npu.stages.2.gpu_memory_utilization": 0.11
+      },
+      "delete": {
+        "stages": {
+          "0": ["speculative_config"]
+        },
+        "platforms.npu.stages.0.speculative_config": null
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "async-prefix-seed-tts-c1",
+        "dataset_name": "seed-tts",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "backend": "openai-chat-omni",
+        "endpoint": "/v1/chat/completions",
+        "num_prompts": [32],
+        "max_concurrency": [1],
+        "no_oversample": true,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "seed_tts_locale": "en",
+        "omni_fail_fast_on_timeout": true,
+        "extra_body": {
+          "modalities": ["text", "audio"],
+          "chat_template_kwargs": {
+            "enable_thinking": false,
+            "use_tts_template": true
+          }
+        },
+        "percentile-metrics": "ttft,tpot,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "baseline": {}
+      },
+      {
+        "name": "async-prefix-seed-tts-c16",
+        "dataset_name": "seed-tts",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "backend": "openai-chat-omni",
+        "endpoint": "/v1/chat/completions",
+        "num_prompts": [256],
+        "max_concurrency": [16],
+        "no_oversample": true,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "seed_tts_locale": "en",
+        "omni_fail_fast_on_timeout": true,
+        "extra_body": {
+          "modalities": ["text", "audio"],
+          "chat_template_kwargs": {
+            "enable_thinking": false,
+            "use_tts_template": true
+          }
+        },
+        "percentile-metrics": "ttft,tpot,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "baseline": {}
+      },
+      {
+        "name": "async-prefix-seed-tts-c32",
+        "dataset_name": "seed-tts",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "backend": "openai-chat-omni",
+        "endpoint": "/v1/chat/completions",
+        "num_prompts": [1088],
+        "max_concurrency": [32],
+        "num_warmups": 0,
+        "no_oversample": true,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "seed_tts_locale": "en",
+        "seed_tts_wer_eval": true,
+        "omni_fail_fast_on_timeout": true,
+        "max_seed_tts_mean_wer": 0.05,
+        "min_seed_tts_mean_sim": 0.80,
+        "extra_body": {
+          "modalities": ["text", "audio"],
+          "chat_template_kwargs": {
+            "enable_thinking": false,
+            "use_tts_template": true
+          }
+        },
+        "percentile-metrics": "ttft,tpot,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "baseline": {}
+      }
+    ]
+  },
+  {
+    "test_name": "test_minicpmo_4_5_npu_nightly_async_prefix_c64",
+    "description": "Single replica · 2 cards (stage0,1: 1 card; stage2: 1 card) (MiniCPM-o only; Whisper/SIM uses a third NPU). NPU nightly async_chunk + Thinker prefix cache on turn serving. Seed-TTS C1/C16/C32 are perf-only prefixes (32/256/512); C64 also gates WER 0.05 / SIM 0.80 on all 1088 English utterances. pytest cards_3 is the scorer, not a third model card. max_num_seqs is 64; drop to 32 if C64 OOMs. Stage-0 ngram is removed because omni prefix cache refuses speculative decoding. Performance baselines start empty until a measured A3 window is collected.",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "npu": "A3"
+          },
+          "num_cards": 3
+        }
+      },
+      "full_model",
+      "omni"
+    ],
+    "server_params": {
+      "model": "openbmb/MiniCPM-o-4_5",
+      "extra_cli_args": [
+        "--deploy-config",
+        "vllm_omni/deploy/minicpmo_4_5_npu_2card.yaml",
+        "--trust-remote-code",
+        "--stage-init-timeout",
+        "1200",
+        "--init-timeout",
+        "1500"
+      ],
+      "update": {
+        "async_chunk": true,
+        "session_mode": "turn",
+        "stages": {
+          "0": {
+            "devices": "0",
+            "enable_prefix_caching": true,
+            "max_num_seqs": 64
+          },
+          "1": {
+            "devices": "0",
+            "max_num_seqs": 64
+          },
+          "2": {
+            "devices": "1",
+            "max_num_seqs": 64
+          }
+        },
+        "platforms.npu.stages.0.enable_prefix_caching": true,
+        "platforms.npu.stages.0.max_num_seqs": 64,
+        "platforms.npu.stages.1.max_num_seqs": 64,
+        "platforms.npu.stages.2.max_num_seqs": 64
+      },
+      "delete": {
+        "stages": {
+          "0": ["speculative_config"]
+        },
+        "platforms.npu.stages.0.speculative_config": null
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "async-prefix-seed-tts-c1",
+        "dataset_name": "seed-tts",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "backend": "openai-chat-omni",
+        "endpoint": "/v1/chat/completions",
+        "num_prompts": [32],
+        "max_concurrency": [1],
+        "no_oversample": true,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "seed_tts_locale": "en",
+        "omni_fail_fast_on_timeout": true,
+        "extra_body": {
+          "modalities": ["text", "audio"],
+          "chat_template_kwargs": {
+            "enable_thinking": false,
+            "use_tts_template": true
+          }
+        },
+        "percentile-metrics": "ttft,tpot,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "baseline": {}
+      },
+      {
+        "name": "async-prefix-seed-tts-c16",
+        "dataset_name": "seed-tts",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "backend": "openai-chat-omni",
+        "endpoint": "/v1/chat/completions",
+        "num_prompts": [256],
+        "max_concurrency": [16],
+        "no_oversample": true,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "seed_tts_locale": "en",
+        "omni_fail_fast_on_timeout": true,
+        "extra_body": {
+          "modalities": ["text", "audio"],
+          "chat_template_kwargs": {
+            "enable_thinking": false,
+            "use_tts_template": true
+          }
+        },
+        "percentile-metrics": "ttft,tpot,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "baseline": {}
+      },
+      {
+        "name": "async-prefix-seed-tts-c32",
+        "dataset_name": "seed-tts",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "backend": "openai-chat-omni",
+        "endpoint": "/v1/chat/completions",
+        "num_prompts": [512],
+        "max_concurrency": [32],
+        "no_oversample": true,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "seed_tts_locale": "en",
+        "omni_fail_fast_on_timeout": true,
+        "extra_body": {
+          "modalities": ["text", "audio"],
+          "chat_template_kwargs": {
+            "enable_thinking": false,
+            "use_tts_template": true
+          }
+        },
+        "percentile-metrics": "ttft,tpot,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "baseline": {}
+      },
+      {
+        "name": "async-prefix-seed-tts-c64",
+        "dataset_name": "seed-tts",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "backend": "openai-chat-omni",
+        "endpoint": "/v1/chat/completions",
+        "num_prompts": [1088],
+        "max_concurrency": [64],
+        "num_warmups": 0,
+        "no_oversample": true,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "seed_tts_locale": "en",
+        "seed_tts_wer_eval": true,
+        "omni_fail_fast_on_timeout": true,
+        "max_seed_tts_mean_wer": 0.05,
+        "min_seed_tts_mean_sim": 0.80,
+        "extra_body": {
+          "modalities": ["text", "audio"],
+          "chat_template_kwargs": {
+            "enable_thinking": false,
+            "use_tts_template": true
+          }
+        },
+        "percentile-metrics": "ttft,tpot,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "baseline": {}
+      }
+    ]
+  }
+]
