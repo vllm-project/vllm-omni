@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 
 import logging
@@ -15,6 +15,10 @@ from vllm_omni.model_executor.stage_input_processors.mimo_audio import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_to_code_tensor_missing_codes_returns_none():
+    assert sip._to_code_tensor(None) is None
 
 
 def test_llm2code2wav_full_payload_truncates_when_flat_exceeds_max(caplog):
