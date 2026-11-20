@@ -148,7 +148,7 @@ You can configure per-stage sampling parameters for multi-stage models.
 >
 > Do not combine `frame` with `first_frame` or `last_frame`, and do not combine any frame input with
 > `references`. Task routing is automatic from which inputs you connect.
-
+>
 > For MiniMax-H3 Fun ControlNet Union, connect a **MiniMax-H3 Control** node. It cannot be combined with `frame`, `first_frame`/`last_frame`, `references`, or `latent_edit` either.
 
 #### MiniMax-H3 Fun ControlNet Union
@@ -174,6 +174,8 @@ Control videos are re-encoded as lossless H.264 (CRF 0) and uploaded whole, so e
 > `inpaint` needs a mask. `source_video` without a mask, a structure mode without `control_video`, or `mask` together with `mask_video` are rejected before the request is sent.
 >
 > Control requires a MiniMax-H3 model. With a custom `--served-model-name`, connect **MiniMax-H3 Video Params** so the request is recognised as MiniMax-H3; this is not needed when **FastH3 Deployment** is connected.
+
+Load [MiniMax-H3 ControlNet Canny](example_workflows/vLLM-Omni%20MiniMax-H3%20ControlNet%20Canny.json) for a complete `canny` example. It builds the control video inside the workflow: **Load Video** -> fit to 1344x768 -> first 124 frames -> **Canny** -> **Create Video** at 24 FPS. It also saves the control video so you can check the edges. The **Load Video** filename is a placeholder; put your source clip in `ComfyUI/input`.
 
 For MiniMax-H3 Ref2VA, **Video References** accepts up to 9 images (`image_1`–`image_9`),
 3 videos (`video_1`–`video_3`), and 3 audio clips (`audio_1`–`audio_3`), with at most
