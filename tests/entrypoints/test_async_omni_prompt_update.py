@@ -228,6 +228,7 @@ def _make_rejection_omni(mocker, messages: list) -> tuple[AsyncOmni, ClientReque
 
     omni.engine = mocker.Mock(get_outputs_async=get_outputs_async)
     omni._initialize_async_frontend()
+    omni._pause_cond = asyncio.Condition()
     mocker.patch.object(omni, "_engine_core_rpc", side_effect=engine_core_rpc)
     return omni, req_state, order
 

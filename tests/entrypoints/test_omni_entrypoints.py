@@ -7,12 +7,13 @@ import asyncio
 import gc
 import queue
 import threading
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, Callable
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from vllm.engine.protocol import StreamingInput
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -1891,4 +1892,98 @@ async def test_async_omni_shutdown_rejects_request_racing_the_snapshot(monkeypat
         for stream in streams:
             stream.cancel()
         await asyncio.gather(*streams, return_exceptions=True)
+        app.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("paused", [True, False], ids=["paused", "sleeping"])
+async def test_async_omni_shutdown_releases_admission_waiters(monkeypatch: pytest.MonkeyPatch, paused: bool):
+    engine = FakeAsyncOmniEngine()
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+    app._paused = paused
+    if not paused:
+        app._sleeping_tags.add("kv_cache")
+
+    parked = asyncio.Event()
+    original_wait = app._pause_cond.wait
+
+    async def observe_wait() -> bool:
+        parked.set()
+        return await original_wait()
+
+    monkeypatch.setattr(app._pause_cond, "wait", observe_wait)
+    waiting = asyncio.create_task(_consume_async(app.generate(prompt="hello", request_id="req-parked")))
+    try:
+        await asyncio.wait_for(parked.wait(), timeout=5)
+        assert not app.request_states
+        assert app.final_output_task is None
+
+        await asyncio.wait_for(asyncio.to_thread(app.shutdown), timeout=5)
+
+        with pytest.raises(OmniEngineDeadError, match="shutting down"):
+            await asyncio.wait_for(waiting, timeout=1)
+        with pytest.raises(OmniEngineDeadError, match="shutting down"):
+            await asyncio.wait_for(_consume_async(app.generate(prompt="hello", request_id="req-later")), timeout=1)
+        assert not engine.submitted
+        assert not app.request_states
+        assert app.final_output_task is None
+    finally:
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+        app.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start_input_pump", [True, False], ids=["waiting-for-input", "before-pump-start"])
+async def test_async_omni_shutdown_releases_first_streaming_input(
+    monkeypatch: pytest.MonkeyPatch, start_input_pump: bool
+):
+    engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META[:1])
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+    input_started = asyncio.Event()
+    input_closed = asyncio.Event()
+    allow_input = asyncio.Event()
+
+    async def inputs() -> AsyncGenerator[StreamingInput, None]:
+        input_started.set()
+        try:
+            await allow_input.wait()
+            yield StreamingInput(prompt={"prompt_token_ids": [1]})
+        finally:
+            input_closed.set()
+
+    original_add_streaming = app._add_streaming_input_request
+    pumps: list[asyncio.Task] = []
+
+    async def capture_input_pump(**kwargs) -> asyncio.Task:
+        pump = await original_add_streaming(**kwargs)
+        pumps.append(pump)
+        if not start_input_pump:
+            # The pump is queued on this loop and has yet to execute its try/finally.
+            app.shutdown()
+        return pump
+
+    monkeypatch.setattr(app, "_add_streaming_input_request", capture_input_pump)
+    waiting = asyncio.create_task(_consume_async(app.generate(prompt=inputs(), request_id="req-input")))
+    try:
+        if start_input_pump:
+            await asyncio.wait_for(input_started.wait(), timeout=5)
+            assert app.request_states["req-input"].input_stream_task is pumps[0]
+            await asyncio.wait_for(asyncio.to_thread(app.shutdown), timeout=5)
+
+        with pytest.raises(OmniEngineDeadError, match="shutting down"):
+            await asyncio.wait_for(waiting, timeout=1)
+        assert len(pumps) == 1
+        await asyncio.wait_for(asyncio.gather(*pumps, return_exceptions=True), timeout=1)
+        assert input_started.is_set() is start_input_pump
+        assert input_closed.is_set() is start_input_pump
+        assert not allow_input.is_set()
+        assert not engine.submitted
+        assert not app.request_states
+        assert app.final_output_task is None
+    finally:
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
         app.shutdown()

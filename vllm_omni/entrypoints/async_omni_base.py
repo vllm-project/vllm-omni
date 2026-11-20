@@ -395,19 +395,23 @@ class AsyncOmniBase(OmniBase):
 
     # ==================== Output Handler ====================
 
+    def _check_frontend_admission(self) -> None:
+        """Bind the serving loop before a request can park or register."""
+        # Serialize the first admission check with shutdown before any loop
+        # has been bound, even when no output pump has started.
+        if self._output_loop is None:
+            with self._output_loop_lock:
+                self._output_loop = asyncio.get_running_loop()
+        if self._frontend_shutting_down:
+            raise OmniEngineDeadError(_SHUTDOWN_REASON)
+
     def _final_output_handler(self) -> None:
         """Start the final output handler if not already running.
 
         This handler reads messages from the Orchestrator output queue and
         routes them to per-request asyncio.Queues.
         """
-        # Publish the owner before starting the pump or registering a request.
-        # The lock covers shutdown racing the first call, before a loop exists.
-        if self._output_loop is None:
-            with self._output_loop_lock:
-                self._output_loop = asyncio.get_running_loop()
-        if self._frontend_shutting_down:
-            raise OmniEngineDeadError(_SHUTDOWN_REASON)
+        self._check_frontend_admission()
         if self.final_output_task is not None:
             return
 
@@ -736,8 +740,19 @@ class AsyncOmniBase(OmniBase):
             req_state.queue.put_nowait(
                 ErrorMessage(error=_SHUTDOWN_REASON, fatal=True, request_id=req_state.request_id)
             )
+            # generate() can be waiting for its first input before it starts
+            # reading the output queue. The pump may not have run yet.
+            first_chunk_submitted = req_state.first_chunk_submitted
+            if first_chunk_submitted is not None and not first_chunk_submitted.done():
+                first_chunk_submitted.set_result(None)
+            if req_state.input_stream_task is not None:
+                req_state.input_stream_task.cancel()
             for task in list(req_state.interaction_error_tasks):
                 task.cancel()
         if self.final_output_task is not None:
             self.final_output_task.cancel()
             self.final_output_task = None
+        self._on_frontend_shutdown()
+
+    def _on_frontend_shutdown(self) -> None:
+        """Wake any subclass-owned frontend waiters."""
