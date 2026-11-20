@@ -13,8 +13,8 @@ from tests.diffusion.models.hunyuan_image3.test_diffusion_kv_request import _com
 from tests.diffusion.models.hunyuan_image3.test_hunyuan_image3_step_execution import _pipeline, _state
 from vllm_omni.diffusion.data import AttentionScheduleConfig, DiffusionKVCacheMode
 from vllm_omni.diffusion.mixfusion.plan import MixFusionSequenceRequest
+from vllm_omni.diffusion.mixfusion.prefix_kv import build_document_plan
 from vllm_omni.diffusion.mixfusion.scheduling import MixFusionCapability, MixFusionSequenceInfo, fits_mixfusion_budget
-from vllm_omni.diffusion.mixfusion.sequence import build_sequence_plan
 from vllm_omni.diffusion.mixfusion.setup import prepare_mixfusion_admission
 from vllm_omni.diffusion.models.hunyuan_image3 import pipeline_hunyuan_image3 as pipeline_module
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
@@ -39,6 +39,7 @@ class _Config:
     diffusion_attention_schedule: AttentionScheduleConfig | None = None
     enable_mixfusion: bool = True
     max_num_seqs: int = 2
+    mixfusion_min_chunk_tokens: int = 16
 
 
 @dataclass
@@ -82,13 +83,15 @@ def test_host_sequence_summary_and_request_opt_in(monkeypatch, server, flag, exp
     assert (request.mixfusion_info is not None) == expected
     assert not request.diffusion_kv_requests
     if expected:
-        assert request.mixfusion_info == MixFusionSequenceInfo((1, 4, 96, 128), 16, (12, 14), (32, 34), 1)
+        assert request.mixfusion_info == MixFusionSequenceInfo(
+            (1, 4, 96, 128), 16, (12, 14), (32, 34), 1, min_chunk_tokens=16
+        )
         assert len(tokenizer.calls) == 1
     else:
         assert not tokenizer.calls
 
 
-def test_sequence_scheduler_ignores_chunk_limits_and_refreshes_members(monkeypatch):
+def test_chunk_scheduler_applies_image_budget_and_refreshes_members(monkeypatch):
     config, preprocess, _ = _preprocessor(monkeypatch)
     engine = _AdmissionEngine(config)
     scheduler = StepScheduler()
@@ -97,11 +100,14 @@ def test_sequence_scheduler_ignores_chunk_limits_and_refreshes_members(monkeypat
     for i, (h, w) in enumerate([(768, 1024), (1024, 768), (512, 512)]):
         request = _request(guidance_scale=5.0, request_id=str(i))
         request.sampling_params.height, request.sampling_params.width = h, w
-        request.sampling_params.extra_args = {"mixfusion_min_chunk_tokens": 99999, "mixfusion_max_chunks": 1}
+        request.sampling_params.extra_args = {"mixfusion_min_chunk_tokens": 16, "mixfusion_max_chunks": 4}
         preprocess(request)
         prepare_mixfusion_admission(engine, request)
         assert request.mixfusion_info is not None
         requests.append(request)
+    # Individual requests fit, but moving one below the aggregate budget
+    # prevents it from sharing a batch with another two-branch request.
+    assert not fits_mixfusion_budget([requests[0].mixfusion_info, replace(requests[1].mixfusion_info, max_chunks=3)])
     scheduler.add_request(requests[0])
     assert scheduler.schedule().scheduled_request_ids == ["0"]
     scheduler.add_request(requests[1])
@@ -185,15 +191,17 @@ def test_first_and_later_sequence_masks_match_existing_hunyuan_masks(monkeypatch
     docs = pipeline._mixfusion_documents(state, prepared)
 
     def plan_mask(doc):
-        plan = build_sequence_plan((doc.geometry,), torch.device("cpu"))
+        plan = build_document_plan((doc.geometry,), torch.device("cpu"))
         mask = torch.zeros(
             doc.geometry.query_length, doc.geometry.prefix_length + doc.geometry.query_length, dtype=torch.bool
         )
+        query_order = plan.document_indices[0]
+        kv_order = torch.cat((torch.arange(doc.geometry.prefix_length) + doc.geometry.query_length, query_order))
         for segment in plan.segments:
             qo = ko = 0
             for qlen, klen in zip(segment.query_lengths, segment.key_lengths, strict=True):
-                qi = segment.query_indices[qo : qo + qlen]
-                ki = segment.kv_indices[ko : ko + klen]
+                qi = query_order.argsort()[segment.query_indices[qo : qo + qlen]]
+                ki = kv_order.argsort()[segment.kv_indices[ko : ko + klen]]
                 block = torch.ones(qlen, klen, dtype=torch.bool)
                 if segment.causal:
                     block = block.tril(klen - qlen)
@@ -228,5 +236,5 @@ def test_first_and_later_sequence_masks_match_existing_hunyuan_masks(monkeypatch
     "changes", [{"image_tokens": 0}, {"prefix_lengths": ()}, {"query_lengths": (1,)}, {"latent_shape": (1, 4, 0, 8)}]
 )
 def test_invalid_host_sequence_never_admitted(changes):
-    info = MixFusionSequenceInfo((1, 4, 8, 8), 16, (12,), (32,), 1)
+    info = MixFusionSequenceInfo((1, 4, 8, 8), 16, (12,), (32,), 1, min_chunk_tokens=16)
     assert not fits_mixfusion_budget([replace(info, **changes)])

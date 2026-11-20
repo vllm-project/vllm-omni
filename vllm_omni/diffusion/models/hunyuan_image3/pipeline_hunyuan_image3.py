@@ -39,9 +39,9 @@ from vllm_omni.diffusion.forward_context import (
     request_denoise_progress,
     set_forward_context_denoise_step_idx,
 )
+from vllm_omni.diffusion.mixfusion.prefix_kv import PackedDocument, PackedDocumentGeometry
 from vllm_omni.diffusion.mixfusion.request import mixfusion_requested
 from vllm_omni.diffusion.mixfusion.scheduling import MixFusionSequenceInfo
-from vllm_omni.diffusion.mixfusion.sequence import SequenceDocument, SequenceGeometry
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import _is_rank_zero
@@ -2643,7 +2643,7 @@ class HunyuanImage3Pipeline(
         """Prepare requests independently, then execute one packed decoder call."""
         from vllm.forward_context import set_forward_context
 
-        documents: list[SequenceDocument] = []
+        documents: list[PackedDocument] = []
         prepared_requests: list[_PreparedModelForward] = []
         with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
             for state in states:
@@ -2702,7 +2702,7 @@ class HunyuanImage3Pipeline(
         self,
         state: "StepRequestState",
         prepared: _PreparedModelForward,
-    ) -> list[SequenceDocument]:
+    ) -> list[PackedDocument]:
         info = state.mixfusion_info
         if not isinstance(info, MixFusionSequenceInfo):
             raise ValueError("Hunyuan packed execution requires sequence admission metadata")
@@ -2718,16 +2718,19 @@ class HunyuanImage3Pipeline(
                 reused = int(values["ar_kv_reuse_len"])
                 query_length = info.query_lengths[branch] - reused
                 spans = tuple(tuple(span) for span in values["full_attn_spans"][branch])
+                if len(spans) != 1 or spans[0][1] - spans[0][0] != info.image_tokens:
+                    raise ValueError("Hunyuan generated image span disagrees with MixFusion admission")
                 if reused:
                     snapshot = state.extra[_STEP_AR_KV]
                     prefix_kv = tuple(layer[branch] for layer in snapshot)
-                geometry = SequenceGeometry(
+                geometry = PackedDocumentGeometry(
                     state.request_id,
                     branch,
                     query_length,
                     prepared.inputs_embeds.shape[1],
                     reused,
                     spans,
+                    spans[0],
                     capture_length=prefix_length,
                 )
             else:
@@ -2739,16 +2742,17 @@ class HunyuanImage3Pipeline(
                 # The later-step state selects only special + image positions;
                 # boi/eoi and tokenizer padding are absent from its compact KV.
                 spans = ((prefix_length + info.special_tokens, prefix_length + query_length),)
-                geometry = SequenceGeometry(
+                geometry = PackedDocumentGeometry(
                     state.request_id,
                     branch,
                     query_length,
                     prepared.inputs_embeds.shape[1],
                     prefix_length,
                     spans,
+                    spans[0],
                 )
             docs.append(
-                SequenceDocument(
+                PackedDocument(
                     geometry,
                     prepared.inputs_embeds[branch : branch + 1],
                     values["position_ids"][branch : branch + 1],
@@ -2759,7 +2763,7 @@ class HunyuanImage3Pipeline(
             )
         return docs
 
-    def _save_mixfusion_prefix(self, state: "StepRequestState", documents: list[SequenceDocument]) -> None:
+    def _save_mixfusion_prefix(self, state: "StepRequestState", documents: list[PackedDocument]) -> None:
         """Keep the existing per-request cache format, including branch lengths."""
         cache = []
         for layer_index in range(len(self.model.layers)):

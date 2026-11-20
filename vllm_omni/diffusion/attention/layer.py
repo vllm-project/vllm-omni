@@ -25,6 +25,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
 from vllm_omni.diffusion.attention.backends.abstract import (
+    PACKED_CAUSAL_KEY,
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
@@ -1010,50 +1011,39 @@ class Attention(nn.Module):
         causal: bool = False,
         sequence_lengths: tuple[tuple[int, ...], tuple[int, ...]] | None = None,
     ) -> torch.Tensor:
-        """Run attention over a flat ``[total_tokens, heads, head_dim]`` packing.
-
-        ``cu_seqlens`` are the cumulative document boundaries; documents never
-        attend across them. Backends advertising
-        ``supports_multi_doc_packed_varlen`` for the effective quantization
-        policy receive one varlen forward; every other backend is served by
-        mask-free equal-length dense buckets with the same isolation.
-        """
-        if cu_seqlens_k is not None:
-            from vllm_omni.diffusion.mixfusion.sequence_attention import sequence_attention
-
+        """Run flat packed attention with document isolation and optional prefix KV."""
+        backend = spec = None
+        extra: dict[str, Any] = {}
+        kv_dtype = self._effective_kv_cache_dtype()
+        if cu_seqlens_k is None:
+            if causal or max_seqlen_k is not None or sequence_lengths is not None:
+                raise ValueError("Packed prefix attention requires independent Q/K boundaries")
+            cu_seqlens_k, max_seqlen_k = cu_seqlens, max_seqlen
+            native_varlen = self.supports_multi_doc_packed_varlen(kv_cache_dtype=kv_dtype)
+        else:
             if max_seqlen_k is None:
                 raise ValueError("Packed prefix attention requires max_seqlen_k")
-            return sequence_attention(
-                self,
-                query,
-                key,
-                value,
-                cu_query=cu_seqlens,
-                cu_key=cu_seqlens_k,
-                max_query=max_seqlen,
-                max_key=max_seqlen_k,
-                causal=causal,
-                lengths=sequence_lengths,
+            _, backend, spec = self.effective_attention()
+            native_varlen = backend is not None and backend.supports_packed_prefix_kv(kv_cache_dtype=kv_dtype)
+            extra[PACKED_CAUSAL_KEY] = causal
+
+        if native_varlen:
+            extra.update(
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen_k,
+                attention_mask_mode="none",
             )
-        if causal or max_seqlen_k is not None or sequence_lengths is not None:
-            raise ValueError("Packed prefix attention requires independent Q/K boundaries")
-        if self.supports_multi_doc_packed_varlen(kv_cache_dtype=self._effective_kv_cache_dtype()):
-            metadata = AttentionMetadata(
-                extra={
-                    "cu_seqlens_q": cu_seqlens,
-                    "cu_seqlens_k": cu_seqlens,
-                    "max_seqlen_q": max_seqlen,
-                    "max_seqlen_k": max_seqlen,
-                    "attention_mask_mode": "none",
-                }
+            output = self.forward(
+                query.unsqueeze(0), key.unsqueeze(0), value.unsqueeze(0), AttentionMetadata(extra=extra)
             )
-            # Varlen backends run the packed row as [1, total_tokens, heads,
-            # head_dim] (TRTLLM's forward_cuda unpacks a 4-D query; Flash
-            # accepts either layout and returns the one it got), and the
-            # result returns to the flat packing.
-            out = self.forward(query.unsqueeze(0), key.unsqueeze(0), value.unsqueeze(0), metadata)
-            return out.reshape(query.shape)
-        return self._forward_packed_dense_buckets(query, key, value, cu_seqlens)
+            return output.reshape_as(query)
+
+        mask_capable = causal and backend is not None and backend.supports_dense_4d_mask(spec)
+        return self._forward_packed_dense_buckets(
+            query, key, value, cu_seqlens, cu_seqlens_k, causal, mask_capable, sequence_lengths
+        )
 
     def _forward_packed_dense_buckets(
         self,
@@ -1061,34 +1051,62 @@ class Attention(nn.Module):
         key: torch.Tensor,
         value: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        causal: bool,
+        mask_capable: bool,
+        lengths: tuple[tuple[int, ...], tuple[int, ...]] | None,
     ) -> torch.Tensor:
-        """Serve packed documents with mask-free dense attention, by length.
-
-        Documents sharing a sequence length are stacked into one dense
-        ``[m, L, heads, head_dim]`` forward; the outputs scatter back into
-        the flat layout, so no attention crosses a document boundary even
-        though the underlying backend never sees cu_seqlens.
-        """
-        seqlens = cu_seqlens.diff().tolist()
-        buckets: dict[int, list[int]] = {}
-        for segment, length in enumerate(seqlens):
-            if length > 0:
-                buckets.setdefault(length, []).append(segment)
-        cu = cu_seqlens.to(device=query.device, dtype=torch.long)
-        out = torch.empty_like(query)
-        for length, segments in buckets.items():
-            rows = cu[segments].unsqueeze(1) + torch.arange(length, device=query.device)
-            flat_rows = rows.reshape(-1)
-            # Q and K/V may carry different head counts; each gets its own
-            # bucket shape and scatters back to its own flat layout.
-            bucket_out = self.forward(
-                query.index_select(0, flat_rows).reshape(len(segments), length, *query.shape[1:]),
-                key.index_select(0, flat_rows).reshape(len(segments), length, *key.shape[1:]),
-                value.index_select(0, flat_rows).reshape(len(segments), length, *value.shape[1:]),
-                AttentionMetadata(),
+        """Bucket by Q/K lengths and keep each query within its legal KV range."""
+        if cu_seqlens_k is cu_seqlens:
+            qlens = klens = tuple(cu_seqlens.diff().tolist())
+        else:
+            qlens, klens = lengths or (tuple(cu_seqlens.diff().tolist()), tuple(cu_seqlens_k.diff().tolist()))
+        if cu_seqlens_k is not cu_seqlens and (
+            len(qlens) != len(klens) or sum(qlens) != query.shape[0] or sum(klens) != key.shape[0]
+        ):
+            raise ValueError("Packed prefix Q/K lengths do not cover their tensors")
+        buckets: dict[tuple[int, int], list[tuple[int, int]]] = {}
+        qoff = koff = 0
+        for qlen, klen in zip(qlens, klens, strict=True):
+            if qlen == 0 and klen == 0:
+                continue
+            if qlen <= 0 or klen < qlen:
+                raise ValueError("Prefix attention requires 0 < query length <= KV length")
+            if causal and not mask_capable:
+                # Each query becomes a non-causal segment over exactly its visible
+                # KV prefix. This also supports dense kernels without mask/causal
+                # support; no query is allowed to see future tokens.
+                for pos in range(qlen):
+                    buckets.setdefault((1, klen - qlen + pos + 1), []).append((qoff + pos, koff))
+            else:
+                buckets.setdefault((qlen, klen), []).append((qoff, koff))
+            qoff += qlen
+            koff += klen
+        result = torch.empty_like(query)
+        for (qlen, klen), rows in buckets.items():
+            qs = torch.tensor([q for q, _ in rows], device=query.device, dtype=torch.long)
+            qi = (qs[:, None] + torch.arange(qlen, device=query.device)).flatten()
+            if cu_seqlens_k is cu_seqlens:
+                ki = qi
+            else:
+                ks = torch.tensor([k for _, k in rows], device=key.device, dtype=torch.long)
+                ki = (ks[:, None] + torch.arange(klen, device=key.device)).flatten()
+            mask = None
+            if causal and mask_capable:
+                mask = torch.arange(klen, device=query.device)[None, :] <= (
+                    torch.arange(qlen, device=query.device)[:, None] + klen - qlen
+                )
+                mask = mask[None, None]
+            output = self.forward(
+                query.index_select(0, qi).reshape(len(rows), qlen, *query.shape[1:]),
+                key.index_select(0, ki).reshape(len(rows), klen, *key.shape[1:]),
+                value.index_select(0, ki).reshape(len(rows), klen, *value.shape[1:]),
+                AttentionMetadata(
+                    attn_mask=mask, extra={"attention_mask_mode": "arbitrary"} if mask is not None else {}
+                ),
             )
-            out.index_copy_(0, flat_rows, bucket_out.reshape(flat_rows.shape[0], *query.shape[1:]))
-        return out
+            result.index_copy_(0, qi, output.reshape(len(rows) * qlen, *query.shape[1:]))
+        return result
 
     def _register_scheduled_op(self) -> None:
         """Give this layer the id the compiled scheduled-attention op carries.

@@ -89,10 +89,9 @@ from vllm_omni.diffusion.layers.fused_moe import FusedMoE
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.mixfusion.plan import MixFusionRoot, MixFusionSequenceRequest
-from vllm_omni.diffusion.mixfusion.sequence import (
+from vllm_omni.diffusion.mixfusion.prefix_kv import (
     SEQUENCE_DOCUMENTS_KEY,
-    PackedSequencePlan,
-    SequenceDocument,
+    PackedDocument,
     run_prefix_attention,
 )
 
@@ -878,7 +877,7 @@ class HunYuanRotary2DEmbedder:
         device = q.device
         # 1. Prepare cos/sin
         step = get_forward_context().mixfusion_step if is_forward_context_available() else None
-        if step is not None and isinstance(step.plan, PackedSequencePlan):
+        if step is not None and step.plan is not None and step.plan.documents:
             cos, sin = custom_pos_emb
         else:
             cos, sin = self._prepare_cos_sin(custom_pos_emb, first_step, device)
@@ -1292,7 +1291,7 @@ class ImageKVCacheManager(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         step = get_forward_context().mixfusion_step if is_forward_context_available() else None
-        if step is not None and isinstance(step.plan, PackedSequencePlan):
+        if step is not None and step.plan is not None and step.plan.documents:
             return run_prefix_attention(
                 self.attn,
                 query.reshape(-1, self.num_heads, self.head_dim),
@@ -2573,7 +2572,7 @@ class HunyuanImage3Model(nn.Module):
         ar_kv_reuse_len: int = 0,
         paged_kv_cached_prefix_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
-        mixfusion_documents: list[SequenceDocument] | None = None,
+        mixfusion_documents: list[PackedDocument] | None = None,
     ) -> tuple | BaseModelOutputWithPast:
         current_omni_platform.reset_diffusion_fused_moe_forward_context()
 

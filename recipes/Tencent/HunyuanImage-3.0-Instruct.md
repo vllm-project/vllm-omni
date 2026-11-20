@@ -314,12 +314,12 @@ diffusion_attention_config:
     backend: FLASH_ATTN  # TORCH_SDPA uses attention-local dense buckets
 ```
 
-MixFusion combines each request's CFG branches as independent decoder
-sequences. Image projection and output decoding retain each request's spatial
-shape; no GCD chunks are needed. `mixfusion_min_chunk_tokens` and
-`mixfusion_max_chunks` apply to chunked layouts such as Qwen-Image and do not
-control Hunyuan's flat sequence layout. Increase `max_num_seqs` only after
-checking peak memory for the intended resolutions and prompt lengths.
+MixFusion packs each request's CFG branches into one decoder call while
+keeping their attention separate. Image projection and output decoding retain
+each request's spatial shape. `mixfusion_min_chunk_tokens` sets the minimum
+GCD chunk size for generated image tokens, and `mixfusion_max_chunks` caps
+the total across CFG branches. Check peak memory for the intended resolutions
+and prompt lengths before increasing `max_num_seqs`.
 
 Some prompts and seeds can exceed image similarity thresholds compared with
 serial execution, even with identical sampling settings. Validate accuracy

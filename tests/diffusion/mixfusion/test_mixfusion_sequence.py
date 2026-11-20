@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Flat prefix-KV execution against independent masked attention references."""
+"""Chunked prefix-KV execution against independent masked attention references."""
 
 from dataclasses import dataclass
 
@@ -14,13 +14,13 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.forward_context import ForwardContext, MixFusionStep, override_forward_context
 from vllm_omni.diffusion.hooks.mixfusion import apply_mixfusion, plan_foreign_hooks
 from vllm_omni.diffusion.mixfusion.plan import MixFusionRoot, MixFusionSequenceRequest, mixfusion_compatible_hook
-from vllm_omni.diffusion.mixfusion.sequence import (
-    SequenceDocument,
-    SequenceGeometry,
-    build_sequence_plan,
+from vllm_omni.diffusion.mixfusion.prefix_kv import (
+    PackedDocument,
+    PackedDocumentGeometry,
+    build_document_plan,
+    pack_document_queries,
     run_prefix_attention,
 )
-from vllm_omni.diffusion.mixfusion.sequence_attention import sequence_attention
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -37,6 +37,7 @@ class _MaskFreeBackend(AttentionBackend):
 
 class _Attention:
     forward_packed = Attention.forward_packed
+    _forward_packed_dense_buckets = Attention._forward_packed_dense_buckets
 
     def __init__(self, masked=True):
         self.backend = _DenseBackend if masked else _MaskFreeBackend
@@ -65,9 +66,9 @@ def test_prefix_segments_match_dense_reference_with_mixed_phases(masked):
     # A later step, a first step, and its other CFG branch. Prefix and image
     # sizes differ, and the first step contains a causal tail after the image.
     geometries = (
-        SequenceGeometry("old", 0, 5, 5, 3, ((4, 8),)),
-        SequenceGeometry("new", 0, 10, 10, 0, ((4, 9),), capture_length=3),
-        SequenceGeometry("new", 1, 8, 10, 0, ((2, 7),), capture_length=1),
+        PackedDocumentGeometry("old", 0, 5, 5, 3, ((4, 8),), (4, 8)),
+        PackedDocumentGeometry("new", 0, 10, 10, 0, ((4, 9),), (4, 9), capture_length=3),
+        PackedDocumentGeometry("new", 1, 8, 10, 0, ((2, 7),), (2, 7), capture_length=1),
     )
     docs, qs, ks, vs, expected = [], [], [], [], []
     for geo in geometries:
@@ -86,37 +87,42 @@ def test_prefix_segments_match_dense_reference_with_mixed_phases(masked):
             enable_gqa=True,
         )[0].transpose(0, 1)
         expected.append(ref)
-        docs.append(SequenceDocument(geo, q, q, q, q, prefix_kv=((pk, pv),)))
+        docs.append(PackedDocument(geo, q, q, q, q, prefix_kv=((pk, pv),)))
         qs.append(q)
         ks.append(k)
         vs.append(v)
-    plan = build_sequence_plan(geometries, torch.device("cpu"))
+    plan = build_document_plan(geometries, torch.device("cpu"))
     attn = _Attention(masked)
-    actual = run_prefix_attention(attn, torch.cat(qs), torch.cat(ks), torch.cat(vs), plan, docs, 0)
-    torch.testing.assert_close(actual, torch.cat(expected))
+
+    def packed_attention():
+        q, k, v = (pack_document_queries(rows, plan) for rows in (qs, ks, vs))
+        result = run_prefix_attention(attn, q, k, v, plan, docs, 0)
+        return [result.index_select(0, idx) for idx in plan.document_indices]
+
+    actual = packed_attention()
+    for result, ref in zip(actual, expected, strict=True):
+        torch.testing.assert_close(result, ref)
     assert docs[0].captured_kv == []
     torch.testing.assert_close(docs[1].captured_kv[0][0], ks[1][:3])
     assert docs[1].captured_kv[0][0].untyped_storage().data_ptr() != ks[1].untyped_storage().data_ptr()
     # Mutation of the other CFG branch must not change the old request.
     vs[-1].fill_(100)
-    changed = run_prefix_attention(attn, torch.cat(qs), torch.cat(ks), torch.cat(vs), plan, docs, 0)
-    torch.testing.assert_close(changed[:5], actual[:5])
+    torch.testing.assert_close(packed_attention()[0], actual[0])
 
 
 def test_equal_prefix_shapes_share_dense_attention_bucket():
     attn = _Attention()
     q, k, v = torch.randn(6, 2, 4), torch.randn(14, 1, 4), torch.randn(14, 1, 4)
-    sequence_attention(
-        attn,
+    attn.forward_packed(
         q,
         k,
         v,
-        cu_query=torch.tensor([0, 3, 6]),
-        cu_key=torch.tensor([0, 7, 14]),
-        max_query=3,
-        max_key=7,
+        cu_seqlens=torch.tensor([0, 3, 6]),
+        cu_seqlens_k=torch.tensor([0, 7, 14]),
+        max_seqlen=3,
+        max_seqlen_k=7,
         causal=True,
-        lengths=((3, 3), (7, 7)),
+        sequence_lengths=((3, 3), (7, 7)),
     )
     assert len(attn.calls) == 1
     assert attn.calls[0][0][0] == 2
@@ -151,11 +157,11 @@ def test_sequence_root_restores_order_and_rebuilds_after_departure():
     model = _Decoder()
     apply_mixfusion(model, model._mixfusion_plan)
     docs = []
-    for idx, length in enumerate([4, 7]):
-        x = torch.full((1, length, 8), float(idx + 1))
+    for idx, length in enumerate([5, 9]):
+        x = torch.arange(length * 8, dtype=torch.float32).reshape(1, length, 8) + idx
         docs.append(
-            SequenceDocument(
-                SequenceGeometry(str(idx), 0, length, length, 0, ((0, length),)),
+            PackedDocument(
+                PackedDocumentGeometry(str(idx), 0, length, length, 0, ((1, length),), (1, length)),
                 x,
                 torch.arange(length)[None],
                 x,
@@ -166,6 +172,8 @@ def test_sequence_root_restores_order_and_rebuilds_after_departure():
         step = MixFusionStep()
         with override_forward_context(ForwardContext(mixfusion_step=step)):
             outputs = model(mixfusion_documents=active)
+        assert step.plan.chunk_size == (4 if len(active) == 2 else active[0].geometry.query_length - 1)
+        assert step.plan.num_chunks == (3 if len(active) == 2 else 1)
         assert len(outputs) == len(active)
         for out, doc in zip(outputs, active, strict=True):
             torch.testing.assert_close(out, doc.hidden_states * 2)

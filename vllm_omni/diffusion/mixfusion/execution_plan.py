@@ -12,45 +12,74 @@ max_seqlen). Layout only: no model-specific semantics, no ``nn.Module`` state.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.mixfusion.adapter import AttentionLayout
+    from vllm_omni.diffusion.mixfusion.prefix_kv import PackedDocumentGeometry
+
+
+@dataclass
+class PackedAttentionSegments:
+    causal: bool
+    query_indices: torch.Tensor
+    kv_indices: torch.Tensor
+    cu_query: torch.Tensor
+    cu_key: torch.Tensor
+    query_lengths: tuple[int, ...]
+    key_lengths: tuple[int, ...]
 
 
 @dataclass
 class PackedExecutionPlan:
-    """Per-step MixFusion packing layout, computed once and shared by all blocks.
+    """Chunk geometry and attention indices shared by all layers of a step."""
 
-    Holds the flat varlen layout (cu_seqlens / max_seq_len) and the index
-    tensors that recover each stream's rows, so per-block work stays on-GPU.
-    The stream set and order come from the model's ``layout``; this plan
-    records their lengths and indices.
-    """
-
-    layout: AttentionLayout
     chunk_size: int
-    num_chunks: int
     request_chunk_ranges: list[tuple[int, int]]
-    # Number of packed rows per caller-side state (a state may hold several
-    # images/prompts); output reassembly concatenates each state's rows back
-    # into one tensor.
     image_row_counts: tuple[int, ...]
     chunk_to_request: torch.Tensor
-    # Stream name -> per-request token count, in request order.
-    request_stream_lens: dict[str, tuple[int, ...]]
-    # Padded width of each ``"request"`` stream's output buffer. The model
-    # supplies this because only it knows the caller-side padded shape.
-    stream_padded_lens: dict[str, int]
-    cu_seqlens_tensor: torch.Tensor
-    max_seq_len: int
-    # Stream name -> (gather rows out of the packed result, scatter targets in
-    # the padded per-request output space or None when no padding is needed).
-    output_indices: dict[str, tuple[torch.Tensor, torch.Tensor | None]]
+
+    # Joint text/image streams share Q/K boundaries.
+    layout: AttentionLayout | None = None
+    request_stream_lens: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    stream_padded_lens: dict[str, int] = field(default_factory=dict)
+    cu_seqlens_tensor: torch.Tensor | None = None
+    max_seq_len: int = 0
+    output_indices: dict[str, tuple[torch.Tensor, torch.Tensor | None]] = field(default_factory=dict)
+
+    # Prefix-KV documents index the same chunk rows, followed by other queries.
+    documents: tuple[PackedDocumentGeometry, ...] = ()
+    document_indices: tuple[torch.Tensor, ...] = ()
+    segments: tuple[PackedAttentionSegments, ...] = ()
+
+    @property
+    def num_chunks(self) -> int:
+        return self.request_chunk_ranges[-1][1] if self.request_chunk_ranges else 0
+
+    def image_chunk_rows(self, tokens: torch.Tensor) -> torch.Tensor:
+        """View contiguous image tokens as rows of the common chunk size."""
+        return tokens.reshape(-1, self.chunk_size, *tokens.shape[1:])
+
+
+def build_chunk_plan(
+    image_lengths: Sequence[int], image_row_counts: Sequence[int], device: torch.device
+) -> PackedExecutionPlan:
+    """Allocate equal-length chunk rows from the actual image token lengths."""
+    if not image_lengths or min(image_lengths) <= 0 or sum(image_row_counts) != len(image_lengths):
+        raise ValueError("MixFusion chunk rows must cover a nonempty image batch")
+    chunk_size = math.gcd(*image_lengths)
+    ranges = []
+    owners: list[int] = []
+    for row, length in enumerate(image_lengths):
+        start = len(owners)
+        owners.extend([row] * (length // chunk_size))
+        ranges.append((start, len(owners)))
+    return PackedExecutionPlan(chunk_size, ranges, tuple(image_row_counts), torch.tensor(owners, device=device))
 
 
 def build_execution_plan(
@@ -98,7 +127,6 @@ def build_execution_plan(
     return PackedExecutionPlan(
         layout=layout,
         chunk_size=chunk_size,
-        num_chunks=request_chunk_ranges[-1][1] if request_chunk_ranges else 0,
         request_chunk_ranges=request_chunk_ranges,
         image_row_counts=tuple(image_row_counts),
         chunk_to_request=chunk_to_request,

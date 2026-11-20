@@ -9,6 +9,7 @@ MixFusion logic of their own.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from operator import attrgetter
 from typing import TYPE_CHECKING, Any
 
@@ -179,6 +180,16 @@ def prepare_mixfusion_admission(engine: DiffusionEngine, request: OmniDiffusionR
         return
     if not mixfusion_requested(request.sampling_params, engine.od_config, supported=True):
         return
+    extras = request.sampling_params.extra_args or {}
+    min_chunk_tokens = int(
+        extras.get(
+            "mixfusion_min_chunk_tokens",
+            getattr(engine.od_config, "mixfusion_min_chunk_tokens", DEFAULT_MIN_CHUNK_TOKENS),
+        )
+    )
+    max_chunks = int(
+        extras.get("mixfusion_max_chunks", getattr(engine.od_config, "mixfusion_max_chunks", DEFAULT_MAX_CHUNKS))
+    )
     if isinstance(capability.request_config, MixFusionSequenceRequest):
         from vllm_omni.diffusion.attention.schedule import (
             resolve_request_attention_schedule,
@@ -194,20 +205,11 @@ def prepare_mixfusion_admission(engine: DiffusionEngine, request: OmniDiffusionR
             info = attrgetter(capability.request_config.metadata_attr)(request)
         except AttributeError:
             return
-        if isinstance(info, MixFusionSequenceInfo) and fits_mixfusion_budget([info]):
-            request.mixfusion_info = info
+        if isinstance(info, MixFusionSequenceInfo):
+            info = replace(info, min_chunk_tokens=min_chunk_tokens, max_chunks=max_chunks)
+            if fits_mixfusion_budget([info]):
+                request.mixfusion_info = info
         return
-    extras = request.sampling_params.extra_args or {}
-    info = prepare_image_request(
-        request,
-        capability.request_config,
-        int(
-            extras.get(
-                "mixfusion_min_chunk_tokens",
-                getattr(engine.od_config, "mixfusion_min_chunk_tokens", DEFAULT_MIN_CHUNK_TOKENS),
-            )
-        ),
-        int(extras.get("mixfusion_max_chunks", getattr(engine.od_config, "mixfusion_max_chunks", DEFAULT_MAX_CHUNKS))),
-    )
+    info = prepare_image_request(request, capability.request_config, min_chunk_tokens, max_chunks)
     if info is not None and fits_mixfusion_budget([info]):
         request.mixfusion_info = info

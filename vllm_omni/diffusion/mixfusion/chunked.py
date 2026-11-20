@@ -13,8 +13,7 @@ chunk-stacks its outputs, and the output is reassembled per request.
 
 from __future__ import annotations
 
-import math
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 from torch import nn
@@ -22,13 +21,11 @@ from torch import nn
 from vllm_omni.diffusion.mixfusion.adapter import AttentionLayout, MixFusionAdapter, PackedInputs, StreamSpec
 from vllm_omni.diffusion.mixfusion.execution_plan import (
     PackedExecutionPlan,
+    build_chunk_plan,
     build_execution_plan,
     reassemble_chunk_rows,
 )
 from vllm_omni.diffusion.mixfusion.plan import MixFusionRoot
-
-if TYPE_CHECKING:
-    from vllm_omni.diffusion.mixfusion.sequence import PackedSequencePlan
 
 #: Joint attention streams of a packed call, in per-request token order: the
 #: request-level text stream opens each request, the chunk-stacked image
@@ -92,15 +89,10 @@ class ChunkedJointAdapter:
         else:
             # Derive the layout from this step's actual prepared batch. Adding or
             # removing requests can change the GCD, including preparation failures.
-            chunk_size = math.gcd(*(int(sample.shape[1]) for sample in latents))
-            plan = _build_plan(latents, rows, real_lens, padded, chunk_size=chunk_size, device=text.device)
+            plan = _build_plan(latents, rows, real_lens, padded, device=text.device)
         return PackedInputs(args=tuple(bound.args), kwargs=dict(bound.kwargs), plan=plan, adapter_state=(key, plan))
 
-    def restore_output(
-        self, module: nn.Module, output: Any, plan: PackedExecutionPlan | PackedSequencePlan
-    ) -> list[torch.Tensor]:
-        if not isinstance(plan, PackedExecutionPlan):
-            raise TypeError("Chunked joint output requires its matching execution plan")
+    def restore_output(self, module: nn.Module, output: Any, plan: PackedExecutionPlan) -> list[torch.Tensor]:
         sample = output[0] if isinstance(output, (tuple, list)) else getattr(output, self.root.output_attr)
         return reassemble_chunk_rows(sample, plan.request_chunk_ranges, plan.image_row_counts)
 
@@ -111,23 +103,18 @@ def _build_plan(
     text_lens: list[int],
     text_padded: int,
     *,
-    chunk_size: int,
     device: torch.device,
 ) -> PackedExecutionPlan:
-    ranges: list[tuple[int, int]] = []
-    chunk_to_request: list[int] = []
-    for row_idx, row in enumerate(rows):
-        start = len(chunk_to_request)
-        chunk_to_request.extend([row_idx] * (int(row.shape[1]) // chunk_size))
-        ranges.append((start, len(chunk_to_request)))
+    image_lengths = [int(row.shape[1]) for row in rows]
+    chunks = build_chunk_plan(image_lengths, [int(sample.shape[0]) for sample in latents], device)
     return build_execution_plan(
         layout=JOINT_TEXT_IMAGE_LAYOUT,
-        chunk_size=chunk_size,
-        request_chunk_ranges=ranges,
-        image_row_counts=[int(sample.shape[0]) for sample in latents],
-        request_stream_lens={"text": text_lens, "image": [int(row.shape[1]) for row in rows]},
+        chunk_size=chunks.chunk_size,
+        request_chunk_ranges=chunks.request_chunk_ranges,
+        image_row_counts=chunks.image_row_counts,
+        request_stream_lens={"text": text_lens, "image": image_lengths},
         stream_padded_lens={"text": text_padded},
-        chunk_to_request=torch.tensor(chunk_to_request, dtype=torch.long, device=device),
+        chunk_to_request=chunks.chunk_to_request,
         device=device,
     )
 
@@ -136,7 +123,7 @@ def resolve_mixfusion_adapter(module: nn.Module, plan: dict | None) -> MixFusion
     """The adapter that packs ``module``: an explicit ``mixfusion_adapter`` wins.
 
     Otherwise :class:`MixFusionRoot` selects the framework's layout family:
-    sequence requests use ``PrefixKVAdapter`` and other roots use
+    prepared prefix-KV requests use ``PrefixKVAdapter`` and other roots use
     :class:`ChunkedJointAdapter`. ``None`` retains dense admission.
     """
     explicit = getattr(module, "mixfusion_adapter", None)
@@ -146,7 +133,7 @@ def resolve_mixfusion_adapter(module: nn.Module, plan: dict | None) -> MixFusion
     from vllm_omni.diffusion.mixfusion.plan import MixFusionSequenceRequest
 
     if isinstance(root, MixFusionRoot) and isinstance(root.request, MixFusionSequenceRequest):
-        from vllm_omni.diffusion.mixfusion.sequence import PrefixKVAdapter
+        from vllm_omni.diffusion.mixfusion.prefix_kv import PrefixKVAdapter
 
         return PrefixKVAdapter()
     return ChunkedJointAdapter(root) if isinstance(root, MixFusionRoot) else None

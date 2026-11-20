@@ -248,7 +248,7 @@ def _chunk_stack(values, seq_dim: int, plan) -> torch.Tensor:
             rows = value.reshape(-1, *value.shape[2:])
         else:
             rows = torch.cat([value] * count, dim=0) if count > 1 else value
-        pieces.append(rows.reshape(-1, plan.chunk_size, *rows.shape[1:]))
+        pieces.append(plan.image_chunk_rows(rows))
     stacked = torch.cat(pieces, dim=0)
     if stacked.shape[0] != plan.num_chunks:
         raise ValueError(

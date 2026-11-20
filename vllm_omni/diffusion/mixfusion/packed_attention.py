@@ -173,6 +173,7 @@ def run_mixfusion_packed_attention(
     """
     plan: PackedExecutionPlan = attn_metadata.extra[MIXFUSION_PLAN_KEY]
     layout = plan.layout
+    assert layout is not None and plan.cu_seqlens_tensor is not None
     chunked_name = next(spec.name for spec in layout.streams if spec.kind == "chunked")
     all_streams = {**attn_metadata.extra[MIXFUSION_STREAMS_KEY], chunked_name: (query, key, value)}
 

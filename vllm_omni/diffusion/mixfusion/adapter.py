@@ -16,14 +16,11 @@ boundaries the plan declares.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from torch import nn
 
 from vllm_omni.diffusion.mixfusion.execution_plan import PackedExecutionPlan
-
-if TYPE_CHECKING:
-    from vllm_omni.diffusion.mixfusion.sequence import PackedSequencePlan
 
 #: How a stream's tokens are laid out across the packed rows. ``"chunked"``
 #: streams arrive as one row per (request, chunk) and carry one chunk per
@@ -72,7 +69,7 @@ class PackedInputs:
 
     args: tuple[Any, ...]
     kwargs: dict[str, Any]
-    plan: PackedExecutionPlan | PackedSequencePlan
+    plan: PackedExecutionPlan
     boundary_outputs: dict[str, Any] = field(default_factory=dict)
     adapter_state: Any = None
 
@@ -99,8 +96,6 @@ class MixFusionAdapter(Protocol):
         """
         ...
 
-    def restore_output(
-        self, module: nn.Module, output: Any, plan: PackedExecutionPlan | PackedSequencePlan
-    ) -> list[Any]:
+    def restore_output(self, module: nn.Module, output: Any, plan: PackedExecutionPlan) -> list[Any]:
         """Turn the packed forward output back into one output per request."""
         ...

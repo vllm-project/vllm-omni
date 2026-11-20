@@ -13,7 +13,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from vllm_omni.diffusion.mixfusion.plan import MixFusionSequenceRequest
-from vllm_omni.diffusion.mixfusion.request import MixFusionImageRequestConfig
+from vllm_omni.diffusion.mixfusion.request import (
+    DEFAULT_MAX_CHUNKS,
+    DEFAULT_MIN_CHUNK_TOKENS,
+    MixFusionImageRequestConfig,
+)
 
 
 @dataclass(frozen=True)
@@ -37,11 +41,11 @@ class MixFusionRequestInfo:
 
 @dataclass(frozen=True)
 class MixFusionSequenceInfo:
-    """Host-only spatial and document geometry for a flat prefix-KV layout.
+    """Host-only spatial and document geometry for prefix-KV attention.
 
     Sequence lengths describe the logical first step, before any imported
-    prefix is removed from the worker's queries. No chunk budget applies:
-    StepScheduler's normal request-count limit controls this layout.
+    prefix is removed from the worker's queries. Only image tokens count
+    toward the shared chunk budget.
     """
 
     latent_shape: tuple[int, int, int, int]
@@ -49,10 +53,16 @@ class MixFusionSequenceInfo:
     prefix_lengths: tuple[int, ...]
     query_lengths: tuple[int, ...]
     special_tokens: int
+    min_chunk_tokens: int = DEFAULT_MIN_CHUNK_TOKENS
+    max_chunks: int = DEFAULT_MAX_CHUNKS
+
+    @property
+    def num_images(self) -> int:
+        return len(self.prefix_lengths)
 
     @property
     def condition_key(self) -> tuple[str, int]:
-        return ("flat_prefix_kv", len(self.prefix_lengths))
+        return ("prefix_kv", self.num_images)
 
 
 def fits_mixfusion_budget(requests: Sequence[MixFusionRequestInfo | MixFusionSequenceInfo]) -> bool:
@@ -72,14 +82,14 @@ def fits_mixfusion_budget(requests: Sequence[MixFusionRequestInfo | MixFusionSeq
                 for p, q in zip(info.prefix_lengths, info.query_lengths, strict=True)
             )
             for info in sequences
-        )
+        ) and fits_chunk_budget(sequences)
     chunks = [info for info in requests if isinstance(info, MixFusionRequestInfo)]
     if len(chunks) == len(requests):
         return fits_chunk_budget(chunks)
     return False
 
 
-def fits_chunk_budget(requests: Sequence[MixFusionRequestInfo]) -> bool:
+def fits_chunk_budget(requests: Sequence[MixFusionRequestInfo | MixFusionSequenceInfo]) -> bool:
     """Whether the complete candidate batch fits every request's limits.
 
     GCD is a cost estimate here, not an execution plan. The adapter chooses

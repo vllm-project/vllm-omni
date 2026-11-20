@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Flat decoder sequences with request-owned prefix KV and piecewise attention.
+"""Chunked decoder inputs with request-owned prefix KV and piecewise attention.
 
 The model prepares embeddings and document semantics. This layout family owns
 packing, attention segments and output restoration, independently of image
@@ -17,6 +17,7 @@ import torch
 from torch import nn
 
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import build_segments
+from vllm_omni.diffusion.mixfusion.execution_plan import PackedAttentionSegments, build_chunk_plan
 from vllm_omni.diffusion.mixfusion.scheduling import MixFusionSequenceInfo
 
 SEQUENCE_DOCUMENTS_KEY = "mixfusion_documents"
@@ -29,20 +30,22 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
-class SequenceGeometry:
+class PackedDocumentGeometry:
     request_id: str
     branch: int
     query_length: int
     padded_length: int
     prefix_length: int
     full_spans: tuple[tuple[int, int], ...]
+    # Half-open image range in the logical Q+KV sequence.
+    image_span: tuple[int, int]
     # Capture the invariant prefix on the first denoising step only.
     capture_length: int | None = None
 
 
 @dataclass
-class SequenceDocument:
-    geometry: SequenceGeometry
+class PackedDocument:
+    geometry: PackedDocumentGeometry
     hidden_states: torch.Tensor
     position_ids: torch.Tensor
     cos: torch.Tensor
@@ -51,33 +54,30 @@ class SequenceDocument:
     captured_kv: list[tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)
 
 
-@dataclass
-class SequenceSegmentBatch:
-    causal: bool
-    query_indices: torch.Tensor
-    kv_indices: torch.Tensor
-    cu_query: torch.Tensor
-    cu_key: torch.Tensor
-    query_lengths: tuple[int, ...]
-    key_lengths: tuple[int, ...]
-
-
-@dataclass
-class PackedSequencePlan:
-    documents: tuple[SequenceGeometry, ...]
-    query_offsets: tuple[int, ...]
-    segments: tuple[SequenceSegmentBatch, ...]
-
-
-def build_sequence_plan(documents: tuple[SequenceGeometry, ...], device: torch.device) -> PackedSequencePlan:
-    """Batch causal/full segments, without requiring aligned document phases."""
-    query_offsets = [0]
-    kv_offset = 0
+def build_document_plan(documents: tuple[PackedDocumentGeometry, ...], device: torch.device) -> PackedExecutionPlan:
+    """Address each request's queries in image-chunk then non-image storage."""
+    image_lengths = [doc.image_span[1] - doc.image_span[0] for doc in documents]
+    # Each request/CFG branch supplies one image row.
+    plan = build_chunk_plan(image_lengths, [1] * len(documents), device)
+    other_offset = plan.num_chunks * plan.chunk_size
+    kv_offset = sum(doc.query_length for doc in documents)
+    document_indices = []
     grouped: dict[bool, list[tuple[list[int], list[int]]]] = {}
-    for doc in documents:
+    for doc, (chunk_start, chunk_end) in zip(documents, plan.request_chunk_ranges, strict=True):
         qlen, plen = doc.query_length, doc.prefix_length
         if not 0 < qlen <= doc.padded_length or plen < 0:
             raise ValueError("Invalid packed sequence query/prefix length")
+        start, stop = doc.image_span
+        if not plen <= start < stop <= plen + qlen:
+            raise ValueError("Image chunks must cover current queries")
+        before, after = start - plen, plen + qlen - stop
+        indices = [
+            *range(other_offset, other_offset + before),
+            *range(chunk_start * plan.chunk_size, chunk_end * plan.chunk_size),
+            *range(other_offset + before, other_offset + before + after),
+        ]
+        document_indices.append(torch.tensor(indices, device=device, dtype=torch.long))
+        other_offset += before + after
         end = 0
         for start, stop in doc.full_spans:
             if not end <= start < stop <= plen + qlen:
@@ -85,12 +85,12 @@ def build_sequence_plan(documents: tuple[SequenceGeometry, ...], device: torch.d
             end = stop
         if doc.capture_length is not None and not plen <= doc.capture_length <= plen + qlen:
             raise ValueError("Captured prefix must include imported KV and fit the first step")
+        keys_in_order = [*range(kv_offset, kv_offset + plen), *indices]
         for segment in build_segments(doc.full_spans, plen, qlen):
-            query = list(range(query_offsets[-1] + segment.q_start - plen, query_offsets[-1] + segment.q_end - plen))
-            keys = list(range(kv_offset, kv_offset + segment.kv_end))
+            query = indices[segment.q_start - plen : segment.q_end - plen]
+            keys = keys_in_order[: segment.kv_end]
             grouped.setdefault(segment.mode == "causal", []).append((query, keys))
-        query_offsets.append(query_offsets[-1] + qlen)
-        kv_offset += plen + qlen
+        kv_offset += plen
     batches = []
     for causal, segments in grouped.items():
         qi, ki, cq, ck = [], [], [0], [0]
@@ -100,7 +100,7 @@ def build_sequence_plan(documents: tuple[SequenceGeometry, ...], device: torch.d
             cq.append(len(qi))
             ck.append(len(ki))
         batches.append(
-            SequenceSegmentBatch(
+            PackedAttentionSegments(
                 causal,
                 torch.tensor(qi, device=device, dtype=torch.long),
                 torch.tensor(ki, device=device, dtype=torch.long),
@@ -110,7 +110,23 @@ def build_sequence_plan(documents: tuple[SequenceGeometry, ...], device: torch.d
                 tuple(len(k) for _, k in segments),
             )
         )
-    return PackedSequencePlan(documents, tuple(query_offsets), tuple(batches))
+    plan.documents = documents
+    plan.document_indices = tuple(document_indices)
+    plan.segments = tuple(batches)
+    return plan
+
+
+def pack_document_queries(rows: list[torch.Tensor], plan: PackedExecutionPlan) -> torch.Tensor:
+    """Pack image chunks followed by the remaining queries in one allocation."""
+    images, others = [], []
+    for row, doc in zip(rows, plan.documents, strict=True):
+        start, stop = (pos - doc.prefix_length for pos in doc.image_span)
+        images.append(plan.image_chunk_rows(row[start:stop]).flatten(0, 1))
+        if start:
+            others.append(row[:start])
+        if stop < doc.query_length:
+            others.append(row[stop : doc.query_length])
+    return torch.cat(images + others)
 
 
 class PrefixKVAdapter:
@@ -132,28 +148,26 @@ class PrefixKVAdapter:
         from vllm_omni.diffusion.mixfusion.adapter import PackedInputs
 
         documents = bound.arguments.get(SEQUENCE_DOCUMENTS_KEY)
-        if not documents or not all(isinstance(doc, SequenceDocument) for doc in documents):
-            raise ValueError("Packed decoder input requires prepared SequenceDocuments")
+        if not documents or not all(isinstance(doc, PackedDocument) for doc in documents):
+            raise ValueError("Packed decoder input requires prepared PackedDocuments")
         geometry = tuple(doc.geometry for doc in documents)
         device = documents[0].hidden_states.device
         key = (geometry, device)
         plan = (
             adapter_state[1]
             if adapter_state is not None and adapter_state[0] == key
-            else build_sequence_plan(geometry, device)
+            else build_document_plan(geometry, device)
         )
-        bound.arguments["inputs_embeds"] = torch.cat(
-            [doc.hidden_states[:, : doc.geometry.query_length] for doc in documents], dim=1
-        )
-        bound.arguments["position_ids"] = torch.cat(
-            [doc.position_ids[:, : doc.geometry.query_length] for doc in documents], dim=1
-        )
-        bound.arguments["custom_pos_emb"] = tuple(
-            torch.cat([getattr(doc, name)[:, : doc.geometry.query_length] for doc in documents], dim=1)
-            for name in ("cos", "sin")
-        )
-        bound.arguments["query_lens"] = [plan.query_offsets[-1]]
-        bound.arguments["seq_lens"] = [plan.query_offsets[-1]]
+
+        def pack(name: str) -> torch.Tensor:
+            return pack_document_queries([getattr(doc, name)[0] for doc in documents], plan).unsqueeze(0)
+
+        bound.arguments["inputs_embeds"] = pack("hidden_states")
+        bound.arguments["position_ids"] = pack("position_ids")
+        bound.arguments["custom_pos_emb"] = (pack("cos"), pack("sin"))
+        length = bound.arguments["inputs_embeds"].shape[1]
+        bound.arguments["query_lens"] = [length]
+        bound.arguments["seq_lens"] = [length]
         bound.arguments[SEQUENCE_DOCUMENTS_KEY] = None
         return PackedInputs(
             tuple(bound.args),
@@ -163,15 +177,11 @@ class PrefixKVAdapter:
             adapter_state=(key, plan),
         )
 
-    def restore_output(
-        self, module: nn.Module, output, plan: PackedSequencePlan | PackedExecutionPlan
-    ) -> list[torch.Tensor]:
-        if not isinstance(plan, PackedSequencePlan):
-            raise TypeError("Prefix-KV output requires its matching execution plan")
+    def restore_output(self, module: nn.Module, output, plan: PackedExecutionPlan) -> list[torch.Tensor]:
         hidden = output[0]
         restored = []
-        for doc, start, end in zip(plan.documents, plan.query_offsets[:-1], plan.query_offsets[1:], strict=True):
-            value = hidden[:, start:end]
+        for doc, indices in zip(plan.documents, plan.document_indices, strict=True):
+            value = hidden.index_select(1, indices)
             if doc.padded_length != doc.query_length:
                 value = torch.nn.functional.pad(value, (0, 0, 0, doc.padded_length - doc.query_length))
             restored.append(value)
@@ -183,27 +193,30 @@ def run_prefix_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    plan: PackedSequencePlan,
-    documents: list[SequenceDocument],
+    plan: PackedExecutionPlan,
+    documents: list[PackedDocument],
     layer_index: int,
 ) -> torch.Tensor:
-    """Assemble each document's KV, run segment batches, restore query order."""
-    keys, values = [], []
-    for doc, start, end in zip(documents, plan.query_offsets[:-1], plan.query_offsets[1:], strict=True):
-        k, v = key[start:end], value[start:end]
-        if doc.geometry.prefix_length:
+    """Gather legal KV directly from chunk storage or each request's cache."""
+    cached_keys, cached_values = [], []
+    for doc, indices in zip(documents, plan.document_indices, strict=True):
+        plen = doc.geometry.prefix_length
+        if plen:
             pk, pv = doc.prefix_kv[layer_index]
-            if pk.shape[0] != doc.geometry.prefix_length or pv.shape != pk.shape:
+            if pk.shape[0] != plen or pv.shape != pk.shape:
                 raise ValueError("Packed prefix KV does not match the document's declared prefix length")
-            k, v = torch.cat((pk, k)), torch.cat((pv, v))
+            cached_keys.append(pk)
+            cached_values.append(pv)
         capture = doc.geometry.capture_length
         if capture is not None:
-            # The request outlives this step. Copy only its invariant prefix;
-            # a view would pin every current image token until completion.
-            doc.captured_kv.append((k[:capture].detach().clone(), v[:capture].detach().clone()))
-        keys.append(k)
-        values.append(v)
-    flat_key, flat_value = torch.cat(keys), torch.cat(values)
+            # index_select owns the captured storage. A view could pin all image tokens.
+            rows = indices[: capture - plen]
+            ck, cv = key.index_select(0, rows), value.index_select(0, rows)
+            if plen:
+                ck, cv = torch.cat((pk, ck)), torch.cat((pv, cv))
+            doc.captured_kv.append((ck.detach(), cv.detach()))
+    flat_key = torch.cat((key, *cached_keys)) if cached_keys else key
+    flat_value = torch.cat((value, *cached_values)) if cached_values else value
     result = torch.empty_like(query)
     for segment in plan.segments:
         output = attn.forward_packed(

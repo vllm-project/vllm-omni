@@ -248,12 +248,10 @@ to meet the chunk policy even alone, also keep dense scheduling. Existing
 per-prompt input isolation remains in effect.
 
 `StepScheduler` passes the entire running batch plus each candidate to the
-common `fits_mixfusion_budget` predicate. For chunked joint attention, its
-GCD cost estimate must meet the strictest `mixfusion_min_chunk_tokens` and
-total chunks, including multiple images, must fit the strictest
-`mixfusion_max_chunks`. Flat prefix-KV layouts validate their sequence
-geometry and use the existing `max_num_seqs` capacity; chunk limits do not
-apply because these layouts do not split requests into chunks. A candidate that fails
+common `fits_mixfusion_budget` predicate. The image-token GCD must meet the
+strictest `mixfusion_min_chunk_tokens`, and total chunks across image rows
+must fit the strictest `mixfusion_max_chunks`. Prefix-KV layouts also validate
+sequence geometry and count each CFG branch as one image row. A candidate that fails
 stays waiting under the normal FIFO policy. The scheduler publishes selected
 requests and a `use_mixfusion` execution flag in `DiffusionSchedulerOutput`.
 It does not publish a chunk size, tensor shape map or packing plan.
@@ -264,10 +262,9 @@ The runner retains each new request's admission metadata in `StepRequestState`.
 `MixFusionDriver` validates request identity, dtype/device and runtime
 compatibility; each adapter validates its latent shape and token contract. It
 arms an empty `MixFusionStep`, and calls the ordinary `pipeline.denoise_step`.
-It does not admit, split, regroup or silently fall back. The root adapter
-for chunked joint attention computes the GCD from actual prepared latents
-and builds `PackedExecutionPlan`. Prefix-KV packing builds a
-`PackedSequencePlan` from the current request/CFG documents instead.
+The driver executes the scheduled group. The root adapter computes the image
+token GCD from actual prepared inputs and builds the shared `PackedExecutionPlan`.
+It records either joint streams or the prefix-KV documents and their segments.
 Request arrivals, departures, reordering and text-length changes invalidate
 the layout cache. Failed preparation may remove a request before packing;
 the remaining requests use their own GCD immediately. Removing requests cannot
@@ -308,8 +305,8 @@ implements *how*.
 | Driver | `mixfusion/driver.py` (`MixFusionDriver`) | Execution validation and arming/restoring `MixFusionStep` |
 | Hooks + plan types | `hooks/mixfusion.py`, `mixfusion/plan.py` | Applying `_mixfusion_plan` at module boundaries |
 | Chunked packing | `mixfusion/chunked.py` (`ChunkedJointAdapter`), `mixfusion/execution_plan.py` | Actual-input GCD and `PackedExecutionPlan`, per-request RoPE through the model's own boundary module, chunk split/reassembly |
-| Prefix-KV packing | `mixfusion/sequence.py` (`PrefixKVAdapter`) | Independent request/CFG documents, causal/full segments, prefix capture and output restoration |
-| Prefix attention | `mixfusion/sequence_attention.py` | Independent Q/K boundaries, varlen or dense buckets with bottom-right causal alignment |
+| Prefix-KV packing | `mixfusion/prefix_kv.py` (`PrefixKVAdapter`) | Shared image chunks, request/CFG indices, causal/full segments and prefix capture |
+| Packed attention | `Attention.forward_packed` | Varlen or dense buckets with independent Q/K boundaries and bottom-right causal alignment when required |
 | Joint attention | `Attention.forward` (plan-key dispatch), `mixfusion/packed_attention.py` | Per-request text + image reassembly, one packed varlen forward (or the dense fallbacks), scatter back per stream |
 | Startup wiring | `mixfusion/setup.py`, `mixfusion/request.py` | Config validation, mounting, request opt-in and batch-key relaxation |
 
@@ -397,9 +394,11 @@ reads only that immutable summary. It does not hold latent or embedding tensors.
 
 The pipeline retains per-request 2D patch projection, timestep conditioning,
 output projection, CFG and diffusion scheduler state. The root adapter packs
-`(request, CFG branch)` documents into `[1, total_query_tokens, hidden_size]`.
-Decoder normalization, QKV and MoE run on that flat sequence, without GCD
-chunks or request padding. Each document keeps its own positions and prefix KV.
+generated image tokens into GCD chunks and stores the remaining queries after
+them. Decoder normalization, QKV and MoE consume those tokens together in a
+single `[1, total_query_tokens, hidden_size]` view. Each request and CFG branch
+keeps its own positions and prefix KV. Plan indices give attention direct
+access to the chunks and restore each branch’s output order.
 
 First steps use the tokenizer's causal/full image spans. Subsequent steps query
 only timestep/special and image tokens, reusing the invariant prefix captured
@@ -419,7 +418,7 @@ Packed execution can produce numerical differences from serial execution
 that exceed image similarity thresholds for some prompts and seeds. Validate
 accuracy and throughput together on the intended workload and hardware.
 
-The sequence root checks native hooks throughout the decoder subtree. A hook
+The prefix-KV root checks native hooks throughout the decoder subtree. A hook
 may opt in with `mixfusion_compatible_hook` only if it is independent of request
 layout or derives its geometry from the actual packed input. The MoE token-count
 and one-time kernel initialization hooks satisfy this contract; unknown hooks
