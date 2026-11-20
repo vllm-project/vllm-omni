@@ -7,8 +7,8 @@
 # model_type stays "yue2" so the registered Yue2Config is used; no
 # trust_remote_code is needed (the registered config/model win over the
 # checkpoint's auto_map).
-# Audio synthesis depends on V1 model sampling hooks.
-model_runner: v1
+# Model-owned sampling and acoustic completion use V2 model-state hooks.
+model_runner: v2
 pipeline: yue2
 async_chunk: false
 dtype: bfloat16
