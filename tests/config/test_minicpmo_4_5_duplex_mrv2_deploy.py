@@ -57,33 +57,6 @@ def test_duplex_mrv2_rocm_profile_preserves_shared_contract(monkeypatch) -> None
     assert structured.stage_by_id(2).model_config.enforce_eager is True
 
 
-def test_cuda_replica_profile_disables_prompt_logprobs_for_automatic_sizing(monkeypatch) -> None:
-    monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
-    config = _apply_platform_overrides(
-        load_deploy_config(get_deploy_config_path("minicpmo_4_5_3gpu_stage1_replicas.yaml")),
-        platform="cuda",
-    )
-    stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
-
-    assert stages[1].yaml_engine_args["kv_cache_memory_bytes"] is None
-    assert stages[1].yaml_engine_args["max_logprobs"] == 0
-    assert stages[1].yaml_runtime["num_replicas"] == 2
-    assert stages[1].yaml_runtime["devices"] == "1,2"
-    assert "max_logprobs" not in stages[0].yaml_engine_args
-    assert "max_logprobs" not in stages[2].yaml_engine_args
-
-    _, base_stages = _resolve_stages(monkeypatch, "cuda")
-    assert all("max_logprobs" not in stage.yaml_engine_args for stage in base_stages)
-
-    monkeypatch.setattr(current_omni_platform, "device_name", "rocm")
-    rocm_config = _apply_platform_overrides(
-        load_deploy_config(get_deploy_config_path("minicpmo_4_5_3gpu_stage1_replicas.yaml")),
-        platform="rocm",
-    )
-    rocm_stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, rocm_config)
-    assert all("max_logprobs" not in stage.yaml_engine_args for stage in rocm_stages)
-
-
 @pytest.mark.parametrize("platform", ["xpu", "musa"])
 def test_duplex_mrv2_profile_keeps_deferred_platforms_on_v1(monkeypatch, platform) -> None:
     monkeypatch.setattr(current_omni_platform, "device_name", platform)

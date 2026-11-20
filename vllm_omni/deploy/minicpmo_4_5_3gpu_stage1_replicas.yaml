@@ -21,7 +21,3 @@ platforms:
       - stage_id: 1
         # Stage 1 has dedicated GPUs in this profile; retain automatic sizing.
         kv_cache_memory_bytes: null
-        # Automatic KV sizing runs the prompt-logprob warmup. The CUDA K-step
-        # Talker exposes only its virtual continue/stop head, so vLLM's
-        # default top-20 request exceeds the two available output columns.
-        max_logprobs: 0
