@@ -35,14 +35,14 @@ classifiers = [
 [project.optional-dependencies]
 
 tracing = [
-    "opentelemetry-sdk>=1.28.0",
-    "opentelemetry-exporter-otlp>=1.28.0",
+    "opentelemetry-sdk==1.45.2",
+    "opentelemetry-exporter-otlp==1.45.2",
     "opentelemetry-instrumentation-fastapi>=0.49b0",
 ]
 
 ming-tn = [
     "pynini",
-    "inflect",
+    "inflect==5.6.2",
 ]
 
 watermarking = [
@@ -50,30 +50,29 @@ watermarking = [
 ]
 
 dev = [
-    "opentelemetry-sdk>=1.28.0",
+    "opentelemetry-sdk==1.45.2",
     "opentelemetry-instrumentation-fastapi>=0.49b0",
-    "pytest==9.1.1",
+    "pytest==9.1.0",
     "pytest-asyncio==1.4.0",
-    "pytest-cov==7.1.0",
-    "pytest-mock==3.15.1",
+    "pytest-cov==6.3.0",
+    "pytest-mock==3.14.0",
     "pytest-shard==0.1.2",
     "pytest-xdist==3.8.0",
-    "websockets==16.1",
+    "websockets==16.0",
     "pytest-subtests==0.15.0",
-    "filelock>=3.16.1,<4",
-    "datasets==3.6.0",
+    "filelock==4.2.6",
+    "datasets==3.3.0",
     "mypy==1.11.1",
     "pre-commit==4.0.1",
     "openai-whisper==20250625",
-    "psutil==7.2.2",
-    "soundfile==0.14.0",
-    "imageio[ffmpeg]==2.37.4",
+    "psutil==6.1.0",
+    "soundfile==0.12.1",
+    "imageio[ffmpeg]==2.37.0",
     "opencv-python==5.0.0.93",
     # 0.3.12 includes acknowledged TCP writes (Mooncake #2850): completion
     # must mean the receive buffer is ready before zero-copy consumers read it.
-    "mooncake-transfer-engine-cuda13==0.3.12.post1",
-    "av==18.0.0; python_version >= '3.11'", # for ComfyUI tests
-    "av==17.1.0; python_version < '3.11'", # last av release that supports Python 3.10
+    "mooncake-transfer-engine-cuda13==0.3.14",
+    "av==16.1.0", # for ComfyUI tests
     "tomli==2.4.1; python_version < '3.11'", # tomllib backport used by tests/helpers/mark.py
     "openpyxl==3.1.5", # for nightly CI
     "pyttsx3==2.99",
@@ -81,13 +80,13 @@ dev = [
     "mistune==3.3.4", # for example tests
     "torchmetrics==1.9.0", # for accuracy similarity metrics
     "ray[default]==2.56.1", # for RL test
-    "jiwer==4.0.0",
+    "jiwer==3.0.5",
     "zhon==2.1.1",
     "zhconv==1.4.3",
     "funasr==1.3.29",
     "audioseal==0.2.0", # for audio watermarking tests
     "lpips==0.1.4", # for quantization fp8
-    "orjson==3.11.9", # to make v1/embeddings API fast
+    "orjson==3.12.0", # to make v1/embeddings API fast
     "voxcpm==2.0.3", # for VoxCPM2 path-locating in tests
     "torchdiffeq==0.2.5", # for covo_audio Test
     "FlagEmbedding==1.4.0", # for hunyuan_image3 tests
@@ -101,7 +100,7 @@ dev = [
 demo = [
     "gradio>=6.7.0",
     "opencv-python>=4.12.0.88",  # cli/stream_client frame reading
-    "requests>=2.28.0",  # cli/stream_client HTTP
+    "requests==2.34.2",  # cli/stream_client HTTP
     "cn2an>=0.5.22",  # Chinese number normalization for TTS (e.g. "1次" -> "一次")
 ]
 
@@ -127,7 +126,7 @@ local = [
 longcat-video-avatar = [
     "audio-separator==0.44.2",
     "pyloudnorm==0.1.1",
-    "soundfile>=0.13.1",
+    "soundfile==0.12.1",
 ]
 
 # Optional torch-based fallback for server-side Silero VAD.
@@ -168,7 +167,7 @@ docs = [
     "mkdocs-glightbox",
     "mkdocs-git-revision-date-localized-plugin",
     "mkdocs-minify-plugin",
-    "regex",
+    "regex==2026.2.28",
     "ruff",
     "pydantic",
 ]

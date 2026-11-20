@@ -17,47 +17,13 @@ from vllm.v1.worker.workspace import init_workspace_manager
 from vllm_omni.diffusion.data import OmniACK, OmniSleepTask, OmniWakeTask
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.base import OmniGPUWorkerBase
-from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.memory_utils import request_memory_tolerant
 from vllm_omni.worker.mixins import OmniWorkerMixin
 from vllm_omni.worker.moe_prefill_warmup import warm_up_moe_prefill_kernels
 from vllm_omni.worker.sampler_warmup import register_top_k_top_p_warmup
+from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
 
 logger = init_logger(__name__)
-
-
-def _is_mammoth_moda2_vllm_config(vllm_config) -> bool:
-    """True when this stage loads a MammothModa2 AR / multimodal checkpoint.
-
-    AR stages do not yet have a per-model ``model_runner_cls`` registry like
-    diffusion, so Mammoth specialty capture is selected by checkpoint metadata
-    here. Prefer ``model_type`` / ``architectures`` over path heuristics.
-    """
-    model_config = getattr(vllm_config, "model_config", None)
-    hf_config = getattr(model_config, "hf_config", None)
-    model_type = getattr(hf_config, "model_type", None)
-    if isinstance(model_type, str) and model_type.startswith("mammoth_moda2"):
-        return True
-    architectures = getattr(model_config, "architectures", None) or ()
-    return any("MammothModa2" in str(arch) for arch in architectures)
-
-
-def resolve_gpu_ar_model_runner_cls(vllm_config, runner_cls):
-    """Pick the AR runner class for this stage.
-
-    MammothModa2 MoE specialty capture/replay lives on
-    ``MammothGPUARModelRunner`` so shared ``OmniGPUModelRunner`` stays a thin
-    hook. Custom ``model_runner_cls`` overrides and V2 runners are left alone.
-    Specialty/flag mismatches are checked after ``load_model`` (the flag is
-    set during Mammoth model ``__init__``), not here at ``init_device``.
-    """
-    if runner_cls is not GPUARModelRunner or not _is_mammoth_moda2_vllm_config(vllm_config):
-        return runner_cls
-    from vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph_bridge import (
-        MammothGPUARModelRunner,
-    )
-
-    return MammothGPUARModelRunner
 
 
 class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
@@ -67,7 +33,7 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
     model runners for text generation stages (e.g., thinker stages).
     """
 
-    model_runner_cls = GPUARModelRunner
+    model_runner_cls = OmniARModelRunner
 
     def weight_sharing_control(self, operation: str, messages: tuple[bytes, ...] = ()) -> dict[str, object]:
         from vllm_omni.distributed.weight_sharing.worker_session import control_runner
@@ -171,25 +137,12 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         model_stage = getattr(self.model_config, "model_stage", None)
         stage_id = getattr(self.model_config, "stage_id", None)
 
-        self.use_v2_model_runner = bool(getattr(self.model_config, "use_v2_model_runner", False))
-        if self.use_v2_model_runner:
-            from vllm_omni.worker_v2.omni_ar_model_runner import (
-                OmniARModelRunner,
-            )
-
-            logger.info(
-                "Using MR v2 OmniARModelRunner for omni AR stage (stage_id=%s model_stage=%s).",
-                stage_id,
-                model_stage,
-            )
-            self.model_runner = OmniARModelRunner(self.vllm_config, self.device)
-        else:
-            self.use_v2_model_runner = False
-            runner_cls = resolve_gpu_ar_model_runner_cls(self.vllm_config, self.model_runner_cls)
-            self.model_runner = runner_cls(self.vllm_config, self.device)
-
-        if sharing is not None and not self.use_v2_model_runner:
-            raise ValueError("weight sharing requires model_runner: v2")
+        logger.info(
+            "Using MR v2 OmniARModelRunner for omni AR stage (stage_id=%s model_stage=%s).",
+            stage_id,
+            model_stage,
+        )
+        self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.

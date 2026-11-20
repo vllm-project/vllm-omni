@@ -678,6 +678,51 @@ def test_forward_passes_variable_length_padded_batch_to_decoder():
     torch.testing.assert_close(audios[1], torch.arange(1008, 1016, dtype=torch.float32))
 
 
+def test_decoder_graphs_are_captured_by_the_warmup_hook_not_load_weights():
+    model = _make_model(async_chunk=True, device=torch.device("cuda"))
+
+    _load_weights_noop(model)
+    assert model.decoder.cudagraph_calls == []
+
+    model.capture_auxiliary_graphs()
+    model.capture_auxiliary_graphs()
+    assert len(model.decoder.cudagraph_calls) == 1
+
+
+def test_weight_reload_after_warmup_recaptures_decoder_graphs_at_once():
+    model = _make_model(async_chunk=True, device=torch.device("cuda"))
+    _load_weights_noop(model)
+    model.capture_auxiliary_graphs()
+
+    _load_weights_noop(model)
+
+    assert len(model.decoder.cudagraph_calls) == 2
+
+
+def test_streaming_codec_is_built_by_the_warmup_hook(monkeypatch):
+    from vllm_omni.model_executor.models.qwen3_tts import streaming_code2wav
+    from vllm_omni.platforms import current_omni_platform
+
+    built = []
+    monkeypatch.setattr(streaming_code2wav, "StreamingCode2Wav", lambda decoder, **kwargs: built.append(kwargs))
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    model = _make_model(
+        async_chunk=True,
+        device=torch.device("cuda"),
+        stage_connector_config={"extra": {"decode_streaming": True}},
+    )
+    model.vllm_config.scheduler_config = SimpleNamespace(max_num_seqs=4)
+
+    _load_weights_noop(model)
+    assert built == []
+
+    model.capture_auxiliary_graphs()
+    model.capture_auxiliary_graphs()
+    assert len(built) == 1
+    assert built[0]["num_slots"] == 4
+    assert model.decoder.cudagraph_calls == []  # the streaming codec captures its own graphs
+
+
 def test_decode_chunking_override_is_passed_to_cudagraph():
     model = _make_model(
         async_chunk=True,
@@ -693,6 +738,7 @@ def test_decode_chunking_override_is_passed_to_cudagraph():
     )
 
     _load_weights_noop(model)
+    model.capture_auxiliary_graphs()
 
     assert model.decoder.cudagraph_calls[-1] == {
         "capture_modes": ("icl", "xvec"),
@@ -721,6 +767,7 @@ def test_cudagraph_batch_config_is_preserved():
     )
 
     _load_weights_noop(model)
+    model.capture_auxiliary_graphs()
 
     call = model.decoder.cudagraph_calls[-1]
     assert call["capture_batch_sizes"] == [1, 2, 4, 8]
@@ -730,6 +777,7 @@ def test_cudagraph_captures_only_modes_used_by_the_model():
     model = _make_model(async_chunk=True, device=torch.device("cuda"))
     model.decoder_cudagraph_modes = ("xvec",)
     _load_weights_noop(model)
+    model.capture_auxiliary_graphs()
     assert model.decoder.cudagraph_calls[-1]["capture_modes"] == ("xvec",)
 
 
@@ -745,6 +793,7 @@ def test_stateless_cudagraph_capture_sizes_are_passed_from_config():
     )
 
     _load_weights_noop(model)
+    model.capture_auxiliary_graphs()
 
     assert model.decoder.cudagraph_calls[-1]["stateless_capture_sizes"] == [97, 400]
 
@@ -761,6 +810,7 @@ def test_async_cudagraph_ignores_stateless_capture_sizes():
     )
 
     _load_weights_noop(model)
+    model.capture_auxiliary_graphs()
 
     assert model.decoder.cudagraph_calls[-1]["stateless_capture_sizes"] is None
 
@@ -1201,6 +1251,7 @@ def test_decode_autotune_restores_process_flags(mocker, monkeypatch, capture_fai
 
     capture_mock = mocker.patch.object(model, "_maybe_enable_decoder_cudagraph", side_effect=capture)
     _load_weights_noop(model)
+    model.capture_auxiliary_graphs()
     capture_mock.assert_called_once()
     assert observed == [(True, 10, *original)]
     assert torch.backends.cudnn.benchmark is False
