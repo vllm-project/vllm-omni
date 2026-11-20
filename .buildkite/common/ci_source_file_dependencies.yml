@@ -1595,6 +1595,10 @@ source_file_dependencies:
     - tests/assets/hunyuan_image3/
     - tests/dfx/perf/tests/test_hunyuan_image3_it2i.json
     - tests/dfx/perf/tests/test_hunyuan_image3_dit_sp4.json
+    - tests/dfx/perf/tests/test_hunyuan_image_tp2_cfgp2.json
+    - tests/dfx/perf/tests/test_hunyuan_image_tp2_sp2.json
+    - tests/dfx/perf/tests/test_hunyuan_image_tp4.json
+    - tests/dfx/perf/scripts/run_diffusion_benchmark.py
     - vllm_omni/deploy/hunyuan_image_3_moe.yaml
     - vllm_omni/deploy/hunyuan_image3_dit.yaml
 
