@@ -1,6 +1,9 @@
 # LFM3-Audio-2B speech profile on the LFM3-Omni eager bring-up runtime, with
 # the checkpoint's speech sampling defaults (generation_config.json).
 base_config: lfm3_omni.yaml
+# Not validated on Model Runner V2 yet: selecting the retired V1 runner keeps
+# the explicit load-time rejection.
+model_runner: v1
 stages:
   - stage_id: 0
     default_sampling_params:

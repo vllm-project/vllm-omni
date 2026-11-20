@@ -1,3 +1,6 @@
 # LFM3-Audio-2B text-output profile (ASR and audio understanding), no codec stage.
 base_config: lfm3_omni_text.yaml
+# Not validated on Model Runner V2 yet: selecting the retired V1 runner keeps
+# the explicit load-time rejection.
+model_runner: v1
 pipeline: lfm3_audio_text
